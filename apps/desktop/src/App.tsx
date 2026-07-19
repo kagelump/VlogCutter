@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import { api } from "./api";
-import type { Asset, AssetPatch, AutoplayMode, DesktopSettings, Project, ProjectLibrary, ProjectLocation, ReviewStatus } from "./types";
+import type { Asset, AssetPatch, AutoplayMode, DesktopSettings, Project, ProjectLibrary, ProjectLocation } from "./types";
 
 interface OperationProgress {
   kind: "proxy" | "thumbnail";
@@ -11,13 +11,6 @@ interface OperationProgress {
   workerCount: number;
   estimatedRemainingSeconds: number | null;
 }
-
-const statusLabels: Record<ReviewStatus, string> = {
-  unreviewed: "Unreviewed",
-  reviewed: "Reviewed",
-  skipped: "Skipped",
-  needs_attention: "Needs attention",
-};
 
 const autoplayOptions: Array<{ value: AutoplayMode; label: string; detail: string }> = [
   { value: "never", label: "Never", detail: "Keep each clip paused until you press Space." },
@@ -82,11 +75,33 @@ function formatDate(value: string | null) {
 function patchFor(asset: Asset): AssetPatch {
   return {
     notes: asset.notes,
-    status: asset.status,
-    included: asset.included,
-    sourceIn: asset.sourceIn,
-    sourceOut: asset.sourceOut,
+    labels: asset.labels,
+    removed: asset.removed,
+    rotationDegrees: asset.rotationDegrees,
   };
+}
+
+function rotationAfter(rotationDegrees: number, addition: number) {
+  return ((rotationDegrees + addition) % 360 + 360) % 360;
+}
+
+function portraitRotation(asset: Asset) {
+  return rotationAfter(asset.defaultRotationDegrees, 270);
+}
+
+function isRawOrientationProxy(asset: Asset) {
+  return Boolean(asset.proxyPath?.endsWith(".v2.mp4"));
+}
+
+function isRawOrientationThumbnail(asset: Asset) {
+  return Boolean(asset.thumbnailPath?.endsWith(".v2.jpg"));
+}
+
+function renderedRotation(asset: Asset, representationIsRaw: boolean) {
+  return rotationAfter(
+    asset.rotationDegrees,
+    representationIsRaw ? 0 : -asset.metadataRotationDegrees,
+  );
 }
 
 function assetContextKey(asset: Asset) {
@@ -101,6 +116,8 @@ function App() {
   const [assets, setAssets] = useState<Asset[]>([]);
   const [selectedId, setSelectedId] = useState("");
   const [query, setQuery] = useState("");
+  const [showRemoved, setShowRemoved] = useState(false);
+  const [labelDraft, setLabelDraft] = useState("");
   const [busy, setBusy] = useState(false);
   const [operationProgress, setOperationProgress] = useState<OperationProgress | null>(null);
   const [message, setMessage] = useState("Loading catalog…");
@@ -111,8 +128,20 @@ function App() {
   const [showSettings, setShowSettings] = useState(false);
   const [newProjectName, setNewProjectName] = useState("");
   const [library, setLibrary] = useState<ProjectLibrary>({ rootPath: "", projects: [] });
-  const [settings, setSettings] = useState<DesktopSettings>({ projectsRoot: "", autoplayMode: "proxyAvailable" });
+  const [settings, setSettings] = useState<DesktopSettings>({
+    projectsRoot: "",
+    autoplayMode: "proxyAvailable",
+    lastCatalogPath: null,
+    lastProjectId: null,
+    lastAssetId: null,
+    lastContextUpdatedAt: null,
+  });
   const [isMuted, setIsMuted] = useState(true);
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [playbackSeconds, setPlaybackSeconds] = useState(0);
+  const [mediaDuration, setMediaDuration] = useState(0);
+  const [isBuffering, setIsBuffering] = useState(false);
+  const [isViewerFullscreen, setIsViewerFullscreen] = useState(false);
   const [offsetMinutes, setOffsetMinutes] = useState(0);
   const [offsetLabel, setOffsetLabel] = useState("Camera time change");
   const [chronologyZoom, setChronologyZoom] = useState(chronologyZoomDefault);
@@ -120,33 +149,45 @@ function App() {
   const notesEditingRef = useRef<{ assetId: string; savedNotes: string; cancelOnBlur: boolean } | null>(null);
   const chronologyScrollRef = useRef<HTMLDivElement>(null);
   const queueRef = useRef<HTMLDivElement>(null);
+  const viewerStageRef = useRef<HTMLDivElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
+  const assetsRef = useRef<Asset[]>([]);
+  const selectedIdRef = useRef("");
+  const orientationQueueRef = useRef<string[]>([]);
+  const orientationActiveRef = useRef(new Set<string>());
 
   const selected = assets.find((asset) => asset.id === selectedId) ?? null;
   const project = projects.find((item) => item.id === projectId) ?? null;
 
+  useEffect(() => {
+    assetsRef.current = assets;
+    selectedIdRef.current = selectedId;
+  }, [assets, selectedId]);
+
+  const activeAssets = useMemo(() => assets.filter((asset) => !asset.removed), [assets]);
   const filteredAssets = useMemo(() => {
     const needle = query.trim().toLocaleLowerCase();
-    if (!needle) return assets;
-    return assets.filter((asset) =>
-      [asset.filename, asset.camera, asset.notes, asset.status]
+    const queueAssets = assets.filter((asset) => asset.removed === showRemoved);
+    if (!needle) return queueAssets;
+    return queueAssets.filter((asset) =>
+      [asset.filename, asset.camera, asset.notes, ...asset.labels]
         .join(" ")
         .toLocaleLowerCase()
         .includes(needle),
     );
-  }, [assets, query]);
+  }, [assets, query, showRemoved]);
 
   const lanes = useMemo(() => {
     const grouped = new Map<string, Asset[]>();
-    assets.forEach((asset) => {
+    activeAssets.forEach((asset) => {
       grouped.set(asset.camera, [...(grouped.get(asset.camera) ?? []), asset]);
     });
     return [...grouped.entries()].slice(0, 5);
-  }, [assets]);
+  }, [activeAssets]);
 
   const contextRuns = useMemo(() => {
     const runs: Array<{ start: number; end: number; asset: Asset }> = [];
-    assets.forEach((asset, index) => {
+    activeAssets.forEach((asset, index) => {
       const previous = runs.at(-1);
       if (previous && assetContextKey(previous.asset) === assetContextKey(asset)) {
         previous.end = index;
@@ -155,7 +196,7 @@ function App() {
       }
     });
     return runs;
-  }, [assets]);
+  }, [activeAssets]);
 
   const refreshProjects = useCallback(async () => {
     const result = await api.listProjects();
@@ -201,6 +242,48 @@ function App() {
   useEffect(() => {
     refreshAssets(projectId).catch((reason) => setError(String(reason)));
   }, [projectId, refreshAssets]);
+
+  useEffect(() => {
+    if (!projectId) return;
+    const timeout = window.setTimeout(() => {
+      api.recordDesktopContext(projectId, selectedId || null).catch((reason) => setError(String(reason)));
+    }, 100);
+    return () => window.clearTimeout(timeout);
+  }, [projectId, selectedId]);
+
+  const pumpOrientationQueue = useCallback(() => {
+    while (orientationActiveRef.current.size < 2) {
+      const assetId = orientationQueueRef.current.shift();
+      if (!assetId) return;
+      if (orientationActiveRef.current.has(assetId)) continue;
+      const asset = assetsRef.current.find((candidate) => candidate.id === assetId);
+      if (!asset || asset.orientationProbed || !asset.originalAvailable) continue;
+      orientationActiveRef.current.add(assetId);
+      void api.refreshAssetOrientation(assetId)
+        .then((updated) => {
+          setAssets((current) => current.map((candidate) => candidate.id === updated.id ? updated : candidate));
+        })
+        .catch((reason) => {
+          if (selectedIdRef.current === assetId) setError(String(reason));
+        })
+        .finally(() => {
+          orientationActiveRef.current.delete(assetId);
+          pumpOrientationQueue();
+        });
+    }
+  }, []);
+
+  useEffect(() => {
+    const selectedIndex = filteredAssets.findIndex((asset) => asset.id === selectedId);
+    if (selectedIndex < 0) return;
+    const candidates = [selectedIndex, selectedIndex + 1, selectedIndex + 2, selectedIndex - 1]
+      .map((index) => filteredAssets[index])
+      .filter((asset): asset is Asset => Boolean(asset && !asset.orientationProbed && asset.originalAvailable))
+      .map((asset) => asset.id)
+      .filter((assetId, index, ids) => ids.indexOf(assetId) === index && !orientationActiveRef.current.has(assetId));
+    orientationQueueRef.current = candidates;
+    pumpOrientationQueue();
+  }, [filteredAssets, pumpOrientationQueue, selectedId]);
 
   useEffect(() => {
     const unlisten: Array<() => void> = [];
@@ -262,6 +345,13 @@ function App() {
       ?.scrollIntoView({ block: "nearest" });
   }, [selectedId]);
 
+  useEffect(() => {
+    if (filteredAssets.some((asset) => asset.id === selectedId)) return;
+    setSelectedId(filteredAssets[0]?.id ?? "");
+  }, [filteredAssets, selectedId]);
+
+  useEffect(() => setLabelDraft(""), [selectedId]);
+
   const replaceAsset = (updated: Asset) => {
     setAssets((current) =>
       current
@@ -288,6 +378,28 @@ function App() {
     [],
   );
 
+  const addLabel = useCallback((asset: Asset, value: string) => {
+    const label = value.trim();
+    if (!label) return;
+    setLabelDraft("");
+    if (asset.labels.some((current) => current.toLocaleLowerCase() === label.toLocaleLowerCase())) return;
+    void persistAsset(asset, { labels: [...asset.labels, label] });
+  }, [persistAsset]);
+
+  const removeLabel = useCallback((asset: Asset, label: string) => {
+    void persistAsset(asset, {
+      labels: asset.labels.filter((current) => current.toLocaleLowerCase() !== label.toLocaleLowerCase()),
+    });
+  }, [persistAsset]);
+
+  const toggleRemoved = useCallback((asset: Asset) => {
+    const index = filteredAssets.findIndex((candidate) => candidate.id === asset.id);
+    const nextId = filteredAssets[index + 1]?.id ?? filteredAssets[index - 1]?.id ?? "";
+    void persistAsset(asset, { removed: !asset.removed });
+    if (asset.removed && filteredAssets.length === 1) setShowRemoved(false);
+    setSelectedId(nextId);
+  }, [filteredAssets, persistAsset]);
+
   const moveSelection = useCallback(
     (delta: number) => {
       if (!filteredAssets.length) return;
@@ -300,11 +412,11 @@ function App() {
 
   const centerSelectedInChronology = useCallback((behavior: ScrollBehavior = "smooth") => {
     const scroll = chronologyScrollRef.current;
-    const index = assets.findIndex((asset) => asset.id === selectedId);
+    const index = activeAssets.findIndex((asset) => asset.id === selectedId);
     if (!scroll || index < 0) return;
     const clipCenter = index * chronologyZoom + chronologyZoom / 2;
     scroll.scrollTo({ left: Math.max(0, clipCenter - scroll.clientWidth / 2), behavior });
-  }, [assets, chronologyZoom, selectedId]);
+  }, [activeAssets, chronologyZoom, selectedId]);
 
   useEffect(() => {
     centerSelectedInChronology("smooth");
@@ -325,20 +437,26 @@ function App() {
 
     if (event.key !== "Enter" || event.nativeEvent.isComposing) return;
 
-    // Keep the browser's native textarea insertion so the newline lands at the cursor.
-    if (event.metaKey) return;
-
     event.preventDefault();
+    event.stopPropagation();
     if (event.repeat || !selected) return;
 
+    if (event.metaKey) {
+      const textarea = event.currentTarget;
+      const selectionStart = textarea.selectionStart;
+      const selectionEnd = textarea.selectionEnd;
+      const notes = `${selected.notes.slice(0, selectionStart)}\n${selected.notes.slice(selectionEnd)}`;
+      replaceAsset({ ...selected, notes });
+      window.requestAnimationFrame(() => textarea.setSelectionRange(selectionStart + 1, selectionStart + 1));
+      return;
+    }
+
+    notesEditingRef.current = null;
+    event.currentTarget.blur();
+    void persistAsset(selected, { notes: selected.notes });
+
     if (event.shiftKey) {
-      event.currentTarget.blur();
       moveSelection(1);
-    } else {
-      if (notesEditingRef.current?.assetId === selected.id) {
-        notesEditingRef.current.savedNotes = selected.notes;
-      }
-      void persistAsset(selected, { notes: selected.notes });
     }
   };
 
@@ -393,20 +511,11 @@ function App() {
         if (videoRef.current?.paused) void videoRef.current.play();
         else videoRef.current?.pause();
       } else if (selected && key === "r") {
-        void persistAsset(selected, { status: "reviewed" });
-      } else if (selected && key === "u") {
-        void persistAsset(selected, { status: "unreviewed" });
-      } else if (selected && key === "s") {
-        void persistAsset(selected, { status: "skipped" });
-      } else if (selected && key === "a") {
-        void persistAsset(selected, { status: "needs_attention" });
-      } else if (selected && key === "e") {
-        void persistAsset(selected, { included: !selected.included });
-      } else if (selected && key === "i" && videoRef.current) {
-        void persistAsset(selected, { sourceIn: Math.min(videoRef.current.currentTime, selected.sourceOut) });
-      } else if (selected && key === "o" && videoRef.current) {
-        void persistAsset(selected, { sourceOut: Math.max(videoRef.current.currentTime, selected.sourceIn) });
-      } else if (key === "n") {
+        toggleRemoved(selected);
+      } else if (selected && key === "l") {
+        event.preventDefault();
+        document.querySelector<HTMLInputElement>("#label-input")?.focus();
+      } else if (key === "n" || (key === "enter" && tag !== "BUTTON" && !event.shiftKey && !event.metaKey && !event.ctrlKey && !event.altKey)) {
         event.preventDefault();
         document.querySelector<HTMLTextAreaElement>("#notes")?.focus();
       } else if (key === "[") {
@@ -426,13 +535,11 @@ function App() {
         void makeMissingThumbnails();
       } else if (key === "m") {
         void importFolder();
-      } else if (key === "x") {
-        void exportCut();
       }
     };
     window.addEventListener("keydown", handleKey);
     return () => window.removeEventListener("keydown", handleKey);
-  }, [busy, centerSelectedInChronology, moveSelection, persistAsset, projectId, projects.length, selected]);
+  }, [busy, centerSelectedInChronology, moveSelection, projectId, projects.length, selected, toggleRemoved]);
 
   async function createProject() {
     const name = newProjectName.trim();
@@ -649,40 +756,101 @@ function App() {
     }
   }
 
-  async function exportCut() {
-    if (!projectId) return;
-    setBusy(true);
-    setError("");
-    try {
-      const path = await api.exportOtio(projectId);
-      setMessage(`Exported ${path}`);
-    } catch (reason) {
-      setError(String(reason));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  const mediaUrl = selected ? api.mediaUrl(selected) : null;
-  const posterUrl = selected ? api.thumbnailUrl(selected) : null;
+  const bufferedMedia = useMemo(() => {
+    const selectedIndex = filteredAssets.findIndex((asset) => asset.id === selectedId);
+    if (selectedIndex < 0) return [];
+    return [-1, 0, 1]
+      .map((offset) => ({ asset: filteredAssets[selectedIndex + offset], offset }))
+      .filter((entry): entry is { asset: Asset; offset: number } => Boolean(entry.asset?.orientationProbed && entry.asset.available))
+      .map(({ asset, offset }) => {
+        const url = api.mediaUrl(asset);
+        const usingProxy = Boolean(asset.proxyAvailable && asset.proxyPath);
+        const rotation = renderedRotation(asset, usingProxy && isRawOrientationProxy(asset));
+        const displayIsQuarterTurn = asset.rotationDegrees % 180 !== 0;
+        const displayAspect = (displayIsQuarterTurn ? asset.height / asset.width : asset.width / asset.height) || 16 / 9;
+        return {
+          asset,
+          offset,
+          active: asset.id === selectedId,
+          url,
+          usingProxy,
+          rotation,
+          displayAspect,
+          posterUrl: api.thumbnailUrl(asset),
+        };
+      })
+      .filter((entry) => Boolean(entry.url));
+  }, [filteredAssets, selectedId]);
+  const activeMedia = bufferedMedia.find((entry) => entry.active) ?? null;
+  const mediaUrl = activeMedia?.url ?? null;
   const shouldAutoplay = Boolean(
     selected && mediaUrl && (
       settings.autoplayMode === "always"
       || (settings.autoplayMode === "proxyAvailable" && selected.proxyAvailable)
     ),
   );
-  const cutCount = assets.filter((asset) => asset.included).length;
-  const reviewedCount = assets.filter((asset) => asset.status === "reviewed").length;
+  const labeledCount = activeAssets.filter((asset) => asset.labels.length > 0).length;
+  const removedCount = assets.length - activeAssets.length;
   const missingProxyCount = assets.filter((asset) => !asset.proxyAvailable).length;
   const missingThumbnailCount = assets.filter((asset) => asset.thumbnailQuality < 1 || !asset.thumbnailPath).length;
 
   useEffect(() => {
+    setPlaybackSeconds(0);
+    setMediaDuration(selected?.durationSeconds ?? 0);
+    setIsPlaying(false);
+    setIsBuffering(Boolean(mediaUrl));
+  }, [mediaUrl, selected?.durationSeconds, selectedId]);
+
+  useEffect(() => {
+    viewerStageRef.current?.querySelectorAll<HTMLVideoElement>("video[data-asset-id]").forEach((candidate) => {
+      candidate.muted = isMuted;
+    });
+  }, [isMuted, mediaUrl]);
+
+  useEffect(() => {
+    viewerStageRef.current?.querySelectorAll<HTMLVideoElement>("video[data-asset-id]").forEach((candidate) => {
+      if (candidate.dataset.assetId !== selectedId) candidate.pause();
+    });
     const video = videoRef.current;
     if (!video) return;
-    video.muted = isMuted;
+    setMediaDuration(Number.isFinite(video.duration) ? video.duration : selected?.durationSeconds ?? 0);
+    setPlaybackSeconds(video.currentTime);
+    setIsBuffering(video.readyState < HTMLMediaElement.HAVE_FUTURE_DATA);
     if (shouldAutoplay) void video.play().catch(() => {});
     else video.pause();
-  }, [isMuted, mediaUrl, selectedId, settings.autoplayMode, shouldAutoplay]);
+  }, [mediaUrl, selected?.durationSeconds, selectedId, shouldAutoplay]);
+
+  useEffect(() => {
+    const handleFullscreenChange = () => {
+      setIsViewerFullscreen(document.fullscreenElement === viewerStageRef.current);
+    };
+    document.addEventListener("fullscreenchange", handleFullscreenChange);
+    return () => document.removeEventListener("fullscreenchange", handleFullscreenChange);
+  }, []);
+
+  function togglePlayback() {
+    const video = videoRef.current;
+    if (!video) return;
+    if (video.paused) void video.play();
+    else video.pause();
+  }
+
+  function seekBy(seconds: number) {
+    const video = videoRef.current;
+    if (!video) return;
+    const duration = Number.isFinite(video.duration) ? video.duration : selected?.durationSeconds ?? 0;
+    video.currentTime = Math.min(duration, Math.max(0, video.currentTime + seconds));
+    setPlaybackSeconds(video.currentTime);
+  }
+
+  async function toggleViewerFullscreen() {
+    try {
+      if (document.fullscreenElement) await document.exitFullscreen();
+      else await viewerStageRef.current?.requestFullscreen();
+    } catch (reason) {
+      setError(`Fullscreen unavailable: ${String(reason)}`);
+    }
+  }
 
   function toggleMute() {
     setIsMuted((current) => {
@@ -691,6 +859,9 @@ function App() {
       return next;
     });
   }
+
+  const seekMaximum = Math.max(0, mediaDuration || selected?.durationSeconds || 0);
+  const seekProgress = seekMaximum > 0 ? Math.min(100, (playbackSeconds / seekMaximum) * 100) : 0;
 
   return (
     <main className="app-shell">
@@ -712,8 +883,8 @@ function App() {
         <button className="text-button" onClick={() => setShowCreate(true)} aria-keyshortcuts="Meta+N">New project</button>
         <div className="topbar-spacer" />
         <div className="session-readout">
-          <span>{reviewedCount}/{assets.length} reviewed</span>
-          <span>{cutCount} in cut</span>
+          <span>{labeledCount}/{activeAssets.length} labeled</span>
+          <span>{removedCount} removed</span>
         </div>
         <div className="media-split">
           <button className="button secondary media-split-main" disabled={busy || missingProxyCount === 0} onClick={makeMissingProxies} aria-keyshortcuts="Shift+P">
@@ -736,9 +907,6 @@ function App() {
             </div>
           )}
         </div>
-        <button className="button secondary" disabled={busy || cutCount === 0} onClick={exportCut} aria-keyshortcuts="X">
-          Export OTIO <kbd>X</kbd>
-        </button>
         <button className="button primary" disabled={busy || !projectId} onClick={importFolder} aria-keyshortcuts="M">
           Add media <kbd>M</kbd>
         </button>
@@ -774,10 +942,19 @@ function App() {
         <aside className="queue-panel">
           <div className="panel-heading">
             <div>
-              <span className="eyebrow">Review queue</span>
+              <span className="eyebrow">{showRemoved ? "Removed clips" : "Label queue"}</span>
               <h1>{project?.name ?? "No project"}</h1>
             </div>
-            <span className="count-badge">{filteredAssets.length}</span>
+            <div className="queue-heading-actions">
+              {removedCount > 0 && (
+                <button
+                  className={`queue-view-toggle ${showRemoved ? "active" : ""}`}
+                  onClick={() => setShowRemoved((current) => !current)}
+                  aria-pressed={showRemoved}
+                >{showRemoved ? "Back to labels" : `Removed ${removedCount}`}</button>
+              )}
+              <span className="count-badge">{filteredAssets.length}</span>
+            </div>
           </div>
           <label className="search-box">
             <span className="sr-only">Filter clips</span>
@@ -785,15 +962,15 @@ function App() {
               id="queue-search"
               value={query}
               onChange={(event) => setQuery(event.target.value)}
-              placeholder="Filter filename, camera, notes…"
+              placeholder="Filter filename, labels, notes…"
             />
             <kbd>/</kbd>
           </label>
           <div className="queue-list" ref={queueRef} role="listbox" aria-label="Clips" tabIndex={0}>
             {filteredAssets.length === 0 ? (
               <div className="empty-queue">
-                <strong>No clips here yet.</strong>
-                <span>Add a NAS or drive folder to begin.</span>
+                <strong>{showRemoved ? "No removed clips." : "No clips here yet."}</strong>
+                <span>{showRemoved ? "Removed clips can be restored here." : "Add a NAS or drive folder to begin."}</span>
               </div>
             ) : filteredAssets.map((asset, index) => {
               const thumbnailUrl = api.thumbnailUrl(asset);
@@ -805,8 +982,11 @@ function App() {
                   role="option"
                   aria-selected={asset.id === selectedId}
                 >
-                  <span className={`review-pip ${asset.status}`} />
-                  <span className="queue-thumbnail">
+                  <span className={`label-pip ${asset.labels.length ? "labeled" : ""}`} aria-hidden="true" />
+                  <span
+                    className={`queue-thumbnail ${renderedRotation(asset, isRawOrientationThumbnail(asset)) % 180 !== 0 ? "quarter-turn" : ""}`}
+                    style={{ "--thumbnail-rotation": `${renderedRotation(asset, isRawOrientationThumbnail(asset))}deg` } as CSSProperties}
+                  >
                     {thumbnailUrl ? <img src={thumbnailUrl} alt="" loading="lazy" /> : <span className="thumbnail-empty">Q0</span>}
                     <span className="queue-index">{String(index + 1).padStart(3, "0")}</span>
                   </span>
@@ -816,7 +996,7 @@ function App() {
                   </span>
                   <span className="queue-tail">
                     <time>{formatDuration(asset.durationSeconds)}</time>
-                    {asset.included && <span className="cut-flag">CUT</span>}
+                    {asset.labels.length > 0 && <span className="label-count">{asset.labels.length} label{asset.labels.length === 1 ? "" : "s"}</span>}
                   </span>
                 </button>
               );
@@ -825,16 +1005,66 @@ function App() {
           <div className="shortcut-strip" aria-label="Keyboard shortcuts">
             <span><kbd>J</kbd><kbd>K</kbd> move</span>
             <span><kbd>Space</kbd> play</span>
-            <span><kbd>R</kbd> reviewed</span>
-            <span><kbd>E</kbd> cut</span>
+            <span><kbd>L</kbd> label</span>
+            <span><kbd>R</kbd> remove</span>
           </div>
         </aside>
 
         <section className="viewer-panel">
-          <div className="viewer-stage">
+          <div ref={viewerStageRef} className={`viewer-stage ${isPlaying ? "is-playing" : "is-paused"}`}>
             {selected ? (
-              mediaUrl ? (
-                <video ref={videoRef} key={mediaUrl} src={mediaUrl} poster={posterUrl ?? undefined} controls preload="metadata" autoPlay={shouldAutoplay} muted={isMuted} />
+              !selected.orientationProbed && selected.originalAvailable ? (
+                <div className="offline-slate">
+                  <strong>Reading frame orientation…</strong>
+                  <span>{selected.filename}</span>
+                </div>
+              ) : mediaUrl ? (
+                <>
+                  {bufferedMedia.map((entry) => {
+                    const style = {
+                      "--display-aspect": String(entry.displayAspect),
+                      "--inverse-display-aspect": String(1 / entry.displayAspect),
+                      "--viewer-rotation": `${entry.rotation}deg`,
+                    } as CSSProperties;
+                    return (
+                      <div
+                        className={`viewer-media ${entry.active ? "active" : "preloaded"} ${entry.rotation % 180 !== 0 ? "quarter-turn" : ""}`}
+                        style={style}
+                        key={entry.asset.id}
+                        aria-hidden={!entry.active}
+                      >
+                        <video
+                          ref={entry.active ? videoRef : undefined}
+                          data-asset-id={entry.asset.id}
+                          data-cache-slot={entry.active ? "current" : entry.offset < 0 ? "previous" : "next"}
+                          src={entry.url ?? undefined}
+                          poster={entry.active && entry.posterUrl && isRawOrientationThumbnail(entry.asset) === (entry.usingProxy && isRawOrientationProxy(entry.asset)) ? entry.posterUrl : undefined}
+                          preload={entry.active || entry.offset > 0 ? "auto" : "metadata"}
+                          autoPlay={entry.active && shouldAutoplay}
+                          muted={isMuted}
+                          onClick={entry.active ? togglePlayback : undefined}
+                          onLoadStart={() => entry.active && setIsBuffering(true)}
+                          onWaiting={() => entry.active && setIsBuffering(true)}
+                          onCanPlay={() => entry.active && setIsBuffering(false)}
+                          onPlaying={() => entry.active && setIsBuffering(false)}
+                          onPlay={() => entry.active && setIsPlaying(true)}
+                          onPause={() => entry.active && setIsPlaying(false)}
+                          onEnded={() => entry.active && setIsPlaying(false)}
+                          onLoadedMetadata={(event) => {
+                            if (!entry.active) return;
+                            setMediaDuration(Number.isFinite(event.currentTarget.duration) ? event.currentTarget.duration : entry.asset.durationSeconds);
+                            setPlaybackSeconds(event.currentTarget.currentTime);
+                          }}
+                          onDurationChange={(event) => {
+                            if (entry.active && Number.isFinite(event.currentTarget.duration)) setMediaDuration(event.currentTarget.duration);
+                          }}
+                          onTimeUpdate={(event) => entry.active && setPlaybackSeconds(event.currentTarget.currentTime)}
+                        />
+                      </div>
+                    );
+                  })}
+                  {isBuffering && <div className="viewer-buffering" role="status"><span /> Buffering</div>}
+                </>
               ) : (
                 <div className="offline-slate">
                   <span className="slate-time">{formatDate(selected.bestTime)}</span>
@@ -857,19 +1087,65 @@ function App() {
                 <span>{selected.width}×{selected.height} · {selected.frameRate.toFixed(2)} fps</span>
               </div>
             )}
+            {selected && mediaUrl && selected.orientationProbed && (
+              <div className="viewer-controls" role="group" aria-label="Video playback controls">
+                <button type="button" onClick={() => seekBy(-15)} aria-label="Go back 15 seconds" title="Back 15 seconds">−15</button>
+                <button
+                  type="button"
+                  className="viewer-play"
+                  onClick={togglePlayback}
+                  aria-label={isPlaying ? "Pause" : "Play"}
+                  aria-keyshortcuts="Space"
+                  title={isPlaying ? "Pause (Space)" : "Play (Space)"}
+                >{isPlaying ? "Ⅱ" : "▶"}</button>
+                <button type="button" onClick={() => seekBy(15)} aria-label="Go forward 15 seconds" title="Forward 15 seconds">+15</button>
+                <input
+                  type="range"
+                  min="0"
+                  max={seekMaximum || 0}
+                  step="0.01"
+                  value={Math.min(playbackSeconds, seekMaximum)}
+                  onChange={(event) => {
+                    const seconds = Number(event.currentTarget.value);
+                    if (videoRef.current) videoRef.current.currentTime = seconds;
+                    setPlaybackSeconds(seconds);
+                  }}
+                  aria-label="Video position"
+                  style={{ "--seek-progress": `${seekProgress}%` } as CSSProperties}
+                />
+                <output className="viewer-time" aria-live="off">
+                  {formatDuration(playbackSeconds)} <span>/</span> {formatDuration(seekMaximum)}
+                </output>
+                <button
+                  type="button"
+                  className={isMuted ? "active" : ""}
+                  onClick={toggleMute}
+                  aria-label={isMuted ? "Unmute playback" : "Mute playback"}
+                  aria-pressed={isMuted}
+                  title={isMuted ? "Unmute" : "Mute"}
+                >{isMuted ? "MUTED" : "AUDIO"}</button>
+                <button
+                  type="button"
+                  onClick={() => void toggleViewerFullscreen()}
+                  aria-label={isViewerFullscreen ? "Exit fullscreen" : "Enter fullscreen"}
+                  aria-pressed={isViewerFullscreen}
+                  title={isViewerFullscreen ? "Exit fullscreen" : "Fullscreen"}
+                >{isViewerFullscreen ? "EXIT" : "FULL"}</button>
+              </div>
+            )}
           </div>
 
           <div className="transport-bar">
             <button className="transport-button" onClick={() => moveSelection(-1)} aria-label="Previous clip" aria-keyshortcuts="ArrowUp K">←</button>
             <button
               className="transport-button play"
-              onClick={() => videoRef.current?.paused ? void videoRef.current.play() : videoRef.current?.pause()}
+              onClick={togglePlayback}
               aria-label="Play or pause"
               aria-keyshortcuts="Space"
-            >▶</button>
+            >{isPlaying ? "Ⅱ" : "▶"}</button>
             <button className="transport-button" onClick={() => moveSelection(1)} aria-label="Next clip" aria-keyshortcuts="ArrowDown J">→</button>
             <div className="transport-divider" />
-            <span className="timecode">{selected ? formatDuration(selected.durationSeconds) : "0:00"}</span>
+            <span className="timecode">{selected ? `${formatDuration(playbackSeconds)} / ${formatDuration(seekMaximum)}` : "0:00"}</span>
             <button
               className={`transport-audio-button ${isMuted ? "muted" : ""}`}
               onClick={toggleMute}
@@ -882,11 +1158,11 @@ function App() {
             <div className="transport-spacer" />
             {selected && (
               <button
-                className={`button ${selected.included ? "active-cut" : "secondary"}`}
-                onClick={() => persistAsset(selected, { included: !selected.included })}
-                aria-keyshortcuts="E"
+                className="button label-action"
+                onClick={() => document.querySelector<HTMLInputElement>("#label-input")?.focus()}
+                aria-keyshortcuts="L"
               >
-                {selected.included ? "In rough cut" : "Add to rough cut"} <kbd>E</kbd>
+                Label clip <kbd>L</kbd>
               </button>
             )}
           </div>
@@ -895,11 +1171,11 @@ function App() {
             <div className="chronology-heading">
               <div>
                 <span className="eyebrow">Story ribbon</span>
-                <strong>{assets.length ? `${assets.length} clips in relative order` : "Relative order across sources"}</strong>
+                <strong>{activeAssets.length ? `${activeAssets.length} clips in relative order` : "Relative order across sources"}</strong>
               </div>
               <div className="chronology-actions">
                 <span className="chronology-position">
-                  {selected ? `#${assets.findIndex((asset) => asset.id === selected.id) + 1} · ${formatDate(selected.bestTime)}` : "No clip selected"}
+                  {selected && !selected.removed ? `#${activeAssets.findIndex((asset) => asset.id === selected.id) + 1} · ${formatDate(selected.bestTime)}` : "No active clip selected"}
                 </span>
                 <div className="zoom-control" aria-label="Story ribbon zoom">
                   <button
@@ -948,7 +1224,7 @@ function App() {
                   <div
                     className="story-canvas"
                     style={{
-                      width: `${Math.max(chronologyZoom, assets.length * chronologyZoom)}px`,
+                      width: `${Math.max(chronologyZoom, activeAssets.length * chronologyZoom)}px`,
                       minWidth: "100%",
                       "--clip-step": `${chronologyZoom}px`,
                     } as React.CSSProperties}
@@ -975,7 +1251,7 @@ function App() {
                       })}
                     </div>
                     <div className="order-track" aria-hidden="true">
-                      {assets.map((asset, index) => (
+                      {activeAssets.map((asset, index) => (
                         <span className={asset.id === selectedId ? "active" : ""} style={{ left: index * chronologyZoom }} key={asset.id}>
                           {String(index + 1).padStart(3, "0")}
                         </span>
@@ -984,7 +1260,7 @@ function App() {
                     {lanes.map(([camera, cameraAssets]) => (
                       <div className="lane-track" key={camera}>
                         {cameraAssets.map((asset) => {
-                          const index = assets.findIndex((candidate) => candidate.id === asset.id);
+                          const index = activeAssets.findIndex((candidate) => candidate.id === asset.id);
                           return (
                             <button
                               key={asset.id}
@@ -995,7 +1271,7 @@ function App() {
                               title={`#${index + 1} · ${asset.filename} · ${formatDate(asset.bestTime)}`}
                             >
                               <span>{asset.filename.replace(/\.[^.]+$/, "")}</span>
-                              {asset.included && <i aria-hidden="true" />}
+                              {asset.labels.length > 0 && <i aria-hidden="true" />}
                             </button>
                           );
                         })}
@@ -1019,24 +1295,77 @@ function App() {
                 </span>
               </div>
 
-              <section className="inspector-section">
-                <span className="section-label">Review state</span>
-                <div className="segmented-control">
-                  {(["unreviewed", "reviewed", "needs_attention", "skipped"] as ReviewStatus[]).map((status) => (
-                    <button
-                      key={status}
-                      className={selected.status === status ? "active" : ""}
-                      onClick={() => persistAsset(selected, { status })}
-                      aria-keyshortcuts={{ unreviewed: "U", reviewed: "R", needs_attention: "A", skipped: "S" }[status]}
-                    >
-                      {statusLabels[status]} <kbd>{{ unreviewed: "U", reviewed: "R", needs_attention: "A", skipped: "S" }[status]}</kbd>
+              <section className="inspector-section labels-section">
+                <label htmlFor="label-input" className="section-label">Labels <kbd>L</kbd></label>
+                <div className="label-entry">
+                  <input
+                    id="label-input"
+                    value={labelDraft}
+                    placeholder="Add place, action, subject…"
+                    aria-keyshortcuts="L Enter"
+                    onChange={(event) => setLabelDraft(event.currentTarget.value)}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter" || event.key === ",") {
+                        event.preventDefault();
+                        addLabel(selected, labelDraft);
+                      } else if (event.key === "Backspace" && !labelDraft && selected.labels.length > 0) {
+                        removeLabel(selected, selected.labels.at(-1) ?? "");
+                      }
+                    }}
+                  />
+                  <button className="label-add-button" disabled={!labelDraft.trim()} onClick={() => addLabel(selected, labelDraft)}>Add</button>
+                </div>
+                <div className={`label-chips ${selected.labels.length ? "" : "empty"}`} aria-label="Clip labels">
+                  {selected.labels.length ? selected.labels.map((label) => (
+                    <button key={label} onClick={() => removeLabel(selected, label)} title={`Remove ${label}`}>
+                      <span>{label}</span><i aria-hidden="true">×</i>
                     </button>
-                  ))}
+                  )) : <span>No labels yet. Add the most useful search terms for this clip.</span>}
                 </div>
               </section>
 
+              <section className="inspector-section orientation-section">
+                <div className="section-heading-row">
+                  <span className="section-label">Frame orientation</span>
+                  <span>{selected.rotationDegrees === selected.defaultRotationDegrees ? "Landscape (automatic)" : `${selected.rotationDegrees}° override`}</span>
+                </div>
+                <div className="orientation-controls">
+                  <button
+                    className={`orientation-choice portrait ${selected.rotationDegrees === portraitRotation(selected) ? "active" : ""}`}
+                    onClick={() => persistAsset(selected, {
+                      rotationDegrees: selected.rotationDegrees === portraitRotation(selected)
+                        ? selected.defaultRotationDegrees
+                        : portraitRotation(selected),
+                    })}
+                    aria-pressed={selected.rotationDegrees === portraitRotation(selected)}
+                    title="Show this clip vertically"
+                  >
+                    <span className="orientation-thumbnail" aria-hidden="true"><i /></span>
+                    <strong>Portrait</strong>
+                    <small>Show vertical</small>
+                  </button>
+                  <button
+                    className="orientation-choice"
+                    onClick={() => persistAsset(selected, { rotationDegrees: rotationAfter(selected.rotationDegrees, 180) })}
+                    title="Rotate the current view 180 degrees"
+                  >
+                    <span className="orientation-thumbnail upside-down" aria-hidden="true"><i /></span>
+                    <strong>Flip 180°</strong>
+                    <small>Turn current view</small>
+                  </button>
+                </div>
+                {selected.rotationDegrees !== selected.defaultRotationDegrees && (
+                  <button
+                    className="orientation-reset"
+                    onClick={() => persistAsset(selected, { rotationDegrees: selected.defaultRotationDegrees })}
+                  >
+                    Reset automatic landscape
+                  </button>
+                )}
+              </section>
+
               <section className="inspector-section notes-section">
-                <label htmlFor="notes" className="section-label">Notes <kbd>N</kbd></label>
+                <label htmlFor="notes" className="section-label">Notes <kbd>N</kbd><kbd>Enter</kbd></label>
                 <textarea
                   id="notes"
                   value={selected.notes}
@@ -1057,40 +1386,22 @@ function App() {
                 </div>
               </section>
 
+              <section className={`inspector-section remove-section ${selected.removed ? "is-removed" : ""}`}>
+                <div>
+                  <span className="section-label">Queue visibility</span>
+                  <p>{selected.removed ? "Restore this clip to the labeling queue." : "Hide clips that are unusable or clearly accidental."}</p>
+                </div>
+                <button onClick={() => toggleRemoved(selected)} aria-keyshortcuts="R">
+                  {selected.removed ? "Restore clip" : "Remove from labeling"} <kbd>R</kbd>
+                </button>
+              </section>
+
               <section className="inspector-section metadata-grid">
                 <span className="section-label full-row">Source</span>
                 <div><span>Camera</span><strong>{selected.camera}</strong></div>
                 <div><span>Format</span><strong>{selected.codec.toUpperCase()} · {formatBytes(selected.sizeBytes)}</strong></div>
                 <div><span>Raw time</span><strong className="mono">{formatDate(selected.capturedAtRaw)}</strong></div>
                 <div><span>Best time</span><strong className="mono">{formatDate(selected.bestTime)}</strong></div>
-              </section>
-
-              <section className="inspector-section">
-                <span className="section-label">Rough-cut range</span>
-                <div className="range-row">
-                  <label>In <kbd>I</kbd>
-                    <input
-                      type="number"
-                      min="0"
-                      max={selected.sourceOut}
-                      step="0.1"
-                      value={selected.sourceIn}
-                      onChange={(event) => replaceAsset({ ...selected, sourceIn: Number(event.target.value) })}
-                      onBlur={() => persistAsset(selected, { sourceIn: selected.sourceIn })}
-                    />
-                  </label>
-                  <label>Out <kbd>O</kbd>
-                    <input
-                      type="number"
-                      min={selected.sourceIn}
-                      max={selected.durationSeconds}
-                      step="0.1"
-                      value={selected.sourceOut}
-                      onChange={(event) => replaceAsset({ ...selected, sourceOut: Number(event.target.value) })}
-                      onBlur={() => persistAsset(selected, { sourceOut: selected.sourceOut })}
-                    />
-                  </label>
-                </div>
               </section>
 
               <section className="inspector-section calibration-section">
@@ -1135,7 +1446,7 @@ function App() {
                     onClick={() => openLibraryProject(location)}
                   >
                     <strong>{location.project.name}</strong>
-                    <span>{location.project.assetCount} clips · {location.project.reviewedCount} reviewed</span>
+                    <span>{location.project.assetCount} clips · {location.project.labeledCount} labeled</span>
                   </button>
                 ))}
               </div>
@@ -1143,7 +1454,7 @@ function App() {
               <p className="project-library-empty">No VlogCutter projects found in this folder.</p>
             )}
             <div className="modal-divider"><span>New project</span></div>
-            <p>Originals stay where they are. The catalog, proxies, and exports will live in this project’s folder.</p>
+            <p>Originals stay where they are. The catalog, proxies, and thumbnails will live in this project’s folder.</p>
             <input
               autoFocus
               value={newProjectName}
@@ -1220,9 +1531,9 @@ function App() {
             <div className="shortcut-map">
               <div><kbd>J</kbd><kbd>K</kbd><span>Next / previous clip</span></div>
               <div><kbd>Space</kbd><span>Play / pause</span></div>
-              <div><kbd>R</kbd><kbd>U</kbd><kbd>S</kbd><kbd>A</kbd><span>Review state</span></div>
-              <div><kbd>E</kbd><span>Toggle rough cut</span></div>
-              <div><kbd>N</kbd><span>Focus notes</span></div>
+              <div><kbd>L</kbd><span>Focus labels</span></div>
+              <div><kbd>R</kbd><span>Remove / restore clip</span></div>
+              <div><kbd>N</kbd><kbd>Enter</kbd><span>Focus notes</span></div>
               <div><kbd>Enter</kbd><span>Save note</span></div>
               <div><kbd>⇧ Enter</kbd><span>Save note and advance</span></div>
               <div><kbd>⌘ Enter</kbd><span>Insert a note line break</span></div>
@@ -1230,12 +1541,10 @@ function App() {
               <div><kbd>/</kbd><span>Search clips</span></div>
               <div><kbd>[</kbd><kbd>]</kbd><span>Zoom story ribbon</span></div>
               <div><kbd>C</kbd><span>Center selected clip in ribbon</span></div>
-              <div><kbd>I</kbd><kbd>O</kbd><span>Set range at playhead</span></div>
               <div><kbd>P</kbd><span>Proxy selected clip</span></div>
               <div><kbd>⇧P</kbd><span>Generate missing proxies</span></div>
               <div><kbd>T</kbd><span>Generate missing thumbnails</span></div>
               <div><kbd>M</kbd><span>Add media</span></div>
-              <div><kbd>X</kbd><span>Export OTIO</span></div>
               <div><kbd>⌘N</kbd><kbd>⌘O</kbd><span>New / open project</span></div>
               <div><kbd>⌘,</kbd><span>Open global settings</span></div>
               <div><kbd>Tab</kbd><kbd>Enter</kbd><span>Navigate / activate every control</span></div>

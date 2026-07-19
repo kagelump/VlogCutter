@@ -2542,7 +2542,6 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
- "url",
  "uuid",
  "walkdir",
 ]
@@ -2552,6 +2551,7 @@ name = "rcdvlog-desktop"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "dirs",
  "rcdvlog-core",
  "serde",

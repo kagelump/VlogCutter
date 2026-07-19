@@ -1,4 +1,5 @@
 use anyhow::{Context, bail};
+use chrono::{SecondsFormat, Utc};
 use rcdvlog_core::{
     Asset, AssetPatch, Catalog, ClockEvent, IngestReport, Project, ProxyReport, ThumbnailReport,
     ToolStatus,
@@ -56,6 +57,14 @@ struct DesktopSettings {
     projects_root: PathBuf,
     #[serde(default = "default_autoplay_mode")]
     autoplay_mode: AutoplayMode,
+    #[serde(default)]
+    last_catalog_path: Option<PathBuf>,
+    #[serde(default)]
+    last_project_id: Option<String>,
+    #[serde(default)]
+    last_asset_id: Option<String>,
+    #[serde(default)]
+    last_context_updated_at: Option<String>,
 }
 
 impl AppState {
@@ -95,6 +104,8 @@ impl AppState {
             .catalog
             .write()
             .map_err(|_| "catalog state is unavailable".to_string())? = catalog;
+        self.record_context_path(path, None, None)
+            .map_err(error_message)?;
         Ok(loaded)
     }
 
@@ -189,6 +200,54 @@ impl AppState {
         Ok(updated)
     }
 
+    fn record_context_path(
+        &self,
+        catalog_path: PathBuf,
+        project_id: Option<String>,
+        asset_id: Option<String>,
+    ) -> anyhow::Result<DesktopSettings> {
+        let mut settings = self
+            .settings
+            .write()
+            .map_err(|_| anyhow::anyhow!("desktop settings are unavailable"))?;
+        let updated = DesktopSettings {
+            last_catalog_path: Some(catalog_path),
+            last_project_id: project_id,
+            last_asset_id: asset_id,
+            last_context_updated_at: Some(Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)),
+            ..settings.clone()
+        };
+        write_settings(&self.settings_path, &updated)?;
+        *settings = updated.clone();
+        Ok(updated)
+    }
+
+    fn record_desktop_context(
+        &self,
+        project_id: String,
+        asset_id: Option<String>,
+    ) -> anyhow::Result<DesktopSettings> {
+        let catalog = self.catalog().map_err(anyhow::Error::msg)?;
+        if !catalog
+            .list_projects()?
+            .iter()
+            .any(|project| project.id == project_id)
+        {
+            bail!("project not found: {project_id}");
+        }
+        if let Some(asset_id) = asset_id.as_deref() {
+            let asset = catalog.get_asset(asset_id)?;
+            if asset.project_id != project_id {
+                bail!("asset {asset_id} does not belong to project {project_id}");
+            }
+        }
+        self.record_context_path(
+            catalog.database_path().to_path_buf(),
+            Some(project_id),
+            asset_id,
+        )
+    }
+
     fn create_project(&self, name: &str) -> anyhow::Result<Project> {
         let name = name.trim();
         if name.is_empty() {
@@ -216,6 +275,7 @@ impl AppState {
             .catalog
             .write()
             .map_err(|_| anyhow::anyhow!("catalog state is unavailable"))? = catalog;
+        self.record_desktop_context(project.id.clone(), None)?;
         Ok(project)
     }
 }
@@ -247,6 +307,10 @@ fn load_settings(settings_path: &Path, default_root: PathBuf) -> DesktopSettings
         .unwrap_or(DesktopSettings {
             projects_root: default_root,
             autoplay_mode: default_autoplay_mode(),
+            last_catalog_path: None,
+            last_project_id: None,
+            last_asset_id: None,
+            last_context_updated_at: None,
         })
 }
 
@@ -255,8 +319,11 @@ fn write_settings(settings_path: &Path, settings: &DesktopSettings) -> anyhow::R
         fs::create_dir_all(parent)?;
     }
     let bytes = serde_json::to_vec_pretty(settings)?;
-    fs::write(settings_path, bytes)
-        .with_context(|| format!("save settings {}", settings_path.display()))
+    let temporary_path = settings_path.with_extension("json.tmp");
+    fs::write(&temporary_path, bytes)
+        .with_context(|| format!("save temporary settings {}", temporary_path.display()))?;
+    fs::rename(&temporary_path, settings_path)
+        .with_context(|| format!("commit settings {}", settings_path.display()))
 }
 
 fn error_message(error: impl std::fmt::Display) -> String {
@@ -304,6 +371,17 @@ fn set_autoplay_mode(
 }
 
 #[tauri::command]
+fn record_desktop_context(
+    project_id: String,
+    asset_id: Option<String>,
+    state: State<'_, AppState>,
+) -> std::result::Result<DesktopSettings, String> {
+    state
+        .record_desktop_context(project_id, asset_id)
+        .map_err(error_message)
+}
+
+#[tauri::command]
 fn list_projects(state: State<'_, AppState>) -> Result<Vec<Project>, String> {
     state.catalog()?.list_projects().map_err(error_message)
 }
@@ -334,6 +412,18 @@ fn list_assets(project_id: String, state: State<'_, AppState>) -> Result<Vec<Ass
     state
         .catalog()?
         .list_assets(&project_id)
+        .map_err(error_message)
+}
+
+#[tauri::command]
+async fn refresh_asset_orientation(
+    asset_id: String,
+    state: State<'_, AppState>,
+) -> Result<Asset, String> {
+    let catalog = state.catalog()?;
+    tauri::async_runtime::spawn_blocking(move || catalog.refresh_asset_orientation(&asset_id))
+        .await
+        .map_err(error_message)?
         .map_err(error_message)
 }
 
@@ -435,15 +525,6 @@ async fn generate_missing_thumbnails(
     .map_err(error_message)
 }
 
-#[tauri::command]
-fn export_otio(project_id: String, state: State<'_, AppState>) -> Result<String, String> {
-    state
-        .catalog()?
-        .export_otio(&project_id)
-        .map(|path| path.to_string_lossy().into_owned())
-        .map_err(error_message)
-}
-
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -470,17 +551,18 @@ pub fn run() {
             set_projects_root,
             desktop_settings,
             set_autoplay_mode,
+            record_desktop_context,
             list_projects,
             create_project,
             ingest_folder,
             list_assets,
+            refresh_asset_orientation,
             update_asset,
             apply_clock_event,
             generate_proxy,
             generate_missing_proxies,
             generate_thumbnail,
             generate_missing_thumbnails,
-            export_otio,
         ])
         .run(tauri::generate_context!())
         .expect("error while running RCD VlogCutter");
@@ -495,6 +577,10 @@ mod tests {
         DesktopSettings {
             projects_root,
             autoplay_mode: default_autoplay_mode(),
+            last_catalog_path: None,
+            last_project_id: None,
+            last_asset_id: None,
+            last_context_updated_at: None,
         }
     }
 
@@ -519,6 +605,12 @@ mod tests {
         assert_eq!(loaded.projects.len(), 1);
         assert_eq!(loaded.projects[0].id, loaded_project.id);
         assert_eq!(state.catalog().unwrap().database_path(), loaded_path);
+        let context = state.desktop_settings().unwrap();
+        assert_eq!(
+            context.last_catalog_path.as_deref(),
+            Some(loaded_path.as_path())
+        );
+        assert_eq!(context.last_project_id, None);
 
         let missing = directory.path().join("missing.sqlite3");
         assert!(state.load_catalog(missing).is_err());
@@ -544,6 +636,10 @@ mod tests {
         let first = state.create_project("Hokkaido: Winter/2026").unwrap();
         let first_folder = projects_root.join("Hokkaido- Winter-2026");
         assert!(first_folder.join("catalog.sqlite3").is_file());
+        assert_eq!(
+            state.desktop_settings().unwrap().last_project_id,
+            Some(first.id.clone())
+        );
         let second = state.create_project("Hokkaido: Winter/2026").unwrap();
         assert!(
             projects_root

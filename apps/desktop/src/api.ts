@@ -10,7 +10,8 @@ const mockProject: Project = {
   name: "Hokkaido field test",
   createdAt: "2026-07-18T04:20:00.000Z",
   assetCount: 7,
-  reviewedCount: 2,
+  labeledCount: 4,
+  removedCount: 1,
 };
 
 let mockAssets: Asset[] = [
@@ -38,15 +39,17 @@ let mockAssets: Asset[] = [
   bestTime: String(bestTime),
   offsetSeconds: index === 4 ? -3600 : 0,
   proxyPath: index < 5 ? `/tmp/rcdvlog-demo/${index}.mp4` : null,
+  metadataRotationDegrees: 0,
+  defaultRotationDegrees: 0,
+  rotationDegrees: 0,
+  orientationProbed: true,
   originalAvailable: index < 5,
   proxyAvailable: index < 5,
   thumbnailPath: null,
   thumbnailQuality: 0,
   notes: index === 0 ? "First clean view of the station clock." : index === 3 ? "Good transition into the market." : "",
-  status: index < 2 ? "reviewed" : "unreviewed",
-  included: index === 0 || index === 3,
-  sourceIn: 0,
-  sourceOut: Number(duration),
+  labels: index === 0 ? ["arrival", "establishing"] : index === 1 ? ["train"] : index === 3 ? ["market", "transition"] : [],
+  removed: index === 6,
   available: index < 5,
   phase: index < 3 ? "Arrival" : "Market morning",
   location: index < 3 ? "Otaru" : "Sapporo",
@@ -57,6 +60,10 @@ let mockAssets: Asset[] = [
 const defaultDesktopSettings: DesktopSettings = {
   projectsRoot: "/Users/demo/Movies/VideoProjects",
   autoplayMode: "proxyAvailable",
+  lastCatalogPath: null,
+  lastProjectId: null,
+  lastAssetId: null,
+  lastContextUpdatedAt: null,
 };
 
 function readMockSettings(): DesktopSettings {
@@ -141,9 +148,31 @@ export const api = {
     return settings;
   },
 
+  async recordDesktopContext(projectId: string, assetId: string | null): Promise<DesktopSettings> {
+    if (inTauri()) return invoke("record_desktop_context", { projectId, assetId });
+    const settings = {
+      ...readMockSettings(),
+      lastCatalogPath: "/Users/demo/Movies/VideoProjects/Hokkaido field test/catalog.sqlite3",
+      lastProjectId: projectId,
+      lastAssetId: assetId,
+      lastContextUpdatedAt: new Date().toISOString(),
+    };
+    writeMockSettings(settings);
+    return settings;
+  },
+
   async createProject(name: string): Promise<Project> {
     if (!inTauri()) return { ...mockProject, name };
     return invoke("create_project", { name });
+  },
+
+  async refreshAssetOrientation(assetId: string): Promise<Asset> {
+    if (!inTauri()) {
+      const asset = mockAssets.find((item) => item.id === assetId);
+      if (!asset) throw new Error(`asset not found: ${assetId}`);
+      return { ...asset, orientationProbed: true };
+    }
+    return invoke("refresh_asset_orientation", { assetId });
   },
 
   async chooseFolder(): Promise<string | null> {
@@ -220,11 +249,6 @@ export const api = {
   async onThumbnailProgress(callback: (progress: GenerationProgress) => void): Promise<() => void> {
     if (!inTauri()) return () => {};
     return listen<GenerationProgress>("thumbnail-progress", (event) => callback(event.payload));
-  },
-
-  async exportOtio(projectId: string): Promise<string> {
-    if (!inTauri()) return "/Users/demo/Library/Application Support/RCD VlogCutter/exports/rough-cut.otio";
-    return invoke("export_otio", { projectId });
   },
 
   mediaUrl(asset: Asset): string | null {

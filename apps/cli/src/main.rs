@@ -1,8 +1,12 @@
 use anyhow::{Context, Result, anyhow};
 #[cfg(test)]
 use clap::CommandFactory;
-use clap::{ArgAction, Parser, Subcommand, ValueEnum, error::ErrorKind};
-use rcdvlog_core::{AssetPatch, Catalog, ReviewStatus};
+use clap::{Parser, Subcommand, error::ErrorKind};
+use rcdvlog_core::{
+    AssetPatch, Catalog, MediaStreamInfo, inspect_catalog, landscape_default_rotation,
+    probe_media_stream,
+};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -30,6 +34,16 @@ struct Cli {
 enum Commands {
     /// Report required external tools and the selected catalog.
     Doctor,
+    /// Inspect catalog structure without migrations or writes.
+    Catalog {
+        #[command(subcommand)]
+        command: CatalogCommand,
+    },
+    /// Discover the catalog, project, and clip last shown by the desktop app.
+    Desktop {
+        #[command(subcommand)]
+        command: DesktopCommand,
+    },
     /// Create, list, or summarize projects.
     Project {
         #[command(subcommand)]
@@ -62,11 +76,6 @@ enum Commands {
         #[command(subcommand)]
         command: ThumbnailCommand,
     },
-    /// Export a single-track rough cut.
-    Export {
-        #[command(subcommand)]
-        command: ExportCommand,
-    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -80,6 +89,21 @@ enum ProjectCommand {
         #[arg(long)]
         project: String,
     },
+    /// Summarize diagnostic risks without probing every source file.
+    Diagnose {
+        #[arg(long)]
+        project: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum CatalogCommand {
+    Inspect,
+}
+
+#[derive(Debug, Subcommand)]
+enum DesktopCommand {
+    LastOpened,
 }
 
 #[derive(Debug, Subcommand)]
@@ -93,8 +117,21 @@ enum ClipsCommand {
         limit: usize,
         #[arg(long, default_value_t = 0)]
         offset: usize,
+        /// Include clips removed from the labeling queue.
+        #[arg(long)]
+        include_removed: bool,
     },
     Get {
+        #[arg(long)]
+        asset: String,
+    },
+    /// Probe source/cache media and explain the exact render plan without writes.
+    Diagnose {
+        #[arg(long)]
+        asset: String,
+    },
+    /// Persist current orientation metadata from the immutable original.
+    RefreshOrientation {
         #[arg(long)]
         asset: String,
     },
@@ -103,14 +140,18 @@ enum ClipsCommand {
         asset: String,
         #[arg(long)]
         notes: Option<String>,
+        /// Add a free-form label. Repeat to add more than one.
+        #[arg(long = "add-label")]
+        add_labels: Vec<String>,
+        /// Remove a label by case-insensitive match. Repeat as needed.
+        #[arg(long = "remove-label")]
+        remove_labels: Vec<String>,
+        /// Hide or restore the clip in the labeling queue.
         #[arg(long)]
-        status: Option<CliReviewStatus>,
-        #[arg(long, action = ArgAction::Set)]
-        included: Option<bool>,
+        removed: Option<bool>,
+        /// Clockwise display rotation: 0, 90, 180, or 270 degrees.
         #[arg(long)]
-        source_in: Option<f64>,
-        #[arg(long)]
-        source_out: Option<f64>,
+        rotation_degrees: Option<u16>,
     },
 }
 
@@ -140,6 +181,15 @@ enum ProxyCommand {
         #[arg(long)]
         project: String,
     },
+    /// Report missing and obsolete proxy representations without generating them.
+    Status {
+        #[arg(long, required_unless_present = "project", conflicts_with = "project")]
+        asset: Option<String>,
+        #[arg(long, required_unless_present = "asset", conflicts_with = "asset")]
+        project: Option<String>,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -158,31 +208,32 @@ enum ThumbnailCommand {
     },
 }
 
-#[derive(Debug, Subcommand)]
-enum ExportCommand {
-    Otio {
-        #[arg(long)]
-        project: String,
-    },
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DesktopContext {
+    last_catalog_path: Option<PathBuf>,
+    last_project_id: Option<String>,
+    last_asset_id: Option<String>,
+    last_context_updated_at: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum CliReviewStatus {
-    Unreviewed,
-    Reviewed,
-    Skipped,
-    NeedsAttention,
+fn desktop_settings_path() -> Result<PathBuf> {
+    let data_dir =
+        dirs::data_dir().ok_or_else(|| anyhow!("cannot resolve application data directory"))?;
+    Ok(data_dir.join("com.rcd.vlogcutter").join("settings.json"))
 }
 
-impl From<CliReviewStatus> for ReviewStatus {
-    fn from(value: CliReviewStatus) -> Self {
-        match value {
-            CliReviewStatus::Unreviewed => Self::Unreviewed,
-            CliReviewStatus::Reviewed => Self::Reviewed,
-            CliReviewStatus::Skipped => Self::Skipped,
-            CliReviewStatus::NeedsAttention => Self::NeedsAttention,
-        }
+fn desktop_context() -> Result<DesktopContext> {
+    let path = desktop_settings_path()?;
+    if !path.is_file() {
+        return Ok(DesktopContext::default());
     }
+    let value: Value = serde_json::from_slice(
+        &std::fs::read(&path)
+            .with_context(|| format!("read desktop settings {}", path.display()))?,
+    )
+    .with_context(|| format!("parse desktop settings {}", path.display()))?;
+    Ok(serde_json::from_value(value).unwrap_or_default())
 }
 
 fn default_catalog_path() -> Result<PathBuf> {
@@ -192,36 +243,44 @@ fn default_catalog_path() -> Result<PathBuf> {
 }
 
 fn selected_catalog(cli: &Cli) -> Result<PathBuf> {
-    cli.catalog
-        .clone()
-        .map(Ok)
-        .unwrap_or_else(default_catalog_path)
+    if let Some(path) = cli.catalog.clone() {
+        return Ok(path);
+    }
+    if let Some(path) = desktop_context()?.last_catalog_path {
+        return Ok(path);
+    }
+    default_catalog_path()
 }
 
 fn command_name(command: &Commands) -> &'static str {
     match command {
         Commands::Doctor => "doctor",
+        Commands::Catalog { .. } => "catalog.inspect",
+        Commands::Desktop { .. } => "desktop.last-opened",
         Commands::Project { command } => match command {
             ProjectCommand::Create { .. } => "project.create",
             ProjectCommand::List => "project.list",
             ProjectCommand::Status { .. } => "project.status",
+            ProjectCommand::Diagnose { .. } => "project.diagnose",
         },
         Commands::Ingest { .. } => "ingest",
         Commands::Clips { command } => match command {
             ClipsCommand::List { .. } => "clips.list",
             ClipsCommand::Get { .. } => "clips.get",
+            ClipsCommand::Diagnose { .. } => "clips.diagnose",
+            ClipsCommand::RefreshOrientation { .. } => "clips.refresh-orientation",
             ClipsCommand::Update { .. } => "clips.update",
         },
         Commands::Clock { .. } => "clock.apply",
         Commands::Proxy { command } => match command {
             ProxyCommand::Generate { .. } => "proxy.generate",
             ProxyCommand::Missing { .. } => "proxy.missing",
+            ProxyCommand::Status { .. } => "proxy.status",
         },
         Commands::Thumbnails { command } => match command {
             ThumbnailCommand::Generate { .. } => "thumbnails.generate",
             ThumbnailCommand::Missing { .. } => "thumbnails.missing",
         },
-        Commands::Export { .. } => "export.otio",
     }
 }
 
@@ -234,15 +293,45 @@ fn execute(cli: &Cli) -> Result<Value> {
         }));
     }
 
-    let catalog = Catalog::open(&catalog_path)?;
+    if matches!(cli.command, Commands::Desktop { .. }) {
+        let context = desktop_context()?;
+        return Ok(json!({
+            "settingsPath": desktop_settings_path()?,
+            "catalogPath": context.last_catalog_path,
+            "projectId": context.last_project_id,
+            "assetId": context.last_asset_id,
+            "updatedAt": context.last_context_updated_at,
+        }));
+    }
+    if matches!(cli.command, Commands::Catalog { .. }) {
+        return Ok(serde_json::to_value(inspect_catalog(&catalog_path)?)?);
+    }
+
+    let read_only = matches!(
+        cli.command,
+        Commands::Project {
+            command: ProjectCommand::Diagnose { .. }
+        } | Commands::Clips {
+            command: ClipsCommand::Diagnose { .. }
+        } | Commands::Proxy {
+            command: ProxyCommand::Status { .. }
+        }
+    );
+    let catalog = if read_only {
+        Catalog::open_read_only_existing(&catalog_path)?
+    } else {
+        Catalog::open(&catalog_path)?
+    };
     match &cli.command {
         Commands::Doctor => unreachable!(),
+        Commands::Catalog { .. } | Commands::Desktop { .. } => unreachable!(),
         Commands::Project { command } => match command {
             ProjectCommand::Create { name } => {
                 Ok(serde_json::to_value(catalog.create_project(name)?)?)
             }
             ProjectCommand::List => Ok(serde_json::to_value(catalog.list_projects()?)?),
             ProjectCommand::Status { project } => project_status(&catalog, project),
+            ProjectCommand::Diagnose { project } => project_diagnosis(&catalog, project),
         },
         Commands::Ingest { project, folder } => Ok(serde_json::to_value(
             catalog.ingest_folder_with_progress(project, folder, |completed, total, path| {
@@ -265,17 +354,23 @@ fn execute(cli: &Cli) -> Result<Value> {
                 query,
                 limit,
                 offset,
+                include_removed,
             } => {
                 let all = catalog.list_assets(project)?;
                 let filtered: Vec<_> = all
                     .into_iter()
                     .filter(|asset| {
-                        query.as_ref().is_none_or(|query| {
-                            let needle = query.to_lowercase();
-                            asset.filename.to_lowercase().contains(&needle)
-                                || asset.camera.to_lowercase().contains(&needle)
-                                || asset.notes.to_lowercase().contains(&needle)
-                        })
+                        (*include_removed || !asset.removed)
+                            && query.as_ref().is_none_or(|query| {
+                                let needle = query.to_lowercase();
+                                asset.filename.to_lowercase().contains(&needle)
+                                    || asset.camera.to_lowercase().contains(&needle)
+                                    || asset.notes.to_lowercase().contains(&needle)
+                                    || asset
+                                        .labels
+                                        .iter()
+                                        .any(|label| label.to_lowercase().contains(&needle))
+                            })
                     })
                     .collect();
                 let total = filtered.len();
@@ -283,21 +378,31 @@ fn execute(cli: &Cli) -> Result<Value> {
                 Ok(json!({ "total": total, "offset": offset, "limit": limit, "items": items }))
             }
             ClipsCommand::Get { asset } => Ok(serde_json::to_value(catalog.get_asset(asset)?)?),
+            ClipsCommand::Diagnose { asset } => clip_diagnosis(&catalog, asset),
+            ClipsCommand::RefreshOrientation { asset } => Ok(serde_json::to_value(
+                catalog.refresh_asset_orientation(asset)?,
+            )?),
             ClipsCommand::Update {
                 asset,
                 notes,
-                status,
-                included,
-                source_in,
-                source_out,
+                add_labels,
+                remove_labels,
+                removed,
+                rotation_degrees,
             } => {
                 let current = catalog.get_asset(asset)?;
+                let mut labels = current.labels;
+                labels.retain(|label| {
+                    !remove_labels
+                        .iter()
+                        .any(|removed| removed.trim().eq_ignore_ascii_case(label))
+                });
+                labels.extend(add_labels.iter().cloned());
                 let patch = AssetPatch {
                     notes: notes.clone().unwrap_or(current.notes),
-                    status: status.map(Into::into).unwrap_or(current.status),
-                    included: included.unwrap_or(current.included),
-                    source_in: source_in.unwrap_or(current.source_in),
-                    source_out: source_out.unwrap_or(current.source_out),
+                    labels,
+                    removed: removed.unwrap_or(current.removed),
+                    rotation_degrees: rotation_degrees.unwrap_or(current.rotation_degrees),
                 };
                 Ok(serde_json::to_value(catalog.update_asset(asset, &patch)?)?)
             }
@@ -324,6 +429,11 @@ fn execute(cli: &Cli) -> Result<Value> {
             ProxyCommand::Missing { project } => Ok(serde_json::to_value(
                 catalog.generate_missing_proxies(project)?,
             )?),
+            ProxyCommand::Status {
+                asset,
+                project,
+                limit,
+            } => proxy_status(&catalog, asset.as_deref(), project.as_deref(), *limit),
         },
         Commands::Thumbnails { command } => match command {
             ThumbnailCommand::Generate { asset, quality } => Ok(serde_json::to_value(
@@ -333,13 +443,224 @@ fn execute(cli: &Cli) -> Result<Value> {
                 catalog.generate_missing_thumbnails(project, *quality)?,
             )?),
         },
-        Commands::Export { command } => match command {
-            ExportCommand::Otio { project } => {
-                let path = catalog.export_otio(project)?;
-                Ok(json!({ "path": path }))
-            }
-        },
     }
+}
+
+fn representation_version(path: Option<&str>, current_suffix: &str) -> &'static str {
+    match path {
+        None => "missing",
+        Some(path) if !Path::new(path).is_file() => "missing",
+        Some(path) if path.ends_with(current_suffix) => "current_raw_v2",
+        Some(_) => "legacy_metadata_baked_v1",
+    }
+}
+
+fn probe_value(path: &str) -> (Option<MediaStreamInfo>, Value) {
+    match probe_media_stream(path) {
+        Ok(probe) => {
+            let value = serde_json::to_value(&probe).unwrap_or(Value::Null);
+            (Some(probe), value)
+        }
+        Err(error) => (None, json!({ "path": path, "error": format!("{error:#}") })),
+    }
+}
+
+fn rotation_after(rotation: u16, addition: i32) -> u16 {
+    ((rotation as i32 + addition).rem_euclid(360)) as u16
+}
+
+fn clip_diagnosis(catalog: &Catalog, asset_id: &str) -> Result<Value> {
+    let asset = catalog.get_asset(asset_id)?;
+    let (original_probe, original) = probe_value(&asset.path);
+    let proxy_version = representation_version(asset.proxy_path.as_deref(), ".v2.mp4");
+    let proxy_probe = asset
+        .proxy_path
+        .as_deref()
+        .filter(|path| Path::new(path).is_file())
+        .map(probe_value);
+    let thumbnail_version = representation_version(asset.thumbnail_path.as_deref(), ".v2.jpg");
+
+    let live_metadata_rotation = original_probe
+        .as_ref()
+        .map(|probe| probe.metadata_rotation_degrees);
+    let live_default_rotation = original_probe.as_ref().map(|probe| {
+        landscape_default_rotation(probe.width, probe.height, probe.metadata_rotation_degrees)
+    });
+    let has_override = asset.rotation_degrees != asset.default_rotation_degrees;
+    let effective_rotation = if asset.orientation_probed || has_override {
+        asset.rotation_degrees
+    } else {
+        live_default_rotation.unwrap_or(asset.rotation_degrees)
+    };
+    let effective_metadata = if asset.orientation_probed {
+        asset.metadata_rotation_degrees
+    } else {
+        live_metadata_rotation.unwrap_or(asset.metadata_rotation_degrees)
+    };
+
+    let (selected_kind, selected_version, selected_probe) = if let Some((probe, _)) = &proxy_probe {
+        ("proxy", proxy_version, probe.as_ref())
+    } else {
+        ("original", "source_with_metadata", original_probe.as_ref())
+    };
+    let representation_is_raw = selected_version == "current_raw_v2";
+    let baked_rotation = if representation_is_raw {
+        0
+    } else {
+        effective_metadata
+    };
+    let applied_rotation = rotation_after(effective_rotation, -(baked_rotation as i32));
+    let (final_width, final_height) = selected_probe
+        .map(|probe| {
+            if matches!(applied_rotation, 90 | 270) {
+                (probe.height, probe.width)
+            } else {
+                (probe.width, probe.height)
+            }
+        })
+        .unwrap_or((0, 0));
+    let final_orientation = if final_width > final_height {
+        "landscape"
+    } else if final_width < final_height {
+        "portrait"
+    } else {
+        "unknown"
+    };
+
+    let mut warnings = Vec::new();
+    if !asset.orientation_probed {
+        warnings.push(
+            "catalog orientation is unprobed; stored 0° means unknown, not confirmed".to_string(),
+        );
+    }
+    if let Some(rotation) = live_metadata_rotation
+        && rotation != asset.metadata_rotation_degrees
+    {
+        warnings.push(format!(
+            "stored metadata rotation is {}° but the original currently reports {}°",
+            asset.metadata_rotation_degrees, rotation
+        ));
+    }
+    if proxy_version == "legacy_metadata_baked_v1" {
+        warnings.push(
+            "selected proxy is legacy v1 media with camera rotation baked into its pixels"
+                .to_string(),
+        );
+    }
+    if final_orientation != "landscape" {
+        warnings.push(format!(
+            "computed rendered result is {final_orientation}, not landscape"
+        ));
+    }
+
+    Ok(json!({
+        "catalogPath": catalog.database_path(),
+        "asset": asset,
+        "storedOrientation": {
+            "probed": asset.orientation_probed,
+            "metadataRotationDegrees": asset.metadata_rotation_degrees,
+            "defaultRotationDegrees": asset.default_rotation_degrees,
+            "rotationDegrees": asset.rotation_degrees,
+            "hasUserOverride": has_override,
+        },
+        "liveOrientation": {
+            "metadataRotationDegrees": live_metadata_rotation,
+            "landscapeDefaultRotationDegrees": live_default_rotation,
+            "effectiveRotationDegrees": effective_rotation,
+        },
+        "representations": {
+            "original": original,
+            "proxy": {
+                "path": asset.proxy_path,
+                "version": proxy_version,
+                "probe": proxy_probe.as_ref().map(|(_, value)| value),
+            },
+            "thumbnail": {
+                "path": asset.thumbnail_path,
+                "version": thumbnail_version,
+            },
+        },
+        "renderPlan": {
+            "selectedRepresentation": selected_kind,
+            "selectedVersion": selected_version,
+            "representationRotationAlreadyAppliedDegrees": baked_rotation,
+            "cssRotationDegrees": applied_rotation,
+            "finalWidth": final_width,
+            "finalHeight": final_height,
+            "finalOrientation": final_orientation,
+        },
+        "warnings": warnings,
+        "recommendedActions": if asset.orientation_probed {
+            Vec::<String>::new()
+        } else {
+            vec![format!("rcdvlog --catalog {} clips refresh-orientation --asset {}", catalog.database_path().display(), asset.id)]
+        },
+    }))
+}
+
+fn proxy_status(
+    catalog: &Catalog,
+    asset_id: Option<&str>,
+    project_id: Option<&str>,
+    limit: usize,
+) -> Result<Value> {
+    let assets = if let Some(asset_id) = asset_id {
+        vec![catalog.get_asset(asset_id)?]
+    } else {
+        catalog.list_assets(project_id.expect("clap requires asset or project"))?
+    };
+    let total = assets.len();
+    let items = assets
+        .iter()
+        .take(limit)
+        .map(|asset| {
+            let version = representation_version(asset.proxy_path.as_deref(), ".v2.mp4");
+            json!({
+                "assetId": asset.id,
+                "filename": asset.filename,
+                "path": asset.proxy_path,
+                "version": version,
+                "ready": version == "current_raw_v2",
+                "regenerationRequired": version != "current_raw_v2",
+                "originalAvailable": asset.original_available,
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "total": total,
+        "limit": limit,
+        "summary": {
+            "current": assets.iter().filter(|asset| representation_version(asset.proxy_path.as_deref(), ".v2.mp4") == "current_raw_v2").count(),
+            "legacy": assets.iter().filter(|asset| representation_version(asset.proxy_path.as_deref(), ".v2.mp4") == "legacy_metadata_baked_v1").count(),
+            "missing": assets.iter().filter(|asset| representation_version(asset.proxy_path.as_deref(), ".v2.mp4") == "missing").count(),
+        },
+        "items": items,
+    }))
+}
+
+fn project_diagnosis(catalog: &Catalog, project_id: &str) -> Result<Value> {
+    let status = project_status(catalog, project_id)?;
+    let assets = catalog.list_assets(project_id)?;
+    let context = desktop_context().unwrap_or_default();
+    Ok(json!({
+        "catalogPath": catalog.database_path(),
+        "status": status,
+        "orientation": {
+            "unprobed": assets.iter().filter(|asset| !asset.orientation_probed).count(),
+            "overridden": assets.iter().filter(|asset| asset.rotation_degrees != asset.default_rotation_degrees).count(),
+        },
+        "proxies": {
+            "current": assets.iter().filter(|asset| representation_version(asset.proxy_path.as_deref(), ".v2.mp4") == "current_raw_v2").count(),
+            "legacy": assets.iter().filter(|asset| representation_version(asset.proxy_path.as_deref(), ".v2.mp4") == "legacy_metadata_baked_v1").count(),
+            "missing": assets.iter().filter(|asset| representation_version(asset.proxy_path.as_deref(), ".v2.mp4") == "missing").count(),
+        },
+        "desktopContext": {
+            "matchesProject": context.last_project_id.as_deref() == Some(project_id),
+            "selectedAssetId": context.last_asset_id,
+            "updatedAt": context.last_context_updated_at,
+        },
+        "next": "Run clips diagnose --asset <id> for live ffprobe evidence and the exact render plan.",
+    }))
 }
 
 fn project_status(catalog: &Catalog, project_id: &str) -> Result<Value> {
@@ -356,9 +677,10 @@ fn project_status(catalog: &Catalog, project_id: &str) -> Result<Value> {
             "assets": assets.len(),
             "durationSeconds": duration_seconds,
             "originalsOffline": assets.iter().filter(|asset| !Path::new(&asset.path).exists()).count(),
-            "proxiesReady": assets.iter().filter(|asset| asset.proxy_path.as_deref().is_some_and(|path| Path::new(path).exists())).count(),
-            "reviewed": assets.iter().filter(|asset| asset.status == ReviewStatus::Reviewed).count(),
-            "included": assets.iter().filter(|asset| asset.included).count(),
+            "proxiesReady": assets.iter().filter(|asset| representation_version(asset.proxy_path.as_deref(), ".v2.mp4") == "current_raw_v2").count(),
+            "proxiesLegacy": assets.iter().filter(|asset| representation_version(asset.proxy_path.as_deref(), ".v2.mp4") == "legacy_metadata_baked_v1").count(),
+            "labeled": assets.iter().filter(|asset| !asset.labels.is_empty()).count(),
+            "removed": assets.iter().filter(|asset| asset.removed).count(),
             "thumbnailsReady": assets.iter().filter(|asset| asset.thumbnail_quality > 0 && asset.thumbnail_path.as_deref().is_some_and(|path| Path::new(path).exists())).count(),
         }
     }))
@@ -463,8 +785,8 @@ mod tests {
         id: &str,
         filename: &str,
         notes: &str,
-        status: &str,
-        included: bool,
+        labels_json: &str,
+        removed: bool,
     ) {
         Connection::open(catalog_path)
             .unwrap()
@@ -473,11 +795,11 @@ mod tests {
                 INSERT INTO assets (
                     id, project_id, fingerprint, path, filename, size_bytes,
                     duration_seconds, frame_rate, width, height, codec, camera,
-                    captured_at_raw, best_time, notes, status, included,
-                    source_in, source_out, created_at
+                    captured_at_raw, best_time, notes, labels_json, removed,
+                    created_at
                 ) VALUES (?1, ?2, ?3, ?4, ?5, 100, 10, 30, 1920, 1080,
                           'h264', 'DJI', '2026-07-18T00:00:00Z',
-                          '2026-07-18T00:00:00.000Z', ?6, ?7, ?8, 1, 5,
+                          '2026-07-18T00:00:00.000Z', ?6, ?7, ?8,
                           '2026-07-18T00:00:00.000Z')
                 "#,
                 params![
@@ -487,8 +809,8 @@ mod tests {
                     format!("/missing/{filename}"),
                     filename,
                     notes,
-                    status,
-                    included,
+                    labels_json,
+                    removed,
                 ],
             )
             .unwrap();
@@ -537,14 +859,13 @@ mod tests {
             "clock",
             "proxy",
             "thumbnails",
-            "export",
         ] {
             assert!(help.contains(command));
         }
     }
 
     #[test]
-    fn clip_update_is_a_patch_and_accepts_agent_status_spelling() {
+    fn clip_update_is_a_patch_for_labels_and_removed_state() {
         let directory = tempdir().unwrap();
         let catalog_path = directory.path().join("catalog.sqlite3");
         let catalog = Catalog::open(&catalog_path).unwrap();
@@ -555,8 +876,8 @@ mod tests {
             "asset_a",
             "DJI_A.MP4",
             "original note",
-            "reviewed",
-            true,
+            "[\"arrival\"]",
+            false,
         );
         let catalog_arg = catalog_path.to_string_lossy();
 
@@ -573,12 +894,10 @@ mod tests {
         ]);
         let updated = execute(&notes_only).unwrap();
         assert_eq!(updated["notes"], "changed note");
-        assert_eq!(updated["status"], "reviewed");
-        assert_eq!(updated["included"], true);
-        assert_eq!(updated["sourceIn"], 1.0);
-        assert_eq!(updated["sourceOut"], 5.0);
+        assert_eq!(updated["labels"], json!(["arrival"]));
+        assert_eq!(updated["removed"], false);
 
-        let status_update = parse(&[
+        let label_update = parse(&[
             "rcdvlog",
             "--catalog",
             &catalog_arg,
@@ -586,14 +905,18 @@ mod tests {
             "update",
             "--asset",
             "asset_a",
-            "--status",
-            "needs-attention",
-            "--included",
-            "false",
+            "--remove-label",
+            "ARRIVAL",
+            "--add-label",
+            "train",
+            "--add-label",
+            "Train",
+            "--removed",
+            "true",
         ]);
-        let updated = execute(&status_update).unwrap();
-        assert_eq!(updated["status"], "needs_attention");
-        assert_eq!(updated["included"], false);
+        let updated = execute(&label_update).unwrap();
+        assert_eq!(updated["labels"], json!(["train"]));
+        assert_eq!(updated["removed"], true);
         assert_eq!(updated["notes"], "changed note");
     }
 
@@ -608,15 +931,7 @@ mod tests {
             ("asset_b", "DJI_B.MP4", "arrival interior"),
             ("asset_c", "DJI_C.MP4", "departure"),
         ] {
-            insert_cli_asset(
-                &catalog_path,
-                &project.id,
-                id,
-                filename,
-                notes,
-                "unreviewed",
-                false,
-            );
+            insert_cli_asset(&catalog_path, &project.id, id, filename, notes, "[]", false);
         }
         let catalog_arg = catalog_path.to_string_lossy();
         let command = parse(&[
@@ -649,6 +964,37 @@ mod tests {
         let result = execute(&doctor).unwrap();
         assert_eq!(result["catalog"], catalog_arg.as_ref());
         assert!(!catalog_path.exists());
+    }
+
+    #[test]
+    fn catalog_inspection_reports_pending_schema_without_migrating() {
+        let directory = tempdir().unwrap();
+        let catalog_path = directory.path().join("legacy.sqlite3");
+        let connection = Connection::open(&catalog_path).unwrap();
+        connection
+            .execute_batch("CREATE TABLE projects (id TEXT); CREATE TABLE assets (id TEXT);")
+            .unwrap();
+        drop(connection);
+        let catalog_arg = catalog_path.to_string_lossy();
+        let inspect = parse(&["rcdvlog", "--catalog", &catalog_arg, "catalog", "inspect"]);
+        let result = execute(&inspect).unwrap();
+        assert_eq!(result["readOnly"], true);
+        assert!(
+            result["pendingAssetColumns"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|column| column == "orientation_probed")
+        );
+        let columns = Connection::open(&catalog_path)
+            .unwrap()
+            .prepare("PRAGMA table_info(assets)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert!(!columns.iter().any(|column| column == "orientation_probed"));
     }
 
     #[test]

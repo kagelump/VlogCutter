@@ -1,15 +1,10 @@
-export type ReviewStatus =
-  | "unreviewed"
-  | "reviewed"
-  | "skipped"
-  | "needs_attention";
-
 export interface Project {
   id: string;
   name: string;
   createdAt: string;
   assetCount: number;
-  reviewedCount: number;
+  labeledCount: number;
+  removedCount: number;
 }
 
 export interface LoadedCatalog {
@@ -33,6 +28,10 @@ export type AutoplayMode = "never" | "proxyAvailable" | "always";
 export interface DesktopSettings {
   projectsRoot: string;
   autoplayMode: AutoplayMode;
+  lastCatalogPath: string | null;
+  lastProjectId: string | null;
+  lastAssetId: string | null;
+  lastContextUpdatedAt: string | null;
 }
 
 export interface Asset {
@@ -52,15 +51,17 @@ export interface Asset {
   bestTime: string | null;
   offsetSeconds: number;
   proxyPath: string | null;
+  metadataRotationDegrees: number;
+  defaultRotationDegrees: number;
+  rotationDegrees: number;
+  orientationProbed: boolean;
   originalAvailable: boolean;
   proxyAvailable: boolean;
   thumbnailPath: string | null;
   thumbnailQuality: number;
   notes: string;
-  status: ReviewStatus;
-  included: boolean;
-  sourceIn: number;
-  sourceOut: number;
+  labels: string[];
+  removed: boolean;
   available: boolean;
   phase?: string | null;
   location?: string | null;
@@ -70,10 +71,9 @@ export interface Asset {
 
 export interface AssetPatch {
   notes: string;
-  status: ReviewStatus;
-  included: boolean;
-  sourceIn: number;
-  sourceOut: number;
+  labels: string[];
+  removed: boolean;
+  rotationDegrees: number;
 }
 
 export interface IngestReport {

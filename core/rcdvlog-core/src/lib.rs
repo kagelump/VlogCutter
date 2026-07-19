@@ -4,27 +4,29 @@ use blake3::Hasher;
 use chrono::{DateTime, Duration, NaiveDateTime, SecondsFormat, Utc};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::env;
 use std::fs::{self, File};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
-use url::Url;
 use uuid::Uuid;
 use walkdir::WalkDir;
 
 const SAMPLE_BYTES: usize = 1024 * 1024;
 const MEDIA_EXTENSIONS: &[&str] = &["mp4", "mov", "m4v", "mts", "m2ts", "avi"];
-const PROXY_TASK_KIND: &str = "proxy.h264-720p.v1";
-const THUMBNAIL_TASK_KIND: &str = "thumbnail.q1.v1";
+const PROXY_TASK_KIND: &str = "proxy.h264-720p.orientation-v2";
+const THUMBNAIL_TASK_KIND: &str = "thumbnail.q1.orientation-v2";
+const PROXY_CACHE_VERSION: &str = "v2";
+const THUMBNAIL_CACHE_VERSION: &str = "v2";
 const PROXY_WORKERS: usize = 1;
 const THUMBNAIL_WORKERS: usize = 1;
 
 #[derive(Debug, Clone)]
 pub struct Catalog {
     database_path: PathBuf,
+    read_only: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -34,7 +36,8 @@ pub struct Project {
     pub name: String,
     pub created_at: String,
     pub asset_count: u64,
-    pub reviewed_count: u64,
+    pub labeled_count: u64,
+    pub removed_count: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,55 +59,31 @@ pub struct Asset {
     pub best_time: Option<String>,
     pub offset_seconds: i64,
     pub proxy_path: Option<String>,
+    /// Rotation applied to the encoded frame by camera metadata, in clockwise degrees.
+    pub metadata_rotation_degrees: u16,
+    /// Landscape-first orientation selected when the clip was ingested.
+    pub default_rotation_degrees: u16,
+    /// The reviewer-selected rotation applied to review media, in clockwise degrees.
+    pub rotation_degrees: u16,
+    /// True when camera rotation metadata has been explicitly probed for this asset.
+    pub orientation_probed: bool,
     pub original_available: bool,
     pub proxy_available: bool,
     pub thumbnail_path: Option<String>,
     pub thumbnail_quality: u8,
     pub notes: String,
-    pub status: ReviewStatus,
-    pub included: bool,
-    pub source_in: f64,
-    pub source_out: f64,
+    pub labels: Vec<String>,
+    pub removed: bool,
     pub available: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ReviewStatus {
-    Unreviewed,
-    Reviewed,
-    Skipped,
-    NeedsAttention,
-}
-
-impl ReviewStatus {
-    fn as_str(&self) -> &'static str {
-        match self {
-            Self::Unreviewed => "unreviewed",
-            Self::Reviewed => "reviewed",
-            Self::Skipped => "skipped",
-            Self::NeedsAttention => "needs_attention",
-        }
-    }
-
-    fn parse(value: &str) -> Self {
-        match value {
-            "reviewed" => Self::Reviewed,
-            "skipped" => Self::Skipped,
-            "needs_attention" => Self::NeedsAttention,
-            _ => Self::Unreviewed,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AssetPatch {
     pub notes: String,
-    pub status: ReviewStatus,
-    pub included: bool,
-    pub source_in: f64,
-    pub source_out: f64,
+    pub labels: Vec<String>,
+    pub removed: bool,
+    pub rotation_degrees: u16,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -155,6 +134,134 @@ pub struct ToolStatus {
     pub available: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogInspection {
+    pub path: String,
+    pub read_only: bool,
+    pub journal_mode: String,
+    pub project_count: u64,
+    pub asset_count: u64,
+    pub missing_required_tables: Vec<String>,
+    pub pending_asset_columns: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MediaStreamInfo {
+    pub path: String,
+    pub width: u32,
+    pub height: u32,
+    pub codec: String,
+    pub metadata_rotation_degrees: u16,
+    pub display_width: u32,
+    pub display_height: u32,
+    pub display_orientation: String,
+}
+
+/// Inspects catalog shape and counts without running migrations or opening it writable.
+pub fn inspect_catalog(path: impl AsRef<Path>) -> Result<CatalogInspection> {
+    let path = path.as_ref();
+    if !path.is_file() {
+        bail!("catalog file not found: {}", path.display());
+    }
+    let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .with_context(|| format!("inspect catalog {}", path.display()))?;
+    connection.pragma_update(None, "query_only", "ON")?;
+    connection.busy_timeout(std::time::Duration::from_secs(5))?;
+    let tables = connection
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let missing_required_tables = ["projects", "assets"]
+        .into_iter()
+        .filter(|name| !tables.iter().any(|table| table == name))
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let required_columns = [
+        "metadata_rotation_degrees",
+        "default_rotation_degrees",
+        "rotation_degrees",
+        "orientation_probed",
+        "labels_json",
+        "removed",
+    ];
+    let asset_columns = if tables.iter().any(|table| table == "assets") {
+        connection
+            .prepare("PRAGMA table_info(assets)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    } else {
+        Vec::new()
+    };
+    let pending_asset_columns = required_columns
+        .into_iter()
+        .filter(|name| !asset_columns.iter().any(|column| column == name))
+        .map(str::to_string)
+        .collect();
+    let project_count = if missing_required_tables.is_empty() {
+        connection.query_row("SELECT COUNT(*) FROM projects", [], |row| {
+            row.get::<_, i64>(0)
+        })? as u64
+    } else {
+        0
+    };
+    let asset_count = if missing_required_tables.is_empty() {
+        connection.query_row("SELECT COUNT(*) FROM assets", [], |row| {
+            row.get::<_, i64>(0)
+        })? as u64
+    } else {
+        0
+    };
+    let journal_mode = connection.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+    Ok(CatalogInspection {
+        path: path.to_string_lossy().into_owned(),
+        read_only: true,
+        journal_mode,
+        project_count,
+        asset_count,
+        missing_required_tables,
+        pending_asset_columns,
+    })
+}
+
+/// Probes the encoded video stream and its display rotation without changing catalog state.
+pub fn probe_media_stream(path: impl AsRef<Path>) -> Result<MediaStreamInfo> {
+    let path = path.as_ref();
+    if !path.is_file() {
+        bail!("media file not found: {}", path.display());
+    }
+    let probe = probe_media_document(path)?;
+    let stream = probe["streams"].as_array().and_then(|items| items.first());
+    let width = stream
+        .and_then(|value| value["width"].as_u64())
+        .unwrap_or(0) as u32;
+    let height = stream
+        .and_then(|value| value["height"].as_u64())
+        .unwrap_or(0) as u32;
+    let metadata_rotation_degrees = stream_rotation(stream);
+    let sideways = matches!(metadata_rotation_degrees, 90 | 270);
+    let (display_width, display_height) = if sideways {
+        (height, width)
+    } else {
+        (width, height)
+    };
+    let display_orientation = orientation_name(display_width, display_height).to_string();
+    Ok(MediaStreamInfo {
+        path: path.to_string_lossy().into_owned(),
+        width,
+        height,
+        codec: stream
+            .and_then(|value| value["codec_name"].as_str())
+            .unwrap_or("unknown")
+            .to_string(),
+        metadata_rotation_degrees,
+        display_width,
+        display_height,
+        display_orientation,
+    })
+}
+
 pub fn prerequisite_status() -> Vec<ToolStatus> {
     ["ffmpeg", "ffprobe", "exiftool"]
         .into_iter()
@@ -191,6 +298,8 @@ struct MediaProbe {
     camera: String,
     captured_at_raw: Option<String>,
     best_time: Option<String>,
+    metadata_rotation_degrees: u16,
+    default_rotation_degrees: u16,
 }
 
 impl Catalog {
@@ -200,13 +309,31 @@ impl Catalog {
             fs::create_dir_all(parent)
                 .with_context(|| format!("create catalog directory {}", parent.display()))?;
         }
-        let catalog = Self { database_path };
+        let catalog = Self {
+            database_path,
+            read_only: false,
+        };
         catalog.migrate()?;
         Ok(catalog)
     }
 
     pub fn open_existing(database_path: impl AsRef<Path>) -> Result<Self> {
         let database_path = database_path.as_ref();
+        Self::validate_existing(database_path)?;
+        Self::open(database_path)
+    }
+
+    /// Opens an existing catalog without running migrations or permitting writes.
+    pub fn open_read_only_existing(database_path: impl AsRef<Path>) -> Result<Self> {
+        let database_path = database_path.as_ref();
+        Self::validate_existing(database_path)?;
+        Ok(Self {
+            database_path: database_path.to_path_buf(),
+            read_only: true,
+        })
+    }
+
+    fn validate_existing(database_path: &Path) -> Result<()> {
         if !database_path.is_file() {
             bail!("catalog file not found: {}", database_path.display());
         }
@@ -226,8 +353,7 @@ impl Catalog {
                 );
             }
         }
-        drop(connection);
-        Self::open(database_path)
+        Ok(())
     }
 
     pub fn database_path(&self) -> &Path {
@@ -235,10 +361,18 @@ impl Catalog {
     }
 
     fn connection(&self) -> Result<Connection> {
-        let connection = Connection::open(&self.database_path)
-            .with_context(|| format!("open catalog {}", self.database_path.display()))?;
+        let connection = if self.read_only {
+            Connection::open_with_flags(&self.database_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        } else {
+            Connection::open(&self.database_path)
+        }
+        .with_context(|| format!("open catalog {}", self.database_path.display()))?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
-        connection.pragma_update(None, "journal_mode", "WAL")?;
+        if self.read_only {
+            connection.pragma_update(None, "query_only", "ON")?;
+        } else {
+            connection.pragma_update(None, "journal_mode", "WAL")?;
+        }
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
         Ok(connection)
     }
@@ -270,7 +404,13 @@ impl Catalog {
                 best_time TEXT,
                 offset_seconds INTEGER NOT NULL DEFAULT 0,
                 proxy_path TEXT,
+                metadata_rotation_degrees INTEGER NOT NULL DEFAULT 0,
+                default_rotation_degrees INTEGER NOT NULL DEFAULT 0,
+                rotation_degrees INTEGER NOT NULL DEFAULT 0,
+                orientation_probed INTEGER NOT NULL DEFAULT 1,
                 notes TEXT NOT NULL DEFAULT '',
+                labels_json TEXT NOT NULL DEFAULT '[]',
+                removed INTEGER NOT NULL DEFAULT 0,
                 status TEXT NOT NULL DEFAULT 'unreviewed',
                 included INTEGER NOT NULL DEFAULT 0,
                 source_in REAL NOT NULL DEFAULT 0,
@@ -308,7 +448,56 @@ impl Catalog {
             );
             "#,
         )?;
+        let added_default_rotation = self.add_asset_column_if_missing(
+            &connection,
+            "default_rotation_degrees",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        self.add_asset_column_if_missing(
+            &connection,
+            "metadata_rotation_degrees",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        let added_rotation = self.add_asset_column_if_missing(
+            &connection,
+            "rotation_degrees",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        self.add_asset_column_if_missing(
+            &connection,
+            "orientation_probed",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        self.add_asset_column_if_missing(&connection, "labels_json", "TEXT NOT NULL DEFAULT '[]'")?;
+        self.add_asset_column_if_missing(&connection, "removed", "INTEGER NOT NULL DEFAULT 0")?;
+        if added_default_rotation || added_rotation {
+            // Older catalogs did not retain camera display metadata. A portrait-encoded
+            // frame is therefore the best available signal for their landscape-first default.
+            connection.execute(
+                r#"
+                UPDATE assets
+                SET default_rotation_degrees = CASE WHEN height > width THEN 90 ELSE 0 END,
+                    rotation_degrees = CASE WHEN height > width THEN 90 ELSE 0 END
+                "#,
+                [],
+            )?;
+        }
         Ok(())
+    }
+
+    fn add_asset_column_if_missing(
+        &self,
+        connection: &Connection,
+        column: &str,
+        definition: &str,
+    ) -> Result<bool> {
+        let exists = asset_column_exists(connection, column)?;
+        if !exists {
+            connection.execute_batch(&format!(
+                "ALTER TABLE assets ADD COLUMN {column} {definition}"
+            ))?;
+        }
+        Ok(!exists)
     }
 
     pub fn create_project(&self, name: &str) -> Result<Project> {
@@ -327,30 +516,36 @@ impl Catalog {
             name: name.to_string(),
             created_at,
             asset_count: 0,
-            reviewed_count: 0,
+            labeled_count: 0,
+            removed_count: 0,
         })
     }
 
     pub fn list_projects(&self) -> Result<Vec<Project>> {
         let connection = self.connection()?;
-        let mut statement = connection.prepare(
+        let labels = asset_column_expression(&connection, "labels_json", "a.labels_json", "'[]'")?;
+        let removed = asset_column_expression(&connection, "removed", "a.removed", "0")?;
+        let sql = format!(
             r#"
             SELECT p.id, p.name, p.created_at,
                    COUNT(a.id),
-                   COALESCE(SUM(CASE WHEN a.status = 'reviewed' THEN 1 ELSE 0 END), 0)
+                   COALESCE(SUM(CASE WHEN {labels} != '[]' THEN 1 ELSE 0 END), 0),
+                   COALESCE(SUM(CASE WHEN {removed} = 1 THEN 1 ELSE 0 END), 0)
             FROM projects p
             LEFT JOIN assets a ON a.project_id = p.id
             GROUP BY p.id
             ORDER BY p.created_at DESC
-            "#,
-        )?;
+            "#
+        );
+        let mut statement = connection.prepare(&sql)?;
         let rows = statement.query_map([], |row| {
             Ok(Project {
                 id: row.get(0)?,
                 name: row.get(1)?,
                 created_at: row.get(2)?,
                 asset_count: row.get::<_, i64>(3)? as u64,
-                reviewed_count: row.get::<_, i64>(4)? as u64,
+                labeled_count: row.get::<_, i64>(4)? as u64,
+                removed_count: row.get::<_, i64>(5)? as u64,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -431,9 +626,11 @@ impl Catalog {
             INSERT INTO assets (
                 id, project_id, fingerprint, path, filename, size_bytes,
                 duration_seconds, frame_rate, width, height, codec, camera,
-                captured_at_raw, best_time, source_out, created_at
+                captured_at_raw, best_time, metadata_rotation_degrees,
+                default_rotation_degrees, rotation_degrees, orientation_probed,
+                created_at
             ) VALUES (
-                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, 1, ?18
             )
             "#,
             params![
@@ -451,7 +648,9 @@ impl Catalog {
                 probe.camera,
                 probe.captured_at_raw,
                 probe.best_time,
-                probe.duration_seconds,
+                probe.metadata_rotation_degrees,
+                probe.default_rotation_degrees,
+                probe.default_rotation_degrees,
                 now(),
             ],
         )?;
@@ -461,77 +660,151 @@ impl Catalog {
     pub fn list_assets(&self, project_id: &str) -> Result<Vec<Asset>> {
         self.require_project(project_id)?;
         let connection = self.connection()?;
-        let mut statement = connection.prepare(
+        let metadata_rotation = asset_column_expression(
+            &connection,
+            "metadata_rotation_degrees",
+            "a.metadata_rotation_degrees",
+            "0",
+        )?;
+        let default_rotation = asset_column_expression(
+            &connection,
+            "default_rotation_degrees",
+            "a.default_rotation_degrees",
+            "0",
+        )?;
+        let rotation =
+            asset_column_expression(&connection, "rotation_degrees", "a.rotation_degrees", "0")?;
+        let orientation_probed = asset_column_expression(
+            &connection,
+            "orientation_probed",
+            "a.orientation_probed",
+            "0",
+        )?;
+        let labels = asset_column_expression(&connection, "labels_json", "a.labels_json", "'[]'")?;
+        let removed = asset_column_expression(&connection, "removed", "a.removed", "0")?;
+        let (thumbnail_path, thumbnail_quality, thumbnail_join) = if table_exists(
+            &connection,
+            "asset_thumbnails",
+        )? {
+            (
+                "t.path",
+                "COALESCE(t.quality, 0)",
+                "LEFT JOIN asset_thumbnails t ON t.asset_id = a.id AND t.quality = (SELECT MAX(t2.quality) FROM asset_thumbnails t2 WHERE t2.asset_id = a.id)",
+            )
+        } else {
+            ("NULL", "0", "")
+        };
+        let sql = format!(
             r#"
             SELECT a.id, a.project_id, a.path, a.filename, a.fingerprint, a.size_bytes,
                    a.duration_seconds, a.frame_rate, a.width, a.height, a.codec, a.camera,
                    a.captured_at_raw, a.best_time, a.offset_seconds, a.proxy_path,
-                   t.path, COALESCE(t.quality, 0),
-                   a.notes, a.status, a.included, a.source_in, a.source_out
+                   {metadata_rotation}, {default_rotation}, {rotation},
+                   {orientation_probed}, {thumbnail_path}, {thumbnail_quality},
+                   a.notes, {labels}, {removed}
             FROM assets a
-            LEFT JOIN asset_thumbnails t
-              ON t.asset_id = a.id
-             AND t.quality = (SELECT MAX(t2.quality) FROM asset_thumbnails t2 WHERE t2.asset_id = a.id)
+            {thumbnail_join}
             WHERE a.project_id = ?1
             ORDER BY a.best_time IS NULL, a.best_time, a.filename, a.id
-            "#,
-        )?;
+            "#
+        );
+        let mut statement = connection.prepare(&sql)?;
         let rows = statement.query_map([project_id], row_to_asset)?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    /// Lists assets after explicitly probing legacy rows whose orientation is unknown.
+    pub fn list_assets_with_refreshed_orientation(&self, project_id: &str) -> Result<Vec<Asset>> {
+        self.list_assets(project_id)?
+            .into_iter()
+            .map(|asset| {
+                if !asset.orientation_probed && asset.original_available {
+                    self.refresh_asset_orientation(&asset.id)
+                } else {
+                    Ok(asset)
+                }
+            })
+            .collect()
+    }
+
     pub fn get_asset(&self, asset_id: &str) -> Result<Asset> {
         let connection = self.connection()?;
-        connection
-            .query_row(
-                r#"
-                SELECT a.id, a.project_id, a.path, a.filename, a.fingerprint, a.size_bytes,
-                       a.duration_seconds, a.frame_rate, a.width, a.height, a.codec, a.camera,
-                       a.captured_at_raw, a.best_time, a.offset_seconds, a.proxy_path,
-                       t.path, COALESCE(t.quality, 0),
-                       a.notes, a.status, a.included, a.source_in, a.source_out
-                FROM assets a
-                LEFT JOIN asset_thumbnails t
-                  ON t.asset_id = a.id
-                 AND t.quality = (SELECT MAX(t2.quality) FROM asset_thumbnails t2 WHERE t2.asset_id = a.id)
-                WHERE a.id = ?1
-                "#,
-                [asset_id],
-                row_to_asset,
+        let metadata_rotation = asset_column_expression(
+            &connection,
+            "metadata_rotation_degrees",
+            "a.metadata_rotation_degrees",
+            "0",
+        )?;
+        let default_rotation = asset_column_expression(
+            &connection,
+            "default_rotation_degrees",
+            "a.default_rotation_degrees",
+            "0",
+        )?;
+        let rotation =
+            asset_column_expression(&connection, "rotation_degrees", "a.rotation_degrees", "0")?;
+        let orientation_probed = asset_column_expression(
+            &connection,
+            "orientation_probed",
+            "a.orientation_probed",
+            "0",
+        )?;
+        let labels = asset_column_expression(&connection, "labels_json", "a.labels_json", "'[]'")?;
+        let removed = asset_column_expression(&connection, "removed", "a.removed", "0")?;
+        let (thumbnail_path, thumbnail_quality, thumbnail_join) = if table_exists(
+            &connection,
+            "asset_thumbnails",
+        )? {
+            (
+                "t.path",
+                "COALESCE(t.quality, 0)",
+                "LEFT JOIN asset_thumbnails t ON t.asset_id = a.id AND t.quality = (SELECT MAX(t2.quality) FROM asset_thumbnails t2 WHERE t2.asset_id = a.id)",
             )
+        } else {
+            ("NULL", "0", "")
+        };
+        let sql = format!(
+            r#"
+            SELECT a.id, a.project_id, a.path, a.filename, a.fingerprint, a.size_bytes,
+                   a.duration_seconds, a.frame_rate, a.width, a.height, a.codec, a.camera,
+                   a.captured_at_raw, a.best_time, a.offset_seconds, a.proxy_path,
+                   {metadata_rotation}, {default_rotation}, {rotation},
+                   {orientation_probed}, {thumbnail_path}, {thumbnail_quality},
+                   a.notes, {labels}, {removed}
+            FROM assets a
+            {thumbnail_join}
+            WHERE a.id = ?1
+            "#
+        );
+        connection
+            .query_row(&sql, [asset_id], row_to_asset)
             .optional()?
             .ok_or_else(|| anyhow!("asset not found: {asset_id}"))
     }
 
     pub fn update_asset(&self, asset_id: &str, patch: &AssetPatch) -> Result<Asset> {
-        let current = self.get_asset(asset_id)?;
-        if !patch.source_in.is_finite()
-            || !patch.source_out.is_finite()
-            || patch.source_in < 0.0
-            || patch.source_out < patch.source_in
-            || patch.source_out > current.duration_seconds
-        {
+        self.get_asset(asset_id)?;
+        if !is_right_angle(patch.rotation_degrees) {
             bail!(
-                "invalid source range: {}–{} for {:.3}-second asset",
-                patch.source_in,
-                patch.source_out,
-                current.duration_seconds
+                "invalid rotation: {}; expected 0, 90, 180, or 270 degrees",
+                patch.rotation_degrees
             );
         }
+        let labels = normalize_labels(&patch.labels)?;
+        let labels_json = serde_json::to_string(&labels)?;
         let connection = self.connection()?;
         let changed = connection.execute(
             r#"
             UPDATE assets
-            SET notes = ?2, status = ?3, included = ?4, source_in = ?5, source_out = ?6
+            SET notes = ?2, labels_json = ?3, removed = ?4, rotation_degrees = ?5
             WHERE id = ?1
             "#,
             params![
                 asset_id,
                 patch.notes,
-                patch.status.as_str(),
-                patch.included,
-                patch.source_in,
-                patch.source_out,
+                labels_json,
+                patch.removed,
+                patch.rotation_degrees,
             ],
         )?;
         if changed == 0 {
@@ -628,7 +901,7 @@ impl Catalog {
     }
 
     fn generate_proxy_untracked(&self, asset_id: &str) -> Result<Asset> {
-        let asset = self.get_asset(asset_id)?;
+        let asset = self.refresh_asset_orientation(asset_id)?;
         if !Path::new(&asset.path).exists() {
             bail!("original is offline: {}", asset.path);
         }
@@ -638,9 +911,16 @@ impl Catalog {
             .ok_or_else(|| anyhow!("catalog has no parent directory"))?;
         let proxy_dir = parent.join("cache").join("proxies").join(&asset.project_id);
         fs::create_dir_all(&proxy_dir)?;
-        let output = proxy_dir.join(format!("{}.mp4", asset.id));
+        let output = proxy_dir.join(format!("{}.{}.mp4", asset.id, PROXY_CACHE_VERSION));
         let status = tool_command("ffmpeg")
-            .args(["-y", "-hide_banner", "-loglevel", "error", "-i"])
+            .args([
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-noautorotate",
+                "-i",
+            ])
             .arg(&asset.path)
             .args([
                 "-vf",
@@ -659,6 +939,8 @@ impl Catalog {
                 "128k",
                 "-movflags",
                 "+faststart",
+                "-map_metadata",
+                "-1",
             ])
             .arg(&output)
             .status()
@@ -671,6 +953,39 @@ impl Catalog {
             params![asset_id, output.to_string_lossy()],
         )?;
         self.get_asset(asset_id)
+    }
+
+    /// Explicitly refreshes legacy orientation metadata from the immutable original.
+    pub fn refresh_asset_orientation(&self, asset_id: &str) -> Result<Asset> {
+        let asset = self.get_asset(asset_id)?;
+        if asset.orientation_probed || !Path::new(&asset.path).is_file() {
+            if !Path::new(&asset.path).is_file() && !asset.orientation_probed {
+                bail!("original is offline: {}", asset.path);
+            }
+            return Ok(asset);
+        }
+
+        let probe = probe_media(Path::new(&asset.path))?;
+        let rotation_degrees = if asset.rotation_degrees != asset.default_rotation_degrees {
+            asset.rotation_degrees
+        } else {
+            probe.default_rotation_degrees
+        };
+        self.connection()?.execute(
+            r#"
+                UPDATE assets
+                SET metadata_rotation_degrees = ?2, default_rotation_degrees = ?3,
+                    rotation_degrees = ?4, orientation_probed = 1
+                WHERE id = ?1
+                "#,
+            params![
+                &asset.id,
+                probe.metadata_rotation_degrees,
+                probe.default_rotation_degrees,
+                rotation_degrees,
+            ],
+        )?;
+        self.get_asset(&asset.id)
     }
 
     pub fn generate_proxy(&self, asset_id: &str) -> Result<Asset> {
@@ -730,10 +1045,7 @@ impl Catalog {
     {
         let assets = self.list_assets(project_id)?;
         let (ready, pending): (Vec<_>, Vec<_>) = assets.into_iter().partition(|asset| {
-            asset
-                .proxy_path
-                .as_deref()
-                .is_some_and(|path| Path::new(path).exists())
+            has_current_proxy(asset) || (!asset.original_available && asset.proxy_available)
         });
         let mut report = ProxyReport {
             generated: 0,
@@ -798,8 +1110,8 @@ impl Catalog {
             .ok_or_else(|| anyhow!("catalog has no parent directory"))?;
         let thumbnail_dir = parent.join("cache").join("thumbnails").join(&asset.id);
         fs::create_dir_all(&thumbnail_dir)?;
-        let output = thumbnail_dir.join(format!("q{quality}.jpg"));
-        let temporary = thumbnail_dir.join(format!("q{quality}.tmp.jpg"));
+        let output = thumbnail_dir.join(format!("q{quality}.{THUMBNAIL_CACHE_VERSION}.jpg"));
+        let temporary = thumbnail_dir.join(format!("q{quality}.{THUMBNAIL_CACHE_VERSION}.tmp.jpg"));
         let seek = (asset.duration_seconds.max(0.0) * 0.2).to_string();
         let status = tool_command("ffmpeg")
             .args([
@@ -809,6 +1121,7 @@ impl Catalog {
                 "error",
                 "-ss",
                 &seek,
+                "-noautorotate",
                 "-i",
             ])
             .arg(&input)
@@ -861,13 +1174,9 @@ impl Catalog {
             bail!("invalid thumbnail quality {quality}; MVP supports quality 1");
         }
         let assets = self.list_assets(project_id)?;
-        let (ready, pending): (Vec<_>, Vec<_>) = assets.into_iter().partition(|asset| {
-            asset.thumbnail_quality >= quality
-                && asset
-                    .thumbnail_path
-                    .as_deref()
-                    .is_some_and(|path| Path::new(path).is_file())
-        });
+        let (ready, pending): (Vec<_>, Vec<_>) = assets
+            .into_iter()
+            .partition(|asset| has_current_thumbnail(asset, quality));
         let mut report = ThumbnailReport {
             quality,
             generated: 0,
@@ -908,66 +1217,6 @@ impl Catalog {
             });
         }
         Ok(report)
-    }
-
-    pub fn export_otio(&self, project_id: &str) -> Result<PathBuf> {
-        let project = self
-            .list_projects()?
-            .into_iter()
-            .find(|project| project.id == project_id)
-            .ok_or_else(|| anyhow!("project not found: {project_id}"))?;
-        let assets: Vec<Asset> = self
-            .list_assets(project_id)?
-            .into_iter()
-            .filter(|asset| asset.included)
-            .collect();
-        if assets.is_empty() {
-            bail!("rough cut is empty; include at least one clip");
-        }
-        let children: Vec<Value> = assets.iter().map(asset_to_otio_clip).collect();
-        let timeline = json!({
-            "OTIO_SCHEMA": "Timeline.1",
-            "name": format!("{} Rough Cut", project.name),
-            "global_start_time": Value::Null,
-            "metadata": { "rcdvlog": { "project_id": project.id, "exported_at": now() } },
-            "tracks": {
-                "OTIO_SCHEMA": "Stack.1",
-                "name": "tracks",
-                "effects": [],
-                "markers": [],
-                "metadata": {},
-                "source_range": Value::Null,
-                "enabled": true,
-                "color": Value::Null,
-                "children": [{
-                    "OTIO_SCHEMA": "Track.1",
-                    "name": "V1",
-                    "kind": "Video",
-                    "effects": [],
-                    "markers": [],
-                    "metadata": {},
-                    "source_range": Value::Null,
-                    "enabled": true,
-                    "color": Value::Null,
-                    "children": children
-                }]
-            }
-        });
-        let parent = self
-            .database_path
-            .parent()
-            .unwrap_or_else(|| Path::new("."));
-        let export_dir = parent.join("exports").join(project_id);
-        fs::create_dir_all(&export_dir)?;
-        let path = export_dir.join(format!(
-            "rough-cut-{}-{}.otio",
-            Utc::now().format("%Y%m%d-%H%M%S"),
-            &Uuid::new_v4().simple().to_string()[..8]
-        ));
-        let mut file = File::create(&path)?;
-        serde_json::to_writer_pretty(&mut file, &timeline)?;
-        file.write_all(b"\n")?;
-        Ok(path)
     }
 
     fn require_project(&self, project_id: &str) -> Result<()> {
@@ -1021,6 +1270,84 @@ impl Catalog {
     }
 }
 
+fn asset_column_exists(connection: &Connection, column: &str) -> Result<bool> {
+    Ok(connection
+        .prepare("PRAGMA table_info(assets)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .iter()
+        .any(|name| name == column))
+}
+
+fn table_exists(connection: &Connection, table: &str) -> Result<bool> {
+    Ok(connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+        [table],
+        |row| row.get(0),
+    )?)
+}
+
+fn asset_column_expression(
+    connection: &Connection,
+    column: &str,
+    present_expression: &'static str,
+    missing_expression: &'static str,
+) -> Result<&'static str> {
+    Ok(if asset_column_exists(connection, column)? {
+        present_expression
+    } else {
+        missing_expression
+    })
+}
+
+fn has_current_proxy(asset: &Asset) -> bool {
+    asset.proxy_path.as_deref().is_some_and(|path| {
+        Path::new(path).is_file() && path.ends_with(&format!(".{PROXY_CACHE_VERSION}.mp4"))
+    })
+}
+
+fn has_current_thumbnail(asset: &Asset, quality: u8) -> bool {
+    asset.thumbnail_quality >= quality
+        && asset.thumbnail_path.as_deref().is_some_and(|path| {
+            Path::new(path).is_file()
+                && path.ends_with(&format!("q{quality}.{THUMBNAIL_CACHE_VERSION}.jpg"))
+        })
+}
+
+fn is_right_angle(degrees: u16) -> bool {
+    matches!(degrees, 0 | 90 | 180 | 270)
+}
+
+fn normalize_rotation(degrees: f64) -> u16 {
+    let rounded = degrees.round() as i32;
+    let normalized = rounded.rem_euclid(360) as u16;
+    match normalized {
+        0..=44 | 316..=359 => 0,
+        45..=134 => 90,
+        135..=224 => 180,
+        _ => 270,
+    }
+}
+
+pub fn landscape_default_rotation(width: u32, height: u32, metadata_rotation_degrees: u16) -> u16 {
+    let metadata_turns_sideways = matches!(metadata_rotation_degrees, 90 | 270);
+    let displayed_width = if metadata_turns_sideways {
+        height
+    } else {
+        width
+    };
+    let displayed_height = if metadata_turns_sideways {
+        width
+    } else {
+        height
+    };
+    if displayed_height > displayed_width {
+        (metadata_rotation_degrees + 90) % 360
+    } else {
+        metadata_rotation_degrees
+    }
+}
+
 fn row_to_asset(row: &rusqlite::Row<'_>) -> rusqlite::Result<Asset> {
     let path: String = row.get(2)?;
     let proxy_path: Option<String> = row.get(15)?;
@@ -1028,8 +1355,8 @@ fn row_to_asset(row: &rusqlite::Row<'_>) -> rusqlite::Result<Asset> {
     let proxy_available = proxy_path
         .as_deref()
         .is_some_and(|path| Path::new(path).is_file());
-    let stored_thumbnail_path: Option<String> = row.get(16)?;
-    let stored_thumbnail_quality = row.get::<_, i64>(17)? as u8;
+    let stored_thumbnail_path: Option<String> = row.get(20)?;
+    let stored_thumbnail_quality = row.get::<_, i64>(21)? as u8;
     let thumbnail_available = stored_thumbnail_path
         .as_deref()
         .is_some_and(|path| Path::new(path).is_file());
@@ -1051,6 +1378,10 @@ fn row_to_asset(row: &rusqlite::Row<'_>) -> rusqlite::Result<Asset> {
         best_time: row.get(13)?,
         offset_seconds: row.get(14)?,
         proxy_path,
+        metadata_rotation_degrees: row.get::<_, i64>(16)? as u16,
+        default_rotation_degrees: row.get::<_, i64>(17)? as u16,
+        rotation_degrees: row.get::<_, i64>(18)? as u16,
+        orientation_probed: row.get::<_, i64>(19)? != 0,
         original_available,
         proxy_available,
         thumbnail_path: thumbnail_available
@@ -1061,11 +1392,9 @@ fn row_to_asset(row: &rusqlite::Row<'_>) -> rusqlite::Result<Asset> {
         } else {
             0
         },
-        notes: row.get(18)?,
-        status: ReviewStatus::parse(&row.get::<_, String>(19)?),
-        included: row.get::<_, i64>(20)? != 0,
-        source_in: row.get(21)?,
-        source_out: row.get(22)?,
+        notes: row.get(22)?,
+        labels: serde_json::from_str(&row.get::<_, String>(23)?).unwrap_or_default(),
+        removed: row.get::<_, i64>(24)? != 0,
         available,
     })
 }
@@ -1120,27 +1449,7 @@ fn sampled_fingerprint(path: &Path, size: u64) -> Result<String> {
 }
 
 fn probe_media(path: &Path) -> Result<MediaProbe> {
-    let output = tool_command("ffprobe")
-        .args([
-            "-v",
-            "error",
-            "-select_streams",
-            "v:0",
-            "-show_entries",
-            "format=duration:format_tags=creation_time:stream=width,height,codec_name,r_frame_rate:stream_tags=creation_time",
-            "-of",
-            "json",
-        ])
-        .arg(path)
-        .output()
-        .context("start ffprobe")?;
-    if !output.status.success() {
-        bail!(
-            "ffprobe failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    let document: Value = serde_json::from_slice(&output.stdout).context("parse ffprobe JSON")?;
+    let document = probe_media_document(path)?;
     let stream = document["streams"]
         .as_array()
         .and_then(|items| items.first());
@@ -1158,15 +1467,18 @@ fn probe_media(path: &Path) -> Result<MediaProbe> {
         .and_then(|value| value["r_frame_rate"].as_str())
         .map(parse_rate)
         .unwrap_or(30.0);
+    let metadata_rotation_degrees = stream_rotation(stream);
+    let width = stream
+        .and_then(|value| value["width"].as_u64())
+        .unwrap_or(0) as u32;
+    let height = stream
+        .and_then(|value| value["height"].as_u64())
+        .unwrap_or(0) as u32;
     Ok(MediaProbe {
         duration_seconds,
         frame_rate: rate,
-        width: stream
-            .and_then(|value| value["width"].as_u64())
-            .unwrap_or(0) as u32,
-        height: stream
-            .and_then(|value| value["height"].as_u64())
-            .unwrap_or(0) as u32,
+        width,
+        height,
         codec: stream
             .and_then(|value| value["codec_name"].as_str())
             .unwrap_or("unknown")
@@ -1176,7 +1488,63 @@ fn probe_media(path: &Path) -> Result<MediaProbe> {
         best_time: raw_time
             .as_deref()
             .and_then(|value| normalize_datetime(value, 0)),
+        metadata_rotation_degrees,
+        default_rotation_degrees: landscape_default_rotation(
+            width,
+            height,
+            metadata_rotation_degrees,
+        ),
     })
+}
+
+fn probe_media_document(path: &Path) -> Result<Value> {
+    let output = tool_command("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "format=duration:format_tags=creation_time:stream=width,height,codec_name,r_frame_rate:stream_tags=creation_time,rotate:stream_side_data=rotation",
+            "-of",
+            "json",
+        ])
+        .arg(path)
+        .output()
+        .context("start ffprobe")?;
+    if !output.status.success() {
+        bail!(
+            "ffprobe failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    serde_json::from_slice(&output.stdout).context("parse ffprobe JSON")
+}
+
+fn stream_rotation(stream: Option<&Value>) -> u16 {
+    stream
+        .and_then(|value| {
+            value["side_data_list"]
+                .as_array()
+                .and_then(|items| items.iter().find_map(|item| item["rotation"].as_f64()))
+                .or_else(|| {
+                    value
+                        .pointer("/tags/rotate")
+                        .and_then(Value::as_str)?
+                        .parse()
+                        .ok()
+                })
+        })
+        .map(normalize_rotation)
+        .unwrap_or(0)
+}
+
+fn orientation_name(width: u32, height: u32) -> &'static str {
+    match width.cmp(&height) {
+        std::cmp::Ordering::Greater => "landscape",
+        std::cmp::Ordering::Less => "portrait",
+        std::cmp::Ordering::Equal => "square",
+    }
 }
 
 fn exif_camera(path: &Path) -> Option<String> {
@@ -1231,55 +1599,27 @@ fn normalize_datetime(value: &str, offset_seconds: i64) -> Option<String> {
     None
 }
 
-fn asset_to_otio_clip(asset: &Asset) -> Value {
-    let rate = if asset.frame_rate > 0.0 {
-        asset.frame_rate
-    } else {
-        30.0
-    };
-    let source_in = asset.source_in.max(0.0);
-    let source_out = asset.source_out.min(asset.duration_seconds).max(source_in);
-    let duration = source_out - source_in;
-    let target_url = Url::from_file_path(&asset.path)
-        .map(String::from)
-        .unwrap_or_else(|_| asset.path.clone());
-    json!({
-        "OTIO_SCHEMA": "Clip.2",
-        "name": asset.filename,
-        "effects": [],
-        "markers": [],
-        "enabled": true,
-        "color": Value::Null,
-        "metadata": { "rcdvlog": { "asset_id": asset.id, "notes": asset.notes } },
-        "source_range": time_range(source_in, duration, rate),
-        "media_references": {
-            "DEFAULT_MEDIA": {
-                "OTIO_SCHEMA": "ExternalReference.1",
-                "name": "",
-                "metadata": {},
-                "target_url": target_url,
-                "available_range": time_range(0.0, asset.duration_seconds, rate),
-                "available_image_bounds": Value::Null
-            }
-        },
-        "active_media_reference_key": "DEFAULT_MEDIA"
-    })
-}
-
-fn time_range(start_seconds: f64, duration_seconds: f64, rate: f64) -> Value {
-    json!({
-        "OTIO_SCHEMA": "TimeRange.1",
-        "start_time": {
-            "OTIO_SCHEMA": "RationalTime.1",
-            "value": start_seconds * rate,
-            "rate": rate
-        },
-        "duration": {
-            "OTIO_SCHEMA": "RationalTime.1",
-            "value": duration_seconds * rate,
-            "rate": rate
+fn normalize_labels(labels: &[String]) -> Result<Vec<String>> {
+    let mut normalized = Vec::new();
+    for label in labels {
+        let label = label.trim();
+        if label.is_empty() {
+            continue;
         }
-    })
+        if label.chars().count() > 64 {
+            bail!("invalid label: labels must be 64 characters or fewer");
+        }
+        if !normalized
+            .iter()
+            .any(|existing: &String| existing.eq_ignore_ascii_case(label))
+        {
+            normalized.push(label.to_string());
+        }
+    }
+    if normalized.len() > 24 {
+        bail!("invalid labels: an asset can have at most 24 labels");
+    }
+    Ok(normalized)
 }
 
 fn now() -> String {
@@ -1374,6 +1714,67 @@ mod tests {
     }
 
     #[test]
+    fn migrates_legacy_catalogs_to_labels_removal_and_landscape_orientation() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("catalog.sqlite3");
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch(
+            r#"
+            CREATE TABLE projects (id TEXT PRIMARY KEY, name TEXT NOT NULL, created_at TEXT NOT NULL);
+            CREATE TABLE assets (
+                id TEXT PRIMARY KEY, project_id TEXT NOT NULL, fingerprint TEXT NOT NULL,
+                path TEXT NOT NULL, filename TEXT NOT NULL, size_bytes INTEGER NOT NULL,
+                duration_seconds REAL NOT NULL, frame_rate REAL NOT NULL DEFAULT 30,
+                width INTEGER NOT NULL DEFAULT 0, height INTEGER NOT NULL DEFAULT 0,
+                codec TEXT NOT NULL DEFAULT '', camera TEXT NOT NULL DEFAULT 'Unknown camera',
+                captured_at_raw TEXT, best_time TEXT, offset_seconds INTEGER NOT NULL DEFAULT 0,
+                proxy_path TEXT, notes TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'unreviewed',
+                included INTEGER NOT NULL DEFAULT 0, source_in REAL NOT NULL DEFAULT 0,
+                source_out REAL NOT NULL DEFAULT 0, created_at TEXT NOT NULL,
+                UNIQUE(project_id, fingerprint)
+            );
+            "#,
+        ).unwrap();
+        connection.execute(
+            "INSERT INTO projects (id, name, created_at) VALUES ('project_old', 'Old', '2026-07-18T00:00:00Z')",
+            [],
+        ).unwrap();
+        connection
+            .execute(
+                r#"
+            INSERT INTO assets (id, project_id, fingerprint, path, filename, size_bytes,
+                duration_seconds, frame_rate, width, height, codec, camera, source_out, created_at)
+            VALUES ('asset_portrait', 'project_old', 'fingerprint', '/missing/portrait.mp4',
+                'PORTRAIT.MP4', 1, 1, 30, 1080, 1920, 'h264', 'Camera A', 1, '2026-07-18T00:00:00Z')
+            "#,
+                [],
+            )
+            .unwrap();
+        drop(connection);
+
+        let read_only = Catalog::open_read_only_existing(&path).unwrap();
+        let legacy_asset = read_only.get_asset("asset_portrait").unwrap();
+        assert!(!legacy_asset.orientation_probed);
+        assert_eq!(legacy_asset.metadata_rotation_degrees, 0);
+        assert!(legacy_asset.labels.is_empty());
+        assert!(!legacy_asset.removed);
+        let still_legacy = Connection::open(&path).unwrap();
+        assert!(!asset_column_exists(&still_legacy, "orientation_probed").unwrap());
+        drop(still_legacy);
+
+        let catalog = Catalog::open_existing(&path).unwrap();
+        let asset = catalog.get_asset("asset_portrait").unwrap();
+        assert_eq!(asset.metadata_rotation_degrees, 0);
+        assert_eq!(asset.default_rotation_degrees, 90);
+        assert_eq!(asset.rotation_degrees, 90);
+        assert!(asset.labels.is_empty());
+        assert!(!asset.removed);
+        let migrated = Connection::open(&path).unwrap();
+        assert!(asset_column_exists(&migrated, "labels_json").unwrap());
+        assert!(asset_column_exists(&migrated, "removed").unwrap());
+    }
+
+    #[test]
     fn normalizes_offset_datetimes() {
         assert_eq!(
             normalize_datetime("2026-07-18T09:00:00+09:00", -3600).as_deref(),
@@ -1387,7 +1788,7 @@ mod tests {
     }
 
     #[test]
-    fn validates_projects_asset_ranges_and_missing_ids() {
+    fn validates_projects_labels_rotation_and_missing_ids() {
         let (_directory, catalog, project) = catalog_fixture();
         assert!(catalog.create_project("  ").is_err());
         insert_asset(
@@ -1400,31 +1801,64 @@ mod tests {
             Path::new("/missing/A.MP4"),
         );
         let current = catalog.get_asset("asset_a").unwrap();
-        for (source_in, source_out) in [
-            (-1.0, 2.0),
-            (4.0, 3.0),
-            (0.0, 11.0),
-            (f64::NAN, 2.0),
-            (0.0, f64::INFINITY),
-        ] {
-            let result = catalog.update_asset(
-                "asset_a",
-                &AssetPatch {
-                    notes: current.notes.clone(),
-                    status: current.status.clone(),
-                    included: false,
-                    source_in,
-                    source_out,
-                },
-            );
-            assert!(result.is_err());
-        }
+        let result = catalog.update_asset(
+            "asset_a",
+            &AssetPatch {
+                notes: current.notes.clone(),
+                labels: vec!["x".repeat(65)],
+                removed: false,
+                rotation_degrees: current.rotation_degrees,
+            },
+        );
+        assert!(result.is_err());
         assert!(catalog.get_asset("asset_missing").is_err());
         assert!(catalog.list_assets("project_missing").is_err());
     }
 
     #[test]
-    fn orders_by_best_time_then_filename_and_counts_reviewed_assets() {
+    fn persists_only_right_angle_orientation_overrides() {
+        let (_directory, catalog, project) = catalog_fixture();
+        insert_asset(
+            &catalog,
+            &project.id,
+            "asset_a",
+            "A.MP4",
+            "Camera A",
+            "2026-07-18T00:00:00Z",
+            Path::new("/missing/A.MP4"),
+        );
+        let asset = catalog.get_asset("asset_a").unwrap();
+        let updated = catalog
+            .update_asset(
+                &asset.id,
+                &AssetPatch {
+                    notes: asset.notes.clone(),
+                    labels: asset.labels.clone(),
+                    removed: asset.removed,
+                    rotation_degrees: 180,
+                },
+            )
+            .unwrap();
+        assert_eq!(updated.rotation_degrees, 180);
+        assert_eq!(landscape_default_rotation(1080, 1920, 0), 90);
+        assert_eq!(landscape_default_rotation(1920, 1080, 90), 180);
+        assert!(
+            catalog
+                .update_asset(
+                    &asset.id,
+                    &AssetPatch {
+                        notes: asset.notes,
+                        labels: asset.labels,
+                        removed: asset.removed,
+                        rotation_degrees: 45,
+                    },
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn orders_by_best_time_then_filename_and_counts_labeled_assets() {
         let (_directory, catalog, project) = catalog_fixture();
         for (id, filename, raw_time) in [
             ("asset_late", "B.MP4", "2026-07-18T03:00:00Z"),
@@ -1446,11 +1880,10 @@ mod tests {
             .update_asset(
                 &tie.id,
                 &AssetPatch {
-                    notes: "reviewed".to_string(),
-                    status: ReviewStatus::Reviewed,
-                    included: false,
-                    source_in: 0.0,
-                    source_out: tie.duration_seconds,
+                    notes: "labeled".to_string(),
+                    labels: vec!["arrival".to_string()],
+                    removed: false,
+                    rotation_degrees: tie.rotation_degrees,
                 },
             )
             .unwrap();
@@ -1464,7 +1897,8 @@ mod tests {
         assert_eq!(filenames, ["C.MP4", "D.MP4", "B.MP4"]);
         let summary = catalog.list_projects().unwrap().remove(0);
         assert_eq!(summary.asset_count, 3);
-        assert_eq!(summary.reviewed_count, 1);
+        assert_eq!(summary.labeled_count, 1);
+        assert_eq!(summary.removed_count, 0);
     }
 
     #[test]
@@ -1592,75 +2026,6 @@ mod tests {
     }
 
     #[test]
-    fn otio_contains_only_included_assets_in_chronological_order() {
-        let (directory, catalog, project) = catalog_fixture();
-        let source_dir = directory.path().join("source with spaces");
-        fs::create_dir_all(&source_dir).unwrap();
-        for (id, filename, raw_time) in [
-            ("late", "LATE.MP4", "2026-07-18T03:00:00Z"),
-            ("early", "EARLY.MP4", "2026-07-18T01:00:00Z"),
-            ("excluded", "EXCLUDED.MP4", "2026-07-18T02:00:00Z"),
-        ] {
-            let path = source_dir.join(filename);
-            fs::write(&path, b"source sentinel").unwrap();
-            insert_asset(
-                &catalog,
-                &project.id,
-                id,
-                filename,
-                "Camera A",
-                raw_time,
-                &path,
-            );
-        }
-        for (id, source_in, source_out, notes) in
-            [("early", 1.0, 7.0, "first"), ("late", 2.0, 8.0, "second")]
-        {
-            let asset = catalog.get_asset(id).unwrap();
-            catalog
-                .update_asset(
-                    id,
-                    &AssetPatch {
-                        notes: notes.to_string(),
-                        status: asset.status,
-                        included: true,
-                        source_in,
-                        source_out,
-                    },
-                )
-                .unwrap();
-        }
-
-        let otio_path = catalog.export_otio(&project.id).unwrap();
-        let otio: Value = serde_json::from_slice(&fs::read(&otio_path).unwrap()).unwrap();
-        let clips = otio["tracks"]["children"][0]["children"]
-            .as_array()
-            .unwrap();
-        assert_eq!(clips.len(), 2);
-        assert_eq!(clips[0]["name"], "EARLY.MP4");
-        assert_eq!(clips[1]["name"], "LATE.MP4");
-        assert_eq!(clips[0]["source_range"]["start_time"]["value"], 30.0);
-        assert_eq!(clips[0]["source_range"]["duration"]["value"], 180.0);
-        assert_eq!(clips[0]["metadata"]["rcdvlog"]["notes"], "first");
-        assert!(
-            clips[0]["media_references"]["DEFAULT_MEDIA"]["target_url"]
-                .as_str()
-                .unwrap()
-                .contains("source%20with%20spaces")
-        );
-
-        let second_path = catalog.export_otio(&project.id).unwrap();
-        assert_ne!(second_path, otio_path);
-        assert!(second_path.exists());
-    }
-
-    #[test]
-    fn empty_rough_cut_is_rejected() {
-        let (_directory, catalog, project) = catalog_fixture();
-        assert!(catalog.export_otio(&project.id).is_err());
-    }
-
-    #[test]
     fn recognizes_media_extensions_and_parses_rates() {
         assert!(is_media(Path::new("clip.MP4")));
         assert!(is_media(Path::new("clip.m2ts")));
@@ -1671,7 +2036,7 @@ mod tests {
     }
 
     #[test]
-    fn media_round_trip_ingest_proxy_notes_clock_and_otio() {
+    fn media_round_trip_ingest_labels_proxy_notes_and_clock() {
         if tool_command("ffmpeg").arg("-version").output().is_err() {
             eprintln!("ffmpeg is unavailable; skipping media integration test");
             return;
@@ -1725,14 +2090,14 @@ mod tests {
                 &asset.id,
                 &AssetPatch {
                     notes: "Opening station view".to_string(),
-                    status: ReviewStatus::Reviewed,
-                    included: true,
-                    source_in: 0.0,
-                    source_out: asset.duration_seconds,
+                    labels: vec!["station".to_string(), "opening".to_string()],
+                    removed: false,
+                    rotation_degrees: asset.rotation_degrees,
                 },
             )
             .unwrap();
         assert_eq!(updated.notes, "Opening station view");
+        assert_eq!(updated.labels, ["station", "opening"]);
 
         catalog
             .apply_clock_event(
@@ -1802,7 +2167,7 @@ mod tests {
         let thumbnail_path = PathBuf::from(thumbnail.thumbnail_path.as_deref().unwrap());
         assert!(thumbnail_path.is_file());
         assert_eq!(thumbnail.thumbnail_quality, 1);
-        assert!(thumbnail_path.ends_with(format!("{}/q1.jpg", asset.id)));
+        assert!(thumbnail_path.ends_with(format!("{}/q1.v2.jpg", asset.id)));
         fs::remove_file(&thumbnail_path).unwrap();
         fs::rename(&source, source.with_extension("offline")).unwrap();
         let mut thumbnail_progress = Vec::new();
@@ -1831,28 +2196,5 @@ mod tests {
         let thumbnail_report = catalog.generate_missing_thumbnails(&project.id, 1).unwrap();
         assert_eq!(thumbnail_report.generated, 0);
         assert_eq!(thumbnail_report.skipped, 1);
-
-        let otio_path = catalog.export_otio(&project.id).unwrap();
-        let otio: Value = serde_json::from_slice(&fs::read(&otio_path).unwrap()).unwrap();
-        assert_eq!(otio["OTIO_SCHEMA"], "Timeline.1");
-        assert_eq!(
-            otio["tracks"]["children"][0]["children"][0]["name"],
-            "C0001.MP4"
-        );
-        let otio_available = tool_command("python3")
-            .args(["-c", "import opentimelineio"])
-            .status()
-            .is_ok_and(|status| status.success());
-        if otio_available {
-            let status = tool_command("python3")
-                .args([
-                    "-c",
-                    "import opentimelineio as otio, sys; otio.adapters.read_from_file(sys.argv[1])",
-                ])
-                .arg(&otio_path)
-                .status()
-                .unwrap();
-            assert!(status.success(), "OpenTimelineIO rejected the Rust export");
-        }
     }
 }

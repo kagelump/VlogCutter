@@ -207,7 +207,7 @@ fn media_workflow_runs_end_to_end_through_the_agent_cli() {
     assert_eq!(asset["width"], 640);
     assert_eq!(asset["height"], 360);
 
-    let invalid_out = (duration + 1.0).to_string();
+    let invalid_label = "x".repeat(65);
     let invalid = failure(
         &catalog,
         [
@@ -215,13 +215,12 @@ fn media_workflow_runs_end_to_end_through_the_agent_cli() {
             "update",
             "--asset",
             &asset_id,
-            "--source-out",
-            &invalid_out,
+            "--add-label",
+            &invalid_label,
         ],
     );
     assert_eq!(invalid["error"]["code"], "invalid_input");
 
-    let duration_argument = duration.to_string();
     let updated = success(
         &catalog,
         [
@@ -231,19 +230,43 @@ fn media_workflow_runs_end_to_end_through_the_agent_cli() {
             &asset_id,
             "--notes",
             "Opening station view",
-            "--status",
-            "reviewed",
-            "--included",
-            "true",
-            "--source-in",
-            "0",
-            "--source-out",
-            &duration_argument,
+            "--add-label",
+            "station",
+            "--add-label",
+            "opening",
         ],
     );
     assert_eq!(updated.json["data"]["notes"], "Opening station view");
-    assert_eq!(updated.json["data"]["status"], "reviewed");
-    assert_eq!(updated.json["data"]["included"], true);
+    assert_eq!(
+        updated.json["data"]["labels"],
+        serde_json::json!(["station", "opening"])
+    );
+    assert_eq!(updated.json["data"]["removed"], false);
+
+    let rotated = success(
+        &catalog,
+        [
+            "clips",
+            "update",
+            "--asset",
+            &asset_id,
+            "--rotation-degrees",
+            "180",
+        ],
+    );
+    assert_eq!(rotated.json["data"]["rotationDegrees"], 180);
+    let invalid_rotation = failure(
+        &catalog,
+        [
+            "clips",
+            "update",
+            "--asset",
+            &asset_id,
+            "--rotation-degrees",
+            "45",
+        ],
+    );
+    assert_eq!(invalid_rotation["error"]["code"], "invalid_input");
 
     let camera = updated.json["data"]["camera"].as_str().unwrap();
     let corrected = success(
@@ -270,6 +293,21 @@ fn media_workflow_runs_end_to_end_through_the_agent_cli() {
     let proxied = success(&catalog, ["proxy", "generate", "--asset", &asset_id]);
     let proxy_path = PathBuf::from(proxied.json["data"]["proxyPath"].as_str().unwrap());
     assert!(proxy_path.is_file());
+    let diagnosed = success(&catalog, ["clips", "diagnose", "--asset", &asset_id]);
+    assert_eq!(
+        diagnosed.json["data"]["renderPlan"]["selectedRepresentation"],
+        "proxy"
+    );
+    assert_eq!(
+        diagnosed.json["data"]["renderPlan"]["finalOrientation"],
+        "landscape"
+    );
+    let proxy_status = success(&catalog, ["proxy", "status", "--asset", &asset_id]);
+    assert_eq!(proxy_status.json["data"]["summary"]["current"], 1);
+    assert_eq!(
+        proxy_status.json["data"]["items"][0]["regenerationRequired"],
+        false
+    );
     let missing = success(&catalog, ["proxy", "missing", "--project", &project_id]);
     assert_eq!(missing.json["data"]["generated"], 0);
     assert_eq!(missing.json["data"]["skipped"], 1);
@@ -301,16 +339,22 @@ fn media_workflow_runs_end_to_end_through_the_agent_cli() {
     assert_eq!(status.json["data"]["media"]["originalsOffline"], 1);
     assert_eq!(status.json["data"]["media"]["proxiesReady"], 1);
 
-    let exported = success(&catalog, ["export", "otio", "--project", &project_id]);
-    let export_path = PathBuf::from(exported.json["data"]["path"].as_str().unwrap());
-    let timeline: Value = serde_json::from_slice(&fs::read(&export_path).unwrap()).unwrap();
-    let clip = &timeline["tracks"]["children"][0]["children"][0];
-    assert_eq!(clip["name"], "C0001.MP4");
-    assert_eq!(clip["metadata"]["rcdvlog"]["notes"], "Opening station view");
-    assert!(
-        clip["media_references"]["DEFAULT_MEDIA"]["target_url"]
-            .as_str()
-            .unwrap()
-            .contains("media%20with%20spaces")
+    let removed = success(
+        &catalog,
+        ["clips", "update", "--asset", &asset_id, "--removed", "true"],
     );
+    assert_eq!(removed.json["data"]["removed"], true);
+    let active = success(&catalog, ["clips", "list", "--project", &project_id]);
+    assert_eq!(active.json["data"]["total"], 0);
+    let all = success(
+        &catalog,
+        [
+            "clips",
+            "list",
+            "--project",
+            &project_id,
+            "--include-removed",
+        ],
+    );
+    assert_eq!(all.json["data"]["total"], 1);
 }

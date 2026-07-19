@@ -1,6 +1,6 @@
 # RCD VlogCutter
 
-A local-first macOS review bench for trip footage. The MVP references originals on NAS or removable storage, keeps review proxies and thumbnails in each project folder, supports notes and fixed clock corrections, and exports a single-track hard-cut OpenTimelineIO sequence.
+A local-first macOS labeling bench for trip footage. The current phase references originals on NAS or removable storage, keeps review proxies and thumbnails in each project folder, and supports free-form labels, notes, reversible clip removal, and fixed clock corrections.
 
 ## Prerequisites
 
@@ -28,7 +28,7 @@ RCDVLOG_CATALOG=/absolute/path/catalog.sqlite3 pnpm dev
 
 You can also switch catalogs at runtime with **Open catalog** in the desktop toolbar. The project selector lists every project in the active catalog.
 
-New projects default to `~/Movies/VideoProjects/<project name>/`. Each project folder contains its own `catalog.sqlite3`, proxy cache, and exports. Use **Settings** in the desktop toolbar or **Change…** on the first-run screen to configure a different parent folder. Global settings also control autoplay: never, only when a proxy is available (the default), or always. Autoplay starts muted; the **Muted / Sound on** transport button keeps the session-wide playback state consistent as you move between clips.
+New projects default to `~/Movies/VideoProjects/<project name>/`. Each project folder contains its own `catalog.sqlite3` and media cache. Use **Settings** in the desktop toolbar or **Change…** on the first-run screen to configure a different parent folder. Global settings also control autoplay: never, only when a proxy is available (the default), or always. Autoplay starts muted; the **Muted / Sound on** transport button keeps the session-wide playback state consistent as you move between clips.
 
 ## Verify
 
@@ -36,9 +36,9 @@ New projects default to `~/Movies/VideoProjects/<project name>/`. Each project f
 pnpm check
 ```
 
-The Rust integration suite creates real fixture media with FFmpeg and verifies ingest, metadata probing, sampled deduplication, notes, review state, clock correction, proxy generation, and OTIO export.
+The Rust integration suite creates real fixture media with FFmpeg and verifies ingest, metadata probing, sampled deduplication, labels, notes, reversible removal, clock correction, and proxy generation.
 
-Run only the process-level integration suite with `pnpm test:integration`. See [docs/integration-testing.md](docs/integration-testing.md) for its automated coverage and the Resolve, Tauri, and NAS acceptance checks that remain manual.
+Run only the process-level integration suite with `pnpm test:integration`. See [docs/integration-testing.md](docs/integration-testing.md) for its automated coverage and the Tauri and NAS acceptance checks that remain manual. Resolve acceptance returns with the later edit-planning stage.
 
 Long-running media batches use the worker-aware weighted ETA library in `core/batch-estimator`; see [docs/batch-estimation.md](docs/batch-estimation.md) for its persistence and multi-worker model.
 
@@ -65,10 +65,10 @@ Successful commands write one JSON envelope to stdout. Failures write a JSON err
 
 1. Create a project.
 2. Add a folder from a mounted NAS, SSD, SD card, or local disk.
-3. Generate quality-1 thumbnails and laptop proxies as needed, then review clips in datetime order.
-4. Add notes and review state from the keyboard-first review bench.
+3. Generate quality-1 thumbnails and laptop proxies as needed, then label clips in datetime order.
+4. Add free-form labels and notes from the keyboard-first labeling bench.
 5. Apply a fixed offset from a selected filename onward for one camera.
-6. Mark full clips or source ranges for the rough cut.
-7. Export the single-track `.otio` sequence and import it into DaVinci Resolve.
+6. Remove unusable clips from the labeling queue; restore them from the Removed view when needed.
+7. Build the rough cut in the later edit-planning stage after labeling is complete.
 
 See [PRD.md](PRD.md) for the scope contract and implementation decisions.

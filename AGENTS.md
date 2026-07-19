@@ -4,7 +4,7 @@ This file is the operational handoff for agents working on RCD VlogCutter. It ap
 
 ## 1. Product in one paragraph
 
-RCD VlogCutter is a local-first, single-user macOS application for reviewing large trip-footage projects. Originals remain immutable and referenced in place on a NAS, removable drive, or local disk. Each project has a laptop-local SQLite catalog plus disposable proxies, thumbnails, and exports. The current vertical slice supports project creation/opening, ingest, metadata probing, review, notes, fixed camera-clock offsets, quality-1 thumbnails, H.264 review proxies, rough-cut inclusion/ranges, a machine-readable CLI, and direct OpenTimelineIO export for DaVinci Resolve.
+RCD VlogCutter is a local-first, single-user macOS application for labeling large trip-footage projects. Originals remain immutable and referenced in place on a NAS, removable drive, or local disk. Each project has a laptop-local SQLite catalog plus disposable proxies and thumbnails. The current vertical slice supports project creation/opening, ingest, metadata probing, free-form labels, notes, reversible clip removal, fixed camera-clock offsets, quality-1 thumbnails, H.264 review proxies, and a machine-readable CLI.
 
 The target workload is roughly 100 hours, thousands of mostly 4K/60 clips, and about five cameras (Sony, DJI, iPhone, Insta360, and similar). Optimize data structures and UI choices for that scale even when tests use tiny fixtures.
 
@@ -26,7 +26,7 @@ Never violate these invariants without explicit user approval:
 - Generated proxies, thumbnails, and exports live beside the project catalog, not beside originals.
 - Review, notes, search, and chronology should remain useful when originals are offline and proxies are available.
 - Chronology changes are explicit. Do not silently apply inferred clock or timezone corrections.
-- The rough cut is a single video track with hard cuts. DaVinci Resolve remains the finishing editor.
+- Rough-cut selection belongs to the later edit-planning stage. Do not add inclusion or source-range controls back to the labeling phase.
 - The accepted finishing target is the latest Resolve release (Resolve 21 in the product decision), while retaining practical compatibility with the user's installed Resolve 20.
 - AI analysis, transcription, embeddings, and VLM inference are out of the current MVP.
 - The app must work offline apart from access to mounted source media.
@@ -43,12 +43,13 @@ Implemented now:
 - Reference-in-place recursive ingest of supported media extensions.
 - Sampled fingerprint deduplication within a project.
 - ffprobe technical/timestamp metadata and ExifTool camera make/model lookup.
-- Review queue, playback, notes, review states, rough-cut ranges, and keyboard shortcuts.
+- Label queue, playback, free-form labels, notes, reversible removal, and keyboard shortcuts.
 - Fixed camera offset events from a filename boundary onward.
 - Quality-1 thumbnails and one-worker 720p H.264/AAC proxies.
 - Weighted batch progress and ETA with project-persisted rate history.
 - Relative-order “story ribbon” with camera lanes, horizontal scrolling, and zoom.
-- Direct `.otio` JSON export and a non-interactive JSON CLI.
+- A non-interactive JSON CLI for catalog, clip annotation, chronology, and media operations.
+- Read-only catalog/project/clip/proxy diagnostics, including the desktop's persisted last-selected catalog, project, and asset breadcrumb.
 
 Important gaps; do not accidentally describe these as complete:
 
@@ -56,13 +57,13 @@ Important gaps; do not accidentally describe these as complete:
 - No durable resumable job queue, cancellation, leases, or restart recovery.
 - No relink workflow, mounted-volume inventory, project deletion, or cache cleanup UI.
 - No revision tokens or optimistic-concurrency model for desktop/CLI writes.
-- Search is currently simple filename/camera/note/status filtering, not SQLite FTS.
-- No labels, key moments, chapters, events, scripts, edit-plan revisions, or preview render.
+- Search is currently simple filename/camera/label/note filtering, not SQLite FTS.
+- No key moments, chapters, events, scripts, edit-plan revisions, rough-cut selection, timeline export, or preview render.
 - No trip-phase/location/timezone/story-beat persistence or editor. The TypeScript `Asset` context fields and browser mock only make the story-ribbon display contract visible; the Rust model and SQLite schema do not store them yet.
 - No expanded chronology calibration view, clip exceptions, contradiction reporting, or confidence/evidence explanation.
 - No automated React component/unit test runner and no automated native Tauri UI suite.
 - No macOS signing/notarization or clean-machine packaging acceptance.
-- Resolve import, native media playback, filesystem permission prompts, sleep/wake, and NAS-scale behavior remain manual acceptance checks.
+- Native media playback, filesystem permission prompts, sleep/wake, and NAS-scale behavior remain manual acceptance checks. Resolve import returns as a later edit-planning acceptance check.
 
 Before implementing persisted trip context, resolve the domain question of whether story beats are independent overlapping ranges or must be nested under physical phases. The current recommendation is independent ranges because narrative beats may cross a location or timezone transition.
 
@@ -93,7 +94,7 @@ Before implementing persisted trip context, resolve the domain question of wheth
 │       ├── package.json              # Vite/TypeScript/Tauri scripts
 │       └── vite.config.ts            # Fixed dev port 1420
 ├── core/
-│   ├── rcdvlog-core/src/lib.rs       # Canonical catalog, media, chronology, export logic
+│   ├── rcdvlog-core/src/lib.rs       # Canonical catalog, media, annotation, chronology logic
 │   └── batch-estimator/src/lib.rs    # Domain-independent weighted ETA library
 └── docs/
     ├── agent-cli.md                  # Full CLI and JSON contract
@@ -115,7 +116,7 @@ Tauri commands (`apps/desktop/src-tauri/src/lib.rs`)
 Rust core (`core/rcdvlog-core`)
     ├── SQLite catalog in WAL mode
     ├── managed ffmpeg / ffprobe / exiftool child processes
-    ├── project-local cache and export files
+    ├── project-local cache files
     └── weighted ETA library (`core/batch-estimator`)
 
 CLI (`apps/cli`) ─────────────────────┘
@@ -126,7 +127,7 @@ Rules for this boundary:
 - React code calls the exported `api` object. Do not scatter direct `invoke(...)` calls through components.
 - Tauri commands should be thin wrappers over `Catalog` methods. CPU/media work must use `spawn_blocking` so it does not block the async runtime.
 - The CLI must call the same `Catalog` methods as Tauri.
-- Shared DTOs use Serde `camelCase`, except `ReviewStatus`, which is stored/serialized as snake case (`needs_attention`). The CLI spelling accepted by clap is `needs-attention`.
+- Shared DTOs use Serde `camelCase`. Clip labels are free-form strings and `removed` is a reversible visibility flag.
 - Register every new Tauri command in `tauri::generate_handler![...]` and add a matching method/type in `api.ts`/`types.ts`.
 - Expose agent-relevant domain operations through the CLI as stable JSON, not human-formatted text.
 
@@ -207,10 +208,9 @@ New desktop projects default to one folder per project:
 ├── catalog.sqlite3
 ├── catalog.sqlite3-wal             # while active; SQLite-managed
 ├── catalog.sqlite3-shm             # while active; SQLite-managed
-├── cache/
+└── cache/
 │   ├── proxies/<project-id>/<asset-id>.mp4
-│   └── thumbnails/<asset-id>/q1.jpg
-└── exports/<project-id>/rough-cut-<timestamp>-<suffix>.otio
+│   └── thumbnails/<asset-id>/q1.v2.jpg
 ```
 
 The projects parent folder is configurable in global settings. The desktop scans immediate child directories for `catalog.sqlite3`; invalid catalogs are skipped. The settings file is stored in the macOS application-data directory for `com.rcd.vlogcutter` (normally under `~/Library/Application Support/`). A legacy application-support catalog is still used when the app/CLI is started without an explicit per-project catalog.
@@ -244,13 +244,7 @@ Current migrations are idempotent `CREATE TABLE IF NOT EXISTS` statements with n
 - `available`: original or proxy is available.
 - Thumbnail path/quality are returned only when the stored file exists.
 
-The Rust/Tauri `AssetPatch` is a full review-state replacement: notes, status, included, source-in, and source-out are all required. React's `patchFor(asset)` deliberately sends the full current state. The CLI offers patch-like optional flags by fetching the current asset, merging changes, and then sending the full core patch. Do not change one side without preserving this behavior.
-
-Source ranges must be finite and satisfy:
-
-```text
-0 <= source_in <= source_out <= duration_seconds
-```
+The Rust/Tauri `AssetPatch` is a full annotation replacement: notes, labels, removed, and rotation are all required. React's `patchFor(asset)` deliberately sends the full current state. The CLI offers patch-like optional flags by fetching the current asset, merging changes, and then sending the full core patch. Do not change one side without preserving this behavior.
 
 ### Ingest and identity
 
@@ -288,7 +282,7 @@ Only the original is accepted as proxy input. If the original is offline, proxy 
 
 ### Thumbnails
 
-Only quality 1 is implemented. It is a JPEG at 20% of clip duration, at most 480 px wide, generated first to `q1.tmp.jpg` and atomically renamed to `q1.jpg`. Input preference is original, then available proxy. Qualities 2–10 are reserved and must continue to fail clearly until intentionally implemented.
+Only quality 1 is implemented. It is a JPEG at 20% of clip duration, at most 480 px wide, generated first to `q1.v2.tmp.jpg` and atomically renamed to `q1.v2.jpg`. Input preference is original, then available proxy. Qualities 2–10 are reserved and must continue to fail clearly until intentionally implemented.
 
 ### Batch estimation
 
@@ -297,17 +291,15 @@ All long batch work should use `core/batch-estimator`, not an ad hoc ETA. Caller
 Current task keys are versioned:
 
 ```text
-proxy.h264-720p.v1
-thumbnail.q1.v1
+proxy.h264-720p.orientation-v2
+thumbnail.q1.orientation-v2
 ```
 
 Change the task key when settings change enough that old throughput is no longer comparable. Proxy and thumbnail weights are source bytes and both currently use one worker. A future cloud/VLM task must pass its real shard concurrency.
 
-### OTIO export
+### Deferred edit planning and export
 
-Export is direct Rust-generated OTIO JSON; there is no Python exporter today. It includes only assets marked `included`, in best-time order, with selected source ranges and original file URLs. It writes one `V1` video track with hard cuts. Notes and stable asset IDs are stored in RCD VlogCutter metadata.
-
-Resolve sequence import is proven, but Resolve may drop nonessential metadata such as names or colors. Acceptance requires correct media references, ordering, and source ranges. Do not add a permanent Python runtime; a short-lived OpenTimelineIO validation/export fallback is allowed only if direct JSON becomes insufficient.
+The labeling phase intentionally has no rough-cut inclusion, source ranges, or OTIO export. Those concepts return in a later edit-planning stage after clips are labeled. Keep any future edit-plan state separate from labels and reversible removal; removal only controls visibility in the labeling workflow.
 
 ## 10. Desktop UI conventions
 
@@ -319,6 +311,9 @@ The UI is intentionally keyboard-first and dense, using one main `App.tsx` today
 - Optimistic asset updates call the core and replace the returned canonical `Asset`; failures roll back and surface an error.
 - Progress events are `proxy-progress` and `thumbnail-progress`. Each carries an optional completed asset plus a batch estimate. Merge a completed asset immediately so thumbnails/proxies appear as they finish.
 - Media playback prefers an available proxy, otherwise an available original. Thumbnails are also used as the video's poster frame.
+- Playback controls are custom stage-level UI so they remain horizontal while the media element rotates. Do not re-enable native `<video controls>` unless rotation is moved off the video element; native controls inherit its CSS transform.
+- The React `assets` array is the in-memory metadata cache. Legacy orientation probing uses a two-worker, deduplicated priority queue for current, next, next-next, and previous clips; successful probes persist to SQLite and replace the cached asset.
+- Playback uses a bounded three-slot sliding window (previous/current/next). The next available representation is preloaded automatically (proxy preferred, otherwise one original), the previous slot stays mounted but requests metadata only, and clips outside the window are unmounted. Preserve these bounds unless memory, file-handle, and NAS-read measurements justify a wider cache.
 - Global autoplay settings are `never`, `proxyAvailable` (default), and `always`.
 
 ### Keyboard contract
@@ -327,14 +322,13 @@ Preserve and update both visible hints and the `?` keyboard map when shortcuts c
 
 - `J`/`K` or arrow keys: next/previous clip.
 - Space: play/pause.
-- `R`, `U`, `S`, `A`: reviewed, unreviewed, skipped, needs attention.
-- `E`: toggle rough-cut inclusion.
-- `I`/`O`: source range at playhead.
+- `L`: focus the free-form label field; Enter adds the label.
+- `R`: remove the selected clip from the labeling queue, or restore it in the Removed view.
 - `N`: focus notes. Consume the original `n` key event before focusing so it is not inserted.
 - Notes: Enter saves; Command+Enter inserts a newline; Shift+Enter saves and advances; Escape discards the current editing session and removes focus. After advancing, notes must not remain focused.
 - `/`: focus queue search.
 - `P`: selected proxy; Shift+`P`: missing proxies; `T`: missing thumbnails.
-- `M`: add media; `X`: export OTIO.
+- `M`: add media.
 - `[`/`]`: story-ribbon zoom; `C`: center selected clip.
 - Command+`N`: new project; Command+`O`: open catalog; Command+`,`: global settings; `?`: keyboard map.
 
@@ -379,6 +373,10 @@ target/debug/rcdvlog --catalog /absolute/project/catalog.sqlite3 project status 
 target/debug/rcdvlog --catalog /absolute/project/catalog.sqlite3 clips list --project <project-id> --limit 20
 ```
 
+Screenshot-driven debugging is a normal agent workflow for this repository. The user may provide only a screenshot and expect the agent to recover the relevant app state. Begin with `desktop last-opened`, then use `catalog inspect`, `project diagnose`, `clips diagnose`, and `proxy status` as appropriate. The desktop breadcrumb is the last persisted selection, so compare its timestamp and stable IDs with the screenshot rather than claiming it is live IPC. Diagnostic commands must remain strictly read-only: do not run migrations, rewrite metadata, or generate cache files while observing. Keep stored catalog state, live filesystem/media observations, derived render behavior, warnings, and recommended explicit mutations separate in JSON.
+
+When adding a selectable UI entity or a failure-prone representation, extend this diagnostic path at the same time: persist its stable selected ID, add a focused machine-readable diagnosis, include representation/version identity and external availability, and explain important derived decisions. Mutations must be separate, deliberately named commands. This convention is what makes the CLI reusable for future screenshot-led issues instead of accumulating one-off database queries.
+
 Never parse human prose from the CLI. Add/extend JSON contract tests whenever commands, fields, errors, or progress events change.
 
 ## 12. Testing and verification
@@ -395,7 +393,7 @@ Run the narrowest useful tests while iterating, then the full gate before handof
 | Formatting/lints | `cargo fmt --all -- --check` | `cargo clippy --workspace --all-targets -- -D warnings` |
 | Full repository | — | `pnpm check` |
 
-`pnpm check` runs TypeScript checking followed by all Rust workspace tests. The process-level integration suite creates a real one-second FFmpeg fixture and validates CLI persistence, WAL reads, ingest, metadata, deduplication, notes/state/ranges, clock correction, thumbnails/proxies, offline-original review, and OTIO. Its media portion skips when FFmpeg or ffprobe is missing.
+`pnpm check` runs TypeScript checking followed by all Rust workspace tests. The process-level integration suite creates a real one-second FFmpeg fixture and validates CLI persistence, WAL reads, ingest, metadata, deduplication, labels/notes/removal, clock correction, thumbnails/proxies, and offline-original review. Its media portion skips when FFmpeg or ffprobe is missing.
 
 Do not replace these real process/media boundaries with mocks. Conversely, do not pretend headless tests validate:
 

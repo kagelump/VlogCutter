@@ -21,4 +21,4 @@ batch.record_completion(900, Duration::from_secs(9));
 let estimate = batch.estimate(&weights[1..]);
 ```
 
-VlogCutter persists separate histories in each project catalog using versioned task keys such as `proxy.h264-720p.v1` and `thumbnail.q1.v1`. History uses a bounded eight-sample exponential window so recent hardware, codec, storage, or service behavior gradually replaces older measurements. Successful observations update speed; failures advance completion without poisoning throughput.
+VlogCutter persists separate histories in each project catalog using versioned task keys such as `proxy.h264-720p.orientation-v2` and `thumbnail.q1.orientation-v2`. History uses a bounded eight-sample exponential window so recent hardware, codec, storage, or service behavior gradually replaces older measurements. Successful observations update speed; failures advance completion without poisoning throughput.

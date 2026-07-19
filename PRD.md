@@ -620,7 +620,8 @@ rcdvlog ingest --project project_123 --folder /Volumes/data/Expo
 
 rcdvlog clips list --project project_123 --query arrival --limit 20
 rcdvlog clips get --asset asset_7f31e2
-rcdvlog clips update --asset asset_7f31e2 --notes "Arrival" --status reviewed
+rcdvlog clips update --asset asset_7f31e2 --notes "Arrival" --add-label arrival
+rcdvlog clips update --asset asset_7f31e2 --removed true
 
 rcdvlog clock apply --project project_123 --camera "DJI Pocket 3" \
   --start-filename DJI_0001.MP4 --offset-minutes -60
@@ -629,7 +630,6 @@ rcdvlog proxy generate --asset asset_7f31e2
 rcdvlog proxy missing --project project_123
 rcdvlog thumbnails generate --asset asset_7f31e2 --quality 1
 rcdvlog thumbnails missing --project project_123 --quality 1
-rcdvlog export otio --project project_123
 ```
 
 The CLI retains the legacy application-support catalog as its no-argument fallback. Agents use `--catalog <project folder>/catalog.sqlite3` or `RCDVLOG_CATALOG` to select a desktop project explicitly.
@@ -820,13 +820,13 @@ The MVP is successful when one real trip project can be completed through that l
 3. Inspect detected assets and capture sequences before committing the ingest.
 4. Reference originals in place and generate local quality-1 thumbnails and review proxies.
 5. Begin reviewing available clips while remaining processing jobs continue.
-6. Add notes, labels, key moments, and review status with keyboard-first controls.
+6. Add free-form labels and notes with keyboard-first controls, and reversibly remove unusable clips from this view.
 7. Inspect the proposed chronology and correct a camera or filename range with a clock epoch.
 8. Add trip-context phases and verify how local time is displayed.
 9. Resume the review queue without losing the next intended item after a chronology change.
 10. Search project metadata and expose project state through the CLI.
 11. Create and validate a versioned script and edit plan without silently replacing newer work.
-12. Render a low-resolution preview and export a deterministic timeline for the finishing editor.
+12. After labeling is complete, create an edit plan, render a low-resolution preview, and export a deterministic timeline for the finishing editor.
 13. Close and reopen the application with project state, job state, and review position intact.
 14. Disconnect and reconnect a media volume without corrupting the project.
 
@@ -838,7 +838,7 @@ The MVP is successful when one real trip project can be completed through that l
 * Metadata extraction and capture-sequence proposals
 * Resumable job execution
 * Standardized review proxies and deterministic quality-1 thumbnails
-* Keyboard-first playback, annotation, and review status
+* Keyboard-first playback, free-form labeling, notes, and reversible clip removal
 * Stable review ordering and resume behavior
 * Manual trip-context phases
 * Manual clock epochs, explicit clip exceptions, and contradiction reporting
@@ -995,8 +995,8 @@ Build:
 
 * Implement the review queue, previous/current/next context, proxy playback, and last-position persistence.
 * Define the initial keyboard map and an in-app shortcut reference.
-* Implement reviewed, skipped, and needs-attention states.
-* Implement notes, labels, and source-time key moments with revision history.
+* Implement free-form labels, notes, and reversible queue removal.
+* Implement source-time key moments with revision history after the basic labeling loop is validated.
 * Show technical metadata, raw timestamps, camera, sequence, media availability, and processing state.
 * Implement queue filtering and basic SQLite FTS search over filename, notes, labels, and any available transcript or analysis text.
 * Add optimistic concurrency checks to annotation mutations.
@@ -1200,6 +1200,8 @@ The following decisions were accepted for the MVP on 2026-07-18.
 
 11. **Implementation:** React/TypeScript UI with a canonical Rust desktop and core. FFmpeg, ffprobe, and ExifTool are managed children. Python is allowed only for small exploratory analysis scripts or a short-lived OTIO exporter if direct JSON is insufficient.
 
+12. **Labeling workflow (accepted 2026-07-20):** the initial footage pass uses free-form labels and notes, with a reversible `removed` flag for unusable clips. Review-status states, rough-cut inclusion, source ranges, and timeline export do not appear in this phase. Rough-cut decisions begin in the later edit-planning stage after clips are labeled.
+
 ## 25.2 Remaining reversible workflow questions
 
 1. **Is CLI plus workspace access sufficient for Claude and Codex?** Or is an MCP server required later? Proposed MVP behavior: CLI and files only; reads and version-creating writes are allowed, while activation and destructive changes require explicit revision checks.
@@ -1208,8 +1210,6 @@ The following decisions were accepted for the MVP on 2026-07-18.
 
 3. **What should happen when the same physical media is available at multiple paths?** Proposed MVP behavior: retain the first ingested location, deduplicate within a project by sampled fingerprint, and add explicit relinking after the main loop is validated.
 
-4. **What are the exact review states, labels, and keyboard shortcuts?** Proposed MVP behavior: unreviewed, reviewed, skipped, and needs attention; labels are free-form; initial shortcuts are fixed and documented in-app.
+4. **How are events and chapters created?** Proposed MVP behavior: defer both. Notes and chronological order are sufficient for the first workflow validation.
 
-5. **How are events and chapters created?** Proposed MVP behavior: defer both. Notes and chronological order are sufficient for the first workflow validation.
-
-6. **How should project deletion and cache cleanup work?** Proposed MVP behavior: no destructive project deletion in the UI; proxy cleanup is an explicit project action added after the main loop is validated.
+5. **How should project deletion and cache cleanup work?** Proposed MVP behavior: no destructive project deletion in the UI; proxy cleanup is an explicit project action added after the main loop is validated.
