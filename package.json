@@ -1,0 +1,13 @@
+{
+  "name": "rcd-vlogcutter",
+  "private": true,
+  "packageManager": "pnpm@10.17.0",
+  "scripts": {
+    "dev": "pnpm --dir apps/desktop tauri dev",
+    "build": "pnpm --dir apps/desktop tauri build",
+    "build:cli": "cargo build -p rcdvlog-cli",
+    "check": "pnpm --dir apps/desktop check && cargo test --workspace",
+    "test:core": "cargo test -p rcdvlog-core",
+    "test:integration": "cargo test -p rcdvlog-cli --test cli_workflow"
+  }
+}

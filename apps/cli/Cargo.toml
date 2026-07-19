@@ -1,0 +1,21 @@
+[package]
+name = "rcdvlog-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "rcdvlog"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+dirs.workspace = true
+rcdvlog-core = { path = "../../core/rcdvlog-core" }
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+rusqlite.workspace = true
+tempfile = "3.24"
