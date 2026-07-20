@@ -394,6 +394,31 @@ impl JobEngine {
         tx.commit()?;
         Ok(definition)
     }
+
+    /// Enqueue a job with a pre-determined job_id. The definition's job_id is
+    /// ignored; `known_id` is used instead. Used for scan root jobs where the
+    /// ID must be stable before the job row exists.
+    pub fn enqueue_with_id(
+        &self,
+        known_id: &str,
+        definition: JobDefinition,
+    ) -> Result<JobDefinition, JobEngineError> {
+        let job_id = JobId::parse(known_id)
+            .map_err(|e| JobEngineError::InvalidInput(format!("invalid known job id: {e}")))?;
+        // Check if already exists
+        let existing = {
+            let mut c = open_read_only_connection(&self.database_path)?;
+            let tx = c.transaction()?;
+            load_definition(&tx, known_id).ok()
+        };
+        if let Some(def) = existing {
+            return Ok(def);
+        }
+        let mut definition = definition;
+        definition.job_id = job_id;
+        self.enqueue(definition)
+    }
+
     /// Reads durable job state without running migrations or mutating the catalog.
     pub fn get_job(&self, id: &JobId) -> Result<JobSnapshot, JobEngineError> {
         let mut connection = open_read_only_connection(&self.database_path)?;

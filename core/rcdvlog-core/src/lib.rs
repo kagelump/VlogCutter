@@ -1477,15 +1477,27 @@ fn row_to_asset(row: &rusqlite::Row<'_>) -> rusqlite::Result<Asset> {
     })
 }
 
-fn is_media(path: &Path) -> bool {
+/// Returns true when the path has a supported media extension (case-insensitive).
+/// The extension set is the same one used for desktop ingest and server scanning.
+pub fn is_supported_media_path(path: &Path) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
         .map(|extension| MEDIA_EXTENSIONS.contains(&extension.to_ascii_lowercase().as_str()))
         .unwrap_or(false)
 }
 
+fn is_media(path: &Path) -> bool {
+    is_supported_media_path(path)
+}
+
 fn tool_command(name: &str) -> Command {
     Command::new(resolve_tool(name))
+}
+
+/// Resolves a tool executable path from the environment. Returns the command
+/// name itself when no concrete path is found on PATH or standard directories.
+pub fn resolve_tool_path(name: &str) -> PathBuf {
+    resolve_tool(name)
 }
 
 fn resolve_tool(name: &str) -> PathBuf {
@@ -1513,6 +1525,10 @@ fn resolve_tool(name: &str) -> PathBuf {
 
 /// Computes a sampled BLAKE3 fingerprint of a file: file size plus up to 1 MiB
 /// from the beginning and end. Returns a 64-char lowercase hex digest.
+pub fn sampled_media_fingerprint(path: &Path, size: u64) -> Result<String> {
+    sampled_fingerprint(path, size)
+}
+
 fn sampled_fingerprint(path: &Path, size: u64) -> Result<String> {
     let mut file = File::open(path)?;
     let mut hasher = Hasher::new();
@@ -1576,6 +1592,232 @@ fn probe_media(path: &Path) -> Result<MediaProbe> {
             metadata_rotation_degrees,
         ),
     })
+}
+
+/// Normalized technical probe DTO shared between desktop and server.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NormalizedMediaProbe {
+    pub duration_seconds: f64,
+    pub frame_rate: f64,
+    pub encoded_width: u32,
+    pub encoded_height: u32,
+    pub codec: String,
+    pub camera_make: Option<String>,
+    pub camera_model: Option<String>,
+    pub camera_string: Option<String>,
+    pub captured_at_raw: Option<String>,
+    pub best_time: Option<String>,
+    pub metadata_rotation_degrees: u16,
+    pub enrichment_status: String,
+    pub enrichment_warning: Option<String>,
+}
+
+/// Probes a media file with configured ffprobe and optional ExifTool,
+/// returning a normalized DTO suitable for cross-node persistence.
+pub fn probe_media_normalized(
+    path: &Path,
+    ffprobe_program: &Path,
+    exiftool_program: Option<&Path>,
+) -> Result<NormalizedMediaProbe> {
+    let document = probe_media_document_with(path, ffprobe_program)?;
+    let (camera_make, camera_model, enrichment_status, enrichment_warning) =
+        if let Some(exif_tool) = exiftool_program {
+            // First check if exiftool can run at all
+            let can_run = std::process::Command::new(exif_tool)
+                .arg("-ver")
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+            if !can_run {
+                (
+                    None,
+                    None,
+                    "unavailable".to_string(),
+                    Some("ExifTool could not be executed".to_string()),
+                )
+            } else {
+                match exif_camera_with(path, exif_tool) {
+                    Some((make, model)) => (Some(make), Some(model), "ok".to_string(), None),
+                    None => (
+                        None,
+                        None,
+                        "ok".to_string(),
+                        Some(
+                            "ExifTool ran successfully but found no camera make/model metadata"
+                                .to_string(),
+                        ),
+                    ),
+                }
+            }
+        } else {
+            (None, None, "unavailable".to_string(), None)
+        };
+    let camera_string = match (&camera_make, &camera_model) {
+        (Some(make), Some(model)) => Some(format!("{make} {model}").trim().to_string()),
+        (Some(make), None) => Some(make.clone()),
+        _ => None,
+    };
+    let stream = document["streams"]
+        .as_array()
+        .and_then(|items| items.first());
+    let raw_time = stream
+        .and_then(|value| value.pointer("/tags/creation_time"))
+        .or_else(|| document.pointer("/format/tags/creation_time"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let duration_seconds = document["format"]["duration"]
+        .as_str()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0.0);
+    let rate = stream
+        .and_then(|value| value["r_frame_rate"].as_str())
+        .map(parse_rate)
+        .unwrap_or(30.0);
+    let metadata_rotation_degrees = stream_rotation(stream);
+    let width = stream
+        .and_then(|value| value["width"].as_u64())
+        .unwrap_or(0) as u32;
+    let height = stream
+        .and_then(|value| value["height"].as_u64())
+        .unwrap_or(0) as u32;
+    Ok(NormalizedMediaProbe {
+        duration_seconds,
+        frame_rate: rate,
+        encoded_width: width,
+        encoded_height: height,
+        codec: stream
+            .and_then(|value| value["codec_name"].as_str())
+            .unwrap_or("unknown")
+            .to_string(),
+        camera_make,
+        camera_model,
+        camera_string,
+        captured_at_raw: raw_time.clone(),
+        best_time: raw_time
+            .as_deref()
+            .and_then(|value| normalize_datetime(value, 0)),
+        metadata_rotation_degrees,
+        enrichment_status,
+        enrichment_warning,
+    })
+}
+
+/// Returns the raw ffprobe JSON document using a specific ffprobe executable.
+fn probe_media_document_with(path: &Path, ffprobe_program: &Path) -> Result<Value> {
+    let output = Command::new(ffprobe_program)
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "format=duration:format_tags=creation_time:stream=width,height,codec_name,r_frame_rate:stream_tags=creation_time,rotate:stream_side_data=rotation",
+            "-of",
+            "json",
+        ])
+        .arg(path)
+        .output()
+        .context("start ffprobe")?;
+    if !output.status.success() {
+        bail!(
+            "ffprobe failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    serde_json::from_slice(&output.stdout).context("parse ffprobe JSON")
+}
+
+/// Extracts camera make/model via a specific ExifTool executable.
+fn exif_camera_with(path: &Path, exiftool_program: &Path) -> Option<(String, String)> {
+    let output = Command::new(exiftool_program)
+        .args(["-json", "-Make", "-Model"])
+        .arg(path)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let document: Value = serde_json::from_slice(&output.stdout).ok()?;
+    let item = document.as_array()?.first()?;
+    let make = item["Make"].as_str().unwrap_or("").trim();
+    let model = item["Model"].as_str().unwrap_or("").trim();
+    match (make.is_empty(), model.is_empty()) {
+        (true, true) => None,
+        _ => Some((make.to_string(), model.to_string())),
+    }
+}
+
+/// Full-file BLAKE3 result with pre- and post-read file evidence.
+#[derive(Debug, Clone)]
+pub struct FullFileHashResult {
+    pub hex_digest: String,
+    pub byte_count: u64,
+    pub pre_read_size: u64,
+    pub pre_read_modified_ns: Option<i128>,
+    pub post_read_size: u64,
+    pub post_read_modified_ns: Option<i128>,
+}
+
+/// Streams a file through BLAKE3 using bounded memory (64 KiB buffer).
+/// Returns `input_changed` when size or modification metadata differs
+/// between the pre-read and post-read stat calls.
+///
+/// `check_cancellation` is called between read chunks to enable cooperative
+/// cancellation without storing a concrete cancellation type in the core.
+pub fn full_file_blake3(
+    path: &Path,
+    check_cancellation: &dyn Fn() -> bool,
+) -> Result<FullFileHashResult> {
+    let pre_meta = fs::metadata(path).context("stat file before hash")?;
+    let pre_size = pre_meta.len();
+    let pre_modified_ns = modified_nanos(&pre_meta);
+
+    let mut file = File::open(path)?;
+    let mut hasher = Hasher::new();
+    let mut buffer = [0u8; 65536];
+    let mut byte_count: u64 = 0;
+    loop {
+        if check_cancellation() {
+            anyhow::bail!("full-file BLAKE3 cancelled");
+        }
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+        byte_count += read as u64;
+    }
+
+    let post_meta = fs::metadata(path).context("stat file after hash")?;
+    let post_size = post_meta.len();
+    let post_modified_ns = modified_nanos(&post_meta);
+
+    if pre_size != post_size || pre_modified_ns != post_modified_ns || byte_count != pre_size {
+        anyhow::bail!("input_changed");
+    }
+
+    Ok(FullFileHashResult {
+        hex_digest: hasher.finalize().to_hex().to_string(),
+        byte_count,
+        pre_read_size: pre_size,
+        pre_read_modified_ns: pre_modified_ns,
+        post_read_size: post_size,
+        post_read_modified_ns: post_modified_ns,
+    })
+}
+
+#[cfg(unix)]
+fn modified_nanos(metadata: &std::fs::Metadata) -> Option<i128> {
+    use std::os::unix::fs::MetadataExt;
+    let secs = metadata.mtime() as i128;
+    let nsecs = metadata.mtime_nsec() as i128;
+    Some(secs * 1_000_000_000 + nsecs)
+}
+
+#[cfg(not(unix))]
+fn modified_nanos(_metadata: &std::fs::Metadata) -> Option<i128> {
+    None
 }
 
 /// Returns the raw ffprobe JSON document for a media file.

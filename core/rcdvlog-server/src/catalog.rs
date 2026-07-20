@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 use crate::ConfigDiagnostics;
 
-pub const CONTROL_CATALOG_SCHEMA_VERSION: u32 = 3;
+pub const CONTROL_CATALOG_SCHEMA_VERSION: u32 = 4;
 pub const CONTROL_DATABASE_FILENAME: &str = "control.sqlite3";
 pub const INSTANCE_LOCK_FILENAME: &str = "server.lock";
 
@@ -39,6 +39,12 @@ pub const CONTROL_CATALOG_MIGRATIONS: &[SqliteMigration] = &[
         name: "durable_server_job_engine",
         source_identity: "server-control/0003-durable-server-job-engine/20260720",
         apply: create_durable_server_job_engine,
+    },
+    SqliteMigration {
+        id: 4,
+        name: "nas_scan_verified_content_identity",
+        source_identity: "server-control/0004-nas-scan-verified-content-identity/20260720",
+        apply: create_nas_scan_verified_content_identity,
     },
 ];
 
@@ -191,7 +197,7 @@ pub fn inspect_control_catalog_migrations(
     inspect_sqlite_migrations(&connection, CONTROL_CATALOG_MIGRATIONS)
 }
 
-pub(crate) fn open_writable_connection(path: &Path) -> Result<Connection> {
+pub fn open_writable_connection(path: &Path) -> Result<Connection> {
     let connection = Connection::open(path)
         .with_context(|| format!("open server control catalog at {}", path.display()))?;
     connection.busy_timeout(std::time::Duration::from_secs(5))?;
@@ -205,7 +211,7 @@ pub(crate) fn open_writable_connection(path: &Path) -> Result<Connection> {
     Ok(connection)
 }
 
-pub(crate) fn open_read_only_connection(path: &Path) -> Result<Connection> {
+pub fn open_read_only_connection(path: &Path) -> Result<Connection> {
     let connection = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
@@ -527,6 +533,146 @@ fn create_durable_server_job_engine(transaction: &Transaction<'_>) -> Result<()>
     Ok(())
 }
 
+fn create_nas_scan_verified_content_identity(transaction: &Transaction<'_>) -> Result<()> {
+    transaction.execute_batch(
+        r#"
+        CREATE TABLE scan_runs (
+            scan_id TEXT PRIMARY KEY,
+            node_id TEXT NOT NULL,
+            storage_root_id TEXT NOT NULL REFERENCES storage_roots(storage_root_id),
+            scope_relative_path TEXT,
+            generation_id TEXT NOT NULL,
+            root_job_id TEXT NOT NULL,
+            scheduled_occurrence_at TEXT,
+            source TEXT NOT NULL CHECK(source IN ('manual', 'schedule')),
+            schedule_id TEXT,
+            state TEXT NOT NULL CHECK(state IN ('queued', 'running', 'succeeded', 'failed', 'canceled')),
+            visited_entries INTEGER NOT NULL DEFAULT 0 CHECK(visited_entries >= 0),
+            supported_files INTEGER NOT NULL DEFAULT 0 CHECK(supported_files >= 0),
+            unchanged_files INTEGER NOT NULL DEFAULT 0 CHECK(unchanged_files >= 0),
+            queued_files INTEGER NOT NULL DEFAULT 0 CHECK(queued_files >= 0),
+            completed_files INTEGER NOT NULL DEFAULT 0 CHECK(completed_files >= 0),
+            failed_files INTEGER NOT NULL DEFAULT 0 CHECK(failed_files >= 0),
+            error_code TEXT CHECK(error_code IS NULL OR length(error_code) <= 128),
+            error_details_json TEXT CHECK(error_details_json IS NULL OR length(error_details_json) <= 8192),
+            created_at TEXT NOT NULL,
+            started_at TEXT,
+            completed_at TEXT,
+            CHECK(
+                (state IN ('succeeded', 'failed', 'canceled') AND completed_at IS NOT NULL)
+                OR (state IN ('queued', 'running') AND completed_at IS NULL)
+            ),
+            CHECK(failed_files <= completed_files AND completed_files <= queued_files),
+            CHECK(supported_files <= visited_entries)
+        );
+        CREATE UNIQUE INDEX scan_runs_active_scope
+            ON scan_runs(node_id, storage_root_id, scope_relative_path)
+            WHERE state IN ('queued', 'running');
+        CREATE INDEX scan_runs_state ON scan_runs(node_id, state, created_at DESC);
+
+        -- Durable child-job tracking so the finalizer can check settlement
+        -- without storing thousands of dependency IDs on one job definition.
+        CREATE TABLE scan_run_jobs (
+            scan_id TEXT NOT NULL REFERENCES scan_runs(scan_id),
+            job_id TEXT NOT NULL REFERENCES jobs(job_id),
+            storage_object_id TEXT REFERENCES storage_objects(storage_object_id),
+            stage TEXT NOT NULL CHECK(stage IN ('root','quick_fingerprint','probe','full_hash','finalizer')),
+            PRIMARY KEY(scan_id, job_id)
+        );
+        CREATE INDEX scan_run_jobs_storage
+            ON scan_run_jobs(scan_id, stage, storage_object_id);
+        CREATE INDEX scan_run_jobs_job ON scan_run_jobs(job_id);
+
+        CREATE TABLE scan_schedules (
+            schedule_id TEXT PRIMARY KEY,
+            storage_root_id TEXT NOT NULL REFERENCES storage_roots(storage_root_id),
+            scope_relative_path TEXT,
+            enabled INTEGER NOT NULL DEFAULT 0 CHECK(enabled IN (0, 1)),
+            local_time TEXT NOT NULL,
+            timezone TEXT NOT NULL CHECK(length(timezone) BETWEEN 1 AND 64),
+            next_run_at TEXT NOT NULL,
+            last_enqueued_at TEXT,
+            last_scan_id TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE UNIQUE INDEX scan_schedules_enabled_scope
+            ON scan_schedules(storage_root_id, scope_relative_path, local_time, timezone)
+            WHERE enabled = 1;
+        CREATE INDEX scan_schedules_due ON scan_schedules(enabled, next_run_at);
+
+        CREATE TABLE media_quick_fingerprint_facts (
+            storage_object_id TEXT NOT NULL REFERENCES storage_objects(storage_object_id),
+            recipe_key TEXT NOT NULL CHECK(length(recipe_key) BETWEEN 1 AND 255),
+            recipe_version TEXT NOT NULL CHECK(length(recipe_version) BETWEEN 1 AND 64),
+            size_bytes INTEGER NOT NULL CHECK(size_bytes >= 0),
+            quick_fingerprint TEXT NOT NULL,
+            captured_at TEXT NOT NULL,
+            PRIMARY KEY(storage_object_id, recipe_key, recipe_version)
+        );
+        CREATE INDEX media_quick_fingerprint_lookup
+            ON media_quick_fingerprint_facts(quick_fingerprint, size_bytes);
+
+        CREATE TABLE media_full_hash_facts (
+            storage_object_id TEXT NOT NULL REFERENCES storage_objects(storage_object_id),
+            recipe_key TEXT NOT NULL CHECK(length(recipe_key) BETWEEN 1 AND 255),
+            recipe_version TEXT NOT NULL CHECK(length(recipe_version) BETWEEN 1 AND 64),
+            full_content_hash TEXT NOT NULL,
+            byte_count INTEGER NOT NULL CHECK(byte_count >= 0),
+            pre_read_size_bytes INTEGER NOT NULL CHECK(pre_read_size_bytes >= 0),
+            pre_read_modified_ns INTEGER,
+            post_read_size_bytes INTEGER NOT NULL CHECK(post_read_size_bytes >= 0),
+            post_read_modified_ns INTEGER,
+            captured_at TEXT NOT NULL,
+            PRIMARY KEY(storage_object_id, recipe_key, recipe_version)
+        );
+        CREATE INDEX media_full_hash_verified_lookup
+            ON media_full_hash_facts(full_content_hash, byte_count);
+
+        CREATE TABLE media_probe_facts (
+            storage_object_id TEXT NOT NULL REFERENCES storage_objects(storage_object_id),
+            recipe_key TEXT NOT NULL CHECK(length(recipe_key) BETWEEN 1 AND 255),
+            recipe_version TEXT NOT NULL CHECK(length(recipe_version) BETWEEN 1 AND 64),
+            probe_json TEXT NOT NULL CHECK(length(probe_json) <= 32768),
+            camera_make TEXT,
+            camera_model TEXT,
+            enrichment_status TEXT CHECK(enrichment_status IN ('ok', 'warning', 'unavailable')),
+            enrichment_warning TEXT CHECK(length(enrichment_warning) <= 1024),
+            captured_at TEXT NOT NULL,
+            PRIMARY KEY(storage_object_id, recipe_key, recipe_version)
+        );
+
+        CREATE TABLE scan_file_diagnostics (
+            diagnostic_id TEXT PRIMARY KEY,
+            scan_id TEXT NOT NULL REFERENCES scan_runs(scan_id),
+            storage_object_id TEXT REFERENCES storage_objects(storage_object_id),
+            stage TEXT NOT NULL CHECK(length(stage) BETWEEN 1 AND 64),
+            code TEXT NOT NULL CHECK(length(code) BETWEEN 1 AND 128),
+            safe_path_identity TEXT NOT NULL CHECK(length(safe_path_identity) BETWEEN 1 AND 256),
+            retryable INTEGER NOT NULL CHECK(retryable IN (0, 1)),
+            recorded_at TEXT NOT NULL
+        );
+        CREATE INDEX scan_file_diagnostics_scan
+            ON scan_file_diagnostics(scan_id, recorded_at);
+        CREATE INDEX scan_file_diagnostics_object
+            ON scan_file_diagnostics(storage_object_id, recorded_at);
+
+        CREATE TABLE media_mismatch_evidence (
+            mismatch_id TEXT PRIMARY KEY,
+            media_object_id TEXT REFERENCES media_objects(media_object_id),
+            storage_object_id TEXT REFERENCES storage_objects(storage_object_id),
+            mismatch_type TEXT NOT NULL CHECK(mismatch_type IN ('quick_fingerprint_collision')),
+            related_media_object_id TEXT REFERENCES media_objects(media_object_id),
+            related_storage_object_id TEXT REFERENCES storage_objects(storage_object_id),
+            recorded_at TEXT NOT NULL
+        );
+        CREATE INDEX media_mismatch_evidence_media
+            ON media_mismatch_evidence(media_object_id, recorded_at);
+        "#,
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -625,6 +771,115 @@ mod tests {
         let error =
             ControlCatalog::open_or_create(&config.data_dir, &config.diagnostics()).unwrap_err();
         assert!(format!("{error:#}").contains("newer than supported"));
+    }
+
+    #[test]
+    fn scan_migration_upgrade_preserves_existing_rows() {
+        let root = TempDir::new().unwrap();
+        let database_path = root.path().join(CONTROL_DATABASE_FILENAME);
+        let mut connection = open_writable_connection(&database_path).unwrap();
+        // Run migrations 1-3
+        run_sqlite_migrations(&mut connection, &CONTROL_CATALOG_MIGRATIONS[..3]).unwrap();
+        // Insert existing data
+        connection
+            .execute(
+                "INSERT INTO server_identity(singleton_id, node_id, created_at) VALUES (1, ?1, ?2)",
+                params!["node_server_preserved", "2026-07-20T00:00:00Z"],
+            )
+            .unwrap();
+        connection.execute(
+            "INSERT INTO project_registry(project_id, replica_relative_path, state, registered_at, created_at, updated_at) VALUES (?1, ?2, 'registered', ?3, ?3, ?3)",
+            params!["project_preserved", "projects/project_preserved/catalog.sqlite3", "2026-07-20T00:00:00Z"],
+        ).unwrap();
+        connection.execute(
+            "INSERT INTO storage_roots(storage_root_id, display_name, immutable_original, created_at, updated_at) VALUES ('root_1', 'Root 1', 1, '2026-07-20T00:00:00Z', '2026-07-20T00:00:00Z')",
+            [],
+        ).unwrap();
+        // Enqueue a job using params
+        let reqs = r#"{"schema_version":1,"requires_original":false,"requires_derived_write":false,"capabilities":[]}"#;
+        connection.execute(
+            "INSERT INTO jobs(job_id, job_type, payload_version, payload_json, immutable_identity_json, requirements_json, target_node_id, recipe_key, job_class, idempotency_key, idempotency_identity_hash, enqueue_sequence, state, max_attempts, retry_initial_seconds, retry_max_seconds, available_at, total_work_units, total_items, created_at, updated_at) VALUES (?1, 'test.v1', 1, '{}', '{}', ?2, 'node_server_preserved', 'test.v1', 'lightweight', 'key_1', ?3, 1, 'queued', 3, 5, 300, '2026-07-20T00:00:00Z', 10, 1, '2026-07-20T00:00:00Z', '2026-07-20T00:00:00Z')",
+            params!["job_keep", reqs, "a".repeat(64)],
+        ).unwrap();
+
+        // Run migration 4
+        run_sqlite_migrations(&mut connection, CONTROL_CATALOG_MIGRATIONS).unwrap();
+
+        // Verify existing rows survive
+        let node: String = connection
+            .query_row(
+                "SELECT node_id FROM server_identity WHERE singleton_id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(node, "node_server_preserved");
+        let project: String = connection
+            .query_row("SELECT project_id FROM project_registry", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(project, "project_preserved");
+        let root: String = connection
+            .query_row("SELECT storage_root_id FROM storage_roots", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(root, "root_1");
+        let job_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM jobs WHERE job_id='job_keep'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(job_count, 1);
+
+        // New tables exist
+        connection
+            .query_row("SELECT COUNT(*) FROM scan_runs", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+        connection
+            .query_row("SELECT COUNT(*) FROM scan_schedules", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM media_quick_fingerprint_facts",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        connection
+            .query_row("SELECT COUNT(*) FROM media_full_hash_facts", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+        connection
+            .query_row("SELECT COUNT(*) FROM media_probe_facts", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+        connection
+            .query_row("SELECT COUNT(*) FROM scan_file_diagnostics", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+        connection
+            .query_row("SELECT COUNT(*) FROM media_mismatch_evidence", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+
+        assert_eq!(
+            inspect_sqlite_migrations(&connection, CONTROL_CATALOG_MIGRATIONS)
+                .unwrap()
+                .status,
+            MigrationHistoryStatus::Current
+        );
     }
 
     #[test]

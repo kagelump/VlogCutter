@@ -3,6 +3,9 @@ mod config;
 mod foundation;
 mod jobs;
 mod library;
+mod media_facts;
+mod scan;
+pub mod scan_handler;
 mod storage_path;
 
 pub use rcdvlog_core::CatalogSchemaError;
@@ -10,7 +13,7 @@ pub use rcdvlog_core::CatalogSchemaError;
 pub use catalog::{
     CONTROL_CATALOG_MIGRATIONS, CONTROL_CATALOG_SCHEMA_VERSION, CONTROL_DATABASE_FILENAME,
     ControlCatalog, INSTANCE_LOCK_FILENAME, InstanceLockError, ServerInstanceLock,
-    inspect_control_catalog_migrations,
+    inspect_control_catalog_migrations, open_read_only_connection, open_writable_connection,
 };
 pub use config::{
     ConfigDiagnostics, ConfigError, ConfigErrorReason, DEFAULT_DATA_DIR, DEFAULT_LISTEN_ADDR,
@@ -34,6 +37,17 @@ pub use library::{
     ProjectMediaMembershipProjection, StorageLibrary, StorageLibraryError,
     StorageLocationAvailability, StorageObject, StorageRoot, StorageRootUpdate,
 };
+pub use media_facts::{
+    FullHashFact, MediaFactsError, MediaMismatchEvidence, ProbeFact, QuickFingerprintFact,
+    ScanFileDiagnostic,
+};
+pub use rcdvlog_core::StorageAccessMode;
+pub use scan::{
+    NewScanSchedule, RecoveryReport, ScanRun, ScanSchedule, ScanScheduleUpdate, ScanService,
+    ScanServiceError, ScanSource, ScanState, ScanToolConfig, compute_next_run_utc,
+    safe_path_identity, validate_local_time, validate_timezone,
+};
+pub use scan_handler::ScanJobHandler;
 pub use storage_path::{
     PathAccessIntent, PathResolutionError, PathResolutionErrorReason,
     resolve_existing_binding_path, validate_local_mount_path,

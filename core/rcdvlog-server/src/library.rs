@@ -302,6 +302,12 @@ impl StorageLibrary {
         &self.local_node_id
     }
 
+    /// The control catalog database path. Exposed for direct transactional
+    /// operations needed by scan/facts handlers during result commits.
+    pub fn database_path(&self) -> &PathBuf {
+        &self.database_path
+    }
+
     pub fn create_storage_root(
         &self,
         input: NewStorageRoot,
@@ -735,6 +741,210 @@ impl StorageLibrary {
             ],
         )?;
         self.get_storage_object(&input.id)
+    }
+
+    /// Get or create a storage object by logical path. Returns the ID.
+    /// When the storage object already exists, updates evidence.
+    pub fn upsert_storage_object(
+        &self,
+        id: &StorageObjectId,
+        root_id: &StorageRootId,
+        relative_path: &RootRelativePath,
+        size_bytes: Option<u64>,
+        modified_at: Option<&str>,
+    ) -> Result<StorageObjectId, StorageLibraryError> {
+        self.get_storage_root(root_id)?;
+        let now = now();
+        let size = to_i64(size_bytes, "sizeBytes")?;
+        let connection = open_writable_connection(&self.database_path)?;
+        connection.execute(
+            r#"
+            INSERT INTO storage_objects (
+                storage_object_id, storage_root_id, relative_path,
+                size_bytes, modified_at, created_at, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
+            ON CONFLICT(storage_object_id, storage_root_id) DO UPDATE SET
+                size_bytes = COALESCE(excluded.size_bytes, storage_objects.size_bytes),
+                modified_at = COALESCE(excluded.modified_at, storage_objects.modified_at),
+                updated_at = excluded.updated_at
+            "#,
+            params![
+                id.as_str(),
+                root_id.as_str(),
+                relative_path.as_str(),
+                size,
+                modified_at,
+                now,
+            ],
+        )?;
+        Ok(id.clone())
+    }
+
+    /// Find a storage object by logical root and relative path.
+    pub fn find_storage_object(
+        &self,
+        root_id: &StorageRootId,
+        relative_path: &RootRelativePath,
+    ) -> Result<Option<StorageObjectId>, StorageLibraryError> {
+        let connection = open_read_only_connection(&self.database_path)?;
+        Ok(connection
+            .query_row(
+                r#"
+                SELECT storage_object_id FROM storage_objects
+                WHERE storage_root_id = ?1 AND relative_path = ?2
+                "#,
+                params![root_id.as_str(), relative_path.as_str()],
+                |row| StorageObjectId::parse(row.get::<_, String>(0)?).map_err(stored_error(0)),
+            )
+            .optional()?)
+    }
+
+    /// Find candidate media objects by quick fingerprint and size.
+    pub fn find_candidates_by_quick_fingerprint(
+        &self,
+        quick_fingerprint: &str,
+        size_bytes: u64,
+    ) -> Result<Vec<MediaObjectId>, StorageLibraryError> {
+        let connection = open_read_only_connection(&self.database_path)?;
+        let mut statement = connection.prepare(
+            r#"
+            SELECT media_object_id FROM media_objects
+            WHERE quick_fingerprint = ?1 AND size_bytes = ?2
+              AND verification_state IN ('provisional', 'verified')
+            "#,
+        )?;
+        statement
+            .query_map(params![quick_fingerprint, size_bytes as i64], |row| {
+                MediaObjectId::parse(row.get::<_, String>(0)?).map_err(stored_error(0))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    /// Find a verified media object by full hash and size.
+    pub fn find_verified_by_full_hash(
+        &self,
+        full_content_hash: &str,
+        byte_count: u64,
+    ) -> Result<Option<MediaObjectId>, StorageLibraryError> {
+        let connection = open_read_only_connection(&self.database_path)?;
+        Ok(connection
+            .query_row(
+                r#"
+                SELECT media_object_id FROM media_objects
+                WHERE full_content_hash = ?1 AND size_bytes = ?2
+                  AND verification_state = 'verified'
+                LIMIT 1
+                "#,
+                params![full_content_hash, byte_count as i64],
+                |row| MediaObjectId::parse(row.get::<_, String>(0)?).map_err(stored_error(0)),
+            )
+            .optional()?)
+    }
+
+    /// Promote a provisional media object to verified (full hash + size).
+    pub fn verify_media_object(
+        &self,
+        media_id: &MediaObjectId,
+        full_content_hash: &str,
+        size_bytes: u64,
+    ) -> Result<MediaObject, StorageLibraryError> {
+        validate_blake3("fullContentHash", full_content_hash)?;
+        let now = now();
+        let connection = open_writable_connection(&self.database_path)?;
+        connection.execute(
+            r#"
+            UPDATE media_objects SET
+                full_content_hash = ?2, size_bytes = ?3,
+                verification_state = 'verified', updated_at = ?4
+            WHERE media_object_id = ?1
+            "#,
+            params![media_id.as_str(), full_content_hash, size_bytes as i64, now],
+        )?;
+        self.get_media_object(media_id)
+    }
+
+    /// Update a storage-object/media-object location to a new verification state.
+    pub fn update_location_verification(
+        &self,
+        media_object_id: &MediaObjectId,
+        storage_object_id: &StorageObjectId,
+        verification_state: LocationVerificationState,
+    ) -> Result<MediaObjectLocation, StorageLibraryError> {
+        let now = now();
+        let connection = open_writable_connection(&self.database_path)?;
+        connection.execute(
+            r#"
+            UPDATE media_object_locations SET
+                verification_state = ?3, updated_at = ?4
+            WHERE media_object_id = ?1 AND storage_object_id = ?2
+            "#,
+            params![
+                media_object_id.as_str(),
+                storage_object_id.as_str(),
+                verification_state.as_str(),
+                now,
+            ],
+        )?;
+        connection
+            .query_row(
+                r#"
+                SELECT media_object_id, storage_object_id, verification_state,
+                       linked_at, updated_at
+                FROM media_object_locations
+                WHERE media_object_id = ?1 AND storage_object_id = ?2
+                "#,
+                params![media_object_id.as_str(), storage_object_id.as_str()],
+                location_from_row,
+            )
+            .map_err(Into::into)
+    }
+
+    /// Relink a storage object from one media object to another.
+    /// Used when a full hash matches an existing verified media object
+    /// that this storage object should converge to.
+    pub fn relink_storage_to_media(
+        &self,
+        old_media_id: &MediaObjectId,
+        new_media_id: &MediaObjectId,
+        storage_object_id: &StorageObjectId,
+        verification_state: LocationVerificationState,
+    ) -> Result<MediaObjectLocation, StorageLibraryError> {
+        let now = now();
+        let connection = open_writable_connection(&self.database_path)?;
+        connection.execute(
+            r#"
+            DELETE FROM media_object_locations
+            WHERE media_object_id = ?1 AND storage_object_id = ?2
+            "#,
+            params![old_media_id.as_str(), storage_object_id.as_str()],
+        )?;
+        connection.execute(
+            r#"
+            INSERT INTO media_object_locations (
+                media_object_id, storage_object_id, verification_state,
+                linked_at, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?4)
+            "#,
+            params![
+                new_media_id.as_str(),
+                storage_object_id.as_str(),
+                verification_state.as_str(),
+                now,
+            ],
+        )?;
+        connection
+            .query_row(
+                r#"
+                SELECT media_object_id, storage_object_id, verification_state,
+                       linked_at, updated_at
+                FROM media_object_locations
+                WHERE media_object_id = ?1 AND storage_object_id = ?2
+                "#,
+                params![new_media_id.as_str(), storage_object_id.as_str()],
+                location_from_row,
+            )
+            .map_err(Into::into)
     }
 
     pub fn get_storage_object(

@@ -3,8 +3,9 @@ use clap::Parser;
 use rcdvlog_server::{HttpState, ShutdownCoordinator, bind_loopback, router, serve_until_shutdown};
 use rcdvlog_server_core::{
     APPLICATION_VERSION, CONTROL_CATALOG_SCHEMA_VERSION, CatalogSchemaError, ConfigError,
-    InstanceLockError, PROTOCOL_MAJOR_VERSION, PROTOCOL_MINOR_VERSION, RuntimeFoundation,
-    ServerConfig,
+    InstanceLockError, JobScheduler, JobSchedulerConfig, PROTOCOL_MAJOR_VERSION,
+    PROTOCOL_MINOR_VERSION, RuntimeFoundation, ScanJobHandler, ScanService, ScanSource,
+    ScanToolConfig, ServerConfig, compute_next_run_utc,
 };
 use serde::Serialize;
 use std::process::ExitCode;
@@ -95,7 +96,8 @@ async fn run() -> Result<()> {
         "configuration_validated"
     );
     let foundation = Arc::new(
-        RuntimeFoundation::initialize(config).context("initialize server runtime foundation")?,
+        RuntimeFoundation::initialize(config.clone())
+            .context("initialize server runtime foundation")?,
     );
     let listener = bind_loopback(foundation.config().listen_addr).await?;
     let local_address = listener.local_addr()?;
@@ -118,6 +120,90 @@ async fn run() -> Result<()> {
         signal_shutdown.cancel();
     });
 
+    // ── Startup scan recovery ──────────────────────────────────────
+    {
+        let recovery_library = foundation.catalog().storage_library();
+        let recovery_tool_config = ScanToolConfig {
+            ffprobe_program: std::path::PathBuf::from(&config.ffprobe_command),
+            exiftool_program: if config.exiftool_command.is_empty() {
+                None
+            } else {
+                Some(std::path::PathBuf::from(&config.exiftool_command))
+            },
+        };
+        let recovery_service = ScanService::new(recovery_library, recovery_tool_config);
+        match recovery_service.recover_active_scan_jobs() {
+            Ok(report) => {
+                tracing::info!(
+                    component = "recovery",
+                    total_pending = report.total_pending,
+                    recovered = report.recovered,
+                    skipped = report.skipped,
+                    "startup_scan_recovery_complete"
+                );
+            }
+            Err(e) => {
+                tracing::error!(
+                    component = "recovery",
+                    error = %e,
+                    "startup_scan_recovery_failed"
+                );
+            }
+        }
+    }
+
+    // ── Scan workers ────────────────────────────────────────────────
+    let worker_catalog = foundation.catalog().clone();
+    let worker_shutdown = shutdown.clone();
+    let worker_config = foundation.config().clone();
+    let scan_handle = tokio::spawn(async move {
+        let tool_config = ScanToolConfig {
+            ffprobe_program: std::path::PathBuf::from(&worker_config.ffprobe_command),
+            exiftool_program: if worker_config.exiftool_command.is_empty() {
+                None
+            } else {
+                Some(std::path::PathBuf::from(&worker_config.exiftool_command))
+            },
+        };
+        let library = worker_catalog.storage_library();
+        let scan_service = Arc::new(ScanService::new(library.clone(), tool_config));
+        let handler = Arc::new(ScanJobHandler::new(library, scan_service.clone()));
+
+        let engine = worker_catalog.jobs();
+        let scheduler = match JobScheduler::new(
+            engine,
+            JobSchedulerConfig::default(),
+            worker_shutdown.child_token(),
+        ) {
+            Ok(scheduler) => scheduler,
+            Err(error) => {
+                tracing::error!(
+                    component = "scheduler",
+                    error = %error,
+                    "job_scheduler_creation_failed"
+                );
+                return;
+            }
+        };
+
+        // Start the schedule loop in a separate task
+        let schedule_shutdown = worker_shutdown.clone();
+        let schedule_service = scan_service.clone();
+        tokio::spawn(async move {
+            run_schedule_loop(schedule_service, schedule_shutdown.child_token()).await;
+        });
+
+        tracing::info!(component = "scheduler", "job_scheduler_starting");
+        if let Err(error) = scheduler.run(handler).await {
+            tracing::error!(
+                component = "scheduler",
+                error = %error,
+                "job_scheduler_stopped_unexpectedly"
+            );
+        }
+        tracing::info!(component = "scheduler", "job_scheduler_stopped");
+    });
+
     let result = serve_until_shutdown(
         listener,
         router(HttpState::new(foundation.clone())),
@@ -125,6 +211,9 @@ async fn run() -> Result<()> {
         foundation.config().shutdown_timeout,
     )
     .await;
+
+    // Drain the scan worker (scheduler + schedule loop)
+    let _ = tokio::time::timeout(Duration::from_secs(30), scan_handle).await;
 
     foundation
         .checkpoint()
@@ -164,6 +253,77 @@ fn startup_error_metadata(error: &anyhow::Error) -> StartupErrorMetadata {
             code: "server_runtime_failed",
             field: None,
             action: None,
+        }
+    }
+}
+
+async fn run_schedule_loop(
+    scan_service: Arc<ScanService>,
+    shutdown: tokio_util::sync::CancellationToken,
+) {
+    tracing::info!(component = "schedule", "schedule_loop_starting");
+    loop {
+        tokio::select! {
+            _ = shutdown.cancelled() => {
+                tracing::info!(component = "schedule", "schedule_loop_stopped");
+                return;
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {}
+        }
+        if shutdown.is_cancelled() {
+            return;
+        }
+        match scan_service.list_due_schedules() {
+            Ok(schedules) => {
+                for schedule in schedules {
+                    if shutdown.is_cancelled() {
+                        return;
+                    }
+                    let root_id = schedule.storage_root_id.clone();
+                    let scope = schedule.scope_relative_path.clone();
+                    match scan_service.request_scan(
+                        ScanSource::Schedule,
+                        Some(&schedule.schedule_id),
+                        &root_id,
+                        scope.as_ref(),
+                    ) {
+                        Ok(scan_run) => {
+                            let next =
+                                compute_next_run_utc(&schedule.local_time, &schedule.timezone)
+                                    .unwrap_or_else(|_| {
+                                        chrono::Utc::now()
+                                            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+                                    });
+                            let _ = scan_service.record_schedule_trigger(
+                                &schedule.schedule_id,
+                                &scan_run.scan_id,
+                                &next,
+                            );
+                            tracing::info!(
+                                component = "schedule",
+                                scheduleId = %schedule.schedule_id,
+                                scanId = %scan_run.scan_id,
+                                "schedule_triggered_scan"
+                            );
+                        }
+                        Err(error) => {
+                            tracing::error!(
+                                component = "schedule",
+                                scheduleId = %schedule.schedule_id,
+                                error = %error,
+                                "schedule_scan_request_failed"
+                            );
+                        }
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::error!(
+                    component = "schedule",
+                    error = %error,
+                    "list_due_schedules_failed"
+                );
+            }
         }
     }
 }
