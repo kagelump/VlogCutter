@@ -144,7 +144,7 @@ rcdvlog proxy status --asset <asset-id>
 rcdvlog proxy status --project <project-id> --limit 100
 ```
 
-`proxy status` is read-only and distinguishes current raw-orientation v2 proxies, legacy metadata-baked v1 proxies, and missing files. `proxy missing` may be long-running and regenerates obsolete v1 representations when originals are available. Completed proxies remain committed if the command is interrupted.
+`proxy status` is read-only and distinguishes verified raw-orientation v3 proxies, obsolete metadata-tagged raw v2 proxies, legacy metadata-baked v1 proxies, and missing files. Listed v3 items are live-probed and are ready only when their display rotation is 0°. `proxy missing` may be long-running and regenerates obsolete representations when originals are available. Completed proxies remain committed if the command is interrupted.
 
 ### Thumbnails
 

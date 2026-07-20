@@ -140,7 +140,7 @@ Minimum documented environment:
 - Rust 1.85+ and Cargo
 - Node.js 22+
 - pnpm 10
-- FFmpeg and ffprobe on `PATH`
+- FFmpeg 7+ and ffprobe on `PATH`
 - ExifTool on `PATH`
 
 The development environment was last verified on 2026-07-19 with Rust/Cargo 1.97.1, Node 24.11, pnpm 10.17, FFmpeg/ffprobe 7.1.3, and ExifTool 13.36.
@@ -274,11 +274,12 @@ The current compact story ribbon spaces clips by ordinal position, not duration 
 
 Proxy generation currently uses one local worker and FFmpeg settings equivalent to:
 
+- Override the input display rotation to 0 and disable autorotation, preserving raw encoded orientation without copying the camera display matrix.
 - Scale down to at most 1280 px wide while preserving aspect ratio.
 - H.264 `libx264`, `veryfast`, CRF 23, `yuv420p`.
 - AAC 128 kb/s and `+faststart`.
 
-Only the original is accepted as proxy input. If the original is offline, proxy generation fails explicitly. Completed files are committed asset-by-asset; a later “missing” run skips files that still exist.
+Only the original is accepted as proxy input. If the original is offline, proxy generation fails explicitly. Version-3 proxies are written to a temporary file, verified with ffprobe to have 0° display rotation, and then atomically committed asset-by-asset. Version-2 proxies are obsolete because they may retain the source display matrix; a later “missing” run regenerates them and skips only valid current-version paths that still exist.
 
 ### Thumbnails
 
@@ -291,7 +292,7 @@ All long batch work should use `core/batch-estimator`, not an ad hoc ETA. Caller
 Current task keys are versioned:
 
 ```text
-proxy.h264-720p.orientation-v2
+proxy.h264-720p.orientation-v3
 thumbnail.q1.orientation-v2
 ```
 

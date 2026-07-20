@@ -84,6 +84,37 @@ impl BatchEstimator {
         }
     }
 
+    /// Restores durable item/work counters without adding a throughput sample.
+    /// Callers use this when successful and failed item facts were committed
+    /// before a process restart.
+    pub fn with_progress(
+        task_work_units: &[u64],
+        worker_count: usize,
+        history: RateHistory,
+        completed_items: usize,
+        completed_work_units: u64,
+    ) -> Self {
+        let mut estimator = Self::new(task_work_units, worker_count, history);
+        estimator.completed_items = completed_items.min(estimator.total_items);
+        estimator.completed_work_units = completed_work_units.min(estimator.total_work_units);
+        estimator
+    }
+    pub fn with_explicit_progress(
+        total_items: usize,
+        total_work_units: u64,
+        worker_count: usize,
+        history: RateHistory,
+        completed_items: usize,
+        completed_work_units: u64,
+    ) -> Self {
+        let mut estimator = Self::new(&[], worker_count, history);
+        estimator.total_items = total_items;
+        estimator.total_work_units = total_work_units;
+        estimator.completed_items = completed_items.min(total_items);
+        estimator.completed_work_units = completed_work_units.min(total_work_units);
+        estimator
+    }
+
     pub fn record_completion(&mut self, work_units: u64, worker_duration: Duration) {
         self.completed_items = self.completed_items.saturating_add(1);
         self.completed_work_units = self.completed_work_units.saturating_add(work_units);

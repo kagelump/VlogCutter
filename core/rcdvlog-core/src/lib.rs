@@ -14,11 +14,31 @@ use std::time::Instant;
 use uuid::Uuid;
 use walkdir::WalkDir;
 
+mod identifiers;
+mod migrations;
+mod storage;
+
+pub use identifiers::{
+    IdentifierError, IdentifierErrorReason, JobId, MediaObjectId, NodeId, OperationId,
+    ProjectAssetId, ProjectId, RepresentationId, StorageObjectId, StorageRootId,
+};
+pub use migrations::{
+    CatalogSchemaError, MigrationHistoryInspection, MigrationHistoryStatus,
+    PROJECT_CATALOG_SCHEMA_VERSION, PendingMigration, SchemaMigrationRecord, SqliteMigration,
+    inspect_project_catalog_migrations, inspect_sqlite_migrations, run_sqlite_migrations,
+};
+pub use storage::{
+    BindingVerificationStatus, GlobalMediaVerificationState, LocationVerificationState,
+    NodeAvailabilityState, ObservationGenerationState, ObservationStatus, RelativePathError,
+    RelativePathErrorReason, RootAssociationConfirmation, RootAssociationConfirmationStatus,
+    RootAssociationEvidence, RootRelativePath, StorageAccessMode, StorageProtocol,
+};
+
 const SAMPLE_BYTES: usize = 1024 * 1024;
 const MEDIA_EXTENSIONS: &[&str] = &["mp4", "mov", "m4v", "mts", "m2ts", "avi"];
-const PROXY_TASK_KIND: &str = "proxy.h264-720p.orientation-v2";
+const PROXY_TASK_KIND: &str = "proxy.h264-720p.orientation-v3";
 const THUMBNAIL_TASK_KIND: &str = "thumbnail.q1.orientation-v2";
-const PROXY_CACHE_VERSION: &str = "v2";
+const PROXY_CACHE_VERSION: &str = "v3";
 const THUMBNAIL_CACHE_VERSION: &str = "v2";
 const PROXY_WORKERS: usize = 1;
 const THUMBNAIL_WORKERS: usize = 1;
@@ -38,6 +58,38 @@ pub struct Project {
     pub asset_count: u64,
     pub labeled_count: u64,
     pub removed_count: u64,
+    pub origin_node_id: Option<String>,
+    pub paired_server_node_id: Option<String>,
+    pub paired_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProxyRepresentation {
+    RawV3,
+    MetadataTaggedRawV2,
+    MetadataBakedV1,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MediaVerificationState {
+    #[default]
+    Unlinked,
+    Provisional,
+    Verified,
+    Mismatch,
+}
+
+impl MediaVerificationState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unlinked => "unlinked",
+            Self::Provisional => "provisional",
+            Self::Verified => "verified",
+            Self::Mismatch => "mismatch",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,6 +111,7 @@ pub struct Asset {
     pub best_time: Option<String>,
     pub offset_seconds: i64,
     pub proxy_path: Option<String>,
+    pub proxy_representation: Option<ProxyRepresentation>,
     /// Rotation applied to the encoded frame by camera metadata, in clockwise degrees.
     pub metadata_rotation_degrees: u16,
     /// Landscape-first orientation selected when the clip was ingested.
@@ -74,6 +127,8 @@ pub struct Asset {
     pub notes: String,
     pub labels: Vec<String>,
     pub removed: bool,
+    pub media_object_id: Option<String>,
+    pub media_verification_state: MediaVerificationState,
     pub available: bool,
 }
 
@@ -143,7 +198,14 @@ pub struct CatalogInspection {
     pub project_count: u64,
     pub asset_count: u64,
     pub missing_required_tables: Vec<String>,
+    pub pending_project_columns: Vec<String>,
     pub pending_asset_columns: Vec<String>,
+    pub schema_history_present: bool,
+    pub current_schema_version: u32,
+    pub latest_supported_schema_version: u32,
+    pub schema_status: MigrationHistoryStatus,
+    pub applied_migrations: Vec<SchemaMigrationRecord>,
+    pub pending_migrations: Vec<PendingMigration>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -178,6 +240,20 @@ pub fn inspect_catalog(path: impl AsRef<Path>) -> Result<CatalogInspection> {
         .filter(|name| !tables.iter().any(|table| table == name))
         .map(str::to_string)
         .collect::<Vec<_>>();
+    let required_project_columns = ["origin_node_id", "paired_server_node_id", "paired_at"];
+    let project_columns = if tables.iter().any(|table| table == "projects") {
+        connection
+            .prepare("PRAGMA table_info(projects)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    } else {
+        Vec::new()
+    };
+    let pending_project_columns = required_project_columns
+        .into_iter()
+        .filter(|name| !project_columns.iter().any(|column| column == name))
+        .map(str::to_string)
+        .collect();
     let required_columns = [
         "metadata_rotation_degrees",
         "default_rotation_degrees",
@@ -185,6 +261,8 @@ pub fn inspect_catalog(path: impl AsRef<Path>) -> Result<CatalogInspection> {
         "orientation_probed",
         "labels_json",
         "removed",
+        "media_object_id",
+        "media_verification_state",
     ];
     let asset_columns = if tables.iter().any(|table| table == "assets") {
         connection
@@ -214,6 +292,7 @@ pub fn inspect_catalog(path: impl AsRef<Path>) -> Result<CatalogInspection> {
         0
     };
     let journal_mode = connection.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+    let migration_history = inspect_project_catalog_migrations(&connection)?;
     Ok(CatalogInspection {
         path: path.to_string_lossy().into_owned(),
         read_only: true,
@@ -221,7 +300,14 @@ pub fn inspect_catalog(path: impl AsRef<Path>) -> Result<CatalogInspection> {
         project_count,
         asset_count,
         missing_required_tables,
+        pending_project_columns,
         pending_asset_columns,
+        schema_history_present: migration_history.history_present,
+        current_schema_version: migration_history.current_version,
+        latest_supported_schema_version: migration_history.latest_supported_version,
+        schema_status: migration_history.status,
+        applied_migrations: migration_history.applied_migrations,
+        pending_migrations: migration_history.pending_migrations,
     })
 }
 
@@ -305,6 +391,12 @@ struct MediaProbe {
 impl Catalog {
     pub fn open(database_path: impl AsRef<Path>) -> Result<Self> {
         let database_path = database_path.as_ref().to_path_buf();
+        if database_path.is_file() {
+            let connection =
+                Connection::open_with_flags(&database_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+                    .with_context(|| format!("inspect catalog {}", database_path.display()))?;
+            migrations::validate_project_catalog_migrations(&connection)?;
+        }
         if let Some(parent) = database_path.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("create catalog directory {}", parent.display()))?;
@@ -378,126 +470,8 @@ impl Catalog {
     }
 
     fn migrate(&self) -> Result<()> {
-        let connection = self.connection()?;
-        connection.execute_batch(
-            r#"
-            CREATE TABLE IF NOT EXISTS projects (
-                id TEXT PRIMARY KEY,
-                name TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS assets (
-                id TEXT PRIMARY KEY,
-                project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-                fingerprint TEXT NOT NULL,
-                path TEXT NOT NULL,
-                filename TEXT NOT NULL,
-                size_bytes INTEGER NOT NULL,
-                duration_seconds REAL NOT NULL,
-                frame_rate REAL NOT NULL DEFAULT 30,
-                width INTEGER NOT NULL DEFAULT 0,
-                height INTEGER NOT NULL DEFAULT 0,
-                codec TEXT NOT NULL DEFAULT '',
-                camera TEXT NOT NULL DEFAULT 'Unknown camera',
-                captured_at_raw TEXT,
-                best_time TEXT,
-                offset_seconds INTEGER NOT NULL DEFAULT 0,
-                proxy_path TEXT,
-                metadata_rotation_degrees INTEGER NOT NULL DEFAULT 0,
-                default_rotation_degrees INTEGER NOT NULL DEFAULT 0,
-                rotation_degrees INTEGER NOT NULL DEFAULT 0,
-                orientation_probed INTEGER NOT NULL DEFAULT 1,
-                notes TEXT NOT NULL DEFAULT '',
-                labels_json TEXT NOT NULL DEFAULT '[]',
-                removed INTEGER NOT NULL DEFAULT 0,
-                status TEXT NOT NULL DEFAULT 'unreviewed',
-                included INTEGER NOT NULL DEFAULT 0,
-                source_in REAL NOT NULL DEFAULT 0,
-                source_out REAL NOT NULL DEFAULT 0,
-                created_at TEXT NOT NULL,
-                UNIQUE(project_id, fingerprint)
-            );
-
-            CREATE INDEX IF NOT EXISTS assets_project_order
-            ON assets(project_id, best_time, filename, id);
-
-            CREATE TABLE IF NOT EXISTS clock_events (
-                id TEXT PRIMARY KEY,
-                project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-                camera TEXT NOT NULL,
-                start_filename TEXT NOT NULL,
-                offset_seconds INTEGER NOT NULL,
-                label TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS asset_thumbnails (
-                asset_id TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
-                quality INTEGER NOT NULL CHECK(quality BETWEEN 1 AND 10),
-                path TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                PRIMARY KEY(asset_id, quality)
-            );
-
-            CREATE TABLE IF NOT EXISTS batch_performance (
-                task_kind TEXT PRIMARY KEY,
-                work_units_per_worker_second REAL NOT NULL,
-                samples INTEGER NOT NULL,
-                updated_at TEXT NOT NULL
-            );
-            "#,
-        )?;
-        let added_default_rotation = self.add_asset_column_if_missing(
-            &connection,
-            "default_rotation_degrees",
-            "INTEGER NOT NULL DEFAULT 0",
-        )?;
-        self.add_asset_column_if_missing(
-            &connection,
-            "metadata_rotation_degrees",
-            "INTEGER NOT NULL DEFAULT 0",
-        )?;
-        let added_rotation = self.add_asset_column_if_missing(
-            &connection,
-            "rotation_degrees",
-            "INTEGER NOT NULL DEFAULT 0",
-        )?;
-        self.add_asset_column_if_missing(
-            &connection,
-            "orientation_probed",
-            "INTEGER NOT NULL DEFAULT 0",
-        )?;
-        self.add_asset_column_if_missing(&connection, "labels_json", "TEXT NOT NULL DEFAULT '[]'")?;
-        self.add_asset_column_if_missing(&connection, "removed", "INTEGER NOT NULL DEFAULT 0")?;
-        if added_default_rotation || added_rotation {
-            // Older catalogs did not retain camera display metadata. A portrait-encoded
-            // frame is therefore the best available signal for their landscape-first default.
-            connection.execute(
-                r#"
-                UPDATE assets
-                SET default_rotation_degrees = CASE WHEN height > width THEN 90 ELSE 0 END,
-                    rotation_degrees = CASE WHEN height > width THEN 90 ELSE 0 END
-                "#,
-                [],
-            )?;
-        }
-        Ok(())
-    }
-
-    fn add_asset_column_if_missing(
-        &self,
-        connection: &Connection,
-        column: &str,
-        definition: &str,
-    ) -> Result<bool> {
-        let exists = asset_column_exists(connection, column)?;
-        if !exists {
-            connection.execute_batch(&format!(
-                "ALTER TABLE assets ADD COLUMN {column} {definition}"
-            ))?;
-        }
-        Ok(!exists)
+        let mut connection = self.connection()?;
+        migrations::migrate_project_catalog(&mut connection)
     }
 
     pub fn create_project(&self, name: &str) -> Result<Project> {
@@ -518,6 +492,9 @@ impl Catalog {
             asset_count: 0,
             labeled_count: 0,
             removed_count: 0,
+            origin_node_id: None,
+            paired_server_node_id: None,
+            paired_at: None,
         })
     }
 
@@ -525,12 +502,29 @@ impl Catalog {
         let connection = self.connection()?;
         let labels = asset_column_expression(&connection, "labels_json", "a.labels_json", "'[]'")?;
         let removed = asset_column_expression(&connection, "removed", "a.removed", "0")?;
+        let origin_node_id = table_column_expression(
+            &connection,
+            "projects",
+            "origin_node_id",
+            "p.origin_node_id",
+            "NULL",
+        )?;
+        let paired_server_node_id = table_column_expression(
+            &connection,
+            "projects",
+            "paired_server_node_id",
+            "p.paired_server_node_id",
+            "NULL",
+        )?;
+        let paired_at =
+            table_column_expression(&connection, "projects", "paired_at", "p.paired_at", "NULL")?;
         let sql = format!(
             r#"
             SELECT p.id, p.name, p.created_at,
                    COUNT(a.id),
                    COALESCE(SUM(CASE WHEN {labels} != '[]' THEN 1 ELSE 0 END), 0),
-                   COALESCE(SUM(CASE WHEN {removed} = 1 THEN 1 ELSE 0 END), 0)
+                   COALESCE(SUM(CASE WHEN {removed} = 1 THEN 1 ELSE 0 END), 0),
+                   {origin_node_id}, {paired_server_node_id}, {paired_at}
             FROM projects p
             LEFT JOIN assets a ON a.project_id = p.id
             GROUP BY p.id
@@ -546,6 +540,9 @@ impl Catalog {
                 asset_count: row.get::<_, i64>(3)? as u64,
                 labeled_count: row.get::<_, i64>(4)? as u64,
                 removed_count: row.get::<_, i64>(5)? as u64,
+                origin_node_id: row.get(6)?,
+                paired_server_node_id: row.get(7)?,
+                paired_at: row.get(8)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -682,6 +679,14 @@ impl Catalog {
         )?;
         let labels = asset_column_expression(&connection, "labels_json", "a.labels_json", "'[]'")?;
         let removed = asset_column_expression(&connection, "removed", "a.removed", "0")?;
+        let media_object_id =
+            asset_column_expression(&connection, "media_object_id", "a.media_object_id", "NULL")?;
+        let media_verification_state = asset_column_expression(
+            &connection,
+            "media_verification_state",
+            "a.media_verification_state",
+            "'unlinked'",
+        )?;
         let (thumbnail_path, thumbnail_quality, thumbnail_join) = if table_exists(
             &connection,
             "asset_thumbnails",
@@ -701,7 +706,8 @@ impl Catalog {
                    a.captured_at_raw, a.best_time, a.offset_seconds, a.proxy_path,
                    {metadata_rotation}, {default_rotation}, {rotation},
                    {orientation_probed}, {thumbnail_path}, {thumbnail_quality},
-                   a.notes, {labels}, {removed}
+                   a.notes, {labels}, {removed}, {media_object_id},
+                   {media_verification_state}
             FROM assets a
             {thumbnail_join}
             WHERE a.project_id = ?1
@@ -751,6 +757,14 @@ impl Catalog {
         )?;
         let labels = asset_column_expression(&connection, "labels_json", "a.labels_json", "'[]'")?;
         let removed = asset_column_expression(&connection, "removed", "a.removed", "0")?;
+        let media_object_id =
+            asset_column_expression(&connection, "media_object_id", "a.media_object_id", "NULL")?;
+        let media_verification_state = asset_column_expression(
+            &connection,
+            "media_verification_state",
+            "a.media_verification_state",
+            "'unlinked'",
+        )?;
         let (thumbnail_path, thumbnail_quality, thumbnail_join) = if table_exists(
             &connection,
             "asset_thumbnails",
@@ -770,7 +784,8 @@ impl Catalog {
                    a.captured_at_raw, a.best_time, a.offset_seconds, a.proxy_path,
                    {metadata_rotation}, {default_rotation}, {rotation},
                    {orientation_probed}, {thumbnail_path}, {thumbnail_quality},
-                   a.notes, {labels}, {removed}
+                   a.notes, {labels}, {removed}, {media_object_id},
+                   {media_verification_state}
             FROM assets a
             {thumbnail_join}
             WHERE a.id = ?1
@@ -912,12 +927,15 @@ impl Catalog {
         let proxy_dir = parent.join("cache").join("proxies").join(&asset.project_id);
         fs::create_dir_all(&proxy_dir)?;
         let output = proxy_dir.join(format!("{}.{}.mp4", asset.id, PROXY_CACHE_VERSION));
+        let temporary = proxy_dir.join(format!("{}.{}.tmp.mp4", asset.id, PROXY_CACHE_VERSION));
         let status = tool_command("ffmpeg")
             .args([
                 "-y",
                 "-hide_banner",
                 "-loglevel",
                 "error",
+                "-display_rotation:v:0",
+                "0",
                 "-noautorotate",
                 "-i",
             ])
@@ -942,12 +960,29 @@ impl Catalog {
                 "-map_metadata",
                 "-1",
             ])
-            .arg(&output)
+            .arg(&temporary)
             .status()
             .context("start ffmpeg proxy process")?;
         if !status.success() {
+            let _ = fs::remove_file(&temporary);
             bail!("ffmpeg proxy generation failed with {status}");
         }
+        let proxy_probe = probe_media_stream(&temporary);
+        match proxy_probe {
+            Ok(probe) if probe.metadata_rotation_degrees == 0 => {}
+            Ok(probe) => {
+                let _ = fs::remove_file(&temporary);
+                bail!(
+                    "ffmpeg proxy validation failed: output retains a {}° display rotation",
+                    probe.metadata_rotation_degrees
+                );
+            }
+            Err(error) => {
+                let _ = fs::remove_file(&temporary);
+                return Err(error).context("validate generated proxy");
+            }
+        }
+        fs::rename(&temporary, &output).context("commit generated proxy")?;
         self.connection()?.execute(
             "UPDATE assets SET proxy_path = ?2 WHERE id = ?1",
             params![asset_id, output.to_string_lossy()],
@@ -1271,8 +1306,12 @@ impl Catalog {
 }
 
 fn asset_column_exists(connection: &Connection, column: &str) -> Result<bool> {
+    table_column_exists(connection, "assets", column)
+}
+
+fn table_column_exists(connection: &Connection, table: &str, column: &str) -> Result<bool> {
     Ok(connection
-        .prepare("PRAGMA table_info(assets)")?
+        .prepare(&format!("PRAGMA table_info({table})"))?
         .query_map([], |row| row.get::<_, String>(1))?
         .collect::<rusqlite::Result<Vec<_>>>()?
         .iter()
@@ -1300,10 +1339,33 @@ fn asset_column_expression(
     })
 }
 
-fn has_current_proxy(asset: &Asset) -> bool {
-    asset.proxy_path.as_deref().is_some_and(|path| {
-        Path::new(path).is_file() && path.ends_with(&format!(".{PROXY_CACHE_VERSION}.mp4"))
+fn table_column_expression(
+    connection: &Connection,
+    table: &str,
+    column: &str,
+    present_expression: &'static str,
+    missing_expression: &'static str,
+) -> Result<&'static str> {
+    Ok(if table_column_exists(connection, table, column)? {
+        present_expression
+    } else {
+        missing_expression
     })
+}
+
+fn has_current_proxy(asset: &Asset) -> bool {
+    asset.proxy_available && asset.proxy_representation == Some(ProxyRepresentation::RawV3)
+}
+
+pub fn proxy_representation(path: impl AsRef<Path>) -> ProxyRepresentation {
+    let path = path.as_ref().to_string_lossy();
+    if path.ends_with(".v3.mp4") {
+        ProxyRepresentation::RawV3
+    } else if path.ends_with(".v2.mp4") {
+        ProxyRepresentation::MetadataTaggedRawV2
+    } else {
+        ProxyRepresentation::MetadataBakedV1
+    }
 }
 
 fn has_current_thumbnail(asset: &Asset, quality: u8) -> bool {
@@ -1361,6 +1423,19 @@ fn row_to_asset(row: &rusqlite::Row<'_>) -> rusqlite::Result<Asset> {
         .as_deref()
         .is_some_and(|path| Path::new(path).is_file());
     let available = original_available || proxy_available;
+    let media_verification_state = match row.get::<_, String>(26)?.as_str() {
+        "unlinked" => MediaVerificationState::Unlinked,
+        "provisional" => MediaVerificationState::Provisional,
+        "verified" => MediaVerificationState::Verified,
+        "mismatch" => MediaVerificationState::Mismatch,
+        value => {
+            return Err(rusqlite::Error::FromSqlConversionFailure(
+                26,
+                rusqlite::types::Type::Text,
+                format!("invalid media verification state: {value}").into(),
+            ));
+        }
+    };
     Ok(Asset {
         id: row.get(0)?,
         project_id: row.get(1)?,
@@ -1377,6 +1452,7 @@ fn row_to_asset(row: &rusqlite::Row<'_>) -> rusqlite::Result<Asset> {
         captured_at_raw: row.get(12)?,
         best_time: row.get(13)?,
         offset_seconds: row.get(14)?,
+        proxy_representation: proxy_path.as_deref().map(proxy_representation),
         proxy_path,
         metadata_rotation_degrees: row.get::<_, i64>(16)? as u16,
         default_rotation_degrees: row.get::<_, i64>(17)? as u16,
@@ -1395,6 +1471,8 @@ fn row_to_asset(row: &rusqlite::Row<'_>) -> rusqlite::Result<Asset> {
         notes: row.get(22)?,
         labels: serde_json::from_str(&row.get::<_, String>(23)?).unwrap_or_default(),
         removed: row.get::<_, i64>(24)? != 0,
+        media_object_id: row.get(25)?,
+        media_verification_state,
         available,
     })
 }
@@ -1433,6 +1511,8 @@ fn resolve_tool(name: &str) -> PathBuf {
     PathBuf::from(name)
 }
 
+/// Computes a sampled BLAKE3 fingerprint of a file: file size plus up to 1 MiB
+/// from the beginning and end. Returns a 64-char lowercase hex digest.
 fn sampled_fingerprint(path: &Path, size: u64) -> Result<String> {
     let mut file = File::open(path)?;
     let mut hasher = Hasher::new();
@@ -1448,6 +1528,7 @@ fn sampled_fingerprint(path: &Path, size: u64) -> Result<String> {
     Ok(hasher.finalize().to_hex().to_string())
 }
 
+/// Probes a media file with ffprobe and optional ExifTool enrichment.
 fn probe_media(path: &Path) -> Result<MediaProbe> {
     let document = probe_media_document(path)?;
     let stream = document["streams"]
@@ -1497,6 +1578,7 @@ fn probe_media(path: &Path) -> Result<MediaProbe> {
     })
 }
 
+/// Returns the raw ffprobe JSON document for a media file.
 fn probe_media_document(path: &Path) -> Result<Value> {
     let output = tool_command("ffprobe")
         .args([
@@ -1547,6 +1629,7 @@ fn orientation_name(width: u32, height: u32) -> &'static str {
     }
 }
 
+/// Extracts camera make/model via ExifTool. Returns None on failure.
 fn exif_camera(path: &Path) -> Option<String> {
     let output = tool_command("exiftool")
         .args(["-json", "-Make", "-Model"])
@@ -1718,60 +1801,284 @@ mod tests {
         let directory = tempdir().unwrap();
         let path = directory.path().join("catalog.sqlite3");
         let connection = Connection::open(&path).unwrap();
-        connection.execute_batch(
-            r#"
-            CREATE TABLE projects (id TEXT PRIMARY KEY, name TEXT NOT NULL, created_at TEXT NOT NULL);
-            CREATE TABLE assets (
-                id TEXT PRIMARY KEY, project_id TEXT NOT NULL, fingerprint TEXT NOT NULL,
-                path TEXT NOT NULL, filename TEXT NOT NULL, size_bytes INTEGER NOT NULL,
-                duration_seconds REAL NOT NULL, frame_rate REAL NOT NULL DEFAULT 30,
-                width INTEGER NOT NULL DEFAULT 0, height INTEGER NOT NULL DEFAULT 0,
-                codec TEXT NOT NULL DEFAULT '', camera TEXT NOT NULL DEFAULT 'Unknown camera',
-                captured_at_raw TEXT, best_time TEXT, offset_seconds INTEGER NOT NULL DEFAULT 0,
-                proxy_path TEXT, notes TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'unreviewed',
-                included INTEGER NOT NULL DEFAULT 0, source_in REAL NOT NULL DEFAULT 0,
-                source_out REAL NOT NULL DEFAULT 0, created_at TEXT NOT NULL,
-                UNIQUE(project_id, fingerprint)
-            );
-            "#,
-        ).unwrap();
-        connection.execute(
-            "INSERT INTO projects (id, name, created_at) VALUES ('project_old', 'Old', '2026-07-18T00:00:00Z')",
-            [],
-        ).unwrap();
         connection
-            .execute(
-                r#"
-            INSERT INTO assets (id, project_id, fingerprint, path, filename, size_bytes,
-                duration_seconds, frame_rate, width, height, codec, camera, source_out, created_at)
-            VALUES ('asset_portrait', 'project_old', 'fingerprint', '/missing/portrait.mp4',
-                'PORTRAIT.MP4', 1, 1, 30, 1080, 1920, 'h264', 'Camera A', 1, '2026-07-18T00:00:00Z')
-            "#,
-                [],
-            )
+            .execute_batch(include_str!(
+                "../tests/fixtures/catalog_pre_orientation_labels.sql"
+            ))
             .unwrap();
         drop(connection);
 
+        let bytes_before_read_only = fs::read(&path).unwrap();
         let read_only = Catalog::open_read_only_existing(&path).unwrap();
         let legacy_asset = read_only.get_asset("asset_portrait").unwrap();
         assert!(!legacy_asset.orientation_probed);
         assert_eq!(legacy_asset.metadata_rotation_degrees, 0);
+        assert_eq!(legacy_asset.notes, "keep this note");
         assert!(legacy_asset.labels.is_empty());
         assert!(!legacy_asset.removed);
+        assert_eq!(legacy_asset.media_object_id, None);
+        assert_eq!(
+            legacy_asset.media_verification_state,
+            MediaVerificationState::Unlinked
+        );
+        drop(read_only);
+        let inspection = inspect_catalog(&path).unwrap();
+        assert_eq!(inspection.current_schema_version, 0);
+        assert_eq!(
+            inspection.schema_status,
+            MigrationHistoryStatus::LegacyUnversioned
+        );
+        assert_eq!(
+            inspection.pending_migrations.len(),
+            PROJECT_CATALOG_SCHEMA_VERSION as usize
+        );
+        assert_eq!(fs::read(&path).unwrap(), bytes_before_read_only);
         let still_legacy = Connection::open(&path).unwrap();
         assert!(!asset_column_exists(&still_legacy, "orientation_probed").unwrap());
+        assert!(!table_exists(&still_legacy, "schema_migrations").unwrap());
         drop(still_legacy);
 
         let catalog = Catalog::open_existing(&path).unwrap();
         let asset = catalog.get_asset("asset_portrait").unwrap();
+        assert_eq!(asset.id, "asset_portrait");
+        assert_eq!(asset.project_id, "project_old");
         assert_eq!(asset.metadata_rotation_degrees, 0);
         assert_eq!(asset.default_rotation_degrees, 90);
         assert_eq!(asset.rotation_degrees, 90);
+        assert_eq!(asset.notes, "keep this note");
         assert!(asset.labels.is_empty());
         assert!(!asset.removed);
+        assert_eq!(
+            asset.proxy_path.as_deref(),
+            Some("/legacy/cache/asset_portrait.v2.mp4")
+        );
+        assert_eq!(asset.media_object_id, None);
+        assert_eq!(
+            asset.media_verification_state,
+            MediaVerificationState::Unlinked
+        );
+        let asset_json = serde_json::to_value(&asset).unwrap();
+        assert_eq!(asset_json["mediaObjectId"], serde_json::Value::Null);
+        assert_eq!(asset_json["mediaVerificationState"], "unlinked");
+        let project_json = serde_json::to_value(&catalog.list_projects().unwrap()[0]).unwrap();
+        assert_eq!(project_json["originNodeId"], serde_json::Value::Null);
+        assert_eq!(project_json["pairedServerNodeId"], serde_json::Value::Null);
+        assert_eq!(
+            catalog
+                .connection()
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM clock_events WHERE project_id = 'project_old'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
         let migrated = Connection::open(&path).unwrap();
         assert!(asset_column_exists(&migrated, "labels_json").unwrap());
         assert!(asset_column_exists(&migrated, "removed").unwrap());
+        assert!(asset_column_exists(&migrated, "media_object_id").unwrap());
+        assert_eq!(
+            migrated
+                .query_row(
+                    "SELECT path FROM asset_thumbnails WHERE asset_id = 'asset_portrait' AND quality = 1",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "/legacy/cache/asset_portrait/q1.v2.jpg"
+        );
+        let migration_count = migrated
+            .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+        assert_eq!(migration_count, PROJECT_CATALOG_SCHEMA_VERSION as i64);
+    }
+
+    #[test]
+    fn unversioned_current_catalog_upgrades_once_without_changing_ids_or_annotations() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("catalog.sqlite3");
+        let catalog = Catalog::open(&path).unwrap();
+        let project = catalog.create_project("Current catalog").unwrap();
+        insert_asset(
+            &catalog,
+            &project.id,
+            "asset_existing",
+            "A.MP4",
+            "Camera A",
+            "2026-07-18T00:00:00Z",
+            Path::new("/missing/A.MP4"),
+        );
+        let current = catalog.get_asset("asset_existing").unwrap();
+        catalog
+            .update_asset(
+                "asset_existing",
+                &AssetPatch {
+                    notes: "preserved note".to_string(),
+                    labels: vec!["arrival".to_string()],
+                    removed: true,
+                    rotation_degrees: current.rotation_degrees,
+                },
+            )
+            .unwrap();
+        drop(catalog);
+
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch("DROP TABLE schema_migrations")
+            .unwrap();
+        let before = inspect_catalog(&path).unwrap();
+        assert_eq!(before.current_schema_version, 0);
+        assert_eq!(before.pending_migrations.len(), 4);
+
+        let upgraded = Catalog::open_existing(&path).unwrap();
+        let upgraded_project = upgraded.list_projects().unwrap().remove(0);
+        let upgraded_asset = upgraded.get_asset("asset_existing").unwrap();
+        assert_eq!(upgraded_project.id, project.id);
+        assert_eq!(upgraded_asset.id, "asset_existing");
+        assert_eq!(upgraded_asset.notes, "preserved note");
+        assert_eq!(upgraded_asset.labels, vec!["arrival"]);
+        assert!(upgraded_asset.removed);
+        drop(upgraded);
+
+        let first_history = inspect_catalog(&path).unwrap().applied_migrations;
+        assert_eq!(first_history.len(), PROJECT_CATALOG_SCHEMA_VERSION as usize);
+        let reopened = Catalog::open_existing(&path).unwrap();
+        assert_eq!(
+            reopened.get_asset("asset_existing").unwrap().id,
+            "asset_existing"
+        );
+        drop(reopened);
+        let reopened_inspection = inspect_catalog(&path).unwrap();
+        assert_eq!(reopened_inspection.current_schema_version, 4);
+        assert_eq!(
+            reopened_inspection.schema_status,
+            MigrationHistoryStatus::Current
+        );
+        assert!(reopened_inspection.pending_migrations.is_empty());
+        assert_eq!(reopened_inspection.applied_migrations, first_history);
+    }
+
+    #[test]
+    fn writable_open_rejects_a_newer_catalog_with_an_actionable_error() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("catalog.sqlite3");
+        drop(Catalog::open(&path).unwrap());
+        Connection::open(&path)
+            .unwrap()
+            .execute(
+                "INSERT INTO schema_migrations (migration_id, name, source_identity, applied_at) VALUES (5, 'future', 'future/5', '2026-07-20T00:00:00.000Z')",
+                [],
+            )
+            .unwrap();
+
+        let inspection = inspect_catalog(&path).unwrap();
+        assert_eq!(inspection.current_schema_version, 5);
+        assert_eq!(
+            inspection.schema_status,
+            MigrationHistoryStatus::NewerUnsupported
+        );
+        let error = Catalog::open_existing(&path).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<CatalogSchemaError>().unwrap().code(),
+            "schema_incompatible"
+        );
+        let message = format!("{error:#}");
+        assert!(message.contains("newer than supported version 4"));
+        assert!(message.contains("upgrade RCD VlogCutter"));
+    }
+
+    #[test]
+    fn changed_migration_name_or_source_identity_is_inspectable_but_not_writable() {
+        for (stored_name, stored_source_identity) in [
+            (
+                "changed_catalog_baseline",
+                "project-catalog/0001-catalog-baseline/20260720",
+            ),
+            ("catalog_baseline", "changed/project-catalog/0001"),
+        ] {
+            let directory = tempdir().unwrap();
+            let path = directory.path().join("catalog.sqlite3");
+            drop(Catalog::open(&path).unwrap());
+            Connection::open(&path)
+                .unwrap()
+                .execute(
+                    "UPDATE schema_migrations SET name = ?1, source_identity = ?2 WHERE migration_id = 1",
+                    params![stored_name, stored_source_identity],
+                )
+                .unwrap();
+
+            let before = inspect_catalog(&path).unwrap();
+            assert_eq!(
+                before.schema_status,
+                MigrationHistoryStatus::IncompatibleHistory
+            );
+            assert!(before.pending_migrations.is_empty());
+            let error = Catalog::open_existing(&path).unwrap_err();
+            assert!(matches!(
+                error.downcast_ref::<CatalogSchemaError>(),
+                Some(CatalogSchemaError::IncompatibleHistory {
+                    migration_id: 1,
+                    ..
+                })
+            ));
+            let after = inspect_catalog(&path).unwrap();
+            assert_eq!(after.applied_migrations, before.applied_migrations);
+            assert_eq!(after.pending_migrations, before.pending_migrations);
+            assert_eq!(
+                after.schema_status,
+                MigrationHistoryStatus::IncompatibleHistory
+            );
+        }
+    }
+
+    #[test]
+    fn migration_history_gap_is_rejected_without_applying_the_pending_migration() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("catalog.sqlite3");
+        drop(Catalog::open(&path).unwrap());
+        Connection::open(&path)
+            .unwrap()
+            .execute("DELETE FROM schema_migrations WHERE migration_id = 2", [])
+            .unwrap();
+
+        let before = inspect_catalog(&path).unwrap();
+        assert_eq!(
+            before.current_schema_version,
+            PROJECT_CATALOG_SCHEMA_VERSION
+        );
+        assert_eq!(
+            before.schema_status,
+            MigrationHistoryStatus::IncompatibleHistory
+        );
+        assert_eq!(
+            before
+                .pending_migrations
+                .iter()
+                .map(|migration| migration.id)
+                .collect::<Vec<_>>(),
+            vec![2]
+        );
+        let error = Catalog::open_existing(&path).unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<CatalogSchemaError>(),
+            Some(CatalogSchemaError::IncompatibleHistory {
+                migration_id: 2,
+                ..
+            })
+        ));
+        assert!(format!("{error:#}").contains("migration history contains a gap"));
+
+        let after = inspect_catalog(&path).unwrap();
+        assert_eq!(after.applied_migrations, before.applied_migrations);
+        assert_eq!(after.pending_migrations, before.pending_migrations);
+        assert_eq!(
+            after.schema_status,
+            MigrationHistoryStatus::IncompatibleHistory
+        );
     }
 
     #[test]
@@ -2030,9 +2337,93 @@ mod tests {
         assert!(is_media(Path::new("clip.MP4")));
         assert!(is_media(Path::new("clip.m2ts")));
         assert!(!is_media(Path::new("notes.txt")));
+        assert_eq!(
+            proxy_representation("asset.v3.mp4"),
+            ProxyRepresentation::RawV3
+        );
+        assert_eq!(
+            proxy_representation("asset.v2.mp4"),
+            ProxyRepresentation::MetadataTaggedRawV2
+        );
+        assert_eq!(
+            proxy_representation("asset.mp4"),
+            ProxyRepresentation::MetadataBakedV1
+        );
         assert!((parse_rate("60000/1001") - 59.94005994).abs() < 0.0001);
         assert_eq!(parse_rate("30/0"), 30.0);
         assert_eq!(parse_rate("invalid"), 30.0);
+    }
+
+    #[test]
+    fn proxy_v3_clears_the_source_display_rotation() {
+        if tool_command("ffmpeg").arg("-version").output().is_err()
+            || tool_command("ffprobe").arg("-version").output().is_err()
+        {
+            eprintln!("ffmpeg or ffprobe is unavailable; skipping media integration test");
+            return;
+        }
+        let directory = tempdir().unwrap();
+        let source_dir = directory.path().join("source");
+        fs::create_dir_all(&source_dir).unwrap();
+        let unrotated = directory.path().join("unrotated.mp4");
+        let source = source_dir.join("ROTATED.MP4");
+        let create_status = tool_command("ffmpeg")
+            .args([
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=navy:s=640x360:r=30:d=1",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+            ])
+            .arg(&unrotated)
+            .status()
+            .unwrap();
+        assert!(create_status.success());
+        let rotation_status = tool_command("ffmpeg")
+            .args([
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-display_rotation:v:0",
+                "90",
+                "-i",
+            ])
+            .arg(&unrotated)
+            .args(["-c", "copy"])
+            .arg(&source)
+            .status()
+            .unwrap();
+        assert!(rotation_status.success());
+        assert_eq!(
+            probe_media_stream(&source)
+                .unwrap()
+                .metadata_rotation_degrees,
+            90
+        );
+
+        let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).unwrap();
+        let project = catalog.create_project("Rotated source").unwrap();
+        catalog.ingest_folder(&project.id, &source_dir).unwrap();
+        let asset = catalog.list_assets(&project.id).unwrap().remove(0);
+        let proxied = catalog.generate_proxy(&asset.id).unwrap();
+        let proxy_path = PathBuf::from(proxied.proxy_path.as_deref().unwrap());
+
+        assert!(proxy_path.ends_with(format!("{}.v3.mp4", asset.id)));
+        assert_eq!(
+            proxied.proxy_representation,
+            Some(ProxyRepresentation::RawV3)
+        );
+        let proxy_probe = probe_media_stream(proxy_path).unwrap();
+        assert_eq!(proxy_probe.metadata_rotation_degrees, 0);
+        assert_eq!((proxy_probe.width, proxy_probe.height), (640, 360));
     }
 
     #[test]
@@ -2133,6 +2524,17 @@ mod tests {
         );
         let proxied = proxy_progress[1].asset.as_ref().unwrap();
         assert!(Path::new(proxied.proxy_path.as_deref().unwrap()).exists());
+        assert!(proxied.proxy_path.as_deref().unwrap().ends_with(".v3.mp4"));
+        assert_eq!(
+            proxied.proxy_representation,
+            Some(ProxyRepresentation::RawV3)
+        );
+        assert_eq!(
+            probe_media_stream(proxied.proxy_path.as_deref().unwrap())
+                .unwrap()
+                .metadata_rotation_degrees,
+            0
+        );
         let proxy_report = catalog.generate_missing_proxies(&project.id).unwrap();
         assert_eq!(proxy_report.generated, 0);
         assert_eq!(proxy_report.skipped, 1);

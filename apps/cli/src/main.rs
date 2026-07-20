@@ -3,8 +3,8 @@ use anyhow::{Context, Result, anyhow};
 use clap::CommandFactory;
 use clap::{Parser, Subcommand, error::ErrorKind};
 use rcdvlog_core::{
-    AssetPatch, Catalog, MediaStreamInfo, inspect_catalog, landscape_default_rotation,
-    probe_media_stream,
+    Asset, AssetPatch, Catalog, MediaStreamInfo, ProxyRepresentation, inspect_catalog,
+    landscape_default_rotation, probe_media_stream,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -446,11 +446,23 @@ fn execute(cli: &Cli) -> Result<Value> {
     }
 }
 
-fn representation_version(path: Option<&str>, current_suffix: &str) -> &'static str {
+fn proxy_version(asset: &Asset) -> &'static str {
+    if !asset.proxy_available {
+        return "missing";
+    }
+    match asset.proxy_representation {
+        Some(ProxyRepresentation::RawV3) => "current_raw_v3",
+        Some(ProxyRepresentation::MetadataTaggedRawV2) => "metadata_tagged_raw_v2",
+        Some(ProxyRepresentation::MetadataBakedV1) => "legacy_metadata_baked_v1",
+        None => "missing",
+    }
+}
+
+fn thumbnail_version(path: Option<&str>) -> &'static str {
     match path {
         None => "missing",
         Some(path) if !Path::new(path).is_file() => "missing",
-        Some(path) if path.ends_with(current_suffix) => "current_raw_v2",
+        Some(path) if path.ends_with(".v2.jpg") => "current_raw_v2",
         Some(_) => "legacy_metadata_baked_v1",
     }
 }
@@ -472,13 +484,13 @@ fn rotation_after(rotation: u16, addition: i32) -> u16 {
 fn clip_diagnosis(catalog: &Catalog, asset_id: &str) -> Result<Value> {
     let asset = catalog.get_asset(asset_id)?;
     let (original_probe, original) = probe_value(&asset.path);
-    let proxy_version = representation_version(asset.proxy_path.as_deref(), ".v2.mp4");
+    let proxy_version = proxy_version(&asset);
     let proxy_probe = asset
         .proxy_path
         .as_deref()
         .filter(|path| Path::new(path).is_file())
         .map(probe_value);
-    let thumbnail_version = representation_version(asset.thumbnail_path.as_deref(), ".v2.jpg");
+    let thumbnail_version = thumbnail_version(asset.thumbnail_path.as_deref());
 
     let live_metadata_rotation = original_probe
         .as_ref()
@@ -503,19 +515,34 @@ fn clip_diagnosis(catalog: &Catalog, asset_id: &str) -> Result<Value> {
     } else {
         ("original", "source_with_metadata", original_probe.as_ref())
     };
-    let representation_is_raw = selected_version == "current_raw_v2";
+    let proxy_live_rotation = proxy_probe
+        .as_ref()
+        .and_then(|(probe, _)| probe.as_ref())
+        .map(|probe| probe.metadata_rotation_degrees);
+    let current_proxy_contract_valid =
+        proxy_version == "current_raw_v3" && proxy_live_rotation == Some(0);
+    let representation_is_raw =
+        selected_version == "current_raw_v3" && current_proxy_contract_valid;
     let baked_rotation = if representation_is_raw {
         0
+    } else if selected_kind == "proxy"
+        && matches!(
+            selected_version,
+            "current_raw_v3" | "metadata_tagged_raw_v2"
+        )
+    {
+        proxy_live_rotation.unwrap_or(effective_metadata)
     } else {
         effective_metadata
     };
     let applied_rotation = rotation_after(effective_rotation, -(baked_rotation as i32));
     let (final_width, final_height) = selected_probe
         .map(|probe| {
+            let (width, height) = (probe.display_width, probe.display_height);
             if matches!(applied_rotation, 90 | 270) {
-                (probe.height, probe.width)
+                (height, width)
             } else {
-                (probe.width, probe.height)
+                (width, height)
             }
         })
         .unwrap_or((0, 0));
@@ -541,15 +568,45 @@ fn clip_diagnosis(catalog: &Catalog, asset_id: &str) -> Result<Value> {
             asset.metadata_rotation_degrees, rotation
         ));
     }
-    if proxy_version == "legacy_metadata_baked_v1" {
+    if proxy_version == "metadata_tagged_raw_v2" {
+        warnings.push(
+            "selected proxy is obsolete v2 media whose display rotation can be applied twice"
+                .to_string(),
+        );
+    } else if proxy_version == "legacy_metadata_baked_v1" {
         warnings.push(
             "selected proxy is legacy v1 media with camera rotation baked into its pixels"
+                .to_string(),
+        );
+    }
+    if proxy_version == "current_raw_v3" && !current_proxy_contract_valid {
+        warnings.push(
+            "current v3 proxy failed its raw-orientation contract; regenerate it from the original"
                 .to_string(),
         );
     }
     if final_orientation != "landscape" {
         warnings.push(format!(
             "computed rendered result is {final_orientation}, not landscape"
+        ));
+    }
+
+    let mut recommended_actions = Vec::new();
+    if !asset.orientation_probed {
+        recommended_actions.push(format!(
+            "rcdvlog --catalog {} clips refresh-orientation --asset {}",
+            catalog.database_path().display(),
+            asset.id
+        ));
+    }
+    if proxy_version != "missing"
+        && (proxy_version != "current_raw_v3" || !current_proxy_contract_valid)
+        && asset.original_available
+    {
+        recommended_actions.push(format!(
+            "rcdvlog --catalog {} proxy generate --asset {}",
+            catalog.database_path().display(),
+            asset.id
         ));
     }
 
@@ -573,6 +630,7 @@ fn clip_diagnosis(catalog: &Catalog, asset_id: &str) -> Result<Value> {
             "proxy": {
                 "path": asset.proxy_path,
                 "version": proxy_version,
+                "rawOrientationContractValid": current_proxy_contract_valid,
                 "probe": proxy_probe.as_ref().map(|(_, value)| value),
             },
             "thumbnail": {
@@ -590,11 +648,7 @@ fn clip_diagnosis(catalog: &Catalog, asset_id: &str) -> Result<Value> {
             "finalOrientation": final_orientation,
         },
         "warnings": warnings,
-        "recommendedActions": if asset.orientation_probed {
-            Vec::<String>::new()
-        } else {
-            vec![format!("rcdvlog --catalog {} clips refresh-orientation --asset {}", catalog.database_path().display(), asset.id)]
-        },
+        "recommendedActions": recommended_actions,
     }))
 }
 
@@ -614,14 +668,34 @@ fn proxy_status(
         .iter()
         .take(limit)
         .map(|asset| {
-            let version = representation_version(asset.proxy_path.as_deref(), ".v2.mp4");
+            let version = proxy_version(asset);
+            let validation = if version == "current_raw_v3" {
+                asset
+                    .proxy_path
+                    .as_deref()
+                    .map(|path| match probe_media_stream(path) {
+                        Ok(probe) => json!({
+                            "valid": probe.metadata_rotation_degrees == 0,
+                            "metadataRotationDegrees": probe.metadata_rotation_degrees,
+                        }),
+                        Err(error) => json!({ "valid": false, "error": format!("{error:#}") }),
+                    })
+            } else {
+                None
+            };
+            let ready = version == "current_raw_v3"
+                && validation
+                    .as_ref()
+                    .and_then(|value| value["valid"].as_bool())
+                    == Some(true);
             json!({
                 "assetId": asset.id,
                 "filename": asset.filename,
                 "path": asset.proxy_path,
                 "version": version,
-                "ready": version == "current_raw_v2",
-                "regenerationRequired": version != "current_raw_v2",
+                "validation": validation,
+                "ready": ready,
+                "regenerationRequired": !ready,
                 "originalAvailable": asset.original_available,
             })
         })
@@ -630,9 +704,10 @@ fn proxy_status(
         "total": total,
         "limit": limit,
         "summary": {
-            "current": assets.iter().filter(|asset| representation_version(asset.proxy_path.as_deref(), ".v2.mp4") == "current_raw_v2").count(),
-            "legacy": assets.iter().filter(|asset| representation_version(asset.proxy_path.as_deref(), ".v2.mp4") == "legacy_metadata_baked_v1").count(),
-            "missing": assets.iter().filter(|asset| representation_version(asset.proxy_path.as_deref(), ".v2.mp4") == "missing").count(),
+            "current": assets.iter().filter(|asset| proxy_version(asset) == "current_raw_v3").count(),
+            "obsoleteV2": assets.iter().filter(|asset| proxy_version(asset) == "metadata_tagged_raw_v2").count(),
+            "legacy": assets.iter().filter(|asset| proxy_version(asset) == "legacy_metadata_baked_v1").count(),
+            "missing": assets.iter().filter(|asset| proxy_version(asset) == "missing").count(),
         },
         "items": items,
     }))
@@ -650,9 +725,10 @@ fn project_diagnosis(catalog: &Catalog, project_id: &str) -> Result<Value> {
             "overridden": assets.iter().filter(|asset| asset.rotation_degrees != asset.default_rotation_degrees).count(),
         },
         "proxies": {
-            "current": assets.iter().filter(|asset| representation_version(asset.proxy_path.as_deref(), ".v2.mp4") == "current_raw_v2").count(),
-            "legacy": assets.iter().filter(|asset| representation_version(asset.proxy_path.as_deref(), ".v2.mp4") == "legacy_metadata_baked_v1").count(),
-            "missing": assets.iter().filter(|asset| representation_version(asset.proxy_path.as_deref(), ".v2.mp4") == "missing").count(),
+            "current": assets.iter().filter(|asset| proxy_version(asset) == "current_raw_v3").count(),
+            "obsoleteV2": assets.iter().filter(|asset| proxy_version(asset) == "metadata_tagged_raw_v2").count(),
+            "legacy": assets.iter().filter(|asset| proxy_version(asset) == "legacy_metadata_baked_v1").count(),
+            "missing": assets.iter().filter(|asset| proxy_version(asset) == "missing").count(),
         },
         "desktopContext": {
             "matchesProject": context.last_project_id.as_deref() == Some(project_id),
@@ -677,8 +753,9 @@ fn project_status(catalog: &Catalog, project_id: &str) -> Result<Value> {
             "assets": assets.len(),
             "durationSeconds": duration_seconds,
             "originalsOffline": assets.iter().filter(|asset| !Path::new(&asset.path).exists()).count(),
-            "proxiesReady": assets.iter().filter(|asset| representation_version(asset.proxy_path.as_deref(), ".v2.mp4") == "current_raw_v2").count(),
-            "proxiesLegacy": assets.iter().filter(|asset| representation_version(asset.proxy_path.as_deref(), ".v2.mp4") == "legacy_metadata_baked_v1").count(),
+            "proxiesReady": assets.iter().filter(|asset| proxy_version(asset) == "current_raw_v3").count(),
+            "proxiesObsoleteV2": assets.iter().filter(|asset| proxy_version(asset) == "metadata_tagged_raw_v2").count(),
+            "proxiesLegacy": assets.iter().filter(|asset| proxy_version(asset) == "legacy_metadata_baked_v1").count(),
             "labeled": assets.iter().filter(|asset| !asset.labels.is_empty()).count(),
             "removed": assets.iter().filter(|asset| asset.removed).count(),
             "thumbnailsReady": assets.iter().filter(|asset| asset.thumbnail_quality > 0 && asset.thumbnail_path.as_deref().is_some_and(|path| Path::new(path).exists())).count(),
@@ -688,7 +765,9 @@ fn project_status(catalog: &Catalog, project_id: &str) -> Result<Value> {
 
 fn error_code(message: &str) -> &'static str {
     let message = message.to_lowercase();
-    if message.contains("not found") {
+    if message.contains("catalog schema") || message.contains("migration history") {
+        "schema_incompatible"
+    } else if message.contains("not found") {
         "not_found"
     } else if message.contains("offline") {
         "media_offline"
@@ -979,6 +1058,14 @@ mod tests {
         let inspect = parse(&["rcdvlog", "--catalog", &catalog_arg, "catalog", "inspect"]);
         let result = execute(&inspect).unwrap();
         assert_eq!(result["readOnly"], true);
+        assert_eq!(result["schemaHistoryPresent"], false);
+        assert_eq!(result["currentSchemaVersion"], 0);
+        assert_eq!(
+            result["latestSupportedSchemaVersion"],
+            rcdvlog_core::PROJECT_CATALOG_SCHEMA_VERSION
+        );
+        assert_eq!(result["schemaStatus"], "legacy_unversioned");
+        assert_eq!(result["pendingMigrations"].as_array().unwrap().len(), 4);
         assert!(
             result["pendingAssetColumns"]
                 .as_array()
@@ -995,6 +1082,17 @@ mod tests {
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap();
         assert!(!columns.iter().any(|column| column == "orientation_probed"));
+        assert_eq!(
+            Connection::open(&catalog_path)
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
     }
 
     #[test]
@@ -1003,6 +1101,10 @@ mod tests {
         assert_eq!(error_code("original is offline"), "media_offline");
         assert_eq!(error_code("invalid source range"), "invalid_input");
         assert_eq!(error_code("ffmpeg failed"), "media_tool_failed");
+        assert_eq!(
+            error_code("catalog schema version 5 is newer than supported version 4"),
+            "schema_incompatible"
+        );
         assert_eq!(error_code("database locked"), "internal_error");
         assert!(Cli::try_parse_from(["rcdvlog", "clips", "list"]).is_err());
         assert!(Cli::try_parse_from(["rcdvlog", "project", "status"]).is_err());

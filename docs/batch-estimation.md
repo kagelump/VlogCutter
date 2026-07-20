@@ -21,4 +21,12 @@ batch.record_completion(900, Duration::from_secs(9));
 let estimate = batch.estimate(&weights[1..]);
 ```
 
-VlogCutter persists separate histories in each project catalog using versioned task keys such as `proxy.h264-720p.orientation-v2` and `thumbnail.q1.orientation-v2`. History uses a bounded eight-sample exponential window so recent hardware, codec, storage, or service behavior gradually replaces older measurements. Successful observations update speed; failures advance completion without poisoning throughput.
+When a caller restores a durable aggregate job rather than a complete original
+task list, `BatchEstimator::with_explicit_progress` accepts its persisted total
+item/work counters plus current completed counters. The caller must still pass
+the exact individual weights of every remaining task to `estimate`; this keeps
+parallel ETA based on the slowest shard. The server job engine validates that
+those weights exactly match durable remaining item and work totals before using
+the constructor.
+
+VlogCutter persists separate histories in each project catalog using versioned task keys such as `proxy.h264-720p.orientation-v3` and `thumbnail.q1.orientation-v2`. History uses a bounded eight-sample exponential window so recent hardware, codec, storage, or service behavior gradually replaces older measurements. Successful observations update speed; failures advance completion without poisoning throughput.

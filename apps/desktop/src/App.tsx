@@ -90,7 +90,7 @@ function portraitRotation(asset: Asset) {
 }
 
 function isRawOrientationProxy(asset: Asset) {
-  return Boolean(asset.proxyPath?.endsWith(".v2.mp4"));
+  return asset.proxyRepresentation === "raw_v3";
 }
 
 function isRawOrientationThumbnail(asset: Asset) {
@@ -791,7 +791,9 @@ function App() {
   );
   const labeledCount = activeAssets.filter((asset) => asset.labels.length > 0).length;
   const removedCount = assets.length - activeAssets.length;
-  const missingProxyCount = assets.filter((asset) => !asset.proxyAvailable).length;
+  const missingProxyCount = assets.filter(
+    (asset) => !asset.proxyAvailable || asset.proxyRepresentation !== "raw_v3",
+  ).length;
   const missingThumbnailCount = assets.filter((asset) => asset.thumbnailQuality < 1 || !asset.thumbnailPath).length;
 
   useEffect(() => {

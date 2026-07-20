@@ -8,10 +8,10 @@ A local-first macOS labeling bench for trip footage. The current phase reference
 * Xcode command-line tools
 * Rust 1.85 or later and Cargo
 * Node.js 22 or later and pnpm 10
-* FFmpeg and ffprobe on `PATH`
+* FFmpeg 7 or later and ffprobe on `PATH`
 * ExifTool on `PATH`
 
-The current development machine uses Rust 1.97, Node 24, pnpm 10, FFmpeg 7, and ExifTool 13.
+The current development machine uses Rust 1.97, Node 24, pnpm 10, FFmpeg 7, and ExifTool 13. Proxy generation requires FFmpeg's `-display_rotation` input override so raw-orientation proxies cannot retain a camera display matrix.
 
 ## Run in development
 

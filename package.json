@@ -6,8 +6,10 @@
     "dev": "pnpm --dir apps/desktop tauri dev",
     "build": "pnpm --dir apps/desktop tauri build",
     "build:cli": "cargo build -p rcdvlog-cli",
+    "build:server": "cargo build -p rcdvlog-server",
     "check": "pnpm --dir apps/desktop check && cargo test --workspace",
     "test:core": "cargo test -p rcdvlog-core",
-    "test:integration": "cargo test -p rcdvlog-cli --test cli_workflow"
+    "test:integration": "cargo test -p rcdvlog-cli --test cli_workflow",
+    "test:server": "cargo test -p rcdvlog-server-core && cargo test -p rcdvlog-server"
   }
 }

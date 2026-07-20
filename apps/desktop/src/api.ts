@@ -12,6 +12,9 @@ const mockProject: Project = {
   assetCount: 7,
   labeledCount: 4,
   removedCount: 1,
+  originNodeId: null,
+  pairedServerNodeId: null,
+  pairedAt: null,
 };
 
 let mockAssets: Asset[] = [
@@ -39,6 +42,7 @@ let mockAssets: Asset[] = [
   bestTime: String(bestTime),
   offsetSeconds: index === 4 ? -3600 : 0,
   proxyPath: index < 5 ? `/tmp/rcdvlog-demo/${index}.mp4` : null,
+  proxyRepresentation: index < 5 ? "metadata_baked_v1" : null,
   metadataRotationDegrees: 0,
   defaultRotationDegrees: 0,
   rotationDegrees: 0,
@@ -50,6 +54,8 @@ let mockAssets: Asset[] = [
   notes: index === 0 ? "First clean view of the station clock." : index === 3 ? "Good transition into the market." : "",
   labels: index === 0 ? ["arrival", "establishing"] : index === 1 ? ["train"] : index === 3 ? ["market", "transition"] : [],
   removed: index === 6,
+  mediaObjectId: null,
+  mediaVerificationState: "unlinked",
   available: index < 5,
   phase: index < 3 ? "Arrival" : "Market morning",
   location: index < 3 ? "Otaru" : "Sapporo",

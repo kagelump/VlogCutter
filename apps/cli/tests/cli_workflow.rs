@@ -108,6 +108,15 @@ fn process_contract_persists_across_invocations_and_routes_errors() {
     assert!(!catalog.exists(), "doctor must not mutate the catalog");
 
     let project_id = create_project(&catalog, "Process contract");
+    let inspection = success(&catalog, ["catalog", "inspect"]);
+    assert_eq!(inspection.json["data"]["currentSchemaVersion"], 4);
+    assert_eq!(inspection.json["data"]["schemaStatus"], "current");
+    assert!(
+        inspection.json["data"]["pendingMigrations"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
     let list = success(&catalog, ["project", "list"]);
     assert_eq!(list.json["data"].as_array().unwrap().len(), 1);
     assert_eq!(list.json["data"][0]["id"], project_id);
@@ -118,6 +127,32 @@ fn process_contract_persists_across_invocations_and_routes_errors() {
     let missing = failure(&catalog, ["clips", "get", "--asset", "asset_missing"]);
     assert_eq!(missing["command"], "clips.get");
     assert_eq!(missing["error"]["code"], "not_found");
+}
+
+#[test]
+fn newer_catalog_schema_is_reported_without_attempting_a_downgrade() {
+    let directory = tempdir().unwrap();
+    let catalog = directory.path().join("catalog.sqlite3");
+    create_project(&catalog, "Future schema");
+    Connection::open(&catalog)
+        .unwrap()
+        .execute(
+            "INSERT INTO schema_migrations (migration_id, name, source_identity, applied_at) VALUES (5, 'future', 'future/5', '2026-07-20T00:00:00.000Z')",
+            [],
+        )
+        .unwrap();
+
+    let inspection = success(&catalog, ["catalog", "inspect"]);
+    assert_eq!(inspection.json["data"]["currentSchemaVersion"], 5);
+    assert_eq!(inspection.json["data"]["schemaStatus"], "newer_unsupported");
+    let rejected = failure(&catalog, ["project", "list"]);
+    assert_eq!(rejected["error"]["code"], "schema_incompatible");
+    assert!(
+        rejected["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("upgrade RCD VlogCutter")
+    );
 }
 
 #[test]
@@ -293,6 +328,8 @@ fn media_workflow_runs_end_to_end_through_the_agent_cli() {
     let proxied = success(&catalog, ["proxy", "generate", "--asset", &asset_id]);
     let proxy_path = PathBuf::from(proxied.json["data"]["proxyPath"].as_str().unwrap());
     assert!(proxy_path.is_file());
+    assert!(proxy_path.to_string_lossy().ends_with(".v3.mp4"));
+    assert_eq!(proxied.json["data"]["proxyRepresentation"], "raw_v3");
     let diagnosed = success(&catalog, ["clips", "diagnose", "--asset", &asset_id]);
     assert_eq!(
         diagnosed.json["data"]["renderPlan"]["selectedRepresentation"],
@@ -304,6 +341,10 @@ fn media_workflow_runs_end_to_end_through_the_agent_cli() {
     );
     let proxy_status = success(&catalog, ["proxy", "status", "--asset", &asset_id]);
     assert_eq!(proxy_status.json["data"]["summary"]["current"], 1);
+    assert_eq!(
+        proxy_status.json["data"]["items"][0]["validation"]["metadataRotationDegrees"],
+        0
+    );
     assert_eq!(
         proxy_status.json["data"]["items"][0]["regenerationRequired"],
         false

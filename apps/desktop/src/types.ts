@@ -5,6 +5,9 @@ export interface Project {
   assetCount: number;
   labeledCount: number;
   removedCount: number;
+  originNodeId: string | null;
+  pairedServerNodeId: string | null;
+  pairedAt: string | null;
 }
 
 export interface LoadedCatalog {
@@ -51,6 +54,7 @@ export interface Asset {
   bestTime: string | null;
   offsetSeconds: number;
   proxyPath: string | null;
+  proxyRepresentation: "raw_v3" | "metadata_tagged_raw_v2" | "metadata_baked_v1" | null;
   metadataRotationDegrees: number;
   defaultRotationDegrees: number;
   rotationDegrees: number;
@@ -62,6 +66,8 @@ export interface Asset {
   notes: string;
   labels: string[];
   removed: boolean;
+  mediaObjectId: string | null;
+  mediaVerificationState: "unlinked" | "provisional" | "verified" | "mismatch";
   available: boolean;
   phase?: string | null;
   location?: string | null;

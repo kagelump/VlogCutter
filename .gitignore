@@ -7,3 +7,4 @@ dist/
 *.sqlite3-wal
 *.tsbuildinfo
 apps/desktop/src-tauri/gen/
+deploy/server/.env

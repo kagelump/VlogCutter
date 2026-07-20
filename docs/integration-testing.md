@@ -8,7 +8,7 @@ The automated integration suite exercises the MVP through the same compiled CLI 
 | --- | --- |
 | CLI process contract | Independent invocations, persistent catalog selection, JSON stdout/stderr envelopes, exit status, and stable error codes |
 | Catalog concurrency | A read-only CLI process remains responsive while another SQLite connection holds an uncommitted write transaction in WAL mode |
-| Media workflow | Real FFmpeg fixture creation, ffprobe ingest, non-media filtering, progress events, idempotent re-ingest, metadata persistence, labels/notes/removal edits, clock correction, proxy generation, and offline-original review |
+| Media workflow | Real FFmpeg fixture creation, ffprobe ingest, non-media filtering, progress events, idempotent re-ingest, metadata persistence, labels/notes/removal edits, clock correction, proxy generation, rotated-source display-matrix removal, and offline-original review |
 
 Run the integration suite with:
 

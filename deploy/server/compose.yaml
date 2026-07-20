@@ -1,0 +1,56 @@
+services:
+  rcdvlog-server:
+    platform: linux/amd64
+    build:
+      context: ../..
+      dockerfile: deploy/server/Dockerfile
+    image: rcdvlog-server:local
+    restart: unless-stopped
+    network_mode: host
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 65s
+    environment:
+      RCDVLOG_DATA_DIR: /var/lib/rcdvlog
+      RCDVLOG_TEMP_DIR: /var/lib/rcdvlog/tmp
+      RCDVLOG_DERIVED_DIR: /srv/rcdvlog/derived
+      RCDVLOG_BACKUP_DIR: /srv/rcdvlog/backups
+      RCDVLOG_ALLOWED_ORIGINAL_MOUNTS: /media/originals
+      RCDVLOG_LISTEN_ADDR: 127.0.0.1:8090
+      RCDVLOG_SHUTDOWN_TIMEOUT_SECONDS: ${RCDVLOG_SHUTDOWN_TIMEOUT_SECONDS:-10}
+      RUST_LOG: ${RUST_LOG:-info}
+    volumes:
+      - type: volume
+        source: rcdvlog-state
+        target: /var/lib/rcdvlog
+      - type: bind
+        source: ${RCDVLOG_DERIVED_HOST_PATH:-/srv/rcdvlog/derived}
+        target: /srv/rcdvlog/derived
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${RCDVLOG_BACKUP_HOST_PATH:-/srv/rcdvlog/backups}
+        target: /srv/rcdvlog/backups
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${RCDVLOG_ORIGINALS_HOST_PATH:-/mnt/rcdvlog/originals}
+        target: /media/originals
+        read_only: true
+        bind:
+          create_host_path: false
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8090/api/v1/health"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  rcdvlog-state:
+    driver: local

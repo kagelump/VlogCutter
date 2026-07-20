@@ -1,0 +1,7 @@
+.git
+.DS_Store
+node_modules
+target
+apps/desktop/dist
+apps/desktop/node_modules
+deploy/server/.env
