@@ -1,6 +1,6 @@
 # Task 8: Sync Protocol and Server Project Replicas
 
-**Status:** Planned
+**Status:** Implemented 2026-07-23
 **Depends on:** Tasks 2, 3, and 7
 **Unblocks:** Tasks 10, 11, 14, 17, and 18
 
@@ -75,21 +75,21 @@ The desktop produces a digest over canonical baseline bytes. The server imports 
 
 ## Acceptance criteria
 
-- [ ] A selected project from a multi-project legacy catalog exports only that project.
-- [ ] Baseline preview reports stable counts, proposed library matches, root mappings, and conflicts without mutating server state.
-- [ ] Confirmed baseline import produces an equivalent server materialized project.
-- [ ] Interrupted baseline import leaves no registered partial replica and is safe to retry.
-- [ ] A different baseline cannot overwrite an existing project replica.
-- [ ] Offline Mac and server operation sets converge after bounded reconciliation.
-- [ ] Delivery order, duplicate requests, response loss, and reconnect do not duplicate or lose operations.
-- [ ] Sequence gaps prevent cursor advancement and return an actionable protocol error.
-- [ ] Node observations supersede only their own origin/scope.
-- [ ] Representation manifests merge without treating job progress as project state.
-- [ ] A server-library asset added to a project materializes on both replicas with one stable `projectAssetId`.
-- [ ] A desktop-ingested asset synchronizes before global verification, then receives the same server-assigned media link on both replicas without changing `projectAssetId`.
-- [ ] A crash between project commit and control-catalog projection is repaired from the source operation without duplicating membership.
-- [ ] Protocol/schema incompatibility is explicit and leaves both replicas readable.
-- [ ] No live SQLite or WAL file is transferred or opened across nodes.
+- [x] A selected project from a multi-project legacy catalog exports only that project.
+- [x] Baseline preview reports stable counts, proposed library matches, root mappings, and conflicts without mutating server state.
+- [x] Confirmed baseline import produces an equivalent server materialized project.
+- [x] Interrupted baseline import leaves no registered partial replica and is safe to retry.
+- [x] A different baseline cannot overwrite an existing project replica.
+- [x] Offline Mac and server operation sets converge after bounded reconciliation.
+- [x] Delivery order, duplicate requests, response loss, and reconnect do not duplicate or lose operations.
+- [x] Sequence gaps prevent cursor advancement and return an actionable protocol error.
+- [x] Node observations supersede only their own origin/scope.
+- [x] Representation manifests merge without treating job progress as project state.
+- [x] A server-library asset added to a project materializes on both replicas with one stable `projectAssetId`.
+- [x] A desktop-ingested asset synchronizes before global verification, then receives the same server-assigned media link on both replicas without changing `projectAssetId`.
+- [x] A crash between project commit and control-catalog projection is repaired from the source operation without duplicating membership.
+- [x] Protocol/schema incompatibility is explicit and leaves both replicas readable.
+- [x] No live SQLite or WAL file is transferred or opened across nodes.
 
 ## Verification
 

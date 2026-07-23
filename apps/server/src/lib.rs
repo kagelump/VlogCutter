@@ -1,15 +1,16 @@
 use anyhow::{Context, Result, anyhow};
 use axum::body::Body;
-use axum::extract::{Extension, Path as AxumPath, State};
+use axum::extract::{DefaultBodyLimit, Extension, Path as AxumPath, State};
 use axum::http::{HeaderMap, HeaderValue, Method, Request, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use rcdvlog_server_core::{
-    APPLICATION_VERSION, CONTROL_CATALOG_SCHEMA_VERSION, PROTOCOL_MAJOR_VERSION,
-    PROTOCOL_MINOR_VERSION, ReadinessReport, Representation, RepresentationError, RepresentationId,
-    RepresentationRequest, RuntimeFoundation,
+    APPLICATION_VERSION, BaselineEnvelope, BaselinePreview, CONTROL_CATALOG_SCHEMA_VERSION,
+    PROTOCOL_MAJOR_VERSION, PROTOCOL_MINOR_VERSION, ProjectReplica, ProjectReplicaError,
+    ReadinessReport, ReconcileRequest, ReconcileResponse, Representation, RepresentationError,
+    RepresentationId, RepresentationRequest, RuntimeFoundation,
 };
 use serde::Serialize;
 use std::future::IntoFuture;
@@ -28,6 +29,7 @@ use uuid::Uuid;
 pub const REQUEST_ID_HEADER: &str = "x-request-id";
 const MAX_REQUEST_ID_BYTES: usize = 64;
 const DEFAULT_READINESS_TIMEOUT: Duration = Duration::from_secs(2);
+const MAX_HTTP_BODY_BYTES: usize = 64 * 1024 * 1024;
 
 type ReadinessEvaluator = dyn Fn() -> ReadinessReport + Send + Sync + 'static;
 
@@ -177,6 +179,18 @@ pub fn router(state: HttpState) -> Router {
         .route("/api/v1/health", get(health))
         .route("/api/v1/ready", get(ready))
         .route("/api/v1/version", get(version))
+        .route(
+            "/api/v1/internal/projects/baseline/preview",
+            post(preview_project_baseline),
+        )
+        .route(
+            "/api/v1/internal/projects/baseline/import",
+            post(import_project_baseline),
+        )
+        .route(
+            "/api/v1/internal/projects/{project_id}/reconcile",
+            post(reconcile_project),
+        )
         .route("/api/v1/representations", post(request_representation))
         .route(
             "/api/v1/representations/{representation_id}",
@@ -188,6 +202,7 @@ pub fn router(state: HttpState) -> Router {
         )
         .fallback(not_found)
         .with_state(state)
+        .layer(DefaultBodyLimit::max(MAX_HTTP_BODY_BYTES))
         .layer(middleware::from_fn(request_context))
 }
 
@@ -200,6 +215,123 @@ struct RepresentationResponse {
     job_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reused: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BaselinePreviewResponse {
+    request_id: String,
+    preview: BaselinePreview,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BaselineImportResponse {
+    request_id: String,
+    replica: ProjectReplica,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ReconcileHttpResponse {
+    request_id: String,
+    #[serde(flatten)]
+    reconciliation: ReconcileResponse,
+}
+
+async fn preview_project_baseline(
+    State(state): State<HttpState>,
+    Extension(request_id): Extension<RequestId>,
+    Json(envelope): Json<BaselineEnvelope>,
+) -> Response {
+    let manager = state.foundation.catalog().project_replicas();
+    match tokio::task::spawn_blocking(move || manager.preview(&envelope)).await {
+        Ok(Ok(preview)) => Json(BaselinePreviewResponse {
+            request_id: request_id.0,
+            preview,
+        })
+        .into_response(),
+        Ok(Err(error)) => project_replica_error(request_id.0, error),
+        Err(_) => internal_project_replica_error(request_id.0),
+    }
+}
+
+async fn import_project_baseline(
+    State(state): State<HttpState>,
+    Extension(request_id): Extension<RequestId>,
+    Json(envelope): Json<BaselineEnvelope>,
+) -> Response {
+    let manager = state.foundation.catalog().project_replicas();
+    match tokio::task::spawn_blocking(move || manager.import_baseline(&envelope)).await {
+        Ok(Ok(replica)) => {
+            let status = if replica.reused_existing {
+                StatusCode::OK
+            } else {
+                StatusCode::CREATED
+            };
+            (
+                status,
+                Json(BaselineImportResponse {
+                    request_id: request_id.0,
+                    replica,
+                }),
+            )
+                .into_response()
+        }
+        Ok(Err(error)) => project_replica_error(request_id.0, error),
+        Err(_) => internal_project_replica_error(request_id.0),
+    }
+}
+
+async fn reconcile_project(
+    State(state): State<HttpState>,
+    Extension(request_id): Extension<RequestId>,
+    AxumPath(project_id): AxumPath<String>,
+    Json(request): Json<ReconcileRequest>,
+) -> Response {
+    let manager = state.foundation.catalog().project_replicas();
+    match tokio::task::spawn_blocking(move || manager.reconcile(&project_id, &request)).await {
+        Ok(Ok(reconciliation)) => Json(ReconcileHttpResponse {
+            request_id: request_id.0,
+            reconciliation,
+        })
+        .into_response(),
+        Ok(Err(error)) => project_replica_error(request_id.0, error),
+        Err(_) => internal_project_replica_error(request_id.0),
+    }
+}
+
+fn internal_project_replica_error(request_id: String) -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(ErrorResponse {
+            request_id,
+            code: "internal_error",
+        }),
+    )
+        .into_response()
+}
+
+fn project_replica_error(request_id: String, error: ProjectReplicaError) -> Response {
+    let status = match &error {
+        ProjectReplicaError::InvalidBaseline(_)
+        | ProjectReplicaError::UnsafeReplicaPath
+        | ProjectReplicaError::Sync(_) => StatusCode::BAD_REQUEST,
+        ProjectReplicaError::DifferentBaseline { .. } => StatusCode::CONFLICT,
+        ProjectReplicaError::NotFound { .. } => StatusCode::NOT_FOUND,
+        ProjectReplicaError::Storage(_)
+        | ProjectReplicaError::Infrastructure(_)
+        | ProjectReplicaError::Database(_)
+        | ProjectReplicaError::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    (
+        status,
+        Json(ErrorResponse {
+            request_id,
+            code: error.code(),
+        }),
+    )
+        .into_response()
 }
 
 async fn request_representation(
@@ -550,7 +682,7 @@ fn valid_request_id(value: &str) -> bool {
 mod tests {
     use super::*;
     use axum::body::to_bytes;
-    use rcdvlog_server_core::ServerConfig;
+    use rcdvlog_server_core::{BaselineEnvelope, Catalog, ProjectAssetAddedPayload, ServerConfig};
     use serde_json::Value;
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -632,6 +764,116 @@ mod tests {
     async fn json(response: Response) -> Value {
         let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    fn baseline_envelope(root: &TempDir) -> BaselineEnvelope {
+        let catalog = Catalog::open(root.path().join("desktop.sqlite3")).unwrap();
+        catalog.set_local_node_id("node_mac").unwrap();
+        let project = catalog.create_project("HTTP Trip").unwrap();
+        catalog
+            .add_portable_project_asset(
+                &project.id,
+                ProjectAssetAddedPayload {
+                    id: "asset_http".to_string(),
+                    fingerprint: "fingerprint-http".to_string(),
+                    filename: "http.mov".to_string(),
+                    size_bytes: 10,
+                    duration_seconds: 1.0,
+                    frame_rate: 30.0,
+                    width: 1920,
+                    height: 1080,
+                    codec: "h264".to_string(),
+                    camera: "camera".to_string(),
+                    captured_at_raw: None,
+                    best_time: None,
+                    metadata_rotation_degrees: 0,
+                    default_rotation_degrees: 0,
+                    created_at: "2026-07-23T00:00:00Z".to_string(),
+                },
+            )
+            .unwrap();
+        BaselineEnvelope::export(&catalog, &project.id, vec![], vec![]).unwrap()
+    }
+
+    #[tokio::test]
+    async fn baseline_preview_import_and_reconcile_routes_preserve_protocol_errors() {
+        let fixture = Fixture::new(false);
+        let source = TempDir::new().unwrap();
+        let envelope = baseline_envelope(&source);
+        let body = serde_json::to_vec(&envelope).unwrap();
+
+        let preview = fixture
+            .app()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/internal/projects/baseline/preview")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(preview.status(), StatusCode::OK);
+        let preview = json(preview).await;
+        assert_eq!(preview["preview"]["assetCount"], 1);
+        assert_eq!(
+            preview["preview"]["projectId"],
+            envelope.payload.project.project_id
+        );
+
+        let imported = fixture
+            .app()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/internal/projects/baseline/import")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(imported.status(), StatusCode::CREATED);
+        let imported = json(imported).await;
+        assert_eq!(
+            imported["replica"]["baselineDigest"],
+            envelope.digest.as_str()
+        );
+
+        let bad_reconcile = serde_json::json!({
+            "protocolVersion": {
+                "minimumMajor": 99,
+                "minimumMinor": 0,
+                "maximumMajor": 99,
+                "maximumMinor": 0
+            },
+            "projectSchemaVersion": rcdvlog_server_core::PROJECT_CATALOG_SCHEMA_VERSION,
+            "projectId": envelope.payload.project.project_id,
+            "serverNodeId": fixture.foundation.catalog().node_id().as_str(),
+            "operationCursors": {},
+            "operations": [],
+            "observations": [],
+            "representationManifests": [],
+            "maximumResponseOperations": 10
+        });
+        let response = fixture
+            .app()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/api/v1/internal/projects/{}/reconcile",
+                        envelope.payload.project.project_id
+                    ))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&bad_reconcile).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(json(response).await["code"], "sync_protocol_incompatible");
     }
 
     #[tokio::test]

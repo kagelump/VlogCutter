@@ -6,6 +6,7 @@ members = [
   "core/batch-estimator",
   "core/rcdvlog-core",
   "core/rcdvlog-server",
+  "core/rcdvlog-sync",
 ]
 resolver = "2"
 

@@ -70,7 +70,7 @@ rcdvlog project diagnose --project <project-id>
 rcdvlog clips diagnose --asset <asset-id>
 ```
 
-`catalog inspect`, `project diagnose`, `clips diagnose`, and `proxy status` open SQLite strictly read-only and never run migrations. `clips diagnose` combines the stored asset row, live ffprobe data for the original and selected proxy, cache-version classification, the computed render transform/final dimensions, warnings, and recommended explicit actions. It is the preferred evidence bundle when a screenshot disagrees with catalog labels.
+`catalog inspect`, `project diagnose`, `clips diagnose`, and `proxy status` open SQLite strictly read-only and never run migrations. Catalog inspection includes unresolved operation-conflict count when schema version 5 is present. Project diagnosis includes operation/conflict state, and clip diagnosis includes materialized revision plus immutable note history alongside the stored asset row, live ffprobe evidence, cache-version classification, computed render transform/final dimensions, warnings, and recommended explicit actions. It is the preferred evidence bundle when a screenshot disagrees with catalog labels.
 
 The pattern is intentionally extensible: persist a stable ID for newly selectable UI entities, add a focused read-only `diagnose` projection in the Rust core/CLI, report stored state separately from observed external state, explain the derived behavior, and expose mutations as separate commands.
 
@@ -80,7 +80,7 @@ The pattern is intentionally extensible: persist a stable ID for newly selectabl
 rcdvlog catalog inspect
 ```
 
-Reports required tables, pending diagnostic/schema columns, journal mode, and project/asset counts without changing the file.
+Reports required tables, pending diagnostic/schema columns, journal mode, project/asset counts, and unresolved operation conflicts without changing the file.
 
 ### Projects
 
@@ -118,7 +118,7 @@ rcdvlog clips update \
   --rotation-degrees 180
 ```
 
-`clips update` is a patch operation: omitted fields retain their current values. Repeat `--add-label` or `--remove-label` to change multiple free-form labels. Label matching for removal is case-insensitive; the core trims, deduplicates, and validates labels. `--removed true` hides a clip from the default labeling queue without deleting its catalog row or source media. `clips list` excludes removed clips unless `--include-removed` is passed. `--rotation-degrees` controls the review-only orientation and accepts `0`, `90`, `180`, or `270`; it never changes the source file.
+`clips update` is a patch operation: omitted fields retain their current values. The merged patch is converted to typed note/label/removal/rotation operations and committed atomically; unchanged fields emit nothing. Repeat `--add-label` or `--remove-label` to change multiple free-form labels. Label matching for removal is case-insensitive; the core trims, deduplicates, and validates labels. `--removed true` hides a clip from the default labeling queue without deleting its catalog row or source media. `clips list` excludes removed clips unless `--include-removed` is passed. `--rotation-degrees` controls the review-only orientation and accepts `0`, `90`, `180`, or `270`; it never changes the source file.
 
 `clips refresh-orientation` is the explicit mutating counterpart to diagnosis. It probes the immutable original, marks orientation as known even when the answer is 0°, preserves a user override, and updates only catalog metadata.
 

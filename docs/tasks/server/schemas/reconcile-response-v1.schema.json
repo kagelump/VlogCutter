@@ -1,0 +1,73 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://rcdvlog.local/schemas/reconcile-response-v1.schema.json",
+  "title": "RCD VlogCutter reconcile response v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "protocolMajor",
+    "protocolMinor",
+    "projectId",
+    "committedCursors",
+    "operations",
+    "observationCursors",
+    "representationCursors",
+    "conflicts",
+    "hasMoreOperations"
+  ],
+  "properties": {
+    "protocolMajor": { "const": 1 },
+    "protocolMinor": { "type": "integer", "minimum": 0 },
+    "projectId": { "type": "string", "minLength": 1 },
+    "committedCursors": { "$ref": "#/$defs/cursors" },
+    "operations": {
+      "type": "array",
+      "maxItems": 500,
+      "items": { "$ref": "#/$defs/operation" }
+    },
+    "observationCursors": { "$ref": "#/$defs/cursors" },
+    "representationCursors": { "$ref": "#/$defs/cursors" },
+    "conflicts": {
+      "type": "array",
+      "items": { "type": "object" }
+    },
+    "hasMoreOperations": { "type": "boolean" }
+  },
+  "$defs": {
+    "cursors": {
+      "type": "object",
+      "additionalProperties": { "type": "integer", "minimum": 0 }
+    },
+    "operation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operationId", "projectId", "originNodeId", "originSequence",
+        "logicalTime", "aggregateType", "aggregateId", "operationType",
+        "payloadVersion", "baseRevision", "payload"
+      ],
+      "properties": {
+        "operationId": { "type": "string", "minLength": 1 },
+        "projectId": { "type": "string", "minLength": 1 },
+        "originNodeId": { "type": "string", "minLength": 1 },
+        "originSequence": { "type": "integer", "minimum": 1 },
+        "logicalTime": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["wallMillis", "counter", "nodeId"],
+          "properties": {
+            "wallMillis": { "type": "integer" },
+            "counter": { "type": "integer", "minimum": 0 },
+            "nodeId": { "type": "string", "minLength": 1 }
+          }
+        },
+        "aggregateType": { "type": "string" },
+        "aggregateId": { "type": "string" },
+        "operationType": { "type": "string" },
+        "payloadVersion": { "const": 1 },
+        "baseRevision": { "type": ["integer", "null"], "minimum": 0 },
+        "payload": { "type": "object" }
+      }
+    }
+  }
+}

@@ -1,3 +1,4 @@
+use rcdvlog_core::PROJECT_CATALOG_SCHEMA_VERSION;
 use rusqlite::{Connection, params};
 use serde_json::Value;
 use std::ffi::OsStr;
@@ -109,7 +110,10 @@ fn process_contract_persists_across_invocations_and_routes_errors() {
 
     let project_id = create_project(&catalog, "Process contract");
     let inspection = success(&catalog, ["catalog", "inspect"]);
-    assert_eq!(inspection.json["data"]["currentSchemaVersion"], 4);
+    assert_eq!(
+        inspection.json["data"]["currentSchemaVersion"],
+        PROJECT_CATALOG_SCHEMA_VERSION
+    );
     assert_eq!(inspection.json["data"]["schemaStatus"], "current");
     assert!(
         inspection.json["data"]["pendingMigrations"]
@@ -137,13 +141,16 @@ fn newer_catalog_schema_is_reported_without_attempting_a_downgrade() {
     Connection::open(&catalog)
         .unwrap()
         .execute(
-            "INSERT INTO schema_migrations (migration_id, name, source_identity, applied_at) VALUES (5, 'future', 'future/5', '2026-07-20T00:00:00.000Z')",
-            [],
+            "INSERT INTO schema_migrations (migration_id, name, source_identity, applied_at) VALUES (?1, 'future', ?2, '2026-07-20T00:00:00.000Z')",
+            params![PROJECT_CATALOG_SCHEMA_VERSION + 1, format!("future/{}", PROJECT_CATALOG_SCHEMA_VERSION + 1)],
         )
         .unwrap();
 
     let inspection = success(&catalog, ["catalog", "inspect"]);
-    assert_eq!(inspection.json["data"]["currentSchemaVersion"], 5);
+    assert_eq!(
+        inspection.json["data"]["currentSchemaVersion"],
+        PROJECT_CATALOG_SCHEMA_VERSION + 1
+    );
     assert_eq!(inspection.json["data"]["schemaStatus"], "newer_unsupported");
     let rejected = failure(&catalog, ["project", "list"]);
     assert_eq!(rejected["error"]["code"], "schema_incompatible");

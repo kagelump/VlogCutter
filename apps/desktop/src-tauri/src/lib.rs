@@ -55,6 +55,8 @@ fn default_autoplay_mode() -> AutoplayMode {
 #[serde(rename_all = "camelCase")]
 struct DesktopSettings {
     projects_root: PathBuf,
+    #[serde(default = "default_node_id")]
+    node_id: String,
     #[serde(default = "default_autoplay_mode")]
     autoplay_mode: AutoplayMode,
     #[serde(default)]
@@ -67,6 +69,10 @@ struct DesktopSettings {
     last_context_updated_at: Option<String>,
 }
 
+fn default_node_id() -> String {
+    format!("node_desktop_{}", uuid::Uuid::new_v4().simple())
+}
+
 impl AppState {
     fn new(
         catalog: Catalog,
@@ -76,6 +82,7 @@ impl AppState {
         fs::create_dir_all(&settings.projects_root).with_context(|| {
             format!("create project folder {}", settings.projects_root.display())
         })?;
+        catalog.set_local_node_id(&settings.node_id)?;
         Ok(Self {
             catalog: RwLock::new(catalog),
             settings: RwLock::new(settings),
@@ -95,6 +102,13 @@ impl AppState {
             return Err(format!("catalog file not found: {}", path.display()));
         }
         let catalog = Catalog::open_existing(&path).map_err(error_message)?;
+        let node_id = self
+            .settings
+            .read()
+            .map_err(|_| "desktop settings are unavailable".to_string())?
+            .node_id
+            .clone();
+        catalog.set_local_node_id(&node_id).map_err(error_message)?;
         let projects = catalog.list_projects().map_err(error_message)?;
         let loaded = LoadedCatalog {
             path: catalog.database_path().to_string_lossy().into_owned(),
@@ -270,6 +284,7 @@ impl AppState {
             }
         };
         let catalog = Catalog::open(folder.join("catalog.sqlite3"))?;
+        catalog.set_local_node_id(&self.desktop_settings()?.node_id)?;
         let project = catalog.create_project(name)?;
         *self
             .catalog
@@ -306,6 +321,7 @@ fn load_settings(settings_path: &Path, default_root: PathBuf) -> DesktopSettings
         .and_then(|bytes| serde_json::from_slice::<DesktopSettings>(&bytes).ok())
         .unwrap_or(DesktopSettings {
             projects_root: default_root,
+            node_id: default_node_id(),
             autoplay_mode: default_autoplay_mode(),
             last_catalog_path: None,
             last_project_id: None,
@@ -440,6 +456,62 @@ fn update_asset(
 }
 
 #[tauri::command]
+fn create_note_revision(
+    asset_id: String,
+    text: String,
+    state: State<'_, AppState>,
+) -> Result<Asset, String> {
+    state
+        .catalog()?
+        .create_note_revision(&asset_id, &text)
+        .map_err(error_message)
+}
+
+#[tauri::command]
+fn add_label(asset_id: String, label: String, state: State<'_, AppState>) -> Result<Asset, String> {
+    state
+        .catalog()?
+        .add_label(&asset_id, &label)
+        .map_err(error_message)
+}
+
+#[tauri::command]
+fn remove_label(
+    asset_id: String,
+    label: String,
+    state: State<'_, AppState>,
+) -> Result<Asset, String> {
+    state
+        .catalog()?
+        .remove_label(&asset_id, &label)
+        .map_err(error_message)
+}
+
+#[tauri::command]
+fn set_removed(
+    asset_id: String,
+    removed: bool,
+    state: State<'_, AppState>,
+) -> Result<Asset, String> {
+    state
+        .catalog()?
+        .set_removed(&asset_id, removed)
+        .map_err(error_message)
+}
+
+#[tauri::command]
+fn set_rotation(
+    asset_id: String,
+    rotation_degrees: u16,
+    state: State<'_, AppState>,
+) -> Result<Asset, String> {
+    state
+        .catalog()?
+        .set_rotation(&asset_id, rotation_degrees)
+        .map_err(error_message)
+}
+
+#[tauri::command]
 fn apply_clock_event(
     project_id: String,
     camera: String,
@@ -537,6 +609,7 @@ pub fn run() {
                 .join("Movies")
                 .join("VideoProjects");
             let settings = load_settings(&settings_path, default_root);
+            write_settings(&settings_path, &settings)?;
             let catalog = match std::env::var_os("RCDVLOG_CATALOG") {
                 Some(path) => Catalog::open_existing(PathBuf::from(path))?,
                 None => Catalog::open(app_data.join("catalog.sqlite3"))?,
@@ -558,6 +631,11 @@ pub fn run() {
             list_assets,
             refresh_asset_orientation,
             update_asset,
+            create_note_revision,
+            add_label,
+            remove_label,
+            set_removed,
+            set_rotation,
             apply_clock_event,
             generate_proxy,
             generate_missing_proxies,
@@ -576,6 +654,7 @@ mod tests {
     fn test_settings(projects_root: PathBuf) -> DesktopSettings {
         DesktopSettings {
             projects_root,
+            node_id: "node_desktop_test".to_string(),
             autoplay_mode: default_autoplay_mode(),
             last_catalog_path: None,
             last_project_id: None,

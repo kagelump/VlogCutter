@@ -14,10 +14,20 @@ use std::time::Instant;
 use uuid::Uuid;
 use walkdir::WalkDir;
 
+mod baseline;
 mod identifiers;
 mod migrations;
+mod operations;
 mod storage;
 
+pub use operations::{
+    ApplyOperationResult, AssetRevisionDiagnostics, CLOCK_EVENT_CREATED, ConflictProjection,
+    HybridLogicalTime, LABEL_ADDED, LABEL_REMOVED, NOTE_REVISION_CREATED, NoteRevisionProjection,
+    OperationBatchResult, OperationDiagnostics, PROJECT_ASSET_ADDED, PROJECT_ASSET_MEDIA_LINKED,
+    ProjectAssetAddedPayload, ProjectOperation, REMOVED_SET, ROTATION_SET,
+};
+
+pub use baseline::{PortableAssetBaseline, PortableRootMapping, ProjectBaselineSnapshot};
 pub use identifiers::{
     IdentifierError, IdentifierErrorReason, JobId, MediaObjectId, NodeId, OperationId,
     ProjectAssetId, ProjectId, RepresentationId, StorageObjectId, StorageRootId,
@@ -49,7 +59,7 @@ pub struct Catalog {
     read_only: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Project {
     pub id: String,
@@ -206,6 +216,7 @@ pub struct CatalogInspection {
     pub schema_status: MigrationHistoryStatus,
     pub applied_migrations: Vec<SchemaMigrationRecord>,
     pub pending_migrations: Vec<PendingMigration>,
+    pub unresolved_conflict_count: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -293,6 +304,15 @@ pub fn inspect_catalog(path: impl AsRef<Path>) -> Result<CatalogInspection> {
     };
     let journal_mode = connection.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
     let migration_history = inspect_project_catalog_migrations(&connection)?;
+    let unresolved_conflict_count = if table_exists(&connection, "operation_conflicts")? {
+        connection.query_row(
+            "SELECT COUNT(*) FROM operation_conflicts WHERE resolved_at IS NULL",
+            [],
+            |row| row.get::<_, i64>(0),
+        )? as u64
+    } else {
+        0
+    };
     Ok(CatalogInspection {
         path: path.to_string_lossy().into_owned(),
         read_only: true,
@@ -308,6 +328,7 @@ pub fn inspect_catalog(path: impl AsRef<Path>) -> Result<CatalogInspection> {
         schema_status: migration_history.status,
         applied_migrations: migration_history.applied_migrations,
         pending_migrations: migration_history.pending_migrations,
+        unresolved_conflict_count,
     })
 }
 
@@ -362,7 +383,7 @@ pub fn prerequisite_status() -> Vec<ToolStatus> {
         .collect()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClockEvent {
     pub id: String,
@@ -481,10 +502,14 @@ impl Catalog {
         }
         let id = format!("project_{}", Uuid::new_v4().simple());
         let created_at = now();
-        self.connection()?.execute(
-            "INSERT INTO projects (id, name, created_at) VALUES (?1, ?2, ?3)",
-            params![id, name, created_at],
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let origin_node_id = operations::ensure_node(&transaction)?;
+        transaction.execute(
+            "INSERT INTO projects (id, name, created_at, origin_node_id) VALUES (?1, ?2, ?3, ?4)",
+            params![id, name, created_at, origin_node_id],
         )?;
+        transaction.commit()?;
         Ok(Project {
             id,
             name: name.to_string(),
@@ -492,7 +517,7 @@ impl Catalog {
             asset_count: 0,
             labeled_count: 0,
             removed_count: 0,
-            origin_node_id: None,
+            origin_node_id: Some(origin_node_id),
             paired_server_node_id: None,
             paired_at: None,
         })
@@ -618,38 +643,27 @@ impl Catalog {
             .file_name()
             .and_then(|name| name.to_str())
             .ok_or_else(|| anyhow!("media filename is not valid UTF-8"))?;
-        connection.execute(
-            r#"
-            INSERT INTO assets (
-                id, project_id, fingerprint, path, filename, size_bytes,
-                duration_seconds, frame_rate, width, height, codec, camera,
-                captured_at_raw, best_time, metadata_rotation_degrees,
-                default_rotation_degrees, rotation_degrees, orientation_probed,
-                created_at
-            ) VALUES (
-                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, 1, ?18
-            )
-            "#,
-            params![
+        drop(connection);
+        self.add_project_asset(
+            project_id,
+            &path.to_string_lossy(),
+            operations::ProjectAssetAddedPayload {
                 id,
-                project_id,
                 fingerprint,
-                path.to_string_lossy(),
-                filename,
-                metadata.len() as i64,
-                probe.duration_seconds,
-                probe.frame_rate,
-                probe.width,
-                probe.height,
-                probe.codec,
-                probe.camera,
-                probe.captured_at_raw,
-                probe.best_time,
-                probe.metadata_rotation_degrees,
-                probe.default_rotation_degrees,
-                probe.default_rotation_degrees,
-                now(),
-            ],
+                filename: filename.to_string(),
+                size_bytes: metadata.len(),
+                duration_seconds: probe.duration_seconds,
+                frame_rate: probe.frame_rate,
+                width: probe.width,
+                height: probe.height,
+                codec: probe.codec,
+                camera: probe.camera,
+                captured_at_raw: probe.captured_at_raw,
+                best_time: probe.best_time,
+                metadata_rotation_degrees: probe.metadata_rotation_degrees,
+                default_rotation_degrees: probe.default_rotation_degrees,
+                created_at: now(),
+            },
         )?;
         Ok(true)
     }
@@ -798,34 +812,7 @@ impl Catalog {
     }
 
     pub fn update_asset(&self, asset_id: &str, patch: &AssetPatch) -> Result<Asset> {
-        self.get_asset(asset_id)?;
-        if !is_right_angle(patch.rotation_degrees) {
-            bail!(
-                "invalid rotation: {}; expected 0, 90, 180, or 270 degrees",
-                patch.rotation_degrees
-            );
-        }
-        let labels = normalize_labels(&patch.labels)?;
-        let labels_json = serde_json::to_string(&labels)?;
-        let connection = self.connection()?;
-        let changed = connection.execute(
-            r#"
-            UPDATE assets
-            SET notes = ?2, labels_json = ?3, removed = ?4, rotation_degrees = ?5
-            WHERE id = ?1
-            "#,
-            params![
-                asset_id,
-                patch.notes,
-                labels_json,
-                patch.removed,
-                patch.rotation_degrees,
-            ],
-        )?;
-        if changed == 0 {
-            bail!("asset not found: {asset_id}");
-        }
-        self.get_asset(asset_id)
+        self.update_asset_with_operations(asset_id, patch)
     }
 
     pub fn apply_clock_event(
@@ -836,83 +823,7 @@ impl Catalog {
         offset_seconds: i64,
         label: &str,
     ) -> Result<ClockEvent> {
-        self.require_project(project_id)?;
-        let event = ClockEvent {
-            id: format!("clock_{}", Uuid::new_v4().simple()),
-            project_id: project_id.to_string(),
-            camera: camera.to_string(),
-            start_filename: start_filename.to_string(),
-            offset_seconds,
-            label: label.trim().to_string(),
-            created_at: now(),
-        };
-        let mut connection = self.connection()?;
-        let transaction = connection.transaction()?;
-        transaction.execute(
-            r#"
-            INSERT INTO clock_events
-                (id, project_id, camera, start_filename, offset_seconds, label, created_at)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-            "#,
-            params![
-                event.id,
-                event.project_id,
-                event.camera,
-                event.start_filename,
-                event.offset_seconds,
-                event.label,
-                event.created_at,
-            ],
-        )?;
-
-        let mut event_statement = transaction.prepare(
-            r#"
-            SELECT start_filename, offset_seconds FROM clock_events
-            WHERE project_id = ?1 AND camera = ?2
-            ORDER BY start_filename, created_at, rowid
-            "#,
-        )?;
-        let events = event_statement
-            .query_map(params![project_id, camera], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        drop(event_statement);
-
-        let mut asset_statement = transaction.prepare(
-            r#"
-            SELECT id, filename, captured_at_raw FROM assets
-            WHERE project_id = ?1 AND camera = ?2
-            "#,
-        )?;
-        let affected = asset_statement
-            .query_map(params![project_id, camera], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                ))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        drop(asset_statement);
-
-        for (asset_id, filename, raw) in affected {
-            let effective_offset = events
-                .iter()
-                .filter(|(boundary, _)| boundary <= &filename)
-                .map(|(_, offset)| *offset)
-                .next_back()
-                .unwrap_or(0);
-            let best_time = raw
-                .as_deref()
-                .and_then(|value| normalize_datetime(value, effective_offset));
-            transaction.execute(
-                "UPDATE assets SET offset_seconds = ?2, best_time = ?3 WHERE id = ?1",
-                params![asset_id, effective_offset, best_time],
-            )?;
-        }
-        transaction.commit()?;
-        Ok(event)
+        self.create_clock_event_operation(project_id, camera, start_filename, offset_seconds, label)
     }
 
     fn generate_proxy_untracked(&self, asset_id: &str) -> Result<Asset> {
@@ -1374,10 +1285,6 @@ fn has_current_thumbnail(asset: &Asset, quality: u8) -> bool {
             Path::new(path).is_file()
                 && path.ends_with(&format!("q{quality}.{THUMBNAIL_CACHE_VERSION}.jpg"))
         })
-}
-
-fn is_right_angle(degrees: u16) -> bool {
-    matches!(degrees, 0 | 90 | 180 | 270)
 }
 
 fn normalize_rotation(degrees: f64) -> u16 {
@@ -2174,7 +2081,10 @@ mod tests {
             .unwrap();
         let before = inspect_catalog(&path).unwrap();
         assert_eq!(before.current_schema_version, 0);
-        assert_eq!(before.pending_migrations.len(), 4);
+        assert_eq!(
+            before.pending_migrations.len(),
+            PROJECT_CATALOG_SCHEMA_VERSION as usize
+        );
 
         let upgraded = Catalog::open_existing(&path).unwrap();
         let upgraded_project = upgraded.list_projects().unwrap().remove(0);
@@ -2195,13 +2105,61 @@ mod tests {
         );
         drop(reopened);
         let reopened_inspection = inspect_catalog(&path).unwrap();
-        assert_eq!(reopened_inspection.current_schema_version, 4);
+        assert_eq!(
+            reopened_inspection.current_schema_version,
+            PROJECT_CATALOG_SCHEMA_VERSION
+        );
         assert_eq!(
             reopened_inspection.schema_status,
             MigrationHistoryStatus::Current
         );
         assert!(reopened_inspection.pending_migrations.is_empty());
         assert_eq!(reopened_inspection.applied_migrations, first_history);
+    }
+
+    #[test]
+    fn migration_four_upgrades_to_operation_baselines_without_inventing_history() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("catalog-v4.sqlite3");
+        let mut connection = Connection::open(&path).unwrap();
+        migrations::run_sqlite_migrations(
+            &mut connection,
+            &migrations::PROJECT_CATALOG_MIGRATIONS[..4],
+        )
+        .unwrap();
+        connection.execute("INSERT INTO projects(id, name, created_at) VALUES ('project_v4', 'Version four', '2026-01-01T00:00:00Z')", []).unwrap();
+        connection.execute("INSERT INTO assets(id, project_id, fingerprint, path, filename, size_bytes, duration_seconds, frame_rate, width, height, codec, camera, captured_at_raw, best_time, notes, labels_json, removed, rotation_degrees, created_at) VALUES ('asset_v4', 'project_v4', 'fingerprint-v4', '/offline/v4.mp4', 'v4.mp4', 100, 10, 30, 1920, 1080, 'h264', 'DJI', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00.000Z', 'kept note', '[\"kept label\"]', 1, 90, '2026-01-01T00:00:00Z')", []).unwrap();
+        connection.execute("INSERT INTO clock_events(id, project_id, camera, start_filename, offset_seconds, label, created_at) VALUES ('clock_v4', 'project_v4', 'DJI', 'v4.mp4', 60, 'kept clock', '2026-01-01T00:00:00Z')", []).unwrap();
+        drop(connection);
+
+        let before = inspect_catalog(&path).unwrap();
+        assert_eq!(before.current_schema_version, 4);
+        assert_eq!(before.pending_migrations.len(), 2);
+        let catalog = Catalog::open_existing(&path).unwrap();
+        let asset = catalog.get_asset("asset_v4").unwrap();
+        assert_eq!(asset.notes, "kept note");
+        assert_eq!(asset.labels, ["kept label"]);
+        assert!(asset.removed);
+        assert_eq!(asset.rotation_degrees, 90);
+        assert_eq!(catalog.list_operations("project_v4").unwrap().len(), 0);
+        let diagnostics = catalog.asset_revision_diagnostics("asset_v4").unwrap();
+        assert_eq!(diagnostics.materialized_revision, 0);
+        assert_eq!(diagnostics.note_revisions.len(), 1);
+        assert!(diagnostics.note_revisions[0].active);
+        let connection = catalog.connection().unwrap();
+        for table in [
+            "project_baseline_metadata",
+            "project_storage_root_mappings",
+            "sync_origin_cursors",
+            "sync_observation_facts",
+            "sync_representation_manifests",
+        ] {
+            assert!(table_exists(&connection, table).unwrap(), "{table}");
+        }
+        assert_eq!(
+            connection.query_row("SELECT revision FROM materialized_revisions WHERE project_id='project_v4' AND aggregate_type='clock' AND aggregate_id='DJI'", [], |row| row.get::<_, i64>(0)).unwrap(),
+            1
+        );
     }
 
     #[test]
@@ -2212,13 +2170,19 @@ mod tests {
         Connection::open(&path)
             .unwrap()
             .execute(
-                "INSERT INTO schema_migrations (migration_id, name, source_identity, applied_at) VALUES (5, 'future', 'future/5', '2026-07-20T00:00:00.000Z')",
-                [],
+                "INSERT INTO schema_migrations (migration_id, name, source_identity, applied_at) VALUES (?1, 'future', ?2, '2026-07-20T00:00:00.000Z')",
+                params![
+                    PROJECT_CATALOG_SCHEMA_VERSION + 1,
+                    format!("future/{}", PROJECT_CATALOG_SCHEMA_VERSION + 1)
+                ],
             )
             .unwrap();
 
         let inspection = inspect_catalog(&path).unwrap();
-        assert_eq!(inspection.current_schema_version, 5);
+        assert_eq!(
+            inspection.current_schema_version,
+            PROJECT_CATALOG_SCHEMA_VERSION + 1
+        );
         assert_eq!(
             inspection.schema_status,
             MigrationHistoryStatus::NewerUnsupported
@@ -2229,7 +2193,9 @@ mod tests {
             "schema_incompatible"
         );
         let message = format!("{error:#}");
-        assert!(message.contains("newer than supported version 4"));
+        assert!(message.contains(&format!(
+            "newer than supported version {PROJECT_CATALOG_SCHEMA_VERSION}"
+        )));
         assert!(message.contains("upgrade RCD VlogCutter"));
     }
 
@@ -2702,6 +2668,13 @@ mod tests {
         let project = catalog.create_project("Round trip").unwrap();
         let report = catalog.ingest_folder(&project.id, &source_dir).unwrap();
         assert_eq!(report.imported, 1);
+        let ingest_operations = catalog.list_operations(&project.id).unwrap();
+        assert_eq!(ingest_operations.len(), 1);
+        assert_eq!(
+            ingest_operations[0].operation_type,
+            operations::PROJECT_ASSET_ADDED
+        );
+        assert!(ingest_operations[0].payload.get("path").is_none());
 
         fs::copy(&source, source_dir.join("COPY.MP4")).unwrap();
         fs::write(source_dir.join("README.txt"), b"ignored").unwrap();

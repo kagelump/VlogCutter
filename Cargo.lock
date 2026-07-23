@@ -2761,6 +2761,7 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-dialog",
  "tempfile",
+ "uuid",
 ]
 
 [[package]]
@@ -2797,6 +2798,7 @@ dependencies = [
  "fs2",
  "libc",
  "rcdvlog-core",
+ "rcdvlog-sync",
  "rusqlite",
  "serde",
  "serde_json",
@@ -2807,6 +2809,21 @@ dependencies = [
  "tracing",
  "uuid",
  "walkdir",
+]
+
+[[package]]
+name = "rcdvlog-sync"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "chrono",
+ "rcdvlog-core",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

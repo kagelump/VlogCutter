@@ -130,6 +130,7 @@ function App() {
   const [library, setLibrary] = useState<ProjectLibrary>({ rootPath: "", projects: [] });
   const [settings, setSettings] = useState<DesktopSettings>({
     projectsRoot: "",
+    nodeId: "node_desktop_pending",
     autoplayMode: "proxyAvailable",
     lastCatalogPath: null,
     lastProjectId: null,

@@ -1,0 +1,1735 @@
+use crate::{
+    Asset, AssetPatch, Catalog, ClockEvent, MediaVerificationState, normalize_datetime,
+    normalize_labels, now,
+};
+use anyhow::{Result, anyhow, bail};
+use chrono::Utc;
+use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde_json::Value;
+use std::collections::BTreeSet;
+use uuid::Uuid;
+
+pub const NOTE_REVISION_CREATED: &str = "noteRevisionCreated";
+pub const LABEL_ADDED: &str = "labelAdded";
+pub const LABEL_REMOVED: &str = "labelRemoved";
+pub const REMOVED_SET: &str = "removedSet";
+pub const ROTATION_SET: &str = "rotationSet";
+pub const PROJECT_ASSET_ADDED: &str = "projectAssetAdded";
+pub const PROJECT_ASSET_MEDIA_LINKED: &str = "projectAssetMediaLinked";
+pub const CLOCK_EVENT_CREATED: &str = "clockEventCreated";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HybridLogicalTime {
+    pub wall_millis: i64,
+    pub counter: u64,
+    pub node_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProjectOperation {
+    pub operation_id: String,
+    pub project_id: String,
+    pub origin_node_id: String,
+    pub origin_sequence: u64,
+    pub logical_time: HybridLogicalTime,
+    pub aggregate_type: String,
+    pub aggregate_id: String,
+    pub operation_type: String,
+    pub payload_version: u32,
+    pub base_revision: Option<u64>,
+    pub payload: Value,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApplyOperationResult {
+    Applied,
+    Duplicate,
+    Conflict,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConflictProjection {
+    pub conflict_id: String,
+    pub project_id: String,
+    pub aggregate_type: String,
+    pub aggregate_id: String,
+    pub incoming_operation_id: String,
+    pub active_operation_id: Option<String>,
+    pub expected_base_revision: Option<u64>,
+    pub actual_revision: u64,
+    pub conflict_type: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OperationDiagnostics {
+    pub project_id: String,
+    pub operation_count: u64,
+    pub latest_local_sequence: u64,
+    pub unresolved_conflicts: Vec<ConflictProjection>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NoteRevisionProjection {
+    pub revision_id: String,
+    pub operation_id: Option<String>,
+    pub text: String,
+    pub logical_time: HybridLogicalTime,
+    pub active: bool,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AssetRevisionDiagnostics {
+    pub asset_id: String,
+    pub materialized_revision: u64,
+    pub note_revisions: Vec<NoteRevisionProjection>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OperationBatchResult {
+    pub origin_node_id: String,
+    pub committed_sequence: u64,
+    pub applied: usize,
+    pub duplicates: usize,
+    pub conflicts: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct NotePayload {
+    revision_id: String,
+    text: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LabelAddPayload {
+    add_tag: String,
+    label: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LabelRemovePayload {
+    normalized_label: String,
+    observed_add_tags: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RemovedPayload {
+    removed: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RotationPayload {
+    rotation_degrees: u16,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ClockPayload {
+    event_id: String,
+    camera: String,
+    start_filename: String,
+    offset_seconds: i64,
+    label: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProjectAssetAddedPayload {
+    pub id: String,
+    pub fingerprint: String,
+    pub filename: String,
+    pub size_bytes: u64,
+    pub duration_seconds: f64,
+    pub frame_rate: f64,
+    pub width: u32,
+    pub height: u32,
+    pub codec: String,
+    pub camera: String,
+    pub captured_at_raw: Option<String>,
+    pub best_time: Option<String>,
+    pub metadata_rotation_degrees: u16,
+    pub default_rotation_degrees: u16,
+    pub created_at: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct MediaLinkedPayload {
+    media_object_id: String,
+    verification_state: MediaVerificationState,
+}
+
+struct NewOperation {
+    aggregate_type: &'static str,
+    aggregate_id: String,
+    operation_type: &'static str,
+    base_revision: Option<u64>,
+    payload: Value,
+}
+
+impl Catalog {
+    /// Seeds the stable local node identity supplied by an installation adapter.
+    /// A catalog that has already acknowledged operations cannot be reassigned.
+    pub fn set_local_node_id(&self, node_id: &str) -> Result<()> {
+        validate_id("node ID", node_id)?;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing = transaction
+            .query_row(
+                "SELECT node_id FROM catalog_identity WHERE singleton_id = 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        match existing {
+            Some(existing) if existing != node_id => {
+                let operations: i64 = transaction.query_row(
+                    "SELECT COUNT(*) FROM project_operations",
+                    [],
+                    |row| row.get(0),
+                )?;
+                if operations != 0 {
+                    bail!("catalog node identity is already in use: {existing}");
+                }
+                transaction.execute(
+                    "UPDATE catalog_identity SET node_id = ?1 WHERE singleton_id = 1",
+                    [node_id],
+                )?;
+                transaction.execute(
+                    "UPDATE projects SET origin_node_id=?1 WHERE origin_node_id=?2",
+                    params![node_id, existing],
+                )?;
+                transaction.execute(
+                    "DELETE FROM project_asset_local_locations WHERE node_id=?1",
+                    [existing],
+                )?;
+            }
+            Some(_) => {}
+            None => {
+                transaction.execute(
+                    "INSERT INTO catalog_identity(singleton_id, node_id, created_at) VALUES (1, ?1, ?2)",
+                    params![node_id, now()],
+                )?;
+            }
+        }
+        backfill_local_locations(&transaction, node_id)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn local_node_id(&self) -> Result<Option<String>> {
+        Ok(self
+            .connection()?
+            .query_row(
+                "SELECT node_id FROM catalog_identity WHERE singleton_id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    pub fn create_note_revision(&self, asset_id: &str, text: &str) -> Result<Asset> {
+        let current = self.get_asset(asset_id)?;
+        if current.notes == text {
+            return Ok(current);
+        }
+        let operation = NewOperation {
+            aggregate_type: "projectAsset",
+            aggregate_id: asset_id.to_string(),
+            operation_type: NOTE_REVISION_CREATED,
+            base_revision: None,
+            payload: serde_json::to_value(NotePayload {
+                revision_id: format!("note_{}", Uuid::new_v4().simple()),
+                text: text.to_string(),
+            })?,
+        };
+        self.commit_local(&current.project_id, vec![operation])?;
+        self.get_asset(asset_id)
+    }
+
+    pub fn add_label(&self, asset_id: &str, label: &str) -> Result<Asset> {
+        let current = self.get_asset(asset_id)?;
+        let normalized = normalize_labels(&[label.to_string()])?;
+        let Some(label) = normalized.into_iter().next() else {
+            return Ok(current);
+        };
+        if current
+            .labels
+            .iter()
+            .any(|value| value.eq_ignore_ascii_case(&label))
+        {
+            return Ok(current);
+        }
+        if current.labels.len() >= 24 {
+            bail!("invalid labels: an asset can have at most 24 labels");
+        }
+        let operation = label_add_operation(asset_id, label)?;
+        self.commit_local(&current.project_id, vec![operation])?;
+        self.get_asset(asset_id)
+    }
+
+    pub fn remove_label(&self, asset_id: &str, label: &str) -> Result<Asset> {
+        let current = self.get_asset(asset_id)?;
+        let Some(display) = current
+            .labels
+            .iter()
+            .find(|value| value.eq_ignore_ascii_case(label.trim()))
+        else {
+            return Ok(current);
+        };
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        reconcile_asset_baseline(&transaction, &current.project_id, asset_id)?;
+        let tags = active_label_tags(&transaction, asset_id, &label_key(display))?;
+        if tags.is_empty() {
+            transaction.commit()?;
+            return self.get_asset(asset_id);
+        }
+        let operation = NewOperation {
+            aggregate_type: "projectAsset",
+            aggregate_id: asset_id.to_string(),
+            operation_type: LABEL_REMOVED,
+            base_revision: None,
+            payload: serde_json::to_value(LabelRemovePayload {
+                normalized_label: label_key(display),
+                observed_add_tags: tags,
+            })?,
+        };
+        commit_local_in_transaction(&transaction, &current.project_id, vec![operation])?;
+        transaction.commit()?;
+        self.get_asset(asset_id)
+    }
+
+    pub fn set_removed(&self, asset_id: &str, removed: bool) -> Result<Asset> {
+        let current = self.get_asset(asset_id)?;
+        if current.removed == removed {
+            return Ok(current);
+        }
+        self.commit_local(
+            &current.project_id,
+            vec![NewOperation {
+                aggregate_type: "projectAsset",
+                aggregate_id: asset_id.to_string(),
+                operation_type: REMOVED_SET,
+                base_revision: None,
+                payload: serde_json::to_value(RemovedPayload { removed })?,
+            }],
+        )?;
+        self.get_asset(asset_id)
+    }
+
+    pub fn set_rotation(&self, asset_id: &str, rotation_degrees: u16) -> Result<Asset> {
+        if !matches!(rotation_degrees, 0 | 90 | 180 | 270) {
+            bail!("invalid rotation: {rotation_degrees}; expected 0, 90, 180, or 270 degrees");
+        }
+        let current = self.get_asset(asset_id)?;
+        if current.rotation_degrees == rotation_degrees {
+            return Ok(current);
+        }
+        self.commit_local(
+            &current.project_id,
+            vec![NewOperation {
+                aggregate_type: "projectAsset",
+                aggregate_id: asset_id.to_string(),
+                operation_type: ROTATION_SET,
+                base_revision: None,
+                payload: serde_json::to_value(RotationPayload { rotation_degrees })?,
+            }],
+        )?;
+        self.get_asset(asset_id)
+    }
+
+    /// Compatibility adapter for the desktop's full replacement patch.
+    pub(crate) fn update_asset_with_operations(
+        &self,
+        asset_id: &str,
+        patch: &AssetPatch,
+    ) -> Result<Asset> {
+        if !matches!(patch.rotation_degrees, 0 | 90 | 180 | 270) {
+            bail!(
+                "invalid rotation: {}; expected 0, 90, 180, or 270 degrees",
+                patch.rotation_degrees
+            );
+        }
+        let labels = normalize_labels(&patch.labels)?;
+        let current = self.get_asset(asset_id)?;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        reconcile_asset_baseline(&transaction, &current.project_id, asset_id)?;
+        let mut operations = Vec::new();
+        if current.notes != patch.notes {
+            operations.push(NewOperation {
+                aggregate_type: "projectAsset",
+                aggregate_id: asset_id.to_string(),
+                operation_type: NOTE_REVISION_CREATED,
+                base_revision: None,
+                payload: serde_json::to_value(NotePayload {
+                    revision_id: format!("note_{}", Uuid::new_v4().simple()),
+                    text: patch.notes.clone(),
+                })?,
+            });
+        }
+        for label in &current.labels {
+            if !labels
+                .iter()
+                .any(|wanted| wanted.eq_ignore_ascii_case(label))
+            {
+                let normalized_label = label_key(label);
+                operations.push(NewOperation {
+                    aggregate_type: "projectAsset",
+                    aggregate_id: asset_id.to_string(),
+                    operation_type: LABEL_REMOVED,
+                    base_revision: None,
+                    payload: serde_json::to_value(LabelRemovePayload {
+                        observed_add_tags: active_label_tags(
+                            &transaction,
+                            asset_id,
+                            &normalized_label,
+                        )?,
+                        normalized_label,
+                    })?,
+                });
+            }
+        }
+        for label in labels {
+            if !current
+                .labels
+                .iter()
+                .any(|existing| existing.eq_ignore_ascii_case(&label))
+            {
+                operations.push(label_add_operation(asset_id, label)?);
+            }
+        }
+        if current.removed != patch.removed {
+            operations.push(NewOperation {
+                aggregate_type: "projectAsset",
+                aggregate_id: asset_id.to_string(),
+                operation_type: REMOVED_SET,
+                base_revision: None,
+                payload: serde_json::to_value(RemovedPayload {
+                    removed: patch.removed,
+                })?,
+            });
+        }
+        if current.rotation_degrees != patch.rotation_degrees {
+            operations.push(NewOperation {
+                aggregate_type: "projectAsset",
+                aggregate_id: asset_id.to_string(),
+                operation_type: ROTATION_SET,
+                base_revision: None,
+                payload: serde_json::to_value(RotationPayload {
+                    rotation_degrees: patch.rotation_degrees,
+                })?,
+            });
+        }
+        if !operations.is_empty() {
+            commit_local_in_transaction(&transaction, &current.project_id, operations)?;
+        }
+        transaction.commit()?;
+        self.get_asset(asset_id)
+    }
+
+    pub(crate) fn add_project_asset(
+        &self,
+        project_id: &str,
+        local_path: &str,
+        payload: ProjectAssetAddedPayload,
+    ) -> Result<()> {
+        let asset_id = payload.id.clone();
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        commit_local_in_transaction(
+            &transaction,
+            project_id,
+            vec![NewOperation {
+                aggregate_type: "projectAsset",
+                aggregate_id: asset_id.clone(),
+                operation_type: PROJECT_ASSET_ADDED,
+                base_revision: Some(0),
+                payload: serde_json::to_value(payload)?,
+            }],
+        )?;
+        let node_id = ensure_node(&transaction)?;
+        transaction.execute(
+            "INSERT INTO project_asset_local_locations(asset_id, node_id, local_path, created_at) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(asset_id, node_id) DO UPDATE SET local_path=excluded.local_path",
+            params![asset_id, node_id, local_path, now()],
+        )?;
+        transaction.execute(
+            "UPDATE assets SET path=?2 WHERE id=?1",
+            params![asset_id, local_path],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn add_portable_project_asset(
+        &self,
+        project_id: &str,
+        payload: ProjectAssetAddedPayload,
+    ) -> Result<Asset> {
+        let asset_id = payload.id.clone();
+        self.commit_local(
+            project_id,
+            vec![NewOperation {
+                aggregate_type: "projectAsset",
+                aggregate_id: asset_id.clone(),
+                operation_type: PROJECT_ASSET_ADDED,
+                base_revision: Some(0),
+                payload: serde_json::to_value(payload)?,
+            }],
+        )?;
+        self.get_asset(&asset_id)
+    }
+
+    pub fn link_project_asset_media(
+        &self,
+        asset_id: &str,
+        media_object_id: &str,
+        verification_state: MediaVerificationState,
+    ) -> Result<Asset> {
+        let current = self.get_asset(asset_id)?;
+        if current.media_object_id.as_deref() == Some(media_object_id)
+            && current.media_verification_state == verification_state
+        {
+            return Ok(current);
+        }
+        self.commit_local(
+            &current.project_id,
+            vec![NewOperation {
+                aggregate_type: "projectAsset",
+                aggregate_id: asset_id.to_string(),
+                operation_type: PROJECT_ASSET_MEDIA_LINKED,
+                base_revision: None,
+                payload: serde_json::to_value(MediaLinkedPayload {
+                    media_object_id: media_object_id.to_string(),
+                    verification_state,
+                })?,
+            }],
+        )?;
+        self.get_asset(asset_id)
+    }
+
+    pub(crate) fn create_clock_event_operation(
+        &self,
+        project_id: &str,
+        camera: &str,
+        start_filename: &str,
+        offset_seconds: i64,
+        label: &str,
+    ) -> Result<ClockEvent> {
+        self.require_project(project_id)?;
+        if camera.trim().is_empty() || start_filename.trim().is_empty() {
+            bail!("camera and start filename cannot be empty");
+        }
+        let event = ClockEvent {
+            id: format!("clock_{}", Uuid::new_v4().simple()),
+            project_id: project_id.to_string(),
+            camera: camera.to_string(),
+            start_filename: start_filename.to_string(),
+            offset_seconds,
+            label: label.trim().to_string(),
+            created_at: now(),
+        };
+        let revision = current_revision(&self.connection()?, project_id, "clock", camera)?;
+        self.commit_local(
+            project_id,
+            vec![NewOperation {
+                aggregate_type: "clock",
+                aggregate_id: camera.to_string(),
+                operation_type: CLOCK_EVENT_CREATED,
+                base_revision: Some(revision),
+                payload: serde_json::to_value(ClockPayload {
+                    event_id: event.id.clone(),
+                    camera: event.camera.clone(),
+                    start_filename: event.start_filename.clone(),
+                    offset_seconds,
+                    label: event.label.clone(),
+                })?,
+            }],
+        )?;
+        Ok(event)
+    }
+
+    pub fn apply_operation(&self, operation: &ProjectOperation) -> Result<ApplyOperationResult> {
+        validate_operation(operation)?;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if operation_exists(&transaction, &operation.operation_id)? {
+            return Ok(ApplyOperationResult::Duplicate);
+        }
+        let result = insert_and_materialize(&transaction, operation)?;
+        receive_hlc(&transaction, operation)?;
+        transaction.commit()?;
+        Ok(result)
+    }
+
+    /// Applies one origin's contiguous operation page and advances its durable
+    /// acknowledgement cursor in the same SQLite transaction.
+    pub fn apply_operation_batch(
+        &self,
+        origin_node_id: &str,
+        operations: &[ProjectOperation],
+    ) -> Result<OperationBatchResult> {
+        validate_id("origin node ID", origin_node_id)?;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut cursor = transaction
+            .query_row(
+                "SELECT committed_sequence FROM sync_origin_cursors WHERE origin_node_id=?1",
+                [origin_node_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .unwrap_or(0) as u64;
+        let mut result = OperationBatchResult {
+            origin_node_id: origin_node_id.to_string(),
+            committed_sequence: cursor,
+            applied: 0,
+            duplicates: 0,
+            conflicts: 0,
+        };
+        for operation in operations {
+            validate_operation(operation)?;
+            if operation.origin_node_id != origin_node_id {
+                bail!("operation origin does not match batch origin");
+            }
+            if operation.origin_sequence <= cursor {
+                if !operation_matches_acknowledged_sequence(&transaction, operation)? {
+                    bail!(
+                        "operation sequence {} is already acknowledged with a different operation",
+                        operation.origin_sequence
+                    );
+                }
+                result.duplicates += 1;
+                continue;
+            }
+            let expected = cursor + 1;
+            if operation.origin_sequence != expected {
+                bail!(
+                    "operation sequence gap for {origin_node_id}: expected {expected}, received {}",
+                    operation.origin_sequence
+                );
+            }
+            match insert_and_materialize(&transaction, operation)? {
+                ApplyOperationResult::Applied => result.applied += 1,
+                ApplyOperationResult::Duplicate => result.duplicates += 1,
+                ApplyOperationResult::Conflict => result.conflicts += 1,
+            }
+            receive_hlc(&transaction, operation)?;
+            cursor = operation.origin_sequence;
+        }
+        transaction.execute(
+            "INSERT INTO sync_origin_cursors(origin_node_id, committed_sequence, updated_at) VALUES (?1, ?2, ?3) ON CONFLICT(origin_node_id) DO UPDATE SET committed_sequence=excluded.committed_sequence, updated_at=excluded.updated_at",
+            params![origin_node_id, cursor as i64, now()],
+        )?;
+        result.committed_sequence = cursor;
+        transaction.commit()?;
+        Ok(result)
+    }
+
+    pub fn operation_cursors(&self) -> Result<std::collections::BTreeMap<String, u64>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare("SELECT origin_node_id, committed_sequence FROM sync_origin_cursors ORDER BY origin_node_id")?;
+        Ok(statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
+            })?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn list_operations(&self, project_id: &str) -> Result<Vec<ProjectOperation>> {
+        self.require_project(project_id)?;
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT operation_id, project_id, origin_node_id, origin_sequence, hlc_wall_millis, hlc_counter, aggregate_type, aggregate_id, operation_type, payload_version, base_revision, payload_json FROM project_operations WHERE project_id = ?1 ORDER BY hlc_wall_millis, hlc_counter, origin_node_id, operation_id",
+        )?;
+        Ok(statement
+            .query_map([project_id], operation_from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn operation_diagnostics(&self, project_id: &str) -> Result<OperationDiagnostics> {
+        self.require_project(project_id)?;
+        let connection = self.connection()?;
+        if !crate::table_exists(&connection, "project_operations")? {
+            return Ok(OperationDiagnostics {
+                project_id: project_id.to_string(),
+                operation_count: 0,
+                latest_local_sequence: 0,
+                unresolved_conflicts: Vec::new(),
+            });
+        }
+        let operation_count = connection.query_row(
+            "SELECT COUNT(*) FROM project_operations WHERE project_id = ?1",
+            [project_id],
+            |row| row.get::<_, i64>(0),
+        )? as u64;
+        let node = connection
+            .query_row(
+                "SELECT node_id FROM catalog_identity WHERE singleton_id = 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let latest_local_sequence = match node {
+            Some(node) => connection.query_row(
+                "SELECT COALESCE(last_sequence, 0) FROM operation_origin_sequences WHERE origin_node_id = ?1",
+                [node],
+                |row| row.get::<_, i64>(0),
+            ).optional()?.unwrap_or(0) as u64,
+            None => 0,
+        };
+        let mut statement = connection.prepare(
+            "SELECT conflict_id, project_id, aggregate_type, aggregate_id, incoming_operation_id, active_operation_id, expected_base_revision, actual_revision, conflict_type, created_at FROM operation_conflicts WHERE project_id = ?1 AND resolved_at IS NULL ORDER BY created_at, conflict_id",
+        )?;
+        let unresolved_conflicts = statement
+            .query_map([project_id], |row| {
+                Ok(ConflictProjection {
+                    conflict_id: row.get(0)?,
+                    project_id: row.get(1)?,
+                    aggregate_type: row.get(2)?,
+                    aggregate_id: row.get(3)?,
+                    incoming_operation_id: row.get(4)?,
+                    active_operation_id: row.get(5)?,
+                    expected_base_revision: row.get::<_, Option<i64>>(6)?.map(|value| value as u64),
+                    actual_revision: row.get::<_, i64>(7)? as u64,
+                    conflict_type: row.get(8)?,
+                    created_at: row.get(9)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(OperationDiagnostics {
+            project_id: project_id.to_string(),
+            operation_count,
+            latest_local_sequence,
+            unresolved_conflicts,
+        })
+    }
+
+    pub fn asset_revision_diagnostics(&self, asset_id: &str) -> Result<AssetRevisionDiagnostics> {
+        let asset = self.get_asset(asset_id)?;
+        let connection = self.connection()?;
+        if !crate::table_exists(&connection, "note_revisions")? {
+            return Ok(AssetRevisionDiagnostics {
+                asset_id: asset_id.to_string(),
+                materialized_revision: 0,
+                note_revisions: vec![NoteRevisionProjection {
+                    revision_id: format!("baseline_note_{asset_id}"),
+                    operation_id: None,
+                    text: asset.notes,
+                    logical_time: HybridLogicalTime {
+                        wall_millis: 0,
+                        counter: 0,
+                        node_id: "baseline".to_string(),
+                    },
+                    active: true,
+                    created_at: String::new(),
+                }],
+            });
+        }
+        let materialized_revision =
+            current_revision(&connection, &asset.project_id, "projectAsset", asset_id)?;
+        let active_id = connection.query_row(
+            "SELECT revision_id FROM note_revisions WHERE asset_id=?1 ORDER BY hlc_wall_millis DESC, hlc_counter DESC, origin_node_id DESC, revision_id DESC LIMIT 1",
+            [asset_id], |row| row.get::<_, String>(0),
+        ).optional()?;
+        let mut statement = connection.prepare(
+            "SELECT revision_id, operation_id, text, hlc_wall_millis, hlc_counter, origin_node_id, created_at FROM note_revisions WHERE asset_id=?1 ORDER BY hlc_wall_millis DESC, hlc_counter DESC, origin_node_id DESC, revision_id DESC",
+        )?;
+        let note_revisions = statement
+            .query_map([asset_id], |row| {
+                let revision_id: String = row.get(0)?;
+                let node_id: String = row.get(5)?;
+                Ok(NoteRevisionProjection {
+                    active: active_id.as_deref() == Some(&revision_id),
+                    revision_id,
+                    operation_id: row.get(1)?,
+                    text: row.get(2)?,
+                    logical_time: HybridLogicalTime {
+                        wall_millis: row.get(3)?,
+                        counter: row.get::<_, i64>(4)? as u64,
+                        node_id,
+                    },
+                    created_at: row.get(6)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(AssetRevisionDiagnostics {
+            asset_id: asset_id.to_string(),
+            materialized_revision,
+            note_revisions,
+        })
+    }
+
+    fn commit_local(&self, project_id: &str, operations: Vec<NewOperation>) -> Result<()> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        commit_local_in_transaction(&transaction, project_id, operations)?;
+        transaction.commit()?;
+        Ok(())
+    }
+}
+
+fn label_add_operation(asset_id: &str, label: String) -> Result<NewOperation> {
+    Ok(NewOperation {
+        aggregate_type: "projectAsset",
+        aggregate_id: asset_id.to_string(),
+        operation_type: LABEL_ADDED,
+        base_revision: None,
+        payload: serde_json::to_value(LabelAddPayload {
+            add_tag: format!("label_{}", Uuid::new_v4().simple()),
+            label,
+        })?,
+    })
+}
+
+fn commit_local_in_transaction(
+    transaction: &Transaction<'_>,
+    project_id: &str,
+    operations: Vec<NewOperation>,
+) -> Result<()> {
+    let exists: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM projects WHERE id = ?1)",
+        [project_id],
+        |row| row.get(0),
+    )?;
+    if !exists {
+        bail!("project not found: {project_id}");
+    }
+    let node_id = ensure_node(transaction)?;
+    transaction.execute(
+        "UPDATE projects SET origin_node_id = COALESCE(origin_node_id, ?2) WHERE id = ?1",
+        params![project_id, node_id],
+    )?;
+    for new in operations {
+        if new.aggregate_type == "projectAsset" && new.operation_type != PROJECT_ASSET_ADDED {
+            reconcile_asset_baseline(transaction, project_id, &new.aggregate_id)?;
+        }
+        let origin_sequence = next_sequence(transaction, &node_id)?;
+        let logical_time = next_hlc(transaction, &node_id)?;
+        let operation = ProjectOperation {
+            operation_id: format!(
+                "op_{:013}_{}",
+                logical_time.wall_millis,
+                Uuid::new_v4().simple()
+            ),
+            project_id: project_id.to_string(),
+            origin_node_id: node_id.clone(),
+            origin_sequence,
+            logical_time,
+            aggregate_type: new.aggregate_type.to_string(),
+            aggregate_id: new.aggregate_id,
+            operation_type: new.operation_type.to_string(),
+            payload_version: 1,
+            base_revision: new.base_revision,
+            payload: new.payload,
+        };
+        let result = insert_and_materialize(transaction, &operation)?;
+        if result == ApplyOperationResult::Conflict {
+            bail!("locally constructed operation unexpectedly conflicted");
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn reconcile_asset_baseline(
+    transaction: &Transaction<'_>,
+    project_id: &str,
+    asset_id: &str,
+) -> Result<()> {
+    let current = transaction
+        .query_row(
+            "SELECT notes, labels_json, removed, rotation_degrees, created_at FROM assets WHERE id=?1 AND project_id=?2",
+            params![asset_id, project_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, bool>(2)?, row.get::<_, i64>(3)?, row.get::<_, String>(4)?)),
+        )
+        .optional()?
+        .ok_or_else(|| anyhow!("asset not found: {asset_id}"))?;
+    transaction.execute(
+        "INSERT INTO materialized_revisions(project_id, aggregate_type, aggregate_id, revision, last_operation_id) VALUES (?1, 'projectAsset', ?2, 0, NULL) ON CONFLICT DO NOTHING",
+        params![project_id, asset_id],
+    )?;
+    transaction.execute(
+        "INSERT INTO note_revisions(revision_id, project_id, asset_id, operation_id, text, hlc_wall_millis, hlc_counter, origin_node_id, created_at) VALUES (?1, ?2, ?3, NULL, ?4, 0, 0, 'baseline', ?5) ON CONFLICT DO NOTHING",
+        params![format!("baseline_note_{asset_id}"), project_id, asset_id, current.0, current.4],
+    )?;
+    for (field, value) in [
+        (
+            "removed",
+            if current.2 {
+                "true".to_string()
+            } else {
+                "false".to_string()
+            },
+        ),
+        ("rotationDegrees", current.3.to_string()),
+    ] {
+        transaction.execute(
+            "INSERT INTO lww_registers(project_id, aggregate_type, aggregate_id, field_name, value_json, operation_id, hlc_wall_millis, hlc_counter, origin_node_id) VALUES (?1, 'projectAsset', ?2, ?3, ?4, NULL, 0, 0, 'baseline') ON CONFLICT DO NOTHING",
+            params![project_id, asset_id, field, value],
+        )?;
+    }
+    let tag_count: i64 = transaction.query_row(
+        "SELECT COUNT(*) FROM label_tags WHERE asset_id=?1",
+        [asset_id],
+        |row| row.get(0),
+    )?;
+    if tag_count == 0 {
+        for (ordinal, label) in serde_json::from_str::<Vec<String>>(&current.1)
+            .unwrap_or_default()
+            .into_iter()
+            .enumerate()
+        {
+            transaction.execute(
+                "INSERT INTO label_tags(add_tag, project_id, asset_id, normalized_label, display_label, operation_id, hlc_wall_millis, hlc_counter, origin_node_id, created_at) VALUES (?1, ?2, ?3, ?4, ?5, NULL, 0, ?6, 'baseline', ?7) ON CONFLICT DO NOTHING",
+                params![format!("baseline_label_{asset_id}_{ordinal}"), project_id, asset_id, label_key(&label), label, ordinal as i64, current.4],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn ensure_node(transaction: &Transaction<'_>) -> Result<String> {
+    if let Some(node) = transaction
+        .query_row(
+            "SELECT node_id FROM catalog_identity WHERE singleton_id = 1",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+    {
+        return Ok(node);
+    }
+    let node = format!("node_desktop_{}", Uuid::new_v4().simple());
+    transaction.execute(
+        "INSERT INTO catalog_identity(singleton_id, node_id, created_at) VALUES (1, ?1, ?2)",
+        params![node, now()],
+    )?;
+    backfill_local_locations(transaction, &node)?;
+    Ok(node)
+}
+
+fn backfill_local_locations(transaction: &Transaction<'_>, node_id: &str) -> Result<()> {
+    transaction.execute(
+        "INSERT OR IGNORE INTO project_asset_local_locations(asset_id, node_id, local_path, created_at) SELECT id, ?1, path, created_at FROM assets WHERE path != ''",
+        [node_id],
+    )?;
+    Ok(())
+}
+
+fn next_sequence(transaction: &Transaction<'_>, node_id: &str) -> Result<u64> {
+    transaction.execute(
+        "INSERT INTO operation_origin_sequences(origin_node_id, last_sequence) VALUES (?1, 0) ON CONFLICT(origin_node_id) DO NOTHING",
+        [node_id],
+    )?;
+    transaction.execute(
+        "UPDATE operation_origin_sequences SET last_sequence = last_sequence + 1 WHERE origin_node_id = ?1",
+        [node_id],
+    )?;
+    Ok(transaction.query_row(
+        "SELECT last_sequence FROM operation_origin_sequences WHERE origin_node_id = ?1",
+        [node_id],
+        |row| row.get::<_, i64>(0),
+    )? as u64)
+}
+
+fn next_hlc(transaction: &Transaction<'_>, node_id: &str) -> Result<HybridLogicalTime> {
+    let wall_now = Utc::now().timestamp_millis().max(0);
+    let previous = transaction
+        .query_row(
+            "SELECT wall_millis, counter FROM operation_hlc_state WHERE node_id = ?1",
+            [node_id],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .optional()?;
+    let (wall_millis, counter) = match previous {
+        Some((wall, counter)) if wall >= wall_now => (wall, counter as u64 + 1),
+        _ => (wall_now, 0),
+    };
+    transaction.execute(
+        "INSERT INTO operation_hlc_state(node_id, wall_millis, counter) VALUES (?1, ?2, ?3) ON CONFLICT(node_id) DO UPDATE SET wall_millis=excluded.wall_millis, counter=excluded.counter",
+        params![node_id, wall_millis, counter as i64],
+    )?;
+    Ok(HybridLogicalTime {
+        wall_millis,
+        counter,
+        node_id: node_id.to_string(),
+    })
+}
+
+fn receive_hlc(transaction: &Transaction<'_>, operation: &ProjectOperation) -> Result<()> {
+    let local = ensure_node(transaction)?;
+    let wall_now = Utc::now().timestamp_millis().max(0);
+    let (last_wall, last_counter) = transaction
+        .query_row(
+            "SELECT wall_millis, counter FROM operation_hlc_state WHERE node_id = ?1",
+            [&local],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .optional()?
+        .unwrap_or((0, 0));
+    let wall = wall_now
+        .max(last_wall)
+        .max(operation.logical_time.wall_millis);
+    let counter = if wall == last_wall && wall == operation.logical_time.wall_millis {
+        last_counter.max(operation.logical_time.counter as i64) + 1
+    } else if wall == last_wall {
+        last_counter + 1
+    } else if wall == operation.logical_time.wall_millis {
+        operation.logical_time.counter as i64 + 1
+    } else {
+        0
+    };
+    transaction.execute(
+        "INSERT INTO operation_hlc_state(node_id, wall_millis, counter) VALUES (?1, ?2, ?3) ON CONFLICT(node_id) DO UPDATE SET wall_millis=excluded.wall_millis, counter=excluded.counter",
+        params![local, wall, counter],
+    )?;
+    Ok(())
+}
+
+fn insert_and_materialize(
+    transaction: &Transaction<'_>,
+    operation: &ProjectOperation,
+) -> Result<ApplyOperationResult> {
+    validate_operation(operation)?;
+    if operation_exists(transaction, &operation.operation_id)? {
+        return Ok(ApplyOperationResult::Duplicate);
+    }
+    if operation.aggregate_type == "projectAsset" && operation.operation_type != PROJECT_ASSET_ADDED
+    {
+        reconcile_asset_baseline(transaction, &operation.project_id, &operation.aggregate_id)?;
+    }
+    transaction.execute(
+        "INSERT INTO project_operations(operation_id, project_id, origin_node_id, origin_sequence, hlc_wall_millis, hlc_counter, aggregate_type, aggregate_id, operation_type, payload_version, base_revision, payload_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+        params![operation.operation_id, operation.project_id, operation.origin_node_id, operation.origin_sequence as i64,
+            operation.logical_time.wall_millis, operation.logical_time.counter as i64, operation.aggregate_type,
+            operation.aggregate_id, operation.operation_type, operation.payload_version, operation.base_revision.map(|v| v as i64),
+            serde_json::to_string(&operation.payload)?, now()],
+    )?;
+
+    let outcome = match operation.operation_type.as_str() {
+        NOTE_REVISION_CREATED => materialize_note(transaction, operation)?,
+        LABEL_ADDED => materialize_label_add(transaction, operation)?,
+        LABEL_REMOVED => materialize_label_remove(transaction, operation)?,
+        REMOVED_SET => materialize_register(transaction, operation, "removed")?,
+        ROTATION_SET => materialize_register(transaction, operation, "rotationDegrees")?,
+        PROJECT_ASSET_ADDED => materialize_asset_add(transaction, operation)?,
+        PROJECT_ASSET_MEDIA_LINKED => materialize_media_link(transaction, operation)?,
+        CLOCK_EVENT_CREATED => return materialize_clock(transaction, operation),
+        value => bail!("unsupported operation type: {value}"),
+    };
+    if outcome {
+        advance_revision(transaction, operation)?;
+    }
+    Ok(ApplyOperationResult::Applied)
+}
+
+fn materialize_note(transaction: &Transaction<'_>, operation: &ProjectOperation) -> Result<bool> {
+    let payload: NotePayload = payload(operation)?;
+    require_asset(transaction, operation)?;
+    transaction.execute(
+        "INSERT INTO note_revisions(revision_id, project_id, asset_id, operation_id, text, hlc_wall_millis, hlc_counter, origin_node_id, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![payload.revision_id, operation.project_id, operation.aggregate_id, operation.operation_id, payload.text,
+            operation.logical_time.wall_millis, operation.logical_time.counter as i64, operation.origin_node_id, now()],
+    )?;
+    let active: String = transaction.query_row(
+        "SELECT text FROM note_revisions WHERE asset_id = ?1 ORDER BY hlc_wall_millis DESC, hlc_counter DESC, origin_node_id DESC, revision_id DESC LIMIT 1",
+        [&operation.aggregate_id], |row| row.get(0))?;
+    transaction.execute(
+        "UPDATE assets SET notes = ?2 WHERE id = ?1",
+        params![operation.aggregate_id, active],
+    )?;
+    Ok(true)
+}
+
+fn materialize_label_add(
+    transaction: &Transaction<'_>,
+    operation: &ProjectOperation,
+) -> Result<bool> {
+    let payload: LabelAddPayload = payload(operation)?;
+    require_asset(transaction, operation)?;
+    let labels = normalize_labels(std::slice::from_ref(&payload.label))?;
+    let label = labels
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow!("label cannot be empty"))?;
+    transaction.execute(
+        "INSERT INTO label_tags(add_tag, project_id, asset_id, normalized_label, display_label, operation_id, hlc_wall_millis, hlc_counter, origin_node_id, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        params![payload.add_tag, operation.project_id, operation.aggregate_id, label_key(&label), label, operation.operation_id,
+            operation.logical_time.wall_millis, operation.logical_time.counter as i64, operation.origin_node_id, now()],
+    )?;
+    refresh_labels(transaction, &operation.aggregate_id)?;
+    Ok(true)
+}
+
+fn materialize_label_remove(
+    transaction: &Transaction<'_>,
+    operation: &ProjectOperation,
+) -> Result<bool> {
+    let payload: LabelRemovePayload = payload(operation)?;
+    require_asset(transaction, operation)?;
+    if payload.normalized_label.is_empty()
+        || label_key(&payload.normalized_label) != payload.normalized_label
+    {
+        bail!("labelRemoved normalized label is invalid");
+    }
+    for tag in payload.observed_add_tags {
+        transaction.execute(
+            "INSERT INTO label_tag_removals(remove_operation_id, add_tag, normalized_label) VALUES (?1, ?2, ?3) ON CONFLICT DO NOTHING",
+            params![operation.operation_id, tag, payload.normalized_label],
+        )?;
+    }
+    refresh_labels(transaction, &operation.aggregate_id)?;
+    Ok(true)
+}
+
+fn materialize_register(
+    transaction: &Transaction<'_>,
+    operation: &ProjectOperation,
+    field: &str,
+) -> Result<bool> {
+    require_asset(transaction, operation)?;
+    let value = match field {
+        "removed" => serde_json::to_value(payload::<RemovedPayload>(operation)?.removed)?,
+        "rotationDegrees" => {
+            let rotation = payload::<RotationPayload>(operation)?.rotation_degrees;
+            if !matches!(rotation, 0 | 90 | 180 | 270) {
+                bail!("invalid rotation: {rotation}; expected 0, 90, 180, or 270 degrees");
+            }
+            serde_json::to_value(rotation)?
+        }
+        _ => unreachable!(),
+    };
+    let wins = transaction.query_row(
+        "SELECT hlc_wall_millis, hlc_counter, origin_node_id, COALESCE(operation_id, '') FROM lww_registers WHERE project_id=?1 AND aggregate_type=?2 AND aggregate_id=?3 AND field_name=?4",
+        params![operation.project_id, operation.aggregate_type, operation.aggregate_id, field],
+        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?)),
+    ).optional()?.is_none_or(|current| operation_key(operation) > current);
+    if wins {
+        transaction.execute(
+            "INSERT INTO lww_registers(project_id, aggregate_type, aggregate_id, field_name, value_json, operation_id, hlc_wall_millis, hlc_counter, origin_node_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) ON CONFLICT(project_id, aggregate_type, aggregate_id, field_name) DO UPDATE SET value_json=excluded.value_json, operation_id=excluded.operation_id, hlc_wall_millis=excluded.hlc_wall_millis, hlc_counter=excluded.hlc_counter, origin_node_id=excluded.origin_node_id",
+            params![operation.project_id, operation.aggregate_type, operation.aggregate_id, field, serde_json::to_string(&value)?, operation.operation_id,
+                operation.logical_time.wall_millis, operation.logical_time.counter as i64, operation.origin_node_id],
+        )?;
+        match field {
+            "removed" => {
+                transaction.execute(
+                    "UPDATE assets SET removed=?2 WHERE id=?1",
+                    params![operation.aggregate_id, value.as_bool().unwrap()],
+                )?;
+            }
+            "rotationDegrees" => {
+                transaction.execute(
+                    "UPDATE assets SET rotation_degrees=?2 WHERE id=?1",
+                    params![operation.aggregate_id, value.as_u64().unwrap() as i64],
+                )?;
+            }
+            _ => unreachable!(),
+        }
+    }
+    Ok(true)
+}
+
+fn materialize_asset_add(
+    transaction: &Transaction<'_>,
+    operation: &ProjectOperation,
+) -> Result<bool> {
+    let payload: ProjectAssetAddedPayload = payload(operation)?;
+    if payload.id != operation.aggregate_id {
+        bail!("projectAssetAdded payload ID does not match aggregate ID");
+    }
+    if operation.aggregate_type != "projectAsset" {
+        bail!("projectAssetAdded requires a projectAsset aggregate");
+    }
+    let existing: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM assets WHERE id=?1)",
+        [&payload.id],
+        |row| row.get(0),
+    )?;
+    if existing {
+        return Ok(true);
+    }
+    transaction.execute(
+        "INSERT INTO assets(id, project_id, fingerprint, path, filename, size_bytes, duration_seconds, frame_rate, width, height, codec, camera, captured_at_raw, best_time, metadata_rotation_degrees, default_rotation_degrees, rotation_degrees, orientation_probed, created_at) VALUES (?1, ?2, ?3, '', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?15, 1, ?16)",
+        params![payload.id, operation.project_id, payload.fingerprint, payload.filename, payload.size_bytes as i64,
+            payload.duration_seconds, payload.frame_rate, payload.width, payload.height, payload.codec, payload.camera,
+            payload.captured_at_raw, payload.best_time, payload.metadata_rotation_degrees, payload.default_rotation_degrees, payload.created_at],
+    )?;
+    transaction.execute(
+        "INSERT INTO note_revisions(revision_id, project_id, asset_id, operation_id, text, hlc_wall_millis, hlc_counter, origin_node_id, created_at) VALUES (?1, ?2, ?3, NULL, '', 0, 0, 'baseline', ?4)",
+        params![format!("baseline_note_{}", operation.aggregate_id), operation.project_id, operation.aggregate_id, payload.created_at],
+    )?;
+    for (field, value) in [
+        ("removed", "false".to_string()),
+        (
+            "rotationDegrees",
+            payload.default_rotation_degrees.to_string(),
+        ),
+    ] {
+        transaction.execute("INSERT INTO lww_registers(project_id, aggregate_type, aggregate_id, field_name, value_json, operation_id, hlc_wall_millis, hlc_counter, origin_node_id) VALUES (?1, 'projectAsset', ?2, ?3, ?4, NULL, 0, 0, 'baseline')",
+            params![operation.project_id, operation.aggregate_id, field, value])?;
+    }
+    Ok(true)
+}
+
+fn materialize_media_link(
+    transaction: &Transaction<'_>,
+    operation: &ProjectOperation,
+) -> Result<bool> {
+    let payload: MediaLinkedPayload = payload(operation)?;
+    require_asset(transaction, operation)?;
+    transaction.execute(
+        "UPDATE assets SET media_object_id=?2, media_verification_state=?3 WHERE id=?1",
+        params![
+            operation.aggregate_id,
+            payload.media_object_id,
+            payload.verification_state.as_str()
+        ],
+    )?;
+    Ok(true)
+}
+
+fn materialize_clock(
+    transaction: &Transaction<'_>,
+    operation: &ProjectOperation,
+) -> Result<ApplyOperationResult> {
+    let payload: ClockPayload = payload(operation)?;
+    if operation.aggregate_type != "clock" || operation.aggregate_id != payload.camera {
+        bail!("clock operation aggregate does not match its camera");
+    }
+    let actual = current_revision(
+        transaction,
+        &operation.project_id,
+        "clock",
+        &operation.aggregate_id,
+    )?;
+    if operation.base_revision != Some(actual) {
+        let active = transaction.query_row(
+            "SELECT last_operation_id FROM materialized_revisions WHERE project_id=?1 AND aggregate_type='clock' AND aggregate_id=?2",
+            params![operation.project_id, operation.aggregate_id], |row| row.get::<_, Option<String>>(0)).optional()?.flatten();
+        transaction.execute("INSERT INTO operation_conflicts(conflict_id, project_id, aggregate_type, aggregate_id, incoming_operation_id, active_operation_id, expected_base_revision, actual_revision, conflict_type, created_at) VALUES (?1, ?2, 'clock', ?3, ?4, ?5, ?6, ?7, 'stale_clock_base_revision', ?8)",
+            params![format!("conflict_{}", Uuid::new_v4().simple()), operation.project_id, operation.aggregate_id, operation.operation_id,
+                active, operation.base_revision.map(|v| v as i64), actual as i64, now()])?;
+        return Ok(ApplyOperationResult::Conflict);
+    }
+    transaction.execute("INSERT INTO clock_events(id, project_id, camera, start_filename, offset_seconds, label, created_at, operation_id, hlc_wall_millis, hlc_counter, origin_node_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        params![payload.event_id, operation.project_id, payload.camera, payload.start_filename, payload.offset_seconds, payload.label, now(), operation.operation_id,
+            operation.logical_time.wall_millis, operation.logical_time.counter as i64, operation.origin_node_id])?;
+    recalculate_clock(transaction, &operation.project_id, &operation.aggregate_id)?;
+    advance_revision(transaction, operation)?;
+    Ok(ApplyOperationResult::Applied)
+}
+
+fn recalculate_clock(transaction: &Transaction<'_>, project_id: &str, camera: &str) -> Result<()> {
+    let mut events_statement = transaction.prepare("SELECT start_filename, offset_seconds FROM clock_events WHERE project_id=?1 AND camera=?2 ORDER BY start_filename, COALESCE(hlc_wall_millis, 0), COALESCE(hlc_counter, 0), COALESCE(origin_node_id, ''), COALESCE(operation_id, ''), created_at, rowid")?;
+    let events = events_statement
+        .query_map(params![project_id, camera], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(events_statement);
+    let mut assets_statement = transaction.prepare(
+        "SELECT id, filename, captured_at_raw FROM assets WHERE project_id=?1 AND camera=?2",
+    )?;
+    let assets = assets_statement
+        .query_map(params![project_id, camera], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(assets_statement);
+    for (asset_id, filename, raw) in assets {
+        let offset = events
+            .iter()
+            .filter(|(boundary, _)| boundary <= &filename)
+            .map(|(_, offset)| *offset)
+            .next_back()
+            .unwrap_or(0);
+        let best = raw
+            .as_deref()
+            .and_then(|value| normalize_datetime(value, offset));
+        transaction.execute(
+            "UPDATE assets SET offset_seconds=?2, best_time=?3 WHERE id=?1",
+            params![asset_id, offset, best],
+        )?;
+    }
+    Ok(())
+}
+
+fn refresh_labels(transaction: &Transaction<'_>, asset_id: &str) -> Result<()> {
+    let mut statement = transaction.prepare(
+        "SELECT normalized_label, display_label FROM label_tags t WHERE asset_id=?1 AND NOT EXISTS(SELECT 1 FROM label_tag_removals r WHERE r.add_tag=t.add_tag AND r.normalized_label=t.normalized_label) ORDER BY hlc_wall_millis, hlc_counter, origin_node_id, add_tag",
+    )?;
+    let rows = statement
+        .query_map([asset_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(statement);
+    let mut seen = BTreeSet::new();
+    let labels = rows
+        .into_iter()
+        .filter_map(|(key, display)| seen.insert(key).then_some(display))
+        .collect::<Vec<_>>();
+    if labels.len() > 24 {
+        bail!("invalid labels: an asset can have at most 24 labels");
+    }
+    transaction.execute(
+        "UPDATE assets SET labels_json=?2 WHERE id=?1",
+        params![asset_id, serde_json::to_string(&labels)?],
+    )?;
+    Ok(())
+}
+
+fn active_label_tags(
+    transaction: &Transaction<'_>,
+    asset_id: &str,
+    normalized: &str,
+) -> Result<Vec<String>> {
+    let mut statement = transaction.prepare("SELECT add_tag FROM label_tags t WHERE asset_id=?1 AND normalized_label=?2 AND NOT EXISTS(SELECT 1 FROM label_tag_removals r WHERE r.add_tag=t.add_tag AND r.normalized_label=t.normalized_label) ORDER BY add_tag")?;
+    Ok(statement
+        .query_map(params![asset_id, normalized], |row| row.get(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+fn advance_revision(transaction: &Transaction<'_>, operation: &ProjectOperation) -> Result<()> {
+    transaction.execute(
+        "INSERT INTO materialized_revisions(project_id, aggregate_type, aggregate_id, revision, last_operation_id) VALUES (?1, ?2, ?3, 1, ?4) ON CONFLICT(project_id, aggregate_type, aggregate_id) DO UPDATE SET revision=revision+1, last_operation_id=excluded.last_operation_id",
+        params![operation.project_id, operation.aggregate_type, operation.aggregate_id, operation.operation_id],
+    )?;
+    Ok(())
+}
+
+fn current_revision(
+    connection: &rusqlite::Connection,
+    project_id: &str,
+    aggregate_type: &str,
+    aggregate_id: &str,
+) -> Result<u64> {
+    Ok(connection.query_row("SELECT revision FROM materialized_revisions WHERE project_id=?1 AND aggregate_type=?2 AND aggregate_id=?3",
+        params![project_id, aggregate_type, aggregate_id], |row| row.get::<_, i64>(0)).optional()?.unwrap_or(0) as u64)
+}
+
+fn require_asset(transaction: &Transaction<'_>, operation: &ProjectOperation) -> Result<()> {
+    if operation.aggregate_type != "projectAsset" {
+        bail!(
+            "{} requires a projectAsset aggregate",
+            operation.operation_type
+        );
+    }
+    let belongs: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM assets WHERE id=?1 AND project_id=?2)",
+        params![operation.aggregate_id, operation.project_id],
+        |row| row.get(0),
+    )?;
+    if !belongs {
+        bail!("asset not found: {}", operation.aggregate_id);
+    }
+    Ok(())
+}
+
+fn payload<T: DeserializeOwned>(operation: &ProjectOperation) -> Result<T> {
+    if operation.payload_version != 1 {
+        bail!(
+            "unsupported payload version {} for {}",
+            operation.payload_version,
+            operation.operation_type
+        );
+    }
+    Ok(serde_json::from_value(operation.payload.clone())?)
+}
+
+fn validate_operation(operation: &ProjectOperation) -> Result<()> {
+    validate_id("operation ID", &operation.operation_id)?;
+    validate_id("project ID", &operation.project_id)?;
+    validate_id("origin node ID", &operation.origin_node_id)?;
+    if operation.origin_sequence == 0 {
+        bail!("origin sequence must be greater than zero");
+    }
+    if operation.origin_sequence > i64::MAX as u64
+        || operation.logical_time.counter > i64::MAX as u64
+        || operation
+            .base_revision
+            .is_some_and(|value| value > i64::MAX as u64)
+    {
+        bail!("operation sequence, counter, or revision exceeds SQLite integer range");
+    }
+    if operation.logical_time.wall_millis < 0 {
+        bail!("logical wall time cannot be negative");
+    }
+    if operation.logical_time.node_id != operation.origin_node_id {
+        bail!("logical time node ID must match origin node ID");
+    }
+    if operation.payload_version != 1 {
+        bail!(
+            "unsupported payload version {} for {}",
+            operation.payload_version,
+            operation.operation_type
+        );
+    }
+    Ok(())
+}
+
+fn validate_id(kind: &str, value: &str) -> Result<()> {
+    if value.is_empty()
+        || value.len() > 255
+        || value.chars().any(|c| c.is_whitespace() || c.is_control())
+    {
+        bail!("invalid {kind}");
+    }
+    Ok(())
+}
+
+fn operation_exists(transaction: &Transaction<'_>, operation_id: &str) -> Result<bool> {
+    Ok(transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM project_operations WHERE operation_id=?1)",
+        [operation_id],
+        |row| row.get(0),
+    )?)
+}
+
+fn operation_matches_acknowledged_sequence(
+    transaction: &Transaction<'_>,
+    operation: &ProjectOperation,
+) -> Result<bool> {
+    Ok(transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM project_operations WHERE operation_id=?1 AND origin_node_id=?2 AND origin_sequence=?3)",
+        params![
+            operation.operation_id,
+            operation.origin_node_id,
+            operation.origin_sequence as i64
+        ],
+        |row| row.get(0),
+    )?)
+}
+
+fn operation_key(operation: &ProjectOperation) -> (i64, i64, String, String) {
+    (
+        operation.logical_time.wall_millis,
+        operation.logical_time.counter as i64,
+        operation.origin_node_id.clone(),
+        operation.operation_id.clone(),
+    )
+}
+
+fn operation_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProjectOperation> {
+    let origin_node_id: String = row.get(2)?;
+    Ok(ProjectOperation {
+        operation_id: row.get(0)?,
+        project_id: row.get(1)?,
+        origin_node_id: origin_node_id.clone(),
+        origin_sequence: row.get::<_, i64>(3)? as u64,
+        logical_time: HybridLogicalTime {
+            wall_millis: row.get(4)?,
+            counter: row.get::<_, i64>(5)? as u64,
+            node_id: origin_node_id,
+        },
+        aggregate_type: row.get(6)?,
+        aggregate_id: row.get(7)?,
+        operation_type: row.get(8)?,
+        payload_version: row.get(9)?,
+        base_revision: row.get::<_, Option<i64>>(10)?.map(|value| value as u64),
+        payload: serde_json::from_str(&row.get::<_, String>(11)?).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                11,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?,
+    })
+}
+
+fn label_key(label: &str) -> String {
+    label.trim().to_ascii_lowercase()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+    use serde_json::json;
+    use tempfile::{TempDir, tempdir};
+
+    fn fixture() -> (TempDir, Catalog) {
+        let directory = tempdir().unwrap();
+        let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).unwrap();
+        let connection = catalog.connection().unwrap();
+        connection.execute("INSERT INTO projects(id, name, created_at) VALUES ('project_test', 'Test', '2026-01-01T00:00:00Z')", []).unwrap();
+        connection.execute(
+            "INSERT INTO assets(id, project_id, fingerprint, path, filename, size_bytes, duration_seconds, frame_rate, width, height, codec, camera, captured_at_raw, best_time, notes, labels_json, removed, rotation_degrees, created_at) VALUES ('asset_test', 'project_test', 'fingerprint', '/offline/clip.mp4', 'clip.mp4', 100, 10, 30, 1920, 1080, 'h264', 'DJI', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00.000Z', 'baseline', '[\"arrival\"]', 0, 0, '2026-01-01T00:00:00Z')",
+            [],
+        ).unwrap();
+        (directory, catalog)
+    }
+
+    fn operation(
+        id: &str,
+        node: &str,
+        sequence: u64,
+        wall: i64,
+        operation_type: &str,
+        payload: Value,
+    ) -> ProjectOperation {
+        ProjectOperation {
+            operation_id: id.to_string(),
+            project_id: "project_test".to_string(),
+            origin_node_id: node.to_string(),
+            origin_sequence: sequence,
+            logical_time: HybridLogicalTime {
+                wall_millis: wall,
+                counter: 0,
+                node_id: node.to_string(),
+            },
+            aggregate_type: "projectAsset".to_string(),
+            aggregate_id: "asset_test".to_string(),
+            operation_type: operation_type.to_string(),
+            payload_version: 1,
+            base_revision: None,
+            payload,
+        }
+    }
+
+    #[test]
+    fn unchanged_patches_allocate_no_identity_sequence_or_operation() {
+        let (_directory, catalog) = fixture();
+        let asset = catalog.get_asset("asset_test").unwrap();
+        catalog
+            .update_asset(
+                "asset_test",
+                &AssetPatch {
+                    notes: asset.notes,
+                    labels: asset.labels,
+                    removed: asset.removed,
+                    rotation_degrees: asset.rotation_degrees,
+                },
+            )
+            .unwrap();
+        assert_eq!(catalog.local_node_id().unwrap(), None);
+        assert_eq!(
+            catalog
+                .operation_diagnostics("project_test")
+                .unwrap()
+                .operation_count,
+            0
+        );
+    }
+
+    #[test]
+    fn compatibility_patch_is_atomic_and_emits_only_explicit_changes() {
+        let (_directory, catalog) = fixture();
+        let updated = catalog
+            .update_asset(
+                "asset_test",
+                &AssetPatch {
+                    notes: "new note".to_string(),
+                    labels: vec!["market".to_string()],
+                    removed: true,
+                    rotation_degrees: 90,
+                },
+            )
+            .unwrap();
+        assert_eq!(updated.notes, "new note");
+        assert_eq!(updated.labels, ["market"]);
+        assert!(updated.removed);
+        assert_eq!(updated.rotation_degrees, 90);
+        assert_eq!(
+            catalog
+                .operation_diagnostics("project_test")
+                .unwrap()
+                .operation_count,
+            5
+        );
+
+        let error = catalog
+            .update_asset(
+                "asset_test",
+                &AssetPatch {
+                    notes: "must roll back".to_string(),
+                    labels: vec!["x".repeat(65)],
+                    removed: false,
+                    rotation_degrees: 180,
+                },
+            )
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("64 characters"));
+        let unchanged = catalog.get_asset("asset_test").unwrap();
+        assert_eq!(unchanged.notes, "new note");
+        assert_eq!(
+            catalog
+                .operation_diagnostics("project_test")
+                .unwrap()
+                .operation_count,
+            5
+        );
+    }
+
+    #[test]
+    fn note_and_lww_materialization_converge_under_reversed_delivery() {
+        let (_left_dir, left) = fixture();
+        let (_right_dir, right) = fixture();
+        let early_note = operation(
+            "op_note_early",
+            "node_a",
+            1,
+            10,
+            NOTE_REVISION_CREATED,
+            json!({"revisionId":"note_early","text":"early"}),
+        );
+        let late_note = operation(
+            "op_note_late",
+            "node_b",
+            1,
+            20,
+            NOTE_REVISION_CREATED,
+            json!({"revisionId":"note_late","text":"late"}),
+        );
+        let early_removed = operation(
+            "op_removed_early",
+            "node_a",
+            2,
+            11,
+            REMOVED_SET,
+            json!({"removed":true}),
+        );
+        let late_removed = operation(
+            "op_removed_late",
+            "node_b",
+            2,
+            21,
+            REMOVED_SET,
+            json!({"removed":false}),
+        );
+        for value in [&early_note, &late_note, &early_removed, &late_removed] {
+            left.apply_operation(value).unwrap();
+        }
+        for value in [&late_removed, &early_removed, &late_note, &early_note] {
+            right.apply_operation(value).unwrap();
+        }
+        for catalog in [&left, &right] {
+            let asset = catalog.get_asset("asset_test").unwrap();
+            assert_eq!(asset.notes, "late");
+            assert!(!asset.removed);
+        }
+        assert_eq!(
+            left.apply_operation(&late_note).unwrap(),
+            ApplyOperationResult::Duplicate
+        );
+        assert_eq!(left.list_operations("project_test").unwrap().len(), 4);
+    }
+
+    #[test]
+    fn labels_are_add_wins_observed_remove_even_when_delivered_out_of_order() {
+        let (_directory, catalog) = fixture();
+        let remove = operation(
+            "op_remove",
+            "node_a",
+            2,
+            20,
+            LABEL_REMOVED,
+            json!({"normalizedLabel":"market","observedAddTags":["tag_observed"]}),
+        );
+        let observed_add = operation(
+            "op_add_observed",
+            "node_a",
+            1,
+            10,
+            LABEL_ADDED,
+            json!({"addTag":"tag_observed","label":"Market"}),
+        );
+        let concurrent_add = operation(
+            "op_add_concurrent",
+            "node_b",
+            1,
+            15,
+            LABEL_ADDED,
+            json!({"addTag":"tag_concurrent","label":"MARKET"}),
+        );
+        catalog.apply_operation(&remove).unwrap();
+        catalog.apply_operation(&observed_add).unwrap();
+        catalog.apply_operation(&concurrent_add).unwrap();
+        assert_eq!(
+            catalog.get_asset("asset_test").unwrap().labels,
+            ["arrival", "MARKET"]
+        );
+    }
+
+    #[test]
+    fn stale_clock_base_creates_a_conflict_without_replacing_chronology() {
+        let (_directory, catalog) = fixture();
+        let mut first = operation(
+            "op_clock_first",
+            "node_a",
+            1,
+            10,
+            CLOCK_EVENT_CREATED,
+            json!({"eventId":"clock_first","camera":"DJI","startFilename":"clip.mp4","offsetSeconds":60,"label":"first"}),
+        );
+        first.aggregate_type = "clock".to_string();
+        first.aggregate_id = "DJI".to_string();
+        first.base_revision = Some(0);
+        let mut stale = operation(
+            "op_clock_stale",
+            "node_b",
+            1,
+            20,
+            CLOCK_EVENT_CREATED,
+            json!({"eventId":"clock_stale","camera":"DJI","startFilename":"clip.mp4","offsetSeconds":120,"label":"stale"}),
+        );
+        stale.aggregate_type = "clock".to_string();
+        stale.aggregate_id = "DJI".to_string();
+        stale.base_revision = Some(0);
+        assert_eq!(
+            catalog.apply_operation(&first).unwrap(),
+            ApplyOperationResult::Applied
+        );
+        assert_eq!(
+            catalog.apply_operation(&stale).unwrap(),
+            ApplyOperationResult::Conflict
+        );
+        assert_eq!(catalog.get_asset("asset_test").unwrap().offset_seconds, 60);
+        assert_eq!(
+            catalog
+                .operation_diagnostics("project_test")
+                .unwrap()
+                .unresolved_conflicts
+                .len(),
+            1
+        );
+    }
+
+    proptest! {
+        #[test]
+        fn lww_rotation_converges_for_shuffled_delivery(order_keys in any::<[u8; 3]>()) {
+            let (_directory, catalog) = fixture();
+            let operations = [
+                operation("op_rotation_1", "node_a", 1, 10, ROTATION_SET, json!({"rotationDegrees":90})),
+                operation("op_rotation_2", "node_b", 1, 30, ROTATION_SET, json!({"rotationDegrees":270})),
+                operation("op_rotation_3", "node_a", 2, 20, ROTATION_SET, json!({"rotationDegrees":180})),
+            ];
+            let mut indices = [0_usize, 1, 2];
+            indices.sort_by_key(|index| (order_keys[*index], *index));
+            for index in indices {
+                catalog.apply_operation(&operations[index]).unwrap();
+            }
+            prop_assert_eq!(catalog.get_asset("asset_test").unwrap().rotation_degrees, 270);
+        }
+    }
+}

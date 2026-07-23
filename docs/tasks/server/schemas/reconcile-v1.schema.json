@@ -1,0 +1,106 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://rcdvlog.local/schemas/reconcile-v1.schema.json",
+  "title": "RCD VlogCutter reconcile request v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "protocolVersion",
+    "projectSchemaVersion",
+    "projectId",
+    "serverNodeId",
+    "operationCursors",
+    "operations",
+    "observations",
+    "representationManifests",
+    "maximumResponseOperations"
+  ],
+  "properties": {
+    "protocolVersion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["minimumMajor", "minimumMinor", "maximumMajor", "maximumMinor"],
+      "properties": {
+        "minimumMajor": { "type": "integer", "minimum": 0 },
+        "minimumMinor": { "type": "integer", "minimum": 0 },
+        "maximumMajor": { "type": "integer", "minimum": 0 },
+        "maximumMinor": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "projectSchemaVersion": { "type": "integer", "minimum": 1 },
+    "projectId": { "type": "string", "minLength": 1 },
+    "serverNodeId": { "type": "string", "minLength": 1 },
+    "operationCursors": {
+      "type": "object",
+      "additionalProperties": { "type": "integer", "minimum": 0 }
+    },
+    "operations": {
+      "type": "array",
+      "maxItems": 500,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "operationId", "projectId", "originNodeId", "originSequence",
+          "logicalTime", "aggregateType", "aggregateId", "operationType",
+          "payloadVersion", "baseRevision", "payload"
+        ],
+        "properties": {
+          "operationId": { "type": "string", "minLength": 1 },
+          "projectId": { "type": "string", "minLength": 1 },
+          "originNodeId": { "type": "string", "minLength": 1 },
+          "originSequence": { "type": "integer", "minimum": 1 },
+          "logicalTime": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["wallMillis", "counter", "nodeId"],
+            "properties": {
+              "wallMillis": { "type": "integer" },
+              "counter": { "type": "integer", "minimum": 0 },
+              "nodeId": { "type": "string", "minLength": 1 }
+            }
+          },
+          "aggregateType": { "type": "string", "minLength": 1 },
+          "aggregateId": { "type": "string", "minLength": 1 },
+          "operationType": { "type": "string", "minLength": 1 },
+          "payloadVersion": { "const": 1 },
+          "baseRevision": { "type": ["integer", "null"], "minimum": 0 },
+          "payload": { "type": "object" }
+        }
+      }
+    },
+    "observations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["originNodeId", "originSequence", "scopeKey", "payload"],
+        "properties": {
+          "originNodeId": { "type": "string", "minLength": 1 },
+          "originSequence": { "type": "integer", "minimum": 1 },
+          "scopeKey": { "type": "string", "minLength": 1 },
+          "payload": {}
+        }
+      }
+    },
+    "representationManifests": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["manifestId", "originNodeId", "originSequence", "payload"],
+        "properties": {
+          "manifestId": { "type": "string", "minLength": 1 },
+          "originNodeId": { "type": "string", "minLength": 1 },
+          "originSequence": { "type": "integer", "minimum": 1 },
+          "payload": { "type": "object" }
+        }
+      }
+    },
+    "maximumResponseOperations": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 500
+    }
+  }
+}

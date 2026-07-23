@@ -30,6 +30,7 @@ export type AutoplayMode = "never" | "proxyAvailable" | "always";
 
 export interface DesktopSettings {
   projectsRoot: string;
+  nodeId: string;
   autoplayMode: AutoplayMode;
   lastCatalogPath: string | null;
   lastProjectId: string | null;

@@ -4,12 +4,20 @@ mod foundation;
 mod jobs;
 mod library;
 mod media_facts;
+mod replicas;
 mod representations;
 mod scan;
 pub mod scan_handler;
 mod storage_path;
 
-pub use rcdvlog_core::{CatalogSchemaError, RepresentationId};
+pub use rcdvlog_core::{
+    Catalog, CatalogSchemaError, PROJECT_CATALOG_SCHEMA_VERSION, ProjectAssetAddedPayload,
+    RepresentationId,
+};
+pub use rcdvlog_sync::{
+    BASELINE_VERSION, BaselineEnvelope, BaselinePayload, BaselinePreview, ObservationFact,
+    ProtocolRange, ReconcileRequest, ReconcileResponse, RepresentationManifestFact, SyncError,
+};
 
 pub use catalog::{
     CONTROL_CATALOG_MIGRATIONS, CONTROL_CATALOG_SCHEMA_VERSION, CONTROL_DATABASE_FILENAME,
@@ -43,6 +51,7 @@ pub use media_facts::{
     ScanFileDiagnostic,
 };
 pub use rcdvlog_core::StorageAccessMode;
+pub use replicas::{ProjectReplica, ProjectReplicaError, ProjectReplicaManager};
 pub use representations::{
     PROXY_RECIPE_KEY, Representation, RepresentationError, RepresentationJobHandler,
     RepresentationKind, RepresentationNeed, RepresentationRequest, RepresentationRequestResult,

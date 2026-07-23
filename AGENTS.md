@@ -49,6 +49,7 @@ Implemented now:
 - Weighted batch progress and ETA with project-persisted rate history.
 - Relative-order “story ribbon” with camera lanes, horizontal scrolling, and zoom.
 - A non-interactive JSON CLI for catalog, clip annotation, chronology, and media operations.
+- Immutable typed project operations for asset membership, notes, labels, removal, rotation, and fixed clock events, with deterministic materialized views and conflict diagnostics.
 - Read-only catalog/project/clip/proxy diagnostics, including the desktop's persisted last-selected catalog, project, and asset breadcrumb.
 
 Important gaps; do not accidentally describe these as complete:
@@ -95,6 +96,7 @@ Before implementing persisted trip context, resolve the domain question of wheth
 │       └── vite.config.ts            # Fixed dev port 1420
 ├── core/
 │   ├── rcdvlog-core/src/lib.rs       # Canonical catalog, media, annotation, chronology logic
+│   ├── rcdvlog-core/src/operations.rs # Typed operations, HLC, materialization, conflicts
 │   └── batch-estimator/src/lib.rs    # Domain-independent weighted ETA library
 └── docs/
     ├── agent-cli.md                  # Full CLI and JSON contract
@@ -223,9 +225,9 @@ Catalog selection precedence for the CLI:
 
 Always pass `--catalog` in agent automation, tests, and temporary workflows. A desktop project folder can otherwise be confused with the legacy catalog.
 
-SQLite connections enable foreign keys, WAL journal mode, and a five-second busy timeout. Read operations can continue during an uncommitted writer. Avoid simultaneous mutations to the same asset; revision protection is not implemented.
+SQLite connections enable foreign keys, WAL journal mode, and a five-second busy timeout. Read operations can continue during an uncommitted writer. Project mutations now append typed operations with materialized revisions; transport-level optimistic concurrency and sync cursors remain deferred to Tasks 8–11.
 
-Current migrations are idempotent `CREATE TABLE IF NOT EXISTS` statements with no schema-version table. When changing the schema:
+Project catalogs use an explicit `schema_migrations` history and are currently at version 5. Migration definitions have immutable names/source identities and each migration commits atomically. When changing the schema:
 
 - Preserve existing catalogs; never solve migration issues by deleting the database.
 - Add a forward migration and an upgrade test using an older schema fixture.

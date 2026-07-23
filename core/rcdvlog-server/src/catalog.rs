@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 use crate::ConfigDiagnostics;
 
-pub const CONTROL_CATALOG_SCHEMA_VERSION: u32 = 5;
+pub const CONTROL_CATALOG_SCHEMA_VERSION: u32 = 6;
 pub const CONTROL_DATABASE_FILENAME: &str = "control.sqlite3";
 pub const INSTANCE_LOCK_FILENAME: &str = "server.lock";
 
@@ -51,6 +51,12 @@ pub const CONTROL_CATALOG_MIGRATIONS: &[SqliteMigration] = &[
         name: "representation_store_media_jobs",
         source_identity: "server-control/0005-representation-store-media-jobs/20260723",
         apply: create_representation_store_media_jobs,
+    },
+    SqliteMigration {
+        id: 6,
+        name: "project_replica_sync_registry",
+        source_identity: "server-control/0006-project-replica-sync-registry/20260723",
+        apply: create_project_replica_sync_registry,
     },
 ];
 
@@ -159,6 +165,16 @@ impl ControlCatalog {
 
     pub fn representations(&self, derived_root: PathBuf) -> crate::RepresentationService {
         crate::RepresentationService::new(self.storage_library(), self.jobs(), derived_root)
+    }
+
+    pub fn project_replicas(&self) -> crate::ProjectReplicaManager {
+        crate::ProjectReplicaManager::new(
+            self.database_path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .to_path_buf(),
+            self.clone(),
+        )
     }
 
     pub fn inspect_migrations(&self) -> Result<MigrationHistoryInspection> {
@@ -347,6 +363,49 @@ fn create_control_catalog_foundation(transaction: &Transaction<'_>) -> Result<()
         );
         "#,
     )?;
+    Ok(())
+}
+
+fn create_project_replica_sync_registry(transaction: &Transaction<'_>) -> Result<()> {
+    add_column_if_missing(
+        transaction,
+        "project_registry",
+        "baseline_version",
+        "INTEGER",
+    )?;
+    add_column_if_missing(transaction, "project_registry", "baseline_digest", "TEXT")?;
+    add_column_if_missing(transaction, "project_registry", "origin_node_id", "TEXT")?;
+    add_column_if_missing(transaction, "project_registry", "server_node_id", "TEXT")?;
+    transaction.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS project_projection_repairs (
+            project_id TEXT NOT NULL REFERENCES project_registry(project_id),
+            source_operation_id TEXT NOT NULL,
+            projection_kind TEXT NOT NULL,
+            state TEXT NOT NULL CHECK(state IN ('pending', 'completed', 'failed')),
+            last_error_code TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(project_id, source_operation_id, projection_kind)
+        );
+        "#,
+    )?;
+    Ok(())
+}
+
+fn add_column_if_missing(
+    transaction: &Transaction<'_>,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> Result<()> {
+    let sql = format!("SELECT EXISTS(SELECT 1 FROM pragma_table_info('{table}') WHERE name=?1)");
+    let exists: bool = transaction.query_row(&sql, [column], |row| row.get(0))?;
+    if !exists {
+        transaction.execute_batch(&format!(
+            "ALTER TABLE {table} ADD COLUMN {column} {definition}"
+        ))?;
+    }
     Ok(())
 }
 

@@ -1,6 +1,6 @@
 # Task 7: Operation-Backed Project Mutations
 
-**Status:** Planned
+**Status:** Implemented 2026-07-23
 **Depends on:** Task 1
 **Unblocks:** Tasks 8 and 15
 
@@ -75,19 +75,19 @@ Operations and their materialized effects commit together. Retrying an operation
 
 ## Acceptance criteria
 
-- [ ] Existing catalogs migrate and display identical active annotations and chronology before/after migration.
-- [ ] Every supported local mutation appends typed operations and updates materialized state in one transaction.
-- [ ] Each successfully ingested file has one idempotent `projectAssetAdded` operation, while a failed file does not roll back other successful imports.
-- [ ] Retrying the same operation ID does not duplicate revisions, label tags, or clock effects.
-- [ ] Concurrent note revisions both survive and choose the deterministic active revision.
-- [ ] Concurrent label add/remove tests demonstrate add-wins observed-remove behavior.
-- [ ] Removed and rotation registers converge under reversed application order.
-- [ ] Stale incompatible clock changes produce a conflict and do not silently change active chronology.
-- [ ] Unchanged full patches emit no new operations.
-- [ ] Multi-field compatibility patches either apply all changes or none.
-- [ ] Desktop keyboard/focus review behavior and optimistic rollback remain unchanged.
-- [ ] CLI success/error envelope rules and stable error codes remain intact.
-- [ ] Read-only commands do not allocate node IDs, sequences, or migrations.
+- [x] Existing catalogs migrate and display identical active annotations and chronology before/after migration.
+- [x] Every supported local mutation appends typed operations and updates materialized state in one transaction.
+- [x] Each successfully ingested file has one idempotent `projectAssetAdded` operation, while a failed file does not roll back other successful imports.
+- [x] Retrying the same operation ID does not duplicate revisions, label tags, or clock effects.
+- [x] Concurrent note revisions both survive and choose the deterministic active revision.
+- [x] Concurrent label add/remove tests demonstrate add-wins observed-remove behavior.
+- [x] Removed and rotation registers converge under reversed application order.
+- [x] Stale incompatible clock changes produce a conflict and do not silently change active chronology.
+- [x] Unchanged full patches emit no new operations.
+- [x] Multi-field compatibility patches either apply all changes or none.
+- [x] Desktop keyboard/focus review behavior and optimistic rollback remain unchanged at the adapter boundary.
+- [x] CLI success/error envelope rules and stable error codes remain intact.
+- [x] Read-only commands do not allocate node IDs, sequences, or migrations.
 
 ## Verification
 
@@ -96,3 +96,5 @@ Run core property tests that shuffle operation delivery order and assert converg
 ## Handoff notes
 
 Freeze operation type names and payload version 1 before Task 8. Any later breaking semantic change requires a new operation/payload version rather than reinterpreting stored history.
+
+The frozen v1 names and persistence contract are documented in [OPERATIONS.md](OPERATIONS.md). Automated browser and Rust gates pass; a real Tauri keyboard/focus smoke test was not run for this data-layer change.

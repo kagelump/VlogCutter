@@ -483,6 +483,7 @@ fn rotation_after(rotation: u16, addition: i32) -> u16 {
 
 fn clip_diagnosis(catalog: &Catalog, asset_id: &str) -> Result<Value> {
     let asset = catalog.get_asset(asset_id)?;
+    let revision = catalog.asset_revision_diagnostics(asset_id)?;
     let (original_probe, original) = probe_value(&asset.path);
     let proxy_version = proxy_version(&asset);
     let proxy_probe = asset
@@ -613,6 +614,7 @@ fn clip_diagnosis(catalog: &Catalog, asset_id: &str) -> Result<Value> {
     Ok(json!({
         "catalogPath": catalog.database_path(),
         "asset": asset,
+        "revision": revision,
         "storedOrientation": {
             "probed": asset.orientation_probed,
             "metadataRotationDegrees": asset.metadata_rotation_degrees,
@@ -716,10 +718,12 @@ fn proxy_status(
 fn project_diagnosis(catalog: &Catalog, project_id: &str) -> Result<Value> {
     let status = project_status(catalog, project_id)?;
     let assets = catalog.list_assets(project_id)?;
+    let operations = catalog.operation_diagnostics(project_id)?;
     let context = desktop_context().unwrap_or_default();
     Ok(json!({
         "catalogPath": catalog.database_path(),
         "status": status,
+        "operations": operations,
         "orientation": {
             "unprobed": assets.iter().filter(|asset| !asset.orientation_probed).count(),
             "overridden": assets.iter().filter(|asset| asset.rotation_degrees != asset.default_rotation_degrees).count(),
@@ -1065,7 +1069,10 @@ mod tests {
             rcdvlog_core::PROJECT_CATALOG_SCHEMA_VERSION
         );
         assert_eq!(result["schemaStatus"], "legacy_unversioned");
-        assert_eq!(result["pendingMigrations"].as_array().unwrap().len(), 4);
+        assert_eq!(
+            result["pendingMigrations"].as_array().unwrap().len(),
+            rcdvlog_core::PROJECT_CATALOG_SCHEMA_VERSION as usize
+        );
         assert!(
             result["pendingAssetColumns"]
                 .as_array()

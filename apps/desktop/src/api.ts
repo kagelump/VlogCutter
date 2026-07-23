@@ -65,6 +65,7 @@ let mockAssets: Asset[] = [
 
 const defaultDesktopSettings: DesktopSettings = {
   projectsRoot: "/Users/demo/Movies/VideoProjects",
+  nodeId: "node_desktop_browser_demo",
   autoplayMode: "proxyAvailable",
   lastCatalogPath: null,
   lastProjectId: null,
@@ -202,6 +203,41 @@ export const api = {
     const updated = { ...current, ...patch };
     mockAssets = mockAssets.map((asset) => (asset.id === assetId ? updated : asset));
     return updated;
+  },
+
+  async createNoteRevision(assetId: string, text: string): Promise<Asset> {
+    if (inTauri()) return invoke("create_note_revision", { assetId, text });
+    const current = mockAssets.find((asset) => asset.id === assetId);
+    if (!current) throw new Error("Asset not found");
+    return this.updateAsset(assetId, { notes: text, labels: current.labels, removed: current.removed, rotationDegrees: current.rotationDegrees });
+  },
+
+  async addLabel(assetId: string, label: string): Promise<Asset> {
+    if (inTauri()) return invoke("add_label", { assetId, label });
+    const current = mockAssets.find((asset) => asset.id === assetId);
+    if (!current) throw new Error("Asset not found");
+    return this.updateAsset(assetId, { notes: current.notes, labels: [...current.labels, label], removed: current.removed, rotationDegrees: current.rotationDegrees });
+  },
+
+  async removeLabel(assetId: string, label: string): Promise<Asset> {
+    if (inTauri()) return invoke("remove_label", { assetId, label });
+    const current = mockAssets.find((asset) => asset.id === assetId);
+    if (!current) throw new Error("Asset not found");
+    return this.updateAsset(assetId, { notes: current.notes, labels: current.labels.filter((value) => value.toLowerCase() !== label.trim().toLowerCase()), removed: current.removed, rotationDegrees: current.rotationDegrees });
+  },
+
+  async setRemoved(assetId: string, removed: boolean): Promise<Asset> {
+    if (inTauri()) return invoke("set_removed", { assetId, removed });
+    const current = mockAssets.find((asset) => asset.id === assetId);
+    if (!current) throw new Error("Asset not found");
+    return this.updateAsset(assetId, { notes: current.notes, labels: current.labels, removed, rotationDegrees: current.rotationDegrees });
+  },
+
+  async setRotation(assetId: string, rotationDegrees: number): Promise<Asset> {
+    if (inTauri()) return invoke("set_rotation", { assetId, rotationDegrees });
+    const current = mockAssets.find((asset) => asset.id === assetId);
+    if (!current) throw new Error("Asset not found");
+    return this.updateAsset(assetId, { notes: current.notes, labels: current.labels, removed: current.removed, rotationDegrees });
   },
 
   async applyClockEvent(

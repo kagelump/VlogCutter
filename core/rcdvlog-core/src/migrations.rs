@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
-pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 4;
+pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 6;
 
 const MIGRATION_TABLE_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -105,6 +105,18 @@ pub const PROJECT_CATALOG_MIGRATIONS: &[SqliteMigration] = &[
         name: "companion_identity_links",
         source_identity: "project-catalog/0004-companion-identity-links/20260720",
         apply: add_companion_identity_links,
+    },
+    SqliteMigration {
+        id: 5,
+        name: "operation_backed_project_mutations",
+        source_identity: "project-catalog/0005-operation-backed-project-mutations/20260723",
+        apply: add_operation_backed_project_mutations,
+    },
+    SqliteMigration {
+        id: 6,
+        name: "project_sync_state",
+        source_identity: "project-catalog/0006-project-sync-state/20260723",
+        apply: add_project_sync_state,
     },
 ];
 
@@ -519,6 +531,256 @@ fn add_companion_identity_links(transaction: &Transaction<'_>) -> Result<()> {
         CREATE INDEX IF NOT EXISTS assets_media_object
         ON assets(media_object_id)
         WHERE media_object_id IS NOT NULL;
+        "#,
+    )?;
+    Ok(())
+}
+
+fn add_operation_backed_project_mutations(transaction: &Transaction<'_>) -> Result<()> {
+    add_column_if_missing(transaction, "clock_events", "operation_id", "TEXT")?;
+    add_column_if_missing(transaction, "clock_events", "hlc_wall_millis", "INTEGER")?;
+    add_column_if_missing(transaction, "clock_events", "hlc_counter", "INTEGER")?;
+    add_column_if_missing(transaction, "clock_events", "origin_node_id", "TEXT")?;
+    transaction.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS catalog_identity (
+            singleton_id INTEGER PRIMARY KEY CHECK(singleton_id = 1),
+            node_id TEXT NOT NULL UNIQUE,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS operation_origin_sequences (
+            origin_node_id TEXT PRIMARY KEY,
+            last_sequence INTEGER NOT NULL CHECK(last_sequence >= 0)
+        );
+
+        CREATE TABLE IF NOT EXISTS operation_hlc_state (
+            node_id TEXT PRIMARY KEY,
+            wall_millis INTEGER NOT NULL CHECK(wall_millis >= 0),
+            counter INTEGER NOT NULL CHECK(counter >= 0)
+        );
+
+        CREATE TABLE IF NOT EXISTS project_operations (
+            operation_id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            origin_node_id TEXT NOT NULL,
+            origin_sequence INTEGER NOT NULL CHECK(origin_sequence > 0),
+            hlc_wall_millis INTEGER NOT NULL CHECK(hlc_wall_millis >= 0),
+            hlc_counter INTEGER NOT NULL CHECK(hlc_counter >= 0),
+            aggregate_type TEXT NOT NULL,
+            aggregate_id TEXT NOT NULL,
+            operation_type TEXT NOT NULL,
+            payload_version INTEGER NOT NULL CHECK(payload_version > 0),
+            base_revision INTEGER CHECK(base_revision >= 0),
+            payload_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE(origin_node_id, origin_sequence)
+        );
+        CREATE INDEX IF NOT EXISTS project_operations_project_order
+        ON project_operations(project_id, hlc_wall_millis, hlc_counter, origin_node_id, operation_id);
+        CREATE INDEX IF NOT EXISTS project_operations_aggregate
+        ON project_operations(project_id, aggregate_type, aggregate_id, operation_id);
+
+        CREATE TABLE IF NOT EXISTS materialized_revisions (
+            project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            aggregate_type TEXT NOT NULL,
+            aggregate_id TEXT NOT NULL,
+            revision INTEGER NOT NULL CHECK(revision >= 0),
+            last_operation_id TEXT,
+            PRIMARY KEY(project_id, aggregate_type, aggregate_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS project_asset_local_locations (
+            asset_id TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+            node_id TEXT NOT NULL,
+            local_path TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY(asset_id, node_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS note_revisions (
+            revision_id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            asset_id TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+            operation_id TEXT UNIQUE REFERENCES project_operations(operation_id),
+            text TEXT NOT NULL,
+            hlc_wall_millis INTEGER NOT NULL CHECK(hlc_wall_millis >= 0),
+            hlc_counter INTEGER NOT NULL CHECK(hlc_counter >= 0),
+            origin_node_id TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS note_revisions_active_order
+        ON note_revisions(asset_id, hlc_wall_millis DESC, hlc_counter DESC, origin_node_id DESC, revision_id DESC);
+
+        CREATE TABLE IF NOT EXISTS label_tags (
+            add_tag TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            asset_id TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+            normalized_label TEXT NOT NULL,
+            display_label TEXT NOT NULL,
+            operation_id TEXT UNIQUE REFERENCES project_operations(operation_id),
+            hlc_wall_millis INTEGER NOT NULL CHECK(hlc_wall_millis >= 0),
+            hlc_counter INTEGER NOT NULL CHECK(hlc_counter >= 0),
+            origin_node_id TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS label_tags_asset_value
+        ON label_tags(asset_id, normalized_label, hlc_wall_millis, hlc_counter, origin_node_id, add_tag);
+
+        CREATE TABLE IF NOT EXISTS label_tag_removals (
+            remove_operation_id TEXT NOT NULL REFERENCES project_operations(operation_id),
+            add_tag TEXT NOT NULL,
+            normalized_label TEXT NOT NULL,
+            PRIMARY KEY(remove_operation_id, add_tag)
+        );
+        CREATE INDEX IF NOT EXISTS label_tag_removals_tag ON label_tag_removals(add_tag);
+
+        CREATE TABLE IF NOT EXISTS lww_registers (
+            project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            aggregate_type TEXT NOT NULL,
+            aggregate_id TEXT NOT NULL,
+            field_name TEXT NOT NULL,
+            value_json TEXT NOT NULL,
+            operation_id TEXT REFERENCES project_operations(operation_id),
+            hlc_wall_millis INTEGER NOT NULL CHECK(hlc_wall_millis >= 0),
+            hlc_counter INTEGER NOT NULL CHECK(hlc_counter >= 0),
+            origin_node_id TEXT NOT NULL,
+            PRIMARY KEY(project_id, aggregate_type, aggregate_id, field_name)
+        );
+
+        CREATE TABLE IF NOT EXISTS operation_conflicts (
+            conflict_id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            aggregate_type TEXT NOT NULL,
+            aggregate_id TEXT NOT NULL,
+            incoming_operation_id TEXT NOT NULL UNIQUE REFERENCES project_operations(operation_id),
+            active_operation_id TEXT,
+            expected_base_revision INTEGER,
+            actual_revision INTEGER NOT NULL,
+            conflict_type TEXT NOT NULL,
+            resolved_at TEXT,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS operation_conflicts_unresolved
+        ON operation_conflicts(project_id, resolved_at, aggregate_type, aggregate_id);
+
+        INSERT OR IGNORE INTO materialized_revisions(project_id, aggregate_type, aggregate_id, revision, last_operation_id)
+        SELECT project_id, 'projectAsset', id, 0, NULL FROM assets;
+
+        INSERT OR IGNORE INTO note_revisions(
+            revision_id, project_id, asset_id, operation_id, text,
+            hlc_wall_millis, hlc_counter, origin_node_id, created_at
+        )
+        SELECT 'baseline_note_' || id, project_id, id, NULL, notes,
+               0, 0, 'baseline', created_at
+        FROM assets;
+
+        INSERT OR IGNORE INTO lww_registers(
+            project_id, aggregate_type, aggregate_id, field_name, value_json,
+            operation_id, hlc_wall_millis, hlc_counter, origin_node_id
+        )
+        SELECT project_id, 'projectAsset', id, 'removed',
+               CASE WHEN removed = 1 THEN 'true' ELSE 'false' END,
+               NULL, 0, 0, 'baseline'
+        FROM assets;
+        INSERT OR IGNORE INTO lww_registers(
+            project_id, aggregate_type, aggregate_id, field_name, value_json,
+            operation_id, hlc_wall_millis, hlc_counter, origin_node_id
+        )
+        SELECT project_id, 'projectAsset', id, 'rotationDegrees',
+               CAST(rotation_degrees AS TEXT), NULL, 0, 0, 'baseline'
+        FROM assets;
+
+        INSERT OR IGNORE INTO materialized_revisions(project_id, aggregate_type, aggregate_id, revision, last_operation_id)
+        SELECT project_id, 'clock', camera, COUNT(*), NULL
+        FROM clock_events GROUP BY project_id, camera;
+        "#,
+    )?;
+
+    let mut assets =
+        transaction.prepare("SELECT id, project_id, labels_json, created_at FROM assets")?;
+    let rows = assets
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(assets);
+    for (asset_id, project_id, labels_json, created_at) in rows {
+        let labels = serde_json::from_str::<Vec<String>>(&labels_json).unwrap_or_default();
+        for (ordinal, label) in labels.into_iter().enumerate() {
+            let normalized = label.trim().to_lowercase();
+            transaction.execute(
+                r#"
+                INSERT INTO label_tags(
+                    add_tag, project_id, asset_id, normalized_label, display_label,
+                    operation_id, hlc_wall_millis, hlc_counter, origin_node_id, created_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, 0, ?6, 'baseline', ?7)
+                ON CONFLICT(add_tag) DO NOTHING
+                "#,
+                params![
+                    format!("baseline_label_{asset_id}_{ordinal}"),
+                    project_id,
+                    asset_id,
+                    normalized,
+                    label,
+                    ordinal as i64,
+                    created_at,
+                ],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn add_project_sync_state(transaction: &Transaction<'_>) -> Result<()> {
+    transaction.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS project_baseline_metadata (
+            singleton_id INTEGER PRIMARY KEY CHECK(singleton_id = 1),
+            project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            baseline_version INTEGER NOT NULL CHECK(baseline_version > 0),
+            baseline_digest TEXT NOT NULL,
+            imported_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS project_storage_root_mappings (
+            project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            storage_root_id TEXT NOT NULL,
+            relative_prefix TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY(project_id, storage_root_id, relative_prefix)
+        );
+
+        CREATE TABLE IF NOT EXISTS sync_origin_cursors (
+            origin_node_id TEXT PRIMARY KEY,
+            committed_sequence INTEGER NOT NULL CHECK(committed_sequence >= 0),
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS sync_observation_facts (
+            origin_node_id TEXT NOT NULL,
+            origin_sequence INTEGER NOT NULL CHECK(origin_sequence > 0),
+            scope_key TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            recorded_at TEXT NOT NULL,
+            PRIMARY KEY(origin_node_id, origin_sequence)
+        );
+        CREATE INDEX IF NOT EXISTS sync_observation_scope
+        ON sync_observation_facts(origin_node_id, scope_key, origin_sequence DESC);
+
+        CREATE TABLE IF NOT EXISTS sync_representation_manifests (
+            manifest_id TEXT PRIMARY KEY,
+            origin_node_id TEXT NOT NULL,
+            origin_sequence INTEGER NOT NULL CHECK(origin_sequence > 0),
+            payload_json TEXT NOT NULL,
+            recorded_at TEXT NOT NULL,
+            UNIQUE(origin_node_id, origin_sequence)
+        );
         "#,
     )?;
     Ok(())

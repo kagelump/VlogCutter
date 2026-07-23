@@ -1,0 +1,238 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://rcdvlog.local/schemas/baseline-v1.schema.json",
+  "title": "RCD VlogCutter baseline envelope v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["digest", "payload"],
+  "properties": {
+    "digest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "payload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "baselineVersion",
+        "protocolVersion",
+        "projectSchemaVersion",
+        "project",
+        "observations",
+        "representationManifests"
+      ],
+      "properties": {
+        "baselineVersion": { "const": 1 },
+        "protocolVersion": { "$ref": "#/$defs/protocolRange" },
+        "projectSchemaVersion": { "type": "integer", "minimum": 1 },
+        "project": { "$ref": "#/$defs/project" },
+        "observations": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/observation" }
+        },
+        "representationManifests": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/manifest" }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "protocolRange": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["minimumMajor", "minimumMinor", "maximumMajor", "maximumMinor"],
+      "properties": {
+        "minimumMajor": { "type": "integer", "minimum": 0 },
+        "minimumMinor": { "type": "integer", "minimum": 0 },
+        "maximumMajor": { "type": "integer", "minimum": 0 },
+        "maximumMinor": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "project": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "projectId",
+        "name",
+        "createdAt",
+        "originNodeId",
+        "pairedServerNodeId",
+        "pairedAt",
+        "assets",
+        "rootMappings",
+        "baselineClockEvents",
+        "operations",
+        "operationCursors",
+        "materializedRevisionCount",
+        "conflicts"
+      ],
+      "properties": {
+        "projectId": { "type": "string", "minLength": 1 },
+        "name": { "type": "string", "minLength": 1 },
+        "createdAt": { "type": "string" },
+        "originNodeId": { "type": ["string", "null"] },
+        "pairedServerNodeId": { "type": ["string", "null"] },
+        "pairedAt": { "type": ["string", "null"] },
+        "assets": { "type": "array", "items": { "$ref": "#/$defs/asset" } },
+        "rootMappings": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["storageRootId", "relativePrefix", "createdAt"],
+            "properties": {
+              "storageRootId": { "type": "string", "minLength": 1 },
+              "relativePrefix": { "type": "string" },
+              "createdAt": { "type": "string" }
+            }
+          }
+        },
+        "baselineClockEvents": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/clockEvent" }
+        },
+        "operations": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/operation" }
+        },
+        "operationCursors": {
+          "type": "object",
+          "additionalProperties": { "type": "integer", "minimum": 0 }
+        },
+        "materializedRevisionCount": { "type": "integer", "minimum": 0 },
+        "conflicts": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/conflict" }
+        }
+      }
+    },
+    "asset": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id", "fingerprint", "filename", "sizeBytes", "durationSeconds",
+        "frameRate", "width", "height", "codec", "camera", "capturedAtRaw",
+        "bestTime", "offsetSeconds", "metadataRotationDegrees",
+        "defaultRotationDegrees", "orientationProbed", "baselineNotes",
+        "baselineLabels", "baselineRemoved", "baselineRotationDegrees",
+        "mediaObjectId", "mediaVerificationState", "createdAt"
+      ],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "fingerprint": { "type": "string", "minLength": 1 },
+        "filename": { "type": "string", "minLength": 1 },
+        "sizeBytes": { "type": "integer", "minimum": 0 },
+        "durationSeconds": { "type": "number", "minimum": 0 },
+        "frameRate": { "type": "number", "minimum": 0 },
+        "width": { "type": "integer", "minimum": 0 },
+        "height": { "type": "integer", "minimum": 0 },
+        "codec": { "type": "string" },
+        "camera": { "type": "string" },
+        "capturedAtRaw": { "type": ["string", "null"] },
+        "bestTime": { "type": ["string", "null"] },
+        "offsetSeconds": { "type": "integer" },
+        "metadataRotationDegrees": { "type": "integer" },
+        "defaultRotationDegrees": { "type": "integer" },
+        "orientationProbed": { "type": "boolean" },
+        "baselineNotes": { "type": "string" },
+        "baselineLabels": { "type": "array", "items": { "type": "string" } },
+        "baselineRemoved": { "type": "boolean" },
+        "baselineRotationDegrees": { "enum": [0, 90, 180, 270] },
+        "mediaObjectId": { "type": ["string", "null"] },
+        "mediaVerificationState": {
+          "enum": ["unlinked", "provisional", "verified", "mismatch"]
+        },
+        "createdAt": { "type": "string" }
+      }
+    },
+    "clockEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id", "projectId", "camera", "startFilename", "offsetSeconds",
+        "label", "createdAt"
+      ],
+      "properties": {
+        "id": { "type": "string" },
+        "projectId": { "type": "string" },
+        "camera": { "type": "string" },
+        "startFilename": { "type": "string" },
+        "offsetSeconds": { "type": "integer" },
+        "label": { "type": "string" },
+        "createdAt": { "type": "string" }
+      }
+    },
+    "operation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operationId", "projectId", "originNodeId", "originSequence",
+        "logicalTime", "aggregateType", "aggregateId", "operationType",
+        "payloadVersion", "baseRevision", "payload"
+      ],
+      "properties": {
+        "operationId": { "type": "string", "minLength": 1 },
+        "projectId": { "type": "string", "minLength": 1 },
+        "originNodeId": { "type": "string", "minLength": 1 },
+        "originSequence": { "type": "integer", "minimum": 1 },
+        "logicalTime": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["wallMillis", "counter", "nodeId"],
+          "properties": {
+            "wallMillis": { "type": "integer" },
+            "counter": { "type": "integer", "minimum": 0 },
+            "nodeId": { "type": "string", "minLength": 1 }
+          }
+        },
+        "aggregateType": { "type": "string", "minLength": 1 },
+        "aggregateId": { "type": "string", "minLength": 1 },
+        "operationType": { "type": "string", "minLength": 1 },
+        "payloadVersion": { "const": 1 },
+        "baseRevision": { "type": ["integer", "null"], "minimum": 0 },
+        "payload": { "type": "object" }
+      }
+    },
+    "conflict": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "conflictId", "projectId", "aggregateType", "aggregateId",
+        "incomingOperationId", "activeOperationId", "expectedBaseRevision",
+        "actualRevision", "conflictType", "createdAt"
+      ],
+      "properties": {
+        "conflictId": { "type": "string" },
+        "projectId": { "type": "string" },
+        "aggregateType": { "type": "string" },
+        "aggregateId": { "type": "string" },
+        "incomingOperationId": { "type": "string" },
+        "activeOperationId": { "type": ["string", "null"] },
+        "expectedBaseRevision": { "type": ["integer", "null"], "minimum": 0 },
+        "actualRevision": { "type": "integer", "minimum": 0 },
+        "conflictType": { "type": "string" },
+        "createdAt": { "type": "string" }
+      }
+    },
+    "observation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["originNodeId", "originSequence", "scopeKey", "payload"],
+      "properties": {
+        "originNodeId": { "type": "string", "minLength": 1 },
+        "originSequence": { "type": "integer", "minimum": 1 },
+        "scopeKey": { "type": "string", "minLength": 1 },
+        "payload": {}
+      }
+    },
+    "manifest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["manifestId", "originNodeId", "originSequence", "payload"],
+      "properties": {
+        "manifestId": { "type": "string", "minLength": 1 },
+        "originNodeId": { "type": "string", "minLength": 1 },
+        "originSequence": { "type": "integer", "minimum": 1 },
+        "payload": { "type": "object" }
+      }
+    }
+  }
+}
