@@ -4,11 +4,12 @@ mod foundation;
 mod jobs;
 mod library;
 mod media_facts;
+mod representations;
 mod scan;
 pub mod scan_handler;
 mod storage_path;
 
-pub use rcdvlog_core::CatalogSchemaError;
+pub use rcdvlog_core::{CatalogSchemaError, RepresentationId};
 
 pub use catalog::{
     CONTROL_CATALOG_MIGRATIONS, CONTROL_CATALOG_SCHEMA_VERSION, CONTROL_DATABASE_FILENAME,
@@ -42,6 +43,11 @@ pub use media_facts::{
     ScanFileDiagnostic,
 };
 pub use rcdvlog_core::StorageAccessMode;
+pub use representations::{
+    PROXY_RECIPE_KEY, Representation, RepresentationError, RepresentationJobHandler,
+    RepresentationKind, RepresentationNeed, RepresentationRequest, RepresentationRequestResult,
+    RepresentationService, RepresentationState, ServerJobHandler, THUMBNAIL_RECIPE_KEY,
+};
 pub use scan::{
     NewScanSchedule, RecoveryReport, ScanRun, ScanSchedule, ScanScheduleUpdate, ScanService,
     ScanServiceError, ScanSource, ScanState, ScanToolConfig, compute_next_run_utc,

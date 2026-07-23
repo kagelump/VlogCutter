@@ -24,4 +24,6 @@ tracing-subscriber.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+blake3.workspace = true
+rusqlite.workspace = true
 tempfile = "3.24"

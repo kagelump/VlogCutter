@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 use crate::ConfigDiagnostics;
 
-pub const CONTROL_CATALOG_SCHEMA_VERSION: u32 = 4;
+pub const CONTROL_CATALOG_SCHEMA_VERSION: u32 = 5;
 pub const CONTROL_DATABASE_FILENAME: &str = "control.sqlite3";
 pub const INSTANCE_LOCK_FILENAME: &str = "server.lock";
 
@@ -45,6 +45,12 @@ pub const CONTROL_CATALOG_MIGRATIONS: &[SqliteMigration] = &[
         name: "nas_scan_verified_content_identity",
         source_identity: "server-control/0004-nas-scan-verified-content-identity/20260720",
         apply: create_nas_scan_verified_content_identity,
+    },
+    SqliteMigration {
+        id: 5,
+        name: "representation_store_media_jobs",
+        source_identity: "server-control/0005-representation-store-media-jobs/20260723",
+        apply: create_representation_store_media_jobs,
     },
 ];
 
@@ -149,6 +155,10 @@ impl ControlCatalog {
     /// catalog's stable server node, not a distributed competitive worker pool.
     pub fn jobs(&self) -> crate::JobEngine {
         crate::JobEngine::new(self.database_path.clone(), self.node_id.clone())
+    }
+
+    pub fn representations(&self, derived_root: PathBuf) -> crate::RepresentationService {
+        crate::RepresentationService::new(self.storage_library(), self.jobs(), derived_root)
     }
 
     pub fn inspect_migrations(&self) -> Result<MigrationHistoryInspection> {
@@ -673,6 +683,62 @@ fn create_nas_scan_verified_content_identity(transaction: &Transaction<'_>) -> R
     Ok(())
 }
 
+/// Content-addressed derived-media manifests. Absolute paths remain node-local;
+/// the durable protocol fact is the representation identity plus a relative
+/// location beneath a configured derived root.
+fn create_representation_store_media_jobs(transaction: &Transaction<'_>) -> Result<()> {
+    transaction.execute_batch(
+        r#"
+        CREATE TABLE representations (
+            representation_id TEXT PRIMARY KEY,
+            media_object_id TEXT NOT NULL REFERENCES media_objects(media_object_id),
+            source_content_hash TEXT NOT NULL CHECK(length(source_content_hash) = 64),
+            source_size_bytes INTEGER NOT NULL CHECK(source_size_bytes >= 0),
+            kind TEXT NOT NULL CHECK(kind IN ('proxy', 'thumbnail')),
+            recipe_key TEXT NOT NULL CHECK(length(recipe_key) BETWEEN 1 AND 255),
+            settings_identity TEXT NOT NULL CHECK(length(settings_identity) = 64),
+            state TEXT NOT NULL CHECK(state IN ('pending', 'available')),
+            output_content_hash TEXT CHECK(output_content_hash IS NULL OR length(output_content_hash) = 64),
+            byte_length INTEGER CHECK(byte_length IS NULL OR byte_length >= 0),
+            content_type TEXT NOT NULL CHECK(length(content_type) BETWEEN 1 AND 128),
+            created_at TEXT NOT NULL,
+            completed_at TEXT,
+            updated_at TEXT NOT NULL,
+            UNIQUE(source_content_hash, source_size_bytes, kind, recipe_key, settings_identity),
+            CHECK(
+                (state = 'available' AND output_content_hash IS NOT NULL AND byte_length IS NOT NULL AND completed_at IS NOT NULL)
+                OR (state = 'pending' AND output_content_hash IS NULL AND byte_length IS NULL AND completed_at IS NULL)
+            )
+        );
+        CREATE INDEX representations_media_recipe
+            ON representations(media_object_id, kind, recipe_key, state);
+
+        CREATE TABLE representation_locations (
+            representation_id TEXT NOT NULL REFERENCES representations(representation_id),
+            node_id TEXT NOT NULL,
+            location_kind TEXT NOT NULL CHECK(location_kind IN ('shared_derived', 'server_local', 'project_local')),
+            location_key TEXT NOT NULL CHECK(length(location_key) BETWEEN 1 AND 2048),
+            relative_path TEXT CHECK(relative_path IS NULL OR length(relative_path) BETWEEN 1 AND 2048),
+            local_path TEXT CHECK(local_path IS NULL OR length(local_path) BETWEEN 1 AND 8192),
+            state TEXT NOT NULL CHECK(state IN ('available', 'missing', 'invalid')),
+            verified_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(representation_id, node_id, location_kind, location_key),
+            CHECK(
+                (location_kind = 'shared_derived' AND relative_path IS NOT NULL AND local_path IS NULL)
+                OR (location_kind != 'shared_derived' AND relative_path IS NULL AND local_path IS NOT NULL)
+            )
+        );
+        CREATE INDEX representation_locations_node_state
+            ON representation_locations(node_id, state, representation_id);
+        CREATE UNIQUE INDEX jobs_one_active_representation
+            ON jobs(representation_id)
+            WHERE representation_id IS NOT NULL AND state IN ('queued', 'running', 'retry_wait');
+        "#,
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -933,6 +999,69 @@ mod tests {
                 "projects/project_preserved/catalog.sqlite3".to_string(),
                 "registered".to_string()
             )
+        );
+        assert_eq!(
+            inspect_sqlite_migrations(&connection, CONTROL_CATALOG_MIGRATIONS)
+                .unwrap()
+                .status,
+            MigrationHistoryStatus::Current
+        );
+    }
+
+    #[test]
+    fn representation_migration_upgrade_preserves_verified_media_and_jobs() {
+        let root = TempDir::new().unwrap();
+        let database_path = root.path().join(CONTROL_DATABASE_FILENAME);
+        let mut connection = open_writable_connection(&database_path).unwrap();
+        run_sqlite_migrations(&mut connection, &CONTROL_CATALOG_MIGRATIONS[..4]).unwrap();
+        connection.execute(
+            "INSERT INTO media_objects(media_object_id,size_bytes,full_content_hash,verification_state,created_at,updated_at) VALUES('media_preserved',10,?1,'verified',?2,?2)",
+            params!["a".repeat(64), "2026-07-23T00:00:00Z"],
+        ).unwrap();
+        connection
+            .execute(
+                r#"
+            INSERT INTO jobs(
+                job_id,job_type,payload_version,payload_json,immutable_identity_json,
+                requirements_json,target_node_id,recipe_key,job_class,idempotency_key,
+                priority,idempotency_identity_hash,enqueue_sequence,state,attempt_count,
+                max_attempts,retry_initial_seconds,retry_max_seconds,available_at,
+                total_work_units,total_items,created_at,updated_at
+            ) VALUES(
+                'job_preserved','fixture.v1',1,'{}','{}',?1,'node_preserved',
+                'fixture.v1','lightweight','preserved',0,?2,1,'queued',0,3,1,5,
+                ?3,1,1,?3,?3
+            )
+            "#,
+                params![
+                    serde_json::json!({
+                        "schemaVersion": 1,
+                        "requiresOriginal": false,
+                        "requiresDerivedWrite": false,
+                        "capabilities": []
+                    })
+                    .to_string(),
+                    "b".repeat(64),
+                    "2026-07-23T00:00:00Z"
+                ],
+            )
+            .unwrap();
+
+        run_sqlite_migrations(&mut connection, CONTROL_CATALOG_MIGRATIONS).unwrap();
+
+        assert_eq!(connection.query_row(
+            "SELECT verification_state FROM media_objects WHERE media_object_id='media_preserved'",
+            [], |row| row.get::<_, String>(0),
+        ).unwrap(), "verified");
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT state FROM jobs WHERE job_id='job_preserved'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "queued"
         );
         assert_eq!(
             inspect_sqlite_migrations(&connection, CONTROL_CATALOG_MIGRATIONS)

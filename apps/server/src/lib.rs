@@ -1,23 +1,26 @@
 use anyhow::{Context, Result, anyhow};
 use axum::body::Body;
-use axum::extract::{Extension, State};
-use axum::http::{HeaderValue, Request, StatusCode, header};
+use axum::extract::{Extension, Path as AxumPath, State};
+use axum::http::{HeaderMap, HeaderValue, Method, Request, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use rcdvlog_server_core::{
     APPLICATION_VERSION, CONTROL_CATALOG_SCHEMA_VERSION, PROTOCOL_MAJOR_VERSION,
-    PROTOCOL_MINOR_VERSION, ReadinessReport, RuntimeFoundation,
+    PROTOCOL_MINOR_VERSION, ReadinessReport, Representation, RepresentationError, RepresentationId,
+    RepresentationRequest, RuntimeFoundation,
 };
 use serde::Serialize;
 use std::future::IntoFuture;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tokio::time::timeout;
+use tokio_util::io::ReaderStream;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 use uuid::Uuid;
@@ -174,9 +177,227 @@ pub fn router(state: HttpState) -> Router {
         .route("/api/v1/health", get(health))
         .route("/api/v1/ready", get(ready))
         .route("/api/v1/version", get(version))
+        .route("/api/v1/representations", post(request_representation))
+        .route(
+            "/api/v1/representations/{representation_id}",
+            get(get_representation),
+        )
+        .route(
+            "/api/v1/media/{representation_id}/content",
+            get(media_content).head(media_content),
+        )
         .fallback(not_found)
         .with_state(state)
         .layer(middleware::from_fn(request_context))
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RepresentationResponse {
+    request_id: String,
+    representation: Representation,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    job_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reused: Option<bool>,
+}
+
+async fn request_representation(
+    State(state): State<HttpState>,
+    Extension(request_id): Extension<RequestId>,
+    Json(request): Json<RepresentationRequest>,
+) -> Response {
+    let service = state
+        .foundation
+        .catalog()
+        .representations(state.foundation.config().derived_dir.clone());
+    match tokio::task::spawn_blocking(move || service.request(request)).await {
+        Ok(Ok(result)) => {
+            let status = if result.reused {
+                StatusCode::OK
+            } else {
+                StatusCode::ACCEPTED
+            };
+            (
+                status,
+                Json(RepresentationResponse {
+                    request_id: request_id.0,
+                    representation: result.representation,
+                    job_id: result.job_id.map(|id| id.to_string()),
+                    reused: Some(result.reused),
+                }),
+            )
+                .into_response()
+        }
+        Ok(Err(error)) => representation_error(request_id.0, error),
+        Err(_) => representation_error(
+            request_id.0,
+            RepresentationError::InvalidInput("request worker failed".into()),
+        ),
+    }
+}
+
+async fn get_representation(
+    State(state): State<HttpState>,
+    Extension(request_id): Extension<RequestId>,
+    AxumPath(raw_id): AxumPath<String>,
+) -> Response {
+    let Ok(id) = RepresentationId::parse(raw_id) else {
+        return representation_error(request_id.0, RepresentationError::NotFound);
+    };
+    let service = state
+        .foundation
+        .catalog()
+        .representations(state.foundation.config().derived_dir.clone());
+    match tokio::task::spawn_blocking(move || service.get(&id)).await {
+        Ok(Ok(representation)) => Json(RepresentationResponse {
+            request_id: request_id.0,
+            representation,
+            job_id: None,
+            reused: None,
+        })
+        .into_response(),
+        Ok(Err(error)) => representation_error(request_id.0, error),
+        Err(_) => representation_error(request_id.0, RepresentationError::NotFound),
+    }
+}
+
+async fn media_content(
+    State(state): State<HttpState>,
+    Extension(request_id): Extension<RequestId>,
+    AxumPath(raw_id): AxumPath<String>,
+    method: Method,
+    headers: HeaderMap,
+) -> Response {
+    let Ok(id) = RepresentationId::parse(raw_id) else {
+        return representation_error(request_id.0, RepresentationError::NotFound);
+    };
+    let service = state
+        .foundation
+        .catalog()
+        .representations(state.foundation.config().derived_dir.clone());
+    let lookup_id = id.clone();
+    let lookup = tokio::task::spawn_blocking(move || {
+        let representation = service.get(&lookup_id)?;
+        let path = service.content_path(&lookup_id)?;
+        Ok::<_, RepresentationError>((representation, path))
+    })
+    .await;
+    let (representation, path) = match lookup {
+        Ok(Ok(value)) => value,
+        Ok(Err(error)) => return representation_error(request_id.0, error),
+        Err(_) => return representation_error(request_id.0, RepresentationError::NotFound),
+    };
+    let length = match tokio::fs::metadata(&path).await {
+        Ok(metadata) => metadata.len(),
+        Err(_) => return representation_error(request_id.0, RepresentationError::NotFound),
+    };
+    if representation.byte_length != Some(length) {
+        return representation_error(request_id.0, RepresentationError::NotFound);
+    }
+    let selected = match parse_range(headers.get(header::RANGE), length) {
+        Ok(value) => value,
+        Err(()) => {
+            let mut response = StatusCode::RANGE_NOT_SATISFIABLE.into_response();
+            response.headers_mut().insert(
+                header::CONTENT_RANGE,
+                HeaderValue::from_str(&format!("bytes */{length}")).expect("valid content-range"),
+            );
+            response
+                .headers_mut()
+                .insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+            return response;
+        }
+    };
+    let (start, end, status) = selected.map_or(
+        (0, length.saturating_sub(1), StatusCode::OK),
+        |(start, end)| (start, end, StatusCode::PARTIAL_CONTENT),
+    );
+    let response_length = if length == 0 { 0 } else { end - start + 1 };
+    let mut builder = Response::builder()
+        .status(status)
+        .header(header::ACCEPT_RANGES, "bytes")
+        .header(header::CONTENT_TYPE, representation.content_type)
+        .header(header::CONTENT_LENGTH, response_length.to_string())
+        .header(header::ETAG, format!("\"{}\"", id.as_str()))
+        .header(
+            header::CACHE_CONTROL,
+            "private, max-age=31536000, immutable",
+        );
+    if status == StatusCode::PARTIAL_CONTENT {
+        builder = builder.header(
+            header::CONTENT_RANGE,
+            format!("bytes {start}-{end}/{length}"),
+        );
+    }
+    if method == Method::HEAD {
+        return builder.body(Body::empty()).expect("valid media headers");
+    }
+    let mut file = match tokio::fs::File::open(path).await {
+        Ok(file) => file,
+        Err(_) => return representation_error(request_id.0, RepresentationError::NotFound),
+    };
+    if file.seek(std::io::SeekFrom::Start(start)).await.is_err() {
+        return representation_error(request_id.0, RepresentationError::NotFound);
+    }
+    let stream = ReaderStream::new(file.take(response_length));
+    builder
+        .body(Body::from_stream(stream))
+        .expect("valid media response")
+}
+
+fn parse_range(value: Option<&HeaderValue>, length: u64) -> Result<Option<(u64, u64)>, ()> {
+    let Some(value) = value else { return Ok(None) };
+    let value = value.to_str().map_err(|_| ())?;
+    let spec = value.strip_prefix("bytes=").ok_or(())?;
+    if spec.contains(',') || length == 0 {
+        return Err(());
+    }
+    let (start, end) = spec.split_once('-').ok_or(())?;
+    if start.is_empty() {
+        let suffix = end.parse::<u64>().map_err(|_| ())?;
+        if suffix == 0 {
+            return Err(());
+        }
+        let selected = suffix.min(length);
+        return Ok(Some((length - selected, length - 1)));
+    }
+    let start = start.parse::<u64>().map_err(|_| ())?;
+    if start >= length {
+        return Err(());
+    }
+    let end = if end.is_empty() {
+        length - 1
+    } else {
+        end.parse::<u64>().map_err(|_| ())?.min(length - 1)
+    };
+    if end < start {
+        return Err(());
+    }
+    Ok(Some((start, end)))
+}
+
+fn representation_error(request_id: String, error: RepresentationError) -> Response {
+    let status = match &error {
+        RepresentationError::NotFound => StatusCode::NOT_FOUND,
+        RepresentationError::InvalidInput(_) | RepresentationError::SourceNotVerified => {
+            StatusCode::BAD_REQUEST
+        }
+        RepresentationError::MediaOffline | RepresentationError::DerivedRootUnavailable => {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+        RepresentationError::Database(_)
+        | RepresentationError::Job(_)
+        | RepresentationError::Infrastructure(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    (
+        status,
+        Json(ErrorResponse {
+            request_id,
+            code: error.code(),
+        }),
+    )
+        .into_response()
 }
 
 pub async fn bind_loopback(address: SocketAddr) -> Result<TcpListener> {
@@ -380,11 +601,107 @@ mod tests {
         fn app(&self) -> Router {
             router(HttpState::new(self.foundation.clone()))
         }
+
+        fn seed_media_content(&self, bytes: &[u8]) -> RepresentationId {
+            let id = RepresentationId::parse("representation_http_fixture").unwrap();
+            let relative = "representations/http/fixture/representation_http_fixture.mp4";
+            let path = self.foundation.config().derived_dir.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, bytes).unwrap();
+            let now = "2026-07-23T00:00:00Z";
+            let connection = rcdvlog_server_core::open_writable_connection(
+                self.foundation.catalog().database_path(),
+            )
+            .unwrap();
+            connection.execute(
+                "INSERT INTO media_objects(media_object_id,size_bytes,full_content_hash,verification_state,created_at,updated_at) VALUES(?1,?2,?3,'verified',?4,?4)",
+                rusqlite::params!["media_http_fixture", bytes.len() as i64, "a".repeat(64), now],
+            ).unwrap();
+            connection.execute(
+                "INSERT INTO representations(representation_id,media_object_id,source_content_hash,source_size_bytes,kind,recipe_key,settings_identity,state,output_content_hash,byte_length,content_type,created_at,completed_at,updated_at) VALUES(?1,'media_http_fixture',?2,?3,'proxy','proxy.h264-720p.orientation-v3',?4,'available',?5,?3,'video/mp4',?6,?6,?6)",
+                rusqlite::params![id.as_str(), "a".repeat(64), bytes.len() as i64, "b".repeat(64), blake3::hash(bytes).to_hex().to_string(), now],
+            ).unwrap();
+            connection.execute(
+                "INSERT INTO representation_locations(representation_id,node_id,location_kind,location_key,relative_path,state,verified_at,updated_at) VALUES(?1,?2,'shared_derived',?3,?3,'available',?4,?4)",
+                rusqlite::params![id.as_str(), self.foundation.catalog().node_id().as_str(), relative, now],
+            ).unwrap();
+            id
+        }
     }
 
     async fn json(response: Response) -> Value {
         let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn media_content_supports_head_and_single_ranges_without_exposing_paths() {
+        let fixture = Fixture::new(false);
+        let bytes = b"0123456789abcdef";
+        let id = fixture.seed_media_content(bytes);
+        let uri = format!("/api/v1/media/{}/content", id.as_str());
+
+        let partial = fixture
+            .app()
+            .oneshot(
+                Request::builder()
+                    .uri(&uri)
+                    .header(header::RANGE, "bytes=3-7")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(partial.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(partial.headers()[header::CONTENT_RANGE], "bytes 3-7/16");
+        assert_eq!(partial.headers()[header::ACCEPT_RANGES], "bytes");
+        assert_eq!(
+            to_bytes(partial.into_body(), 32).await.unwrap(),
+            &bytes[3..=7]
+        );
+
+        let head = fixture
+            .app()
+            .oneshot(
+                Request::builder()
+                    .method(Method::HEAD)
+                    .uri(&uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(head.status(), StatusCode::OK);
+        assert_eq!(head.headers()[header::CONTENT_LENGTH], "16");
+        assert!(to_bytes(head.into_body(), 32).await.unwrap().is_empty());
+
+        let invalid = fixture
+            .app()
+            .oneshot(
+                Request::builder()
+                    .uri(&uri)
+                    .header(header::RANGE, "bytes=0-1,4-5")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(invalid.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(invalid.headers()[header::CONTENT_RANGE], "bytes */16");
+    }
+
+    #[test]
+    fn range_parser_handles_open_suffix_and_unsatisfiable_ranges() {
+        assert_eq!(
+            parse_range(Some(&HeaderValue::from_static("bytes=4-")), 10),
+            Ok(Some((4, 9)))
+        );
+        assert_eq!(
+            parse_range(Some(&HeaderValue::from_static("bytes=-3")), 10),
+            Ok(Some((7, 9)))
+        );
+        assert!(parse_range(Some(&HeaderValue::from_static("bytes=10-")), 10).is_err());
+        assert!(parse_range(Some(&HeaderValue::from_static("items=0-1")), 10).is_err());
     }
 
     #[tokio::test]

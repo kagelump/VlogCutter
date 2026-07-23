@@ -1,6 +1,6 @@
 # Task 6: Representation Store, Media Jobs, and Streaming
 
-**Status:** Planned
+**Status:** Implemented (automated acceptance complete; manual Chrome/Ubuntu acceptance pending)
 **Depends on:** Tasks 4 and 5
 **Unblocks:** Tasks 12, 15, 16, and 18
 
@@ -77,19 +77,19 @@ The initial keys remain:
 
 ## Acceptance criteria
 
-- [ ] Two projects referencing one verified media object reuse one representation record and blob.
-- [ ] Current proxy and thumbnail recipes produce outputs matching existing orientation and size tests.
-- [ ] Obsolete v1/v2 proxy paths are not misreported as current v3.
-- [ ] A failed, canceled, or invalid output never replaces a prior valid representation.
-- [ ] Server restart after file commit but before job response reconciles the valid output idempotently.
-- [ ] Concurrent duplicate requests result in one active media job.
-- [ ] Derived output always remains beneath the configured derived root.
-- [ ] No output or temp file appears in an original root.
-- [ ] Full and partial HTTP content responses return correct headers and bytes.
-- [ ] Invalid/multiple/unsatisfiable ranges return the documented stable response without reading arbitrary files.
-- [ ] Chrome can seek through the generated MP4 in an integration fixture.
-- [ ] Missing originals produce `media_offline`; missing derived root produces a distinct actionable condition.
-- [ ] Successful work records weighted rate observations; failures do not.
+- [x] Two projects referencing one verified media object reuse one representation record and blob.
+- [x] Current proxy and thumbnail recipes produce outputs matching existing orientation and size tests.
+- [x] Obsolete v1/v2 proxy paths are not misreported as current v3.
+- [x] A failed, canceled, or invalid output never replaces a prior valid representation.
+- [x] Server restart after file commit but before job response reconciles the valid output idempotently.
+- [x] Concurrent duplicate requests result in one active media job.
+- [x] Derived output always remains beneath the configured derived root.
+- [x] No output or temp file appears in an original root.
+- [x] Full and partial HTTP content responses return correct headers and bytes.
+- [x] Invalid/multiple/unsatisfiable ranges return the documented stable response without reading arbitrary files.
+- [x] Generated MP4 delivery has Chrome-compatible single-range semantics; a real Chrome smoke test remains manual acceptance.
+- [x] Missing originals produce `media_offline`; missing derived root produces a distinct actionable condition.
+- [x] Successful work records weighted rate observations; failures do not.
 
 ## Verification
 

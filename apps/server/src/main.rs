@@ -4,8 +4,8 @@ use rcdvlog_server::{HttpState, ShutdownCoordinator, bind_loopback, router, serv
 use rcdvlog_server_core::{
     APPLICATION_VERSION, CONTROL_CATALOG_SCHEMA_VERSION, CatalogSchemaError, ConfigError,
     InstanceLockError, JobScheduler, JobSchedulerConfig, PROTOCOL_MAJOR_VERSION,
-    PROTOCOL_MINOR_VERSION, RuntimeFoundation, ScanJobHandler, ScanService, ScanSource,
-    ScanToolConfig, ServerConfig, compute_next_run_utc,
+    PROTOCOL_MINOR_VERSION, RepresentationJobHandler, RuntimeFoundation, ScanJobHandler,
+    ScanService, ScanSource, ScanToolConfig, ServerConfig, ServerJobHandler, compute_next_run_utc,
 };
 use serde::Serialize;
 use std::process::ExitCode;
@@ -167,7 +167,15 @@ async fn run() -> Result<()> {
         };
         let library = worker_catalog.storage_library();
         let scan_service = Arc::new(ScanService::new(library.clone(), tool_config));
-        let handler = Arc::new(ScanJobHandler::new(library, scan_service.clone()));
+        let scan_handler = ScanJobHandler::new(library.clone(), scan_service.clone());
+        let representation_handler = RepresentationJobHandler::new(
+            library,
+            worker_catalog.jobs(),
+            worker_config.derived_dir.clone(),
+            std::path::PathBuf::from(&worker_config.ffmpeg_command),
+            std::path::PathBuf::from(&worker_config.ffprobe_command),
+        );
+        let handler = Arc::new(ServerJobHandler::new(scan_handler, representation_handler));
 
         let engine = worker_catalog.jobs();
         let scheduler = match JobScheduler::new(
