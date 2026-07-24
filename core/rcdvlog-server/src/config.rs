@@ -9,6 +9,11 @@ use thiserror::Error;
 pub const DEFAULT_DATA_DIR: &str = "/var/lib/rcdvlog";
 pub const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1:8090";
 pub const DEFAULT_SHUTDOWN_TIMEOUT_SECONDS: u64 = 10;
+pub const DEFAULT_TRUSTED_PROXY_CIDRS: &str = "127.0.0.1/32,::1/128";
+pub const DEFAULT_LAN_HOSTNAME: &str = "rcdvlog.local";
+pub const DEFAULT_SESSION_MAX_AGE_SECONDS: u64 = 86400;
+pub const DEFAULT_BOOTSTRAP_TTL_SECONDS: u64 = 300;
+pub const DEFAULT_PAIRING_TTL_SECONDS: u64 = 600;
 
 const DATA_DIR_FIELD: &str = "dataDir";
 const TEMP_DIR_FIELD: &str = "tempDir";
@@ -17,6 +22,11 @@ const BACKUP_DIR_FIELD: &str = "backupDir";
 const ORIGINAL_MOUNTS_FIELD: &str = "allowedOriginalMounts";
 const LISTEN_ADDR_FIELD: &str = "listenAddr";
 const SHUTDOWN_TIMEOUT_FIELD: &str = "shutdownTimeoutSeconds";
+const TRUSTED_PROXY_CIDRS_FIELD: &str = "trustedProxyCidrs";
+const LAN_HOSTNAME_FIELD: &str = "lanHostname";
+const SESSION_MAX_AGE_FIELD: &str = "sessionMaxAgeSeconds";
+const BOOTSTRAP_TTL_FIELD: &str = "bootstrapCodeTtlSeconds";
+const PAIRING_TTL_FIELD: &str = "pairingCodeTtlSeconds";
 const FFMPEG_FIELD: &str = "ffmpegCommand";
 const FFPROBE_FIELD: &str = "ffprobeCommand";
 const EXIFTOOL_FIELD: &str = "exiftoolCommand";
@@ -65,6 +75,8 @@ pub enum ConfigErrorReason {
     InvalidUnicode,
     OutOfRange,
     EmptyValue,
+    InvalidHostname,
+    InvalidCidr,
 }
 
 impl fmt::Display for ConfigErrorReason {
@@ -83,6 +95,8 @@ impl fmt::Display for ConfigErrorReason {
             Self::InvalidUnicode => "must contain valid Unicode",
             Self::OutOfRange => "is outside the supported range",
             Self::EmptyValue => "must not be empty",
+            Self::InvalidHostname => "must be a valid LAN hostname",
+            Self::InvalidCidr => "must be a valid CIDR notation (e.g. 127.0.0.1/32)",
         })
     }
 }
@@ -115,6 +129,11 @@ pub struct ServerConfig {
     pub allowed_original_mounts: Vec<PathBuf>,
     pub listen_addr: SocketAddr,
     pub shutdown_timeout: Duration,
+    pub trusted_proxy_cidrs: Vec<String>,
+    pub lan_hostname: String,
+    pub session_max_age: Duration,
+    pub bootstrap_code_ttl: Duration,
+    pub pairing_code_ttl: Duration,
     pub ffmpeg_command: String,
     pub ffprobe_command: String,
     pub exiftool_command: String,
@@ -136,6 +155,11 @@ pub struct ConfigDiagnostics {
     pub allowed_original_mounts: Vec<PathBuf>,
     pub listen_addr: String,
     pub shutdown_timeout_seconds: u64,
+    pub trusted_proxy_cidr_count: usize,
+    pub lan_hostname: String,
+    pub session_max_age_seconds: u64,
+    pub bootstrap_code_ttl_seconds: u64,
+    pub pairing_code_ttl_seconds: u64,
     pub ffmpeg_command: String,
     pub ffprobe_command: String,
     pub exiftool_command: String,
@@ -152,6 +176,11 @@ impl ServerConfig {
             ("RCDVLOG_ALLOWED_ORIGINAL_MOUNTS", ORIGINAL_MOUNTS_FIELD),
             ("RCDVLOG_LISTEN_ADDR", LISTEN_ADDR_FIELD),
             ("RCDVLOG_SHUTDOWN_TIMEOUT_SECONDS", SHUTDOWN_TIMEOUT_FIELD),
+            ("RCDVLOG_TRUSTED_PROXY_CIDRS", TRUSTED_PROXY_CIDRS_FIELD),
+            ("RCDVLOG_LAN_HOSTNAME", LAN_HOSTNAME_FIELD),
+            ("RCDVLOG_SESSION_MAX_AGE_SECONDS", SESSION_MAX_AGE_FIELD),
+            ("RCDVLOG_BOOTSTRAP_CODE_TTL_SECONDS", BOOTSTRAP_TTL_FIELD),
+            ("RCDVLOG_PAIRING_CODE_TTL_SECONDS", PAIRING_TTL_FIELD),
             ("RCDVLOG_FFMPEG", FFMPEG_FIELD),
             ("RCDVLOG_FFPROBE", FFPROBE_FIELD),
             ("RCDVLOG_EXIFTOOL", EXIFTOOL_FIELD),
@@ -201,6 +230,37 @@ impl ServerConfig {
             })?,
             None => DEFAULT_SHUTDOWN_TIMEOUT_SECONDS,
         };
+        let trusted_proxy_cidrs = values
+            .get("RCDVLOG_TRUSTED_PROXY_CIDRS")
+            .map(|value| {
+                value
+                    .split(',')
+                    .filter(|part| !part.is_empty())
+                    .map(|part| part.trim().to_string())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_else(|| {
+                DEFAULT_TRUSTED_PROXY_CIDRS
+                    .split(',')
+                    .map(|part| part.trim().to_string())
+                    .collect()
+            });
+        let lan_hostname = values
+            .get("RCDVLOG_LAN_HOSTNAME")
+            .cloned()
+            .unwrap_or_else(|| DEFAULT_LAN_HOSTNAME.to_string());
+        let session_max_age_seconds = parse_u64_or_default(
+            values.get("RCDVLOG_SESSION_MAX_AGE_SECONDS"),
+            DEFAULT_SESSION_MAX_AGE_SECONDS,
+        );
+        let bootstrap_code_ttl_seconds = parse_u64_or_default(
+            values.get("RCDVLOG_BOOTSTRAP_CODE_TTL_SECONDS"),
+            DEFAULT_BOOTSTRAP_TTL_SECONDS,
+        );
+        let pairing_code_ttl_seconds = parse_u64_or_default(
+            values.get("RCDVLOG_PAIRING_CODE_TTL_SECONDS"),
+            DEFAULT_PAIRING_TTL_SECONDS,
+        );
 
         let config = Self {
             data_dir,
@@ -210,6 +270,11 @@ impl ServerConfig {
             allowed_original_mounts,
             listen_addr,
             shutdown_timeout: Duration::from_secs(shutdown_timeout_seconds),
+            trusted_proxy_cidrs,
+            lan_hostname,
+            session_max_age: Duration::from_secs(session_max_age_seconds),
+            bootstrap_code_ttl: Duration::from_secs(bootstrap_code_ttl_seconds),
+            pairing_code_ttl: Duration::from_secs(pairing_code_ttl_seconds),
             ffmpeg_command: configured_command(&values, "RCDVLOG_FFMPEG", "ffmpeg"),
             ffprobe_command: configured_command(&values, "RCDVLOG_FFPROBE", "ffprobe"),
             exiftool_command: configured_command(&values, "RCDVLOG_EXIFTOOL", "exiftool"),
@@ -295,6 +360,29 @@ impl ServerConfig {
                 ConfigErrorReason::OutOfRange,
             ));
         }
+        for cidr in &self.trusted_proxy_cidrs {
+            if cidr.is_empty() || !cidr.contains('/') {
+                return Err(ConfigError::new(
+                    TRUSTED_PROXY_CIDRS_FIELD,
+                    ConfigErrorReason::InvalidCidr,
+                ));
+            }
+        }
+        if self.lan_hostname.is_empty() {
+            return Err(ConfigError::new(
+                LAN_HOSTNAME_FIELD,
+                ConfigErrorReason::EmptyValue,
+            ));
+        }
+        for (field, seconds) in [
+            (SESSION_MAX_AGE_FIELD, self.session_max_age.as_secs()),
+            (BOOTSTRAP_TTL_FIELD, self.bootstrap_code_ttl.as_secs()),
+            (PAIRING_TTL_FIELD, self.pairing_code_ttl.as_secs()),
+        ] {
+            if !(30..=86400 * 365).contains(&seconds) {
+                return Err(ConfigError::new(field, ConfigErrorReason::OutOfRange));
+            }
+        }
         for (field, command) in [
             (FFMPEG_FIELD, self.ffmpeg_command.as_str()),
             (FFPROBE_FIELD, self.ffprobe_command.as_str()),
@@ -316,6 +404,11 @@ impl ServerConfig {
             allowed_original_mounts: self.allowed_original_mounts.clone(),
             listen_addr: self.listen_addr.to_string(),
             shutdown_timeout_seconds: self.shutdown_timeout.as_secs(),
+            trusted_proxy_cidr_count: self.trusted_proxy_cidrs.len(),
+            lan_hostname: self.lan_hostname.clone(),
+            session_max_age_seconds: self.session_max_age.as_secs(),
+            bootstrap_code_ttl_seconds: self.bootstrap_code_ttl.as_secs(),
+            pairing_code_ttl_seconds: self.pairing_code_ttl.as_secs(),
             ffmpeg_command: self.ffmpeg_command.clone(),
             ffprobe_command: self.ffprobe_command.clone(),
             exiftool_command: self.exiftool_command.clone(),
@@ -343,6 +436,10 @@ fn configured_command(values: &BTreeMap<String, String>, key: &str, default: &st
         .get(key)
         .cloned()
         .unwrap_or_else(|| default.to_string())
+}
+
+fn parse_u64_or_default(value: Option<&String>, default: u64) -> u64 {
+    value.and_then(|v| v.parse::<u64>().ok()).unwrap_or(default)
 }
 
 fn validate_path(field: &'static str, path: &Path) -> Result<(), ConfigError> {

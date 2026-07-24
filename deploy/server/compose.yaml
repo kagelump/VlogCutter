@@ -1,3 +1,19 @@
+# ── RCD VlogCutter Companion Server ──────────────────────────────────
+#
+# This Compose file runs the private server backend. TLS is terminated
+# externally by one of two front doors:
+#
+#   LAN:  Caddy (Caddyfile in this directory) listens on rcdvlog.local:8443
+#         and reverse-proxies to the loopback backend with a local CA cert.
+#
+#   WAN:  Tailscale Serve proxies the loopback backend with tailnet HTTPS.
+#         See tailscale-setup.md for configuration steps.
+#
+# Both front doors set X-Forwarded-For / X-Forwarded-Proto / X-Forwarded-Host
+# headers. The server only trusts these headers from 127.0.0.1/::1.
+#
+# Funnel is never configured and must not be enabled.
+
 services:
   rcdvlog-server:
     platform: linux/amd64

@@ -1,21 +1,29 @@
 use anyhow::{Context, Result, anyhow};
 use axum::body::Body;
-use axum::extract::{DefaultBodyLimit, Extension, Path as AxumPath, State};
+use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
+use axum::extract::{DefaultBodyLimit, Extension, OriginalUri, Path as AxumPath, State};
 use axum::http::{HeaderMap, HeaderValue, Method, Request, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
+use futures::SinkExt;
+use futures::stream::StreamExt;
 use rcdvlog_server_core::{
-    APPLICATION_VERSION, BaselineEnvelope, BaselinePreview, CONTROL_CATALOG_SCHEMA_VERSION,
-    PROTOCOL_MAJOR_VERSION, PROTOCOL_MINOR_VERSION, ProjectReplica, ProjectReplicaError,
-    ReadinessReport, ReconcileRequest, ReconcileResponse, Representation, RepresentationError,
-    RepresentationId, RepresentationRequest, RuntimeFoundation,
+    APPLICATION_VERSION, AuthDiagnostics, AuthError, AuthService, BaselineEnvelope,
+    BaselinePreview, CONTROL_CATALOG_SCHEMA_VERSION, DeviceCredentialInfo, JobId, MediaObjectId,
+    NodeId, NodeJobCompletion, PROTOCOL_MAJOR_VERSION, PROTOCOL_MINOR_VERSION, ProjectId,
+    ProjectReplica, ProjectReplicaError, ReadinessReport, ReconcileRequest, ReconcileResponse,
+    Representation, RepresentationError, RepresentationId, RepresentationRequest,
+    RuntimeFoundation, SessionInfo,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::future::IntoFuture;
 use std::net::SocketAddr;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
+use std::sync::RwLock as StdRwLock;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::net::TcpListener;
@@ -36,7 +44,10 @@ type ReadinessEvaluator = dyn Fn() -> ReadinessReport + Send + Sync + 'static;
 #[derive(Clone)]
 pub struct HttpState {
     foundation: Arc<RuntimeFoundation>,
+    auth: Arc<AuthService>,
     readiness_gate: ReadinessGate,
+    ws_channels: Arc<WsChannels>,
+    web_root: Option<Arc<PathBuf>>,
 }
 
 #[derive(Clone)]
@@ -46,27 +57,72 @@ struct ReadinessGate {
     response_timeout: Duration,
 }
 
+// ── WebSocket hint broadcast ──────────────────────────────────────────
+
+/// Per-project broadcast channels for sync hints.
+/// Tokio broadcast drops slow consumers — acceptable since hints are
+/// ephemeral; every reconnect triggers a full HTTP cursor reconcile.
+#[derive(Clone)]
+struct WsChannels {
+    channels: Arc<StdRwLock<HashMap<String, tokio::sync::broadcast::Sender<String>>>>,
+}
+
+impl WsChannels {
+    fn new() -> Self {
+        Self {
+            channels: Arc::new(StdRwLock::new(HashMap::new())),
+        }
+    }
+
+    fn subscribe(&self, project_id: &str) -> tokio::sync::broadcast::Receiver<String> {
+        let mut map = self.channels.write().unwrap();
+        map.entry(project_id.to_string())
+            .or_insert_with(|| tokio::sync::broadcast::channel::<String>(16).0)
+            .subscribe()
+    }
+
+    fn broadcast(&self, project_id: &str, hint: &str) {
+        if let Ok(map) = self.channels.read()
+            && let Some(tx) = map.get(project_id)
+        {
+            let _ = tx.send(hint.to_string());
+        }
+    }
+}
+
 impl HttpState {
     pub fn new(foundation: Arc<RuntimeFoundation>) -> Self {
         let readiness_foundation = foundation.clone();
-        Self::with_readiness_evaluator(foundation, DEFAULT_READINESS_TIMEOUT, move || {
+        let auth = Arc::new(foundation.auth().clone());
+        Self::with_readiness_evaluator(foundation, auth, DEFAULT_READINESS_TIMEOUT, move || {
             readiness_foundation.readiness()
         })
     }
 
     fn with_readiness_evaluator(
         foundation: Arc<RuntimeFoundation>,
+        auth: Arc<AuthService>,
         response_timeout: Duration,
         evaluator: impl Fn() -> ReadinessReport + Send + Sync + 'static,
     ) -> Self {
         Self {
             foundation,
+            auth,
             readiness_gate: ReadinessGate {
                 evaluator: Arc::new(evaluator),
                 single_flight: Arc::new(Semaphore::new(1)),
                 response_timeout,
             },
+            ws_channels: Arc::new(WsChannels::new()),
+            web_root: std::env::var_os("RCDVLOG_WEB_DIR")
+                .map(PathBuf::from)
+                .map(Arc::new),
         }
+    }
+
+    pub fn with_web_root(mut self, web_root: impl Into<PathBuf>) -> Self {
+        self.web_root = Some(Arc::new(web_root.into()));
+        self
     }
 }
 
@@ -142,6 +198,103 @@ struct ErrorResponse {
     code: &'static str,
 }
 
+// ── Auth DTOs ──────────────────────────────────────────────────────
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BootstrapCodeResponse {
+    request_id: String,
+    code: String,
+    expires_at: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BootstrapExchangeRequest {
+    code: String,
+    hostname: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionCreatedResponse {
+    request_id: String,
+    session_id: String,
+    display_prefix: String,
+    expires_at: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionsListResponse {
+    request_id: String,
+    sessions: Vec<SessionInfo>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionRefreshResponse {
+    request_id: String,
+    session: SessionInfo,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PairingCodeResponse {
+    request_id: String,
+    code: String,
+    expires_at: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PairingExchangeRequest {
+    code: String,
+    #[serde(default = "default_device_label")]
+    label: String,
+}
+
+fn default_device_label() -> String {
+    "MacBook Pro".to_string()
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DeviceCreatedResponse {
+    request_id: String,
+    credential_id: String,
+    token: String,
+    token_prefix: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DevicesListResponse {
+    request_id: String,
+    devices: Vec<DeviceCredentialInfo>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AuthDiagnosticsResponse {
+    request_id: String,
+    diagnostics: AuthDiagnostics,
+}
+
+// ── Auth principal ─────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+enum AuthPrincipal {
+    Browser {
+        session_id: String,
+        csrf_token: String,
+    },
+    Device {
+        credential_id: String,
+    },
+}
+
 #[derive(Clone)]
 pub struct ShutdownCoordinator {
     token: CancellationToken,
@@ -173,12 +326,183 @@ impl ShutdownCoordinator {
     }
 }
 
+// ── Auth middleware ──────────────────────────────────────────────────
+
+async fn auth_middleware(
+    State(state): State<HttpState>,
+    mut request: Request<Body>,
+    next: Next,
+) -> Response {
+    let auth = state.auth.clone();
+
+    // Try device bearer token first
+    if let Some(auth_header) = request.headers().get(header::AUTHORIZATION)
+        && let Ok(value) = auth_header.to_str()
+        && let Some(token) = value.strip_prefix("Bearer ")
+    {
+        match auth.validate_device(token) {
+            Ok(credential_id) => {
+                request
+                    .extensions_mut()
+                    .insert(AuthPrincipal::Device { credential_id });
+                return next.run(request).await;
+            }
+            Err(AuthError::DeviceNotFound) => {}
+            Err(AuthError::DeviceRevoked) => {
+                return auth_error_response(AuthError::DeviceRevoked);
+            }
+            Err(_) => {}
+        }
+    }
+
+    // Try session cookie
+    if let Some(cookie_header) = request.headers().get(header::COOKIE)
+        && let Ok(cookie_str) = cookie_header.to_str()
+        && let Some((session_id, session_token)) = parse_session_cookie(cookie_str)
+    {
+        let csrf_token = request
+            .headers()
+            .get("x-csrf-token")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+
+        match auth.validate_session(&session_id, &session_token) {
+            Ok(()) => {
+                request.extensions_mut().insert(AuthPrincipal::Browser {
+                    session_id,
+                    csrf_token,
+                });
+                return next.run(request).await;
+            }
+            Err(AuthError::SessionInvalid) => {}
+            Err(e) => {
+                return auth_error_response(e);
+            }
+        }
+    }
+
+    auth_error_response(AuthError::SessionInvalid)
+}
+
+async fn require_csrf(
+    State(state): State<HttpState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    if request.method() == Method::GET || request.method() == Method::HEAD {
+        return next.run(request).await;
+    }
+
+    if let AuthPrincipal::Browser {
+        session_id,
+        csrf_token,
+    } = &principal
+    {
+        if csrf_token.is_empty() {
+            return auth_error_response(AuthError::CsrfMismatch);
+        }
+        // Session was already validated by auth_middleware; only verify the
+        // CSRF token against the stored hash.
+        if state
+            .auth
+            .validate_csrf_token(session_id, csrf_token)
+            .is_err()
+        {
+            return auth_error_response(AuthError::CsrfMismatch);
+        }
+    }
+    next.run(request).await
+}
+
+async fn security_headers(request: Request<Body>, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+    headers.insert(
+        header::HeaderName::from_static("x-content-type-options"),
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        header::HeaderName::from_static("x-frame-options"),
+        HeaderValue::from_static("DENY"),
+    );
+    headers.insert(
+        header::HeaderName::from_static("referrer-policy"),
+        HeaderValue::from_static("same-origin"),
+    );
+    response
+}
+
+fn parse_session_cookie(cookie_str: &str) -> Option<(String, String)> {
+    for part in cookie_str.split(';') {
+        let trimmed = part.trim();
+        if let Some(value) = trimmed.strip_prefix("rcdvlog_session=") {
+            let decoded = value.trim_matches('"');
+            let mut parts = decoded.splitn(2, ':');
+            let session_id = parts.next()?.to_string();
+            let session_token = parts.next()?.to_string();
+            if session_id.is_empty() || session_token.is_empty() {
+                return None;
+            }
+            return Some((session_id, session_token));
+        }
+    }
+    None
+}
+
+fn auth_error_response(error: AuthError) -> Response {
+    let (status, code) = match &error {
+        AuthError::SessionInvalid
+        | AuthError::DeviceNotFound
+        | AuthError::BootstrapNotFoundOrExpired
+        | AuthError::PairingNotFoundOrExpired => (StatusCode::UNAUTHORIZED, error.code()),
+        AuthError::DeviceRevoked
+        | AuthError::BootstrapAlreadyUsed
+        | AuthError::PairingAlreadyUsed => (StatusCode::FORBIDDEN, error.code()),
+        AuthError::CsrfMismatch => (StatusCode::FORBIDDEN, error.code()),
+        AuthError::Database(_) => (StatusCode::INTERNAL_SERVER_ERROR, error.code()),
+    };
+    (
+        status,
+        Json(ErrorResponse {
+            request_id: String::new(),
+            code,
+        }),
+    )
+        .into_response()
+}
+
 pub fn router(state: HttpState) -> Router {
-    Router::new()
-        .route("/", get(root))
-        .route("/api/v1/health", get(health))
-        .route("/api/v1/ready", get(ready))
-        .route("/api/v1/version", get(version))
+    // Auth routes (open to bootstrap/pairing exchange)
+    let auth_open = Router::new()
+        .route("/api/v1/auth/bootstrap", get(create_bootstrap_code))
+        .route(
+            "/api/v1/auth/bootstrap/exchange",
+            post(exchange_bootstrap_code),
+        )
+        .route("/api/v1/auth/devices/exchange", post(exchange_pairing_code));
+
+    // Auth routes (require browser session)
+    let auth_session = Router::new()
+        .route("/api/v1/auth/sessions", get(list_sessions))
+        .route("/api/v1/auth/sessions/{session_id}", delete(revoke_session))
+        .route("/api/v1/auth/sessions/refresh", post(refresh_session))
+        .route("/api/v1/auth/pairing", post(create_pairing_code))
+        .route("/api/v1/auth/devices", get(list_devices))
+        .route(
+            "/api/v1/auth/devices/{credential_id}",
+            delete(revoke_device),
+        )
+        .route("/api/v1/auth/diagnostics", get(auth_diagnostics))
+        .layer(middleware::from_fn_with_state(state.clone(), require_csrf))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ));
+
+    // Internal routes (require auth — device or session)
+    let internal = Router::new()
         .route(
             "/api/v1/internal/projects/baseline/preview",
             post(preview_project_baseline),
@@ -193,6 +517,10 @@ pub fn router(state: HttpState) -> Router {
         )
         .route("/api/v1/representations", post(request_representation))
         .route(
+            "/api/v1/library/representations/query",
+            post(query_representations),
+        )
+        .route(
             "/api/v1/representations/{representation_id}",
             get(get_representation),
         )
@@ -200,10 +528,268 @@ pub fn router(state: HttpState) -> Router {
             "/api/v1/media/{representation_id}/content",
             get(media_content).head(media_content),
         )
-        .fallback(not_found)
+        .route(
+            "/api/v1/internal/jobs/{job_id}/complete",
+            post(complete_node_job),
+        )
+        .route("/api/v1/ws/events", get(ws_events_handler))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ));
+
+    // Public routes (no auth)
+    let public = Router::new()
+        .route("/api/v1", get(root))
+        .route("/api/openapi.json", get(openapi))
+        .route("/api/v1/health", get(health))
+        .route("/api/v1/ready", get(ready))
+        .route("/api/v1/version", get(version));
+
+    Router::new()
+        .merge(public)
+        .merge(auth_open)
+        .merge(auth_session)
+        .merge(internal)
+        .fallback(web_or_not_found)
         .with_state(state)
         .layer(DefaultBodyLimit::max(MAX_HTTP_BODY_BYTES))
+        .layer(middleware::from_fn(security_headers))
         .layer(middleware::from_fn(request_context))
+}
+
+pub fn openapi_document() -> serde_json::Value {
+    serde_json::json!({
+        "openapi": "3.1.0",
+        "info": {
+            "title": "RCD VlogCutter Server API",
+            "version": APPLICATION_VERSION
+        },
+        "paths": {
+            "/api/v1/version": {
+                "get": {
+                    "operationId": "getServerVersion",
+                    "responses": { "200": { "$ref": "#/components/responses/Version" } }
+                }
+            },
+            "/api/v1/ready": {
+                "get": {
+                    "operationId": "getServerReadiness",
+                    "responses": {
+                        "200": { "$ref": "#/components/responses/Readiness" },
+                        "503": { "$ref": "#/components/responses/Readiness" }
+                    }
+                }
+            },
+            "/api/v1/auth/bootstrap/exchange": {
+                "post": {
+                    "operationId": "exchangeBootstrapCode",
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": { "$ref": "#/components/schemas/BootstrapExchangeRequest" }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": { "$ref": "#/components/responses/SessionCreated" },
+                        "401": { "$ref": "#/components/responses/Error" }
+                    }
+                }
+            },
+            "/api/v1/auth/sessions": {
+                "get": {
+                    "operationId": "listSessions",
+                    "responses": {
+                        "200": { "$ref": "#/components/responses/Sessions" },
+                        "401": { "$ref": "#/components/responses/Error" }
+                    }
+                }
+            }
+        },
+        "components": {
+            "schemas": {
+                "BootstrapExchangeRequest": {
+                    "type": "object",
+                    "required": ["code"],
+                    "properties": {
+                        "code": { "type": "string" },
+                        "hostname": { "type": ["string", "null"] }
+                    }
+                },
+                "Error": {
+                    "type": "object",
+                    "required": ["requestId", "code"],
+                    "properties": {
+                        "requestId": { "type": "string" },
+                        "code": { "type": "string" }
+                    }
+                },
+                "ProtocolVersion": {
+                    "type": "object",
+                    "required": ["major", "minor"],
+                    "properties": {
+                        "major": { "type": "integer", "minimum": 0 },
+                        "minor": { "type": "integer", "minimum": 0 }
+                    }
+                },
+                "Version": {
+                    "type": "object",
+                    "required": ["requestId", "applicationVersion", "protocolVersion", "controlSchemaVersion", "nodeId"],
+                    "properties": {
+                        "requestId": { "type": "string" },
+                        "applicationVersion": { "type": "string" },
+                        "protocolVersion": { "$ref": "#/components/schemas/ProtocolVersion" },
+                        "controlSchemaVersion": { "type": "integer", "minimum": 0 },
+                        "nodeId": { "type": "string" }
+                    }
+                },
+                "ReadinessCheck": {
+                    "type": "object",
+                    "required": ["name", "status"],
+                    "properties": {
+                        "name": { "type": "string" },
+                        "status": { "type": "string", "enum": ["ok", "error"] },
+                        "code": { "type": "string" }
+                    }
+                },
+                "Readiness": {
+                    "type": "object",
+                    "required": ["requestId", "status", "checks"],
+                    "properties": {
+                        "requestId": { "type": "string" },
+                        "status": { "type": "string", "enum": ["ready", "not_ready"] },
+                        "checks": {
+                            "type": "array",
+                            "items": { "$ref": "#/components/schemas/ReadinessCheck" }
+                        }
+                    }
+                },
+                "SessionInfo": {
+                    "type": "object",
+                    "required": ["sessionId", "displayPrefix", "hostname", "createdAt", "lastUsedAt", "expiresAt", "revoked"],
+                    "properties": {
+                        "sessionId": { "type": "string" },
+                        "displayPrefix": { "type": "string" },
+                        "hostname": { "type": "string" },
+                        "createdAt": { "type": "string", "format": "date-time" },
+                        "lastUsedAt": { "type": "string", "format": "date-time" },
+                        "expiresAt": { "type": "string", "format": "date-time" },
+                        "revoked": { "type": "boolean" }
+                    }
+                },
+                "SessionCreated": {
+                    "type": "object",
+                    "required": ["requestId", "sessionId", "displayPrefix", "expiresAt"],
+                    "properties": {
+                        "requestId": { "type": "string" },
+                        "sessionId": { "type": "string" },
+                        "displayPrefix": { "type": "string" },
+                        "expiresAt": { "type": "string", "format": "date-time" }
+                    }
+                },
+                "Sessions": {
+                    "type": "object",
+                    "required": ["requestId", "sessions"],
+                    "properties": {
+                        "requestId": { "type": "string" },
+                        "sessions": {
+                            "type": "array",
+                            "items": { "$ref": "#/components/schemas/SessionInfo" }
+                        }
+                    }
+                }
+            },
+            "responses": {
+                "Version": { "description": "Server identity and protocol", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Version" } } } },
+                "Readiness": { "description": "Readiness report", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Readiness" } } } },
+                "SessionCreated": { "description": "Browser session created", "headers": { "x-csrf-token": { "schema": { "type": "string" } } }, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SessionCreated" } } } },
+                "Sessions": { "description": "Browser sessions", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Sessions" } } } },
+                "Error": { "description": "Stable server error", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+            }
+        }
+    })
+}
+
+async fn openapi() -> Json<serde_json::Value> {
+    Json(openapi_document())
+}
+
+async fn web_or_not_found(
+    State(state): State<HttpState>,
+    Extension(request_id): Extension<RequestId>,
+    OriginalUri(uri): OriginalUri,
+    method: Method,
+) -> Response {
+    if uri.path() == "/api" || uri.path().starts_with("/api/") {
+        return not_found(Extension(request_id)).await.into_response();
+    }
+    if method != Method::GET && method != Method::HEAD {
+        return not_found(Extension(request_id)).await.into_response();
+    }
+    if uri.path() == "/" && state.web_root.is_none() {
+        return root(Extension(request_id)).await.into_response();
+    }
+    let Some(web_root) = state.web_root else {
+        return not_found(Extension(request_id)).await.into_response();
+    };
+    let requested = uri.path().trim_start_matches('/');
+    let safe_path = Path::new(requested);
+    if safe_path
+        .components()
+        .any(|component| !matches!(component, Component::Normal(_)))
+        && !requested.is_empty()
+    {
+        return not_found(Extension(request_id)).await.into_response();
+    }
+    let candidate = if requested.is_empty() {
+        web_root.join("index.html")
+    } else {
+        web_root.join(safe_path)
+    };
+    let (path, is_index) = if candidate.is_file() {
+        let is_index = candidate
+            .file_name()
+            .is_some_and(|name| name == "index.html");
+        (candidate, is_index)
+    } else if safe_path.extension().is_none() {
+        (web_root.join("index.html"), true)
+    } else {
+        return not_found(Extension(request_id)).await.into_response();
+    };
+    match tokio::fs::read(&path).await {
+        Ok(bytes) => {
+            let mut response = Response::new(Body::from(bytes));
+            response.headers_mut().insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static(content_type(&path)),
+            );
+            response.headers_mut().insert(
+                header::CACHE_CONTROL,
+                HeaderValue::from_static(if is_index {
+                    "no-cache"
+                } else {
+                    "public, max-age=31536000, immutable"
+                }),
+            );
+            response
+        }
+        Err(_) => not_found(Extension(request_id)).await.into_response(),
+    }
+}
+
+fn content_type(path: &Path) -> &'static str {
+    match path.extension().and_then(|value| value.to_str()) {
+        Some("html") => "text/html; charset=utf-8",
+        Some("js") => "text/javascript; charset=utf-8",
+        Some("css") => "text/css; charset=utf-8",
+        Some("svg") => "image/svg+xml",
+        Some("png") => "image/png",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("map" | "json") => "application/json",
+        _ => "application/octet-stream",
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -215,6 +801,19 @@ struct RepresentationResponse {
     job_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reused: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct QueryRepresentationsRequest {
+    media_object_ids: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct QueryRepresentationsResponse {
+    request_id: String,
+    representations: Vec<Representation>,
 }
 
 #[derive(Debug, Serialize)]
@@ -237,6 +836,197 @@ struct ReconcileHttpResponse {
     request_id: String,
     #[serde(flatten)]
     reconciliation: ReconcileResponse,
+}
+
+// ── Auth route handlers ──────────────────────────────────────────────
+
+async fn create_bootstrap_code(
+    State(state): State<HttpState>,
+    Extension(request_id): Extension<RequestId>,
+) -> Response {
+    match state.auth.create_bootstrap_code() {
+        Ok(bootstrap) => {
+            tracing::info!(
+                component = "auth",
+                requestId = %request_id.0,
+                codePrefix = %&bootstrap.code.expose()[..8.min(bootstrap.code.expose().len())],
+                "bootstrap_code_created"
+            );
+            Json(BootstrapCodeResponse {
+                request_id: request_id.0,
+                code: bootstrap.code.expose().to_string(),
+                expires_at: bootstrap.expires_at,
+            })
+            .into_response()
+        }
+        Err(error) => auth_error_response(error),
+    }
+}
+
+async fn exchange_bootstrap_code(
+    State(state): State<HttpState>,
+    Extension(request_id): Extension<RequestId>,
+    Json(body): Json<BootstrapExchangeRequest>,
+) -> Response {
+    let hostname = body.hostname.as_deref().unwrap_or("rcdvlog.local");
+    match state.auth.exchange_bootstrap(&body.code, hostname) {
+        Ok(session) => {
+            let cookie_value = format!(
+                "rcdvlog_session={}:{}",
+                session.session_id,
+                session.session_token.expose()
+            );
+            let set_cookie = format!(
+                "{}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=86400",
+                cookie_value
+            );
+            let mut response = Json(SessionCreatedResponse {
+                request_id: request_id.0,
+                session_id: session.session_id,
+                display_prefix: session.display_prefix,
+                expires_at: session.expires_at,
+            })
+            .into_response();
+            response.headers_mut().insert(
+                header::SET_COOKIE,
+                HeaderValue::from_str(&set_cookie).expect("valid cookie header"),
+            );
+            response.headers_mut().insert(
+                header::HeaderName::from_static("x-csrf-token"),
+                HeaderValue::from_str(&session.csrf_token).expect("valid csrf token"),
+            );
+            response
+        }
+        Err(error) => auth_error_response(error),
+    }
+}
+
+async fn list_sessions(
+    State(state): State<HttpState>,
+    Extension(request_id): Extension<RequestId>,
+) -> Response {
+    match state.auth.list_sessions() {
+        Ok(sessions) => Json(SessionsListResponse {
+            request_id: request_id.0,
+            sessions,
+        })
+        .into_response(),
+        Err(error) => auth_error_response(error),
+    }
+}
+
+async fn revoke_session(
+    State(state): State<HttpState>,
+    Extension(request_id): Extension<RequestId>,
+    AxumPath(session_id): AxumPath<String>,
+) -> Response {
+    match state.auth.revoke_session(&session_id) {
+        Ok(()) => Json(ErrorResponse {
+            request_id: request_id.0,
+            code: "session_revoked",
+        })
+        .into_response(),
+        Err(error) => auth_error_response(error),
+    }
+}
+
+async fn refresh_session(
+    State(state): State<HttpState>,
+    Extension(request_id): Extension<RequestId>,
+    Extension(principal): Extension<AuthPrincipal>,
+) -> Response {
+    let session_id = match &principal {
+        AuthPrincipal::Browser { session_id, .. } => session_id.clone(),
+        _ => return auth_error_response(AuthError::SessionInvalid),
+    };
+    match state.auth.refresh_session(&session_id) {
+        Ok(session) => Json(SessionRefreshResponse {
+            request_id: request_id.0,
+            session,
+        })
+        .into_response(),
+        Err(error) => auth_error_response(error),
+    }
+}
+
+async fn create_pairing_code(
+    State(state): State<HttpState>,
+    Extension(request_id): Extension<RequestId>,
+    Extension(principal): Extension<AuthPrincipal>,
+) -> Response {
+    let session_id = match &principal {
+        AuthPrincipal::Browser { session_id, .. } => session_id.clone(),
+        _ => return auth_error_response(AuthError::SessionInvalid),
+    };
+    match state.auth.create_pairing_code(&session_id) {
+        Ok(pairing) => Json(PairingCodeResponse {
+            request_id: request_id.0,
+            code: pairing.code.expose().to_string(),
+            expires_at: pairing.expires_at,
+        })
+        .into_response(),
+        Err(error) => auth_error_response(error),
+    }
+}
+
+async fn exchange_pairing_code(
+    State(state): State<HttpState>,
+    Extension(request_id): Extension<RequestId>,
+    Json(body): Json<PairingExchangeRequest>,
+) -> Response {
+    match state.auth.exchange_pairing(&body.code, &body.label) {
+        Ok(device) => Json(DeviceCreatedResponse {
+            request_id: request_id.0,
+            credential_id: device.credential_id,
+            token: device.token.expose().to_string(),
+            token_prefix: device.token_prefix,
+        })
+        .into_response(),
+        Err(error) => auth_error_response(error),
+    }
+}
+
+async fn list_devices(
+    State(state): State<HttpState>,
+    Extension(request_id): Extension<RequestId>,
+) -> Response {
+    match state.auth.list_devices() {
+        Ok(devices) => Json(DevicesListResponse {
+            request_id: request_id.0,
+            devices,
+        })
+        .into_response(),
+        Err(error) => auth_error_response(error),
+    }
+}
+
+async fn revoke_device(
+    State(state): State<HttpState>,
+    Extension(request_id): Extension<RequestId>,
+    AxumPath(credential_id): AxumPath<String>,
+) -> Response {
+    match state.auth.revoke_device(&credential_id) {
+        Ok(()) => Json(ErrorResponse {
+            request_id: request_id.0,
+            code: "device_revoked",
+        })
+        .into_response(),
+        Err(error) => auth_error_response(error),
+    }
+}
+
+async fn auth_diagnostics(
+    State(state): State<HttpState>,
+    Extension(request_id): Extension<RequestId>,
+) -> Response {
+    match state.auth.diagnostics() {
+        Ok(diag) => Json(AuthDiagnosticsResponse {
+            request_id: request_id.0,
+            diagnostics: diag,
+        })
+        .into_response(),
+        Err(error) => auth_error_response(error),
+    }
 }
 
 async fn preview_project_baseline(
@@ -290,12 +1080,46 @@ async fn reconcile_project(
     Json(request): Json<ReconcileRequest>,
 ) -> Response {
     let manager = state.foundation.catalog().project_replicas();
-    match tokio::task::spawn_blocking(move || manager.reconcile(&project_id, &request)).await {
-        Ok(Ok(reconciliation)) => Json(ReconcileHttpResponse {
-            request_id: request_id.0,
-            reconciliation,
-        })
-        .into_response(),
+    let ws_channels = state.ws_channels.clone();
+    let jobs = state.foundation.jobs();
+    let server_node_id = state.foundation.catalog().node_id().clone();
+    match tokio::task::spawn_blocking(move || {
+        let mut reconciliation = manager.reconcile(&project_id, &request)?;
+
+        // Query pending Mac-targeted jobs for the requesting node.
+        // The requesting node is the origin of the sent operations.
+        let requestor_node_id: Option<NodeId> = request
+            .operation_cursors
+            .keys()
+            .find(|k| *k != server_node_id.as_str())
+            .and_then(|id| NodeId::parse(id).ok());
+
+        if let (Some(requestor), Ok(project_id_parsed)) =
+            (requestor_node_id, ProjectId::parse(&project_id))
+            && let Ok(pending) = jobs.pending_jobs_for_node(&requestor, &project_id_parsed)
+        {
+            reconciliation.node_targeted_jobs = pending;
+        }
+
+        Ok(reconciliation)
+    })
+    .await
+    {
+        Ok(Ok(reconciliation)) => {
+            // Broadcast a hint to WebSocket subscribers so other clients
+            // wake up and reconcile via HTTP.
+            let hint = serde_json::json!({
+                "type": "hint",
+                "projectId": reconciliation.project_id,
+                "timestamp": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            });
+            ws_channels.broadcast(&reconciliation.project_id, &hint.to_string());
+            Json(ReconcileHttpResponse {
+                request_id: request_id.0,
+                reconciliation,
+            })
+            .into_response()
+        }
         Ok(Err(error)) => project_replica_error(request_id.0, error),
         Err(_) => internal_project_replica_error(request_id.0),
     }
@@ -310,6 +1134,86 @@ fn internal_project_replica_error(request_id: String) -> Response {
         }),
     )
         .into_response()
+}
+
+// ── WebSocket hint handler ──────────────────────────────────────────
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SubscribeMessage {
+    #[serde(rename = "type")]
+    msg_type: String,
+    project_id: String,
+}
+
+async fn ws_events_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<HttpState>,
+    Extension(principal): Extension<AuthPrincipal>,
+) -> Response {
+    // Only device credentials may subscribe to sync hints.
+    match &principal {
+        AuthPrincipal::Device { .. } => {}
+        _ => {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(ErrorResponse {
+                    request_id: String::new(),
+                    code: "forbidden",
+                }),
+            )
+                .into_response();
+        }
+    }
+    ws.on_upgrade(move |socket| handle_ws_socket(socket, state))
+}
+
+async fn handle_ws_socket(socket: WebSocket, state: HttpState) {
+    let (mut sender, mut receiver) = socket.split();
+
+    // First message MUST be a subscribe message:
+    //   {"type":"subscribe","projectId":"proj_..."}
+    let first_msg = match receiver.next().await {
+        Some(Ok(WsMessage::Text(text))) => text.to_string(),
+        _ => return,
+    };
+
+    let subscribe: SubscribeMessage = match serde_json::from_str::<SubscribeMessage>(&first_msg) {
+        Ok(msg) if msg.msg_type == "subscribe" => msg,
+        _ => return,
+    };
+
+    let mut rx = state.ws_channels.subscribe(&subscribe.project_id);
+
+    loop {
+        tokio::select! {
+            msg = rx.recv() => {
+                match msg {
+                    Ok(hint) => {
+                        if sender.send(WsMessage::Text(hint.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+            ws_msg = receiver.next() => {
+                match ws_msg {
+                    Some(Ok(WsMessage::Close(_))) | None => break,
+                    Some(Ok(WsMessage::Text(text))) => {
+                        // Allow resubscribe to a different project
+                        if let Ok(sub) = serde_json::from_str::<SubscribeMessage>(&text)
+                            && sub.msg_type == "subscribe"
+                        {
+                            rx = state.ws_channels.subscribe(&sub.project_id);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
 }
 
 fn project_replica_error(request_id: String, error: ProjectReplicaError) -> Response {
@@ -391,6 +1295,177 @@ async fn get_representation(
         .into_response(),
         Ok(Err(error)) => representation_error(request_id.0, error),
         Err(_) => representation_error(request_id.0, RepresentationError::NotFound),
+    }
+}
+
+async fn query_representations(
+    State(state): State<HttpState>,
+    Extension(request_id): Extension<RequestId>,
+    Json(body): Json<QueryRepresentationsRequest>,
+) -> Response {
+    let service = state
+        .foundation
+        .catalog()
+        .representations(state.foundation.config().derived_dir.clone());
+    let media_ids: Vec<MediaObjectId> = match body
+        .media_object_ids
+        .iter()
+        .map(MediaObjectId::parse)
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(ids) => ids,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    request_id: request_id.0,
+                    code: "invalid_media_object_id",
+                }),
+            )
+                .into_response();
+        }
+    };
+    match tokio::task::spawn_blocking(move || service.list_available(&media_ids)).await {
+        Ok(Ok(representations)) => Json(QueryRepresentationsResponse {
+            request_id: request_id.0,
+            representations,
+        })
+        .into_response(),
+        Ok(Err(error)) => representation_error(request_id.0, error),
+        Err(_) => representation_error(
+            request_id.0,
+            RepresentationError::InvalidInput("query worker failed".into()),
+        ),
+    }
+}
+
+// ── Node-targeted job completion ─────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CompleteNodeJobRequest {
+    status: String,
+    #[serde(default)]
+    output_identity: Option<String>,
+    #[serde(default)]
+    details: serde_json::Value,
+}
+
+async fn complete_node_job(
+    State(state): State<HttpState>,
+    Extension(request_id): Extension<RequestId>,
+    Extension(principal): Extension<AuthPrincipal>,
+    AxumPath(job_id): AxumPath<String>,
+    Json(body): Json<CompleteNodeJobRequest>,
+) -> Response {
+    // Only device principals may report job results
+    let is_device = matches!(&principal, AuthPrincipal::Device { .. });
+    if !is_device {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(ErrorResponse {
+                request_id: request_id.0,
+                code: "forbidden",
+            }),
+        )
+            .into_response();
+    }
+
+    let Ok(job_id_parsed) = JobId::parse(&job_id) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                request_id: request_id.0,
+                code: "invalid_job_id",
+            }),
+        )
+            .into_response();
+    };
+
+    let jobs = state.foundation.jobs();
+    let server_node_id = state.foundation.catalog().node_id().clone();
+    let representations = state
+        .foundation
+        .catalog()
+        .representations(state.foundation.config().derived_dir.clone());
+
+    let status = body.status.clone();
+    let output_identity = body.output_identity.clone();
+    let details = body.details.clone();
+
+    // Run the completion + representation registration on a blocking thread
+    let result = tokio::task::spawn_blocking(move || {
+        let completion = match status.as_str() {
+            "succeeded" => NodeJobCompletion::Succeeded {
+                output_identity: output_identity.clone(),
+                details: details.clone(),
+            },
+            "failed" => NodeJobCompletion::Failed {
+                code: "node_reported_failure".to_string(),
+                details: details.clone(),
+            },
+            _ => {
+                return Err(RepresentationError::InvalidInput(format!(
+                    "unknown status: {status}",
+                )));
+            }
+        };
+
+        jobs.complete_node_targeted_job(&job_id_parsed, &server_node_id, &completion)
+            .map_err(|e| RepresentationError::InvalidInput(e.to_string()))?;
+
+        // If succeeded and the job was a representation generation, register the output
+        if status == "succeeded"
+            && let Some(ref output_id) = output_identity
+            && let Ok(rep_id) = RepresentationId::parse(output_id)
+        {
+            let hash = details
+                .get("outputContentHash")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let byte_len = details
+                .get("byteLength")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let local_path = details
+                .get("localPath")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            if byte_len > 0 && !local_path.is_empty() {
+                let hash = if hash.is_empty() {
+                    "remote_generated"
+                } else {
+                    hash
+                };
+                let _ = representations.register_remote_output(
+                    &rep_id,
+                    &server_node_id,
+                    local_path,
+                    hash,
+                    byte_len,
+                );
+            }
+        }
+        Ok::<_, RepresentationError>(())
+    })
+    .await;
+
+    match result {
+        Ok(Ok(())) => Json(serde_json::json!({
+            "requestId": request_id.0,
+            "status": "ok"
+        }))
+        .into_response(),
+        Ok(Err(error)) => representation_error(request_id.0, error),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                request_id: request_id.0,
+                code: "internal_error",
+            }),
+        )
+            .into_response(),
     }
 }
 
@@ -766,6 +1841,26 @@ mod tests {
         serde_json::from_slice(&bytes).unwrap()
     }
 
+    fn device_auth_token(fixture: &Fixture) -> String {
+        let bootstrap = fixture.foundation.auth().create_bootstrap_code().unwrap();
+        let session = fixture
+            .foundation
+            .auth()
+            .exchange_bootstrap(bootstrap.code.expose(), "rcdvlog.local")
+            .unwrap();
+        let pairing = fixture
+            .foundation
+            .auth()
+            .create_pairing_code(&session.session_id)
+            .unwrap();
+        let device = fixture
+            .foundation
+            .auth()
+            .exchange_pairing(pairing.code.expose(), "Test Mac")
+            .unwrap();
+        device.token.expose().to_string()
+    }
+
     fn baseline_envelope(root: &TempDir) -> BaselineEnvelope {
         let catalog = Catalog::open(root.path().join("desktop.sqlite3")).unwrap();
         catalog.set_local_node_id("node_mac").unwrap();
@@ -798,6 +1893,7 @@ mod tests {
     #[tokio::test]
     async fn baseline_preview_import_and_reconcile_routes_preserve_protocol_errors() {
         let fixture = Fixture::new(false);
+        let token = device_auth_token(&fixture);
         let source = TempDir::new().unwrap();
         let envelope = baseline_envelope(&source);
         let body = serde_json::to_vec(&envelope).unwrap();
@@ -809,6 +1905,7 @@ mod tests {
                     .method(Method::POST)
                     .uri("/api/v1/internal/projects/baseline/preview")
                     .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {}", token))
                     .body(Body::from(body.clone()))
                     .unwrap(),
             )
@@ -829,6 +1926,7 @@ mod tests {
                     .method(Method::POST)
                     .uri("/api/v1/internal/projects/baseline/import")
                     .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {}", token))
                     .body(Body::from(body))
                     .unwrap(),
             )
@@ -867,6 +1965,7 @@ mod tests {
                         envelope.payload.project.project_id
                     ))
                     .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {}", token))
                     .body(Body::from(serde_json::to_vec(&bad_reconcile).unwrap()))
                     .unwrap(),
             )
@@ -879,6 +1978,7 @@ mod tests {
     #[tokio::test]
     async fn media_content_supports_head_and_single_ranges_without_exposing_paths() {
         let fixture = Fixture::new(false);
+        let token = device_auth_token(&fixture);
         let bytes = b"0123456789abcdef";
         let id = fixture.seed_media_content(bytes);
         let uri = format!("/api/v1/media/{}/content", id.as_str());
@@ -889,6 +1989,7 @@ mod tests {
                 Request::builder()
                     .uri(&uri)
                     .header(header::RANGE, "bytes=3-7")
+                    .header(header::AUTHORIZATION, format!("Bearer {}", token))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -908,6 +2009,7 @@ mod tests {
                 Request::builder()
                     .method(Method::HEAD)
                     .uri(&uri)
+                    .header(header::AUTHORIZATION, format!("Bearer {}", token))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -923,6 +2025,7 @@ mod tests {
                 Request::builder()
                     .uri(&uri)
                     .header(header::RANGE, "bytes=0-1,4-5")
+                    .header(header::AUTHORIZATION, format!("Bearer {}", token))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1029,6 +2132,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn serves_built_web_assets_with_spa_and_cache_policy() {
+        let fixture = Fixture::new(false);
+        let foundation_root = fixture
+            .app()
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(foundation_root.status(), StatusCode::OK);
+        assert_eq!(json(foundation_root).await["status"], "private_foundation");
+
+        let web_root = fixture._root.path().join("web");
+        std::fs::create_dir_all(web_root.join("assets")).unwrap();
+        std::fs::write(web_root.join("index.html"), b"<main>web shell</main>").unwrap();
+        std::fs::write(web_root.join("assets/app-abc123.js"), b"export {};").unwrap();
+        let app = router(HttpState::new(fixture.foundation.clone()).with_web_root(web_root));
+
+        let index = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/projects")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(index.status(), StatusCode::OK);
+        assert_eq!(index.headers()[header::CACHE_CONTROL], "no-cache");
+        assert_eq!(
+            to_bytes(index.into_body(), 1024).await.unwrap(),
+            "<main>web shell</main>"
+        );
+
+        let asset = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/assets/app-abc123.js")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(asset.status(), StatusCode::OK);
+        assert_eq!(
+            asset.headers()[header::CACHE_CONTROL],
+            "public, max-age=31536000, immutable"
+        );
+
+        let missing_api = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/not-real")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing_api.status(), StatusCode::NOT_FOUND);
+        assert_eq!(json(missing_api).await["code"], "not_found");
+    }
+
+    #[tokio::test]
+    async fn exposes_the_rust_owned_openapi_contract() {
+        let fixture = Fixture::new(false);
+        let response = fixture
+            .app()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/openapi.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json(response).await;
+        assert_eq!(body["openapi"], "3.1.0");
+        assert!(body["paths"]["/api/v1/auth/bootstrap/exchange"].is_object());
+    }
+
+    #[tokio::test]
     async fn cancellation_stops_the_listener_within_the_bound() {
         let fixture = Fixture::new(false);
         let listener = match bind_loopback("127.0.0.1:0".parse().unwrap()).await {
@@ -1072,8 +2257,10 @@ mod tests {
         let (started_sender, started_receiver) = tokio::sync::oneshot::channel();
         let started_sender = Arc::new(Mutex::new(Some(started_sender)));
         let evaluator_started_sender = started_sender.clone();
+        let auth = Arc::new(fixture.foundation.auth().clone());
         let state = HttpState::with_readiness_evaluator(
             fixture.foundation.clone(),
+            auth,
             Duration::from_millis(20),
             move || {
                 evaluator_count.fetch_add(1, Ordering::SeqCst);

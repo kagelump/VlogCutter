@@ -7,4 +7,6 @@ dist/
 *.sqlite3-wal
 *.tsbuildinfo
 apps/desktop/src-tauri/gen/
+apps/web/test-results/
+apps/web/playwright-report/
 deploy/server/.env

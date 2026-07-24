@@ -1,6 +1,6 @@
 # Task 11: Automatic Sync and Conflict Handling
 
-**Status:** Planned
+**Status:** Implemented
 **Depends on:** Tasks 8 and 10
 **Unblocks:** Tasks 12, 15, 16, and 18
 
@@ -62,19 +62,19 @@ The user can annotate offline, reconnect through either LAN or Tailscale, and se
 
 ## Acceptance criteria
 
-- [ ] Desktop notes/labels/removal/rotation commit while the server is offline.
-- [ ] Offline Mac operations and server-origin operations converge after reconnect.
-- [ ] Duplicate requests, lost responses, process restart, and WebSocket loss do not duplicate or lose state.
-- [ ] LAN-to-Tailscale and Tailscale-to-LAN failover uses the same server pairing and resumes cursors.
-- [ ] A malicious/different server at a configured URL is rejected by server ID.
-- [ ] Sync status accurately reports unpaired, offline, connecting, syncing, synced, attention, incompatible, and credential-revoked states.
-- [ ] Pending operation counts survive desktop restart.
-- [ ] Note revisions both survive a concurrent edit and the deterministic active note matches on both replicas.
-- [ ] Label add/remove, removed, and rotation convergence matches Task 7 rules.
-- [ ] Clock conflicts are visible and no silent winner changes chronology.
-- [ ] Project review/focus/playback remains responsive during a large reconciliation.
-- [ ] Local database transactions are not held across HTTP requests.
-- [ ] Explicit “Sync now” accelerates reconciliation but is not required for eventual convergence.
+- [x] Desktop notes/labels/removal/rotation commit while the server is offline.
+- [x] Offline Mac operations and server-origin operations converge after reconnect.
+- [x] Duplicate requests, lost responses, process restart, and WebSocket loss do not duplicate or lose state.
+- [x] LAN-to-Tailscale and Tailscale-to-LAN failover uses the same server pairing and resumes cursors.
+- [x] A malicious/different server at a configured URL is rejected by server ID.
+- [x] Sync status accurately reports unpaired, offline, connecting, syncing, synced, attention, incompatible, and credential-revoked states.
+- [x] Pending operation counts survive desktop restart.
+- [x] Note revisions both survive a concurrent edit and the deterministic active note matches on both replicas.
+- [x] Label add/remove, removed, and rotation convergence matches Task 7 rules.
+- [x] Clock conflicts are visible and no silent winner changes chronology.
+- [x] Project review/focus/playback remains responsive during a large reconciliation.
+- [x] Local database transactions are not held across HTTP requests.
+- [x] Explicit “Sync now” accelerates reconciliation but is not required for eventual convergence.
 
 ## Verification
 

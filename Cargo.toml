@@ -17,17 +17,22 @@ version = "0.1.0"
 
 [workspace.dependencies]
 anyhow = "1.0"
-axum = "0.8"
+argon2 = "0.5"
+axum = { version = "0.8", features = ["ws"] }
+base64 = "0.22"
 blake3 = "1.8"
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"
 clap = { version = "4.5", features = ["derive", "env"] }
 dirs = "6.0"
 fs2 = "0.4"
+hex = "0.4"
 libc = "0.2"
+rand = "0.8"
 rusqlite = { version = "0.38", features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+sha2 = "0.10"
 thiserror = "2.0"
 tokio = { version = "1.48", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["io", "rt"] }

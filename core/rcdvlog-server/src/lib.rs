@@ -1,3 +1,4 @@
+pub mod auth;
 mod catalog;
 mod config;
 mod foundation;
@@ -11,14 +12,19 @@ pub mod scan_handler;
 mod storage_path;
 
 pub use rcdvlog_core::{
-    Catalog, CatalogSchemaError, PROJECT_CATALOG_SCHEMA_VERSION, ProjectAssetAddedPayload,
-    RepresentationId,
+    Catalog, CatalogSchemaError, JobId, MediaObjectId, NodeId, PROJECT_CATALOG_SCHEMA_VERSION,
+    ProjectAssetAddedPayload, ProjectId, RepresentationId,
 };
 pub use rcdvlog_sync::{
-    BASELINE_VERSION, BaselineEnvelope, BaselinePayload, BaselinePreview, ObservationFact,
-    ProtocolRange, ReconcileRequest, ReconcileResponse, RepresentationManifestFact, SyncError,
+    BASELINE_VERSION, BaselineEnvelope, BaselinePayload, BaselinePreview, NodeTargetedJob,
+    ObservationFact, ProtocolRange, ReconcileRequest, ReconcileResponse,
+    RepresentationManifestFact, SyncError,
 };
 
+pub use auth::{
+    AuthConfig, AuthDiagnostics, AuthError, AuthService, BootstrapCode, DeviceCredentialCreated,
+    DeviceCredentialInfo, PairingCode, SessionCreated, SessionInfo,
+};
 pub use catalog::{
     CONTROL_CATALOG_MIGRATIONS, CONTROL_CATALOG_SCHEMA_VERSION, CONTROL_DATABASE_FILENAME,
     ControlCatalog, INSTANCE_LOCK_FILENAME, InstanceLockError, ServerInstanceLock,
@@ -35,8 +41,8 @@ pub use jobs::{
     CancellableChild, ClaimedJob, Clock, FailureKind, ItemCompletion, JobClass, JobDefinition,
     JobEngine, JobEngineError, JobEvent, JobEventPage, JobHandler, JobHandlerFailure, JobProgress,
     JobRequirements, JobResultCommit, JobScheduler, JobSchedulerConfig, JobSnapshot,
-    JobSnapshotError, JobState, ProgressEstimateInput, RetryPolicy, ServerCapability, SystemClock,
-    cancel_child_safely,
+    JobSnapshotError, JobState, NodeJobCompletion, ProgressEstimateInput, RetryPolicy,
+    ServerCapability, SystemClock, cancel_child_safely,
 };
 pub use library::{
     AssetObservationInput, LibraryCursor, LocalNodeRootBindingInput, MediaAvailability,

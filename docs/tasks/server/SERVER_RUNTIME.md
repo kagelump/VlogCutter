@@ -24,7 +24,9 @@ The binary accepts only an IP loopback socket address. Its default is `127.0.0.1
 
 | Route | Behavior |
 | --- | --- |
-| `GET /` | Identifies the private foundation and points at the version route. |
+| `GET /api/v1` | Identifies the private foundation and points at the version route. |
+| `GET /` | Serves the built Chrome web application when `RCDVLOG_WEB_DIR` is configured. |
+| `GET /api/openapi.json` | Returns the Rust-owned OpenAPI contract used to verify the TypeScript client. |
 | `GET /api/v1/health` | Non-mutating liveness response. It does not inspect or migrate SQLite. |
 | `GET /api/v1/ready` | `200` when the catalog, configured directories, resolved path separation, and tools passed checks; otherwise `503` with stable check codes. |
 | `GET /api/v1/version` | Reports application, protocol, control-schema, and stable server-node versions/identity. |

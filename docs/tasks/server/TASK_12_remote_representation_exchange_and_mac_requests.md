@@ -1,6 +1,6 @@
 # Task 12: Remote Representation Exchange and Mac Requests
 
-**Status:** Planned
+**Status:** Implemented
 **Depends on:** Tasks 6 and 11
 **Unblocks:** Task 19
 

@@ -1,0 +1,17 @@
+{
+  "name": "@rcdvlog/project-client",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./http": "./src/http.ts",
+    "./generated": "./src/generated.ts"
+  },
+  "scripts": {
+    "check": "tsc --noEmit --pretty false"
+  },
+  "devDependencies": {
+    "typescript": "~5.9.3"
+  }
+}

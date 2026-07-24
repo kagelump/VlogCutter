@@ -250,6 +250,22 @@ fn default_max_operations() -> usize {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct NodeTargetedJob {
+    pub job_id: String,
+    pub job_type: String,
+    pub media_object_id: String,
+    pub project_id: Option<String>,
+    pub representation_id: Option<String>,
+    /// Representation kind: "proxy" or "thumbnail".
+    pub kind: String,
+    /// Kind-specific parameters (e.g. quality for thumbnails).
+    #[serde(default)]
+    pub payload: serde_json::Value,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ReconcileResponse {
     pub protocol_major: u32,
     pub protocol_minor: u32,
@@ -260,6 +276,11 @@ pub struct ReconcileResponse {
     pub representation_cursors: BTreeMap<String, u64>,
     pub conflicts: Vec<ConflictProjection>,
     pub has_more_operations: bool,
+    /// Jobs that the server has enqueued for the requesting node (e.g. Mac-targeted
+    /// proxy/thumbnail generation). These are surfaced during reconciliation so the
+    /// desktop can execute them locally and report results back.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub node_targeted_jobs: Vec<NodeTargetedJob>,
 }
 
 pub fn reconcile(
@@ -375,6 +396,7 @@ pub fn reconcile(
         representation_cursors,
         conflicts,
         has_more_operations,
+        node_targeted_jobs: vec![],
     };
     while serde_json::to_vec(&response)?.len() > DEFAULT_MAX_BYTES {
         if response.operations.len() <= 1 {

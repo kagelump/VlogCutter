@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 use crate::ConfigDiagnostics;
 
-pub const CONTROL_CATALOG_SCHEMA_VERSION: u32 = 6;
+pub const CONTROL_CATALOG_SCHEMA_VERSION: u32 = 7;
 pub const CONTROL_DATABASE_FILENAME: &str = "control.sqlite3";
 pub const INSTANCE_LOCK_FILENAME: &str = "server.lock";
 
@@ -57,6 +57,12 @@ pub const CONTROL_CATALOG_MIGRATIONS: &[SqliteMigration] = &[
         name: "project_replica_sync_registry",
         source_identity: "server-control/0006-project-replica-sync-registry/20260723",
         apply: create_project_replica_sync_registry,
+    },
+    SqliteMigration {
+        id: 7,
+        name: "authentication_credentials_sessions",
+        source_identity: "server-control/0007-authentication-credentials-sessions/20260723",
+        apply: create_authentication_credentials_sessions,
     },
 ];
 
@@ -388,6 +394,66 @@ fn create_project_replica_sync_registry(transaction: &Transaction<'_>) -> Result
             updated_at TEXT NOT NULL,
             PRIMARY KEY(project_id, source_operation_id, projection_kind)
         );
+        "#,
+    )?;
+    Ok(())
+}
+
+fn create_authentication_credentials_sessions(transaction: &Transaction<'_>) -> Result<()> {
+    transaction.execute_batch(
+        r#"
+        CREATE TABLE bootstrap_codes (
+            code_hash TEXT PRIMARY KEY,
+            code_prefix TEXT NOT NULL CHECK(length(code_prefix) = 8),
+            expires_at TEXT NOT NULL,
+            consumed_at TEXT,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX bootstrap_codes_expiry
+            ON bootstrap_codes(expires_at) WHERE consumed_at IS NULL;
+
+        CREATE TABLE browser_sessions (
+            session_id TEXT PRIMARY KEY,
+            session_token_hash TEXT NOT NULL UNIQUE,
+            display_prefix TEXT NOT NULL CHECK(length(display_prefix) = 8),
+            hostname TEXT NOT NULL,
+            csrf_token_hash TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            last_used_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            revoked_at TEXT
+        );
+        CREATE INDEX browser_sessions_lookup
+            ON browser_sessions(session_token_hash);
+        CREATE INDEX browser_sessions_active
+            ON browser_sessions(expires_at, revoked_at);
+
+        CREATE TABLE pairing_codes (
+            code_hash TEXT PRIMARY KEY,
+            code_prefix TEXT NOT NULL CHECK(length(code_prefix) = 8),
+            expires_at TEXT NOT NULL,
+            consumed_at TEXT,
+            created_at TEXT NOT NULL,
+            created_by_session_id TEXT REFERENCES browser_sessions(session_id)
+        );
+        CREATE INDEX pairing_codes_expiry
+            ON pairing_codes(expires_at) WHERE consumed_at IS NULL;
+
+        CREATE TABLE device_credentials (
+            credential_id TEXT PRIMARY KEY,
+            token_hash TEXT NOT NULL UNIQUE,
+            token_prefix TEXT NOT NULL CHECK(length(token_prefix) = 8),
+            label TEXT NOT NULL CHECK(length(label) BETWEEN 1 AND 255),
+            created_at TEXT NOT NULL,
+            last_used_at TEXT NOT NULL,
+            expires_at TEXT,
+            revoked_at TEXT,
+            expected_server_node_id TEXT NOT NULL
+        );
+        CREATE INDEX device_credentials_active
+            ON device_credentials(credential_id, revoked_at);
+        CREATE INDEX device_credentials_listing
+            ON device_credentials(created_at DESC);
         "#,
     )?;
     Ok(())
@@ -1127,6 +1193,65 @@ mod tests {
                 .unwrap()
                 .status,
             MigrationHistoryStatus::Current
+        );
+    }
+
+    #[test]
+    fn auth_migration_upgrade_preserves_existing_data() {
+        let root = TempDir::new().unwrap();
+        let database_path = root.path().join(CONTROL_DATABASE_FILENAME);
+        let mut connection = open_writable_connection(&database_path).unwrap();
+        run_sqlite_migrations(&mut connection, &CONTROL_CATALOG_MIGRATIONS[..6]).unwrap();
+        connection
+            .execute(
+                "INSERT INTO server_identity(singleton_id, node_id, created_at) VALUES (1, ?1, ?2)",
+                params!["node_server_auth_upgrade", "2026-07-23T00:00:00Z"],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO project_registry(project_id, replica_relative_path, state, registered_at, created_at, updated_at) VALUES (?1, ?2, 'registered', ?3, ?3, ?3)",
+                params!["project_auth_upgrade", "projects/project_auth_upgrade/catalog.sqlite3", "2026-07-23T00:00:00Z"],
+            )
+            .unwrap();
+
+        run_sqlite_migrations(&mut connection, CONTROL_CATALOG_MIGRATIONS).unwrap();
+
+        let node: String = connection
+            .query_row(
+                "SELECT node_id FROM server_identity WHERE singleton_id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(node, "node_server_auth_upgrade");
+
+        // New tables exist
+        for table in &[
+            "bootstrap_codes",
+            "browser_sessions",
+            "pairing_codes",
+            "device_credentials",
+        ] {
+            connection
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap();
+        }
+
+        assert_eq!(
+            inspect_sqlite_migrations(&connection, CONTROL_CATALOG_MIGRATIONS)
+                .unwrap()
+                .status,
+            MigrationHistoryStatus::Current
+        );
+        assert_eq!(
+            inspect_sqlite_migrations(&connection, CONTROL_CATALOG_MIGRATIONS)
+                .unwrap()
+                .applied_migrations
+                .len(),
+            7
         );
     }
 }

@@ -1,6 +1,7 @@
 use batch_estimator::{BatchEstimate, BatchEstimator, RateHistory};
 use chrono::{DateTime, Duration as ChronoDuration, SecondsFormat, Utc};
 use rcdvlog_core::{JobId, MediaObjectId, NodeId, ProjectId, RepresentationId, StorageRootId};
+use rcdvlog_sync::NodeTargetedJob;
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -228,6 +229,21 @@ pub struct ItemCompletion {
     pub work_units: u64,
     pub succeeded: bool,
     pub worker_elapsed_millis: u64,
+}
+
+/// Result reported by a node that executed a node-targeted job.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum NodeJobCompletion {
+    Succeeded {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        output_identity: Option<String>,
+        details: Value,
+    },
+    Failed {
+        code: String,
+        details: Value,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -483,6 +499,52 @@ impl JobEngine {
             completed_at: row.completed_at,
         })
     }
+
+    /// List queued jobs targeted at a specific (non-server) node.
+    /// Used during reconciliation to surface Mac-targeted work requests.
+    pub fn pending_jobs_for_node(
+        &self,
+        target_node_id: &NodeId,
+        project_id: &ProjectId,
+    ) -> Result<Vec<NodeTargetedJob>, JobEngineError> {
+        let connection = open_read_only_connection(&self.database_path)?;
+        let mut statement = connection.prepare(
+            r#"
+            SELECT j.job_id, j.job_type, j.media_object_id, j.project_id,
+                   j.representation_id, j.recipe_key, j.payload_json, j.created_at
+            FROM jobs j
+            WHERE j.target_node_id = ?1
+              AND j.project_id = ?2
+              AND j.state = 'queued'
+              AND j.cancel_requested_at IS NULL
+            ORDER BY j.priority DESC, j.enqueue_sequence ASC
+            "#,
+        )?;
+        let rows = statement.query_map(
+            rusqlite::params![target_node_id.as_str(), project_id.as_str()],
+            |row| {
+                let kind = if row.get::<_, String>(5)?.contains("thumbnail") {
+                    "thumbnail"
+                } else {
+                    "proxy"
+                };
+                let payload: Value =
+                    serde_json::from_str(&row.get::<_, String>(6)?).unwrap_or_default();
+                Ok(NodeTargetedJob {
+                    job_id: row.get(0)?,
+                    job_type: row.get(1)?,
+                    media_object_id: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                    project_id: row.get(3)?,
+                    representation_id: row.get(4)?,
+                    kind: kind.to_string(),
+                    payload,
+                    created_at: row.get(8)?,
+                })
+            },
+        )?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     pub fn claim_next(
         &self,
         lease_owner: &str,
@@ -822,6 +884,105 @@ impl JobEngine {
             Ok(state)
         })
     }
+
+    /// Complete a node-targeted job that was executed externally (on the Mac).
+    /// Unlike `complete()`, this does not require a lease — node-targeted jobs
+    /// are never claimed by the server scheduler.
+    pub fn complete_node_targeted_job(
+        &self,
+        job_id: &JobId,
+        target_node_id: &NodeId,
+        status: &NodeJobCompletion,
+    ) -> Result<(), JobEngineError> {
+        let now = timestamp(self.clock.now());
+        let mut connection = open_writable_connection(&self.database_path)?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        // Verify the job is queued and belongs to this target node
+        let current: (String, String) = tx
+            .query_row(
+                "SELECT state, target_node_id FROM jobs WHERE job_id=?1",
+                [job_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|_| JobEngineError::NotFound(job_id.to_string()))?;
+
+        if current.0 != "queued" {
+            return Err(JobEngineError::CorruptState(format!(
+                "job {} is in state '{}', expected 'queued'",
+                job_id.as_str(),
+                current.0
+            )));
+        }
+        if current.1 != target_node_id.as_str() {
+            return Err(JobEngineError::CorruptState(format!(
+                "job {} belongs to node '{}', not '{}'",
+                job_id.as_str(),
+                current.1,
+                target_node_id.as_str()
+            )));
+        }
+
+        let canceled: Option<String> = tx.query_row(
+            "SELECT cancel_requested_at FROM jobs WHERE job_id=?1",
+            [job_id.as_str()],
+            |row| row.get(0),
+        )?;
+        if canceled.is_some() {
+            ack_cancel_simple(&tx, job_id.as_str(), &now)?;
+            tx.commit()?;
+            return Ok(());
+        }
+
+        match status {
+            NodeJobCompletion::Succeeded {
+                output_identity,
+                details,
+            } => {
+                let output = output_identity.as_deref().map(redact_text).transpose()?;
+                validate_event(details, MAX_EVENT_BYTES)?;
+                tx.execute(
+                    "UPDATE jobs SET state='succeeded', output_identity=?2, \
+                     completed_work_units=total_work_units, completed_items=total_items, \
+                     updated_at=?3, completed_at=?3, error_code=NULL, error_details_json=NULL \
+                     WHERE job_id=?1 AND state='queued' AND cancel_requested_at IS NULL",
+                    params![job_id.as_str(), output, now],
+                )?;
+                emit(
+                    &tx,
+                    job_id.as_str(),
+                    None,
+                    "succeeded",
+                    JobState::Succeeded,
+                    details,
+                    &now,
+                )?;
+            }
+            NodeJobCompletion::Failed { code, details } => {
+                valid_token(code, "error code")?;
+                validate_event(details, MAX_ERROR_BYTES)?;
+                let detail_json = canonical_json(details, MAX_ERROR_BYTES)?;
+                tx.execute(
+                    "UPDATE jobs SET state='failed', error_code=?2, error_details_json=?3, \
+                     updated_at=?4, completed_at=?4 WHERE job_id=?1 AND state='queued' \
+                     AND cancel_requested_at IS NULL",
+                    params![job_id.as_str(), code, detail_json, now],
+                )?;
+                emit(
+                    &tx,
+                    job_id.as_str(),
+                    None,
+                    "failed",
+                    JobState::Failed,
+                    details,
+                    &now,
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn recover_expired(&self) -> Result<u64, JobEngineError> {
         let now = timestamp(self.clock.now());
         let lease_expired_details = canonical_json(&json!({}), MAX_ERROR_BYTES)?;
@@ -1112,6 +1273,23 @@ fn ack_cancel(tx: &Transaction<'_>, job: &ClaimedJob, now: &str) -> Result<(), J
         tx,
         job.job.job_id.as_str(),
         Some(job.attempt_number),
+        "canceled",
+        JobState::Canceled,
+        &json!({}),
+        now,
+    )
+}
+
+/// Acknowledge cancellation for a node-targeted job that has no lease.
+fn ack_cancel_simple(tx: &Transaction<'_>, job_id: &str, now: &str) -> Result<(), JobEngineError> {
+    tx.execute(
+        "UPDATE jobs SET state='canceled', updated_at=?1, completed_at=?1 WHERE job_id=?2",
+        params![now, job_id],
+    )?;
+    emit(
+        tx,
+        job_id,
+        None,
         "canceled",
         JobState::Canceled,
         &json!({}),
@@ -1507,6 +1685,11 @@ mod tests {
             allowed_original_mounts: vec![],
             listen_addr: "127.0.0.1:1".parse().unwrap(),
             shutdown_timeout_seconds: 1,
+            trusted_proxy_cidr_count: 1,
+            lan_hostname: "rcdvlog.local".into(),
+            session_max_age_seconds: 86400,
+            bootstrap_code_ttl_seconds: 300,
+            pairing_code_ttl_seconds: 600,
             ffmpeg_command: "ffmpeg".into(),
             ffprobe_command: "ffprobe".into(),
             exiftool_command: "exiftool".into(),

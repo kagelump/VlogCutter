@@ -1,6 +1,6 @@
 # Task 13: Web Foundation, Typed Client, and Shared UI
 
-**Status:** Planned
+**Status:** Implemented (2026-07-24)
 **Depends on:** Task 9
 **Unblocks:** Tasks 14, 15, and 16
 
@@ -62,17 +62,17 @@ Chrome can authenticate to the server and load a responsive, accessible applicat
 
 ## Acceptance criteria
 
-- [ ] `pnpm --dir apps/web build` produces static assets served by the server.
-- [ ] Unauthenticated Chrome receives the bootstrap/session flow rather than product data.
-- [ ] Authenticated Chrome loads the application shell and global server status.
-- [ ] Session expiry, credential revocation, CSRF failure, server unavailable, and protocol mismatch have distinct usable states.
-- [ ] `HttpProjectClient` and `TauriProjectClient` satisfy the same compile-time interface for shared operations.
-- [ ] API schema drift fails a checked command.
-- [ ] Shared component extraction does not introduce direct Tauri or HTTP calls.
-- [ ] Existing desktop TypeScript build and interaction behavior pass.
-- [ ] Web component tests and a Chrome Playwright login/shell smoke test run in automation.
-- [ ] Production server image contains no development server and needs no Node runtime.
-- [ ] Web layout is usable at desktop Chrome widths and a narrower tablet-like viewport, with phone treated as status/browse best effort.
+- [x] `pnpm --dir apps/web build` produces static assets served by the server.
+- [x] Unauthenticated Chrome receives the bootstrap/session flow rather than product data.
+- [x] Authenticated Chrome loads the application shell and global server status.
+- [x] Session expiry, credential revocation, CSRF failure, server unavailable, and protocol mismatch have distinct usable states.
+- [x] `HttpProjectClient` and `TauriProjectClient` satisfy the same compile-time interface for shared operations.
+- [x] API schema drift fails a checked command.
+- [x] Shared component extraction does not introduce direct Tauri or HTTP calls.
+- [x] Existing desktop TypeScript build and interaction behavior pass.
+- [x] Web component tests and a Chrome Playwright login/shell smoke test run in automation.
+- [x] Production server image contains no development server and needs no Node runtime.
+- [x] Web layout is usable at desktop Chrome widths and a narrower tablet-like viewport, with phone treated as status/browse best effort.
 
 ## Verification
 
@@ -81,3 +81,12 @@ Run desktop and web TypeScript checks/builds, component tests, Playwright smoke 
 ## Handoff notes
 
 Freeze the client and shell extension points before feature tasks. Avoid speculative packages for timeline, trip context, scripts, or edit planning.
+
+Implemented seams:
+
+- `packages/project-client` owns shared server status/session DTOs, stable client errors, protocol checks, and the HTTP transport.
+- `apps/desktop/src/projectClient.ts` adapts the existing `api` boundary to `ProjectClient`; existing desktop calls still use `api`.
+- `packages/review-ui` contains only `StatusBadge` and `StatePanel`; both surfaces consume the status primitive.
+- `apps/server` owns the OpenAPI document, exposes it at `/api/openapi.json`, and serves the built SPA with immutable hashed-asset caching.
+- `pnpm check:openapi` compares committed schema/client artifacts with the Rust-owned contract.
+- Playwright starts a disposable real server and exercises both unauthenticated and authenticated Chrome flows.

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent } from "react";
+import { StatusBadge } from "@rcdvlog/review-ui";
 import { api } from "./api";
-import type { Asset, AssetPatch, AutoplayMode, DesktopSettings, Project, ProjectLibrary, ProjectLocation } from "./types";
+import type { Asset, AssetPatch, AutoplayMode, BaselineImportResult, BaselinePreviewResult, DesktopSettings, PathAnalysis, Project, ProjectLibrary, ProjectLocation, ProjectPairingStatus, RootMappingEntry, ServerConnectionStatus, ServerVersionInfo, SyncStatus } from "./types";
 
 interface OperationProgress {
   kind: "proxy" | "thumbnail";
@@ -146,6 +147,28 @@ function App() {
   const [offsetMinutes, setOffsetMinutes] = useState(0);
   const [offsetLabel, setOffsetLabel] = useState("Camera time change");
   const [chronologyZoom, setChronologyZoom] = useState(chronologyZoomDefault);
+
+  // ── Server pairing / sync state ────────────────────────────────────
+  const [serverStatus, setServerStatus] = useState<ServerConnectionStatus | null>(null);
+  const [showPairingWizard, setShowPairingWizard] = useState(false);
+  const [pairingWizardStep, setPairingWizardStep] = useState<"endpoint" | "code" | "connecting">("endpoint");
+  const [serverEndpoint, setServerEndpoint] = useState("");
+  const [pairingCode, setPairingCode] = useState("");
+  const [deviceLabel, setDeviceLabel] = useState("MacBook Pro");
+  const [serverIdentity, setServerIdentity] = useState<ServerVersionInfo | null>(null);
+
+  // ── Sync state ─────────────────────────────────────────────────────
+  const [syncStatus, setSyncStatus] = useState<SyncStatus | null>(null);
+  const [showSyncDiagnostics, setShowSyncDiagnostics] = useState(false);
+
+  // ── Baseline pairing wizard (per-project) ─────────────────────────
+  const [showBaselineWizard, setShowBaselineWizard] = useState(false);
+  const [baselineStep, setBaselineStep] = useState<"root_mapping" | "preview" | "confirming" | "complete" | "error">("root_mapping");
+  const [pathAnalysis, setPathAnalysis] = useState<PathAnalysis | null>(null);
+  const [rootMappings, setRootMappings] = useState<RootMappingEntry[]>([]);
+  const [baselinePreview, setBaselinePreview] = useState<BaselinePreviewResult | null>(null);
+  const [baselineError, setBaselineError] = useState("");
+  const [pairingProjectId, setPairingProjectId] = useState("");
   const activeOperationRef = useRef<OperationProgress["kind"] | null>(null);
   const notesEditingRef = useRef<{ assetId: string; savedNotes: string; cancelOnBlur: boolean } | null>(null);
   const chronologyScrollRef = useRef<HTMLDivElement>(null);
@@ -229,6 +252,7 @@ function App() {
     Promise.all([refreshProjects(), refreshLibrary(), api.prerequisiteStatus(), api.desktopSettings()])
       .then(([, , tools, desktopSettings]) => {
         setSettings(desktopSettings);
+        api.serverConnectionStatus().then(setServerStatus).catch(() => {});
         const missing = tools.filter((tool) => !tool.available).map((tool) => tool.name);
         if (missing.length) {
           setError(`Missing prerequisites: ${missing.join(", ")}. Install them and relaunch.`);
@@ -243,6 +267,28 @@ function App() {
   useEffect(() => {
     refreshAssets(projectId).catch((reason) => setError(String(reason)));
   }, [projectId, refreshAssets]);
+
+  // ── Sync status listener ──────────────────────────────────────────
+  useEffect(() => {
+    const unlisten = api.onSyncStatusChanged((status) => {
+      setSyncStatus((current) => {
+        if (current && current.projectId === status.projectId) return status;
+        return current;
+      });
+    });
+    return () => {
+      unlisten.then((fn) => fn()).catch(() => {});
+    };
+  }, []);
+
+  // Load sync status when project changes
+  useEffect(() => {
+    if (!projectId) {
+      setSyncStatus(null);
+      return;
+    }
+    api.syncStatus(projectId).then(setSyncStatus).catch(() => {});
+  }, [projectId]);
 
   useEffect(() => {
     if (!projectId) return;
@@ -863,6 +909,140 @@ function App() {
     });
   }
 
+  // ── Sync helpers ────────────────────────────────────────────────────
+
+  function syncStateLabel(state: string): string {
+    switch (state) {
+      case "unpaired": return "Unpaired";
+      case "offline": return "Offline";
+      case "connecting": return "Connecting…";
+      case "syncing": return "Syncing…";
+      case "synced": return "Synced";
+      case "attention": return "Needs attention";
+      case "incompatible": return "Incompatible";
+      case "credential_revoked": return "Credential revoked";
+      default: return state;
+    }
+  }
+
+  // ── Server pairing handlers ─────────────────────────────────────────
+
+  async function handleTestServerConnection() {
+    setBusy(true);
+    setError("");
+    try {
+      const identity = await api.fetchServerInfo(serverEndpoint.trim());
+      setServerIdentity(identity);
+      setPairingWizardStep("code");
+    } catch (err: any) {
+      setError(`Cannot reach server: ${err}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handlePairWithServer() {
+    setBusy(true);
+    setError("");
+    try {
+      const result = await api.pairWithServer(serverEndpoint.trim(), pairingCode.trim(), deviceLabel.trim() || "MacBook Pro");
+      const status = await api.serverConnectionStatus();
+      setServerStatus(status);
+      setShowPairingWizard(false);
+      setPairingWizardStep("endpoint");
+      setPairingCode("");
+      setServerIdentity(null);
+      setMessage(`Connected to ${result.label} (${result.nodeId.slice(0, 12)}…)`);
+    } catch (err: any) {
+      setError(`Pairing failed: ${err}`);
+      setPairingWizardStep("code");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleUnpairServer() {
+    setBusy(true);
+    setError("");
+    try {
+      await api.unpairServer();
+      setServerStatus({ paired: false, nodeId: null, endpoint: null, label: null, pairedAt: null, endpoints: null });
+      setMessage("Disconnected from server.");
+    } catch (err: any) {
+      setError(`Failed to unpair: ${err}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  // ── Baseline pairing handlers ───────────────────────────────────────
+
+  async function handleStartBaselineWizard(projectId: string) {
+    setPairingProjectId(projectId);
+    setBaselineStep("root_mapping");
+    setBaselineError("");
+    setShowBaselineWizard(true);
+
+    // Load path analysis
+    setBusy(true);
+    try {
+      const analysis = await api.analyzeProjectPaths(projectId);
+      setPathAnalysis(analysis);
+      const mappings = await api.proposeRootMappings(analysis);
+      setRootMappings(mappings);
+    } catch (err: any) {
+      setBaselineError(`Failed to analyze project paths: ${err}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleProceedToPreview() {
+    setBaselineStep("preview");
+    setBaselineError("");
+    setBusy(true);
+    try {
+      const result = await api.previewProjectBaseline(pairingProjectId);
+      setBaselinePreview(result);
+    } catch (err: any) {
+      setBaselineError(`Preview failed: ${err}`);
+      setBaselineStep("root_mapping");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleConfirmBaseline() {
+    if (!baselinePreview) return;
+    setBaselineStep("confirming");
+    setBaselineError("");
+    setBusy(true);
+    try {
+      await api.confirmBaselineImport(pairingProjectId, baselinePreview.digest);
+      setBaselineStep("complete");
+      setMessage("Project paired with server successfully.");
+    } catch (err: any) {
+      setBaselineError(`Import failed: ${err}`);
+      setBaselineStep("error");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleRetryBaseline() {
+    setBaselineStep("preview");
+    await handleProceedToPreview();
+  }
+
+  function handleCancelBaselineWizard() {
+    api.abandonBaselineAttempt().catch(() => {});
+    setShowBaselineWizard(false);
+    setPathAnalysis(null);
+    setRootMappings([]);
+    setBaselinePreview(null);
+    setBaselineError("");
+  }
+
   const seekMaximum = Math.max(0, mediaDuration || selected?.durationSeconds || 0);
   const seekProgress = seekMaximum > 0 ? Math.min(100, (playbackSeconds / seekMaximum) * 100) : 0;
 
@@ -884,6 +1064,21 @@ function App() {
         {api.isDesktop() && <button className="text-button" disabled={busy} onClick={openCatalog} aria-keyshortcuts="Meta+O">Open catalog</button>}
         <button className="text-button" onClick={() => setShowSettings(true)} aria-keyshortcuts="Meta+,">Settings <kbd>⌘,</kbd></button>
         <button className="text-button" onClick={() => setShowCreate(true)} aria-keyshortcuts="Meta+N">New project</button>
+        {api.isDesktop() && serverStatus?.paired && projectId && (
+          <button className="text-button" disabled={busy} onClick={() => void handleStartBaselineWizard(projectId)}>
+            Pair with server
+          </button>
+        )}
+        {syncStatus && syncStatus.state !== "unpaired" && (
+          <button
+            className={`sync-indicator sync-${syncStatus.state}`}
+            onClick={() => setShowSyncDiagnostics(true)}
+            title={`Sync: ${syncStatus.state}${syncStatus.lastError ? ` — ${syncStatus.lastError}` : ""}`}
+          >
+            <span className={`sync-dot sync-dot-${syncStatus.state}`} />
+            <span className="sync-label">{syncStateLabel(syncStatus.state)}</span>
+          </button>
+        )}
         <div className="topbar-spacer" />
         <div className="session-readout">
           <span>{labeledCount}/{activeAssets.length} labeled</span>
@@ -1519,6 +1714,233 @@ function App() {
               </div>
               {api.isDesktop() && <button className="button secondary" disabled={busy} onClick={() => void configureProjectsRoot()}>Change…</button>}
             </div>
+
+            <div className="settings-group server-setting">
+              <div>
+                <span className="settings-legend">Server connection</span>
+                {serverStatus?.paired ? (
+                  <div className="server-status connected">
+                    <span className="server-dot" aria-label="connected"></span>
+                    <span>{serverStatus.label || "Server"} — {serverStatus.nodeId?.slice(0, 12)}…</span>
+                    {serverStatus.endpoints && serverStatus.endpoints.length > 0 && (
+                      <div className="endpoint-list">
+                        {serverStatus.endpoints.map((ep) => (
+                          <span className="mono endpoint-tag" key={ep.url}>{ep.kind}: {ep.url}</span>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                ) : (
+                  <div className="server-status disconnected">
+                    <span className="server-dot" aria-label="disconnected"></span>
+                    <span>Not connected to a server</span>
+                  </div>
+                )}
+              </div>
+              {api.isDesktop() && (
+                serverStatus?.paired ? (
+                  <button className="button secondary" disabled={busy} onClick={() => void handleUnpairServer()}>Disconnect</button>
+                ) : (
+                  <button className="button primary" disabled={busy} onClick={() => setShowPairingWizard(true)}>Connect to server…</button>
+                )
+              )}
+            </div>
+          </section>
+        </div>
+      )}
+
+      {/* ── Pairing wizard ─────────────────────────────────────────── */}
+      {showPairingWizard && (
+        <div className="modal-backdrop pairing-backdrop" role="presentation" onKeyDown={(event) => { if (event.key === "Escape") { setShowPairingWizard(false); setPairingWizardStep("endpoint"); setPairingCode(""); setServerIdentity(null); }}}>
+          <section className="modal pairing-modal" role="dialog" aria-modal="true" aria-labelledby="pairing-title">
+            <span className="eyebrow">Connect to server</span>
+            <div className="settings-modal-heading">
+              <h2 id="pairing-title">
+                {pairingWizardStep === "endpoint" && "Enter server address"}
+                {pairingWizardStep === "code" && "Enter pairing code"}
+                {pairingWizardStep === "connecting" && "Connecting…"}
+              </h2>
+              <button className="text-button" onClick={() => { setShowPairingWizard(false); setPairingWizardStep("endpoint"); setPairingCode(""); setServerIdentity(null); }}>Cancel <kbd>Esc</kbd></button>
+            </div>
+
+            {pairingWizardStep === "endpoint" && (
+              <div className="wizard-step">
+                <p>Enter the HTTPS URL of your RCD VlogCutter server on the home network or Tailscale.</p>
+                <label className="field">
+                  <span>Server URL</span>
+                  <input
+                    type="text"
+                    className="mono"
+                    placeholder="https://rcdvlog.local"
+                    value={serverEndpoint}
+                    onChange={(e) => setServerEndpoint(e.target.value)}
+                    onKeyDown={(e) => { if (e.key === "Enter") void handleTestServerConnection(); }}
+                    autoFocus
+                  />
+                </label>
+                <div className="modal-actions">
+                  <button className="button primary" disabled={busy || !serverEndpoint.trim()} onClick={() => void handleTestServerConnection()}>Test connection</button>
+                </div>
+              </div>
+            )}
+
+            {pairingWizardStep === "code" && serverIdentity && (
+              <div className="wizard-step">
+                <div className="server-identity">
+                  <span className="server-dot connected"></span>
+                  <span>Server: <strong>{serverIdentity.nodeId.slice(0, 16)}…</strong></span>
+                  <span className="mono quiet">v{serverIdentity.applicationVersion} · protocol {serverIdentity.protocolMajor}.{serverIdentity.protocolMinor}</span>
+                </div>
+                <p>Open the RCD VlogCutter web interface in Chrome, go to <strong>Settings → Devices</strong>, and generate a pairing code. Paste it below:</p>
+                <label className="field">
+                  <span>Pairing code</span>
+                  <input
+                    type="text"
+                    className="mono"
+                    placeholder="ABCDEFGHIJKLMNOP"
+                    value={pairingCode}
+                    onChange={(e) => setPairingCode(e.target.value)}
+                    onKeyDown={(e) => { if (e.key === "Enter") void handlePairWithServer(); }}
+                    autoFocus
+                    maxLength={20}
+                  />
+                </label>
+                <label className="field">
+                  <span>This device label</span>
+                  <input
+                    type="text"
+                    value={deviceLabel}
+                    onChange={(e) => setDeviceLabel(e.target.value)}
+                    placeholder="MacBook Pro"
+                  />
+                </label>
+                <div className="modal-actions">
+                  <button className="button secondary" onClick={() => setPairingWizardStep("endpoint")}>Back</button>
+                  <button className="button primary" disabled={busy || !pairingCode.trim()} onClick={() => void handlePairWithServer()}>Pair with server</button>
+                </div>
+              </div>
+            )}
+
+            {pairingWizardStep === "connecting" && (
+              <div className="wizard-step">
+                <p>Connecting to server…</p>
+              </div>
+            )}
+          </section>
+        </div>
+      )}
+
+      {/* ── Baseline pairing wizard ────────────────────────────────── */}
+      {showBaselineWizard && (
+        <div className="modal-backdrop pairing-backdrop" role="presentation" onKeyDown={(event) => { if (event.key === "Escape") handleCancelBaselineWizard(); }}>
+          <section className="modal baseline-modal" role="dialog" aria-modal="true" aria-labelledby="baseline-title">
+            <span className="eyebrow">Pair project with server</span>
+            <div className="settings-modal-heading">
+              <h2 id="baseline-title">
+                {baselineStep === "root_mapping" && "Step 1: Map media paths"}
+                {baselineStep === "preview" && "Step 2: Review baseline preview"}
+                {baselineStep === "confirming" && "Uploading baseline…"}
+                {baselineStep === "complete" && "Project paired!"}
+                {baselineStep === "error" && "Pairing issue"}
+              </h2>
+              <button className="text-button" onClick={handleCancelBaselineWizard}>Cancel <kbd>Esc</kbd></button>
+            </div>
+
+            {baselineError && <p className="error-message" role="alert">{baselineError}</p>}
+
+            {/* Step 1: Root mapping */}
+            {baselineStep === "root_mapping" && pathAnalysis && (
+              <div className="wizard-step">
+                <p>Your project has <strong>{pathAnalysis.absolutePathCount}</strong> assets with absolute paths. Map each source folder to a logical storage root that the server can recognize.</p>
+                {pathAnalysis.commonPrefixes.length === 0 ? (
+                  <p className="quiet">No absolute-path assets found — skipping root mapping.</p>
+                ) : (
+                  <div className="root-mapping-table">
+                    <div className="root-mapping-header">
+                      <span>Local path</span>
+                      <span>Assets</span>
+                      <span>Storage root ID</span>
+                    </div>
+                    {rootMappings.map((mapping, i) => (
+                      <div className="root-mapping-row" key={i}>
+                        <span className="mono" title={mapping.localPrefix}>{mapping.localPrefix}</span>
+                        <span>{pathAnalysis.commonPrefixes[i]?.assetCount ?? "?"}</span>
+                        <span className="mono">{mapping.storageRootId}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+                <p className="quiet">No original media will be uploaded during baseline pairing.</p>
+                <div className="modal-actions">
+                  <button className="button secondary" onClick={handleCancelBaselineWizard}>Cancel</button>
+                  <button className="button primary" disabled={busy} onClick={() => void handleProceedToPreview()}>Preview baseline</button>
+                </div>
+              </div>
+            )}
+
+            {/* Step 2: Baseline preview */}
+            {baselineStep === "preview" && baselinePreview && (
+              <div className="wizard-step">
+                <p>Server preview of <strong>{baselinePreview.preview.projectName}</strong>:</p>
+                <div className="baseline-stats">
+                  <div className="baseline-stat">
+                    <span className="baseline-stat-value">{baselinePreview.preview.assetCount}</span>
+                    <span className="baseline-stat-label">Assets</span>
+                  </div>
+                  <div className="baseline-stat">
+                    <span className="baseline-stat-value">{baselinePreview.preview.operationCount}</span>
+                    <span className="baseline-stat-label">Operations</span>
+                  </div>
+                  <div className="baseline-stat">
+                    <span className="baseline-stat-value">{baselinePreview.preview.conflictCount}</span>
+                    <span className="baseline-stat-label">Conflicts</span>
+                  </div>
+                  <div className="baseline-stat">
+                    <span className="baseline-stat-value">{baselinePreview.preview.rootMappingCount}</span>
+                    <span className="baseline-stat-label">Root mappings</span>
+                  </div>
+                  <div className="baseline-stat">
+                    <span className="baseline-stat-value">{baselinePreview.preview.linkedMediaCount}</span>
+                    <span className="baseline-stat-label">Linked media</span>
+                  </div>
+                </div>
+                <p className="quiet">Baseline digest: <span className="mono">{baselinePreview.digest.slice(0, 16)}…</span></p>
+                <p className="quiet">This operation will NOT upload any original media files. Only project metadata and manifests are transferred.</p>
+                <div className="modal-actions">
+                  <button className="button secondary" onClick={() => setBaselineStep("root_mapping")}>Back</button>
+                  <button className="button primary" disabled={busy} onClick={() => void handleConfirmBaseline()}>Confirm &amp; upload baseline</button>
+                </div>
+              </div>
+            )}
+
+            {/* Step 3: Confirming */}
+            {baselineStep === "confirming" && (
+              <div className="wizard-step">
+                <p>Uploading baseline to server…</p>
+              </div>
+            )}
+
+            {/* Step 4: Complete */}
+            {baselineStep === "complete" && (
+              <div className="wizard-step">
+                <p className="success">Project is now paired with the server!</p>
+                <p>The server has a replica of your project. Background sync will begin automatically.</p>
+                <div className="modal-actions">
+                  <button className="button primary" autoFocus onClick={() => { setShowBaselineWizard(false); setBaselineStep("root_mapping"); setPathAnalysis(null); setRootMappings([]); setBaselinePreview(null); }}>Done</button>
+                </div>
+              </div>
+            )}
+
+            {/* Error state */}
+            {baselineStep === "error" && (
+              <div className="wizard-step">
+                <p>The baseline operation did not complete. You can retry safely — no data has been lost.</p>
+                <div className="modal-actions">
+                  <button className="button secondary" onClick={handleCancelBaselineWizard}>Abandon</button>
+                  <button className="button primary" onClick={() => void handleRetryBaseline()}>Retry</button>
+                </div>
+              </div>
+            )}
           </section>
         </div>
       )}
@@ -1552,6 +1974,124 @@ function App() {
               <div><kbd>⌘,</kbd><span>Open global settings</span></div>
               <div><kbd>Tab</kbd><kbd>Enter</kbd><span>Navigate / activate every control</span></div>
               <div><kbd>?</kbd><span>Open this keyboard map</span></div>
+            </div>
+          </section>
+        </div>
+      )}
+      {/* ── Sync diagnostics ─────────────────────────────────────── */}
+      {showSyncDiagnostics && syncStatus && (
+        <div className="modal-backdrop" role="presentation" onKeyDown={(event) => { if (event.key === "Escape") setShowSyncDiagnostics(false); }}>
+          <section className="modal sync-diagnostics-modal" role="dialog" aria-modal="true" aria-labelledby="sync-diag-title">
+            <span className="eyebrow">Sync status</span>
+            <div className="settings-modal-heading">
+              <h2 id="sync-diag-title">{syncStateLabel(syncStatus.state)}</h2>
+              <button className="text-button" onClick={() => setShowSyncDiagnostics(false)}>Close</button>
+            </div>
+            <div className="sync-diag-grid">
+              <div className="sync-diag-row">
+                <span className="sync-diag-label">State</span>
+                <StatusBadge
+                  className={`sync-state-badge sync-state-${syncStatus.state}`}
+                  label={syncStateLabel(syncStatus.state)}
+                  tone={syncStatus.state === "synced" ? "positive" : syncStatus.state === "attention" ? "warning" : "neutral"}
+                />
+              </div>
+              {syncStatus.lastSyncAt && (
+                <div className="sync-diag-row">
+                  <span className="sync-diag-label">Last sync</span>
+                  <span>{new Date(syncStatus.lastSyncAt).toLocaleString()}</span>
+                </div>
+              )}
+              {syncStatus.activeEndpoint && (
+                <div className="sync-diag-row">
+                  <span className="sync-diag-label">Endpoint</span>
+                  <span className="endpoint-tag">{syncStatus.activeEndpoint}</span>
+                </div>
+              )}
+              <div className="sync-diag-row">
+                <span className="sync-diag-label">Pending (local → server)</span>
+                <span>{syncStatus.localPendingOperations}</span>
+              </div>
+              <div className="sync-diag-row">
+                <span className="sync-diag-label">Pending (server → local)</span>
+                <span>{syncStatus.remotePendingOperations}</span>
+              </div>
+              {syncStatus.conflictCount > 0 && (
+                <div className="sync-diag-section">
+                  <div className="sync-diag-row sync-diag-warn">
+                    <span className="sync-diag-label">Conflicts</span>
+                    <span>{syncStatus.conflictCount} unresolved</span>
+                  </div>
+                  {syncStatus.conflictDetails?.map((detail) => (
+                    <div key={detail.conflictId} className="sync-diag-conflict">
+                      <div className="sync-diag-conflict-header">
+                        <span className="sync-diag-label">{detail.conflictType.replace(/_/g, ' ')}</span>
+                        <span className="sync-diag-label">on {detail.aggregateId}</span>
+                      </div>
+                      <div className="sync-diag-conflict-sides">
+                        {detail.incomingOperationSummary && (
+                          <div className="sync-diag-conflict-side">
+                            <span className="sync-diag-side-label">Incoming (conflicting)</span>
+                            <div className="sync-diag-conflict-detail">
+                              <span>Node: {detail.incomingOperationSummary.originNodeId}</span>
+                              {detail.incomingOperationSummary.camera && (
+                                <span>Camera: {detail.incomingOperationSummary.camera}</span>
+                              )}
+                              {detail.incomingOperationSummary.startFilename && (
+                                <span>File: {detail.incomingOperationSummary.startFilename}</span>
+                              )}
+                              {detail.incomingOperationSummary.offsetSeconds != null && (
+                                <span>Offset: {detail.incomingOperationSummary.offsetSeconds}s</span>
+                              )}
+                              {detail.incomingOperationSummary.label && (
+                                <span>Label: {detail.incomingOperationSummary.label}</span>
+                              )}
+                            </div>
+                          </div>
+                        )}
+                        {detail.activeOperationSummary && (
+                          <div className="sync-diag-conflict-side">
+                            <span className="sync-diag-side-label">Active (currently applied)</span>
+                            <div className="sync-diag-conflict-detail">
+                              <span>Node: {detail.activeOperationSummary.originNodeId}</span>
+                              {detail.activeOperationSummary.camera && (
+                                <span>Camera: {detail.activeOperationSummary.camera}</span>
+                              )}
+                              {detail.activeOperationSummary.startFilename && (
+                                <span>File: {detail.activeOperationSummary.startFilename}</span>
+                              )}
+                              {detail.activeOperationSummary.offsetSeconds != null && (
+                                <span>Offset: {detail.activeOperationSummary.offsetSeconds}s</span>
+                              )}
+                              {detail.activeOperationSummary.label && (
+                                <span>Label: {detail.activeOperationSummary.label}</span>
+                              )}
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                      <div className="sync-diag-conflict-meta">
+                        <span>Expected revision: {detail.expectedBaseRevision ?? "—"} → Actual: {detail.actualRevision}</span>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+              {syncStatus.lastError && (
+                <div className="sync-diag-row sync-diag-error">
+                  <span className="sync-diag-label">Last error</span>
+                  <span>{syncStatus.lastError}</span>
+                </div>
+              )}
+              {syncStatus.backoffUntil && (
+                <div className="sync-diag-row">
+                  <span className="sync-diag-label">Next retry</span>
+                  <span>{new Date(syncStatus.backoffUntil).toLocaleString()}</span>
+                </div>
+              )}
+            </div>
+            <div className="sync-diag-actions">
+              <button className="button secondary" onClick={() => { api.syncNow(syncStatus.projectId).catch(() => {}); }}>Sync now</button>
             </div>
           </section>
         </div>

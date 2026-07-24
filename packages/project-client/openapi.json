@@ -1,0 +1,336 @@
+{
+  "components": {
+    "responses": {
+      "Error": {
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        },
+        "description": "Stable server error"
+      },
+      "Readiness": {
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Readiness"
+            }
+          }
+        },
+        "description": "Readiness report"
+      },
+      "SessionCreated": {
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/SessionCreated"
+            }
+          }
+        },
+        "description": "Browser session created",
+        "headers": {
+          "x-csrf-token": {
+            "schema": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "Sessions": {
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Sessions"
+            }
+          }
+        },
+        "description": "Browser sessions"
+      },
+      "Version": {
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Version"
+            }
+          }
+        },
+        "description": "Server identity and protocol"
+      }
+    },
+    "schemas": {
+      "BootstrapExchangeRequest": {
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "hostname": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "code"
+        ],
+        "type": "object"
+      },
+      "Error": {
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "requestId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "requestId",
+          "code"
+        ],
+        "type": "object"
+      },
+      "ProtocolVersion": {
+        "properties": {
+          "major": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "minor": {
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "major",
+          "minor"
+        ],
+        "type": "object"
+      },
+      "Readiness": {
+        "properties": {
+          "checks": {
+            "items": {
+              "$ref": "#/components/schemas/ReadinessCheck"
+            },
+            "type": "array"
+          },
+          "requestId": {
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "ready",
+              "not_ready"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "requestId",
+          "status",
+          "checks"
+        ],
+        "type": "object"
+      },
+      "ReadinessCheck": {
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "ok",
+              "error"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "status"
+        ],
+        "type": "object"
+      },
+      "SessionCreated": {
+        "properties": {
+          "displayPrefix": {
+            "type": "string"
+          },
+          "expiresAt": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "requestId": {
+            "type": "string"
+          },
+          "sessionId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "requestId",
+          "sessionId",
+          "displayPrefix",
+          "expiresAt"
+        ],
+        "type": "object"
+      },
+      "SessionInfo": {
+        "properties": {
+          "createdAt": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "displayPrefix": {
+            "type": "string"
+          },
+          "expiresAt": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "hostname": {
+            "type": "string"
+          },
+          "lastUsedAt": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "revoked": {
+            "type": "boolean"
+          },
+          "sessionId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "sessionId",
+          "displayPrefix",
+          "hostname",
+          "createdAt",
+          "lastUsedAt",
+          "expiresAt",
+          "revoked"
+        ],
+        "type": "object"
+      },
+      "Sessions": {
+        "properties": {
+          "requestId": {
+            "type": "string"
+          },
+          "sessions": {
+            "items": {
+              "$ref": "#/components/schemas/SessionInfo"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "requestId",
+          "sessions"
+        ],
+        "type": "object"
+      },
+      "Version": {
+        "properties": {
+          "applicationVersion": {
+            "type": "string"
+          },
+          "controlSchemaVersion": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "nodeId": {
+            "type": "string"
+          },
+          "protocolVersion": {
+            "$ref": "#/components/schemas/ProtocolVersion"
+          },
+          "requestId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "requestId",
+          "applicationVersion",
+          "protocolVersion",
+          "controlSchemaVersion",
+          "nodeId"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  "info": {
+    "title": "RCD VlogCutter Server API",
+    "version": "0.1.0"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/api/v1/auth/bootstrap/exchange": {
+      "post": {
+        "operationId": "exchangeBootstrapCode",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BootstrapExchangeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/SessionCreated"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/v1/auth/sessions": {
+      "get": {
+        "operationId": "listSessions",
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/Sessions"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/v1/ready": {
+      "get": {
+        "operationId": "getServerReadiness",
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/Readiness"
+          },
+          "503": {
+            "$ref": "#/components/responses/Readiness"
+          }
+        }
+      }
+    },
+    "/api/v1/version": {
+      "get": {
+        "operationId": "getServerVersion",
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/Version"
+          }
+        }
+      }
+    }
+  }
+}

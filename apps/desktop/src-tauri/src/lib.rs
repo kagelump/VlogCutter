@@ -4,17 +4,97 @@ use rcdvlog_core::{
     Asset, AssetPatch, Catalog, ClockEvent, IngestReport, Project, ProxyReport, ThumbnailReport,
     ToolStatus,
 };
+use rcdvlog_sync::BaselineEnvelope;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 use tauri::{Emitter, Manager, State};
 
+mod keychain;
+mod server_client;
+mod sync_manager;
+
+// ── Server connection types ────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ServerEndpoint {
+    url: String,
+    kind: String,
+    label: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PathPrefix {
+    prefix: String,
+    asset_count: usize,
+    sample_assets: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PathAnalysis {
+    common_prefixes: Vec<PathPrefix>,
+    total_assets: usize,
+    absolute_path_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RootMappingEntry {
+    local_prefix: String,
+    storage_root_id: String,
+    kind: String,
+    label: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BaselinePreviewResult {
+    digest: String,
+    preview: rcdvlog_sync::BaselinePreview,
+    endpoint_used: String,
+    server_node_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BaselineImportResult {
+    project_id: String,
+    baseline_digest: String,
+    reused_existing: bool,
+    state: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectPairingStatus {
+    paired: bool,
+    server_node_id: Option<String>,
+    paired_at: Option<String>,
+}
+
+// ── Baseline attempt (in-memory, survives within one app session) ─────
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+struct BaselineAttempt {
+    project_id: String,
+    digest: String,
+    envelope_json: String,
+}
+
 struct AppState {
-    catalog: RwLock<Catalog>,
-    settings: RwLock<DesktopSettings>,
+    catalog: Arc<RwLock<Catalog>>,
+    settings: Arc<RwLock<DesktopSettings>>,
     settings_path: PathBuf,
+    baseline_attempt: Arc<RwLock<Option<BaselineAttempt>>>,
+    sync_manager: sync_manager::SyncManager,
+    sync_status: Arc<RwLock<HashMap<String, sync_manager::SyncStatus>>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -67,6 +147,36 @@ struct DesktopSettings {
     last_asset_id: Option<String>,
     #[serde(default)]
     last_context_updated_at: Option<String>,
+    #[serde(default)]
+    paired_server_node_id: Option<String>,
+    #[serde(default)]
+    paired_server_endpoint: Option<String>,
+    #[serde(default)]
+    paired_server_label: Option<String>,
+    #[serde(default)]
+    paired_at: Option<String>,
+    #[serde(default)]
+    paired_server_endpoints: Option<Vec<ServerEndpoint>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ServerPairingResult {
+    node_id: String,
+    endpoint: String,
+    label: String,
+    paired_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ServerConnectionStatus {
+    paired: bool,
+    node_id: Option<String>,
+    endpoint: Option<String>,
+    label: Option<String>,
+    paired_at: Option<String>,
+    endpoints: Option<Vec<ServerEndpoint>>,
 }
 
 fn default_node_id() -> String {
@@ -75,6 +185,36 @@ fn default_node_id() -> String {
 
 impl AppState {
     fn new(
+        app_handle: tauri::AppHandle,
+        catalog: Catalog,
+        settings: DesktopSettings,
+        settings_path: PathBuf,
+    ) -> anyhow::Result<Self> {
+        fs::create_dir_all(&settings.projects_root).with_context(|| {
+            format!("create project folder {}", settings.projects_root.display())
+        })?;
+        catalog.set_local_node_id(&settings.node_id)?;
+        let catalog = Arc::new(RwLock::new(catalog));
+        let settings = Arc::new(RwLock::new(settings));
+        let sync_status = Arc::new(RwLock::new(HashMap::new()));
+        let sync_manager = sync_manager::SyncManager::spawn(
+            app_handle,
+            catalog.clone(),
+            settings.clone(),
+            sync_status.clone(),
+        );
+        Ok(Self {
+            catalog,
+            settings,
+            settings_path,
+            baseline_attempt: Arc::new(RwLock::new(None)),
+            sync_manager,
+            sync_status,
+        })
+    }
+
+    #[cfg(test)]
+    fn new_for_test(
         catalog: Catalog,
         settings: DesktopSettings,
         settings_path: PathBuf,
@@ -84,9 +224,12 @@ impl AppState {
         })?;
         catalog.set_local_node_id(&settings.node_id)?;
         Ok(Self {
-            catalog: RwLock::new(catalog),
-            settings: RwLock::new(settings),
+            catalog: Arc::new(RwLock::new(catalog)),
+            settings: Arc::new(RwLock::new(settings)),
             settings_path,
+            baseline_attempt: Arc::new(RwLock::new(None)),
+            sync_manager: sync_manager::SyncManager::spawn_test(),
+            sync_status: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -327,6 +470,11 @@ fn load_settings(settings_path: &Path, default_root: PathBuf) -> DesktopSettings
             last_project_id: None,
             last_asset_id: None,
             last_context_updated_at: None,
+            paired_server_node_id: None,
+            paired_server_endpoint: None,
+            paired_server_label: None,
+            paired_at: None,
+            paired_server_endpoints: None,
         })
 }
 
@@ -417,10 +565,13 @@ async fn ingest_folder(
     state: State<'_, AppState>,
 ) -> Result<IngestReport, String> {
     let catalog = state.catalog()?;
-    tauri::async_runtime::spawn_blocking(move || catalog.ingest_folder(&project_id, path))
+    let pid = project_id.clone();
+    let report = tauri::async_runtime::spawn_blocking(move || catalog.ingest_folder(&pid, path))
         .await
         .map_err(error_message)?
-        .map_err(error_message)
+        .map_err(error_message)?;
+    state.sync_manager.wake_project(&project_id);
+    Ok(report)
 }
 
 #[tauri::command]
@@ -461,18 +612,22 @@ fn create_note_revision(
     text: String,
     state: State<'_, AppState>,
 ) -> Result<Asset, String> {
-    state
+    let asset = state
         .catalog()?
         .create_note_revision(&asset_id, &text)
-        .map_err(error_message)
+        .map_err(error_message)?;
+    state.sync_manager.wake_project(&asset.project_id);
+    Ok(asset)
 }
 
 #[tauri::command]
 fn add_label(asset_id: String, label: String, state: State<'_, AppState>) -> Result<Asset, String> {
-    state
+    let asset = state
         .catalog()?
         .add_label(&asset_id, &label)
-        .map_err(error_message)
+        .map_err(error_message)?;
+    state.sync_manager.wake_project(&asset.project_id);
+    Ok(asset)
 }
 
 #[tauri::command]
@@ -481,10 +636,12 @@ fn remove_label(
     label: String,
     state: State<'_, AppState>,
 ) -> Result<Asset, String> {
-    state
+    let asset = state
         .catalog()?
         .remove_label(&asset_id, &label)
-        .map_err(error_message)
+        .map_err(error_message)?;
+    state.sync_manager.wake_project(&asset.project_id);
+    Ok(asset)
 }
 
 #[tauri::command]
@@ -493,10 +650,12 @@ fn set_removed(
     removed: bool,
     state: State<'_, AppState>,
 ) -> Result<Asset, String> {
-    state
+    let asset = state
         .catalog()?
         .set_removed(&asset_id, removed)
-        .map_err(error_message)
+        .map_err(error_message)?;
+    state.sync_manager.wake_project(&asset.project_id);
+    Ok(asset)
 }
 
 #[tauri::command]
@@ -505,10 +664,12 @@ fn set_rotation(
     rotation_degrees: u16,
     state: State<'_, AppState>,
 ) -> Result<Asset, String> {
-    state
+    let asset = state
         .catalog()?
         .set_rotation(&asset_id, rotation_degrees)
-        .map_err(error_message)
+        .map_err(error_message)?;
+    state.sync_manager.wake_project(&asset.project_id);
+    Ok(asset)
 }
 
 #[tauri::command]
@@ -520,7 +681,7 @@ fn apply_clock_event(
     label: String,
     state: State<'_, AppState>,
 ) -> Result<ClockEvent, String> {
-    state
+    let event = state
         .catalog()?
         .apply_clock_event(
             &project_id,
@@ -529,7 +690,9 @@ fn apply_clock_event(
             offset_seconds,
             &label,
         )
-        .map_err(error_message)
+        .map_err(error_message)?;
+    state.sync_manager.wake_project(&project_id);
+    Ok(event)
 }
 
 #[tauri::command]
@@ -597,6 +760,441 @@ async fn generate_missing_thumbnails(
     .map_err(error_message)
 }
 
+#[tauri::command]
+async fn pair_with_server(
+    endpoint: String,
+    pairing_code: String,
+    label: String,
+    state: State<'_, AppState>,
+) -> Result<ServerPairingResult, String> {
+    // 1. Verify server identity before exchanging code
+    let version = server_client::ServerClient::fetch_version(&endpoint)
+        .await
+        .map_err(|e| format!("server identity check failed: {e}"))?;
+
+    let endpoint = endpoint.trim_end_matches('/').to_string();
+
+    // 2. Exchange pairing code
+    let url = format!("{}/api/v1/auth/devices/exchange", endpoint);
+    let body = serde_json::json!({
+        "code": pairing_code,
+        "label": label,
+    });
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("failed to reach server: {e}"))?;
+
+    if !response.status().is_success() {
+        let error_body = response.text().await.unwrap_or_default();
+        return Err(format!("pairing failed: {error_body}"));
+    }
+
+    let result: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|e| format!("invalid server response: {e}"))?;
+
+    let token = result["token"]
+        .as_str()
+        .ok_or("missing token in server response")?;
+    let _credential_id = result["credential_id"]
+        .as_str()
+        .ok_or("missing credential_id in server response")?;
+
+    // 3. Verify the server node ID from /version matches the credential
+    // The credential_id is a server-side identifier for this device, not the server's node ID.
+    // We store using the server's stable node_id from /version as the account.
+    let server_node_id = &version.node_id;
+
+    // Store token in Keychain keyed by the server's stable node_id
+    keychain::store_server_credential(&endpoint, server_node_id, token)
+        .map_err(|e| format!("keychain error: {e}"))?;
+
+    let now = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+    let paired_at_clone = now.clone();
+
+    // Build endpoints list (add or update the current endpoint)
+    let mut endpoints: Vec<ServerEndpoint> = state
+        .settings
+        .read()
+        .map_err(|_| "desktop settings are unavailable".to_string())?
+        .paired_server_endpoints
+        .clone()
+        .unwrap_or_default();
+
+    // Remove any existing entry for this URL, then add the new one
+    endpoints.retain(|ep| ep.url != endpoint);
+    endpoints.push(ServerEndpoint {
+        url: endpoint.clone(),
+        kind: "lan".to_string(), // caller can update to "tailnet" later
+        label: label.clone(),
+    });
+
+    // Persist pairing metadata in settings (no secrets)
+    let mut settings = state
+        .settings
+        .write()
+        .map_err(|_| "desktop settings are unavailable".to_string())?;
+    let updated = DesktopSettings {
+        paired_server_node_id: Some(server_node_id.to_string()),
+        paired_server_endpoint: Some(endpoint.clone()),
+        paired_server_label: Some(label.clone()),
+        paired_at: Some(now),
+        paired_server_endpoints: Some(endpoints),
+        ..settings.clone()
+    };
+    write_settings(&state.settings_path, &updated)
+        .map_err(|e| format!("failed to save settings: {e}"))?;
+    *settings = updated;
+
+    Ok(ServerPairingResult {
+        node_id: server_node_id.to_string(),
+        endpoint,
+        label,
+        paired_at: paired_at_clone,
+    })
+}
+
+#[tauri::command]
+fn server_connection_status(state: State<'_, AppState>) -> Result<ServerConnectionStatus, String> {
+    let settings = state
+        .settings
+        .read()
+        .map_err(|_| "desktop settings are unavailable".to_string())?;
+    Ok(ServerConnectionStatus {
+        paired: settings.paired_server_node_id.is_some(),
+        node_id: settings.paired_server_node_id.clone(),
+        endpoint: settings.paired_server_endpoint.clone(),
+        label: settings.paired_server_label.clone(),
+        paired_at: settings.paired_at.clone(),
+        endpoints: settings.paired_server_endpoints.clone(),
+    })
+}
+
+#[tauri::command]
+fn unpair_server(state: State<'_, AppState>) -> Result<(), String> {
+    let settings = state
+        .settings
+        .read()
+        .map_err(|_| "desktop settings are unavailable".to_string())?;
+
+    if let (Some(endpoint), Some(node_id)) = (
+        &settings.paired_server_endpoint,
+        &settings.paired_server_node_id,
+    ) {
+        keychain::delete_server_credential(endpoint, node_id).ok();
+    }
+
+    let mut settings = state
+        .settings
+        .write()
+        .map_err(|_| "desktop settings are unavailable".to_string())?;
+    let updated = DesktopSettings {
+        paired_server_node_id: None,
+        paired_server_endpoint: None,
+        paired_server_label: None,
+        paired_at: None,
+        paired_server_endpoints: None,
+        ..settings.clone()
+    };
+    write_settings(&state.settings_path, &updated)
+        .map_err(|e| format!("failed to save settings: {e}"))?;
+    *settings = updated;
+    Ok(())
+}
+
+// ── Server info ──────────────────────────────────────────────────────
+
+#[tauri::command]
+async fn fetch_server_info(endpoint: String) -> Result<server_client::ServerVersionInfo, String> {
+    server_client::ServerClient::fetch_version(&endpoint)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+// ── Path analysis / root mapping ─────────────────────────────────────
+
+#[tauri::command]
+fn analyze_project_paths(
+    project_id: String,
+    state: State<'_, AppState>,
+) -> Result<PathAnalysis, String> {
+    let catalog = state.catalog()?;
+    let assets = catalog.list_assets(&project_id).map_err(error_message)?;
+    let total = assets.len();
+
+    // Group assets by directory prefix
+    let mut prefix_groups: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    let mut absolute_count = 0_usize;
+
+    for asset in &assets {
+        let path = std::path::Path::new(&asset.path);
+        if path.is_absolute() {
+            absolute_count += 1;
+            if let Some(parent) = path.parent() {
+                let key = parent.to_string_lossy().into_owned();
+                prefix_groups
+                    .entry(key)
+                    .or_default()
+                    .push(asset.filename.clone());
+            }
+        }
+    }
+
+    let mut common_prefixes: Vec<PathPrefix> = prefix_groups
+        .into_iter()
+        .filter(|(_, filenames)| !filenames.is_empty())
+        .map(|(prefix, filenames)| {
+            let count = filenames.len();
+            let samples: Vec<String> = filenames.into_iter().take(3).collect();
+            PathPrefix {
+                prefix,
+                asset_count: count,
+                sample_assets: samples,
+            }
+        })
+        .collect();
+
+    // Sort by asset count descending
+    common_prefixes.sort_by_key(|b| std::cmp::Reverse(b.asset_count));
+
+    Ok(PathAnalysis {
+        common_prefixes,
+        total_assets: total,
+        absolute_path_count: absolute_count,
+    })
+}
+
+#[tauri::command]
+fn propose_root_mappings(
+    path_analysis: PathAnalysis,
+    _state: State<'_, AppState>,
+) -> Result<Vec<RootMappingEntry>, String> {
+    let mut mappings = Vec::new();
+
+    for prefix_info in &path_analysis.common_prefixes {
+        // Generate a stable storage_root_id from the path prefix
+        let slug = prefix_info
+            .prefix
+            .chars()
+            .map(|c| {
+                if c.is_alphanumeric() {
+                    c.to_ascii_lowercase()
+                } else {
+                    '-'
+                }
+            })
+            .collect::<String>();
+        let slug = slug.trim_matches('-');
+        let storage_root_id = format!("root_{}", slug.chars().take(48).collect::<String>());
+
+        mappings.push(RootMappingEntry {
+            local_prefix: prefix_info.prefix.clone(),
+            storage_root_id,
+            kind: "new_logical_root".to_string(),
+            label: format!(
+                "{} ({} assets)",
+                prefix_info.prefix, prefix_info.asset_count
+            ),
+        });
+    }
+
+    Ok(mappings)
+}
+
+// ── Baseline preview / import ────────────────────────────────────────
+
+fn read_server_credentials(settings: &DesktopSettings) -> Result<(String, String), String> {
+    let raw_endpoint = settings
+        .paired_server_endpoint
+        .as_deref()
+        .ok_or("no server endpoint configured — pair with a server first")?;
+    let endpoint = raw_endpoint.trim_end_matches('/');
+    let node_id = settings
+        .paired_server_node_id
+        .as_deref()
+        .ok_or("no server node ID configured — pair with a server first")?;
+    let token = keychain::get_server_credential(endpoint, node_id)
+        .map_err(|e| format!("keychain read failed: {e}"))?
+        .ok_or("server credential not found in keychain — pair again")?;
+    Ok((node_id.to_string(), token))
+}
+
+#[tauri::command]
+async fn preview_project_baseline(
+    project_id: String,
+    state: State<'_, AppState>,
+) -> Result<BaselinePreviewResult, String> {
+    let settings = state.desktop_settings().map_err(error_message)?;
+    let (server_node_id, _token) = read_server_credentials(&settings)?;
+    let endpoint = settings
+        .paired_server_endpoint
+        .clone()
+        .ok_or("no server endpoint configured")?;
+
+    // Export baseline from local catalog
+    let catalog = state.catalog()?;
+    let envelope = BaselineEnvelope::export_catalog(&catalog, &project_id)
+        .map_err(|e| format!("baseline export failed: {e}"))?;
+    envelope
+        .validate()
+        .map_err(|e| format!("baseline validation failed: {e}"))?;
+
+    let digest = envelope.digest.clone();
+
+    // Store the envelope for potential retry (as JSON)
+    let envelope_json = serde_json::to_string(&envelope)
+        .map_err(|e| format!("failed to serialize baseline: {e}"))?;
+    *state
+        .baseline_attempt
+        .write()
+        .map_err(|_| "baseline attempt state unavailable".to_string())? = Some(BaselineAttempt {
+        project_id: project_id.clone(),
+        digest: digest.clone(),
+        envelope_json,
+    });
+
+    // Send to server for server-side preview
+    let client = server_client::ServerClient::new(endpoint.clone(), server_node_id.clone())
+        .map_err(|e| e.to_string())?;
+    let server_preview = client
+        .preview_baseline(&envelope)
+        .await
+        .map_err(|e| format!("server preview failed: {e}"))?;
+
+    Ok(BaselinePreviewResult {
+        digest,
+        preview: server_preview,
+        endpoint_used: endpoint,
+        server_node_id,
+    })
+}
+
+#[tauri::command]
+async fn confirm_baseline_import(
+    project_id: String,
+    expected_digest: String,
+    state: State<'_, AppState>,
+) -> Result<BaselineImportResult, String> {
+    let settings = state.desktop_settings().map_err(error_message)?;
+    let (server_node_id, _token) = read_server_credentials(&settings)?;
+    let endpoint = settings
+        .paired_server_endpoint
+        .clone()
+        .ok_or("no server endpoint configured")?;
+
+    // Re-export baseline to ensure it matches the previewed state
+    let catalog = state.catalog()?;
+    let envelope = BaselineEnvelope::export_catalog(&catalog, &project_id)
+        .map_err(|e| format!("baseline export failed: {e}"))?;
+
+    if envelope.digest != expected_digest {
+        // Clear the stale attempt
+        *state
+            .baseline_attempt
+            .write()
+            .map_err(|_| "baseline attempt state unavailable".to_string())? = None;
+        return Err(
+            "project state changed since preview — re-run preview before confirming".to_string(),
+        );
+    }
+
+    let client = server_client::ServerClient::new(endpoint.clone(), server_node_id.clone())
+        .map_err(|e| e.to_string())?;
+    let replica = client
+        .import_baseline(&envelope)
+        .await
+        .map_err(|e| format!("baseline import failed: {e}"))?;
+
+    // Persist pairing in the local project catalog
+    catalog
+        .pair_project_with_server(&project_id, &server_node_id)
+        .map_err(|e| format!("failed to record pairing in project: {e}"))?;
+
+    // Clear the baseline attempt
+    *state
+        .baseline_attempt
+        .write()
+        .map_err(|_| "baseline attempt state unavailable".to_string())? = None;
+
+    Ok(BaselineImportResult {
+        project_id: replica.project_id,
+        baseline_digest: replica.baseline_digest,
+        reused_existing: replica.reused_existing,
+        state: replica.state,
+    })
+}
+
+#[tauri::command]
+fn abandon_baseline_attempt(state: State<'_, AppState>) -> Result<(), String> {
+    *state
+        .baseline_attempt
+        .write()
+        .map_err(|_| "baseline attempt state unavailable".to_string())? = None;
+    Ok(())
+}
+
+// ── Project pairing status ───────────────────────────────────────────
+
+#[tauri::command]
+fn project_pairing_status(
+    project_id: String,
+    state: State<'_, AppState>,
+) -> Result<ProjectPairingStatus, String> {
+    let catalog = state.catalog()?;
+    let projects = catalog.list_projects().map_err(error_message)?;
+    let project = projects
+        .into_iter()
+        .find(|p| p.id == project_id)
+        .ok_or("project not found")?;
+
+    Ok(ProjectPairingStatus {
+        paired: project.paired_server_node_id.is_some(),
+        server_node_id: project.paired_server_node_id,
+        paired_at: project.paired_at,
+    })
+}
+
+// ── Sync status commands ─────────────────────────────────────────────
+
+#[tauri::command]
+fn sync_status(
+    project_id: String,
+    state: State<'_, AppState>,
+) -> Result<sync_manager::SyncStatus, String> {
+    let map = state
+        .sync_status
+        .read()
+        .map_err(|_| "sync status unavailable".to_string())?;
+    if let Some(status) = map.get(&project_id) {
+        Ok(status.clone())
+    } else {
+        Ok(sync_manager::SyncStatus::unpaired(project_id))
+    }
+}
+
+#[tauri::command]
+fn sync_now(project_id: String, state: State<'_, AppState>) -> Result<(), String> {
+    state.sync_manager.sync_now(&project_id);
+    Ok(())
+}
+
+#[tauri::command]
+fn sync_all_status(state: State<'_, AppState>) -> Result<Vec<sync_manager::SyncStatus>, String> {
+    let map = state
+        .sync_status
+        .read()
+        .map_err(|_| "sync status unavailable".to_string())?;
+    Ok(map.values().cloned().collect())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -614,7 +1212,12 @@ pub fn run() {
                 Some(path) => Catalog::open_existing(PathBuf::from(path))?,
                 None => Catalog::open(app_data.join("catalog.sqlite3"))?,
             };
-            app.manage(AppState::new(catalog, settings, settings_path)?);
+            app.manage(AppState::new(
+                app.handle().clone(),
+                catalog,
+                settings,
+                settings_path,
+            )?);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -641,6 +1244,19 @@ pub fn run() {
             generate_missing_proxies,
             generate_thumbnail,
             generate_missing_thumbnails,
+            pair_with_server,
+            server_connection_status,
+            unpair_server,
+            fetch_server_info,
+            analyze_project_paths,
+            propose_root_mappings,
+            preview_project_baseline,
+            confirm_baseline_import,
+            abandon_baseline_attempt,
+            project_pairing_status,
+            sync_status,
+            sync_now,
+            sync_all_status,
         ])
         .run(tauri::generate_context!())
         .expect("error while running RCD VlogCutter");
@@ -660,6 +1276,11 @@ mod tests {
             last_project_id: None,
             last_asset_id: None,
             last_context_updated_at: None,
+            paired_server_node_id: None,
+            paired_server_endpoint: None,
+            paired_server_label: None,
+            paired_at: None,
+            paired_server_endpoints: None,
         }
     }
 
@@ -669,7 +1290,7 @@ mod tests {
         let original_path = directory.path().join("original.sqlite3");
         let original = Catalog::open(&original_path).unwrap();
         let original_project = original.create_project("Original").unwrap();
-        let state = AppState::new(
+        let state = AppState::new_for_test(
             original,
             test_settings(directory.path().join("projects")),
             directory.path().join("settings.json"),
@@ -705,7 +1326,7 @@ mod tests {
         let scratch = Catalog::open(directory.path().join("scratch.sqlite3")).unwrap();
         let projects_root = directory.path().join("VideoProjects");
         let settings_path = directory.path().join("settings.json");
-        let state = AppState::new(
+        let state = AppState::new_for_test(
             scratch,
             test_settings(projects_root.clone()),
             settings_path.clone(),

@@ -1,0 +1,54 @@
+# RCD VlogCutter — Caddy reverse proxy for LAN HTTPS access
+#
+# This Caddyfile is expected to run on the Ubuntu server host (not inside the
+# rcdvlog-server container). Caddy terminates LAN HTTPS and forwards to the
+# private loopback backend at 127.0.0.1:8090.
+#
+# Setup:
+#   1. Install Caddy: https://caddyserver.com/docs/install#debian-ubuntu
+#   2. Copy this file to /etc/caddy/Caddyfile
+#   3. Export and trust the internal CA root certificate on the Mac/Chrome:
+#        caddy trust   # installs the root CA in the system trust store
+#      Or manually copy /var/lib/caddy/.local/share/caddy/pki/authorities/local/root.crt
+#      to the Mac and add it to the login keychain.
+#   4. sudo systemctl reload caddy
+#
+# Plain HTTP access is disabled — auth tokens and cookies are only sent over
+# the trusted LAN HTTPS connection.
+
+{
+    # Internal CA for LAN certificates. The root must be trusted on every
+    # client that accesses the server (Mac + Chrome).
+}
+
+rcdvlog.local:8443 {
+    tls internal {
+        on_demand
+    }
+
+    # Security headers (defense-in-depth; the backend also sets its own)
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "DENY"
+        Referrer-Policy "same-origin"
+        -Server
+    }
+
+    reverse_proxy 127.0.0.1:8090 {
+        header_up X-Forwarded-Proto "https"
+        header_up X-Forwarded-Host {host}
+        header_up X-Forwarded-For {remote_host}
+    }
+
+    # Request size limit matches the server's MAX_HTTP_BODY_BYTES (64 MiB)
+    request_body {
+        max_size 64MiB
+    }
+}
+
+# Explicitly deny Funnel / public exposure
+# Tailscale Funnel is NOT configured. This block is a safety net.
+:80 {
+    respond "RCD VlogCutter requires HTTPS" 403
+}

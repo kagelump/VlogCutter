@@ -28,6 +28,12 @@ export interface ProjectLibrary {
 
 export type AutoplayMode = "never" | "proxyAvailable" | "always";
 
+export interface ServerEndpoint {
+  url: string;
+  kind: string;
+  label: string;
+}
+
 export interface DesktopSettings {
   projectsRoot: string;
   nodeId: string;
@@ -36,6 +42,11 @@ export interface DesktopSettings {
   lastProjectId: string | null;
   lastAssetId: string | null;
   lastContextUpdatedAt: string | null;
+  pairedServerNodeId?: string | null;
+  pairedServerEndpoint?: string | null;
+  pairedServerLabel?: string | null;
+  pairedAt?: string | null;
+  pairedServerEndpoints?: ServerEndpoint[] | null;
 }
 
 export interface Asset {
@@ -111,4 +122,132 @@ export interface BatchEstimate {
   workUnitsPerWorkerSecond: number | null;
   elapsedSeconds: number;
   estimatedRemainingSeconds: number | null;
+}
+
+// ── Server pairing types ─────────────────────────────────────────────
+
+export interface ServerPairingResult {
+  nodeId: string;
+  endpoint: string;
+  label: string;
+  pairedAt: string;
+}
+
+export interface ServerConnectionStatus {
+  paired: boolean;
+  nodeId: string | null;
+  endpoint: string | null;
+  label: string | null;
+  pairedAt: string | null;
+  endpoints: ServerEndpoint[] | null;
+}
+
+export interface ServerVersionInfo {
+  nodeId: string;
+  applicationVersion: string;
+  protocolMajor: number;
+  protocolMinor: number;
+}
+
+// ── Root mapping types ───────────────────────────────────────────────
+
+export interface PathPrefix {
+  prefix: string;
+  assetCount: number;
+  sampleAssets: string[];
+}
+
+export interface PathAnalysis {
+  commonPrefixes: PathPrefix[];
+  totalAssets: number;
+  absolutePathCount: number;
+}
+
+export interface RootMappingEntry {
+  localPrefix: string;
+  storageRootId: string;
+  kind: string;
+  label: string;
+}
+
+// ── Baseline types ───────────────────────────────────────────────────
+
+export interface BaselinePreview {
+  projectId: string;
+  projectName: string;
+  assetCount: number;
+  operationCount: number;
+  conflictCount: number;
+  linkedMediaCount: number;
+  proposedLibraryMatches: number;
+  rootMappingCount: number;
+  representationManifestCount: number;
+}
+
+export interface BaselinePreviewResult {
+  digest: string;
+  preview: BaselinePreview;
+  endpointUsed: string;
+  serverNodeId: string;
+}
+
+export interface BaselineImportResult {
+  projectId: string;
+  baselineDigest: string;
+  reusedExisting: boolean;
+  state: string;
+}
+
+export interface ProjectPairingStatus {
+  paired: boolean;
+  serverNodeId: string | null;
+  pairedAt: string | null;
+}
+
+// ── Sync types ─────────────────────────────────────────────────────────
+
+export type SyncState =
+  | "unpaired"
+  | "offline"
+  | "connecting"
+  | "syncing"
+  | "synced"
+  | "attention"
+  | "incompatible"
+  | "credential_revoked";
+
+export interface OperationSummary {
+  operationId: string;
+  operationType: string;
+  originNodeId: string;
+  originSequence: number;
+  camera: string | null;
+  startFilename: string | null;
+  offsetSeconds: number | null;
+  label: string | null;
+}
+
+export interface ConflictDetail {
+  conflictId: string;
+  conflictType: string;
+  aggregateType: string;
+  aggregateId: string;
+  incomingOperationSummary: OperationSummary | null;
+  activeOperationSummary: OperationSummary | null;
+  expectedBaseRevision: number | null;
+  actualRevision: number;
+  createdAt: string;
+}
+
+export interface SyncStatus {
+  projectId: string;
+  state: SyncState;
+  lastSyncAt: string | null;
+  lastError: string | null;
+  localPendingOperations: number;
+  remotePendingOperations: number;
+  conflictCount: number;
+  conflictDetails: ConflictDetail[];
+  activeEndpoint: string | null;
+  backoffUntil: string | null;
 }

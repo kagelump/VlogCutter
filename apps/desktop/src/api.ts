@@ -1,7 +1,7 @@
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
-import type { Asset, AssetPatch, AutoplayMode, DesktopSettings, GenerationProgress, IngestReport, LoadedCatalog, Project, ProjectLibrary, ThumbnailReport } from "./types";
+import type { Asset, AssetPatch, AutoplayMode, BaselineImportResult, BaselinePreviewResult, DesktopSettings, GenerationProgress, IngestReport, LoadedCatalog, PathAnalysis, Project, ProjectLibrary, ProjectPairingStatus, RootMappingEntry, ServerConnectionStatus, ServerPairingResult, ServerVersionInfo, SyncStatus, ThumbnailReport } from "./types";
 
 const inTauri = () => "__TAURI_INTERNALS__" in window;
 
@@ -71,6 +71,11 @@ const defaultDesktopSettings: DesktopSettings = {
   lastProjectId: null,
   lastAssetId: null,
   lastContextUpdatedAt: null,
+  pairedServerNodeId: null,
+  pairedServerEndpoint: null,
+  pairedServerLabel: null,
+  pairedAt: null,
+  pairedServerEndpoints: null,
 };
 
 function readMockSettings(): DesktopSettings {
@@ -291,6 +296,182 @@ export const api = {
   async onThumbnailProgress(callback: (progress: GenerationProgress) => void): Promise<() => void> {
     if (!inTauri()) return () => {};
     return listen<GenerationProgress>("thumbnail-progress", (event) => callback(event.payload));
+  },
+
+  // ── Server pairing ──────────────────────────────────────────────
+
+  async pairWithServer(endpoint: string, pairingCode: string, label: string): Promise<ServerPairingResult> {
+    if (!inTauri()) {
+      const mockResult: ServerPairingResult = {
+        nodeId: "node_server_browser_mock",
+        endpoint,
+        label,
+        pairedAt: new Date().toISOString(),
+      };
+      writeMockSettings({
+        ...readMockSettings(),
+        pairedServerNodeId: mockResult.nodeId,
+        pairedServerEndpoint: mockResult.endpoint,
+        pairedServerLabel: mockResult.label,
+        pairedAt: mockResult.pairedAt,
+        pairedServerEndpoints: [{ url: endpoint, kind: "lan", label }],
+      });
+      return mockResult;
+    }
+    return invoke("pair_with_server", { endpoint, pairingCode, label });
+  },
+
+  async serverConnectionStatus(): Promise<ServerConnectionStatus> {
+    if (!inTauri()) {
+      const settings = readMockSettings();
+      return {
+        paired: settings.pairedServerNodeId != null,
+        nodeId: settings.pairedServerNodeId ?? null,
+        endpoint: settings.pairedServerEndpoint ?? null,
+        label: settings.pairedServerLabel ?? null,
+        pairedAt: settings.pairedAt ?? null,
+        endpoints: settings.pairedServerEndpoints ?? null,
+      };
+    }
+    return invoke("server_connection_status");
+  },
+
+  async unpairServer(): Promise<void> {
+    if (inTauri()) return invoke("unpair_server");
+    writeMockSettings({
+      ...readMockSettings(),
+      pairedServerNodeId: null,
+      pairedServerEndpoint: null,
+      pairedServerLabel: null,
+      pairedAt: null,
+      pairedServerEndpoints: null,
+    });
+  },
+
+  async fetchServerInfo(endpoint: string): Promise<ServerVersionInfo> {
+    if (!inTauri()) {
+      return {
+        nodeId: "node_server_browser_mock",
+        applicationVersion: "0.1.0",
+        protocolMajor: 1,
+        protocolMinor: 0,
+      };
+    }
+    return invoke("fetch_server_info", { endpoint });
+  },
+
+  // ── Root mapping ─────────────────────────────────────────────────
+
+  async analyzeProjectPaths(projectId: string): Promise<PathAnalysis> {
+    if (!inTauri()) {
+      return {
+        commonPrefixes: [
+          { prefix: "/Volumes/Travel/Hokkaido", assetCount: 5, sampleAssets: ["C0163.MP4", "DJI_0342.MP4", "IMG_8841.MOV"] },
+          { prefix: "/Volumes/Travel/Sapporo", assetCount: 2, sampleAssets: ["C0165.MP4"] },
+        ],
+        totalAssets: 7,
+        absolutePathCount: 7,
+      };
+    }
+    return invoke("analyze_project_paths", { projectId });
+  },
+
+  async proposeRootMappings(pathAnalysis: PathAnalysis): Promise<RootMappingEntry[]> {
+    if (!inTauri()) {
+      return pathAnalysis.commonPrefixes.map((p) => ({
+        localPrefix: p.prefix,
+        storageRootId: `root_${p.prefix.replace(/[^a-zA-Z0-9]/g, "-").toLowerCase().slice(0, 48)}`,
+        kind: "new_logical_root",
+        label: `${p.prefix} (${p.assetCount} assets)`,
+      }));
+    }
+    return invoke("propose_root_mappings", { pathAnalysis });
+  },
+
+  // ── Baseline ─────────────────────────────────────────────────────
+
+  async previewProjectBaseline(projectId: string): Promise<BaselinePreviewResult> {
+    if (!inTauri()) {
+      return {
+        digest: "mock-digest-001",
+        preview: {
+          projectId,
+          projectName: "Hokkaido field test",
+          assetCount: 7,
+          operationCount: 3,
+          conflictCount: 0,
+          linkedMediaCount: 0,
+          proposedLibraryMatches: 2,
+          rootMappingCount: 2,
+          representationManifestCount: 0,
+        },
+        endpointUsed: "https://rcdvlog.local",
+        serverNodeId: "node_server_browser_mock",
+      };
+    }
+    return invoke("preview_project_baseline", { projectId });
+  },
+
+  async confirmBaselineImport(projectId: string, expectedDigest: string): Promise<BaselineImportResult> {
+    if (!inTauri()) {
+      return {
+        projectId,
+        baselineDigest: expectedDigest,
+        reusedExisting: false,
+        state: "registered",
+      };
+    }
+    return invoke("confirm_baseline_import", { projectId, expectedDigest });
+  },
+
+  async abandonBaselineAttempt(): Promise<void> {
+    if (inTauri()) return invoke("abandon_baseline_attempt");
+  },
+
+  async projectPairingStatus(projectId: string): Promise<ProjectPairingStatus> {
+    if (!inTauri()) {
+      const settings = readMockSettings();
+      return {
+        paired: settings.pairedServerNodeId != null,
+        serverNodeId: settings.pairedServerNodeId ?? null,
+        pairedAt: settings.pairedAt ?? null,
+      };
+    }
+    return invoke("project_pairing_status", { projectId });
+  },
+
+  // ── Sync ───────────────────────────────────────────────────────
+
+  async syncStatus(projectId: string): Promise<SyncStatus> {
+    if (!inTauri()) {
+      return {
+        projectId,
+        state: "unpaired",
+        lastSyncAt: null,
+        lastError: null,
+        localPendingOperations: 0,
+        remotePendingOperations: 0,
+        conflictCount: 0,
+        conflictDetails: [],
+        activeEndpoint: null,
+        backoffUntil: null,
+      };
+    }
+    return invoke("sync_status", { projectId });
+  },
+
+  async syncAllStatus(): Promise<SyncStatus[]> {
+    if (!inTauri()) return [];
+    return invoke("sync_all_status");
+  },
+
+  async syncNow(projectId: string): Promise<void> {
+    if (inTauri()) return invoke("sync_now", { projectId });
+  },
+
+  async onSyncStatusChanged(callback: (status: SyncStatus) => void): Promise<() => void> {
+    if (!inTauri()) return () => {};
+    return listen<SyncStatus>("sync-status-changed", (event) => callback(event.payload));
   },
 
   mediaUrl(asset: Asset): string | null {

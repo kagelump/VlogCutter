@@ -1,6 +1,8 @@
 use anyhow::{Context, Result};
 use clap::Parser;
-use rcdvlog_server::{HttpState, ShutdownCoordinator, bind_loopback, router, serve_until_shutdown};
+use rcdvlog_server::{
+    HttpState, ShutdownCoordinator, bind_loopback, openapi_document, router, serve_until_shutdown,
+};
 use rcdvlog_server_core::{
     APPLICATION_VERSION, CONTROL_CATALOG_SCHEMA_VERSION, CatalogSchemaError, ConfigError,
     InstanceLockError, JobScheduler, JobSchedulerConfig, PROTOCOL_MAJOR_VERSION,
@@ -25,6 +27,8 @@ struct Arguments {
         help = "Print application, protocol, and control-schema versions as JSON"
     )]
     version_json: bool,
+    #[arg(long, help = "Print the Rust-owned OpenAPI contract as JSON")]
+    openapi_json: bool,
 }
 
 #[derive(Serialize)]
@@ -48,6 +52,14 @@ fn main() -> ExitCode {
         println!(
             "{}",
             serde_json::to_string(&output).expect("serialize static version output")
+        );
+        return ExitCode::SUCCESS;
+    }
+    if arguments.openapi_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&openapi_document())
+                .expect("serialize static OpenAPI document")
         );
         return ExitCode::SUCCESS;
     }

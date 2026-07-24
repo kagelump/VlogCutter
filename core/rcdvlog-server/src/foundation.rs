@@ -4,12 +4,14 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use crate::auth::{AuthConfig, AuthService};
 use crate::{ConfigError, ConfigErrorReason, ControlCatalog, ServerConfig, ServerInstanceLock};
 
 #[derive(Debug)]
 pub struct RuntimeFoundation {
     config: ServerConfig,
     catalog: ControlCatalog,
+    auth_service: AuthService,
     _instance_lock: ServerInstanceLock,
 }
 
@@ -86,12 +88,24 @@ impl RuntimeFoundation {
         prepare_local_state(&config)?;
         let instance_lock = ServerInstanceLock::acquire(&config.data_dir)?;
         let catalog = ControlCatalog::open_or_create(&config.data_dir, &config.diagnostics())?;
+        let auth_service = AuthService::new(
+            config
+                .data_dir
+                .join(super::catalog::CONTROL_DATABASE_FILENAME),
+            catalog.node_id().clone(),
+            AuthConfig {
+                session_max_age: config.session_max_age,
+                bootstrap_code_ttl: config.bootstrap_code_ttl,
+                pairing_code_ttl: config.pairing_code_ttl,
+            },
+        );
         // Recovery is a short durable transition; no handler is started here.
         // Task 5 will register concrete server-only handlers with the scheduler.
         catalog.jobs().recover_expired()?;
         Ok(Self {
             config,
             catalog,
+            auth_service,
             _instance_lock: instance_lock,
         })
     }
@@ -104,6 +118,10 @@ impl RuntimeFoundation {
         &self.catalog
     }
 
+    pub fn auth(&self) -> &AuthService {
+        &self.auth_service
+    }
+
     pub fn jobs(&self) -> crate::JobEngine {
         self.catalog.jobs()
     }
@@ -113,6 +131,10 @@ impl RuntimeFoundation {
             match self.catalog.check_usable() {
                 Ok(()) => ReadinessCheck::ok("control_catalog"),
                 Err(_) => ReadinessCheck::error("control_catalog", "control_catalog_unavailable"),
+            },
+            match self.auth_service.diagnostics() {
+                Ok(_) => ReadinessCheck::ok("authentication"),
+                Err(_) => ReadinessCheck::error("authentication", "auth_service_unavailable"),
             },
             inspect_external_directory("data_directory", &self.config.data_dir, true),
             inspect_external_directory("temp_directory", &self.config.temp_dir, true),

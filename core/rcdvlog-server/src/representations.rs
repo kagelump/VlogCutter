@@ -458,6 +458,55 @@ impl RepresentationService {
         Err(RepresentationError::NotFound)
     }
 
+    /// Registers a representation that was generated on a remote node (e.g. the Mac).
+    /// The remote node has already validated the output and reports the content hash
+    /// and byte length. The server records the location but cannot validate the file locally.
+    pub fn register_remote_output(
+        &self,
+        id: &RepresentationId,
+        remote_node_id: &NodeId,
+        local_path: &str,
+        output_content_hash: &str,
+        byte_length: u64,
+    ) -> Result<Representation, RepresentationError> {
+        let _representation = self.get(id)?;
+        let location_key = blake3::hash(local_path.as_bytes()).to_hex().to_string();
+        let now = timestamp();
+        let mut connection = open_writable_connection(self.library.database_path())?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let updated = tx.execute(
+            "UPDATE representations SET state='available', output_content_hash=?2, byte_length=?3, \
+             completed_at=COALESCE(completed_at,?4), updated_at=?4 \
+             WHERE representation_id=?1 AND (state='pending' OR (output_content_hash=?2 AND byte_length=?3))",
+            params![id.as_str(), output_content_hash, byte_length as i64, now],
+        )?;
+        if updated != 1 {
+            return Err(RepresentationError::InvalidInput(
+                "remote output conflicts with representation manifest".into(),
+            ));
+        }
+        tx.execute(
+            r#"
+            INSERT INTO representation_locations(
+                representation_id, node_id, location_kind, location_key,
+                relative_path, local_path, state, verified_at, updated_at
+            ) VALUES(?1, ?2, 'project_local', ?3, NULL, ?4, 'available', ?5, ?5)
+            ON CONFLICT(representation_id, node_id, location_kind, location_key)
+            DO UPDATE SET state='available', verified_at=excluded.verified_at,
+                          updated_at=excluded.updated_at
+            "#,
+            params![
+                id.as_str(),
+                remote_node_id.as_str(),
+                location_key,
+                local_path,
+                now
+            ],
+        )?;
+        tx.commit()?;
+        self.get(id)
+    }
+
     /// Registers an existing current-recipe project/server-local output after
     /// validating its media contract. The absolute path remains node-local and
     /// is never returned by representation DTOs or used in media URLs.
@@ -504,6 +553,52 @@ impl RepresentationService {
         )?;
         tx.commit()?;
         self.get(id)
+    }
+
+    /// List all available representations for a set of media objects on this node.
+    /// Used by the desktop to discover server-side representations for download.
+    pub fn list_available(
+        &self,
+        media_ids: &[MediaObjectId],
+    ) -> Result<Vec<Representation>, RepresentationError> {
+        if media_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let connection = open_read_only_connection(self.library.database_path())?;
+        let placeholders: Vec<String> = media_ids
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("?{}", i + 1))
+            .collect();
+        let sql = format!(
+            r#"
+            SELECT r.representation_id, r.media_object_id, r.source_content_hash,
+                   r.source_size_bytes, r.kind, r.recipe_key, r.state,
+                   r.output_content_hash, r.byte_length, r.content_type,
+                   r.created_at, r.completed_at,
+                   EXISTS(
+                       SELECT 1 FROM representation_locations l
+                       WHERE l.representation_id = r.representation_id
+                         AND l.node_id = ?{} AND l.state = 'available'
+                   )
+            FROM representations r
+            WHERE r.media_object_id IN ({})
+              AND r.state = 'available'
+            ORDER BY r.kind, r.created_at
+            "#,
+            media_ids.len() + 1,
+            placeholders.join(", "),
+        );
+        let mut statement = connection.prepare(&sql)?;
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        for id in media_ids {
+            params.push(Box::new(id.as_str().to_string()));
+        }
+        params.push(Box::new(self.library.local_node_id().as_str().to_string()));
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params.iter().map(|p| p.as_ref()).collect();
+        let rows = statement.query_map(param_refs.as_slice(), representation_from_row)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 }
 

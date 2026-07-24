@@ -5,9 +5,15 @@
   "scripts": {
     "dev": "pnpm --dir apps/desktop tauri dev",
     "build": "pnpm --dir apps/desktop tauri build",
+    "build:web": "pnpm --dir apps/web build",
     "build:cli": "cargo build -p rcdvlog-cli",
     "build:server": "cargo build -p rcdvlog-server",
-    "check": "pnpm --dir apps/desktop check && cargo test --workspace",
+    "check": "pnpm check:frontend && cargo test --workspace",
+    "check:frontend": "pnpm --dir packages/project-client check && pnpm --dir packages/review-ui check && pnpm --dir apps/desktop check && pnpm --dir apps/web check",
+    "check:openapi": "node scripts/sync-openapi.mjs --check",
+    "generate:openapi": "node scripts/sync-openapi.mjs",
+    "test:web": "pnpm --dir apps/web test",
+    "test:web:e2e": "pnpm --dir apps/web test:e2e",
     "test:core": "cargo test -p rcdvlog-core",
     "test:integration": "cargo test -p rcdvlog-cli --test cli_workflow",
     "test:server": "cargo test -p rcdvlog-server-core && cargo test -p rcdvlog-server"
