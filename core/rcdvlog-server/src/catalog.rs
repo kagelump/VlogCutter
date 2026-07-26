@@ -1378,4 +1378,131 @@ mod tests {
         assert_eq!(row.3.as_deref(), Some("ILCE-7M4"));
         assert_eq!(row.4, 1);
     }
+
+    #[test]
+    fn library_search_index_migration_handles_backfill_edge_cases() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("control.sqlite3");
+        let mut connection = rusqlite::Connection::open(&path).unwrap();
+        run_sqlite_migrations(&mut connection, &CONTROL_CATALOG_MIGRATIONS[..7]).unwrap();
+
+        connection
+            .execute_batch(
+                r#"
+            INSERT INTO storage_roots(storage_root_id, display_name, immutable_original, enabled, created_at, updated_at) VALUES
+                ('root_b1', 'Root B1', 1, 1, '2026-07-20T00:00:00Z', '2026-07-20T00:00:00Z'),
+                ('root_b2', 'Root B2', 1, 1, '2026-07-20T00:00:00Z', '2026-07-20T00:00:00Z');
+
+            -- Case 1: two storage locations for one media object. The
+            -- lexicographically lowest storage_object_id must win, and every
+            -- derived column (root, filename, camera facts) must come from
+            -- that same underlying row (bare-column / MIN resolution).
+            INSERT INTO media_objects(media_object_id, size_bytes, quick_fingerprint, full_content_hash, verification_state, created_at, updated_at)
+                VALUES ('media_multi', 2048, 'quick_multi', NULL, 'provisional', '2026-07-21T00:00:00Z', '2026-07-21T00:00:00Z');
+            INSERT INTO storage_objects(storage_object_id, storage_root_id, relative_path, size_bytes, created_at, updated_at) VALUES
+                ('object_b1_low', 'root_b1', 'Trips/2025/Sony/LOW.MP4', 2048, '2026-07-21T00:00:00Z', '2026-07-21T00:00:00Z'),
+                ('object_b2_high', 'root_b2', 'Trips/2025/Canon/HIGH.MP4', 2048, '2026-07-21T00:00:00Z', '2026-07-21T00:00:00Z');
+            INSERT INTO media_object_locations(media_object_id, storage_object_id, verification_state, linked_at, updated_at) VALUES
+                ('media_multi', 'object_b1_low', 'provisional', '2026-07-21T00:00:00Z', '2026-07-21T00:00:00Z'),
+                ('media_multi', 'object_b2_high', 'provisional', '2026-07-21T00:00:00Z', '2026-07-21T00:00:00Z');
+            INSERT INTO media_probe_facts(storage_object_id, recipe_key, recipe_version, probe_json, camera_make, camera_model, captured_at) VALUES
+                ('object_b1_low', 'probe', '1', '{}', 'Sony', 'ILCE-7M4', '2026-07-21T00:00:00Z'),
+                ('object_b2_high', 'probe', '1', '{}', 'Canon', 'EOS R5', '2026-07-21T00:00:00Z');
+
+            -- Case 2: relative path with no '/' at all -- filename is the whole path.
+            INSERT INTO media_objects(media_object_id, size_bytes, quick_fingerprint, full_content_hash, verification_state, created_at, updated_at)
+                VALUES ('media_no_slash', 512, 'quick_no_slash', NULL, 'provisional', '2026-07-22T00:00:00Z', '2026-07-22T00:00:00Z');
+            INSERT INTO storage_objects(storage_object_id, storage_root_id, relative_path, size_bytes, created_at, updated_at)
+                VALUES ('object_no_slash', 'root_b1', 'C0200.MP4', 512, '2026-07-22T00:00:00Z', '2026-07-22T00:00:00Z');
+            INSERT INTO media_object_locations(media_object_id, storage_object_id, verification_state, linked_at, updated_at)
+                VALUES ('media_no_slash', 'object_no_slash', 'provisional', '2026-07-22T00:00:00Z', '2026-07-22T00:00:00Z');
+
+            -- Case 3: relative path with repeated separators -- filename is still
+            -- just the final path component.
+            INSERT INTO media_objects(media_object_id, size_bytes, quick_fingerprint, full_content_hash, verification_state, created_at, updated_at)
+                VALUES ('media_repeated_sep', 768, 'quick_repeated_sep', NULL, 'provisional', '2026-07-23T00:00:00Z', '2026-07-23T00:00:00Z');
+            INSERT INTO storage_objects(storage_object_id, storage_root_id, relative_path, size_bytes, created_at, updated_at)
+                VALUES ('object_repeated_sep', 'root_b1', 'Trips//2025///Sony//C0999.MP4', 768, '2026-07-23T00:00:00Z', '2026-07-23T00:00:00Z');
+            INSERT INTO media_object_locations(media_object_id, storage_object_id, verification_state, linked_at, updated_at)
+                VALUES ('media_repeated_sep', 'object_repeated_sep', 'provisional', '2026-07-23T00:00:00Z', '2026-07-23T00:00:00Z');
+
+            -- Case 4: media object with no storage location at all.
+            INSERT INTO media_objects(media_object_id, size_bytes, quick_fingerprint, full_content_hash, verification_state, created_at, updated_at)
+                VALUES ('media_no_location', NULL, 'quick_no_location', NULL, 'unverified', '2026-07-24T00:00:00Z', '2026-07-24T00:00:00Z');
+            "#,
+            )
+            .unwrap();
+
+        run_sqlite_migrations(&mut connection, CONTROL_CATALOG_MIGRATIONS).unwrap();
+
+        // Case 1: bare-column MIN resolution must pick one consistent row.
+        let multi: (
+            String,
+            Option<String>,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            u32,
+        ) = connection
+            .query_row(
+                "SELECT primary_storage_object_id, primary_storage_root_id, filename, filename_folded,
+                        camera_make, camera_model, storage_location_count
+                 FROM media_search_index WHERE media_object_id = 'media_multi'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(multi.0, "object_b1_low");
+        assert_eq!(multi.1.as_deref(), Some("root_b1"));
+        assert_eq!(multi.2, "LOW.MP4");
+        assert_eq!(multi.3, "low.mp4");
+        assert_eq!(multi.4.as_deref(), Some("Sony"));
+        assert_eq!(multi.5.as_deref(), Some("ILCE-7M4"));
+        assert_eq!(multi.6, 2);
+
+        // Case 2: no separator at all -- filename is the whole path.
+        let filename: String = connection
+            .query_row(
+                "SELECT filename FROM media_search_index WHERE media_object_id = 'media_no_slash'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(filename, "C0200.MP4");
+
+        // Case 3: repeated separators still yield only the final path component.
+        let filename: String = connection
+            .query_row(
+                "SELECT filename FROM media_search_index WHERE media_object_id = 'media_repeated_sep'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(filename, "C0999.MP4");
+
+        // Case 4: media object with no storage location still gets a row.
+        let no_location: (String, Option<String>, Option<String>, u32) = connection
+            .query_row(
+                "SELECT filename, primary_storage_object_id, primary_storage_root_id, storage_location_count
+                 FROM media_search_index WHERE media_object_id = 'media_no_location'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(no_location.0, "");
+        assert_eq!(no_location.1, None);
+        assert_eq!(no_location.2, None);
+        assert_eq!(no_location.3, 0);
+    }
 }
