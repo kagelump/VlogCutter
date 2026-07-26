@@ -12,6 +12,9 @@ use std::path::PathBuf;
 use thiserror::Error;
 
 use crate::catalog::{open_read_only_connection, open_writable_connection};
+use crate::library_query::{
+    CursorKey, LibraryQuery, LibraryQueryError, LibrarySort, encode_cursor, plan_library_query,
+};
 use crate::storage_path::{
     PathAccessIntent, PathResolutionError, resolve_existing_binding_path, validate_local_mount_path,
 };
@@ -41,6 +44,8 @@ pub enum StorageLibraryError {
     ObservationOutsideScope { storage_object_id: String },
     #[error(transparent)]
     Path(#[from] PathResolutionError),
+    #[error(transparent)]
+    Query(#[from] LibraryQueryError),
     #[error(transparent)]
     Database(#[from] rusqlite::Error),
     #[error(transparent)]
@@ -236,6 +241,34 @@ pub struct MediaLibraryItem {
 pub struct MediaLibraryPage {
     pub items: Vec<MediaLibraryItem>,
     pub next_cursor: Option<LibraryCursor>,
+}
+
+/// One row of an indexed [`StorageLibrary::search_media`] page. Everything
+/// here is safe to hand to a remote client: no absolute filesystem path ever
+/// appears on this type.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LibrarySearchItem {
+    pub media: MediaObject,
+    pub filename: String,
+    pub camera_make: Option<String>,
+    pub camera_model: Option<String>,
+    pub primary_storage_root_id: Option<StorageRootId>,
+    pub storage_location_count: u64,
+    pub project_membership_count: u64,
+    pub availability: NodeAvailabilityState,
+}
+
+/// A page produced by [`StorageLibrary::search_media`]. See that method's
+/// documentation for the pagination contract when an availability filter is
+/// supplied -- `items` can legitimately be shorter than the requested limit,
+/// or empty, while `next_cursor` still points further into the result set.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LibrarySearchPage {
+    pub items: Vec<LibrarySearchItem>,
+    pub next_cursor: Option<String>,
+    pub availability_filter_applied: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1152,6 +1185,88 @@ impl StorageLibrary {
         Ok(MediaLibraryPage { items, next_cursor })
     }
 
+    /// Executes an index-planned library query into one bounded page and
+    /// narrows it to node-relative availability.
+    ///
+    /// The plan is served entirely from `media_search_index` (see
+    /// `library_query::plan_library_query`); availability is never joined
+    /// into that SQL. Instead, once the page's rows come back -- at most
+    /// `query.limit + 1` of them -- [`Self::media_availability`] is called
+    /// once per row already on the page. Serving one page therefore never
+    /// scans more of the archive than its own bounded row set, regardless of
+    /// how large the library is.
+    ///
+    /// **Pagination contract:** when `availability` is `Some`, rows whose
+    /// computed availability does not match are dropped from the page
+    /// *after* `next_cursor` has already been derived from the full,
+    /// pre-filter page. A page can therefore come back shorter than
+    /// `query.limit`, or even completely empty, while `next_cursor` is still
+    /// `Some` and more matching rows exist further along the sort order.
+    /// Callers must not treat an empty `items` as end-of-results -- keep
+    /// paging while `next_cursor` is `Some`. `availability_filter_applied`
+    /// tells a caller whether this contract is in effect for the page it
+    /// received.
+    pub fn search_media(
+        &self,
+        query: LibraryQuery,
+        availability: Option<NodeAvailabilityState>,
+    ) -> Result<LibrarySearchPage, StorageLibraryError> {
+        let plan = plan_library_query(&query)?;
+        let connection = open_read_only_connection(&self.database_path)?;
+        let mut rows = {
+            let mut statement = connection.prepare(&plan.sql)?;
+            statement
+                .query_map(
+                    rusqlite::params_from_iter(plan.bindings.iter()),
+                    search_index_row_from_row,
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+
+        let has_more = rows.len() > query.limit as usize;
+        rows.truncate(query.limit as usize);
+        let next_cursor = has_more.then(|| {
+            let boundary = rows.last().expect("a page with more rows has a last item");
+            encode_cursor(
+                query.sort,
+                &query.filters,
+                &cursor_key_for_row(query.sort, boundary),
+            )
+        });
+
+        let availability_filter_applied = availability.is_some();
+        let mut items = Vec::with_capacity(rows.len());
+        for row in rows {
+            let media_object_id =
+                MediaObjectId::parse(row.media_object_id.clone()).map_err(stored_error(0))?;
+            let row_availability = self
+                .media_availability(&media_object_id, &self.local_node_id)?
+                .state;
+            if let Some(target) = availability
+                && row_availability != target
+            {
+                continue;
+            }
+            let media = self.get_media_object(&media_object_id)?;
+            items.push(LibrarySearchItem {
+                media,
+                filename: row.filename,
+                camera_make: row.camera_make,
+                camera_model: row.camera_model,
+                primary_storage_root_id: row.primary_storage_root_id,
+                storage_location_count: row.storage_location_count,
+                project_membership_count: row.project_membership_count,
+                availability: row_availability,
+            });
+        }
+
+        Ok(LibrarySearchPage {
+            items,
+            next_cursor,
+            availability_filter_applied,
+        })
+    }
+
     pub fn start_observation_generation(
         &self,
         generation_id: impl Into<String>,
@@ -1795,6 +1910,65 @@ fn library_item_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MediaLibra
         storage_location_count: from_i64(Some(row.get(7)?), 7)?.unwrap_or(0),
         project_membership_count: from_i64(Some(row.get(8)?), 8)?.unwrap_or(0),
     })
+}
+
+/// One row of `library_query::plan_library_query`'s `SELECT` column list --
+/// see that module's `SELECT_COLUMNS` for the exact order this indexes into.
+/// This intentionally does not carry every column the projection has (for
+/// example `verification_state` is skipped): the projection is a rebuildable
+/// derived index, not authoritative, so `search_media` re-reads the
+/// authoritative `media_objects` row for each surviving result instead of
+/// trusting the projection's copy.
+struct SearchIndexRow {
+    media_object_id: String,
+    primary_storage_root_id: Option<StorageRootId>,
+    filename: String,
+    camera_make: Option<String>,
+    camera_model: Option<String>,
+    size_bytes: Option<i64>,
+    created_at: String,
+    storage_location_count: u64,
+    project_membership_count: u64,
+}
+
+fn search_index_row_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SearchIndexRow> {
+    Ok(SearchIndexRow {
+        media_object_id: row.get(0)?,
+        primary_storage_root_id: row
+            .get::<_, Option<String>>(2)?
+            .map(StorageRootId::parse)
+            .transpose()
+            .map_err(stored_error(2))?,
+        filename: row.get(3)?,
+        camera_make: row.get(4)?,
+        camera_model: row.get(5)?,
+        size_bytes: row.get(7)?,
+        created_at: row.get(8)?,
+        storage_location_count: from_i64(Some(row.get(9)?), 9)?.unwrap_or(0),
+        project_membership_count: from_i64(Some(row.get(10)?), 10)?.unwrap_or(0),
+    })
+}
+
+/// The cursor a client would need to resume immediately after `row`, given
+/// the sort it was fetched under. `filename_folded` is not one of the
+/// projection's selected columns, so it is recomputed with the same
+/// `to_lowercase()` folding `search_index.rs` uses when it writes the
+/// projection, keeping this in step with the authoritative fold.
+fn cursor_key_for_row(sort: LibrarySort, row: &SearchIndexRow) -> CursorKey {
+    match sort {
+        LibrarySort::CreatedDesc => CursorKey::Created {
+            created_at: row.created_at.clone(),
+            media_object_id: row.media_object_id.clone(),
+        },
+        LibrarySort::FilenameAsc => CursorKey::Filename {
+            filename_folded: row.filename.to_lowercase(),
+            media_object_id: row.media_object_id.clone(),
+        },
+        LibrarySort::SizeDesc => CursorKey::Size {
+            size_bytes: row.size_bytes,
+            media_object_id: row.media_object_id.clone(),
+        },
+    }
 }
 
 fn generation_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ObservationGeneration> {
@@ -3148,5 +3322,172 @@ mod tests {
             )
             .unwrap();
         assert_eq!(verification_state, "verified");
+    }
+
+    #[test]
+    fn search_pages_deterministically_across_a_full_archive() {
+        let fixture = fixture();
+        let library = &fixture.library;
+        let root = create_root(library, "root_a", true);
+        for index in 0..25 {
+            let media = create_media(library, &format!("media_{index:03}"));
+            let object = create_object(
+                library,
+                &format!("object_{index:03}"),
+                &root,
+                &format!("Trips/C{index:04}.MP4"),
+            );
+            link(library, &media, &object);
+        }
+
+        let mut seen = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = library
+                .search_media(
+                    LibraryQuery {
+                        limit: 10,
+                        sort: LibrarySort::FilenameAsc,
+                        filters: Default::default(),
+                        after: cursor.clone(),
+                    },
+                    None,
+                )
+                .unwrap();
+            seen.extend(page.items.iter().map(|item| item.filename.clone()));
+            match page.next_cursor {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+        assert_eq!(seen.len(), 25);
+        let mut sorted = seen.clone();
+        sorted.sort();
+        assert_eq!(seen, sorted, "pages must not repeat or reorder rows");
+    }
+
+    #[test]
+    fn availability_filter_marks_itself_as_applied_and_never_pages_the_whole_archive() {
+        let fixture = fixture();
+        let library = &fixture.library;
+        let root = create_root(library, "root_a", true);
+        let media = create_media(library, "media_a");
+        let object = create_object(library, "object_a", &root, "Trips/A.MP4");
+        link(library, &media, &object);
+
+        let page = library
+            .search_media(
+                LibraryQuery {
+                    limit: 10,
+                    sort: LibrarySort::CreatedDesc,
+                    filters: Default::default(),
+                    after: None,
+                },
+                Some(NodeAvailabilityState::AccessibleHere),
+            )
+            .unwrap();
+        assert!(page.availability_filter_applied);
+        assert!(
+            page.items
+                .iter()
+                .all(|item| item.availability == NodeAvailabilityState::AccessibleHere)
+        );
+    }
+
+    #[test]
+    fn search_media_can_return_an_empty_page_with_a_cursor_when_the_filter_matches_nothing_yet() {
+        // No confirmed node/root binding is set up for `root_a`, so every one
+        // of these rows resolves to `NodeAvailabilityState::Known` (see
+        // `aggregate_availability`'s fallback when there are no locations to
+        // reason about). Filtering for `AccessibleHere` therefore drops every
+        // row on the first page, while the 15 rows created here (against a
+        // limit of 10) guarantee there is a second page to advance to. This
+        // is exactly the "empty items, but next_cursor is still Some" shape
+        // the pagination contract documented on `search_media` calls out --
+        // a caller must keep paging instead of treating the empty page as
+        // the end of the result set.
+        let fixture = fixture();
+        let library = &fixture.library;
+        let root = create_root(library, "root_a", true);
+        for index in 0..15 {
+            let media = create_media(library, &format!("media_{index:03}"));
+            let object = create_object(
+                library,
+                &format!("object_{index:03}"),
+                &root,
+                &format!("Trips/C{index:04}.MP4"),
+            );
+            link(library, &media, &object);
+        }
+
+        let page = library
+            .search_media(
+                LibraryQuery {
+                    limit: 10,
+                    sort: LibrarySort::CreatedDesc,
+                    filters: Default::default(),
+                    after: None,
+                },
+                Some(NodeAvailabilityState::AccessibleHere),
+            )
+            .unwrap();
+
+        assert!(page.availability_filter_applied);
+        assert!(
+            page.items.is_empty(),
+            "every row on this page is Known, not AccessibleHere"
+        );
+        assert!(
+            page.next_cursor.is_some(),
+            "15 rows exist against a limit of 10, so a caller must keep paging \
+             even though this page came back empty"
+        );
+
+        // Confirms the archive genuinely has more matching-eligible rows
+        // beyond this page -- the cursor is not a dead end.
+        let next_page = library
+            .search_media(
+                LibraryQuery {
+                    limit: 10,
+                    sort: LibrarySort::CreatedDesc,
+                    filters: Default::default(),
+                    after: page.next_cursor,
+                },
+                Some(NodeAvailabilityState::AccessibleHere),
+            )
+            .unwrap();
+        assert!(next_page.availability_filter_applied);
+        assert!(next_page.items.is_empty());
+        assert!(next_page.next_cursor.is_none());
+    }
+
+    #[test]
+    fn search_does_not_load_the_archive_to_serve_one_page() {
+        let fixture = fixture();
+        let library = &fixture.library;
+        let root = create_root(library, "root_a", true);
+        for index in 0..2000 {
+            let media = create_media(library, &format!("media_{index:05}"));
+            let object = create_object(
+                library,
+                &format!("object_{index:05}"),
+                &root,
+                &format!("Trips/C{index:05}.MP4"),
+            );
+            link(library, &media, &object);
+        }
+        let page = library
+            .search_media(
+                LibraryQuery {
+                    limit: 50,
+                    sort: LibrarySort::CreatedDesc,
+                    filters: Default::default(),
+                    after: None,
+                },
+                None,
+            )
+            .unwrap();
+        assert_eq!(page.items.len(), 50);
+        assert!(page.next_cursor.is_some());
     }
 }
