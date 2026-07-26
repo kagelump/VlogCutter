@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 use crate::ConfigDiagnostics;
 
-pub const CONTROL_CATALOG_SCHEMA_VERSION: u32 = 7;
+pub const CONTROL_CATALOG_SCHEMA_VERSION: u32 = 8;
 pub const CONTROL_DATABASE_FILENAME: &str = "control.sqlite3";
 pub const INSTANCE_LOCK_FILENAME: &str = "server.lock";
 
@@ -63,6 +63,12 @@ pub const CONTROL_CATALOG_MIGRATIONS: &[SqliteMigration] = &[
         name: "authentication_credentials_sessions",
         source_identity: "server-control/0007-authentication-credentials-sessions/20260723",
         apply: create_authentication_credentials_sessions,
+    },
+    SqliteMigration {
+        id: 8,
+        name: "library_search_index",
+        source_identity: "server-control/0008-library-search-index/20260727",
+        apply: create_library_search_index,
     },
 ];
 
@@ -454,6 +460,83 @@ fn create_authentication_credentials_sessions(transaction: &Transaction<'_>) -> 
             ON device_credentials(credential_id, revoked_at);
         CREATE INDEX device_credentials_listing
             ON device_credentials(created_at DESC);
+        "#,
+    )?;
+    Ok(())
+}
+
+/// One-row-per-media-object projection supporting deterministic library sort
+/// and filter. Every column is derived from other control-catalog tables, so
+/// the table is fully rebuildable and never an authority.
+fn create_library_search_index(transaction: &Transaction<'_>) -> Result<()> {
+    transaction.execute_batch(
+        r#"
+        CREATE TABLE media_search_index (
+            media_object_id TEXT PRIMARY KEY REFERENCES media_objects(media_object_id),
+            primary_storage_object_id TEXT REFERENCES storage_objects(storage_object_id),
+            primary_storage_root_id TEXT REFERENCES storage_roots(storage_root_id),
+            filename TEXT NOT NULL DEFAULT '',
+            filename_folded TEXT NOT NULL DEFAULT '',
+            camera_make TEXT,
+            camera_model TEXT,
+            camera_folded TEXT NOT NULL DEFAULT '',
+            verification_state TEXT NOT NULL,
+            size_bytes INTEGER,
+            created_at TEXT NOT NULL,
+            storage_location_count INTEGER NOT NULL DEFAULT 0,
+            project_membership_count INTEGER NOT NULL DEFAULT 0,
+            refreshed_at TEXT NOT NULL
+        );
+
+        CREATE INDEX media_search_created
+            ON media_search_index(created_at DESC, media_object_id ASC);
+        CREATE INDEX media_search_filename
+            ON media_search_index(filename_folded ASC, media_object_id ASC);
+        CREATE INDEX media_search_size
+            ON media_search_index(size_bytes DESC, media_object_id ASC);
+        CREATE INDEX media_search_state_created
+            ON media_search_index(verification_state, created_at DESC, media_object_id ASC);
+        CREATE INDEX media_search_root_created
+            ON media_search_index(primary_storage_root_id, created_at DESC, media_object_id ASC);
+        CREATE INDEX media_search_camera_created
+            ON media_search_index(camera_folded, created_at DESC, media_object_id ASC);
+
+        INSERT INTO media_search_index (
+            media_object_id, primary_storage_object_id, primary_storage_root_id,
+            filename, filename_folded, camera_make, camera_model, camera_folded,
+            verification_state, size_bytes, created_at,
+            storage_location_count, project_membership_count, refreshed_at
+        )
+        SELECT
+            m.media_object_id,
+            p.storage_object_id,
+            p.storage_root_id,
+            COALESCE(p.filename, ''),
+            LOWER(COALESCE(p.filename, '')),
+            p.camera_make,
+            p.camera_model,
+            LOWER(TRIM(COALESCE(p.camera_make, '') || ' ' || COALESCE(p.camera_model, ''))),
+            m.verification_state,
+            m.size_bytes,
+            m.created_at,
+            (SELECT COUNT(*) FROM media_object_locations l WHERE l.media_object_id = m.media_object_id),
+            (SELECT COUNT(*) FROM project_media_memberships pm WHERE pm.media_object_id = m.media_object_id),
+            m.updated_at
+        FROM media_objects m
+        LEFT JOIN (
+            SELECT
+                mol.media_object_id AS media_object_id,
+                so.storage_object_id AS storage_object_id,
+                so.storage_root_id AS storage_root_id,
+                REPLACE(so.relative_path, RTRIM(so.relative_path, REPLACE(so.relative_path, '/', '')), '') AS filename,
+                pf.camera_make AS camera_make,
+                pf.camera_model AS camera_model
+            FROM media_object_locations mol
+            JOIN storage_objects so ON so.storage_object_id = mol.storage_object_id
+            LEFT JOIN media_probe_facts pf ON pf.storage_object_id = so.storage_object_id
+            GROUP BY mol.media_object_id
+            HAVING so.storage_object_id = MIN(so.storage_object_id)
+        ) p ON p.media_object_id = m.media_object_id;
         "#,
     )?;
     Ok(())
@@ -1251,7 +1334,48 @@ mod tests {
                 .unwrap()
                 .applied_migrations
                 .len(),
-            7
+            8
         );
+    }
+
+    #[test]
+    fn library_search_index_migration_backfills_existing_media() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("control.sqlite3");
+        let mut connection = rusqlite::Connection::open(&path).unwrap();
+        run_sqlite_migrations(&mut connection, &CONTROL_CATALOG_MIGRATIONS[..7]).unwrap();
+
+        connection
+            .execute_batch(
+                r#"
+            INSERT INTO storage_roots(storage_root_id, display_name, immutable_original, enabled, created_at, updated_at)
+                VALUES ('root_a', 'Main NAS', 1, 1, '2026-07-20T00:00:00Z', '2026-07-20T00:00:00Z');
+            INSERT INTO media_objects(media_object_id, size_bytes, quick_fingerprint, full_content_hash, verification_state, created_at, updated_at)
+                VALUES ('media_a', 1024, 'quick', NULL, 'provisional', '2026-07-20T00:00:00Z', '2026-07-20T00:00:00Z');
+            INSERT INTO storage_objects(storage_object_id, storage_root_id, relative_path, size_bytes, created_at, updated_at)
+                VALUES ('object_a', 'root_a', 'Trips/2025/Sony/C0103.MP4', 1024, '2026-07-20T00:00:00Z', '2026-07-20T00:00:00Z');
+            INSERT INTO media_object_locations(media_object_id, storage_object_id, verification_state, linked_at, updated_at)
+                VALUES ('media_a', 'object_a', 'provisional', '2026-07-20T00:00:00Z', '2026-07-20T00:00:00Z');
+            INSERT INTO media_probe_facts(storage_object_id, recipe_key, recipe_version, probe_json, camera_make, camera_model, captured_at)
+                VALUES ('object_a', 'probe', '1', '{}', 'Sony', 'ILCE-7M4', '2026-07-20T00:00:00Z');
+            "#,
+            )
+            .unwrap();
+
+        run_sqlite_migrations(&mut connection, CONTROL_CATALOG_MIGRATIONS).unwrap();
+
+        let row: (String, String, String, Option<String>, u32) = connection
+            .query_row(
+                "SELECT media_object_id, filename, filename_folded, camera_model, storage_location_count
+                 FROM media_search_index WHERE media_object_id = 'media_a'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!(row.0, "media_a");
+        assert_eq!(row.1, "C0103.MP4");
+        assert_eq!(row.2, "c0103.mp4");
+        assert_eq!(row.3.as_deref(), Some("ILCE-7M4"));
+        assert_eq!(row.4, 1);
     }
 }
