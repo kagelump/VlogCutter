@@ -33,10 +33,33 @@ The user can review server-hosted proxies in Chrome, add or revise notes and fre
 - Rough-cut inclusion, source ranges, timeline export, scripts, or edit plans
 - Offline web editing
 
+## Command semantics
+
+The Task 7 payload version 1 operations are frozen. This task adds web adapters for them, not
+new operation types, and must match their existing conflict rules:
+
+- **Notes.** `noteRevisionCreated` is append-only and never fails on a stale base. The base
+  revision travels with the command so the UI can tell the user another revision arrived, but
+  the server does not reject the write: concurrent notes both survive and the greatest HLC key
+  becomes active. Do not build an optimistic-concurrency retry loop around note saves.
+- **Labels.** `labelRemoved` carries `observedAddTags` and removes only those tags, so an
+  unobserved concurrent add wins. A browser sends the label; the server resolves the observed
+  add-tags from its own materialized state inside the command transaction. The client must not
+  invent add-tags from a possibly stale React cache, and the response returns the canonical
+  label set.
+- **Removed and rotation.** HLC last-write-wins registers. Rotation accepts only 0, 90, 180,
+  and 270, and is persisted project state that synchronizes to the Mac — not a view-only
+  display toggle.
+- **Clock events.** Not editable from the web in this epic. An unresolved conflict is reported
+  and directs the user to the desktop or CLI.
+
+"Downloadable server proxy" is an availability state meaning the Mac can fetch this proxy
+through Task 12. It is not a browser download control, and this task adds no such control.
+
 ## Design requirements
 
 1. Chrome plays only a server-accessible compatible proxy in this epic.
-2. Native media requests remain authenticated without bearer tokens in query strings.
+2. Native media requests remain authenticated without bearer tokens in query strings. `<video>` and `<img>` rely on the same-origin HttpOnly session cookie, which is what keeps native range seeking working; a fetch-to-blob workaround defeats ranged delivery and is not acceptable.
 3. Playback seeking uses range requests and does not fetch the entire proxy first.
 4. Rotation applies to video content while controls remain correctly oriented.
 5. Note saves create immutable revisions and include base revision.
@@ -48,6 +71,8 @@ The user can review server-hosted proxies in Chrome, add or revise notes and fre
 11. Text-field focus prevents global shortcuts, matching the desktop's safety principles.
 12. Missing representations present safe actions and execution location, not generic playback errors.
 13. The web UI never implies the browser works offline.
+14. A media element that fails on authentication reports session expiry and offers re-authentication, distinct from a missing or pending representation.
+15. Every new endpoint updates the committed OpenAPI document and generated TypeScript client.
 
 ## Suggested web keyboard contract
 
@@ -88,6 +113,10 @@ Visible help and `aria-keyshortcuts` must match the implemented contract.
 - [ ] Keyboard focus/shortcut behavior, notes newline/save behavior, and visible help are tested.
 - [ ] Desktop shared-component extraction does not regress current desktop keyboard, focus, playback, or minimum-window layout.
 - [ ] Chrome wide/narrow visual acceptance and reduced-motion behavior pass.
+- [ ] A note saved against a stale base revision still commits, and the UI reports that another revision arrived rather than failing the save.
+- [ ] A label removed from a stale client cache removes only server-observed add-tags and leaves a concurrent add intact.
+- [ ] Session expiry during playback shows a re-authentication state, not a playback error.
+- [ ] Seeking issues range requests rather than a whole-file fetch, verified from network records.
 
 ## Verification
 

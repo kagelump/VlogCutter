@@ -2,7 +2,7 @@
 
 **Status:** Implemented (automated acceptance complete; manual Chrome/Ubuntu acceptance pending)
 **Depends on:** Tasks 4 and 5
-**Unblocks:** Tasks 12, 15, 16, and 18
+**Unblocks:** Tasks 12, 14, 15, 16, and 18
 
 ## Objective
 

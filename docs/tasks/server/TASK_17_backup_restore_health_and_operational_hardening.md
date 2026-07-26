@@ -1,7 +1,7 @@
 # Task 17: Backup, Restore, Health, and Operational Hardening
 
 **Status:** Planned
-**Depends on:** Tasks 2, 8, and 9
+**Depends on:** Tasks 2, 4, 8, and 9
 **Unblocks:** Tasks 18 and 19
 
 ## Objective
@@ -45,6 +45,41 @@ A restore point contains:
 
 It excludes plaintext credentials, one-time codes, original media, temp files, and derived blobs. Credential verifiers may remain in the control database, but restored sessions/devices can be explicitly revoked after recovery.
 
+## Restore and synchronization identity
+
+A restore rolls a project replica backward in time while the Mac keeps its full history and
+its cursors. That interacts badly with the operation log, and the interaction must be handled
+here rather than discovered during acceptance.
+
+Server-origin sequences are allocated per replica from `operation_origin_sequences`. A
+restored replica's counter is therefore behind the highest server-origin sequence the Mac has
+already committed. If the restored server allocates from the stale counter, it emits a
+*different* operation carrying an already-acknowledged `(originNodeId, originSequence)`, and
+`Catalog::apply_operation_batch` on the Mac rejects the whole batch with "already acknowledged
+with a different operation". Synchronization for that project wedges permanently and no
+retry clears it.
+
+The Mac-origin direction self-heals: the restored server's receive cursor for the Mac origin
+also moves backward, and the Mac still holds those operations and resends them.
+
+Required behavior after a restore is activated:
+
+1. The restored replica is marked `sequence_recovery` for every paired origin. The server
+   serves reads and accepts Mac operations but emits no new server-origin operation until
+   recovery completes.
+2. The first reconciliation learns the Mac's highest committed server-origin sequence, and the
+   server advances its local allocator past that value before its next allocation. A restore
+   point's manifest records the same watermark so recovery can also complete offline.
+3. If the Mac reports a committed server-origin sequence the restored replica does not
+   contain, the lost operations are surfaced as an explicit divergence with the affected
+   range. They are not silently skipped, and the cursor is not force-advanced without a
+   recorded decision.
+4. A restored replica never reuses a `(originNodeId, originSequence)` pair for different
+   content, and this is asserted by test rather than left to convention.
+5. Restore also revalidates representation locations. A manifest whose blob is absent or
+   size-mismatched after restore becomes unavailable and regenerable; it is never served as a
+   successful response.
+
 ## Design requirements
 
 1. Never copy a live WAL database with an ordinary filesystem copy.
@@ -59,6 +94,9 @@ It excludes plaintext credentials, one-time codes, original media, temp files, a
 10. Health checks are bounded and do not run full media scans or expensive integrity checks on every request.
 11. Readiness distinguishes core unavailability from degraded optional mounts/backups.
 12. Diagnostic bundles redact credentials, cookies, tokens, and unnecessary absolute paths.
+13. The online backup API restarts its copy when a writer commits mid-snapshot. Backup runs under a bounded attempt/duration budget and reports a retryable failure instead of looping forever against a busy replica; it never takes a long write lock that stalls sync or media work.
+14. Backups run through the Task 4 durable job engine, so a backup surviving restart, cancellation, and retry uses the same lease and idempotency rules as other server work.
+15. Wall-clock sanity is a bound on HLC intake, not only a health string. A wall time beyond the configured skew bound is flagged and does not permanently advance the hybrid logical clock.
 
 ## Likely implementation areas
 
@@ -82,6 +120,10 @@ It excludes plaintext credentials, one-time codes, original media, temp files, a
 - [ ] Container restart recovers expired jobs and serves acknowledged project operations.
 - [ ] Diagnostic bundle contains required evidence and no known secrets.
 - [ ] A project replica can be identified as reseedable from the Mac without silently replacing it.
+- [ ] A restored replica advances its server-origin allocator past the Mac's committed sequence before emitting any new operation, and a two-replica test proves sync still converges after restore.
+- [ ] Operations lost by restoring an older replica are reported as an explicit divergence range rather than skipped.
+- [ ] A backup taken while a replica is being written either completes consistently or fails retryably within its budget, and never blocks sync.
+- [ ] A representation whose blob is missing after restore reports unavailable and regenerable instead of returning a broken response.
 
 ## Verification
 

@@ -1,7 +1,7 @@
 # Task 14: Web Library, Project Browse, and Add-to-Project
 
 **Status:** Planned
-**Depends on:** Tasks 5, 8, and 13
+**Depends on:** Tasks 5, 6, 8, and 13
 **Unblocks:** Task 15
 
 ## Objective
@@ -33,6 +33,54 @@ In Chrome, the user can find archived footage, understand whether it is verified
 - Full-text/semantic search
 - Automatically adding scanned media to a project
 
+## Query surface
+
+Task 3 shipped `StorageLibrary::list_media` with a 1–200 limit, a single optional
+verification-state filter, and `(createdAt DESC, mediaObjectId ASC)` ordering. Every filter
+and sort key this task adds is a schema change, not a query-builder change:
+
+- Each supported sort order needs its own composite index and a cursor tuple matching that
+  order exactly. A cursor is only valid for the sort/filter combination that produced it.
+- An unsupported sort/filter combination is rejected with `invalid_query` rather than served
+  by a full scan.
+- Availability is a derived projection over observation generations, not a column. Either
+  materialize an indexed availability summary per `(mediaObjectId, nodeId)` alongside the
+  observation-completion transaction, or restrict availability to a post-filter over an
+  already-bounded page and say so in the API contract. Do not filter availability with a
+  correlated subquery over `observation_generations`.
+- Current notes and labels live in the project replica, not the control catalog, and SQLite
+  cannot join across the two databases. Annotation search is therefore a project-scoped query
+  served by the replica; the global library search covers only global technical facts. The
+  two are separate endpoints with separate cursors and must not be merged into one result set.
+
+## Add-to-project command rule
+
+Global library membership dedupe cannot read `project_media_memberships`. That table is a
+repairable projection that legitimately lags a project commit and stays `pending` when the
+referenced media row has not arrived, so it can report "not a member" for an asset that is
+already committed in the replica.
+
+The command therefore:
+
+1. Opens the project replica and resolves existing membership from the durable operation log
+   or its materialized projection — the replica is the only dedupe authority.
+2. Emits `projectAssetAdded` with a self-contained metadata projection built from the media
+   object's global technical facts and no absolute path, then `projectAssetMediaLinked`
+   carrying `mediaObjectId` and the current `verificationState`. Both are frozen payload
+   version 1 operations from Task 7; this task adds no new operation type.
+3. Repairs the control-catalog membership projection after the replica commit.
+
+Verification gating:
+
+| Media state | Behavior |
+| --- | --- |
+| `verified` | Add normally. |
+| `provisional` or `unverified` | Add only with explicit acknowledgement; the link records the state at add time and no representation may be requested until full-hash verification completes. |
+| `mismatch` | Blocked with an actionable diagnostic; the user resolves identity first. |
+
+A later verification transition emits a new `projectAssetMediaLinked` for the same stable
+`projectAssetId`. It never rewrites or collapses the existing project asset.
+
 ## UX requirements
 
 - Default library view identifies verified versus provisional media without alarming normal users.
@@ -57,6 +105,10 @@ In Chrome, the user can find archived footage, understand whether it is verified
 11. Thumbnail requests remain authenticated and do not expose filesystem paths.
 12. Keyboard navigation, focus after add, and batch selection are accessible.
 13. Project membership commits in the project replica first; the global-library membership index is an idempotent projection that can be repaired after interruption.
+14. Duplicate detection reads the project replica, never the membership projection.
+15. Media without a verified full hash has no thumbnail, because representations require verified identity. That case renders identity state and technical facts, not a broken image or an infinite skeleton.
+16. Every new endpoint updates the committed OpenAPI document and generated TypeScript client; `pnpm check:openapi` fails on drift.
+17. WebSocket messages are hints that trigger a canonical refetch. No list or detail view derives its contents from an event payload.
 
 ## Likely implementation areas
 
@@ -79,6 +131,11 @@ In Chrome, the user can find archived footage, understand whether it is verified
 - [ ] A server-only asset appears in the project immediately and later synchronizes to the offline/reconnected Mac.
 - [ ] An added asset with no Mac binding shows remote-only rather than missing everywhere.
 - [ ] Provisional/mismatch states require explicit acknowledgement or block unsafe add according to the documented command rule.
+- [ ] An add issued while the membership projection is stale or `pending` still detects existing membership from the replica and does not create a second project asset.
+- [ ] Unverified media renders identity and technical facts with no thumbnail request and no broken-image state.
+- [ ] An unsupported sort/filter combination and a cursor reused across a different sort return `invalid_query` rather than a scan or a wrong page.
+- [ ] Annotation search returns project-scoped results and global library search returns global facts; neither claims to cover the other.
+- [ ] Committed OpenAPI and generated client match the Rust contract.
 - [ ] No project create/delete or original-media mutation is exposed.
 - [ ] Browser back/forward restores useful query/page state.
 - [ ] Wide and narrow Chrome layouts, keyboard selection, focus, empty, and error states are visually verified.

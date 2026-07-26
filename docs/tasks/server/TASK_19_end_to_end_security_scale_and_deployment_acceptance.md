@@ -24,7 +24,9 @@ The planned MVP is demonstrably safe and usable on the actual Mac/Ubuntu/NAS top
 - Run same-NAS/different-path root-binding acceptance.
 - Run NAS disconnect/reconnect and server reboot cases.
 - Run verified backup/restore drill on disposable data.
-- Record exact evidence, failures, fixes, and unrun manual checks in an acceptance report.
+- Record exact evidence, failures, fixes, and unrun manual checks in a checked-in acceptance
+  report at `docs/tasks/server/ACCEPTANCE_TASK_19.md`. Task 20 cites that path as its sole
+  evidence base, so it must be a repository document rather than session output.
 
 ## Out of scope
 
@@ -52,6 +54,8 @@ The planned MVP is demonstrably safe and usable on the actual Mac/Ubuntu/NAS top
 - LAN/tailnet endpoint failover.
 - Credential revocation and protocol incompatibility.
 - Note/label/LWW/clock conflict semantics.
+- Restore-then-resync: restore the server from a backup taken before operations the Mac has already committed, then reconcile and converge without sequence reuse or a wedged origin.
+- Wall-clock skew and a backward clock jump on either node without poisoning HLC ordering.
 
 ### Media and jobs
 
@@ -67,6 +71,7 @@ The planned MVP is demonstrably safe and usable on the actual Mac/Ubuntu/NAS top
 - Unauthenticated and revoked access.
 - Bootstrap replay/expiry.
 - CSRF, Host, Origin, forwarded-header spoofing, request-size, and rate-limit checks.
+- WebSocket origin validation. Browsers do not apply CORS to WebSocket handshakes and send cookies anyway, so `/api/v1/ws/events` must reject a handshake from a foreign origin; a cross-site page must not be able to open an authenticated event stream.
 - Root/path traversal, symlink escape, arbitrary-file, and malformed range attempts.
 - Log, diagnostic bundle, URL, process-argument, and fixture secret scan.
 - Compose assertion that original mounts are read-only and backend is not publicly bound.
@@ -75,6 +80,7 @@ The planned MVP is demonstrably safe and usable on the actual Mac/Ubuntu/NAS top
 
 - Chrome browse/add/review/annotation/admin flows.
 - WebSocket loss with polling/reconciliation recovery.
+- Two Chrome tabs editing the same asset concurrently, which is an ordinary single-user case and produces same-origin concurrent operations.
 - Wide and narrow viewport accessibility/focus checks.
 - Existing desktop keyboard, focus, playback, proxy, thumbnail, and offline behavior regression.
 
@@ -126,7 +132,10 @@ Record measured values rather than inventing pass thresholds after seeing result
 - [ ] Backup verification and disposable restore succeed.
 - [ ] Target server resource observations are recorded and acceptable for continued use.
 - [ ] Any manual check not run is explicitly marked with reason and risk.
-- [ ] An acceptance report records commands, versions, fixtures, counts, results, and remaining known limitations.
+- [ ] `docs/tasks/server/ACCEPTANCE_TASK_19.md` records commands, versions, fixtures, counts, results, and remaining known limitations.
+- [ ] A server restored from an older backup reconciles with a Mac that is ahead, without reusing an origin sequence and without wedging sync.
+- [ ] A cross-origin WebSocket handshake is rejected.
+- [ ] Concurrent edits from two Chrome tabs converge to one canonical state.
 
 ## Verification commands
 

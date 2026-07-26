@@ -124,16 +124,16 @@ At epic completion, the user can:
 | Task | Deliverable | Depends on |
 | --- | --- | --- |
 | [13](TASK_13_web_foundation_typed_client_and_shared_ui.md) | Web foundation, typed client, and shared UI seam | 9 |
-| [14](TASK_14_web_library_project_browse_and_add.md) | Library/project browsing and add-to-project | 5, 8, 13 |
+| [14](TASK_14_web_library_project_browse_and_add.md) | Library/project browsing and add-to-project | 5, 6, 8, 13 |
 | [15](TASK_15_web_proxy_review_and_annotations.md) | Proxy review and annotation editing | 6, 7, 11, 13, 14 |
-| [16](TASK_16_web_jobs_storage_sync_and_credential_admin.md) | Jobs, storage, sync, credential, and schedule administration | 4, 5, 9, 11, 13 |
+| [16](TASK_16_web_jobs_storage_sync_and_credential_admin.md) | Jobs, storage, sync, credential, and schedule administration | 3, 4, 5, 6, 9, 11, 13 |
 
 ### Operations and completion
 
 | Task | Deliverable | Depends on |
 | --- | --- | --- |
-| [17](TASK_17_backup_restore_health_and_operational_hardening.md) | Backup, restore, health, and operational hardening | 2, 8, 9 |
-| [18](TASK_18_cli_and_machine_readable_diagnostics.md) | CLI and machine-readable diagnostics | 5, 6, 8, 11, 17 |
+| [17](TASK_17_backup_restore_health_and_operational_hardening.md) | Backup, restore, health, and operational hardening | 2, 4, 8, 9 |
+| [18](TASK_18_cli_and_machine_readable_diagnostics.md) | CLI and machine-readable diagnostics | 5, 6, 8, 9, 11, 17 |
 | [19](TASK_19_end_to_end_security_scale_and_deployment_acceptance.md) | End-to-end, security, scale, and deployment acceptance | 12, 15, 16, 17, 18 |
 | [20](TASK_20_update_all_documentation.md) | Repository-wide documentation update | 19 |
 

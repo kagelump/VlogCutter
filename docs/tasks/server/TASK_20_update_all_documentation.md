@@ -24,6 +24,16 @@ A user or future agent can install, operate, diagnose, extend, and safely test t
 - Update checked-in CLI `--help`, example config, Compose comments, API schema descriptions, and UI help text.
 - Reconcile `ARCHITECTURE.md`, `EPIC.md`, and task statuses with actual implementation and accepted deviations.
 - Add links among documents and remove or mark superseded guidance.
+- Mark the point-in-time engineering documents under `docs/tasks/server/` as historical rather
+  than current contracts: `NOTES.md`, `HANDOFF_AFTER_TASK_*.md`, `REVIEW_TASKS_9_12.md`, and
+  any task-scoped handoff that a later task superseded.
+- Verify the frozen contracts in `docs/tasks/server/schemas/` still match the shipped DTOs, and
+  document that they are frozen — not a place to make edits when the code changes.
+- Check `docs/tasks/travel/` for statements this epic invalidated, and keep this epic's
+  documents consistent with the two travel amendments recorded in `EPIC.md`: project creation
+  is no longer permanently desktop-only, and a writable archive root is a planned distinct
+  logical root. Describe both as current-implementation facts plus a linked planned successor,
+  never as permanent product law.
 
 ## Out of scope
 
@@ -51,6 +61,9 @@ At minimum create or update focused documents for:
 
 ## Design requirements
 
+`docs/tasks/server/ACCEPTANCE_TASK_19.md` is the sole evidence base. Any claim this task cannot
+trace to that report, to checked-in code, or to a command it re-ran is not written.
+
 1. Current implementation facts and future plans are labeled distinctly.
 2. User request and accepted companion-server decisions supersede older “future node/cross-device deferred” text where implementation is complete.
 3. Original immutability, local SQLite placement, operation sync, and node-local paths are consistent in every document.
@@ -76,6 +89,9 @@ At minimum create or update focused documents for:
 - [ ] Confirm backup/restore warnings and destructive-action boundaries are prominent.
 - [ ] Confirm all CLI examples use explicit catalog/server selection and stable JSON.
 - [ ] Confirm testing tables distinguish mocks, automated processes, Chrome, Tauri, Ubuntu, NAS, and Tailscale.
+- [ ] Confirm every `Status:` marker in `docs/tasks/server/` and `docs/tasks/travel/` matches reality, and delete the interim "trust the code and git history" note in `EPIC.md` once it does.
+- [ ] Confirm superseded handoff and review documents are labeled historical and are not linked as current contracts.
+- [ ] Confirm the restore-and-resync constraints from Task 17 appear in the backup/recovery document, since a restore that ignores them wedges synchronization.
 
 ## Acceptance criteria
 

@@ -2,7 +2,7 @@
 
 **Status:** Planned
 **Depends on:** Task 2
-**Unblocks:** Tasks 5, 6, and 16
+**Unblocks:** Tasks 5, 6, 16, and 17
 
 ## Objective
 

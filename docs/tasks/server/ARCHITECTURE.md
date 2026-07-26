@@ -737,6 +737,8 @@ Deployment configuration declares every allowed root rather than accepting arbit
 
 Restore is an explicit offline administrative command. It validates the backup, writes to a new path, and requires confirmation before changing the configured active catalog. It never deletes or overwrites the only existing copy automatically.
 
+Restore moves a replica backward while the Mac keeps its full history, so it is also a synchronization event. A restored replica must advance its server-origin sequence allocator past the highest server-origin sequence the Mac has already committed before emitting any new operation. Reusing an acknowledged `(originNodeId, originSequence)` pair for different content is rejected by the receiving replica and wedges that project's synchronization permanently. Operations that the restore lost are reported as an explicit divergence rather than skipped. The Mac-origin direction recovers on its own because the Mac still holds the operations behind the server's rolled-back receive cursor.
+
 Recovery priorities:
 
 1. Restore server databases from backup.
@@ -759,6 +761,7 @@ Recovery priorities:
 | Full hash mismatch | Candidates remain separate; warning is visible |
 | Protocol mismatch | Sync pauses with explicit upgrade guidance; desktop local work continues |
 | Corrupt backup | Backup is rejected and active data remains untouched |
+| Restored replica behind the Mac | Server-origin allocator advances past the acknowledged watermark; lost operations surface as an explicit divergence |
 
 Transient absence is never treated as permission to delete state or media.
 
