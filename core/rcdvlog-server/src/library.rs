@@ -681,8 +681,9 @@ impl StorageLibrary {
     ) -> Result<MediaObject, StorageLibraryError> {
         validate_media_identity(&input)?;
         let now = now();
-        let connection = open_writable_connection(&self.database_path)?;
-        connection.execute(
+        let mut connection = open_writable_connection(&self.database_path)?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
             r#"
             INSERT INTO media_objects (
                 media_object_id, size_bytes, quick_fingerprint, full_content_hash,
@@ -698,6 +699,8 @@ impl StorageLibrary {
                 now,
             ],
         )?;
+        crate::search_index::refresh_media_search_row(&tx, input.id.as_str())?;
+        tx.commit()?;
         self.get_media_object(&input.id)
     }
 
@@ -851,8 +854,9 @@ impl StorageLibrary {
     ) -> Result<MediaObject, StorageLibraryError> {
         validate_blake3("fullContentHash", full_content_hash)?;
         let now = now();
-        let connection = open_writable_connection(&self.database_path)?;
-        connection.execute(
+        let mut connection = open_writable_connection(&self.database_path)?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
             r#"
             UPDATE media_objects SET
                 full_content_hash = ?2, size_bytes = ?3,
@@ -861,6 +865,8 @@ impl StorageLibrary {
             "#,
             params![media_id.as_str(), full_content_hash, size_bytes as i64, now],
         )?;
+        crate::search_index::refresh_media_search_row(&tx, media_id.as_str())?;
+        tx.commit()?;
         self.get_media_object(media_id)
     }
 
@@ -983,8 +989,9 @@ impl StorageLibrary {
             });
         }
         let now = now();
-        let connection = open_writable_connection(&self.database_path)?;
-        connection.execute(
+        let mut connection = open_writable_connection(&self.database_path)?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
             r#"
             INSERT INTO media_object_locations (
                 media_object_id, storage_object_id, verification_state, linked_at, updated_at
@@ -1000,6 +1007,8 @@ impl StorageLibrary {
                 now,
             ],
         )?;
+        crate::search_index::refresh_media_search_row(&tx, media_object_id.as_str())?;
+        tx.commit()?;
         connection
             .query_row(
                 r#"
@@ -1011,6 +1020,29 @@ impl StorageLibrary {
                 location_from_row,
             )
             .map_err(Into::into)
+    }
+
+    /// Rebuilds every search-projection row from authoritative tables and
+    /// returns the number of media objects refreshed. Used after restore,
+    /// after an interrupted scan, and by diagnostics.
+    pub fn rebuild_media_search_index(&self) -> Result<u64, StorageLibraryError> {
+        let mut connection = open_writable_connection(&self.database_path)?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let ids: Vec<String> = {
+            let mut statement = tx.prepare("SELECT media_object_id FROM media_objects")?;
+            statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        tx.execute(
+            "DELETE FROM media_search_index WHERE media_object_id NOT IN (SELECT media_object_id FROM media_objects)",
+            [],
+        )?;
+        for id in &ids {
+            crate::search_index::refresh_media_search_row(&tx, id)?;
+        }
+        tx.commit()?;
+        Ok(ids.len() as u64)
     }
 
     pub fn upsert_project_media_membership_projection(
@@ -1946,7 +1978,7 @@ fn invalid_generation_state(generation: &ObservationGeneration) -> StorageLibrar
     }
 }
 
-fn now() -> String {
+pub(crate) fn now() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
@@ -3072,5 +3104,25 @@ mod tests {
             ),
             Err(StorageLibraryError::InvalidGenerationState { .. })
         ));
+    }
+
+    #[test]
+    fn linking_a_location_refreshes_the_search_projection() {
+        let fixture = fixture();
+        let library = &fixture.library;
+        let root = create_root(library, "root_a", true);
+        let media = create_media(library, "media_a");
+        let object = create_object(library, "object_a", &root, "Trips/C0103.MP4");
+        link(library, &media, &object);
+
+        let connection = open_read_only_connection(library.database_path()).unwrap();
+        let filename: String = connection
+            .query_row(
+                "SELECT filename FROM media_search_index WHERE media_object_id = ?1",
+                [media.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(filename, "C0103.MP4");
     }
 }

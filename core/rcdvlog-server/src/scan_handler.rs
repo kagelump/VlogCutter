@@ -1077,6 +1077,8 @@ fn commit_quick_fingerprint(
             r#"INSERT INTO media_object_locations (media_object_id, storage_object_id, verification_state, linked_at, updated_at) VALUES (?1, ?2, 'provisional', ?3, ?3)"#,
             rusqlite::params![new_media_id.as_str(), object_id.as_str(), now],
         )?;
+        crate::search_index::refresh_media_search_row(tx, new_media_id.as_str())
+            .map_err(|e| JobEngineError::InvalidInput(format!("{e}")))?;
     }
 
     // Record accessible observation in the scan generation
@@ -1134,6 +1136,19 @@ fn commit_probe(
     };
     crate::media_facts::upsert_probe_fact(tx, &fact)
         .map_err(|e| JobEngineError::InvalidInput(format!("{e}")))?;
+
+    if let Some(media_object_id) = tx
+        .query_row(
+            "SELECT media_object_id FROM media_object_locations WHERE storage_object_id = ?1",
+            [fact.storage_object_id.as_str()],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|e| JobEngineError::InvalidInput(format!("{e}")))?
+    {
+        crate::search_index::refresh_media_search_row(tx, &media_object_id)
+            .map_err(|e| JobEngineError::InvalidInput(format!("{e}")))?;
+    }
     Ok(())
 }
 
@@ -1211,18 +1226,26 @@ fn commit_full_hash(
                     r#"INSERT INTO media_object_locations (media_object_id, storage_object_id, verification_state, linked_at, updated_at) VALUES (?1, ?2, 'verified', ?3, ?3)"#,
                     rusqlite::params![verified_media_id, object_id.as_str(), now],
                 )?;
+                crate::search_index::refresh_media_search_row(tx, current_media)
+                    .map_err(|e| JobEngineError::InvalidInput(format!("{e}")))?;
+                crate::search_index::refresh_media_search_row(tx, &verified_media_id)
+                    .map_err(|e| JobEngineError::InvalidInput(format!("{e}")))?;
             } else {
                 // Already linked to the correct verified media; just update state
                 tx.execute(
                     "UPDATE media_object_locations SET verification_state = 'verified', updated_at = ?2 WHERE storage_object_id = ?1",
                     rusqlite::params![object_id.as_str(), now],
                 )?;
+                crate::search_index::refresh_media_search_row(tx, &verified_media_id)
+                    .map_err(|e| JobEngineError::InvalidInput(format!("{e}")))?;
             }
         } else {
             tx.execute(
                 r#"INSERT INTO media_object_locations (media_object_id, storage_object_id, verification_state, linked_at, updated_at) VALUES (?1, ?2, 'verified', ?3, ?3)"#,
                 rusqlite::params![verified_media_id, object_id.as_str(), now],
             )?;
+            crate::search_index::refresh_media_search_row(tx, &verified_media_id)
+                .map_err(|e| JobEngineError::InvalidInput(format!("{e}")))?;
         }
     } else {
         // No verified match: promote the current provisional to verified.
@@ -1277,6 +1300,8 @@ fn commit_full_hash(
                 "UPDATE media_object_locations SET verification_state = 'verified', updated_at = ?2 WHERE storage_object_id = ?1",
                 rusqlite::params![object_id.as_str(), now],
             )?;
+            crate::search_index::refresh_media_search_row(tx, current_media)
+                .map_err(|e| JobEngineError::InvalidInput(format!("{e}")))?;
         }
     }
 

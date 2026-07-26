@@ -9,6 +9,7 @@ mod replicas;
 mod representations;
 mod scan;
 pub mod scan_handler;
+mod search_index;
 mod storage_path;
 
 pub use rcdvlog_core::{
