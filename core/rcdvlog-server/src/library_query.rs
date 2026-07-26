@@ -392,99 +392,226 @@ mod tests {
         ));
     }
 
-    /// One `LibraryQuery` per row of the supported sort/filter matrix in the
-    /// task brief, plus a cursor-bearing variant of each row -- a
-    /// continuation predicate can change which index SQLite picks, so the
-    /// cursor-present shape has to be proven independently of the bare one.
-    fn supported_query_matrix() -> Vec<LibraryQuery> {
-        let mut queries = Vec::new();
+    #[test]
+    fn verification_state_filter_is_present_in_sql_and_bindings() {
+        let query = LibraryQuery {
+            limit: 50,
+            sort: LibrarySort::CreatedDesc,
+            filters: LibraryFilters {
+                verification_state: Some(GlobalMediaVerificationState::Verified),
+                ..filters()
+            },
+            after: None,
+        };
+        let plan = plan_library_query(&query).unwrap();
+        assert!(plan.sql.contains("verification_state = ?1"));
+        assert_eq!(
+            plan.bindings[0],
+            rusqlite::types::Value::Text("verified".to_string())
+        );
+    }
+
+    #[test]
+    fn storage_root_filter_is_present_in_sql_and_bindings() {
+        let query = LibraryQuery {
+            limit: 50,
+            sort: LibrarySort::CreatedDesc,
+            filters: LibraryFilters {
+                storage_root_id: Some(StorageRootId::parse("root_a").unwrap()),
+                ..filters()
+            },
+            after: None,
+        };
+        let plan = plan_library_query(&query).unwrap();
+        assert!(plan.sql.contains("primary_storage_root_id = ?1"));
+        assert_eq!(
+            plan.bindings[0],
+            rusqlite::types::Value::Text("root_a".to_string())
+        );
+    }
+
+    #[test]
+    fn camera_folded_filter_is_present_in_sql_and_bindings() {
+        let query = LibraryQuery {
+            limit: 50,
+            sort: LibrarySort::CreatedDesc,
+            filters: LibraryFilters {
+                camera_folded: Some("Sony ILCE-7M4".into()),
+                ..filters()
+            },
+            after: None,
+        };
+        let plan = plan_library_query(&query).unwrap();
+        assert!(plan.sql.contains("camera_folded = ?1"));
+        assert_eq!(
+            plan.bindings[0],
+            rusqlite::types::Value::Text("sony ilce-7m4".to_string())
+        );
+    }
+
+    #[test]
+    fn filename_prefix_filter_is_present_in_sql_and_bindings() {
+        let query = LibraryQuery {
+            limit: 50,
+            sort: LibrarySort::FilenameAsc,
+            filters: LibraryFilters {
+                filename_prefix: Some("Clip".into()),
+                ..filters()
+            },
+            after: None,
+        };
+        let plan = plan_library_query(&query).unwrap();
+        assert!(
+            plan.sql
+                .contains("filename_folded >= ?1 AND filename_folded < ?2")
+        );
+        assert_eq!(
+            plan.bindings[0],
+            rusqlite::types::Value::Text("clip".to_string())
+        );
+        assert_eq!(
+            plan.bindings[1],
+            rusqlite::types::Value::Text(prefix_upper_bound("clip"))
+        );
+    }
+
+    /// One `(LibraryQuery, expected_index)` pair per row of the supported
+    /// sort/filter matrix in the task brief, plus a cursor-bearing variant of
+    /// each row -- a continuation predicate can change which index SQLite
+    /// picks, so the cursor-present shape has to be proven independently of
+    /// the bare one. The expected index is asserted by name, not merely "some
+    /// index was used" -- a plain `ORDER BY created_at DESC` scan of
+    /// `media_search_created` would satisfy a name-blind check even if the
+    /// filter predicate itself had been silently dropped, which is exactly
+    /// the regression this matrix exists to catch.
+    fn supported_query_matrix() -> Vec<(LibraryQuery, &'static str)> {
+        let mut rows = Vec::new();
 
         let created_filter_sets = [
-            LibraryFilters::default(),
-            LibraryFilters {
-                verification_state: Some(GlobalMediaVerificationState::Verified),
-                ..LibraryFilters::default()
-            },
-            LibraryFilters {
-                storage_root_id: Some(StorageRootId::parse("root_matrix").unwrap()),
-                ..LibraryFilters::default()
-            },
-            LibraryFilters {
-                camera_folded: Some("acme cam-1".into()),
-                ..LibraryFilters::default()
-            },
+            (LibraryFilters::default(), "media_search_created"),
+            (
+                LibraryFilters {
+                    verification_state: Some(GlobalMediaVerificationState::Verified),
+                    ..LibraryFilters::default()
+                },
+                "media_search_state_created",
+            ),
+            (
+                LibraryFilters {
+                    storage_root_id: Some(StorageRootId::parse("root_matrix").unwrap()),
+                    ..LibraryFilters::default()
+                },
+                "media_search_root_created",
+            ),
+            (
+                LibraryFilters {
+                    camera_folded: Some("acme cam-1".into()),
+                    ..LibraryFilters::default()
+                },
+                "media_search_camera_created",
+            ),
         ];
-        for filter_set in created_filter_sets {
-            queries.push(LibraryQuery {
-                limit: 50,
-                sort: LibrarySort::CreatedDesc,
-                filters: filter_set.clone(),
-                after: None,
-            });
+        for (filter_set, expected_index) in created_filter_sets {
+            rows.push((
+                LibraryQuery {
+                    limit: 50,
+                    sort: LibrarySort::CreatedDesc,
+                    filters: filter_set.clone(),
+                    after: None,
+                },
+                expected_index,
+            ));
             let key = CursorKey::Created {
                 created_at: "2026-07-20T00:00:00Z".into(),
                 media_object_id: "media_a".into(),
             };
             let after = encode_cursor(LibrarySort::CreatedDesc, &filter_set, &key);
-            queries.push(LibraryQuery {
-                limit: 50,
-                sort: LibrarySort::CreatedDesc,
-                filters: filter_set,
-                after: Some(after),
-            });
+            rows.push((
+                LibraryQuery {
+                    limit: 50,
+                    sort: LibrarySort::CreatedDesc,
+                    filters: filter_set,
+                    after: Some(after),
+                },
+                expected_index,
+            ));
         }
 
         let filename_filter_sets = [
-            LibraryFilters::default(),
-            LibraryFilters {
-                filename_prefix: Some("clip".into()),
-                ..LibraryFilters::default()
-            },
+            (LibraryFilters::default(), "media_search_filename"),
+            (
+                LibraryFilters {
+                    filename_prefix: Some("clip".into()),
+                    ..LibraryFilters::default()
+                },
+                "media_search_filename",
+            ),
         ];
-        for filter_set in filename_filter_sets {
-            queries.push(LibraryQuery {
-                limit: 50,
-                sort: LibrarySort::FilenameAsc,
-                filters: filter_set.clone(),
-                after: None,
-            });
+        for (filter_set, expected_index) in filename_filter_sets {
+            rows.push((
+                LibraryQuery {
+                    limit: 50,
+                    sort: LibrarySort::FilenameAsc,
+                    filters: filter_set.clone(),
+                    after: None,
+                },
+                expected_index,
+            ));
             let key = CursorKey::Filename {
                 filename_folded: "clip_001.mov".into(),
                 media_object_id: "media_a".into(),
             };
             let after = encode_cursor(LibrarySort::FilenameAsc, &filter_set, &key);
-            queries.push(LibraryQuery {
-                limit: 50,
-                sort: LibrarySort::FilenameAsc,
-                filters: filter_set,
-                after: Some(after),
-            });
+            rows.push((
+                LibraryQuery {
+                    limit: 50,
+                    sort: LibrarySort::FilenameAsc,
+                    filters: filter_set,
+                    after: Some(after),
+                },
+                expected_index,
+            ));
         }
 
         let size_filters = LibraryFilters::default();
-        queries.push(LibraryQuery {
-            limit: 50,
-            sort: LibrarySort::SizeDesc,
-            filters: size_filters.clone(),
-            after: None,
-        });
+        rows.push((
+            LibraryQuery {
+                limit: 50,
+                sort: LibrarySort::SizeDesc,
+                filters: size_filters.clone(),
+                after: None,
+            },
+            "media_search_size",
+        ));
         let key = CursorKey::Size {
             size_bytes: Some(1_048_576),
             media_object_id: "media_a".into(),
         };
         let after = encode_cursor(LibrarySort::SizeDesc, &size_filters, &key);
-        queries.push(LibraryQuery {
-            limit: 50,
-            sort: LibrarySort::SizeDesc,
-            filters: size_filters,
-            after: Some(after),
-        });
+        rows.push((
+            LibraryQuery {
+                limit: 50,
+                sort: LibrarySort::SizeDesc,
+                filters: size_filters,
+                after: Some(after),
+            },
+            "media_search_size",
+        ));
 
-        queries
+        rows
+    }
+
+    /// True if some plan row both used an index (not a bare table scan) and
+    /// named the specific index we expect for this combination.
+    fn plan_uses_named_index(rows: &[String], index_name: &str) -> bool {
+        rows.iter().any(|row| {
+            (row.contains("USING INDEX") || row.contains("USING COVERING INDEX"))
+                && row.contains(index_name)
+        })
     }
 
     #[test]
-    fn every_supported_combination_uses_an_index() {
+    fn every_supported_combination_uses_its_specific_index() {
         let directory = tempfile::tempdir().unwrap();
         let mut connection =
             rusqlite::Connection::open(directory.path().join("control.sqlite3")).unwrap();
@@ -494,7 +621,7 @@ mod tests {
         )
         .unwrap();
 
-        for query in supported_query_matrix() {
+        for (query, expected_index) in supported_query_matrix() {
             let plan = plan_library_query(&query).unwrap();
             let mut statement = connection
                 .prepare(&format!("EXPLAIN QUERY PLAN {}", plan.sql))
@@ -506,13 +633,21 @@ mod tests {
                 .unwrap()
                 .collect::<Result<_, _>>()
                 .unwrap();
-            let uses_index = rows
-                .iter()
-                .any(|row| row.contains("USING INDEX") || row.contains("USING COVERING INDEX"));
             assert!(
-                uses_index,
-                "combination produced a scan: sort={:?} filters={:?} after={:?} plan={rows:?}",
-                query.sort, query.filters, query.after
+                !rows.iter().any(|row| row.contains("TEMP B-TREE")),
+                "combination required an extra sort step, so its index does not \
+                 fully satisfy ORDER BY: sort={:?} filters={:?} after={:?} plan={rows:?}",
+                query.sort,
+                query.filters,
+                query.after
+            );
+            assert!(
+                plan_uses_named_index(&rows, expected_index),
+                "combination did not use the expected index {expected_index}: \
+                 sort={:?} filters={:?} after={:?} plan={rows:?}",
+                query.sort,
+                query.filters,
+                query.after
             );
         }
     }

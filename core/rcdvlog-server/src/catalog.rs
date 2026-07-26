@@ -72,6 +72,19 @@ pub const CONTROL_CATALOG_MIGRATIONS: &[SqliteMigration] = &[
     },
 ];
 
+/// Migration 8's backfill folds `media_search_index.filename_folded` and
+/// `camera_folded` with SQLite's `LOWER()`, which is ASCII-only in a default
+/// build. Every other write path (`search_index::refresh_media_search_row`,
+/// and the query planner's `filenamePrefix` handling in `library_query.rs`)
+/// folds with Rust's Unicode-aware `str::to_lowercase`. A catalog that has
+/// pre-existing non-ASCII filenames or camera strings when this migration
+/// first applies would otherwise carry backfilled rows whose folding
+/// disagrees with every row touched afterward. `ControlCatalog::open_or_create`
+/// uses this id to detect "migration 8 is about to apply for the first time"
+/// so it can run one reconciling `rebuild_media_search_index()` pass
+/// immediately after -- see the comment there.
+const LIBRARY_SEARCH_INDEX_MIGRATION_ID: u32 = 8;
+
 #[derive(Debug, Error, Serialize)]
 #[error("another RCD VlogCutter server process already holds the data-directory lock; {action}")]
 #[serde(rename_all = "camelCase")]
@@ -146,15 +159,42 @@ impl ControlCatalog {
     pub fn open_or_create(data_dir: &Path, config: &ConfigDiagnostics) -> Result<Self> {
         let database_path = data_dir.join(CONTROL_DATABASE_FILENAME);
         let mut connection = open_writable_connection(&database_path)?;
+
+        // Must be read before migrating: once migration 8 has run, it is no
+        // longer "pending" and this signal is gone. See the constant's doc
+        // comment for why this reconciliation exists at all.
+        let library_search_index_pending =
+            inspect_sqlite_migrations(&connection, CONTROL_CATALOG_MIGRATIONS)
+                .context("inspect server control catalog migrations")?
+                .pending_migrations
+                .iter()
+                .any(|migration| migration.id == LIBRARY_SEARCH_INDEX_MIGRATION_ID);
+
         run_sqlite_migrations(&mut connection, CONTROL_CATALOG_MIGRATIONS)
             .context("migrate server control catalog")?;
         let node_id = load_or_create_node_id(&mut connection)?;
         record_configuration_revision(&mut connection, config)?;
         record_operational_timestamp(&connection, "last_started_at")?;
-        Ok(Self {
+
+        let catalog = Self {
             database_path,
             node_id,
-        })
+        };
+
+        // Runs at most once per catalog, ever: after this open, migration 8
+        // is applied and `library_search_index_pending` will be false on
+        // every future open. Cheap on a fresh install (no media objects
+        // exist yet); on an upgrade it re-derives every row's folded columns
+        // through the same Rust `to_lowercase` path every other write uses,
+        // so the ASCII-only SQL backfill never lingers as a mismatched copy.
+        if library_search_index_pending {
+            catalog
+                .storage_library()
+                .rebuild_media_search_index()
+                .context("reconcile library search index folding after migration 8")?;
+        }
+
+        Ok(catalog)
     }
 
     pub fn database_path(&self) -> &Path {
@@ -1504,5 +1544,92 @@ mod tests {
         assert_eq!(no_location.1, None);
         assert_eq!(no_location.2, None);
         assert_eq!(no_location.3, 0);
+    }
+
+    #[test]
+    fn opening_after_migration_8_reconciles_non_ascii_folding_from_the_backfill_path() {
+        use crate::library_query::{LibraryFilters, LibraryQuery, LibrarySort, plan_library_query};
+
+        let root = TempDir::new().unwrap();
+        let config = config(&root);
+        let database_path = config.data_dir.join(CONTROL_DATABASE_FILENAME);
+
+        // Simulate a pre-existing catalog already at migration 7 (before
+        // library_search_index ships) that already has a media object with a
+        // non-ASCII filename -- exactly the kind of row migration 8's SQL
+        // `LOWER()` backfill folds differently from Rust's `to_lowercase()`.
+        {
+            let mut connection = Connection::open(&database_path).unwrap();
+            run_sqlite_migrations(&mut connection, &CONTROL_CATALOG_MIGRATIONS[..7]).unwrap();
+            connection
+                .execute_batch(
+                    r#"
+                INSERT INTO storage_roots(storage_root_id, display_name, immutable_original, enabled, created_at, updated_at)
+                    VALUES ('root_nonascii', 'Root NonAscii', 1, 1, '2026-07-20T00:00:00Z', '2026-07-20T00:00:00Z');
+                INSERT INTO media_objects(media_object_id, size_bytes, quick_fingerprint, full_content_hash, verification_state, created_at, updated_at)
+                    VALUES ('media_nonascii', 4096, 'quick_nonascii', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'verified', '2026-07-20T00:00:00Z', '2026-07-20T00:00:00Z');
+                INSERT INTO storage_objects(storage_object_id, storage_root_id, relative_path, size_bytes, created_at, updated_at)
+                    VALUES ('object_nonascii', 'root_nonascii', 'Trips/2025/ÄRLIG.MP4', 4096, '2026-07-20T00:00:00Z', '2026-07-20T00:00:00Z');
+                INSERT INTO media_object_locations(media_object_id, storage_object_id, verification_state, linked_at, updated_at)
+                    VALUES ('media_nonascii', 'object_nonascii', 'verified', '2026-07-20T00:00:00Z', '2026-07-20T00:00:00Z');
+                "#,
+                )
+                .unwrap();
+
+            // Documents the premise this whole reconciliation exists for:
+            // SQLite's built-in LOWER() is ASCII-only in this build, so it
+            // leaves the non-ASCII character untouched.
+            let sql_lower: String = connection
+                .query_row("SELECT LOWER('ÄRLIG.MP4')", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(sql_lower, "Ärlig.mp4");
+        }
+
+        // Opening the catalog applies migration 8 (the ASCII-only SQL
+        // backfill) and must also trigger the one-time reconciliation pass.
+        let catalog =
+            ControlCatalog::open_or_create(&config.data_dir, &config.diagnostics()).unwrap();
+
+        let verify_connection = Connection::open(catalog.database_path()).unwrap();
+        let filename_folded: String = verify_connection
+            .query_row(
+                "SELECT filename_folded FROM media_search_index WHERE media_object_id = 'media_nonascii'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            filename_folded, "ärlig.mp4",
+            "reconciliation must fold with Rust's Unicode-aware to_lowercase, \
+             not SQL LOWER()'s ASCII-only fold"
+        );
+
+        // Prove it end-to-end: a filenamePrefix query for the Rust-folded
+        // prefix finds this media object, even though it only ever went
+        // through the migration backfill -- never an explicit per-row
+        // refresh call.
+        let query = LibraryQuery {
+            limit: 50,
+            sort: LibrarySort::FilenameAsc,
+            filters: LibraryFilters {
+                filename_prefix: Some("är".to_string()),
+                ..LibraryFilters::default()
+            },
+            after: None,
+        };
+        let plan = plan_library_query(&query).unwrap();
+        let mut statement = verify_connection.prepare(&plan.sql).unwrap();
+        let ids: Vec<String> = statement
+            .query_map(rusqlite::params_from_iter(plan.bindings.iter()), |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert!(
+            ids.contains(&"media_nonascii".to_string()),
+            "non-ASCII filename must be findable by its Rust-folded prefix \
+             after the backfill path, not only after a refresh: {ids:?}"
+        );
     }
 }
