@@ -62,7 +62,8 @@ At epic completion, the user can:
 - Public hosting or Tailscale Funnel
 - Offline browser editing
 - Web project creation or any project deletion
-- Original upload, archive transfer, rename, deletion, or cleanup
+- Original upload, archive transfer, rename, deletion, or cleanup (original upload and
+  archive transfer are taken up by the [Travel Ingest epic](../travel/EPIC.md))
 - Bulk offline preparation and cache policy
 - Durable local Mac worker queue or competitive cross-node scheduling
 - Web chronology editing or conflict resolution
@@ -137,6 +138,37 @@ At epic completion, the user can:
 | [20](TASK_20_update_all_documentation.md) | Repository-wide documentation update | 19 |
 
 Tasks should land in dependency order. Tasks on separate branches may proceed concurrently only after their declared prerequisites have stabilized their contracts.
+
+### Follow-on: Travel Ingest
+
+The [Travel Ingest epic](../travel/EPIC.md) extends this work with phone-carried SD-card
+ingest, a writable NAS archive root, a resumable original-media transfer protocol, and
+server-origin project creation. It builds on this epic rather than replacing any part of it.
+
+| Travel task | Depends on this epic's |
+| --- | --- |
+| [T1](../travel/TASK_T1_writable_archive_root_and_commit_path.md) Writable archive root | 3, 5 |
+| [T2](../travel/TASK_T2_resumable_transfer_protocol.md) Resumable transfer protocol | 4 |
+| [T3](../travel/TASK_T3_archive_ingest_and_dedupe.md) Archive ingest and dedupe | 5 |
+| [T4](../travel/TASK_T4_mobile_proxy_recipe.md) Mobile proxy recipe | 6 |
+| [T5](../travel/TASK_T5_server_origin_projects_and_desktop_adoption.md) Server-origin projects | 7, 8, **10** |
+| [T6](../travel/TASK_T6_mobile_app_foundation.md) Mobile app foundation | 9 |
+
+Two decisions in that epic amend commitments made here, and are recorded in
+[its architecture document](../travel/ARCHITECTURE.md):
+
+- **Project creation is no longer desktop-only.** Projects may be created on the desktop or
+  the server; each project has one replica per node that has adopted it. Project deletion
+  remains out of scope everywhere. Task 10's baseline machinery is reused in reverse.
+- **A writable storage root is introduced.** It is a distinct logical root with
+  `immutable_original: false` and a create-only write path. Existing NAS scan roots remain
+  immutable and read-only, and the enforcement in `library.rs` is unchanged.
+
+Task 10 is the one genuine prerequisite gap: travel T5 cannot start until it lands.
+
+Several task files below carry stale `Status:` markers — Tasks 1–8, 11, 12, and 13 are
+implemented in whole or in part despite being marked Planned, and Task 9's authentication
+core exists. Trust the code and git history until Task 20 reconciles them.
 
 ## Milestones
 
