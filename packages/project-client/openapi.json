@@ -11,6 +11,46 @@
         },
         "description": "Stable server error"
       },
+      "LibraryMediaDetail": {
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/LibraryMediaDetail"
+            }
+          }
+        },
+        "description": "One media object with its search facts and node-relative availability"
+      },
+      "LibrarySearchPage": {
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/LibrarySearchPage"
+            }
+          }
+        },
+        "description": "A page of the global media library search"
+      },
+      "ProjectAssetPage": {
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ProjectAssetPage"
+            }
+          }
+        },
+        "description": "A page of one project's assets"
+      },
+      "Projects": {
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Projects"
+            }
+          }
+        },
+        "description": "Every registered project replica"
+      },
       "Readiness": {
         "content": {
           "application/json": {
@@ -91,6 +131,364 @@
           "code"
         ],
         "type": "object"
+      },
+      "GlobalMediaVerificationState": {
+        "enum": [
+          "unverified",
+          "provisional",
+          "verified",
+          "mismatch"
+        ],
+        "type": "string"
+      },
+      "LibraryMediaDetail": {
+        "properties": {
+          "availability": {
+            "$ref": "#/components/schemas/MediaAvailability"
+          },
+          "facts": {
+            "$ref": "#/components/schemas/MediaSearchFacts"
+          },
+          "media": {
+            "$ref": "#/components/schemas/MediaObject"
+          }
+        },
+        "required": [
+          "media",
+          "facts",
+          "availability"
+        ],
+        "type": "object"
+      },
+      "LibrarySearchItem": {
+        "properties": {
+          "availability": {
+            "$ref": "#/components/schemas/NodeAvailabilityState"
+          },
+          "cameraMake": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "cameraModel": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "filename": {
+            "type": "string"
+          },
+          "media": {
+            "$ref": "#/components/schemas/MediaObject"
+          },
+          "primaryStorageRootId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "projectMembershipCount": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "storageLocationCount": {
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "media",
+          "filename",
+          "cameraMake",
+          "cameraModel",
+          "primaryStorageRootId",
+          "storageLocationCount",
+          "projectMembershipCount",
+          "availability"
+        ],
+        "type": "object"
+      },
+      "LibrarySearchPage": {
+        "properties": {
+          "availabilityFilterApplied": {
+            "type": "boolean"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/LibrarySearchItem"
+            },
+            "type": "array"
+          },
+          "nextCursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "items",
+          "nextCursor",
+          "availabilityFilterApplied"
+        ],
+        "type": "object"
+      },
+      "LibrarySort": {
+        "enum": [
+          "createdDesc",
+          "filenameAsc",
+          "sizeDesc"
+        ],
+        "type": "string"
+      },
+      "MediaAvailability": {
+        "properties": {
+          "locations": {
+            "items": {
+              "$ref": "#/components/schemas/StorageLocationAvailability"
+            },
+            "type": "array"
+          },
+          "mediaObjectId": {
+            "type": "string"
+          },
+          "queriedNodeId": {
+            "type": "string"
+          },
+          "state": {
+            "$ref": "#/components/schemas/NodeAvailabilityState"
+          }
+        },
+        "required": [
+          "mediaObjectId",
+          "queriedNodeId",
+          "state",
+          "locations"
+        ],
+        "type": "object"
+      },
+      "MediaObject": {
+        "properties": {
+          "createdAt": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "fullContentHash": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "type": "string"
+          },
+          "quickFingerprint": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "sizeBytes": {
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "updatedAt": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "verificationState": {
+            "$ref": "#/components/schemas/GlobalMediaVerificationState"
+          }
+        },
+        "required": [
+          "id",
+          "sizeBytes",
+          "quickFingerprint",
+          "fullContentHash",
+          "verificationState",
+          "createdAt",
+          "updatedAt"
+        ],
+        "type": "object"
+      },
+      "MediaSearchFacts": {
+        "properties": {
+          "cameraMake": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "cameraModel": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "filename": {
+            "type": "string"
+          },
+          "primaryStorageRootId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "projectMembershipCount": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "storageLocationCount": {
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "filename",
+          "cameraMake",
+          "cameraModel",
+          "primaryStorageRootId",
+          "storageLocationCount",
+          "projectMembershipCount"
+        ],
+        "type": "object"
+      },
+      "NodeAvailabilityState": {
+        "enum": [
+          "known",
+          "accessible_here",
+          "accessible_on_another_node",
+          "temporarily_unavailable",
+          "missing_after_completed_observation",
+          "fingerprint_mismatch"
+        ],
+        "type": "string"
+      },
+      "ProjectAssetItem": {
+        "properties": {
+          "activeNote": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "bestTime": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "camera": {
+            "type": "string"
+          },
+          "durationSeconds": {
+            "type": "number"
+          },
+          "filename": {
+            "type": "string"
+          },
+          "labels": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "mediaObjectId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "mediaVerificationState": {
+            "type": "string"
+          },
+          "projectAssetId": {
+            "type": "string"
+          },
+          "removed": {
+            "type": "boolean"
+          },
+          "rotationDegrees": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "projectAssetId",
+          "filename",
+          "camera",
+          "mediaObjectId",
+          "mediaVerificationState",
+          "removed",
+          "rotationDegrees",
+          "labels",
+          "activeNote",
+          "durationSeconds",
+          "bestTime"
+        ],
+        "type": "object"
+      },
+      "ProjectAssetPage": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/ProjectAssetItem"
+            },
+            "type": "array"
+          },
+          "nextCursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "items",
+          "nextCursor"
+        ],
+        "type": "object"
+      },
+      "ProjectSummary": {
+        "properties": {
+          "assetCount": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "projectId": {
+            "type": "string"
+          },
+          "registeredAt": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "state": {
+            "type": "string"
+          },
+          "updatedAt": {
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "projectId",
+          "state",
+          "assetCount",
+          "registeredAt",
+          "updatedAt"
+        ],
+        "type": "object"
+      },
+      "Projects": {
+        "items": {
+          "$ref": "#/components/schemas/ProjectSummary"
+        },
+        "type": "array"
       },
       "ProtocolVersion": {
         "properties": {
@@ -237,6 +635,40 @@
         ],
         "type": "object"
       },
+      "StorageLocationAvailability": {
+        "properties": {
+          "completedGenerationId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "completedGenerationSequence": {
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "nodeId": {
+            "type": "string"
+          },
+          "state": {
+            "$ref": "#/components/schemas/NodeAvailabilityState"
+          },
+          "storageObjectId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "nodeId",
+          "storageObjectId",
+          "state",
+          "completedGenerationId",
+          "completedGenerationSequence"
+        ],
+        "type": "object"
+      },
       "Version": {
         "properties": {
           "applicationVersion": {
@@ -304,6 +736,176 @@
             "$ref": "#/components/responses/Sessions"
           },
           "401": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/v1/library/media": {
+      "get": {
+        "operationId": "listLibraryMedia",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "limit",
+            "schema": {
+              "maximum": 200,
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "sort",
+            "schema": {
+              "$ref": "#/components/schemas/LibrarySort"
+            }
+          },
+          {
+            "in": "query",
+            "name": "verificationState",
+            "schema": {
+              "$ref": "#/components/schemas/GlobalMediaVerificationState"
+            }
+          },
+          {
+            "in": "query",
+            "name": "storageRootId",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "camera",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "filenamePrefix",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "availability",
+            "schema": {
+              "$ref": "#/components/schemas/NodeAvailabilityState"
+            }
+          },
+          {
+            "in": "query",
+            "name": "after",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/LibrarySearchPage"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/v1/library/media/{mediaObjectId}": {
+      "get": {
+        "operationId": "getLibraryMediaDetail",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "mediaObjectId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/LibraryMediaDetail"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/v1/projects": {
+      "get": {
+        "operationId": "listProjects",
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/Projects"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/v1/projects/{projectId}/assets": {
+      "get": {
+        "operationId": "listProjectAssets",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "projectId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "schema": {
+              "maximum": 200,
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "after",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "search",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/ProjectAssetPage"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
             "$ref": "#/components/responses/Error"
           }
         }

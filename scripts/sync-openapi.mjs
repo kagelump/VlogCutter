@@ -24,6 +24,8 @@ export const API_PATHS = {
   ready: "/api/v1/ready",
   sessions: "/api/v1/auth/sessions",
   bootstrapExchange: "/api/v1/auth/bootstrap/exchange",
+  libraryMedia: "/api/v1/library/media",
+  projects: "/api/v1/projects",
 } as const;
 `;
 const schemaPath = resolve(root, "packages/project-client/openapi.json");

@@ -14,8 +14,9 @@ mod search_index;
 mod storage_path;
 
 pub use rcdvlog_core::{
-    Catalog, CatalogSchemaError, JobId, MediaObjectId, NodeId, PROJECT_CATALOG_SCHEMA_VERSION,
-    ProjectAssetAddedPayload, ProjectAssetItem, ProjectAssetPage, ProjectId, RepresentationId,
+    Catalog, CatalogSchemaError, GlobalMediaVerificationState, JobId, MediaObjectId,
+    NodeAvailabilityState, NodeId, PROJECT_CATALOG_SCHEMA_VERSION, ProjectAssetAddedPayload,
+    ProjectAssetItem, ProjectAssetPage, ProjectId, RepresentationId, StorageRootId,
 };
 pub use rcdvlog_sync::{
     BASELINE_VERSION, BaselineEnvelope, BaselinePayload, BaselinePreview, NodeTargetedJob,
@@ -47,9 +48,10 @@ pub use jobs::{
     ServerCapability, SystemClock, cancel_child_safely,
 };
 pub use library::{
-    AssetObservationInput, LibraryCursor, LocalNodeRootBindingInput, MediaAvailability,
-    MediaLibraryItem, MediaLibraryPage, MediaLibraryQuery, MediaObject, MediaObjectLocation,
-    NewMediaObject, NewStorageObject, NewStorageRoot, NodeRootBindingAdmin, NodeRootCapability,
+    AssetObservationInput, LibraryCursor, LibrarySearchItem, LibrarySearchPage,
+    LocalNodeRootBindingInput, MediaAvailability, MediaLibraryItem, MediaLibraryPage,
+    MediaLibraryQuery, MediaObject, MediaObjectLocation, MediaSearchFacts, NewMediaObject,
+    NewStorageObject, NewStorageRoot, NodeRootBindingAdmin, NodeRootCapability,
     NodeRootCapabilityInput, ObservationGeneration, ObservationScope,
     ProjectMediaMembershipProjection, StorageLibrary, StorageLibraryError,
     StorageLocationAvailability, StorageObject, StorageRoot, StorageRootUpdate,

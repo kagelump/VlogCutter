@@ -1,7 +1,10 @@
+#![recursion_limit = "256"]
+
 use anyhow::{Context, Result, anyhow};
 use axum::body::Body;
+use axum::extract::rejection::QueryRejection;
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
-use axum::extract::{DefaultBodyLimit, Extension, OriginalUri, Path as AxumPath, State};
+use axum::extract::{DefaultBodyLimit, Extension, OriginalUri, Path as AxumPath, Query, State};
 use axum::http::{HeaderMap, HeaderValue, Method, Request, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -9,13 +12,15 @@ use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use futures::SinkExt;
 use futures::stream::StreamExt;
+use rcdvlog_server_core::library_query::{LibraryFilters, LibraryQuery, LibrarySort};
 use rcdvlog_server_core::{
     APPLICATION_VERSION, AuthDiagnostics, AuthError, AuthService, BaselineEnvelope,
-    BaselinePreview, CONTROL_CATALOG_SCHEMA_VERSION, DeviceCredentialInfo, JobId, MediaObjectId,
-    NodeId, NodeJobCompletion, PROTOCOL_MAJOR_VERSION, PROTOCOL_MINOR_VERSION, ProjectId,
-    ProjectReplica, ProjectReplicaError, ReadinessReport, ReconcileRequest, ReconcileResponse,
-    Representation, RepresentationError, RepresentationId, RepresentationRequest,
-    RuntimeFoundation, SessionInfo,
+    BaselinePreview, CONTROL_CATALOG_SCHEMA_VERSION, DeviceCredentialInfo,
+    GlobalMediaVerificationState, JobId, MediaAvailability, MediaObject, MediaObjectId,
+    MediaSearchFacts, NodeAvailabilityState, NodeId, NodeJobCompletion, PROTOCOL_MAJOR_VERSION,
+    PROTOCOL_MINOR_VERSION, ProjectId, ProjectReplica, ProjectReplicaError, ReadinessReport,
+    ReconcileRequest, ReconcileResponse, Representation, RepresentationError, RepresentationId,
+    RepresentationRequest, RuntimeFoundation, SessionInfo, StorageLibraryError, StorageRootId,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -533,6 +538,16 @@ pub fn router(state: HttpState) -> Router {
             post(complete_node_job),
         )
         .route("/api/v1/ws/events", get(ws_events_handler))
+        .route("/api/v1/library/media", get(list_library_media))
+        .route(
+            "/api/v1/library/media/{media_object_id}",
+            get(get_library_media_detail),
+        )
+        .route("/api/v1/projects", get(list_projects))
+        .route(
+            "/api/v1/projects/{project_id}/assets",
+            get(list_project_assets),
+        )
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
@@ -604,6 +619,66 @@ pub fn openapi_document() -> serde_json::Value {
                     "responses": {
                         "200": { "$ref": "#/components/responses/Sessions" },
                         "401": { "$ref": "#/components/responses/Error" }
+                    }
+                }
+            },
+            "/api/v1/library/media": {
+                "get": {
+                    "operationId": "listLibraryMedia",
+                    "parameters": [
+                        { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 200 } },
+                        { "name": "sort", "in": "query", "schema": { "$ref": "#/components/schemas/LibrarySort" } },
+                        { "name": "verificationState", "in": "query", "schema": { "$ref": "#/components/schemas/GlobalMediaVerificationState" } },
+                        { "name": "storageRootId", "in": "query", "schema": { "type": "string" } },
+                        { "name": "camera", "in": "query", "schema": { "type": "string" } },
+                        { "name": "filenamePrefix", "in": "query", "schema": { "type": "string" } },
+                        { "name": "availability", "in": "query", "schema": { "$ref": "#/components/schemas/NodeAvailabilityState" } },
+                        { "name": "after", "in": "query", "schema": { "type": "string" } }
+                    ],
+                    "responses": {
+                        "200": { "$ref": "#/components/responses/LibrarySearchPage" },
+                        "400": { "$ref": "#/components/responses/Error" },
+                        "401": { "$ref": "#/components/responses/Error" }
+                    }
+                }
+            },
+            "/api/v1/library/media/{mediaObjectId}": {
+                "get": {
+                    "operationId": "getLibraryMediaDetail",
+                    "parameters": [
+                        { "name": "mediaObjectId", "in": "path", "required": true, "schema": { "type": "string" } }
+                    ],
+                    "responses": {
+                        "200": { "$ref": "#/components/responses/LibraryMediaDetail" },
+                        "401": { "$ref": "#/components/responses/Error" },
+                        "404": { "$ref": "#/components/responses/Error" }
+                    }
+                }
+            },
+            "/api/v1/projects": {
+                "get": {
+                    "operationId": "listProjects",
+                    "responses": {
+                        "200": { "$ref": "#/components/responses/Projects" },
+                        "400": { "$ref": "#/components/responses/Error" },
+                        "401": { "$ref": "#/components/responses/Error" }
+                    }
+                }
+            },
+            "/api/v1/projects/{projectId}/assets": {
+                "get": {
+                    "operationId": "listProjectAssets",
+                    "parameters": [
+                        { "name": "projectId", "in": "path", "required": true, "schema": { "type": "string" } },
+                        { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 200 } },
+                        { "name": "after", "in": "query", "schema": { "type": "string" } },
+                        { "name": "search", "in": "query", "schema": { "type": "string" } }
+                    ],
+                    "responses": {
+                        "200": { "$ref": "#/components/responses/ProjectAssetPage" },
+                        "400": { "$ref": "#/components/responses/Error" },
+                        "401": { "$ref": "#/components/responses/Error" },
+                        "404": { "$ref": "#/components/responses/Error" }
                     }
                 }
             }
@@ -699,6 +774,146 @@ pub fn openapi_document() -> serde_json::Value {
                             "items": { "$ref": "#/components/schemas/SessionInfo" }
                         }
                     }
+                },
+                "LibrarySort": { "type": "string", "enum": ["createdDesc", "filenameAsc", "sizeDesc"] },
+                "GlobalMediaVerificationState": { "type": "string", "enum": ["unverified", "provisional", "verified", "mismatch"] },
+                "NodeAvailabilityState": {
+                    "type": "string",
+                    "enum": [
+                        "known",
+                        "accessible_here",
+                        "accessible_on_another_node",
+                        "temporarily_unavailable",
+                        "missing_after_completed_observation",
+                        "fingerprint_mismatch"
+                    ]
+                },
+                "MediaObject": {
+                    "type": "object",
+                    "required": ["id", "sizeBytes", "quickFingerprint", "fullContentHash", "verificationState", "createdAt", "updatedAt"],
+                    "properties": {
+                        "id": { "type": "string" },
+                        "sizeBytes": { "type": ["integer", "null"], "minimum": 0 },
+                        "quickFingerprint": { "type": ["string", "null"] },
+                        "fullContentHash": { "type": ["string", "null"] },
+                        "verificationState": { "$ref": "#/components/schemas/GlobalMediaVerificationState" },
+                        "createdAt": { "type": "string", "format": "date-time" },
+                        "updatedAt": { "type": "string", "format": "date-time" }
+                    }
+                },
+                "LibrarySearchItem": {
+                    "type": "object",
+                    "required": ["media", "filename", "cameraMake", "cameraModel", "primaryStorageRootId", "storageLocationCount", "projectMembershipCount", "availability"],
+                    "properties": {
+                        "media": { "$ref": "#/components/schemas/MediaObject" },
+                        "filename": { "type": "string" },
+                        "cameraMake": { "type": ["string", "null"] },
+                        "cameraModel": { "type": ["string", "null"] },
+                        "primaryStorageRootId": { "type": ["string", "null"] },
+                        "storageLocationCount": { "type": "integer", "minimum": 0 },
+                        "projectMembershipCount": { "type": "integer", "minimum": 0 },
+                        "availability": { "$ref": "#/components/schemas/NodeAvailabilityState" }
+                    }
+                },
+                "LibrarySearchPage": {
+                    "type": "object",
+                    "required": ["items", "nextCursor", "availabilityFilterApplied"],
+                    "properties": {
+                        "items": {
+                            "type": "array",
+                            "items": { "$ref": "#/components/schemas/LibrarySearchItem" }
+                        },
+                        "nextCursor": { "type": ["string", "null"] },
+                        "availabilityFilterApplied": { "type": "boolean" }
+                    }
+                },
+                "MediaSearchFacts": {
+                    "type": "object",
+                    "required": ["filename", "cameraMake", "cameraModel", "primaryStorageRootId", "storageLocationCount", "projectMembershipCount"],
+                    "properties": {
+                        "filename": { "type": "string" },
+                        "cameraMake": { "type": ["string", "null"] },
+                        "cameraModel": { "type": ["string", "null"] },
+                        "primaryStorageRootId": { "type": ["string", "null"] },
+                        "storageLocationCount": { "type": "integer", "minimum": 0 },
+                        "projectMembershipCount": { "type": "integer", "minimum": 0 }
+                    }
+                },
+                "StorageLocationAvailability": {
+                    "type": "object",
+                    "required": ["nodeId", "storageObjectId", "state", "completedGenerationId", "completedGenerationSequence"],
+                    "properties": {
+                        "nodeId": { "type": "string" },
+                        "storageObjectId": { "type": "string" },
+                        "state": { "$ref": "#/components/schemas/NodeAvailabilityState" },
+                        "completedGenerationId": { "type": ["string", "null"] },
+                        "completedGenerationSequence": { "type": ["integer", "null"], "minimum": 0 }
+                    }
+                },
+                "MediaAvailability": {
+                    "type": "object",
+                    "required": ["mediaObjectId", "queriedNodeId", "state", "locations"],
+                    "properties": {
+                        "mediaObjectId": { "type": "string" },
+                        "queriedNodeId": { "type": "string" },
+                        "state": { "$ref": "#/components/schemas/NodeAvailabilityState" },
+                        "locations": {
+                            "type": "array",
+                            "items": { "$ref": "#/components/schemas/StorageLocationAvailability" }
+                        }
+                    }
+                },
+                "LibraryMediaDetail": {
+                    "type": "object",
+                    "required": ["media", "facts", "availability"],
+                    "properties": {
+                        "media": { "$ref": "#/components/schemas/MediaObject" },
+                        "facts": { "$ref": "#/components/schemas/MediaSearchFacts" },
+                        "availability": { "$ref": "#/components/schemas/MediaAvailability" }
+                    }
+                },
+                "ProjectSummary": {
+                    "type": "object",
+                    "required": ["projectId", "state", "assetCount", "registeredAt", "updatedAt"],
+                    "properties": {
+                        "projectId": { "type": "string" },
+                        "state": { "type": "string" },
+                        "assetCount": { "type": "integer", "minimum": 0 },
+                        "registeredAt": { "type": "string", "format": "date-time" },
+                        "updatedAt": { "type": "string", "format": "date-time" }
+                    }
+                },
+                "Projects": {
+                    "type": "array",
+                    "items": { "$ref": "#/components/schemas/ProjectSummary" }
+                },
+                "ProjectAssetItem": {
+                    "type": "object",
+                    "required": ["projectAssetId", "filename", "camera", "mediaObjectId", "mediaVerificationState", "removed", "rotationDegrees", "labels", "activeNote", "durationSeconds", "bestTime"],
+                    "properties": {
+                        "projectAssetId": { "type": "string" },
+                        "filename": { "type": "string" },
+                        "camera": { "type": "string" },
+                        "mediaObjectId": { "type": ["string", "null"] },
+                        "mediaVerificationState": { "type": "string" },
+                        "removed": { "type": "boolean" },
+                        "rotationDegrees": { "type": "integer" },
+                        "labels": { "type": "array", "items": { "type": "string" } },
+                        "activeNote": { "type": ["string", "null"] },
+                        "durationSeconds": { "type": "number" },
+                        "bestTime": { "type": ["string", "null"], "format": "date-time" }
+                    }
+                },
+                "ProjectAssetPage": {
+                    "type": "object",
+                    "required": ["items", "nextCursor"],
+                    "properties": {
+                        "items": {
+                            "type": "array",
+                            "items": { "$ref": "#/components/schemas/ProjectAssetItem" }
+                        },
+                        "nextCursor": { "type": ["string", "null"] }
+                    }
                 }
             },
             "responses": {
@@ -706,6 +921,10 @@ pub fn openapi_document() -> serde_json::Value {
                 "Readiness": { "description": "Readiness report", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Readiness" } } } },
                 "SessionCreated": { "description": "Browser session created", "headers": { "x-csrf-token": { "schema": { "type": "string" } } }, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SessionCreated" } } } },
                 "Sessions": { "description": "Browser sessions", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Sessions" } } } },
+                "LibrarySearchPage": { "description": "A page of the global media library search", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/LibrarySearchPage" } } } },
+                "LibraryMediaDetail": { "description": "One media object with its search facts and node-relative availability", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/LibraryMediaDetail" } } } },
+                "Projects": { "description": "Every registered project replica", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Projects" } } } },
+                "ProjectAssetPage": { "description": "A page of one project's assets", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ProjectAssetPage" } } } },
                 "Error": { "description": "Stable server error", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
             }
         }
@@ -1607,6 +1826,257 @@ fn representation_error(request_id: String, error: RepresentationError) -> Respo
         .into_response()
 }
 
+// ── Library and project browse ────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LibraryMediaParams {
+    #[serde(default = "default_page_limit")]
+    limit: u32,
+    #[serde(default)]
+    sort: Option<LibrarySort>,
+    #[serde(default)]
+    verification_state: Option<GlobalMediaVerificationState>,
+    #[serde(default)]
+    storage_root_id: Option<String>,
+    #[serde(default)]
+    camera: Option<String>,
+    #[serde(default)]
+    filename_prefix: Option<String>,
+    #[serde(default)]
+    availability: Option<NodeAvailabilityState>,
+    #[serde(default)]
+    after: Option<String>,
+}
+
+fn default_page_limit() -> u32 {
+    50
+}
+
+fn query_error_response(
+    request_id: &RequestId,
+    code: &'static str,
+    status: StatusCode,
+) -> Response {
+    (
+        status,
+        Json(ErrorResponse {
+            request_id: request_id.0.clone(),
+            code,
+        }),
+    )
+        .into_response()
+}
+
+async fn list_library_media(
+    State(state): State<HttpState>,
+    Extension(request_id): Extension<RequestId>,
+    params: Result<Query<LibraryMediaParams>, QueryRejection>,
+) -> Response {
+    let Query(params) = match params {
+        Ok(value) => value,
+        Err(_) => {
+            return query_error_response(&request_id, "invalid_query", StatusCode::BAD_REQUEST);
+        }
+    };
+
+    let storage_root_id = match params.storage_root_id.as_deref().map(StorageRootId::parse) {
+        Some(Ok(value)) => Some(value),
+        Some(Err(_)) => {
+            return query_error_response(&request_id, "invalid_query", StatusCode::BAD_REQUEST);
+        }
+        None => None,
+    };
+
+    let query = LibraryQuery {
+        limit: params.limit,
+        sort: params.sort.unwrap_or(LibrarySort::CreatedDesc),
+        filters: LibraryFilters {
+            verification_state: params.verification_state,
+            storage_root_id,
+            camera_folded: params.camera,
+            filename_prefix: params.filename_prefix,
+        },
+        after: params.after,
+    };
+
+    match state
+        .foundation
+        .catalog()
+        .storage_library()
+        .search_media(query, params.availability)
+    {
+        Ok(page) => (StatusCode::OK, Json(page)).into_response(),
+        Err(StorageLibraryError::Query(error)) => {
+            query_error_response(&request_id, error.code(), StatusCode::BAD_REQUEST)
+        }
+        Err(StorageLibraryError::InvalidInput { .. }) => {
+            query_error_response(&request_id, "invalid_query", StatusCode::BAD_REQUEST)
+        }
+        Err(StorageLibraryError::NotFound { .. }) => {
+            query_error_response(&request_id, "not_found", StatusCode::NOT_FOUND)
+        }
+        Err(_) => query_error_response(
+            &request_id,
+            "internal_error",
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+    }
+}
+
+/// Combines the authoritative [`MediaObject`], its non-authoritative search
+/// projection facts, and its node-relative availability into one detail
+/// response. No field here is invented beyond what earlier tasks already
+/// produce for a media object.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LibraryMediaDetail {
+    media: MediaObject,
+    facts: MediaSearchFacts,
+    availability: MediaAvailability,
+}
+
+async fn get_library_media_detail(
+    State(state): State<HttpState>,
+    Extension(request_id): Extension<RequestId>,
+    AxumPath(raw_media_object_id): AxumPath<String>,
+) -> Response {
+    let Ok(media_object_id) = MediaObjectId::parse(raw_media_object_id) else {
+        return query_error_response(&request_id, "not_found", StatusCode::NOT_FOUND);
+    };
+    let library = state.foundation.catalog().storage_library();
+    let node_id = state.foundation.catalog().node_id().clone();
+
+    let media = match library.get_media_object(&media_object_id) {
+        Ok(media) => media,
+        Err(error) => return library_error_response(&request_id, error),
+    };
+    let facts = match library.media_search_facts(&media_object_id) {
+        Ok(facts) => facts,
+        Err(error) => return library_error_response(&request_id, error),
+    };
+    let availability = match library.media_availability(&media_object_id, &node_id) {
+        Ok(availability) => availability,
+        Err(error) => return library_error_response(&request_id, error),
+    };
+
+    (
+        StatusCode::OK,
+        Json(LibraryMediaDetail {
+            media,
+            facts,
+            availability,
+        }),
+    )
+        .into_response()
+}
+
+fn library_error_response(request_id: &RequestId, error: StorageLibraryError) -> Response {
+    match error {
+        StorageLibraryError::Query(error) => {
+            query_error_response(request_id, error.code(), StatusCode::BAD_REQUEST)
+        }
+        StorageLibraryError::InvalidInput { .. } => {
+            query_error_response(request_id, "invalid_query", StatusCode::BAD_REQUEST)
+        }
+        StorageLibraryError::NotFound { .. } => {
+            query_error_response(request_id, "not_found", StatusCode::NOT_FOUND)
+        }
+        _ => query_error_response(
+            request_id,
+            "internal_error",
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ListProjectsParams {}
+
+async fn list_projects(
+    State(state): State<HttpState>,
+    Extension(request_id): Extension<RequestId>,
+    params: Result<Query<ListProjectsParams>, QueryRejection>,
+) -> Response {
+    if params.is_err() {
+        return query_error_response(&request_id, "invalid_query", StatusCode::BAD_REQUEST);
+    }
+    match state
+        .foundation
+        .catalog()
+        .project_replicas()
+        .list_projects()
+    {
+        Ok(projects) => (StatusCode::OK, Json(projects)).into_response(),
+        Err(error) => project_read_error_response(&request_id, error),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProjectAssetParams {
+    #[serde(default = "default_page_limit")]
+    limit: u32,
+    #[serde(default)]
+    after: Option<String>,
+    #[serde(default)]
+    search: Option<String>,
+}
+
+async fn list_project_assets(
+    State(state): State<HttpState>,
+    Extension(request_id): Extension<RequestId>,
+    AxumPath(project_id): AxumPath<String>,
+    params: Result<Query<ProjectAssetParams>, QueryRejection>,
+) -> Response {
+    let Query(params) = match params {
+        Ok(value) => value,
+        Err(_) => {
+            return query_error_response(&request_id, "invalid_query", StatusCode::BAD_REQUEST);
+        }
+    };
+    match state
+        .foundation
+        .catalog()
+        .project_replicas()
+        .list_project_assets(
+            &project_id,
+            params.limit,
+            params.after.as_deref(),
+            params.search.as_deref(),
+        ) {
+        Ok(page) => (StatusCode::OK, Json(page)).into_response(),
+        Err(error) => project_read_error_response(&request_id, error),
+    }
+}
+
+/// Error mapping for the read-only project browse endpoints (`GET
+/// /api/v1/projects` and `GET /api/v1/projects/{projectId}/assets`).
+/// Distinct from [`project_replica_error`], which maps the baseline
+/// import/preview/reconcile write path onto its own, more granular set of
+/// stable codes (`baseline_invalid`, `baseline_different`, ...). Those codes
+/// describe a sync protocol violation; a read endpoint has no baseline to
+/// violate, so it only ever needs three outcomes: the project does not
+/// exist, the request itself was malformed (currently just an out-of-range
+/// `limit`, which `list_project_assets` reports as `InvalidBaseline`), or
+/// something unexpected happened.
+fn project_read_error_response(request_id: &RequestId, error: ProjectReplicaError) -> Response {
+    match error {
+        ProjectReplicaError::NotFound { .. } => {
+            query_error_response(request_id, "not_found", StatusCode::NOT_FOUND)
+        }
+        ProjectReplicaError::InvalidBaseline(_) => {
+            query_error_response(request_id, "invalid_query", StatusCode::BAD_REQUEST)
+        }
+        _ => query_error_response(
+            request_id,
+            "internal_error",
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+    }
+}
+
 pub async fn bind_loopback(address: SocketAddr) -> Result<TcpListener> {
     if !address.ip().is_loopback() {
         return Err(anyhow!(
@@ -2325,5 +2795,242 @@ mod tests {
         *lock.lock().unwrap() = true;
         condition.notify_all();
         assert_eq!(evaluations.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn library_media_requires_authentication() {
+        let fixture = Fixture::new(false);
+        let response = fixture
+            .app()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/library/media?limit=10")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn library_media_rejects_unsupported_query_combinations() {
+        let fixture = Fixture::new(false);
+        let token = device_auth_token(&fixture);
+
+        for uri in [
+            "/api/v1/library/media?limit=500",
+            "/api/v1/library/media?limit=10&sort=filenameAsc&storageRootId=root_a",
+            "/api/v1/library/media?limit=10&nonsense=1",
+        ] {
+            let response = fixture
+                .app()
+                .oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "uri: {uri}");
+            let body = json(response).await;
+            assert_eq!(body["code"], "invalid_query", "uri: {uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cursor_cannot_be_replayed_against_another_sort() {
+        let fixture = Fixture::new(false);
+        let token = device_auth_token(&fixture);
+        let cursor = rcdvlog_server_core::library_query::encode_cursor(
+            rcdvlog_server_core::library_query::LibrarySort::CreatedDesc,
+            &Default::default(),
+            &rcdvlog_server_core::library_query::CursorKey::Created {
+                created_at: "2026-07-20T00:00:00Z".to_string(),
+                media_object_id: "media_a".to_string(),
+            },
+        );
+        let response = fixture
+            .app()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/v1/library/media?limit=10&sort=filenameAsc&after={cursor}"
+                    ))
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(json(response).await["code"], "invalid_query");
+    }
+
+    #[tokio::test]
+    async fn project_asset_responses_contain_no_absolute_paths() {
+        let fixture = Fixture::new(false);
+        let token = device_auth_token(&fixture);
+        let source = TempDir::new().unwrap();
+        let envelope = baseline_envelope(&source);
+        let project_id = envelope.payload.project.project_id.clone();
+        let body = serde_json::to_vec(&envelope).unwrap();
+        let imported = fixture
+            .app()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/internal/projects/baseline/import")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(imported.status(), StatusCode::CREATED);
+
+        let response = fixture
+            .app()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/projects/{project_id}/assets?limit=10"))
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let text = json(response).await.to_string();
+        assert!(!text.contains(source.path().to_str().unwrap()));
+        assert!(!text.contains("\"path\""));
+        assert!(!text.contains("proxyPath"));
+    }
+
+    #[tokio::test]
+    async fn library_media_detail_requires_authentication() {
+        let fixture = Fixture::new(false);
+        let response = fixture
+            .app()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/library/media/media_missing")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn library_media_detail_reports_not_found_for_unknown_media() {
+        let fixture = Fixture::new(false);
+        let token = device_auth_token(&fixture);
+        let response = fixture
+            .app()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/library/media/media_missing")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(json(response).await["code"], "not_found");
+    }
+
+    #[tokio::test]
+    async fn projects_requires_authentication() {
+        let fixture = Fixture::new(false);
+        let response = fixture
+            .app()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/projects")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn projects_lists_registered_project_replicas() {
+        let fixture = Fixture::new(false);
+        let token = device_auth_token(&fixture);
+        let source = TempDir::new().unwrap();
+        let envelope = baseline_envelope(&source);
+        let project_id = envelope.payload.project.project_id.clone();
+        let body = serde_json::to_vec(&envelope).unwrap();
+        let imported = fixture
+            .app()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/internal/projects/baseline/import")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(imported.status(), StatusCode::CREATED);
+
+        let response = fixture
+            .app()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/projects")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json(response).await;
+        assert_eq!(body[0]["projectId"], project_id);
+    }
+
+    #[tokio::test]
+    async fn project_assets_rejects_unknown_query_parameters_and_missing_project() {
+        let fixture = Fixture::new(false);
+        let token = device_auth_token(&fixture);
+
+        let unknown_param = fixture
+            .app()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/projects/project_missing/assets?limit=10&nonsense=1")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unknown_param.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(json(unknown_param).await["code"], "invalid_query");
+
+        let missing_project = fixture
+            .app()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/projects/project_missing/assets?limit=10")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing_project.status(), StatusCode::NOT_FOUND);
+        assert_eq!(json(missing_project).await["code"], "not_found");
     }
 }

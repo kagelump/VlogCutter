@@ -271,6 +271,22 @@ pub struct LibrarySearchPage {
     pub availability_filter_applied: bool,
 }
 
+/// Read-only projection facts for a single media object, drawn from the
+/// rebuildable `media_search_index` projection (see
+/// [`StorageLibrary::search_media`]'s documentation for why that projection
+/// is never treated as authoritative). Fetched by the HTTP detail endpoint
+/// alongside the authoritative [`MediaObject`] and its [`MediaAvailability`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MediaSearchFacts {
+    pub filename: String,
+    pub camera_make: Option<String>,
+    pub camera_model: Option<String>,
+    pub primary_storage_root_id: Option<StorageRootId>,
+    pub storage_location_count: u64,
+    pub project_membership_count: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ObservationScope {
@@ -1265,6 +1281,46 @@ impl StorageLibrary {
             next_cursor,
             availability_filter_applied,
         })
+    }
+
+    /// Projection facts for one media object -- the same non-authoritative
+    /// columns [`Self::search_media`] reads from `media_search_index`, but
+    /// for a single already-known id rather than a page. Returns
+    /// [`StorageLibraryError::NotFound`] if the projection has no row for
+    /// this id; that should not happen for any id [`Self::get_media_object`]
+    /// resolves, since every media object gets a projection row when it is
+    /// created, but the projection is rebuildable and so is checked rather
+    /// than assumed.
+    pub fn media_search_facts(
+        &self,
+        id: &MediaObjectId,
+    ) -> Result<MediaSearchFacts, StorageLibraryError> {
+        let connection = open_read_only_connection(&self.database_path)?;
+        connection
+            .query_row(
+                r#"
+                SELECT primary_storage_root_id, filename, camera_make, camera_model,
+                       storage_location_count, project_membership_count
+                FROM media_search_index WHERE media_object_id = ?1
+                "#,
+                [id.as_str()],
+                |row| {
+                    Ok(MediaSearchFacts {
+                        primary_storage_root_id: row
+                            .get::<_, Option<String>>(0)?
+                            .map(StorageRootId::parse)
+                            .transpose()
+                            .map_err(stored_error(0))?,
+                        filename: row.get(1)?,
+                        camera_make: row.get(2)?,
+                        camera_model: row.get(3)?,
+                        storage_location_count: from_i64(Some(row.get(4)?), 4)?.unwrap_or(0),
+                        project_membership_count: from_i64(Some(row.get(5)?), 5)?.unwrap_or(0),
+                    })
+                },
+            )
+            .optional()?
+            .ok_or_else(|| not_found("media search projection", id.as_str()))
     }
 
     pub fn start_observation_generation(
