@@ -1936,11 +1936,19 @@ struct LibraryMediaDetail {
     availability: MediaAvailability,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LibraryMediaDetailParams {}
+
 async fn get_library_media_detail(
     State(state): State<HttpState>,
     Extension(request_id): Extension<RequestId>,
     AxumPath(raw_media_object_id): AxumPath<String>,
+    params: Result<Query<LibraryMediaDetailParams>, QueryRejection>,
 ) -> Response {
+    if params.is_err() {
+        return query_error_response(&request_id, "invalid_query", StatusCode::BAD_REQUEST);
+    }
     let Ok(media_object_id) = MediaObjectId::parse(raw_media_object_id) else {
         return query_error_response(&request_id, "not_found", StatusCode::NOT_FOUND);
     };
@@ -2946,6 +2954,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn library_media_detail_rejects_unknown_query_parameters() {
+        let fixture = Fixture::new(false);
+        let token = device_auth_token(&fixture);
+        let response = fixture
+            .app()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/library/media/media_missing?nonsense=1")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(json(response).await["code"], "invalid_query");
+    }
+
+    #[tokio::test]
     async fn projects_requires_authentication() {
         let fixture = Fixture::new(false);
         let response = fixture
@@ -2998,6 +3025,22 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = json(response).await;
         assert_eq!(body[0]["projectId"], project_id);
+    }
+
+    #[tokio::test]
+    async fn project_assets_requires_authentication() {
+        let fixture = Fixture::new(false);
+        let response = fixture
+            .app()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/projects/project_missing/assets")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
