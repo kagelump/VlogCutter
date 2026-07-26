@@ -79,6 +79,18 @@ pub struct ProjectSummary {
     pub updated_at: String,
 }
 
+/// A cursor-paginated page of registered project replicas, ordered by the
+/// stable raw `project_id`. Mirrors the shape [`rcdvlog_core::ProjectAssetPage`]
+/// uses (raw-ID cursor, `limit + 1` overflow detection) rather than the
+/// envelope-cursor scheme the global library routes use -- the project
+/// count here is bounded by admin-registered replicas, not archive size.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectPage {
+    pub items: Vec<ProjectSummary>,
+    pub next_cursor: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ProjectReplicaManager {
     data_dir: PathBuf,
@@ -228,29 +240,48 @@ impl ProjectReplicaManager {
         Catalog::open_existing(path).map_err(ProjectReplicaError::Infrastructure)
     }
 
-    /// Lists every registered project replica with its current asset count.
-    pub fn list_projects(&self) -> Result<Vec<ProjectSummary>, ProjectReplicaError> {
+    /// Pages every registered project replica, with its current asset
+    /// count, by the stable raw `project_id` order. The project count is
+    /// bounded by admin-registered replicas (not by archive size), but this
+    /// is still a cursor-paginated, explicitly-limited collection endpoint
+    /// like every other one in this surface.
+    pub fn list_projects(
+        &self,
+        limit: u32,
+        after: Option<&str>,
+    ) -> Result<ProjectPage, ProjectReplicaError> {
+        if limit == 0 || limit > 200 {
+            return Err(ProjectReplicaError::InvalidBaseline(
+                "limit must be between 1 and 200".to_string(),
+            ));
+        }
         let connection = open_read_only_connection(self.control.database_path())
             .map_err(ProjectReplicaError::Infrastructure)?;
-        let rows: Vec<(String, String, String, String)> = {
+        let mut rows: Vec<(String, String, String, String)> = {
             let mut statement = connection.prepare(
                 "SELECT project_id, state, registered_at, updated_at
-                 FROM project_registry ORDER BY project_id ASC",
+                 FROM project_registry
+                 WHERE (?1 IS NULL OR project_id > ?1)
+                 ORDER BY project_id ASC
+                 LIMIT ?2",
             )?;
             statement
-                .query_map([], |row| {
+                .query_map(params![after, i64::from(limit + 1)], |row| {
                     Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?
         };
 
-        let mut summaries = Vec::with_capacity(rows.len());
+        let has_more = rows.len() > limit as usize;
+        rows.truncate(limit as usize);
+
+        let mut items = Vec::with_capacity(rows.len());
         for (project_id, state, registered_at, updated_at) in rows {
             let catalog = self.open_catalog(&project_id)?;
             let asset_count = catalog
                 .count_project_assets(&project_id)
                 .map_err(ProjectReplicaError::Infrastructure)?;
-            summaries.push(ProjectSummary {
+            items.push(ProjectSummary {
                 project_id,
                 state,
                 asset_count,
@@ -258,7 +289,14 @@ impl ProjectReplicaManager {
                 updated_at,
             });
         }
-        Ok(summaries)
+        let next_cursor = has_more.then(|| {
+            items
+                .last()
+                .expect("a page with more rows has a last item")
+                .project_id
+                .clone()
+        });
+        Ok(ProjectPage { items, next_cursor })
     }
 
     /// Pages one project's assets by the stable `project_asset_id` order,
@@ -848,10 +886,55 @@ mod tests {
     #[test]
     fn listing_projects_reports_asset_counts() {
         let fixture = replica_fixture_with_assets(4);
-        let projects = fixture.manager.list_projects().unwrap();
-        assert_eq!(projects.len(), 1);
-        assert_eq!(projects[0].project_id, fixture.project_id);
-        assert_eq!(projects[0].asset_count, 4);
+        let page = fixture.manager.list_projects(10, None).unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].project_id, fixture.project_id);
+        assert_eq!(page.items[0].asset_count, 4);
+        assert_eq!(page.next_cursor, None);
+    }
+
+    #[test]
+    fn listing_projects_pages_deterministically_across_many_registered_replicas() {
+        let fixture = Fixture::new();
+        let mut project_ids: Vec<String> = Vec::new();
+        for _ in 0..5 {
+            let source = TempDir::new().unwrap();
+            let envelope = baseline(&source);
+            let registered = fixture.manager.import_baseline(&envelope).unwrap();
+            project_ids.push(registered.project_id);
+        }
+        project_ids.sort();
+
+        let mut seen: Vec<String> = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let page = fixture.manager.list_projects(2, cursor.as_deref()).unwrap();
+            assert!(page.items.len() <= 2, "page exceeded its explicit limit");
+            for item in &page.items {
+                seen.push(item.project_id.clone());
+            }
+            match page.next_cursor {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+        assert_eq!(
+            seen, project_ids,
+            "pages must be ordered by project_id and exhaustive"
+        );
+    }
+
+    #[test]
+    fn list_projects_rejects_out_of_range_limits() {
+        let fixture = replica_fixture_with_assets(1);
+        assert!(matches!(
+            fixture.manager.list_projects(0, None),
+            Err(ProjectReplicaError::InvalidBaseline(_))
+        ));
+        assert!(matches!(
+            fixture.manager.list_projects(201, None),
+            Err(ProjectReplicaError::InvalidBaseline(_))
+        ));
     }
 
     #[test]

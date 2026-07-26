@@ -41,15 +41,15 @@
         },
         "description": "A page of one project's assets"
       },
-      "Projects": {
+      "ProjectPage": {
         "content": {
           "application/json": {
             "schema": {
-              "$ref": "#/components/schemas/Projects"
+              "$ref": "#/components/schemas/ProjectPage"
             }
           }
         },
-        "description": "Every registered project replica"
+        "description": "A page of registered project replicas"
       },
       "Readiness": {
         "content": {
@@ -454,6 +454,27 @@
         ],
         "type": "object"
       },
+      "ProjectPage": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/ProjectSummary"
+            },
+            "type": "array"
+          },
+          "nextCursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "items",
+          "nextCursor"
+        ],
+        "type": "object"
+      },
       "ProjectSummary": {
         "properties": {
           "assetCount": {
@@ -483,12 +504,6 @@
           "updatedAt"
         ],
         "type": "object"
-      },
-      "Projects": {
-        "items": {
-          "$ref": "#/components/schemas/ProjectSummary"
-        },
-        "type": "array"
       },
       "ProtocolVersion": {
         "properties": {
@@ -846,9 +861,27 @@
     "/api/v1/projects": {
       "get": {
         "operationId": "listProjects",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "limit",
+            "schema": {
+              "maximum": 200,
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "after",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "responses": {
           "200": {
-            "$ref": "#/components/responses/Projects"
+            "$ref": "#/components/responses/ProjectPage"
           },
           "400": {
             "$ref": "#/components/responses/Error"

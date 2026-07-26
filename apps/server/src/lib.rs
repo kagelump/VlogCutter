@@ -658,8 +658,12 @@ pub fn openapi_document() -> serde_json::Value {
             "/api/v1/projects": {
                 "get": {
                     "operationId": "listProjects",
+                    "parameters": [
+                        { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 200 } },
+                        { "name": "after", "in": "query", "schema": { "type": "string" } }
+                    ],
                     "responses": {
-                        "200": { "$ref": "#/components/responses/Projects" },
+                        "200": { "$ref": "#/components/responses/ProjectPage" },
                         "400": { "$ref": "#/components/responses/Error" },
                         "401": { "$ref": "#/components/responses/Error" }
                     }
@@ -883,9 +887,16 @@ pub fn openapi_document() -> serde_json::Value {
                         "updatedAt": { "type": "string", "format": "date-time" }
                     }
                 },
-                "Projects": {
-                    "type": "array",
-                    "items": { "$ref": "#/components/schemas/ProjectSummary" }
+                "ProjectPage": {
+                    "type": "object",
+                    "required": ["items", "nextCursor"],
+                    "properties": {
+                        "items": {
+                            "type": "array",
+                            "items": { "$ref": "#/components/schemas/ProjectSummary" }
+                        },
+                        "nextCursor": { "type": ["string", "null"] }
+                    }
                 },
                 "ProjectAssetItem": {
                     "type": "object",
@@ -923,7 +934,7 @@ pub fn openapi_document() -> serde_json::Value {
                 "Sessions": { "description": "Browser sessions", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Sessions" } } } },
                 "LibrarySearchPage": { "description": "A page of the global media library search", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/LibrarySearchPage" } } } },
                 "LibraryMediaDetail": { "description": "One media object with its search facts and node-relative availability", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/LibraryMediaDetail" } } } },
-                "Projects": { "description": "Every registered project replica", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Projects" } } } },
+                "ProjectPage": { "description": "A page of registered project replicas", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ProjectPage" } } } },
                 "ProjectAssetPage": { "description": "A page of one project's assets", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ProjectAssetPage" } } } },
                 "Error": { "description": "Stable server error", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
             }
@@ -2000,23 +2011,31 @@ fn library_error_response(request_id: &RequestId, error: StorageLibraryError) ->
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct ListProjectsParams {}
+struct ListProjectsParams {
+    #[serde(default = "default_page_limit")]
+    limit: u32,
+    #[serde(default)]
+    after: Option<String>,
+}
 
 async fn list_projects(
     State(state): State<HttpState>,
     Extension(request_id): Extension<RequestId>,
     params: Result<Query<ListProjectsParams>, QueryRejection>,
 ) -> Response {
-    if params.is_err() {
-        return query_error_response(&request_id, "invalid_query", StatusCode::BAD_REQUEST);
-    }
+    let Query(params) = match params {
+        Ok(value) => value,
+        Err(_) => {
+            return query_error_response(&request_id, "invalid_query", StatusCode::BAD_REQUEST);
+        }
+    };
     match state
         .foundation
         .catalog()
         .project_replicas()
-        .list_projects()
+        .list_projects(params.limit, params.after.as_deref())
     {
-        Ok(projects) => (StatusCode::OK, Json(projects)).into_response(),
+        Ok(page) => (StatusCode::OK, Json(page)).into_response(),
         Err(error) => project_read_error_response(&request_id, error),
     }
 }
@@ -3024,7 +3043,27 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let body = json(response).await;
-        assert_eq!(body[0]["projectId"], project_id);
+        assert_eq!(body["items"][0]["projectId"], project_id);
+        assert!(body["nextCursor"].is_null());
+    }
+
+    #[tokio::test]
+    async fn projects_rejects_unknown_query_parameters() {
+        let fixture = Fixture::new(false);
+        let token = device_auth_token(&fixture);
+        let response = fixture
+            .app()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/projects?limit=10&nonsense=1")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(json(response).await["code"], "invalid_query");
     }
 
     #[tokio::test]
