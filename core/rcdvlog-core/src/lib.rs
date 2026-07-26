@@ -24,7 +24,8 @@ pub use operations::{
     ApplyOperationResult, AssetRevisionDiagnostics, CLOCK_EVENT_CREATED, ConflictProjection,
     HybridLogicalTime, LABEL_ADDED, LABEL_REMOVED, NOTE_REVISION_CREATED, NoteRevisionProjection,
     OperationBatchResult, OperationDiagnostics, PROJECT_ASSET_ADDED, PROJECT_ASSET_MEDIA_LINKED,
-    ProjectAssetAddedPayload, ProjectOperation, REMOVED_SET, ROTATION_SET,
+    ProjectAssetAddedPayload, ProjectAssetItem, ProjectAssetPage, ProjectOperation, REMOVED_SET,
+    ROTATION_SET,
 };
 
 pub use baseline::{PortableAssetBaseline, PortableRootMapping, ProjectBaselineSnapshot};

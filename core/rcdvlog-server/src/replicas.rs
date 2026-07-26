@@ -5,7 +5,7 @@ use crate::{
 use chrono::{SecondsFormat, Utc};
 use rcdvlog_core::{
     Asset, Catalog, MediaObjectId, MediaVerificationState, OperationId, PROJECT_ASSET_MEDIA_LINKED,
-    ProjectAssetAddedPayload, ProjectAssetId, ProjectId,
+    ProjectAssetAddedPayload, ProjectAssetId, ProjectAssetPage, ProjectId,
 };
 use rcdvlog_sync::{
     BASELINE_VERSION, BaselineEnvelope, BaselinePreview, ReconcileRequest, ReconcileResponse,
@@ -67,6 +67,16 @@ impl ProjectReplicaError {
             Self::Infrastructure(_) | Self::Database(_) | Self::Io(_) => "internal_error",
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectSummary {
+    pub project_id: String,
+    pub state: String,
+    pub asset_count: u64,
+    pub registered_at: String,
+    pub updated_at: String,
 }
 
 #[derive(Debug, Clone)]
@@ -216,6 +226,61 @@ impl ProjectReplicaManager {
         let replica = self.get(project_id)?;
         let path = self.resolve_relative_path(&replica.replica_relative_path)?;
         Catalog::open_existing(path).map_err(ProjectReplicaError::Infrastructure)
+    }
+
+    /// Lists every registered project replica with its current asset count.
+    pub fn list_projects(&self) -> Result<Vec<ProjectSummary>, ProjectReplicaError> {
+        let connection = open_read_only_connection(self.control.database_path())
+            .map_err(ProjectReplicaError::Infrastructure)?;
+        let rows: Vec<(String, String, String, String)> = {
+            let mut statement = connection.prepare(
+                "SELECT project_id, state, registered_at, updated_at
+                 FROM project_registry ORDER BY project_id ASC",
+            )?;
+            statement
+                .query_map([], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+
+        let mut summaries = Vec::with_capacity(rows.len());
+        for (project_id, state, registered_at, updated_at) in rows {
+            let catalog = self.open_catalog(&project_id)?;
+            let asset_count = catalog
+                .count_project_assets(&project_id)
+                .map_err(ProjectReplicaError::Infrastructure)?;
+            summaries.push(ProjectSummary {
+                project_id,
+                state,
+                asset_count,
+                registered_at,
+                updated_at,
+            });
+        }
+        Ok(summaries)
+    }
+
+    /// Pages one project's assets by the stable `project_asset_id` order,
+    /// optionally scoped by a substring search. Never merged with the global
+    /// library query path — see design requirement 4 of the parent plan.
+    pub fn list_project_assets(
+        &self,
+        project_id: &str,
+        limit: u32,
+        after: Option<&str>,
+        search: Option<&str>,
+    ) -> Result<ProjectAssetPage, ProjectReplicaError> {
+        if limit == 0 || limit > 200 {
+            return Err(ProjectReplicaError::InvalidBaseline(
+                "limit must be between 1 and 200".to_string(),
+            ));
+        }
+        self.get(project_id)?;
+        let catalog = self.open_catalog(project_id)?;
+        catalog
+            .list_project_asset_page(project_id, limit, after, search)
+            .map_err(ProjectReplicaError::Infrastructure)
     }
 
     pub fn reconcile(
@@ -688,6 +753,170 @@ mod tests {
                 )
                 .unwrap(),
             1
+        );
+    }
+
+    /// A registered replica with `count` portable assets named
+    /// `asset_000.mov` .. `asset_{count-1:03}.mov`, imported through the same
+    /// `import_baseline` path a real desktop sync would use.
+    struct AssetPageFixture {
+        _server_root: TempDir,
+        _source_root: TempDir,
+        manager: ProjectReplicaManager,
+        project_id: String,
+    }
+
+    fn portable_asset_payload(index: usize) -> ProjectAssetAddedPayload {
+        ProjectAssetAddedPayload {
+            id: format!("asset_{index:03}"),
+            fingerprint: format!("fingerprint_{index:03}"),
+            filename: format!("asset_{index:03}.mov"),
+            size_bytes: 5,
+            duration_seconds: 1.0,
+            frame_rate: 30.0,
+            width: 1920,
+            height: 1080,
+            codec: "h264".to_string(),
+            camera: "camera".to_string(),
+            captured_at_raw: None,
+            best_time: None,
+            metadata_rotation_degrees: 0,
+            default_rotation_degrees: 0,
+            created_at: "2026-07-23T00:00:00Z".to_string(),
+        }
+    }
+
+    fn replica_fixture_with_assets(count: usize) -> AssetPageFixture {
+        let fixture = Fixture::new();
+        let source_root = TempDir::new().unwrap();
+        let catalog = Catalog::open(source_root.path().join("desktop.sqlite3")).unwrap();
+        catalog.set_local_node_id("node_mac").unwrap();
+        let project = catalog.create_project("Trip").unwrap();
+        for index in 0..count {
+            catalog
+                .add_portable_project_asset(&project.id, portable_asset_payload(index))
+                .unwrap();
+        }
+        let envelope = BaselineEnvelope::export(&catalog, &project.id, vec![], vec![]).unwrap();
+        let registered = fixture.manager.import_baseline(&envelope).unwrap();
+        AssetPageFixture {
+            _server_root: fixture._root,
+            _source_root: source_root,
+            manager: fixture.manager,
+            project_id: registered.project_id,
+        }
+    }
+
+    #[test]
+    fn project_assets_page_deterministically_and_exclude_absolute_paths() {
+        let fixture = replica_fixture_with_assets(25);
+        let mut seen: Vec<String> = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let page = fixture
+                .manager
+                .list_project_assets(&fixture.project_id, 10, cursor.as_deref(), None)
+                .unwrap();
+            for item in &page.items {
+                let encoded = serde_json::to_string(item).unwrap();
+                assert!(!encoded.contains('/'), "asset DTO leaked a path: {encoded}");
+                seen.push(item.project_asset_id.clone());
+            }
+            match page.next_cursor {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+        assert_eq!(seen.len(), 25);
+        let mut sorted = seen.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), 25, "pages repeated an asset");
+    }
+
+    #[test]
+    fn project_asset_search_is_scoped_to_one_project() {
+        let fixture = replica_fixture_with_assets(3);
+        let page = fixture
+            .manager
+            .list_project_assets(&fixture.project_id, 10, None, Some("asset_00"))
+            .unwrap();
+        assert!(!page.items.is_empty());
+        assert!(page.items.iter().all(|item| item.filename.contains("00")));
+    }
+
+    #[test]
+    fn listing_projects_reports_asset_counts() {
+        let fixture = replica_fixture_with_assets(4);
+        let projects = fixture.manager.list_projects().unwrap();
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].project_id, fixture.project_id);
+        assert_eq!(projects[0].asset_count, 4);
+    }
+
+    #[test]
+    fn listing_assets_for_an_unregistered_project_is_a_structured_error() {
+        let fixture = replica_fixture_with_assets(1);
+        let error = fixture
+            .manager
+            .list_project_assets("project_missing", 10, None, None)
+            .unwrap_err();
+        assert!(matches!(error, ProjectReplicaError::NotFound { .. }));
+    }
+
+    #[test]
+    fn list_project_assets_rejects_out_of_range_limits() {
+        let fixture = replica_fixture_with_assets(1);
+        assert!(matches!(
+            fixture
+                .manager
+                .list_project_assets(&fixture.project_id, 0, None, None),
+            Err(ProjectReplicaError::InvalidBaseline(_))
+        ));
+        assert!(matches!(
+            fixture
+                .manager
+                .list_project_assets(&fixture.project_id, 201, None, None),
+            Err(ProjectReplicaError::InvalidBaseline(_))
+        ));
+    }
+
+    /// Documents the known limitation of the chosen search strategy: it is a
+    /// case-folded substring match over the raw `labels_json` text, not a
+    /// parsed-label match. A label of "covered" contains the literal
+    /// substring "red", so searching "red" surfaces it even though no label
+    /// equals "red". This is accepted for a bounded, per-project, human-typed
+    /// search (see the task report for the justification) - the test exists
+    /// to keep the assertion honest about actual behavior rather than
+    /// aspirational behavior.
+    #[test]
+    fn project_asset_search_over_labels_matches_json_substrings_including_false_positives() {
+        let fixture = Fixture::new();
+        let source_root = TempDir::new().unwrap();
+        let catalog = Catalog::open(source_root.path().join("desktop.sqlite3")).unwrap();
+        catalog.set_local_node_id("node_mac").unwrap();
+        let project = catalog.create_project("Trip").unwrap();
+        catalog
+            .add_portable_project_asset(&project.id, portable_asset_payload(0))
+            .unwrap();
+        catalog.add_label("asset_000", "covered").unwrap();
+        let envelope = BaselineEnvelope::export(&catalog, &project.id, vec![], vec![]).unwrap();
+        let registered = fixture.manager.import_baseline(&envelope).unwrap();
+
+        let page = fixture
+            .manager
+            .list_project_assets(&registered.project_id, 10, None, Some("red"))
+            .unwrap();
+
+        assert_eq!(
+            page.items.len(),
+            1,
+            "labels_json substring match should hit 'covered'"
+        );
+        assert_eq!(page.items[0].labels, vec!["covered".to_string()]);
+        assert!(
+            !page.items[0].labels.iter().any(|label| label == "red"),
+            "no label actually equals the search term - this is the accepted false positive"
         );
     }
 }

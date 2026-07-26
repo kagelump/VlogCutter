@@ -15,7 +15,7 @@ mod storage_path;
 
 pub use rcdvlog_core::{
     Catalog, CatalogSchemaError, JobId, MediaObjectId, NodeId, PROJECT_CATALOG_SCHEMA_VERSION,
-    ProjectAssetAddedPayload, ProjectId, RepresentationId,
+    ProjectAssetAddedPayload, ProjectAssetItem, ProjectAssetPage, ProjectId, RepresentationId,
 };
 pub use rcdvlog_sync::{
     BASELINE_VERSION, BaselineEnvelope, BaselinePayload, BaselinePreview, NodeTargetedJob,
@@ -59,7 +59,7 @@ pub use media_facts::{
     ScanFileDiagnostic,
 };
 pub use rcdvlog_core::StorageAccessMode;
-pub use replicas::{ProjectReplica, ProjectReplicaError, ProjectReplicaManager};
+pub use replicas::{ProjectReplica, ProjectReplicaError, ProjectReplicaManager, ProjectSummary};
 pub use representations::{
     PROXY_RECIPE_KEY, Representation, RepresentationError, RepresentationJobHandler,
     RepresentationKind, RepresentationNeed, RepresentationRequest, RepresentationRequestResult,

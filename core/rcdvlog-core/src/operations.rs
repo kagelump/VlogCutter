@@ -104,6 +104,31 @@ pub struct OperationBatchResult {
     pub conflicts: usize,
 }
 
+/// Path-free projection of one project asset. `assets.path` and
+/// `assets.proxy_path` are node-local absolutes and are deliberately absent.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectAssetItem {
+    pub project_asset_id: String,
+    pub filename: String,
+    pub camera: String,
+    pub media_object_id: Option<String>,
+    pub media_verification_state: String,
+    pub removed: bool,
+    pub rotation_degrees: i32,
+    pub labels: Vec<String>,
+    pub active_note: Option<String>,
+    pub duration_seconds: f64,
+    pub best_time: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectAssetPage {
+    pub items: Vec<ProjectAssetItem>,
+    pub next_cursor: Option<String>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct NotePayload {
@@ -774,6 +799,81 @@ impl Catalog {
             materialized_revision,
             note_revisions,
         })
+    }
+
+    pub fn count_project_assets(&self, project_id: &str) -> Result<u64> {
+        let connection = self.connection()?;
+        let count: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM assets WHERE project_id = ?1",
+            [project_id],
+            |row| row.get(0),
+        )?;
+        Ok(count as u64)
+    }
+
+    /// Pages one project's assets by the stable `project_asset_id` order.
+    /// Search is a case-folded substring match over this project's own
+    /// filename, camera, active note, and labels. A replica is per-project and
+    /// bounded, so a substring match is acceptable here in a way it is not for
+    /// the global library.
+    pub fn list_project_asset_page(
+        &self,
+        project_id: &str,
+        limit: u32,
+        after: Option<&str>,
+        search: Option<&str>,
+    ) -> Result<ProjectAssetPage> {
+        let connection = self.connection()?;
+        let folded = search.map(|value| format!("%{}%", value.to_lowercase()));
+        let mut statement = connection.prepare(
+            r#"
+            SELECT id, filename, camera, media_object_id, media_verification_state,
+                   removed, rotation_degrees, labels_json, notes, duration_seconds, best_time
+            FROM assets
+            WHERE project_id = ?1
+              AND (?2 IS NULL OR id > ?2)
+              AND (?3 IS NULL
+                   OR LOWER(filename) LIKE ?3
+                   OR LOWER(camera) LIKE ?3
+                   OR LOWER(notes) LIKE ?3
+                   OR LOWER(labels_json) LIKE ?3)
+            ORDER BY id ASC
+            LIMIT ?4
+            "#,
+        )?;
+        let mut items = statement
+            .query_map(
+                rusqlite::params![project_id, after, folded, i64::from(limit + 1)],
+                |row| {
+                    let labels_json: String = row.get(7)?;
+                    let notes: String = row.get(8)?;
+                    Ok(ProjectAssetItem {
+                        project_asset_id: row.get(0)?,
+                        filename: row.get(1)?,
+                        camera: row.get(2)?,
+                        media_object_id: row.get(3)?,
+                        media_verification_state: row.get(4)?,
+                        removed: row.get::<_, i64>(5)? != 0,
+                        rotation_degrees: row.get(6)?,
+                        labels: serde_json::from_str(&labels_json).unwrap_or_default(),
+                        active_note: (!notes.is_empty()).then_some(notes),
+                        duration_seconds: row.get(9)?,
+                        best_time: row.get(10)?,
+                    })
+                },
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        let has_more = items.len() > limit as usize;
+        items.truncate(limit as usize);
+        let next_cursor = has_more.then(|| {
+            items
+                .last()
+                .expect("a page with more rows has a last item")
+                .project_asset_id
+                .clone()
+        });
+        Ok(ProjectAssetPage { items, next_cursor })
     }
 
     fn commit_local(&self, project_id: &str, operations: Vec<NewOperation>) -> Result<()> {
