@@ -927,8 +927,9 @@ impl StorageLibrary {
         verification_state: LocationVerificationState,
     ) -> Result<MediaObjectLocation, StorageLibraryError> {
         let now = now();
-        let connection = open_writable_connection(&self.database_path)?;
-        connection.execute(
+        let mut connection = open_writable_connection(&self.database_path)?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
             r#"
             UPDATE media_object_locations SET
                 verification_state = ?3, updated_at = ?4
@@ -941,6 +942,8 @@ impl StorageLibrary {
                 now,
             ],
         )?;
+        crate::search_index::refresh_media_search_row(&tx, media_object_id.as_str())?;
+        tx.commit()?;
         connection
             .query_row(
                 r#"
@@ -966,15 +969,16 @@ impl StorageLibrary {
         verification_state: LocationVerificationState,
     ) -> Result<MediaObjectLocation, StorageLibraryError> {
         let now = now();
-        let connection = open_writable_connection(&self.database_path)?;
-        connection.execute(
+        let mut connection = open_writable_connection(&self.database_path)?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
             r#"
             DELETE FROM media_object_locations
             WHERE media_object_id = ?1 AND storage_object_id = ?2
             "#,
             params![old_media_id.as_str(), storage_object_id.as_str()],
         )?;
-        connection.execute(
+        tx.execute(
             r#"
             INSERT INTO media_object_locations (
                 media_object_id, storage_object_id, verification_state,
@@ -988,6 +992,11 @@ impl StorageLibrary {
                 now,
             ],
         )?;
+        // Both the media object this storage object left and the one it
+        // joined have a stale primary-location/count until refreshed.
+        crate::search_index::refresh_media_search_row(&tx, old_media_id.as_str())?;
+        crate::search_index::refresh_media_search_row(&tx, new_media_id.as_str())?;
+        tx.commit()?;
         connection
             .query_row(
                 r#"
@@ -3378,6 +3387,102 @@ mod tests {
             )
             .unwrap();
         assert_eq!(verification_state, "verified");
+    }
+
+    fn corrupt_search_projection_filename(library: &StorageLibrary, media: &MediaObjectId) {
+        let connection = open_writable_connection(library.database_path()).unwrap();
+        connection
+            .execute(
+                "UPDATE media_search_index SET filename = 'STALE_PROJECTION' WHERE media_object_id = ?1",
+                [media.as_str()],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn updating_location_verification_refreshes_the_search_projection() {
+        let fixture = fixture();
+        let library = &fixture.library;
+        let root = create_root(library, "root_a", true);
+        let media = create_media(library, "media_a");
+        let object = create_object(library, "object_a", &root, "Trips/C0105.MP4");
+        link(library, &media, &object);
+
+        // Hand-corrupt the projection so the assertion below can only pass
+        // if `update_location_verification` actually refreshes it, not
+        // because `link` already left the correct value behind.
+        corrupt_search_projection_filename(library, &media);
+
+        library
+            .update_location_verification(&media, &object, LocationVerificationState::Provisional)
+            .unwrap();
+
+        let connection = open_read_only_connection(library.database_path()).unwrap();
+        let filename: String = connection
+            .query_row(
+                "SELECT filename FROM media_search_index WHERE media_object_id = ?1",
+                [media.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            filename, "C0105.MP4",
+            "update_location_verification must refresh the search projection, \
+             not leave a stale row in place"
+        );
+    }
+
+    #[test]
+    fn relinking_storage_to_media_refreshes_both_the_old_and_new_search_projections() {
+        let fixture = fixture();
+        let library = &fixture.library;
+        let root = create_root(library, "root_a", true);
+        let old_media = create_media(library, "media_old");
+        let new_media = create_media(library, "media_new");
+        let object = create_object(library, "object_a", &root, "Trips/C0106.MP4");
+        link(library, &old_media, &object);
+
+        // Hand-corrupt both projections so the assertions below can only
+        // pass if `relink_storage_to_media` actually refreshes each one.
+        corrupt_search_projection_filename(library, &old_media);
+        corrupt_search_projection_filename(library, &new_media);
+
+        library
+            .relink_storage_to_media(
+                &old_media,
+                &new_media,
+                &object,
+                LocationVerificationState::Verified,
+            )
+            .unwrap();
+
+        let connection = open_read_only_connection(library.database_path()).unwrap();
+        let (old_filename, old_primary, old_count): (String, Option<String>, u32) = connection
+            .query_row(
+                "SELECT filename, primary_storage_object_id, storage_location_count
+                 FROM media_search_index WHERE media_object_id = ?1",
+                [old_media.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            old_filename, "",
+            "the old media object lost its only location and must show no filename"
+        );
+        assert_eq!(old_primary, None);
+        assert_eq!(old_count, 0);
+
+        let (new_filename, new_primary, new_count): (String, Option<String>, u32) = connection
+            .query_row(
+                "SELECT filename, primary_storage_object_id, storage_location_count
+                 FROM media_search_index WHERE media_object_id = ?1",
+                [new_media.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(new_filename, "C0106.MP4");
+        assert_eq!(new_primary.as_deref(), Some(object.as_str()));
+        assert_eq!(new_count, 1);
     }
 
     #[test]
