@@ -3125,4 +3125,28 @@ mod tests {
             .unwrap();
         assert_eq!(filename, "C0103.MP4");
     }
+
+    #[test]
+    fn verifying_a_media_object_updates_the_search_projection_verification_state() {
+        let fixture = fixture();
+        let library = &fixture.library;
+        let root = create_root(library, "root_a", true);
+        let media = create_media(library, "media_a");
+        let object = create_object(library, "object_a", &root, "Trips/C0104.MP4");
+        link(library, &media, &object);
+
+        library
+            .verify_media_object(&media, &"a".repeat(64), 7)
+            .unwrap();
+
+        let connection = open_read_only_connection(library.database_path()).unwrap();
+        let verification_state: String = connection
+            .query_row(
+                "SELECT verification_state FROM media_search_index WHERE media_object_id = ?1",
+                [media.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(verification_state, "verified");
+    }
 }

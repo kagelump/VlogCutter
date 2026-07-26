@@ -1388,3 +1388,127 @@ fn migration_4_preserves_job_engine_tables() {
         assert_eq!(count, 1, "migration 4 table '{table}' should exist");
     }
 }
+
+/// Two byte-identical files converge onto one media object at full-hash
+/// time via the `commit_full_hash` "converge" branch: each file gets its own
+/// provisional media object at quick-fingerprint time (quick fingerprint
+/// alone never attaches a new location to an existing media object), and
+/// whichever file's full-hash job commits second finds the first already
+/// `verified` with a matching hash+size, deletes its own location, and
+/// re-inserts it under the first's media object. That relink changes
+/// `storage_location_count` and `primary_storage_object_id` for *two* media
+/// objects without ever running `UPDATE media_objects` -- exactly the branch
+/// the search-index refresh wiring must not miss.
+#[test]
+fn full_hash_convergence_updates_the_projection_for_both_media_objects() {
+    if !ffmpeg_available() {
+        eprintln!("ffmpeg/ffprobe unavailable; skipping integration test");
+        return;
+    }
+    let fixture = setup_scan_fixture();
+
+    fs::create_dir_all(fixture.original_dir.join("Trip")).unwrap();
+    generate_test_clip(&fixture.original_dir.join("Trip"), "first.mp4", 1);
+    fs::copy(
+        fixture.original_dir.join("Trip").join("first.mp4"),
+        fixture.original_dir.join("Trip").join("second.mp4"),
+    )
+    .unwrap();
+
+    let scan = fixture
+        .scan_service
+        .request_scan(ScanSource::Manual, None, &fixture.root_id, None)
+        .unwrap();
+
+    drain_all_jobs(&fixture);
+
+    let completed_scan = fixture.scan_service.get_scan(&scan.scan_id).unwrap();
+    assert_eq!(
+        completed_scan.state,
+        ScanState::Succeeded,
+        "scan did not succeed: state={:?}, error={:?}",
+        completed_scan.state,
+        completed_scan.error_code
+    );
+    assert!(completed_scan.supported_files >= 2);
+
+    let connection =
+        rcdvlog_server_core::open_read_only_connection(fixture.library.database_path()).unwrap();
+
+    let object_first: String = connection
+        .query_row(
+            "SELECT storage_object_id FROM storage_objects WHERE relative_path = 'Trip/first.mp4'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let object_second: String = connection
+        .query_row(
+            "SELECT storage_object_id FROM storage_objects WHERE relative_path = 'Trip/second.mp4'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+
+    let media_for_first: String = connection
+        .query_row(
+            "SELECT media_object_id FROM media_object_locations WHERE storage_object_id = ?1",
+            [object_first.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let media_for_second: String = connection
+        .query_row(
+            "SELECT media_object_id FROM media_object_locations WHERE storage_object_id = ?1",
+            [object_second.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        media_for_first, media_for_second,
+        "identical files did not converge onto one media object"
+    );
+    let surviving = media_for_first;
+
+    // Both storage objects started under two *different* provisional media
+    // objects (see doc comment above), so whichever media object is not the
+    // surviving one lost its only location during the converge branch, and
+    // its projection row must reflect that -- this is the assertion that
+    // would catch a missing refresh call on the "loser" side of the relink.
+    let orphan: String = connection
+        .query_row(
+            "SELECT media_object_id FROM media_objects WHERE media_object_id != ?1",
+            [surviving.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+
+    let expected_primary = if object_first < object_second {
+        &object_first
+    } else {
+        &object_second
+    };
+
+    let (primary, count, verification_state): (String, u32, String) = connection
+        .query_row(
+            "SELECT primary_storage_object_id, storage_location_count, verification_state
+             FROM media_search_index WHERE media_object_id = ?1",
+            [surviving.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(&primary, expected_primary);
+    assert_eq!(count, 2);
+    assert_eq!(verification_state, "verified");
+
+    let (orphan_primary, orphan_count): (Option<String>, u32) = connection
+        .query_row(
+            "SELECT primary_storage_object_id, storage_location_count
+             FROM media_search_index WHERE media_object_id = ?1",
+            [orphan.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(orphan_primary, None);
+    assert_eq!(orphan_count, 0);
+}

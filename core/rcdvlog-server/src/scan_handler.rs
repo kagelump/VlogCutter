@@ -1556,3 +1556,269 @@ fn modified_rfc3339(metadata: &std::fs::Metadata) -> Option<String> {
         Some(dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
     })
 }
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests that drive the `commit_*` functions through a real
+    //! `JobEngine` transaction (mirroring the fixture style in
+    //! `jobs.rs::tests::engine()`), without spawning ffmpeg/ffprobe/exiftool.
+    //! These exist because the end-to-end `scan_integration` tests only
+    //! prove the pipeline as a whole succeeds -- they cannot isolate a single
+    //! `commit_*` function's wiring, since a later stage's own refresh call
+    //! can silently paper over an earlier stage's missing one.
+    use super::*;
+    use crate::catalog::open_read_only_connection;
+    use crate::{
+        ControlCatalog, NewMediaObject, NewStorageObject, NewStorageRoot, NodeRootCapabilityInput,
+        ObservationScope, ServerConfig,
+    };
+    use rcdvlog_core::{
+        BindingVerificationStatus, GlobalMediaVerificationState, LocationVerificationState,
+        RootAssociationConfirmation, RootAssociationConfirmationStatus, RootAssociationEvidence,
+        StorageAccessMode, StorageProtocol,
+    };
+    use std::collections::BTreeMap;
+    use std::time::Duration;
+    use tempfile::TempDir;
+
+    struct Fixture {
+        _dir: TempDir,
+        library: crate::StorageLibrary,
+        engine: JobEngine,
+    }
+
+    fn fixture() -> Fixture {
+        let dir = TempDir::new().unwrap();
+        let data = dir.path().join("state");
+        let derived = dir.path().join("derived");
+        let backups = dir.path().join("backups");
+        fs::create_dir_all(&data).unwrap();
+        fs::create_dir_all(&derived).unwrap();
+        fs::create_dir_all(&backups).unwrap();
+        let config = ServerConfig::from_values(BTreeMap::from([
+            ("RCDVLOG_DATA_DIR".to_string(), data.display().to_string()),
+            (
+                "RCDVLOG_DERIVED_DIR".to_string(),
+                derived.display().to_string(),
+            ),
+            (
+                "RCDVLOG_BACKUP_DIR".to_string(),
+                backups.display().to_string(),
+            ),
+        ]))
+        .unwrap();
+        let catalog = ControlCatalog::open_or_create(&data, &config.diagnostics()).unwrap();
+        let library = catalog.storage_library();
+        let engine = catalog.jobs();
+        Fixture {
+            _dir: dir,
+            library,
+            engine,
+        }
+    }
+
+    fn claim_one(fixture: &Fixture) -> ClaimedJob {
+        fixture
+            .engine
+            .claim_next("test-worker", Duration::from_secs(30))
+            .unwrap()
+            .expect("a job was enqueued")
+    }
+
+    /// `commit_quick_fingerprint` also records a scan observation, which
+    /// requires a confirmed node-root binding and an open observation
+    /// generation to exist first (foreign-key requirements independent of
+    /// the search-index projection itself).
+    fn ready_generation(fixture: &Fixture, root: &StorageRootId, generation_id: &str) {
+        let node = fixture.library.local_node_id().clone();
+        fixture
+            .library
+            .upsert_node_root_capability(NodeRootCapabilityInput {
+                node_id: node.clone(),
+                storage_root_id: root.clone(),
+                root_subpath: None,
+                protocol: StorageProtocol::Local,
+                access_mode: StorageAccessMode::ReadOnly,
+                verification_status: BindingVerificationStatus::Confirmed,
+                enabled: true,
+                association_evidence: Some(RootAssociationEvidence {
+                    matching_relative_paths: 0,
+                    matching_quick_fingerprints: 0,
+                    matching_full_hashes: 0,
+                    mismatches: 0,
+                    sampled_relative_paths: vec![],
+                    captured_at: "2026-07-20T00:00:00Z".to_string(),
+                }),
+                confirmation: RootAssociationConfirmation {
+                    status: RootAssociationConfirmationStatus::Confirmed,
+                    confirmed_by_node_id: Some(node.clone()),
+                    confirmed_at: Some("2026-07-20T00:00:00Z".to_string()),
+                },
+            })
+            .unwrap();
+        fixture
+            .library
+            .start_observation_generation(
+                generation_id,
+                &node,
+                ObservationScope {
+                    storage_root_id: root.clone(),
+                    relative_prefix: None,
+                },
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn quick_fingerprint_commit_creates_search_projection_row() {
+        let fixture = fixture();
+        let root = StorageRootId::parse("root_quick").unwrap();
+        fixture
+            .library
+            .create_storage_root(NewStorageRoot {
+                id: root.clone(),
+                display_name: "Root Quick".into(),
+                immutable_original: true,
+            })
+            .unwrap();
+        let object = StorageObjectId::parse("object_quick").unwrap();
+        let relative_path = RootRelativePath::parse("Trips/C0103.MP4").unwrap();
+        fixture
+            .library
+            .create_storage_object(NewStorageObject {
+                id: object.clone(),
+                storage_root_id: root.clone(),
+                relative_path: relative_path.clone(),
+                size_bytes: Some(4096),
+                modified_at: Some("2026-07-20T00:00:00Z".to_string()),
+            })
+            .unwrap();
+        ready_generation(&fixture, &root, "generation_quick");
+
+        let job_def = build_quick_fingerprint_job(
+            "scan_quick",
+            "generation_quick",
+            &object,
+            &root,
+            &relative_path,
+            4096,
+            Some("2026-07-20T00:00:00Z"),
+            fixture.library.local_node_id(),
+        )
+        .unwrap();
+        fixture.engine.enqueue(job_def).unwrap();
+        let claimed = claim_one(&fixture);
+
+        let result = JobResultCommit {
+            output_identity: Some(format!("quick:{}", object.as_str())),
+            details: json!({
+                "quickFingerprint": "1".repeat(64),
+                "sizeBytes": 4096,
+                "modifiedAt": "2026-07-20T00:00:00Z",
+            }),
+        };
+        fixture
+            .engine
+            .complete(&claimed, result.clone(), |tx| {
+                commit_quick_fingerprint(tx, &claimed, &result)
+            })
+            .unwrap();
+
+        let connection = open_read_only_connection(fixture.library.database_path()).unwrap();
+        let (filename, count): (String, u32) = connection
+            .query_row(
+                "SELECT filename, storage_location_count FROM media_search_index",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(filename, "C0103.MP4");
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn probe_commit_populates_camera_fields_in_search_projection() {
+        let fixture = fixture();
+        let root = StorageRootId::parse("root_probe").unwrap();
+        fixture
+            .library
+            .create_storage_root(NewStorageRoot {
+                id: root.clone(),
+                display_name: "Root Probe".into(),
+                immutable_original: true,
+            })
+            .unwrap();
+        let object = StorageObjectId::parse("object_probe").unwrap();
+        let relative_path = RootRelativePath::parse("Trips/Sony/C0200.MP4").unwrap();
+        fixture
+            .library
+            .create_storage_object(NewStorageObject {
+                id: object.clone(),
+                storage_root_id: root.clone(),
+                relative_path: relative_path.clone(),
+                size_bytes: Some(2048),
+                modified_at: Some("2026-07-20T00:00:00Z".to_string()),
+            })
+            .unwrap();
+        let media = MediaObjectId::parse("media_probe").unwrap();
+        fixture
+            .library
+            .create_media_object(NewMediaObject {
+                id: media.clone(),
+                size_bytes: Some(2048),
+                quick_fingerprint: Some("2".repeat(64)),
+                full_content_hash: None,
+                verification_state: GlobalMediaVerificationState::Provisional,
+            })
+            .unwrap();
+        fixture
+            .library
+            .link_media_object_location(&media, &object, LocationVerificationState::Provisional)
+            .unwrap();
+
+        let job_def = build_probe_job(
+            "scan_probe",
+            "generation_probe",
+            &object,
+            &root,
+            &relative_path,
+            fixture.library.local_node_id(),
+        )
+        .unwrap();
+        fixture.engine.enqueue(job_def).unwrap();
+        let claimed = claim_one(&fixture);
+
+        let result = JobResultCommit {
+            output_identity: Some(format!("probe:{}", object.as_str())),
+            details: json!({
+                "scanId": "scan_probe",
+                "storageObjectId": object.as_str(),
+                "probe": {
+                    "cameraMake": "Sony",
+                    "cameraModel": "ILCE-7M4",
+                    "enrichmentStatus": "ok",
+                },
+            }),
+        };
+        fixture
+            .engine
+            .complete(&claimed, result.clone(), |tx| {
+                commit_probe(tx, &claimed, &result)
+            })
+            .unwrap();
+
+        let connection = open_read_only_connection(fixture.library.database_path()).unwrap();
+        let (camera_make, camera_model, camera_folded): (Option<String>, Option<String>, String) =
+            connection
+                .query_row(
+                    "SELECT camera_make, camera_model, camera_folded FROM media_search_index
+                     WHERE media_object_id = ?1",
+                    [media.as_str()],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+        assert_eq!(camera_make.as_deref(), Some("Sony"));
+        assert_eq!(camera_model.as_deref(), Some("ILCE-7M4"));
+        assert_eq!(camera_folded, "sony ilce-7m4");
+    }
+}

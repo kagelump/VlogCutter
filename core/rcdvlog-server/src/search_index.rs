@@ -36,6 +36,17 @@ pub(crate) fn refresh_media_search_row(
         None => (None, None, String::new()),
     };
 
+    // `ORDER BY captured_at DESC LIMIT 1` picks the most recently captured
+    // probe fact, whereas the migration's backfill (create_library_search_index
+    // in catalog.rs) joins media_probe_facts directly with no ordering and
+    // relies on SQLite's bare-column MIN/GROUP BY resolution. The two can only
+    // disagree if a storage object ever has more than one media_probe_facts
+    // row -- today's schema makes that unreachable, since probe facts are
+    // keyed on (storage_object_id, recipe_key, recipe_version) and there is
+    // exactly one recipe/version (MEDIA_PROBE_RECIPE/MEDIA_PROBE_VERSION in
+    // scan_handler.rs) with an ON CONFLICT DO UPDATE upsert, so there is
+    // never more than one row per storage object to disagree over. Whoever
+    // adds a second probe recipe version needs to revisit this.
     let camera: Option<(Option<String>, Option<String>)> = match primary_object {
         Some(object) => tx
             .query_row(
