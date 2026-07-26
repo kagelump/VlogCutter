@@ -79,11 +79,26 @@ pub const CONTROL_CATALOG_MIGRATIONS: &[SqliteMigration] = &[
 /// folds with Rust's Unicode-aware `str::to_lowercase`. A catalog that has
 /// pre-existing non-ASCII filenames or camera strings when this migration
 /// first applies would otherwise carry backfilled rows whose folding
-/// disagrees with every row touched afterward. `ControlCatalog::open_or_create`
-/// uses this id to detect "migration 8 is about to apply for the first time"
-/// so it can run one reconciling `rebuild_media_search_index()` pass
-/// immediately after -- see the comment there.
-const LIBRARY_SEARCH_INDEX_MIGRATION_ID: u32 = 8;
+/// disagrees with every row touched afterward.
+///
+/// `ControlCatalog::open_or_create` reconciles this with one
+/// `rebuild_media_search_index()` pass, gated on this key being absent from
+/// `operational_metadata` (the general-purpose key/value table migration 1
+/// creates in `create_control_catalog_foundation`). The key is written only
+/// after the rebuild's own transaction has committed successfully, so:
+///   - a rebuild that fails leaves `open_or_create` failing loudly (as
+///     before) but leaves no marker, so the *next* restart retries instead
+///     of silently accepting the still-ASCII-folded projection forever, and
+///   - a rebuild that succeeds is never repeated on a later restart, keeping
+///     this a one-time cost rather than a per-boot walk of the whole
+///     library.
+///
+/// This is deliberately keyed on completion, not on "migration 8 is
+/// currently pending" (the earlier approach): the pending check is only
+/// observable on the one open where migration 8 first applies, so a
+/// crash/kill/I-O-error during the rebuild left no way to tell a later open
+/// that reconciliation still owed.
+const LIBRARY_SEARCH_INDEX_RECONCILIATION_KEY: &str = "library_search_index_folding_reconciled";
 
 #[derive(Debug, Error, Serialize)]
 #[error("another RCD VlogCutter server process already holds the data-directory lock; {action}")]
@@ -160,16 +175,6 @@ impl ControlCatalog {
         let database_path = data_dir.join(CONTROL_DATABASE_FILENAME);
         let mut connection = open_writable_connection(&database_path)?;
 
-        // Must be read before migrating: once migration 8 has run, it is no
-        // longer "pending" and this signal is gone. See the constant's doc
-        // comment for why this reconciliation exists at all.
-        let library_search_index_pending =
-            inspect_sqlite_migrations(&connection, CONTROL_CATALOG_MIGRATIONS)
-                .context("inspect server control catalog migrations")?
-                .pending_migrations
-                .iter()
-                .any(|migration| migration.id == LIBRARY_SEARCH_INDEX_MIGRATION_ID);
-
         run_sqlite_migrations(&mut connection, CONTROL_CATALOG_MIGRATIONS)
             .context("migrate server control catalog")?;
         let node_id = load_or_create_node_id(&mut connection)?;
@@ -181,17 +186,24 @@ impl ControlCatalog {
             node_id,
         };
 
-        // Runs at most once per catalog, ever: after this open, migration 8
-        // is applied and `library_search_index_pending` will be false on
-        // every future open. Cheap on a fresh install (no media objects
-        // exist yet); on an upgrade it re-derives every row's folded columns
-        // through the same Rust `to_lowercase` path every other write uses,
-        // so the ASCII-only SQL backfill never lingers as a mismatched copy.
-        if library_search_index_pending {
+        // Durable retry rather than a one-shot "migration 8 just applied"
+        // signal -- see LIBRARY_SEARCH_INDEX_RECONCILIATION_KEY's doc
+        // comment. Cheap on a fresh install (no media objects exist yet);
+        // on an upgrade it re-derives every row's folded columns through the
+        // same Rust `to_lowercase` path every other write uses, so the
+        // ASCII-only SQL backfill never lingers as a mismatched copy. The
+        // marker is written only once the rebuild transaction has committed,
+        // so a crash between them simply means the next open pays this cost
+        // again -- still cheaper than a permanently corrupted cursor.
+        if !library_search_index_reconciliation_done(&connection)
+            .context("check library search index reconciliation marker")?
+        {
             catalog
                 .storage_library()
                 .rebuild_media_search_index()
-                .context("reconcile library search index folding after migration 8")?;
+                .context("reconcile library search index folding")?;
+            mark_library_search_index_reconciled(&connection)
+                .context("record library search index reconciliation marker")?;
         }
 
         Ok(catalog)
@@ -381,6 +393,26 @@ fn record_operational_timestamp(connection: &Connection, key: &str) -> Result<()
         params![key, Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),],
     )?;
     Ok(())
+}
+
+/// Whether the library-search-index folding reconciliation (see
+/// `LIBRARY_SEARCH_INDEX_RECONCILIATION_KEY`) has ever completed
+/// successfully for this catalog.
+fn library_search_index_reconciliation_done(connection: &Connection) -> Result<bool> {
+    Ok(connection
+        .query_row(
+            "SELECT 1 FROM operational_metadata WHERE key = ?1",
+            params![LIBRARY_SEARCH_INDEX_RECONCILIATION_KEY],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .is_some())
+}
+
+/// Durably records that the folding reconciliation has completed. Callers
+/// must only call this after the rebuild it guards has already committed.
+fn mark_library_search_index_reconciled(connection: &Connection) -> Result<()> {
+    record_operational_timestamp(connection, LIBRARY_SEARCH_INDEX_RECONCILIATION_KEY)
 }
 
 fn create_control_catalog_foundation(transaction: &Transaction<'_>) -> Result<()> {
@@ -1631,5 +1663,154 @@ mod tests {
             "non-ASCII filename must be findable by its Rust-folded prefix \
              after the backfill path, not only after a refresh: {ids:?}"
         );
+    }
+
+    /// Simulates the crash window the fix targets: migration 8 has already
+    /// applied (so it is no longer "pending") but the process died before
+    /// `open_or_create` ever recorded the reconciliation marker. A restart
+    /// must still notice the folding is unreconciled and retry it, rather
+    /// than reading "migration 8 not pending" and skipping forever.
+    #[test]
+    fn a_restart_after_a_crashed_reconciliation_retries_it_instead_of_skipping_it() {
+        let root = TempDir::new().unwrap();
+        let config = config(&root);
+        let database_path = config.data_dir.join(CONTROL_DATABASE_FILENAME);
+
+        {
+            // Apply every migration directly, bypassing `open_or_create`
+            // entirely, so migration 8's own ASCII-only SQL backfill runs
+            // but no marker is ever written -- exactly what a crash between
+            // "migration 8 committed" and "reconciliation marker written"
+            // would leave behind.
+            let mut connection = Connection::open(&database_path).unwrap();
+            run_sqlite_migrations(&mut connection, &CONTROL_CATALOG_MIGRATIONS[..7]).unwrap();
+            connection
+                .execute_batch(
+                    r#"
+                INSERT INTO storage_roots(storage_root_id, display_name, immutable_original, enabled, created_at, updated_at)
+                    VALUES ('root_crash', 'Root Crash', 1, 1, '2026-07-20T00:00:00Z', '2026-07-20T00:00:00Z');
+                INSERT INTO media_objects(media_object_id, size_bytes, quick_fingerprint, full_content_hash, verification_state, created_at, updated_at)
+                    VALUES ('media_crash', 4096, 'quick_crash', 'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc', 'verified', '2026-07-20T00:00:00Z', '2026-07-20T00:00:00Z');
+                INSERT INTO storage_objects(storage_object_id, storage_root_id, relative_path, size_bytes, created_at, updated_at)
+                    VALUES ('object_crash', 'root_crash', 'Trips/2025/ÖVNING.MP4', 4096, '2026-07-20T00:00:00Z', '2026-07-20T00:00:00Z');
+                INSERT INTO media_object_locations(media_object_id, storage_object_id, verification_state, linked_at, updated_at)
+                    VALUES ('media_crash', 'object_crash', 'verified', '2026-07-20T00:00:00Z', '2026-07-20T00:00:00Z');
+                "#,
+                )
+                .unwrap();
+
+            // Migration 8 runs its ASCII-only SQL backfill here. No marker
+            // is written by this raw path -- only `open_or_create` writes it.
+            run_sqlite_migrations(&mut connection, CONTROL_CATALOG_MIGRATIONS).unwrap();
+
+            let unreconciled: String = connection
+                .query_row(
+                    "SELECT filename_folded FROM media_search_index WHERE media_object_id = 'media_crash'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                unreconciled, "Övning.mp4",
+                "premise check: the raw ASCII-only backfill must leave the \
+                 folding wrong before the simulated restart"
+            );
+
+            let marker_present = library_search_index_reconciliation_done(&connection).unwrap();
+            assert!(
+                !marker_present,
+                "premise check: the crashed state must not carry the marker"
+            );
+        }
+
+        // A normal restart through the real API must detect the missing
+        // marker (independent of migration 8's pending status, which is now
+        // false) and retry the reconciliation.
+        let catalog =
+            ControlCatalog::open_or_create(&config.data_dir, &config.diagnostics()).unwrap();
+
+        let verify_connection = Connection::open(catalog.database_path()).unwrap();
+        let filename_folded: String = verify_connection
+            .query_row(
+                "SELECT filename_folded FROM media_search_index WHERE media_object_id = 'media_crash'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            filename_folded, "övning.mp4",
+            "the retried reconciliation must fold with Rust's to_lowercase"
+        );
+        assert!(
+            library_search_index_reconciliation_done(&verify_connection).unwrap(),
+            "a successful reconciliation must leave the durable marker behind"
+        );
+    }
+
+    /// The marker must make reconciliation a one-time cost. Proven here by
+    /// corrupting a folded value by hand after the marker is set and
+    /// confirming a second normal open leaves it untouched -- if the second
+    /// open silently rebuilt the whole index again, this corruption would be
+    /// erased.
+    #[test]
+    fn a_second_open_does_not_rebuild_the_index_again() {
+        let root = TempDir::new().unwrap();
+        let config = config(&root);
+
+        let first =
+            ControlCatalog::open_or_create(&config.data_dir, &config.diagnostics()).unwrap();
+        assert!(
+            library_search_index_reconciliation_done(
+                &Connection::open(first.database_path()).unwrap()
+            )
+            .unwrap(),
+            "the first open must leave the reconciliation marker behind"
+        );
+        drop(first);
+
+        // Insert a row directly and hand-corrupt its folded column to a
+        // sentinel that a rebuild would never produce.
+        let connection = Connection::open(database_path_for(&config)).unwrap();
+        connection
+            .execute_batch(
+                r#"
+                INSERT INTO media_objects(media_object_id, size_bytes, quick_fingerprint, full_content_hash, verification_state, created_at, updated_at)
+                    VALUES ('media_sentinel', 10, 'quick_sentinel', NULL, 'unverified', '2026-07-20T00:00:00Z', '2026-07-20T00:00:00Z');
+                "#,
+            )
+            .unwrap();
+        connection
+            .execute(
+                r#"
+                INSERT INTO media_search_index (
+                    media_object_id, filename, filename_folded, camera_folded,
+                    verification_state, created_at, refreshed_at
+                ) VALUES ('media_sentinel', 'SENTINEL', 'sentinel-not-rebuilt', '', 'unverified', '2026-07-20T00:00:00Z', '2026-07-20T00:00:00Z')
+                "#,
+                [],
+            )
+            .unwrap();
+        drop(connection);
+
+        let _second =
+            ControlCatalog::open_or_create(&config.data_dir, &config.diagnostics()).unwrap();
+
+        let verify_connection = Connection::open(database_path_for(&config)).unwrap();
+        let folded: String = verify_connection
+            .query_row(
+                "SELECT filename_folded FROM media_search_index WHERE media_object_id = 'media_sentinel'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            folded, "sentinel-not-rebuilt",
+            "a second open must not rebuild the index -- the hand-planted \
+             sentinel would be overwritten by `refresh_media_search_row` if it did"
+        );
+    }
+
+    fn database_path_for(config: &ServerConfig) -> PathBuf {
+        config.data_dir.join(CONTROL_DATABASE_FILENAME)
     }
 }
