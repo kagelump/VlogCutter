@@ -16,7 +16,7 @@ use crate::storage_path::{
     PathAccessIntent, PathResolutionError, resolve_existing_binding_path, validate_local_mount_path,
 };
 
-const MAX_PAGE_SIZE: u32 = 200;
+pub(crate) const MAX_PAGE_SIZE: u32 = 200;
 const MAX_DISPLAY_NAME_BYTES: usize = 255;
 
 #[derive(Debug, Error)]

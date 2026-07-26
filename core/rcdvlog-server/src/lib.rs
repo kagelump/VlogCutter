@@ -4,6 +4,7 @@ mod config;
 mod foundation;
 mod jobs;
 mod library;
+pub mod library_query;
 mod media_facts;
 mod replicas;
 mod representations;
