@@ -33,7 +33,7 @@
   "source_hash_artifact": null,
   "merge": {
     "authorized": true,
-    "merged": false,
-    "merge_sha": null
+    "merged": true,
+    "merge_sha": "746a92bdf3b4e9dd97e9626e0da6b298bc99e907"
   }
 }
