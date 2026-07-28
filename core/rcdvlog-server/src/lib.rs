@@ -61,7 +61,11 @@ pub use media_facts::{
     ScanFileDiagnostic,
 };
 pub use rcdvlog_core::StorageAccessMode;
-pub use replicas::{ProjectReplica, ProjectReplicaError, ProjectReplicaManager, ProjectSummary};
+pub use replicas::{
+    AddToProjectDisposition, AddToProjectItem, AddToProjectPreview, AddToProjectRequest,
+    AddToProjectResult, MAX_ADD_TO_PROJECT_ITEMS, ProjectPage, ProjectReplica, ProjectReplicaError,
+    ProjectReplicaManager, ProjectSummary,
+};
 pub use representations::{
     PROXY_RECIPE_KEY, Representation, RepresentationError, RepresentationJobHandler,
     RepresentationKind, RepresentationNeed, RepresentationRequest, RepresentationRequestResult,

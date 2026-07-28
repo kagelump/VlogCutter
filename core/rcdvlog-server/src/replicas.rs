@@ -4,8 +4,9 @@ use crate::{
 };
 use chrono::{SecondsFormat, Utc};
 use rcdvlog_core::{
-    Asset, Catalog, MediaObjectId, MediaVerificationState, OperationId, PROJECT_ASSET_MEDIA_LINKED,
-    ProjectAssetAddedPayload, ProjectAssetId, ProjectAssetPage, ProjectId,
+    Asset, Catalog, GlobalMediaVerificationState, MediaObjectId, MediaVerificationState,
+    NormalizedMediaProbe, OperationId, PROJECT_ASSET_MEDIA_LINKED, ProjectAssetAddedPayload,
+    ProjectAssetId, ProjectAssetPage, ProjectId,
 };
 use rcdvlog_sync::{
     BASELINE_VERSION, BaselineEnvelope, BaselinePreview, ReconcileRequest, ReconcileResponse,
@@ -89,6 +90,59 @@ pub struct ProjectSummary {
 pub struct ProjectPage {
     pub items: Vec<ProjectSummary>,
     pub next_cursor: Option<String>,
+}
+
+pub const MAX_ADD_TO_PROJECT_ITEMS: usize = 100;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AddToProjectRequest {
+    pub media_object_ids: Vec<MediaObjectId>,
+    pub acknowledge_unverified: bool,
+    pub idempotency_key: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AddToProjectDisposition {
+    Ready,
+    Added,
+    AlreadyMember,
+    AcknowledgementRequired,
+    IdentityMismatch,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AddToProjectItem {
+    pub media_object_id: MediaObjectId,
+    pub project_asset_id: Option<ProjectAssetId>,
+    pub verification_state: GlobalMediaVerificationState,
+    pub disposition: AddToProjectDisposition,
+    pub remote_only: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AddToProjectPreview {
+    pub project_id: String,
+    pub selected_count: usize,
+    pub ready_count: usize,
+    pub already_member_count: usize,
+    pub acknowledgement_required_count: usize,
+    pub mismatch_count: usize,
+    pub items: Vec<AddToProjectItem>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AddToProjectResult {
+    pub project_id: String,
+    pub idempotency_key: String,
+    pub added_count: usize,
+    pub already_member_count: usize,
+    pub blocked_count: usize,
+    pub items: Vec<AddToProjectItem>,
 }
 
 #[derive(Debug, Clone)]
@@ -321,6 +375,220 @@ impl ProjectReplicaManager {
             .map_err(ProjectReplicaError::Infrastructure)
     }
 
+    pub fn preview_add_to_project(
+        &self,
+        project_id: &str,
+        request: &AddToProjectRequest,
+    ) -> Result<AddToProjectPreview, ProjectReplicaError> {
+        validate_add_request(request)?;
+        let catalog = self.open_catalog(project_id)?;
+        let library = self.control.storage_library();
+        let mut items = Vec::with_capacity(request.media_object_ids.len());
+        for media_object_id in unique_media_ids(&request.media_object_ids) {
+            let media = library.get_media_object(&media_object_id)?;
+            let existing = catalog
+                .project_asset_for_media_object(project_id, media_object_id.as_str())
+                .map_err(ProjectReplicaError::Infrastructure)?;
+            let disposition = if existing.is_some() {
+                AddToProjectDisposition::AlreadyMember
+            } else {
+                match media.verification_state {
+                    GlobalMediaVerificationState::Verified => AddToProjectDisposition::Ready,
+                    GlobalMediaVerificationState::Unverified
+                    | GlobalMediaVerificationState::Provisional => {
+                        AddToProjectDisposition::AcknowledgementRequired
+                    }
+                    GlobalMediaVerificationState::Mismatch => {
+                        AddToProjectDisposition::IdentityMismatch
+                    }
+                }
+            };
+            let availability =
+                library.media_availability(&media_object_id, library.local_node_id())?;
+            let remote_only = availability.state
+                == rcdvlog_core::NodeAvailabilityState::AccessibleHere
+                && !availability.locations.iter().any(|location| {
+                    &location.node_id != library.local_node_id()
+                        && location.state == rcdvlog_core::NodeAvailabilityState::AccessibleHere
+                });
+            items.push(AddToProjectItem {
+                media_object_id,
+                project_asset_id: existing
+                    .as_ref()
+                    .map(|asset| ProjectAssetId::parse(&asset.id))
+                    .transpose()
+                    .map_err(|error| ProjectReplicaError::InvalidBaseline(error.to_string()))?,
+                verification_state: media.verification_state,
+                disposition,
+                remote_only,
+            });
+        }
+        Ok(AddToProjectPreview {
+            project_id: project_id.to_string(),
+            selected_count: items.len(),
+            ready_count: items
+                .iter()
+                .filter(|item| item.disposition == AddToProjectDisposition::Ready)
+                .count(),
+            already_member_count: items
+                .iter()
+                .filter(|item| item.disposition == AddToProjectDisposition::AlreadyMember)
+                .count(),
+            acknowledgement_required_count: items
+                .iter()
+                .filter(|item| item.disposition == AddToProjectDisposition::AcknowledgementRequired)
+                .count(),
+            mismatch_count: items
+                .iter()
+                .filter(|item| item.disposition == AddToProjectDisposition::IdentityMismatch)
+                .count(),
+            items,
+        })
+    }
+
+    pub fn add_media_to_project(
+        &self,
+        project_id: &str,
+        request: &AddToProjectRequest,
+    ) -> Result<AddToProjectResult, ProjectReplicaError> {
+        validate_add_request(request)?;
+        let preview = self.preview_add_to_project(project_id, request)?;
+        let catalog = self.open_catalog(project_id)?;
+        let mut items = Vec::with_capacity(preview.items.len());
+
+        for mut item in preview.items {
+            if item.disposition == AddToProjectDisposition::AlreadyMember {
+                items.push(item);
+                continue;
+            }
+            if item.disposition == AddToProjectDisposition::IdentityMismatch
+                || (item.disposition == AddToProjectDisposition::AcknowledgementRequired
+                    && !request.acknowledge_unverified)
+            {
+                items.push(item);
+                continue;
+            }
+
+            let asset_id = deterministic_server_asset_id(project_id, &item.media_object_id);
+            let asset = match catalog.get_asset(asset_id.as_str()) {
+                Ok(asset) => asset,
+                Err(_) => {
+                    let payload = self.portable_payload(&item.media_object_id, &asset_id)?;
+                    catalog
+                        .add_portable_project_asset(project_id, payload)
+                        .map_err(ProjectReplicaError::Infrastructure)?
+                }
+            };
+            let verification_state = match item.verification_state {
+                GlobalMediaVerificationState::Verified => MediaVerificationState::Verified,
+                GlobalMediaVerificationState::Unverified
+                | GlobalMediaVerificationState::Provisional => MediaVerificationState::Provisional,
+                GlobalMediaVerificationState::Mismatch => unreachable!("mismatches are blocked"),
+            };
+            catalog
+                .link_project_asset_media(
+                    &asset.id,
+                    item.media_object_id.as_str(),
+                    verification_state,
+                )
+                .map_err(ProjectReplicaError::Infrastructure)?;
+            item.project_asset_id = Some(asset_id);
+            item.disposition = AddToProjectDisposition::Added;
+            items.push(item);
+        }
+
+        // The operation log is authoritative. If this process previously
+        // stopped after its replica commit, this replay repairs the lagging
+        // control-catalog membership projection without duplicating assets.
+        self.repair_membership_projections(project_id)?;
+        Ok(AddToProjectResult {
+            project_id: project_id.to_string(),
+            idempotency_key: request.idempotency_key.clone(),
+            added_count: items
+                .iter()
+                .filter(|item| item.disposition == AddToProjectDisposition::Added)
+                .count(),
+            already_member_count: items
+                .iter()
+                .filter(|item| item.disposition == AddToProjectDisposition::AlreadyMember)
+                .count(),
+            blocked_count: items
+                .iter()
+                .filter(|item| {
+                    matches!(
+                        item.disposition,
+                        AddToProjectDisposition::AcknowledgementRequired
+                            | AddToProjectDisposition::IdentityMismatch
+                    )
+                })
+                .count(),
+            items,
+        })
+    }
+
+    fn portable_payload(
+        &self,
+        media_object_id: &MediaObjectId,
+        asset_id: &ProjectAssetId,
+    ) -> Result<ProjectAssetAddedPayload, ProjectReplicaError> {
+        let library = self.control.storage_library();
+        let media = library.get_media_object(media_object_id)?;
+        let facts = library.media_search_facts(media_object_id)?;
+        let connection = open_read_only_connection(self.control.database_path())
+            .map_err(ProjectReplicaError::Infrastructure)?;
+        let probe_json = connection
+            .query_row(
+                r#"
+                SELECT pf.probe_json
+                FROM media_object_locations mol
+                JOIN media_probe_facts pf ON pf.storage_object_id = mol.storage_object_id
+                WHERE mol.media_object_id = ?1
+                ORDER BY pf.captured_at DESC, pf.storage_object_id ASC
+                LIMIT 1
+                "#,
+                [media_object_id.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let probe = probe_json
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<NormalizedMediaProbe>(raw).ok());
+        let camera = probe
+            .as_ref()
+            .and_then(|probe| probe.camera_string.clone())
+            .or_else(|| facts.camera_model.clone())
+            .or(facts.camera_make.clone())
+            .unwrap_or_default();
+        let size_bytes = media.size_bytes.unwrap_or_default();
+        Ok(ProjectAssetAddedPayload {
+            id: asset_id.as_str().to_string(),
+            fingerprint: media
+                .full_content_hash
+                .clone()
+                .or(media.quick_fingerprint.clone())
+                .unwrap_or_else(|| media_object_id.as_str().to_string()),
+            filename: facts.filename,
+            size_bytes,
+            duration_seconds: probe.as_ref().map_or(0.0, |value| value.duration_seconds),
+            frame_rate: probe.as_ref().map_or(0.0, |value| value.frame_rate),
+            width: probe.as_ref().map_or(0, |value| value.encoded_width),
+            height: probe.as_ref().map_or(0, |value| value.encoded_height),
+            codec: probe
+                .as_ref()
+                .map_or_else(String::new, |value| value.codec.clone()),
+            camera,
+            captured_at_raw: probe
+                .as_ref()
+                .and_then(|value| value.captured_at_raw.clone()),
+            best_time: probe.as_ref().and_then(|value| value.best_time.clone()),
+            metadata_rotation_degrees: probe
+                .as_ref()
+                .map_or(0, |value| value.metadata_rotation_degrees),
+            default_rotation_degrees: 0,
+            created_at: media.created_at,
+        })
+    }
+
     pub fn reconcile(
         &self,
         project_id: &str,
@@ -498,6 +766,38 @@ impl ProjectReplicaManager {
         }
         Ok(self.data_dir.join(relative))
     }
+}
+
+fn validate_add_request(request: &AddToProjectRequest) -> Result<(), ProjectReplicaError> {
+    if request.media_object_ids.is_empty()
+        || request.media_object_ids.len() > MAX_ADD_TO_PROJECT_ITEMS
+    {
+        return Err(ProjectReplicaError::InvalidBaseline(format!(
+            "mediaObjectIds must contain between 1 and {MAX_ADD_TO_PROJECT_ITEMS} items"
+        )));
+    }
+    if request.idempotency_key.trim().is_empty() || request.idempotency_key.len() > 255 {
+        return Err(ProjectReplicaError::InvalidBaseline(
+            "idempotencyKey must contain between 1 and 255 bytes".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn unique_media_ids(values: &[MediaObjectId]) -> Vec<MediaObjectId> {
+    let mut values = values.to_vec();
+    values.sort();
+    values.dedup();
+    values
+}
+
+fn deterministic_server_asset_id(
+    project_id: &str,
+    media_object_id: &MediaObjectId,
+) -> ProjectAssetId {
+    let digest = blake3::hash(format!("{project_id}\0{}", media_object_id.as_str()).as_bytes());
+    ProjectAssetId::parse(format!("asset_server_{}", &digest.to_hex()[..32]))
+        .expect("a hex digest always forms a valid project asset ID")
 }
 
 fn replica_relative_path(project_id: &str) -> String {
@@ -792,6 +1092,116 @@ mod tests {
                 .unwrap(),
             1
         );
+    }
+
+    fn seed_global_media(fixture: &Fixture, id: &str, state: GlobalMediaVerificationState) {
+        fixture
+            .manager
+            .control
+            .storage_library()
+            .create_media_object(crate::NewMediaObject {
+                id: MediaObjectId::parse(id).unwrap(),
+                size_bytes: Some(42),
+                quick_fingerprint: Some(blake3::hash(id.as_bytes()).to_hex().to_string()),
+                full_content_hash: (state == GlobalMediaVerificationState::Verified)
+                    .then(|| "a".repeat(64)),
+                verification_state: state,
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn add_to_project_deduplicates_from_replica_and_repairs_projection() {
+        let fixture = Fixture::new();
+        let source_root = TempDir::new().unwrap();
+        let envelope = baseline(&source_root);
+        let project_id = envelope.payload.project.project_id.clone();
+        fixture.manager.import_baseline(&envelope).unwrap();
+        seed_global_media(
+            &fixture,
+            "media_add_verified",
+            GlobalMediaVerificationState::Verified,
+        );
+        let request = AddToProjectRequest {
+            media_object_ids: vec![MediaObjectId::parse("media_add_verified").unwrap()],
+            acknowledge_unverified: false,
+            idempotency_key: "request-add-1".to_string(),
+        };
+
+        let preview = fixture
+            .manager
+            .preview_add_to_project(&project_id, &request)
+            .unwrap();
+        assert_eq!(preview.ready_count, 1);
+        let first = fixture
+            .manager
+            .add_media_to_project(&project_id, &request)
+            .unwrap();
+        assert_eq!(first.added_count, 1);
+        assert_eq!(first.blocked_count, 0);
+
+        let retried = fixture
+            .manager
+            .add_media_to_project(&project_id, &request)
+            .unwrap();
+        assert_eq!(retried.added_count, 0);
+        assert_eq!(retried.already_member_count, 1);
+        let catalog = fixture.manager.open_catalog(&project_id).unwrap();
+        assert_eq!(catalog.count_project_assets(&project_id).unwrap(), 2);
+        let projected: i64 = open_read_only_connection(fixture.manager.control.database_path())
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM project_media_memberships WHERE media_object_id='media_add_verified'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(projected, 1);
+    }
+
+    #[test]
+    fn add_to_project_requires_acknowledgement_and_blocks_mismatch() {
+        let fixture = Fixture::new();
+        let source_root = TempDir::new().unwrap();
+        let envelope = baseline(&source_root);
+        let project_id = envelope.payload.project.project_id.clone();
+        fixture.manager.import_baseline(&envelope).unwrap();
+        seed_global_media(
+            &fixture,
+            "media_add_provisional",
+            GlobalMediaVerificationState::Provisional,
+        );
+        seed_global_media(
+            &fixture,
+            "media_add_mismatch",
+            GlobalMediaVerificationState::Mismatch,
+        );
+        let mut request = AddToProjectRequest {
+            media_object_ids: vec![
+                MediaObjectId::parse("media_add_provisional").unwrap(),
+                MediaObjectId::parse("media_add_mismatch").unwrap(),
+            ],
+            acknowledge_unverified: false,
+            idempotency_key: "request-add-unsafe".to_string(),
+        };
+        let blocked = fixture
+            .manager
+            .add_media_to_project(&project_id, &request)
+            .unwrap();
+        assert_eq!(blocked.added_count, 0);
+        assert_eq!(blocked.blocked_count, 2);
+
+        request.acknowledge_unverified = true;
+        let acknowledged = fixture
+            .manager
+            .add_media_to_project(&project_id, &request)
+            .unwrap();
+        assert_eq!(acknowledged.added_count, 1);
+        assert_eq!(acknowledged.blocked_count, 1);
+        assert!(acknowledged.items.iter().any(|item| {
+            item.media_object_id.as_str() == "media_add_mismatch"
+                && item.disposition == AddToProjectDisposition::IdentityMismatch
+        }));
     }
 
     /// A registered replica with `count` portable assets named

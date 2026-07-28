@@ -2,7 +2,14 @@ import {
   assertProtocolCompatible,
   ProjectClientError,
   type BrowserProjectClient,
+  type AddToProjectPreview,
+  type AddToProjectRequest,
+  type AddToProjectResult,
+  type LibraryQueryParams,
+  type LibrarySearchPage,
   type LoginResult,
+  type ProjectAssetPage,
+  type ProjectPage,
   type ServerReadiness,
   type ServerStatus,
   type ServerVersion,
@@ -92,6 +99,33 @@ export class HttpProjectClient implements BrowserProjectClient {
     return response.json() as Promise<LoginResult>;
   }
 
+  async listLibraryMedia(query: LibraryQueryParams = {}): Promise<LibrarySearchPage> {
+    return this.request<LibrarySearchPage>(`${API_PATHS.libraryMedia}${queryString(query)}`);
+  }
+
+  async listProjects(limit = 50, after?: string): Promise<ProjectPage> {
+    return this.request<ProjectPage>(`${API_PATHS.projects}${queryString({ limit, after })}`);
+  }
+
+  async listProjectAssets(projectId: string, limit = 50, after?: string, search?: string): Promise<ProjectAssetPage> {
+    const path = API_PATHS.projectAssets.replace("{projectId}", encodeURIComponent(projectId));
+    return this.request<ProjectAssetPage>(`${path}${queryString({ limit, after, search })}`);
+  }
+
+  async previewAddToProject(projectId: string, request: AddToProjectRequest): Promise<AddToProjectPreview> {
+    return this.request<AddToProjectPreview>(
+      API_PATHS.previewAddToProject.replace("{projectId}", encodeURIComponent(projectId)),
+      jsonPost(request),
+    );
+  }
+
+  async addToProject(projectId: string, request: AddToProjectRequest): Promise<AddToProjectResult> {
+    return this.request<AddToProjectResult>(
+      API_PATHS.addToProject.replace("{projectId}", encodeURIComponent(projectId)),
+      jsonPost(request),
+    );
+  }
+
   private async request<T>(
     path: string,
     init?: RequestInit,
@@ -118,6 +152,19 @@ export class HttpProjectClient implements BrowserProjectClient {
     }
     return response.json() as Promise<T>;
   }
+}
+
+function jsonPost(body: unknown): RequestInit {
+  return { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) };
+}
+
+function queryString(values: object): string {
+  const query = new URLSearchParams();
+  for (const [key, value] of Object.entries(values)) {
+    if (value !== undefined && value !== null && value !== "") query.set(key, String(value));
+  }
+  const encoded = query.toString();
+  return encoded ? `?${encoded}` : "";
 }
 
 async function responseError(response: Response): Promise<ProjectClientError> {

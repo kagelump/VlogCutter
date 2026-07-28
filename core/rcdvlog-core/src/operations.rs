@@ -811,6 +811,26 @@ impl Catalog {
         Ok(count as u64)
     }
 
+    /// Resolves project membership from the replica itself. Callers must use
+    /// this instead of a control-catalog projection when deduplicating an
+    /// add-to-project command because that projection can legitimately lag.
+    pub fn project_asset_for_media_object(
+        &self,
+        project_id: &str,
+        media_object_id: &str,
+    ) -> Result<Option<Asset>> {
+        let connection = self.connection()?;
+        let asset_id = connection
+            .query_row(
+                "SELECT id FROM assets WHERE project_id = ?1 AND media_object_id = ?2 ORDER BY id LIMIT 1",
+                params![project_id, media_object_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        drop(connection);
+        asset_id.map(|id| self.get_asset(&id)).transpose()
+    }
+
     /// Pages one project's assets by the stable `project_asset_id` order.
     /// Search is a case-folded substring match over this project's own
     /// filename, camera, active note, and labels. A replica is per-project and

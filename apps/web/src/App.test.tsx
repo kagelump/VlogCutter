@@ -24,6 +24,11 @@ function client(session: SessionState): BrowserProjectClient {
       displayPrefix: "12345678",
       expiresAt: "2026-07-25T00:00:00Z",
     }),
+    listLibraryMedia: vi.fn().mockResolvedValue({ items: [], nextCursor: null, availabilityFilterApplied: false }),
+    listProjects: vi.fn().mockResolvedValue({ items: [], nextCursor: null }),
+    listProjectAssets: vi.fn().mockResolvedValue({ items: [], nextCursor: null }),
+    previewAddToProject: vi.fn(),
+    addToProject: vi.fn(),
   };
 }
 
@@ -46,4 +51,17 @@ test("submits a bootstrap code through the client seam", async () => {
   await userEvent.type(input, "ABC123");
   await userEvent.click(screen.getByRole("button", { name: "Open review desk" }));
   await waitFor(() => expect(mock.loginWithBootstrapCode).toHaveBeenCalledWith("ABC123"));
+});
+
+test("library route uses bounded query state from browser history", async () => {
+  window.history.replaceState({}, "", "/library?q=C01&sort=filenameAsc");
+  const mock = client({ authenticated: true, sessions: [] });
+  render(<App client={mock} />);
+  expect(await screen.findByRole("heading", { name: "Library" })).toBeVisible();
+  await waitFor(() => expect(mock.listLibraryMedia).toHaveBeenCalledWith(expect.objectContaining({
+    limit: 48,
+    filenamePrefix: "C01",
+    sort: "filenameAsc",
+  })));
+  window.history.replaceState({}, "", "/");
 });

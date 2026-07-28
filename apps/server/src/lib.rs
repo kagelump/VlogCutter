@@ -2,6 +2,7 @@
 
 use anyhow::{Context, Result, anyhow};
 use axum::body::Body;
+use axum::extract::rejection::JsonRejection;
 use axum::extract::rejection::QueryRejection;
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
 use axum::extract::{DefaultBodyLimit, Extension, OriginalUri, Path as AxumPath, Query, State};
@@ -14,8 +15,8 @@ use futures::SinkExt;
 use futures::stream::StreamExt;
 use rcdvlog_server_core::library_query::{LibraryFilters, LibraryQuery, LibrarySort};
 use rcdvlog_server_core::{
-    APPLICATION_VERSION, AuthDiagnostics, AuthError, AuthService, BaselineEnvelope,
-    BaselinePreview, CONTROL_CATALOG_SCHEMA_VERSION, DeviceCredentialInfo,
+    APPLICATION_VERSION, AddToProjectRequest, AuthDiagnostics, AuthError, AuthService,
+    BaselineEnvelope, BaselinePreview, CONTROL_CATALOG_SCHEMA_VERSION, DeviceCredentialInfo,
     GlobalMediaVerificationState, JobId, MediaAvailability, MediaObject, MediaObjectId,
     MediaSearchFacts, NodeAvailabilityState, NodeId, NodeJobCompletion, PROTOCOL_MAJOR_VERSION,
     PROTOCOL_MINOR_VERSION, ProjectId, ProjectReplica, ProjectReplicaError, ReadinessReport,
@@ -548,6 +549,15 @@ pub fn router(state: HttpState) -> Router {
             "/api/v1/projects/{project_id}/assets",
             get(list_project_assets),
         )
+        .route(
+            "/api/v1/projects/{project_id}/assets/add/preview",
+            post(preview_add_to_project),
+        )
+        .route(
+            "/api/v1/projects/{project_id}/assets/add",
+            post(add_to_project),
+        )
+        .layer(middleware::from_fn_with_state(state.clone(), require_csrf))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
@@ -685,6 +695,36 @@ pub fn openapi_document() -> serde_json::Value {
                         "404": { "$ref": "#/components/responses/Error" }
                     }
                 }
+            },
+            "/api/v1/projects/{projectId}/assets/add/preview": {
+                "post": {
+                    "operationId": "previewAddToProject",
+                    "parameters": [
+                        { "name": "projectId", "in": "path", "required": true, "schema": { "type": "string" } }
+                    ],
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/AddToProjectRequest" } } } },
+                    "responses": {
+                        "200": { "$ref": "#/components/responses/AddToProjectPreview" },
+                        "400": { "$ref": "#/components/responses/Error" },
+                        "401": { "$ref": "#/components/responses/Error" },
+                        "404": { "$ref": "#/components/responses/Error" }
+                    }
+                }
+            },
+            "/api/v1/projects/{projectId}/assets/add": {
+                "post": {
+                    "operationId": "addToProject",
+                    "parameters": [
+                        { "name": "projectId", "in": "path", "required": true, "schema": { "type": "string" } }
+                    ],
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/AddToProjectRequest" } } } },
+                    "responses": {
+                        "200": { "$ref": "#/components/responses/AddToProjectResult" },
+                        "400": { "$ref": "#/components/responses/Error" },
+                        "401": { "$ref": "#/components/responses/Error" },
+                        "404": { "$ref": "#/components/responses/Error" }
+                    }
+                }
             }
         },
         "components": {
@@ -807,7 +847,7 @@ pub fn openapi_document() -> serde_json::Value {
                 },
                 "LibrarySearchItem": {
                     "type": "object",
-                    "required": ["media", "filename", "cameraMake", "cameraModel", "primaryStorageRootId", "storageLocationCount", "projectMembershipCount", "availability"],
+                    "required": ["media", "filename", "cameraMake", "cameraModel", "primaryStorageRootId", "storageLocationCount", "projectMembershipCount", "availability", "thumbnailRepresentationId"],
                     "properties": {
                         "media": { "$ref": "#/components/schemas/MediaObject" },
                         "filename": { "type": "string" },
@@ -816,7 +856,8 @@ pub fn openapi_document() -> serde_json::Value {
                         "primaryStorageRootId": { "type": ["string", "null"] },
                         "storageLocationCount": { "type": "integer", "minimum": 0 },
                         "projectMembershipCount": { "type": "integer", "minimum": 0 },
-                        "availability": { "$ref": "#/components/schemas/NodeAvailabilityState" }
+                        "availability": { "$ref": "#/components/schemas/NodeAvailabilityState" },
+                        "thumbnailRepresentationId": { "type": ["string", "null"] }
                     }
                 },
                 "LibrarySearchPage": {
@@ -925,6 +966,55 @@ pub fn openapi_document() -> serde_json::Value {
                         },
                         "nextCursor": { "type": ["string", "null"] }
                     }
+                },
+                "AddToProjectRequest": {
+                    "type": "object",
+                    "required": ["mediaObjectIds", "acknowledgeUnverified", "idempotencyKey"],
+                    "properties": {
+                        "mediaObjectIds": { "type": "array", "minItems": 1, "maxItems": 100, "items": { "type": "string" } },
+                        "acknowledgeUnverified": { "type": "boolean" },
+                        "idempotencyKey": { "type": "string", "minLength": 1, "maxLength": 255 }
+                    }
+                },
+                "AddToProjectDisposition": {
+                    "type": "string",
+                    "enum": ["ready", "added", "already_member", "acknowledgement_required", "identity_mismatch"]
+                },
+                "AddToProjectItem": {
+                    "type": "object",
+                    "required": ["mediaObjectId", "projectAssetId", "verificationState", "disposition", "remoteOnly"],
+                    "properties": {
+                        "mediaObjectId": { "type": "string" },
+                        "projectAssetId": { "type": ["string", "null"] },
+                        "verificationState": { "$ref": "#/components/schemas/GlobalMediaVerificationState" },
+                        "disposition": { "$ref": "#/components/schemas/AddToProjectDisposition" },
+                        "remoteOnly": { "type": "boolean" }
+                    }
+                },
+                "AddToProjectPreview": {
+                    "type": "object",
+                    "required": ["projectId", "selectedCount", "readyCount", "alreadyMemberCount", "acknowledgementRequiredCount", "mismatchCount", "items"],
+                    "properties": {
+                        "projectId": { "type": "string" },
+                        "selectedCount": { "type": "integer", "minimum": 0 },
+                        "readyCount": { "type": "integer", "minimum": 0 },
+                        "alreadyMemberCount": { "type": "integer", "minimum": 0 },
+                        "acknowledgementRequiredCount": { "type": "integer", "minimum": 0 },
+                        "mismatchCount": { "type": "integer", "minimum": 0 },
+                        "items": { "type": "array", "items": { "$ref": "#/components/schemas/AddToProjectItem" } }
+                    }
+                },
+                "AddToProjectResult": {
+                    "type": "object",
+                    "required": ["projectId", "idempotencyKey", "addedCount", "alreadyMemberCount", "blockedCount", "items"],
+                    "properties": {
+                        "projectId": { "type": "string" },
+                        "idempotencyKey": { "type": "string" },
+                        "addedCount": { "type": "integer", "minimum": 0 },
+                        "alreadyMemberCount": { "type": "integer", "minimum": 0 },
+                        "blockedCount": { "type": "integer", "minimum": 0 },
+                        "items": { "type": "array", "items": { "$ref": "#/components/schemas/AddToProjectItem" } }
+                    }
                 }
             },
             "responses": {
@@ -936,6 +1026,8 @@ pub fn openapi_document() -> serde_json::Value {
                 "LibraryMediaDetail": { "description": "One media object with its search facts and node-relative availability", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/LibraryMediaDetail" } } } },
                 "ProjectPage": { "description": "A page of registered project replicas", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ProjectPage" } } } },
                 "ProjectAssetPage": { "description": "A page of one project's assets", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ProjectAssetPage" } } } },
+                "AddToProjectPreview": { "description": "A non-mutating preview of add-to-project outcomes", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/AddToProjectPreview" } } } },
+                "AddToProjectResult": { "description": "Canonical add-to-project outcomes", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/AddToProjectResult" } } } },
                 "Error": { "description": "Stable server error", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
             }
         }
@@ -2078,6 +2170,76 @@ async fn list_project_assets(
     }
 }
 
+async fn preview_add_to_project(
+    State(state): State<HttpState>,
+    Extension(request_id): Extension<RequestId>,
+    AxumPath(project_id): AxumPath<String>,
+    request: Result<Json<AddToProjectRequest>, JsonRejection>,
+) -> Response {
+    let Json(request) = match request {
+        Ok(value) => value,
+        Err(_) => {
+            return query_error_response(&request_id, "invalid_input", StatusCode::BAD_REQUEST);
+        }
+    };
+    match state
+        .foundation
+        .catalog()
+        .project_replicas()
+        .preview_add_to_project(&project_id, &request)
+    {
+        Ok(preview) => (StatusCode::OK, Json(preview)).into_response(),
+        Err(error) => project_command_error_response(&request_id, error),
+    }
+}
+
+async fn add_to_project(
+    State(state): State<HttpState>,
+    Extension(request_id): Extension<RequestId>,
+    AxumPath(project_id): AxumPath<String>,
+    request: Result<Json<AddToProjectRequest>, JsonRejection>,
+) -> Response {
+    let Json(request) = match request {
+        Ok(value) => value,
+        Err(_) => {
+            return query_error_response(&request_id, "invalid_input", StatusCode::BAD_REQUEST);
+        }
+    };
+    match state
+        .foundation
+        .catalog()
+        .project_replicas()
+        .add_media_to_project(&project_id, &request)
+    {
+        Ok(result) => {
+            if result.added_count > 0 {
+                state
+                    .ws_channels
+                    .broadcast(&project_id, "projectAssetsChanged");
+            }
+            (StatusCode::OK, Json(result)).into_response()
+        }
+        Err(error) => project_command_error_response(&request_id, error),
+    }
+}
+
+fn project_command_error_response(request_id: &RequestId, error: ProjectReplicaError) -> Response {
+    match error {
+        ProjectReplicaError::NotFound { .. }
+        | ProjectReplicaError::Storage(StorageLibraryError::NotFound { .. }) => {
+            query_error_response(request_id, "not_found", StatusCode::NOT_FOUND)
+        }
+        ProjectReplicaError::InvalidBaseline(_) => {
+            query_error_response(request_id, "invalid_input", StatusCode::BAD_REQUEST)
+        }
+        _ => query_error_response(
+            request_id,
+            "internal_error",
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+    }
+}
+
 /// Error mapping for the read-only project browse endpoints (`GET
 /// /api/v1/projects` and `GET /api/v1/projects/{projectId}/assets`).
 /// Distinct from [`project_replica_error`], which maps the baseline
@@ -2935,6 +3097,68 @@ mod tests {
         assert!(!text.contains(source.path().to_str().unwrap()));
         assert!(!text.contains("\"path\""));
         assert!(!text.contains("proxyPath"));
+    }
+
+    #[tokio::test]
+    async fn add_to_project_route_is_bounded_idempotent_and_replica_authoritative() {
+        let fixture = Fixture::new(false);
+        let token = device_auth_token(&fixture);
+        let source = TempDir::new().unwrap();
+        let envelope = baseline_envelope(&source);
+        let project_id = envelope.payload.project.project_id.clone();
+        fixture
+            .foundation
+            .catalog()
+            .project_replicas()
+            .import_baseline(&envelope)
+            .unwrap();
+        fixture
+            .foundation
+            .catalog()
+            .storage_library()
+            .create_media_object(rcdvlog_server_core::NewMediaObject {
+                id: MediaObjectId::parse("media_http_add").unwrap(),
+                size_bytes: Some(10),
+                quick_fingerprint: Some(blake3::hash(b"http-add").to_hex().to_string()),
+                full_content_hash: Some("a".repeat(64)),
+                verification_state: GlobalMediaVerificationState::Verified,
+            })
+            .unwrap();
+        let body = serde_json::to_vec(&serde_json::json!({
+            "mediaObjectIds": ["media_http_add"],
+            "acknowledgeUnverified": false,
+            "idempotencyKey": "http-add-1"
+        }))
+        .unwrap();
+
+        for expected in ["added", "already_member"] {
+            let response = fixture
+                .app()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(format!("/api/v1/projects/{project_id}/assets/add"))
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                        .body(Body::from(body.clone()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(json(response).await["items"][0]["disposition"], expected);
+        }
+        assert_eq!(
+            fixture
+                .foundation
+                .catalog()
+                .project_replicas()
+                .open_catalog(&project_id)
+                .unwrap()
+                .count_project_assets(&project_id)
+                .unwrap(),
+            2
+        );
     }
 
     #[tokio::test]

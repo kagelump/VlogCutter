@@ -1,6 +1,26 @@
 {
   "components": {
     "responses": {
+      "AddToProjectPreview": {
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/AddToProjectPreview"
+            }
+          }
+        },
+        "description": "A non-mutating preview of add-to-project outcomes"
+      },
+      "AddToProjectResult": {
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/AddToProjectResult"
+            }
+          }
+        },
+        "description": "Canonical add-to-project outcomes"
+      },
       "Error": {
         "content": {
           "application/json": {
@@ -100,6 +120,152 @@
       }
     },
     "schemas": {
+      "AddToProjectDisposition": {
+        "enum": [
+          "ready",
+          "added",
+          "already_member",
+          "acknowledgement_required",
+          "identity_mismatch"
+        ],
+        "type": "string"
+      },
+      "AddToProjectItem": {
+        "properties": {
+          "disposition": {
+            "$ref": "#/components/schemas/AddToProjectDisposition"
+          },
+          "mediaObjectId": {
+            "type": "string"
+          },
+          "projectAssetId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "remoteOnly": {
+            "type": "boolean"
+          },
+          "verificationState": {
+            "$ref": "#/components/schemas/GlobalMediaVerificationState"
+          }
+        },
+        "required": [
+          "mediaObjectId",
+          "projectAssetId",
+          "verificationState",
+          "disposition",
+          "remoteOnly"
+        ],
+        "type": "object"
+      },
+      "AddToProjectPreview": {
+        "properties": {
+          "acknowledgementRequiredCount": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "alreadyMemberCount": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/AddToProjectItem"
+            },
+            "type": "array"
+          },
+          "mismatchCount": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "projectId": {
+            "type": "string"
+          },
+          "readyCount": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "selectedCount": {
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "projectId",
+          "selectedCount",
+          "readyCount",
+          "alreadyMemberCount",
+          "acknowledgementRequiredCount",
+          "mismatchCount",
+          "items"
+        ],
+        "type": "object"
+      },
+      "AddToProjectRequest": {
+        "properties": {
+          "acknowledgeUnverified": {
+            "type": "boolean"
+          },
+          "idempotencyKey": {
+            "maxLength": 255,
+            "minLength": 1,
+            "type": "string"
+          },
+          "mediaObjectIds": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 100,
+            "minItems": 1,
+            "type": "array"
+          }
+        },
+        "required": [
+          "mediaObjectIds",
+          "acknowledgeUnverified",
+          "idempotencyKey"
+        ],
+        "type": "object"
+      },
+      "AddToProjectResult": {
+        "properties": {
+          "addedCount": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "alreadyMemberCount": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "blockedCount": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "idempotencyKey": {
+            "type": "string"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/AddToProjectItem"
+            },
+            "type": "array"
+          },
+          "projectId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "projectId",
+          "idempotencyKey",
+          "addedCount",
+          "alreadyMemberCount",
+          "blockedCount",
+          "items"
+        ],
+        "type": "object"
+      },
       "BootstrapExchangeRequest": {
         "properties": {
           "code": {
@@ -196,6 +362,12 @@
           "storageLocationCount": {
             "minimum": 0,
             "type": "integer"
+          },
+          "thumbnailRepresentationId": {
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
@@ -206,7 +378,8 @@
           "primaryStorageRootId",
           "storageLocationCount",
           "projectMembershipCount",
-          "availability"
+          "availability",
+          "thumbnailRepresentationId"
         ],
         "type": "object"
       },
@@ -931,6 +1104,84 @@
         "responses": {
           "200": {
             "$ref": "#/components/responses/ProjectAssetPage"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/v1/projects/{projectId}/assets/add": {
+      "post": {
+        "operationId": "addToProject",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "projectId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AddToProjectRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/AddToProjectResult"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/v1/projects/{projectId}/assets/add/preview": {
+      "post": {
+        "operationId": "previewAddToProject",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "projectId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AddToProjectRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/AddToProjectPreview"
           },
           "400": {
             "$ref": "#/components/responses/Error"

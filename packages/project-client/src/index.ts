@@ -52,6 +52,76 @@ export interface LoginResult {
   expiresAt: string;
 }
 
+export type GlobalMediaVerificationState = "unverified" | "provisional" | "verified" | "mismatch";
+export type NodeAvailabilityState = "known" | "accessible_here" | "accessible_on_another_node" | "temporarily_unavailable" | "missing_after_completed_observation" | "fingerprint_mismatch";
+export type LibrarySort = "createdDesc" | "filenameAsc" | "sizeDesc";
+
+export interface MediaObject {
+  id: string;
+  sizeBytes: number | null;
+  quickFingerprint: string | null;
+  fullContentHash: string | null;
+  verificationState: GlobalMediaVerificationState;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface LibrarySearchItem {
+  media: MediaObject;
+  filename: string;
+  cameraMake: string | null;
+  cameraModel: string | null;
+  primaryStorageRootId: string | null;
+  storageLocationCount: number;
+  projectMembershipCount: number;
+  availability: NodeAvailabilityState;
+  thumbnailRepresentationId: string | null;
+}
+
+export interface LibrarySearchPage {
+  items: LibrarySearchItem[];
+  nextCursor: string | null;
+  availabilityFilterApplied: boolean;
+}
+
+export interface LibraryQueryParams {
+  limit?: number;
+  sort?: LibrarySort;
+  verificationState?: GlobalMediaVerificationState;
+  camera?: string;
+  filenamePrefix?: string;
+  availability?: NodeAvailabilityState;
+  after?: string;
+}
+
+export interface ProjectSummary { projectId: string; state: string; assetCount: number; registeredAt: string; updatedAt: string }
+export interface ProjectPage { items: ProjectSummary[]; nextCursor: string | null }
+export interface ProjectAssetItem {
+  projectAssetId: string; filename: string; camera: string; mediaObjectId: string | null;
+  mediaVerificationState: string; removed: boolean; rotationDegrees: number; labels: string[];
+  activeNote: string | null; durationSeconds: number; bestTime: string | null;
+}
+export interface ProjectAssetPage { items: ProjectAssetItem[]; nextCursor: string | null }
+
+export interface AddToProjectRequest {
+  mediaObjectIds: string[];
+  acknowledgeUnverified: boolean;
+  idempotencyKey: string;
+}
+export type AddToProjectDisposition = "ready" | "added" | "already_member" | "acknowledgement_required" | "identity_mismatch";
+export interface AddToProjectItem {
+  mediaObjectId: string; projectAssetId: string | null; verificationState: GlobalMediaVerificationState;
+  disposition: AddToProjectDisposition; remoteOnly: boolean;
+}
+export interface AddToProjectPreview {
+  projectId: string; selectedCount: number; readyCount: number; alreadyMemberCount: number;
+  acknowledgementRequiredCount: number; mismatchCount: number; items: AddToProjectItem[];
+}
+export interface AddToProjectResult {
+  projectId: string; idempotencyKey: string; addedCount: number; alreadyMemberCount: number;
+  blockedCount: number; items: AddToProjectItem[];
+}
+
 export type ClientErrorKind =
   | "server_unavailable"
   | "session_expired"
@@ -82,6 +152,11 @@ export interface ProjectClient {
 export interface BrowserProjectClient extends ProjectClient {
   getSession(): Promise<SessionState>;
   loginWithBootstrapCode(code: string, hostname?: string): Promise<LoginResult>;
+  listLibraryMedia(query?: LibraryQueryParams): Promise<LibrarySearchPage>;
+  listProjects(limit?: number, after?: string): Promise<ProjectPage>;
+  listProjectAssets(projectId: string, limit?: number, after?: string, search?: string): Promise<ProjectAssetPage>;
+  previewAddToProject(projectId: string, request: AddToProjectRequest): Promise<AddToProjectPreview>;
+  addToProject(projectId: string, request: AddToProjectRequest): Promise<AddToProjectResult>;
 }
 
 export function assertProtocolCompatible(version: ServerVersion): void {

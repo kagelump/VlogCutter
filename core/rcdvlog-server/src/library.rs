@@ -2,7 +2,7 @@ use chrono::{SecondsFormat, Utc};
 use rcdvlog_core::{
     BindingVerificationStatus, GlobalMediaVerificationState, LocationVerificationState,
     MediaObjectId, NodeAvailabilityState, NodeId, ObservationGenerationState, ObservationStatus,
-    OperationId, ProjectAssetId, ProjectId, RootAssociationConfirmation,
+    OperationId, ProjectAssetId, ProjectId, RepresentationId, RootAssociationConfirmation,
     RootAssociationConfirmationStatus, RootAssociationEvidence, RootRelativePath,
     StorageAccessMode, StorageObjectId, StorageProtocol, StorageRootId,
 };
@@ -257,6 +257,7 @@ pub struct LibrarySearchItem {
     pub storage_location_count: u64,
     pub project_membership_count: u64,
     pub availability: NodeAvailabilityState,
+    pub thumbnail_representation_id: Option<RepresentationId>,
 }
 
 /// A page produced by [`StorageLibrary::search_media`]. See that method's
@@ -1282,6 +1283,11 @@ impl StorageLibrary {
                 storage_location_count: row.storage_location_count,
                 project_membership_count: row.project_membership_count,
                 availability: row_availability,
+                thumbnail_representation_id: current_thumbnail_id(
+                    &connection,
+                    &media_object_id,
+                    &self.local_node_id,
+                )?,
             });
         }
 
@@ -1699,6 +1705,42 @@ fn load_bindings_for_availability(
             })
         })?
         .collect()
+}
+
+fn current_thumbnail_id(
+    connection: &rusqlite::Connection,
+    media_object_id: &MediaObjectId,
+    node_id: &NodeId,
+) -> Result<Option<RepresentationId>, StorageLibraryError> {
+    connection
+        .query_row(
+            r#"
+            SELECT r.representation_id
+            FROM representations r
+            JOIN representation_locations l ON l.representation_id = r.representation_id
+            WHERE r.media_object_id = ?1
+              AND r.kind = 'thumbnail'
+              AND r.recipe_key = ?2
+              AND r.state = 'available'
+              AND l.node_id = ?3
+              AND l.state = 'available'
+            ORDER BY r.completed_at DESC, r.representation_id ASC
+            LIMIT 1
+            "#,
+            params![
+                media_object_id.as_str(),
+                crate::representations::THUMBNAIL_RECIPE_KEY,
+                node_id.as_str()
+            ],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .map(RepresentationId::parse)
+        .transpose()
+        .map_err(|error| StorageLibraryError::InvalidInput {
+            field: "representationId",
+            reason: error.to_string(),
+        })
 }
 
 fn latest_completed_availability(
