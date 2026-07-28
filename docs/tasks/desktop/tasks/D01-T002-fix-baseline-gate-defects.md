@@ -7,7 +7,7 @@
   "epic_id": "D01",
   "title": "Fix baseline gate defects",
   "slug": "fix-baseline-gate-defects",
-  "status": "draft",
+  "status": "ready",
   "task_class": "implementation",
   "depends_on": ["D01-T001"],
   "principal_invariant": "Every command classified real_defect in the baseline audit exits zero, with no gate command that previously passed regressing.",
@@ -23,7 +23,14 @@
   },
   "path_ownership": {
     "contract_editor": ["docs/tasks/desktop/tasks/D01-T002-fix-baseline-gate-defects.md"],
-    "implementer": ["docs/tasks/desktop/BASELINE_AUDIT.md"],
+    "implementer": [
+      "docs/tasks/desktop/BASELINE_AUDIT.md",
+      ".claude/skills/executing-bounded-task-cycle/SKILL.md",
+      ".claude/skills/executing-bounded-task-cycle/references/epic-schema.md",
+      ".claude/skills/writing-bounded-task-packets/references/epic-schema.md",
+      ".claude/skills/writing-bounded-task-packets/assets/EPIC.template.md",
+      "scripts/check-docs.mjs"
+    ],
     "independent_tester": ["docs/task-cycles/D01-T002/verification/**"],
     "integrator": ["docs/task-cycles/D01-T002/evidence/**"]
   },
@@ -34,7 +41,8 @@
     "cargo test --workspace",
     "pnpm check:frontend",
     "pnpm test:web",
-    "pnpm test:integration"
+    "pnpm test:integration",
+    "pnpm check:docs"
   ],
   "reconciliation_checks": [
     {
@@ -84,6 +92,15 @@ Outputs:
   narrowing a command's arguments to make it pass are all prohibited unless the
   audit itself classified the check as wrong, and then only with the reviewer's
   explicit agreement recorded in the resolution.
+- That exception is live for exactly one of RD-1's three root causes. The audit
+  states the `{{TASK_ID}}` template placeholder links "should be excluded from
+  link checking" — a claim that the check is wrong for unexpanded template
+  placeholders, not that the document is broken. Changing `check-docs.mjs` to
+  exclude them is therefore permitted, and requires the reviewer's explicit
+  agreement recorded in the `## Resolution` section. The exception does not
+  extend to the other two root causes: the missing `planning/ORCHESTRATION.md`
+  target and the `tasks/E01-T00*.md` example references are broken documents,
+  and suppressing them in the checker is prohibited.
 - `AGENTS.md` §15 applies: no reformatting of `core/rcdvlog-core/src/lib.rs`,
   `core/rcdvlog-core/src/operations.rs`, or `apps/desktop/src/App.tsx` beyond the
   lines a specific `RD-n` requires.
@@ -92,26 +109,42 @@ Outputs:
 
 ## Owned paths
 
-This packet is `draft` for exactly one reason: its implementer path set is the
-set of files named by the audit's `RD-n` rows, and that audit does not exist yet.
-A fix packet whose paths cannot be enumerated fails admission criterion 5, so it
-is not marked `ready`.
+This packet was `draft` for exactly one reason: its implementer path set is the
+set of files named by the audit's `RD-n` rows, and that audit did not exist yet.
+D01-T001 published `docs/tasks/desktop/BASELINE_AUDIT.md`, so the set is now
+enumerable and this packet is promoted to `ready`.
 
-The only paths ownable today are the ones that do not depend on the ledger's
-contents: the implementer owns the ledger's `## Resolution` section, and the
-independent tester and integrator own their cycle directories. The source paths
-are added at promotion.
+The audit recorded one `real_defect` (RD-1, `pnpm check:docs`), which is below
+the split threshold of eight and confined to a single seam — documentation link
+integrity. No split into `D01-T002a`/`D01-T002b` is required.
 
-Promotion procedure for the contract editor, once D01-T001 is complete:
+`path_ownership.implementer` is the four skill documentation files RD-1 names,
+plus `scripts/check-docs.mjs`, plus the ledger's `## Resolution` section. The
+checker is owned because RD-1 has three distinct root causes and one of them —
+the `{{TASK_ID}}` placeholder link in `EPIC.template.md` — cannot be fixed in
+the template alone: `check-docs.mjs` has no placeholder-exclusion mechanism, so
+the fix is either an exclusion rule in the checker or a change to how the
+template expresses the link. Both must be reachable.
 
-1. Read every `RD-n` and list the exact files each requires changing.
-2. Add that list to `path_ownership.implementer`, and the corresponding test
-   files to `path_ownership.independent_tester`.
-3. If the union spans more than one load-bearing seam, or the `real_defect`
-   count exceeds eight, split this row into `D01-T002a`, `D01-T002b`, … before
-   promoting.
-4. Re-run the admission gate, then set both this packet and the epic row to
-   `ready`.
+Nothing is added to `path_ownership.independent_tester` beyond its cycle
+directory. RD-1 is a repository-wide link check with no test fixtures of its
+own; the tester's reproduction is running `pnpm check:docs`, not editing a test
+file.
+
+`pnpm check:docs` was added to `verification_commands` at promotion. It was
+absent from the drafted list, which would have left the acceptance oracle
+("every `RD-n` command exits zero") unobservable by this packet's own gate,
+since RD-1's command is `pnpm check:docs`.
+
+### Note on the files this packet edits
+
+Four of the five source files belong to the `executing-bounded-task-cycle` and
+`writing-bounded-task-packets` skills — the machinery that executes this very
+cycle. Editing them is in scope and permitted; `.claude/**` is not a forbidden
+path. The implementer must confine changes to the specific broken links RD-1
+names and must not alter skill behavior, procedure, or schema semantics in
+passing. A change to what a skill *instructs* rather than what it *links to* is
+a stop condition.
 
 ## Required interface
 
@@ -202,6 +235,7 @@ cargo test --workspace
 pnpm check:frontend
 pnpm test:web
 pnpm test:integration
+pnpm check:docs
 ```
 
 Expected result: every command exits zero.

@@ -82,7 +82,7 @@ flat table of per-camera filename offsets. This epic rebalances that.
 | Order | Task | Title | Depends on | Status |
 | ---: | --- | --- | --- | --- |
 | 10 | [D01-T001](tasks/D01-T001-verification-baseline-audit.md) | Verification baseline audit | — | complete |
-| 20 | [D01-T002](tasks/D01-T002-fix-baseline-gate-defects.md) | Fix baseline gate defects | D01-T001 | draft |
+| 20 | [D01-T002](tasks/D01-T002-fix-baseline-gate-defects.md) | Fix baseline gate defects | D01-T001 | ready |
 | 30 | [D01-T003](tasks/D01-T003-desktop-frontend-testability-seam.md) | Desktop frontend testability seam | D01-T002 | ready |
 | 40 | [D01-T004](tasks/D01-T004-github-actions-ci.md) | GitHub Actions CI with macOS native build | D01-T003 | ready |
 | 50 | [D01-T005](tasks/D01-T005-native-desktop-smoke-acceptance.md) | Native macOS desktop smoke acceptance | D01-T004 | ready |
@@ -114,7 +114,7 @@ row on its own.
 
 | Rows | Blocked on | Promoted by |
 | --- | --- | --- |
-| T002, T006 | Their path ownership is the set of files named in a defect ledger that does not exist yet. A fix packet cannot exhaustively own paths before the audit that finds the defects. | The contract editor, after T001 / T005 publishes its ledger. |
+| ~~T002~~, T006 | Their path ownership is the set of files named in a defect ledger that does not exist yet. A fix packet cannot exhaustively own paths before the audit that finds the defects. | The contract editor, after T001 / T005 publishes its ledger. |
 | T008–T017 | `architecture_decisions_frozen` would be a false claim: the chronology tables, operation vocabulary, and solver interface are frozen *by* T007, whose packet is the authority for them. | The contract editor, after T007 publishes `CHRONOLOGY_MODEL.md`. |
 | T020–T023 | Same shape: frozen by T019's `EDIT_PLAN_MODEL.md`. | The contract editor, after T019 publishes it. |
 | T024, T025 | Depend on the two contracts above plus the acceptance surface. | The contract editor, after T022 and T018 respectively. |
