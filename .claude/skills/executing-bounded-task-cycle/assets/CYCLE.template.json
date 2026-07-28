@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "task_id": "{{TASK_ID}}",
+  "epic_file": "{{EPIC_FILE}}",
+  "task_file": "{{TASK_FILE}}",
+  "base_branch": "{{BASE_BRANCH}}",
+  "base_sha": "{{BASE_SHA}}",
+  "task_branch": "{{TASK_BRANCH}}",
+  "contract_sha": null,
+  "implementation_base_sha": "{{IMPLEMENTATION_BASE_SHA}}",
+  "implementation_sha": "{{IMPLEMENTATION_SHA}}",
+  "subject_sha": "{{SUBJECT_SHA}}",
+  "independent_tested_sha": "{{SUBJECT_SHA}}",
+  "reviewed_sha": "{{SUBJECT_SHA}}",
+  "gated_sha": "{{SUBJECT_SHA}}",
+  "evidence_commit_sha": null,
+  "test_verdict": "PASS",
+  "review_verdict": "APPROVE",
+  "open_findings": {
+    "p0": 0,
+    "p1": 0,
+    "p2": 0
+  },
+  "gate_commands": [],
+  "source_hash_artifact": null,
+  "merge": {
+    "authorized": false,
+    "merged": false,
+    "merge_sha": null
+  }
+}
