@@ -207,6 +207,25 @@ pub struct JobSnapshotError {
     pub details: Value,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JobListItem {
+    pub enqueue_sequence: u64,
+    /// Reconstructed from durable counters and persisted recipe throughput.
+    /// One durable job is executed by one worker; scheduler class concurrency
+    /// controls how many jobs may run beside it.
+    pub estimate: BatchEstimate,
+    #[serde(flatten)]
+    pub snapshot: JobSnapshot,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JobPage {
+    pub items: Vec<JobListItem>,
+    pub next_before: Option<u64>,
+}
+
 /// The scheduler's actual concurrency and the individual remaining task weights.
 /// These are transient estimation inputs; durable counters remain authoritative.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -498,6 +517,122 @@ impl JobEngine {
             updated_at: row.updated_at,
             completed_at: row.completed_at,
         })
+    }
+
+    pub fn list_jobs(
+        &self,
+        limit: u32,
+        before: Option<u64>,
+        state: Option<JobState>,
+    ) -> Result<JobPage, JobEngineError> {
+        if limit == 0 || limit > 200 {
+            return Err(JobEngineError::InvalidInput(
+                "limit must be between 1 and 200".to_string(),
+            ));
+        }
+        let before = before
+            .map(i64::try_from)
+            .transpose()
+            .map_err(|_| JobEngineError::InvalidInput("before is too large".to_string()))?;
+        let connection = open_read_only_connection(&self.database_path)?;
+        let mut statement = connection.prepare(
+            "SELECT job_id,enqueue_sequence FROM jobs WHERE (?1 IS NULL OR enqueue_sequence < ?1) AND (?2 IS NULL OR state = ?2) ORDER BY enqueue_sequence DESC LIMIT ?3",
+        )?;
+        let rows = statement
+            .query_map(
+                params![before, state.map(JobState::as_str), i64::from(limit + 1)],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+        drop(connection);
+        let has_more = rows.len() > limit as usize;
+        let mut items = Vec::with_capacity(rows.len().min(limit as usize));
+        for (job_id, enqueue_sequence) in rows.into_iter().take(limit as usize) {
+            let snapshot = self.get_job(
+                &JobId::parse(job_id)
+                    .map_err(|error| JobEngineError::CorruptState(error.to_string()))?,
+            )?;
+            let estimate = self.estimate_snapshot(&snapshot)?;
+            items.push(JobListItem {
+                enqueue_sequence: u64::try_from(enqueue_sequence).map_err(|_| {
+                    JobEngineError::CorruptState("negative enqueue sequence".to_string())
+                })?,
+                estimate,
+                snapshot,
+            });
+        }
+        let next_before = has_more
+            .then(|| items.last().map(|item| item.enqueue_sequence))
+            .flatten();
+        Ok(JobPage { items, next_before })
+    }
+
+    fn estimate_snapshot(&self, snapshot: &JobSnapshot) -> Result<BatchEstimate, JobEngineError> {
+        let connection = open_read_only_connection(&self.database_path)?;
+        let history = connection
+            .query_row(
+                "SELECT work_units_per_worker_second,samples FROM job_rate_history WHERE node_id=?1 AND recipe_key=?2",
+                params![self.node_id.as_str(), &snapshot.definition.recipe_key],
+                |row| {
+                    Ok(RateHistory {
+                        work_units_per_worker_second: row.get(0)?,
+                        samples: row.get::<_, i64>(1)? as u64,
+                    })
+                },
+            )
+            .optional()?
+            .unwrap_or_default();
+        let estimator = BatchEstimator::with_explicit_progress(
+            snapshot.total_items as usize,
+            snapshot.total_work_units,
+            1,
+            history,
+            snapshot.completed_items as usize,
+            snapshot.completed_work_units,
+        );
+        let remaining = snapshot
+            .total_work_units
+            .saturating_sub(snapshot.completed_work_units);
+        Ok(estimator.estimate(if remaining == 0 {
+            &[]
+        } else {
+            std::slice::from_ref(&remaining)
+        }))
+    }
+
+    pub fn retry_failed(&self, id: &JobId) -> Result<JobSnapshot, JobEngineError> {
+        let now = timestamp(self.clock.now());
+        let mut connection = open_writable_connection(&self.database_path)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (state, attempt_count, max_attempts): (String, u32, u32) = transaction
+            .query_row(
+                "SELECT state,attempt_count,max_attempts FROM jobs WHERE job_id=?1",
+                [id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?
+            .ok_or_else(|| JobEngineError::NotFound(id.to_string()))?;
+        if state != "failed" || attempt_count >= max_attempts {
+            return Err(JobEngineError::InvalidState(format!(
+                "failed job has {attempt_count} of {max_attempts} attempts consumed"
+            )));
+        }
+        transaction.execute(
+            "UPDATE jobs SET state='queued',available_at=?1,cancel_requested_at=NULL,cancel_reason=NULL,error_code=NULL,error_details_json=NULL,completed_at=NULL,updated_at=?1 WHERE job_id=?2 AND state='failed'",
+            params![now, id.as_str()],
+        )?;
+        emit(
+            &transaction,
+            id.as_str(),
+            None,
+            "manual_retry_queued",
+            JobState::Queued,
+            &json!({}),
+            &now,
+        )?;
+        transaction.commit()?;
+        self.get_job(id)
     }
 
     /// List queued jobs targeted at a specific (non-server) node.

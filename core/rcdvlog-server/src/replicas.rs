@@ -93,6 +93,27 @@ pub struct ProjectPage {
     pub next_cursor: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectSyncOverview {
+    pub project_id: String,
+    pub registry_state: String,
+    pub origin_node_id: Option<String>,
+    pub server_node_id: String,
+    pub asset_count: u64,
+    pub operation_count: u64,
+    pub latest_local_sequence: u64,
+    pub pending_projection_repairs: u64,
+    pub unresolved_conflict_count: usize,
+    pub node_observation_count: u64,
+    pub last_success_at: String,
+    pub last_error_code: Option<String>,
+    pub endpoint: Option<String>,
+    pub compatibility: String,
+    pub connectivity: String,
+    pub recommendations: Vec<String>,
+}
+
 pub const MAX_ADD_TO_PROJECT_ITEMS: usize = 100;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -403,6 +424,67 @@ impl ProjectReplicaManager {
         catalog
             .list_project_asset_page(project_id, limit, after, search)
             .map_err(ProjectReplicaError::Infrastructure)
+    }
+
+    pub fn list_sync_overview(&self) -> Result<Vec<ProjectSyncOverview>, ProjectReplicaError> {
+        let projects = self.list_projects(200, None)?.items;
+        let connection = open_read_only_connection(self.control.database_path())
+            .map_err(ProjectReplicaError::Infrastructure)?;
+        let mut result = Vec::with_capacity(projects.len());
+        for project in projects {
+            let replica = self.get(&project.project_id)?;
+            let diagnostics = self
+                .open_catalog(&project.project_id)?
+                .operation_diagnostics(&project.project_id)
+                .map_err(ProjectReplicaError::Infrastructure)?;
+            let pending_projection_repairs: i64 = connection.query_row(
+                "SELECT COUNT(*) FROM project_projection_repairs WHERE project_id=?1 AND state='pending'",
+                [&project.project_id],
+                |row| row.get(0),
+            )?;
+            let node_observation_count: i64 = connection.query_row(
+                r#"
+                SELECT COUNT(DISTINCT o.node_id || ':' || o.storage_object_id)
+                FROM project_media_memberships pm
+                JOIN media_object_locations ml ON ml.media_object_id = pm.media_object_id
+                JOIN node_asset_observations o ON o.storage_object_id = ml.storage_object_id
+                WHERE pm.project_id = ?1
+                "#,
+                [&project.project_id],
+                |row| row.get(0),
+            )?;
+            let mut recommendations = Vec::new();
+            if !diagnostics.unresolved_conflicts.is_empty() {
+                recommendations.push("review_conflicts_on_desktop".to_string());
+            }
+            if pending_projection_repairs > 0 {
+                recommendations.push("wait_for_projection_repair".to_string());
+            }
+            recommendations.push("reconcile_paired_mac_to_refresh_connectivity".to_string());
+            result.push(ProjectSyncOverview {
+                project_id: project.project_id,
+                registry_state: project.state,
+                origin_node_id: replica.origin_node_id,
+                server_node_id: replica.server_node_id,
+                asset_count: project.asset_count,
+                operation_count: diagnostics.operation_count,
+                latest_local_sequence: diagnostics.latest_local_sequence,
+                pending_projection_repairs: u64::try_from(pending_projection_repairs).map_err(
+                    |_| ProjectReplicaError::InvalidBaseline("negative repair count".to_string()),
+                )?,
+                unresolved_conflict_count: diagnostics.unresolved_conflicts.len(),
+                node_observation_count: u64::try_from(node_observation_count).map_err(|_| {
+                    ProjectReplicaError::InvalidBaseline("negative observation count".to_string())
+                })?,
+                last_success_at: project.updated_at,
+                last_error_code: None,
+                endpoint: None,
+                compatibility: "compatible".to_string(),
+                connectivity: "not_probed".to_string(),
+                recommendations,
+            });
+        }
+        Ok(result)
     }
 
     pub fn get_review_asset(

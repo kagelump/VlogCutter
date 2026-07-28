@@ -22,6 +22,8 @@ pub enum ScanServiceError {
     NotFound { entity: &'static str, id: String },
     #[error("scan scope is already active")]
     ScanAlreadyActive,
+    #[error("idempotency key conflicts with a different scan request")]
+    IdempotencyConflict,
     #[error(transparent)]
     Library(#[from] StorageLibraryError),
     #[error(transparent)]
@@ -208,11 +210,65 @@ impl ScanService {
         root_id: &StorageRootId,
         scope: Option<&RootRelativePath>,
     ) -> Result<ScanRun, ScanServiceError> {
+        self.request_scan_with_idempotency(source, schedule_id, root_id, scope, None)
+    }
+
+    /// Request a manual scan with a durable caller-provided idempotency key.
+    /// Reusing the key with the same root and scope returns the original scan,
+    /// including after it becomes terminal; changing the immutable request is
+    /// rejected as a conflict.
+    pub fn request_scan_idempotent(
+        &self,
+        root_id: &StorageRootId,
+        scope: Option<&RootRelativePath>,
+        idempotency_key: &str,
+    ) -> Result<ScanRun, ScanServiceError> {
+        if idempotency_key.trim().is_empty() || idempotency_key.len() > 255 {
+            return Err(ScanServiceError::InvalidInput {
+                field: "idempotencyKey",
+                reason: "must be 1–255 non-whitespace characters".into(),
+            });
+        }
+        self.request_scan_with_idempotency(
+            ScanSource::Manual,
+            None,
+            root_id,
+            scope,
+            Some(idempotency_key),
+        )
+    }
+
+    fn request_scan_with_idempotency(
+        &self,
+        source: ScanSource,
+        schedule_id: Option<&str>,
+        root_id: &StorageRootId,
+        scope: Option<&RootRelativePath>,
+        idempotency_key: Option<&str>,
+    ) -> Result<ScanRun, ScanServiceError> {
         self.library.get_storage_root(root_id)?;
         let mut connection = open_writable_connection(self.library.database_path())?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
         let scope_str = scope.map(RootRelativePath::as_str);
+        if let Some(key) = idempotency_key {
+            let existing = transaction
+                .query_row(
+                    "SELECT scan_id, storage_root_id, scope_relative_path FROM scan_runs WHERE node_id = ?1 AND request_idempotency_key = ?2",
+                    params![self.local_node_id().as_str(), key],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?)),
+                )
+                .optional()?;
+            if let Some((scan_id, existing_root, existing_scope)) = existing {
+                if existing_root != root_id.as_str() || existing_scope.as_deref() != scope_str {
+                    return Err(ScanServiceError::IdempotencyConflict);
+                }
+                let scan = load_scan(&transaction, &scan_id)?;
+                transaction.commit()?;
+                self.ensure_root_job_enqueued(&scan, &scan.root_job_id)?;
+                return Ok(scan);
+            }
+        }
         let existing = transaction
             .query_row(
                 r#"
@@ -258,8 +314,8 @@ impl ScanService {
             INSERT INTO scan_runs (
                 scan_id, node_id, storage_root_id, scope_relative_path,
                 generation_id, root_job_id, scheduled_occurrence_at,
-                source, schedule_id, state, created_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'queued', ?10)
+                source, schedule_id, state, created_at, request_idempotency_key
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'queued', ?10, ?11)
             "#,
             params![
                 scan_id,
@@ -272,6 +328,7 @@ impl ScanService {
                 source.as_str(),
                 schedule_id,
                 now,
+                idempotency_key,
             ],
         )?;
         let scan = load_scan(&transaction, &scan_id)?;
@@ -1461,6 +1518,31 @@ mod tests {
             .unwrap();
         assert_eq!(second.scan_id, first.scan_id);
         assert_eq!(second.state, ScanState::Queued);
+    }
+
+    #[test]
+    fn manual_scan_request_key_is_durable_after_terminal_state() {
+        let (_root, _catalog, library) = fixture();
+        let root_id = create_root(&library, "root_scan_request_key");
+        let other_root_id = create_root(&library, "root_scan_request_key_other");
+        let scan_service = make_scan_service(&library);
+
+        let first = scan_service
+            .request_scan_idempotent(&root_id, None, "admin-scan-1")
+            .unwrap();
+        scan_service
+            .complete_scan(&first.scan_id, ScanState::Succeeded, None)
+            .unwrap();
+        let replay = scan_service
+            .request_scan_idempotent(&root_id, None, "admin-scan-1")
+            .unwrap();
+        assert_eq!(replay.scan_id, first.scan_id);
+        assert_eq!(replay.state, ScanState::Succeeded);
+
+        assert!(matches!(
+            scan_service.request_scan_idempotent(&other_root_id, None, "admin-scan-1"),
+            Err(ScanServiceError::IdempotencyConflict)
+        ));
     }
 
     #[test]

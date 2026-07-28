@@ -3049,6 +3049,7 @@ dependencies = [
  "blake3",
  "chrono",
  "clap",
+ "fs2",
  "futures",
  "rcdvlog-server-core",
  "rusqlite",

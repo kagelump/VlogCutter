@@ -283,13 +283,6 @@ async fn run_schedule_loop(
 ) {
     tracing::info!(component = "schedule", "schedule_loop_starting");
     loop {
-        tokio::select! {
-            _ = shutdown.cancelled() => {
-                tracing::info!(component = "schedule", "schedule_loop_stopped");
-                return;
-            }
-            _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {}
-        }
         if shutdown.is_cancelled() {
             return;
         }
@@ -344,6 +337,13 @@ async fn run_schedule_loop(
                     "list_due_schedules_failed"
                 );
             }
+        }
+        tokio::select! {
+            _ = shutdown.cancelled() => {
+                tracing::info!(component = "schedule", "schedule_loop_stopped");
+                return;
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {}
         }
     }
 }

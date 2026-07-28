@@ -54,6 +54,30 @@ function client(session: SessionState): BrowserProjectClient {
     removeReviewLabel: vi.fn(),
     setReviewRemoved: vi.fn(),
     setReviewRotation: vi.fn(),
+    getAdminOverview: vi.fn(),
+    listAdminAudit: vi.fn(),
+    listAdminStorageRoots: vi.fn(),
+    createAdminStorageRoot: vi.fn(),
+    updateAdminStorageRoot: vi.fn(),
+    listAdminStorageBindings: vi.fn(),
+    upsertAdminStorageBinding: vi.fn(),
+    verifyAdminStorageBinding: vi.fn(),
+    confirmAdminStorageBinding: vi.fn(),
+    listAdminScans: vi.fn(),
+    listAdminScanDiagnostics: vi.fn(),
+    requestAdminScan: vi.fn(),
+    listAdminScanSchedules: vi.fn(),
+    createAdminScanSchedule: vi.fn(),
+    updateAdminScanSchedule: vi.fn(),
+    listAdminJobs: vi.fn(),
+    getAdminJob: vi.fn(),
+    cancelAdminJob: vi.fn(),
+    retryAdminJob: vi.fn(),
+    listAdminSync: vi.fn(),
+    requestAdminRepresentationBatch: vi.fn(),
+    listDevices: vi.fn(),
+    revokeDevice: vi.fn(),
+    revokeSession: vi.fn(),
     previewAddToProject: vi.fn(),
     addToProject: vi.fn(),
   };
@@ -134,5 +158,33 @@ test("failed optimistic removal restores the canonical clip and reports the requ
   await userEvent.click(await screen.findByRole("button", { name: "R · Remove from queue" }));
   expect(await screen.findByRole("alert")).toHaveTextContent("request_rollback");
   expect(screen.getByRole("button", { name: "R · Remove from queue" })).toBeVisible();
+  window.history.replaceState({}, "", "/");
+});
+
+test("administration loads durable projections and confirms root registration", async () => {
+  window.history.replaceState({}, "", "/admin");
+  const mock = client({ authenticated: true, sessions: [] });
+  vi.mocked(mock.getAdminOverview).mockResolvedValue({
+    applicationVersion: "0.1.0", protocolMajor: 1, protocolMinor: 0, controlSchemaVersion: 9, nodeId: "node_fixture",
+    readiness: { status: "ready", checks: [{ name: "control_catalog", status: "ok" }] },
+    config: { dataDir: "/state", tempDir: "/state/tmp", derivedDir: "/derived", backupDir: "/backup", allowedOriginalMounts: ["/archive"], listenAddr: "127.0.0.1:8090", shutdownTimeoutSeconds: 30, trustedProxyCidrCount: 0, lanHostname: "localhost", sessionMaxAgeSeconds: 3600, bootstrapCodeTtlSeconds: 300, pairingCodeTtlSeconds: 300, ffmpegCommand: "ffmpeg", ffprobeCommand: "ffprobe", exiftoolCommand: "exiftool" },
+    auth: { activeSessions: 1, activeDeviceCredentials: 1, pendingBootstrapCodes: 0, nodeId: "node_fixture" },
+    derivedAvailableBytes: 1_000_000, backupAvailableBytes: 2_000_000,
+  });
+  vi.mocked(mock.listAdminStorageRoots).mockResolvedValue({ items: [] });
+  vi.mocked(mock.listAdminStorageBindings).mockResolvedValue({ items: [] });
+  vi.mocked(mock.listAdminScans).mockResolvedValue({ items: [] });
+  vi.mocked(mock.listAdminScanSchedules).mockResolvedValue({ items: [] });
+  vi.mocked(mock.listAdminJobs).mockResolvedValue({ items: [], nextBefore: null });
+  vi.mocked(mock.listAdminSync).mockResolvedValue({ items: [] });
+  vi.mocked(mock.listDevices).mockResolvedValue([]);
+  vi.mocked(mock.listAdminAudit).mockResolvedValue({ items: [] });
+  vi.mocked(mock.createAdminStorageRoot).mockResolvedValue({ id: "root_1", displayName: "Archive", immutableOriginal: true, enabled: true, disabledAt: null, createdAt: "now", updatedAt: "now" });
+  render(<App client={mock} />);
+  expect(await screen.findByRole("heading", { name: "Administration" })).toBeVisible();
+  expect(await screen.findByText("All prerequisites ready")).toBeVisible();
+  await userEvent.type(screen.getByLabelText("Logical root name"), "Archive");
+  await userEvent.click(screen.getByRole("button", { name: "Register root" }));
+  await waitFor(() => expect(mock.createAdminStorageRoot).toHaveBeenCalledWith("Archive"));
   window.history.replaceState({}, "", "/");
 });

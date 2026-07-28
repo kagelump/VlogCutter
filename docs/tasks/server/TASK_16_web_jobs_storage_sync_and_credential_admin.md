@@ -1,6 +1,6 @@
 # Task 16: Web Jobs, Storage, Sync, and Credential Administration
 
-**Status:** Planned
+**Status:** Implemented (2026-07-28)
 **Depends on:** Tasks 3, 4, 5, 6, 9, 11, and 13
 **Unblocks:** Task 19
 
@@ -92,23 +92,23 @@ Persisted schedules run on a laptop that sleeps and reboots, so the contract mus
 
 ## Acceptance criteria
 
-- [ ] A configured allowed root can be registered, verified, and disabled without filesystem mutation.
-- [ ] An arbitrary/disallowed path and a traversal/symlink escape are rejected.
-- [ ] Manual and scheduled scans are visible with durable progress and per-file failures.
-- [ ] Proxy/thumbnail batch requests show reused, queued, succeeded, and failed counts.
-- [ ] Job retry/cancel rules match Task 4 and survive server restart.
-- [ ] WebSocket loss does not leave permanently stale job or sync status.
-- [ ] Project sync overview matches durable cursor/pending/conflict state.
-- [ ] Sessions and desktop credentials can be listed and individually revoked.
-- [ ] The current browser session revokes cleanly; a desktop revocation leaves desktop local work intact.
-- [ ] No UI/API can delete projects, originals, representations, or storage history.
-- [ ] Server prerequisites, versions, and disk/derived-root status are visible.
-- [ ] Chrome layout, focus, validation, confirmation, empty, loading, and failure states pass visual/interaction checks.
-- [ ] A binding stays unusable for resolution until its evidence is shown and it is explicitly confirmed; rejecting it leaves the root and its history intact.
-- [ ] An immutable original root refuses a read-write binding through the UI and the API.
-- [ ] A schedule missed across a server outage produces one catch-up run, and a schedule never overlaps its own previous run.
-- [ ] Administrative mutations leave durable audit rows containing the request ID and no secrets, and those rows survive restart.
-- [ ] A batch containing unverified media reports skipped counts with reasons instead of enqueuing unrunnable jobs.
+- [x] A configured allowed root can be registered, verified, and disabled without filesystem mutation.
+- [x] An arbitrary/disallowed path and a traversal/symlink escape are rejected.
+- [x] Manual and scheduled scans are visible with durable progress and per-file failures.
+- [x] Proxy/thumbnail batch requests show reused, queued, succeeded, and failed counts.
+- [x] Job retry/cancel rules match Task 4 and survive server restart.
+- [x] WebSocket loss does not leave permanently stale job or sync status.
+- [x] Project sync overview matches durable cursor/pending/conflict state.
+- [x] Sessions and desktop credentials can be listed and individually revoked.
+- [x] The current browser session revokes cleanly; a desktop revocation leaves desktop local work intact.
+- [x] No UI/API can delete projects, originals, representations, or storage history.
+- [x] Server prerequisites, versions, and disk/derived-root status are visible.
+- [x] Chrome layout, focus, validation, confirmation, empty, loading, and failure states pass visual/interaction checks.
+- [x] A binding stays unusable for resolution until its evidence is shown and it is explicitly confirmed; rejecting it leaves the root and its history intact.
+- [x] An immutable original root refuses a read-write binding through the UI and the API.
+- [x] A schedule missed across a server outage produces one catch-up run, and a schedule never overlaps its own previous run.
+- [x] Administrative mutations leave durable audit rows containing the request ID and no secrets, and those rows survive restart.
+- [x] A batch containing unverified media reports skipped counts with reasons instead of enqueuing unrunnable jobs.
 
 ## Verification
 

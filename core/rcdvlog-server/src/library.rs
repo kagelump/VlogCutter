@@ -8,7 +8,7 @@ use rcdvlog_core::{
 };
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 use crate::catalog::{open_read_only_connection, open_writable_connection};
@@ -671,6 +671,75 @@ impl StorageLibrary {
         Ok(statement
             .query_map([self.local_node_id.as_str()], binding_from_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Produces bounded, server-local association evidence without mutating
+    /// originals. It checks catalog-relative paths and recorded byte sizes;
+    /// fingerprint/hash counts remain zero unless a future verifier performs
+    /// the corresponding immutable reads.
+    pub fn inspect_local_root_association(
+        &self,
+        root_id: &StorageRootId,
+        local_mount_path: &Path,
+        root_subpath: Option<&RootRelativePath>,
+    ) -> Result<RootAssociationEvidence, StorageLibraryError> {
+        validate_local_mount_path(local_mount_path)?;
+        let resolved_mount =
+            local_mount_path
+                .canonicalize()
+                .map_err(|_| StorageLibraryError::InvalidInput {
+                    field: "localMountPath",
+                    reason: "must exist and be accessible before verification".to_string(),
+                })?;
+        let connection = open_read_only_connection(&self.database_path)?;
+        let mut statement = connection.prepare(
+            "SELECT relative_path,size_bytes FROM storage_objects WHERE storage_root_id=?1 ORDER BY relative_path LIMIT 32",
+        )?;
+        let rows = statement
+            .query_map([root_id.as_str()], |row| {
+                Ok((
+                    RootRelativePath::parse(row.get::<_, String>(0)?).map_err(stored_error(0))?,
+                    row.get::<_, Option<i64>>(1)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut matching_relative_paths = 0u64;
+        let mut mismatches = 0u64;
+        let mut sampled_relative_paths = Vec::new();
+        for (relative_path, recorded_size) in rows {
+            if root_subpath.is_some_and(|scope| !relative_path.is_within(scope)) {
+                continue;
+            }
+            let suffix = relative_path
+                .suffix_after(root_subpath)
+                .unwrap_or(relative_path.as_str());
+            let candidate = resolved_mount.join(suffix);
+            let matches = candidate
+                .canonicalize()
+                .ok()
+                .filter(|resolved| resolved.starts_with(&resolved_mount))
+                .and_then(|resolved| std::fs::metadata(resolved).ok())
+                .is_some_and(|metadata| {
+                    metadata.is_file()
+                        && recorded_size.is_none_or(|size| {
+                            u64::try_from(size).is_ok_and(|size| size == metadata.len())
+                        })
+                });
+            sampled_relative_paths.push(relative_path);
+            if matches {
+                matching_relative_paths += 1;
+            } else {
+                mismatches += 1;
+            }
+        }
+        Ok(RootAssociationEvidence {
+            matching_relative_paths,
+            matching_quick_fingerprints: 0,
+            matching_full_hashes: 0,
+            mismatches,
+            sampled_relative_paths,
+            captured_at: now(),
+        })
     }
 
     pub fn set_node_root_binding_enabled(

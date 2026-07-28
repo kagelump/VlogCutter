@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 use crate::ConfigDiagnostics;
 
-pub const CONTROL_CATALOG_SCHEMA_VERSION: u32 = 8;
+pub const CONTROL_CATALOG_SCHEMA_VERSION: u32 = 9;
 pub const CONTROL_DATABASE_FILENAME: &str = "control.sqlite3";
 pub const INSTANCE_LOCK_FILENAME: &str = "server.lock";
 
@@ -69,6 +69,12 @@ pub const CONTROL_CATALOG_MIGRATIONS: &[SqliteMigration] = &[
         name: "library_search_index",
         source_identity: "server-control/0008-library-search-index/20260727",
         apply: create_library_search_index,
+    },
+    SqliteMigration {
+        id: 9,
+        name: "administrative_audit_log",
+        source_identity: "server-control/0009-administrative-audit-log/20260728",
+        apply: create_administrative_audit_log,
     },
 ];
 
@@ -239,6 +245,10 @@ impl ControlCatalog {
                 .to_path_buf(),
             self.clone(),
         )
+    }
+
+    pub fn audit_log(&self) -> crate::AdminAuditLog {
+        crate::AdminAuditLog::new(self.database_path.clone())
     }
 
     pub fn inspect_migrations(&self) -> Result<MigrationHistoryInspection> {
@@ -609,6 +619,38 @@ fn create_library_search_index(transaction: &Transaction<'_>) -> Result<()> {
             GROUP BY mol.media_object_id
             HAVING so.storage_object_id = MIN(so.storage_object_id)
         ) p ON p.media_object_id = m.media_object_id;
+        "#,
+    )?;
+    Ok(())
+}
+
+fn create_administrative_audit_log(transaction: &Transaction<'_>) -> Result<()> {
+    add_column_if_missing(
+        transaction,
+        "scan_runs",
+        "request_idempotency_key",
+        "TEXT CHECK(request_idempotency_key IS NULL OR length(request_idempotency_key) BETWEEN 1 AND 255)",
+    )?;
+    transaction.execute_batch(
+        r#"
+        CREATE UNIQUE INDEX scan_runs_manual_idempotency
+            ON scan_runs(node_id, request_idempotency_key)
+            WHERE request_idempotency_key IS NOT NULL;
+        CREATE TABLE administrative_audit_events (
+            event_sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+            occurred_at TEXT NOT NULL,
+            actor_type TEXT NOT NULL CHECK(actor_type IN ('browser_session','device_credential')),
+            actor_id TEXT NOT NULL CHECK(length(actor_id) BETWEEN 1 AND 255),
+            action TEXT NOT NULL CHECK(length(action) BETWEEN 1 AND 128),
+            target_type TEXT NOT NULL CHECK(length(target_type) BETWEEN 1 AND 128),
+            target_id TEXT CHECK(target_id IS NULL OR length(target_id) BETWEEN 1 AND 255),
+            request_id TEXT NOT NULL CHECK(length(request_id) BETWEEN 1 AND 64),
+            detail_json TEXT NOT NULL CHECK(length(detail_json) <= 8192)
+        );
+        CREATE INDEX administrative_audit_events_recent
+            ON administrative_audit_events(event_sequence DESC);
+        CREATE INDEX administrative_audit_events_target
+            ON administrative_audit_events(target_type, target_id, event_sequence DESC);
         "#,
     )?;
     Ok(())
@@ -1406,7 +1448,7 @@ mod tests {
                 .unwrap()
                 .applied_migrations
                 .len(),
-            8
+            CONTROL_CATALOG_SCHEMA_VERSION as usize
         );
     }
 

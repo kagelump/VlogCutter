@@ -143,6 +143,53 @@ export interface AddToProjectResult {
   blockedCount: number; items: AddToProjectItem[];
 }
 
+export interface DeviceCredentialInfo { credentialId: string; tokenPrefix: string; label: string; createdAt: string; lastUsedAt: string; revoked: boolean }
+export interface AuthDiagnostics { activeSessions: number; activeDeviceCredentials: number; pendingBootstrapCodes: number; nodeId: string }
+export interface AdminConfigDiagnostics {
+  dataDir: string; tempDir: string; derivedDir: string; backupDir: string; allowedOriginalMounts: string[];
+  listenAddr: string; shutdownTimeoutSeconds: number; trustedProxyCidrCount: number; lanHostname: string;
+  sessionMaxAgeSeconds: number; bootstrapCodeTtlSeconds: number; pairingCodeTtlSeconds: number;
+  ffmpegCommand: string; ffprobeCommand: string; exiftoolCommand: string;
+}
+export interface AdminOverview {
+  applicationVersion: string; protocolMajor: number; protocolMinor: number; controlSchemaVersion: number;
+  nodeId: string; readiness: Omit<ServerReadiness, "requestId">; config: AdminConfigDiagnostics;
+  auth: AuthDiagnostics; derivedAvailableBytes: number | null; backupAvailableBytes: number | null;
+}
+export interface StorageRoot { id: string; displayName: string; immutableOriginal: boolean; enabled: boolean; disabledAt: string | null; createdAt: string; updatedAt: string }
+export interface RootAssociationEvidence {
+  matchingRelativePaths: number; matchingQuickFingerprints: number; matchingFullHashes: number; mismatches: number;
+  sampledRelativePaths: string[]; capturedAt: string;
+}
+export interface StorageBinding {
+  nodeId: string; storageRootId: string; localMountPath: string; rootSubpath: string | null;
+  protocol: "nfs" | "smb" | "local" | "other"; accessMode: "read_only" | "read_write";
+  verificationStatus: "pending" | "confirmed" | "unavailable" | "mismatch" | "rejected"; enabled: boolean;
+  associationEvidence: RootAssociationEvidence | null;
+  confirmation: { status: "pending" | "confirmed" | "rejected"; confirmedByNodeId?: string; confirmedAt?: string };
+  createdAt: string; updatedAt: string;
+}
+export interface ScanRun {
+  scanId: string; nodeId: string; storageRootId: string; scopeRelativePath: string | null; rootJobId: string;
+  source: "manual" | "schedule"; scheduleId: string | null; state: string; visitedEntries: number; supportedFiles: number;
+  unchangedFiles: number; queuedFiles: number; completedFiles: number; failedFiles: number; errorCode: string | null;
+  createdAt: string; startedAt: string | null; completedAt: string | null;
+}
+export interface ScanFileDiagnostic { diagnosticId: string; scanId: string; storageObjectId: string | null; stage: string; code: string; safePathIdentity: string; retryable: boolean; recordedAt: string }
+export interface ScanSchedule { scheduleId: string; storageRootId: string; scopeRelativePath: string | null; enabled: boolean; localTime: string; timezone: string; nextRunAt: string; lastEnqueuedAt: string | null; lastScanId: string | null; createdAt: string; updatedAt: string }
+export type AdminJobState = "queued" | "running" | "retry_wait" | "succeeded" | "failed" | "canceled";
+export interface AdminJob {
+  enqueueSequence?: number; definition: { jobId: string; jobType: string; jobClass: string; targetNodeId: string; projectId: string | null; mediaObjectId: string | null; recipeKey: string; totalItems: number };
+  estimate?: { completedItems: number; totalItems: number; completedWorkUnits: number; totalWorkUnits: number; workerCount: number; workUnitsPerWorkerSecond: number | null; elapsedSeconds: number; estimatedRemainingSeconds: number | null };
+  state: AdminJobState; attemptCount: number; cancelRequestedAt: string | null; completedWorkUnits: number; totalWorkUnits: number;
+  completedItems: number; failedItems: number; totalItems: number; error: { code: string; details: unknown } | null;
+  createdAt: string; updatedAt: string; completedAt: string | null;
+}
+export interface AdminJobPage { items: AdminJob[]; nextBefore: number | null }
+export interface ProjectSyncOverview { projectId: string; registryState: string; originNodeId: string | null; serverNodeId: string; assetCount: number; operationCount: number; latestLocalSequence: number; pendingProjectionRepairs: number; unresolvedConflictCount: number; nodeObservationCount: number; lastSuccessAt: string; lastErrorCode: string | null; endpoint: string | null; compatibility: string; connectivity: string; recommendations: string[] }
+export interface AdminAuditEvent { eventSequence: number; occurredAt: string; actorType: string; actorId: string; action: string; targetType: string; targetId: string | null; requestId: string; detail: Record<string, unknown> }
+export interface RepresentationBatchResult { selectedCount: number; reusedCount: number; queuedCount: number; succeededCount: number; failedCount: number; skippedCount: number; skipped: { mediaObjectId: string; reason: string }[] }
+
 export type ClientErrorKind =
   | "server_unavailable"
   | "session_expired"
@@ -184,6 +231,30 @@ export interface BrowserProjectClient extends ProjectClient {
   setReviewRotation(projectId: string, assetId: string, rotationDegrees: number, baseRevision: number): Promise<ReviewMutationResult>;
   previewAddToProject(projectId: string, request: AddToProjectRequest): Promise<AddToProjectPreview>;
   addToProject(projectId: string, request: AddToProjectRequest): Promise<AddToProjectResult>;
+  getAdminOverview(): Promise<AdminOverview>;
+  listAdminAudit(limit?: number, before?: number): Promise<{ items: AdminAuditEvent[] }>;
+  listAdminStorageRoots(): Promise<{ items: StorageRoot[] }>;
+  createAdminStorageRoot(displayName: string, immutableOriginal?: boolean): Promise<StorageRoot>;
+  updateAdminStorageRoot(rootId: string, update: { displayName?: string; enabled?: boolean; confirmDisable?: boolean }): Promise<StorageRoot>;
+  listAdminStorageBindings(): Promise<{ items: StorageBinding[] }>;
+  upsertAdminStorageBinding(rootId: string, request: { localMountPath: string; rootSubpath?: string; protocol: StorageBinding["protocol"]; accessMode: StorageBinding["accessMode"]; enabled?: boolean }): Promise<StorageBinding>;
+  verifyAdminStorageBinding(rootId: string): Promise<StorageBinding>;
+  confirmAdminStorageBinding(rootId: string, action: "confirm" | "reject"): Promise<StorageBinding>;
+  listAdminScans(limit?: number): Promise<{ items: ScanRun[] }>;
+  listAdminScanDiagnostics(scanId: string, limit?: number): Promise<{ items: ScanFileDiagnostic[] }>;
+  requestAdminScan(request: { storageRootId: string; scopeRelativePath?: string; idempotencyKey: string }): Promise<ScanRun>;
+  listAdminScanSchedules(): Promise<{ items: ScanSchedule[] }>;
+  createAdminScanSchedule(request: { storageRootId: string; scopeRelativePath?: string; enabled: boolean; localTime: string; timezone: string }): Promise<ScanSchedule>;
+  updateAdminScanSchedule(scheduleId: string, update: { enabled?: boolean; localTime?: string; timezone?: string }): Promise<ScanSchedule>;
+  listAdminJobs(limit?: number, before?: number, state?: AdminJobState): Promise<AdminJobPage>;
+  getAdminJob(jobId: string): Promise<AdminJob>;
+  cancelAdminJob(jobId: string): Promise<AdminJob>;
+  retryAdminJob(jobId: string): Promise<AdminJob>;
+  listAdminSync(): Promise<{ items: ProjectSyncOverview[] }>;
+  requestAdminRepresentationBatch(request: { mediaObjectIds: string[]; kind: "proxy" | "thumbnail"; idempotencyKey: string }): Promise<RepresentationBatchResult>;
+  listDevices(): Promise<DeviceCredentialInfo[]>;
+  revokeDevice(credentialId: string): Promise<void>;
+  revokeSession(sessionId: string): Promise<void>;
 }
 
 export function assertProtocolCompatible(version: ServerVersion): void {

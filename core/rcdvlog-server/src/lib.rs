@@ -1,3 +1,4 @@
+mod audit;
 pub mod auth;
 mod catalog;
 mod config;
@@ -14,9 +15,11 @@ mod search_index;
 mod storage_path;
 
 pub use rcdvlog_core::{
-    Catalog, CatalogSchemaError, GlobalMediaVerificationState, JobId, MediaObjectId,
-    NodeAvailabilityState, NodeId, PROJECT_CATALOG_SCHEMA_VERSION, ProjectAssetAddedPayload,
-    ProjectAssetItem, ProjectAssetPage, ProjectId, RepresentationId, StorageRootId,
+    BindingVerificationStatus, Catalog, CatalogSchemaError, GlobalMediaVerificationState, JobId,
+    MediaObjectId, NodeAvailabilityState, NodeId, PROJECT_CATALOG_SCHEMA_VERSION,
+    ProjectAssetAddedPayload, ProjectAssetItem, ProjectAssetPage, ProjectId, RepresentationId,
+    RootAssociationConfirmation, RootAssociationConfirmationStatus, RootAssociationEvidence,
+    RootRelativePath, StorageObjectId, StorageProtocol, StorageRootId,
 };
 pub use rcdvlog_sync::{
     BASELINE_VERSION, BaselineEnvelope, BaselinePayload, BaselinePreview, NodeTargetedJob,
@@ -42,9 +45,9 @@ pub use foundation::{
 };
 pub use jobs::{
     CancellableChild, ClaimedJob, Clock, FailureKind, ItemCompletion, JobClass, JobDefinition,
-    JobEngine, JobEngineError, JobEvent, JobEventPage, JobHandler, JobHandlerFailure, JobProgress,
-    JobRequirements, JobResultCommit, JobScheduler, JobSchedulerConfig, JobSnapshot,
-    JobSnapshotError, JobState, NodeJobCompletion, ProgressEstimateInput, RetryPolicy,
+    JobEngine, JobEngineError, JobEvent, JobEventPage, JobHandler, JobHandlerFailure, JobListItem,
+    JobPage, JobProgress, JobRequirements, JobResultCommit, JobScheduler, JobSchedulerConfig,
+    JobSnapshot, JobSnapshotError, JobState, NodeJobCompletion, ProgressEstimateInput, RetryPolicy,
     ServerCapability, SystemClock, cancel_child_safely,
 };
 pub use library::{
@@ -64,8 +67,8 @@ pub use rcdvlog_core::StorageAccessMode;
 pub use replicas::{
     AddToProjectDisposition, AddToProjectItem, AddToProjectPreview, AddToProjectRequest,
     AddToProjectResult, MAX_ADD_TO_PROJECT_ITEMS, ProjectPage, ProjectReplica, ProjectReplicaError,
-    ProjectReplicaManager, ProjectReviewAsset, ProjectSummary, ReviewMutationResult,
-    ReviewRepresentation,
+    ProjectReplicaManager, ProjectReviewAsset, ProjectSummary, ProjectSyncOverview,
+    ReviewMutationResult, ReviewRepresentation,
 };
 pub use representations::{
     PROXY_RECIPE_KEY, Representation, RepresentationError, RepresentationJobHandler,
@@ -86,3 +89,4 @@ pub use storage_path::{
 pub const APPLICATION_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const PROTOCOL_MAJOR_VERSION: u32 = 1;
 pub const PROTOCOL_MINOR_VERSION: u32 = 0;
+pub use audit::{AdminAuditError, AdminAuditEvent, AdminAuditLog, AuditActorType};

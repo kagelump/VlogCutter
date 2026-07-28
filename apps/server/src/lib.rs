@@ -9,19 +9,24 @@ use axum::extract::{DefaultBodyLimit, Extension, OriginalUri, Path as AxumPath, 
 use axum::http::{HeaderMap, HeaderValue, Method, Request, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, patch, post, put};
 use axum::{Json, Router};
 use futures::SinkExt;
 use futures::stream::StreamExt;
 use rcdvlog_server_core::library_query::{LibraryFilters, LibraryQuery, LibrarySort};
 use rcdvlog_server_core::{
-    APPLICATION_VERSION, AddToProjectRequest, AuthDiagnostics, AuthError, AuthService,
-    BaselineEnvelope, BaselinePreview, CONTROL_CATALOG_SCHEMA_VERSION, DeviceCredentialInfo,
-    GlobalMediaVerificationState, JobId, MediaAvailability, MediaObject, MediaObjectId,
-    MediaSearchFacts, NodeAvailabilityState, NodeId, NodeJobCompletion, PROTOCOL_MAJOR_VERSION,
-    PROTOCOL_MINOR_VERSION, ProjectId, ProjectReplica, ProjectReplicaError, ReadinessReport,
-    ReconcileRequest, ReconcileResponse, Representation, RepresentationError, RepresentationId,
-    RepresentationRequest, RuntimeFoundation, SessionInfo, StorageLibraryError, StorageRootId,
+    APPLICATION_VERSION, AddToProjectRequest, AuditActorType, AuthDiagnostics, AuthError,
+    AuthService, BaselineEnvelope, BaselinePreview, BindingVerificationStatus,
+    CONTROL_CATALOG_SCHEMA_VERSION, DeviceCredentialInfo, GlobalMediaVerificationState,
+    JobEngineError, JobId, JobState, LocalNodeRootBindingInput, MediaAvailability, MediaObject,
+    MediaObjectId, MediaSearchFacts, NewScanSchedule, NewStorageRoot, NodeAvailabilityState,
+    NodeId, NodeJobCompletion, PROTOCOL_MAJOR_VERSION, PROTOCOL_MINOR_VERSION, ProjectId,
+    ProjectReplica, ProjectReplicaError, ReadinessReport, ReconcileRequest, ReconcileResponse,
+    Representation, RepresentationError, RepresentationId, RepresentationKind,
+    RepresentationRequest, RootAssociationConfirmation, RootAssociationConfirmationStatus,
+    RootRelativePath, RuntimeFoundation, ScanScheduleUpdate, ScanService, ScanServiceError,
+    ScanToolConfig, SessionInfo, StorageAccessMode, StorageLibraryError, StorageProtocol,
+    StorageRootId, StorageRootUpdate,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -581,6 +586,57 @@ pub fn router(state: HttpState) -> Router {
             "/api/v1/projects/{project_id}/assets/{asset_id}/rotation",
             post(set_review_rotation),
         )
+        .route("/api/v1/admin/overview", get(admin_overview))
+        .route("/api/v1/admin/audit", get(list_admin_audit))
+        .route(
+            "/api/v1/admin/storage-roots",
+            get(list_admin_storage_roots).post(create_admin_storage_root),
+        )
+        .route(
+            "/api/v1/admin/storage-roots/{root_id}",
+            patch(update_admin_storage_root),
+        )
+        .route(
+            "/api/v1/admin/storage-bindings",
+            get(list_admin_storage_bindings),
+        )
+        .route(
+            "/api/v1/admin/storage-roots/{root_id}/binding",
+            put(upsert_admin_storage_binding),
+        )
+        .route(
+            "/api/v1/admin/storage-roots/{root_id}/binding/confirmation",
+            post(confirm_admin_storage_binding),
+        )
+        .route(
+            "/api/v1/admin/storage-roots/{root_id}/binding/verify",
+            post(verify_admin_storage_binding),
+        )
+        .route(
+            "/api/v1/admin/scans",
+            get(list_admin_scans).post(request_admin_scan),
+        )
+        .route(
+            "/api/v1/admin/scans/{scan_id}/diagnostics",
+            get(list_admin_scan_diagnostics),
+        )
+        .route(
+            "/api/v1/admin/scan-schedules",
+            get(list_admin_scan_schedules).post(create_admin_scan_schedule),
+        )
+        .route(
+            "/api/v1/admin/scan-schedules/{schedule_id}",
+            patch(update_admin_scan_schedule),
+        )
+        .route("/api/v1/admin/jobs", get(list_admin_jobs))
+        .route("/api/v1/admin/sync", get(list_admin_sync))
+        .route("/api/v1/admin/jobs/{job_id}", get(get_admin_job))
+        .route("/api/v1/admin/jobs/{job_id}/cancel", post(cancel_admin_job))
+        .route("/api/v1/admin/jobs/{job_id}/retry", post(retry_admin_job))
+        .route(
+            "/api/v1/admin/representations/batch",
+            post(request_admin_representation_batch),
+        )
         .layer(middleware::from_fn_with_state(state.clone(), require_csrf))
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -789,10 +845,45 @@ pub fn openapi_document() -> serde_json::Value {
                     { "name": "projectId", "in": "path", "required": true, "schema": { "type": "string" } },
                     { "name": "assetId", "in": "path", "required": true, "schema": { "type": "string" } }
                 ], "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/RotationMutationRequest" } } } }, "responses": { "200": { "$ref": "#/components/responses/ReviewMutationResult" }, "400": { "$ref": "#/components/responses/Error" }, "401": { "$ref": "#/components/responses/Error" } } }
-            }
+            },
+            "/api/v1/auth/sessions/{sessionId}": { "delete": { "operationId": "revokeSession", "parameters": [{ "name": "sessionId", "in": "path", "required": true, "schema": { "type": "string" } }], "responses": { "200": { "$ref": "#/components/responses/AdminPayload" }, "401": { "$ref": "#/components/responses/Error" } } } },
+            "/api/v1/auth/devices": { "get": { "operationId": "listDevices", "responses": { "200": { "$ref": "#/components/responses/AdminPayload" }, "401": { "$ref": "#/components/responses/Error" } } } },
+            "/api/v1/auth/devices/{credentialId}": { "delete": { "operationId": "revokeDevice", "parameters": [{ "name": "credentialId", "in": "path", "required": true, "schema": { "type": "string" } }], "responses": { "200": { "$ref": "#/components/responses/AdminPayload" }, "401": { "$ref": "#/components/responses/Error" } } } },
+            "/api/v1/admin/overview": { "get": { "operationId": "getAdminOverview", "responses": { "200": { "$ref": "#/components/responses/AdminPayload" } } } },
+            "/api/v1/admin/audit": { "get": { "operationId": "listAdminAudit", "parameters": [{"name":"limit","in":"query","schema":{"type":"integer","minimum":1,"maximum":200}}, {"name":"before","in":"query","schema":{"type":"integer"}}], "responses": { "200": { "$ref": "#/components/responses/AdminPayload" } } } },
+            "/api/v1/admin/storage-roots": {
+                "get": { "operationId": "listAdminStorageRoots", "responses": { "200": { "$ref": "#/components/responses/AdminPayload" } } },
+                "post": { "operationId": "createAdminStorageRoot", "requestBody": { "$ref": "#/components/requestBodies/AdminPayload" }, "responses": { "201": { "$ref": "#/components/responses/AdminPayload" } } }
+            },
+            "/api/v1/admin/storage-roots/{rootId}": { "patch": { "operationId": "updateAdminStorageRoot", "parameters": [{"name":"rootId","in":"path","required":true,"schema":{"type":"string"}}], "requestBody": { "$ref": "#/components/requestBodies/AdminPayload" }, "responses": { "200": { "$ref": "#/components/responses/AdminPayload" } } } },
+            "/api/v1/admin/storage-bindings": { "get": { "operationId": "listAdminStorageBindings", "responses": { "200": { "$ref": "#/components/responses/AdminPayload" } } } },
+            "/api/v1/admin/storage-roots/{rootId}/binding": { "put": { "operationId": "upsertAdminStorageBinding", "parameters": [{"name":"rootId","in":"path","required":true,"schema":{"type":"string"}}], "requestBody": { "$ref": "#/components/requestBodies/AdminPayload" }, "responses": { "200": { "$ref": "#/components/responses/AdminPayload" } } } },
+            "/api/v1/admin/storage-roots/{rootId}/binding/confirmation": { "post": { "operationId": "confirmAdminStorageBinding", "parameters": [{"name":"rootId","in":"path","required":true,"schema":{"type":"string"}}], "requestBody": { "$ref": "#/components/requestBodies/AdminPayload" }, "responses": { "200": { "$ref": "#/components/responses/AdminPayload" } } } },
+            "/api/v1/admin/storage-roots/{rootId}/binding/verify": { "post": { "operationId": "verifyAdminStorageBinding", "parameters": [{"name":"rootId","in":"path","required":true,"schema":{"type":"string"}}], "responses": { "200": { "$ref": "#/components/responses/AdminPayload" } } } },
+            "/api/v1/admin/scans": {
+                "get": { "operationId": "listAdminScans", "responses": { "200": { "$ref": "#/components/responses/AdminPayload" } } },
+                "post": { "operationId": "requestAdminScan", "requestBody": { "$ref": "#/components/requestBodies/AdminPayload" }, "responses": { "202": { "$ref": "#/components/responses/AdminPayload" } } }
+            },
+            "/api/v1/admin/scans/{scanId}/diagnostics": { "get": { "operationId": "listAdminScanDiagnostics", "parameters": [
+                { "name": "scanId", "in": "path", "required": true, "schema": { "type": "string" } },
+                { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 200 } },
+                { "name": "after", "in": "query", "schema": { "type": "string" } }
+            ], "responses": { "200": { "$ref": "#/components/responses/AdminPayload" }, "404": { "$ref": "#/components/responses/Error" } } } },
+            "/api/v1/admin/scan-schedules": {
+                "get": { "operationId": "listAdminScanSchedules", "responses": { "200": { "$ref": "#/components/responses/AdminPayload" } } },
+                "post": { "operationId": "createAdminScanSchedule", "requestBody": { "$ref": "#/components/requestBodies/AdminPayload" }, "responses": { "201": { "$ref": "#/components/responses/AdminPayload" } } }
+            },
+            "/api/v1/admin/scan-schedules/{scheduleId}": { "patch": { "operationId": "updateAdminScanSchedule", "parameters": [{"name":"scheduleId","in":"path","required":true,"schema":{"type":"string"}}], "requestBody": { "$ref": "#/components/requestBodies/AdminPayload" }, "responses": { "200": { "$ref": "#/components/responses/AdminPayload" } } } },
+            "/api/v1/admin/jobs": { "get": { "operationId": "listAdminJobs", "responses": { "200": { "$ref": "#/components/responses/AdminPayload" } } } },
+            "/api/v1/admin/jobs/{jobId}": { "get": { "operationId": "getAdminJob", "parameters": [{"name":"jobId","in":"path","required":true,"schema":{"type":"string"}}], "responses": { "200": { "$ref": "#/components/responses/AdminPayload" } } } },
+            "/api/v1/admin/jobs/{jobId}/cancel": { "post": { "operationId": "cancelAdminJob", "parameters": [{"name":"jobId","in":"path","required":true,"schema":{"type":"string"}}], "responses": { "200": { "$ref": "#/components/responses/AdminPayload" } } } },
+            "/api/v1/admin/jobs/{jobId}/retry": { "post": { "operationId": "retryAdminJob", "parameters": [{"name":"jobId","in":"path","required":true,"schema":{"type":"string"}}], "responses": { "200": { "$ref": "#/components/responses/AdminPayload" } } } },
+            "/api/v1/admin/sync": { "get": { "operationId": "listAdminSync", "responses": { "200": { "$ref": "#/components/responses/AdminPayload" } } } },
+            "/api/v1/admin/representations/batch": { "post": { "operationId": "requestAdminRepresentationBatch", "requestBody": { "$ref": "#/components/requestBodies/AdminPayload" }, "responses": { "202": { "$ref": "#/components/responses/AdminPayload" } } } }
         },
         "components": {
             "schemas": {
+                "AdminPayload": { "type": "object", "additionalProperties": true },
                 "BootstrapExchangeRequest": {
                     "type": "object",
                     "required": ["code"],
@@ -1116,7 +1207,11 @@ pub fn openapi_document() -> serde_json::Value {
                 "RemovedMutationRequest": { "type": "object", "required": ["removed", "baseRevision"], "properties": { "removed": { "type": "boolean" }, "baseRevision": { "type": "integer", "minimum": 0 } } },
                 "RotationMutationRequest": { "type": "object", "required": ["rotationDegrees", "baseRevision"], "properties": { "rotationDegrees": { "type": "integer", "enum": [0, 90, 180, 270] }, "baseRevision": { "type": "integer", "minimum": 0 } } }
             },
+            "requestBodies": {
+                "AdminPayload": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/AdminPayload" } } } }
+            },
             "responses": {
+                "AdminPayload": { "description": "Authenticated administrative projection or canonical mutation result", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/AdminPayload" } } } },
                 "Version": { "description": "Server identity and protocol", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Version" } } } },
                 "Readiness": { "description": "Readiness report", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Readiness" } } } },
                 "SessionCreated": { "description": "Browser session created", "headers": { "x-csrf-token": { "schema": { "type": "string" } } }, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SessionCreated" } } } },
@@ -1341,14 +1436,33 @@ async fn list_sessions(
 async fn revoke_session(
     State(state): State<HttpState>,
     Extension(request_id): Extension<RequestId>,
+    Extension(principal): Extension<AuthPrincipal>,
     AxumPath(session_id): AxumPath<String>,
 ) -> Response {
     match state.auth.revoke_session(&session_id) {
-        Ok(()) => Json(ErrorResponse {
-            request_id: request_id.0,
-            code: "session_revoked",
-        })
-        .into_response(),
+        Ok(()) => match audit_admin(
+            &state,
+            &principal,
+            &request_id,
+            "session.revoked",
+            "browser_session",
+            Some(&session_id),
+            serde_json::json!({}),
+        ) {
+            Ok(()) => {
+                let current = matches!(&principal, AuthPrincipal::Browser { session_id: current, .. } if current == &session_id);
+                let mut response = Json(ErrorResponse {
+                    request_id: request_id.0,
+                    code: "session_revoked",
+                })
+                .into_response();
+                if current {
+                    response.headers_mut().insert(header::SET_COOKIE, HeaderValue::from_static("rcdvlog_session=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0"));
+                }
+                response
+            }
+            Err(response) => *response,
+        },
         Err(error) => auth_error_response(error),
     }
 }
@@ -1426,14 +1540,26 @@ async fn list_devices(
 async fn revoke_device(
     State(state): State<HttpState>,
     Extension(request_id): Extension<RequestId>,
+    Extension(principal): Extension<AuthPrincipal>,
     AxumPath(credential_id): AxumPath<String>,
 ) -> Response {
     match state.auth.revoke_device(&credential_id) {
-        Ok(()) => Json(ErrorResponse {
-            request_id: request_id.0,
-            code: "device_revoked",
-        })
-        .into_response(),
+        Ok(()) => match audit_admin(
+            &state,
+            &principal,
+            &request_id,
+            "device.revoked",
+            "device_credential",
+            Some(&credential_id),
+            serde_json::json!({}),
+        ) {
+            Ok(()) => Json(ErrorResponse {
+                request_id: request_id.0,
+                code: "device_revoked",
+            })
+            .into_response(),
+            Err(response) => *response,
+        },
         Err(error) => auth_error_response(error),
     }
 }
@@ -2556,6 +2682,959 @@ fn project_read_error_response(request_id: &RequestId, error: ProjectReplicaErro
     }
 }
 
+// ── Browser administration ─────────────────────────────────────────
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AdminOverviewResponse {
+    application_version: &'static str,
+    protocol_major: u32,
+    protocol_minor: u32,
+    control_schema_version: u32,
+    node_id: String,
+    readiness: ReadinessReport,
+    config: rcdvlog_server_core::ConfigDiagnostics,
+    auth: AuthDiagnostics,
+    derived_available_bytes: Option<u64>,
+    backup_available_bytes: Option<u64>,
+}
+
+async fn admin_overview(State(state): State<HttpState>) -> Response {
+    let readiness = state.readiness_gate.evaluate().await;
+    let auth = match state.auth.diagnostics() {
+        Ok(value) => value,
+        Err(error) => return auth_error_response(error),
+    };
+    Json(AdminOverviewResponse {
+        application_version: APPLICATION_VERSION,
+        protocol_major: PROTOCOL_MAJOR_VERSION,
+        protocol_minor: PROTOCOL_MINOR_VERSION,
+        control_schema_version: CONTROL_CATALOG_SCHEMA_VERSION,
+        node_id: state.foundation.catalog().node_id().to_string(),
+        readiness,
+        config: state.foundation.config().diagnostics(),
+        derived_available_bytes: fs2::available_space(&state.foundation.config().derived_dir).ok(),
+        backup_available_bytes: fs2::available_space(&state.foundation.config().backup_dir).ok(),
+        auth,
+    })
+    .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AdminAuditQuery {
+    #[serde(default = "default_admin_limit")]
+    limit: u32,
+    before: Option<u64>,
+}
+
+fn default_admin_limit() -> u32 {
+    50
+}
+
+async fn list_admin_audit(
+    State(state): State<HttpState>,
+    Extension(request_id): Extension<RequestId>,
+    query: Result<Query<AdminAuditQuery>, QueryRejection>,
+) -> Response {
+    let Query(query) = match query {
+        Ok(value) => value,
+        Err(_) => {
+            return query_error_response(&request_id, "invalid_query", StatusCode::BAD_REQUEST);
+        }
+    };
+    match state
+        .foundation
+        .catalog()
+        .audit_log()
+        .list(query.limit, query.before)
+    {
+        Ok(items) => Json(serde_json::json!({ "items": items })).into_response(),
+        Err(_) => query_error_response(&request_id, "invalid_query", StatusCode::BAD_REQUEST),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CreateStorageRootRequest {
+    display_name: String,
+    #[serde(default = "default_true")]
+    immutable_original: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct UpdateStorageRootRequest {
+    display_name: Option<String>,
+    enabled: Option<bool>,
+    #[serde(default)]
+    confirm_disable: bool,
+}
+
+async fn list_admin_storage_roots(
+    State(state): State<HttpState>,
+    Extension(request_id): Extension<RequestId>,
+) -> Response {
+    match state
+        .foundation
+        .catalog()
+        .storage_library()
+        .list_storage_roots(true)
+    {
+        Ok(items) => Json(serde_json::json!({ "items": items })).into_response(),
+        Err(error) => storage_admin_error(&request_id, error),
+    }
+}
+
+async fn create_admin_storage_root(
+    State(state): State<HttpState>,
+    Extension(request_id): Extension<RequestId>,
+    Extension(principal): Extension<AuthPrincipal>,
+    request: Result<Json<CreateStorageRootRequest>, JsonRejection>,
+) -> Response {
+    let Json(request) = match request {
+        Ok(value) => value,
+        Err(_) => {
+            return query_error_response(&request_id, "invalid_input", StatusCode::BAD_REQUEST);
+        }
+    };
+    let id = match StorageRootId::parse(format!("root_{}", Uuid::new_v4().simple())) {
+        Ok(id) => id,
+        Err(_) => {
+            return query_error_response(&request_id, "invalid_input", StatusCode::BAD_REQUEST);
+        }
+    };
+    match state
+        .foundation
+        .catalog()
+        .storage_library()
+        .create_storage_root(NewStorageRoot {
+            id: id.clone(),
+            display_name: request.display_name.clone(),
+            immutable_original: request.immutable_original,
+        }) {
+        Ok(root) => match audit_admin(
+            &state,
+            &principal,
+            &request_id,
+            "storage_root.created",
+            "storage_root",
+            Some(id.as_str()),
+            serde_json::json!({"displayName": request.display_name, "immutableOriginal": request.immutable_original}),
+        ) {
+            Ok(()) => (StatusCode::CREATED, Json(root)).into_response(),
+            Err(response) => *response,
+        },
+        Err(error) => storage_admin_error(&request_id, error),
+    }
+}
+
+async fn update_admin_storage_root(
+    State(state): State<HttpState>,
+    Extension(request_id): Extension<RequestId>,
+    Extension(principal): Extension<AuthPrincipal>,
+    AxumPath(raw_id): AxumPath<String>,
+    request: Result<Json<UpdateStorageRootRequest>, JsonRejection>,
+) -> Response {
+    let id = match StorageRootId::parse(raw_id) {
+        Ok(id) => id,
+        Err(_) => {
+            return query_error_response(&request_id, "invalid_input", StatusCode::BAD_REQUEST);
+        }
+    };
+    let Json(request) = match request {
+        Ok(value) => value,
+        Err(_) => {
+            return query_error_response(&request_id, "invalid_input", StatusCode::BAD_REQUEST);
+        }
+    };
+    if request.enabled == Some(false) && !request.confirm_disable {
+        return query_error_response(
+            &request_id,
+            "confirmation_required",
+            StatusCode::BAD_REQUEST,
+        );
+    }
+    match state
+        .foundation
+        .catalog()
+        .storage_library()
+        .update_storage_root(
+            &id,
+            StorageRootUpdate {
+                display_name: request.display_name.clone(),
+                enabled: request.enabled,
+            },
+        ) {
+        Ok(root) => match audit_admin(
+            &state,
+            &principal,
+            &request_id,
+            "storage_root.updated",
+            "storage_root",
+            Some(id.as_str()),
+            serde_json::json!({"displayNameChanged": request.display_name.is_some(), "enabled": request.enabled}),
+        ) {
+            Ok(()) => Json(root).into_response(),
+            Err(response) => *response,
+        },
+        Err(error) => storage_admin_error(&request_id, error),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct UpsertBindingRequest {
+    local_mount_path: String,
+    root_subpath: Option<RootRelativePath>,
+    protocol: StorageProtocol,
+    access_mode: StorageAccessMode,
+    #[serde(default = "default_true")]
+    enabled: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ConfirmBindingRequest {
+    action: BindingConfirmationAction,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum BindingConfirmationAction {
+    Confirm,
+    Reject,
+}
+
+async fn list_admin_storage_bindings(
+    State(state): State<HttpState>,
+    Extension(request_id): Extension<RequestId>,
+) -> Response {
+    match state
+        .foundation
+        .catalog()
+        .storage_library()
+        .list_local_node_root_bindings_admin()
+    {
+        Ok(items) => Json(serde_json::json!({ "items": items })).into_response(),
+        Err(error) => storage_admin_error(&request_id, error),
+    }
+}
+
+async fn upsert_admin_storage_binding(
+    State(state): State<HttpState>,
+    Extension(request_id): Extension<RequestId>,
+    Extension(principal): Extension<AuthPrincipal>,
+    AxumPath(raw_id): AxumPath<String>,
+    request: Result<Json<UpsertBindingRequest>, JsonRejection>,
+) -> Response {
+    let root_id = match StorageRootId::parse(raw_id) {
+        Ok(id) => id,
+        Err(_) => {
+            return query_error_response(&request_id, "invalid_input", StatusCode::BAD_REQUEST);
+        }
+    };
+    let Json(request) = match request {
+        Ok(value) => value,
+        Err(_) => {
+            return query_error_response(&request_id, "invalid_input", StatusCode::BAD_REQUEST);
+        }
+    };
+    let mount = PathBuf::from(&request.local_mount_path);
+    if !admin_mount_is_allowed(state.foundation.config(), &mount) {
+        return query_error_response(
+            &request_id,
+            "mount_path_not_allowed",
+            StatusCode::BAD_REQUEST,
+        );
+    }
+    let input = LocalNodeRootBindingInput {
+        storage_root_id: root_id.clone(),
+        local_mount_path: mount,
+        root_subpath: request.root_subpath,
+        protocol: request.protocol,
+        access_mode: request.access_mode,
+        verification_status: BindingVerificationStatus::Pending,
+        enabled: request.enabled,
+        association_evidence: None,
+        confirmation: RootAssociationConfirmation {
+            status: RootAssociationConfirmationStatus::Pending,
+            confirmed_by_node_id: None,
+            confirmed_at: None,
+        },
+    };
+    match state
+        .foundation
+        .catalog()
+        .storage_library()
+        .upsert_local_node_root_binding(input)
+    {
+        Ok(binding) => match audit_admin(
+            &state,
+            &principal,
+            &request_id,
+            "storage_binding.configured",
+            "storage_root",
+            Some(root_id.as_str()),
+            serde_json::json!({"enabled": binding.enabled, "protocol": binding.protocol.as_str(), "accessMode": binding.access_mode.as_str(), "evidencePresent": binding.association_evidence.is_some()}),
+        ) {
+            Ok(()) => Json(binding).into_response(),
+            Err(response) => *response,
+        },
+        Err(error) => storage_admin_error(&request_id, error),
+    }
+}
+
+async fn verify_admin_storage_binding(
+    State(state): State<HttpState>,
+    Extension(request_id): Extension<RequestId>,
+    Extension(principal): Extension<AuthPrincipal>,
+    AxumPath(raw_id): AxumPath<String>,
+) -> Response {
+    let root_id = match StorageRootId::parse(raw_id) {
+        Ok(id) => id,
+        Err(_) => {
+            return query_error_response(&request_id, "invalid_input", StatusCode::BAD_REQUEST);
+        }
+    };
+    let library = state.foundation.catalog().storage_library();
+    let existing = match library.get_local_node_root_binding_admin(&root_id) {
+        Ok(value) => value,
+        Err(error) => return storage_admin_error(&request_id, error),
+    };
+    let evidence = match library.inspect_local_root_association(
+        &root_id,
+        &existing.local_mount_path,
+        existing.root_subpath.as_ref(),
+    ) {
+        Ok(value) => value,
+        Err(error) => return storage_admin_error(&request_id, error),
+    };
+    let verification_status = if evidence.mismatches == 0 && evidence.matching_relative_paths > 0 {
+        BindingVerificationStatus::Pending
+    } else {
+        BindingVerificationStatus::Mismatch
+    };
+    let input = LocalNodeRootBindingInput {
+        storage_root_id: root_id.clone(),
+        local_mount_path: existing.local_mount_path,
+        root_subpath: existing.root_subpath,
+        protocol: existing.protocol,
+        access_mode: existing.access_mode,
+        verification_status,
+        enabled: existing.enabled,
+        association_evidence: Some(evidence.clone()),
+        confirmation: RootAssociationConfirmation {
+            status: RootAssociationConfirmationStatus::Pending,
+            confirmed_by_node_id: None,
+            confirmed_at: None,
+        },
+    };
+    match library.upsert_local_node_root_binding(input) {
+        Ok(binding) => match audit_admin(
+            &state,
+            &principal,
+            &request_id,
+            "storage_binding.verified",
+            "storage_root",
+            Some(root_id.as_str()),
+            serde_json::json!({"associationEvidence": evidence}),
+        ) {
+            Ok(()) => Json(binding).into_response(),
+            Err(response) => *response,
+        },
+        Err(error) => storage_admin_error(&request_id, error),
+    }
+}
+
+async fn confirm_admin_storage_binding(
+    State(state): State<HttpState>,
+    Extension(request_id): Extension<RequestId>,
+    Extension(principal): Extension<AuthPrincipal>,
+    AxumPath(raw_id): AxumPath<String>,
+    request: Result<Json<ConfirmBindingRequest>, JsonRejection>,
+) -> Response {
+    let root_id = match StorageRootId::parse(raw_id) {
+        Ok(id) => id,
+        Err(_) => {
+            return query_error_response(&request_id, "invalid_input", StatusCode::BAD_REQUEST);
+        }
+    };
+    let Json(request) = match request {
+        Ok(value) => value,
+        Err(_) => {
+            return query_error_response(&request_id, "invalid_input", StatusCode::BAD_REQUEST);
+        }
+    };
+    let library = state.foundation.catalog().storage_library();
+    let existing = match library.get_local_node_root_binding_admin(&root_id) {
+        Ok(value) => value,
+        Err(error) => return storage_admin_error(&request_id, error),
+    };
+    if matches!(request.action, BindingConfirmationAction::Confirm)
+        && existing
+            .association_evidence
+            .as_ref()
+            .is_none_or(|evidence| evidence.matching_relative_paths == 0 || evidence.mismatches > 0)
+    {
+        return query_error_response(
+            &request_id,
+            "association_evidence_required",
+            StatusCode::BAD_REQUEST,
+        );
+    }
+    let confirmed = matches!(request.action, BindingConfirmationAction::Confirm);
+    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let input = LocalNodeRootBindingInput {
+        storage_root_id: root_id.clone(),
+        local_mount_path: existing.local_mount_path,
+        root_subpath: existing.root_subpath,
+        protocol: existing.protocol,
+        access_mode: existing.access_mode,
+        verification_status: if confirmed {
+            BindingVerificationStatus::Confirmed
+        } else {
+            BindingVerificationStatus::Rejected
+        },
+        enabled: existing.enabled,
+        association_evidence: existing.association_evidence,
+        confirmation: RootAssociationConfirmation {
+            status: if confirmed {
+                RootAssociationConfirmationStatus::Confirmed
+            } else {
+                RootAssociationConfirmationStatus::Rejected
+            },
+            confirmed_by_node_id: confirmed.then(|| state.foundation.catalog().node_id().clone()),
+            confirmed_at: Some(now),
+        },
+    };
+    match library.upsert_local_node_root_binding(input) {
+        Ok(binding) => match audit_admin(
+            &state,
+            &principal,
+            &request_id,
+            if confirmed {
+                "storage_binding.confirmed"
+            } else {
+                "storage_binding.rejected"
+            },
+            "storage_root",
+            Some(root_id.as_str()),
+            serde_json::json!({"evidence": binding.association_evidence}),
+        ) {
+            Ok(()) => Json(binding).into_response(),
+            Err(response) => *response,
+        },
+        Err(error) => storage_admin_error(&request_id, error),
+    }
+}
+
+fn admin_mount_is_allowed(config: &rcdvlog_server_core::ServerConfig, mount: &Path) -> bool {
+    if !mount.is_absolute()
+        || mount
+            .components()
+            .any(|component| matches!(component, Component::ParentDir | Component::CurDir))
+    {
+        return false;
+    }
+    let Ok(resolved_mount) = mount.canonicalize() else {
+        return false;
+    };
+    config.allowed_original_mounts.iter().any(|allowed| {
+        allowed
+            .canonicalize()
+            .is_ok_and(|resolved_allowed| resolved_mount.starts_with(resolved_allowed))
+    })
+}
+
+fn storage_admin_error(request_id: &RequestId, error: StorageLibraryError) -> Response {
+    match error {
+        StorageLibraryError::InvalidInput { .. } | StorageLibraryError::Path(_) => {
+            query_error_response(request_id, "invalid_input", StatusCode::BAD_REQUEST)
+        }
+        StorageLibraryError::NotFound { .. } => {
+            query_error_response(request_id, "not_found", StatusCode::NOT_FOUND)
+        }
+        _ => query_error_response(
+            request_id,
+            "internal_error",
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+    }
+}
+
+fn admin_scan_service(state: &HttpState) -> ScanService {
+    ScanService::new(
+        state.foundation.catalog().storage_library(),
+        ScanToolConfig {
+            ffprobe_program: PathBuf::from(&state.foundation.config().ffprobe_command),
+            exiftool_program: (!state.foundation.config().exiftool_command.is_empty())
+                .then(|| PathBuf::from(&state.foundation.config().exiftool_command)),
+        },
+    )
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AdminScanQuery {
+    #[serde(default = "default_admin_limit")]
+    limit: u32,
+    after: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RequestScanRequest {
+    storage_root_id: StorageRootId,
+    scope_relative_path: Option<RootRelativePath>,
+    idempotency_key: String,
+}
+
+async fn list_admin_scans(
+    State(state): State<HttpState>,
+    Extension(request_id): Extension<RequestId>,
+    query: Result<Query<AdminScanQuery>, QueryRejection>,
+) -> Response {
+    let Query(query) = match query {
+        Ok(value) => value,
+        Err(_) => {
+            return query_error_response(&request_id, "invalid_query", StatusCode::BAD_REQUEST);
+        }
+    };
+    match admin_scan_service(&state).list_scans(query.limit, query.after.as_deref()) {
+        Ok(items) => Json(serde_json::json!({"items":items})).into_response(),
+        Err(error) => scan_admin_error(&request_id, error),
+    }
+}
+
+async fn request_admin_scan(
+    State(state): State<HttpState>,
+    Extension(request_id): Extension<RequestId>,
+    Extension(principal): Extension<AuthPrincipal>,
+    request: Result<Json<RequestScanRequest>, JsonRejection>,
+) -> Response {
+    let Json(request) = match request {
+        Ok(value) => value,
+        Err(_) => {
+            return query_error_response(&request_id, "invalid_input", StatusCode::BAD_REQUEST);
+        }
+    };
+    if request.idempotency_key.trim().is_empty() || request.idempotency_key.len() > 255 {
+        return query_error_response(&request_id, "invalid_input", StatusCode::BAD_REQUEST);
+    }
+    match admin_scan_service(&state).request_scan_idempotent(
+        &request.storage_root_id,
+        request.scope_relative_path.as_ref(),
+        &request.idempotency_key,
+    ) {
+        Ok(scan) => match audit_admin(
+            &state,
+            &principal,
+            &request_id,
+            "scan.requested",
+            "scan",
+            Some(&scan.scan_id),
+            serde_json::json!({"storageRootId": request.storage_root_id, "scopeRelativePath": request.scope_relative_path, "idempotencyKey": request.idempotency_key}),
+        ) {
+            Ok(()) => (StatusCode::ACCEPTED, Json(scan)).into_response(),
+            Err(response) => *response,
+        },
+        Err(error) => scan_admin_error(&request_id, error),
+    }
+}
+
+async fn list_admin_scan_diagnostics(
+    State(state): State<HttpState>,
+    Extension(request_id): Extension<RequestId>,
+    AxumPath(scan_id): AxumPath<String>,
+    query: Result<Query<AdminScanQuery>, QueryRejection>,
+) -> Response {
+    let Query(query) = match query {
+        Ok(value) => value,
+        Err(_) => {
+            return query_error_response(&request_id, "invalid_query", StatusCode::BAD_REQUEST);
+        }
+    };
+    let service = admin_scan_service(&state);
+    if let Err(error) = service.get_scan(&scan_id) {
+        return scan_admin_error(&request_id, error);
+    }
+    match service.list_scan_diagnostics(&scan_id, query.limit, query.after.as_deref()) {
+        Ok(items) => Json(serde_json::json!({"items":items})).into_response(),
+        Err(error) => scan_admin_error(&request_id, error),
+    }
+}
+
+async fn list_admin_scan_schedules(
+    State(state): State<HttpState>,
+    Extension(request_id): Extension<RequestId>,
+) -> Response {
+    match admin_scan_service(&state).list_schedules() {
+        Ok(items) => Json(serde_json::json!({"items":items})).into_response(),
+        Err(error) => scan_admin_error(&request_id, error),
+    }
+}
+
+async fn create_admin_scan_schedule(
+    State(state): State<HttpState>,
+    Extension(request_id): Extension<RequestId>,
+    Extension(principal): Extension<AuthPrincipal>,
+    request: Result<Json<NewScanSchedule>, JsonRejection>,
+) -> Response {
+    let Json(request) = match request {
+        Ok(value) => value,
+        Err(_) => {
+            return query_error_response(&request_id, "invalid_input", StatusCode::BAD_REQUEST);
+        }
+    };
+    match admin_scan_service(&state).create_schedule(request) {
+        Ok(schedule) => match audit_admin(
+            &state,
+            &principal,
+            &request_id,
+            "scan_schedule.created",
+            "scan_schedule",
+            Some(&schedule.schedule_id),
+            serde_json::json!({"timezone":schedule.timezone,"localTime":schedule.local_time,"enabled":schedule.enabled}),
+        ) {
+            Ok(()) => (StatusCode::CREATED, Json(schedule)).into_response(),
+            Err(response) => *response,
+        },
+        Err(error) => scan_admin_error(&request_id, error),
+    }
+}
+
+async fn update_admin_scan_schedule(
+    State(state): State<HttpState>,
+    Extension(request_id): Extension<RequestId>,
+    Extension(principal): Extension<AuthPrincipal>,
+    AxumPath(schedule_id): AxumPath<String>,
+    request: Result<Json<ScanScheduleUpdate>, JsonRejection>,
+) -> Response {
+    let Json(request) = match request {
+        Ok(value) => value,
+        Err(_) => {
+            return query_error_response(&request_id, "invalid_input", StatusCode::BAD_REQUEST);
+        }
+    };
+    match admin_scan_service(&state).update_schedule(&schedule_id, request) {
+        Ok(schedule) => match audit_admin(
+            &state,
+            &principal,
+            &request_id,
+            "scan_schedule.updated",
+            "scan_schedule",
+            Some(&schedule_id),
+            serde_json::json!({"timezone":schedule.timezone,"localTime":schedule.local_time,"enabled":schedule.enabled}),
+        ) {
+            Ok(()) => Json(schedule).into_response(),
+            Err(response) => *response,
+        },
+        Err(error) => scan_admin_error(&request_id, error),
+    }
+}
+
+fn scan_admin_error(request_id: &RequestId, error: ScanServiceError) -> Response {
+    match error {
+        ScanServiceError::InvalidInput { .. } => {
+            query_error_response(request_id, "invalid_input", StatusCode::BAD_REQUEST)
+        }
+        ScanServiceError::NotFound { .. } => {
+            query_error_response(request_id, "not_found", StatusCode::NOT_FOUND)
+        }
+        ScanServiceError::ScanAlreadyActive => {
+            query_error_response(request_id, "scan_already_active", StatusCode::CONFLICT)
+        }
+        ScanServiceError::IdempotencyConflict => {
+            query_error_response(request_id, "idempotency_conflict", StatusCode::CONFLICT)
+        }
+        _ => query_error_response(
+            request_id,
+            "internal_error",
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AdminJobsQuery {
+    #[serde(default = "default_admin_limit")]
+    limit: u32,
+    before: Option<u64>,
+    state: Option<JobState>,
+}
+
+async fn list_admin_jobs(
+    State(state): State<HttpState>,
+    Extension(request_id): Extension<RequestId>,
+    query: Result<Query<AdminJobsQuery>, QueryRejection>,
+) -> Response {
+    let Query(query) = match query {
+        Ok(value) => value,
+        Err(_) => {
+            return query_error_response(&request_id, "invalid_query", StatusCode::BAD_REQUEST);
+        }
+    };
+    match state
+        .foundation
+        .jobs()
+        .list_jobs(query.limit, query.before, query.state)
+    {
+        Ok(page) => Json(page).into_response(),
+        Err(error) => job_admin_error(&request_id, error),
+    }
+}
+
+async fn list_admin_sync(
+    State(state): State<HttpState>,
+    Extension(request_id): Extension<RequestId>,
+) -> Response {
+    match state
+        .foundation
+        .catalog()
+        .project_replicas()
+        .list_sync_overview()
+    {
+        Ok(items) => Json(serde_json::json!({"items":items})).into_response(),
+        Err(error) => project_read_error_response(&request_id, error),
+    }
+}
+
+async fn get_admin_job(
+    State(state): State<HttpState>,
+    Extension(request_id): Extension<RequestId>,
+    AxumPath(raw_id): AxumPath<String>,
+) -> Response {
+    let id = match JobId::parse(raw_id) {
+        Ok(id) => id,
+        Err(_) => return query_error_response(&request_id, "not_found", StatusCode::NOT_FOUND),
+    };
+    match state.foundation.jobs().get_job(&id) {
+        Ok(job) => Json(job).into_response(),
+        Err(error) => job_admin_error(&request_id, error),
+    }
+}
+
+async fn cancel_admin_job(
+    State(state): State<HttpState>,
+    Extension(request_id): Extension<RequestId>,
+    Extension(principal): Extension<AuthPrincipal>,
+    AxumPath(raw_id): AxumPath<String>,
+) -> Response {
+    let id = match JobId::parse(raw_id) {
+        Ok(id) => id,
+        Err(_) => return query_error_response(&request_id, "not_found", StatusCode::NOT_FOUND),
+    };
+    match state
+        .foundation
+        .jobs()
+        .request_cancel(&id, Some("browser administration request"))
+    {
+        Ok(()) => match audit_admin(
+            &state,
+            &principal,
+            &request_id,
+            "job.cancel_requested",
+            "job",
+            Some(id.as_str()),
+            serde_json::json!({}),
+        ) {
+            Ok(()) => match state.foundation.jobs().get_job(&id) {
+                Ok(job) => Json(job).into_response(),
+                Err(error) => job_admin_error(&request_id, error),
+            },
+            Err(response) => *response,
+        },
+        Err(error) => job_admin_error(&request_id, error),
+    }
+}
+
+async fn retry_admin_job(
+    State(state): State<HttpState>,
+    Extension(request_id): Extension<RequestId>,
+    Extension(principal): Extension<AuthPrincipal>,
+    AxumPath(raw_id): AxumPath<String>,
+) -> Response {
+    let id = match JobId::parse(raw_id) {
+        Ok(id) => id,
+        Err(_) => return query_error_response(&request_id, "not_found", StatusCode::NOT_FOUND),
+    };
+    match state.foundation.jobs().retry_failed(&id) {
+        Ok(job) => match audit_admin(
+            &state,
+            &principal,
+            &request_id,
+            "job.retry_queued",
+            "job",
+            Some(id.as_str()),
+            serde_json::json!({"attemptCount":job.attempt_count}),
+        ) {
+            Ok(()) => Json(job).into_response(),
+            Err(response) => *response,
+        },
+        Err(error) => job_admin_error(&request_id, error),
+    }
+}
+
+fn job_admin_error(request_id: &RequestId, error: JobEngineError) -> Response {
+    match error {
+        JobEngineError::InvalidInput(_) => {
+            query_error_response(request_id, "invalid_input", StatusCode::BAD_REQUEST)
+        }
+        JobEngineError::NotFound(_) => {
+            query_error_response(request_id, "not_found", StatusCode::NOT_FOUND)
+        }
+        JobEngineError::InvalidState(_) => {
+            query_error_response(request_id, "job_not_retryable", StatusCode::CONFLICT)
+        }
+        _ => query_error_response(
+            request_id,
+            "internal_error",
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RepresentationBatchRequest {
+    media_object_ids: Vec<MediaObjectId>,
+    kind: RepresentationKind,
+    idempotency_key: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RepresentationBatchResult {
+    selected_count: usize,
+    reused_count: usize,
+    queued_count: usize,
+    succeeded_count: usize,
+    failed_count: usize,
+    skipped_count: usize,
+    skipped: Vec<RepresentationBatchSkip>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RepresentationBatchSkip {
+    media_object_id: MediaObjectId,
+    reason: String,
+}
+
+async fn request_admin_representation_batch(
+    State(state): State<HttpState>,
+    Extension(request_id): Extension<RequestId>,
+    Extension(principal): Extension<AuthPrincipal>,
+    request: Result<Json<RepresentationBatchRequest>, JsonRejection>,
+) -> Response {
+    let Json(request) = match request {
+        Ok(value) => value,
+        Err(_) => {
+            return query_error_response(&request_id, "invalid_input", StatusCode::BAD_REQUEST);
+        }
+    };
+    if request.media_object_ids.is_empty()
+        || request.media_object_ids.len() > 200
+        || request.idempotency_key.is_empty()
+        || request.idempotency_key.len() > 255
+    {
+        return query_error_response(&request_id, "invalid_input", StatusCode::BAD_REQUEST);
+    }
+    let service = state
+        .foundation
+        .catalog()
+        .representations(state.foundation.config().derived_dir.clone());
+    let mut reused_count = 0;
+    let mut queued_count = 0;
+    let mut succeeded_count = 0;
+    let mut skipped = Vec::new();
+    for media_object_id in &request.media_object_ids {
+        match service.request(RepresentationRequest {
+            media_object_id: media_object_id.clone(),
+            kind: request.kind,
+        }) {
+            Ok(result) if result.reused => {
+                reused_count += 1;
+                succeeded_count += 1;
+            }
+            Ok(_) => queued_count += 1,
+            Err(error) => skipped.push(RepresentationBatchSkip {
+                media_object_id: media_object_id.clone(),
+                reason: error.code().to_string(),
+            }),
+        }
+    }
+    let result = RepresentationBatchResult {
+        selected_count: request.media_object_ids.len(),
+        reused_count,
+        queued_count,
+        succeeded_count,
+        failed_count: 0,
+        skipped_count: skipped.len(),
+        skipped,
+    };
+    match audit_admin(
+        &state,
+        &principal,
+        &request_id,
+        "representation_batch.requested",
+        "representation_batch",
+        None,
+        serde_json::json!({"kind":match request.kind { RepresentationKind::Proxy => "proxy", RepresentationKind::Thumbnail => "thumbnail" },"selectedCount":result.selected_count,"reusedCount":result.reused_count,"queuedCount":result.queued_count,"skippedCount":result.skipped_count,"idempotencyKey":request.idempotency_key}),
+    ) {
+        Ok(()) => (StatusCode::ACCEPTED, Json(result)).into_response(),
+        Err(response) => *response,
+    }
+}
+
+fn audit_admin(
+    state: &HttpState,
+    principal: &AuthPrincipal,
+    request_id: &RequestId,
+    action: &str,
+    target_type: &str,
+    target_id: Option<&str>,
+    detail: serde_json::Value,
+) -> Result<(), Box<Response>> {
+    let (actor_type, actor_id) = match principal {
+        AuthPrincipal::Browser { session_id, .. } => {
+            (AuditActorType::BrowserSession, session_id.as_str())
+        }
+        AuthPrincipal::Device { credential_id } => {
+            (AuditActorType::DeviceCredential, credential_id.as_str())
+        }
+    };
+    state
+        .foundation
+        .catalog()
+        .audit_log()
+        .record(
+            actor_type,
+            actor_id,
+            action,
+            target_type,
+            target_id,
+            &request_id.0,
+            &detail,
+        )
+        .map(|_| {
+            state.ws_channels.broadcast("__admin__", "adminChanged");
+        })
+        .map_err(|_| {
+            Box::new(query_error_response(
+                request_id,
+                "audit_write_failed",
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ))
+        })
+}
+
 pub async fn bind_loopback(address: SocketAddr) -> Result<TcpListener> {
     if !address.ip().is_loopback() {
         return Err(anyhow!(
@@ -2725,8 +3804,10 @@ mod tests {
             let data = root.path().join("state");
             let derived = root.path().join("derived");
             let backup = root.path().join("backup");
+            let originals = root.path().join("originals");
             std::fs::create_dir_all(&derived).unwrap();
             std::fs::create_dir_all(&backup).unwrap();
+            std::fs::create_dir_all(&originals).unwrap();
             let tool = if missing_tool {
                 "rcdvlog-tool-that-does-not-exist"
             } else {
@@ -2741,6 +3822,10 @@ mod tests {
                 (
                     "RCDVLOG_BACKUP_DIR".to_string(),
                     backup.display().to_string(),
+                ),
+                (
+                    "RCDVLOG_ALLOWED_ORIGINAL_MOUNTS".to_string(),
+                    originals.display().to_string(),
                 ),
                 ("RCDVLOG_FFMPEG".to_string(), tool.to_string()),
                 ("RCDVLOG_FFPROBE".to_string(), tool.to_string()),
@@ -2808,6 +3893,20 @@ mod tests {
             .exchange_pairing(pairing.code.expose(), "Test Mac")
             .unwrap();
         device.token.expose().to_string()
+    }
+
+    fn browser_auth(fixture: &Fixture) -> (String, String, String) {
+        let bootstrap = fixture.foundation.auth().create_bootstrap_code().unwrap();
+        let session = fixture
+            .foundation
+            .auth()
+            .exchange_bootstrap(bootstrap.code.expose(), "rcdvlog.local")
+            .unwrap();
+        (
+            session.session_id,
+            session.session_token.expose().to_string(),
+            session.csrf_token,
+        )
     }
 
     fn baseline_envelope(root: &TempDir) -> BaselineEnvelope {
@@ -3753,5 +4852,253 @@ mod tests {
             .unwrap();
         assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
         assert_eq!(json(invalid).await["code"], "invalid_input");
+    }
+
+    #[tokio::test]
+    async fn storage_admin_requires_allowed_paths_evidence_confirmation_and_audits_mutations() {
+        let fixture = Fixture::new(false);
+        let token = device_auth_token(&fixture);
+        let create = fixture
+            .app()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/admin/storage-roots")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::from(
+                        r#"{"displayName":"Archive","immutableOriginal":true}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(create.status(), StatusCode::CREATED);
+        let root = json(create).await;
+        let root_id = root["id"].as_str().unwrap();
+        std::fs::write(
+            fixture._root.path().join("originals/sample.mov"),
+            b"0123456789",
+        )
+        .unwrap();
+        fixture
+            .foundation
+            .catalog()
+            .storage_library()
+            .create_storage_object(rcdvlog_server_core::NewStorageObject {
+                id: rcdvlog_server_core::StorageObjectId::parse("storage_admin_sample").unwrap(),
+                storage_root_id: StorageRootId::parse(root_id).unwrap(),
+                relative_path: RootRelativePath::parse("sample.mov").unwrap(),
+                size_bytes: Some(10),
+                modified_at: None,
+            })
+            .unwrap();
+
+        let rejected_write = fixture
+            .app()
+            .oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri(format!("/api/v1/admin/storage-roots/{root_id}/binding"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "localMountPath": fixture._root.path().join("originals"),
+                            "protocol": "local", "accessMode": "read_write"
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rejected_write.status(), StatusCode::BAD_REQUEST);
+
+        let disallowed = fixture
+            .app()
+            .oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri(format!("/api/v1/admin/storage-roots/{root_id}/binding"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "localMountPath": fixture.foundation.config().derived_dir,
+                            "protocol": "local", "accessMode": "read_only"
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(disallowed.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(json(disallowed).await["code"], "mount_path_not_allowed");
+
+        let binding = fixture
+            .app()
+            .oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri(format!("/api/v1/admin/storage-roots/{root_id}/binding"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "localMountPath": fixture._root.path().join("originals"),
+                            "protocol": "local", "accessMode": "read_only"
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(binding.status(), StatusCode::OK);
+        assert_eq!(json(binding).await["confirmation"]["status"], "pending");
+
+        let verified = fixture
+            .app()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/api/v1/admin/storage-roots/{root_id}/binding/verify"
+                    ))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(verified.status(), StatusCode::OK);
+        let verified = json(verified).await;
+        assert_eq!(verified["associationEvidence"]["matchingRelativePaths"], 1);
+        assert_eq!(verified["associationEvidence"]["mismatches"], 0);
+
+        let confirmed = fixture
+            .app()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/api/v1/admin/storage-roots/{root_id}/binding/confirmation"
+                    ))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::from(r#"{"action":"confirm"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(confirmed.status(), StatusCode::OK);
+        assert_eq!(json(confirmed).await["confirmation"]["status"], "confirmed");
+
+        let audit = fixture
+            .app()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/admin/audit?limit=10")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let audit = json(audit).await;
+        assert!(audit["items"].as_array().unwrap().len() >= 4);
+        assert!(!audit.to_string().to_ascii_lowercase().contains("token"));
+    }
+
+    #[tokio::test]
+    async fn representation_batch_skips_unverified_sources_instead_of_enqueuing() {
+        let fixture = Fixture::new(false);
+        let token = device_auth_token(&fixture);
+        fixture
+            .foundation
+            .catalog()
+            .storage_library()
+            .create_media_object(rcdvlog_server_core::NewMediaObject {
+                id: MediaObjectId::parse("media_unverified_admin").unwrap(),
+                size_bytes: Some(100),
+                quick_fingerprint: Some("a".repeat(64)),
+                full_content_hash: None,
+                verification_state: GlobalMediaVerificationState::Unverified,
+            })
+            .unwrap();
+        let response = fixture
+            .app()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/admin/representations/batch")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::from(r#"{"mediaObjectIds":["media_unverified_admin"],"kind":"proxy","idempotencyKey":"batch-1"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body = json(response).await;
+        assert_eq!(body["queuedCount"], 0);
+        assert_eq!(body["skipped"][0]["reason"], "source_not_verified");
+    }
+
+    #[tokio::test]
+    async fn revoking_current_browser_session_commits_audit_and_expires_cookie() {
+        let fixture = Fixture::new(false);
+        let (session_id, session_token, csrf_token) = browser_auth(&fixture);
+        let cookie = format!("rcdvlog_session={session_id}:{session_token}");
+        let response = fixture
+            .app()
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri(format!("/api/v1/auth/sessions/{session_id}"))
+                    .header(header::COOKIE, &cookie)
+                    .header("x-csrf-token", csrf_token)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response
+                .headers()
+                .get(header::SET_COOKIE)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .contains("Max-Age=0")
+        );
+
+        let denied = fixture
+            .app()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/auth/sessions")
+                    .header(header::COOKIE, cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+        let events = fixture
+            .foundation
+            .catalog()
+            .audit_log()
+            .list(10, None)
+            .unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|event| { event.action == "session.revoked" && event.actor_id == session_id })
+        );
     }
 }

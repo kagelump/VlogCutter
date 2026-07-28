@@ -5,17 +5,30 @@ import {
   type AddToProjectPreview,
   type AddToProjectRequest,
   type AddToProjectResult,
+  type AdminAuditEvent,
+  type AdminJob,
+  type AdminJobPage,
+  type AdminJobState,
+  type AdminOverview,
+  type DeviceCredentialInfo,
   type LibraryQueryParams,
   type LibrarySearchPage,
   type LoginResult,
   type ProjectAssetPage,
   type ProjectReviewAsset,
   type ProjectPage,
+  type ProjectSyncOverview,
+  type RepresentationBatchResult,
   type ReviewMutationResult,
   type ServerReadiness,
   type ServerStatus,
   type ServerVersion,
   type SessionState,
+  type ScanRun,
+  type ScanFileDiagnostic,
+  type ScanSchedule,
+  type StorageBinding,
+  type StorageRoot,
 } from "./index";
 import { API_PATHS } from "./generated";
 
@@ -152,6 +165,31 @@ export class HttpProjectClient implements BrowserProjectClient {
     );
   }
 
+  async getAdminOverview(): Promise<AdminOverview> { return this.request(API_PATHS.adminOverview); }
+  async listAdminAudit(limit = 50, before?: number): Promise<{ items: AdminAuditEvent[] }> { return this.request(`${API_PATHS.adminAudit}${queryString({ limit, before })}`); }
+  async listAdminStorageRoots(): Promise<{ items: StorageRoot[] }> { return this.request(API_PATHS.adminStorageRoots); }
+  async createAdminStorageRoot(displayName: string, immutableOriginal = true): Promise<StorageRoot> { return this.request(API_PATHS.adminStorageRoots, jsonPost({ displayName, immutableOriginal })); }
+  async updateAdminStorageRoot(rootId: string, update: { displayName?: string; enabled?: boolean; confirmDisable?: boolean }): Promise<StorageRoot> { return this.request(pathParam(API_PATHS.adminStorageRoot, "rootId", rootId), jsonRequest("PATCH", update)); }
+  async listAdminStorageBindings(): Promise<{ items: StorageBinding[] }> { return this.request(API_PATHS.adminStorageBindings); }
+  async upsertAdminStorageBinding(rootId: string, request: Parameters<BrowserProjectClient["upsertAdminStorageBinding"]>[1]): Promise<StorageBinding> { return this.request(pathParam(API_PATHS.adminStorageBinding, "rootId", rootId), jsonRequest("PUT", request)); }
+  async verifyAdminStorageBinding(rootId: string): Promise<StorageBinding> { return this.request(pathParam(API_PATHS.adminStorageBindingVerification, "rootId", rootId), jsonPost({})); }
+  async confirmAdminStorageBinding(rootId: string, action: "confirm" | "reject"): Promise<StorageBinding> { return this.request(pathParam(API_PATHS.adminStorageBindingConfirmation, "rootId", rootId), jsonPost({ action })); }
+  async listAdminScans(limit = 50): Promise<{ items: ScanRun[] }> { return this.request(`${API_PATHS.adminScans}${queryString({ limit })}`); }
+  async listAdminScanDiagnostics(scanId: string, limit = 50): Promise<{ items: ScanFileDiagnostic[] }> { return this.request(`${pathParam(API_PATHS.adminScanDiagnostics, "scanId", scanId)}${queryString({ limit })}`); }
+  async requestAdminScan(request: Parameters<BrowserProjectClient["requestAdminScan"]>[0]): Promise<ScanRun> { return this.request(API_PATHS.adminScans, jsonPost(request)); }
+  async listAdminScanSchedules(): Promise<{ items: ScanSchedule[] }> { return this.request(API_PATHS.adminScanSchedules); }
+  async createAdminScanSchedule(request: Parameters<BrowserProjectClient["createAdminScanSchedule"]>[0]): Promise<ScanSchedule> { return this.request(API_PATHS.adminScanSchedules, jsonPost(request)); }
+  async updateAdminScanSchedule(scheduleId: string, update: Parameters<BrowserProjectClient["updateAdminScanSchedule"]>[1]): Promise<ScanSchedule> { return this.request(pathParam(API_PATHS.adminScanSchedule, "scheduleId", scheduleId), jsonRequest("PATCH", update)); }
+  async listAdminJobs(limit = 50, before?: number, state?: AdminJobState): Promise<AdminJobPage> { return this.request(`${API_PATHS.adminJobs}${queryString({ limit, before, state })}`); }
+  async getAdminJob(jobId: string): Promise<AdminJob> { return this.request(pathParam(API_PATHS.adminJob, "jobId", jobId)); }
+  async cancelAdminJob(jobId: string): Promise<AdminJob> { return this.request(pathParam(API_PATHS.adminJobCancel, "jobId", jobId), jsonPost({})); }
+  async retryAdminJob(jobId: string): Promise<AdminJob> { return this.request(pathParam(API_PATHS.adminJobRetry, "jobId", jobId), jsonPost({})); }
+  async listAdminSync(): Promise<{ items: ProjectSyncOverview[] }> { return this.request(API_PATHS.adminSync); }
+  async requestAdminRepresentationBatch(request: Parameters<BrowserProjectClient["requestAdminRepresentationBatch"]>[0]): Promise<RepresentationBatchResult> { return this.request(API_PATHS.adminRepresentationBatch, jsonPost(request)); }
+  async listDevices(): Promise<DeviceCredentialInfo[]> { const result = await this.request<{ devices: DeviceCredentialInfo[] }>(API_PATHS.devices); return result.devices; }
+  async revokeDevice(credentialId: string): Promise<void> { await this.request(pathParam(API_PATHS.revokeDevice, "credentialId", credentialId), { method: "DELETE" }); }
+  async revokeSession(sessionId: string): Promise<void> { await this.request(pathParam(API_PATHS.revokeSession, "sessionId", sessionId), { method: "DELETE" }); }
+
   private async request<T>(
     path: string,
     init?: RequestInit,
@@ -182,6 +220,14 @@ export class HttpProjectClient implements BrowserProjectClient {
 
 function jsonPost(body: unknown): RequestInit {
   return { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) };
+}
+
+function jsonRequest(method: string, body: unknown): RequestInit {
+  return { method, headers: { "content-type": "application/json" }, body: JSON.stringify(body) };
+}
+
+function pathParam(template: string, name: string, value: string): string {
+  return template.replace(`{${name}}`, encodeURIComponent(value));
 }
 
 function reviewPath(template: string, projectId: string, assetId: string): string {

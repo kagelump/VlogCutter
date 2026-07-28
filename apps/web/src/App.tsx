@@ -1,7 +1,10 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
 import {
   ProjectClientError,
   type AddToProjectPreview,
+  type AdminAuditEvent,
+  type AdminJob,
+  type AdminOverview,
   type BrowserProjectClient,
   type LibrarySearchItem,
   type LibrarySort,
@@ -9,8 +12,14 @@ import {
   type ProjectReviewAsset,
   type ReviewMutationResult,
   type ProjectSummary,
+  type ProjectSyncOverview,
+  type ScanRun,
+  type ScanFileDiagnostic,
+  type ScanSchedule,
   type ServerStatus,
   type SessionState,
+  type StorageBinding,
+  type StorageRoot,
 } from "@rcdvlog/project-client";
 import { StatePanel, StatusBadge } from "@rcdvlog/review-ui";
 
@@ -116,6 +125,7 @@ function AuthenticatedShell({ client, status, session }: { client: BrowserProjec
     { path: "/", label: "Overview" },
     { path: "/library", label: "Library" },
     { path: "/projects", label: "Projects" },
+    { path: "/admin", label: "Administration" },
   ];
 
   function navigate(next: string) {
@@ -155,10 +165,114 @@ function AuthenticatedShell({ client, status, session }: { client: BrowserProjec
           <ProjectAssetsView client={client} projectId={decodeURIComponent(path.slice("/projects/".length))} />
         ) : path === "/projects" ? (
           <ProjectsView client={client} navigate={navigate} />
+        ) : path === "/admin" ? (
+          <AdminView client={client} initialSession={session} />
         ) : <Overview status={status} session={session} />}
       </main>
     </div>
   );
+}
+
+function AdminView({ client, initialSession }: { client: BrowserProjectClient; initialSession: SessionState }) {
+  const [overview, setOverview] = useState<AdminOverview | null>(null);
+  const [roots, setRoots] = useState<StorageRoot[]>([]);
+  const [bindings, setBindings] = useState<StorageBinding[]>([]);
+  const [scans, setScans] = useState<ScanRun[]>([]);
+  const [scanDiagnostics, setScanDiagnostics] = useState<Record<string, ScanFileDiagnostic[]>>({});
+  const [schedules, setSchedules] = useState<ScanSchedule[]>([]);
+  const [jobs, setJobs] = useState<AdminJob[]>([]);
+  const [sync, setSync] = useState<ProjectSyncOverview[]>([]);
+  const [sessions, setSessions] = useState(initialSession.sessions);
+  const [devices, setDevices] = useState<Awaited<ReturnType<BrowserProjectClient["listDevices"]>>>([]);
+  const [audit, setAudit] = useState<AdminAuditEvent[]>([]);
+  const [error, setError] = useState<ProjectClientError | null>(null);
+  const [busy, setBusy] = useState<string | null>(null);
+  const [rootName, setRootName] = useState("");
+  const [bindingRoot, setBindingRoot] = useState("");
+  const [mountPath, setMountPath] = useState("");
+  const [rootSubpath, setRootSubpath] = useState("");
+  const [bindingProtocol, setBindingProtocol] = useState<StorageBinding["protocol"]>("local");
+  const [scheduleRoot, setScheduleRoot] = useState("");
+  const [scheduleTime, setScheduleTime] = useState("03:00");
+  const [scheduleTimezone, setScheduleTimezone] = useState(Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC");
+  const [batchIds, setBatchIds] = useState("");
+  const [batchMessage, setBatchMessage] = useState("");
+
+  const load = useCallback(async () => {
+    try {
+      const [nextOverview, nextRoots, nextBindings, nextScans, nextSchedules, nextJobs, nextSync, nextSession, nextDevices, nextAudit] = await Promise.all([
+        client.getAdminOverview(), client.listAdminStorageRoots(), client.listAdminStorageBindings(), client.listAdminScans(30),
+        client.listAdminScanSchedules(), client.listAdminJobs(50), client.listAdminSync(), client.getSession(), client.listDevices(), client.listAdminAudit(30),
+      ]);
+      if (!nextSession.authenticated) {
+        window.location.reload();
+        return;
+      }
+      const diagnostics = await Promise.all(nextScans.items.filter((scan) => scan.failedFiles > 0).map(async (scan) => [scan.scanId, (await client.listAdminScanDiagnostics(scan.scanId, 20)).items] as const));
+      setOverview(nextOverview); setRoots(nextRoots.items); setBindings(nextBindings.items); setScans(nextScans.items); setSchedules(nextSchedules.items);
+      setScanDiagnostics(Object.fromEntries(diagnostics));
+      setJobs(nextJobs.items); setSync(nextSync.items); setSessions(nextSession.sessions); setDevices(nextDevices); setAudit(nextAudit.items);
+      setScheduleRoot((current) => current || nextRoots.items.find((root) => root.enabled)?.id || ""); setError(null);
+      setBindingRoot((current) => current || nextRoots.items.find((root) => root.enabled)?.id || "");
+    } catch (reason) { setError(normalizeError(reason)); }
+  }, [client]);
+
+  useEffect(() => { void load(); const timer = window.setInterval(() => void load(), 15_000); return () => window.clearInterval(timer); }, [load]);
+  useEffect(() => {
+    if (typeof WebSocket === "undefined") return;
+    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+    const socket = new WebSocket(`${protocol}//${window.location.host}/api/v1/ws/events`);
+    socket.addEventListener("open", () => socket.send(JSON.stringify({ type: "subscribe", projectId: "__admin__" })));
+    socket.addEventListener("message", () => void load());
+    return () => socket.close();
+  }, [load]);
+
+  async function action(key: string, operation: () => Promise<unknown>) {
+    setBusy(key); setError(null);
+    try { await operation(); await load(); } catch (reason) { setError(normalizeError(reason)); } finally { setBusy(null); }
+  }
+
+  return <section className="workspace-page admin-page">
+    <div className="page-heading"><div><p className="eyebrow">Home node / controlled operations</p><h1>Administration</h1></div>{overview ? <StatusBadge label={overview.readiness.status === "ready" ? "All prerequisites ready" : "Attention required"} tone={overview.readiness.status === "ready" ? "positive" : "warning"} /> : null}</div>
+    {error ? <InlineError error={error} /> : null}
+    {overview ? <div className="admin-vitals">
+      <article><span>Node</span><strong>{overview.nodeId}</strong><small>server {overview.applicationVersion} · schema {overview.controlSchemaVersion}</small></article>
+      <article><span>Derived capacity</span><strong>{formatBytes(overview.derivedAvailableBytes)}</strong><small>{overview.config.derivedDir}</small></article>
+      <article><span>Credentials</span><strong>{overview.auth.activeSessions + overview.auth.activeDeviceCredentials}</strong><small>{overview.auth.activeSessions} sessions · {overview.auth.activeDeviceCredentials} Macs</small></article>
+      <article><span>Prerequisites</span><strong>{overview.readiness.checks.filter((check) => check.status === "ok").length}/{overview.readiness.checks.length}</strong><small>{overview.readiness.checks.filter((check) => check.status !== "ok").map((check) => check.code).join(", ") || "All checks pass"}</small></article>
+    </div> : <p className="loading-line">Loading durable server state…</p>}
+
+    <AdminSection index="01" title="Storage roots & bindings">
+      <form className="admin-inline-form" onSubmit={(event) => { event.preventDefault(); const name = rootName.trim(); if (name) void action("create-root", () => client.createAdminStorageRoot(name).then(() => setRootName(""))); }}><label>Logical root name<input value={rootName} onChange={(event) => setRootName(event.target.value)} placeholder="Expo archive" /></label><button disabled={!rootName.trim() || busy === "create-root"}>Register root</button></form>
+      <div className="admin-table">{roots.map((root) => { const binding = bindings.find((item) => item.storageRootId === root.id); const evidenceReady = !!binding?.associationEvidence && binding.associationEvidence.matchingRelativePaths > 0 && binding.associationEvidence.mismatches === 0; return <article key={root.id}><div><strong>{root.displayName}</strong><small>{root.id} · {root.immutableOriginal ? "immutable originals" : "writable root"}</small></div><div><StatusBadge label={root.enabled ? "Enabled" : "Disabled"} tone={root.enabled ? "positive" : "warning"} /><small>{binding ? `${binding.confirmation.status} · ${binding.verificationStatus} · ${binding.accessMode} ${binding.protocol} · ${binding.localMountPath}${binding.rootSubpath ? ` / ${binding.rootSubpath}` : ""}${binding.associationEvidence ? ` · ${binding.associationEvidence.matchingRelativePaths} paths / ${binding.associationEvidence.mismatches} mismatches` : " · evidence not checked"}` : "No server binding"}</small></div><div className="row-actions"><button className="secondary" disabled={busy !== null} onClick={() => { const displayName = window.prompt("Logical storage-root display name", root.displayName)?.trim(); if (displayName && displayName !== root.displayName) void action(`rename-${root.id}`, () => client.updateAdminStorageRoot(root.id, { displayName })); }}>Rename</button><button className="secondary" disabled={!root.enabled || busy !== null} onClick={() => void action(`scan-${root.id}`, () => client.requestAdminScan({ storageRootId: root.id, idempotencyKey: `web-${Date.now()}` }))}>Scan now</button>{binding && binding.confirmation.status !== "confirmed" ? <button className="secondary" disabled={busy !== null} onClick={() => void action(`verify-${root.id}`, () => client.verifyAdminStorageBinding(root.id))}>Verify</button> : null}{evidenceReady && binding?.confirmation.status !== "confirmed" ? <button disabled={busy !== null} onClick={() => void action(`confirm-${root.id}`, () => client.confirmAdminStorageBinding(root.id, "confirm"))}>Confirm</button> : null}{binding && binding.confirmation.status === "pending" ? <button className="danger-button" disabled={busy !== null} onClick={() => void action(`reject-${root.id}`, () => client.confirmAdminStorageBinding(root.id, "reject"))}>Reject</button> : null}{root.enabled ? <button className="danger-button" disabled={busy !== null} onClick={() => { if (window.confirm(`Disable ${root.displayName}? Historical records remain intact.`)) void action(`disable-${root.id}`, () => client.updateAdminStorageRoot(root.id, { enabled: false, confirmDisable: true })); }}>Disable</button> : null}</div></article>; })}</div>
+      {overview?.config.allowedOriginalMounts.length ? <p className="admin-note">Bindings are limited to deployment-approved mounts: {overview.config.allowedOriginalMounts.join(" · ")}. Association evidence must be present before confirmation.</p> : <p className="admin-note warning">No original mounts are allowed by deployment configuration. The web UI cannot register arbitrary paths.</p>}
+      <form className="admin-inline-form binding-form" onSubmit={(event) => { event.preventDefault(); if (!bindingRoot || !mountPath.trim()) return; void action("binding", () => client.upsertAdminStorageBinding(bindingRoot, { localMountPath: mountPath.trim(), ...(rootSubpath.trim() ? { rootSubpath: rootSubpath.trim() } : {}), protocol: bindingProtocol, accessMode: "read_only" })); }}><label>Logical root<select value={bindingRoot} onChange={(event) => setBindingRoot(event.target.value)}>{roots.filter((root) => root.enabled).map((root) => <option key={root.id} value={root.id}>{root.displayName}</option>)}</select></label><label>Approved local mount<input value={mountPath} onChange={(event) => setMountPath(event.target.value)} placeholder={overview?.config.allowedOriginalMounts[0] ?? "/Volumes/archive"} /></label><label>Optional root subpath<input value={rootSubpath} onChange={(event) => setRootSubpath(event.target.value)} placeholder="Trips/2026" /></label><label>Protocol<select value={bindingProtocol} onChange={(event) => setBindingProtocol(event.target.value as StorageBinding["protocol"])}><option value="local">Local</option><option value="smb">SMB</option><option value="nfs">NFS</option><option value="other">Other</option></select></label><button disabled={!bindingRoot || !mountPath.trim() || busy !== null}>Configure pending binding</button></form>
+    </AdminSection>
+
+    <AdminSection index="02" title="Scans & schedules">
+      <form className="admin-inline-form schedule-form" onSubmit={(event) => { event.preventDefault(); if (scheduleRoot) void action("schedule", () => client.createAdminScanSchedule({ storageRootId: scheduleRoot, enabled: true, localTime: scheduleTime, timezone: scheduleTimezone })); }}><label>Root<select value={scheduleRoot} onChange={(event) => setScheduleRoot(event.target.value)}>{roots.filter((root) => root.enabled).map((root) => <option key={root.id} value={root.id}>{root.displayName}</option>)}</select></label><label>Local time<input type="time" value={scheduleTime} onChange={(event) => setScheduleTime(event.target.value)} /></label><label>IANA timezone<input value={scheduleTimezone} onChange={(event) => setScheduleTimezone(event.target.value)} /></label><button disabled={!scheduleRoot || busy !== null}>Add schedule</button></form>
+      <div className="admin-split"><div><h3>Recent scans</h3>{scans.map((scan) => <div className="scan-entry" key={scan.scanId}><p className="admin-line"><span>{scan.storageRootId}<small>{scan.source} · {scan.visitedEntries} visited · {scan.queuedFiles} queued · {scan.completedFiles} completed · {scan.failedFiles} failed</small></span><StatusBadge label={scan.state} tone={scan.state === "failed" ? "critical" : scan.state === "succeeded" ? "positive" : "warning"} /></p>{scanDiagnostics[scan.scanId]?.map((diagnostic) => <p className="scan-diagnostic" key={diagnostic.diagnosticId}><code>{diagnostic.code}</code><span>{diagnostic.stage} · {diagnostic.safePathIdentity}{diagnostic.retryable ? " · retryable" : ""}</span></p>)}</div>)}</div><div><h3>Schedules</h3>{schedules.map((schedule) => <p className="admin-line" key={schedule.scheduleId}><span>{schedule.localTime} · {schedule.timezone}<small>next {schedule.nextRunAt}</small></span><button className="secondary" onClick={() => void action(`schedule-${schedule.scheduleId}`, () => client.updateAdminScanSchedule(schedule.scheduleId, { enabled: !schedule.enabled }))}>{schedule.enabled ? "Pause" : "Enable"}</button></p>)}</div></div>
+    </AdminSection>
+
+    <AdminSection index="03" title="Durable jobs & representation batches">
+      <p className="admin-note">Execution node: {overview?.nodeId ?? "loading"}. Originals are read only; outputs are written under the configured derived root.</p>
+      <form className="batch-form" onSubmit={(event) => { event.preventDefault(); const mediaObjectIds = batchIds.split(/[\s,]+/).filter(Boolean); if (!mediaObjectIds.length) return; void action("batch", async () => { const result = await client.requestAdminRepresentationBatch({ mediaObjectIds, kind: "proxy", idempotencyKey: `web-${Date.now()}` }); setBatchMessage(`${result.queuedCount} queued · ${result.reusedCount} reused · ${result.succeededCount} succeeded · ${result.failedCount} failed · ${result.skippedCount} skipped${result.skipped.length ? ` (${result.skipped.map((item) => item.reason).join(", ")})` : ""}`); }); }}><label>Full-hash-verified media IDs<textarea value={batchIds} onChange={(event) => setBatchIds(event.target.value)} placeholder="media_… one per line" /></label><button disabled={!batchIds.trim() || busy !== null}>Request proxies</button>{batchMessage ? <p>{batchMessage}</p> : null}</form>
+      <div className="admin-table compact">{jobs.map((job) => <article key={job.definition.jobId}><div><strong>{job.definition.jobType}</strong><small>{job.definition.jobId} · {job.definition.targetNodeId}</small></div><div className="job-progress"><span style={{ width: `${job.totalItems ? Math.min(100, (job.completedItems / job.totalItems) * 100) : 0}%` }} /><small>{job.completedItems}/{job.totalItems} items · {job.failedItems} failed · attempt {job.attemptCount} · {job.estimate?.workerCount ?? 1} worker · ETA {job.estimate?.estimatedRemainingSeconds == null ? "calculating" : formatEta(job.estimate.estimatedRemainingSeconds)}</small></div><StatusBadge label={job.state} tone={job.state === "failed" ? "critical" : job.state === "succeeded" ? "positive" : "warning"} /><div className="row-actions">{["queued", "running", "retry_wait"].includes(job.state) ? <button className="danger-button" onClick={() => void action(`cancel-${job.definition.jobId}`, () => client.cancelAdminJob(job.definition.jobId))}>Cancel</button> : null}{job.state === "failed" ? <button className="secondary" onClick={() => void action(`retry-${job.definition.jobId}`, () => client.retryAdminJob(job.definition.jobId))}>Retry if eligible</button> : null}</div></article>)}</div>
+    </AdminSection>
+
+    <AdminSection index="04" title="Project synchronization">
+      <div className="admin-table compact">{sync.map((project) => <article key={project.projectId}><div><strong>{project.projectId}</strong><small>{project.originNodeId ?? "origin unknown"} → {project.serverNodeId} · endpoint {project.endpoint ?? "not recorded"}</small></div><div><span>{project.operationCount} stored operations · cursor {project.latestLocalSequence}</span><small>{project.nodeObservationCount} node observations · {project.connectivity} · {project.pendingProjectionRepairs} pending repairs · last {project.lastSuccessAt}</small></div><StatusBadge label={project.unresolvedConflictCount ? `${project.unresolvedConflictCount} conflicts · ${project.recommendations.join(", ")}` : project.compatibility} tone={project.unresolvedConflictCount ? "warning" : "positive"} /></article>)}</div>
+    </AdminSection>
+
+    <AdminSection index="05" title="Sessions, paired Macs & audit">
+      <div className="admin-split"><div><h3>Browser sessions</h3>{sessions.map((item) => <p className="admin-line" key={item.sessionId}><span>{item.hostname}<small>{item.displayPrefix} · last {item.lastUsedAt}</small></span>{!item.revoked ? <button className="danger-button" onClick={() => { if (window.confirm(`Revoke browser session ${item.displayPrefix} on ${item.hostname}?`)) void action(`session-${item.sessionId}`, () => client.revokeSession(item.sessionId)); }}>Revoke</button> : <span>Revoked</span>}</p>)}</div><div><h3>Paired desktops</h3>{devices.map((item) => <p className="admin-line" key={item.credentialId}><span>{item.label}<small>{item.tokenPrefix} · last {item.lastUsedAt}</small></span>{!item.revoked ? <button className="danger-button" onClick={() => { if (window.confirm(`Revoke ${item.label} (${item.tokenPrefix})? Local desktop work remains intact.`)) void action(`device-${item.credentialId}`, () => client.revokeDevice(item.credentialId)); }}>Revoke</button> : <span>Revoked</span>}</p>)}</div></div>
+      <h3>Recent administrative audit</h3><div className="audit-list">{audit.map((event) => <p key={event.eventSequence}><b>{event.action}</b><span>{event.actorType} · {event.actorId}</span><small>{event.occurredAt} · request {event.requestId}</small></p>)}</div>
+    </AdminSection>
+  </section>;
+}
+
+function AdminSection({ index, title, children }: { index: string; title: string; children: ReactNode }) {
+  return <section className="admin-section"><header><span>{index}</span><h2>{title}</h2></header><div>{children}</div></section>;
 }
 
 function Overview({ status, session }: { status: ServerStatus; session: SessionState }) {
@@ -492,6 +606,7 @@ function AddToProjectDialog({ client, mediaObjectIds, close, complete }: { clien
 
 function availabilityLabel(value: string) { return value.replaceAll("_", " "); }
 function formatBytes(value: number | null) { if (value == null) return "Size unknown"; const units = ["B", "KB", "MB", "GB", "TB"]; let amount = value; let unit = 0; while (amount >= 1000 && unit < units.length - 1) { amount /= 1000; unit += 1; } return `${amount.toFixed(unit ? 1 : 0)} ${units[unit]}`; }
+function formatEta(seconds: number) { const rounded = Math.max(0, Math.round(seconds)); if (rounded < 60) return `${rounded}s`; const minutes = Math.floor(rounded / 60); if (minutes < 60) return `${minutes}m ${rounded % 60}s`; return `${Math.floor(minutes / 60)}h ${minutes % 60}m`; }
 
 function StatusSummary({ status, compact = false }: { status: ServerStatus; compact?: boolean }) {
   const ready = status.readiness.status === "ready";
