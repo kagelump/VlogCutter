@@ -11,6 +11,7 @@
     "check": "pnpm check:frontend && cargo test --workspace",
     "check:frontend": "pnpm --dir packages/project-client check && pnpm --dir packages/review-ui check && pnpm --dir apps/desktop check && pnpm --dir apps/web check",
     "check:openapi": "node scripts/sync-openapi.mjs --check",
+    "check:deployment": "node scripts/check-server-deployment.mjs",
     "generate:openapi": "node scripts/sync-openapi.mjs",
     "test:web": "pnpm --dir apps/web test",
     "test:web:e2e": "pnpm --dir apps/web test:e2e",

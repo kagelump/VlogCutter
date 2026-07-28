@@ -2136,7 +2136,10 @@ mod tests {
 
         let before = inspect_catalog(&path).unwrap();
         assert_eq!(before.current_schema_version, 4);
-        assert_eq!(before.pending_migrations.len(), 3);
+        assert_eq!(
+            before.pending_migrations.len(),
+            PROJECT_CATALOG_SCHEMA_VERSION as usize - 4
+        );
         let catalog = Catalog::open_existing(&path).unwrap();
         let asset = catalog.get_asset("asset_v4").unwrap();
         assert_eq!(asset.notes, "kept note");

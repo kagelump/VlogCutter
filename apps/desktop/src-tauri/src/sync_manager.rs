@@ -2,7 +2,10 @@ use crate::server_client::{ClientError, ServerClient};
 use futures_util::{SinkExt, StreamExt};
 use rand::Rng;
 use rcdvlog_core::Catalog;
-use rcdvlog_sync::{DEFAULT_MAX_OPERATIONS, ProtocolRange, ReconcileRequest, ReconcileResponse};
+use rcdvlog_sync::{
+    DEFAULT_MAX_OPERATIONS, ProtocolRange, ReconcileRequest, ReconcileResponse,
+    apply_reconcile_operations, exact_sequence_recovery_page, sequence_recovery_requires_attention,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -460,8 +463,6 @@ impl SyncLoopHandle {
             }
         };
 
-        let server_cursor = cursors.get(&server_node_id).copied().unwrap_or(0);
-
         let all_ops = match catalog.list_operations(project_id) {
             Ok(ops) => ops,
             Err(_) => {
@@ -471,18 +472,28 @@ impl SyncLoopHandle {
         };
 
         // Send local operations that the server hasn't acknowledged
-        let local_unacked: Vec<_> = all_ops
+        let peer_acknowledgements = catalog
+            .peer_operation_acknowledgements(&server_node_id)
+            .unwrap_or_default();
+        let acknowledged_local = peer_acknowledgements
+            .get(&local_node_id)
+            .copied()
+            .unwrap_or(0);
+        let local_unacked = all_ops
             .iter()
-            .filter(|op| op.origin_node_id == local_node_id && op.origin_sequence > server_cursor)
+            .filter(|op| {
+                op.origin_node_id == local_node_id && op.origin_sequence > acknowledged_local
+            })
             .cloned()
+            .collect::<Vec<_>>();
+        let has_more_local_operations = local_unacked.len() > DEFAULT_MAX_OPERATIONS;
+        let local_unacked = local_unacked
+            .into_iter()
+            .take(DEFAULT_MAX_OPERATIONS)
             .collect();
 
-        // Count server operations we haven't seen yet (for status)
-        let local_cursor = cursors.get(&local_node_id).copied().unwrap_or(0);
-        let remote_unseen_count = all_ops
-            .iter()
-            .filter(|op| op.origin_node_id == server_node_id && op.origin_sequence > local_cursor)
-            .count();
+        // The remote pending count is unknown until the server responds.
+        let remote_unseen_count = 0;
 
         let request = ReconcileRequest {
             protocol_version: ProtocolRange::default(),
@@ -547,8 +558,35 @@ impl SyncLoopHandle {
             };
 
             match client.reconcile(project_id, &request).await {
-                Ok(r) => {
-                    response = Some(r);
+                Ok(mut reconciled) => {
+                    let maximum_recovery_pages = all_ops
+                        .len()
+                        .div_ceil(DEFAULT_MAX_OPERATIONS)
+                        .saturating_add(1);
+                    let mut recovery_pages = 0;
+                    let mut recovery_failed = false;
+                    while recovery_pages < maximum_recovery_pages {
+                        let Some(operations) =
+                            exact_sequence_recovery_page(&reconciled, &server_node_id, &all_ops)
+                        else {
+                            break;
+                        };
+                        recovery_pages += 1;
+                        let mut recovery_request = request.clone();
+                        recovery_request.operations = operations;
+                        match client.reconcile(project_id, &recovery_request).await {
+                            Ok(next) => reconciled = next,
+                            Err(error) => {
+                                last_error = Some(error);
+                                recovery_failed = true;
+                                break;
+                            }
+                        }
+                    }
+                    if recovery_failed {
+                        continue;
+                    }
+                    response = Some(reconciled);
                     used_endpoint = Some(endpoint.clone());
                     break;
                 }
@@ -571,9 +609,17 @@ impl SyncLoopHandle {
                 };
 
                 if !resp.operations.is_empty()
-                    && let Err(e) = catalog.apply_operation_batch(&server_node_id, &resp.operations)
+                    && let Err(e) = apply_reconcile_operations(&catalog, &resp.operations)
                 {
                     self.record_failure(project_id, Some(&format!("apply failed: {e}")));
+                    self.active_projects.remove(project_id);
+                    return;
+                }
+                if let Err(e) = catalog.record_peer_operation_acknowledgements(
+                    &server_node_id,
+                    &resp.committed_cursors,
+                ) {
+                    self.record_failure(project_id, Some(&format!("acknowledgement failed: {e}")));
                     self.active_projects.remove(project_id);
                     return;
                 }
@@ -602,7 +648,7 @@ impl SyncLoopHandle {
                     backoff_until: None,
                 };
 
-                if status.conflict_count > 0 {
+                if status.conflict_count > 0 || sequence_recovery_requires_attention(&resp) {
                     status.state = SyncState::Attention;
                 }
 
@@ -627,7 +673,7 @@ impl SyncLoopHandle {
                 }
 
                 // If there are more operations to fetch, loop immediately
-                if resp.has_more_operations {
+                if resp.has_more_operations || has_more_local_operations {
                     self.active_projects.remove(project_id);
                     // Recurse without backoff — pull next page
                     if self.should_attempt(project_id) {
@@ -1048,9 +1094,17 @@ async fn connect_async_with_auth(
     ),
     tokio_tungstenite::tungstenite::Error,
 > {
+    let origin = if let Some(rest) = url.strip_prefix("wss://") {
+        format!("https://{}", rest.split('/').next().unwrap_or_default())
+    } else if let Some(rest) = url.strip_prefix("ws://") {
+        format!("http://{}", rest.split('/').next().unwrap_or_default())
+    } else {
+        String::new()
+    };
     let request = http::Request::builder()
         .uri(url)
         .header("Authorization", format!("Bearer {token}"))
+        .header("Origin", origin)
         .body(())
         .map_err(|_e| {
             tokio_tungstenite::tungstenite::Error::Http(Box::new(

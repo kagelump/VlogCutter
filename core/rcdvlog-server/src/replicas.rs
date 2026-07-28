@@ -1699,6 +1699,30 @@ mod tests {
     }
 
     #[test]
+    fn two_thousand_asset_baseline_remains_bounded_and_pages_exhaustively() {
+        let fixture = replica_fixture_with_assets(2_000);
+        let mut cursor = None;
+        let mut seen = 0;
+        loop {
+            let page = fixture
+                .manager
+                .list_project_assets(&fixture.project_id, 200, cursor.as_deref(), None)
+                .unwrap();
+            assert!(page.items.len() <= 200);
+            seen += page.items.len();
+            match page.next_cursor {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+        assert_eq!(seen, 2_000);
+        assert_eq!(
+            fixture.manager.list_projects(10, None).unwrap().items[0].asset_count,
+            2_000
+        );
+    }
+
+    #[test]
     fn project_asset_search_is_scoped_to_one_project() {
         let fixture = replica_fixture_with_assets(3);
         let page = fixture

@@ -1,7 +1,10 @@
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Subcommand};
 use rcdvlog_core::Catalog;
-use rcdvlog_sync::{DEFAULT_MAX_OPERATIONS, ProtocolRange, ReconcileRequest, ReconcileResponse};
+use rcdvlog_sync::{
+    DEFAULT_MAX_OPERATIONS, ProtocolRange, ReconcileRequest, ReconcileResponse,
+    apply_reconcile_operations, exact_sequence_recovery_page,
+};
 use reqwest::Method;
 use serde_json::{Value, json};
 use std::env;
@@ -648,42 +651,82 @@ fn sync_now(
     let local_node_id = catalog
         .local_node_id()?
         .ok_or_else(|| anyhow!("catalog local node identity is missing"))?;
-    let cursors = catalog.operation_cursors()?;
-    let acknowledged_local = cursors.get(&server_node_id).copied().unwrap_or(0);
-    let operations = catalog
-        .list_operations(project_id)?
-        .into_iter()
-        .filter(|operation| {
-            operation.origin_node_id == local_node_id
-                && operation.origin_sequence > acknowledged_local
-        })
-        .collect::<Vec<_>>();
-    let request = ReconcileRequest {
-        protocol_version: ProtocolRange::default(),
-        project_schema_version: rcdvlog_core::PROJECT_CATALOG_SCHEMA_VERSION,
-        project_id: project_id.to_string(),
-        server_node_id: server_node_id.clone(),
-        operation_cursors: cursors,
-        operations,
-        observations: vec![],
-        representation_manifests: vec![],
-        maximum_response_operations: DEFAULT_MAX_OPERATIONS,
+    let path = format!("/api/v1/internal/projects/{project_id}/reconcile");
+    let mut sent = 0;
+    let mut received = 0;
+    let response = loop {
+        let cursors = catalog.operation_cursors()?;
+        let acknowledged_local = catalog
+            .peer_operation_acknowledgements(&server_node_id)?
+            .get(&local_node_id)
+            .copied()
+            .unwrap_or(0);
+        let all_operations = catalog.list_operations(project_id)?;
+        let operations = all_operations
+            .iter()
+            .filter(|operation| {
+                operation.origin_node_id == local_node_id
+                    && operation.origin_sequence > acknowledged_local
+            })
+            .take(DEFAULT_MAX_OPERATIONS)
+            .cloned()
+            .collect::<Vec<_>>();
+        let request = ReconcileRequest {
+            protocol_version: ProtocolRange::default(),
+            project_schema_version: rcdvlog_core::PROJECT_CATALOG_SCHEMA_VERSION,
+            project_id: project_id.to_string(),
+            server_node_id: server_node_id.clone(),
+            operation_cursors: cursors,
+            operations,
+            observations: vec![],
+            representation_manifests: vec![],
+            maximum_response_operations: DEFAULT_MAX_OPERATIONS,
+        };
+        let sent_this_page = request.operations.len();
+        let value = client.post(&path, &serde_json::to_value(&request)?)?;
+        let mut page: ReconcileResponse = serde_json::from_value(value)?;
+        let maximum_recovery_pages = all_operations
+            .len()
+            .div_ceil(DEFAULT_MAX_OPERATIONS)
+            .saturating_add(1);
+        for _ in 0..maximum_recovery_pages {
+            let Some(operations) =
+                exact_sequence_recovery_page(&page, &server_node_id, &all_operations)
+            else {
+                break;
+            };
+            let mut recovery_request = request.clone();
+            recovery_request.operations = operations;
+            let value = client.post(&path, &serde_json::to_value(&recovery_request)?)?;
+            page = serde_json::from_value(value)?;
+        }
+        if !page.operations.is_empty() {
+            apply_reconcile_operations(&catalog, &page.operations)?;
+        }
+        catalog.record_peer_operation_acknowledgements(&server_node_id, &page.committed_cursors)?;
+        if let Some(last_sent) = request.operations.last()
+            && page
+                .committed_cursors
+                .get(&local_node_id)
+                .copied()
+                .unwrap_or(0)
+                < last_sent.origin_sequence
+        {
+            bail!("server did not acknowledge the uploaded operation page");
+        }
+        sent += sent_this_page;
+        received += page.operations.len();
+        let has_more = page.has_more_operations || sent_this_page == DEFAULT_MAX_OPERATIONS;
+        if !has_more {
+            break page;
+        }
     };
-    let sent = request.operations.len();
-    let value = client.post(
-        &format!("/api/v1/internal/projects/{project_id}/reconcile"),
-        &serde_json::to_value(&request)?,
-    )?;
-    let response: ReconcileResponse = serde_json::from_value(value)?;
-    if !response.operations.is_empty() {
-        catalog.apply_operation_batch(&server_node_id, &response.operations)?;
-    }
     Ok(json!({
         "path": "exclusive_cli_reconciliation",
         "projectId": project_id,
         "reconciliationStartedByCli": true,
         "sentOperations": sent,
-        "receivedOperations": response.operations.len(),
+        "receivedOperations": received,
         "hasMoreOperations": response.has_more_operations,
         "conflicts": response.conflicts,
         "sequenceRecovery": response.sequence_recovery,

@@ -1,8 +1,8 @@
 use anyhow::Result;
 use chrono::{SecondsFormat, Utc};
 use rcdvlog_core::{
-    Catalog, ConflictProjection, PROJECT_CATALOG_SCHEMA_VERSION, ProjectBaselineSnapshot,
-    ProjectOperation, SequenceRecoveryProjection,
+    Catalog, ConflictProjection, OperationBatchResult, PROJECT_CATALOG_SCHEMA_VERSION,
+    ProjectBaselineSnapshot, ProjectOperation, SequenceRecoveryProjection, SequenceRecoveryState,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -104,6 +104,79 @@ pub const BASELINE_VERSION: u32 = 1;
 pub const DEFAULT_MAX_OPERATIONS: usize = 500;
 pub const DEFAULT_MAX_FACTS_PER_CLASS: usize = 500;
 pub const DEFAULT_MAX_BYTES: usize = 4 * 1024 * 1024;
+
+/// Return the next exact, contiguous page of server-origin operations that a
+/// peer can safely replay after the server restores an older backup.
+///
+/// Missing or non-contiguous local history deliberately returns `None`: the
+/// caller must surface the unresolved recovery instead of advancing the
+/// allocator based only on a claimed cursor.
+pub fn exact_sequence_recovery_page(
+    response: &ReconcileResponse,
+    server_node_id: &str,
+    retained_operations: &[ProjectOperation],
+) -> Option<Vec<ProjectOperation>> {
+    let recovery = response.sequence_recovery.iter().find(|recovery| {
+        recovery.server_origin_node_id == server_node_id
+            && recovery.state == SequenceRecoveryState::Divergent
+    })?;
+    let start = recovery.divergence_start?;
+    let end = recovery.divergence_end?;
+    if start > end {
+        return None;
+    }
+    let page_end = end.min(start.saturating_add(DEFAULT_MAX_OPERATIONS as u64 - 1));
+    let mut operations = retained_operations
+        .iter()
+        .filter(|operation| {
+            operation.origin_node_id == server_node_id
+                && operation.origin_sequence >= start
+                && operation.origin_sequence <= page_end
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    operations.sort_by_key(|operation| operation.origin_sequence);
+    let expected_len = usize::try_from(page_end - start + 1).ok()?;
+    if operations.len() != expected_len
+        || operations
+            .iter()
+            .enumerate()
+            .any(|(index, operation)| operation.origin_sequence != start + index as u64)
+    {
+        return None;
+    }
+    Some(operations)
+}
+
+pub fn sequence_recovery_requires_attention(response: &ReconcileResponse) -> bool {
+    response
+        .sequence_recovery
+        .iter()
+        .any(|recovery| recovery.state != SequenceRecoveryState::Completed)
+}
+
+/// Apply a reconciliation response one origin at a time. A response can
+/// legitimately include the caller's own operations as idempotent echoes as
+/// well as operations created by the peer.
+pub fn apply_reconcile_operations(
+    catalog: &Catalog,
+    operations: &[ProjectOperation],
+) -> Result<Vec<OperationBatchResult>> {
+    let mut grouped = BTreeMap::<String, Vec<ProjectOperation>>::new();
+    for operation in operations {
+        grouped
+            .entry(operation.origin_node_id.clone())
+            .or_default()
+            .push(operation.clone());
+    }
+    grouped
+        .into_iter()
+        .map(|(origin, mut operations)| {
+            operations.sort_by_key(|operation| operation.origin_sequence);
+            catalog.apply_operation_batch(&origin, &operations)
+        })
+        .collect()
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

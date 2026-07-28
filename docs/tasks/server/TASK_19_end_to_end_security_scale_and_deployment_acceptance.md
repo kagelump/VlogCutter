@@ -1,6 +1,6 @@
 # Task 19: End-to-End, Security, Scale, and Deployment Acceptance
 
-**Status:** Planned
+**Status:** Complete with external-topology gaps recorded in `ACCEPTANCE_TASK_19.md`
 **Depends on:** Tasks 12, 15, 16, 17, and 18
 **Unblocks:** Task 20
 

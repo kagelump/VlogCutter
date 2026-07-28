@@ -30,5 +30,6 @@ uuid.workspace = true
 
 [dev-dependencies]
 blake3.workspace = true
+reqwest = { version = "0.12", features = ["blocking", "json"] }
 rusqlite.workspace = true
 tempfile = "3.24"

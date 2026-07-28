@@ -29,11 +29,12 @@ use rcdvlog_server_core::{
     StorageRootId, StorageRootUpdate,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::future::IntoFuture;
 use std::net::SocketAddr;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::sync::RwLock as StdRwLock;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
@@ -49,6 +50,9 @@ pub const REQUEST_ID_HEADER: &str = "x-request-id";
 const MAX_REQUEST_ID_BYTES: usize = 64;
 const DEFAULT_READINESS_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_HTTP_BODY_BYTES: usize = 64 * 1024 * 1024;
+const MAX_AUTH_BODY_BYTES: usize = 64 * 1024;
+const AUTH_ATTEMPT_LIMIT: usize = 12;
+const AUTH_ATTEMPT_WINDOW: Duration = Duration::from_secs(60);
 
 type ReadinessEvaluator = dyn Fn() -> ReadinessReport + Send + Sync + 'static;
 
@@ -58,6 +62,7 @@ pub struct HttpState {
     auth: Arc<AuthService>,
     readiness_gate: ReadinessGate,
     ws_channels: Arc<WsChannels>,
+    auth_rate_limiter: Arc<AuthRateLimiter>,
     web_root: Option<Arc<PathBuf>>,
 }
 
@@ -66,6 +71,37 @@ struct ReadinessGate {
     evaluator: Arc<ReadinessEvaluator>,
     single_flight: Arc<Semaphore>,
     response_timeout: Duration,
+}
+
+struct AuthRateLimiter {
+    attempts: StdMutex<VecDeque<Instant>>,
+    maximum_attempts: usize,
+    window: Duration,
+}
+
+impl AuthRateLimiter {
+    fn new(maximum_attempts: usize, window: Duration) -> Self {
+        Self {
+            attempts: StdMutex::new(VecDeque::new()),
+            maximum_attempts,
+            window,
+        }
+    }
+
+    fn allow(&self, now: Instant) -> bool {
+        let mut attempts = self.attempts.lock().unwrap();
+        while attempts
+            .front()
+            .is_some_and(|attempt| now.duration_since(*attempt) >= self.window)
+        {
+            attempts.pop_front();
+        }
+        if attempts.len() >= self.maximum_attempts {
+            return false;
+        }
+        attempts.push_back(now);
+        true
+    }
 }
 
 // ── WebSocket hint broadcast ──────────────────────────────────────────
@@ -125,6 +161,10 @@ impl HttpState {
                 response_timeout,
             },
             ws_channels: Arc::new(WsChannels::new()),
+            auth_rate_limiter: Arc::new(AuthRateLimiter::new(
+                AUTH_ATTEMPT_LIMIT,
+                AUTH_ATTEMPT_WINDOW,
+            )),
             web_root: std::env::var_os("RCDVLOG_WEB_DIR")
                 .map(PathBuf::from)
                 .map(Arc::new),
@@ -133,6 +173,12 @@ impl HttpState {
 
     pub fn with_web_root(mut self, web_root: impl Into<PathBuf>) -> Self {
         self.web_root = Some(Arc::new(web_root.into()));
+        self
+    }
+
+    #[cfg(test)]
+    fn with_auth_rate_limit(mut self, maximum_attempts: usize, window: Duration) -> Self {
+        self.auth_rate_limiter = Arc::new(AuthRateLimiter::new(maximum_attempts, window));
         self
     }
 }
@@ -210,14 +256,6 @@ struct ErrorResponse {
 }
 
 // ── Auth DTOs ──────────────────────────────────────────────────────
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct BootstrapCodeResponse {
-    request_id: String,
-    code: String,
-    expires_at: String,
-}
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -438,6 +476,115 @@ async fn require_csrf(
     next.run(request).await
 }
 
+async fn limit_open_auth_attempts(
+    State(state): State<HttpState>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    if !state.auth_rate_limiter.allow(Instant::now()) {
+        let request_id = request
+            .extensions()
+            .get::<RequestId>()
+            .cloned()
+            .unwrap_or_else(|| RequestId(String::new()));
+        return query_error_response(&request_id, "rate_limited", StatusCode::TOO_MANY_REQUESTS);
+    }
+    next.run(request).await
+}
+
+async fn validate_transport_request(
+    State(state): State<HttpState>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let request_id = request
+        .extensions()
+        .get::<RequestId>()
+        .cloned()
+        .unwrap_or_else(|| RequestId(String::new()));
+    let headers = request.headers();
+    let host = match validated_host(headers.get(header::HOST), state.foundation.config()) {
+        Ok(host) => host,
+        Err(code) => return query_error_response(&request_id, code, StatusCode::FORBIDDEN),
+    };
+    let forwarded_host = match validated_host(
+        headers.get(header::HeaderName::from_static("x-forwarded-host")),
+        state.foundation.config(),
+    ) {
+        Ok(host) => host,
+        Err(code) => return query_error_response(&request_id, code, StatusCode::FORBIDDEN),
+    };
+    if host.is_some() && forwarded_host.is_some() && host != forwarded_host {
+        return query_error_response(
+            &request_id,
+            "invalid_forwarded_headers",
+            StatusCode::FORBIDDEN,
+        );
+    }
+    if headers.contains_key(header::FORWARDED) {
+        return query_error_response(
+            &request_id,
+            "invalid_forwarded_headers",
+            StatusCode::FORBIDDEN,
+        );
+    }
+    let forwarded_scheme = match headers
+        .get(header::HeaderName::from_static("x-forwarded-proto"))
+        .and_then(|value| value.to_str().ok())
+    {
+        Some("http") => Some("http"),
+        Some("https") => Some("https"),
+        Some(_) => {
+            return query_error_response(
+                &request_id,
+                "invalid_forwarded_headers",
+                StatusCode::FORBIDDEN,
+            );
+        }
+        None => None,
+    };
+    if let Some(origin) = headers.get(header::ORIGIN) {
+        let Ok(origin) = origin.to_str() else {
+            return query_error_response(&request_id, "origin_mismatch", StatusCode::FORBIDDEN);
+        };
+        let Ok(uri) = origin.parse::<axum::http::Uri>() else {
+            return query_error_response(&request_id, "origin_mismatch", StatusCode::FORBIDDEN);
+        };
+        let expected_host = forwarded_host.as_deref().or(host.as_deref());
+        let actual_host = uri
+            .authority()
+            .map(|authority| authority.as_str().to_ascii_lowercase());
+        let actual_scheme = uri.scheme_str();
+        let expected_scheme = forwarded_scheme.unwrap_or("http");
+        if actual_host.as_deref() != expected_host || actual_scheme != Some(expected_scheme) {
+            return query_error_response(&request_id, "origin_mismatch", StatusCode::FORBIDDEN);
+        }
+    }
+    next.run(request).await
+}
+
+fn validated_host(
+    value: Option<&HeaderValue>,
+    config: &rcdvlog_server_core::ServerConfig,
+) -> std::result::Result<Option<String>, &'static str> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let value = value.to_str().map_err(|_| "invalid_host")?;
+    let authority = value
+        .parse::<axum::http::uri::Authority>()
+        .map_err(|_| "invalid_host")?;
+    let hostname = authority.host().to_ascii_lowercase();
+    let allowed = hostname == "localhost"
+        || hostname == config.listen_addr.ip().to_string()
+        || hostname == config.lan_hostname.to_ascii_lowercase()
+        || hostname.ends_with(".ts.net");
+    if !allowed {
+        return Err("invalid_host");
+    }
+    Ok(Some(authority.as_str().to_ascii_lowercase()))
+}
+
 async fn security_headers(request: Request<Body>, next: Next) -> Response {
     let mut response = next.run(request).await;
     let headers = response.headers_mut();
@@ -452,6 +599,16 @@ async fn security_headers(request: Request<Body>, next: Next) -> Response {
     headers.insert(
         header::HeaderName::from_static("referrer-policy"),
         HeaderValue::from_static("same-origin"),
+    );
+    headers.insert(
+        header::HeaderName::from_static("content-security-policy"),
+        HeaderValue::from_static(
+            "default-src 'self'; base-uri 'self'; frame-ancestors 'none'; object-src 'none'; connect-src 'self'",
+        ),
+    );
+    headers.insert(
+        header::HeaderName::from_static("permissions-policy"),
+        HeaderValue::from_static("camera=(), microphone=(), geolocation=()"),
     );
     response
 }
@@ -496,14 +653,19 @@ fn auth_error_response_with_request(error: AuthError, request_id: &str) -> Respo
 }
 
 pub fn router(state: HttpState) -> Router {
-    // Auth routes (open to bootstrap/pairing exchange)
+    // Open auth routes exchange one-time credentials created through the
+    // server-local admin command. Remote bootstrap creation is forbidden.
     let auth_open = Router::new()
-        .route("/api/v1/auth/bootstrap", get(create_bootstrap_code))
         .route(
             "/api/v1/auth/bootstrap/exchange",
             post(exchange_bootstrap_code),
         )
-        .route("/api/v1/auth/devices/exchange", post(exchange_pairing_code));
+        .route("/api/v1/auth/devices/exchange", post(exchange_pairing_code))
+        .layer(DefaultBodyLimit::max(MAX_AUTH_BODY_BYTES))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            limit_open_auth_attempts,
+        ));
 
     // Auth routes (require browser session)
     let auth_session = Router::new()
@@ -673,8 +835,12 @@ pub fn router(state: HttpState) -> Router {
         .merge(auth_session)
         .merge(internal)
         .fallback(web_or_not_found)
-        .with_state(state)
+        .with_state(state.clone())
         .layer(DefaultBodyLimit::max(MAX_HTTP_BODY_BYTES))
+        .layer(middleware::from_fn_with_state(
+            state,
+            validate_transport_request,
+        ))
         .layer(middleware::from_fn(security_headers))
         .layer(middleware::from_fn(request_context))
 }
@@ -1379,29 +1545,6 @@ struct ReconcileHttpResponse {
 
 // ── Auth route handlers ──────────────────────────────────────────────
 
-async fn create_bootstrap_code(
-    State(state): State<HttpState>,
-    Extension(request_id): Extension<RequestId>,
-) -> Response {
-    match state.auth.create_bootstrap_code() {
-        Ok(bootstrap) => {
-            tracing::info!(
-                component = "auth",
-                requestId = %request_id.0,
-                codePrefix = %&bootstrap.code.expose()[..8.min(bootstrap.code.expose().len())],
-                "bootstrap_code_created"
-            );
-            Json(BootstrapCodeResponse {
-                request_id: request_id.0,
-                code: bootstrap.code.expose().to_string(),
-                expires_at: bootstrap.expires_at,
-            })
-            .into_response()
-        }
-        Err(error) => auth_error_response_with_request(error, &request_id.0),
-    }
-}
-
 async fn exchange_bootstrap_code(
     State(state): State<HttpState>,
     Extension(request_id): Extension<RequestId>,
@@ -1732,8 +1875,13 @@ struct SubscribeMessage {
 async fn ws_events_handler(
     ws: WebSocketUpgrade,
     State(state): State<HttpState>,
+    Extension(request_id): Extension<RequestId>,
     Extension(_principal): Extension<AuthPrincipal>,
+    headers: HeaderMap,
 ) -> Response {
+    if !headers.contains_key(header::ORIGIN) {
+        return query_error_response(&request_id, "origin_mismatch", StatusCode::FORBIDDEN);
+    }
     // Both browser sessions and device credentials receive non-canonical change
     // hints. Consumers must refetch the authenticated REST projection.
     ws.on_upgrade(move |socket| handle_ws_socket(socket, state))
@@ -3999,6 +4147,13 @@ mod tests {
             router(HttpState::new(self.foundation.clone()))
         }
 
+        fn app_with_auth_rate_limit(&self, maximum_attempts: usize) -> Router {
+            router(
+                HttpState::new(self.foundation.clone())
+                    .with_auth_rate_limit(maximum_attempts, Duration::from_secs(60)),
+            )
+        }
+
         fn seed_media_content(&self, bytes: &[u8]) -> RepresentationId {
             let id = RepresentationId::parse("representation_http_fixture").unwrap();
             let relative = "representations/http/fixture/representation_http_fixture.mp4";
@@ -4439,6 +4594,141 @@ mod tests {
         let value = json(response).await;
         assert_eq!(value["code"], "session_invalid");
         assert_eq!(value["requestId"], "req_cli_fixture");
+    }
+
+    #[tokio::test]
+    async fn bootstrap_creation_is_local_only_and_open_exchanges_are_bounded() {
+        let fixture = Fixture::new(false);
+        let remote_creation = fixture
+            .app()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/auth/bootstrap")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(remote_creation.status(), StatusCode::NOT_FOUND);
+
+        let app = fixture.app_with_auth_rate_limit(2);
+        for _ in 0..2 {
+            let _ = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/api/v1/auth/bootstrap/exchange")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(r#"{"code":"invalid"}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+        let limited = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/auth/bootstrap/exchange")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"code":"invalid"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(json(limited).await["code"], "rate_limited");
+
+        let oversized = fixture
+            .app()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/auth/bootstrap/exchange")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(vec![b'x'; MAX_AUTH_BODY_BYTES + 1]))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn host_origin_forwarded_headers_and_websocket_origin_are_enforced() {
+        let fixture = Fixture::new(false);
+        let invalid_host = fixture
+            .app()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/health")
+                    .header(header::HOST, "attacker.example")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(invalid_host.status(), StatusCode::FORBIDDEN);
+        assert_eq!(json(invalid_host).await["code"], "invalid_host");
+
+        let foreign_origin = fixture
+            .app()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/auth/bootstrap/exchange")
+                    .header(header::HOST, "rcdvlog.local")
+                    .header(header::ORIGIN, "https://foreign.example")
+                    .header("x-forwarded-proto", "https")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"code":"invalid"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(foreign_origin.status(), StatusCode::FORBIDDEN);
+        assert_eq!(json(foreign_origin).await["code"], "origin_mismatch");
+
+        let forwarded_mismatch = fixture
+            .app()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/health")
+                    .header(header::HOST, "rcdvlog.local")
+                    .header("x-forwarded-host", "server.tailnet.ts.net")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(forwarded_mismatch.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            json(forwarded_mismatch).await["code"],
+            "invalid_forwarded_headers"
+        );
+
+        let token = device_auth_token(&fixture);
+        let websocket = fixture
+            .app()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/ws/events")
+                    .header(header::HOST, "rcdvlog.local")
+                    .header(header::ORIGIN, "https://foreign.example")
+                    .header("x-forwarded-proto", "https")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(header::CONNECTION, "upgrade")
+                    .header(header::UPGRADE, "websocket")
+                    .header("sec-websocket-version", "13")
+                    .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(websocket.status(), StatusCode::FORBIDDEN);
+        assert_eq!(json(websocket).await["code"], "origin_mismatch");
     }
 
     #[tokio::test]

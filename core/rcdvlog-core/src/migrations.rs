@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
-pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 7;
+pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 8;
 
 const MIGRATION_TABLE_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -123,6 +123,12 @@ pub const PROJECT_CATALOG_MIGRATIONS: &[SqliteMigration] = &[
         name: "restore_sequence_recovery",
         source_identity: "project-catalog/0007-restore-sequence-recovery/20260728",
         apply: add_restore_sequence_recovery,
+    },
+    SqliteMigration {
+        id: 8,
+        name: "peer_operation_acknowledgements",
+        source_identity: "project-catalog/0008-peer-operation-acknowledgements/20260728",
+        apply: add_peer_operation_acknowledgements,
     },
 ];
 
@@ -812,6 +818,21 @@ fn add_restore_sequence_recovery(transaction: &Transaction<'_>) -> Result<()> {
         );
         CREATE INDEX IF NOT EXISTS operation_sequence_recovery_state
             ON operation_sequence_recovery(state, peer_origin_node_id);
+        "#,
+    )?;
+    Ok(())
+}
+
+fn add_peer_operation_acknowledgements(transaction: &Transaction<'_>) -> Result<()> {
+    transaction.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS sync_peer_operation_acknowledgements (
+            peer_node_id TEXT NOT NULL,
+            origin_node_id TEXT NOT NULL,
+            committed_sequence INTEGER NOT NULL CHECK(committed_sequence >= 0),
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(peer_node_id, origin_node_id)
+        );
         "#,
     )?;
     Ok(())

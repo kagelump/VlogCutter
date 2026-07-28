@@ -26,7 +26,7 @@ pub use rcdvlog_core::{
 pub use rcdvlog_sync::{
     BASELINE_VERSION, BaselineEnvelope, BaselinePayload, BaselinePreview, NodeTargetedJob,
     ObservationFact, ProtocolRange, ReconcileRequest, ReconcileResponse,
-    RepresentationManifestFact, SyncError,
+    RepresentationManifestFact, SyncError, apply_reconcile_operations,
 };
 
 pub use auth::{

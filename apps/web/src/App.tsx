@@ -23,6 +23,8 @@ import {
 } from "@rcdvlog/project-client";
 import { StatePanel, StatusBadge } from "@rcdvlog/review-ui";
 
+const PROJECT_REFRESH_INTERVAL_MS = 5_000;
+
 type ShellState =
   | { kind: "loading" }
   | { kind: "login"; status: ServerStatus }
@@ -435,6 +437,15 @@ function ProjectAssetsView({ client, projectId }: { client: BrowserProjectClient
     socket.addEventListener("message", () => { void loadAssets(); void loadReview(selectedId); });
     return () => socket.close();
   }, [loadAssets, loadReview, projectId, selectedId]);
+
+  useEffect(() => {
+    if (!selectedId) return;
+    const timer = window.setInterval(() => {
+      void loadAssets();
+      void loadReview(selectedId);
+    }, PROJECT_REFRESH_INTERVAL_MS);
+    return () => window.clearInterval(timer);
+  }, [loadAssets, loadReview, selectedId]);
 
   const selectedIndex = assets.findIndex((asset) => asset.projectAssetId === selectedId);
   const move = useCallback((delta: number) => {

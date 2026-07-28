@@ -693,12 +693,57 @@ impl Catalog {
 
     pub fn operation_cursors(&self) -> Result<std::collections::BTreeMap<String, u64>> {
         let connection = self.connection()?;
-        let mut statement = connection.prepare("SELECT origin_node_id, committed_sequence FROM sync_origin_cursors ORDER BY origin_node_id")?;
+        let mut statement = connection.prepare(
+            r#"
+            SELECT origin_node_id, MAX(sequence) FROM (
+                SELECT origin_node_id, committed_sequence AS sequence FROM sync_origin_cursors
+                UNION ALL
+                SELECT origin_node_id, origin_sequence AS sequence FROM project_operations
+            ) GROUP BY origin_node_id ORDER BY origin_node_id
+            "#,
+        )?;
         Ok(statement
             .query_map([], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
             })?
             .collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn peer_operation_acknowledgements(
+        &self,
+        peer_node_id: &str,
+    ) -> Result<std::collections::BTreeMap<String, u64>> {
+        validate_id("peer node ID", peer_node_id)?;
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT origin_node_id, committed_sequence FROM sync_peer_operation_acknowledgements WHERE peer_node_id=?1 ORDER BY origin_node_id",
+        )?;
+        Ok(statement
+            .query_map([peer_node_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
+            })?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn record_peer_operation_acknowledgements(
+        &self,
+        peer_node_id: &str,
+        cursors: &std::collections::BTreeMap<String, u64>,
+    ) -> Result<()> {
+        validate_id("peer node ID", peer_node_id)?;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let timestamp = now();
+        for (origin_node_id, sequence) in cursors {
+            validate_id("origin node ID", origin_node_id)?;
+            let sequence = i64::try_from(*sequence)?;
+            transaction.execute(
+                "INSERT INTO sync_peer_operation_acknowledgements(peer_node_id,origin_node_id,committed_sequence,updated_at) VALUES(?1,?2,?3,?4) ON CONFLICT(peer_node_id,origin_node_id) DO UPDATE SET committed_sequence=MAX(committed_sequence,excluded.committed_sequence),updated_at=excluded.updated_at",
+                params![peer_node_id, origin_node_id, sequence, timestamp],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
     }
 
     pub fn mark_sequence_recovery(
@@ -759,21 +804,32 @@ impl Catalog {
             transaction.commit()?;
             return Ok(Some(current));
         }
+        let contained_watermark = transaction.query_row(
+            "SELECT COALESCE(MAX(origin_sequence), 0) FROM project_operations WHERE origin_node_id=?1",
+            [&current.server_origin_node_id],
+            |row| row.get::<_, i64>(0),
+        )? as u64;
+        if contained_watermark != current.contained_watermark {
+            transaction.execute(
+                "UPDATE operation_sequence_recovery SET contained_watermark=?2 WHERE peer_origin_node_id=?1",
+                params![peer_origin_node_id, i64::try_from(contained_watermark)?],
+            )?;
+        }
         let timestamp = now();
-        if reported_server_sequence > current.contained_watermark {
+        if reported_server_sequence > contained_watermark {
             transaction.execute(
                 "UPDATE operation_sequence_recovery SET reported_watermark=?2,state='divergent',divergence_start=?3,divergence_end=?2,updated_at=?4 WHERE peer_origin_node_id=?1",
                 params![
                     peer_origin_node_id,
                     i64::try_from(reported_server_sequence)?,
-                    i64::try_from(current.contained_watermark.saturating_add(1))?,
+                    i64::try_from(contained_watermark.saturating_add(1))?,
                     timestamp,
                 ],
             )?;
         } else {
             let safe = current
                 .manifest_watermark
-                .max(current.contained_watermark)
+                .max(contained_watermark)
                 .max(reported_server_sequence);
             transaction.execute(
                 "INSERT INTO operation_origin_sequences(origin_node_id,last_sequence) VALUES(?1,?2) ON CONFLICT(origin_node_id) DO UPDATE SET last_sequence=MAX(last_sequence,excluded.last_sequence)",
@@ -2085,6 +2141,81 @@ mod tests {
             .unwrap();
         let operations = catalog.list_operations("project_test").unwrap();
         assert_eq!(operations.last().unwrap().origin_sequence, 8);
+    }
+
+    #[test]
+    fn restore_sequence_recovery_completes_after_exact_operations_are_replayed() {
+        let (_directory, catalog) = fixture();
+        catalog.set_local_node_id("node_server").unwrap();
+        catalog
+            .mark_sequence_recovery("node_mac", "node_server", 0)
+            .unwrap();
+        let divergent = catalog
+            .reconcile_sequence_recovery("node_mac", 2)
+            .unwrap()
+            .unwrap();
+        assert_eq!(divergent.state, SequenceRecoveryState::Divergent);
+
+        let first = operation(
+            "op_recovered_1",
+            "node_server",
+            1,
+            10,
+            LABEL_ADDED,
+            json!({"addTag":"tag_recovered_1","label":"recovered-one"}),
+        );
+        let second = operation(
+            "op_recovered_2",
+            "node_server",
+            2,
+            20,
+            LABEL_ADDED,
+            json!({"addTag":"tag_recovered_2","label":"recovered-two"}),
+        );
+        catalog
+            .apply_operation_batch("node_server", &[first, second])
+            .unwrap();
+        let completed = catalog
+            .reconcile_sequence_recovery("node_mac", 2)
+            .unwrap()
+            .unwrap();
+        assert_eq!(completed.state, SequenceRecoveryState::Completed);
+        assert_eq!(completed.contained_watermark, 2);
+
+        catalog
+            .create_note_revision("asset_test", "after exact recovery")
+            .unwrap();
+        let operations = catalog.list_operations("project_test").unwrap();
+        assert_eq!(operations.last().unwrap().origin_sequence, 3);
+    }
+
+    #[test]
+    fn operation_cursors_include_local_history_and_peer_acknowledgements_are_monotonic() {
+        let (_directory, catalog) = fixture();
+        catalog.set_local_node_id("node_mac").unwrap();
+        catalog
+            .create_note_revision("asset_test", "local history")
+            .unwrap();
+        assert_eq!(catalog.operation_cursors().unwrap()["node_mac"], 1);
+
+        catalog
+            .record_peer_operation_acknowledgements(
+                "node_server",
+                &std::collections::BTreeMap::from([("node_mac".to_string(), 1)]),
+            )
+            .unwrap();
+        catalog
+            .record_peer_operation_acknowledgements(
+                "node_server",
+                &std::collections::BTreeMap::from([("node_mac".to_string(), 0)]),
+            )
+            .unwrap();
+        assert_eq!(
+            catalog
+                .peer_operation_acknowledgements("node_server")
+                .unwrap()["node_mac"],
+            1
+        );
     }
 
     #[test]

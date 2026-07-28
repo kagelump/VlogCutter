@@ -6,9 +6,12 @@ import { AppErrorBoundary } from "./ErrorBoundary";
 import "./styles.css";
 
 const csrfStore = {
-  get: () => window.sessionStorage.getItem("rcdvlog.csrf"),
-  set: (value: string) => window.sessionStorage.setItem("rcdvlog.csrf", value),
-  clear: () => window.sessionStorage.removeItem("rcdvlog.csrf"),
+  // The HttpOnly session cookie is shared by same-origin tabs, so the
+  // double-submit value must be shared as well. It is never placed in a URL,
+  // process argument, or server-rendered markup.
+  get: () => window.localStorage.getItem("rcdvlog.csrf"),
+  set: (value: string) => window.localStorage.setItem("rcdvlog.csrf", value),
+  clear: () => window.localStorage.removeItem("rcdvlog.csrf"),
 };
 
 createRoot(document.getElementById("root")!).render(

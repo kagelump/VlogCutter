@@ -1196,6 +1196,10 @@ fn symlink_scope_escape_is_prevented() {
 /// claimable root job appears after recover_active_scan_jobs.
 #[test]
 fn recovery_recreates_missing_root_job() {
+    if !ffmpeg_available() {
+        eprintln!("ffmpeg/ffprobe unavailable; skipping integration test");
+        return;
+    }
     let fixture = setup_scan_fixture();
 
     generate_test_clip(&fixture.original_dir, "recover_test.mp4", 1);
@@ -1252,6 +1256,10 @@ fn recovery_recreates_missing_root_job() {
 /// An already-succeeded root job is not duplicated by recovery.
 #[test]
 fn recovery_does_not_duplicate_existing_root_job() {
+    if !ffmpeg_available() {
+        eprintln!("ffmpeg/ffprobe unavailable; skipping integration test");
+        return;
+    }
     let fixture = setup_scan_fixture();
 
     generate_test_clip(&fixture.original_dir, "nodupe_test.mp4", 1);

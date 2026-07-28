@@ -3058,6 +3058,7 @@ dependencies = [
  "fs2",
  "futures",
  "rcdvlog-server-core",
+ "reqwest 0.12.28",
  "rusqlite",
  "serde",
  "serde_json",

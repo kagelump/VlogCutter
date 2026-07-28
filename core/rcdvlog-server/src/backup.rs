@@ -1359,6 +1359,10 @@ fn timestamp() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rcdvlog_core::ProjectAssetAddedPayload;
+    use rcdvlog_sync::{
+        DEFAULT_MAX_OPERATIONS, ProtocolRange, ReconcileRequest, exact_sequence_recovery_page,
+    };
     use std::collections::BTreeMap;
     use tempfile::TempDir;
 
@@ -1416,6 +1420,26 @@ mod tests {
 
         fn manager(&self) -> BackupManager {
             self.control.backups(self.config.clone())
+        }
+    }
+
+    fn portable_asset(id: &str) -> ProjectAssetAddedPayload {
+        ProjectAssetAddedPayload {
+            id: id.to_string(),
+            fingerprint: format!("fingerprint_{id}"),
+            filename: format!("{id}.mp4"),
+            size_bytes: 10,
+            duration_seconds: 1.0,
+            frame_rate: 30.0,
+            width: 1920,
+            height: 1080,
+            codec: "h264".into(),
+            camera: "Fixture".into(),
+            captured_at_raw: None,
+            best_time: None,
+            metadata_rotation_degrees: 0,
+            default_rotation_degrees: 0,
+            created_at: timestamp(),
         }
     }
 
@@ -1569,6 +1593,86 @@ mod tests {
                 .restore_to_new_data_root(&published, &target),
             Err(BackupError::InvalidInput(_))
         ));
+    }
+
+    #[test]
+    fn restored_replica_accepts_exact_peer_copy_before_reusing_server_sequence() {
+        let fixture = Fixture::new();
+        let backup = fixture
+            .manager()
+            .create_restore_point("recovery_exact_copy", || false)
+            .unwrap();
+        let server_catalog = Catalog::open_existing(
+            fixture
+                .config
+                .data_dir
+                .join("projects/fixture/catalog.sqlite3"),
+        )
+        .unwrap();
+        server_catalog
+            .add_portable_project_asset(&fixture.project_id, portable_asset("asset_recovered"))
+            .unwrap();
+        let peer_retained_operations = server_catalog.list_operations(&fixture.project_id).unwrap();
+        assert_eq!(peer_retained_operations[0].origin_sequence, 1);
+
+        let restore_point = fixture
+            .config
+            .backup_dir
+            .join(backup.published_relative_path);
+        let restored_root = fixture.root.path().join("restored-exact-copy");
+        fixture
+            .manager()
+            .restore_to_new_data_root(&restore_point, &restored_root)
+            .unwrap();
+        let restored_control =
+            ControlCatalog::open_or_create(&restored_root, &fixture.config.diagnostics()).unwrap();
+        assert_eq!(restored_control.node_id(), fixture.control.node_id());
+        let replicas = restored_control.project_replicas();
+        let mut cursors = BTreeMap::new();
+        cursors.insert(restored_control.node_id().as_str().to_string(), 1);
+        let request = ReconcileRequest {
+            protocol_version: ProtocolRange::default(),
+            project_schema_version: PROJECT_CATALOG_SCHEMA_VERSION,
+            project_id: fixture.project_id.clone(),
+            server_node_id: restored_control.node_id().as_str().to_string(),
+            operation_cursors: cursors,
+            operations: vec![],
+            observations: vec![],
+            representation_manifests: vec![],
+            maximum_response_operations: DEFAULT_MAX_OPERATIONS,
+        };
+        let divergent = replicas.reconcile(&fixture.project_id, &request).unwrap();
+        let recovery_page = exact_sequence_recovery_page(
+            &divergent,
+            restored_control.node_id().as_str(),
+            &peer_retained_operations,
+        )
+        .unwrap();
+        assert_eq!(recovery_page.len(), 1);
+
+        let mut recovery_request = request.clone();
+        recovery_request.operations = recovery_page;
+        let completed = replicas
+            .reconcile(&fixture.project_id, &recovery_request)
+            .unwrap();
+        assert_eq!(completed.sequence_recovery.len(), 1);
+        assert_eq!(
+            completed.sequence_recovery[0].state,
+            rcdvlog_core::SequenceRecoveryState::Completed
+        );
+
+        let restored_catalog =
+            Catalog::open_existing(restored_root.join("projects/fixture/catalog.sqlite3")).unwrap();
+        restored_catalog
+            .add_portable_project_asset(&fixture.project_id, portable_asset("asset_after_restore"))
+            .unwrap();
+        let sequences = restored_catalog
+            .list_operations(&fixture.project_id)
+            .unwrap()
+            .into_iter()
+            .map(|operation| operation.origin_sequence)
+            .collect::<Vec<_>>();
+        assert_eq!(sequences, vec![1, 2]);
     }
 
     #[test]

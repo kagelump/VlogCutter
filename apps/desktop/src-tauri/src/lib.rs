@@ -1117,6 +1117,22 @@ async fn confirm_baseline_import(
     catalog
         .pair_project_with_server(&project_id, &server_node_id)
         .map_err(|e| format!("failed to record pairing in project: {e}"))?;
+    let local_node_id = catalog
+        .local_node_id()
+        .map_err(|e| format!("failed to read local node identity: {e}"))?
+        .ok_or("local node identity is missing")?;
+    let local_sequence = catalog
+        .operation_cursors()
+        .map_err(|e| format!("failed to read baseline cursors: {e}"))?
+        .get(&local_node_id)
+        .copied()
+        .unwrap_or(0);
+    catalog
+        .record_peer_operation_acknowledgements(
+            &server_node_id,
+            &std::collections::BTreeMap::from([(local_node_id, local_sequence)]),
+        )
+        .map_err(|e| format!("failed to record baseline acknowledgement: {e}"))?;
 
     // Clear the baseline attempt
     *state
