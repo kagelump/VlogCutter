@@ -207,7 +207,10 @@ impl SyncManager {
             active_projects: HashSet::new(),
             wake_tx: wake_tx.clone(),
         };
-        tokio::spawn(async move {
+        // `spawn` is called from Tauri's setup hook, which runs on the main
+        // thread outside any Tokio runtime context — `tokio::spawn` would panic
+        // there. `tauri::async_runtime::spawn` targets Tauri's global runtime.
+        tauri::async_runtime::spawn(async move {
             let Some(catalog_path) = catalog_path else {
                 return;
             };
