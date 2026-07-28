@@ -857,6 +857,7 @@
           "status": {
             "enum": [
               "ready",
+              "degraded",
               "not_ready"
             ],
             "type": "string"
@@ -880,6 +881,7 @@
           "status": {
             "enum": [
               "ok",
+              "warning",
               "error"
             ],
             "type": "string"

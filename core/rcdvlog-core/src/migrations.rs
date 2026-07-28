@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
-pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 6;
+pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 7;
 
 const MIGRATION_TABLE_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -117,6 +117,12 @@ pub const PROJECT_CATALOG_MIGRATIONS: &[SqliteMigration] = &[
         name: "project_sync_state",
         source_identity: "project-catalog/0006-project-sync-state/20260723",
         apply: add_project_sync_state,
+    },
+    SqliteMigration {
+        id: 7,
+        name: "restore_sequence_recovery",
+        source_identity: "project-catalog/0007-restore-sequence-recovery/20260728",
+        apply: add_restore_sequence_recovery,
     },
 ];
 
@@ -781,6 +787,31 @@ fn add_project_sync_state(transaction: &Transaction<'_>) -> Result<()> {
             recorded_at TEXT NOT NULL,
             UNIQUE(origin_node_id, origin_sequence)
         );
+        "#,
+    )?;
+    Ok(())
+}
+
+fn add_restore_sequence_recovery(transaction: &Transaction<'_>) -> Result<()> {
+    transaction.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS operation_sequence_recovery (
+            peer_origin_node_id TEXT PRIMARY KEY,
+            server_origin_node_id TEXT NOT NULL,
+            manifest_watermark INTEGER NOT NULL CHECK(manifest_watermark >= 0),
+            contained_watermark INTEGER NOT NULL CHECK(contained_watermark >= 0),
+            reported_watermark INTEGER CHECK(reported_watermark IS NULL OR reported_watermark >= 0),
+            state TEXT NOT NULL CHECK(state IN ('awaiting','divergent','completed')),
+            divergence_start INTEGER,
+            divergence_end INTEGER,
+            decision TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            CHECK((state = 'divergent') = (divergence_start IS NOT NULL AND divergence_end IS NOT NULL)),
+            CHECK(decision IS NULL OR state = 'completed')
+        );
+        CREATE INDEX IF NOT EXISTS operation_sequence_recovery_state
+            ON operation_sequence_recovery(state, peer_origin_node_id);
         "#,
     )?;
     Ok(())

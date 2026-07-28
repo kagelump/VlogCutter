@@ -15,13 +15,13 @@ export interface ServerVersion {
 
 export interface ReadinessCheck {
   name: string;
-  status: "ok" | "error";
+  status: "ok" | "warning" | "error";
   code?: string;
 }
 
 export interface ServerReadiness {
   requestId: string;
-  status: "ready" | "not_ready";
+  status: "ready" | "degraded" | "not_ready";
   checks: ReadinessCheck[];
 }
 
@@ -149,6 +149,7 @@ export interface AdminConfigDiagnostics {
   dataDir: string; tempDir: string; derivedDir: string; backupDir: string; allowedOriginalMounts: string[];
   listenAddr: string; shutdownTimeoutSeconds: number; trustedProxyCidrCount: number; lanHostname: string;
   sessionMaxAgeSeconds: number; bootstrapCodeTtlSeconds: number; pairingCodeTtlSeconds: number;
+  backupIntervalSeconds: number; backupDailyRetention: number; backupWeeklyRetention: number; minimumFreeBytes: number;
   ffmpegCommand: string; ffprobeCommand: string; exiftoolCommand: string;
 }
 export interface AdminOverview {

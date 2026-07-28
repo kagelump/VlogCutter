@@ -915,13 +915,38 @@ impl ProjectReplicaManager {
         request: &ReconcileRequest,
     ) -> Result<ReconcileResponse, ProjectReplicaError> {
         let catalog = self.open_catalog(project_id)?;
-        let response = reconcile(
+        let mut response = reconcile(
             &catalog,
             project_id,
             self.control.node_id().as_str(),
             request,
         )
         .map_err(map_sync_error)?;
+        let replica = self.get(project_id)?;
+        if let Some(peer_node_id) = replica.origin_node_id.as_deref() {
+            let reported_server_sequence = request
+                .operation_cursors
+                .get(self.control.node_id().as_str())
+                .copied()
+                .unwrap_or(0);
+            let connection = open_writable_connection(self.control.database_path())
+                .map_err(ProjectReplicaError::Infrastructure)?;
+            connection.execute(
+                "INSERT INTO project_peer_sync_state(project_id,peer_node_id,acknowledged_server_sequence,last_reconciled_at) VALUES(?1,?2,?3,?4) ON CONFLICT(project_id,peer_node_id) DO UPDATE SET acknowledged_server_sequence=MAX(acknowledged_server_sequence,excluded.acknowledged_server_sequence),last_reconciled_at=excluded.last_reconciled_at",
+                params![project_id, peer_node_id, i64::try_from(reported_server_sequence).map_err(|error| ProjectReplicaError::InvalidBaseline(error.to_string()))?, now()],
+            )?;
+            if let Some(recovery) = catalog
+                .reconcile_sequence_recovery(peer_node_id, reported_server_sequence)
+                .map_err(ProjectReplicaError::Infrastructure)?
+            {
+                let completed = recovery.state == rcdvlog_core::SequenceRecoveryState::Completed;
+                response.sequence_recovery.push(recovery);
+                if !completed {
+                    response.operations.clear();
+                    response.has_more_operations = false;
+                }
+            }
+        }
         self.repair_membership_projections(project_id)?;
         Ok(response)
     }

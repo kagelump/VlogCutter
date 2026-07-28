@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 use crate::ConfigDiagnostics;
 
-pub const CONTROL_CATALOG_SCHEMA_VERSION: u32 = 9;
+pub const CONTROL_CATALOG_SCHEMA_VERSION: u32 = 10;
 pub const CONTROL_DATABASE_FILENAME: &str = "control.sqlite3";
 pub const INSTANCE_LOCK_FILENAME: &str = "server.lock";
 
@@ -75,6 +75,12 @@ pub const CONTROL_CATALOG_MIGRATIONS: &[SqliteMigration] = &[
         name: "administrative_audit_log",
         source_identity: "server-control/0009-administrative-audit-log/20260728",
         apply: create_administrative_audit_log,
+    },
+    SqliteMigration {
+        id: 10,
+        name: "backup_restore_operations",
+        source_identity: "server-control/0010-backup-restore-operations/20260728",
+        apply: create_backup_restore_operations,
     },
 ];
 
@@ -249,6 +255,10 @@ impl ControlCatalog {
 
     pub fn audit_log(&self) -> crate::AdminAuditLog {
         crate::AdminAuditLog::new(self.database_path.clone())
+    }
+
+    pub fn backups(&self, config: crate::ServerConfig) -> crate::BackupManager {
+        crate::BackupManager::new(self.clone(), config)
     }
 
     pub fn inspect_migrations(&self) -> Result<MigrationHistoryInspection> {
@@ -651,6 +661,36 @@ fn create_administrative_audit_log(transaction: &Transaction<'_>) -> Result<()> 
             ON administrative_audit_events(event_sequence DESC);
         CREATE INDEX administrative_audit_events_target
             ON administrative_audit_events(target_type, target_id, event_sequence DESC);
+        "#,
+    )?;
+    Ok(())
+}
+
+fn create_backup_restore_operations(transaction: &Transaction<'_>) -> Result<()> {
+    transaction.execute_batch(
+        r#"
+        CREATE TABLE backup_sets (
+            backup_id TEXT PRIMARY KEY CHECK(length(backup_id) BETWEEN 1 AND 128),
+            job_id TEXT UNIQUE,
+            state TEXT NOT NULL CHECK(state IN ('completed','pruned')),
+            published_relative_path TEXT NOT NULL UNIQUE CHECK(length(published_relative_path) BETWEEN 1 AND 512),
+            manifest_sha256 TEXT NOT NULL CHECK(length(manifest_sha256) = 64),
+            database_count INTEGER NOT NULL CHECK(database_count > 0),
+            project_count INTEGER NOT NULL CHECK(project_count >= 0),
+            total_bytes INTEGER NOT NULL CHECK(total_bytes >= 0),
+            created_at TEXT NOT NULL,
+            completed_at TEXT NOT NULL,
+            pruned_at TEXT
+        );
+        CREATE INDEX backup_sets_recent ON backup_sets(completed_at DESC, backup_id DESC);
+
+        CREATE TABLE project_peer_sync_state (
+            project_id TEXT NOT NULL REFERENCES project_registry(project_id),
+            peer_node_id TEXT NOT NULL,
+            acknowledged_server_sequence INTEGER NOT NULL DEFAULT 0 CHECK(acknowledged_server_sequence >= 0),
+            last_reconciled_at TEXT NOT NULL,
+            PRIMARY KEY(project_id, peer_node_id)
+        );
         "#,
     )?;
     Ok(())

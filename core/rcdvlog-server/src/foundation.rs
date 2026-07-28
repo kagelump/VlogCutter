@@ -1,8 +1,10 @@
 use anyhow::{Context, Result, anyhow};
+use rusqlite::OptionalExtension;
 use serde::Serialize;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 use crate::auth::{AuthConfig, AuthService};
 use crate::{ConfigError, ConfigErrorReason, ControlCatalog, ServerConfig, ServerInstanceLock};
@@ -19,6 +21,7 @@ pub struct RuntimeFoundation {
 #[serde(rename_all = "snake_case")]
 pub enum ReadinessStatus {
     Ready,
+    Degraded,
     NotReady,
 }
 
@@ -26,6 +29,7 @@ pub enum ReadinessStatus {
 #[serde(rename_all = "snake_case")]
 pub enum CheckStatus {
     Ok,
+    Warning,
     Error,
 }
 
@@ -39,7 +43,7 @@ pub struct ReadinessCheck {
 }
 
 impl ReadinessCheck {
-    fn ok(name: impl Into<String>) -> Self {
+    pub fn ok(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
             status: CheckStatus::Ok,
@@ -47,7 +51,15 @@ impl ReadinessCheck {
         }
     }
 
-    fn error(name: impl Into<String>, code: impl Into<String>) -> Self {
+    pub fn warning(name: impl Into<String>, code: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            status: CheckStatus::Warning,
+            code: Some(code.into()),
+        }
+    }
+
+    pub fn error(name: impl Into<String>, code: impl Into<String>) -> Self {
         Self {
             name: name.into(),
             status: CheckStatus::Error,
@@ -65,16 +77,24 @@ pub struct ReadinessReport {
 
 impl ReadinessReport {
     pub fn from_checks(checks: Vec<ReadinessCheck>) -> Self {
-        let status = if checks.iter().all(|check| check.status == CheckStatus::Ok) {
-            ReadinessStatus::Ready
-        } else {
+        let status = if checks
+            .iter()
+            .any(|check| check.status == CheckStatus::Error)
+        {
             ReadinessStatus::NotReady
+        } else if checks
+            .iter()
+            .any(|check| check.status == CheckStatus::Warning)
+        {
+            ReadinessStatus::Degraded
+        } else {
+            ReadinessStatus::Ready
         };
         Self { status, checks }
     }
 
     pub fn is_ready(&self) -> bool {
-        self.status == ReadinessStatus::Ready
+        self.status != ReadinessStatus::NotReady
     }
 
     pub fn evaluation_unavailable(code: impl Into<String>) -> Self {
@@ -137,17 +157,44 @@ impl RuntimeFoundation {
                 Err(_) => ReadinessCheck::error("authentication", "auth_service_unavailable"),
             },
             inspect_external_directory("data_directory", &self.config.data_dir, true),
+            inspect_free_space(
+                "data_disk_space",
+                &self.config.data_dir,
+                self.config.minimum_free_bytes,
+                false,
+            ),
             inspect_external_directory("temp_directory", &self.config.temp_dir, true),
             inspect_resolved_path_separation(&self.config),
             inspect_external_directory("derived_directory", &self.config.derived_dir, true),
-            inspect_external_directory("backup_directory", &self.config.backup_dir, true),
+            inspect_free_space(
+                "derived_disk_space",
+                &self.config.derived_dir,
+                self.config.minimum_free_bytes,
+                false,
+            ),
+            degrade(inspect_external_directory(
+                "backup_directory",
+                &self.config.backup_dir,
+                true,
+            )),
+            inspect_free_space(
+                "backup_disk_space",
+                &self.config.backup_dir,
+                self.config.minimum_free_bytes,
+                true,
+            ),
+            inspect_control_integrity(self.catalog.database_path()),
+            inspect_project_replicas(self.catalog.database_path(), &self.config.data_dir),
+            inspect_expired_job_leases(self.catalog.database_path()),
+            inspect_backup_freshness(self.catalog.database_path(), self.config.backup_interval),
+            inspect_hlc_clock_sanity(self.catalog.database_path(), &self.config.data_dir),
         ];
         for index in 0..self.config.allowed_original_mounts.len() {
-            checks.push(inspect_external_directory(
+            checks.push(degrade(inspect_external_directory(
                 format!("original_mount_{index}"),
                 &self.config.allowed_original_mounts[index],
                 false,
-            ));
+            )));
         }
         checks.extend([
             probe_tool("ffmpeg", &self.config.ffmpeg_command, "-version"),
@@ -271,6 +318,164 @@ fn canonicalize_if_present(path: &Path) -> std::io::Result<Option<PathBuf>> {
 
 fn paths_overlap(left: &Path, right: &Path) -> bool {
     left.starts_with(right) || right.starts_with(left)
+}
+
+fn degrade(check: ReadinessCheck) -> ReadinessCheck {
+    if check.status == CheckStatus::Error {
+        ReadinessCheck::warning(
+            check.name,
+            check
+                .code
+                .unwrap_or_else(|| "optional_resource_unavailable".into()),
+        )
+    } else {
+        check
+    }
+}
+
+fn inspect_free_space(
+    name: &str,
+    path: &Path,
+    minimum_bytes: u64,
+    optional: bool,
+) -> ReadinessCheck {
+    match fs2::available_space(path) {
+        Ok(available) if available >= minimum_bytes => ReadinessCheck::ok(name),
+        Ok(_) if optional => ReadinessCheck::warning(name, "low_disk_space"),
+        Ok(_) => ReadinessCheck::error(name, "low_disk_space"),
+        Err(_) if optional => ReadinessCheck::warning(name, "disk_space_unavailable"),
+        Err(_) => ReadinessCheck::error(name, "disk_space_unavailable"),
+    }
+}
+
+fn read_only_sqlite(path: &Path) -> rusqlite::Result<rusqlite::Connection> {
+    rusqlite::Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+}
+
+fn inspect_control_integrity(path: &Path) -> ReadinessCheck {
+    let result = read_only_sqlite(path).and_then(|connection| {
+        connection.query_row("PRAGMA quick_check(1)", [], |row| row.get::<_, String>(0))
+    });
+    match result {
+        Ok(result) if result == "ok" => ReadinessCheck::ok("control_integrity"),
+        _ => ReadinessCheck::error("control_integrity", "control_catalog_corrupt"),
+    }
+}
+
+fn registered_replica_paths(control_path: &Path) -> rusqlite::Result<Vec<String>> {
+    let connection = read_only_sqlite(control_path)?;
+    let mut statement = connection.prepare(
+        "SELECT replica_relative_path FROM project_registry WHERE state='registered' ORDER BY project_id LIMIT 32",
+    )?;
+    statement
+        .query_map([], |row| row.get(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+}
+
+fn inspect_project_replicas(control_path: &Path, data_root: &Path) -> ReadinessCheck {
+    let Ok(paths) = registered_replica_paths(control_path) else {
+        return ReadinessCheck::error("project_replicas", "project_registry_unavailable");
+    };
+    for relative in paths {
+        let relative = Path::new(&relative);
+        if relative.is_absolute()
+            || relative
+                .components()
+                .any(|part| matches!(part, std::path::Component::ParentDir))
+        {
+            return ReadinessCheck::warning("project_replicas", "project_replica_path_unsafe");
+        }
+        let path = data_root.join(relative);
+        if !path.is_file() {
+            return ReadinessCheck::warning("project_replicas", "project_replica_missing");
+        }
+        // Keep per-request readiness bounded: opening the replica and reading its
+        // migration/project roots catches unavailable and structurally broken
+        // catalogs without walking every page of every project database.
+        let valid = read_only_sqlite(&path).is_ok_and(|connection| {
+            connection
+                .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .and_then(|_| {
+                    connection.query_row("SELECT COUNT(*) FROM projects", [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                })
+                .is_ok()
+        });
+        if !valid {
+            return ReadinessCheck::warning("project_replicas", "project_replica_corrupt");
+        }
+    }
+    ReadinessCheck::ok("project_replicas")
+}
+
+fn inspect_expired_job_leases(control_path: &Path) -> ReadinessCheck {
+    let expired = read_only_sqlite(control_path).and_then(|connection| {
+        connection.query_row(
+            "SELECT COUNT(*) FROM jobs WHERE state='running' AND lease_expires_at < ?1",
+            [chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)],
+            |row| row.get::<_, i64>(0),
+        )
+    });
+    match expired {
+        Ok(0) => ReadinessCheck::ok("job_leases"),
+        Ok(_) => ReadinessCheck::warning("job_leases", "expired_job_leases"),
+        Err(_) => ReadinessCheck::error("job_leases", "job_engine_unavailable"),
+    }
+}
+
+fn inspect_backup_freshness(control_path: &Path, interval: Duration) -> ReadinessCheck {
+    let latest = read_only_sqlite(control_path).and_then(|connection| {
+        connection
+            .query_row(
+                "SELECT completed_at FROM backup_sets WHERE state='completed' ORDER BY completed_at DESC LIMIT 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+    });
+    let Ok(Some(latest)) = latest else {
+        return ReadinessCheck::warning("backup_freshness", "backup_missing_or_stale");
+    };
+    let fresh = chrono::DateTime::parse_from_rfc3339(&latest)
+        .ok()
+        .is_some_and(|latest| {
+            chrono::Utc::now().signed_duration_since(latest.with_timezone(&chrono::Utc))
+                <= chrono::Duration::from_std(interval.saturating_mul(2))
+                    .unwrap_or(chrono::Duration::MAX)
+        });
+    if fresh {
+        ReadinessCheck::ok("backup_freshness")
+    } else {
+        ReadinessCheck::warning("backup_freshness", "backup_missing_or_stale")
+    }
+}
+
+fn inspect_hlc_clock_sanity(control_path: &Path, data_root: &Path) -> ReadinessCheck {
+    let Ok(paths) = registered_replica_paths(control_path) else {
+        return ReadinessCheck::error("hlc_clock", "project_registry_unavailable");
+    };
+    let now = chrono::Utc::now().timestamp_millis();
+    let future_limit = now.saturating_add(rcdvlog_core::MAX_REMOTE_HLC_FUTURE_SKEW_MILLIS);
+    for relative in paths {
+        let path = data_root.join(relative);
+        let highest = read_only_sqlite(&path).and_then(|connection| {
+            connection.query_row(
+                "SELECT COALESCE(MAX(wall_millis),0) FROM operation_hlc_state",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+        });
+        if highest.is_ok_and(|value| value > future_limit) {
+            return ReadinessCheck::warning("hlc_clock", "clock_skew_detected");
+        }
+    }
+    ReadinessCheck::ok("hlc_clock")
 }
 
 fn ensure_owned_directory(path: &Path, field: &str) -> Result<()> {

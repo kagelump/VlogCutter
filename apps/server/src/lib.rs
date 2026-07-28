@@ -924,7 +924,7 @@ pub fn openapi_document() -> serde_json::Value {
                     "required": ["name", "status"],
                     "properties": {
                         "name": { "type": "string" },
-                        "status": { "type": "string", "enum": ["ok", "error"] },
+                        "status": { "type": "string", "enum": ["ok", "warning", "error"] },
                         "code": { "type": "string" }
                     }
                 },
@@ -933,7 +933,7 @@ pub fn openapi_document() -> serde_json::Value {
                     "required": ["requestId", "status", "checks"],
                     "properties": {
                         "requestId": { "type": "string" },
-                        "status": { "type": "string", "enum": ["ready", "not_ready"] },
+                        "status": { "type": "string", "enum": ["ready", "degraded", "not_ready"] },
                         "checks": {
                             "type": "array",
                             "items": { "$ref": "#/components/schemas/ReadinessCheck" }
@@ -1780,6 +1780,13 @@ async fn request_representation(
     Extension(request_id): Extension<RequestId>,
     Json(request): Json<RepresentationRequest>,
 ) -> Response {
+    if !has_media_work_capacity(&state) {
+        return query_error_response(
+            &request_id,
+            "low_disk_space",
+            StatusCode::INSUFFICIENT_STORAGE,
+        );
+    }
     let service = state
         .foundation
         .catalog()
@@ -2169,6 +2176,13 @@ struct LibraryMediaParams {
 
 fn default_page_limit() -> u32 {
     50
+}
+
+fn has_media_work_capacity(state: &HttpState) -> bool {
+    fs2::available_space(&state.foundation.config().derived_dir)
+        .is_ok_and(|bytes| bytes >= state.foundation.config().minimum_free_bytes)
+        && fs2::available_space(&state.foundation.config().data_dir)
+            .is_ok_and(|bytes| bytes >= state.foundation.config().minimum_free_bytes)
 }
 
 fn query_error_response(
@@ -3545,6 +3559,13 @@ async fn request_admin_representation_batch(
         || request.idempotency_key.len() > 255
     {
         return query_error_response(&request_id, "invalid_input", StatusCode::BAD_REQUEST);
+    }
+    if !has_media_work_capacity(&state) {
+        return query_error_response(
+            &request_id,
+            "low_disk_space",
+            StatusCode::INSUFFICIENT_STORAGE,
+        );
     }
     let service = state
         .foundation

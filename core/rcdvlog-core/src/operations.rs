@@ -18,6 +18,7 @@ pub const ROTATION_SET: &str = "rotationSet";
 pub const PROJECT_ASSET_ADDED: &str = "projectAssetAdded";
 pub const PROJECT_ASSET_MEDIA_LINKED: &str = "projectAssetMediaLinked";
 pub const CLOCK_EVENT_CREATED: &str = "clockEventCreated";
+pub const MAX_REMOTE_HLC_FUTURE_SKEW_MILLIS: i64 = 5 * 60 * 1000;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -102,6 +103,29 @@ pub struct OperationBatchResult {
     pub applied: usize,
     pub duplicates: usize,
     pub conflicts: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SequenceRecoveryState {
+    Awaiting,
+    Divergent,
+    Completed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SequenceRecoveryProjection {
+    pub peer_origin_node_id: String,
+    pub server_origin_node_id: String,
+    pub manifest_watermark: u64,
+    pub contained_watermark: u64,
+    pub reported_watermark: Option<u64>,
+    pub state: SequenceRecoveryState,
+    pub divergence_start: Option<u64>,
+    pub divergence_end: Option<u64>,
+    pub decision: Option<String>,
+    pub updated_at: String,
 }
 
 /// Path-free projection of one project asset. `assets.path` and
@@ -677,6 +701,138 @@ impl Catalog {
             .collect::<rusqlite::Result<_>>()?)
     }
 
+    pub fn mark_sequence_recovery(
+        &self,
+        peer_origin_node_id: &str,
+        server_origin_node_id: &str,
+        manifest_watermark: u64,
+    ) -> Result<SequenceRecoveryProjection> {
+        validate_id("peer origin node ID", peer_origin_node_id)?;
+        validate_id("server origin node ID", server_origin_node_id)?;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let contained = transaction.query_row(
+            "SELECT COALESCE(MAX(origin_sequence), 0) FROM project_operations WHERE origin_node_id=?1",
+            [server_origin_node_id],
+            |row| row.get::<_, i64>(0),
+        )? as u64;
+        let timestamp = now();
+        transaction.execute(
+            r#"
+            INSERT INTO operation_sequence_recovery(
+                peer_origin_node_id, server_origin_node_id, manifest_watermark,
+                contained_watermark, state, created_at, updated_at
+            ) VALUES(?1, ?2, ?3, ?4, 'awaiting', ?5, ?5)
+            ON CONFLICT(peer_origin_node_id) DO UPDATE SET
+                server_origin_node_id=excluded.server_origin_node_id,
+                manifest_watermark=excluded.manifest_watermark,
+                contained_watermark=excluded.contained_watermark,
+                reported_watermark=NULL, state='awaiting', divergence_start=NULL,
+                divergence_end=NULL, decision=NULL, updated_at=excluded.updated_at
+            "#,
+            params![
+                peer_origin_node_id,
+                server_origin_node_id,
+                i64::try_from(manifest_watermark)?,
+                i64::try_from(contained)?,
+                timestamp,
+            ],
+        )?;
+        let projection = load_sequence_recovery(&transaction, peer_origin_node_id)?;
+        transaction.commit()?;
+        Ok(projection)
+    }
+
+    pub fn reconcile_sequence_recovery(
+        &self,
+        peer_origin_node_id: &str,
+        reported_server_sequence: u64,
+    ) -> Result<Option<SequenceRecoveryProjection>> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let Some(current) = load_sequence_recovery_optional(&transaction, peer_origin_node_id)?
+        else {
+            transaction.commit()?;
+            return Ok(None);
+        };
+        if current.state == SequenceRecoveryState::Completed {
+            transaction.commit()?;
+            return Ok(Some(current));
+        }
+        let timestamp = now();
+        if reported_server_sequence > current.contained_watermark {
+            transaction.execute(
+                "UPDATE operation_sequence_recovery SET reported_watermark=?2,state='divergent',divergence_start=?3,divergence_end=?2,updated_at=?4 WHERE peer_origin_node_id=?1",
+                params![
+                    peer_origin_node_id,
+                    i64::try_from(reported_server_sequence)?,
+                    i64::try_from(current.contained_watermark.saturating_add(1))?,
+                    timestamp,
+                ],
+            )?;
+        } else {
+            let safe = current
+                .manifest_watermark
+                .max(current.contained_watermark)
+                .max(reported_server_sequence);
+            transaction.execute(
+                "INSERT INTO operation_origin_sequences(origin_node_id,last_sequence) VALUES(?1,?2) ON CONFLICT(origin_node_id) DO UPDATE SET last_sequence=MAX(last_sequence,excluded.last_sequence)",
+                params![current.server_origin_node_id, i64::try_from(safe)?],
+            )?;
+            transaction.execute(
+                "UPDATE operation_sequence_recovery SET reported_watermark=?2,state='completed',divergence_start=NULL,divergence_end=NULL,updated_at=?3 WHERE peer_origin_node_id=?1",
+                params![peer_origin_node_id, i64::try_from(reported_server_sequence)?, timestamp],
+            )?;
+        }
+        let projection = load_sequence_recovery(&transaction, peer_origin_node_id)?;
+        transaction.commit()?;
+        Ok(Some(projection))
+    }
+
+    pub fn accept_sequence_divergence(
+        &self,
+        peer_origin_node_id: &str,
+        decision: &str,
+    ) -> Result<SequenceRecoveryProjection> {
+        if decision != "accept_allocator_advance" {
+            bail!("sequence recovery decision is not recognized");
+        }
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = load_sequence_recovery(&transaction, peer_origin_node_id)?;
+        if current.state != SequenceRecoveryState::Divergent {
+            bail!("sequence recovery does not have a divergence to accept");
+        }
+        let reported = current
+            .reported_watermark
+            .ok_or_else(|| anyhow!("divergence is missing its reported watermark"))?;
+        transaction.execute(
+            "INSERT INTO operation_origin_sequences(origin_node_id,last_sequence) VALUES(?1,?2) ON CONFLICT(origin_node_id) DO UPDATE SET last_sequence=MAX(last_sequence,excluded.last_sequence)",
+            params![current.server_origin_node_id, i64::try_from(reported)?],
+        )?;
+        transaction.execute(
+            "UPDATE operation_sequence_recovery SET state='completed',decision=?2,divergence_start=NULL,divergence_end=NULL,updated_at=?3 WHERE peer_origin_node_id=?1",
+            params![peer_origin_node_id, decision, now()],
+        )?;
+        let projection = load_sequence_recovery(&transaction, peer_origin_node_id)?;
+        transaction.commit()?;
+        Ok(projection)
+    }
+
+    pub fn sequence_recovery_state(&self) -> Result<Vec<SequenceRecoveryProjection>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT peer_origin_node_id FROM operation_sequence_recovery ORDER BY peer_origin_node_id",
+        )?;
+        let peers = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        peers
+            .into_iter()
+            .map(|peer| load_sequence_recovery(&connection, &peer))
+            .collect()
+    }
+
     pub fn list_operations(&self, project_id: &str) -> Result<Vec<ProjectOperation>> {
         self.require_project(project_id)?;
         let connection = self.connection()?;
@@ -1052,7 +1208,61 @@ fn backfill_local_locations(transaction: &Transaction<'_>, node_id: &str) -> Res
     Ok(())
 }
 
+fn load_sequence_recovery_optional(
+    connection: &rusqlite::Connection,
+    peer_origin_node_id: &str,
+) -> Result<Option<SequenceRecoveryProjection>> {
+    connection
+        .query_row(
+            r#"
+            SELECT peer_origin_node_id,server_origin_node_id,manifest_watermark,
+                   contained_watermark,reported_watermark,state,divergence_start,
+                   divergence_end,decision,updated_at
+            FROM operation_sequence_recovery WHERE peer_origin_node_id=?1
+            "#,
+            [peer_origin_node_id],
+            |row| {
+                let state = match row.get::<_, String>(5)?.as_str() {
+                    "awaiting" => SequenceRecoveryState::Awaiting,
+                    "divergent" => SequenceRecoveryState::Divergent,
+                    "completed" => SequenceRecoveryState::Completed,
+                    _ => return Err(rusqlite::Error::InvalidQuery),
+                };
+                Ok(SequenceRecoveryProjection {
+                    peer_origin_node_id: row.get(0)?,
+                    server_origin_node_id: row.get(1)?,
+                    manifest_watermark: row.get::<_, i64>(2)? as u64,
+                    contained_watermark: row.get::<_, i64>(3)? as u64,
+                    reported_watermark: row.get::<_, Option<i64>>(4)?.map(|value| value as u64),
+                    state,
+                    divergence_start: row.get::<_, Option<i64>>(6)?.map(|value| value as u64),
+                    divergence_end: row.get::<_, Option<i64>>(7)?.map(|value| value as u64),
+                    decision: row.get(8)?,
+                    updated_at: row.get(9)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+fn load_sequence_recovery(
+    connection: &rusqlite::Connection,
+    peer_origin_node_id: &str,
+) -> Result<SequenceRecoveryProjection> {
+    load_sequence_recovery_optional(connection, peer_origin_node_id)?
+        .ok_or_else(|| anyhow!("sequence recovery state was not found"))
+}
+
 fn next_sequence(transaction: &Transaction<'_>, node_id: &str) -> Result<u64> {
+    let blocked: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM operation_sequence_recovery WHERE server_origin_node_id=?1 AND state IN ('awaiting','divergent'))",
+        [node_id],
+        |row| row.get(0),
+    )?;
+    if blocked {
+        bail!("server-origin operation allocation is blocked by sequence recovery");
+    }
     transaction.execute(
         "INSERT INTO operation_origin_sequences(origin_node_id, last_sequence) VALUES (?1, 0) ON CONFLICT(origin_node_id) DO NOTHING",
         [node_id],
@@ -1095,6 +1305,11 @@ fn next_hlc(transaction: &Transaction<'_>, node_id: &str) -> Result<HybridLogica
 fn receive_hlc(transaction: &Transaction<'_>, operation: &ProjectOperation) -> Result<()> {
     let local = ensure_node(transaction)?;
     let wall_now = Utc::now().timestamp_millis().max(0);
+    if operation.logical_time.wall_millis
+        > wall_now.saturating_add(MAX_REMOTE_HLC_FUTURE_SKEW_MILLIS)
+    {
+        bail!("incoming operation wall clock exceeds the allowed future skew");
+    }
     let (last_wall, last_counter) = transaction
         .query_row(
             "SELECT wall_millis, counter FROM operation_hlc_state WHERE node_id = ?1",
@@ -1833,6 +2048,64 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn restore_sequence_recovery_blocks_reuse_and_records_divergence_decision() {
+        let (_directory, catalog) = fixture();
+        catalog.set_local_node_id("node_server").unwrap();
+        let marked = catalog
+            .mark_sequence_recovery("node_mac", "node_server", 0)
+            .unwrap();
+        assert_eq!(marked.state, SequenceRecoveryState::Awaiting);
+        assert!(
+            catalog
+                .create_note_revision("asset_test", "blocked")
+                .is_err()
+        );
+
+        let divergent = catalog
+            .reconcile_sequence_recovery("node_mac", 7)
+            .unwrap()
+            .unwrap();
+        assert_eq!(divergent.state, SequenceRecoveryState::Divergent);
+        assert_eq!(divergent.divergence_start, Some(1));
+        assert_eq!(divergent.divergence_end, Some(7));
+        assert!(
+            catalog
+                .create_note_revision("asset_test", "still blocked")
+                .is_err()
+        );
+
+        catalog
+            .accept_sequence_divergence("node_mac", "accept_allocator_advance")
+            .unwrap();
+        catalog
+            .create_note_revision("asset_test", "after decision")
+            .unwrap();
+        let operations = catalog.list_operations("project_test").unwrap();
+        assert_eq!(operations.last().unwrap().origin_sequence, 8);
+    }
+
+    #[test]
+    fn remote_hlc_beyond_future_skew_is_rejected_without_advancing_state() {
+        let (_directory, catalog) = fixture();
+        let future = Utc::now().timestamp_millis() + MAX_REMOTE_HLC_FUTURE_SKEW_MILLIS + 10_000;
+        let incoming = operation(
+            "op_future",
+            "node_mac",
+            1,
+            future,
+            REMOVED_SET,
+            json!({"removed":true}),
+        );
+        assert!(
+            catalog
+                .apply_operation_batch("node_mac", &[incoming])
+                .is_err()
+        );
+        assert!(catalog.operation_cursors().unwrap().is_empty());
+        assert!(!catalog.get_asset("asset_test").unwrap().removed);
     }
 
     proptest! {

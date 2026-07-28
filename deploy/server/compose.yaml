@@ -29,6 +29,11 @@ services:
     security_opt:
       - no-new-privileges:true
     stop_grace_period: 65s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
     environment:
       RCDVLOG_DATA_DIR: /var/lib/rcdvlog
       RCDVLOG_TEMP_DIR: /var/lib/rcdvlog/tmp
@@ -37,6 +42,10 @@ services:
       RCDVLOG_ALLOWED_ORIGINAL_MOUNTS: /media/originals
       RCDVLOG_LISTEN_ADDR: 127.0.0.1:8090
       RCDVLOG_SHUTDOWN_TIMEOUT_SECONDS: ${RCDVLOG_SHUTDOWN_TIMEOUT_SECONDS:-10}
+      RCDVLOG_BACKUP_INTERVAL_SECONDS: ${RCDVLOG_BACKUP_INTERVAL_SECONDS:-86400}
+      RCDVLOG_BACKUP_DAILY_RETENTION: ${RCDVLOG_BACKUP_DAILY_RETENTION:-14}
+      RCDVLOG_BACKUP_WEEKLY_RETENTION: ${RCDVLOG_BACKUP_WEEKLY_RETENTION:-8}
+      RCDVLOG_MINIMUM_FREE_BYTES: ${RCDVLOG_MINIMUM_FREE_BYTES:-5368709120}
       RUST_LOG: ${RUST_LOG:-info}
     volumes:
       - type: volume

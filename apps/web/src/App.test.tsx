@@ -167,7 +167,7 @@ test("administration loads durable projections and confirms root registration", 
   vi.mocked(mock.getAdminOverview).mockResolvedValue({
     applicationVersion: "0.1.0", protocolMajor: 1, protocolMinor: 0, controlSchemaVersion: 9, nodeId: "node_fixture",
     readiness: { status: "ready", checks: [{ name: "control_catalog", status: "ok" }] },
-    config: { dataDir: "/state", tempDir: "/state/tmp", derivedDir: "/derived", backupDir: "/backup", allowedOriginalMounts: ["/archive"], listenAddr: "127.0.0.1:8090", shutdownTimeoutSeconds: 30, trustedProxyCidrCount: 0, lanHostname: "localhost", sessionMaxAgeSeconds: 3600, bootstrapCodeTtlSeconds: 300, pairingCodeTtlSeconds: 300, ffmpegCommand: "ffmpeg", ffprobeCommand: "ffprobe", exiftoolCommand: "exiftool" },
+    config: { dataDir: "/state", tempDir: "/state/tmp", derivedDir: "/derived", backupDir: "/backup", allowedOriginalMounts: ["/archive"], listenAddr: "127.0.0.1:8090", shutdownTimeoutSeconds: 30, trustedProxyCidrCount: 0, lanHostname: "localhost", sessionMaxAgeSeconds: 3600, bootstrapCodeTtlSeconds: 300, pairingCodeTtlSeconds: 300, backupIntervalSeconds: 86400, backupDailyRetention: 14, backupWeeklyRetention: 8, minimumFreeBytes: 64 * 1024 * 1024, ffmpegCommand: "ffmpeg", ffprobeCommand: "ffprobe", exiftoolCommand: "exiftool" },
     auth: { activeSessions: 1, activeDeviceCredentials: 1, pendingBootstrapCodes: 0, nodeId: "node_fixture" },
     derivedAvailableBytes: 1_000_000, backupAvailableBytes: 2_000_000,
   });

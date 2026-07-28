@@ -1,5 +1,6 @@
 mod audit;
 pub mod auth;
+mod backup;
 mod catalog;
 mod config;
 mod foundation;
@@ -30,6 +31,13 @@ pub use rcdvlog_sync::{
 pub use auth::{
     AuthConfig, AuthDiagnostics, AuthError, AuthService, BootstrapCode, DeviceCredentialCreated,
     DeviceCredentialInfo, PairingCode, SessionCreated, SessionInfo,
+};
+pub use backup::{
+    BACKUP_FORMAT_VERSION, BACKUP_JOB_TYPE, BACKUP_MANIFEST_FILENAME, BACKUP_RECIPE_KEY,
+    BackupCreationResult, BackupDatabaseManifest, BackupError, BackupJobHandler, BackupManager,
+    BackupManifest, BackupProjectManifest, BackupService, BackupStorageRootIdentity,
+    DiagnosticBundle, DiagnosticBundleResult, RecoveryDiagnostic, RedactedBackupConfiguration,
+    RestoreInspection, RestoreResult,
 };
 pub use catalog::{
     CONTROL_CATALOG_MIGRATIONS, CONTROL_CATALOG_SCHEMA_VERSION, CONTROL_DATABASE_FILENAME,

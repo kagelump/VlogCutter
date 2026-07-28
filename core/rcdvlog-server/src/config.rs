@@ -14,6 +14,10 @@ pub const DEFAULT_LAN_HOSTNAME: &str = "rcdvlog.local";
 pub const DEFAULT_SESSION_MAX_AGE_SECONDS: u64 = 86400;
 pub const DEFAULT_BOOTSTRAP_TTL_SECONDS: u64 = 300;
 pub const DEFAULT_PAIRING_TTL_SECONDS: u64 = 600;
+pub const DEFAULT_BACKUP_INTERVAL_SECONDS: u64 = 86_400;
+pub const DEFAULT_BACKUP_DAILY_RETENTION: u64 = 14;
+pub const DEFAULT_BACKUP_WEEKLY_RETENTION: u64 = 8;
+pub const DEFAULT_MIN_FREE_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 
 const DATA_DIR_FIELD: &str = "dataDir";
 const TEMP_DIR_FIELD: &str = "tempDir";
@@ -27,6 +31,10 @@ const LAN_HOSTNAME_FIELD: &str = "lanHostname";
 const SESSION_MAX_AGE_FIELD: &str = "sessionMaxAgeSeconds";
 const BOOTSTRAP_TTL_FIELD: &str = "bootstrapCodeTtlSeconds";
 const PAIRING_TTL_FIELD: &str = "pairingCodeTtlSeconds";
+const BACKUP_INTERVAL_FIELD: &str = "backupIntervalSeconds";
+const BACKUP_DAILY_RETENTION_FIELD: &str = "backupDailyRetention";
+const BACKUP_WEEKLY_RETENTION_FIELD: &str = "backupWeeklyRetention";
+const MIN_FREE_BYTES_FIELD: &str = "minimumFreeBytes";
 const FFMPEG_FIELD: &str = "ffmpegCommand";
 const FFPROBE_FIELD: &str = "ffprobeCommand";
 const EXIFTOOL_FIELD: &str = "exiftoolCommand";
@@ -134,6 +142,10 @@ pub struct ServerConfig {
     pub session_max_age: Duration,
     pub bootstrap_code_ttl: Duration,
     pub pairing_code_ttl: Duration,
+    pub backup_interval: Duration,
+    pub backup_daily_retention: usize,
+    pub backup_weekly_retention: usize,
+    pub minimum_free_bytes: u64,
     pub ffmpeg_command: String,
     pub ffprobe_command: String,
     pub exiftool_command: String,
@@ -160,6 +172,10 @@ pub struct ConfigDiagnostics {
     pub session_max_age_seconds: u64,
     pub bootstrap_code_ttl_seconds: u64,
     pub pairing_code_ttl_seconds: u64,
+    pub backup_interval_seconds: u64,
+    pub backup_daily_retention: usize,
+    pub backup_weekly_retention: usize,
+    pub minimum_free_bytes: u64,
     pub ffmpeg_command: String,
     pub ffprobe_command: String,
     pub exiftool_command: String,
@@ -181,6 +197,16 @@ impl ServerConfig {
             ("RCDVLOG_SESSION_MAX_AGE_SECONDS", SESSION_MAX_AGE_FIELD),
             ("RCDVLOG_BOOTSTRAP_CODE_TTL_SECONDS", BOOTSTRAP_TTL_FIELD),
             ("RCDVLOG_PAIRING_CODE_TTL_SECONDS", PAIRING_TTL_FIELD),
+            ("RCDVLOG_BACKUP_INTERVAL_SECONDS", BACKUP_INTERVAL_FIELD),
+            (
+                "RCDVLOG_BACKUP_DAILY_RETENTION",
+                BACKUP_DAILY_RETENTION_FIELD,
+            ),
+            (
+                "RCDVLOG_BACKUP_WEEKLY_RETENTION",
+                BACKUP_WEEKLY_RETENTION_FIELD,
+            ),
+            ("RCDVLOG_MINIMUM_FREE_BYTES", MIN_FREE_BYTES_FIELD),
             ("RCDVLOG_FFMPEG", FFMPEG_FIELD),
             ("RCDVLOG_FFPROBE", FFPROBE_FIELD),
             ("RCDVLOG_EXIFTOOL", EXIFTOOL_FIELD),
@@ -261,6 +287,22 @@ impl ServerConfig {
             values.get("RCDVLOG_PAIRING_CODE_TTL_SECONDS"),
             DEFAULT_PAIRING_TTL_SECONDS,
         );
+        let backup_interval_seconds = parse_u64_or_default(
+            values.get("RCDVLOG_BACKUP_INTERVAL_SECONDS"),
+            DEFAULT_BACKUP_INTERVAL_SECONDS,
+        );
+        let backup_daily_retention = parse_u64_or_default(
+            values.get("RCDVLOG_BACKUP_DAILY_RETENTION"),
+            DEFAULT_BACKUP_DAILY_RETENTION,
+        );
+        let backup_weekly_retention = parse_u64_or_default(
+            values.get("RCDVLOG_BACKUP_WEEKLY_RETENTION"),
+            DEFAULT_BACKUP_WEEKLY_RETENTION,
+        );
+        let minimum_free_bytes = parse_u64_or_default(
+            values.get("RCDVLOG_MINIMUM_FREE_BYTES"),
+            DEFAULT_MIN_FREE_BYTES,
+        );
 
         let config = Self {
             data_dir,
@@ -275,6 +317,14 @@ impl ServerConfig {
             session_max_age: Duration::from_secs(session_max_age_seconds),
             bootstrap_code_ttl: Duration::from_secs(bootstrap_code_ttl_seconds),
             pairing_code_ttl: Duration::from_secs(pairing_code_ttl_seconds),
+            backup_interval: Duration::from_secs(backup_interval_seconds),
+            backup_daily_retention: usize::try_from(backup_daily_retention).map_err(|_| {
+                ConfigError::new(BACKUP_DAILY_RETENTION_FIELD, ConfigErrorReason::OutOfRange)
+            })?,
+            backup_weekly_retention: usize::try_from(backup_weekly_retention).map_err(|_| {
+                ConfigError::new(BACKUP_WEEKLY_RETENTION_FIELD, ConfigErrorReason::OutOfRange)
+            })?,
+            minimum_free_bytes,
             ffmpeg_command: configured_command(&values, "RCDVLOG_FFMPEG", "ffmpeg"),
             ffprobe_command: configured_command(&values, "RCDVLOG_FFPROBE", "ffprobe"),
             exiftool_command: configured_command(&values, "RCDVLOG_EXIFTOOL", "exiftool"),
@@ -383,6 +433,30 @@ impl ServerConfig {
                 return Err(ConfigError::new(field, ConfigErrorReason::OutOfRange));
             }
         }
+        if !(300..=86400 * 30).contains(&self.backup_interval.as_secs()) {
+            return Err(ConfigError::new(
+                BACKUP_INTERVAL_FIELD,
+                ConfigErrorReason::OutOfRange,
+            ));
+        }
+        if !(1..=365).contains(&self.backup_daily_retention) {
+            return Err(ConfigError::new(
+                BACKUP_DAILY_RETENTION_FIELD,
+                ConfigErrorReason::OutOfRange,
+            ));
+        }
+        if !(1..=104).contains(&self.backup_weekly_retention) {
+            return Err(ConfigError::new(
+                BACKUP_WEEKLY_RETENTION_FIELD,
+                ConfigErrorReason::OutOfRange,
+            ));
+        }
+        if self.minimum_free_bytes < 64 * 1024 * 1024 {
+            return Err(ConfigError::new(
+                MIN_FREE_BYTES_FIELD,
+                ConfigErrorReason::OutOfRange,
+            ));
+        }
         for (field, command) in [
             (FFMPEG_FIELD, self.ffmpeg_command.as_str()),
             (FFPROBE_FIELD, self.ffprobe_command.as_str()),
@@ -409,6 +483,10 @@ impl ServerConfig {
             session_max_age_seconds: self.session_max_age.as_secs(),
             bootstrap_code_ttl_seconds: self.bootstrap_code_ttl.as_secs(),
             pairing_code_ttl_seconds: self.pairing_code_ttl.as_secs(),
+            backup_interval_seconds: self.backup_interval.as_secs(),
+            backup_daily_retention: self.backup_daily_retention,
+            backup_weekly_retention: self.backup_weekly_retention,
+            minimum_free_bytes: self.minimum_free_bytes,
             ffmpeg_command: self.ffmpeg_command.clone(),
             ffprobe_command: self.ffprobe_command.clone(),
             exiftool_command: self.exiftool_command.clone(),

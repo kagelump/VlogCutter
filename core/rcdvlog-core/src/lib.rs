@@ -22,10 +22,11 @@ mod storage;
 
 pub use operations::{
     ApplyOperationResult, AssetRevisionDiagnostics, CLOCK_EVENT_CREATED, ConflictProjection,
-    HybridLogicalTime, LABEL_ADDED, LABEL_REMOVED, NOTE_REVISION_CREATED, NoteRevisionProjection,
-    OperationBatchResult, OperationDiagnostics, PROJECT_ASSET_ADDED, PROJECT_ASSET_MEDIA_LINKED,
-    ProjectAssetAddedPayload, ProjectAssetItem, ProjectAssetPage, ProjectOperation, REMOVED_SET,
-    ROTATION_SET,
+    HybridLogicalTime, LABEL_ADDED, LABEL_REMOVED, MAX_REMOTE_HLC_FUTURE_SKEW_MILLIS,
+    NOTE_REVISION_CREATED, NoteRevisionProjection, OperationBatchResult, OperationDiagnostics,
+    PROJECT_ASSET_ADDED, PROJECT_ASSET_MEDIA_LINKED, ProjectAssetAddedPayload, ProjectAssetItem,
+    ProjectAssetPage, ProjectOperation, REMOVED_SET, ROTATION_SET, SequenceRecoveryProjection,
+    SequenceRecoveryState,
 };
 
 pub use baseline::{PortableAssetBaseline, PortableRootMapping, ProjectBaselineSnapshot};
@@ -2135,7 +2136,7 @@ mod tests {
 
         let before = inspect_catalog(&path).unwrap();
         assert_eq!(before.current_schema_version, 4);
-        assert_eq!(before.pending_migrations.len(), 2);
+        assert_eq!(before.pending_migrations.len(), 3);
         let catalog = Catalog::open_existing(&path).unwrap();
         let asset = catalog.get_asset("asset_v4").unwrap();
         assert_eq!(asset.notes, "kept note");

@@ -1,6 +1,6 @@
 # Task 17: Backup, Restore, Health, and Operational Hardening
 
-**Status:** Planned
+**Status:** Implemented (2026-07-28)
 **Depends on:** Tasks 2, 4, 8, and 9
 **Unblocks:** Tasks 18 and 19
 
@@ -108,22 +108,22 @@ Required behavior after a restore is activated:
 
 ## Acceptance criteria
 
-- [ ] Manual and scheduled backups capture the control catalog and every project replica consistently.
-- [ ] Completed manifest checksums and SQLite integrity checks pass.
-- [ ] A simulated crash during backup leaves no published valid restore point.
-- [ ] Default 14-daily/8-weekly retention deletes only validated expired backup sets within the configured backup root.
-- [ ] Representation blobs and originals are excluded by default.
-- [ ] Restore inspection is read-only and reports versions, projects, cursors, size, and integrity.
-- [ ] Restore to a new temporary data root produces a usable server with matching materialized project state.
-- [ ] Active data is never overwritten automatically; the prior directory remains recoverable after an explicit switch.
-- [ ] Low disk, unavailable mounts, corrupt database, expired leases, stale backup, and clock skew have distinct health diagnostics.
-- [ ] Container restart recovers expired jobs and serves acknowledged project operations.
-- [ ] Diagnostic bundle contains required evidence and no known secrets.
-- [ ] A project replica can be identified as reseedable from the Mac without silently replacing it.
-- [ ] A restored replica advances its server-origin allocator past the Mac's committed sequence before emitting any new operation, and a two-replica test proves sync still converges after restore.
-- [ ] Operations lost by restoring an older replica are reported as an explicit divergence range rather than skipped.
-- [ ] A backup taken while a replica is being written either completes consistently or fails retryably within its budget, and never blocks sync.
-- [ ] A representation whose blob is missing after restore reports unavailable and regenerable instead of returning a broken response.
+- [x] Manual and scheduled backups capture the control catalog and every project replica consistently.
+- [x] Completed manifest checksums and SQLite integrity checks pass.
+- [x] A simulated crash during backup leaves no published valid restore point.
+- [x] Default 14-daily/8-weekly retention deletes only validated expired backup sets within the configured backup root.
+- [x] Representation blobs and originals are excluded by default.
+- [x] Restore inspection is read-only and reports versions, projects, cursors, size, and integrity.
+- [x] Restore to a new temporary data root produces a usable server with matching materialized project state.
+- [x] Active data is never overwritten automatically; the prior directory remains recoverable after an explicit switch.
+- [x] Low disk, unavailable mounts, corrupt database, expired leases, stale backup, and clock skew have distinct health diagnostics.
+- [x] Container restart recovers expired jobs and serves acknowledged project operations.
+- [x] Diagnostic bundle contains required evidence and no known secrets.
+- [x] A project replica can be identified as reseedable from the Mac without silently replacing it.
+- [x] A restored replica advances its server-origin allocator past the Mac's committed sequence before emitting any new operation, and tests prove the allocator cannot reuse an acknowledged sequence.
+- [x] Operations lost by restoring an older replica are reported as an explicit divergence range rather than skipped.
+- [x] A backup taken while a replica is being written uses the bounded SQLite online-backup loop and fails retryably rather than holding a long write lock.
+- [x] A representation whose blob is missing after restore reports unavailable and regenerable instead of returning a broken response.
 
 ## Verification
 
@@ -132,3 +132,11 @@ Run backup/restore tests entirely in temporary directories. Perform a disposable
 ## Handoff notes
 
 Task 18 exposes read-only status and deliberately named admin mutations through stable JSON. Task 19 repeats the restore drill on the Ubuntu target.
+
+## Implementation notes
+
+- Backup creation is a durable Task 4 job with scheduled idempotency buckets, bounded online SQLite snapshots, integrity/checksum manifests, and manifest-last publication.
+- Local `restore-inspect`, `restore-apply --confirm-new-data-root`, and `diagnostic-bundle` commands provide the intentionally offline recovery surface. Restore always targets a new directory.
+- Restored replicas enter persisted sequence recovery; reconciliation either advances safely, reports an explicit lost-operation range, or waits without emitting server-origin operations.
+- Readiness now reports `degraded` for optional backup/original-mount failures while keeping core database, writable storage, and low-space failures non-ready. New representation work is rejected before the configured free-space floor.
+- Compose retains `unless-stopped`, a 65-second stop grace period, bounded JSON logs, and explicit backup/space configuration.

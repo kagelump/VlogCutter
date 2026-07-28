@@ -891,13 +891,19 @@ impl JobHandler for RepresentationJobHandler {
 pub struct ServerJobHandler {
     scan: crate::ScanJobHandler,
     representations: RepresentationJobHandler,
+    backups: crate::BackupJobHandler,
 }
 
 impl ServerJobHandler {
-    pub fn new(scan: crate::ScanJobHandler, representations: RepresentationJobHandler) -> Self {
+    pub fn new(
+        scan: crate::ScanJobHandler,
+        representations: RepresentationJobHandler,
+        backups: crate::BackupJobHandler,
+    ) -> Self {
         Self {
             scan,
             representations,
+            backups,
         }
     }
 }
@@ -908,7 +914,9 @@ impl JobHandler for ServerJobHandler {
         job: ClaimedJob,
         cancellation: CancellationToken,
     ) -> Result<JobResultCommit, JobHandlerFailure> {
-        if job.job.job_type == REPRESENTATION_JOB_TYPE {
+        if job.job.job_type == crate::BACKUP_JOB_TYPE {
+            self.backups.run(job, cancellation)
+        } else if job.job.job_type == REPRESENTATION_JOB_TYPE {
             self.representations.run(job, cancellation)
         } else {
             self.scan.run(job, cancellation)
@@ -921,7 +929,9 @@ impl JobHandler for ServerJobHandler {
         job: &ClaimedJob,
         result: &JobResultCommit,
     ) -> Result<(), JobEngineError> {
-        if job.job.job_type == REPRESENTATION_JOB_TYPE {
+        if job.job.job_type == crate::BACKUP_JOB_TYPE {
+            self.backups.commit_result(tx, job, result)
+        } else if job.job.job_type == REPRESENTATION_JOB_TYPE {
             self.representations.commit_result(tx, job, result)
         } else {
             self.scan.commit_result(tx, job, result)

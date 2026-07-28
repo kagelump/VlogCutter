@@ -2,7 +2,7 @@ use anyhow::Result;
 use chrono::{SecondsFormat, Utc};
 use rcdvlog_core::{
     Catalog, ConflictProjection, PROJECT_CATALOG_SCHEMA_VERSION, ProjectBaselineSnapshot,
-    ProjectOperation,
+    ProjectOperation, SequenceRecoveryProjection,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -276,6 +276,8 @@ pub struct ReconcileResponse {
     pub representation_cursors: BTreeMap<String, u64>,
     pub conflicts: Vec<ConflictProjection>,
     pub has_more_operations: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sequence_recovery: Vec<SequenceRecoveryProjection>,
     /// Jobs that the server has enqueued for the requesting node (e.g. Mac-targeted
     /// proxy/thumbnail generation). These are surfaced during reconciliation so the
     /// desktop can execute them locally and report results back.
@@ -396,6 +398,7 @@ pub fn reconcile(
         representation_cursors,
         conflicts,
         has_more_operations,
+        sequence_recovery: vec![],
         node_targeted_jobs: vec![],
     };
     while serde_json::to_vec(&response)?.len() > DEFAULT_MAX_BYTES {
