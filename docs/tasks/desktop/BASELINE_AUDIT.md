@@ -73,10 +73,36 @@ No tracked files modified. Untracked `__pycache__` artifacts are harmless.
 
 **What is broken:** The `check-docs.mjs` script validates relative links in Markdown files and finds six broken links across four skill documentation files. Two are references to a missing `planning/ORCHESTRATION.md`; two are template placeholder links (`{{TASK_ID}}`) that should be excluded from link checking; two are example task-file references in schema docs that reference files outside this repository's task directory layout.
 
-## Environmental gaps
+## Resolution
 
-None. All commands ran without missing tools or fixtures.
+### RD-1: `pnpm check:docs` — resolved
 
-## Real defect count
+**Root cause:** `scripts/check-docs.mjs` had three defects:
 
-1
+1. **Fenced-code-block scanning (4 of 6 failures).** The checker scanned inside
+   `` ```md `` fenced code blocks, treating illustrative queue-table rows in
+   `epic-schema.md` as real relative links. Links inside fenced code blocks are
+   now skipped by tracking line-level fence state.
+
+2. **Template placeholder resolution (1 of 6 failures).** The checker attempted
+   to resolve `{{TASK_ID}}` and `{{TASK_SLUG}}` template placeholders in
+   `EPIC.template.md` as literal filesystem paths. Links whose target contains
+   `{{` are now skipped.
+
+3. **Missing target (1 of 6 failures).** `.claude/skills/executing-bounded-task-cycle/SKILL.md`
+   linked to `../../../planning/ORCHESTRATION.md`, which does not exist in this
+   repository. The link was removed and replaced with plain text referencing the
+   calling repo's own ORCHESTRATION.md convention.
+
+Additionally, the checker walked into git worktree directories under
+`.claude/worktrees/`, duplicating files from sibling checkouts. Directories
+containing a `.git` file (worktree marker) are now skipped.
+
+**Files changed:**
+- `scripts/check-docs.mjs` — fence-aware link scanning, template placeholder skip, worktree skip
+- `.claude/skills/executing-bounded-task-cycle/SKILL.md` — broken link replaced with plain text
+
+**Command re-run:** `pnpm check:docs` exits 0 on 2026-07-29.
+
+All 1 real_defect rows resolved.
+
