@@ -34,6 +34,75 @@ REQUIRED_KEYS = {
     "merge",
 }
 
+GATE_CLASSIFICATIONS = {"green", "real_defect", "environmental"}
+MEASUREMENT_TASK_CLASSES = {"qa"}
+
+
+def _nonempty_string(value: Any) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def check_gate_commands(commands: Any, task_class: Any) -> tuple[list[str], set[str]]:
+    """Validate gate evidence, allowing a qa audit to record a measured failure.
+
+    Each entry may carry an optional ``classification``. It defaults to ``green``,
+    which keeps the historical ``exit_code=0`` assertion. A task whose purpose is to
+    measure the gate may instead classify an entry ``real_defect`` or
+    ``environmental``, which records the nonzero exit as a finding rather than a
+    failure of the cycle.
+    """
+    errors: list[str] = []
+    names: set[str] = set()
+    if not isinstance(commands, list) or not commands:
+        return ["gate_commands must contain at least one command"], names
+
+    for index, command in enumerate(commands):
+        if not isinstance(command, dict):
+            errors.append(f"gate_commands[{index}] must be an object")
+            continue
+        if _nonempty_string(command.get("command")):
+            names.add(command["command"])
+        else:
+            errors.append(f"gate_commands[{index}] must contain a non-empty command")
+
+        classification = command.get("classification", "green")
+        if classification not in GATE_CLASSIFICATIONS:
+            errors.append(
+                f"gate_commands[{index}] classification must be one of "
+                + ", ".join(sorted(GATE_CLASSIFICATIONS))
+            )
+            continue
+
+        exit_code = command.get("exit_code")
+        if not isinstance(exit_code, int) or isinstance(exit_code, bool):
+            errors.append(f"gate_commands[{index}] must contain an integer exit_code")
+            continue
+
+        if classification == "green":
+            if exit_code != 0:
+                errors.append(
+                    f"gate_commands[{index}] is green and must record exit_code=0; "
+                    "classify a measured failure as real_defect or environmental"
+                )
+            continue
+
+        if task_class not in MEASUREMENT_TASK_CLASSES:
+            errors.append(
+                f"gate_commands[{index}] classification {classification!r} requires task_class "
+                + " or ".join(sorted(MEASUREMENT_TASK_CLASSES))
+                + f", not {task_class!r}"
+            )
+        if exit_code == 0:
+            errors.append(
+                f"gate_commands[{index}] is classified {classification!r} but exited 0"
+            )
+        if not _nonempty_string(command.get("finding")):
+            errors.append(
+                f"gate_commands[{index}] classification {classification!r} requires a "
+                "non-empty finding describing what was measured"
+            )
+    return errors, names
+
 
 def git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
     result = subprocess.run(["git", *args], cwd=repo, text=True, capture_output=True)
@@ -115,16 +184,10 @@ def main() -> int:
         findings = manifest.get("open_findings")
         if not isinstance(findings, dict) or findings.get("p0") != 0 or findings.get("p1") != 0:
             errors.append("open_findings must report p0=0 and p1=0")
-        commands = manifest.get("gate_commands")
-        command_names: set[str] = set()
-        if not isinstance(commands, list) or not commands:
-            errors.append("gate_commands must contain at least one command")
-        else:
-            for index, command in enumerate(commands):
-                if not isinstance(command, dict) or command.get("exit_code") != 0 or not command.get("command"):
-                    errors.append(f"gate_commands[{index}] must contain command and exit_code=0")
-                elif isinstance(command.get("command"), str):
-                    command_names.add(command["command"])
+        gate_errors, command_names = check_gate_commands(
+            manifest.get("gate_commands"), task.get("task_class")
+        )
+        errors.extend(gate_errors)
         for required_command in task.get("verification_commands", []):
             if required_command not in command_names:
                 errors.append(f"required verification command missing from gate evidence: {required_command}")

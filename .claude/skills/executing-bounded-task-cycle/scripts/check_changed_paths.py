@@ -18,6 +18,10 @@ ROLE_KEYS = {
     "final": ["contract_editor", "implementer", "independent_tester", "integrator"],
 }
 
+# The cycle requires the integrator to reconcile planning state, and
+# reconciliation_checks already name the exact files that edit must touch.
+RECONCILIATION_ROLES = {"integrator", "final"}
+
 
 def run_git(repo: Path, *args: str) -> str:
     completed = subprocess.run(
@@ -30,6 +34,19 @@ def run_git(repo: Path, *args: str) -> str:
     return completed.stdout
 
 
+def reconciliation_paths(meta: dict) -> list[str]:
+    """Paths the cycle protocol obliges the integrator to reconcile."""
+    checks = meta.get("reconciliation_checks", [])
+    if not isinstance(checks, list):
+        raise WorkflowError("task reconciliation_checks is not a list")
+    paths: list[str] = []
+    for check in checks:
+        if not isinstance(check, dict):
+            continue
+        value = check.get("path")
+        if isinstance(value, str) and value.strip() and value.strip() not in paths:
+            paths.append(value.strip())
+    return paths
 
 
 def main() -> int:
@@ -56,6 +73,11 @@ def main() -> int:
                 raise WorkflowError(f"path_ownership.{role_key} is not a list")
             allowed.extend(str(value) for value in values)
         forbidden = [str(value) for value in meta.get("forbidden_paths", [])]
+        reconciliation: list[str] = []
+        if args.role in RECONCILIATION_ROLES:
+            reconciliation = [
+                value for value in reconciliation_paths(meta) if value not in allowed
+            ]
 
         changed = {
             line.strip()
@@ -73,7 +95,9 @@ def main() -> int:
         for path in sorted(changed):
             if any(path_matches(path, pattern) for pattern in forbidden):
                 violations.append({"path": path, "reason": "matches forbidden path"})
-            elif not any(path_matches(path, pattern) for pattern in allowed):
+            elif not any(
+                path_matches(path, pattern) for pattern in (*allowed, *reconciliation)
+            ):
                 violations.append({"path": path, "reason": "not owned by selected role"})
 
         result = {
@@ -82,6 +106,7 @@ def main() -> int:
             "base": args.base,
             "head": args.head,
             "allowed_patterns": allowed,
+            "reconciliation_patterns": reconciliation,
             "forbidden_patterns": forbidden,
             "changed_paths": sorted(changed),
             "violations": violations,

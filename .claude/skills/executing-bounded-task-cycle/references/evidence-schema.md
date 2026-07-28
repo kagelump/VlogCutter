@@ -44,3 +44,35 @@ Example:
 identical. `implementation_base_sha` is `contract_sha` when present, otherwise
 `base_sha`; `implementation_sha` may be an ancestor of the subject. `evidence_commit_sha` may be
 a descendant containing evidence-only changes.
+
+## Gate command classification
+
+Every entry in `gate_commands` needs a `command` and an integer `exit_code`.
+Entries also accept an optional `classification`:
+
+| Classification | Meaning | Required exit code |
+| --- | --- | --- |
+| `green` (default) | The command passed. | `0` |
+| `real_defect` | The command failed and the failure is a code defect. | nonzero |
+| `environmental` | The command failed only because a host tool or fixture is absent. | nonzero |
+
+Omitting `classification` means `green`, so existing manifests keep the original
+`exit_code=0` assertion unchanged.
+
+`real_defect` and `environmental` exist for a task whose purpose is to *measure*
+the gate, so they are accepted only when the task packet's `task_class` is `qa`.
+For any other task class a failing gate command is still a failing cycle — a
+classification cannot be used to wave one through. A non-green entry must also
+carry a non-empty `finding` naming what was measured, normally the ledger id:
+
+```json
+{
+  "command": "pnpm check:docs",
+  "exit_code": 1,
+  "classification": "real_defect",
+  "finding": "RD-1: check-docs reports two unresolved documentation links."
+}
+```
+
+Classification does not exempt a command from coverage: every entry in the
+packet's `verification_commands` must still appear in `gate_commands`.

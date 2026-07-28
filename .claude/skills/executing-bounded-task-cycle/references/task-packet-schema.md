@@ -122,8 +122,12 @@ No required section may contain `TBD`, `TODO`, or `???` when status is `ready`.
 - The implementer may change only `path_ownership.implementer`.
 - The independent tester may change only `path_ownership.independent_tester`.
 - The contract editor may change only `path_ownership.contract_editor`.
-- The integrator may change the union of all role paths.
-- A forbidden path always wins over an allowed path.
+- The integrator may change the union of all role paths, plus every `path` named
+  in `reconciliation_checks`. The cycle requires that reconciliation edit, so
+  `check_changed_paths.py --role integrator` and `--role final` allow those paths
+  implicitly and report them under `reconciliation_patterns`. No other role gets
+  the allowance.
+- A forbidden path always wins over an allowed path, including a reconciliation path.
 - Shared hot spots belong to the integrator, not the leaf implementer.
 - An unexpected dependency, migration, manifest, or architecture path triggers a stop.
 
@@ -133,3 +137,6 @@ No required section may contain `TBD`, `TODO`, or `???` when status is `ready`.
 is complete. Use them for the epic row, foundation ledger, roadmap, or other
 canonical planning locations. They prevent a report from declaring completion
 while the repository still says the task is open.
+
+Each entry's `path` doubles as the integrator's licence to edit that file. Name
+only files the cycle is genuinely required to touch.
