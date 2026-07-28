@@ -177,16 +177,19 @@ pub struct JobProgress {
     pub estimate: BatchEstimate,
 }
 
-/// A safe, read-only view of durable job state. It deliberately omits every
-/// lease field, including the owner and token.
+/// A safe, read-only view of durable job state. Lease expiry is exposed for
+/// diagnosis, while the lease owner and bearer token remain private.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct JobSnapshot {
     pub definition: JobDefinition,
     pub state: JobState,
     pub attempt_count: u32,
+    pub retryable: bool,
     pub available_at: String,
     pub cancel_requested_at: Option<String>,
+    pub lease_active: bool,
+    pub lease_expires_at: Option<String>,
     pub completed_work_units: u64,
     pub total_work_units: u64,
     pub completed_items: u64,
@@ -330,6 +333,7 @@ struct JobSnapshotRow {
     attempt_count: u32,
     available_at: String,
     cancel_requested_at: Option<String>,
+    lease_expires_at: Option<String>,
     completed_work_units: i64,
     total_work_units: i64,
     completed_items: i64,
@@ -460,25 +464,26 @@ impl JobEngine {
         let transaction = connection.transaction()?;
         let row: Option<JobSnapshotRow> = transaction
             .query_row(
-                "SELECT state,attempt_count,available_at,cancel_requested_at,completed_work_units,total_work_units,completed_items,failed_items,total_items,error_code,error_details_json,output_identity,created_at,started_at,updated_at,completed_at FROM jobs WHERE job_id=?1",
+                "SELECT state,attempt_count,available_at,cancel_requested_at,lease_expires_at,completed_work_units,total_work_units,completed_items,failed_items,total_items,error_code,error_details_json,output_identity,created_at,started_at,updated_at,completed_at FROM jobs WHERE job_id=?1",
                 [id.as_str()],
                 |row| Ok(JobSnapshotRow {
                     state: row.get(0)?,
                     attempt_count: row.get(1)?,
                     available_at: row.get(2)?,
                     cancel_requested_at: row.get(3)?,
-                    completed_work_units: row.get(4)?,
-                    total_work_units: row.get(5)?,
-                    completed_items: row.get(6)?,
-                    failed_items: row.get(7)?,
-                    total_items: row.get(8)?,
-                    error_code: row.get(9)?,
-                    error_details_json: row.get(10)?,
-                    output_identity: row.get(11)?,
-                    created_at: row.get(12)?,
-                    started_at: row.get(13)?,
-                    updated_at: row.get(14)?,
-                    completed_at: row.get(15)?,
+                    lease_expires_at: row.get(4)?,
+                    completed_work_units: row.get(5)?,
+                    total_work_units: row.get(6)?,
+                    completed_items: row.get(7)?,
+                    failed_items: row.get(8)?,
+                    total_items: row.get(9)?,
+                    error_code: row.get(10)?,
+                    error_details_json: row.get(11)?,
+                    output_identity: row.get(12)?,
+                    created_at: row.get(13)?,
+                    started_at: row.get(14)?,
+                    updated_at: row.get(15)?,
+                    completed_at: row.get(16)?,
                 }),
             )
             .optional()?;
@@ -499,12 +504,22 @@ impl JobEngine {
             }
         };
         transaction.commit()?;
+        let lease_active = row
+            .lease_expires_at
+            .as_deref()
+            .is_some_and(|expiry| expiry > timestamp(self.clock.now()).as_str());
+        let state = job_state(row.state)?;
+        let retryable =
+            state == JobState::Failed && row.attempt_count < definition.retry_policy.max_attempts;
         Ok(JobSnapshot {
             definition,
-            state: job_state(row.state)?,
+            state,
             attempt_count: row.attempt_count,
+            retryable,
             available_at: row.available_at,
             cancel_requested_at: row.cancel_requested_at,
+            lease_active,
+            lease_expires_at: row.lease_expires_at,
             completed_work_units: snapshot_counter(row.completed_work_units, "completed work")?,
             total_work_units: snapshot_counter(row.total_work_units, "total work")?,
             completed_items: snapshot_counter(row.completed_items, "completed items")?,
@@ -1903,6 +1918,15 @@ mod tests {
             .claim_next("worker", Duration::from_secs(10))
             .unwrap()
             .unwrap();
+        let running = e.get_job(&claimed.job.job_id).unwrap();
+        assert!(running.lease_active);
+        assert_eq!(
+            running.lease_expires_at.as_deref(),
+            Some(claimed.lease_expires_at.as_str())
+        );
+        let serialized = serde_json::to_value(&running).unwrap();
+        assert!(serialized.get("leaseOwner").is_none());
+        assert!(serialized.get("leaseToken").is_none());
         e.report_progress(&claimed, 50, estimate_input(1, &[50]))
             .unwrap();
         assert_eq!(
@@ -1915,6 +1939,9 @@ mod tests {
             .unwrap(),
             JobState::RetryWait
         );
+        let retrying = e.get_job(&claimed.job.job_id).unwrap();
+        assert!(!retrying.lease_active);
+        assert!(retrying.lease_expires_at.is_none());
         clock.advance(2);
         let again = e
             .claim_next("worker", Duration::from_secs(10))

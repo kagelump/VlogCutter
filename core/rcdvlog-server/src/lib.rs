@@ -3,6 +3,7 @@ pub mod auth;
 mod backup;
 mod catalog;
 mod config;
+mod error_codes;
 mod foundation;
 mod jobs;
 mod library;
@@ -48,6 +49,7 @@ pub use config::{
     ConfigDiagnostics, ConfigError, ConfigErrorReason, DEFAULT_DATA_DIR, DEFAULT_LISTEN_ADDR,
     DEFAULT_SHUTDOWN_TIMEOUT_SECONDS, SecretString, ServerConfig,
 };
+pub use error_codes::{STABLE_ERROR_CODES, is_stable_error_code};
 pub use foundation::{
     CheckStatus, ReadinessCheck, ReadinessReport, ReadinessStatus, RuntimeFoundation,
 };

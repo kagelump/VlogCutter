@@ -1143,6 +1143,50 @@
         }
       }
     },
+    "/api/v1/admin/backups": {
+      "get": {
+        "operationId": "listAdminBackups",
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/AdminPayload"
+          }
+        }
+      },
+      "post": {
+        "operationId": "requestAdminBackup",
+        "requestBody": {
+          "$ref": "#/components/requestBodies/AdminPayload"
+        },
+        "responses": {
+          "202": {
+            "$ref": "#/components/responses/AdminPayload"
+          }
+        }
+      }
+    },
+    "/api/v1/admin/backups/{backupId}": {
+      "get": {
+        "operationId": "getAdminBackup",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "backupId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/AdminPayload"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
     "/api/v1/admin/jobs": {
       "get": {
         "operationId": "listAdminJobs",

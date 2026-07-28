@@ -190,6 +190,10 @@ impl SyncManager {
         settings: Arc<RwLock<crate::DesktopSettings>>,
         status: Arc<RwLock<HashMap<String, SyncStatus>>>,
     ) -> Self {
+        let catalog_path = catalog
+            .read()
+            .ok()
+            .map(|catalog| catalog.database_path().to_path_buf());
         let (wake_tx, wake_rx) = tokio::sync::mpsc::unbounded_channel();
         let handle = SyncLoopHandle {
             app_handle,
@@ -200,7 +204,23 @@ impl SyncManager {
             active_projects: HashSet::new(),
             wake_tx: wake_tx.clone(),
         };
-        tokio::spawn(handle.run(wake_rx));
+        tokio::spawn(async move {
+            let Some(catalog_path) = catalog_path else {
+                return;
+            };
+            loop {
+                match rcdvlog_sync::SyncProcessGuard::try_acquire(&catalog_path) {
+                    Ok(Some(guard)) => {
+                        let _guard = guard;
+                        handle.run(wake_rx).await;
+                        return;
+                    }
+                    Ok(None) | Err(_) => {
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await
+                    }
+                }
+            }
+        });
         Self { wake_tx }
     }
 
@@ -275,7 +295,25 @@ impl SyncLoopHandle {
                     break;
                 }
                 Err(_) => {
-                    // Timeout — periodic tick, reconcile all paired projects
+                    // The cross-process CLI wake path is intentionally polled at the
+                    // existing bounded interval, so it never creates a second loop.
+                    let requests = self
+                        .catalog
+                        .read()
+                        .ok()
+                        .and_then(|catalog| {
+                            rcdvlog_sync::drain_sync_manager_requests(catalog.database_path()).ok()
+                        })
+                        .unwrap_or_default();
+                    if let Some(project_id) = requests.first() {
+                        targeted_project = Some(project_id.clone());
+                        for project_id in requests.iter().skip(1) {
+                            let _ = self.wake_tx.send(WakeEvent::SyncNow {
+                                project_id: project_id.clone(),
+                            });
+                        }
+                    }
+                    // With no request this remains the normal periodic reconcile-all tick.
                 }
             }
 

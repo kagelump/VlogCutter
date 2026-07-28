@@ -422,6 +422,17 @@ impl AuthService {
         &self,
         created_by_session_id: &str,
     ) -> Result<PairingCode, AuthError> {
+        self.create_pairing_code_with_creator(Some(created_by_session_id))
+    }
+
+    pub fn create_pairing_code_for_device(&self) -> Result<PairingCode, AuthError> {
+        self.create_pairing_code_with_creator(None)
+    }
+
+    fn create_pairing_code_with_creator(
+        &self,
+        created_by_session_id: Option<&str>,
+    ) -> Result<PairingCode, AuthError> {
         let code = generate_alphanumeric(PAIRING_CODE_LENGTH);
         let code_prefix = &code[..DISPLAY_PREFIX_LENGTH];
         let code_hash = hash_secret(&code);

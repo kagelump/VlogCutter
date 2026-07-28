@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use clap::{ArgAction, Parser, Subcommand};
+use clap::{ArgAction, Args, Parser, Subcommand};
 use rcdvlog_server::{
     HttpState, ShutdownCoordinator, bind_loopback, openapi_document, router, serve_until_shutdown,
 };
@@ -11,6 +11,8 @@ use rcdvlog_server_core::{
     compute_next_run_utc,
 };
 use serde::Serialize;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -37,13 +39,48 @@ struct Arguments {
 
 #[derive(Debug, Subcommand)]
 enum LocalCommand {
+    #[command(subcommand, about = "Offline administration and recovery commands")]
+    Admin(AdminCommand),
+}
+
+#[derive(Debug, Subcommand)]
+enum AdminCommand {
+    #[command(subcommand, about = "Create a one-time bootstrap credential")]
+    Bootstrap(BootstrapCommand),
+    #[command(subcommand, about = "Inspect verified backups")]
+    Backup(BackupCommand),
+    #[command(subcommand, about = "Inspect or apply a verified restore point")]
+    Restore(RestoreCommand),
+    #[command(subcommand, about = "Create redacted local diagnostics")]
+    Diagnostics(DiagnosticsCommand),
+    #[command(subcommand, about = "Perform explicit sequence-recovery decisions")]
+    Recovery(RecoveryCommand),
+}
+
+#[derive(Debug, Subcommand)]
+enum BootstrapCommand {
+    #[command(about = "Write a one-time bootstrap code to a new owner-only file")]
+    Create(SecureOutputArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum BackupCommand {
+    #[command(about = "Inspect a backup without changing server state")]
+    Inspect {
+        #[arg(long)]
+        backup: PathBuf,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum RestoreCommand {
     #[command(about = "Inspect a restore point without changing server state")]
-    RestoreInspect {
+    Inspect {
         #[arg(long)]
         restore_point: PathBuf,
     },
     #[command(about = "Restore a verified point into a new data directory")]
-    RestoreApply {
+    Apply {
         #[arg(long)]
         restore_point: PathBuf,
         #[arg(long)]
@@ -51,11 +88,34 @@ enum LocalCommand {
         #[arg(long, action = ArgAction::SetTrue, required = true)]
         confirm_new_data_root: bool,
     },
-    #[command(about = "Write a redacted local diagnostic bundle")]
-    DiagnosticBundle {
+}
+
+#[derive(Debug, Subcommand)]
+enum DiagnosticsCommand {
+    #[command(about = "Write a redacted diagnostic bundle")]
+    Bundle {
         #[arg(long)]
         output_directory: PathBuf,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum RecoveryCommand {
+    #[command(about = "Accept a detected operation-sequence allocator advance")]
+    AcceptSequenceDivergence {
+        #[arg(long)]
+        project_id: String,
+        #[arg(long)]
+        peer_node_id: String,
+        #[arg(long, value_parser = ["accept_allocator_advance"], required = true)]
+        decision: String,
+    },
+}
+
+#[derive(Debug, Args)]
+struct SecureOutputArgs {
+    #[arg(long, help = "New absolute path for the owner-only secret file")]
+    output_file: PathBuf,
 }
 
 #[derive(Serialize)]
@@ -101,9 +161,10 @@ fn main() -> ExitCode {
                 ExitCode::SUCCESS
             }
             Err(error) => {
+                let metadata = local_error_metadata(&error);
                 eprintln!(
                     "{}",
-                    serde_json::json!({"ok":false,"error":{"code":"local_admin_failed","message":error.to_string()}})
+                    serde_json::json!({"ok":false,"error":{"code":metadata.code,"message":error.to_string(),"retryable":metadata.retryable}})
                 );
                 ExitCode::FAILURE
             }
@@ -149,18 +210,25 @@ fn main() -> ExitCode {
 fn run_local_command(command: LocalCommand) -> Result<serde_json::Value> {
     let config = ServerConfig::from_environment().context("load server configuration")?;
     match command {
-        LocalCommand::RestoreInspect { restore_point } => {
+        LocalCommand::Admin(AdminCommand::Backup(BackupCommand::Inspect { backup })) => {
+            let inspection = rcdvlog_server_core::BackupManager::inspect_restore_point_in_root(
+                &config.backup_dir,
+                &backup,
+            )?;
+            Ok(serde_json::json!({"ok":true,"result":inspection}))
+        }
+        LocalCommand::Admin(AdminCommand::Restore(RestoreCommand::Inspect { restore_point })) => {
             let inspection = rcdvlog_server_core::BackupManager::inspect_restore_point_in_root(
                 &config.backup_dir,
                 &restore_point,
             )?;
             Ok(serde_json::json!({"ok":true,"result":inspection}))
         }
-        LocalCommand::RestoreApply {
+        LocalCommand::Admin(AdminCommand::Restore(RestoreCommand::Apply {
             restore_point,
             new_data_root,
             confirm_new_data_root,
-        } => {
+        })) => {
             anyhow::ensure!(
                 confirm_new_data_root,
                 "explicit restore confirmation is required"
@@ -173,7 +241,9 @@ fn run_local_command(command: LocalCommand) -> Result<serde_json::Value> {
                 .restore_to_new_data_root(&restore_point, &new_data_root)?;
             Ok(serde_json::json!({"ok":true,"result":result}))
         }
-        LocalCommand::DiagnosticBundle { output_directory } => {
+        LocalCommand::Admin(AdminCommand::Diagnostics(DiagnosticsCommand::Bundle {
+            output_directory,
+        })) => {
             let foundation = RuntimeFoundation::initialize(config)
                 .context("initialize offline diagnostic foundation")?;
             let result = foundation
@@ -181,6 +251,82 @@ fn run_local_command(command: LocalCommand) -> Result<serde_json::Value> {
                 .backups(foundation.config().clone())
                 .generate_diagnostic_bundle(&output_directory, foundation.readiness())?;
             Ok(serde_json::json!({"ok":true,"result":result}))
+        }
+        LocalCommand::Admin(AdminCommand::Bootstrap(BootstrapCommand::Create(args))) => {
+            let foundation = RuntimeFoundation::initialize(config)
+                .context("initialize offline bootstrap foundation")?;
+            let bootstrap = foundation.auth().create_bootstrap_code()?;
+            write_new_private_file(&args.output_file, bootstrap.code.expose().as_bytes())?;
+            Ok(serde_json::json!({
+                "ok": true,
+                "result": {
+                    "credential": "owner_only_file",
+                    "outputFile": args.output_file,
+                    "expiresAt": bootstrap.expires_at
+                }
+            }))
+        }
+        LocalCommand::Admin(AdminCommand::Recovery(
+            RecoveryCommand::AcceptSequenceDivergence {
+                project_id,
+                peer_node_id,
+                decision,
+            },
+        )) => {
+            let foundation = RuntimeFoundation::initialize(config)
+                .context("initialize offline recovery foundation")?;
+            let catalog = foundation
+                .catalog()
+                .project_replicas()
+                .open_catalog(&project_id)?;
+            let result = catalog.accept_sequence_divergence(&peer_node_id, &decision)?;
+            Ok(serde_json::json!({"ok":true,"result":result}))
+        }
+    }
+}
+
+fn write_new_private_file(path: &std::path::Path, contents: &[u8]) -> Result<()> {
+    anyhow::ensure!(path.is_absolute(), "secret output path must be absolute");
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options
+        .open(path)
+        .with_context(|| format!("create owner-only secret file at {}", path.display()))?;
+    file.write_all(contents)?;
+    file.write_all(b"\n")?;
+    file.sync_all()?;
+    Ok(())
+}
+
+struct LocalErrorMetadata {
+    code: &'static str,
+    retryable: bool,
+}
+
+fn local_error_metadata(error: &anyhow::Error) -> LocalErrorMetadata {
+    if let Some(error) = error.downcast_ref::<InstanceLockError>() {
+        LocalErrorMetadata {
+            code: error.code,
+            retryable: true,
+        }
+    } else if let Some(error) = error.downcast_ref::<rcdvlog_server_core::BackupError>() {
+        LocalErrorMetadata {
+            code: error.code(),
+            retryable: error.retryable(),
+        }
+    } else if let Some(error) = error.downcast_ref::<rcdvlog_server_core::AuthError>() {
+        LocalErrorMetadata {
+            code: error.code(),
+            retryable: false,
+        }
+    } else {
+        LocalErrorMetadata {
+            code: "local_admin_failed",
+            retryable: false,
         }
     }
 }

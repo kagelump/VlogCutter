@@ -182,9 +182,9 @@ export type AdminJobState = "queued" | "running" | "retry_wait" | "succeeded" | 
 export interface AdminJob {
   enqueueSequence?: number; definition: { jobId: string; jobType: string; jobClass: string; targetNodeId: string; projectId: string | null; mediaObjectId: string | null; recipeKey: string; totalItems: number };
   estimate?: { completedItems: number; totalItems: number; completedWorkUnits: number; totalWorkUnits: number; workerCount: number; workUnitsPerWorkerSecond: number | null; elapsedSeconds: number; estimatedRemainingSeconds: number | null };
-  state: AdminJobState; attemptCount: number; cancelRequestedAt: string | null; completedWorkUnits: number; totalWorkUnits: number;
+  state: AdminJobState; attemptCount: number; retryable: boolean; availableAt: string; cancelRequestedAt: string | null; leaseActive: boolean; leaseExpiresAt: string | null; completedWorkUnits: number; totalWorkUnits: number;
   completedItems: number; failedItems: number; totalItems: number; error: { code: string; details: unknown } | null;
-  createdAt: string; updatedAt: string; completedAt: string | null;
+  outputIdentity: string | null; createdAt: string; startedAt: string | null; updatedAt: string; completedAt: string | null;
 }
 export interface AdminJobPage { items: AdminJob[]; nextBefore: number | null }
 export interface ProjectSyncOverview { projectId: string; registryState: string; originNodeId: string | null; serverNodeId: string; assetCount: number; operationCount: number; latestLocalSequence: number; pendingProjectionRepairs: number; unresolvedConflictCount: number; nodeObservationCount: number; lastSuccessAt: string; lastErrorCode: string | null; endpoint: string | null; compatibility: string; connectivity: string; recommendations: string[] }

@@ -59,6 +59,26 @@ pub enum BackupError {
     Infrastructure(#[from] anyhow::Error),
 }
 
+impl BackupError {
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::InvalidInput(_) => "invalid_input",
+            Self::Canceled => "backup_canceled",
+            Self::BusyTimeout => "backup_busy",
+            Self::NotFound => "not_found",
+            Self::Incompatible(_) => "backup_incompatible",
+            Self::Verification(_) => "backup_verification_failed",
+            Self::Database(_) | Self::Io(_) | Self::Serialization(_) | Self::Infrastructure(_) => {
+                "internal_error"
+            }
+        }
+    }
+
+    pub const fn retryable(&self) -> bool {
+        matches!(self, Self::Canceled | Self::BusyTimeout | Self::Io(_))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct BackupDatabaseManifest {

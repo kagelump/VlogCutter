@@ -8,7 +8,95 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs::{self, File, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use thiserror::Error;
+
+pub struct SyncProcessGuard {
+    _file: File,
+}
+
+impl SyncProcessGuard {
+    pub fn try_acquire(catalog_path: &Path) -> Result<Option<Self>> {
+        use fs2::FileExt;
+        let lock_path = sync_control_root(catalog_path).join("sync-manager.lock");
+        if let Some(parent) = lock_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(lock_path)?;
+        match file.try_lock_exclusive() {
+            Ok(()) => Ok(Some(Self { _file: file })),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+}
+
+pub fn signal_running_sync_manager(catalog_path: &Path, project_id: &str) -> Result<()> {
+    anyhow::ensure!(
+        !project_id.is_empty()
+            && project_id.len() <= 255
+            && project_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')),
+        "project ID is invalid"
+    );
+    let directory = sync_control_root(catalog_path).join("wake");
+    fs::create_dir_all(&directory)?;
+    let identity = blake3::hash(project_id.as_bytes()).to_hex();
+    let target = directory.join(format!("{}.request", &identity[..32]));
+    let temporary = directory.join(format!(".{}.tmp", &identity[..32]));
+    let mut options = OpenOptions::new();
+    options.create(true).truncate(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&temporary)?;
+    file.write_all(project_id.as_bytes())?;
+    file.sync_all()?;
+    fs::rename(temporary, target)?;
+    Ok(())
+}
+
+pub fn drain_sync_manager_requests(catalog_path: &Path) -> Result<Vec<String>> {
+    let directory = sync_control_root(catalog_path).join("wake");
+    if !directory.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut requests = Vec::new();
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file()
+            || entry.path().extension().and_then(|value| value.to_str()) != Some("request")
+        {
+            continue;
+        }
+        let value = fs::read_to_string(entry.path())?;
+        if !value.is_empty() && value.len() <= 255 {
+            requests.push(value);
+        }
+        fs::remove_file(entry.path())?;
+    }
+    requests.sort();
+    requests.dedup();
+    Ok(requests)
+}
+
+fn sync_control_root(catalog_path: &Path) -> PathBuf {
+    catalog_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("cache")
+        .join("sync-control")
+}
 
 pub const SYNC_PROTOCOL_MAJOR: u32 = 1;
 pub const SYNC_PROTOCOL_MINOR: u32 = 0;
@@ -669,6 +757,41 @@ mod tests {
     use rcdvlog_core::{MediaVerificationState, ProjectAssetAddedPayload};
     use serde_json::json;
     use tempfile::TempDir;
+
+    #[test]
+    fn process_guard_serializes_sync_and_wake_requests_are_bounded() {
+        let root = TempDir::new().unwrap();
+        let catalog_path = root.path().join("catalog.sqlite3");
+        fs::write(&catalog_path, b"").unwrap();
+        let guard = SyncProcessGuard::try_acquire(&catalog_path)
+            .unwrap()
+            .expect("first process acquires guard");
+        assert!(
+            SyncProcessGuard::try_acquire(&catalog_path)
+                .unwrap()
+                .is_none()
+        );
+
+        signal_running_sync_manager(&catalog_path, "project_fixture").unwrap();
+        signal_running_sync_manager(&catalog_path, "project_fixture").unwrap();
+        assert_eq!(
+            drain_sync_manager_requests(&catalog_path).unwrap(),
+            vec!["project_fixture"]
+        );
+        assert!(
+            drain_sync_manager_requests(&catalog_path)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(signal_running_sync_manager(&catalog_path, "../escape").is_err());
+
+        drop(guard);
+        assert!(
+            SyncProcessGuard::try_acquire(&catalog_path)
+                .unwrap()
+                .is_some()
+        );
+    }
 
     fn new_catalog(root: &TempDir, filename: &str, node: &str) -> Catalog {
         let catalog = Catalog::open(root.path().join(filename)).unwrap();

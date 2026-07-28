@@ -2986,11 +2986,17 @@ dependencies = [
  "anyhow",
  "clap",
  "dirs",
+ "keyring",
  "rcdvlog-core",
+ "rcdvlog-server-core",
+ "rcdvlog-sync",
+ "reqwest 0.12.28",
  "rusqlite",
  "serde",
  "serde_json",
  "tempfile",
+ "thiserror 2.0.18",
+ "uuid",
 ]
 
 [[package]]
@@ -3103,6 +3109,7 @@ dependencies = [
  "anyhow",
  "blake3",
  "chrono",
+ "fs2",
  "rcdvlog-core",
  "rusqlite",
  "serde",
@@ -3189,6 +3196,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "encoding_rs",
+ "futures-channel",
  "futures-core",
  "futures-util",
  "h2",

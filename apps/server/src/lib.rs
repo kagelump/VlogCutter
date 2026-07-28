@@ -345,6 +345,12 @@ async fn auth_middleware(
     next: Next,
 ) -> Response {
     let auth = state.auth.clone();
+    let request_id = request
+        .extensions()
+        .get::<RequestId>()
+        .map(|value| value.0.as_str())
+        .unwrap_or("")
+        .to_string();
 
     // Try device bearer token first
     if let Some(auth_header) = request.headers().get(header::AUTHORIZATION)
@@ -360,7 +366,7 @@ async fn auth_middleware(
             }
             Err(AuthError::DeviceNotFound) => {}
             Err(AuthError::DeviceRevoked) => {
-                return auth_error_response(AuthError::DeviceRevoked);
+                return auth_error_response_with_request(AuthError::DeviceRevoked, &request_id);
             }
             Err(_) => {}
         }
@@ -388,12 +394,12 @@ async fn auth_middleware(
             }
             Err(AuthError::SessionInvalid) => {}
             Err(e) => {
-                return auth_error_response(e);
+                return auth_error_response_with_request(e, &request_id);
             }
         }
     }
 
-    auth_error_response(AuthError::SessionInvalid)
+    auth_error_response_with_request(AuthError::SessionInvalid, &request_id)
 }
 
 async fn require_csrf(
@@ -411,8 +417,13 @@ async fn require_csrf(
         csrf_token,
     } = &principal
     {
+        let request_id = request
+            .extensions()
+            .get::<RequestId>()
+            .map(|request_id| request_id.0.as_str())
+            .unwrap_or("");
         if csrf_token.is_empty() {
-            return auth_error_response(AuthError::CsrfMismatch);
+            return auth_error_response_with_request(AuthError::CsrfMismatch, request_id);
         }
         // Session was already validated by auth_middleware; only verify the
         // CSRF token against the stored hash.
@@ -421,7 +432,7 @@ async fn require_csrf(
             .validate_csrf_token(session_id, csrf_token)
             .is_err()
         {
-            return auth_error_response(AuthError::CsrfMismatch);
+            return auth_error_response_with_request(AuthError::CsrfMismatch, request_id);
         }
     }
     next.run(request).await
@@ -462,7 +473,7 @@ fn parse_session_cookie(cookie_str: &str) -> Option<(String, String)> {
     None
 }
 
-fn auth_error_response(error: AuthError) -> Response {
+fn auth_error_response_with_request(error: AuthError, request_id: &str) -> Response {
     let (status, code) = match &error {
         AuthError::SessionInvalid
         | AuthError::DeviceNotFound
@@ -477,7 +488,7 @@ fn auth_error_response(error: AuthError) -> Response {
     (
         status,
         Json(ErrorResponse {
-            request_id: String::new(),
+            request_id: request_id.to_string(),
             code,
         }),
     )
@@ -633,6 +644,11 @@ pub fn router(state: HttpState) -> Router {
         .route("/api/v1/admin/jobs/{job_id}", get(get_admin_job))
         .route("/api/v1/admin/jobs/{job_id}/cancel", post(cancel_admin_job))
         .route("/api/v1/admin/jobs/{job_id}/retry", post(retry_admin_job))
+        .route(
+            "/api/v1/admin/backups",
+            get(list_admin_backups).post(request_admin_backup),
+        )
+        .route("/api/v1/admin/backups/{backup_id}", get(get_admin_backup))
         .route(
             "/api/v1/admin/representations/batch",
             post(request_admin_representation_batch),
@@ -879,6 +895,11 @@ pub fn openapi_document() -> serde_json::Value {
             "/api/v1/admin/jobs/{jobId}/cancel": { "post": { "operationId": "cancelAdminJob", "parameters": [{"name":"jobId","in":"path","required":true,"schema":{"type":"string"}}], "responses": { "200": { "$ref": "#/components/responses/AdminPayload" } } } },
             "/api/v1/admin/jobs/{jobId}/retry": { "post": { "operationId": "retryAdminJob", "parameters": [{"name":"jobId","in":"path","required":true,"schema":{"type":"string"}}], "responses": { "200": { "$ref": "#/components/responses/AdminPayload" } } } },
             "/api/v1/admin/sync": { "get": { "operationId": "listAdminSync", "responses": { "200": { "$ref": "#/components/responses/AdminPayload" } } } },
+            "/api/v1/admin/backups": {
+                "get": { "operationId": "listAdminBackups", "responses": { "200": { "$ref": "#/components/responses/AdminPayload" } } },
+                "post": { "operationId": "requestAdminBackup", "requestBody": { "$ref": "#/components/requestBodies/AdminPayload" }, "responses": { "202": { "$ref": "#/components/responses/AdminPayload" } } }
+            },
+            "/api/v1/admin/backups/{backupId}": { "get": { "operationId": "getAdminBackup", "parameters": [{"name":"backupId","in":"path","required":true,"schema":{"type":"string"}}], "responses": { "200": { "$ref": "#/components/responses/AdminPayload" }, "404": { "$ref": "#/components/responses/Error" } } } },
             "/api/v1/admin/representations/batch": { "post": { "operationId": "requestAdminRepresentationBatch", "requestBody": { "$ref": "#/components/requestBodies/AdminPayload" }, "responses": { "202": { "$ref": "#/components/responses/AdminPayload" } } } }
         },
         "components": {
@@ -1377,7 +1398,7 @@ async fn create_bootstrap_code(
             })
             .into_response()
         }
-        Err(error) => auth_error_response(error),
+        Err(error) => auth_error_response_with_request(error, &request_id.0),
     }
 }
 
@@ -1415,7 +1436,7 @@ async fn exchange_bootstrap_code(
             );
             response
         }
-        Err(error) => auth_error_response(error),
+        Err(error) => auth_error_response_with_request(error, &request_id.0),
     }
 }
 
@@ -1429,7 +1450,7 @@ async fn list_sessions(
             sessions,
         })
         .into_response(),
-        Err(error) => auth_error_response(error),
+        Err(error) => auth_error_response_with_request(error, &request_id.0),
     }
 }
 
@@ -1463,7 +1484,7 @@ async fn revoke_session(
             }
             Err(response) => *response,
         },
-        Err(error) => auth_error_response(error),
+        Err(error) => auth_error_response_with_request(error, &request_id.0),
     }
 }
 
@@ -1474,7 +1495,9 @@ async fn refresh_session(
 ) -> Response {
     let session_id = match &principal {
         AuthPrincipal::Browser { session_id, .. } => session_id.clone(),
-        _ => return auth_error_response(AuthError::SessionInvalid),
+        _ => {
+            return auth_error_response_with_request(AuthError::SessionInvalid, &request_id.0);
+        }
     };
     match state.auth.refresh_session(&session_id) {
         Ok(session) => Json(SessionRefreshResponse {
@@ -1482,7 +1505,7 @@ async fn refresh_session(
             session,
         })
         .into_response(),
-        Err(error) => auth_error_response(error),
+        Err(error) => auth_error_response_with_request(error, &request_id.0),
     }
 }
 
@@ -1491,18 +1514,29 @@ async fn create_pairing_code(
     Extension(request_id): Extension<RequestId>,
     Extension(principal): Extension<AuthPrincipal>,
 ) -> Response {
-    let session_id = match &principal {
-        AuthPrincipal::Browser { session_id, .. } => session_id.clone(),
-        _ => return auth_error_response(AuthError::SessionInvalid),
+    let result = match &principal {
+        AuthPrincipal::Browser { session_id, .. } => state.auth.create_pairing_code(session_id),
+        AuthPrincipal::Device { .. } => state.auth.create_pairing_code_for_device(),
     };
-    match state.auth.create_pairing_code(&session_id) {
-        Ok(pairing) => Json(PairingCodeResponse {
-            request_id: request_id.0,
-            code: pairing.code.expose().to_string(),
-            expires_at: pairing.expires_at,
-        })
-        .into_response(),
-        Err(error) => auth_error_response(error),
+    match result {
+        Ok(pairing) => match audit_admin(
+            &state,
+            &principal,
+            &request_id,
+            "pairing.created",
+            "pairing_code",
+            None,
+            serde_json::json!({"expiresAt":pairing.expires_at}),
+        ) {
+            Ok(()) => Json(PairingCodeResponse {
+                request_id: request_id.0,
+                code: pairing.code.expose().to_string(),
+                expires_at: pairing.expires_at,
+            })
+            .into_response(),
+            Err(response) => *response,
+        },
+        Err(error) => auth_error_response_with_request(error, &request_id.0),
     }
 }
 
@@ -1519,7 +1553,7 @@ async fn exchange_pairing_code(
             token_prefix: device.token_prefix,
         })
         .into_response(),
-        Err(error) => auth_error_response(error),
+        Err(error) => auth_error_response_with_request(error, &request_id.0),
     }
 }
 
@@ -1533,7 +1567,7 @@ async fn list_devices(
             devices,
         })
         .into_response(),
-        Err(error) => auth_error_response(error),
+        Err(error) => auth_error_response_with_request(error, &request_id.0),
     }
 }
 
@@ -1560,7 +1594,7 @@ async fn revoke_device(
             .into_response(),
             Err(response) => *response,
         },
-        Err(error) => auth_error_response(error),
+        Err(error) => auth_error_response_with_request(error, &request_id.0),
     }
 }
 
@@ -1574,7 +1608,7 @@ async fn auth_diagnostics(
             diagnostics: diag,
         })
         .into_response(),
-        Err(error) => auth_error_response(error),
+        Err(error) => auth_error_response_with_request(error, &request_id.0),
     }
 }
 
@@ -2190,6 +2224,10 @@ fn query_error_response(
     code: &'static str,
     status: StatusCode,
 ) -> Response {
+    assert!(
+        rcdvlog_server_core::is_stable_error_code(code),
+        "unregistered HTTP error code: {code}"
+    );
     (
         status,
         Json(ErrorResponse {
@@ -2713,11 +2751,14 @@ struct AdminOverviewResponse {
     backup_available_bytes: Option<u64>,
 }
 
-async fn admin_overview(State(state): State<HttpState>) -> Response {
+async fn admin_overview(
+    State(state): State<HttpState>,
+    Extension(request_id): Extension<RequestId>,
+) -> Response {
     let readiness = state.readiness_gate.evaluate().await;
     let auth = match state.auth.diagnostics() {
         Ok(value) => value,
-        Err(error) => return auth_error_response(error),
+        Err(error) => return auth_error_response_with_request(error, &request_id.0),
     };
     Json(AdminOverviewResponse {
         application_version: APPLICATION_VERSION,
@@ -3516,6 +3557,100 @@ fn job_admin_error(request_id: &RequestId, error: JobEngineError) -> Response {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BackupRequest {
+    idempotency_key: String,
+}
+
+async fn list_admin_backups(
+    State(state): State<HttpState>,
+    Extension(request_id): Extension<RequestId>,
+) -> Response {
+    let manager = state
+        .foundation
+        .catalog()
+        .backups(state.foundation.config().clone());
+    match manager.list_restore_points() {
+        Ok(items) => Json(serde_json::json!({
+            "items": items,
+            "dailyRetention": state.foundation.config().backup_daily_retention,
+            "weeklyRetention": state.foundation.config().backup_weekly_retention,
+        }))
+        .into_response(),
+        Err(error) => backup_admin_error(&request_id, error),
+    }
+}
+
+async fn get_admin_backup(
+    State(state): State<HttpState>,
+    Extension(request_id): Extension<RequestId>,
+    AxumPath(backup_id): AxumPath<String>,
+) -> Response {
+    let manager = state
+        .foundation
+        .catalog()
+        .backups(state.foundation.config().clone());
+    match manager.list_restore_points() {
+        Ok(items) => match items.into_iter().find(|item| {
+            item.manifest
+                .as_ref()
+                .is_some_and(|manifest| manifest.backup_id == backup_id)
+        }) {
+            Some(item) => Json(item).into_response(),
+            None => query_error_response(&request_id, "not_found", StatusCode::NOT_FOUND),
+        },
+        Err(error) => backup_admin_error(&request_id, error),
+    }
+}
+
+async fn request_admin_backup(
+    State(state): State<HttpState>,
+    Extension(request_id): Extension<RequestId>,
+    Extension(principal): Extension<AuthPrincipal>,
+    request: Result<Json<BackupRequest>, JsonRejection>,
+) -> Response {
+    let Json(request) = match request {
+        Ok(request) => request,
+        Err(_) => {
+            return query_error_response(&request_id, "invalid_input", StatusCode::BAD_REQUEST);
+        }
+    };
+    let manager = state
+        .foundation
+        .catalog()
+        .backups(state.foundation.config().clone());
+    let service = rcdvlog_server_core::BackupService::new(manager, state.foundation.jobs());
+    match service.request_backup(&request.idempotency_key) {
+        Ok(job) => match audit_admin(
+            &state,
+            &principal,
+            &request_id,
+            "backup.requested",
+            "backup",
+            None,
+            serde_json::json!({"jobId":job.definition.job_id,"idempotencyKey":request.idempotency_key}),
+        ) {
+            Ok(()) => (StatusCode::ACCEPTED, Json(job)).into_response(),
+            Err(response) => *response,
+        },
+        Err(error) => backup_admin_error(&request_id, error),
+    }
+}
+
+fn backup_admin_error(request_id: &RequestId, error: rcdvlog_server_core::BackupError) -> Response {
+    let status = match &error {
+        rcdvlog_server_core::BackupError::InvalidInput(_) => StatusCode::BAD_REQUEST,
+        rcdvlog_server_core::BackupError::NotFound => StatusCode::NOT_FOUND,
+        rcdvlog_server_core::BackupError::Incompatible(_)
+        | rcdvlog_server_core::BackupError::Verification(_) => StatusCode::CONFLICT,
+        rcdvlog_server_core::BackupError::Canceled
+        | rcdvlog_server_core::BackupError::BusyTimeout => StatusCode::SERVICE_UNAVAILABLE,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    query_error_response(request_id, error.code(), status)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct RepresentationBatchRequest {
     media_object_ids: Vec<MediaObjectId>,
     kind: RepresentationKind,
@@ -4280,6 +4415,87 @@ mod tests {
         let body = json(response).await;
         assert_eq!(body["openapi"], "3.1.0");
         assert!(body["paths"]["/api/v1/auth/bootstrap/exchange"].is_object());
+        assert!(body["paths"]["/api/v1/admin/backups"].is_object());
+        assert!(body["paths"]["/api/v1/admin/backups/{backupId}"].is_object());
+    }
+
+    #[tokio::test]
+    async fn device_cli_auth_errors_preserve_the_caller_request_id() {
+        let fixture = Fixture::new(false);
+        let response = fixture
+            .app()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/admin/overview")
+                    .header(REQUEST_ID_HEADER, "req_cli_fixture")
+                    .header(header::AUTHORIZATION, "Bearer invalid-device-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(response.headers()[REQUEST_ID_HEADER], "req_cli_fixture");
+        let value = json(response).await;
+        assert_eq!(value["code"], "session_invalid");
+        assert_eq!(value["requestId"], "req_cli_fixture");
+    }
+
+    #[tokio::test]
+    async fn device_credentials_can_create_pairing_codes_and_queue_backups() {
+        let fixture = Fixture::new(false);
+        let token = device_auth_token(&fixture);
+        let pairing = fixture
+            .app()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/auth/pairing")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(pairing.status(), StatusCode::OK);
+        let pairing = json(pairing).await;
+        assert!(
+            pairing["code"]
+                .as_str()
+                .is_some_and(|code| !code.is_empty())
+        );
+
+        let backup = fixture
+            .app()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/admin/backups")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"idempotencyKey":"cli-backup-fixture"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(backup.status(), StatusCode::ACCEPTED);
+        let backup = json(backup).await;
+        assert_eq!(backup["definition"]["jobType"], "backup.create.v1");
+
+        let listed = fixture
+            .app()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/admin/backups")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(listed.status(), StatusCode::OK);
+        assert!(json(listed).await["items"].as_array().unwrap().is_empty());
     }
 
     #[tokio::test]

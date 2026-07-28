@@ -12,9 +12,15 @@ path = "src/main.rs"
 anyhow.workspace = true
 clap.workspace = true
 dirs.workspace = true
+keyring = "3.6"
 rcdvlog-core = { path = "../../core/rcdvlog-core" }
+rcdvlog-server-core = { path = "../../core/rcdvlog-server" }
+rcdvlog-sync = { path = "../../core/rcdvlog-sync" }
+reqwest = { version = "0.12", features = ["blocking", "json"] }
 serde.workspace = true
 serde_json.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 rusqlite.workspace = true

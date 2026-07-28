@@ -11,6 +11,8 @@ use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+mod server_commands;
+
 #[derive(Debug, Parser)]
 #[command(
     name = "rcdvlog",
@@ -75,6 +77,13 @@ enum Commands {
     Thumbnails {
         #[command(subcommand)]
         command: ThumbnailCommand,
+    },
+    /// Inspect or operate the authenticated companion server.
+    Server {
+        #[command(flatten)]
+        connection: server_commands::ServerConnectionArgs,
+        #[command(subcommand)]
+        command: server_commands::ServerCommand,
     },
 }
 
@@ -215,6 +224,10 @@ struct DesktopContext {
     last_project_id: Option<String>,
     last_asset_id: Option<String>,
     last_context_updated_at: Option<String>,
+    paired_server_node_id: Option<String>,
+    paired_server_endpoint: Option<String>,
+    paired_server_label: Option<String>,
+    paired_at: Option<String>,
 }
 
 fn desktop_settings_path() -> Result<PathBuf> {
@@ -281,11 +294,19 @@ fn command_name(command: &Commands) -> &'static str {
             ThumbnailCommand::Generate { .. } => "thumbnails.generate",
             ThumbnailCommand::Missing { .. } => "thumbnails.missing",
         },
+        Commands::Server { command, .. } => server_commands::command_name(command),
     }
 }
 
 fn execute(cli: &Cli) -> Result<Value> {
     let catalog_path = selected_catalog(cli)?;
+    if let Commands::Server {
+        connection,
+        command,
+    } = &cli.command
+    {
+        return server_commands::execute(connection, command, &catalog_path);
+    }
     if matches!(cli.command, Commands::Doctor) {
         return Ok(json!({
             "catalog": catalog_path,
@@ -301,6 +322,13 @@ fn execute(cli: &Cli) -> Result<Value> {
             "projectId": context.last_project_id,
             "assetId": context.last_asset_id,
             "updatedAt": context.last_context_updated_at,
+            "serverPairing": {
+                "paired": context.paired_server_node_id.is_some(),
+                "nodeId": context.paired_server_node_id,
+                "endpoint": context.paired_server_endpoint,
+                "label": context.paired_server_label,
+                "pairedAt": context.paired_at,
+            },
         }));
     }
     if matches!(cli.command, Commands::Catalog { .. }) {
@@ -443,6 +471,7 @@ fn execute(cli: &Cli) -> Result<Value> {
                 catalog.generate_missing_thumbnails(project, *quality)?,
             )?),
         },
+        Commands::Server { .. } => unreachable!(),
     }
 }
 
@@ -838,11 +867,16 @@ fn main() -> ExitCode {
         }
         Err(error) => {
             let message = format!("{error:#}");
+            let remote = error.downcast_ref::<server_commands::RemoteCommandError>();
             write_json(
                 &json!({
                     "ok": false,
                     "command": name,
-                    "error": { "code": error_code(&message), "message": message }
+                    "error": {
+                        "code": remote.map(|error| error.code.as_str()).unwrap_or_else(|| error_code(&message)),
+                        "message": message,
+                        "requestId": remote.and_then(|error| error.request_id.as_deref()),
+                    }
                 }),
                 cli.pretty,
                 true,
@@ -1115,5 +1149,45 @@ mod tests {
         assert_eq!(error_code("database locked"), "internal_error");
         assert!(Cli::try_parse_from(["rcdvlog", "clips", "list"]).is_err());
         assert!(Cli::try_parse_from(["rcdvlog", "project", "status"]).is_err());
+    }
+
+    #[test]
+    fn server_command_families_have_stable_noninteractive_clap_shapes() {
+        for suffix in [
+            vec!["status"],
+            vec!["projects", "--limit", "10"],
+            vec!["library", "list"],
+            vec!["library", "diagnose", "--media-object", "media_1"],
+            vec!["storage", "list"],
+            vec!["storage", "diagnose", "--root", "root_1"],
+            vec!["scans", "list"],
+            vec!["jobs", "diagnose", "--job", "job_1"],
+            vec!["sync", "status"],
+            vec!["representations", "status", "--representation", "rep_1"],
+            vec!["credentials", "list"],
+            vec!["backups", "diagnose", "--backup", "backup_1"],
+        ] {
+            let mut arguments = vec![
+                "rcdvlog",
+                "server",
+                "--endpoint",
+                "https://server.example.test",
+                "--credential-file",
+                "/tmp/credential",
+            ];
+            arguments.extend(suffix);
+            assert!(Cli::try_parse_from(arguments).is_ok());
+        }
+        assert!(
+            Cli::try_parse_from([
+                "rcdvlog",
+                "server",
+                "--endpoint",
+                "https://server.example.test",
+                "status"
+            ])
+            .is_ok()
+        );
+        assert!(Cli::try_parse_from(["rcdvlog", "server", "status"]).is_err());
     }
 }

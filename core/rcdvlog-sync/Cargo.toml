@@ -8,6 +8,7 @@ license.workspace = true
 anyhow.workspace = true
 blake3.workspace = true
 chrono.workspace = true
+fs2.workspace = true
 rcdvlog-core = { path = "../rcdvlog-core" }
 rusqlite.workspace = true
 serde.workspace = true

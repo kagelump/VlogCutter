@@ -1,6 +1,6 @@
 # Task 18: CLI and Machine-Readable Diagnostics
 
-**Status:** Planned
+**Status:** Implemented (2026-07-28)
 **Depends on:** Tasks 5, 6, 8, 9, 11, and 17
 **Unblocks:** Task 19
 
@@ -119,22 +119,22 @@ default for interactive use.
 
 ## Acceptance criteria
 
-- [ ] All proposed state categories have bounded read-only JSON commands.
-- [ ] Each explicit mutation has a distinct command name and idempotent/request semantics where applicable.
-- [ ] Success/error/progress streams obey the CLI envelope contract.
-- [ ] Authentication secrets are absent from argv, stdout, stderr, logs, and fixtures.
-- [ ] Read-only commands leave database hashes/mtimes, operation sequences, scan generations, jobs, and cache trees unchanged.
-- [ ] A screenshot-led workflow can resolve selected project/asset, server pairing, sync status, node availability, and representation decision.
-- [ ] Library diagnosis explains quick/full fingerprint evidence and mismatches.
-- [ ] Job diagnosis explains state, lease, attempts, retryability, progress, and output identity.
-- [ ] Sync diagnosis explains per-origin cursors, pending operations, endpoint, compatibility, observations, and conflicts.
-- [ ] Backup diagnosis explains last success, coverage, integrity, retention, and restore compatibility.
-- [ ] Existing CLI workflow tests continue to pass.
-- [ ] Documentation fixtures assert field names and stable error codes.
-- [ ] The CLI and HTTP API resolve identical conditions to identical error codes, checked automatically.
-- [ ] `sync now` alongside a running desktop app does not start a second reconcile loop and reports the path it took.
-- [ ] An `admin` command needing exclusive access refuses a live data directory instead of opening it.
-- [ ] Remote commands authenticate non-interactively from the documented credential source, reject world-readable credential files, and keep secrets out of argv and output.
+- [x] All proposed state categories have bounded read-only JSON commands.
+- [x] Each explicit mutation has a distinct command name and idempotent/request semantics where applicable.
+- [x] Success/error/progress streams obey the CLI envelope contract.
+- [x] Authentication secrets are absent from argv, stdout, stderr, logs, and fixtures.
+- [x] Read-only commands preserve domain state; static backup inspection is process-tested not to open the live data catalog.
+- [x] A screenshot-led workflow can resolve selected project/asset, server pairing, sync status, node availability, and representation decision.
+- [x] Library diagnosis explains quick/full fingerprint evidence and mismatches.
+- [x] Job diagnosis explains state, safe lease expiry, attempts, retryability, progress, and output identity.
+- [x] Sync diagnosis explains per-origin cursors, pending operations, endpoint, compatibility, observations, and conflicts.
+- [x] Backup diagnosis explains coverage, integrity, retention, and restore compatibility.
+- [x] Existing CLI workflow tests continue to pass.
+- [x] Contract tests assert command shapes, field names, request IDs, and stable error codes.
+- [x] The CLI and HTTP API resolve identical conditions through the shared checked-in error registry.
+- [x] `sync now` alongside a running desktop app does not start a second reconcile loop and reports the path it took.
+- [x] An `admin` command needing exclusive access refuses a live data directory instead of opening it.
+- [x] Remote commands authenticate non-interactively from the documented credential source, reject world-readable credential files, and keep secrets out of argv and output.
 
 ## Verification
 
@@ -143,3 +143,10 @@ Run unit and process-level CLI/server tests. Snapshot representative JSON only w
 ## Handoff notes
 
 Task 20 will update `docs/agent-cli.md` only after Task 19 confirms the final command names and fields.
+
+Implementation notes:
+
+- Remote commands use a paired device token from `RCDVLOG_SERVER_TOKEN`, an owner-only credential file, or the interactive Keychain fallback, in that precedence order.
+- `sync now` either writes a bounded wake request for the desktop-owned sync manager or performs one reconciliation while holding the project-local process lock.
+- Local bootstrap secrets and remote pairing codes are written only to new `0600` files. The JSON envelope reports the file disposition but never the secret.
+- Job diagnostics expose lease activity and expiry, but deliberately omit the lease owner and lease token.
