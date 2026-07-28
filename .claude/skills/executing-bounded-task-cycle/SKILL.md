@@ -477,7 +477,7 @@ worth a pre-emptive broadcast the moment it's about to write one.
 
 Distinct from step 13 and from every per-cycle report: this runs once, when
 the *entire* epic promotes — every wave merged, every queue row `complete`,
-exit-gate evidence attached per [ORCHESTRATION.md](../../../planning/ORCHESTRATION.md#9-definition-of-complete)
+exit-gate evidence attached per the calling repo's ORCHESTRATION.md §9 definition-of-complete
 if the calling repo has one. Not after a wave; a wave completing is not an
 epic completing.
 

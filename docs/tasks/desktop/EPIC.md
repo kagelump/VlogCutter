@@ -82,7 +82,7 @@ flat table of per-camera filename offsets. This epic rebalances that.
 | Order | Task | Title | Depends on | Status |
 | ---: | --- | --- | --- | --- |
 | 10 | [D01-T001](tasks/D01-T001-verification-baseline-audit.md) | Verification baseline audit | — | complete |
-| 20 | [D01-T002](tasks/D01-T002-fix-baseline-gate-defects.md) | Fix baseline gate defects | D01-T001 | ready |
+| 20 | [D01-T002](tasks/D01-T002-fix-baseline-gate-defects.md) | Fix baseline gate defects | D01-T001 | complete |
 | 30 | [D01-T003](tasks/D01-T003-desktop-frontend-testability-seam.md) | Desktop frontend testability seam | D01-T002 | ready |
 | 40 | [D01-T004](tasks/D01-T004-github-actions-ci.md) | GitHub Actions CI with macOS native build | D01-T003 | ready |
 | 50 | [D01-T005](tasks/D01-T005-native-desktop-smoke-acceptance.md) | Native macOS desktop smoke acceptance | D01-T004 | ready |

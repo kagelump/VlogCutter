@@ -7,7 +7,7 @@
   "epic_id": "D01",
   "title": "Fix baseline gate defects",
   "slug": "fix-baseline-gate-defects",
-  "status": "ready",
+  "status": "complete",
   "task_class": "implementation",
   "depends_on": ["D01-T001"],
   "principal_invariant": "Every command classified real_defect in the baseline audit exits zero, with no gate command that previously passed regressing.",
