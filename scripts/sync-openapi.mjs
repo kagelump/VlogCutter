@@ -29,6 +29,12 @@ export const API_PATHS = {
   projectAssets: "/api/v1/projects/{projectId}/assets",
   previewAddToProject: "/api/v1/projects/{projectId}/assets/add/preview",
   addToProject: "/api/v1/projects/{projectId}/assets/add",
+  projectReviewAsset: "/api/v1/projects/{projectId}/assets/{assetId}/review",
+  createReviewNote: "/api/v1/projects/{projectId}/assets/{assetId}/notes",
+  addReviewLabel: "/api/v1/projects/{projectId}/assets/{assetId}/labels/add",
+  removeReviewLabel: "/api/v1/projects/{projectId}/assets/{assetId}/labels/remove",
+  setReviewRemoved: "/api/v1/projects/{projectId}/assets/{assetId}/removed",
+  setReviewRotation: "/api/v1/projects/{projectId}/assets/{assetId}/rotation",
 } as const;
 `;
 const schemaPath = resolve(root, "packages/project-client/openapi.json");

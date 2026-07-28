@@ -103,6 +103,27 @@ export interface ProjectAssetItem {
 }
 export interface ProjectAssetPage { items: ProjectAssetItem[]; nextCursor: string | null }
 
+export interface ReviewRepresentation {
+  representationId: string;
+  state: string;
+  availableOnServer: boolean;
+}
+
+export interface ProjectReviewAsset extends ProjectAssetItem {
+  materializedRevision: number;
+  activeNoteRevisionId: string | null;
+  noteRevisionCount: number;
+  proxy: ReviewRepresentation | null;
+  thumbnail: ReviewRepresentation | null;
+  originalAvailability: NodeAvailabilityState | null;
+  unresolvedConflictCount: number;
+}
+
+export interface ReviewMutationResult {
+  asset: ProjectReviewAsset;
+  staleBaseRevision: boolean;
+}
+
 export interface AddToProjectRequest {
   mediaObjectIds: string[];
   acknowledgeUnverified: boolean;
@@ -155,6 +176,12 @@ export interface BrowserProjectClient extends ProjectClient {
   listLibraryMedia(query?: LibraryQueryParams): Promise<LibrarySearchPage>;
   listProjects(limit?: number, after?: string): Promise<ProjectPage>;
   listProjectAssets(projectId: string, limit?: number, after?: string, search?: string): Promise<ProjectAssetPage>;
+  getProjectReviewAsset(projectId: string, assetId: string): Promise<ProjectReviewAsset>;
+  createReviewNote(projectId: string, assetId: string, text: string, baseRevision: number): Promise<ReviewMutationResult>;
+  addReviewLabel(projectId: string, assetId: string, label: string, baseRevision: number): Promise<ReviewMutationResult>;
+  removeReviewLabel(projectId: string, assetId: string, label: string, baseRevision: number): Promise<ReviewMutationResult>;
+  setReviewRemoved(projectId: string, assetId: string, removed: boolean, baseRevision: number): Promise<ReviewMutationResult>;
+  setReviewRotation(projectId: string, assetId: string, rotationDegrees: number, baseRevision: number): Promise<ReviewMutationResult>;
   previewAddToProject(projectId: string, request: AddToProjectRequest): Promise<AddToProjectPreview>;
   addToProject(projectId: string, request: AddToProjectRequest): Promise<AddToProjectResult>;
 }

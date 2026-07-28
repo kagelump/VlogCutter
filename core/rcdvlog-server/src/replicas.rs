@@ -5,8 +5,9 @@ use crate::{
 use chrono::{SecondsFormat, Utc};
 use rcdvlog_core::{
     Asset, Catalog, GlobalMediaVerificationState, MediaObjectId, MediaVerificationState,
-    NormalizedMediaProbe, OperationId, PROJECT_ASSET_MEDIA_LINKED, ProjectAssetAddedPayload,
-    ProjectAssetId, ProjectAssetPage, ProjectId,
+    NodeAvailabilityState, NormalizedMediaProbe, OperationId, PROJECT_ASSET_MEDIA_LINKED,
+    ProjectAssetAddedPayload, ProjectAssetId, ProjectAssetItem, ProjectAssetPage, ProjectId,
+    RepresentationId,
 };
 use rcdvlog_sync::{
     BASELINE_VERSION, BaselineEnvelope, BaselinePreview, ReconcileRequest, ReconcileResponse,
@@ -143,6 +144,35 @@ pub struct AddToProjectResult {
     pub already_member_count: usize,
     pub blocked_count: usize,
     pub items: Vec<AddToProjectItem>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewRepresentation {
+    pub representation_id: RepresentationId,
+    pub state: String,
+    pub available_on_server: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectReviewAsset {
+    #[serde(flatten)]
+    pub asset: ProjectAssetItem,
+    pub materialized_revision: u64,
+    pub active_note_revision_id: Option<String>,
+    pub note_revision_count: usize,
+    pub proxy: Option<ReviewRepresentation>,
+    pub thumbnail: Option<ReviewRepresentation>,
+    pub original_availability: Option<NodeAvailabilityState>,
+    pub unresolved_conflict_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewMutationResult {
+    pub asset: ProjectReviewAsset,
+    pub stale_base_revision: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -373,6 +403,214 @@ impl ProjectReplicaManager {
         catalog
             .list_project_asset_page(project_id, limit, after, search)
             .map_err(ProjectReplicaError::Infrastructure)
+    }
+
+    pub fn get_review_asset(
+        &self,
+        project_id: &str,
+        asset_id: &str,
+    ) -> Result<ProjectReviewAsset, ProjectReplicaError> {
+        let catalog = self.open_catalog(project_id)?;
+        let asset = catalog
+            .get_asset(asset_id)
+            .map_err(ProjectReplicaError::Infrastructure)?;
+        if asset.project_id != project_id {
+            return Err(ProjectReplicaError::NotFound {
+                project_id: project_id.to_string(),
+            });
+        }
+        let revisions = catalog
+            .asset_revision_diagnostics(asset_id)
+            .map_err(ProjectReplicaError::Infrastructure)?;
+        let unresolved_conflict_count = catalog
+            .operation_diagnostics(project_id)
+            .map_err(ProjectReplicaError::Infrastructure)?
+            .unresolved_conflicts
+            .into_iter()
+            .filter(|conflict| conflict.aggregate_id == asset_id)
+            .count();
+        let (proxy, thumbnail, original_availability) =
+            if let Some(media_object_id) = &asset.media_object_id {
+                (
+                    self.current_review_representation(
+                        media_object_id,
+                        "proxy",
+                        crate::PROXY_RECIPE_KEY,
+                    )?,
+                    self.current_review_representation(
+                        media_object_id,
+                        "thumbnail",
+                        crate::THUMBNAIL_RECIPE_KEY,
+                    )?,
+                    self.control
+                        .storage_library()
+                        .media_availability(
+                            &MediaObjectId::parse(media_object_id).map_err(|error| {
+                                ProjectReplicaError::InvalidBaseline(error.to_string())
+                            })?,
+                            self.control.node_id(),
+                        )
+                        .ok()
+                        .map(|availability| availability.state),
+                )
+            } else {
+                (None, None, None)
+            };
+        Ok(ProjectReviewAsset {
+            asset: ProjectAssetItem {
+                project_asset_id: asset.id,
+                filename: asset.filename,
+                camera: asset.camera,
+                media_object_id: asset.media_object_id,
+                media_verification_state: asset.media_verification_state.as_str().to_string(),
+                removed: asset.removed,
+                rotation_degrees: i32::from(asset.rotation_degrees),
+                labels: asset.labels,
+                active_note: (!asset.notes.is_empty()).then_some(asset.notes),
+                duration_seconds: asset.duration_seconds,
+                best_time: asset.best_time,
+            },
+            materialized_revision: revisions.materialized_revision,
+            active_note_revision_id: revisions
+                .note_revisions
+                .iter()
+                .find(|revision| revision.active)
+                .map(|revision| revision.revision_id.clone()),
+            note_revision_count: revisions.note_revisions.len(),
+            proxy,
+            thumbnail,
+            original_availability,
+            unresolved_conflict_count,
+        })
+    }
+
+    pub fn create_review_note(
+        &self,
+        project_id: &str,
+        asset_id: &str,
+        text: &str,
+        base_revision: u64,
+    ) -> Result<ReviewMutationResult, ProjectReplicaError> {
+        if text.len() > 100_000 {
+            return Err(ProjectReplicaError::InvalidBaseline(
+                "note must not exceed 100000 bytes".to_string(),
+            ));
+        }
+        self.review_mutation(project_id, asset_id, base_revision, |catalog| {
+            catalog.create_note_revision(asset_id, text)
+        })
+    }
+
+    pub fn add_review_label(
+        &self,
+        project_id: &str,
+        asset_id: &str,
+        label: &str,
+        base_revision: u64,
+    ) -> Result<ReviewMutationResult, ProjectReplicaError> {
+        self.review_mutation(project_id, asset_id, base_revision, |catalog| {
+            catalog.add_label(asset_id, label)
+        })
+    }
+
+    pub fn remove_review_label(
+        &self,
+        project_id: &str,
+        asset_id: &str,
+        label: &str,
+        base_revision: u64,
+    ) -> Result<ReviewMutationResult, ProjectReplicaError> {
+        self.review_mutation(project_id, asset_id, base_revision, |catalog| {
+            catalog.remove_label(asset_id, label)
+        })
+    }
+
+    pub fn set_review_removed(
+        &self,
+        project_id: &str,
+        asset_id: &str,
+        removed: bool,
+        base_revision: u64,
+    ) -> Result<ReviewMutationResult, ProjectReplicaError> {
+        self.review_mutation(project_id, asset_id, base_revision, |catalog| {
+            catalog.set_removed(asset_id, removed)
+        })
+    }
+
+    pub fn set_review_rotation(
+        &self,
+        project_id: &str,
+        asset_id: &str,
+        rotation_degrees: u16,
+        base_revision: u64,
+    ) -> Result<ReviewMutationResult, ProjectReplicaError> {
+        self.review_mutation(project_id, asset_id, base_revision, |catalog| {
+            catalog.set_rotation(asset_id, rotation_degrees)
+        })
+    }
+
+    fn review_mutation(
+        &self,
+        project_id: &str,
+        asset_id: &str,
+        base_revision: u64,
+        mutate: impl FnOnce(&Catalog) -> anyhow::Result<Asset>,
+    ) -> Result<ReviewMutationResult, ProjectReplicaError> {
+        let before = self.get_review_asset(project_id, asset_id)?;
+        let catalog = self.open_catalog(project_id)?;
+        mutate(&catalog).map_err(|error| {
+            if error.to_string().starts_with("invalid") {
+                ProjectReplicaError::InvalidBaseline(error.to_string())
+            } else {
+                ProjectReplicaError::Infrastructure(error)
+            }
+        })?;
+        Ok(ReviewMutationResult {
+            stale_base_revision: base_revision != before.materialized_revision,
+            asset: self.get_review_asset(project_id, asset_id)?,
+        })
+    }
+
+    fn current_review_representation(
+        &self,
+        media_object_id: &str,
+        kind: &str,
+        recipe_key: &str,
+    ) -> Result<Option<ReviewRepresentation>, ProjectReplicaError> {
+        let connection = open_read_only_connection(self.control.database_path())
+            .map_err(ProjectReplicaError::Infrastructure)?;
+        let row = connection
+            .query_row(
+                r#"
+                SELECT r.representation_id, r.state,
+                       EXISTS(
+                           SELECT 1 FROM representation_locations l
+                           WHERE l.representation_id = r.representation_id
+                             AND l.node_id = ?4 AND l.state = 'available'
+                       )
+                FROM representations r
+                WHERE r.media_object_id = ?1 AND r.kind = ?2 AND r.recipe_key = ?3
+                ORDER BY r.completed_at DESC, r.created_at DESC, r.representation_id ASC
+                LIMIT 1
+                "#,
+                params![
+                    media_object_id,
+                    kind,
+                    recipe_key,
+                    self.control.node_id().as_str()
+                ],
+                |row| Ok((row.get::<_, String>(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        row.map(|(id, state, available_on_server)| {
+            Ok(ReviewRepresentation {
+                representation_id: RepresentationId::parse(id)
+                    .map_err(|error| ProjectReplicaError::InvalidBaseline(error.to_string()))?,
+                state,
+                available_on_server,
+            })
+        })
+        .transpose()
     }
 
     pub fn preview_add_to_project(
@@ -1202,6 +1440,77 @@ mod tests {
             item.media_object_id.as_str() == "media_add_mismatch"
                 && item.disposition == AddToProjectDisposition::IdentityMismatch
         }));
+    }
+
+    #[test]
+    fn review_commands_return_canonical_state_and_stale_notes_still_commit() {
+        let fixture = Fixture::new();
+        let source_root = TempDir::new().unwrap();
+        let envelope = baseline(&source_root);
+        let project_id = envelope.payload.project.project_id.clone();
+        fixture.manager.import_baseline(&envelope).unwrap();
+
+        let before = fixture
+            .manager
+            .get_review_asset(&project_id, "asset_desktop")
+            .unwrap();
+        let note = fixture
+            .manager
+            .create_review_note(
+                &project_id,
+                "asset_desktop",
+                "Web revision",
+                before.materialized_revision.saturating_sub(1),
+            )
+            .unwrap();
+        assert!(note.stale_base_revision);
+        assert_eq!(
+            note.asset.asset.active_note.as_deref(),
+            Some("Web revision")
+        );
+        assert!(note.asset.note_revision_count >= 2);
+
+        let label = fixture
+            .manager
+            .add_review_label(
+                &project_id,
+                "asset_desktop",
+                "arrival",
+                note.asset.materialized_revision,
+            )
+            .unwrap();
+        assert!(!label.stale_base_revision);
+        assert_eq!(label.asset.asset.labels, vec!["arrival"]);
+        let rotated = fixture
+            .manager
+            .set_review_rotation(
+                &project_id,
+                "asset_desktop",
+                90,
+                label.asset.materialized_revision,
+            )
+            .unwrap();
+        assert_eq!(rotated.asset.asset.rotation_degrees, 90);
+        let removed = fixture
+            .manager
+            .set_review_removed(
+                &project_id,
+                "asset_desktop",
+                true,
+                rotated.asset.materialized_revision,
+            )
+            .unwrap();
+        assert!(removed.asset.asset.removed);
+        let restored = fixture
+            .manager
+            .remove_review_label(
+                &project_id,
+                "asset_desktop",
+                "arrival",
+                removed.asset.materialized_revision,
+            )
+            .unwrap();
+        assert!(restored.asset.asset.labels.is_empty());
     }
 
     /// A registered replica with `count` portable assets named

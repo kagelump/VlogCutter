@@ -64,7 +64,8 @@ pub use rcdvlog_core::StorageAccessMode;
 pub use replicas::{
     AddToProjectDisposition, AddToProjectItem, AddToProjectPreview, AddToProjectRequest,
     AddToProjectResult, MAX_ADD_TO_PROJECT_ITEMS, ProjectPage, ProjectReplica, ProjectReplicaError,
-    ProjectReplicaManager, ProjectSummary,
+    ProjectReplicaManager, ProjectReviewAsset, ProjectSummary, ReviewMutationResult,
+    ReviewRepresentation,
 };
 pub use representations::{
     PROXY_RECIPE_KEY, Representation, RepresentationError, RepresentationJobHandler,

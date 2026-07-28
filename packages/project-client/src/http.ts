@@ -9,7 +9,9 @@ import {
   type LibrarySearchPage,
   type LoginResult,
   type ProjectAssetPage,
+  type ProjectReviewAsset,
   type ProjectPage,
+  type ReviewMutationResult,
   type ServerReadiness,
   type ServerStatus,
   type ServerVersion,
@@ -112,6 +114,30 @@ export class HttpProjectClient implements BrowserProjectClient {
     return this.request<ProjectAssetPage>(`${path}${queryString({ limit, after, search })}`);
   }
 
+  async getProjectReviewAsset(projectId: string, assetId: string): Promise<ProjectReviewAsset> {
+    return this.request<ProjectReviewAsset>(reviewPath(API_PATHS.projectReviewAsset, projectId, assetId));
+  }
+
+  async createReviewNote(projectId: string, assetId: string, text: string, baseRevision: number): Promise<ReviewMutationResult> {
+    return this.request<ReviewMutationResult>(reviewPath(API_PATHS.createReviewNote, projectId, assetId), jsonPost({ text, baseRevision }));
+  }
+
+  async addReviewLabel(projectId: string, assetId: string, label: string, baseRevision: number): Promise<ReviewMutationResult> {
+    return this.request<ReviewMutationResult>(reviewPath(API_PATHS.addReviewLabel, projectId, assetId), jsonPost({ label, baseRevision }));
+  }
+
+  async removeReviewLabel(projectId: string, assetId: string, label: string, baseRevision: number): Promise<ReviewMutationResult> {
+    return this.request<ReviewMutationResult>(reviewPath(API_PATHS.removeReviewLabel, projectId, assetId), jsonPost({ label, baseRevision }));
+  }
+
+  async setReviewRemoved(projectId: string, assetId: string, removed: boolean, baseRevision: number): Promise<ReviewMutationResult> {
+    return this.request<ReviewMutationResult>(reviewPath(API_PATHS.setReviewRemoved, projectId, assetId), jsonPost({ removed, baseRevision }));
+  }
+
+  async setReviewRotation(projectId: string, assetId: string, rotationDegrees: number, baseRevision: number): Promise<ReviewMutationResult> {
+    return this.request<ReviewMutationResult>(reviewPath(API_PATHS.setReviewRotation, projectId, assetId), jsonPost({ rotationDegrees, baseRevision }));
+  }
+
   async previewAddToProject(projectId: string, request: AddToProjectRequest): Promise<AddToProjectPreview> {
     return this.request<AddToProjectPreview>(
       API_PATHS.previewAddToProject.replace("{projectId}", encodeURIComponent(projectId)),
@@ -156,6 +182,12 @@ export class HttpProjectClient implements BrowserProjectClient {
 
 function jsonPost(body: unknown): RequestInit {
   return { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) };
+}
+
+function reviewPath(template: string, projectId: string, assetId: string): string {
+  return template
+    .replace("{projectId}", encodeURIComponent(projectId))
+    .replace("{assetId}", encodeURIComponent(assetId));
 }
 
 function queryString(values: object): string {

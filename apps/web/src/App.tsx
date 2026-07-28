@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type FormEvent } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import {
   ProjectClientError,
   type AddToProjectPreview,
@@ -6,6 +6,8 @@ import {
   type LibrarySearchItem,
   type LibrarySort,
   type ProjectAssetItem,
+  type ProjectReviewAsset,
+  type ReviewMutationResult,
   type ProjectSummary,
   type ServerStatus,
   type SessionState,
@@ -272,11 +274,203 @@ function ProjectsView({ client, navigate }: { client: BrowserProjectClient; navi
 function ProjectAssetsView({ client, projectId }: { client: BrowserProjectClient; projectId: string }) {
   const [assets, setAssets] = useState<ProjectAssetItem[]>([]);
   const [search, setSearch] = useState("");
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [review, setReview] = useState<ProjectReviewAsset | null>(null);
+  const [noteDraft, setNoteDraft] = useState("");
+  const [labelDraft, setLabelDraft] = useState("");
+  const [syncState, setSyncState] = useState<"synced" | "saving" | "conflict">("synced");
+  const [staleNote, setStaleNote] = useState(false);
+  const [playbackError, setPlaybackError] = useState<"session" | "media" | null>(null);
   const [error, setError] = useState<ProjectClientError | null>(null);
-  useEffect(() => { client.listProjectAssets(projectId, 100, undefined, search || undefined).then((page) => setAssets(page.items)).catch((reason) => setError(normalizeError(reason))); }, [client, projectId, search]);
-  return <section className="workspace-page"><div className="page-heading"><div><p className="eyebrow">Project / {projectId}</p><h1>Project assets</h1></div><label className="project-search">Search this project<input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Filename, camera, note, label" /></label></div>
-    {error ? <InlineError error={error} /> : null}<div className="asset-table" role="list">{assets.map((asset) => <article role="listitem" key={asset.projectAssetId}><div><strong>{asset.filename}</strong><span>{asset.camera || "Camera unknown"}</span></div><span>{asset.labels.join(", ") || "No labels"}</span><span>{asset.activeNote || "No note"}</span><StatusBadge label={asset.mediaVerificationState} tone={asset.mediaVerificationState === "verified" ? "positive" : "warning"} /></article>)}</div>
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const searchRef = useRef<HTMLInputElement>(null);
+  const labelRef = useRef<HTMLInputElement>(null);
+  const noteRef = useRef<HTMLTextAreaElement>(null);
+
+  const loadAssets = useCallback(async () => {
+    try {
+      const page = await client.listProjectAssets(projectId, 100, undefined, search || undefined);
+      setAssets(page.items);
+      setSelectedId((current) => current && page.items.some((asset) => asset.projectAssetId === current) ? current : page.items[0]?.projectAssetId ?? null);
+      setError(null);
+    } catch (reason) { setError(normalizeError(reason)); }
+  }, [client, projectId, search]);
+
+  const loadReview = useCallback(async (assetId: string) => {
+    try {
+      const asset = await client.getProjectReviewAsset(projectId, assetId);
+      setReview(asset);
+      setNoteDraft(asset.activeNote ?? "");
+      setSyncState(asset.unresolvedConflictCount ? "conflict" : "synced");
+      setPlaybackError(null);
+      setError(null);
+    } catch (reason) { setError(normalizeError(reason)); }
+  }, [client, projectId]);
+
+  useEffect(() => { void loadAssets(); }, [loadAssets]);
+  useEffect(() => {
+    if (selectedId) void loadReview(selectedId);
+    else setReview(null);
+  }, [loadReview, selectedId]);
+
+  useEffect(() => {
+    if (!selectedId || typeof WebSocket === "undefined") return;
+    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+    const socket = new WebSocket(`${protocol}//${window.location.host}/api/v1/ws/events`);
+    socket.addEventListener("open", () => socket.send(JSON.stringify({ type: "subscribe", projectId })));
+    socket.addEventListener("message", () => { void loadAssets(); void loadReview(selectedId); });
+    return () => socket.close();
+  }, [loadAssets, loadReview, projectId, selectedId]);
+
+  const selectedIndex = assets.findIndex((asset) => asset.projectAssetId === selectedId);
+  const move = useCallback((delta: number) => {
+    if (!assets.length) return;
+    const next = Math.min(assets.length - 1, Math.max(0, selectedIndex + delta));
+    setSelectedId(assets[next]?.projectAssetId ?? null);
+  }, [assets, selectedIndex]);
+
+  const mutate = useCallback(async (
+    optimistic: (asset: ProjectReviewAsset) => ProjectReviewAsset,
+    command: (baseRevision: number) => Promise<ReviewMutationResult>,
+  ) => {
+    if (!review || syncState === "saving") return;
+    const before = review;
+    const optimisticAsset = optimistic(before);
+    setReview(optimisticAsset);
+    setAssets((current) => current.map((asset) => asset.projectAssetId === before.projectAssetId ? optimisticAsset : asset));
+    setSyncState("saving");
+    setError(null);
+    try {
+      const result = await command(before.materializedRevision);
+      setReview((current) => current?.projectAssetId === result.asset.projectAssetId ? result.asset : current);
+      setAssets((current) => current.map((asset) => asset.projectAssetId === result.asset.projectAssetId ? result.asset : asset));
+      if (selectedId === result.asset.projectAssetId) setNoteDraft(result.asset.activeNote ?? "");
+      setStaleNote(result.staleBaseRevision);
+      setSyncState(result.asset.unresolvedConflictCount ? "conflict" : "synced");
+    } catch (reason) {
+      setReview((current) => current?.projectAssetId === before.projectAssetId ? before : current);
+      setAssets((current) => current.map((asset) => asset.projectAssetId === before.projectAssetId ? before : asset));
+      setSyncState(before.unresolvedConflictCount ? "conflict" : "synced");
+      setError(normalizeError(reason));
+    }
+  }, [review, selectedId, syncState]);
+
+  const toggleRemoved = useCallback(() => {
+    if (!review || syncState === "saving") return;
+    void mutate(
+      (asset) => ({ ...asset, removed: !asset.removed }),
+      (base) => client.setReviewRemoved(projectId, review.projectAssetId, !review.removed, base),
+    );
+  }, [client, mutate, projectId, review, syncState]);
+
+  useEffect(() => {
+    const handler = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null;
+      const editing = target?.matches("input, textarea, select, [contenteditable='true']");
+      if (event.key === "Escape" && editing) {
+        event.preventDefault();
+        target?.blur();
+        setNoteDraft(review?.activeNote ?? "");
+        return;
+      }
+      if (editing || event.metaKey || event.ctrlKey || event.altKey) return;
+      if (event.key === "j" || event.key === "J" || event.key === "ArrowRight") { event.preventDefault(); move(1); }
+      else if (event.key === "k" || event.key === "K" || event.key === "ArrowLeft") { event.preventDefault(); move(-1); }
+      else if (event.key === " ") { event.preventDefault(); const video = videoRef.current; if (video) void (video.paused ? video.play() : Promise.resolve(video.pause())); }
+      else if (event.key === "l" || event.key === "L") { event.preventDefault(); labelRef.current?.focus(); }
+      else if (event.key === "n" || event.key === "N") { event.preventDefault(); noteRef.current?.focus(); }
+      else if (event.key === "r" || event.key === "R") { event.preventDefault(); toggleRemoved(); }
+      else if (event.key === "/") { event.preventDefault(); searchRef.current?.focus(); }
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [move, review?.activeNote, toggleRemoved]);
+
+  async function diagnosePlaybackFailure() {
+    try {
+      const session = await client.getSession();
+      setPlaybackError(session.authenticated ? "media" : "session");
+    } catch { setPlaybackError("media"); }
+  }
+
+  function saveNote(event?: FormEvent) {
+    event?.preventDefault();
+    if (!review) return;
+    void mutate(
+      (asset) => ({ ...asset, activeNote: noteDraft || null }),
+      (base) => client.createReviewNote(projectId, review.projectAssetId, noteDraft, base),
+    );
+  }
+
+  function addLabel(event: FormEvent) {
+    event.preventDefault();
+    const label = labelDraft.trim();
+    if (!review || !label || review.labels.includes(label)) return;
+    setLabelDraft("");
+    void mutate(
+      (asset) => ({ ...asset, labels: [...asset.labels, label].sort() }),
+      (base) => client.addReviewLabel(projectId, review.projectAssetId, label, base),
+    );
+  }
+
+  const proxyReady = review?.proxy?.state === "available" && review.proxy.availableOnServer;
+  const poster = review?.thumbnail?.state === "available" && review.thumbnail.availableOnServer
+    ? `/api/v1/media/${encodeURIComponent(review.thumbnail.representationId)}/content`
+    : undefined;
+
+  return <section className="workspace-page review-page">
+    <div className="page-heading review-heading"><div><p className="eyebrow">Project / {projectId}</p><h1>Review workspace</h1></div><label className="project-search">Search this project<input ref={searchRef} value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Filename, camera, note, label" aria-keyshortcuts="/" /></label></div>
+    {error ? <InlineError error={error} /> : null}
+    {!assets.length ? <StatePanel title="No clips in this view"><p>Change the project search or add footage from the library.</p></StatePanel> : null}
+    {review ? <div className="review-workbench">
+      <aside className="review-queue" aria-label="Project clip queue">
+        <div className="queue-counter"><strong>{selectedIndex + 1}</strong><span>/ {assets.length}</span></div>
+        <div role="list">{assets.map((asset) => <button role="listitem" key={asset.projectAssetId} aria-current={asset.projectAssetId === selectedId} onClick={() => setSelectedId(asset.projectAssetId)}><span>{asset.filename}</span><small>{asset.camera || "Camera unknown"}</small></button>)}</div>
+      </aside>
+      <section className="review-stage-column" aria-label="Clip player">
+        <div className="review-stage">
+          {proxyReady ? <video key={review.proxy?.representationId} ref={videoRef} src={`/api/v1/media/${encodeURIComponent(review.proxy!.representationId)}/content`} poster={poster} preload="metadata" onError={() => void diagnosePlaybackFailure()} style={{ transform: `rotate(${review.rotationDegrees}deg)` }} /> : poster ? <img src={poster} alt="" /> : null}
+          {!proxyReady ? <div className="representation-state"><p className="eyebrow">Proxy / {review.proxy?.state ?? "missing"}</p><h2>{proxyStateTitle(review)}</h2><p>{proxyStateDetail(review)}</p></div> : null}
+          {playbackError === "session" ? <div className="stage-alert" role="alert"><span>Session expired. Sign in again before continuing playback.</span><button onClick={() => window.location.reload()}>Return to sign in</button></div> : playbackError === "media" ? <div className="stage-alert" role="alert">The proxy became unavailable. The original remains protected and is not served here.</div> : null}
+        </div>
+        <div className="transport"><button className="secondary" disabled={selectedIndex <= 0} onClick={() => move(-1)}>K · Previous</button><button onClick={() => { const video = videoRef.current; if (video) void (video.paused ? video.play() : Promise.resolve(video.pause())); }} disabled={!proxyReady}>Space · Play / pause</button><button className="secondary" disabled={selectedIndex >= assets.length - 1} onClick={() => move(1)}>J · Next</button></div>
+        <div className="clip-strip"><span>{assets[selectedIndex - 1]?.filename ?? "Start of queue"}</span><strong>{review.filename}</strong><span>{assets[selectedIndex + 1]?.filename ?? "End of queue"}</span></div>
+      </section>
+      <aside className="review-inspector">
+        <div className="inspector-status"><StatusBadge label={syncState === "saving" ? "Pending sync" : syncState === "conflict" ? "Conflict recorded" : "Synced"} tone={syncState === "conflict" ? "warning" : "positive"} /><span>rev {review.materializedRevision}</span></div>
+        <h2>{review.filename}</h2><p className="clip-facts">{review.camera || "Camera unknown"} · {formatDuration(review.durationSeconds)} · {review.mediaVerificationState}</p>{proxyReady ? <p className="proxy-capability">Server proxy · browser playable · available for paired-Mac transfer</p> : null}
+        {staleNote ? <p className="revision-notice">A newer note revision existed. Your revision was preserved and the canonical current note is shown.</p> : null}
+        {review.unresolvedConflictCount ? <p className="revision-notice">{review.unresolvedConflictCount} unresolved operation {review.unresolvedConflictCount === 1 ? "conflict" : "conflicts"} recorded.</p> : null}
+        <form onSubmit={saveNote} className="note-form"><label>Revision note<textarea ref={noteRef} value={noteDraft} onChange={(event) => setNoteDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.metaKey && !event.ctrlKey && !event.shiftKey) { event.preventDefault(); saveNote(); } }} aria-keyshortcuts="N Enter Escape" /></label><button disabled={syncState === "saving" || noteDraft === (review.activeNote ?? "")}>Save note</button></form>
+        <div className="label-section"><span className="field-label">Labels</span><div className="label-chips">{review.labels.map((label) => <button className="label-chip" key={label} disabled={syncState === "saving"} aria-label={`Remove label ${label}`} onClick={() => void mutate((asset) => ({ ...asset, labels: asset.labels.filter((value) => value !== label) }), (base) => client.removeReviewLabel(projectId, review.projectAssetId, label, base))}>{label}<b>×</b></button>)}</div><form onSubmit={addLabel}><input ref={labelRef} value={labelDraft} onChange={(event) => setLabelDraft(event.target.value)} placeholder="Add free-form label" aria-label="Add label" aria-keyshortcuts="L Enter" /><button disabled={syncState === "saving" || !labelDraft.trim()}>Add</button></form></div>
+        <div className="inspector-actions"><button disabled={syncState === "saving"} className={review.removed ? "" : "secondary"} onClick={toggleRemoved}>{review.removed ? "Restore to queue" : "R · Remove from queue"}</button><button disabled={syncState === "saving"} className="secondary" onClick={() => { const next = (review.rotationDegrees + 90) % 360; void mutate((asset) => ({ ...asset, rotationDegrees: next }), (base) => client.setReviewRotation(projectId, review.projectAssetId, next, base)); }}>Rotate · {review.rotationDegrees}°</button></div>
+        <p className="shortcut-map">J/K or ←/→ navigate · Space plays · L labels · N notes · R removes · / searches · Enter saves notes · Command+Enter inserts a newline · Escape leaves an editor</p>
+      </aside>
+    </div> : null}
   </section>;
+}
+
+function proxyStateTitle(asset: ProjectReviewAsset) {
+  if (!asset.proxy) return "Proxy not generated";
+  if (asset.proxy.state === "queued" || asset.proxy.state === "running") return "Proxy generation queued";
+  if (asset.proxy.state === "available" && !asset.proxy.availableOnServer) return "Proxy is available on another Mac";
+  if (asset.proxy.state === "failed") return "Proxy generation failed";
+  return "Proxy unavailable";
+}
+
+function proxyStateDetail(asset: ProjectReviewAsset) {
+  if (asset.proxy?.state === "available" && !asset.proxy.availableOnServer) return "This server does not have the review file yet. It may be downloaded by a paired Mac when representation transfer is available.";
+  if (asset.proxy?.state === "queued" || asset.proxy?.state === "running") return "The browser will use the canonical proxy when the server reports it available.";
+  if (asset.mediaVerificationState === "mismatch") return "Identity must be repaired before a trustworthy proxy can be selected.";
+  if (asset.originalAvailability === "accessible_here") return "The server can see the original, but browser review never streams originals. Queue a compatible proxy to enable playback.";
+  if (asset.originalAvailability === "accessible_on_another_node") return "The original is available on a paired Mac only. Generate there or transfer a compatible proxy to this server.";
+  if (asset.originalAvailability === "temporarily_unavailable" || asset.originalAvailability === "missing_after_completed_observation") return "The server original is offline. Reconnect its storage on the owning node, then generate or transfer a proxy.";
+  return "Original availability is not registered here. Browser review requires a server-accessible compatible proxy.";
+}
+
+function formatDuration(seconds: number) {
+  const rounded = Math.max(0, Math.round(seconds));
+  return `${Math.floor(rounded / 60)}:${String(rounded % 60).padStart(2, "0")}`;
 }
 
 function AddToProjectDialog({ client, mediaObjectIds, close, complete }: { client: BrowserProjectClient; mediaObjectIds: string[]; close: () => void; complete: () => void }) {

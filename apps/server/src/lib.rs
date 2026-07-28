@@ -557,6 +557,30 @@ pub fn router(state: HttpState) -> Router {
             "/api/v1/projects/{project_id}/assets/add",
             post(add_to_project),
         )
+        .route(
+            "/api/v1/projects/{project_id}/assets/{asset_id}/review",
+            get(get_project_review_asset),
+        )
+        .route(
+            "/api/v1/projects/{project_id}/assets/{asset_id}/notes",
+            post(create_review_note),
+        )
+        .route(
+            "/api/v1/projects/{project_id}/assets/{asset_id}/labels/add",
+            post(add_review_label),
+        )
+        .route(
+            "/api/v1/projects/{project_id}/assets/{asset_id}/labels/remove",
+            post(remove_review_label),
+        )
+        .route(
+            "/api/v1/projects/{project_id}/assets/{asset_id}/removed",
+            post(set_review_removed),
+        )
+        .route(
+            "/api/v1/projects/{project_id}/assets/{asset_id}/rotation",
+            post(set_review_rotation),
+        )
         .layer(middleware::from_fn_with_state(state.clone(), require_csrf))
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -725,6 +749,46 @@ pub fn openapi_document() -> serde_json::Value {
                         "404": { "$ref": "#/components/responses/Error" }
                     }
                 }
+            },
+            "/api/v1/projects/{projectId}/assets/{assetId}/review": {
+                "get": {
+                    "operationId": "getProjectReviewAsset",
+                    "parameters": [
+                        { "name": "projectId", "in": "path", "required": true, "schema": { "type": "string" } },
+                        { "name": "assetId", "in": "path", "required": true, "schema": { "type": "string" } }
+                    ],
+                    "responses": { "200": { "$ref": "#/components/responses/ProjectReviewAsset" }, "401": { "$ref": "#/components/responses/Error" }, "404": { "$ref": "#/components/responses/Error" } }
+                }
+            },
+            "/api/v1/projects/{projectId}/assets/{assetId}/notes": {
+                "post": { "operationId": "createReviewNote", "parameters": [
+                    { "name": "projectId", "in": "path", "required": true, "schema": { "type": "string" } },
+                    { "name": "assetId", "in": "path", "required": true, "schema": { "type": "string" } }
+                ], "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/NoteMutationRequest" } } } }, "responses": { "200": { "$ref": "#/components/responses/ReviewMutationResult" }, "400": { "$ref": "#/components/responses/Error" }, "401": { "$ref": "#/components/responses/Error" } } }
+            },
+            "/api/v1/projects/{projectId}/assets/{assetId}/labels/add": {
+                "post": { "operationId": "addReviewLabel", "parameters": [
+                    { "name": "projectId", "in": "path", "required": true, "schema": { "type": "string" } },
+                    { "name": "assetId", "in": "path", "required": true, "schema": { "type": "string" } }
+                ], "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/LabelMutationRequest" } } } }, "responses": { "200": { "$ref": "#/components/responses/ReviewMutationResult" }, "400": { "$ref": "#/components/responses/Error" }, "401": { "$ref": "#/components/responses/Error" } } }
+            },
+            "/api/v1/projects/{projectId}/assets/{assetId}/labels/remove": {
+                "post": { "operationId": "removeReviewLabel", "parameters": [
+                    { "name": "projectId", "in": "path", "required": true, "schema": { "type": "string" } },
+                    { "name": "assetId", "in": "path", "required": true, "schema": { "type": "string" } }
+                ], "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/LabelMutationRequest" } } } }, "responses": { "200": { "$ref": "#/components/responses/ReviewMutationResult" }, "400": { "$ref": "#/components/responses/Error" }, "401": { "$ref": "#/components/responses/Error" } } }
+            },
+            "/api/v1/projects/{projectId}/assets/{assetId}/removed": {
+                "post": { "operationId": "setReviewRemoved", "parameters": [
+                    { "name": "projectId", "in": "path", "required": true, "schema": { "type": "string" } },
+                    { "name": "assetId", "in": "path", "required": true, "schema": { "type": "string" } }
+                ], "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/RemovedMutationRequest" } } } }, "responses": { "200": { "$ref": "#/components/responses/ReviewMutationResult" }, "400": { "$ref": "#/components/responses/Error" }, "401": { "$ref": "#/components/responses/Error" } } }
+            },
+            "/api/v1/projects/{projectId}/assets/{assetId}/rotation": {
+                "post": { "operationId": "setReviewRotation", "parameters": [
+                    { "name": "projectId", "in": "path", "required": true, "schema": { "type": "string" } },
+                    { "name": "assetId", "in": "path", "required": true, "schema": { "type": "string" } }
+                ], "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/RotationMutationRequest" } } } }, "responses": { "200": { "$ref": "#/components/responses/ReviewMutationResult" }, "400": { "$ref": "#/components/responses/Error" }, "401": { "$ref": "#/components/responses/Error" } } }
             }
         },
         "components": {
@@ -1015,7 +1079,42 @@ pub fn openapi_document() -> serde_json::Value {
                         "blockedCount": { "type": "integer", "minimum": 0 },
                         "items": { "type": "array", "items": { "$ref": "#/components/schemas/AddToProjectItem" } }
                     }
-                }
+                },
+                "ReviewRepresentation": {
+                    "type": "object",
+                    "required": ["representationId", "state", "availableOnServer"],
+                    "properties": {
+                        "representationId": { "type": "string" },
+                        "state": { "type": "string" },
+                        "availableOnServer": { "type": "boolean" }
+                    }
+                },
+                "ProjectReviewAsset": {
+                    "allOf": [
+                        { "$ref": "#/components/schemas/ProjectAssetItem" },
+                        { "type": "object", "required": ["materializedRevision", "activeNoteRevisionId", "noteRevisionCount", "proxy", "thumbnail", "originalAvailability", "unresolvedConflictCount"], "properties": {
+                            "materializedRevision": { "type": "integer", "minimum": 0 },
+                            "activeNoteRevisionId": { "type": ["string", "null"] },
+                            "noteRevisionCount": { "type": "integer", "minimum": 0 },
+                            "proxy": { "oneOf": [{ "$ref": "#/components/schemas/ReviewRepresentation" }, { "type": "null" }] },
+                            "thumbnail": { "oneOf": [{ "$ref": "#/components/schemas/ReviewRepresentation" }, { "type": "null" }] },
+                            "originalAvailability": { "oneOf": [{ "$ref": "#/components/schemas/NodeAvailabilityState" }, { "type": "null" }] },
+                            "unresolvedConflictCount": { "type": "integer", "minimum": 0 }
+                        } }
+                    ]
+                },
+                "ReviewMutationResult": {
+                    "type": "object",
+                    "required": ["asset", "staleBaseRevision"],
+                    "properties": {
+                        "asset": { "$ref": "#/components/schemas/ProjectReviewAsset" },
+                        "staleBaseRevision": { "type": "boolean" }
+                    }
+                },
+                "NoteMutationRequest": { "type": "object", "required": ["text", "baseRevision"], "properties": { "text": { "type": "string", "maxLength": 100000 }, "baseRevision": { "type": "integer", "minimum": 0 } } },
+                "LabelMutationRequest": { "type": "object", "required": ["label", "baseRevision"], "properties": { "label": { "type": "string" }, "baseRevision": { "type": "integer", "minimum": 0 } } },
+                "RemovedMutationRequest": { "type": "object", "required": ["removed", "baseRevision"], "properties": { "removed": { "type": "boolean" }, "baseRevision": { "type": "integer", "minimum": 0 } } },
+                "RotationMutationRequest": { "type": "object", "required": ["rotationDegrees", "baseRevision"], "properties": { "rotationDegrees": { "type": "integer", "enum": [0, 90, 180, 270] }, "baseRevision": { "type": "integer", "minimum": 0 } } }
             },
             "responses": {
                 "Version": { "description": "Server identity and protocol", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Version" } } } },
@@ -1028,6 +1127,8 @@ pub fn openapi_document() -> serde_json::Value {
                 "ProjectAssetPage": { "description": "A page of one project's assets", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ProjectAssetPage" } } } },
                 "AddToProjectPreview": { "description": "A non-mutating preview of add-to-project outcomes", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/AddToProjectPreview" } } } },
                 "AddToProjectResult": { "description": "Canonical add-to-project outcomes", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/AddToProjectResult" } } } },
+                "ProjectReviewAsset": { "description": "Canonical project asset review projection", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ProjectReviewAsset" } } } },
+                "ReviewMutationResult": { "description": "Canonical asset after an operation-backed review mutation", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ReviewMutationResult" } } } },
                 "Error": { "description": "Stable server error", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
             }
         }
@@ -1471,22 +1572,10 @@ struct SubscribeMessage {
 async fn ws_events_handler(
     ws: WebSocketUpgrade,
     State(state): State<HttpState>,
-    Extension(principal): Extension<AuthPrincipal>,
+    Extension(_principal): Extension<AuthPrincipal>,
 ) -> Response {
-    // Only device credentials may subscribe to sync hints.
-    match &principal {
-        AuthPrincipal::Device { .. } => {}
-        _ => {
-            return (
-                StatusCode::FORBIDDEN,
-                Json(ErrorResponse {
-                    request_id: String::new(),
-                    code: "forbidden",
-                }),
-            )
-                .into_response();
-        }
-    }
+    // Both browser sessions and device credentials receive non-canonical change
+    // hints. Consumers must refetch the authenticated REST projection.
     ws.on_upgrade(move |socket| handle_ws_socket(socket, state))
 }
 
@@ -2237,6 +2326,207 @@ fn project_command_error_response(request_id: &RequestId, error: ProjectReplicaE
             "internal_error",
             StatusCode::INTERNAL_SERVER_ERROR,
         ),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct NoteMutationRequest {
+    text: String,
+    base_revision: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LabelMutationRequest {
+    label: String,
+    base_revision: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RemovedMutationRequest {
+    removed: bool,
+    base_revision: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RotationMutationRequest {
+    rotation_degrees: u16,
+    base_revision: u64,
+}
+
+async fn get_project_review_asset(
+    State(state): State<HttpState>,
+    Extension(request_id): Extension<RequestId>,
+    AxumPath((project_id, asset_id)): AxumPath<(String, String)>,
+) -> Response {
+    match state
+        .foundation
+        .catalog()
+        .project_replicas()
+        .get_review_asset(&project_id, &asset_id)
+    {
+        Ok(asset) => (StatusCode::OK, Json(asset)).into_response(),
+        Err(error) => project_command_error_response(&request_id, error),
+    }
+}
+
+async fn create_review_note(
+    State(state): State<HttpState>,
+    Extension(request_id): Extension<RequestId>,
+    AxumPath((project_id, asset_id)): AxumPath<(String, String)>,
+    request: Result<Json<NoteMutationRequest>, JsonRejection>,
+) -> Response {
+    let Json(request) = match request {
+        Ok(value) => value,
+        Err(_) => {
+            return query_error_response(&request_id, "invalid_input", StatusCode::BAD_REQUEST);
+        }
+    };
+    review_mutation_response(
+        &state,
+        &request_id,
+        &project_id,
+        state
+            .foundation
+            .catalog()
+            .project_replicas()
+            .create_review_note(&project_id, &asset_id, &request.text, request.base_revision),
+    )
+}
+
+async fn add_review_label(
+    State(state): State<HttpState>,
+    Extension(request_id): Extension<RequestId>,
+    AxumPath((project_id, asset_id)): AxumPath<(String, String)>,
+    request: Result<Json<LabelMutationRequest>, JsonRejection>,
+) -> Response {
+    let Json(request) = match request {
+        Ok(value) => value,
+        Err(_) => {
+            return query_error_response(&request_id, "invalid_input", StatusCode::BAD_REQUEST);
+        }
+    };
+    review_mutation_response(
+        &state,
+        &request_id,
+        &project_id,
+        state
+            .foundation
+            .catalog()
+            .project_replicas()
+            .add_review_label(
+                &project_id,
+                &asset_id,
+                &request.label,
+                request.base_revision,
+            ),
+    )
+}
+
+async fn remove_review_label(
+    State(state): State<HttpState>,
+    Extension(request_id): Extension<RequestId>,
+    AxumPath((project_id, asset_id)): AxumPath<(String, String)>,
+    request: Result<Json<LabelMutationRequest>, JsonRejection>,
+) -> Response {
+    let Json(request) = match request {
+        Ok(value) => value,
+        Err(_) => {
+            return query_error_response(&request_id, "invalid_input", StatusCode::BAD_REQUEST);
+        }
+    };
+    review_mutation_response(
+        &state,
+        &request_id,
+        &project_id,
+        state
+            .foundation
+            .catalog()
+            .project_replicas()
+            .remove_review_label(
+                &project_id,
+                &asset_id,
+                &request.label,
+                request.base_revision,
+            ),
+    )
+}
+
+async fn set_review_removed(
+    State(state): State<HttpState>,
+    Extension(request_id): Extension<RequestId>,
+    AxumPath((project_id, asset_id)): AxumPath<(String, String)>,
+    request: Result<Json<RemovedMutationRequest>, JsonRejection>,
+) -> Response {
+    let Json(request) = match request {
+        Ok(value) => value,
+        Err(_) => {
+            return query_error_response(&request_id, "invalid_input", StatusCode::BAD_REQUEST);
+        }
+    };
+    review_mutation_response(
+        &state,
+        &request_id,
+        &project_id,
+        state
+            .foundation
+            .catalog()
+            .project_replicas()
+            .set_review_removed(
+                &project_id,
+                &asset_id,
+                request.removed,
+                request.base_revision,
+            ),
+    )
+}
+
+async fn set_review_rotation(
+    State(state): State<HttpState>,
+    Extension(request_id): Extension<RequestId>,
+    AxumPath((project_id, asset_id)): AxumPath<(String, String)>,
+    request: Result<Json<RotationMutationRequest>, JsonRejection>,
+) -> Response {
+    let Json(request) = match request {
+        Ok(value) => value,
+        Err(_) => {
+            return query_error_response(&request_id, "invalid_input", StatusCode::BAD_REQUEST);
+        }
+    };
+    review_mutation_response(
+        &state,
+        &request_id,
+        &project_id,
+        state
+            .foundation
+            .catalog()
+            .project_replicas()
+            .set_review_rotation(
+                &project_id,
+                &asset_id,
+                request.rotation_degrees,
+                request.base_revision,
+            ),
+    )
+}
+
+fn review_mutation_response(
+    state: &HttpState,
+    request_id: &RequestId,
+    project_id: &str,
+    result: Result<rcdvlog_server_core::ReviewMutationResult, ProjectReplicaError>,
+) -> Response {
+    match result {
+        Ok(result) => {
+            state
+                .ws_channels
+                .broadcast(project_id, "projectAssetChanged");
+            (StatusCode::OK, Json(result)).into_response()
+        }
+        Err(error) => project_command_error_response(request_id, error),
     }
 }
 
@@ -3338,5 +3628,130 @@ mod tests {
             .unwrap();
         assert_eq!(missing_project.status(), StatusCode::NOT_FOUND);
         assert_eq!(json(missing_project).await["code"], "not_found");
+    }
+
+    #[tokio::test]
+    async fn review_routes_return_canonical_state_and_commit_stale_note_revisions() {
+        let fixture = Fixture::new(false);
+        let token = device_auth_token(&fixture);
+        let source = TempDir::new().unwrap();
+        let envelope = baseline_envelope(&source);
+        let project_id = envelope.payload.project.project_id.clone();
+        fixture
+            .foundation
+            .catalog()
+            .project_replicas()
+            .import_baseline(&envelope)
+            .unwrap();
+        let path = format!("/api/v1/projects/{project_id}/assets/asset_http");
+
+        let review = fixture
+            .app()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("{path}/review"))
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(review.status(), StatusCode::OK);
+        let initial = json(review).await;
+        let stale_base = initial["materializedRevision"]
+            .as_u64()
+            .unwrap()
+            .saturating_sub(1);
+
+        let note = fixture
+            .app()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("{path}/notes"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "text": "Browser revision",
+                            "baseRevision": stale_base
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(note.status(), StatusCode::OK);
+        let note = json(note).await;
+        assert_eq!(note["asset"]["activeNote"], "Browser revision");
+        assert_eq!(note["staleBaseRevision"], true);
+        assert!(note["asset"]["noteRevisionCount"].as_u64().unwrap() >= 2);
+
+        let label = fixture
+            .app()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("{path}/labels/add"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "label": "keeper",
+                            "baseRevision": note["asset"]["materializedRevision"]
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(label.status(), StatusCode::OK);
+        assert_eq!(json(label).await["asset"]["labels"][0], "keeper");
+    }
+
+    #[tokio::test]
+    async fn review_routes_require_authentication_and_validate_rotation() {
+        let fixture = Fixture::new(false);
+        let unauthenticated = fixture
+            .app()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/projects/project_missing/assets/asset_missing/review")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+        let token = device_auth_token(&fixture);
+        let source = TempDir::new().unwrap();
+        let envelope = baseline_envelope(&source);
+        let project_id = envelope.payload.project.project_id.clone();
+        fixture
+            .foundation
+            .catalog()
+            .project_replicas()
+            .import_baseline(&envelope)
+            .unwrap();
+        let invalid = fixture
+            .app()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/api/v1/projects/{project_id}/assets/asset_http/rotation"
+                    ))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::from(r#"{"rotationDegrees":45,"baseRevision":0}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(json(invalid).await["code"], "invalid_input");
     }
 }

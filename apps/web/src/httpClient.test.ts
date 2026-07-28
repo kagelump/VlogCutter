@@ -66,3 +66,28 @@ test("reports a network failure as server unavailable", async () => {
     code: "server_unavailable",
   } satisfies Partial<ProjectClientError>);
 });
+
+test("review mutations encode stable IDs and send the session CSRF token", async () => {
+  const fetcher = vi.fn()
+    .mockResolvedValueOnce(response({
+      requestId: "request_login",
+      sessionId: "session_1",
+      displayPrefix: "12345678",
+      expiresAt: "2026-08-01T00:00:00Z",
+    }, 200, { "x-csrf-token": "csrf_fixture" }))
+    .mockResolvedValueOnce(response({ asset: {}, staleBaseRevision: false }));
+  const client = new HttpProjectClient("https://server.test", fetcher);
+  await client.loginWithBootstrapCode("code");
+
+  await client.setReviewRotation("project with space", "asset/one", 90, 7);
+
+  expect(fetcher).toHaveBeenLastCalledWith(
+    "https://server.test/api/v1/projects/project%20with%20space/assets/asset%2Fone/rotation",
+    expect.objectContaining({
+      method: "POST",
+      credentials: "same-origin",
+      headers: expect.objectContaining({ "x-csrf-token": "csrf_fixture" }),
+      body: JSON.stringify({ rotationDegrees: 90, baseRevision: 7 }),
+    }),
+  );
+});

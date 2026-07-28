@@ -71,6 +71,16 @@
         },
         "description": "A page of registered project replicas"
       },
+      "ProjectReviewAsset": {
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ProjectReviewAsset"
+            }
+          }
+        },
+        "description": "Canonical project asset review projection"
+      },
       "Readiness": {
         "content": {
           "application/json": {
@@ -80,6 +90,16 @@
           }
         },
         "description": "Readiness report"
+      },
+      "ReviewMutationResult": {
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ReviewMutationResult"
+            }
+          }
+        },
+        "description": "Canonical asset after an operation-backed review mutation"
       },
       "SessionCreated": {
         "content": {
@@ -306,6 +326,22 @@
           "mismatch"
         ],
         "type": "string"
+      },
+      "LabelMutationRequest": {
+        "properties": {
+          "baseRevision": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "label": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "label",
+          "baseRevision"
+        ],
+        "type": "object"
       },
       "LibraryMediaDetail": {
         "properties": {
@@ -542,6 +578,23 @@
         ],
         "type": "string"
       },
+      "NoteMutationRequest": {
+        "properties": {
+          "baseRevision": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "text": {
+            "maxLength": 100000,
+            "type": "string"
+          }
+        },
+        "required": [
+          "text",
+          "baseRevision"
+        ],
+        "type": "object"
+      },
       "ProjectAssetItem": {
         "properties": {
           "activeNote": {
@@ -648,6 +701,75 @@
         ],
         "type": "object"
       },
+      "ProjectReviewAsset": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/ProjectAssetItem"
+          },
+          {
+            "properties": {
+              "activeNoteRevisionId": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "materializedRevision": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "noteRevisionCount": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "originalAvailability": {
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/NodeAvailabilityState"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "proxy": {
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/ReviewRepresentation"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "thumbnail": {
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/ReviewRepresentation"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "unresolvedConflictCount": {
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "materializedRevision",
+              "activeNoteRevisionId",
+              "noteRevisionCount",
+              "proxy",
+              "thumbnail",
+              "originalAvailability",
+              "unresolvedConflictCount"
+            ],
+            "type": "object"
+          }
+        ]
+      },
       "ProjectSummary": {
         "properties": {
           "assetCount": {
@@ -740,6 +862,78 @@
         "required": [
           "name",
           "status"
+        ],
+        "type": "object"
+      },
+      "RemovedMutationRequest": {
+        "properties": {
+          "baseRevision": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "removed": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "removed",
+          "baseRevision"
+        ],
+        "type": "object"
+      },
+      "ReviewMutationResult": {
+        "properties": {
+          "asset": {
+            "$ref": "#/components/schemas/ProjectReviewAsset"
+          },
+          "staleBaseRevision": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "asset",
+          "staleBaseRevision"
+        ],
+        "type": "object"
+      },
+      "ReviewRepresentation": {
+        "properties": {
+          "availableOnServer": {
+            "type": "boolean"
+          },
+          "representationId": {
+            "type": "string"
+          },
+          "state": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "representationId",
+          "state",
+          "availableOnServer"
+        ],
+        "type": "object"
+      },
+      "RotationMutationRequest": {
+        "properties": {
+          "baseRevision": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "rotationDegrees": {
+            "enum": [
+              0,
+              90,
+              180,
+              270
+            ],
+            "type": "integer"
+          }
+        },
+        "required": [
+          "rotationDegrees",
+          "baseRevision"
         ],
         "type": "object"
       },
@@ -1190,6 +1384,260 @@
             "$ref": "#/components/responses/Error"
           },
           "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/v1/projects/{projectId}/assets/{assetId}/labels/add": {
+      "post": {
+        "operationId": "addReviewLabel",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "projectId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "assetId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LabelMutationRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/ReviewMutationResult"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/v1/projects/{projectId}/assets/{assetId}/labels/remove": {
+      "post": {
+        "operationId": "removeReviewLabel",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "projectId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "assetId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LabelMutationRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/ReviewMutationResult"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/v1/projects/{projectId}/assets/{assetId}/notes": {
+      "post": {
+        "operationId": "createReviewNote",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "projectId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "assetId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NoteMutationRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/ReviewMutationResult"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/v1/projects/{projectId}/assets/{assetId}/removed": {
+      "post": {
+        "operationId": "setReviewRemoved",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "projectId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "assetId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RemovedMutationRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/ReviewMutationResult"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/v1/projects/{projectId}/assets/{assetId}/review": {
+      "get": {
+        "operationId": "getProjectReviewAsset",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "projectId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "assetId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/ProjectReviewAsset"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/v1/projects/{projectId}/assets/{assetId}/rotation": {
+      "post": {
+        "operationId": "setReviewRotation",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "projectId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "assetId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RotationMutationRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/ReviewMutationResult"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
             "$ref": "#/components/responses/Error"
           }
         }
