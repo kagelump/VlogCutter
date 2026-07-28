@@ -7,7 +7,7 @@
   "epic_id": "D01",
   "title": "Verification baseline audit",
   "slug": "verification-baseline-audit",
-  "status": "ready",
+  "status": "complete",
   "task_class": "qa",
   "depends_on": [],
   "principal_invariant": "Every command in the AGENTS.md section 12 verification gate has a recorded, reproducible pass or fail result against the current main commit.",
