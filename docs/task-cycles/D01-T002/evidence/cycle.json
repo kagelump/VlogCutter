@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "task_id": "D01-T002",
+  "epic_file": "docs/tasks/desktop/EPIC.md",
+  "task_file": "docs/tasks/desktop/tasks/D01-T002-fix-baseline-gate-defects.md",
+  "base_branch": "main",
+  "base_sha": "5b458ec48fcbc3400101ffb5de31190f9d59179c",
+  "task_branch": "codex/d01-t002-fix-baseline-gate-defects",
+  "contract_sha": null,
+  "implementation_base_sha": "5b458ec48fcbc3400101ffb5de31190f9d59179c",
+  "implementation_sha": "25fb07f1e968421790820ef4a2030823d5fcdd32",
+  "subject_sha": "1cac6f52ca481f5bf06525c45ab49eab835dff33",
+  "independent_tested_sha": "1cac6f52ca481f5bf06525c45ab49eab835dff33",
+  "reviewed_sha": "1cac6f52ca481f5bf06525c45ab49eab835dff33",
+  "gated_sha": "1cac6f52ca481f5bf06525c45ab49eab835dff33",
+  "evidence_commit_sha": null,
+  "test_verdict": "PASS",
+  "review_verdict": "APPROVE_WITH_FOLLOW_UP",
+  "open_findings": {
+    "p0": 0,
+    "p1": 0,
+    "p2": 2
+  },
+  "gate_commands": [
+    {"command": "cargo fmt --all -- --check", "exit_code": 0},
+    {"command": "cargo clippy --workspace --all-targets -- -D warnings", "exit_code": 0},
+    {"command": "cargo test --workspace", "exit_code": 0},
+    {"command": "pnpm check:frontend", "exit_code": 0},
+    {"command": "pnpm test:web", "exit_code": 0},
+    {"command": "pnpm test:integration", "exit_code": 0},
+    {"command": "pnpm check:docs", "exit_code": 0}
+  ],
+  "source_hash_artifact": null,
+  "merge": {
+    "authorized": true,
+    "merged": false,
+    "merge_sha": null
+  }
+}
