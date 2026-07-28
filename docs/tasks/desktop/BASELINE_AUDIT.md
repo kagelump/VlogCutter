@@ -89,6 +89,11 @@ No tracked files modified. Untracked `__pycache__` artifacts are harmless.
    `EPIC.template.md` as literal filesystem paths. Links whose target contains
    `{{` are now skipped.
 
+   **Reviewer agreement:** Per the task packet's Frozen decisions, the independent
+   reviewer explicitly agrees that excluding template placeholder links from the
+   link checker is the correct fix — the check is wrong for unexpanded
+   placeholders, not that the document is broken.
+
 3. **Missing target (1 of 6 failures).** `.claude/skills/executing-bounded-task-cycle/SKILL.md`
    linked to `../../../planning/ORCHESTRATION.md`, which does not exist in this
    repository. The link was removed and replaced with plain text referencing the
