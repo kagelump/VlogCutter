@@ -1,5 +1,7 @@
 # Review: Tasks 9–12
 
+> Historical point-in-time review. It is preserved as delivery evidence and is superseded by the current [`docs/server`](../../server/README.md) guidance, final task statuses, and Task 19 acceptance report.
+
 **Date:** 2026-07-24
 **Scope:** Authentication & Secure Transports (T9), Desktop Pairing & Root Mapping (T10), Automatic Sync & Conflict Handling (T11), Remote Representation Exchange & MAC Requests (T12)
 

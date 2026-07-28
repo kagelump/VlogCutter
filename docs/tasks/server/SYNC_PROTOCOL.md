@@ -1,5 +1,7 @@
 # Sync Protocol v1
 
+> Historical Task 8 protocol snapshot. Protocol v1 schemas are frozen; current operational guidance is in [`docs/server/sync.md`](../../server/sync.md).
+
 Task 8 freezes baseline version 1 and sync protocol `1.0`. The transport DTOs live in `core/rcdvlog-sync`; HTTP is only one adapter.
 
 ## Baseline

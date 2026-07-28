@@ -1,3 +1,7 @@
+# Historical companion-server design notes
+
+> Historical pre-implementation exploration. Current contracts live in [`docs/server`](../../server/README.md), `AGENTS.md`, and the implemented reference architecture. Do not treat tentative recommendations below as shipped behavior.
+
 The cleanest model is:
 
 > **The desktop is local-first and interaction-first. The server is archive-first and compute-first. The web app is a server-backed secondary surface.**

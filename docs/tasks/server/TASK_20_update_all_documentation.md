@@ -1,6 +1,6 @@
 # Task 20: Update All Documentation
 
-**Status:** Planned
+**Status:** Complete with external setup run-through gaps recorded below (2026-07-28)
 **Depends on:** Task 19
 **Unblocks:** Companion-server epic completion
 
@@ -79,38 +79,42 @@ trace to that report, to checked-in code, or to a command it re-ran is not writt
 
 ## Documentation audit checklist
 
-- [ ] Search for stale statements that Linux server, synchronization, durable jobs, web review, auth, or global media identity do not exist.
-- [ ] Search for old single-path asset assumptions and project-local-only proxy assumptions.
-- [ ] Search for old task keys/recipe versions and update only where implementation changed them.
-- [ ] Search for direct `invoke`/HTTP examples that bypass the intended client/domain boundaries.
-- [ ] Search for unsupported AI, edit-planning, trip-context, cleanup, multi-user, and original-transfer claims.
-- [ ] Confirm repository tree diagrams include new apps, crates, packages, deploy files, and docs.
-- [ ] Confirm setup covers both LAN and Tailscale, not one as an undocumented fallback.
-- [ ] Confirm backup/restore warnings and destructive-action boundaries are prominent.
-- [ ] Confirm all CLI examples use explicit catalog/server selection and stable JSON.
-- [ ] Confirm testing tables distinguish mocks, automated processes, Chrome, Tauri, Ubuntu, NAS, and Tailscale.
-- [ ] Confirm every `Status:` marker in `docs/tasks/server/` and `docs/tasks/travel/` matches reality, and delete the interim "trust the code and git history" note in `EPIC.md` once it does.
-- [ ] Confirm superseded handoff and review documents are labeled historical and are not linked as current contracts.
-- [ ] Confirm the restore-and-resync constraints from Task 17 appear in the backup/recovery document, since a restore that ignores them wedges synchronization.
+- [x] Search for stale statements that Linux server, synchronization, durable jobs, web review, auth, or global media identity do not exist.
+- [x] Search for old single-path asset assumptions and project-local-only proxy assumptions.
+- [x] Search for old task keys/recipe versions and update only where implementation changed them.
+- [x] Search for direct `invoke`/HTTP examples that bypass the intended client/domain boundaries.
+- [x] Search for unsupported AI, edit-planning, trip-context, cleanup, multi-user, and original-transfer claims.
+- [x] Confirm repository tree diagrams include new apps, crates, packages, deploy files, and docs.
+- [x] Confirm setup covers both LAN and Tailscale, not one as an undocumented fallback.
+- [x] Confirm backup/restore warnings and destructive-action boundaries are prominent.
+- [x] Confirm all CLI examples use explicit catalog/server selection and stable JSON.
+- [x] Confirm testing tables distinguish mocks, automated processes, Chrome, Tauri, Ubuntu, NAS, and Tailscale.
+- [x] Confirm every `Status:` marker in `docs/tasks/server/` and `docs/tasks/travel/` matches reality, and delete the interim "trust the code and git history" note in `EPIC.md` once it does.
+- [x] Confirm superseded handoff and review documents are labeled historical and are not linked as current contracts.
+- [x] Confirm the restore-and-resync constraints from Task 17 appear in the backup/recovery document, since a restore that ignores them wedges synchronization.
 
 ## Acceptance criteria
 
-- [ ] Every required repository document is audited and updated or explicitly confirmed unaffected.
-- [ ] `PRD.md` and `AGENTS.md` accurately separate implemented server behavior from remaining gaps.
+- [x] Every required repository document is audited and updated or explicitly confirmed unaffected.
+- [x] `PRD.md` and `AGENTS.md` accurately separate implemented server behavior from remaining gaps.
 - [ ] A fresh Ubuntu setup can follow the deployment documentation without undocumented steps.
 - [ ] A fresh Mac can trust LAN TLS, pair, adopt a project, and use Tailscale by following the docs.
-- [ ] CLI/API/config examples pass against the final implementation or a checked validation script.
-- [ ] Sync/conflict/storage/representation docs match code-level identities and semantics.
-- [ ] Backup and restore documentation matches the verified Task 19 drill.
-- [ ] No document claims an unrun test or deferred feature is complete.
-- [ ] No secret or private real-project path is introduced.
-- [ ] Markdown link and formatting checks pass.
-- [ ] `rg` audit finds no known stale server-deferred or unsafe database/media guidance outside clearly historical context.
-- [ ] `ARCHITECTURE.md`, `EPIC.md`, and all task statuses match the actual delivered scope.
+- [x] CLI/API/config examples pass against the final implementation or a checked validation script.
+- [x] Sync/conflict/storage/representation docs match code-level identities and semantics.
+- [x] Backup and restore documentation matches the verified Task 19 drill.
+- [x] No document claims an unrun test or deferred feature is complete.
+- [x] No secret or private real-project path is introduced.
+- [x] Markdown link and formatting checks pass.
+- [x] `rg` audit finds no known stale server-deferred or unsafe database/media guidance outside clearly historical context.
+- [x] `ARCHITECTURE.md`, `EPIC.md`, and all task statuses match the actual delivered scope.
 
 ## Verification
 
 Run all documentation/command/schema generators and link checks added by the implementation. Re-run representative setup, CLI, Compose validation, and test commands exactly as documented. Have one review pass read only the docs and compare each implementation claim against Task 19 evidence.
+
+Completed locally: documentation/link/fence validation (83 Markdown files), deployment-invariant validation, OpenAPI regeneration/drift check, CLI help and stable command-shape test, protocol/schema tests, Rust formatting, and the web TypeScript/Vitest/build gate (13 tests). A read-only review compared current claims with `ACCEPTANCE_TASK_19.md` and checked code/config.
+
+Not run: `docker compose ... config`, a fresh Ubuntu install, Caddy CA trust on a fresh Mac, physical LAN/Tailscale pairing, and native project adoption. Docker and the target topology were unavailable, exactly as recorded by Task 19. These two unchecked documentation run-through criteria remain release acceptance work; they do not hide or expand implemented behavior.
 
 ## Epic completion
 

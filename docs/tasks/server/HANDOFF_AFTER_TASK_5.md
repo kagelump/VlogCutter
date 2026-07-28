@@ -1,7 +1,9 @@
 # Handoff After Task 5
 
+> Historical point-in-time handoff. It is preserved as delivery evidence and is superseded by the current [`docs/server`](../../server/README.md) guidance and later task records.
+
 **Date:** 2026-07-20 (post-review corrections applied)
-**Status:** Task 5 implemented with post-review corrections; all automated tests pass; manual Ubuntu/NAS acceptance not run
+**Status:** Historical snapshot — Task 5 implemented with post-review corrections; manual Ubuntu/NAS acceptance had not run
 **Epic:** [EPIC.md](EPIC.md)
 **Next:** Task 6 — Shared Representations and Authenticated Media Delivery
 

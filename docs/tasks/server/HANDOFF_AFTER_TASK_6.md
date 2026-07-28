@@ -1,7 +1,9 @@
 # Handoff After Task 6
 
+> Historical point-in-time handoff. It is preserved as delivery evidence and is superseded by the current [`docs/server`](../../server/README.md) guidance and later task records.
+
 **Date:** 2026-07-23
-**Status:** Task 6 implemented; automated tests pass; manual Chrome/Ubuntu/NAS acceptance not run
+**Status:** Historical snapshot — Task 6 implemented; manual Chrome/Ubuntu/NAS acceptance had not run
 **Next:** Task 7 — Operation-Backed Project Mutations
 
 ## Migration identity

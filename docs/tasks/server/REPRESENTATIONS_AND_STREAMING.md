@@ -1,5 +1,7 @@
 # Representations and Streaming
 
+> Historical Task 6 implementation snapshot. Current representation/streaming guidance is in [`docs/server/jobs-and-media.md`](../../server/jobs-and-media.md).
+
 This is the implementation contract delivered by Task 6.
 
 ## Identity and persistence

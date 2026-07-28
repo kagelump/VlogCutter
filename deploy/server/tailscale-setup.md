@@ -36,7 +36,7 @@ tailscale serve --bg --https 8443 http://127.0.0.1:8090
 tailscale serve status
 ```
 
-Expected output (no mention of Funnel):
+Expected output includes an explicit `Funnel off` status:
 
 ```
 # Funnel off
@@ -51,7 +51,7 @@ https://<server-hostname>.<tailnet>.ts.net:8443  -> http://127.0.0.1:8090
 tailscale serve status | grep -i funnel
 ```
 
-This must produce **no output**. If Funnel is shown, disable it immediately:
+The status must explicitly report Funnel off. If it reports an active Funnel, disable it immediately:
 
 ```bash
 tailscale funnel off

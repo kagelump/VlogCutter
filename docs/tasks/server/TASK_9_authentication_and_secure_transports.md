@@ -1,6 +1,6 @@
 # Task 9: Authentication and Secure Transports
 
-**Status:** Planned
+**Status:** Implemented; LAN Caddy and Tailscale target acceptance remains external
 **Depends on:** Task 2
 **Unblocks:** Tasks 10, 13, 16, 17, and 18
 

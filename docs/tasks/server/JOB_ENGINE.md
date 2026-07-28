@@ -1,5 +1,7 @@
 # Durable Server Job Engine
 
+> Historical Task 4 implementation snapshot. Current job/media guidance is in [`docs/server/jobs-and-media.md`](../../server/jobs-and-media.md).
+
 Control-catalog migration 3 (`durable_server_job_engine`) stores server-local
 jobs, attempts, dependencies, leases, rate history, and append-only events.
 Migrations 1 and 2 are unchanged. Jobs move from `queued` to `running`, then

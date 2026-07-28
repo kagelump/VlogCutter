@@ -4,7 +4,7 @@ This file is the operational handoff for agents working on RCD VlogCutter. It ap
 
 ## 1. Product in one paragraph
 
-RCD VlogCutter is a local-first, single-user macOS application for labeling large trip-footage projects. Originals remain immutable and referenced in place on a NAS, removable drive, or local disk. Each project has a laptop-local SQLite catalog plus disposable proxies and thumbnails. The current vertical slice supports project creation/opening, ingest, metadata probing, free-form labels, notes, reversible clip removal, fixed camera-clock offsets, quality-1 thumbnails, H.264 review proxies, and a machine-readable CLI.
+RCD VlogCutter is a local-first, single-user footage labeling system. The macOS desktop references immutable originals in place and keeps one laptop-local SQLite catalog per project. The optional private Ubuntu companion server keeps its own local-SSD control catalog and project replicas, indexes read-only NAS roots, runs durable media jobs, serves Chrome review/admin, synchronizes immutable project operations, and creates verified backups. The Mac remains useful offline and neither node shares live SQLite files.
 
 The target workload is roughly 100 hours, thousands of mostly 4K/60 clips, and about five cameras (Sony, DJI, iPhone, Insta360, and similar). Optimize data structures and UI choices for that scale even when tests use tiny fixtures.
 
@@ -21,15 +21,17 @@ Use these sources in this order when they differ:
 Never violate these invariants without explicit user approval:
 
 - Originals are immutable and referenced in place. Never move, rename, rewrite, or delete source media.
-- SQLite is the canonical project state. Do not introduce a second canonical JSON store or a permanent background Python service.
-- The Rust core owns domain behavior. Desktop and CLI adapters must not implement competing versions of ingest, chronology, proxy, thumbnail, or export logic.
-- Generated proxies, thumbnails, and exports live beside the project catalog, not beside originals.
+- SQLite is canonical. Portable project catalogs own project operations; the server's local-SSD control catalog owns server jobs/library/auth and its local replicas. Do not introduce a competing JSON store, share SQLite/WAL across nodes, or add a permanent Python service.
+- The owning Rust crate controls domain behavior. Desktop, web, HTTP, Tauri, and CLI adapters must not implement competing ingest, sync, job, storage, chronology, or representation logic.
+- Generated outputs live in project-local caches or the configured server derived root, never beside originals.
 - Review, notes, search, and chronology should remain useful when originals are offline and proxies are available.
 - Chronology changes are explicit. Do not silently apply inferred clock or timezone corrections.
 - Rough-cut selection belongs to the later edit-planning stage. Do not add inclusion or source-range controls back to the labeling phase.
 - The accepted finishing target is the latest Resolve release (Resolve 21 in the product decision), while retaining practical compatibility with the user's installed Resolve 20.
 - AI analysis, transcription, embeddings, and VLM inference are out of the current MVP.
-- The app must work offline apart from access to mounted source media.
+- The desktop must work offline apart from access to its mounted source media. The server is optional and never required to commit local annotations.
+- Server original roots are immutable/read-only. The planned travel archive is a separate future create-only writable logical root, not an exception for existing scan roots.
+- The raw server backend remains loopback-only behind trusted LAN Caddy or Tailscale Serve HTTPS. Never enable Funnel or put credentials in URLs/argv.
 
 ## 3. Current implementation versus PRD target
 
@@ -51,20 +53,27 @@ Implemented now:
 - A non-interactive JSON CLI for catalog, clip annotation, chronology, and media operations.
 - Immutable typed project operations for asset membership, notes, labels, removal, rotation, and fixed clock events, with deterministic materialized views and conflict diagnostics.
 - Read-only catalog/project/clip/proxy diagnostics, including the desktop's persisted last-selected catalog, project, and asset breadcrumb.
+- Optional Ubuntu companion runtime with a local-SSD control catalog (schema 10), local project replicas, logical storage roots/node bindings, a global verified-content library, and scoped availability observations.
+- Durable leased jobs, cancellation/retry/restart recovery, scans/schedules, full hashing, shared proxy/thumbnail generation, node-scoped ETA history, and authenticated byte-range streaming.
+- Baseline format 1 and sync protocol 1.0 with bounded operation pages, per-origin cursors/acknowledgements, deterministic conflict handling, WebSocket hints, and polling recovery.
+- Browser bootstrap/session auth, revocable desktop credentials, Keychain storage, CSRF/Host/Origin/proxy validation, LAN Caddy and Tailscale Serve deployment assets.
+- Chrome library/project browse, add-to-project, proxy review, annotations, storage/jobs/sync/credentials administration, and stable polling fallback.
+- Authenticated server CLI families plus local-only bootstrap, restore, sequence-recovery, and redacted diagnostic commands.
+- Verified scheduled/manual backups of server databases with manifest-last publication, integrity/checksum validation, retention, and new-root-only restore.
 
 Important gaps; do not accidentally describe these as complete:
 
 - No ingest preview or capture-sequence split/merge workflow.
-- No durable resumable job queue, cancellation, leases, or restart recovery.
 - No relink workflow, mounted-volume inventory, project deletion, or cache cleanup UI.
-- No revision tokens or optimistic-concurrency model for desktop/CLI writes.
+- Desktop/CLI full-patch writes still have no transport-level optimistic revision token; cross-node operation sync does not make competing local full patches safe.
 - Search is currently simple filename/camera/label/note filtering, not SQLite FTS.
 - No key moments, chapters, events, scripts, edit-plan revisions, rough-cut selection, timeline export, or preview render.
 - No trip-phase/location/timezone/story-beat persistence or editor. The TypeScript `Asset` context fields and browser mock only make the story-ribbon display contract visible; the Rust model and SQLite schema do not store them yet.
 - No expanded chronology calibration view, clip exceptions, contradiction reporting, or confidence/evidence explanation.
-- No automated React component/unit test runner and no automated native Tauri UI suite.
+- Web has automated Vitest and Chrome Playwright coverage; desktop React still has no component runner and there is no automated native Tauri UI suite.
 - No macOS signing/notarization or clean-machine packaging acceptance.
 - Native media playback, filesystem permission prompts, sleep/wake, and NAS-scale behavior remain manual acceptance checks. Resolve import returns as a later edit-planning acceptance check.
+- Ubuntu/Compose, physical NFS/SMB outage behavior, Caddy/Tailscale HTTPS, native pairing/playback, and target resource/thermal acceptance remain unrun; see `docs/tasks/server/ACCEPTANCE_TASK_19.md`.
 
 Before implementing persisted trip context, resolve the domain question of whether story beats are independent overlapping ranges or must be nested under physical phases. The current recommendation is independent ranges because narrative beats may cross a location or timezone transition.
 
@@ -81,27 +90,26 @@ Before implementing persisted trip context, resolve the domain question of wheth
 │   ├── cli/
 │   │   ├── src/main.rs               # clap CLI, JSON envelopes, error mapping
 │   │   └── tests/cli_workflow.rs     # Process-level CLI/media integration tests
-│   └── desktop/
-│       ├── src/
-│       │   ├── App.tsx               # Main React UI and interaction state
-│       │   ├── api.ts                # Sole React↔Tauri boundary plus browser mocks
-│       │   ├── types.ts              # TypeScript DTO mirrors
-│       │   └── styles.css            # Entire current visual system
-│       ├── src-tauri/
-│       │   ├── src/lib.rs            # Tauri state, commands, settings, project library
-│       │   ├── src/main.rs            # Thin native entry point
-│       │   ├── tauri.conf.json       # Window, bundle, and asset-protocol config
-│       │   └── capabilities/         # Native capability permissions
-│       ├── package.json              # Vite/TypeScript/Tauri scripts
-│       └── vite.config.ts            # Fixed dev port 1420
+│   ├── desktop/
+│   │   ├── src/                      # React UI, API boundary, types, styles
+│   │   └── src-tauri/                # Tauri commands, settings, native entry point
+│   ├── server/                       # Axum runtime, admin CLI, HTTP/process tests
+│   └── web/                          # Authenticated Chrome review/admin app
 ├── core/
 │   ├── rcdvlog-core/src/lib.rs       # Canonical catalog, media, annotation, chronology logic
 │   ├── rcdvlog-core/src/operations.rs # Typed operations, HLC, materialization, conflicts
+│   ├── rcdvlog-server/               # Server catalog, storage, jobs, auth, media, backup
+│   ├── rcdvlog-sync/                 # Baseline/reconciliation DTOs and apply logic
 │   └── batch-estimator/src/lib.rs    # Domain-independent weighted ETA library
+├── packages/
+│   ├── project-client/               # OpenAPI snapshot and typed browser client
+│   └── review-ui/                    # Shared review components/types
+├── deploy/server/                    # Dockerfile, Compose, Caddy, Tailscale, example env
 └── docs/
     ├── agent-cli.md                  # Full CLI and JSON contract
     ├── batch-estimation.md           # Estimator semantics and persistence
-    └── integration-testing.md        # Automated versus manual acceptance boundaries
+    ├── integration-testing.md        # Automated versus manual acceptance boundaries
+    └── server/                       # Current server operator/developer contracts
 ```
 
 Generated directories such as `target/`, `node_modules/`, `apps/desktop/dist/`, TypeScript build info, and Tauri schema output are not source.
@@ -122,6 +130,16 @@ Rust core (`core/rcdvlog-core`)
     └── weighted ETA library (`core/batch-estimator`)
 
 CLI (`apps/cli`) ─────────────────────┘
+
+Desktop sync manager ── authenticated HTTPS operations ──▶ Axum (`apps/server`)
+                                                           │
+Chrome (`apps/web`) ── generated typed client ─────────────┤
+                                                           ▼
+                                                 Server Rust domains
+                                                 ├── local SQLite catalogs
+                                                 ├── read-only originals
+                                                 ├── derived/backup roots
+                                                 └── durable workers
 ```
 
 Rules for this boundary:
@@ -132,6 +150,9 @@ Rules for this boundary:
 - Shared DTOs use Serde `camelCase`. Clip labels are free-form strings and `removed` is a reversible visibility flag.
 - Register every new Tauri command in `tauri::generate_handler![...]` and add a matching method/type in `api.ts`/`types.ts`.
 - Expose agent-relevant domain operations through the CLI as stable JSON, not human-formatted text.
+- Browser calls go through `packages/project-client`; the Rust-owned OpenAPI document and checked-in snapshot must remain in sync.
+- Server HTTP handlers are thin auth/validation/transport adapters over `rcdvlog-server`/`rcdvlog-core`/`rcdvlog-sync` domains. They never accept arbitrary filesystem paths outside configured admin boundaries.
+- WebSocket events are hints; durable state and bounded HTTP reconciliation/polling remain authoritative.
 
 ## 6. Toolchain and prerequisites
 
@@ -145,7 +166,7 @@ Minimum documented environment:
 - FFmpeg 7+ and ffprobe on `PATH`
 - ExifTool on `PATH`
 
-The development environment was last verified on 2026-07-19 with Rust/Cargo 1.97.1, Node 24.11, pnpm 10.17, FFmpeg/ffprobe 7.1.3, and ExifTool 13.36.
+The full local Task 19 gate was verified on 2026-07-28 with Rust/Cargo 1.97.1, Node 24.14, FFmpeg/ffprobe 8.1.2, ExifTool 13.36, and Chrome 150. Docker was unavailable, so the target Ubuntu/Compose topology is not accepted.
 
 Check the environment with:
 
@@ -201,6 +222,8 @@ pnpm build                          # Tauri application bundle
 
 `pnpm build` may require the native macOS/Tauri packaging environment and takes longer than the frontend build.
 
+Build the companion server and web application with `pnpm build:server` and `pnpm build:web`. Production deployment is documented in `docs/server/deployment.md`; security/bootstrap/pairing is in `docs/server/security.md`. Never expose the raw `127.0.0.1:8090` backend, enable Funnel, or treat the desktop/browser mocks as server acceptance.
+
 ## 8. Project discovery, catalogs, and storage
 
 New desktop projects default to one folder per project:
@@ -221,13 +244,14 @@ Catalog selection precedence for the CLI:
 
 1. `--catalog /absolute/path/catalog.sqlite3`
 2. `RCDVLOG_CATALOG`
-3. Legacy application-support catalog
+3. The desktop's persisted `lastCatalogPath`
+4. Legacy application-support catalog
 
 Always pass `--catalog` in agent automation, tests, and temporary workflows. A desktop project folder can otherwise be confused with the legacy catalog.
 
-SQLite connections enable foreign keys, WAL journal mode, and a five-second busy timeout. Read operations can continue during an uncommitted writer. Project mutations now append typed operations with materialized revisions; transport-level optimistic concurrency and sync cursors remain deferred to Tasks 8–11.
+SQLite connections enable foreign keys, WAL journal mode, and a five-second busy timeout. Read operations can continue during an uncommitted writer. Project mutations append typed operations with materialized revisions. Adopted projects synchronize bounded operation pages between independent local catalogs; live SQLite/WAL files are never copied or placed on NAS.
 
-Project catalogs use an explicit `schema_migrations` history and are currently at version 5. Migration definitions have immutable names/source identities and each migration commits atomically. When changing the schema:
+Project catalogs use an explicit `schema_migrations` history and are currently at version 8. The server control catalog is version 10; backup format is version 1. Migration definitions have immutable names/source identities and each migration commits atomically. When changing the schema:
 
 - Preserve existing catalogs; never solve migration issues by deleting the database.
 - Add a forward migration and an upgrade test using an older schema fixture.
@@ -300,6 +324,8 @@ thumbnail.q1.orientation-v2
 
 Change the task key when settings change enough that old throughput is no longer comparable. Proxy and thumbnail weights are source bytes and both currently use one worker. A future cloud/VLM task must pass its real shard concurrency.
 
+The server persists histories in its control catalog scoped to its stable node and task key. Default caps are one proxy worker, one full-hash worker, and up to two lightweight workers. Durable progress must supply the exact remaining weights and actual worker count; only successful item observations update throughput.
+
 ### Deferred edit planning and export
 
 The labeling phase intentionally has no rough-cut inclusion, source ranges, or OTIO export. Those concepts return in a later edit-planning stage after clips are labeled. Keep any future edit-plan state separate from labels and reversible removal; removal only controls visibility in the labeling workflow.
@@ -363,7 +389,7 @@ Contract rules:
 - Failure: stdout stays empty; exactly one JSON error envelope goes to stderr with nonzero exit.
 - Long ingest progress may write newline-delimited JSON events to stderr before the final stdout result.
 - Stable command names and error codes are public automation contracts.
-- Current error codes: `invalid_arguments`, `invalid_input`, `not_found`, `media_offline`, `media_tool_failed`, and `internal_error`.
+- Desktop-local error codes are `invalid_arguments`, `invalid_input`, `not_found`, `media_offline`, `media_tool_failed`, and `internal_error`; remote server commands preserve the shared server registry.
 - `doctor` must not create or mutate the selected catalog.
 - Read commands should remain usable while another connection has an uncommitted WAL write.
 
@@ -382,6 +408,8 @@ When adding a selectable UI entity or a failure-prone representation, extend thi
 
 Never parse human prose from the CLI. Add/extend JSON contract tests whenever commands, fields, errors, or progress events change.
 
+Remote server commands require an explicit `--endpoint`/`RCDVLOG_SERVER_ENDPOINT` and use a paired device token from `RCDVLOG_SERVER_TOKEN`, an owner-only credential file, or interactive Keychain fallback. Never pass a token in argv. Read-only families cover status, projects, library, storage, scans, jobs, sync, representations, credentials, and backups; mutations are deliberately named. `rcdvlog-server admin` owns offline bootstrap, restore, recovery, and redacted diagnostics. See `docs/agent-cli.md` and `docs/server/troubleshooting.md`.
+
 ## 12. Testing and verification
 
 Run the narrowest useful tests while iterating, then the full gate before handoff.
@@ -393,6 +421,9 @@ Run the narrowest useful tests while iterating, then the full gate before handof
 | ETA library | `cargo test -p batch-estimator` | `cargo test --workspace` |
 | CLI parsing/JSON | `cargo test -p rcdvlog-cli` | `pnpm test:integration` |
 | Tauri commands/settings | `cargo test -p rcdvlog-desktop` | real `pnpm dev` smoke test when native behavior changed |
+| Server core/API | `pnpm test:server` | two-node process test plus target-topology check when external behavior changed |
+| Chrome web | `pnpm test:web` | `pnpm test:web:e2e` plus real HTTPS visual/interaction check |
+| OpenAPI/deployment/docs | `pnpm check:openapi` | `pnpm check:deployment`, `pnpm check:docs`, and Compose render when available |
 | Formatting/lints | `cargo fmt --all -- --check` | `cargo clippy --workspace --all-targets -- -D warnings` |
 | Full repository | — | `pnpm check` |
 
@@ -405,6 +436,9 @@ Do not replace these real process/media boundaries with mocks. Conversely, do no
 - Tauri asset-protocol playback.
 - Sleep/wake or source-volume disconnect/reconnect.
 - Expo-scale NAS performance.
+- Ubuntu/Compose restart and real NFS/SMB mount behavior.
+- LAN Caddy trust, Tailscale Serve/ACLs, and endpoint failover.
+- Target-laptop CPU/RSS/thermal behavior.
 
 For frontend interaction changes, use the Vite browser preview for focus, keyboard, scrolling, progress, and layout behavior, then use Tauri when the change depends on native APIs. Inspect the actual rendered UI; a passing TypeScript build does not catch focus propagation, overflow, or unreadable density.
 
@@ -473,6 +507,7 @@ Scale acceptance should cover thousands of assets, offline behavior, progress re
 - Tests must use `tempfile`/temporary directories. Never point destructive test setup at `~/Movies/VideoProjects`, `/Volumes`, or the repository root.
 - Do not edit SQLite by hand to achieve product behavior. Add a domain operation and migration.
 - Do not use the browser mock as evidence that persistence or media processing works.
+- Do not use local Playwright as evidence that Caddy, Tailscale, Ubuntu, native Tauri, or NAS checks passed.
 - Avoid adding always-running services, network dependencies, analytics, or credential storage.
 - Keep child-process arguments structured with `Command`; do not build shell strings from media paths.
 - Preserve paths with spaces and non-ASCII filenames.
@@ -491,3 +526,5 @@ A change is ready to hand off when:
 - Documentation and CLI contracts were updated if user-visible behavior changed.
 - Known manual acceptance that was not run is stated explicitly.
 - No generated output or real source media was accidentally added or modified.
+- Server changes preserve loopback-only networking, authenticated APIs, read-only original binds, path containment, local-SSD SQLite, and explicit new-root restore.
+- OpenAPI drift, deployment invariants, documentation links, and the applicable external acceptance boundary are checked and reported.

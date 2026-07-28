@@ -1,6 +1,6 @@
 # Task 5: NAS Scan and Verified Content Identity
 
-**Status:** Planned
+**Status:** Implemented; physical NAS acceptance remains external
 **Depends on:** Tasks 3 and 4
 **Unblocks:** Tasks 6, 14, 16, and 18
 

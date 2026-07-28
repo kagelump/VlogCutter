@@ -1,6 +1,6 @@
 # Epic: Local-First Companion Server
 
-**Status:** Planned
+**Status:** Implemented; release-topology acceptance remains outstanding
 **Architecture:** [ARCHITECTURE.md](ARCHITECTURE.md)
 **Owner:** RCD VlogCutter
 **Target:** One Mac, one Ubuntu server, one user, Chrome
@@ -13,7 +13,7 @@ The completed epic must feel like one project appearing on two surfaces. The ser
 
 ## User-visible capabilities
 
-At epic completion, the user can:
+Within the implemented and locally automated boundary, the user can:
 
 1. Deploy RCD VlogCutter Server on the Ubuntu laptop with local-SSD state, read-only NAS originals, and a dedicated derived-media root.
 2. Open the service in Chrome through trusted LAN HTTPS at home or Tailscale HTTPS away.
@@ -157,18 +157,15 @@ server-origin project creation. It builds on this epic rather than replacing any
 Two decisions in that epic amend commitments made here, and are recorded in
 [its architecture document](../travel/ARCHITECTURE.md):
 
-- **Project creation is no longer desktop-only.** Projects may be created on the desktop or
-  the server; each project has one replica per node that has adopted it. Project deletion
-  remains out of scope everywhere. Task 10's baseline machinery is reused in reverse.
-- **A writable storage root is introduced.** It is a distinct logical root with
-  `immutable_original: false` and a create-only write path. Existing NAS scan roots remain
-  immutable and read-only, and the enforcement in `library.rs` is unchanged.
+- **Project creation is not permanently desktop-only.** It is desktop-only in the current
+  implementation. Planned travel Task T5 adds server-origin creation and desktop adoption;
+  project deletion remains out of scope.
+- **A writable storage root is planned.** Travel Task T1 introduces a distinct logical root
+  with a create-only write path. Current NAS scan roots remain immutable and read-only.
 
-Task 10 is the one genuine prerequisite gap: travel T5 cannot start until it lands.
-
-Several task files below carry stale `Status:` markers — Tasks 1–8, 11, 12, and 13 are
-implemented in whole or in part despite being marked Planned, and Task 9's authentication
-core exists. Trust the code and git history until Task 20 reconciles them.
+The companion prerequisites for those travel tasks are implemented. Travel Tasks T1–T9
+remain planned and must add their new capabilities explicitly rather than treating them as
+present in this epic.
 
 ## Milestones
 
@@ -225,7 +222,7 @@ Exit criteria:
 
 - Backups are verified and a disposable restore drill succeeds.
 - CLI diagnostics are stable JSON and read-only where promised.
-- Automated gates and the Ubuntu/LAN/Tailscale/NAS manual matrix pass.
+- Automated gates pass; the Ubuntu/LAN/Tailscale/NAS matrix is recorded honestly and must pass before release deployment acceptance.
 - All repository documentation distinguishes implemented behavior from deferred work.
 
 ## Cross-cutting acceptance criteria
@@ -283,4 +280,4 @@ Manual acceptance must use disposable catalogs and generated representations. Th
 
 ## Definition of done
 
-This epic is complete only when all 20 task files satisfy their acceptance criteria, Task 19 records the automated and manual acceptance evidence, and Task 20 updates the full repository documentation to match the implementation. A working browser mock, an unverified schema migration, or a server that requires the Mac to remain online does not constitute completion.
+The implementation epic is complete: Tasks 1–20 are delivered, Task 19 records the local automated evidence and unrun external checks, and Task 20 reconciles current documentation. Release-topology acceptance is still outstanding until the 17-row Ubuntu/Mac/NAS/LAN/Tailscale matrix in `ACCEPTANCE_TASK_19.md` passes. A browser mock, an unverified migration, or local automation alone is not release approval.

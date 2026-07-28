@@ -1,74 +1,73 @@
 # RCD VlogCutter
 
-A local-first macOS labeling bench for trip footage. The current phase references originals on NAS or removable storage, keeps review proxies and thumbnails in each project folder, and supports free-form labels, notes, reversible clip removal, and fixed clock corrections.
+RCD VlogCutter is a local-first, single-user footage labeling system. The macOS desktop references immutable originals on NAS, removable storage, or local disk and remains fully useful offline. An optional private Ubuntu companion server adds a global media library, durable scans/media jobs, operation-based project synchronization, shared representations, Chrome review/admin, and verified backups.
+
+The current product supports desktop project creation/opening, ingest, metadata probing, labels, notes, reversible removal, fixed clock offsets, thumbnails, H.264 proxies, a chronology ribbon, a stable JSON CLI, server project adoption/sync, browser review/annotation, storage/job administration, and recovery diagnostics. Edit planning/export, persisted trip context, AI analysis, original upload, and the planned travel-ingest archive are not implemented.
 
 ## Prerequisites
 
-* Apple Silicon Mac with macOS 13 or later
-* Xcode command-line tools
-* Rust 1.85 or later and Cargo
-* Node.js 22 or later and pnpm 10
-* FFmpeg 7 or later and ffprobe on `PATH`
-* ExifTool on `PATH`
+- Desktop development: Apple Silicon Mac, macOS 13+, Xcode command-line tools
+- Rust 1.85+, Node.js 22+, pnpm 10
+- FFmpeg 7+ with ffprobe, and ExifTool
+- Companion deployment: Ubuntu 24.04 x86-64 with Docker Engine/Compose and a host-mounted NFS (preferred) or SMB original-media share
 
-The current development machine uses Rust 1.97, Node 24, pnpm 10, FFmpeg 7, and ExifTool 13. Proxy generation requires FFmpeg's `-display_rotation` input override so raw-orientation proxies cannot retain a camera display matrix.
+The Task 19 acceptance environment used Rust 1.97.1, Node 24.14, FFmpeg/ffprobe 8.1.2, ExifTool 13.36, and Chrome 150. See the [acceptance report](docs/tasks/server/ACCEPTANCE_TASK_19.md) for exactly what ran and which target-topology checks remain open.
 
-## Run in development
+## Desktop fast start
 
 ```bash
 pnpm install
 pnpm dev
 ```
 
-To start directly with an existing catalog, pass the same override used by the CLI:
+Open an existing catalog at startup with:
 
 ```bash
-RCDVLOG_CATALOG=/absolute/path/catalog.sqlite3 pnpm dev
+RCDVLOG_CATALOG=/absolute/project/catalog.sqlite3 pnpm dev
 ```
 
-You can also switch catalogs at runtime with **Open catalog** in the desktop toolbar. The project selector lists every project in the active catalog.
+New projects default to `~/Movies/VideoProjects/<project-name>/`, with one local SQLite catalog and project-local cache. The projects parent and autoplay behavior are configurable in desktop Settings.
 
-New projects default to `~/Movies/VideoProjects/<project name>/`. Each project folder contains its own `catalog.sqlite3` and media cache. Use **Settings** in the desktop toolbar or **Change…** on the first-run screen to configure a different parent folder. Global settings also control autoplay: never, only when a proxy is available (the default), or always. Autoplay starts muted; the **Muted / Sound on** transport button keeps the session-wide playback state consistent as you move between clips.
+## Companion server fast start
+
+The raw backend is loopback-only. Originals are mounted read-only; server state stays on local SSD; derived media and backups have separate writable roots.
+
+```bash
+cp deploy/server/example.env deploy/server/.env
+docker compose --env-file deploy/server/.env -f deploy/server/compose.yaml config --quiet
+docker compose --env-file deploy/server/.env -f deploy/server/compose.yaml build
+docker compose --env-file deploy/server/.env -f deploy/server/compose.yaml up -d
+```
+
+Then configure trusted LAN HTTPS with Caddy or private tailnet HTTPS with Tailscale Serve. Follow the complete [companion-server guide](docs/server/README.md); do not expose the backend directly or enable Tailscale Funnel.
 
 ## Verify
 
 ```bash
 pnpm check
+pnpm check:openapi
+pnpm check:deployment
+pnpm check:docs
 ```
 
-The Rust integration suite creates real fixture media with FFmpeg and verifies ingest, metadata probing, sampled deduplication, labels, notes, reversible removal, clock correction, and proxy generation.
-
-Run only the process-level integration suite with `pnpm test:integration`. See [docs/integration-testing.md](docs/integration-testing.md) for its automated coverage and the Tauri and NAS acceptance checks that remain manual. Resolve acceptance returns with the later edit-planning stage.
-
-Long-running media batches use the worker-aware weighted ETA library in `core/batch-estimator`; see [docs/batch-estimation.md](docs/batch-estimation.md) for its persistence and multi-worker model.
+Server/web checks and manual boundaries are listed in [docs/server/development-and-testing.md](docs/server/development-and-testing.md) and [docs/integration-testing.md](docs/integration-testing.md). A passing browser mock is not evidence for native Tauri, Keychain, real NAS, LAN/Tailscale TLS, or Ubuntu behavior.
 
 ## Agent CLI
 
-Build the CLI:
-
 ```bash
 pnpm build:cli
+target/debug/rcdvlog --catalog /absolute/project/catalog.sqlite3 project list
+target/debug/rcdvlog server --endpoint https://<server-host>:8443 status
 ```
 
-The binary is `target/debug/rcdvlog`. Pass `--catalog <project folder>/catalog.sqlite3` or set `RCDVLOG_CATALOG` to select a desktop project explicitly. Without an override it uses the legacy application-support catalog.
+Commands emit one JSON success envelope on stdout or one JSON error envelope on stderr. Remote server commands use a paired device credential from an owner-only file, `RCDVLOG_SERVER_TOKEN`, or interactive macOS Keychain fallback; tokens never belong in argv. See [docs/agent-cli.md](docs/agent-cli.md).
 
-```bash
-target/debug/rcdvlog doctor
-target/debug/rcdvlog project list
-target/debug/rcdvlog project status --project <project-id>
-target/debug/rcdvlog clips list --project <project-id> --limit 20
-```
+## Documentation
 
-Successful commands write one JSON envelope to stdout. Failures write a JSON error envelope to stderr and exit nonzero. Long ingest commands write JSON progress events to stderr without contaminating the final stdout response. See [docs/agent-cli.md](docs/agent-cli.md) for the full contract.
+- [Product scope and decisions](PRD.md)
+- [Agent operational handoff](AGENTS.md)
+- [Companion-server operations](docs/server/README.md)
+- [Batch ETA semantics](docs/batch-estimation.md)
+- [Integration and manual acceptance boundaries](docs/integration-testing.md)
 
-## Current MVP workflow
-
-1. Create a project.
-2. Add a folder from a mounted NAS, SSD, SD card, or local disk.
-3. Generate quality-1 thumbnails and laptop proxies as needed, then label clips in datetime order.
-4. Add free-form labels and notes from the keyboard-first labeling bench.
-5. Apply a fixed offset from a selected filename onward for one camera.
-6. Remove unusable clips from the labeling queue; restore them from the Removed view when needed.
-7. Build the rough cut in the later edit-planning stage after labeling is complete.
-
-See [PRD.md](PRD.md) for the scope contract and implementation decisions.
+Originals are immutable. Never move, rename, rewrite, or delete source media, and never copy live SQLite/WAL files between nodes.

@@ -1,6 +1,6 @@
 # Task 10: Desktop Pairing, Root Mapping, and Baseline Adoption
 
-**Status:** Planned
+**Status:** Implemented; native Tauri/two-machine acceptance remains external
 **Depends on:** Tasks 8 and 9
 **Unblocks:** Task 11
 

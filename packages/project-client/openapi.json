@@ -1110,6 +1110,7 @@
     }
   },
   "info": {
+    "description": "Private single-user companion API for authenticated project synchronization, browser review, storage/library administration, durable jobs, derived-media streaming, and verified backups. Originals are never HTTP content sources.",
     "title": "RCD VlogCutter Server API",
     "version": "0.1.0"
   },

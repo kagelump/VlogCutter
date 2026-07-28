@@ -1,7 +1,9 @@
 # Companion Server Handoff After Task 4
 
+> Historical point-in-time handoff. It is preserved as delivery evidence and is superseded by the current [`docs/server`](../../server/README.md) guidance and later task records.
+
 **Date:** 2026-07-20
-**Status:** Tasks 1–4 accepted; Task 5 not started
+**Status:** Historical snapshot — Tasks 1–4 accepted; Task 5 had not started
 **Epic:** [EPIC.md](EPIC.md)
 **Architecture:** [ARCHITECTURE.md](ARCHITECTURE.md)
 

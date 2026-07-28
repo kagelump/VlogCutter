@@ -584,7 +584,7 @@ function proxyStateTitle(asset: ProjectReviewAsset) {
 }
 
 function proxyStateDetail(asset: ProjectReviewAsset) {
-  if (asset.proxy?.state === "available" && !asset.proxy.availableOnServer) return "This server does not have the review file yet. It may be downloaded by a paired Mac when representation transfer is available.";
+  if (asset.proxy?.state === "available" && !asset.proxy.availableOnServer) return "This server does not have the review file yet. Use the paired Mac to transfer the compatible proxy, or regenerate it where the verified original is accessible.";
   if (asset.proxy?.state === "queued" || asset.proxy?.state === "running") return "The browser will use the canonical proxy when the server reports it available.";
   if (asset.mediaVerificationState === "mismatch") return "Identity must be repaired before a trustworthy proxy can be selected.";
   if (asset.originalAvailability === "accessible_here") return "The server can see the original, but browser review never streams originals. Queue a compatible proxy to enable playback.";

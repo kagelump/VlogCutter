@@ -1,12 +1,12 @@
 # RCD VlogCutter agent CLI
 
-`rcdvlog` is the non-interactive control surface for Codex, Claude, and shell automation. It calls the same Rust core and SQLite catalog as the Tauri desktop app.
+`rcdvlog` is the non-interactive JSON control surface for desktop catalogs and the authenticated companion server. Local commands call the same Rust core as Tauri; remote commands use bounded documented HTTP operations rather than opening server databases.
 
 ## Build and catalog selection
 
 ```bash
 cargo build -p rcdvlog-cli
-target/debug/rcdvlog doctor
+target/debug/rcdvlog --catalog /absolute/project/catalog.sqlite3 doctor
 ```
 
 Catalog selection, in precedence order:
@@ -43,7 +43,7 @@ Failure is one JSON value on stderr with a nonzero exit code:
 }
 ```
 
-Current error codes are `invalid_arguments`, `invalid_input`, `not_found`, `media_offline`, `media_tool_failed`, and `internal_error`.
+Local desktop commands use `invalid_arguments`, `invalid_input`, `not_found`, `media_offline`, `media_tool_failed`, and `internal_error`. Server commands preserve the server's shared stable registry, including authentication, protocol, mount, job, backup, and security codes. The registry is [`core/rcdvlog-server/src/error_codes.rs`](../core/rcdvlog-server/src/error_codes.rs); clients must branch on `error.code`, not prose. Remote failures also return the server `requestId` when available.
 
 Long ingest commands emit JSON progress objects to stderr every 25 assets and on completion:
 
@@ -56,7 +56,7 @@ Long ingest commands emit JSON progress objects to stderr every 25 assets and on
 ### Prerequisites
 
 ```bash
-rcdvlog doctor
+rcdvlog --catalog /absolute/project/catalog.sqlite3 doctor
 ```
 
 ### Screenshot-driven diagnosis
@@ -65,19 +65,19 @@ The desktop persists the last displayed catalog, project, and clip whenever sele
 
 ```bash
 rcdvlog desktop last-opened
-rcdvlog catalog inspect
-rcdvlog project diagnose --project <project-id>
-rcdvlog clips diagnose --asset <asset-id>
+rcdvlog --catalog /absolute/project/catalog.sqlite3 catalog inspect
+rcdvlog --catalog /absolute/project/catalog.sqlite3 project diagnose --project <project-id>
+rcdvlog --catalog /absolute/project/catalog.sqlite3 clips diagnose --asset <asset-id>
 ```
 
-`catalog inspect`, `project diagnose`, `clips diagnose`, and `proxy status` open SQLite strictly read-only and never run migrations. Catalog inspection includes unresolved operation-conflict count when schema version 5 is present. Project diagnosis includes operation/conflict state, and clip diagnosis includes materialized revision plus immutable note history alongside the stored asset row, live ffprobe evidence, cache-version classification, computed render transform/final dimensions, warnings, and recommended explicit actions. It is the preferred evidence bundle when a screenshot disagrees with catalog labels.
+`catalog inspect`, `project diagnose`, `clips diagnose`, and `proxy status` open SQLite strictly read-only and never run migrations. Catalog inspection includes unresolved operation-conflict counts for operation-aware catalogs. Project diagnosis includes operation/conflict state, and clip diagnosis includes materialized revision plus immutable note history alongside the stored asset row, live ffprobe evidence, cache-version classification, computed render transform/final dimensions, warnings, and recommended explicit actions. It is the preferred evidence bundle when a screenshot disagrees with catalog labels.
 
 The pattern is intentionally extensible: persist a stable ID for newly selectable UI entities, add a focused read-only `diagnose` projection in the Rust core/CLI, report stored state separately from observed external state, explain the derived behavior, and expose mutations as separate commands.
 
 ### Catalog inspection
 
 ```bash
-rcdvlog catalog inspect
+rcdvlog --catalog /absolute/project/catalog.sqlite3 catalog inspect
 ```
 
 Reports required tables, pending diagnostic/schema columns, journal mode, project/asset counts, and unresolved operation conflicts without changing the file.
@@ -85,16 +85,17 @@ Reports required tables, pending diagnostic/schema columns, journal mode, projec
 ### Projects
 
 ```bash
-rcdvlog project create --name "Expo 2025"
-rcdvlog project list
-rcdvlog project status --project <project-id>
-rcdvlog project diagnose --project <project-id>
+rcdvlog --catalog /absolute/project/catalog.sqlite3 project create --name "Expo 2025"
+rcdvlog --catalog /absolute/project/catalog.sqlite3 project list
+rcdvlog --catalog /absolute/project/catalog.sqlite3 project status --project <project-id>
+rcdvlog --catalog /absolute/project/catalog.sqlite3 project diagnose --project <project-id>
 ```
 
 ### Ingest
 
 ```bash
-rcdvlog ingest --project <project-id> --folder "/Volumes/data/VideoProjects/2025-08 Expo"
+rcdvlog --catalog /absolute/project/catalog.sqlite3 ingest \
+  --project <project-id> --folder "/absolute/source/Trip Footage"
 ```
 
 Ingest references media in place and is idempotent within a project by sampled fingerprint.
@@ -102,13 +103,13 @@ Ingest references media in place and is idempotent within a project by sampled f
 ### Clips
 
 ```bash
-rcdvlog clips list --project <project-id> --limit 100 --offset 0
-rcdvlog clips list --project <project-id> --query "arrival"
-rcdvlog clips list --project <project-id> --include-removed
-rcdvlog clips get --asset <asset-id>
-rcdvlog clips diagnose --asset <asset-id>
-rcdvlog clips refresh-orientation --asset <asset-id>
-rcdvlog clips update \
+rcdvlog --catalog /absolute/project/catalog.sqlite3 clips list --project <project-id> --limit 100 --offset 0
+rcdvlog --catalog /absolute/project/catalog.sqlite3 clips list --project <project-id> --query "arrival"
+rcdvlog --catalog /absolute/project/catalog.sqlite3 clips list --project <project-id> --include-removed
+rcdvlog --catalog /absolute/project/catalog.sqlite3 clips get --asset <asset-id>
+rcdvlog --catalog /absolute/project/catalog.sqlite3 clips diagnose --asset <asset-id>
+rcdvlog --catalog /absolute/project/catalog.sqlite3 clips refresh-orientation --asset <asset-id>
+rcdvlog --catalog /absolute/project/catalog.sqlite3 clips update \
   --asset <asset-id> \
   --notes "Arrival establishing shot" \
   --add-label arrival \
@@ -125,7 +126,7 @@ rcdvlog clips update \
 ### Camera clock events
 
 ```bash
-rcdvlog clock apply \
+rcdvlog --catalog /absolute/project/catalog.sqlite3 clock apply \
   --project <project-id> \
   --camera "DJI Pocket 3" \
   --start-filename DJI_20250810104709_0002_D.MP4 \
@@ -138,10 +139,10 @@ The fixed offset applies from the filename boundary onward for that camera. It d
 ### Proxies
 
 ```bash
-rcdvlog proxy generate --asset <asset-id>
-rcdvlog proxy missing --project <project-id>
-rcdvlog proxy status --asset <asset-id>
-rcdvlog proxy status --project <project-id> --limit 100
+rcdvlog --catalog /absolute/project/catalog.sqlite3 proxy generate --asset <asset-id>
+rcdvlog --catalog /absolute/project/catalog.sqlite3 proxy missing --project <project-id>
+rcdvlog --catalog /absolute/project/catalog.sqlite3 proxy status --asset <asset-id>
+rcdvlog --catalog /absolute/project/catalog.sqlite3 proxy status --project <project-id> --limit 100
 ```
 
 `proxy status` is read-only and distinguishes verified raw-orientation v3 proxies, obsolete metadata-tagged raw v2 proxies, legacy metadata-baked v1 proxies, and missing files. Listed v3 items are live-probed and are ready only when their display rotation is 0°. `proxy missing` may be long-running and regenerates obsolete representations when originals are available. Completed proxies remain committed if the command is interrupted.
@@ -149,14 +150,88 @@ rcdvlog proxy status --project <project-id> --limit 100
 ### Thumbnails
 
 ```bash
-rcdvlog thumbnails generate --asset <asset-id> --quality 1
-rcdvlog thumbnails missing --project <project-id> --quality 1
+rcdvlog --catalog /absolute/project/catalog.sqlite3 thumbnails generate --asset <asset-id> --quality 1
+rcdvlog --catalog /absolute/project/catalog.sqlite3 thumbnails missing --project <project-id> --quality 1
 ```
 
 Quality 1 is a 480-pixel-wide JPEG sampled at 20% of the clip. It is stored under the project folder at `cache/thumbnails/<asset-id>/q1.v2.jpg`. The original is preferred; an available proxy is used when the original is offline. Qualities 2–10 are reserved and currently rejected.
 
 Rough-cut selection, source ranges, and OTIO export are intentionally absent from this labeling phase. They will return as a separate edit-planning workflow after labeling.
 
+## Companion-server commands
+
+Every remote command requires an explicit endpoint, either `--endpoint` or `RCDVLOG_SERVER_ENDPOINT`:
+
+```bash
+rcdvlog server --endpoint https://<server-host>:8443 status
+```
+
+Credential precedence is:
+
+1. `RCDVLOG_SERVER_TOKEN`.
+2. `--credential-file` or `RCDVLOG_SERVER_CREDENTIAL_FILE`; the file must be owner-only.
+3. Interactive macOS Keychain lookup for the returned stable server node ID.
+
+Prefer an owner-only credential file for unattended automation. Never put the token in argv, a URL, output, a fixture, or a repository file. Every success includes request endpoint, non-secret credential-source label, protocol/version identity, and result.
+
+All list operations are bounded and cursor-based where the API supports pagination:
+
+```bash
+rcdvlog server --endpoint https://<server-host>:8443 projects --limit 50
+rcdvlog server --endpoint https://<server-host>:8443 library list --limit 50 --filename-prefix DJI --camera "Pocket 3"
+rcdvlog server --endpoint https://<server-host>:8443 library diagnose --media-object <media-object-id>
+rcdvlog server --endpoint https://<server-host>:8443 storage list
+rcdvlog server --endpoint https://<server-host>:8443 storage diagnose --root <root-id>
+rcdvlog server --endpoint https://<server-host>:8443 scans list --limit 50
+rcdvlog server --endpoint https://<server-host>:8443 scans diagnose --scan <scan-id>
+rcdvlog server --endpoint https://<server-host>:8443 jobs list --limit 50 --state failed
+rcdvlog server --endpoint https://<server-host>:8443 jobs diagnose --job <job-id>
+rcdvlog server --endpoint https://<server-host>:8443 sync status
+rcdvlog server --endpoint https://<server-host>:8443 sync diagnose --project <project-id>
+rcdvlog server --endpoint https://<server-host>:8443 representations status --representation <representation-id>
+rcdvlog server --endpoint https://<server-host>:8443 credentials list
+rcdvlog server --endpoint https://<server-host>:8443 backups list
+rcdvlog server --endpoint https://<server-host>:8443 backups diagnose --backup <backup-id>
+```
+
+Read commands may inspect already-known filesystem/network/tool state but never migrate, scan broadly, hash a full file, enqueue, repair, change cursors, or create cache output. Their JSON separates stored state, live observation, derived decisions, version identity, warnings, and recommended explicit mutations.
+
+Mutations are deliberately named:
+
+```bash
+rcdvlog server --endpoint https://<server-host>:8443 scans request \
+  --root <root-id> --scope <relative/subtree> --idempotency-key <unique-key>
+rcdvlog server --endpoint https://<server-host>:8443 jobs retry --job <job-id>
+rcdvlog server --endpoint https://<server-host>:8443 jobs cancel --job <job-id>
+rcdvlog --catalog /absolute/project/catalog.sqlite3 server \
+  --endpoint https://<server-host>:8443 sync now --project <project-id>
+rcdvlog server --endpoint https://<server-host>:8443 representations request \
+  --media-object <media-object-id> --kind proxy
+rcdvlog server --endpoint https://<server-host>:8443 credentials pairing-create \
+  --output-file /absolute/new/pairing-code.txt
+rcdvlog server --endpoint https://<server-host>:8443 credentials revoke --credential <credential-id>
+rcdvlog server --endpoint https://<server-host>:8443 backups create --idempotency-key <unique-key>
+```
+
+Pairing-code creation removes the plaintext code from JSON and writes it once to a new owner-only file. `sync now` signals the running desktop when it owns the project sync manager; otherwise it performs one exclusive bounded reconciliation and reports which path ran.
+
+## Server-local administration
+
+`rcdvlog-server admin` is the offline, server-host-only recovery surface. It uses environment-selected data/backup roots, returns one JSON result, and refuses exclusive work against a running server.
+
+```bash
+rcdvlog-server admin bootstrap create --output-file /absolute/new/bootstrap-code.txt
+rcdvlog-server admin backup inspect --backup /absolute/backup/restore-point
+rcdvlog-server admin restore inspect --restore-point /absolute/backup/restore-point
+rcdvlog-server admin restore apply \
+  --restore-point /absolute/backup/restore-point \
+  --new-data-root /absolute/new-server-data \
+  --confirm-new-data-root
+rcdvlog-server admin diagnostics bundle --output-directory /absolute/new/diagnostic-directory
+```
+
+Restore always targets a new directory and requires the server to be stopped. Sequence-divergence acceptance is intentionally omitted from routine examples; use it only after following the investigation in [backup-and-recovery.md](server/backup-and-recovery.md).
+
 ## Concurrency
 
-SQLite runs in WAL mode. Read commands can run while ingest is writing, as verified against the Expo acceptance project. Agents should still avoid simultaneous mutations to the same asset until explicit revision tokens are added.
+Desktop and server SQLite files use WAL mode only for same-host concurrency. Read commands can run while another local connection holds an uncommitted write. Cross-node concurrency uses immutable typed operations, per-origin cursors, deterministic materialization, and explicit conflicts—not shared SQLite files. Avoid competing full-patch desktop/CLI edits to the same asset fields; use the operation-specific server/web mutations where available.

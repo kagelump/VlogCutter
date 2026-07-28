@@ -1,5 +1,7 @@
 # Companion Storage and Library Foundation
 
+> Historical Task 3 implementation snapshot. Current storage/library guidance is in [`docs/server/storage-and-library.md`](../../server/storage-and-library.md).
+
 This is the implementation handoff for Task 3. It documents the Rust storage/library contracts consumed by later server tasks. Filesystem walking, hashing, media probing, jobs, transports, UI, synchronization, and representation storage remain owned by later tasks.
 
 ## Control-catalog migration

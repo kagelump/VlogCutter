@@ -1,7 +1,9 @@
 # Handoff After Task 7
 
+> Historical point-in-time handoff. It is preserved as delivery evidence and is superseded by the current [`docs/server`](../../server/README.md) guidance and later task records.
+
 **Date:** 2026-07-23
-**Status:** Task 7 implemented; automated gates pass; real Tauri keyboard/focus smoke test not run
+**Status:** Historical snapshot — Task 7 implemented; real Tauri keyboard/focus smoke test had not run
 **Next:** Task 8 — Sync Protocol and Server Project Replicas
 
 ## Migration identity

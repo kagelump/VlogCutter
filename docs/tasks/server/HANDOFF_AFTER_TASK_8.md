@@ -1,7 +1,9 @@
 # Handoff After Task 8
 
+> Historical point-in-time handoff. It is preserved as delivery evidence and is superseded by the current [`docs/server`](../../server/README.md) guidance and later task records.
+
 **Date:** 2026-07-23  
-**Status:** Task 8 implemented; automated Rust and HTTP gates pass  
+**Status:** Historical snapshot — Task 8 implemented; automated Rust and HTTP gates passed
 **Next:** Task 9 authentication, then Tasks 10–11 pairing and desktop sync
 
 ## Frozen identities

@@ -23,7 +23,7 @@ use tracing_subscriber::EnvFilter;
 #[command(
     name = "rcdvlog-server",
     version,
-    about = "Private companion server foundation for RCD VlogCutter"
+    about = "Private companion server for RCD VlogCutter"
 )]
 struct Arguments {
     #[arg(

@@ -1,13 +1,13 @@
 # Companion Server Architecture
 
-**Status:** Accepted design for implementation planning
+**Status:** Implemented reference architecture; accepted deviations are recorded below
 **Date:** 2026-07-20
 **Scope:** First companion-server epic for RCD VlogCutter
 **Target deployment:** One Ubuntu home-server laptop, one Mac desktop, one user, Chrome web client
 
 ## 1. Executive summary
 
-RCD VlogCutter will become a two-node, local-first system:
+RCD VlogCutter is implemented as an optional two-node, local-first system:
 
 - The Mac remains the primary interactive client and continues to work without a network connection.
 - The Ubuntu server is the durable synchronization hub, global NAS media index, background processor, and web host.
@@ -36,6 +36,15 @@ These decisions were confirmed for this epic and take precedence over older stat
 10. A project asset may synchronize to the Mac while its original is remote-only. Metadata and thumbnails remain useful, and a compatible server proxy can be downloaded on demand.
 11. The server runs on an Intel i7-8550U Ubuntu laptop with 16 GB RAM and local SSD storage. Defaults must be conservative enough for that machine.
 12. The final implementation task updates all repository documentation after behavior is complete and verified.
+
+### 2.1 Accepted implementation deviations and evidence boundary
+
+- Bootstrap creation is server-local only; the remote unauthenticated creation route was removed after security review. Open exchanges are bounded to 64 KiB and 12 attempts per minute per process.
+- Same-origin browser tabs share the CSRF value through local storage while the session credential remains an HttpOnly cookie. This enables concurrent tabs without exposing the session token to JavaScript.
+- Sync stores explicit per-peer operation acknowledgements (project schema 8), uploads pages of at most 500 operations, groups application by origin, and uses exact contiguous retained-operation replay after restore.
+- WebSocket events are hints. The web application also performs bounded five-second polling, and the desktop recovers through HTTP reconciliation.
+- Task 19 passed local automated/macOS process acceptance but could not run Ubuntu/Compose, physical NAS, Caddy/Tailscale, native Tauri, or target resource checks. See [ACCEPTANCE_TASK_19.md](ACCEPTANCE_TASK_19.md); this architecture is implemented but not release-topology accepted.
+- Project creation remains desktop-only in this epic. Planned travel Task T5 makes that constraint non-permanent. Planned travel Task T1 adds a distinct create-only writable archive root; current original scan roots remain immutable.
 
 ## 3. Goals
 

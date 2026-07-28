@@ -1,30 +1,55 @@
 # Integration testing
 
-The automated integration suite exercises the MVP through the same compiled CLI and SQLite catalog used by agents and the desktop application. It deliberately avoids mocks at the process and media-tool boundaries.
+The repository uses real process, SQLite, HTTP, browser, and media-tool boundaries where automation can represent production behavior. Mocks are limited to fast UI development and are never release evidence for native or network behavior.
 
 ## Automated coverage
 
-| Boundary | Scenarios |
+| Boundary | Checked behavior |
 | --- | --- |
-| CLI process contract | Independent invocations, persistent catalog selection, JSON stdout/stderr envelopes, exit status, and stable error codes |
-| Catalog concurrency | A read-only CLI process remains responsive while another SQLite connection holds an uncommitted write transaction in WAL mode |
-| Media workflow | Real FFmpeg fixture creation, ffprobe ingest, non-media filtering, progress events, idempotent re-ingest, metadata persistence, labels/notes/removal edits, clock correction, proxy generation, rotated-source display-matrix removal, and offline-original review |
+| Rust workspace | Migrations, catalog/domain operations, sync/conflicts, storage identity, scans, jobs, representations, auth/security, backup/restore, health, and diagnostics |
+| Desktop CLI processes | Stable JSON stdout/stderr, explicit catalogs, WAL reads, real FFmpeg ingest/metadata/dedup, labels/notes/removal/clock, thumbnails/proxies, and offline-original review |
+| Independent server processes | Separate Mac/server SQLite files, real authenticated HTTP baseline/reconcile, duplicate delivery, browser-origin mutation, restart, and restore sequence recovery |
+| Web unit/build | Typed client integration, loading/error/empty states, library/project review, annotations, and administration |
+| Chrome Playwright | Local-only bootstrap login, admin mutation, concurrent same-origin tabs, and durable 5-second polling when one WebSocket is disabled |
+| Scale/fault fixtures | 2,000-asset baseline, 2,000-row library/scan pages, 10,000 jobs, sequence gaps/lost acknowledgements, leases/retry/cancel, media cancellation/restart, and byte ranges |
+| Static contracts | OpenAPI drift, loopback/Compose/read-only-original/Funnel deployment invariants, frozen protocol schemas, and Markdown links |
 
-Run the integration suite with:
+Representative gates:
 
 ```bash
-pnpm test:integration
+PATH="/opt/homebrew/bin:/usr/local/bin:$PATH" cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all -- --check
+pnpm check:frontend
+pnpm test:web
+pnpm test:web:e2e
+pnpm check:openapi
+pnpm check:deployment
+pnpm check:docs
 ```
 
-FFmpeg and ffprobe are required for the media workflow. The process and concurrency tests still run if either tool is unavailable; the media test reports that it was skipped. `pnpm check` also includes these tests through the Rust workspace suite.
+`pnpm test:integration` runs the desktop CLI/media process suite. FFmpeg and ffprobe are required for its media case; absence skips media rather than pretending a mock passed. `pnpm check` combines frontend type checking with Rust workspace tests.
 
-## Manual and system-level acceptance
+## What browser modes prove
 
-These behaviors need their real host application or hardware and should not be represented by misleading headless mocks:
+The desktop Vite preview at port 1420 uses in-memory mocks and is appropriate only for layout, focus, keyboard, and scrolling checks. It cannot validate Tauri commands, Keychain, asset-protocol playback, filesystem permission prompts, persistence, media processes, or sync.
 
-- The later edit-planning phase must reintroduce Resolve/OTIO acceptance before timeline export ships again.
-- Exercise the Tauri folder dialog, macOS filesystem permission prompts, native media playback, and laptop sleep/wake behavior.
-- Run the Expo-scale fixture from a mounted NAS, including disconnect/reconnect during ingest and proxy generation.
-- Confirm acceptable scan, proxy, catalog, and UI performance over roughly 100 hours and thousands of 4K/60 clips.
+The web Playwright suite uses a real disposable server and Chrome. It does validate browser authentication, API mutation, multi-tab convergence, WebSocket loss, and polling recovery on one host. It does not validate Caddy certificates, Tailscale ACLs/routing, physical LAN latency, or NAS behavior.
 
-The checked-in media integration fixture is intentionally one second and one source. Scale and Resolve compatibility belong in periodic acceptance runs, not every local or CI test.
+## Manual and target-topology acceptance
+
+These checks require the actual Mac/Ubuntu/NAS/LAN/Tailscale topology and remain unaccepted until recorded:
+
+- Render/start Compose on Ubuntu, prove the data volume is local SSD, and exercise reboot/restart policy.
+- Mount NFS (preferred) or SMB originals read-only, verify a differently named Mac binding, scan exact counts, and prove the original tree/metadata unchanged.
+- Install/trust the Caddy internal CA, then pair/adopt/review/seek in Chrome and the native Tauri app over LAN HTTPS.
+- Repeat endpoint failover, sync, streaming, revocation, and offline review through Tailscale Serve with Funnel off.
+- Disconnect/reconnect NAS during scan/hash/proxy; queue Mac-only work; download a proxy and review with NAS unavailable.
+- Record server CPU, RSS, throughput, temperature, and throttling on the target laptop under representative media load.
+- Repeat backup/restore in Compose and reconnect a retained Mac history.
+- Exercise macOS dialogs, filesystem permissions, native asset-protocol playback, sleep/wake, and clean-machine packaging.
+- Run periodic thousands-of-assets/roughly-100-hour NAS acceptance. The real Expo source fixture is never an automated destructive target.
+
+DaVinci Resolve/OTIO acceptance returns only when the later edit-planning/export stage is implemented.
+
+The authoritative last-run matrix, including every “not run” reason and residual risk, is [Task 19 acceptance](tasks/server/ACCEPTANCE_TASK_19.md). Passing local automation is not permission to relabel those external checks as passed.

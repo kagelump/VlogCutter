@@ -116,22 +116,23 @@ At epic completion, the user can:
 | --- | --- | --- |
 | [T9](TASK_T9_travel_acceptance.md) | End-to-end travel acceptance | T8 |
 
-T1–T4 are server-only and can proceed before the phone application exists. T5 is the one
-task blocked on unbuilt companion-server work.
+T1–T5 can now build on the completed companion-server foundation. All travel tasks remain
+planned and must still land in their declared dependency order.
 
-## Dependencies on unbuilt companion-server work
+## Companion-server foundation
 
-This is accepted and recorded so it is not discovered late.
+The companion-server prerequisites are implemented. Travel work remains planned.
 
 | Needed | Task | Actual status |
 | --- | --- | --- |
-| Desktop pairing, root mapping, baseline adoption | [server 10](../server/TASK_10_desktop_pairing_root_mapping_and_baseline.md) | **Not implemented — blocks T5** |
-| Web library and project browsing | [server 14](../server/TASK_14_web_library_project_browse_and_add.md) | Not implemented; affects web fallback only |
-| Web proxy review and annotation | [server 15](../server/TASK_15_web_proxy_review_and_annotations.md) | Not implemented; affects web fallback only |
-| Authentication and secure transport | [server 9](../server/TASK_9_authentication_and_secure_transports.md) | Core implemented; task file marker is stale |
+| Desktop pairing, root mapping, baseline adoption | [server 10](../server/TASK_10_desktop_pairing_root_mapping_and_baseline.md) | Implemented; T5 adds reverse adoption |
+| Web library and project browsing | [server 14](../server/TASK_14_web_library_project_browse_and_add.md) | Implemented |
+| Web proxy review and annotation | [server 15](../server/TASK_15_web_proxy_review_and_annotations.md) | Implemented |
+| Authentication and secure transport | [server 9](../server/TASK_9_authentication_and_secure_transports.md) | Implemented; target TLS acceptance remains external |
 
-Several companion-server task files carry stale `Status:` markers. Trust the code and git
-history over the markers until server Task 20 reconciles them.
+Current project creation remains desktop-only and current original scan roots remain
+immutable. T5 and T1 are the linked planned successors; neither capability is implemented by
+the completed companion-server epic.
 
 ## Milestones
 

@@ -1,5 +1,7 @@
 # Companion Schema Foundation
 
+> Historical Task 1 schema snapshot. Current schema identities are summarized in [`docs/server/README.md`](../../server/README.md).
+
 This is the implementation handoff for the migration and identity contracts introduced by Task 1. Broad product documentation remains owned by Task 20.
 
 ## Project catalog migration contract

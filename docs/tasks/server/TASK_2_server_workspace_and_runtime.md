@@ -1,6 +1,6 @@
 # Task 2: Server Workspace and Runtime
 
-**Status:** Planned
+**Status:** Implemented; target Ubuntu/Compose acceptance remains external
 **Depends on:** Task 1
 **Unblocks:** Tasks 3, 4, 8, 9, and 17
 

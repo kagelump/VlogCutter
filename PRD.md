@@ -2,8 +2,18 @@
 
 ## MVP Overall Design Sketch
 
-**Version:** 0.6
-**Status:** MVP implementation in progress; core product and architecture decisions recorded in Section 25
+**Version:** 0.7
+**Status:** Desktop MVP implementation and optional companion-server epic implemented; remaining product gaps and external acceptance are explicit below
+
+---
+
+## Current implementation checkpoint — 2026-07-28
+
+The macOS desktop implements the local-first labeling vertical slice: project catalogs, reference-in-place ingest, metadata, notes/labels/reversible removal, fixed clock offsets, thumbnails/proxies, chronology ribbon, typed operations, and JSON CLI diagnostics. It does not yet implement ingest preview/capture-sequence editing, trip-context persistence, expanded chronology calibration, edit planning, preview render, timeline export, relink/cleanup, or AI features.
+
+The optional private Ubuntu companion server is implemented at application `0.1.0`, sync protocol `1.0`, baseline format `1`, project schema `8`, control schema `10`, and backup format `1`. It adds read-only NAS scanning and verified global identity, durable jobs, shared representations, independent server project replicas synchronized by operations, Chrome review/admin, revocable authentication, and verified database backups. It never shares live SQLite files or uploads originals. See [`docs/server/README.md`](docs/server/README.md).
+
+Local automated/macOS process acceptance passed. Ubuntu/Compose, physical NAS, LAN Caddy, Tailscale, native Tauri, and target resource/thermal acceptance did not run and remain release risks; the sole evidence is [`docs/tasks/server/ACCEPTANCE_TASK_19.md`](docs/tasks/server/ACCEPTANCE_TASK_19.md). Sections below preserve the broader product target and must not be read as claiming every listed screen/capability is implemented.
 
 ---
 
@@ -19,7 +29,7 @@ The initial architecture should support:
 * Interactive timeline calibration
 * Structured access from Claude and Codex
 * Deterministic timeline export
-* A future optional Linux home node
+* An optional private Linux companion node without weakening desktop offline use
 
 The design should not prematurely optimize for:
 
@@ -215,7 +225,7 @@ The React frontend never opens SQLite directly. Tauri commands and the Rust CLI 
 
 ## 6.1 Project catalog
 
-The MVP keeps one canonical SQLite catalog inside each project folder. It tracks media facts and project state together; cross-project asset reuse is deferred.
+The desktop keeps one canonical SQLite catalog inside each project folder. It tracks desktop media facts and project state together. The optional server separately provides verified cross-project media/representation reuse while project membership and annotations remain operation-backed in each project catalog/replica.
 
 Tracks media facts:
 
@@ -649,7 +659,7 @@ Transcript, keyframe, script-revision, semantic-search, and preview-render CLI c
 
 ---
 
-# 16. Project Concurrency
+# 16. Project Concurrency and Synchronization
 
 Each MVP project has one canonical local SQLite source of truth at `<project folder>/catalog.sqlite3`. Desktop and CLI processes may concurrently open that catalog in WAL mode.
 
@@ -679,13 +689,15 @@ Initial conflict behavior:
 * Chronology calibration: explicit domain operations
 * Generated outputs: never silently replace newer active output
 
-Full cross-device synchronization is deferred.
+Implemented cross-device behavior uses immutable typed project operations, HLC ordering, deterministic materialized views, per-origin sequence cursors, explicit conflict diagnostics, and bounded at-least-once reconciliation between independent local SQLite files. Network failure never rolls back a committed desktop mutation. Live SQLite/WAL files and absolute paths are not synchronization artifacts.
+
+Transport-level optimistic revision tokens for competing desktop/CLI full-patch writes remain deferred. Multi-user collaboration and multiple independent Mac editing origins are also out of scope.
 
 ---
 
 # 17. Processing Jobs
 
-Long-running work should be represented as resumable jobs.
+Long-running work should be represented as resumable jobs. The companion server implements durable jobs with attempts, dependencies, leases, retry/cancel, crash recovery, schedules, events, and persisted node-scoped throughput. Desktop proxy/thumbnail batches still commit outputs incrementally but are not backed by the server job table.
 
 Examples:
 
@@ -716,49 +728,17 @@ The UI should allow annotation work to begin before all jobs finish.
 
 ---
 
-# 18. Preliminary Repository Structure
+# 18. Repository Structure
 
-```text
-rcd-vlogcutter/
-├── apps/
-│   ├── desktop/
-│   │   ├── src/
-│   │   └── src-tauri/
-│   └── agent-workspace-template/
-│
-├── core/
-│   └── rcdvlog-core/
-│       ├── src/
-│       │   ├── assets/
-│       │   ├── ingest/
-│       │   ├── representations/
-│       │   ├── chronology/
-│       │   ├── edit_plan/
-│       │   └── export/
-│       └── tests/
-│
-├── schemas/
-├── fixtures/
-└── docs/
-```
+The implemented workspace contains `apps/desktop`, `apps/cli`, `apps/server`, and `apps/web`; Rust domain crates under `core/` for desktop/project behavior, synchronization, server domains, and batch estimation; shared TypeScript packages under `packages/`; production assets under `deploy/server`; and current operator/developer guidance under `docs/server`. The detailed operational map lives in [`AGENTS.md`](AGENTS.md).
 
 ---
 
-# 19. Future Home-Node Path
+# 19. Optional Companion Server
 
-The MVP should not depend on a Linux server, but the architecture should permit one later.
+The desktop does not depend on Linux. The implemented companion server can index configured read-only NAS roots without the Mac, verify global content identity, generate shared proxies/thumbnails, host operation-synchronized project replicas, serve selected representations to Chrome, download compatible proxies to the Mac, and queue node-targeted representation requests. It also provides private authenticated web review/admin and verified database backups.
 
-A future home node may:
-
-* Index NAS roots without the Mac
-* Generate proxies
-* Run VLM analysis
-* Host the active project catalog
-* Replicate project operations
-* Serve selected representations
-* Prepare projects for offline use
-
-The same core domain logic and API should run on both Mac and Linux where practical.
+The server is the durable synchronization hub, not the exclusive project owner. Desktop and server databases stay local to their node; they exchange versioned operations and path-free facts. Original bytes never transfer in this epic. VLM analysis, bulk “prepare offline,” multi-user collaboration, and high availability remain deferred.
 
 The desktop remains usable while the node is unavailable.
 
@@ -866,10 +846,9 @@ The core review and chronology flows must remain useful without them. No permane
 
 ## 21.4 Explicitly deferred
 
-* Multi-user or cross-device synchronization
-* Linux home-node execution
+* Multi-user collaboration and multiple independent Mac editing origins
 * Cloud media storage
-* Mobile or web clients
+* Mobile clients and original-media transfer; the private Chrome review/admin client is implemented
 * Fine-cut editing, transitions, effects, color, or audio mixing
 * General-purpose timeline editing
 * Automatic chronology changes that are applied without user confirmation
@@ -891,7 +870,7 @@ These are the accepted MVP implementation defaults.
 * Long-running proxy operations report progress through Tauri events and persist their result state.
 * Batch progress uses a reusable weighted estimator with persisted per-task throughput history. Proxy and thumbnail weights are source bytes and use one local worker; future cloud inference supplies its own cost weights and worker concurrency. ETA is the estimated slowest worker shard, not a naive division by worker count.
 * A tiny, short-lived Python process may be used for OpenTimelineIO export only if direct JSON export proves insufficient.
-* There is no permanent loopback service or embedded Python runtime.
+* The desktop has no permanent loopback sidecar or embedded Python runtime. The optional companion server is a separate private Linux process with a loopback-only backend.
 
 This keeps domain behavior identical across the desktop and CLI while minimizing the MVP's process and packaging surface.
 
@@ -1201,6 +1180,12 @@ The following decisions were accepted for the MVP on 2026-07-18.
 11. **Implementation:** React/TypeScript UI with a canonical Rust desktop and core. FFmpeg, ffprobe, and ExifTool are managed children. Python is allowed only for small exploratory analysis scripts or a short-lived OTIO exporter if direct JSON is insufficient.
 
 12. **Labeling workflow (accepted 2026-07-20):** the initial footage pass uses free-form labels and notes, with a reversible `removed` flag for unusable clips. Review-status states, rough-cut inclusion, source ranges, and timeline export do not appear in this phase. Rough-cut decisions begin in the later edit-planning stage after clips are labeled.
+
+13. **Companion topology (accepted 2026-07-28):** the optional private server is a synchronization hub and compute/archive index, not an exclusive project owner. Each node keeps SQLite on its own local disk and exchanges path-free operations/facts over authenticated HTTPS. The desktop remains offline-capable.
+
+14. **Server storage and network:** original scan roots are immutable and read-only. Derived media and backups use distinct writable roots. The backend binds loopback and is exposed only through trusted LAN Caddy or Tailscale Serve; public Funnel is forbidden.
+
+15. **Project creation and travel successor:** current project creation is desktop-only, but that is no longer permanent product law. The planned [Travel Ingest T5](docs/tasks/travel/TASK_T5_server_origin_projects_and_desktop_adoption.md) adds server-origin project creation and desktop adoption. Its planned archive is a distinct create-only writable logical root; existing original scan roots remain immutable.
 
 ## 25.2 Remaining reversible workflow questions
 

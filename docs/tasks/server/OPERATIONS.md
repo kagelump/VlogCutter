@@ -1,5 +1,7 @@
 # Project Operation Contract
 
+> Historical Task 7 implementation snapshot. Current synchronization guidance is in [`docs/server/sync.md`](../../server/sync.md).
+
 This is the Task 7 handoff for immutable project mutations. Payload version 1 and the operation type names below are frozen for Task 8 synchronization.
 
 ## Envelope and ordering

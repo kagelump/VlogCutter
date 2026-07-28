@@ -850,7 +850,8 @@ pub fn openapi_document() -> serde_json::Value {
         "openapi": "3.1.0",
         "info": {
             "title": "RCD VlogCutter Server API",
-            "version": APPLICATION_VERSION
+            "version": APPLICATION_VERSION,
+            "description": "Private single-user companion API for authenticated project synchronization, browser review, storage/library administration, durable jobs, derived-media streaming, and verified backups. Originals are never HTTP content sources."
         },
         "paths": {
             "/api/v1/version": {

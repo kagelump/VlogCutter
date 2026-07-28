@@ -1,5 +1,7 @@
 # Companion Server Runtime Foundation
 
+> Historical Task 2 implementation snapshot. Current runtime/deployment guidance is in [`docs/server/deployment.md`](../../server/deployment.md).
+
 This is the implementation handoff for Task 2. It describes the private runtime contract that later server tasks extend. Repository-wide product and installation documentation remains owned by Task 20.
 
 ## Crates and ownership

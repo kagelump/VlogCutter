@@ -1,6 +1,6 @@
 # Task 3: Storage Roots and Global Media Library
 
-**Status:** Planned
+**Status:** Implemented; physical NAS acceptance remains external
 **Depends on:** Tasks 1 and 2
 **Unblocks:** Tasks 5, 8, 10, 14, and 16
 

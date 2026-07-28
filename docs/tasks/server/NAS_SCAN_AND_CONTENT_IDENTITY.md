@@ -1,5 +1,7 @@
 # NAS Scan and Verified Content Identity — Implementation Contract
 
+> Historical Task 5 implementation snapshot. Current scan/library guidance is in [`docs/server/storage-and-library.md`](../../server/storage-and-library.md).
+
 **Status:** Implemented, automated tests pass
 **Date:** 2026-07-20
 **Epic task:** TASK_5_nas_scan_and_verified_content_identity

@@ -29,4 +29,8 @@ parallel ETA based on the slowest shard. The server job engine validates that
 those weights exactly match durable remaining item and work totals before using
 the constructor.
 
-VlogCutter persists separate histories in each project catalog using versioned task keys such as `proxy.h264-720p.orientation-v3` and `thumbnail.q1.orientation-v2`. History uses a bounded eight-sample exponential window so recent hardware, codec, storage, or service behavior gradually replaces older measurements. Successful observations update speed; failures advance completion without poisoning throughput.
+Desktop batches persist separate histories in each project catalog using versioned task keys such as `proxy.h264-720p.orientation-v3` and `thumbnail.q1.orientation-v2`. The companion server persists rate history in its local control catalog, scoped to the stable server node and job task key; it never treats a Mac observation as Linux throughput. Current shared representation recipes use the same two keys, and server scan/hash handlers use their own versioned task identities.
+
+The server scheduler caps proxy work at one worker, full-hash work at one worker, and lightweight work at two workers by default. Every progress update supplies the actual worker count and exact remaining item weights; the durable job engine rejects inconsistent counts, excessive concurrency, or aggregate totals that do not match durable progress. A restored job uses `with_explicit_progress` plus the remaining individual weights, so its ETA remains a slowest-shard estimate after restart.
+
+History uses a bounded eight-sample exponential window so recent hardware, codec, storage, or service behavior gradually replaces older measurements. Successful item observations update speed; failures and cancellations advance durable work state without poisoning throughput. Change the versioned task key whenever recipe or cost semantics make older measurements incomparable.

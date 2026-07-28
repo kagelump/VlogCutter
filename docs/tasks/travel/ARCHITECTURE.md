@@ -402,23 +402,21 @@ uploads did not finish would strand notes on assets that can never gain media.
   them now would be speculative.
 - Android, multiple phones, multiple users, and multiple servers
 
-## 15. Dependencies on unbuilt work
+## 15. Companion-server foundation
 
-This design depends on companion-server tasks that are not yet implemented. This is
-accepted, and is recorded here so it is not discovered late:
+The companion-server prerequisites are implemented. This travel architecture remains
+planned and must add the following successor behavior explicitly:
 
 | Needed | Companion-server task | Status |
 | --- | --- | --- |
-| Desktop pairing and baseline adoption | Task 10 | **Not implemented** |
-| Web library and project browsing | Task 14 | Not implemented |
-| Web proxy review and annotation | Task 15 | Not implemented |
-| Authentication and secure transport | Task 9 | Core implemented; task file marks it Planned |
+| Desktop pairing and baseline adoption | Task 10 | Implemented; travel T5 must add the reverse server-origin flow |
+| Web library and project browsing | Task 14 | Implemented |
+| Web proxy review and annotation | Task 15 | Implemented |
+| Authentication and secure transport | Task 9 | Implemented; target LAN/Tailscale acceptance remains external |
 
-Task 10 is the one genuine prerequisite gap: travel task T5 (server-origin project creation
-and desktop adoption) builds directly on its pairing and baseline machinery.
-
-Several companion-server task files carry stale `Status:` markers. Trust the code and the
-git history over the markers until Task 20 reconciles them.
+Current project creation is desktop-only, but that is not permanent product law: travel T5
+adds server-origin creation and desktop adoption. Current original scan roots are immutable;
+travel T1 adds a separate planned create-only writable archive root.
 
 ## 16. Risks
 

@@ -1,6 +1,6 @@
 # Task 14: Web Library, Project Browse, and Add-to-Project
 
-**Status:** Planned
+**Status:** Implemented (2026-07-27)
 **Depends on:** Tasks 5, 6, 8, and 13
 **Unblocks:** Task 15
 
