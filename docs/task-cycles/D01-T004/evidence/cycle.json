@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "task_id": "D01-T004",
+  "epic_file": "docs/tasks/desktop/EPIC.md",
+  "task_file": "docs/tasks/desktop/tasks/D01-T004-github-actions-ci.md",
+  "base_branch": "main",
+  "base_sha": "93e853d540d33f999f94fbda184469e8c42d38e1",
+  "task_branch": "codex/d01-t004-github-actions-ci",
+  "contract_sha": null,
+  "implementation_base_sha": "93e853d540d33f999f94fbda184469e8c42d38e1",
+  "implementation_sha": "9f23b64",
+  "subject_sha": "a935d55",
+  "independent_tested_sha": "a935d55",
+  "reviewed_sha": "a935d55",
+  "gated_sha": "a935d55",
+  "evidence_commit_sha": null,
+  "test_verdict": "PASS",
+  "review_verdict": "APPROVE_WITH_FOLLOW_UP",
+  "open_findings": {
+    "p0": 0,
+    "p1": 0,
+    "p2": 2
+  },
+  "gate_commands": [
+    {"command": "cargo fmt --all -- --check", "exit_code": 0},
+    {"command": "cargo clippy --workspace --all-targets -- -D warnings", "exit_code": 0},
+    {"command": "cargo test --workspace", "exit_code": 0},
+    {"command": "pnpm check:frontend", "exit_code": 0},
+    {"command": "pnpm test:desktop", "exit_code": 0},
+    {"command": "pnpm test:web", "exit_code": 0},
+    {"command": "pnpm test:integration", "exit_code": 0},
+    {"command": "pnpm check:docs", "exit_code": 0}
+  ],
+  "source_hash_artifact": null,
+  "merge": {
+    "authorized": true,
+    "merged": false,
+    "merge_sha": null
+  }
+}
