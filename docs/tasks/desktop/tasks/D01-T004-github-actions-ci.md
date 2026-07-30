@@ -30,7 +30,8 @@
       ".github/workflows/README.md",
       "package.json",
       "docs/tasks/desktop/BASELINE_AUDIT.md",
-      "docs/task-cycles/D01-T004/**"
+      "docs/task-cycles/D01-T004/CYCLE_REPORT.md",
+      "docs/task-cycles/D01-T004/evidence/**"
     ]
   },
   "forbidden_paths": ["core/**", "apps/**", "packages/**", "PRD.md", "Cargo.toml"],
