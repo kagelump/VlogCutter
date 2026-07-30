@@ -429,6 +429,13 @@ Run the narrowest useful tests while iterating, then the full gate before handof
 
 `pnpm check` runs TypeScript checking followed by all Rust workspace tests. The process-level integration suite creates a real one-second FFmpeg fixture and validates CLI persistence, WAL reads, ingest, metadata, deduplication, labels/notes/removal, clock correction, thumbnails/proxies, and offline-original review. Its media portion skips when FFmpeg or ffprobe is missing.
 
+The CI encoding of this gate table lives in `.github/workflows/ci.yml` (two
+jobs, `ubuntu` and `macos`; runs on every push to `main` and every pull request
+targeting `main`). When adding a new gate command to this table, add a
+corresponding named step to the workflow. When a gate command is removed or
+demoted, remove or adjust its CI step. The table and the workflow must not
+drift apart.
+
 Do not replace these real process/media boundaries with mocks. Conversely, do not pretend headless tests validate:
 
 - DaVinci Resolve import.

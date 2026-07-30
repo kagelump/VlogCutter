@@ -111,3 +111,32 @@ containing a `.git` file (worktree marker) are now skipped.
 
 All 1 real_defect rows resolved.
 
+## CI enforcement
+
+The verification gate is encoded in `.github/workflows/ci.yml` (D01-T004).
+Every command the audit classified green is enforced on every push to `main`
+and every pull request targeting `main`.
+
+| # | Command | Job | Enforced |
+| ---: | --- | --- | --- |
+| 1 | `cargo fmt --all -- --check` | `ubuntu` | yes |
+| 2 | `cargo clippy --workspace --all-targets -- -D warnings` | `ubuntu` | yes |
+| 3 | `cargo test --workspace` | `ubuntu` | yes |
+| 4 | `pnpm check:frontend` | `ubuntu` | yes |
+| 5 | `pnpm test:web` | `ubuntu` | yes |
+| 6 | `pnpm test:integration` | `ubuntu` | yes |
+| 7 | `pnpm check:openapi` | `ubuntu` | yes |
+| 8 | `pnpm check:docs` | `ubuntu` | yes |
+| 9 | `pnpm check:deployment` | `ubuntu` | yes |
+
+Additional commands not in the original audit but enforced by CI:
+
+| Command | Job | Rationale |
+| --- | --- | --- |
+| `pnpm test:desktop` | `ubuntu` | Added by D01-T003; desktop frontend vitest suite |
+| `cargo test -p rcdvlog-desktop` | `macos` | Tauri-specific Rust tests |
+| `pnpm --dir apps/desktop tauri build` | `macos` | Native macOS bundle compilation |
+
+No audited-green command is unenforced. No `continue-on-error`, `\|\| true`,
+or `if: always()` masks any step.
+
