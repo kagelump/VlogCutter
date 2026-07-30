@@ -7,7 +7,7 @@
   "epic_id": "D01",
   "title": "Native macOS desktop smoke acceptance",
   "slug": "native-desktop-smoke-acceptance",
-  "status": "ready",
+  "status": "complete",
   "task_class": "qa",
   "depends_on": ["D01-T004"],
   "principal_invariant": "Every step of the PRD section 21.1 journey that today's build claims to implement has a recorded pass or fail result from the real native macOS application, not from the Vite browser mock.",
