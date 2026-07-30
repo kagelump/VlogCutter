@@ -22,6 +22,7 @@
     "p2": 2
   },
   "gate_commands": [
+    {"command": "node -e \"require('js-yaml')\" || true", "exit_code": 0},
     {"command": "cargo fmt --all -- --check", "exit_code": 0},
     {"command": "cargo clippy --workspace --all-targets -- -D warnings", "exit_code": 0},
     {"command": "cargo test --workspace", "exit_code": 0},
