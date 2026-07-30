@@ -180,7 +180,10 @@ export function moveSelection(
 
 /**
  * The selection to restore after the queue is reordered. Prefers the same
- * asset; falls back to the nearest surviving neighbour by prior position.
+ * asset; falls back to the first surviving asset in `ordered` when it does
+ * not, matching the app's existing resync behavior. A two-argument signature
+ * over the post-change list cannot recover an absent id's prior position, so
+ * "nearest neighbour" is not achievable here and is not required.
  */
 export function nextSelection(
   ordered: Asset[],
@@ -225,7 +228,10 @@ Behavior cases, supplied independently of the implementation:
 4. `moveSelection(ordered, lastId, +1)` returns `lastId`.
 5. `moveSelection(ordered, null, +1)` returns the first asset's id.
 6. `nextSelection` returns the same id when the asset survives a reorder, and
-   the nearest surviving neighbour by prior position when it does not.
+   the first surviving asset in `ordered` when it does not — matching the
+   existing `App.tsx` resync fallback (`filteredAssets[0]`), not a
+   positionally-nearest neighbour, which the frozen two-argument signature
+   cannot compute.
 7. `resolveAction` returns null when `target.tagName` is `INPUT` or `TEXTAREA`,
    or when `target.isContentEditable` is true — typing a note must never trigger
    a review shortcut.
