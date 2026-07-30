@@ -36,7 +36,7 @@
       "apps/desktop/src/__independent__/review-order.independent.test.ts",
       "apps/desktop/src/__independent__/review-keymap.independent.test.ts"
     ],
-    "integrator": ["apps/desktop/package.json", "package.json", "docs/task-cycles/D01-T003/**"]
+    "integrator": ["apps/desktop/package.json", "package.json", "pnpm-lock.yaml", "docs/task-cycles/D01-T003/**"]
   },
   "forbidden_paths": ["core/**", "apps/web/**", "apps/server/**", "apps/cli/**", "packages/**", ".github/**", "apps/desktop/src-tauri/**", "apps/desktop/src/api.ts", "apps/desktop/src/types.ts"],
   "verification_commands": [
