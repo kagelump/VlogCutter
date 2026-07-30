@@ -7,7 +7,7 @@
   "epic_id": "D01",
   "title": "GitHub Actions CI with macOS native build",
   "slug": "github-actions-ci",
-  "status": "ready",
+  "status": "complete",
   "task_class": "integration",
   "depends_on": ["D01-T003"],
   "principal_invariant": "Every push and pull request runs the full audited-green verification gate on Ubuntu and compiles the native macOS desktop bundle, and any seeded defect in either turns the run red.",
