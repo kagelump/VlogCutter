@@ -13,7 +13,7 @@
   "independent_tested_sha": "a935d55",
   "reviewed_sha": "a935d55",
   "gated_sha": "a935d55",
-  "evidence_commit_sha": "041b28889df03fcd35ee32bc40b4a61482c43962",
+  "evidence_commit_sha": "041b28890a31ece897f58e5d12dc813586f8d352",
   "test_verdict": "PASS",
   "review_verdict": "APPROVE_WITH_FOLLOW_UP",
   "open_findings": {
@@ -36,6 +36,6 @@
   "merge": {
     "authorized": true,
     "merged": true,
-    "merge_sha": "3bb1b03"
+    "merge_sha": "3bb1b0321b561894034dfbf6257da9190ce06d3a"
   }
 }
