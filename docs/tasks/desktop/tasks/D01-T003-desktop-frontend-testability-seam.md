@@ -7,7 +7,7 @@
   "epic_id": "D01",
   "title": "Desktop frontend testability seam",
   "slug": "desktop-frontend-testability-seam",
-  "status": "ready",
+  "status": "complete",
   "task_class": "foundation",
   "depends_on": ["D01-T002"],
   "principal_invariant": "Desktop review ordering and keyboard dispatch are exercisable by automated tests through modules the running application actually uses, with no change to observable application behavior.",
