@@ -13,7 +13,7 @@
   "independent_tested_sha": "1cac6f52ca481f5bf06525c45ab49eab835dff33",
   "reviewed_sha": "1cac6f52ca481f5bf06525c45ab49eab835dff33",
   "gated_sha": "1cac6f52ca481f5bf06525c45ab49eab835dff33",
-  "evidence_commit_sha": null,
+  "evidence_commit_sha": "6733f844f7b660b3328bd528b78a7dc477f58cb7",
   "test_verdict": "PASS",
   "review_verdict": "APPROVE_WITH_FOLLOW_UP",
   "open_findings": {
