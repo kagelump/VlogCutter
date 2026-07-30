@@ -2,6 +2,8 @@ import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, 
 import { StatusBadge } from "@rcdvlog/review-ui";
 import { api } from "./api";
 import type { Asset, AssetPatch, AutoplayMode, BaselineImportResult, BaselinePreviewResult, DesktopSettings, PathAnalysis, Project, ProjectLibrary, ProjectLocation, ProjectPairingStatus, RootMappingEntry, ServerConnectionStatus, ServerVersionInfo, SyncStatus } from "./types";
+import { orderAssets, moveSelection as moveSelectionInOrder } from "./review/order";
+import { resolveAction } from "./review/keymap";
 
 interface OperationProgress {
   kind: "proxy" | "thumbnail";
@@ -188,10 +190,10 @@ function App() {
     selectedIdRef.current = selectedId;
   }, [assets, selectedId]);
 
-  const activeAssets = useMemo(() => assets.filter((asset) => !asset.removed), [assets]);
+  const activeAssets = useMemo(() => orderAssets(assets, { removedVisible: false }), [assets]);
   const filteredAssets = useMemo(() => {
     const needle = query.trim().toLocaleLowerCase();
-    const queueAssets = assets.filter((asset) => asset.removed === showRemoved);
+    const queueAssets = orderAssets(assets, { removedVisible: showRemoved });
     if (!needle) return queueAssets;
     return queueAssets.filter((asset) =>
       [asset.filename, asset.camera, asset.notes, ...asset.labels]
@@ -450,9 +452,8 @@ function App() {
   const moveSelection = useCallback(
     (delta: number) => {
       if (!filteredAssets.length) return;
-      const index = Math.max(0, filteredAssets.findIndex((asset) => asset.id === selectedId));
-      const next = Math.min(filteredAssets.length - 1, Math.max(0, index + delta));
-      setSelectedId(filteredAssets[next].id);
+      const next = moveSelectionInOrder(filteredAssets, selectedId || null, delta);
+      if (next !== null) setSelectedId(next);
     },
     [filteredAssets, selectedId],
   );
@@ -541,39 +542,58 @@ function App() {
       }
       const tag = (event.target as HTMLElement)?.tagName;
       if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+
+      const reviewAction = resolveAction({
+        key: event.key,
+        metaKey: event.metaKey,
+        ctrlKey: event.ctrlKey,
+        altKey: event.altKey,
+        shiftKey: event.shiftKey,
+        target:
+          event.target instanceof HTMLElement
+            ? { tagName: event.target.tagName, isContentEditable: event.target.isContentEditable }
+            : null,
+      });
+      if (reviewAction) {
+        switch (reviewAction.kind) {
+          case "move":
+            event.preventDefault();
+            moveSelection(reviewAction.delta);
+            return;
+          case "toggleRemoved":
+            if (selected) toggleRemoved(selected);
+            return;
+          case "zoom":
+            event.preventDefault();
+            setChronologyZoom((current) =>
+              reviewAction.delta < 0
+                ? Math.max(chronologyZoomMin, current - chronologyZoomStep)
+                : Math.min(chronologyZoomMax, current + chronologyZoomStep),
+            );
+            return;
+          case "centerSelection":
+            event.preventDefault();
+            centerSelectedInChronology();
+            return;
+        }
+      }
+
       if (event.key === "?") {
         event.preventDefault();
         setShowShortcuts(true);
       } else if (event.key === "/") {
         event.preventDefault();
         document.querySelector<HTMLInputElement>("#queue-search")?.focus();
-      } else if (event.key === "ArrowDown" || key === "j") {
-        event.preventDefault();
-        moveSelection(1);
-      } else if (event.key === "ArrowUp" || key === "k") {
-        event.preventDefault();
-        moveSelection(-1);
       } else if (event.code === "Space") {
         event.preventDefault();
         if (videoRef.current?.paused) void videoRef.current.play();
         else videoRef.current?.pause();
-      } else if (selected && key === "r") {
-        toggleRemoved(selected);
       } else if (selected && key === "l") {
         event.preventDefault();
         document.querySelector<HTMLInputElement>("#label-input")?.focus();
       } else if (key === "n" || (key === "enter" && tag !== "BUTTON" && !event.shiftKey && !event.metaKey && !event.ctrlKey && !event.altKey)) {
         event.preventDefault();
         document.querySelector<HTMLTextAreaElement>("#notes")?.focus();
-      } else if (key === "[") {
-        event.preventDefault();
-        setChronologyZoom((current) => Math.max(chronologyZoomMin, current - chronologyZoomStep));
-      } else if (key === "]") {
-        event.preventDefault();
-        setChronologyZoom((current) => Math.min(chronologyZoomMax, current + chronologyZoomStep));
-      } else if (key === "c") {
-        event.preventDefault();
-        centerSelectedInChronology();
       } else if (key === "p" && event.shiftKey) {
         void makeMissingProxies();
       } else if (key === "p") {
