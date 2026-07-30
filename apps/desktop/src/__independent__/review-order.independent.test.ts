@@ -253,11 +253,17 @@ describe("independent: acceptance oracle case 6 — nextSelection", () => {
     expect(nextSelection(reordered, survivorId)).toBe(survivorId);
   });
 
-  it("falls back to a surviving neighbour (by prior position) when the previous selection is gone", () => {
+  it("falls back to the first surviving asset in `ordered` when the previous selection is gone", () => {
     // Prior queue (conceptually): g1, g2, g3(selected, about to be removed), g4, g5.
-    // After g3 leaves, the two candidates for "nearest surviving neighbour by
-    // prior position" are g2 (immediately before) and g4 (immediately after).
-    // g1 and g5 are NOT nearest — they are two steps away from g3's old slot.
+    // After g3 leaves, the corrected contract (packet commit 47c1c1c,
+    // 2026-07-30) is: fall back to the first surviving asset in `ordered` by
+    // array order, matching the app's existing resync fallback at App.tsx's
+    // `setSelectedId(filteredAssets[0]?.id ?? "")` (~line 399). This is
+    // deliberately NOT "nearest by prior position" — a two-argument
+    // (ordered, previousId) signature over only the post-change list has no
+    // way to recover an absent id's prior adjacency, so g2/g4 being closer to
+    // g3's old slot than g1 is irrelevant; the first surviving entry, g1,
+    // wins regardless of where g3 used to sit.
     const after = [
       buildClip({ id: "g1" }),
       buildClip({ id: "g2" }),
@@ -265,13 +271,7 @@ describe("independent: acceptance oracle case 6 — nextSelection", () => {
       buildClip({ id: "g5" }),
     ];
     const result = nextSelection(after, "g3");
-    // This is the load-bearing spec assertion from the packet's acceptance
-    // oracle #6 ("the nearest surviving neighbour by prior position"). A
-    // fallback to the first surviving item in `ordered` regardless of prior
-    // adjacency (e.g. always returning "g1") would satisfy "returns a
-    // surviving id" but NOT "nearest by prior position" whenever g3's
-    // neighbours weren't at the head of the list.
-    expect(["g2", "g4"]).toContain(result);
+    expect(result).toBe("g1");
   });
 
   it("returns null when nothing survives", () => {
