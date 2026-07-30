@@ -13,7 +13,7 @@
   "independent_tested_sha": "a935d55",
   "reviewed_sha": "a935d55",
   "gated_sha": "a935d55",
-  "evidence_commit_sha": null,
+  "evidence_commit_sha": "041b28889df03fcd35ee32bc40b4a61482c43962",
   "test_verdict": "PASS",
   "review_verdict": "APPROVE_WITH_FOLLOW_UP",
   "open_findings": {
@@ -35,7 +35,7 @@
   "source_hash_artifact": null,
   "merge": {
     "authorized": true,
-    "merged": false,
-    "merge_sha": null
+    "merged": true,
+    "merge_sha": "3bb1b03"
   }
 }
