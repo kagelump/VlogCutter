@@ -12,7 +12,7 @@
   "depends_on": ["D01-T002"],
   "principal_invariant": "Desktop review ordering and keyboard dispatch are exercisable by automated tests through modules the running application actually uses, with no change to observable application behavior.",
   "central_falsification": "Mutate one ordering rule and one key binding inside the extracted modules, run the app's own review flow, and confirm both the extracted-module tests fail and the running application changes behavior; a mutation that tests miss or that the app ignores proves the module is not the real seam.",
-  "architecture_decisions_frozen": false,
+  "architecture_decisions_frozen": true,
   "load_bearing_seams": ["App.tsx render layer -> extracted pure review logic"],
   "documents_by_role": {
     "contract_editor": ["docs/tasks/desktop/ARCHITECTURE.md"],
