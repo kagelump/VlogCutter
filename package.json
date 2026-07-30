@@ -16,6 +16,7 @@
     "generate:openapi": "node scripts/sync-openapi.mjs",
     "test:web": "pnpm --dir apps/web test",
     "test:web:e2e": "pnpm --dir apps/web test:e2e",
+    "test:desktop": "pnpm --dir apps/desktop test",
     "test:core": "cargo test -p rcdvlog-core",
     "test:integration": "cargo test -p rcdvlog-cli --test cli_workflow",
     "test:server": "cargo test -p rcdvlog-server-core && cargo test -p rcdvlog-server"
