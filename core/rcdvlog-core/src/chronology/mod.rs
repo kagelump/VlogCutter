@@ -393,11 +393,25 @@ fn table_exists(connection: &Connection, table: &str) -> Result<bool> {
 ///   signal that materialization is missing, so replaying them would rewrite
 ///   the legacy log);
 /// - `payload_version == 1` (known types keep rejecting other versions);
-/// - no `materialized_revisions` row exists for the operation's aggregate —
-///   for the new vocabulary, insert and materialize are atomic, so
-///   row-persisted-without-a-revision-row is exactly never-applied;
+/// - no `materialized_revisions` row names this operation as the aggregate's
+///   `last_operation_id` — applied-ness is per-OPERATION, not per-aggregate:
+///   migrations 5/6 baseline a revision-0 row for every asset, so a
+///   per-aggregate check would permanently exclude the `projectAsset`
+///   clip-exception family and any op whose aggregate had a later operation
+///   applied;
+/// - for an operation with no declared `base_revision`, the aggregate must
+///   not already have a materialized revision — the revision guard is a no-op
+///   for base-less operations, so an applied-and-superseded base-less op
+///   would otherwise re-apply with a phantom revision bump (and a set-type op
+///   would overwrite newer state). A base-less op that was never applied
+///   still qualifies: a baseline row is revision 0;
 /// - no `operation_conflicts` row names the operation — a previously rejected
 ///   operation must not re-apply.
+///
+/// The revision guard adjudicates the rest honestly: a candidate whose
+/// declared `base_revision` is stale records exactly one `operation_conflicts`
+/// row (the same outcome a stale-base resend gets from the normal apply path)
+/// and is left in the log; the conflict filter then excludes it forever.
 ///
 /// Rows are processed in `operation_id` order inside one transaction. Each row
 /// is best-effort: a row that errors (bail or Conflict) is skipped and left in
@@ -424,8 +438,17 @@ pub(crate) fn redispatch_chronology_operations(connection: &mut Connection) -> R
           AND NOT EXISTS (
               SELECT 1 FROM materialized_revisions mr
               WHERE mr.project_id = project_operations.project_id
-                AND mr.aggregate_type = project_operations.aggregate_type
-                AND mr.aggregate_id = project_operations.aggregate_id
+                AND mr.last_operation_id = project_operations.operation_id
+          )
+          AND (
+              project_operations.base_revision IS NOT NULL
+              OR NOT EXISTS (
+                  SELECT 1 FROM materialized_revisions mr
+                  WHERE mr.project_id = project_operations.project_id
+                    AND mr.aggregate_type = project_operations.aggregate_type
+                    AND mr.aggregate_id = project_operations.aggregate_id
+                    AND mr.revision >= 1
+              )
           )
           AND NOT EXISTS (
               SELECT 1 FROM operation_conflicts oc

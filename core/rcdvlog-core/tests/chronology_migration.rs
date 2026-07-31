@@ -2409,3 +2409,381 @@ fn migration_9_leaves_best_time_and_offset_seconds_untouched() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// F1 follow-up: the re-dispatch filter is per-OPERATION, not per-aggregate.
+// Migrations 5/6 baseline a materialized_revisions row (revision 0,
+// last_operation_id NULL) for every asset, so a per-aggregate filter would
+// permanently exclude the projectAsset clip-exception family and any op whose
+// aggregate had a later operation applied.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn quarantined_clip_time_exception_redispatch_applies_across_the_asset_baseline() {
+    let directory = tempdir().unwrap();
+    let path = quarantined_style_catalog(&directory, "clip_redispatch.sqlite3", "project_clip_rd");
+    // The asset has its baseline materialized_revisions row (revision 0,
+    // last_operation_id NULL) from migrations 5/6. The re-dispatch filter
+    // looks for a row whose last_operation_id IS this operation, so the
+    // quarantined clip-exception op is a candidate and applies.
+    let connection = open_connection(&path);
+    // The asset's baseline row is created by migration 5 only for assets that
+    // existed when it ran, so the fixture builders do not produce one; insert
+    // it explicitly to reproduce a real upgraded catalog's shape.
+    connection
+        .execute(
+            "INSERT INTO materialized_revisions(project_id, aggregate_type, aggregate_id, revision, last_operation_id) VALUES ('project_clip_rd', 'projectAsset', 'asset_rd', 0, NULL)",
+            [],
+        )
+        .unwrap();
+    let exception = operation(
+        "op_rd_exception",
+        "project_clip_rd",
+        "node_old_build",
+        1,
+        1_700_000_000_000,
+        "projectAsset",
+        "asset_rd",
+        CLIP_TIME_EXCEPTION_SET,
+        Some(0),
+        json!({"tripTime":"2026-07-18T08:30:00.000Z","reason":"after upgrade"}),
+    );
+    insert_operation_row(&connection, &exception);
+    drop(connection);
+
+    let catalog = Catalog::open_existing(&path).unwrap();
+    let connection = open_connection(&path);
+    let (trip_time, reason): (String, String) = connection
+        .query_row(
+            "SELECT trip_time, reason FROM clip_time_exceptions WHERE asset_id='asset_rd' AND project_id='project_clip_rd'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(trip_time, "2026-07-18T08:30:00.000Z");
+    assert_eq!(reason, "after upgrade");
+    let (revision, last_operation_id): (i64, String) = connection
+        .query_row(
+            "SELECT revision, last_operation_id FROM materialized_revisions WHERE project_id='project_clip_rd' AND aggregate_type='projectAsset' AND aggregate_id='asset_rd'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (revision, last_operation_id),
+        (1, "op_rd_exception".to_string())
+    );
+    drop(connection);
+
+    // Idempotent: a second open applies nothing new.
+    drop(catalog);
+    let _reopened = Catalog::open_existing(&path).unwrap();
+    let connection = open_connection(&path);
+    let revision_after: i64 = connection
+        .query_row(
+            "SELECT revision FROM materialized_revisions WHERE project_id='project_clip_rd' AND aggregate_type='projectAsset' AND aggregate_id='asset_rd'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        revision_after, 1,
+        "a second open must not re-apply the exception"
+    );
+    let _ = directory;
+}
+
+#[test]
+fn applied_operation_is_never_redispatch_applied_again() {
+    let directory = tempdir().unwrap();
+    let path = quarantined_style_catalog(&directory, "applied.sqlite3", "project_applied");
+    let catalog = Catalog::open_existing(&path).unwrap();
+    let set = operation(
+        "op_applied_set",
+        "project_applied",
+        "node_current",
+        1,
+        1_700_000_000_000,
+        "projectAsset",
+        "asset_rd",
+        CLIP_TIME_EXCEPTION_SET,
+        Some(0),
+        json!({"tripTime":"2026-07-18T09:00:00.000Z","reason":"applied"}),
+    );
+    assert_eq!(
+        catalog.apply_operation(&set).unwrap(),
+        ApplyOperationResult::Applied
+    );
+    drop(catalog);
+
+    // The applied op is its aggregate's last_operation_id, so the filter
+    // excludes it: no re-materialization, no phantom revision bump, no
+    // conflict row.
+    let _reopened = Catalog::open_existing(&path).unwrap();
+    let connection = open_connection(&path);
+    let exception_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM clip_time_exceptions WHERE asset_id='asset_rd' AND project_id='project_applied'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(exception_count, 1, "no second exception row");
+    let revision: i64 = connection
+        .query_row(
+            "SELECT revision FROM materialized_revisions WHERE project_id='project_applied' AND aggregate_type='projectAsset' AND aggregate_id='asset_rd'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(revision, 1, "no phantom revision bump");
+    let conflict_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM operation_conflicts WHERE project_id='project_applied'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        conflict_count, 0,
+        "no conflict row for an applied operation"
+    );
+    let _ = directory;
+}
+
+#[test]
+fn applied_intermediate_operation_records_at_most_one_conflict_and_no_state_change() {
+    let directory = tempdir().unwrap();
+    let path =
+        quarantined_style_catalog(&directory, "intermediate.sqlite3", "project_intermediate");
+    let catalog = Catalog::open_existing(&path).unwrap();
+    let set = operation(
+        "op_intermediate_set",
+        "project_intermediate",
+        "node_current",
+        1,
+        1_700_000_000_000,
+        "projectAsset",
+        "asset_rd",
+        CLIP_TIME_EXCEPTION_SET,
+        Some(0),
+        json!({"tripTime":"2026-07-18T09:00:00.000Z","reason":"first"}),
+    );
+    let clear = operation(
+        "op_intermediate_clear",
+        "project_intermediate",
+        "node_current",
+        2,
+        1_700_000_000_001,
+        "projectAsset",
+        "asset_rd",
+        CLIP_TIME_EXCEPTION_CLEARED,
+        Some(1),
+        json!({}),
+    );
+    assert_eq!(
+        catalog.apply_operation(&set).unwrap(),
+        ApplyOperationResult::Applied
+    );
+    assert_eq!(
+        catalog.apply_operation(&clear).unwrap(),
+        ApplyOperationResult::Applied
+    );
+    drop(catalog);
+
+    // The SET op is no longer its aggregate's last_operation_id, so the
+    // per-operation filter makes it a candidate exactly once; the revision
+    // guard sees a stale base and records exactly one conflict row. State
+    // never changes.
+    let _reopened = Catalog::open_existing(&path).unwrap();
+    let connection = open_connection(&path);
+    let exception_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM clip_time_exceptions WHERE asset_id='asset_rd' AND project_id='project_intermediate'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        exception_count, 0,
+        "the cleared exception must not come back"
+    );
+    let revision: i64 = connection
+        .query_row(
+            "SELECT revision FROM materialized_revisions WHERE project_id='project_intermediate' AND aggregate_type='projectAsset' AND aggregate_id='asset_rd'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(revision, 2, "revision stays at the last applied operation");
+    let conflict_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM operation_conflicts WHERE project_id='project_intermediate' AND incoming_operation_id='op_intermediate_set'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        conflict_count, 1,
+        "exactly one conflict row for the stale intermediate"
+    );
+    drop(connection);
+
+    // The conflict row now excludes the op forever: another open adds nothing.
+    drop(_reopened);
+    let _reopened_again = Catalog::open_existing(&path).unwrap();
+    let connection = open_connection(&path);
+    let conflict_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM operation_conflicts WHERE project_id='project_intermediate'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        conflict_count, 1,
+        "another open must not add a conflict row"
+    );
+    let revision_after: i64 = connection
+        .query_row(
+            "SELECT revision FROM materialized_revisions WHERE project_id='project_intermediate' AND aggregate_type='projectAsset' AND aggregate_id='asset_rd'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(revision_after, 2);
+    let _ = directory;
+}
+
+#[test]
+fn applied_operation_without_base_revision_is_not_redispatch_reapplied() {
+    let directory = tempdir().unwrap();
+    let path = quarantined_style_catalog(&directory, "nobase.sqlite3", "project_nobase");
+    let catalog = Catalog::open_existing(&path).unwrap();
+    // An operation without a declared base revision passes the guard
+    // unconditionally, so a filter that only checked per-operation
+    // applied-ness would re-apply this superseded op, resurrect the cleared
+    // exception, and bump the revision. The filter must also refuse rows
+    // whose aggregate already has a materialized revision.
+    let set = operation(
+        "op_nobase_set",
+        "project_nobase",
+        "node_current",
+        1,
+        1_700_000_000_000,
+        "projectAsset",
+        "asset_rd",
+        CLIP_TIME_EXCEPTION_SET,
+        None,
+        json!({"tripTime":"2026-07-18T09:00:00.000Z","reason":"first"}),
+    );
+    let clear = operation(
+        "op_nobase_clear",
+        "project_nobase",
+        "node_current",
+        2,
+        1_700_000_000_001,
+        "projectAsset",
+        "asset_rd",
+        CLIP_TIME_EXCEPTION_CLEARED,
+        None,
+        json!({}),
+    );
+    assert_eq!(
+        catalog.apply_operation(&set).unwrap(),
+        ApplyOperationResult::Applied
+    );
+    assert_eq!(
+        catalog.apply_operation(&clear).unwrap(),
+        ApplyOperationResult::Applied
+    );
+    drop(catalog);
+
+    let _reopened = Catalog::open_existing(&path).unwrap();
+    let connection = open_connection(&path);
+    let exception_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM clip_time_exceptions WHERE asset_id='asset_rd' AND project_id='project_nobase'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        exception_count, 0,
+        "the superseded set must not resurrect the exception"
+    );
+    let revision: i64 = connection
+        .query_row(
+            "SELECT revision FROM materialized_revisions WHERE project_id='project_nobase' AND aggregate_type='projectAsset' AND aggregate_id='asset_rd'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(revision, 2, "no phantom revision bump");
+    let conflict_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM operation_conflicts WHERE project_id='project_nobase'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        conflict_count, 0,
+        "the filter excludes the row before the guard is reached"
+    );
+    let _ = directory;
+}
+
+#[test]
+fn quarantined_operation_without_base_revision_still_redispatch_applies() {
+    let directory = tempdir().unwrap();
+    let path = quarantined_style_catalog(&directory, "nobase_q.sqlite3", "project_nobase_q");
+    // Never applied (quarantined by an older build) and no declared base
+    // revision: after upgrade it must still apply, even though the asset has
+    // a revision-0 baseline row.
+    let connection = open_connection(&path);
+    // Baseline row as migration 5 would have produced it for an existing asset.
+    connection
+        .execute(
+            "INSERT INTO materialized_revisions(project_id, aggregate_type, aggregate_id, revision, last_operation_id) VALUES ('project_nobase_q', 'projectAsset', 'asset_rd', 0, NULL)",
+            [],
+        )
+        .unwrap();
+    let exception = operation(
+        "op_nobase_quarantined",
+        "project_nobase_q",
+        "node_old_build",
+        1,
+        1_700_000_000_000,
+        "projectAsset",
+        "asset_rd",
+        CLIP_TIME_EXCEPTION_SET,
+        None,
+        json!({"tripTime":"2026-07-18T10:00:00.000Z","reason":"quarantined"}),
+    );
+    insert_operation_row(&connection, &exception);
+    drop(connection);
+
+    let _catalog = Catalog::open_existing(&path).unwrap();
+    let connection = open_connection(&path);
+    let exception_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM clip_time_exceptions WHERE asset_id='asset_rd' AND project_id='project_nobase_q'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        exception_count, 1,
+        "a never-applied base-less operation must apply after upgrade"
+    );
+    let revision: i64 = connection
+        .query_row(
+            "SELECT revision FROM materialized_revisions WHERE project_id='project_nobase_q' AND aggregate_type='projectAsset' AND aggregate_id='asset_rd'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(revision, 1);
+    let _ = directory;
+}
