@@ -439,6 +439,11 @@ impl Catalog {
             read_only: false,
         };
         catalog.migrate()?;
+        // D01-T007 decision 4 "applies after upgrade": operations an older
+        // build quarantined (persisted but not materialized) are re-dispatched
+        // from the log by a build that knows their type. Writable open only —
+        // `open_read_only_existing` must stay side-effect free.
+        catalog.redispatch_chronology_operations()?;
         Ok(catalog)
     }
 
@@ -505,6 +510,11 @@ impl Catalog {
     fn migrate(&self) -> Result<()> {
         let mut connection = self.connection()?;
         migrations::migrate_project_catalog(&mut connection)
+    }
+
+    fn redispatch_chronology_operations(&self) -> Result<()> {
+        let mut connection = self.connection()?;
+        chronology::redispatch_chronology_operations(&mut connection)
     }
 
     pub fn create_project(&self, name: &str) -> Result<Project> {

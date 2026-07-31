@@ -31,6 +31,24 @@ pub const EVENT_ORDER_CONSTRAINT_SET: &str = "eventOrderConstraintSet";
 pub const EVENT_ORDER_CONSTRAINT_CLEARED: &str = "eventOrderConstraintCleared";
 pub const MAX_REMOTE_HLC_FUTURE_SKEW_MILLIS: i64 = 5 * 60 * 1000;
 
+/// The eleven chronology operation types D01-T007 added. The re-dispatch seam
+/// on writable catalog open is scoped to exactly these: for the legacy
+/// vocabulary a persisted row is never a signal that materialization is
+/// missing, so replaying them would rewrite the legacy log.
+pub(crate) const CHRONOLOGY_OPERATION_TYPES: &[&str] = &[
+    CAPTURE_SEQUENCE_DECLARED,
+    CAPTURE_SEQUENCE_SPLIT,
+    CAPTURE_SEQUENCE_MERGED,
+    CLOCK_EPOCH_SET,
+    CLOCK_EPOCH_CLEARED,
+    CLIP_TIME_EXCEPTION_SET,
+    CLIP_TIME_EXCEPTION_CLEARED,
+    TRIP_PHASE_SET,
+    TRIP_PHASE_REMOVED,
+    EVENT_ORDER_CONSTRAINT_SET,
+    EVENT_ORDER_CONSTRAINT_CLEARED,
+];
+
 /// Every operation type this build recognizes. Anything in the operation log
 /// outside this set is retained but quarantined: it is durable, reported
 /// through `quarantined_operations`, never advances an aggregate revision, and
@@ -1564,6 +1582,19 @@ fn insert_and_materialize(
             serde_json::to_string(&operation.payload)?, now()],
     )?;
 
+    materialize_operation(transaction, operation)
+}
+
+/// Applies one already-persisted operation's materialization and revision
+/// advance: the shared dispatch used by the insert path
+/// (`insert_and_materialize`) and by the re-dispatch seam that materializes
+/// quarantined chronology operations when a build that knows their type opens
+/// the catalog. The caller decides whether the operation row was inserted in
+/// this transaction; this function never touches `project_operations`.
+pub(crate) fn materialize_operation(
+    transaction: &Transaction<'_>,
+    operation: &ProjectOperation,
+) -> Result<ApplyOperationResult> {
     let outcome = match operation.operation_type.as_str() {
         NOTE_REVISION_CREATED => materialize_note(transaction, operation)?,
         LABEL_ADDED => materialize_label_add(transaction, operation)?,
@@ -1600,9 +1631,9 @@ fn insert_and_materialize(
         }
         _ => {
             // Unknown operation type: quarantine policy (D01-T007 decision 4).
-            // The operation row is already persisted above. It is retained and
-            // visible, never advances an aggregate revision, and does not fail
-            // the containing batch.
+            // The operation row is already persisted (by the caller's insert
+            // path). It is retained and visible, never advances an aggregate
+            // revision, and does not fail the containing batch.
             return Ok(ApplyOperationResult::Quarantined);
         }
     };
@@ -1926,6 +1957,19 @@ fn materialize_capture_sequence_split(
     {
         bail!("captureSequenceSplit aggregate must be the source capture sequence");
     }
+    // A destination id that already names a sequence in this project (for
+    // example another camera's derived id) must never receive this split's
+    // assets: `INSERT OR IGNORE` would silently no-op and the UPDATE below
+    // would move `filename_counter >= at_counter` assets into an unrelated
+    // sequence. Refuse before any write.
+    let destination_exists: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM capture_sequences WHERE id=?1 AND project_id=?2)",
+        params![payload.new_sequence_id, operation.project_id],
+        |row| row.get(0),
+    )?;
+    if destination_exists {
+        bail!("captureSequenceSplit destination sequence already exists");
+    }
     if !revision_guard_passes(transaction, operation)? {
         return Ok(ApplyOperationResult::Conflict);
     }
@@ -1974,6 +2018,13 @@ fn materialize_capture_sequence_merged(
         || operation.aggregate_id != payload.into_sequence_id
     {
         bail!("captureSequenceMerged aggregate must be the destination capture sequence");
+    }
+    // A self-merge must be refused before any write: with `from == into` both
+    // UPDATEs are no-ops and the DELETE below cascade-destroys every
+    // `asset_capture_sequence` and `clock_epochs` row of the sequence
+    // (cascades declared in migrations.rs).
+    if payload.from_sequence_id == payload.into_sequence_id {
+        bail!("captureSequenceMerged requires two distinct capture sequences");
     }
     if !revision_guard_passes(transaction, operation)? {
         return Ok(ApplyOperationResult::Conflict);
@@ -2453,7 +2504,7 @@ fn operation_key(operation: &ProjectOperation) -> (i64, i64, String, String) {
     )
 }
 
-fn operation_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProjectOperation> {
+pub(crate) fn operation_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProjectOperation> {
     let origin_node_id: String = row.get(2)?;
     Ok(ProjectOperation {
         operation_id: row.get(0)?,

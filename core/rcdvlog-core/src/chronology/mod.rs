@@ -13,9 +13,12 @@ pub use model::{
     ConstraintStrength, DisplayMode, EventOrderConstraint, PhaseKind, TripPhase,
 };
 
-use crate::operations::KNOWN_OPERATION_TYPES;
+use crate::operations::{
+    ApplyOperationResult, CHRONOLOGY_OPERATION_TYPES, KNOWN_OPERATION_TYPES, materialize_operation,
+    operation_from_row,
+};
 use anyhow::Result;
-use rusqlite::{Connection, Transaction, params, params_from_iter};
+use rusqlite::{Connection, Transaction, TransactionBehavior, params, params_from_iter};
 use serde::{Deserialize, Serialize};
 
 /// An operation this build retained but could not materialize, because its
@@ -377,6 +380,84 @@ fn table_exists(connection: &Connection, table: &str) -> Result<bool> {
         [table],
         |row| row.get(0),
     )?)
+}
+
+/// Re-dispatches persisted chronology operations that an older build
+/// quarantined (D01-T007 decision 4, "applies after upgrade"). Runs on
+/// writable catalog open, after migration, and never on a read-only open.
+///
+/// A row qualifies only when all of these hold:
+///
+/// - its operation type is one of the eleven chronology types this task added
+///   (legacy types are never re-dispatched: a persisted legacy row is not a
+///   signal that materialization is missing, so replaying them would rewrite
+///   the legacy log);
+/// - `payload_version == 1` (known types keep rejecting other versions);
+/// - no `materialized_revisions` row exists for the operation's aggregate —
+///   for the new vocabulary, insert and materialize are atomic, so
+///   row-persisted-without-a-revision-row is exactly never-applied;
+/// - no `operation_conflicts` row names the operation — a previously rejected
+///   operation must not re-apply.
+///
+/// Rows are processed in `operation_id` order inside one transaction. Each row
+/// is best-effort: a row that errors (bail or Conflict) is skipped and left in
+/// the log — never aborting the open, never deleted, and a Conflict outcome
+/// records its own durable conflict row, which is the correct outcome for a
+/// stale-base row. The seam is idempotent: every applied row leaves a
+/// `materialized_revisions` row (or a conflict row) behind, so a second open
+/// applies nothing new.
+pub(crate) fn redispatch_chronology_operations(connection: &mut Connection) -> Result<()> {
+    if !table_exists(connection, "project_operations")? {
+        return Ok(());
+    }
+    let placeholders = std::iter::repeat_n("?", CHRONOLOGY_OPERATION_TYPES.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        r#"
+        SELECT operation_id, project_id, origin_node_id, origin_sequence,
+               hlc_wall_millis, hlc_counter, aggregate_type, aggregate_id,
+               operation_type, payload_version, base_revision, payload_json
+        FROM project_operations
+        WHERE operation_type IN ({placeholders})
+          AND payload_version = 1
+          AND NOT EXISTS (
+              SELECT 1 FROM materialized_revisions mr
+              WHERE mr.project_id = project_operations.project_id
+                AND mr.aggregate_type = project_operations.aggregate_type
+                AND mr.aggregate_id = project_operations.aggregate_id
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM operation_conflicts oc
+              WHERE oc.incoming_operation_id = project_operations.operation_id
+          )
+        ORDER BY operation_id
+        "#
+    );
+    let mut statement = connection.prepare(&sql)?;
+    let candidates = statement
+        .query_map(
+            params_from_iter(CHRONOLOGY_OPERATION_TYPES.iter().copied()),
+            operation_from_row,
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(statement);
+    if candidates.is_empty() {
+        return Ok(());
+    }
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    for operation in candidates {
+        match materialize_operation(&transaction, &operation) {
+            Ok(ApplyOperationResult::Applied) => {}
+            Ok(_) => {}
+            Err(_) => {
+                // Best effort: skip the row and leave it in the log. The open
+                // must never fail because one quarantined row cannot apply.
+            }
+        }
+    }
+    transaction.commit()?;
+    Ok(())
 }
 
 /// Runs the migration-9 forward migration for one project: one capture

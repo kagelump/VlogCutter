@@ -1811,6 +1811,578 @@ fn media_file_bytes_are_unchanged_across_migration_and_operation_cycles() {
 }
 
 // ---------------------------------------------------------------------------
+// Oracle 9 continued: the re-dispatch seam (a quarantined operation applies
+// when a build that knows its type opens the catalog writable)
+// ---------------------------------------------------------------------------
+
+/// A minimal schema-8 catalog for the re-dispatch tests.
+fn quarantined_style_catalog(directory: &TempDir, name: &str, project_id: &str) -> PathBuf {
+    build_schema8_catalog(
+        directory,
+        name,
+        project_id,
+        &[FixtureAsset {
+            id: "asset_rd",
+            filename: "C0001.MP4",
+            camera: "Redispatch Cam",
+            captured_at_raw: "2026-07-18T09:00:00Z",
+            best_time: "2026-07-18T09:00:00.000Z",
+            offset_seconds: 0,
+        }],
+        &[],
+    )
+}
+
+/// Inserts an operation row directly into `project_operations`, bypassing
+/// `apply_operation` — exactly the shape an older build's quarantine leaves
+/// behind: the row is durable, nothing was materialized, and no
+/// `materialized_revisions` row exists for its aggregate.
+fn insert_operation_row(connection: &Connection, operation: &ProjectOperation) {
+    connection
+        .execute(
+            "INSERT INTO project_operations(operation_id, project_id, origin_node_id, origin_sequence, hlc_wall_millis, hlc_counter, aggregate_type, aggregate_id, operation_type, payload_version, base_revision, payload_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            rusqlite::params![
+                operation.operation_id,
+                operation.project_id,
+                operation.origin_node_id,
+                operation.origin_sequence as i64,
+                operation.logical_time.wall_millis,
+                operation.logical_time.counter as i64,
+                operation.aggregate_type,
+                operation.aggregate_id,
+                operation.operation_type,
+                operation.payload_version,
+                operation.base_revision.map(|value| value as i64),
+                serde_json::to_string(&operation.payload).unwrap(),
+                "2026-07-25T00:00:00.000Z",
+            ],
+        )
+        .unwrap();
+}
+
+#[test]
+fn quarantined_known_chronology_operation_redispatch_materializes_on_writable_reopen() {
+    let directory = tempdir().unwrap();
+    let path = quarantined_style_catalog(&directory, "redispatch.sqlite3", "project_redispatch");
+    let declared = operation(
+        "op_rd_declared",
+        "project_redispatch",
+        "node_old_build",
+        1,
+        1_700_000_000_000,
+        "captureSequence",
+        "seq_rd_declared",
+        CAPTURE_SEQUENCE_DECLARED,
+        Some(0),
+        json!({"sequenceId":"seq_rd_declared","cameraKey":"Redispatch Cam","label":"After upgrade","volumeHint":"vol","filenamePrefix":"C"}),
+    );
+    insert_operation_row(&open_connection(&path), &declared);
+
+    // A build that knows the type opens the catalog writable: the operation
+    // is re-dispatched from the persisted log and materialized.
+    let catalog = Catalog::open_existing(&path).unwrap();
+    let connection = open_connection(&path);
+    let (label, camera_key): (String, String) = connection
+        .query_row(
+            "SELECT label, camera_key FROM capture_sequences WHERE id='seq_rd_declared' AND project_id='project_redispatch'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(label, "After upgrade");
+    assert_eq!(camera_key, "Redispatch Cam");
+    let (revision, last_operation_id): (i64, String) = connection
+        .query_row(
+            "SELECT revision, last_operation_id FROM materialized_revisions WHERE project_id='project_redispatch' AND aggregate_type='captureSequence' AND aggregate_id='seq_rd_declared'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (revision, last_operation_id),
+        (1, "op_rd_declared".to_string())
+    );
+    drop(connection);
+
+    // Idempotent: a second open applies nothing new.
+    drop(catalog);
+    let _reopened = Catalog::open_existing(&path).unwrap();
+    let connection = open_connection(&path);
+    let sequence_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM capture_sequences WHERE id='seq_rd_declared'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(sequence_count, 1);
+    let revision_after: i64 = connection
+        .query_row(
+            "SELECT revision FROM materialized_revisions WHERE project_id='project_redispatch' AND aggregate_type='captureSequence' AND aggregate_id='seq_rd_declared'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(revision_after, 1, "a second open must not re-apply the row");
+    let _ = directory;
+}
+
+#[test]
+fn unknown_operation_type_is_not_redispatch_applied_and_stays_reported() {
+    let directory = tempdir().unwrap();
+    let path = quarantined_style_catalog(&directory, "unknown.sqlite3", "project_unknown");
+    let mut future = operation(
+        "op_rd_future",
+        "project_unknown",
+        "node_old_build",
+        1,
+        1_700_000_000_000,
+        "captureSequence",
+        "seq_rd_future",
+        "someFutureOperation",
+        Some(5),
+        json!({"futureField":"futureValue"}),
+    );
+    future.payload_version = 2;
+    insert_operation_row(&open_connection(&path), &future);
+
+    let catalog = Catalog::open_existing(&path).unwrap();
+    // Not materialized: the capture sequence the future operation declared
+    // must not exist.
+    let sequence_count: i64 = open_connection(&path)
+        .query_row(
+            "SELECT COUNT(*) FROM capture_sequences WHERE id='seq_rd_future' AND project_id='project_unknown'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(sequence_count, 0);
+    // Still reported through the quarantine diagnostic surface.
+    let quarantined = catalog.quarantined_operations("project_unknown").unwrap();
+    assert_eq!(quarantined.len(), 1);
+    assert_eq!(quarantined[0].operation_id, "op_rd_future");
+    assert_eq!(quarantined[0].payload_version, 2);
+    let _ = directory;
+}
+
+#[test]
+fn known_type_row_with_future_payload_version_is_not_redispatch_applied() {
+    let directory = tempdir().unwrap();
+    let path = quarantined_style_catalog(&directory, "version2.sqlite3", "project_version2");
+    let mut declared = operation(
+        "op_rd_v2",
+        "project_version2",
+        "node_old_build",
+        1,
+        1_700_000_000_000,
+        "captureSequence",
+        "seq_rd_v2",
+        CAPTURE_SEQUENCE_DECLARED,
+        Some(0),
+        json!({"sequenceId":"seq_rd_v2","cameraKey":"Redispatch Cam","label":"v2","volumeHint":"","filenamePrefix":""}),
+    );
+    declared.payload_version = 2;
+    insert_operation_row(&open_connection(&path), &declared);
+
+    let _catalog = Catalog::open_existing(&path).unwrap();
+    let connection = open_connection(&path);
+    let sequence_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM capture_sequences WHERE id='seq_rd_v2'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        sequence_count, 0,
+        "a known type must keep rejecting payload version 2"
+    );
+    let revision_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM materialized_revisions WHERE project_id='project_version2' AND aggregate_type='captureSequence' AND aggregate_id='seq_rd_v2'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(revision_count, 0);
+    let _ = directory;
+}
+
+#[test]
+fn known_type_row_with_existing_conflict_is_not_redispatch_applied() {
+    let directory = tempdir().unwrap();
+    let path = quarantined_style_catalog(&directory, "conflicted.sqlite3", "project_conflicted");
+    let declared = operation(
+        "op_rd_conflicted",
+        "project_conflicted",
+        "node_old_build",
+        1,
+        1_700_000_000_000,
+        "captureSequence",
+        "seq_rd_conflicted",
+        CAPTURE_SEQUENCE_DECLARED,
+        Some(0),
+        json!({"sequenceId":"seq_rd_conflicted","cameraKey":"Redispatch Cam","label":"Never","volumeHint":"","filenamePrefix":""}),
+    );
+    let connection = open_connection(&path);
+    insert_operation_row(&connection, &declared);
+    connection
+        .execute(
+            "INSERT INTO operation_conflicts(conflict_id, project_id, aggregate_type, aggregate_id, incoming_operation_id, active_operation_id, expected_base_revision, actual_revision, conflict_type, created_at) VALUES ('conflict_rd_1', 'project_conflicted', 'captureSequence', 'seq_rd_conflicted', 'op_rd_conflicted', NULL, 1, 2, 'stale_base_revision', '2026-07-25T00:00:00.000Z')",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+
+    let _catalog = Catalog::open_existing(&path).unwrap();
+    let connection = open_connection(&path);
+    let sequence_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM capture_sequences WHERE id='seq_rd_conflicted'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        sequence_count, 0,
+        "a previously rejected operation must not re-apply"
+    );
+    let conflict_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM operation_conflicts WHERE project_id='project_conflicted'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(conflict_count, 1, "no new conflict row may be written");
+    let revision_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM materialized_revisions WHERE project_id='project_conflicted'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(revision_count, 0, "no state change");
+    let _ = directory;
+}
+
+#[test]
+fn legacy_operation_log_is_never_redispatch_replayed() {
+    let directory = tempdir().unwrap();
+    let (assets, events) = fixture_one_camera_one_clock();
+    let path = build_schema8_catalog(
+        &directory,
+        "legacy_replay.sqlite3",
+        "project_legacy_replay",
+        &assets,
+        &events,
+    );
+    // A realistic schema-8 log: the legacy clockEventCreated row is durable
+    // in project_operations with its aggregate revision, and its clock_events
+    // row exists.
+    let legacy = operation(
+        "op_legacy_clock",
+        "project_legacy_replay",
+        "node_legacy",
+        1,
+        1_700_000_000_000,
+        "clock",
+        "Sony A7C II",
+        CLOCK_EVENT_CREATED,
+        Some(0),
+        json!({"eventId":"clock_single_1","camera":"Sony A7C II","startFilename":"C0102.MP4","offsetSeconds":-3600,"label":"one hour fast"}),
+    );
+    let connection = open_connection(&path);
+    insert_operation_row(&connection, &legacy);
+    connection
+        .execute(
+            "INSERT INTO materialized_revisions(project_id, aggregate_type, aggregate_id, revision, last_operation_id) VALUES ('project_legacy_replay', 'clock', 'Sony A7C II', 1, 'op_legacy_clock')",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+
+    // `clock_epochs` does not exist until migration 9, so the first open both
+    // migrates and (in the fixed build) re-dispatches; the first count check
+    // happens after that open.
+    let counts = |path: &Path| -> (i64, i64) {
+        let connection = open_connection(path);
+        let events: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM clock_events WHERE project_id='project_legacy_replay'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let epochs: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM clock_epochs WHERE project_id='project_legacy_replay'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        (events, epochs)
+    };
+
+    let _catalog = Catalog::open_existing(&path).unwrap();
+    assert_eq!(
+        counts(&path),
+        (1, 1),
+        "migration and re-dispatch must not replay the legacy clock event"
+    );
+    drop(_catalog);
+    let _reopened = Catalog::open_existing(&path).unwrap();
+    assert_eq!(counts(&path), (1, 1), "another open applies nothing new");
+    let _ = directory;
+}
+
+#[test]
+fn open_read_only_existing_never_redispatch_applies() {
+    let directory = tempdir().unwrap();
+    let path = quarantined_style_catalog(&directory, "readonly.sqlite3", "project_readonly");
+    // Migrate to schema 9 first (a read-only open does not migrate).
+    let _migrated = Catalog::open_existing(&path).unwrap();
+    drop(_migrated);
+    let declared = operation(
+        "op_rd_readonly",
+        "project_readonly",
+        "node_old_build",
+        1,
+        1_700_000_000_000,
+        "captureSequence",
+        "seq_rd_readonly",
+        CAPTURE_SEQUENCE_DECLARED,
+        Some(0),
+        json!({"sequenceId":"seq_rd_readonly","cameraKey":"Redispatch Cam","label":"Read only","volumeHint":"","filenamePrefix":""}),
+    );
+    insert_operation_row(&open_connection(&path), &declared);
+
+    // A read-only open must be side-effect free: the quarantined-style row is
+    // not applied.
+    let read_only = Catalog::open_read_only_existing(&path).unwrap();
+    let connection = open_connection(&path);
+    let sequence_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM capture_sequences WHERE id='seq_rd_readonly'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        sequence_count, 0,
+        "read-only open must not materialize anything"
+    );
+    let revision_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM materialized_revisions WHERE project_id='project_readonly'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(revision_count, 0);
+    drop(read_only);
+    drop(connection);
+
+    // Sanity: the same row is re-dispatched by a writable open.
+    let _catalog = Catalog::open_existing(&path).unwrap();
+    let sequence_count: i64 = open_connection(&path)
+        .query_row(
+            "SELECT COUNT(*) FROM capture_sequences WHERE id='seq_rd_readonly'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(sequence_count, 1);
+    let _ = directory;
+}
+
+// ---------------------------------------------------------------------------
+// F2: captureSequenceMerged self-merge and captureSequenceSplit id collision
+// ---------------------------------------------------------------------------
+
+#[test]
+fn self_merge_errors_and_leaves_the_sequence_intact() {
+    let (directory, path, project_id) = project_with_asset();
+    let catalog = Catalog::open_existing(&path).unwrap();
+    let connection = open_connection(&path);
+    connection
+        .execute(
+            "INSERT INTO capture_sequences(id, project_id, camera_key, label, volume_hint, filename_prefix, created_at) VALUES ('seq_self', ?1, 'Roundtrip Cam', 'Self', '', '', '2026-07-20T00:00:00.000Z')",
+            [&project_id],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO assets(id, project_id, fingerprint, path, filename, size_bytes, duration_seconds, camera, created_at) VALUES ('asset_self_1', ?1, 'fp-s1', '/offline/s1.mp4', 'C0001.MP4', 1, 1, 'Roundtrip Cam', '2026-07-20T00:00:00.000Z'), ('asset_self_2', ?1, 'fp-s2', '/offline/s2.mp4', 'C0002.MP4', 1, 1, 'Roundtrip Cam', '2026-07-20T00:00:00.000Z')",
+            [&project_id],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO asset_capture_sequence(asset_id, project_id, capture_sequence_id, filename_counter) VALUES ('asset_self_1', ?1, 'seq_self', 1), ('asset_self_2', ?1, 'seq_self', 2)",
+            [&project_id],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO clock_epochs(id, project_id, capture_sequence_id, start_counter, offset_seconds, label, created_at) VALUES ('epoch_self', ?1, 'seq_self', 1, -60, 'self', '2026-07-20T00:00:00.000Z')",
+            [&project_id],
+        )
+        .unwrap();
+    drop(connection);
+
+    let self_merge = operation(
+        "op_self_merge",
+        &project_id,
+        "node_f2",
+        1,
+        1_700_000_000_000,
+        "captureSequence",
+        "seq_self",
+        CAPTURE_SEQUENCE_MERGED,
+        Some(0),
+        json!({"fromSequenceId":"seq_self","intoSequenceId":"seq_self"}),
+    );
+    let error = catalog.apply_operation(&self_merge).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("requires two distinct capture sequences"),
+        "unexpected error: {error}"
+    );
+
+    // Nothing was destroyed: the sequence, its assignments, and its epochs
+    // are all still present, and no revision advanced.
+    let connection = open_connection(&path);
+    let sequence_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM capture_sequences WHERE id='seq_self' AND project_id=?1",
+            [&project_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(sequence_count, 1, "the sequence must survive a self-merge");
+    let assignment_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM asset_capture_sequence WHERE capture_sequence_id='seq_self' AND project_id=?1",
+            [&project_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        assignment_count, 2,
+        "asset assignments must survive a self-merge"
+    );
+    let epoch_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM clock_epochs WHERE capture_sequence_id='seq_self' AND project_id=?1",
+            [&project_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(epoch_count, 1, "clock epochs must survive a self-merge");
+    let revision_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM materialized_revisions WHERE project_id=?1 AND aggregate_type='captureSequence' AND aggregate_id='seq_self'",
+            [&project_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        revision_count, 0,
+        "a failed self-merge must not advance the revision"
+    );
+    let _ = directory;
+}
+
+#[test]
+fn split_into_existing_sequence_id_errors_and_leaves_assignments_unchanged() {
+    let (directory, path, project_id) = project_with_asset();
+    let catalog = Catalog::open_existing(&path).unwrap();
+    let connection = open_connection(&path);
+    connection
+        .execute(
+            "INSERT INTO capture_sequences(id, project_id, camera_key, label, volume_hint, filename_prefix, created_at) VALUES ('seq_split_src', ?1, 'Roundtrip Cam', 'Source', '', '', '2026-07-20T00:00:00.000Z'), ('seq_split_dst', ?1, 'Other Cam', 'Destination', '', '', '2026-07-20T00:00:00.000Z')",
+            [&project_id],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO assets(id, project_id, fingerprint, path, filename, size_bytes, duration_seconds, camera, created_at) VALUES ('asset_split_1', ?1, 'fp-s1', '/offline/s1.mp4', 'C0001.MP4', 1, 1, 'Roundtrip Cam', '2026-07-20T00:00:00.000Z'), ('asset_split_2', ?1, 'fp-s2', '/offline/s2.mp4', 'C0005.MP4', 1, 1, 'Roundtrip Cam', '2026-07-20T00:00:00.000Z'), ('asset_dst_1', ?1, 'fp-d1', '/offline/d1.mp4', 'GX010001.MP4', 1, 1, 'Other Cam', '2026-07-20T00:00:00.000Z')",
+            [&project_id],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO asset_capture_sequence(asset_id, project_id, capture_sequence_id, filename_counter) VALUES ('asset_split_1', ?1, 'seq_split_src', 1), ('asset_split_2', ?1, 'seq_split_src', 5), ('asset_dst_1', ?1, 'seq_split_dst', 1)",
+            [&project_id],
+        )
+        .unwrap();
+    drop(connection);
+
+    // The destination id collides with a sequence that already exists in this
+    // project (another camera's derived id, for example).
+    let split = operation(
+        "op_split_collision",
+        &project_id,
+        "node_f2",
+        1,
+        1_700_000_000_000,
+        "captureSequence",
+        "seq_split_src",
+        CAPTURE_SEQUENCE_SPLIT,
+        Some(0),
+        json!({"newSequenceId":"seq_split_dst","cameraKey":"Roundtrip Cam","label":"Split","volumeHint":"","filenamePrefix":"","atCounter":3}),
+    );
+    let error = catalog.apply_operation(&split).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("destination sequence already exists"),
+        "unexpected error: {error}"
+    );
+
+    let connection = open_connection(&path);
+    // The unrelated destination sequence's assignment is unchanged...
+    let dst_assignment: String = connection
+        .query_row(
+            "SELECT capture_sequence_id FROM asset_capture_sequence WHERE asset_id='asset_dst_1'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(dst_assignment, "seq_split_dst");
+    // ...and no source asset moved into it either.
+    let assignments: Vec<String> = {
+        let mut statement = connection
+            .prepare("SELECT capture_sequence_id FROM asset_capture_sequence WHERE project_id=?1 AND capture_sequence_id IN ('seq_split_src', 'seq_split_dst') ORDER BY asset_id")
+            .unwrap();
+        statement
+            .query_map([&project_id], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    };
+    assert_eq!(
+        assignments,
+        ["seq_split_dst", "seq_split_src", "seq_split_src"],
+        "assignments must not move into the existing destination sequence"
+    );
+    let revision_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM materialized_revisions WHERE project_id=?1 AND aggregate_type='captureSequence' AND aggregate_id='seq_split_src'",
+            [&project_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        revision_count, 0,
+        "a failed split must not advance the revision"
+    );
+    let _ = directory;
+}
+
+// ---------------------------------------------------------------------------
 // Oracle 12: no projection writes
 // ---------------------------------------------------------------------------
 
