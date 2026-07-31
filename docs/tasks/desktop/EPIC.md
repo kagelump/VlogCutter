@@ -86,7 +86,7 @@ flat table of per-camera filename offsets. This epic rebalances that.
 | 30 | [D01-T003](tasks/D01-T003-desktop-frontend-testability-seam.md) | Desktop frontend testability seam | D01-T002 | complete |
 | 40 | [D01-T004](tasks/D01-T004-github-actions-ci.md) | GitHub Actions CI with macOS native build | D01-T003 | complete |
 | 50 | [D01-T005](tasks/D01-T005-native-desktop-smoke-acceptance.md) | Native macOS desktop smoke acceptance | D01-T004 | complete |
-| 60 | [D01-T006](tasks/D01-T006-fix-native-smoke-defects.md) | Fix native smoke defects | D01-T005 | draft |
+| 60 | [D01-T006](tasks/D01-T006-fix-native-smoke-defects.md) | Fix native smoke defects | D01-T005 | ready |
 | 70 | [D01-T007](tasks/D01-T007-chronology-domain-model.md) | Chronology domain model and operation vocabulary | D01-T006 | ready |
 | 80 | [D01-T008](tasks/D01-T008-deterministic-chronology-solver.md) | Deterministic chronology solver | D01-T007 | draft |
 | 90 | [D01-T009](tasks/D01-T009-capture-sequence-management.md) | Capture-sequence management | D01-T008 | draft |
