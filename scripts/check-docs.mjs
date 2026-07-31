@@ -6,12 +6,17 @@ const ignoredDirectories = new Set([".git", "node_modules", "target", "dist"]);
 const markdownFiles = [];
 
 function walk(directory) {
-  // Skip git worktrees — they contain a .git file (not directory) at their
-  // root and are independent checkouts whose docs are not this tree's concern.
-  if (existsSync(join(directory, ".git"))) {
-    try {
-      if (statSync(join(directory, ".git")).isFile()) return;
-    } catch (_) { /* proceed — if we can't stat it, it's not a worktree marker */ }
+  // Skip git worktrees encountered during recursion — they contain a .git
+  // file (not directory) at their root and are independent checkouts whose
+  // docs are not this tree's concern.  Do NOT apply this guard to the walk's
+  // own starting root (process.cwd()), because check-docs.mjs may itself be
+  // invoked from inside a git worktree.
+  if (directory !== root) {
+    if (existsSync(join(directory, ".git"))) {
+      try {
+        if (statSync(join(directory, ".git")).isFile()) return;
+      } catch (_) { /* proceed — if we can't stat it, it's not a worktree marker */ }
+    }
   }
   for (const entry of readdirSync(directory, { withFileTypes: true })) {
     if (entry.isDirectory() && ignoredDirectories.has(entry.name)) continue;

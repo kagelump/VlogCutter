@@ -106,6 +106,7 @@ flat table of per-camera filename offsets. This epic rebalances that.
 | 230 | [D01-T023](tasks/D01-T023-edit-plan-and-export-ui.md) | Edit-plan and export desktop UI | D01-T021, D01-T022 | draft |
 | 240 | [D01-T024](tasks/D01-T024-resolve-import-acceptance.md) | DaVinci Resolve 20/21 import acceptance | D01-T023 | draft |
 | 250 | [D01-T025](tasks/D01-T025-documentation-and-reconciliation.md) | Documentation and planning reconciliation | D01-T018, D01-T024 | draft |
+| 260 | [D01-T026](tasks/D01-T026-check-docs-worktree-skip-regression.md) | Fix check-docs worktree-skip regression | D01-T002 | ready |
 
 ## Draft promotion protocol
 
