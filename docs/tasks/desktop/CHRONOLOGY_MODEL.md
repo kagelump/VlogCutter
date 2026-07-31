@@ -395,6 +395,29 @@ its own legacy guard (`stale_clock_base_revision`).
   a build that knows the type applies it normally — either when it receives the
   operation from the peer (it materializes at apply time) or when the catalog
   is opened by that build and the operation is re-dispatched from the log.
+
+### Re-dispatch seam
+
+On every writable catalog open, after migration, the operation log is scanned
+for persisted-but-never-applied rows of the eleven chronology operation types,
+and each is re-dispatched through the normal materializer dispatch:
+
+- Scope: only the eleven chronology operation types, with `payload_version`
+  1. Legacy and pre-existing operation types are never re-dispatched.
+- A row is a candidate only when it has no `operation_conflicts` row and is
+  not the `last_operation_id` of its aggregate's `materialized_revisions` row.
+  An operation without a declared `base_revision` is additionally a candidate
+  only when its aggregate has no materialized revision.
+- Candidates apply in HLC order (`hlc_wall_millis`, `hlc_counter`,
+  `origin_node_id`, `operation_id`), best-effort per row: a row that cannot
+  apply (guard mismatch, validation bail) is left in the log and re-examined
+  on the next open. The seam never fails the open and never deletes a row.
+- The seam never writes `operation_conflicts` rows: a re-dispatched row whose
+  declared `base_revision` no longer matches the aggregate's current revision
+  is skipped, not recorded. A `stale_base_revision` conflict row therefore
+  always references an operation rejected by the normal apply path, never a
+  re-dispatch — so a baseline export/import cycle is unaffected by the seam.
+- Read-only opens never run the seam.
 - `ApplyOperationResult` gains a `Quarantined` outcome and
   `OperationBatchResult` reports `quarantined` counts. `CLOCK_EVENT_CREATED`
   and the other 18 known types are never quarantined.
@@ -406,7 +429,9 @@ its own legacy guard (`stale_clock_base_revision`).
 - The fact types in `chronology/model.rs`, including field names and types.
 - The loader contract: every `ChronologyFacts` collection sorted by primary
   key, deterministic across calls.
-- The quarantine surface and the revision-guard conflict semantics.
+- The quarantine surface, the revision-guard conflict semantics, and the
+  re-dispatch seam's scope, filters, ordering, and no-conflict-row
+  disposition.
 - The projection-column rule: `assets.best_time` and `assets.offset_seconds`
   are written only by solution projection.
 - `clock_events` stays in the schema. Nothing may drop it.
