@@ -5,6 +5,9 @@ dist/
 *.sqlite3
 *.sqlite3-shm
 *.sqlite3-wal
+# Checked-in schema-8 fixture catalogs (D01-T007) are deliberately tracked.
+!core/rcdvlog-core/tests/fixtures/chronology/*.sqlite3
+!core/rcdvlog-core/tests/fixtures/chronology-independent/*.sqlite3
 *.tsbuildinfo
 apps/desktop/src-tauri/gen/
 apps/web/test-results/

@@ -6,7 +6,7 @@ This is the implementation handoff for the migration and identity contracts intr
 
 ## Project catalog migration contract
 
-The current project-catalog schema version is `6`. Writable `Catalog::open` and `Catalog::open_existing` apply missing migrations in order. Read-only catalog opens and `catalog inspect` never create or update migration history.
+The current project-catalog schema version is `9`. Writable `Catalog::open` and `Catalog::open_existing` apply missing migrations in order. Read-only catalog opens and `catalog inspect` never create or update migration history.
 
 | ID | Name | Immutable source identity | Purpose |
 | --- | --- | --- | --- |
@@ -16,6 +16,19 @@ The current project-catalog schema version is `6`. Writable `Catalog::open` and 
 | 4 | `companion_identity_links` | `project-catalog/0004-companion-identity-links/20260720` | Adds nullable project replica metadata and project-asset media identity state. |
 | 5 | `operation_backed_project_mutations` | `project-catalog/0005-operation-backed-project-mutations/20260723` | Adds stable desktop/catalog identity, immutable project operations, HLC/sequence allocation, materialized revisions, note history, label tags, LWW registers, and chronology conflicts. |
 | 6 | `project_sync_state` | `project-catalog/0006-project-sync-state/20260723` | Adds baseline identity, contiguous receive cursors, origin-scoped observation facts, and representation manifests. |
+| 7 | `restore_sequence_recovery` | `project-catalog/0007-restore-sequence-recovery/20260728` | Adds durable restore/recovery state for server-origin operation sequence allocation. |
+| 8 | `peer_operation_acknowledgements` | `project-catalog/0008-peer-operation-acknowledgements/20260728` | Adds per-peer committed cursors so sync acknowledges each origin's progress. |
+| 9 | `chronology_facts` | `project-catalog/0009-chronology-facts/20260731` | Adds the persisted chronology fact model: `capture_sequences`, `asset_capture_sequence`, `clock_epochs`, `clip_time_exceptions`, `trip_phases`, and `event_order_constraints`, plus their ordering indexes. Existing `clock_events` rows are forward-migrated into `clock_epochs` without recomputing `assets.best_time` or `assets.offset_seconds`, so no existing review order changes. `clock_events` is retained for legacy operation replay. |
+
+Migration 9 freezes the desktop chronology model published in
+`docs/tasks/desktop/CHRONOLOGY_MODEL.md` (D01-T007): capture sequences scope
+filename identity, clock epochs carry one offset model per counter range, clip
+time exceptions ride the `projectAsset` aggregate, trip phases carry timezone
+context, and event-order constraints carry ordering knowledge independent of
+time. Unknown operation types are retained in `project_operations` and reported
+through the catalog's `quarantined_operations` surface instead of failing a
+sync batch; a peer build that knows the type applies them normally from the
+persisted log.
 
 Every migration is committed in its own SQLite transaction. Its record is inserted into `schema_migrations` in that same transaction. Migration names and source identities must be non-empty and unique within a migration list. Applied names and source identities are immutable: changing either is treated as incompatible history. A migration list must be contiguous from ID 1, and a catalog with an applied version newer than the binary is read-only inspectable but rejected for writable use with `schema_incompatible` guidance.
 

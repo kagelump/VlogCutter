@@ -15,18 +15,27 @@ use uuid::Uuid;
 use walkdir::WalkDir;
 
 mod baseline;
+mod chronology;
 mod identifiers;
 mod migrations;
 mod operations;
 mod storage;
 
+pub use chronology::{
+    AssetTimeHypothesis, CaptureSequence, ChronologyFacts, ClipTimeException, ClockEpoch,
+    ConstraintStrength, DisplayMode, EventOrderConstraint, PhaseKind, QuarantinedOperation,
+    TripPhase,
+};
 pub use operations::{
-    ApplyOperationResult, AssetRevisionDiagnostics, CLOCK_EVENT_CREATED, ConflictProjection,
+    ApplyOperationResult, AssetRevisionDiagnostics, CAPTURE_SEQUENCE_DECLARED,
+    CAPTURE_SEQUENCE_MERGED, CAPTURE_SEQUENCE_SPLIT, CLIP_TIME_EXCEPTION_CLEARED,
+    CLIP_TIME_EXCEPTION_SET, CLOCK_EPOCH_CLEARED, CLOCK_EPOCH_SET, CLOCK_EVENT_CREATED,
+    ConflictProjection, EVENT_ORDER_CONSTRAINT_CLEARED, EVENT_ORDER_CONSTRAINT_SET,
     HybridLogicalTime, LABEL_ADDED, LABEL_REMOVED, MAX_REMOTE_HLC_FUTURE_SKEW_MILLIS,
     NOTE_REVISION_CREATED, NoteRevisionProjection, OperationBatchResult, OperationDiagnostics,
     PROJECT_ASSET_ADDED, PROJECT_ASSET_MEDIA_LINKED, ProjectAssetAddedPayload, ProjectAssetItem,
     ProjectAssetPage, ProjectOperation, REMOVED_SET, ROTATION_SET, SequenceRecoveryProjection,
-    SequenceRecoveryState,
+    SequenceRecoveryState, TRIP_PHASE_REMOVED, TRIP_PHASE_SET,
 };
 
 pub use baseline::{PortableAssetBaseline, PortableRootMapping, ProjectBaselineSnapshot};
@@ -36,8 +45,9 @@ pub use identifiers::{
 };
 pub use migrations::{
     CatalogSchemaError, MigrationHistoryInspection, MigrationHistoryStatus,
-    PROJECT_CATALOG_SCHEMA_VERSION, PendingMigration, SchemaMigrationRecord, SqliteMigration,
-    inspect_project_catalog_migrations, inspect_sqlite_migrations, run_sqlite_migrations,
+    PROJECT_CATALOG_MIGRATIONS, PROJECT_CATALOG_SCHEMA_VERSION, PendingMigration,
+    SchemaMigrationRecord, SqliteMigration, inspect_project_catalog_migrations,
+    inspect_sqlite_migrations, run_sqlite_migrations,
 };
 pub use storage::{
     BindingVerificationStatus, GlobalMediaVerificationState, LocationVerificationState,
@@ -429,6 +439,11 @@ impl Catalog {
             read_only: false,
         };
         catalog.migrate()?;
+        // D01-T007 decision 4 "applies after upgrade": operations an older
+        // build quarantined (persisted but not materialized) are re-dispatched
+        // from the log by a build that knows their type. Writable open only —
+        // `open_read_only_existing` must stay side-effect free.
+        catalog.redispatch_chronology_operations()?;
         Ok(catalog)
     }
 
@@ -495,6 +510,11 @@ impl Catalog {
     fn migrate(&self) -> Result<()> {
         let mut connection = self.connection()?;
         migrations::migrate_project_catalog(&mut connection)
+    }
+
+    fn redispatch_chronology_operations(&self) -> Result<()> {
+        let mut connection = self.connection()?;
+        chronology::redispatch_chronology_operations(&mut connection)
     }
 
     pub fn create_project(&self, name: &str) -> Result<Project> {
@@ -1177,6 +1197,28 @@ impl Catalog {
             bail!("project not found: {project_id}");
         }
         Ok(())
+    }
+
+    /// Loads the complete persisted chronology evidence for one project
+    /// (D01-T007). Every collection is returned in deterministic order, sorted
+    /// by primary key, so the solver cannot inherit nondeterminism from the
+    /// loader. The facts are evidence only: derived values belong to the
+    /// solver (D01-T008).
+    pub fn chronology_facts(&self, project_id: &str) -> Result<ChronologyFacts> {
+        self.require_project(project_id)?;
+        let connection = self.connection()?;
+        chronology::load_chronology_facts(&connection, project_id)
+    }
+
+    /// Reports the operations this build retained but could not materialize,
+    /// because their operation type is unknown to this build (D01-T007
+    /// quarantine policy). The operations are durable in `project_operations`,
+    /// never advanced an aggregate revision, and apply normally once a build
+    /// that knows the type opens the catalog.
+    pub fn quarantined_operations(&self, project_id: &str) -> Result<Vec<QuarantinedOperation>> {
+        self.require_project(project_id)?;
+        let connection = self.connection()?;
+        chronology::load_quarantined_operations(&connection, project_id)
     }
 
     fn load_batch_history(&self, task_kind: &str) -> Result<RateHistory> {

@@ -18,7 +18,67 @@ pub const ROTATION_SET: &str = "rotationSet";
 pub const PROJECT_ASSET_ADDED: &str = "projectAssetAdded";
 pub const PROJECT_ASSET_MEDIA_LINKED: &str = "projectAssetMediaLinked";
 pub const CLOCK_EVENT_CREATED: &str = "clockEventCreated";
+pub const CAPTURE_SEQUENCE_DECLARED: &str = "captureSequenceDeclared";
+pub const CAPTURE_SEQUENCE_SPLIT: &str = "captureSequenceSplit";
+pub const CAPTURE_SEQUENCE_MERGED: &str = "captureSequenceMerged";
+pub const CLOCK_EPOCH_SET: &str = "clockEpochSet";
+pub const CLOCK_EPOCH_CLEARED: &str = "clockEpochCleared";
+pub const CLIP_TIME_EXCEPTION_SET: &str = "clipTimeExceptionSet";
+pub const CLIP_TIME_EXCEPTION_CLEARED: &str = "clipTimeExceptionCleared";
+pub const TRIP_PHASE_SET: &str = "tripPhaseSet";
+pub const TRIP_PHASE_REMOVED: &str = "tripPhaseRemoved";
+pub const EVENT_ORDER_CONSTRAINT_SET: &str = "eventOrderConstraintSet";
+pub const EVENT_ORDER_CONSTRAINT_CLEARED: &str = "eventOrderConstraintCleared";
 pub const MAX_REMOTE_HLC_FUTURE_SKEW_MILLIS: i64 = 5 * 60 * 1000;
+
+/// The eleven chronology operation types D01-T007 added. The re-dispatch seam
+/// on writable catalog open is scoped to exactly these: for the legacy
+/// vocabulary a persisted row is never a signal that materialization is
+/// missing, so replaying them would rewrite the legacy log.
+pub(crate) const CHRONOLOGY_OPERATION_TYPES: &[&str] = &[
+    CAPTURE_SEQUENCE_DECLARED,
+    CAPTURE_SEQUENCE_SPLIT,
+    CAPTURE_SEQUENCE_MERGED,
+    CLOCK_EPOCH_SET,
+    CLOCK_EPOCH_CLEARED,
+    CLIP_TIME_EXCEPTION_SET,
+    CLIP_TIME_EXCEPTION_CLEARED,
+    TRIP_PHASE_SET,
+    TRIP_PHASE_REMOVED,
+    EVENT_ORDER_CONSTRAINT_SET,
+    EVENT_ORDER_CONSTRAINT_CLEARED,
+];
+
+/// Every operation type this build recognizes. Anything in the operation log
+/// outside this set is retained but quarantined: it is durable, reported
+/// through `quarantined_operations`, never advances an aggregate revision, and
+/// never fails the containing batch. A build that knows the type materializes
+/// it normally from the persisted log.
+pub(crate) const KNOWN_OPERATION_TYPES: &[&str] = &[
+    NOTE_REVISION_CREATED,
+    LABEL_ADDED,
+    LABEL_REMOVED,
+    REMOVED_SET,
+    ROTATION_SET,
+    PROJECT_ASSET_ADDED,
+    PROJECT_ASSET_MEDIA_LINKED,
+    CLOCK_EVENT_CREATED,
+    CAPTURE_SEQUENCE_DECLARED,
+    CAPTURE_SEQUENCE_SPLIT,
+    CAPTURE_SEQUENCE_MERGED,
+    CLOCK_EPOCH_SET,
+    CLOCK_EPOCH_CLEARED,
+    CLIP_TIME_EXCEPTION_SET,
+    CLIP_TIME_EXCEPTION_CLEARED,
+    TRIP_PHASE_SET,
+    TRIP_PHASE_REMOVED,
+    EVENT_ORDER_CONSTRAINT_SET,
+    EVENT_ORDER_CONSTRAINT_CLEARED,
+];
+
+pub(crate) fn is_known_operation_type(value: &str) -> bool {
+    KNOWN_OPERATION_TYPES.contains(&value)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -50,6 +110,10 @@ pub enum ApplyOperationResult {
     Applied,
     Duplicate,
     Conflict,
+    /// The operation was persisted but not materialized, because its operation
+    /// type is unknown to this build. Durable, visible, and no aggregate
+    /// revision advanced (quarantine policy, D01-T007 decision 4).
+    Quarantined,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -103,6 +167,10 @@ pub struct OperationBatchResult {
     pub applied: usize,
     pub duplicates: usize,
     pub conflicts: usize,
+    /// Operations persisted but not materialized because this build does not
+    /// know their type. They remain durable in `project_operations` and are
+    /// reported through `quarantined_operations`.
+    pub quarantined: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -221,6 +289,103 @@ pub struct ProjectAssetAddedPayload {
 struct MediaLinkedPayload {
     media_object_id: String,
     verification_state: MediaVerificationState,
+}
+
+/// Chronology operation payloads, frozen by D01-T007
+/// (`docs/tasks/desktop/CHRONOLOGY_MODEL.md`). All are payload version 1 with
+/// `deny_unknown_fields`, matching the existing operation payload discipline.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CaptureSequenceDeclaredPayload {
+    sequence_id: String,
+    camera_key: String,
+    label: String,
+    volume_hint: String,
+    filename_prefix: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CaptureSequenceSplitPayload {
+    new_sequence_id: String,
+    camera_key: String,
+    label: String,
+    volume_hint: String,
+    filename_prefix: String,
+    at_counter: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CaptureSequenceMergedPayload {
+    from_sequence_id: String,
+    into_sequence_id: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ClockEpochSetPayload {
+    epoch_id: String,
+    capture_sequence_id: String,
+    start_counter: u64,
+    end_counter: Option<u64>,
+    offset_seconds: i64,
+    label: String,
+    confidence: Option<f32>,
+    evidence: Option<Vec<String>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ClockEpochClearedPayload {
+    epoch_id: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ClipTimeExceptionSetPayload {
+    trip_time: String,
+    reason: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ClipTimeExceptionClearedPayload {}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct TripPhaseSetPayload {
+    phase_id: String,
+    label: String,
+    phase_kind: String,
+    start_trip_time: String,
+    end_trip_time: String,
+    timezone: Option<String>,
+    origin_timezone: Option<String>,
+    destination_timezone: Option<String>,
+    display_mode: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct TripPhaseRemovedPayload {
+    phase_id: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct EventOrderConstraintSetPayload {
+    constraint_id: String,
+    earlier_asset_id: String,
+    later_asset_id: String,
+    strength: String,
+    source: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct EventOrderConstraintClearedPayload {
+    constraint_id: String,
 }
 
 struct NewOperation {
@@ -651,6 +816,7 @@ impl Catalog {
             applied: 0,
             duplicates: 0,
             conflicts: 0,
+            quarantined: 0,
         };
         for operation in operations {
             validate_operation(operation)?;
@@ -678,6 +844,7 @@ impl Catalog {
                 ApplyOperationResult::Applied => result.applied += 1,
                 ApplyOperationResult::Duplicate => result.duplicates += 1,
                 ApplyOperationResult::Conflict => result.conflicts += 1,
+                ApplyOperationResult::Quarantined => result.quarantined += 1,
             }
             receive_hlc(&transaction, operation)?;
             cursor = operation.origin_sequence;
@@ -1401,7 +1568,9 @@ fn insert_and_materialize(
     if operation_exists(transaction, &operation.operation_id)? {
         return Ok(ApplyOperationResult::Duplicate);
     }
-    if operation.aggregate_type == "projectAsset" && operation.operation_type != PROJECT_ASSET_ADDED
+    if is_known_operation_type(&operation.operation_type)
+        && operation.aggregate_type == "projectAsset"
+        && operation.operation_type != PROJECT_ASSET_ADDED
     {
         reconcile_asset_baseline(transaction, &operation.project_id, &operation.aggregate_id)?;
     }
@@ -1413,6 +1582,19 @@ fn insert_and_materialize(
             serde_json::to_string(&operation.payload)?, now()],
     )?;
 
+    materialize_operation(transaction, operation)
+}
+
+/// Applies one already-persisted operation's materialization and revision
+/// advance: the shared dispatch used by the insert path
+/// (`insert_and_materialize`) and by the re-dispatch seam that materializes
+/// quarantined chronology operations when a build that knows their type opens
+/// the catalog. The caller decides whether the operation row was inserted in
+/// this transaction; this function never touches `project_operations`.
+pub(crate) fn materialize_operation(
+    transaction: &Transaction<'_>,
+    operation: &ProjectOperation,
+) -> Result<ApplyOperationResult> {
     let outcome = match operation.operation_type.as_str() {
         NOTE_REVISION_CREATED => materialize_note(transaction, operation)?,
         LABEL_ADDED => materialize_label_add(transaction, operation)?,
@@ -1422,7 +1604,38 @@ fn insert_and_materialize(
         PROJECT_ASSET_ADDED => materialize_asset_add(transaction, operation)?,
         PROJECT_ASSET_MEDIA_LINKED => materialize_media_link(transaction, operation)?,
         CLOCK_EVENT_CREATED => return materialize_clock(transaction, operation),
-        value => bail!("unsupported operation type: {value}"),
+        CAPTURE_SEQUENCE_DECLARED => {
+            return materialize_capture_sequence_declared(transaction, operation);
+        }
+        CAPTURE_SEQUENCE_SPLIT => {
+            return materialize_capture_sequence_split(transaction, operation);
+        }
+        CAPTURE_SEQUENCE_MERGED => {
+            return materialize_capture_sequence_merged(transaction, operation);
+        }
+        CLOCK_EPOCH_SET => return materialize_clock_epoch_set(transaction, operation),
+        CLOCK_EPOCH_CLEARED => return materialize_clock_epoch_cleared(transaction, operation),
+        CLIP_TIME_EXCEPTION_SET => {
+            return materialize_clip_time_exception_set(transaction, operation);
+        }
+        CLIP_TIME_EXCEPTION_CLEARED => {
+            return materialize_clip_time_exception_cleared(transaction, operation);
+        }
+        TRIP_PHASE_SET => return materialize_trip_phase_set(transaction, operation),
+        TRIP_PHASE_REMOVED => return materialize_trip_phase_removed(transaction, operation),
+        EVENT_ORDER_CONSTRAINT_SET => {
+            return materialize_event_order_constraint_set(transaction, operation);
+        }
+        EVENT_ORDER_CONSTRAINT_CLEARED => {
+            return materialize_event_order_constraint_cleared(transaction, operation);
+        }
+        _ => {
+            // Unknown operation type: quarantine policy (D01-T007 decision 4).
+            // The operation row is already persisted (by the caller's insert
+            // path). It is retained and visible, never advances an aggregate
+            // revision, and does not fail the containing batch.
+            return Ok(ApplyOperationResult::Quarantined);
+        }
     };
     if outcome {
         advance_revision(transaction, operation)?;
@@ -1561,6 +1774,25 @@ fn materialize_asset_add(
             payload.duration_seconds, payload.frame_rate, payload.width, payload.height, payload.codec, payload.camera,
             payload.captured_at_raw, payload.best_time, payload.metadata_rotation_degrees, payload.default_rotation_degrees, payload.created_at],
     )?;
+    // Every asset belongs to exactly one capture sequence. A new asset joins
+    // its camera's sequence (created on demand), using the same rule migration
+    // 9 applies to existing assets. This keeps the chronology fact model
+    // closed from migration 9 onward.
+    crate::chronology::ensure_capture_sequence_for_camera(
+        transaction,
+        &operation.project_id,
+        &payload.camera,
+        &payload.created_at,
+    )?;
+    transaction.execute(
+        "INSERT OR IGNORE INTO asset_capture_sequence(asset_id, project_id, capture_sequence_id, filename_counter) VALUES (?1, ?2, ?3, ?4)",
+        params![
+            operation.aggregate_id,
+            operation.project_id,
+            crate::chronology::capture_sequence_id_for(&operation.project_id, &payload.camera),
+            crate::chronology::parse_filename_counter(&payload.filename).map(|value| value as i64),
+        ],
+    )?;
     transaction.execute(
         "INSERT INTO note_revisions(revision_id, project_id, asset_id, operation_id, text, hlc_wall_millis, hlc_counter, origin_node_id, created_at) VALUES (?1, ?2, ?3, NULL, '', 0, 0, 'baseline', ?4)",
         params![format!("baseline_note_{}", operation.aggregate_id), operation.project_id, operation.aggregate_id, payload.created_at],
@@ -1618,10 +1850,491 @@ fn materialize_clock(
                 active, operation.base_revision.map(|v| v as i64), actual as i64, now()])?;
         return Ok(ApplyOperationResult::Conflict);
     }
+    let created_at = now();
     transaction.execute("INSERT INTO clock_events(id, project_id, camera, start_filename, offset_seconds, label, created_at, operation_id, hlc_wall_millis, hlc_counter, origin_node_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-        params![payload.event_id, operation.project_id, payload.camera, payload.start_filename, payload.offset_seconds, payload.label, now(), operation.operation_id,
+        params![payload.event_id, operation.project_id, payload.camera, payload.start_filename, payload.offset_seconds, payload.label, created_at, operation.operation_id,
             operation.logical_time.wall_millis, operation.logical_time.counter as i64, operation.origin_node_id])?;
+    crate::chronology::materialize_legacy_clock_epoch(
+        transaction,
+        &operation.project_id,
+        &crate::chronology::LegacyClockEpoch {
+            event_id: &payload.event_id,
+            camera: &payload.camera,
+            start_filename: &payload.start_filename,
+            offset_seconds: payload.offset_seconds,
+            label: &payload.label,
+            created_at: &created_at,
+        },
+    )?;
     recalculate_clock(transaction, &operation.project_id, &operation.aggregate_id)?;
+    advance_revision(transaction, operation)?;
+    Ok(ApplyOperationResult::Applied)
+}
+
+/// The revision-guard comparison for one operation: `None` when the operation
+/// declares no base revision (the guard passes unconditionally), otherwise
+/// `Some((expected, actual))` from the aggregate's current revision.
+fn guard_comparison(
+    transaction: &Transaction<'_>,
+    operation: &ProjectOperation,
+) -> Result<Option<(u64, u64)>> {
+    let Some(expected) = operation.base_revision else {
+        return Ok(None);
+    };
+    let actual = current_revision(
+        transaction,
+        &operation.project_id,
+        &operation.aggregate_type,
+        &operation.aggregate_id,
+    )?;
+    Ok(Some((expected, actual)))
+}
+
+/// The same guard comparison without conflict recording: the re-dispatch
+/// seam pre-checks candidates with it so a guard-failing row is skipped
+/// silently and left in the log instead of writing a phantom
+/// `operation_conflicts` row for a legitimately applied (but superseded)
+/// operation — a phantom row would break baseline export/import watermark
+/// comparison. Genuine stale-base resends on the normal apply path still
+/// record their conflict rows through `revision_guard_passes`.
+pub(crate) fn revision_guard_passes_without_recording(
+    transaction: &Transaction<'_>,
+    operation: &ProjectOperation,
+) -> Result<bool> {
+    let Some((expected, actual)) = guard_comparison(transaction, operation)? else {
+        return Ok(true);
+    };
+    Ok(expected == actual)
+}
+
+/// The `materialized_revisions` base-revision guard for the chronology
+/// operations: when the operation declares a base revision it must equal the
+/// aggregate's current revision, otherwise a durable conflict row is recorded
+/// and the operation is refused without overwriting. An operation without a
+/// declared base revision passes, matching the existing non-chronology
+/// operations.
+fn revision_guard_passes(
+    transaction: &Transaction<'_>,
+    operation: &ProjectOperation,
+) -> Result<bool> {
+    let Some((expected, actual)) = guard_comparison(transaction, operation)? else {
+        return Ok(true);
+    };
+    if expected == actual {
+        return Ok(true);
+    }
+    let active = transaction
+        .query_row(
+            "SELECT last_operation_id FROM materialized_revisions WHERE project_id=?1 AND aggregate_type=?2 AND aggregate_id=?3",
+            params![operation.project_id, operation.aggregate_type, operation.aggregate_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten();
+    transaction.execute(
+        "INSERT INTO operation_conflicts(conflict_id, project_id, aggregate_type, aggregate_id, incoming_operation_id, active_operation_id, expected_base_revision, actual_revision, conflict_type, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'stale_base_revision', ?9)",
+        params![
+            format!("conflict_{}", Uuid::new_v4().simple()),
+            operation.project_id,
+            operation.aggregate_type,
+            operation.aggregate_id,
+            operation.operation_id,
+            active,
+            expected as i64,
+            actual as i64,
+            now(),
+        ],
+    )?;
+    Ok(false)
+}
+
+fn materialize_capture_sequence_declared(
+    transaction: &Transaction<'_>,
+    operation: &ProjectOperation,
+) -> Result<ApplyOperationResult> {
+    let payload: CaptureSequenceDeclaredPayload = payload(operation)?;
+    if operation.aggregate_type != "captureSequence"
+        || operation.aggregate_id != payload.sequence_id
+    {
+        bail!("captureSequenceDeclared aggregate must be the declared capture sequence");
+    }
+    if !revision_guard_passes(transaction, operation)? {
+        return Ok(ApplyOperationResult::Conflict);
+    }
+    transaction.execute(
+        "INSERT INTO capture_sequences(id, project_id, camera_key, label, volume_hint, filename_prefix, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) ON CONFLICT(id) DO UPDATE SET camera_key=excluded.camera_key, label=excluded.label, volume_hint=excluded.volume_hint, filename_prefix=excluded.filename_prefix",
+        params![
+            payload.sequence_id,
+            operation.project_id,
+            payload.camera_key,
+            payload.label,
+            payload.volume_hint,
+            payload.filename_prefix,
+            now(),
+        ],
+    )?;
+    advance_revision(transaction, operation)?;
+    Ok(ApplyOperationResult::Applied)
+}
+
+fn materialize_capture_sequence_split(
+    transaction: &Transaction<'_>,
+    operation: &ProjectOperation,
+) -> Result<ApplyOperationResult> {
+    let payload: CaptureSequenceSplitPayload = payload(operation)?;
+    if operation.aggregate_type != "captureSequence"
+        || operation.aggregate_id == payload.new_sequence_id
+    {
+        bail!("captureSequenceSplit aggregate must be the source capture sequence");
+    }
+    // A destination id that already names a sequence in this project (for
+    // example another camera's derived id) must never receive this split's
+    // assets: `INSERT OR IGNORE` would silently no-op and the UPDATE below
+    // would move `filename_counter >= at_counter` assets into an unrelated
+    // sequence. Refuse before any write.
+    let destination_exists: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM capture_sequences WHERE id=?1 AND project_id=?2)",
+        params![payload.new_sequence_id, operation.project_id],
+        |row| row.get(0),
+    )?;
+    if destination_exists {
+        bail!("captureSequenceSplit destination sequence already exists");
+    }
+    if !revision_guard_passes(transaction, operation)? {
+        return Ok(ApplyOperationResult::Conflict);
+    }
+    let source_exists: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM capture_sequences WHERE id=?1 AND project_id=?2)",
+        params![operation.aggregate_id, operation.project_id],
+        |row| row.get(0),
+    )?;
+    if !source_exists {
+        bail!(
+            "captureSequenceSplit source sequence not found: {}",
+            operation.aggregate_id
+        );
+    }
+    transaction.execute(
+        "INSERT OR IGNORE INTO capture_sequences(id, project_id, camera_key, label, volume_hint, filename_prefix, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            payload.new_sequence_id,
+            operation.project_id,
+            payload.camera_key,
+            payload.label,
+            payload.volume_hint,
+            payload.filename_prefix,
+            now(),
+        ],
+    )?;
+    transaction.execute(
+        "UPDATE asset_capture_sequence SET capture_sequence_id=?1 WHERE project_id=?2 AND capture_sequence_id=?3 AND filename_counter >= ?4",
+        params![
+            payload.new_sequence_id,
+            operation.project_id,
+            operation.aggregate_id,
+            payload.at_counter as i64,
+        ],
+    )?;
+    advance_revision(transaction, operation)?;
+    Ok(ApplyOperationResult::Applied)
+}
+
+fn materialize_capture_sequence_merged(
+    transaction: &Transaction<'_>,
+    operation: &ProjectOperation,
+) -> Result<ApplyOperationResult> {
+    let payload: CaptureSequenceMergedPayload = payload(operation)?;
+    if operation.aggregate_type != "captureSequence"
+        || operation.aggregate_id != payload.into_sequence_id
+    {
+        bail!("captureSequenceMerged aggregate must be the destination capture sequence");
+    }
+    // A self-merge must be refused before any write: with `from == into` both
+    // UPDATEs are no-ops and the DELETE below cascade-destroys every
+    // `asset_capture_sequence` and `clock_epochs` row of the sequence
+    // (cascades declared in migrations.rs).
+    if payload.from_sequence_id == payload.into_sequence_id {
+        bail!("captureSequenceMerged requires two distinct capture sequences");
+    }
+    if !revision_guard_passes(transaction, operation)? {
+        return Ok(ApplyOperationResult::Conflict);
+    }
+    let into_exists: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM capture_sequences WHERE id=?1 AND project_id=?2)",
+        params![payload.into_sequence_id, operation.project_id],
+        |row| row.get(0),
+    )?;
+    if !into_exists {
+        bail!(
+            "captureSequenceMerged destination sequence not found: {}",
+            payload.into_sequence_id
+        );
+    }
+    let from_exists: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM capture_sequences WHERE id=?1 AND project_id=?2)",
+        params![payload.from_sequence_id, operation.project_id],
+        |row| row.get(0),
+    )?;
+    if !from_exists {
+        bail!(
+            "captureSequenceMerged source sequence not found: {}",
+            payload.from_sequence_id
+        );
+    }
+    transaction.execute(
+        "UPDATE asset_capture_sequence SET capture_sequence_id=?1 WHERE project_id=?2 AND capture_sequence_id=?3",
+        params![payload.into_sequence_id, operation.project_id, payload.from_sequence_id],
+    )?;
+    // Epochs ride their capture sequence; merging unions the asset sets, so
+    // the consumed sequence's epochs follow its assets into the destination.
+    transaction.execute(
+        "UPDATE clock_epochs SET capture_sequence_id=?1 WHERE project_id=?2 AND capture_sequence_id=?3",
+        params![payload.into_sequence_id, operation.project_id, payload.from_sequence_id],
+    )?;
+    transaction.execute(
+        "DELETE FROM capture_sequences WHERE id=?1 AND project_id=?2",
+        params![payload.from_sequence_id, operation.project_id],
+    )?;
+    advance_revision(transaction, operation)?;
+    Ok(ApplyOperationResult::Applied)
+}
+
+fn materialize_clock_epoch_set(
+    transaction: &Transaction<'_>,
+    operation: &ProjectOperation,
+) -> Result<ApplyOperationResult> {
+    let payload: ClockEpochSetPayload = payload(operation)?;
+    if operation.aggregate_type != "clockEpoch" || operation.aggregate_id != payload.epoch_id {
+        bail!("clockEpochSet aggregate must be the clock epoch");
+    }
+    if !revision_guard_passes(transaction, operation)? {
+        return Ok(ApplyOperationResult::Conflict);
+    }
+    if payload
+        .end_counter
+        .is_some_and(|end| end < payload.start_counter)
+    {
+        bail!("clockEpochSet end counter is before its start counter");
+    }
+    let sequence_exists: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM capture_sequences WHERE id=?1 AND project_id=?2)",
+        params![payload.capture_sequence_id, operation.project_id],
+        |row| row.get(0),
+    )?;
+    if !sequence_exists {
+        bail!(
+            "clockEpochSet capture sequence not found: {}",
+            payload.capture_sequence_id
+        );
+    }
+    let confidence = payload.confidence.unwrap_or(1.0);
+    let evidence = payload.evidence.unwrap_or_default();
+    transaction.execute(
+        "INSERT INTO clock_epochs(id, project_id, capture_sequence_id, start_counter, end_counter, offset_seconds, confidence, evidence_json, label, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) ON CONFLICT(id) DO UPDATE SET capture_sequence_id=excluded.capture_sequence_id, start_counter=excluded.start_counter, end_counter=excluded.end_counter, offset_seconds=excluded.offset_seconds, confidence=excluded.confidence, evidence_json=excluded.evidence_json, label=excluded.label",
+        params![
+            payload.epoch_id,
+            operation.project_id,
+            payload.capture_sequence_id,
+            payload.start_counter as i64,
+            payload.end_counter.map(|value| value as i64),
+            payload.offset_seconds,
+            confidence,
+            serde_json::to_string(&evidence)?,
+            payload.label,
+            now(),
+        ],
+    )?;
+    advance_revision(transaction, operation)?;
+    Ok(ApplyOperationResult::Applied)
+}
+
+fn materialize_clock_epoch_cleared(
+    transaction: &Transaction<'_>,
+    operation: &ProjectOperation,
+) -> Result<ApplyOperationResult> {
+    let payload: ClockEpochClearedPayload = payload(operation)?;
+    if operation.aggregate_type != "clockEpoch" || operation.aggregate_id != payload.epoch_id {
+        bail!("clockEpochCleared aggregate must be the clock epoch");
+    }
+    if !revision_guard_passes(transaction, operation)? {
+        return Ok(ApplyOperationResult::Conflict);
+    }
+    transaction.execute(
+        "DELETE FROM clock_epochs WHERE id=?1 AND project_id=?2",
+        params![payload.epoch_id, operation.project_id],
+    )?;
+    advance_revision(transaction, operation)?;
+    Ok(ApplyOperationResult::Applied)
+}
+
+fn materialize_clip_time_exception_set(
+    transaction: &Transaction<'_>,
+    operation: &ProjectOperation,
+) -> Result<ApplyOperationResult> {
+    let payload: ClipTimeExceptionSetPayload = payload(operation)?;
+    require_asset(transaction, operation)?;
+    if !revision_guard_passes(transaction, operation)? {
+        return Ok(ApplyOperationResult::Conflict);
+    }
+    transaction.execute(
+        "INSERT INTO clip_time_exceptions(asset_id, project_id, trip_time, reason, created_at) VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(asset_id) DO UPDATE SET trip_time=excluded.trip_time, reason=excluded.reason",
+        params![
+            operation.aggregate_id,
+            operation.project_id,
+            payload.trip_time,
+            payload.reason,
+            now(),
+        ],
+    )?;
+    advance_revision(transaction, operation)?;
+    Ok(ApplyOperationResult::Applied)
+}
+
+fn materialize_clip_time_exception_cleared(
+    transaction: &Transaction<'_>,
+    operation: &ProjectOperation,
+) -> Result<ApplyOperationResult> {
+    let _payload: ClipTimeExceptionClearedPayload = payload(operation)?;
+    require_asset(transaction, operation)?;
+    if !revision_guard_passes(transaction, operation)? {
+        return Ok(ApplyOperationResult::Conflict);
+    }
+    transaction.execute(
+        "DELETE FROM clip_time_exceptions WHERE asset_id=?1 AND project_id=?2",
+        params![operation.aggregate_id, operation.project_id],
+    )?;
+    advance_revision(transaction, operation)?;
+    Ok(ApplyOperationResult::Applied)
+}
+
+fn materialize_trip_phase_set(
+    transaction: &Transaction<'_>,
+    operation: &ProjectOperation,
+) -> Result<ApplyOperationResult> {
+    let payload: TripPhaseSetPayload = payload(operation)?;
+    if operation.aggregate_type != "tripPhase" || operation.aggregate_id != payload.phase_id {
+        bail!("tripPhaseSet aggregate must be the trip phase");
+    }
+    if !matches!(payload.phase_kind.as_str(), "location" | "transit") {
+        bail!("invalid trip phase kind: {}", payload.phase_kind);
+    }
+    if !matches!(payload.display_mode.as_str(), "local" | "dual" | "utc") {
+        bail!("invalid display mode: {}", payload.display_mode);
+    }
+    if !revision_guard_passes(transaction, operation)? {
+        return Ok(ApplyOperationResult::Conflict);
+    }
+    transaction.execute(
+        "INSERT INTO trip_phases(id, project_id, label, phase_kind, start_trip_time, end_trip_time, timezone, origin_timezone, destination_timezone, display_mode, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) ON CONFLICT(id) DO UPDATE SET label=excluded.label, phase_kind=excluded.phase_kind, start_trip_time=excluded.start_trip_time, end_trip_time=excluded.end_trip_time, timezone=excluded.timezone, origin_timezone=excluded.origin_timezone, destination_timezone=excluded.destination_timezone, display_mode=excluded.display_mode",
+        params![
+            payload.phase_id,
+            operation.project_id,
+            payload.label,
+            payload.phase_kind,
+            payload.start_trip_time,
+            payload.end_trip_time,
+            payload.timezone,
+            payload.origin_timezone,
+            payload.destination_timezone,
+            payload.display_mode,
+            now(),
+        ],
+    )?;
+    advance_revision(transaction, operation)?;
+    Ok(ApplyOperationResult::Applied)
+}
+
+fn materialize_trip_phase_removed(
+    transaction: &Transaction<'_>,
+    operation: &ProjectOperation,
+) -> Result<ApplyOperationResult> {
+    let payload: TripPhaseRemovedPayload = payload(operation)?;
+    if operation.aggregate_type != "tripPhase" || operation.aggregate_id != payload.phase_id {
+        bail!("tripPhaseRemoved aggregate must be the trip phase");
+    }
+    if !revision_guard_passes(transaction, operation)? {
+        return Ok(ApplyOperationResult::Conflict);
+    }
+    transaction.execute(
+        "DELETE FROM trip_phases WHERE id=?1 AND project_id=?2",
+        params![payload.phase_id, operation.project_id],
+    )?;
+    advance_revision(transaction, operation)?;
+    Ok(ApplyOperationResult::Applied)
+}
+
+fn materialize_event_order_constraint_set(
+    transaction: &Transaction<'_>,
+    operation: &ProjectOperation,
+) -> Result<ApplyOperationResult> {
+    let payload: EventOrderConstraintSetPayload = payload(operation)?;
+    if operation.aggregate_type != "eventOrderConstraint"
+        || operation.aggregate_id != payload.constraint_id
+    {
+        bail!("eventOrderConstraintSet aggregate must be the event-order constraint");
+    }
+    if !matches!(payload.strength.as_str(), "hard" | "soft") {
+        bail!("invalid constraint strength: {}", payload.strength);
+    }
+    if payload.earlier_asset_id == payload.later_asset_id {
+        bail!("eventOrderConstraintSet requires two distinct assets");
+    }
+    if !revision_guard_passes(transaction, operation)? {
+        return Ok(ApplyOperationResult::Conflict);
+    }
+    for asset_id in [&payload.earlier_asset_id, &payload.later_asset_id] {
+        let belongs: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM assets WHERE id=?1 AND project_id=?2)",
+            params![asset_id, operation.project_id],
+            |row| row.get(0),
+        )?;
+        if !belongs {
+            bail!("eventOrderConstraintSet asset not found: {asset_id}");
+        }
+    }
+    // One constraint per ordered pair, regardless of constraint id.
+    transaction.execute(
+        "DELETE FROM event_order_constraints WHERE project_id=?1 AND earlier_asset_id=?2 AND later_asset_id=?3 AND id != ?4",
+        params![
+            operation.project_id,
+            payload.earlier_asset_id,
+            payload.later_asset_id,
+            payload.constraint_id,
+        ],
+    )?;
+    transaction.execute(
+        "INSERT INTO event_order_constraints(id, project_id, earlier_asset_id, later_asset_id, strength, source, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) ON CONFLICT(id) DO UPDATE SET earlier_asset_id=excluded.earlier_asset_id, later_asset_id=excluded.later_asset_id, strength=excluded.strength, source=excluded.source",
+        params![
+            payload.constraint_id,
+            operation.project_id,
+            payload.earlier_asset_id,
+            payload.later_asset_id,
+            payload.strength,
+            payload.source,
+            now(),
+        ],
+    )?;
+    advance_revision(transaction, operation)?;
+    Ok(ApplyOperationResult::Applied)
+}
+
+fn materialize_event_order_constraint_cleared(
+    transaction: &Transaction<'_>,
+    operation: &ProjectOperation,
+) -> Result<ApplyOperationResult> {
+    let payload: EventOrderConstraintClearedPayload = payload(operation)?;
+    if operation.aggregate_type != "eventOrderConstraint"
+        || operation.aggregate_id != payload.constraint_id
+    {
+        bail!("eventOrderConstraintCleared aggregate must be the event-order constraint");
+    }
+    if !revision_guard_passes(transaction, operation)? {
+        return Ok(ApplyOperationResult::Conflict);
+    }
+    transaction.execute(
+        "DELETE FROM event_order_constraints WHERE id=?1 AND project_id=?2",
+        params![payload.constraint_id, operation.project_id],
+    )?;
     advance_revision(transaction, operation)?;
     Ok(ApplyOperationResult::Applied)
 }
@@ -1769,7 +2482,7 @@ fn validate_operation(operation: &ProjectOperation) -> Result<()> {
     if operation.logical_time.node_id != operation.origin_node_id {
         bail!("logical time node ID must match origin node ID");
     }
-    if operation.payload_version != 1 {
+    if operation.payload_version != 1 && is_known_operation_type(&operation.operation_type) {
         bail!(
             "unsupported payload version {} for {}",
             operation.payload_version,
@@ -1821,7 +2534,7 @@ fn operation_key(operation: &ProjectOperation) -> (i64, i64, String, String) {
     )
 }
 
-fn operation_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProjectOperation> {
+pub(crate) fn operation_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProjectOperation> {
     let origin_node_id: String = row.get(2)?;
     Ok(ProjectOperation {
         operation_id: row.get(0)?,

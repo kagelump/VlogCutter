@@ -5,7 +5,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
-pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 8;
+use crate::chronology::forward_migrate_project_chronology;
+
+pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 9;
 
 const MIGRATION_TABLE_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -129,6 +131,12 @@ pub const PROJECT_CATALOG_MIGRATIONS: &[SqliteMigration] = &[
         name: "peer_operation_acknowledgements",
         source_identity: "project-catalog/0008-peer-operation-acknowledgements/20260728",
         apply: add_peer_operation_acknowledgements,
+    },
+    SqliteMigration {
+        id: 9,
+        name: "chronology_facts",
+        source_identity: "project-catalog/0009-chronology-facts/20260731",
+        apply: add_chronology_facts,
     },
 ];
 
@@ -835,6 +843,98 @@ fn add_peer_operation_acknowledgements(transaction: &Transaction<'_>) -> Result<
         );
         "#,
     )?;
+    Ok(())
+}
+
+/// Migration 9: the persisted chronology fact model, frozen by D01-T007.
+///
+/// Six fact tables plus two ordering indexes. `clock_events` is retained, not
+/// dropped: legacy operation replay still targets it and a rollback must
+/// remain possible. Existing `clock_events` rows are forward-migrated into
+/// `clock_epochs` by `forward_migrate_project_chronology`, which never writes
+/// `assets.best_time` or `assets.offset_seconds` — recomputing projections is
+/// precisely how a migration reorders a project.
+fn add_chronology_facts(transaction: &Transaction<'_>) -> Result<()> {
+    transaction.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS capture_sequences (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            camera_key TEXT NOT NULL,
+            label TEXT NOT NULL,
+            volume_hint TEXT NOT NULL DEFAULT '',
+            filename_prefix TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS asset_capture_sequence (
+            asset_id TEXT PRIMARY KEY REFERENCES assets(id) ON DELETE CASCADE,
+            project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            capture_sequence_id TEXT NOT NULL REFERENCES capture_sequences(id) ON DELETE CASCADE,
+            filename_counter INTEGER
+        );
+
+        CREATE TABLE IF NOT EXISTS clock_epochs (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            capture_sequence_id TEXT NOT NULL REFERENCES capture_sequences(id) ON DELETE CASCADE,
+            start_counter INTEGER NOT NULL,
+            end_counter INTEGER,
+            offset_seconds INTEGER NOT NULL,
+            confidence REAL NOT NULL DEFAULT 1.0,
+            evidence_json TEXT NOT NULL DEFAULT '[]',
+            label TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS clip_time_exceptions (
+            asset_id TEXT PRIMARY KEY REFERENCES assets(id) ON DELETE CASCADE,
+            project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            trip_time TEXT NOT NULL,
+            reason TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS trip_phases (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            label TEXT NOT NULL,
+            phase_kind TEXT NOT NULL CHECK(phase_kind IN ('location', 'transit')),
+            start_trip_time TEXT NOT NULL,
+            end_trip_time TEXT NOT NULL,
+            timezone TEXT,
+            origin_timezone TEXT,
+            destination_timezone TEXT,
+            display_mode TEXT NOT NULL CHECK(display_mode IN ('local', 'dual', 'utc')),
+            created_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS event_order_constraints (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            earlier_asset_id TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+            later_asset_id TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+            strength TEXT NOT NULL CHECK(strength IN ('hard', 'soft')),
+            source TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE(project_id, earlier_asset_id, later_asset_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS clock_epochs_sequence_range
+        ON clock_epochs(project_id, capture_sequence_id, start_counter);
+
+        CREATE INDEX IF NOT EXISTS trip_phases_project_range
+        ON trip_phases(project_id, start_trip_time);
+        "#,
+    )?;
+    let mut projects = transaction.prepare("SELECT id FROM projects ORDER BY id")?;
+    let project_ids = projects
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(projects);
+    for project_id in project_ids {
+        forward_migrate_project_chronology(transaction, &project_id)?;
+    }
     Ok(())
 }
 
