@@ -9,7 +9,9 @@
   "slug": "chronology-domain-model",
   "status": "ready",
   "task_class": "foundation",
-  "depends_on": ["D01-T006"],
+  "depends_on": [
+    "D01-T006"
+  ],
   "principal_invariant": "Migration 9 replaces the flat clock-event model with the full persisted chronology fact model while producing the identical total review order for every existing project.",
   "central_falsification": "Capture the complete ordered asset list of several schema-8 catalogs built by independently written fixtures, run migration 9, and confirm the ordered list is unchanged; any reordering falsifies the migration.",
   "architecture_decisions_frozen": true,
@@ -19,11 +21,32 @@
     "sync operation exchange -> unknown operation type policy"
   ],
   "documents_by_role": {
-    "contract_editor": ["docs/tasks/desktop/ARCHITECTURE.md", "PRD.md"],
-    "implementer": ["PRD.md", "AGENTS.md", "docs/tasks/desktop/ARCHITECTURE.md", "docs/tasks/server/SCHEMA.md", "docs/tasks/server/SYNC_PROTOCOL.md"],
-    "independent_tester": ["PRD.md", "AGENTS.md", "docs/tasks/desktop/ARCHITECTURE.md"],
-    "reviewer": ["PRD.md", "AGENTS.md", "docs/tasks/desktop/ARCHITECTURE.md", "docs/tasks/server/SYNC_PROTOCOL.md"],
-    "integrator": ["docs/tasks/desktop/ARCHITECTURE.md", "docs/tasks/server/SCHEMA.md"]
+    "contract_editor": [
+      "docs/tasks/desktop/ARCHITECTURE.md",
+      "PRD.md"
+    ],
+    "implementer": [
+      "PRD.md",
+      "AGENTS.md",
+      "docs/tasks/desktop/ARCHITECTURE.md",
+      "docs/tasks/server/SCHEMA.md",
+      "docs/tasks/server/SYNC_PROTOCOL.md"
+    ],
+    "independent_tester": [
+      "PRD.md",
+      "AGENTS.md",
+      "docs/tasks/desktop/ARCHITECTURE.md"
+    ],
+    "reviewer": [
+      "PRD.md",
+      "AGENTS.md",
+      "docs/tasks/desktop/ARCHITECTURE.md",
+      "docs/tasks/server/SYNC_PROTOCOL.md"
+    ],
+    "integrator": [
+      "docs/tasks/desktop/ARCHITECTURE.md",
+      "docs/tasks/server/SCHEMA.md"
+    ]
   },
   "path_ownership": {
     "contract_editor": [
@@ -31,11 +54,13 @@
       "docs/tasks/desktop/CHRONOLOGY_MODEL.md"
     ],
     "implementer": [
+      ".gitignore",
+      "AGENTS.md",
       "core/rcdvlog-core/src/chronology/mod.rs",
       "core/rcdvlog-core/src/chronology/model.rs",
+      "core/rcdvlog-core/src/lib.rs",
       "core/rcdvlog-core/src/migrations.rs",
       "core/rcdvlog-core/src/operations.rs",
-      "core/rcdvlog-core/src/lib.rs",
       "core/rcdvlog-core/tests/chronology_migration.rs",
       "core/rcdvlog-core/tests/fixtures/chronology/**"
     ],
@@ -44,12 +69,20 @@
       "core/rcdvlog-core/tests/fixtures/chronology-independent/**"
     ],
     "integrator": [
+      "AGENTS.md",
+      "docs/task-cycles/D01-T007/**",
       "docs/tasks/desktop/EPIC.md",
-      "docs/tasks/server/SCHEMA.md",
-      "docs/task-cycles/D01-T007/**"
+      "docs/tasks/server/SCHEMA.md"
     ]
   },
-  "forbidden_paths": ["apps/web/**", "apps/server/**", "core/rcdvlog-server/**", "apps/desktop/src/**", "apps/cli/src/**", ".github/**"],
+  "forbidden_paths": [
+    "apps/web/**",
+    "apps/server/**",
+    "core/rcdvlog-server/**",
+    "apps/desktop/src/**",
+    "apps/cli/src/**",
+    ".github/**"
+  ],
   "verification_commands": [
     "cargo test -p rcdvlog-core",
     "cargo test --workspace",
