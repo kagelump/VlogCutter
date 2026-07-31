@@ -143,14 +143,6 @@ pub struct AssetTimeHypothesis {
     pub filename_counter: Option<u64>,
     pub duration_seconds: f64,
 }
-```
-
-The camera-metadata timezone (`PRD.md` §9.1, optional) is deliberately not
-persisted. Local display time derives from the covering trip phase, never from
-camera metadata timezone (architecture contract §3.4), and the solver never
-reads camera metadata timezones; a stored column would be reserved schema with
-no consumer. This is a documented exclusion decision, not an omission for a
-later packet to repair.
 
 pub struct ClockEpoch {
     pub id: String,
@@ -207,6 +199,13 @@ pub struct ChronologyFacts {
     pub constraints: Vec<EventOrderConstraint>,
 }
 ```
+
+The camera-metadata timezone (`PRD.md` §9.1, optional) is deliberately not
+persisted. Local display time derives from the covering trip phase, never from
+camera metadata timezone (architecture contract §3.4), and the solver never
+reads camera metadata timezones; a stored column would be reserved schema with
+no consumer. This is a documented exclusion decision, not an omission for a
+later packet to repair.
 
 ```rust
 // core/rcdvlog-core/src/lib.rs, additive
