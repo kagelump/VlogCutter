@@ -7,7 +7,7 @@
   "epic_id": "D01",
   "title": "Chronology domain model and operation vocabulary",
   "slug": "chronology-domain-model",
-  "status": "ready",
+  "status": "complete",
   "task_class": "foundation",
   "depends_on": [
     "D01-T006"
@@ -55,7 +55,6 @@
     ],
     "implementer": [
       ".gitignore",
-      "AGENTS.md",
       "core/rcdvlog-core/src/chronology/mod.rs",
       "core/rcdvlog-core/src/chronology/model.rs",
       "core/rcdvlog-core/src/lib.rs",
