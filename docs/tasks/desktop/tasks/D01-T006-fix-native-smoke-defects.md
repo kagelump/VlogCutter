@@ -7,7 +7,7 @@
   "epic_id": "D01",
   "title": "Fix native smoke defects",
   "slug": "fix-native-smoke-defects",
-  "status": "ready",
+  "status": "complete",
   "task_class": "implementation",
   "depends_on": ["D01-T005"],
   "principal_invariant": "Every defect in the native smoke ledger is resolved in the built macOS application, and every checklist row that previously passed still passes.",
