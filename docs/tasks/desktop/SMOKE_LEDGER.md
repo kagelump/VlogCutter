@@ -55,3 +55,13 @@ sufficiently exercised to report defects.
   `._*` resource-fork files alongside the real `.MP4` files. The ingest
   correctly rejects these (ffprobe "moov atom not found" / "Invalid data").
   14 of 434 files rejected, all `._*`. This is correct behavior.
+
+## Resolution
+
+D01-T006: No `SD-n` defects were recorded in this ledger run. Every row
+exercised in this run passed (rows 1–4), and no defect section exists to
+resolve. Rows recorded `not_implemented` are later epic packets (D01-T007
+onward), not defects; rows recorded `needs_native` await manual GUI
+verification and produced no defect findings.
+
+All 0 defects resolved.
