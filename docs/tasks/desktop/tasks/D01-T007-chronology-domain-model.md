@@ -12,7 +12,7 @@
   "depends_on": ["D01-T006"],
   "principal_invariant": "Migration 9 replaces the flat clock-event model with the full persisted chronology fact model while producing the identical total review order for every existing project.",
   "central_falsification": "Capture the complete ordered asset list of several schema-8 catalogs built by independently written fixtures, run migration 9, and confirm the ordered list is unchanged; any reordering falsifies the migration.",
-  "architecture_decisions_frozen": false,
+  "architecture_decisions_frozen": true,
   "load_bearing_seams": [
     "clock_events flat model -> persisted chronology fact model",
     "apply_project_operation dispatch -> chronology operation vocabulary",
