@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "task_id": "D01-T007",
+  "epic_file": "docs/tasks/desktop/EPIC.md",
+  "task_file": "docs/tasks/desktop/tasks/D01-T007-chronology-domain-model.md",
+  "base_branch": "main",
+  "base_sha": "340a64c83e70d70bd98db73c0823f5dd179c500e",
+  "task_branch": "codex/d01-t007-chronology-domain-model",
+  "contract_sha": "dcd2a5ffbe6009fe930c2a82e482edfa252ebfcc",
+  "implementation_base_sha": "dcd2a5ffbe6009fe930c2a82e482edfa252ebfcc",
+  "implementation_sha": "41de19b9277d01853f2b5e9cbf88fcbe5e74e856",
+  "subject_sha": "7aad382007b4dd53a34a7140c69230cdc1fb02aa",
+  "independent_tested_sha": "7aad382007b4dd53a34a7140c69230cdc1fb02aa",
+  "reviewed_sha": "7aad382007b4dd53a34a7140c69230cdc1fb02aa",
+  "gated_sha": "7aad382007b4dd53a34a7140c69230cdc1fb02aa",
+  "evidence_commit_sha": null,
+  "test_verdict": "PASS",
+  "review_verdict": "APPROVE_WITH_FOLLOW_UP",
+  "open_findings": {
+    "p0": 0,
+    "p1": 0,
+    "p2": 0
+  },
+  "gate_commands": [
+    {"command": "cargo test -p rcdvlog-core", "exit_code": 0},
+    {"command": "cargo test -p rcdvlog-core --test chronology_migration", "exit_code": 0},
+    {"command": "cargo test -p rcdvlog-core --test chronology_migration_independent", "exit_code": 0},
+    {"command": "cargo test --workspace", "exit_code": 0},
+    {"command": "cargo clippy --workspace --all-targets -- -D warnings", "exit_code": 0},
+    {"command": "cargo fmt --all -- --check", "exit_code": 0},
+    {"command": "grep -n \"HashMap\\|HashSet\" core/rcdvlog-core/src/chronology/*.rs; test $? -eq 1", "exit_code": 0}
+  ],
+  "source_hash_artifact": null,
+  "merge": {
+    "authorized": true,
+    "merged": false,
+    "merge_sha": null
+  }
+}
