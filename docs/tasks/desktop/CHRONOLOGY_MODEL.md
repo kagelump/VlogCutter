@@ -143,6 +143,14 @@ pub struct AssetTimeHypothesis {
     pub filename_counter: Option<u64>,
     pub duration_seconds: f64,
 }
+```
+
+The camera-metadata timezone (`PRD.md` §9.1, optional) is deliberately not
+persisted. Local display time derives from the covering trip phase, never from
+camera metadata timezone (architecture contract §3.4), and the solver never
+reads camera metadata timezones; a stored column would be reserved schema with
+no consumer. This is a documented exclusion decision, not an omission for a
+later packet to repair.
 
 pub struct ClockEpoch {
     pub id: String,
@@ -264,8 +272,11 @@ without further design.
 Persisted chronology state is evidence. Trip time, local display time,
 confidence, evidence, uncertainty, and total order are derived by the pure
 solver (D01-T008). `assets.best_time` and `assets.offset_seconds` are
-projections of the solution for query performance: no chronology operation
-materializer and no migration writes them. After D01-T008, the solver's
+projections of the solution for query performance: no new chronology
+operation materializer and no migration writes them, and no materializer
+introduced after this contract may write them. The legacy `CLOCK_EVENT_CREATED`
+materializer still invokes the pre-existing `recalculate_clock` helper, which
+writes both columns; D01-T008 replaces that path. After D01-T008, the solver's
 projection helper is the sole writer of both columns. D01-T009 through D01-T017
 must never write them.
 
