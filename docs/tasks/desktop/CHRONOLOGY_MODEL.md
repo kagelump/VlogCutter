@@ -407,7 +407,8 @@ and each is re-dispatched through the normal materializer dispatch:
 - A row is a candidate only when it has no `operation_conflicts` row and is
   not the `last_operation_id` of its aggregate's `materialized_revisions` row.
   An operation without a declared `base_revision` is additionally a candidate
-  only when its aggregate has no materialized revision.
+  only when its aggregate has no materialized revision of 1 or higher (a
+  baseline row at revision 0 does not disqualify).
 - Candidates apply in HLC order (`hlc_wall_millis`, `hlc_counter`,
   `origin_node_id`, `operation_id`), best-effort per row: a row that cannot
   apply (guard mismatch, validation bail) is left in the log and re-examined
