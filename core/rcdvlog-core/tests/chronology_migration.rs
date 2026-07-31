@@ -2552,7 +2552,7 @@ fn applied_operation_is_never_redispatch_applied_again() {
 }
 
 #[test]
-fn applied_intermediate_operation_records_at_most_one_conflict_and_no_state_change() {
+fn applied_intermediate_operation_is_skipped_without_a_conflict_row() {
     let directory = tempdir().unwrap();
     let path =
         quarantined_style_catalog(&directory, "intermediate.sqlite3", "project_intermediate");
@@ -2592,9 +2592,10 @@ fn applied_intermediate_operation_records_at_most_one_conflict_and_no_state_chan
     drop(catalog);
 
     // The SET op is no longer its aggregate's last_operation_id, so the
-    // per-operation filter makes it a candidate exactly once; the revision
-    // guard sees a stale base and records exactly one conflict row. State
-    // never changes.
+    // per-operation filter makes it a candidate; its base is stale, but the
+    // seam must NOT write a conflict row for a legitimately applied
+    // operation (a phantom row would break baseline restore). It is skipped
+    // silently. State never changes.
     let _reopened = Catalog::open_existing(&path).unwrap();
     let connection = open_connection(&path);
     let exception_count: i64 = connection
@@ -2624,12 +2625,12 @@ fn applied_intermediate_operation_records_at_most_one_conflict_and_no_state_chan
         )
         .unwrap();
     assert_eq!(
-        conflict_count, 1,
-        "exactly one conflict row for the stale intermediate"
+        conflict_count, 0,
+        "the seam must never write a conflict row for the superseded op"
     );
     drop(connection);
 
-    // The conflict row now excludes the op forever: another open adds nothing.
+    // Another open adds nothing: no conflict row, no state change.
     drop(_reopened);
     let _reopened_again = Catalog::open_existing(&path).unwrap();
     let connection = open_connection(&path);
@@ -2641,7 +2642,7 @@ fn applied_intermediate_operation_records_at_most_one_conflict_and_no_state_chan
         )
         .unwrap();
     assert_eq!(
-        conflict_count, 1,
+        conflict_count, 0,
         "another open must not add a conflict row"
     );
     let revision_after: i64 = connection
@@ -2785,5 +2786,191 @@ fn quarantined_operation_without_base_revision_still_redispatch_applies() {
         )
         .unwrap();
     assert_eq!(revision, 1);
+    let _ = directory;
+}
+
+// ---------------------------------------------------------------------------
+// F3: the re-dispatch seam must never write `operation_conflicts` rows. A
+// phantom conflict row for a legitimately applied (but superseded) operation
+// would be exported by `export_project_baseline` and make
+// `import_project_baseline` bail on the watermark mismatch.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn baseline_restore_survives_a_superseded_chronology_operation() {
+    let directory = tempdir().unwrap();
+    let path = quarantined_style_catalog(
+        &directory,
+        "baseline_restore.sqlite3",
+        "project_baseline_restore",
+    );
+    let catalog = Catalog::open_existing(&path).unwrap();
+    let set = operation(
+        "op_br_set",
+        "project_baseline_restore",
+        "node_br",
+        1,
+        1_700_000_000_000,
+        "projectAsset",
+        "asset_rd",
+        CLIP_TIME_EXCEPTION_SET,
+        Some(0),
+        json!({"tripTime":"2026-07-18T09:00:00.000Z","reason":"first"}),
+    );
+    let clear = operation(
+        "op_br_clear",
+        "project_baseline_restore",
+        "node_br",
+        2,
+        1_700_000_000_001,
+        "projectAsset",
+        "asset_rd",
+        CLIP_TIME_EXCEPTION_CLEARED,
+        Some(1),
+        json!({}),
+    );
+    assert_eq!(
+        catalog.apply_operation(&set).unwrap(),
+        ApplyOperationResult::Applied
+    );
+    assert_eq!(
+        catalog.apply_operation(&clear).unwrap(),
+        ApplyOperationResult::Applied
+    );
+    drop(catalog);
+
+    // A writable open re-dispatches candidates. Without the F3 fix this open
+    // writes a phantom conflict row for the superseded SET op, which the
+    // baseline then exports and the import compares against.
+    let _reopened = Catalog::open_existing(&path).unwrap();
+    drop(_reopened);
+    let source = Catalog::open_existing(&path).unwrap();
+    let snapshot = source
+        .export_project_baseline("project_baseline_restore")
+        .unwrap();
+    assert_eq!(
+        snapshot.conflicts.len(),
+        0,
+        "no phantom conflict rows may be exported"
+    );
+
+    // Restoring into a fresh catalog must succeed: the exported and replayed
+    // conflict counts match. Without the fix, import bails with the
+    // "baseline operation/materialization watermark mismatch".
+    let restored = Catalog::import_project_baseline(
+        directory.path().join("restored.sqlite3"),
+        &snapshot,
+        "node_restore",
+        1,
+        "digest",
+    )
+    .expect("restore must succeed with matching conflict counts");
+    let restored_conflicts = restored
+        .export_project_baseline("project_baseline_restore")
+        .unwrap()
+        .conflicts
+        .len();
+    assert_eq!(restored_conflicts, 0);
+    let _ = directory;
+}
+
+#[test]
+fn guard_failing_new_candidate_is_skipped_without_conflict_and_re_examined() {
+    let directory = tempdir().unwrap();
+    let path = quarantined_style_catalog(
+        &directory,
+        "stale_candidate.sqlite3",
+        "project_stale_candidate",
+    );
+    let catalog = Catalog::open_existing(&path).unwrap();
+    // An applied op advances the asset's revision to 1...
+    let set = operation(
+        "op_stale_applied",
+        "project_stale_candidate",
+        "node_current",
+        1,
+        1_700_000_000_000,
+        "projectAsset",
+        "asset_rd",
+        CLIP_TIME_EXCEPTION_SET,
+        Some(0),
+        json!({"tripTime":"2026-07-18T09:00:00.000Z","reason":"applied"}),
+    );
+    assert_eq!(
+        catalog.apply_operation(&set).unwrap(),
+        ApplyOperationResult::Applied
+    );
+    drop(catalog);
+
+    // ...and a never-applied quarantined op whose declared base is now stale
+    // sits in the log, exactly as an older build would leave it.
+    let stale = operation(
+        "op_stale_candidate",
+        "project_stale_candidate",
+        "node_old_build",
+        2,
+        1_700_000_000_000,
+        "projectAsset",
+        "asset_rd",
+        CLIP_TIME_EXCEPTION_SET,
+        Some(0),
+        json!({"tripTime":"2026-07-18T10:00:00.000Z","reason":"stale"}),
+    );
+    insert_operation_row(&open_connection(&path), &stale);
+
+    // The seam skips the stale candidate silently: no conflict row, no state
+    // change, the row stays in the log.
+    let _reopened = Catalog::open_existing(&path).unwrap();
+    let connection = open_connection(&path);
+    let conflict_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM operation_conflicts WHERE project_id='project_stale_candidate'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        conflict_count, 0,
+        "the seam must never write a conflict row"
+    );
+    let (trip_time, revision): (String, i64) = connection
+        .query_row(
+            "SELECT (SELECT trip_time FROM clip_time_exceptions WHERE asset_id='asset_rd' AND project_id='project_stale_candidate'), (SELECT revision FROM materialized_revisions WHERE project_id='project_stale_candidate' AND aggregate_type='projectAsset' AND aggregate_id='asset_rd')",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(trip_time, "2026-07-18T09:00:00.000Z", "no state change");
+    assert_eq!(revision, 1);
+    let in_log: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM project_operations WHERE operation_id='op_stale_candidate'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(in_log, 1, "the stale candidate stays in the log");
+    drop(connection);
+
+    // The next open re-examines it and again changes nothing.
+    drop(_reopened);
+    let _reopened_again = Catalog::open_existing(&path).unwrap();
+    let connection = open_connection(&path);
+    let conflict_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM operation_conflicts WHERE project_id='project_stale_candidate'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(conflict_count, 0);
+    let revision_after: i64 = connection
+        .query_row(
+            "SELECT revision FROM materialized_revisions WHERE project_id='project_stale_candidate' AND aggregate_type='projectAsset' AND aggregate_id='asset_rd'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(revision_after, 1);
     let _ = directory;
 }

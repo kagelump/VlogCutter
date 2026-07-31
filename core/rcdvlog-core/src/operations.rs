@@ -1871,6 +1871,42 @@ fn materialize_clock(
     Ok(ApplyOperationResult::Applied)
 }
 
+/// The revision-guard comparison for one operation: `None` when the operation
+/// declares no base revision (the guard passes unconditionally), otherwise
+/// `Some((expected, actual))` from the aggregate's current revision.
+fn guard_comparison(
+    transaction: &Transaction<'_>,
+    operation: &ProjectOperation,
+) -> Result<Option<(u64, u64)>> {
+    let Some(expected) = operation.base_revision else {
+        return Ok(None);
+    };
+    let actual = current_revision(
+        transaction,
+        &operation.project_id,
+        &operation.aggregate_type,
+        &operation.aggregate_id,
+    )?;
+    Ok(Some((expected, actual)))
+}
+
+/// The same guard comparison without conflict recording: the re-dispatch
+/// seam pre-checks candidates with it so a guard-failing row is skipped
+/// silently and left in the log instead of writing a phantom
+/// `operation_conflicts` row for a legitimately applied (but superseded)
+/// operation — a phantom row would break baseline export/import watermark
+/// comparison. Genuine stale-base resends on the normal apply path still
+/// record their conflict rows through `revision_guard_passes`.
+pub(crate) fn revision_guard_passes_without_recording(
+    transaction: &Transaction<'_>,
+    operation: &ProjectOperation,
+) -> Result<bool> {
+    let Some((expected, actual)) = guard_comparison(transaction, operation)? else {
+        return Ok(true);
+    };
+    Ok(expected == actual)
+}
+
 /// The `materialized_revisions` base-revision guard for the chronology
 /// operations: when the operation declares a base revision it must equal the
 /// aggregate's current revision, otherwise a durable conflict row is recorded
@@ -1881,15 +1917,9 @@ fn revision_guard_passes(
     transaction: &Transaction<'_>,
     operation: &ProjectOperation,
 ) -> Result<bool> {
-    let Some(expected) = operation.base_revision else {
+    let Some((expected, actual)) = guard_comparison(transaction, operation)? else {
         return Ok(true);
     };
-    let actual = current_revision(
-        transaction,
-        &operation.project_id,
-        &operation.aggregate_type,
-        &operation.aggregate_id,
-    )?;
     if expected == actual {
         return Ok(true);
     }

@@ -15,7 +15,7 @@ pub use model::{
 
 use crate::operations::{
     ApplyOperationResult, CHRONOLOGY_OPERATION_TYPES, KNOWN_OPERATION_TYPES, materialize_operation,
-    operation_from_row,
+    operation_from_row, revision_guard_passes_without_recording,
 };
 use anyhow::Result;
 use rusqlite::{Connection, Transaction, TransactionBehavior, params, params_from_iter};
@@ -408,18 +408,21 @@ fn table_exists(connection: &Connection, table: &str) -> Result<bool> {
 /// - no `operation_conflicts` row names the operation — a previously rejected
 ///   operation must not re-apply.
 ///
-/// The revision guard adjudicates the rest honestly: a candidate whose
-/// declared `base_revision` is stale records exactly one `operation_conflicts`
-/// row (the same outcome a stale-base resend gets from the normal apply path)
-/// and is left in the log; the conflict filter then excludes it forever.
+/// A candidate whose declared `base_revision` no longer matches the
+/// aggregate's current revision is skipped silently and left in the log: the
+/// seam must never write `operation_conflicts` rows, because a phantom row
+/// for a legitimately applied (but superseded) operation would be exported by
+/// `export_project_baseline` and make `import_project_baseline` bail on the
+/// watermark mismatch. The next open re-examines the row. Genuine stale-base
+/// resends still record their conflict rows on the normal apply path.
 ///
-/// Rows are processed in `operation_id` order inside one transaction. Each row
-/// is best-effort: a row that errors (bail or Conflict) is skipped and left in
-/// the log — never aborting the open, never deleted, and a Conflict outcome
-/// records its own durable conflict row, which is the correct outcome for a
-/// stale-base row. The seam is idempotent: every applied row leaves a
-/// `materialized_revisions` row (or a conflict row) behind, so a second open
-/// applies nothing new.
+/// Rows are processed in HLC order (`hlc_wall_millis`, `hlc_counter`,
+/// `origin_node_id`, `operation_id` — the same order `apply_operation_batch`
+/// enforces per origin via `origin_sequence`, and the `project_operations`
+/// HLC index) inside one transaction. Each row is best-effort: a row that
+/// errors (bail) is skipped and left in the log — never aborting the open,
+/// never deleted. The seam is idempotent: every applied row leaves a
+/// `materialized_revisions` row behind, so a second open applies nothing new.
 pub(crate) fn redispatch_chronology_operations(connection: &mut Connection) -> Result<()> {
     if !table_exists(connection, "project_operations")? {
         return Ok(());
@@ -454,7 +457,7 @@ pub(crate) fn redispatch_chronology_operations(connection: &mut Connection) -> R
               SELECT 1 FROM operation_conflicts oc
               WHERE oc.incoming_operation_id = project_operations.operation_id
           )
-        ORDER BY operation_id
+        ORDER BY hlc_wall_millis, hlc_counter, origin_node_id, operation_id
         "#
     );
     let mut statement = connection.prepare(&sql)?;
@@ -470,6 +473,16 @@ pub(crate) fn redispatch_chronology_operations(connection: &mut Connection) -> R
     }
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     for operation in candidates {
+        // Skip a candidate whose declared base no longer matches the
+        // aggregate's current revision: the seam never writes
+        // `operation_conflicts` rows. The row stays in the log and the next
+        // open re-examines it; a genuine stale-base resend records its
+        // conflict row on the normal apply path instead.
+        match revision_guard_passes_without_recording(&transaction, &operation) {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(_) => continue,
+        }
         match materialize_operation(&transaction, &operation) {
             Ok(ApplyOperationResult::Applied) => {}
             Ok(_) => {}
