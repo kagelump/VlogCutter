@@ -4,6 +4,8 @@ import { api } from "./api";
 import type { Asset, AssetPatch, AutoplayMode, BaselineImportResult, BaselinePreviewResult, DesktopSettings, PathAnalysis, Project, ProjectLibrary, ProjectLocation, ProjectPairingStatus, RootMappingEntry, ServerConnectionStatus, ServerVersionInfo, SyncStatus } from "./types";
 import { orderAssets, moveSelection as moveSelectionInOrder } from "./review/order";
 import { resolveAction } from "./review/keymap";
+import { CalibrationPanel } from "./CalibrationPanel";
+import { EditPlanPanel } from "./EditPlanPanel";
 
 interface OperationProgress {
   kind: "proxy" | "thumbnail";
@@ -114,6 +116,9 @@ function assetContextKey(asset: Asset) {
 }
 
 function App() {
+  // D01-T015/T016/T023: the calibration and edit-plan drawers. Closed by
+  // default so the review queue stays the primary surface.
+  const [chronologyDrawer, setChronologyDrawer] = useState<"none" | "calibration" | "editPlan">("none");
   const [projects, setProjects] = useState<Project[]>([]);
   const [projectId, setProjectId] = useState("");
   const [assets, setAssets] = useState<Asset[]>([]);
@@ -2114,6 +2119,43 @@ function App() {
               <button className="button secondary" onClick={() => { api.syncNow(syncStatus.projectId).catch(() => {}); }}>Sync now</button>
             </div>
           </section>
+        </div>
+      )}
+
+      {projectId && (
+        <div className="chronology-drawer">
+          <nav className="chronology-drawer-tabs" aria-label="Chronology and editing">
+            <button
+              type="button"
+              aria-pressed={chronologyDrawer === "calibration"}
+              onClick={() =>
+                setChronologyDrawer(chronologyDrawer === "calibration" ? "none" : "calibration")
+              }
+            >
+              Chronology
+            </button>
+            <button
+              type="button"
+              aria-pressed={chronologyDrawer === "editPlan"}
+              onClick={() =>
+                setChronologyDrawer(chronologyDrawer === "editPlan" ? "none" : "editPlan")
+              }
+            >
+              Edit plan
+            </button>
+          </nav>
+          {chronologyDrawer === "calibration" && (
+            <CalibrationPanel
+              projectId={projectId}
+              currentAssetId={selectedId || null}
+              // A correction can reorder hundreds of clips; resume where the
+              // user was rather than snapping them back to the top.
+              onQueueResumed={(assetId) => setSelectedId(assetId)}
+            />
+          )}
+          {chronologyDrawer === "editPlan" && (
+            <EditPlanPanel projectId={projectId} assets={assets} />
+          )}
         </div>
       )}
     </main>

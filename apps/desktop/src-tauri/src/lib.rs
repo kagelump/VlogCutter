@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use tauri::{Emitter, Manager, State};
 
+mod chronology_commands;
 mod keychain;
 mod server_client;
 mod sync_manager;
@@ -88,7 +89,7 @@ struct BaselineAttempt {
     envelope_json: String,
 }
 
-struct AppState {
+pub(crate) struct AppState {
     catalog: Arc<RwLock<Catalog>>,
     settings: Arc<RwLock<DesktopSettings>>,
     settings_path: PathBuf,
@@ -490,7 +491,7 @@ fn write_settings(settings_path: &Path, settings: &DesktopSettings) -> anyhow::R
         .with_context(|| format!("commit settings {}", settings_path.display()))
 }
 
-fn error_message(error: impl std::fmt::Display) -> String {
+pub(crate) fn error_message(error: impl std::fmt::Display) -> String {
     error.to_string()
 }
 
@@ -1237,6 +1238,35 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            // D01-T015/T016: calibration surface, read and edit
+            chronology_commands::chronology_overview,
+            chronology_commands::chronology_solution,
+            chronology_commands::explain_chronology,
+            chronology_commands::preview_clock_epoch,
+            chronology_commands::set_clock_epoch,
+            chronology_commands::clear_clock_epoch,
+            chronology_commands::split_capture_sequence,
+            chronology_commands::merge_capture_sequences,
+            chronology_commands::set_clip_time_exception,
+            chronology_commands::clear_clip_time_exception,
+            chronology_commands::set_trip_phase,
+            chronology_commands::remove_trip_phase,
+            chronology_commands::set_event_order_constraint,
+            chronology_commands::clear_event_order_constraint,
+            chronology_commands::capture_queue_position,
+            chronology_commands::restore_queue_position,
+            // D01-T027 consumer: diagnostics
+            chronology_commands::list_diagnostics,
+            chronology_commands::acknowledge_diagnostic,
+            chronology_commands::detect_offline_volumes,
+            // D01-T023: edit plan and export
+            chronology_commands::active_edit_plan,
+            chronology_commands::edit_plan_revisions,
+            chronology_commands::create_edit_plan_revision,
+            chronology_commands::activate_edit_plan_revision,
+            chronology_commands::validate_edit_plan,
+            chronology_commands::render_edit_plan_preview,
+            chronology_commands::export_edit_plan_otio,
             prerequisite_status,
             load_catalog,
             project_library,

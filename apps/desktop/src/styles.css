@@ -565,3 +565,86 @@ kbd { padding: 2px 4px; color: #a8b1b6; background: #262d32; border: 1px solid #
   font-size: 0.78em;
   color: var(--color-text-muted, #a6adc8);
 }
+
+/* Chronology calibration and edit-plan drawers (D01-T015, T016, T023).
+   Collapsed by default: the review queue stays the primary surface. */
+.chronology-drawer {
+  border-top: 1px solid var(--border, #2a2a33);
+  padding: 0.75rem 1rem 1.25rem;
+  overflow-y: auto;
+  max-height: 45vh;
+}
+
+.chronology-drawer-tabs {
+  display: flex;
+  gap: 0.5rem;
+  margin-bottom: 0.75rem;
+}
+
+.chronology-drawer-tabs button[aria-pressed="true"] {
+  font-weight: 600;
+  text-decoration: underline;
+}
+
+.calibration-panel h3,
+.edit-plan-panel h3 {
+  font-size: 0.85rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin: 1rem 0 0.4rem;
+}
+
+.calibration-summary,
+.edit-plan-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1rem;
+  font-size: 0.85rem;
+}
+
+.calibration-error,
+.edit-plan-error,
+.calibration-contradictions,
+.edit-plan-errors {
+  border-left: 3px solid #d0454c;
+  padding-left: 0.75rem;
+}
+
+/* An error is louder than a warning, and both are quieter than the queue. */
+.calibration-diagnostics li[data-severity="error"] { border-left: 3px solid #d0454c; }
+.calibration-diagnostics li[data-severity="warning"] { border-left: 3px solid #d1a24a; }
+.calibration-diagnostics li[data-severity="info"] { border-left: 3px solid #4a7fd1; }
+.calibration-diagnostics li { padding-left: 0.5rem; margin-bottom: 0.35rem; }
+
+.calibration-unplaced { color: #d1a24a; }
+
+.calibration-editor label,
+.edit-plan-export label {
+  display: block;
+  margin-bottom: 0.4rem;
+  font-size: 0.85rem;
+}
+
+.calibration-confirm {
+  border: 1px solid var(--border, #2a2a33);
+  padding: 0.75rem;
+  margin-top: 0.75rem;
+}
+
+.calibration-evidence {
+  display: block;
+  font-size: 0.75rem;
+  opacity: 0.75;
+}
+
+.edit-plan-operations li,
+.calibration-epochs li,
+.calibration-sequences li,
+.calibration-proposals li {
+  display: flex;
+  gap: 0.75rem;
+  align-items: baseline;
+  padding: 0.15rem 0;
+}
+
+.edit-plan-warnings { border-left: 3px solid #d1a24a; padding-left: 0.75rem; }
