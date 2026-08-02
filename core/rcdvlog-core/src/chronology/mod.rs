@@ -7,10 +7,18 @@
 //! inherit nondeterminism.
 
 pub mod model;
+pub mod phases;
+pub mod solver;
 
 pub use model::{
     AssetTimeHypothesis, CaptureSequence, ChronologyFacts, ClipTimeException, ClockEpoch,
     ConstraintStrength, DisplayMode, EventOrderConstraint, PhaseKind, TripPhase,
+};
+pub(crate) use phases::parse_utc;
+pub use phases::{DisplayTime, covering_phase, display_time, is_valid_timezone};
+pub use solver::{
+    AssetChronology, ChronologySolution, Contradiction, ContradictionKind, Evidence, OrderKey,
+    solve,
 };
 
 use crate::operations::{

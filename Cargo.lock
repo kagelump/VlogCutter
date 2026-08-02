@@ -3007,6 +3007,7 @@ dependencies = [
  "batch-estimator",
  "blake3",
  "chrono",
+ "chrono-tz",
  "proptest",
  "rusqlite",
  "serde",

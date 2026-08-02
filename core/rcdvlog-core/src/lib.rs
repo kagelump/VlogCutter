@@ -22,9 +22,10 @@ mod operations;
 mod storage;
 
 pub use chronology::{
-    AssetTimeHypothesis, CaptureSequence, ChronologyFacts, ClipTimeException, ClockEpoch,
-    ConstraintStrength, DisplayMode, EventOrderConstraint, PhaseKind, QuarantinedOperation,
-    TripPhase,
+    AssetChronology, AssetTimeHypothesis, CaptureSequence, ChronologyFacts, ChronologySolution,
+    ClipTimeException, ClockEpoch, ConstraintStrength, Contradiction, ContradictionKind,
+    DisplayMode, DisplayTime, EventOrderConstraint, Evidence, OrderKey, PhaseKind,
+    QuarantinedOperation, TripPhase, covering_phase, display_time, is_valid_timezone, solve,
 };
 pub use operations::{
     ApplyOperationResult, AssetRevisionDiagnostics, CAPTURE_SEQUENCE_DECLARED,
@@ -1208,6 +1209,57 @@ impl Catalog {
         self.require_project(project_id)?;
         let connection = self.connection()?;
         chronology::load_chronology_facts(&connection, project_id)
+    }
+
+    /// Solves this project's chronology (D01-T008). Loading is I/O; solving is
+    /// pure, so identical persisted facts always produce an identical solution.
+    pub fn solve_chronology(&self, project_id: &str) -> Result<ChronologySolution> {
+        Ok(solve(&self.chronology_facts(project_id)?))
+    }
+
+    /// Writes the solution's derived times back into the `assets` projection
+    /// columns.
+    ///
+    /// This is the *only* writer of `assets.best_time` and
+    /// `assets.offset_seconds` (`CHRONOLOGY_MODEL.md`, "Evidence only"). No
+    /// migration and no operation materializer may write them; they exist for
+    /// query performance and are always reproducible by re-solving.
+    pub fn project_chronology_solution(
+        &self,
+        project_id: &str,
+        solution: &ChronologySolution,
+    ) -> Result<usize> {
+        self.require_project(project_id)?;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let mut written = 0usize;
+        for asset in &solution.assets {
+            // The offset is the derived shift from the camera's own claim, so
+            // a projection round-trip cannot invent one where none was applied.
+            let offset_seconds = match (asset.raw_time.as_deref(), asset.trip_time.as_deref()) {
+                (Some(raw), Some(trip)) => {
+                    match (chronology::parse_utc(raw), chronology::parse_utc(trip)) {
+                        (Some(from), Some(to)) => (to - from).num_seconds(),
+                        _ => 0,
+                    }
+                }
+                _ => 0,
+            };
+            written += transaction.execute(
+                "UPDATE assets SET best_time = ?1, offset_seconds = ?2 WHERE id = ?3 AND project_id = ?4",
+                params![asset.trip_time, offset_seconds, asset.asset_id, project_id],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(written)
+    }
+
+    /// Solves and projects in one step, the ordinary path after any chronology
+    /// change.
+    pub fn resolve_chronology(&self, project_id: &str) -> Result<ChronologySolution> {
+        let solution = self.solve_chronology(project_id)?;
+        self.project_chronology_solution(project_id, &solution)?;
+        Ok(solution)
     }
 
     /// Reports the operations this build retained but could not materialize,
