@@ -7,7 +7,7 @@
   "epic_id": "D01",
   "title": "Deterministic OTIO export",
   "slug": "deterministic-otio-export",
-  "status": "draft",
+  "status": "complete",
   "task_class": "implementation",
   "depends_on": ["D01-T020"],
   "principal_invariant": "Identical edit-plan input always produces byte-identical OpenTimelineIO output with stable clip and metadata identifiers.",

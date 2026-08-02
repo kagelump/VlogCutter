@@ -7,7 +7,7 @@
   "epic_id": "D01",
   "title": "Clip time exceptions",
   "slug": "clip-time-exceptions",
-  "status": "draft",
+  "status": "complete",
   "task_class": "implementation",
   "depends_on": ["D01-T010"],
   "principal_invariant": "A clip time exception overrides sequence-derived time for exactly one asset and is always surfaced as explicit evidence on that asset.",

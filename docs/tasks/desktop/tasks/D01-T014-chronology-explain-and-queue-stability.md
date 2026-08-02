@@ -7,7 +7,7 @@
   "epic_id": "D01",
   "title": "Chronology explain and review-queue stability",
   "slug": "chronology-explain-and-queue-stability",
-  "status": "draft",
+  "status": "complete",
   "task_class": "implementation",
   "depends_on": ["D01-T013"],
   "principal_invariant": "A chronology change that reorders the queue leaves the reviewer on the item they were about to review next.",

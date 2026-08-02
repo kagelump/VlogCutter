@@ -7,7 +7,7 @@
   "epic_id": "D01",
   "title": "Low-resolution preview render",
   "slug": "low-resolution-preview-render",
-  "status": "draft",
+  "status": "complete",
   "task_class": "implementation",
   "depends_on": ["D01-T020"],
   "principal_invariant": "A rendered preview contains the plan's clips, in the plan's order, with each clip's source range, and a total duration matching the plan within one frame.",

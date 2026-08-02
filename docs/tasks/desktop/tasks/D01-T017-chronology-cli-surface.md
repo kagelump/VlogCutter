@@ -7,7 +7,7 @@
   "epic_id": "D01",
   "title": "Chronology CLI surface",
   "slug": "chronology-cli-surface",
-  "status": "draft",
+  "status": "complete",
   "task_class": "implementation",
   "depends_on": ["D01-T014", "D01-T027"],
   "principal_invariant": "The CLI reports the same total order and the same derived times as the desktop for the same catalog.",

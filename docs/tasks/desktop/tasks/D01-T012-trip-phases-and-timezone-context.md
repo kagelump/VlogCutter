@@ -7,7 +7,7 @@
   "epic_id": "D01",
   "title": "Trip phases and timezone context",
   "slug": "trip-phases-and-timezone-context",
-  "status": "draft",
+  "status": "complete",
   "task_class": "implementation",
   "depends_on": ["D01-T008"],
   "principal_invariant": "An asset's local display time derives from the trip phase covering its trip time, never from camera metadata timezone.",

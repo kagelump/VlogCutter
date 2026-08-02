@@ -7,7 +7,7 @@
   "epic_id": "D01",
   "title": "Clock epochs over capture-sequence ranges",
   "slug": "clock-epoch-ranges",
-  "status": "draft",
+  "status": "complete",
   "task_class": "implementation",
   "depends_on": ["D01-T009"],
   "principal_invariant": "Applying one clock epoch changes derived time for every asset inside its declared counter range and for no asset outside it.",

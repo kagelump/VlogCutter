@@ -7,7 +7,7 @@
   "epic_id": "D01",
   "title": "Expanded calibration surface, read-only",
   "slug": "calibration-surface-read-only",
-  "status": "draft",
+  "status": "complete",
   "task_class": "implementation",
   "depends_on": ["D01-T003", "D01-T014"],
   "principal_invariant": "The calibration view renders the chronology solution faithfully, showing every asset in solver order on its own capture-sequence lane under the trip phase that governs its display time.",

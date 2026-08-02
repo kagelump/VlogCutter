@@ -7,7 +7,7 @@
   "epic_id": "D01",
   "title": "Deterministic chronology solver",
   "slug": "deterministic-chronology-solver",
-  "status": "draft",
+  "status": "complete",
   "task_class": "implementation",
   "depends_on": ["D01-T007"],
   "principal_invariant": "Identical chronology facts always produce an identical solution, including a total order with no ties and identically ordered evidence.",

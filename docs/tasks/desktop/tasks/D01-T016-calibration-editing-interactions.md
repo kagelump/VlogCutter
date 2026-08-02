@@ -7,7 +7,7 @@
   "epic_id": "D01",
   "title": "Calibration editing interactions and impact preview",
   "slug": "calibration-editing-interactions",
-  "status": "draft",
+  "status": "complete",
   "task_class": "implementation",
   "depends_on": ["D01-T015"],
   "principal_invariant": "No chronology change reaches the catalog without an explicit user apply, and the impact preview shown before apply matches exactly what apply produces.",

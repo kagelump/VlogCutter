@@ -7,7 +7,7 @@
   "epic_id": "D01",
   "title": "Camera identification and filename patterns",
   "slug": "camera-identification-and-filename-patterns",
-  "status": "draft",
+  "status": "complete",
   "task_class": "implementation",
   "depends_on": ["D01-T007", "D01-T027"],
   "principal_invariant": "A clip whose EXIF does not name a camera is identified from its filename pattern when a known pattern matches, and that pattern also supplies the filename counter, so a camera with a suffixed filename is neither anonymous nor counterless.",

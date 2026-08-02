@@ -7,7 +7,7 @@
   "epic_id": "D01",
   "title": "Diagnostics and error surfacing",
   "slug": "diagnostics-and-error-surfacing",
-  "status": "draft",
+  "status": "complete",
   "task_class": "foundation",
   "depends_on": ["D01-T007"],
   "principal_invariant": "Every condition the user must know about is recorded as a durable typed diagnostic that survives relaunch and is readable through one surface, so no failure is discoverable only by reading a log or a database.",

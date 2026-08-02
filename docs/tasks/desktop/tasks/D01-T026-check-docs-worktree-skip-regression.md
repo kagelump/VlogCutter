@@ -7,7 +7,7 @@
   "epic_id": "D01",
   "title": "Fix check-docs worktree-skip regression",
   "slug": "check-docs-worktree-skip-regression",
-  "status": "ready",
+  "status": "complete",
   "task_class": "implementation",
   "depends_on": ["D01-T002"],
   "principal_invariant": "check-docs.mjs finds and checks all Markdown files when invoked from inside a git worktree, producing the same result as when invoked from the main checkout.",

@@ -7,7 +7,7 @@
   "epic_id": "D01",
   "title": "Edit-plan validation",
   "slug": "edit-plan-validation",
-  "status": "draft",
+  "status": "complete",
   "task_class": "implementation",
   "depends_on": ["D01-T019"],
   "principal_invariant": "Every invalid edit plan is rejected with a stable error code before any render or export work begins.",

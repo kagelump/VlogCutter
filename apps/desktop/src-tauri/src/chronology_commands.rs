@@ -130,8 +130,12 @@ pub fn chronology_overview(
     state: State<'_, AppState>,
 ) -> Result<ChronologyOverview, String> {
     let catalog = state.catalog()?;
-    let facts = catalog.chronology_facts(&project_id).map_err(error_message)?;
-    let solution = catalog.solve_chronology(&project_id).map_err(error_message)?;
+    let facts = catalog
+        .chronology_facts(&project_id)
+        .map_err(error_message)?;
+    let solution = catalog
+        .solve_chronology(&project_id)
+        .map_err(error_message)?;
     let proposals = catalog
         .propose_capture_sequence_splits(&project_id)
         .map_err(error_message)?;

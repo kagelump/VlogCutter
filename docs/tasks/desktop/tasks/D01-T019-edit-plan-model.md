@@ -7,7 +7,7 @@
   "epic_id": "D01",
   "title": "Edit-plan model and revision semantics",
   "slug": "edit-plan-model",
-  "status": "ready",
+  "status": "complete",
   "task_class": "foundation",
   "depends_on": ["D01-T014"],
   "principal_invariant": "An edit-plan revision can never silently replace a newer one, and the persisted model can express nothing beyond one video track of hard cuts with linked source audio and source in/out ranges.",

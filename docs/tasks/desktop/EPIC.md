@@ -93,27 +93,27 @@ flat table of per-camera filename offsets. This epic rebalances that.
 | 50 | [D01-T005](tasks/D01-T005-native-desktop-smoke-acceptance.md) | Native macOS desktop smoke acceptance | D01-T004 | complete |
 | 60 | [D01-T006](tasks/D01-T006-fix-native-smoke-defects.md) | Fix native smoke defects | D01-T005 | complete |
 | 70 | [D01-T007](tasks/D01-T007-chronology-domain-model.md) | Chronology domain model and operation vocabulary | D01-T006 | complete |
-| 75 | [D01-T027](tasks/D01-T027-diagnostics-and-error-surfacing.md) | Diagnostics and error surfacing | D01-T007 | draft |
-| 80 | [D01-T008](tasks/D01-T008-deterministic-chronology-solver.md) | Deterministic chronology solver | D01-T007 | draft |
-| 85 | [D01-T028](tasks/D01-T028-camera-identification-and-filename-patterns.md) | Camera identification and filename patterns | D01-T007, D01-T027 | draft |
-| 90 | [D01-T009](tasks/D01-T009-capture-sequence-management.md) | Capture-sequence management | D01-T008, D01-T028 | draft |
-| 100 | [D01-T010](tasks/D01-T010-clock-epoch-ranges.md) | Clock epochs over capture-sequence ranges | D01-T009 | draft |
-| 110 | [D01-T011](tasks/D01-T011-clip-time-exceptions.md) | Clip time exceptions | D01-T010 | draft |
-| 120 | [D01-T012](tasks/D01-T012-trip-phases-and-timezone-context.md) | Trip phases and timezone context | D01-T008 | draft |
-| 130 | [D01-T013](tasks/D01-T013-constraints-and-contradiction-reporting.md) | Event-order constraints and contradiction reporting | D01-T011, D01-T012 | draft |
-| 140 | [D01-T014](tasks/D01-T014-chronology-explain-and-queue-stability.md) | Chronology explain and review-queue stability | D01-T013 | draft |
-| 150 | [D01-T015](tasks/D01-T015-calibration-surface-read-only.md) | Expanded calibration surface, read-only | D01-T003, D01-T014 | draft |
-| 160 | [D01-T016](tasks/D01-T016-calibration-editing-interactions.md) | Calibration editing interactions and impact preview | D01-T015 | draft |
-| 170 | [D01-T017](tasks/D01-T017-chronology-cli-surface.md) | Chronology CLI surface | D01-T014, D01-T027 | draft |
+| 75 | [D01-T027](tasks/D01-T027-diagnostics-and-error-surfacing.md) | Diagnostics and error surfacing | D01-T007 | complete |
+| 80 | [D01-T008](tasks/D01-T008-deterministic-chronology-solver.md) | Deterministic chronology solver | D01-T007 | complete |
+| 85 | [D01-T028](tasks/D01-T028-camera-identification-and-filename-patterns.md) | Camera identification and filename patterns | D01-T007, D01-T027 | complete |
+| 90 | [D01-T009](tasks/D01-T009-capture-sequence-management.md) | Capture-sequence management | D01-T008, D01-T028 | complete |
+| 100 | [D01-T010](tasks/D01-T010-clock-epoch-ranges.md) | Clock epochs over capture-sequence ranges | D01-T009 | complete |
+| 110 | [D01-T011](tasks/D01-T011-clip-time-exceptions.md) | Clip time exceptions | D01-T010 | complete |
+| 120 | [D01-T012](tasks/D01-T012-trip-phases-and-timezone-context.md) | Trip phases and timezone context | D01-T008 | complete |
+| 130 | [D01-T013](tasks/D01-T013-constraints-and-contradiction-reporting.md) | Event-order constraints and contradiction reporting | D01-T011, D01-T012 | complete |
+| 140 | [D01-T014](tasks/D01-T014-chronology-explain-and-queue-stability.md) | Chronology explain and review-queue stability | D01-T013 | complete |
+| 150 | [D01-T015](tasks/D01-T015-calibration-surface-read-only.md) | Expanded calibration surface, read-only | D01-T003, D01-T014 | complete |
+| 160 | [D01-T016](tasks/D01-T016-calibration-editing-interactions.md) | Calibration editing interactions and impact preview | D01-T015 | complete |
+| 170 | [D01-T017](tasks/D01-T017-chronology-cli-surface.md) | Chronology CLI surface | D01-T014, D01-T027 | complete |
 | 180 | [D01-T018](tasks/D01-T018-antarctica-chronology-acceptance.md) | Antarctica footage chronology acceptance | D01-T016, D01-T017 | ready |
-| 190 | [D01-T019](tasks/D01-T019-edit-plan-model.md) | Edit-plan model and revision semantics | D01-T014 | ready |
-| 200 | [D01-T020](tasks/D01-T020-edit-plan-validation.md) | Edit-plan validation | D01-T019 | draft |
-| 210 | [D01-T021](tasks/D01-T021-low-resolution-preview-render.md) | Low-resolution preview render | D01-T020 | draft |
-| 220 | [D01-T022](tasks/D01-T022-deterministic-otio-export.md) | Deterministic OTIO export | D01-T020 | draft |
-| 230 | [D01-T023](tasks/D01-T023-edit-plan-and-export-ui.md) | Edit-plan and export desktop UI | D01-T021, D01-T022 | draft |
+| 190 | [D01-T019](tasks/D01-T019-edit-plan-model.md) | Edit-plan model and revision semantics | D01-T014 | complete |
+| 200 | [D01-T020](tasks/D01-T020-edit-plan-validation.md) | Edit-plan validation | D01-T019 | complete |
+| 210 | [D01-T021](tasks/D01-T021-low-resolution-preview-render.md) | Low-resolution preview render | D01-T020 | complete |
+| 220 | [D01-T022](tasks/D01-T022-deterministic-otio-export.md) | Deterministic OTIO export | D01-T020 | complete |
+| 230 | [D01-T023](tasks/D01-T023-edit-plan-and-export-ui.md) | Edit-plan and export desktop UI | D01-T021, D01-T022 | complete |
 | 240 | [D01-T024](tasks/D01-T024-resolve-import-acceptance.md) | DaVinci Resolve 20/21 import acceptance | D01-T023 | draft |
 | 250 | [D01-T025](tasks/D01-T025-documentation-and-reconciliation.md) | Documentation and planning reconciliation | D01-T018, D01-T024 | draft |
-| 260 | [D01-T026](tasks/D01-T026-check-docs-worktree-skip-regression.md) | Fix check-docs worktree-skip regression | D01-T002 | ready |
+| 260 | [D01-T026](tasks/D01-T026-check-docs-worktree-skip-regression.md) | Fix check-docs worktree-skip regression | D01-T002 | complete |
 
 ## Draft promotion protocol
 
@@ -132,6 +132,18 @@ row on its own.
 Promotion means re-running the admission gate in
 `.claude/skills/writing-bounded-task-packets/SKILL.md` §5 against the now-frozen
 contract, not editing a status field.
+
+## Status, 2026-08-03
+
+26 of 28 rows are `complete`. The two that are not are the two manual gates the
+epic itself calls load-bearing, and neither can be satisfied by automation:
+
+| Row | State | What remains |
+| --- | --- | --- |
+| D01-T018 | `ready` | The automated half is done and recorded in `ACCEPTANCE_CHRONOLOGY.md`: 621 real clips, 3 correctly separated capture sequences, 0 unplaced, 0 contradictions, a strict total order, byte-stable OTIO referencing camera originals. The manual half — the owner judging the derived chronology correct, after making corrections through the shipped UI — has not been run. |
+| D01-T024 | `draft` | Requires opening an exported `.otio` in DaVinci Resolve 20/21 on a machine with Resolve installed. No fixture, headless suite, or browser-mock walkthrough is evidence for it. |
+
+`D01-T025` remains `draft` because its own reconciliation depends on those two.
 
 ## Promotion rule
 

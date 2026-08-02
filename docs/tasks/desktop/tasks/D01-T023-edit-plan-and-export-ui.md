@@ -7,7 +7,7 @@
   "epic_id": "D01",
   "title": "Edit-plan and export desktop UI",
   "slug": "edit-plan-and-export-ui",
-  "status": "draft",
+  "status": "complete",
   "task_class": "implementation",
   "depends_on": ["D01-T021", "D01-T022"],
   "principal_invariant": "A user can build a plan from their included clips, see its validation findings and staleness, render a preview, and export a timeline, without any invalid plan reaching render or export.",

@@ -7,7 +7,7 @@
   "epic_id": "D01",
   "title": "Capture-sequence management",
   "slug": "capture-sequence-management",
-  "status": "draft",
+  "status": "complete",
   "task_class": "implementation",
   "depends_on": ["D01-T008", "D01-T028"],
   "principal_invariant": "Filename identity is scoped to its capture sequence, so two cards that reuse the same filename counter are never treated as one monotonic chain.",

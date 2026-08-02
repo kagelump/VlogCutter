@@ -7,7 +7,7 @@
   "epic_id": "D01",
   "title": "Event-order constraints and contradiction reporting",
   "slug": "constraints-and-contradiction-reporting",
-  "status": "draft",
+  "status": "complete",
   "task_class": "implementation",
   "depends_on": ["D01-T011", "D01-T012"],
   "principal_invariant": "A hard contradiction blocks the change that would create it and names every conflicting piece of evidence.",
