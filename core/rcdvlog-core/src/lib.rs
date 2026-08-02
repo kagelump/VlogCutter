@@ -22,10 +22,11 @@ mod operations;
 mod storage;
 
 pub use chronology::{
-    AssetChronology, AssetTimeHypothesis, CaptureSequence, ChronologyFacts, ChronologySolution,
-    ClipTimeException, ClockEpoch, ConstraintStrength, Contradiction, ContradictionKind,
-    DisplayMode, DisplayTime, EventOrderConstraint, Evidence, OrderKey, PhaseKind,
-    QuarantinedOperation, TripPhase, covering_phase, display_time, is_valid_timezone, solve,
+    AssetChronology, AssetTimeHypothesis, CaptureSequence, ChronologyError, ChronologyFacts,
+    ChronologySolution, ClipTimeException, ClockEpoch, ConstraintStrength, Contradiction,
+    ContradictionKind, DisplayMode, DisplayTime, EventOrderConstraint, Evidence, OrderKey,
+    PhaseKind, QuarantinedOperation, SplitProposal, TripPhase, covering_phase, display_time,
+    is_valid_timezone, solve,
 };
 pub use operations::{
     ApplyOperationResult, AssetRevisionDiagnostics, CAPTURE_SEQUENCE_DECLARED,

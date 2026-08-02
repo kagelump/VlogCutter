@@ -6,10 +6,12 @@
 //! leave the loader sorted by primary key so no downstream consumer can
 //! inherit nondeterminism.
 
+pub mod api;
 pub mod model;
 pub mod phases;
 pub mod solver;
 
+pub use api::{ChronologyError, SplitProposal};
 pub use model::{
     AssetTimeHypothesis, CaptureSequence, ChronologyFacts, ClipTimeException, ClockEpoch,
     ConstraintStrength, DisplayMode, EventOrderConstraint, PhaseKind, TripPhase,

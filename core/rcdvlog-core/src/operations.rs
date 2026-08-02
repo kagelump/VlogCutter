@@ -296,104 +296,104 @@ struct MediaLinkedPayload {
 /// `deny_unknown_fields`, matching the existing operation payload discipline.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct CaptureSequenceDeclaredPayload {
-    sequence_id: String,
-    camera_key: String,
-    label: String,
-    volume_hint: String,
-    filename_prefix: String,
+pub(crate) struct CaptureSequenceDeclaredPayload {
+    pub(crate) sequence_id: String,
+    pub(crate) camera_key: String,
+    pub(crate) label: String,
+    pub(crate) volume_hint: String,
+    pub(crate) filename_prefix: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct CaptureSequenceSplitPayload {
-    new_sequence_id: String,
-    camera_key: String,
-    label: String,
-    volume_hint: String,
-    filename_prefix: String,
-    at_counter: u64,
+pub(crate) struct CaptureSequenceSplitPayload {
+    pub(crate) new_sequence_id: String,
+    pub(crate) camera_key: String,
+    pub(crate) label: String,
+    pub(crate) volume_hint: String,
+    pub(crate) filename_prefix: String,
+    pub(crate) at_counter: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct CaptureSequenceMergedPayload {
-    from_sequence_id: String,
-    into_sequence_id: String,
+pub(crate) struct CaptureSequenceMergedPayload {
+    pub(crate) from_sequence_id: String,
+    pub(crate) into_sequence_id: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct ClockEpochSetPayload {
-    epoch_id: String,
-    capture_sequence_id: String,
-    start_counter: u64,
-    end_counter: Option<u64>,
-    offset_seconds: i64,
-    label: String,
-    confidence: Option<f32>,
-    evidence: Option<Vec<String>>,
+pub(crate) struct ClockEpochSetPayload {
+    pub(crate) epoch_id: String,
+    pub(crate) capture_sequence_id: String,
+    pub(crate) start_counter: u64,
+    pub(crate) end_counter: Option<u64>,
+    pub(crate) offset_seconds: i64,
+    pub(crate) label: String,
+    pub(crate) confidence: Option<f32>,
+    pub(crate) evidence: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct ClockEpochClearedPayload {
-    epoch_id: String,
+pub(crate) struct ClockEpochClearedPayload {
+    pub(crate) epoch_id: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct ClipTimeExceptionSetPayload {
-    trip_time: String,
-    reason: String,
+pub(crate) struct ClipTimeExceptionSetPayload {
+    pub(crate) trip_time: String,
+    pub(crate) reason: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct ClipTimeExceptionClearedPayload {}
+pub(crate) struct ClipTimeExceptionClearedPayload {}
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct TripPhaseSetPayload {
-    phase_id: String,
-    label: String,
-    phase_kind: String,
-    start_trip_time: String,
-    end_trip_time: String,
-    timezone: Option<String>,
-    origin_timezone: Option<String>,
-    destination_timezone: Option<String>,
-    display_mode: String,
+pub(crate) struct TripPhaseSetPayload {
+    pub(crate) phase_id: String,
+    pub(crate) label: String,
+    pub(crate) phase_kind: String,
+    pub(crate) start_trip_time: String,
+    pub(crate) end_trip_time: String,
+    pub(crate) timezone: Option<String>,
+    pub(crate) origin_timezone: Option<String>,
+    pub(crate) destination_timezone: Option<String>,
+    pub(crate) display_mode: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct TripPhaseRemovedPayload {
-    phase_id: String,
+pub(crate) struct TripPhaseRemovedPayload {
+    pub(crate) phase_id: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct EventOrderConstraintSetPayload {
-    constraint_id: String,
-    earlier_asset_id: String,
-    later_asset_id: String,
-    strength: String,
-    source: String,
+pub(crate) struct EventOrderConstraintSetPayload {
+    pub(crate) constraint_id: String,
+    pub(crate) earlier_asset_id: String,
+    pub(crate) later_asset_id: String,
+    pub(crate) strength: String,
+    pub(crate) source: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct EventOrderConstraintClearedPayload {
-    constraint_id: String,
+pub(crate) struct EventOrderConstraintClearedPayload {
+    pub(crate) constraint_id: String,
 }
 
-struct NewOperation {
-    aggregate_type: &'static str,
-    aggregate_id: String,
-    operation_type: &'static str,
-    base_revision: Option<u64>,
-    payload: Value,
+pub(crate) struct NewOperation {
+    pub(crate) aggregate_type: &'static str,
+    pub(crate) aggregate_id: String,
+    pub(crate) operation_type: &'static str,
+    pub(crate) base_revision: Option<u64>,
+    pub(crate) payload: Value,
 }
 
 impl Catalog {
@@ -1275,7 +1275,11 @@ impl Catalog {
         Ok(ProjectAssetPage { items, next_cursor })
     }
 
-    fn commit_local(&self, project_id: &str, operations: Vec<NewOperation>) -> Result<()> {
+    pub(crate) fn commit_local(
+        &self,
+        project_id: &str,
+        operations: Vec<NewOperation>,
+    ) -> Result<()> {
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         commit_local_in_transaction(&transaction, project_id, operations)?;
@@ -2422,7 +2426,7 @@ fn advance_revision(transaction: &Transaction<'_>, operation: &ProjectOperation)
     Ok(())
 }
 
-fn current_revision(
+pub(crate) fn current_revision(
     connection: &rusqlite::Connection,
     project_id: &str,
     aggregate_type: &str,
