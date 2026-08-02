@@ -293,11 +293,23 @@ must never write them.
   the operation materializers share this derivation, so legacy replay and
   migration produce identical epochs. The digest keeps camera strings of any
   shape out of the id (operation aggregate ids must be whitespace-free).
-- `filename_counter` is the trailing digit run of the filename's stem
-  (extension stripped, trailing non-alphanumeric characters stripped):
-  `C0101.MP4` → 101, `DJI_0042.MP4` → 42, `clip.mp4` → NULL,
+- `filename_counter` is supplied by the first matching camera filename pattern
+  in `docs/tasks/desktop/CAMERA_PATTERNS.md`, and by the trailing digit run of
+  the filename's stem when no pattern matches (extension stripped, trailing
+  non-alphanumeric characters stripped).
+
+  Pattern-supplied: `DJI_20251221092058_0001_D.MP4` → 1. Trailing-digit rule,
+  unchanged: `C0101.MP4` → 101, `DJI_0042.MP4` → 42, `clip.mp4` → NULL,
   `GX010234.MP4` → 10234, `IMG_1234 (1).MOV` → 1. A digit run exceeding `u64`
   yields NULL, never a panic.
+
+  **Amendment (D01-T028, 2026-08-03).** The original rule was the trailing digit
+  run alone. It left the counter NULL for any camera whose filename carries a
+  suffix — 420 of 621 clips in the real target corpus — and a NULL counter is
+  never inside a bounded range and never moves in a counter split, so those
+  clips could not be targeted by any counter-ranged correction. D01-T028 is the
+  authority for the pattern table and for this amendment; migration 11 backfills
+  NULL counters where a pattern now supplies one, and changes nothing else.
 - A split moves assets with `filename_counter >= at_counter` into a new
   sequence; assets with a NULL counter stay in the source sequence. A merge
   unions the asset sets into the destination sequence, deletes the source

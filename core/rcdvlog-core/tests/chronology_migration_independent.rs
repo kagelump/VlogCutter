@@ -29,7 +29,8 @@ use tempfile::TempDir;
 
 use rcdvlog_core::{
     ApplyOperationResult, Catalog, CatalogSchemaError, HybridLogicalTime, OperationBatchResult,
-    PROJECT_CATALOG_MIGRATIONS, ProjectOperation, run_sqlite_migrations,
+    PROJECT_CATALOG_MIGRATIONS, PROJECT_CATALOG_SCHEMA_VERSION, ProjectOperation,
+    run_sqlite_migrations,
 };
 
 const FIXTURE_DIR: &str = "tests/fixtures/chronology-independent";
@@ -977,8 +978,9 @@ fn verify_order_preservation(spec: &CatalogSpec<'_>) {
         )
         .expect("read schema version");
     assert_eq!(
-        schema_version, 9,
-        "{}: catalog is not at schema 9",
+        schema_version,
+        i64::from(PROJECT_CATALOG_SCHEMA_VERSION),
+        "{}: catalog is not at the current schema",
         spec.name
     );
     let applied_count: i64 = connection
@@ -987,8 +989,9 @@ fn verify_order_preservation(spec: &CatalogSpec<'_>) {
         })
         .expect("count applied migrations");
     assert_eq!(
-        applied_count, 9,
-        "{}: migration 9 applied exactly once",
+        applied_count,
+        i64::from(PROJECT_CATALOG_SCHEMA_VERSION),
+        "{}: every migration applied exactly once",
         spec.name
     );
 
@@ -1791,24 +1794,30 @@ fn directory_entries(path: &Path) -> Vec<String> {
 #[test]
 fn catalog_newer_than_this_build_is_refused_not_migrated_downward() {
     let (_directory, path) = fixture_catalog(&SPEC_ONE_CAMERA_ONE_EVENT);
-    Catalog::open(&path).expect("migrate to schema 9");
+    Catalog::open(&path).expect("migrate to the current schema");
     let connection = Connection::open(&path).expect("open catalog");
     connection
         .execute(
-            "INSERT INTO schema_migrations(migration_id, name, source_identity, applied_at) VALUES (10, 'future_migration', 'project-catalog/0010-future/20990101', '2099-01-01T00:00:00Z')",
-            [],
+            "INSERT INTO schema_migrations(migration_id, name, source_identity, applied_at) VALUES (?1, 'future_migration', ?2, '2099-01-01T00:00:00Z')",
+            rusqlite::params![
+                PROJECT_CATALOG_SCHEMA_VERSION + 1,
+                format!(
+                    "project-catalog/{:04}-future/20990101",
+                    PROJECT_CATALOG_SCHEMA_VERSION + 1
+                )
+            ],
         )
         .expect("stamp a future migration");
     drop(connection);
 
-    let error = Catalog::open(&path).expect_err("a schema-10 catalog must be refused");
+    let error = Catalog::open(&path).expect_err("a catalog newer than this build must be refused");
     let schema_error = error
         .downcast_ref::<CatalogSchemaError>()
         .expect("error must be a CatalogSchemaError");
     match schema_error {
         CatalogSchemaError::NewerSchema { found, supported } => {
-            assert_eq!(*found, 10);
-            assert_eq!(*supported, 9);
+            assert_eq!(*found, PROJECT_CATALOG_SCHEMA_VERSION + 1);
+            assert_eq!(*supported, PROJECT_CATALOG_SCHEMA_VERSION);
         }
         other => panic!("expected NewerSchema, got {other:?}"),
     }

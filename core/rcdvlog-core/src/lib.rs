@@ -15,18 +15,28 @@ use uuid::Uuid;
 use walkdir::WalkDir;
 
 mod baseline;
+mod cameras;
 mod chronology;
+mod diagnostics;
 mod identifiers;
 mod migrations;
 mod operations;
 mod storage;
 
+pub use cameras::{
+    CAMERA_PATTERNS, CameraIdentity, CameraIdentitySource, CameraPattern, PatternConfidence,
+    UNKNOWN_CAMERA, identify_camera, pattern_counter,
+};
 pub use chronology::{
     AssetChronology, AssetTimeHypothesis, CaptureSequence, ChronologyError, ChronologyFacts,
     ChronologySolution, ClipTimeException, ClockEpoch, ConstraintStrength, Contradiction,
     ContradictionKind, DisplayMode, DisplayTime, EventOrderConstraint, Evidence, OrderKey,
     PhaseKind, QuarantinedOperation, SplitProposal, TripPhase, covering_phase, display_time,
     is_valid_timezone, solve,
+};
+pub use diagnostics::{
+    Diagnostic, DiagnosticCounts, DiagnosticFilter, DiagnosticRecord, DiagnosticSeverity,
+    DiagnosticSubject,
 };
 pub use operations::{
     ApplyOperationResult, AssetRevisionDiagnostics, CAPTURE_SEQUENCE_DECLARED,
@@ -637,10 +647,26 @@ impl Catalog {
             match self.ingest_file(project_id, &path) {
                 Ok(true) => report.imported += 1,
                 Ok(false) => report.duplicates += 1,
-                Err(error) => report.failures.push(IngestFailure {
-                    path: path.to_string_lossy().into_owned(),
-                    error: format!("{error:#}"),
-                }),
+                Err(error) => {
+                    // The transient report is not enough: a rejected file must
+                    // still be discoverable after the run, and after relaunch
+                    // (D01-T027). Deduped by folder, so a card full of `._*`
+                    // sidecars is one diagnostic with a count, not 400 rows.
+                    let folder = path
+                        .parent()
+                        .map(|parent| parent.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    let filename = path
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    // Recording a diagnostic must never itself fail an ingest.
+                    let _ = self.record_unreadable_media(project_id, &folder, &filename);
+                    report.failures.push(IngestFailure {
+                        path: path.to_string_lossy().into_owned(),
+                        error: format!("{error:#}"),
+                    });
+                }
             }
             on_progress(index + 1, total, &path);
         }
@@ -662,6 +688,7 @@ impl Catalog {
         }
 
         let probe = probe_media(path)?;
+        self.record_camera_identity_diagnostics(project_id, path, &probe.camera);
         let id = format!("asset_{}", Uuid::new_v4().simple());
         let filename = path
             .file_name()
@@ -1559,7 +1586,13 @@ fn probe_media(path: &Path) -> Result<MediaProbe> {
         .or_else(|| document.pointer("/format/tags/creation_time"))
         .and_then(Value::as_str)
         .map(str::to_owned);
-    let camera = exif_camera(path).unwrap_or_else(|| "Unknown camera".to_string());
+    // EXIF first, then the filename pattern table, then the literal
+    // (D01-T028). A pattern is inference and never overrides EXIF.
+    let camera = cameras::identify_camera(
+        exif_camera(path).as_deref(),
+        &path.file_name().unwrap_or_default().to_string_lossy(),
+    )
+    .camera;
     let duration_seconds = document["format"]["duration"]
         .as_str()
         .and_then(|value| value.parse().ok())
@@ -1951,7 +1984,7 @@ fn normalize_labels(labels: &[String]) -> Result<Vec<String>> {
     Ok(normalized)
 }
 
-fn now() -> String {
+pub(crate) fn now() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 

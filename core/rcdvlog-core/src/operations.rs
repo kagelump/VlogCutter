@@ -789,6 +789,18 @@ impl Catalog {
         let result = insert_and_materialize(&transaction, operation)?;
         receive_hlc(&transaction, operation)?;
         transaction.commit()?;
+        // A quarantined operation is retained and reported by
+        // `quarantined_operations()`, but nothing would tell the user that
+        // surface is non-empty. Record it after the commit so a diagnostic
+        // failure can never roll back a successfully applied operation
+        // (D01-T027).
+        if result == ApplyOperationResult::Quarantined {
+            let _ = self.record_quarantined_operation(
+                &operation.project_id,
+                &operation.operation_id,
+                &operation.operation_type,
+            );
+        }
         Ok(result)
     }
 
@@ -810,6 +822,7 @@ impl Catalog {
             )
             .optional()?
             .unwrap_or(0) as u64;
+        let mut quarantined: Vec<(String, String, String)> = Vec::new();
         let mut result = OperationBatchResult {
             origin_node_id: origin_node_id.to_string(),
             committed_sequence: cursor,
@@ -844,7 +857,14 @@ impl Catalog {
                 ApplyOperationResult::Applied => result.applied += 1,
                 ApplyOperationResult::Duplicate => result.duplicates += 1,
                 ApplyOperationResult::Conflict => result.conflicts += 1,
-                ApplyOperationResult::Quarantined => result.quarantined += 1,
+                ApplyOperationResult::Quarantined => {
+                    result.quarantined += 1;
+                    quarantined.push((
+                        operation.project_id.clone(),
+                        operation.operation_id.clone(),
+                        operation.operation_type.clone(),
+                    ));
+                }
             }
             receive_hlc(&transaction, operation)?;
             cursor = operation.origin_sequence;
@@ -855,6 +875,11 @@ impl Catalog {
         )?;
         result.committed_sequence = cursor;
         transaction.commit()?;
+        // Recorded after the commit, so a diagnostic failure can never roll
+        // back a successfully applied batch (D01-T027).
+        for (project_id, operation_id, operation_type) in quarantined {
+            let _ = self.record_quarantined_operation(&project_id, &operation_id, &operation_type);
+        }
         Ok(result)
     }
 

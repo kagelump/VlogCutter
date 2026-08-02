@@ -70,6 +70,11 @@ pub(crate) fn capture_sequence_id_for(project_id: &str, camera: &str) -> String 
 /// - `GX010234.MP4` → 10234
 /// - `IMG_1234 (1).MOV` → 1
 pub(crate) fn parse_filename_counter(filename: &str) -> Option<u64> {
+    // A matching camera pattern supplies the counter (D01-T028); the
+    // trailing-digit rule below is the fallback for everything else, unchanged.
+    if let Some(from_pattern) = crate::cameras::pattern_counter(filename) {
+        return Some(from_pattern);
+    }
     let stem = match filename.rfind('.') {
         Some(extension) => &filename[..extension],
         None => filename,

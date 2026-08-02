@@ -7,7 +7,7 @@ use thiserror::Error;
 
 use crate::chronology::forward_migrate_project_chronology;
 
-pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 9;
+pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 11;
 
 const MIGRATION_TABLE_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -137,6 +137,18 @@ pub const PROJECT_CATALOG_MIGRATIONS: &[SqliteMigration] = &[
         name: "chronology_facts",
         source_identity: "project-catalog/0009-chronology-facts/20260731",
         apply: add_chronology_facts,
+    },
+    SqliteMigration {
+        id: 10,
+        name: "diagnostics",
+        source_identity: "project-catalog/0010-diagnostics/20260803",
+        apply: add_diagnostics,
+    },
+    SqliteMigration {
+        id: 11,
+        name: "pattern_filename_counters",
+        source_identity: "project-catalog/0011-pattern-filename-counters/20260803",
+        apply: backfill_pattern_filename_counters,
     },
 ];
 
@@ -854,6 +866,75 @@ fn add_peer_operation_acknowledgements(transaction: &Transaction<'_>) -> Result<
 /// `clock_epochs` by `forward_migrate_project_chronology`, which never writes
 /// `assets.best_time` or `assets.offset_seconds` — recomputing projections is
 /// precisely how a migration reorders a project.
+/// Migration 10 (D01-T027). Purely additive: it creates one table and one
+/// index and touches no existing row, so an existing project's asset list and
+/// its order are byte-identical before and after.
+/// Migration 11 (D01-T028). Fills `asset_capture_sequence.filename_counter`
+/// where it is NULL and a camera filename pattern now supplies one.
+///
+/// It deliberately does *not* rewrite `assets.camera`. Doing so retroactively
+/// would regroup capture sequences and reorder an existing project, which is
+/// exactly what `CHRONOLOGY_MODEL.md`'s migration rules forbid. An existing
+/// catalog whose cameras are anonymous is repaired by the user through
+/// D01-T009's split and relabel.
+///
+/// Backfilling the counter is safe in a way that regrouping is not: migration 9
+/// carries legacy clock events forward with `end_counter` NULL — open-ended —
+/// and nothing emits a bounded epoch until D01-T010, so filling a NULL counter
+/// cannot remove an asset from any epoch's coverage in any catalog that can
+/// exist today.
+fn backfill_pattern_filename_counters(transaction: &Transaction<'_>) -> Result<()> {
+    let pending: Vec<(String, String)> = {
+        let mut statement = transaction.prepare(
+            "SELECT acs.asset_id, a.filename
+             FROM asset_capture_sequence acs
+             JOIN assets a ON a.id = acs.asset_id
+             WHERE acs.filename_counter IS NULL
+             ORDER BY acs.asset_id",
+        )?;
+        statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<(String, String)>>>()?
+    };
+    for (asset_id, filename) in pending {
+        let Some(counter) = crate::cameras::pattern_counter(&filename) else {
+            continue;
+        };
+        transaction.execute(
+            "UPDATE asset_capture_sequence SET filename_counter = ?2 WHERE asset_id = ?1",
+            rusqlite::params![asset_id, counter as i64],
+        )?;
+    }
+    Ok(())
+}
+
+fn add_diagnostics(transaction: &Transaction<'_>) -> Result<()> {
+    transaction.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS diagnostics (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            dedupe_key TEXT NOT NULL,
+            severity TEXT NOT NULL CHECK(severity IN ('error', 'warning', 'info')),
+            kind TEXT NOT NULL,
+            subject_type TEXT NOT NULL,
+            subject_id TEXT NOT NULL DEFAULT '',
+            message TEXT NOT NULL,
+            context_json TEXT NOT NULL DEFAULT '{}',
+            occurrence_count INTEGER NOT NULL DEFAULT 1,
+            first_seen_at TEXT NOT NULL,
+            last_seen_at TEXT NOT NULL,
+            acknowledged_at TEXT,
+            UNIQUE(project_id, dedupe_key)
+        );
+
+        CREATE INDEX IF NOT EXISTS diagnostics_project_unacknowledged
+        ON diagnostics(project_id, acknowledged_at, last_seen_at);
+        "#,
+    )?;
+    Ok(())
+}
+
 fn add_chronology_facts(transaction: &Transaction<'_>) -> Result<()> {
     transaction.execute_batch(
         r#"

@@ -15,8 +15,9 @@ use rcdvlog_core::{
     CAPTURE_SEQUENCE_SPLIT, CLIP_TIME_EXCEPTION_CLEARED, CLIP_TIME_EXCEPTION_SET,
     CLOCK_EPOCH_CLEARED, CLOCK_EPOCH_SET, CLOCK_EVENT_CREATED, Catalog, CatalogSchemaError,
     EVENT_ORDER_CONSTRAINT_CLEARED, EVENT_ORDER_CONSTRAINT_SET, HybridLogicalTime,
-    OperationBatchResult, PROJECT_CATALOG_MIGRATIONS, ProjectOperation, TRIP_PHASE_REMOVED,
-    TRIP_PHASE_SET, full_file_blake3, inspect_catalog, run_sqlite_migrations,
+    OperationBatchResult, PROJECT_CATALOG_MIGRATIONS, PROJECT_CATALOG_SCHEMA_VERSION,
+    ProjectOperation, TRIP_PHASE_REMOVED, TRIP_PHASE_SET, full_file_blake3, inspect_catalog,
+    run_sqlite_migrations,
 };
 use rusqlite::Connection;
 use serde_json::{Value, json};
@@ -562,7 +563,10 @@ fn order_is_byte_identical_before_and_after_migration_9_for_every_fixture_shape(
                 .map_or(before.len().min(after.len()), |index| index)
         );
         assert_eq!(before_projections, after_projections);
-        assert_eq!(inspect_catalog(&path).unwrap().current_schema_version, 9);
+        assert_eq!(
+            inspect_catalog(&path).unwrap().current_schema_version,
+            PROJECT_CATALOG_SCHEMA_VERSION
+        );
         eprintln!("{file}: {} assets, order preserved", after.len());
     }
 }
@@ -818,7 +822,10 @@ fn running_the_migration_runner_twice_is_idempotent() {
     let order_second = ordered_asset_ids(&connection, "project_fixture_three");
     let counts_second = table_counts(&connection, "project_fixture_three");
     let inspection = inspect_catalog(&path).unwrap();
-    assert_eq!(inspection.current_schema_version, 9);
+    assert_eq!(
+        inspection.current_schema_version,
+        PROJECT_CATALOG_SCHEMA_VERSION
+    );
     assert_eq!(
         inspection.schema_status,
         rcdvlog_core::MigrationHistoryStatus::Current
@@ -831,7 +838,7 @@ fn running_the_migration_runner_twice_is_idempotent() {
             .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| row
                 .get::<_, i64>(0))
             .unwrap(),
-        9
+        i64::from(PROJECT_CATALOG_SCHEMA_VERSION)
     );
 }
 
@@ -861,7 +868,7 @@ fn table_counts(connection: &Connection, project_id: &str) -> BTreeMap<&'static 
 }
 
 #[test]
-fn a_catalog_at_schema_10_is_refused_as_newer() {
+fn a_catalog_one_schema_past_this_build_is_refused_as_newer() {
     let directory = tempdir().unwrap();
     let path = build_schema8_catalog(
         &directory,
@@ -881,8 +888,11 @@ fn a_catalog_at_schema_10_is_refused_as_newer() {
     let connection = open_connection(&path);
     connection
         .execute(
-            "INSERT INTO schema_migrations (migration_id, name, source_identity, applied_at) VALUES (10, 'future_migration', 'project-catalog/0010-future/20990101', '2099-01-01T00:00:00.000Z')",
-            [],
+            "INSERT INTO schema_migrations (migration_id, name, source_identity, applied_at) VALUES (?1, 'future_migration', ?2, '2099-01-01T00:00:00.000Z')",
+            rusqlite::params![
+                PROJECT_CATALOG_SCHEMA_VERSION + 1,
+                format!("project-catalog/{:04}-future/20990101", PROJECT_CATALOG_SCHEMA_VERSION + 1)
+            ],
         )
         .unwrap();
     drop(connection);
@@ -891,13 +901,14 @@ fn a_catalog_at_schema_10_is_refused_as_newer() {
     let error = Catalog::open_existing(&path).unwrap_err();
     assert!(matches!(
         error.downcast_ref::<CatalogSchemaError>(),
-        Some(CatalogSchemaError::NewerSchema {
-            found: 10,
-            supported: 9
-        })
+        Some(CatalogSchemaError::NewerSchema { found, supported })
+            if *found == PROJECT_CATALOG_SCHEMA_VERSION + 1
+                && *supported == PROJECT_CATALOG_SCHEMA_VERSION
     ));
     let message = format!("{error:#}");
-    assert!(message.contains("newer than supported version 9"));
+    assert!(message.contains(&format!(
+        "newer than supported version {PROJECT_CATALOG_SCHEMA_VERSION}"
+    )));
     assert_eq!(
         inspect_catalog(&path).unwrap().schema_status,
         rcdvlog_core::MigrationHistoryStatus::NewerUnsupported
