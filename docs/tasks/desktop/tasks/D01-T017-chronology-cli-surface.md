@@ -9,7 +9,7 @@
   "slug": "chronology-cli-surface",
   "status": "draft",
   "task_class": "implementation",
-  "depends_on": ["D01-T014"],
+  "depends_on": ["D01-T014", "D01-T027"],
   "principal_invariant": "The CLI reports the same total order and the same derived times as the desktop for the same catalog.",
   "central_falsification": "Produce the ordered asset list and derived times through both the desktop command layer and the CLI for the same catalog, including after a chronology change, and diff them.",
   "architecture_decisions_frozen": false,
@@ -78,16 +78,23 @@ Outputs:
 
 - A `Chronology` subcommand group with `sequences`, `epochs`, `phases`,
   `exceptions`, `constraints`, `contradictions`, `explain`, and `status`.
+- A `Diagnostics` subcommand group with `list` and `acknowledge`, reading the
+  D01-T027 surface. This is the CLI half of the error-surfacing system: every
+  diagnostic the application records must be retrievable non-interactively,
+  including `sync.operation_quarantined`, which shipped in D01-T007 with no reader
+  at all.
 - JSON contract tests for every command, per the `AGENTS.md` §12 expectation that
   every documented CLI command has one.
 - `docs/agent-cli.md` updated.
 
 ## Frozen decisions
 
-- Read-only. This packet adds no mutating chronology command. Mutation through the
-  CLI would be a second apply path that could bypass the confirmation
-  `PRD.md` §21.4 requires, and the agent workflows that need it are `PRD.md` §23
-  Milestone 5 work.
+- Read-only with respect to project facts. This packet adds no mutating
+  chronology command. Mutation through the CLI would be a second apply path that
+  could bypass the confirmation `PRD.md` §21.4 requires, and the agent workflows
+  that need it are `PRD.md` §23 Milestone 5 work. `diagnostics acknowledge` is the
+  sole write, and it mutates only an observation's acknowledged state — no
+  operation, no aggregate revision, no derived order.
 - Envelopes match the existing CLI exactly. Do not invent a second envelope shape
   for chronology.
 - Every failure exits nonzero with a stable error code string, per `AGENTS.md` §11.
@@ -117,12 +124,22 @@ rcdvlog chronology constraints --project <id>
 rcdvlog chronology contradictions --project <id>
 rcdvlog chronology explain     --asset <id>
 rcdvlog chronology status      --project <id>
+
+rcdvlog diagnostics list        --project <id> [--severity error|warning|info]
+                                [--kind-prefix <prefix>] [--include-acknowledged]
+rcdvlog diagnostics acknowledge --project <id> --diagnostic <id>
 ```
 
 `command_name` values, following the existing dotted convention:
 `chronology.sequences`, `chronology.epochs`, `chronology.phases`,
 `chronology.exceptions`, `chronology.constraints`,
-`chronology.contradictions`, `chronology.explain`, `chronology.status`.
+`chronology.contradictions`, `chronology.explain`, `chronology.status`,
+`diagnostics.list`, `diagnostics.acknowledge`.
+
+`diagnostics acknowledge` is the one mutating command in this packet, and it is
+admissible under the read-only decision above because acknowledging an
+observation changes no project fact, emits no operation, and cannot alter derived
+order. It is the exception, not a precedent for chronology mutation.
 
 `chronology status` returns the counts of each fact kind, the number of assets with
 a null trip time, the number of contradictions by strength, and the ordered asset

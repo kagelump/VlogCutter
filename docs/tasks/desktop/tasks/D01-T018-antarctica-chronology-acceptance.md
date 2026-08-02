@@ -7,7 +7,7 @@
   "epic_id": "D01",
   "title": "Antarctica footage chronology acceptance",
   "slug": "antarctica-chronology-acceptance",
-  "status": "blocked",
+  "status": "ready",
   "task_class": "qa",
   "depends_on": ["D01-T016", "D01-T017"],
   "principal_invariant": "The real Antarctica trip footage can be brought to a chronology the owner judges correct, using only the shipped calibration workflow.",
@@ -61,16 +61,23 @@ evidence that those assumptions were right.
 This task is correct when the real Antarctica trip footage can be brought to a
 chronology the owner judges correct, using only the shipped calibration workflow.
 
-## Blocked status
+## Footage path protocol
 
-This packet is `blocked`, not `draft`. Its design is complete; it is waiting on one
-input the product owner supplies:
+This packet is `ready`. The product owner has confirmed the corpus exists and is
+mounted at gate time.
 
-> The filesystem path to the Antarctica trip footage.
+**The footage path is never recorded in this repository.** It is supplied by the
+product owner at invocation, held in the executing agent's environment as
+`$FOOTAGE_ROOT`, and referred to everywhere in this packet as `<footage>`. No
+commit, no evidence file, no cycle report, and no acceptance document may contain
+the literal path. `docs/tasks/desktop/ACCEPTANCE_CHRONOLOGY.md` describes the
+corpus — clip counts, cameras, cards, date range, timezones crossed — without
+naming where it lives.
 
-The product owner supplies the path, the contract editor records it in the
-`Inputs` section below and sets the status to `ready`. Nothing else about this
-packet changes.
+The corpus is a three-camera Antarctica trip: a DJI Pocket 3, an Insta360 Ultra
+Go, and a Sony A7C, in per-camera folders. It is the same corpus D01-T005's smoke
+run drew from, and the same one whose filename shapes D01-T028's pattern table
+was built against.
 
 Do not substitute the Expo fixture at `/Volumes/data/VideoProjects/2025-08 Expo`
 for this gate. That fixture is valuable for scale acceptance, but the product owner
@@ -82,7 +89,8 @@ transit phases, or dual display.
 
 Inputs:
 
-- The Antarctica footage path, supplied by the product owner at gate time.
+- The Antarctica footage path, supplied by the product owner at gate time as
+  `$FOOTAGE_ROOT` and never committed. See `## Footage path protocol` above.
 - The owner's own knowledge of the trip: roughly where they were when, which camera
   clocks were wrong, and which clips they know the order of. This knowledge is the
   oracle; no automated check can supply it.
@@ -223,7 +231,10 @@ Approval vocabulary: `approved`, `approved with non-blocking notes`, or
 
 Stop and escalate when:
 
-- the footage path has not been supplied, in which case this packet stays `blocked`;
+- the footage path has not been supplied at invocation, or the corpus is not
+  mounted, in which case stop and ask rather than substituting a fixture;
+- the literal footage path would have to appear in any committed file to make the
+  evidence reproducible — record the corpus description instead and say so;
 - the volume cannot be mounted or macOS denies access and the prompt does not
   appear;
 - ingest would write into the footage tree — stop immediately, since that breaches

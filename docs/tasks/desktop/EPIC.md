@@ -63,6 +63,11 @@ flat table of per-camera filename offsets. This epic rebalances that.
 - Filename identity is scoped to its capture sequence; two cards reuse counters.
 - Local display time derives from the covering trip phase, never from camera
   metadata timezone.
+- Every condition the user must know about is a durable typed diagnostic read
+  through one surface. No failure is discoverable only from a log line.
+- Camera identity resolves EXIF first, then a documented filename-pattern table,
+  then an explicit unknown. A pattern never overrides EXIF, and a pattern match
+  supplies the filename counter.
 - Hard contradictions block apply and name the conflicting evidence.
 - No chronology change is applied without explicit user confirmation.
 - Editing scope is exhaustively: one video track, linked source audio, hard
@@ -88,8 +93,10 @@ flat table of per-camera filename offsets. This epic rebalances that.
 | 50 | [D01-T005](tasks/D01-T005-native-desktop-smoke-acceptance.md) | Native macOS desktop smoke acceptance | D01-T004 | complete |
 | 60 | [D01-T006](tasks/D01-T006-fix-native-smoke-defects.md) | Fix native smoke defects | D01-T005 | complete |
 | 70 | [D01-T007](tasks/D01-T007-chronology-domain-model.md) | Chronology domain model and operation vocabulary | D01-T006 | complete |
+| 75 | [D01-T027](tasks/D01-T027-diagnostics-and-error-surfacing.md) | Diagnostics and error surfacing | D01-T007 | draft |
 | 80 | [D01-T008](tasks/D01-T008-deterministic-chronology-solver.md) | Deterministic chronology solver | D01-T007 | draft |
-| 90 | [D01-T009](tasks/D01-T009-capture-sequence-management.md) | Capture-sequence management | D01-T008 | draft |
+| 85 | [D01-T028](tasks/D01-T028-camera-identification-and-filename-patterns.md) | Camera identification and filename patterns | D01-T007, D01-T027 | draft |
+| 90 | [D01-T009](tasks/D01-T009-capture-sequence-management.md) | Capture-sequence management | D01-T008, D01-T028 | draft |
 | 100 | [D01-T010](tasks/D01-T010-clock-epoch-ranges.md) | Clock epochs over capture-sequence ranges | D01-T009 | draft |
 | 110 | [D01-T011](tasks/D01-T011-clip-time-exceptions.md) | Clip time exceptions | D01-T010 | draft |
 | 120 | [D01-T012](tasks/D01-T012-trip-phases-and-timezone-context.md) | Trip phases and timezone context | D01-T008 | draft |
@@ -97,8 +104,8 @@ flat table of per-camera filename offsets. This epic rebalances that.
 | 140 | [D01-T014](tasks/D01-T014-chronology-explain-and-queue-stability.md) | Chronology explain and review-queue stability | D01-T013 | draft |
 | 150 | [D01-T015](tasks/D01-T015-calibration-surface-read-only.md) | Expanded calibration surface, read-only | D01-T003, D01-T014 | draft |
 | 160 | [D01-T016](tasks/D01-T016-calibration-editing-interactions.md) | Calibration editing interactions and impact preview | D01-T015 | draft |
-| 170 | [D01-T017](tasks/D01-T017-chronology-cli-surface.md) | Chronology CLI surface | D01-T014 | draft |
-| 180 | [D01-T018](tasks/D01-T018-antarctica-chronology-acceptance.md) | Antarctica footage chronology acceptance | D01-T016, D01-T017 | blocked |
+| 170 | [D01-T017](tasks/D01-T017-chronology-cli-surface.md) | Chronology CLI surface | D01-T014, D01-T027 | draft |
+| 180 | [D01-T018](tasks/D01-T018-antarctica-chronology-acceptance.md) | Antarctica footage chronology acceptance | D01-T016, D01-T017 | ready |
 | 190 | [D01-T019](tasks/D01-T019-edit-plan-model.md) | Edit-plan model and revision semantics | D01-T014 | ready |
 | 200 | [D01-T020](tasks/D01-T020-edit-plan-validation.md) | Edit-plan validation | D01-T019 | draft |
 | 210 | [D01-T021](tasks/D01-T021-low-resolution-preview-render.md) | Low-resolution preview render | D01-T020 | draft |
@@ -119,7 +126,8 @@ row on its own.
 | T008–T017 | `architecture_decisions_frozen` would be a false claim: the chronology tables, operation vocabulary, and solver interface are frozen *by* T007, whose packet is the authority for them. | The contract editor, after T007 publishes `CHRONOLOGY_MODEL.md`. |
 | T020–T023 | Same shape: frozen by T019's `EDIT_PLAN_MODEL.md`. | The contract editor, after T019 publishes it. |
 | T024, T025 | Depend on the two contracts above plus the acceptance surface. | The contract editor, after T022 and T018 respectively. |
-| T018 | The Antarctica footage path has not been supplied. | The product owner supplying the path; the contract editor then sets `ready`. |
+| ~~T018~~ | ~~The Antarctica footage path has not been supplied.~~ Resolved 2026-08-02: the product owner confirmed the corpus and the path is supplied at invocation, never committed. See the packet's `## Footage path protocol`. | — |
+| T027, T028 | Their own contracts. T027 freezes the diagnostics model for T015 and T017; T028 amends T007's counter rule and is the authority for the pattern table. Both are foundation-shaped and self-authorizing, so they promote on their own admission gate. | The contract editor, at promotion time. |
 
 Promotion means re-running the admission gate in
 `.claude/skills/writing-bounded-task-packets/SKILL.md` §5 against the now-frozen

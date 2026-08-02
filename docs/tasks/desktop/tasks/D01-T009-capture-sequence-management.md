@@ -9,16 +9,16 @@
   "slug": "capture-sequence-management",
   "status": "draft",
   "task_class": "implementation",
-  "depends_on": ["D01-T008"],
+  "depends_on": ["D01-T008", "D01-T028"],
   "principal_invariant": "Filename identity is scoped to its capture sequence, so two cards that reuse the same filename counter are never treated as one monotonic chain.",
   "central_falsification": "Ingest two folders from one camera whose filenames both run C0001 to C0100, and confirm the proposal yields two sequences and that a clock epoch on one leaves the other's derived times untouched.",
   "architecture_decisions_frozen": false,
   "load_bearing_seams": ["ingest metadata -> capture sequence assignment"],
   "documents_by_role": {
     "contract_editor": ["docs/tasks/desktop/CHRONOLOGY_MODEL.md", "docs/tasks/desktop/ARCHITECTURE.md"],
-    "implementer": ["docs/tasks/desktop/CHRONOLOGY_MODEL.md", "PRD.md", "AGENTS.md"],
-    "independent_tester": ["docs/tasks/desktop/CHRONOLOGY_MODEL.md", "PRD.md"],
-    "reviewer": ["docs/tasks/desktop/CHRONOLOGY_MODEL.md", "PRD.md", "AGENTS.md"],
+    "implementer": ["docs/tasks/desktop/CHRONOLOGY_MODEL.md", "docs/tasks/desktop/CAMERA_PATTERNS.md", "PRD.md", "AGENTS.md"],
+    "independent_tester": ["docs/tasks/desktop/CHRONOLOGY_MODEL.md", "docs/tasks/desktop/CAMERA_PATTERNS.md", "PRD.md"],
+    "reviewer": ["docs/tasks/desktop/CHRONOLOGY_MODEL.md", "docs/tasks/desktop/CAMERA_PATTERNS.md", "PRD.md", "AGENTS.md"],
     "integrator": ["docs/tasks/desktop/CHRONOLOGY_MODEL.md"]
   },
   "path_ownership": {
@@ -84,6 +84,19 @@ Outputs:
   range. Merging preserves both sequences' assets. Neither ever drops an asset.
 - Every asset always belongs to exactly one sequence. There is no unassigned
   state.
+- A proposal's `camera_key` and `label` come from D01-T028's identification — EXIF
+  first, then the pattern table's label. This packet does not identify cameras and
+  does not add a fourth resolution path.
+- `filename_counter` is read, never recomputed. D01-T028's pattern-first rule is
+  the single authority; a proposal that needs a counter reads the stored value.
+
+The `PrefixChange` evidence already carries the load for a project whose cameras
+were ingested anonymously. `DJI_…`, `VID_…`, and `C…` are three distinct filename
+prefixes, so a legacy catalog where every clip resolved to `"Unknown camera"` and
+collapsed into one sequence is separated correctly by the existing evidence list
+without adding a heuristic. Repairing such a catalog is a user-confirmed split
+plus a relabel, which is exactly this packet's surface — no migration rewrites
+`assets.camera`, per D01-T028 Decision 4.
 
 ## Owned paths
 
