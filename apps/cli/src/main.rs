@@ -11,6 +11,7 @@ use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+mod chronology_commands;
 mod server_commands;
 
 #[derive(Debug, Parser)]
@@ -84,6 +85,17 @@ enum Commands {
         connection: server_commands::ServerConnectionArgs,
         #[command(subcommand)]
         command: server_commands::ServerCommand,
+    },
+    /// Read the derived chronology: sequences, epochs, phases, contradictions,
+    /// and why any one clip landed where it did.
+    Chronology {
+        #[command(subcommand)]
+        command: chronology_commands::ChronologyCommand,
+    },
+    /// Read and acknowledge the conditions the user needs to know about.
+    Diagnostics {
+        #[command(subcommand)]
+        command: chronology_commands::DiagnosticsCommand,
     },
 }
 
@@ -294,6 +306,8 @@ fn command_name(command: &Commands) -> &'static str {
             ThumbnailCommand::Generate { .. } => "thumbnails.generate",
             ThumbnailCommand::Missing { .. } => "thumbnails.missing",
         },
+        Commands::Chronology { command } => chronology_commands::chronology_command_name(command),
+        Commands::Diagnostics { command } => chronology_commands::diagnostics_command_name(command),
         Commands::Server { command, .. } => server_commands::command_name(command),
     }
 }
@@ -344,7 +358,13 @@ fn execute(cli: &Cli) -> Result<Value> {
         } | Commands::Proxy {
             command: ProxyCommand::Status { .. }
         }
-    );
+    ) || match &cli.command {
+        // The chronology surface never writes; diagnostics only writes to
+        // acknowledge, which changes no project fact (D01-T017).
+        Commands::Chronology { command } => chronology_commands::chronology_is_read_only(command),
+        Commands::Diagnostics { command } => chronology_commands::diagnostics_is_read_only(command),
+        _ => false,
+    };
     let catalog = if read_only {
         Catalog::open_read_only_existing(&catalog_path)?
     } else {
@@ -353,6 +373,12 @@ fn execute(cli: &Cli) -> Result<Value> {
     match &cli.command {
         Commands::Doctor => unreachable!(),
         Commands::Catalog { .. } | Commands::Desktop { .. } => unreachable!(),
+        Commands::Chronology { command } => {
+            chronology_commands::execute_chronology(&catalog, command)
+        }
+        Commands::Diagnostics { command } => {
+            chronology_commands::execute_diagnostics(&catalog, command)
+        }
         Commands::Project { command } => match command {
             ProjectCommand::Create { name } => {
                 Ok(serde_json::to_value(catalog.create_project(name)?)?)

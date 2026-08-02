@@ -6,7 +6,7 @@ This is the implementation handoff for the migration and identity contracts intr
 
 ## Project catalog migration contract
 
-The current project-catalog schema version is `11`. Writable `Catalog::open` and `Catalog::open_existing` apply missing migrations in order. Read-only catalog opens and `catalog inspect` never create or update migration history.
+The current project-catalog schema version is `12`. Writable `Catalog::open` and `Catalog::open_existing` apply missing migrations in order. Read-only catalog opens and `catalog inspect` never create or update migration history.
 
 | ID | Name | Immutable source identity | Purpose |
 | --- | --- | --- | --- |
@@ -21,6 +21,7 @@ The current project-catalog schema version is `11`. Writable `Catalog::open` and
 | 9 | `chronology_facts` | `project-catalog/0009-chronology-facts/20260731` | Adds the persisted chronology fact model: `capture_sequences`, `asset_capture_sequence`, `clock_epochs`, `clip_time_exceptions`, `trip_phases`, and `event_order_constraints`, plus their ordering indexes. Existing `clock_events` rows are forward-migrated into `clock_epochs` without recomputing `assets.best_time` or `assets.offset_seconds`, so no existing review order changes. `clock_events` is retained for legacy operation replay. |
 | 10 | `diagnostics` | `project-catalog/0010-diagnostics/20260803` | Adds the `diagnostics` table and its unacknowledged index (D01-T027). Purely additive: it creates one table and one index and touches no existing row. Diagnostics are durable *local* observations — deduplicated by `(project_id, dedupe_key)` with occurrence counting, acknowledged rather than deleted, and never typed operations, so they carry no HLC time, take no part in the revision guard, and are never synchronized to a peer. |
 | 11 | `pattern_filename_counters` | `project-catalog/0011-pattern-filename-counters/20260803` | Backfills `asset_capture_sequence.filename_counter` where it is NULL and a camera filename pattern supplies one (D01-T028, `docs/tasks/desktop/CAMERA_PATTERNS.md`). It does not rewrite `assets.camera`, does not create or merge capture sequences, and does not touch `assets.best_time` or `assets.offset_seconds` — regrouping capture sequences would reorder an existing project. |
+| 12 | `edit_plan` | `project-catalog/0012-edit-plan/20260803` | Adds the edit-plan model: `edit_plan_revisions`, `edit_plan_operations`, `edit_plan_exports`, and the partial unique index enforcing one active revision per project (D01-T019, `docs/tasks/desktop/EDIT_PLAN_MODEL.md`). `UNIQUE(revision_id, position)` makes two clips at one position unrepresentable. There is deliberately no `track` column, no `transition` table, and no `effect` column — not even reserved. |
 
 Migration 9 freezes the desktop chronology model published in
 `docs/tasks/desktop/CHRONOLOGY_MODEL.md` (D01-T007): capture sequences scope

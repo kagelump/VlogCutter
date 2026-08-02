@@ -18,6 +18,7 @@ mod baseline;
 mod cameras;
 mod chronology;
 mod diagnostics;
+mod editplan;
 mod identifiers;
 mod migrations;
 mod operations;
@@ -38,11 +39,17 @@ pub use diagnostics::{
     Diagnostic, DiagnosticCounts, DiagnosticFilter, DiagnosticRecord, DiagnosticSeverity,
     DiagnosticSubject,
 };
+pub use editplan::{
+    EditPlanError, EditPlanExport, EditPlanOperation, EditPlanRevision, EditPlanStaleness, Finding,
+    FindingKind, OtioExportError, OtioExportRequest, OtioExportResult, PreviewFailure,
+    PreviewProgress, PreviewRequest, PreviewResult, Severity, ValidationReport, otio_document,
+};
 pub use operations::{
     ApplyOperationResult, AssetRevisionDiagnostics, CAPTURE_SEQUENCE_DECLARED,
     CAPTURE_SEQUENCE_MERGED, CAPTURE_SEQUENCE_SPLIT, CLIP_TIME_EXCEPTION_CLEARED,
     CLIP_TIME_EXCEPTION_SET, CLOCK_EPOCH_CLEARED, CLOCK_EPOCH_SET, CLOCK_EVENT_CREATED,
-    ConflictProjection, EVENT_ORDER_CONSTRAINT_CLEARED, EVENT_ORDER_CONSTRAINT_SET,
+    ConflictProjection, EDIT_PLAN_EXPORT_RECORDED, EDIT_PLAN_REVISION_ACTIVATED,
+    EDIT_PLAN_REVISION_CREATED, EVENT_ORDER_CONSTRAINT_CLEARED, EVENT_ORDER_CONSTRAINT_SET,
     HybridLogicalTime, LABEL_ADDED, LABEL_REMOVED, MAX_REMOTE_HLC_FUTURE_SKEW_MILLIS,
     NOTE_REVISION_CREATED, NoteRevisionProjection, OperationBatchResult, OperationDiagnostics,
     PROJECT_ASSET_ADDED, PROJECT_ASSET_MEDIA_LINKED, ProjectAssetAddedPayload, ProjectAssetItem,

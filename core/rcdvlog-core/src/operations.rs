@@ -29,6 +29,9 @@ pub const TRIP_PHASE_SET: &str = "tripPhaseSet";
 pub const TRIP_PHASE_REMOVED: &str = "tripPhaseRemoved";
 pub const EVENT_ORDER_CONSTRAINT_SET: &str = "eventOrderConstraintSet";
 pub const EVENT_ORDER_CONSTRAINT_CLEARED: &str = "eventOrderConstraintCleared";
+pub const EDIT_PLAN_REVISION_CREATED: &str = "editPlanRevisionCreated";
+pub const EDIT_PLAN_REVISION_ACTIVATED: &str = "editPlanRevisionActivated";
+pub const EDIT_PLAN_EXPORT_RECORDED: &str = "editPlanExportRecorded";
 pub const MAX_REMOTE_HLC_FUTURE_SKEW_MILLIS: i64 = 5 * 60 * 1000;
 
 /// The eleven chronology operation types D01-T007 added. The re-dispatch seam
@@ -74,6 +77,9 @@ pub(crate) const KNOWN_OPERATION_TYPES: &[&str] = &[
     TRIP_PHASE_REMOVED,
     EVENT_ORDER_CONSTRAINT_SET,
     EVENT_ORDER_CONSTRAINT_CLEARED,
+    EDIT_PLAN_REVISION_CREATED,
+    EDIT_PLAN_REVISION_ACTIVATED,
+    EDIT_PLAN_EXPORT_RECORDED,
 ];
 
 pub(crate) fn is_known_operation_type(value: &str) -> bool {
@@ -1658,6 +1664,15 @@ pub(crate) fn materialize_operation(
         EVENT_ORDER_CONSTRAINT_CLEARED => {
             return materialize_event_order_constraint_cleared(transaction, operation);
         }
+        EDIT_PLAN_REVISION_CREATED => {
+            return materialize_edit_plan_revision_created(transaction, operation);
+        }
+        EDIT_PLAN_REVISION_ACTIVATED => {
+            return materialize_edit_plan_revision_activated(transaction, operation);
+        }
+        EDIT_PLAN_EXPORT_RECORDED => {
+            return materialize_edit_plan_export_recorded(transaction, operation);
+        }
         _ => {
             // Unknown operation type: quarantine policy (D01-T007 decision 4).
             // The operation row is already persisted (by the caller's insert
@@ -2341,6 +2356,105 @@ fn materialize_event_order_constraint_set(
             payload.strength,
             payload.source,
             now(),
+        ],
+    )?;
+    advance_revision(transaction, operation)?;
+    Ok(ApplyOperationResult::Applied)
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct EditPlanRevisionCreatedPayload {
+    pub(crate) revision_id: String,
+    pub(crate) script_revision_id: Option<String>,
+    pub(crate) parent_revision_id: Option<String>,
+    pub(crate) operations: Vec<crate::editplan::EditPlanOperation>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct EditPlanRevisionActivatedPayload {
+    pub(crate) revision_id: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct EditPlanExportRecordedPayload {
+    pub(crate) export_id: String,
+    pub(crate) revision_id: String,
+    pub(crate) output_path: String,
+    pub(crate) output_digest: String,
+    pub(crate) exported_at: String,
+}
+
+/// The edit plan rides the `editPlan` aggregate with the project id as the
+/// aggregate id, because activation is a project-level fact and the active
+/// revision is what actually conflicts.
+fn require_edit_plan_aggregate(operation: &ProjectOperation) -> Result<()> {
+    if operation.aggregate_type != "editPlan" || operation.aggregate_id != operation.project_id {
+        bail!("edit plan operations must ride the editPlan aggregate keyed by project id");
+    }
+    Ok(())
+}
+
+fn materialize_edit_plan_revision_created(
+    transaction: &Transaction<'_>,
+    operation: &ProjectOperation,
+) -> Result<ApplyOperationResult> {
+    let payload: EditPlanRevisionCreatedPayload = payload(operation)?;
+    require_edit_plan_aggregate(operation)?;
+    if !revision_guard_passes(transaction, operation)? {
+        return Ok(ApplyOperationResult::Conflict);
+    }
+    // `INSERT OR IGNORE` throughout, so applying the same operation id twice
+    // materializes exactly once.
+    crate::editplan::insert_revision(
+        transaction,
+        &operation.project_id,
+        &payload.revision_id,
+        payload.script_revision_id.as_deref(),
+        payload.parent_revision_id.as_deref(),
+        &now(),
+        &payload.operations,
+    )?;
+    advance_revision(transaction, operation)?;
+    Ok(ApplyOperationResult::Applied)
+}
+
+fn materialize_edit_plan_revision_activated(
+    transaction: &Transaction<'_>,
+    operation: &ProjectOperation,
+) -> Result<ApplyOperationResult> {
+    let payload: EditPlanRevisionActivatedPayload = payload(operation)?;
+    require_edit_plan_aggregate(operation)?;
+    if !revision_guard_passes(transaction, operation)? {
+        return Ok(ApplyOperationResult::Conflict);
+    }
+    crate::editplan::activate_revision(transaction, &payload.revision_id)?;
+    advance_revision(transaction, operation)?;
+    Ok(ApplyOperationResult::Applied)
+}
+
+fn materialize_edit_plan_export_recorded(
+    transaction: &Transaction<'_>,
+    operation: &ProjectOperation,
+) -> Result<ApplyOperationResult> {
+    let payload: EditPlanExportRecordedPayload = payload(operation)?;
+    require_edit_plan_aggregate(operation)?;
+    if !revision_guard_passes(transaction, operation)? {
+        return Ok(ApplyOperationResult::Conflict);
+    }
+    // Append-only: a new export never removes a prior one.
+    transaction.execute(
+        "INSERT OR IGNORE INTO edit_plan_exports(export_id, project_id, revision_id, output_path, output_digest, exported_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            payload.export_id,
+            operation.project_id,
+            payload.revision_id,
+            payload.output_path,
+            payload.output_digest,
+            payload.exported_at,
         ],
     )?;
     advance_revision(transaction, operation)?;

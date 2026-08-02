@@ -7,7 +7,7 @@ use thiserror::Error;
 
 use crate::chronology::forward_migrate_project_chronology;
 
-pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 11;
+pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 12;
 
 const MIGRATION_TABLE_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -149,6 +149,12 @@ pub const PROJECT_CATALOG_MIGRATIONS: &[SqliteMigration] = &[
         name: "pattern_filename_counters",
         source_identity: "project-catalog/0011-pattern-filename-counters/20260803",
         apply: backfill_pattern_filename_counters,
+    },
+    SqliteMigration {
+        id: 12,
+        name: "edit_plan",
+        source_identity: "project-catalog/0012-edit-plan/20260803",
+        apply: add_edit_plan,
     },
 ];
 
@@ -883,6 +889,54 @@ fn add_peer_operation_acknowledgements(transaction: &Transaction<'_>) -> Result<
 /// and nothing emits a bounded epoch until D01-T010, so filling a NULL counter
 /// cannot remove an asset from any epoch's coverage in any catalog that can
 /// exist today.
+/// Migration 12 (D01-T019). The edit-plan model.
+///
+/// Two invariants are enforced by the database rather than by application
+/// discipline: `UNIQUE(revision_id, position)` makes two clips at one position
+/// unrepresentable, and the partial unique index makes two active revisions for
+/// one project unrepresentable.
+///
+/// There is deliberately no `track` column, no `transition` table, and no
+/// `effect` column — not even reserved. That absence is the deliverable.
+fn add_edit_plan(transaction: &Transaction<'_>) -> Result<()> {
+    transaction.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS edit_plan_revisions (
+            revision_id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            script_revision_id TEXT,
+            parent_revision_id TEXT,
+            active INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS edit_plan_operations (
+            operation_id TEXT PRIMARY KEY,
+            revision_id TEXT NOT NULL REFERENCES edit_plan_revisions(revision_id) ON DELETE CASCADE,
+            position INTEGER NOT NULL,
+            asset_id TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+            source_in_seconds REAL NOT NULL,
+            source_out_seconds REAL NOT NULL,
+            rationale TEXT NOT NULL DEFAULT '',
+            UNIQUE(revision_id, position)
+        );
+
+        CREATE TABLE IF NOT EXISTS edit_plan_exports (
+            export_id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            revision_id TEXT NOT NULL REFERENCES edit_plan_revisions(revision_id) ON DELETE CASCADE,
+            output_path TEXT NOT NULL,
+            output_digest TEXT NOT NULL,
+            exported_at TEXT NOT NULL
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS edit_plan_one_active
+        ON edit_plan_revisions(project_id) WHERE active = 1;
+        "#,
+    )?;
+    Ok(())
+}
+
 fn backfill_pattern_filename_counters(transaction: &Transaction<'_>) -> Result<()> {
     let pending: Vec<(String, String)> = {
         let mut statement = transaction.prepare(
