@@ -175,7 +175,11 @@ fn lookup(index: &[(&str, usize)], key: &str) -> Option<usize> {
 /// never inside a bounded range and is affected only by an open-ended epoch on
 /// its sequence. When several epochs match, the most specific one wins — the
 /// greatest `start_counter`, tie-broken by epoch id.
-fn governing_epoch<'a>(
+///
+/// Crate-visible so the explanation surface (D01-T014) names the *same* epoch
+/// the solver actually applied. An explanation that named a different one would
+/// be worse than no explanation.
+pub(crate) fn governing_epoch_for<'a>(
     epochs: &'a [ClockEpoch],
     sequence_id: &str,
     counter: Option<u64>,
@@ -244,7 +248,7 @@ fn solve_asset(
     }
 
     let exception = find_exception(exceptions, exception_index, &asset.asset_id);
-    let epoch = governing_epoch(epochs, &sequence_id, asset.filename_counter);
+    let epoch = governing_epoch_for(epochs, &sequence_id, asset.filename_counter);
 
     // A clip time exception is user authority and overrides the derived
     // hypothesis outright; a clock epoch shifts the raw timestamp.

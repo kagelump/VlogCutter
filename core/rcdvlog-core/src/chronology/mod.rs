@@ -7,11 +7,13 @@
 //! inherit nondeterminism.
 
 pub mod api;
+pub mod explain;
 pub mod model;
 pub mod phases;
 pub mod solver;
 
 pub use api::{ChronologyError, SplitProposal};
+pub use explain::{AppliedCorrection, ChronologyExplanation, QueuePosition};
 pub use model::{
     AssetTimeHypothesis, CaptureSequence, ChronologyFacts, ClipTimeException, ClockEpoch,
     ConstraintStrength, DisplayMode, EventOrderConstraint, PhaseKind, TripPhase,

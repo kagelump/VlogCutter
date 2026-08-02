@@ -28,11 +28,11 @@ pub use cameras::{
     UNKNOWN_CAMERA, identify_camera, pattern_counter,
 };
 pub use chronology::{
-    AssetChronology, AssetTimeHypothesis, CaptureSequence, ChronologyError, ChronologyFacts,
-    ChronologySolution, ClipTimeException, ClockEpoch, ConstraintStrength, Contradiction,
-    ContradictionKind, DisplayMode, DisplayTime, EventOrderConstraint, Evidence, OrderKey,
-    PhaseKind, QuarantinedOperation, SplitProposal, TripPhase, covering_phase, display_time,
-    is_valid_timezone, solve,
+    AppliedCorrection, AssetChronology, AssetTimeHypothesis, CaptureSequence, ChronologyError,
+    ChronologyExplanation, ChronologyFacts, ChronologySolution, ClipTimeException, ClockEpoch,
+    ConstraintStrength, Contradiction, ContradictionKind, DisplayMode, DisplayTime,
+    EventOrderConstraint, Evidence, OrderKey, PhaseKind, QuarantinedOperation, QueuePosition,
+    SplitProposal, TripPhase, covering_phase, display_time, is_valid_timezone, solve,
 };
 pub use diagnostics::{
     Diagnostic, DiagnosticCounts, DiagnosticFilter, DiagnosticRecord, DiagnosticSeverity,
