@@ -17,6 +17,8 @@ pub mod engine;
 #[allow(dead_code)]
 pub mod quality;
 #[allow(dead_code)]
+pub mod store;
+#[allow(dead_code)]
 pub mod windows;
 
 /// Identity of the speech-to-text recipe. Changing any component of the
