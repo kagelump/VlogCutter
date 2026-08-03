@@ -8,8 +8,9 @@
 pub mod audio;
 pub mod coverage;
 pub mod engine;
-// Consumed by `framepack`, which lands next. Remove this allowance with it.
+// `encode_frames` is consumed by `vlm`, which lands after the provider chain.
 #[allow(dead_code)]
+pub mod framepack;
 pub mod frames;
 pub mod quality;
 pub mod store;

@@ -34,6 +34,7 @@ use analysis::store::{StoredTranscript, is_current, load_transcript, save_transc
 use analysis::stt::transcribe_pcm;
 use analysis::whisper_engine::{WhisperEngine, read_pcm};
 
+pub use analysis::framepack::{FramePackManifest, build_frame_pack};
 pub use analysis::store::TranscriptStatus;
 pub use analysis::stt::TranscribeOutcome;
 pub use analysis::{FRAMEPACK_RECIPE_KEY, STT_RECIPE_KEY, STT_TASK_KEY, VLM_PROMPT_VERSION};
