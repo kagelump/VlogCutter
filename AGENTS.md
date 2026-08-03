@@ -28,7 +28,11 @@ Never violate these invariants without explicit user approval:
 - Chronology changes are explicit. Do not silently apply inferred clock or timezone corrections.
 - Rough-cut selection belongs to the later edit-planning stage. Do not add inclusion or source-range controls back to the labeling phase.
 - The accepted finishing target is the latest Resolve release (Resolve 21 in the product decision), while retaining practical compatibility with the user's installed Resolve 20.
-- Local transcription ships (see "Transcription" in section 9). VLM inference, embeddings, and semantic search remain out of scope. Analysis output is a suggestion layer: it never mutates annotations without an explicit accept, and rough-cut selection stays in the edit-planning stage.
+- Local transcription and bounded cloud clip analysis ship (see "Transcription"
+  and "Clip analysis" in section 9). Local VLM inference, embeddings, and
+  semantic search remain out of scope. Analysis output is a suggestion layer:
+  it never overwrites human notes or human-authored labels, and rough-cut
+  selection stays in the edit-planning stage.
 - The desktop must work offline apart from access to its mounted source media. The server is optional and never required to commit local annotations.
 - Server original roots are immutable/read-only. The planned travel archive is a separate future create-only writable logical root, not an exception for existing scan roots.
 - The raw server backend remains loopback-only behind trusted LAN Caddy or Tailscale Serve HTTPS. Never enable Funnel or put credentials in URLs/argv.
@@ -56,6 +60,9 @@ Implemented now:
   generation, and deterministic pure-Rust OTIO writing.
 - Quality-1 thumbnails and 720p H.264/AAC proxies with four concurrent
   VideoToolbox workers on macOS and a one-worker software fallback elsewhere.
+- Proxy-only cloud clip analysis with deterministic frame packs, transcript
+  fusion, bounded observations, provider fallback, operation-backed AI labels,
+  quality-10 representative thumbnails, and explicit label consolidation.
 - Weighted batch progress and ETA with project-persisted rate history.
 - Relative-order “story ribbon” with camera lanes, horizontal scrolling, and zoom.
 - A non-interactive JSON CLI for catalog, clip annotation, chronology, and media operations.
@@ -90,6 +97,8 @@ Important gaps; do not accidentally describe these as complete:
   reassignments, or bounded before/after impact summaries.
 - Web has automated Vitest and Chrome Playwright coverage; desktop React still has no component runner and there is no automated native Tauri UI suite.
 - No macOS signing/notarization or clean-machine packaging acceptance.
+- Clip analysis is CLI-only and requires an explicitly installed OpenRouter
+  key; there is no desktop review/acceptance surface for generated suggestions.
 - Native media playback, filesystem permission prompts, sleep/wake, and NAS-scale behavior remain manual acceptance checks. Resolve import returns as a later edit-planning acceptance check.
 - Ubuntu/Compose, physical NFS/SMB outage behavior, Caddy/Tailscale HTTPS, native pairing/playback, and target resource/thermal acceptance remain unrun; see `docs/tasks/server/ACCEPTANCE_TASK_19.md`.
 
@@ -417,6 +426,49 @@ Three of these correct round-1's projections and should be trusted over them:
    **not** domain-validated against a closed vocabulary the way the design
    requires for model output.
 
+### Clip analysis
+
+Cloud vision analysis is CLI-only and opt-in. It reads proxies, never originals,
+and sends a deterministic pack of JPEG frames plus an accepted speech transcript
+when one is current. The OpenRouter key resolves from `OPENROUTER_API_KEY` or
+`~/.openrouter.key`; it is never stored in a project catalog.
+
+- **Frame recipe**:
+  `framepack.2fps.skip400ms.max40.win3-8.sharp-bright-motion.dhash8-d5.v1`.
+  Candidates begin 400 ms after the start and omit the final 400 ms. Selection
+  is deterministic and combines sharpness, brightness, motion, and dHash
+  diversity into 3–8 frames.
+- **Prompt version**: `vlm.observe.v2`. Every response passes a bounded JSON
+  schema and domain validation. The representative thumbnail must name one of
+  the supplied frame timestamps.
+- **Providers**: Qwen is the default. A process-wide circuit breaker switches
+  the batch to Gemini after repeated transport/provider failures. A
+  domain-invalid default response is retried once with Gemini.
+- **Ownership**: title, description, and AI labels are suggestions. Human notes
+  are never touched; label consolidation remaps only labels recorded in the AI
+  ownership side table and commits the resulting label changes as typed project
+  operations.
+- **Staleness**: analysis is current only for the same frame recipe, prompt
+  version, representation, and proxy fingerprint. Regenerating the proxy makes
+  the observation stale.
+- **Budget/concurrency**: `RCDVLOG_VLM_MAX_COST_USD` is checked before each
+  request against returned provider usage; `RCDVLOG_VLM_WORKERS` defaults to 4.
+  Progress weights are the exact number of selected frames.
+
+**Measured end to end**, 2026-08-04, M3 MacBook Air, four workers, 273-clip
+Osaka/Expo project:
+
+| Measure | Value |
+| --- | --- |
+| Main pending batch | **252 clips in 10 min 29 s** |
+| Final current coverage | **273 / 273** |
+| Failed or rejected | 0 |
+| Transcript fused | 131 clips |
+| Provider fallback | 1 clip (Qwen 429 to Gemini) |
+| Stored analysis cost | **$0.02732851** |
+| Negative controls | 12 / 12 passed; $0.000505 |
+| Consolidated vocabulary | 6 labels; 149 asset mappings |
+
 ### Batch estimation
 
 All long batch work should use `core/batch-estimator`, not an ad hoc ETA. Callers provide work weights, explicit worker count, optional persisted `RateHistory`, and successful per-worker elapsed observations. The estimator balances remaining weights across workers and reports the slowest shard. Failures advance item completion but do not contaminate throughput.
@@ -429,6 +481,7 @@ proxy.h264-720p.orientation-v3.macos-videotoolbox-q36-w{1,2,3,4}-v1
 proxy.h264-720p.orientation-v3                 # server/non-macOS fallback history
 thumbnail.q1.orientation-v2
 stt.whisper-large-v3-turbo-q5_0.vad-silero-v5.win30.v1-w1
+vlm.observe-v2.framepack.2fps.skip400ms.max40.win3-8.sharp-bright-motion.dhash8-d5.v1-w{1,2,3,4}-v1
 ```
 
 Change the task key when settings or concurrency change enough that old throughput is no longer comparable. Proxy and thumbnail weights are source bytes. macOS proxy batches use up to four workers, single-proxy calls and thumbnails use one, and the non-macOS/server proxy path remains one worker. A future cloud/VLM task must pass its real shard concurrency.

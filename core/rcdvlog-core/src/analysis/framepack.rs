@@ -47,6 +47,8 @@ pub fn candidate_command(proxy: &Path, fps: u32, width: usize, height: usize) ->
         .arg("-hide_banner")
         .arg("-loglevel")
         .arg("error")
+        .arg("-ss")
+        .arg(format!("{}.{:03}", SKIP_MS / 1_000, SKIP_MS % 1_000))
         .arg("-i")
         .arg(proxy)
         .arg("-vf")
@@ -113,6 +115,11 @@ pub fn parse_gray_frames(
         .collect()
 }
 
+fn retain_interior_frames(frames: &mut Vec<GrayFrame>, duration_ms: u32) {
+    let last_allowed = duration_ms.saturating_sub(SKIP_MS);
+    frames.retain(|frame| frame.timestamp_ms <= last_allowed);
+}
+
 /// Samples, scores, and selects a clip's frames.
 pub fn build_frame_pack(proxy: &Path, fingerprint: &str) -> Result<FramePackManifest> {
     if !proxy.is_file() {
@@ -129,13 +136,38 @@ pub fn build_frame_pack(proxy: &Path, fingerprint: &str) -> Result<FramePackMani
     if !output.status.success() {
         bail!("ffmpeg frame sampling failed with {}", output.status);
     }
-    let frames = parse_gray_frames(
+    let duration_output = tool_command("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+        ])
+        .arg(proxy)
+        .output()
+        .context("spawn ffprobe frame-pack duration")?;
+    if !duration_output.status.success() {
+        bail!(
+            "ffprobe frame-pack duration failed with {}",
+            duration_output.status
+        );
+    }
+    let duration_ms = String::from_utf8_lossy(&duration_output.stdout)
+        .trim()
+        .parse::<f64>()
+        .context("parse frame-pack duration")?
+        .mul_add(1_000.0, 0.0)
+        .round() as u32;
+    let mut frames = parse_gray_frames(
         &output.stdout,
         WORK_WIDTH,
         WORK_HEIGHT,
         CANDIDATE_FPS,
         SKIP_MS,
     );
+    retain_interior_frames(&mut frames, duration_ms);
     if frames.is_empty() {
         bail!("no frames could be sampled from {}", proxy.display());
     }
@@ -187,6 +219,9 @@ mod tests {
         assert!(rendered.iter().any(|arg| arg.contains("320x180")));
         assert!(rendered.windows(2).any(|pair| pair == ["-pix_fmt", "gray"]));
         assert!(rendered.windows(2).any(|pair| pair == ["-f", "rawvideo"]));
+        let seek = rendered.iter().position(|arg| arg == "-ss").unwrap();
+        let input = rendered.iter().position(|arg| arg == "-i").unwrap();
+        assert!(seek < input, "the first 400 ms must be skipped at input");
     }
 
     #[test]
@@ -241,6 +276,19 @@ mod tests {
     #[test]
     fn empty_input_parses_to_no_frames() {
         assert!(parse_gray_frames(&[], 4, 2, 2, 400).is_empty());
+    }
+
+    #[test]
+    fn the_last_four_hundred_milliseconds_are_dropped() {
+        let mut frames = parse_gray_frames(&[0; 8 * 4], 4, 2, 2, 400);
+        retain_interior_frames(&mut frames, 1_500);
+        assert_eq!(
+            frames
+                .iter()
+                .map(|frame| frame.timestamp_ms)
+                .collect::<Vec<_>>(),
+            vec![400, 900]
+        );
     }
 
     #[test]

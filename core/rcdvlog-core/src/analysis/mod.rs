@@ -6,6 +6,7 @@
 //! stale rather than silently mixed.
 
 pub mod audio;
+pub mod consolidate;
 pub mod coverage;
 pub mod engine;
 pub mod framepack;
@@ -16,6 +17,8 @@ pub mod quality;
 pub mod schema;
 pub mod store;
 pub mod stt;
+pub mod vlm;
+pub mod vlm_store;
 pub mod whisper_engine;
 pub mod windows;
 

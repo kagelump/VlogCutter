@@ -11,6 +11,8 @@
 //! hidden.
 
 use anyhow::{Result, bail};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 /// Cheapest measured option: $0.03 for a 273-clip project.
 pub const DEFAULT_MODEL: &str = "qwen/qwen3.7-flash";
@@ -79,7 +81,7 @@ pub struct VlmResponse {
 }
 
 /// A transport that can run one request against one named model.
-pub trait VlmProvider {
+pub trait VlmProvider: Send + Sync {
     fn analyze(&self, model: &str, request: &VlmRequest) -> Result<VlmResponse>;
 }
 
@@ -93,9 +95,9 @@ pub struct ChainOutcome {
 }
 
 /// Default → fallback → breaker, for the lifetime of one process.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct ProviderChain {
-    default_failures: u32,
+    default_failures: Arc<AtomicU32>,
 }
 
 impl ProviderChain {
@@ -105,11 +107,11 @@ impl ProviderChain {
 
     /// Once tripped the default model is not attempted again in this process.
     pub fn breaker_tripped(&self) -> bool {
-        self.default_failures >= BREAKER_THRESHOLD
+        self.default_failures() >= BREAKER_THRESHOLD
     }
 
     pub fn default_failures(&self) -> u32 {
-        self.default_failures
+        self.default_failures.load(Ordering::Relaxed)
     }
 
     /// The model this chain would try first right now.
@@ -127,7 +129,7 @@ impl ProviderChain {
     /// 429 does: both mean this model did not produce a usable answer, and both
     /// should push toward the model that does.
     pub fn analyze(
-        &mut self,
+        &self,
         provider: &dyn VlmProvider,
         request: &VlmRequest,
     ) -> Result<ChainOutcome> {
@@ -143,7 +145,7 @@ impl ProviderChain {
                     // The breaker already routed here; there is nowhere else to go.
                     return Err(first_error);
                 }
-                self.default_failures += 1;
+                self.default_failures.fetch_add(1, Ordering::Relaxed);
                 match provider.analyze(FALLBACK_MODEL, request) {
                     Ok(response) => Ok(ChainOutcome {
                         response,
@@ -161,33 +163,33 @@ impl ProviderChain {
 
     /// Records a failure attributable to the default model that did not come
     /// from the transport — a domain-invalid response, for instance.
-    pub fn record_default_failure(&mut self) {
-        self.default_failures += 1;
+    pub fn record_default_failure(&self) {
+        self.default_failures.fetch_add(1, Ordering::Relaxed);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::RefCell;
+    use std::sync::Mutex;
 
     struct ScriptedProvider {
         failing: Vec<&'static str>,
-        calls: RefCell<Vec<String>>,
+        calls: Mutex<Vec<String>>,
     }
 
     impl ScriptedProvider {
         fn new(failing: Vec<&'static str>) -> Self {
             Self {
                 failing,
-                calls: RefCell::new(Vec::new()),
+                calls: Mutex::new(Vec::new()),
             }
         }
     }
 
     impl VlmProvider for ScriptedProvider {
         fn analyze(&self, model: &str, _request: &VlmRequest) -> Result<VlmResponse> {
-            self.calls.borrow_mut().push(model.to_string());
+            self.calls.lock().unwrap().push(model.to_string());
             if self.failing.contains(&model) {
                 bail!("upstream 429");
             }
@@ -205,18 +207,18 @@ mod tests {
     #[test]
     fn the_default_model_serves_when_it_works() {
         let scripted = ScriptedProvider::new(vec![]);
-        let mut chain = ProviderChain::new();
+        let chain = ProviderChain::new();
         let outcome = chain.analyze(&scripted, &VlmRequest::default()).unwrap();
         assert_eq!(outcome.response.model, DEFAULT_MODEL);
         assert_eq!(outcome.attempts, 1);
         assert!(!outcome.fell_back);
-        assert_eq!(*scripted.calls.borrow(), vec![DEFAULT_MODEL]);
+        assert_eq!(*scripted.calls.lock().unwrap(), vec![DEFAULT_MODEL]);
     }
 
     #[test]
     fn a_failure_falls_back_once_and_records_the_serving_model() {
         let scripted = ScriptedProvider::new(vec![DEFAULT_MODEL]);
-        let mut chain = ProviderChain::new();
+        let chain = ProviderChain::new();
         let outcome = chain.analyze(&scripted, &VlmRequest::default()).unwrap();
         assert_eq!(outcome.response.model, FALLBACK_MODEL);
         assert_eq!(outcome.attempts, 2);
@@ -226,7 +228,7 @@ mod tests {
     #[test]
     fn both_failing_is_an_error_naming_both_models() {
         let scripted = ScriptedProvider::new(vec![DEFAULT_MODEL, FALLBACK_MODEL]);
-        let mut chain = ProviderChain::new();
+        let chain = ProviderChain::new();
         let error = chain
             .analyze(&scripted, &VlmRequest::default())
             .unwrap_err()
@@ -238,23 +240,23 @@ mod tests {
     #[test]
     fn ten_default_failures_flip_the_default_for_the_rest_of_the_process() {
         let scripted = ScriptedProvider::new(vec![DEFAULT_MODEL]);
-        let mut chain = ProviderChain::new();
+        let chain = ProviderChain::new();
         for _ in 0..BREAKER_THRESHOLD {
             chain.analyze(&scripted, &VlmRequest::default()).unwrap();
         }
         assert!(chain.breaker_tripped());
         assert_eq!(chain.current_default(), FALLBACK_MODEL);
 
-        scripted.calls.borrow_mut().clear();
+        scripted.calls.lock().unwrap().clear();
         chain.analyze(&scripted, &VlmRequest::default()).unwrap();
         // The default model is not attempted at all any more.
-        assert_eq!(*scripted.calls.borrow(), vec![FALLBACK_MODEL]);
+        assert_eq!(*scripted.calls.lock().unwrap(), vec![FALLBACK_MODEL]);
     }
 
     #[test]
     fn the_breaker_does_not_trip_below_the_threshold() {
         let scripted = ScriptedProvider::new(vec![DEFAULT_MODEL]);
-        let mut chain = ProviderChain::new();
+        let chain = ProviderChain::new();
         for _ in 0..BREAKER_THRESHOLD - 1 {
             chain.analyze(&scripted, &VlmRequest::default()).unwrap();
         }
@@ -264,7 +266,7 @@ mod tests {
 
     #[test]
     fn a_domain_rejection_can_be_charged_to_the_default_model() {
-        let mut chain = ProviderChain::new();
+        let chain = ProviderChain::new();
         for _ in 0..BREAKER_THRESHOLD {
             chain.record_default_failure();
         }
@@ -272,16 +274,27 @@ mod tests {
     }
 
     #[test]
+    fn cloned_chains_share_one_process_wide_breaker() {
+        let chain = ProviderChain::new();
+        let worker = chain.clone();
+        for _ in 0..BREAKER_THRESHOLD {
+            worker.record_default_failure();
+        }
+        assert!(chain.breaker_tripped());
+        assert_eq!(chain.current_default(), FALLBACK_MODEL);
+    }
+
+    #[test]
     fn once_the_breaker_is_tripped_a_fallback_failure_is_not_retried() {
         let scripted = ScriptedProvider::new(vec![FALLBACK_MODEL]);
-        let mut chain = ProviderChain::new();
+        let chain = ProviderChain::new();
         for _ in 0..BREAKER_THRESHOLD {
             chain.record_default_failure();
         }
-        scripted.calls.borrow_mut().clear();
+        scripted.calls.lock().unwrap().clear();
         assert!(chain.analyze(&scripted, &VlmRequest::default()).is_err());
         assert_eq!(
-            scripted.calls.borrow().len(),
+            scripted.calls.lock().unwrap().len(),
             1,
             "a tripped breaker must not double-request the fallback"
         );

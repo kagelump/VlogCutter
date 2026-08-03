@@ -76,6 +76,8 @@ export interface Asset {
   thumbnailPath: string | null;
   thumbnailQuality: number;
   notes: string;
+  title: string;
+  description: string;
   labels: string[];
   removed: boolean;
   mediaObjectId: string | null;

@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use crate::analysis::provider::{VlmProvider, VlmRequest, VlmResponse};
+use crate::analysis::provider::{FALLBACK_MODEL, VlmProvider, VlmRequest, VlmResponse};
 
 const DEFAULT_BASE_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
@@ -69,6 +69,11 @@ pub fn frame_data_uri(bytes: &[u8]) -> String {
 
 /// Builds the request body. Pure, so the wire contract is testable offline.
 pub fn build_request_body(model: &str, prompt: &str, frames: &[String], schema: &Value) -> Value {
+    let schema = if model == FALLBACK_MODEL {
+        gemini_compatible_schema(schema.clone())
+    } else {
+        schema.clone()
+    };
     let mut content = vec![json!({"type": "text", "text": prompt})];
     for frame in frames {
         content.push(json!({"type": "image_url", "image_url": {"url": frame}}));
@@ -91,6 +96,70 @@ pub fn build_request_body(model: &str, prompt: &str, frames: &[String], schema: 
             }
         }
     })
+}
+
+/// Google AI Studio's OpenRouter adapter currently turns numeric JSON-Schema
+/// enums into string enums. Remove only those enums for Gemini; the integer type
+/// remains structural and the domain validator still requires membership in the
+/// exact supplied frame pack. String enums and array bounds remain untouched.
+fn gemini_compatible_schema(mut value: Value) -> Value {
+    if let Some(thumbnail) = value
+        .get_mut("properties")
+        .and_then(|properties| properties.get_mut("thumbnailTimestampMs"))
+    {
+        let mut allowed = thumbnail["anyOf"][0]["enum"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_u64)
+            .map(|timestamp| Value::String(timestamp.to_string()))
+            .collect::<Vec<_>>();
+        allowed.push(Value::String("none".to_string()));
+        *thumbnail = json!({
+            "type": "string",
+            "enum": allowed,
+            "description": "Choose exactly one supplied frame timestamp as a decimal string, or 'none'."
+        });
+    }
+    match &mut value {
+        Value::Object(object) => {
+            let remove_numeric_enum = object
+                .get("enum")
+                .and_then(Value::as_array)
+                .is_some_and(|values| values.iter().any(Value::is_number));
+            if remove_numeric_enum {
+                object.remove("enum");
+            }
+            for child in object.values_mut() {
+                *child = gemini_compatible_schema(child.take());
+            }
+        }
+        Value::Array(values) => {
+            for child in values {
+                *child = gemini_compatible_schema(child.take());
+            }
+        }
+        _ => {}
+    }
+    value
+}
+
+fn normalize_gemini_content(content: String) -> Result<String> {
+    let mut value: Value = serde_json::from_str(&content).context("decode Gemini JSON content")?;
+    if let Some(thumbnail) = value.get_mut("thumbnailTimestampMs")
+        && let Some(text) = thumbnail.as_str()
+    {
+        *thumbnail = if matches!(text, "none" | "null") {
+            Value::Null
+        } else {
+            Value::Number(
+                text.parse::<u64>()
+                    .context("parse Gemini thumbnail timestamp")?
+                    .into(),
+            )
+        };
+    }
+    serde_json::to_string(&value).context("encode normalized Gemini content")
 }
 
 pub struct OpenRouterProvider {
@@ -163,9 +232,13 @@ impl VlmProvider for OpenRouterProvider {
 
         let payload: Value = response.json().context("decode OpenRouter response")?;
         let (prompt_tokens, completion_tokens, cost_usd) = extract_usage(&payload);
+        let mut content = extract_content(&payload)?;
+        if model == FALLBACK_MODEL {
+            content = normalize_gemini_content(content)?;
+        }
         Ok(VlmResponse {
             model: model.to_string(),
-            body: extract_content(&payload)?,
+            body: content,
             prompt_tokens,
             completion_tokens,
             cost_usd,
@@ -213,6 +286,41 @@ mod tests {
             .filter(|part| part["type"] == "image_url")
             .count();
         assert_eq!(images, 5);
+    }
+
+    #[test]
+    fn gemini_keeps_string_enums_and_array_bounds_but_drops_numeric_enums() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "stamp": {"type": "integer", "enum": [400, 900]},
+                "movement": {"type": "string", "enum": ["pan", "other"]},
+                "labels": {"type": "array", "maxItems": 5, "items": {"type": "string"}}
+            }
+        });
+        let body = build_request_body(FALLBACK_MODEL, "p", &[], &schema);
+        let translated = &body["response_format"]["json_schema"]["schema"];
+        assert!(translated["properties"]["stamp"]["enum"].is_null());
+        assert_eq!(
+            translated["properties"]["movement"]["enum"],
+            json!(["pan", "other"])
+        );
+        assert_eq!(translated["properties"]["labels"]["maxItems"], 5);
+    }
+
+    #[test]
+    fn gemini_thumbnail_strings_normalize_to_the_canonical_domain_shape() {
+        let normalized = normalize_gemini_content(
+            r#"{"thumbnailTimestampMs":"2500","usable":true}"#.to_string(),
+        )
+        .unwrap();
+        let value: Value = serde_json::from_str(&normalized).unwrap();
+        assert_eq!(value["thumbnailTimestampMs"], 2_500);
+        let none = normalize_gemini_content(
+            r#"{"thumbnailTimestampMs":"none","usable":false}"#.to_string(),
+        )
+        .unwrap();
+        assert!(serde_json::from_str::<Value>(&none).unwrap()["thumbnailTimestampMs"].is_null());
     }
 
     #[test]

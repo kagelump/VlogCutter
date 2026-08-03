@@ -29,6 +29,8 @@ function asset(overrides: Partial<Asset> & { id: string }): Asset {
     thumbnailPath: null,
     thumbnailQuality: 0,
     notes: "",
+    title: "",
+    description: "",
     labels: [],
     removed: false,
     mediaObjectId: null,

@@ -47,7 +47,8 @@ pub enum UnusableReason {
 }
 
 /// One clip as the model observed it.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ClipObservation {
     pub title: String,
     pub description: String,
@@ -64,13 +65,9 @@ pub struct ClipObservation {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RawObservation {
-    #[serde(default)]
     title: String,
-    #[serde(default)]
     description: String,
-    #[serde(default)]
     labels: Vec<String>,
-    #[serde(default = "default_true")]
     usable: bool,
     #[serde(default)]
     unusable_reason: Option<String>,
@@ -80,14 +77,8 @@ struct RawObservation {
     best_moment_end_ms: Option<i64>,
     #[serde(default)]
     thumbnail_timestamp_ms: Option<i64>,
-    #[serde(default)]
-    camera_movement: Option<String>,
-    #[serde(default)]
+    camera_movement: String,
     ocr_text: Vec<String>,
-}
-
-fn default_true() -> bool {
-    true
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -214,13 +205,11 @@ pub fn validate(
         });
     }
 
-    let camera_movement = match parsed.camera_movement.as_deref() {
-        None => CameraMovement::Other,
-        Some(value) => parse_camera_movement(value).ok_or(DomainError::UnknownEnum {
+    let camera_movement =
+        parse_camera_movement(&parsed.camera_movement).ok_or_else(|| DomainError::UnknownEnum {
             field: "cameraMovement",
-            value: value.to_string(),
-        })?,
-    };
+            value: parsed.camera_movement.clone(),
+        })?;
 
     let unusable_reason = match parsed.unusable_reason.as_deref() {
         None | Some("") => None,
@@ -292,16 +281,18 @@ pub fn output_schema(frame_timestamps: &[u32], clip_duration_ms: u32) -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["title", "description", "labels", "usable", "cameraMovement", "ocrText"],
+        // Gemini's structured-output dialect requires every declared property
+        // to appear in `required`; optional values are represented as nullable.
+        "required": ["title", "description", "labels", "usable", "unusableReason",
+                     "bestMomentStartMs", "bestMomentEndMs", "thumbnailTimestampMs",
+                     "cameraMovement", "ocrText"],
         "properties": {
             "title": {
                 "type": "string",
-                "maxLength": MAX_TITLE_CHARS,
                 "description": "A short English title, 3-6 words. English regardless of the language shown."
             },
             "description": {
                 "type": "string",
-                "maxLength": MAX_DESCRIPTION_CHARS,
                 "description": "Two or three English sentences describing what is visible."
             },
             "labels": {
@@ -315,8 +306,10 @@ pub fn output_schema(frame_timestamps: &[u32], clip_duration_ms: u32) -> Value {
                 "description": "False if the frames are black, blank, or unreadable."
             },
             "unusableReason": {
-                "type": ["string", "null"],
-                "enum": ["black", "blurry", "noise", "overexposed", "other", null]
+                "anyOf": [
+                    {"type": "string", "enum": ["black", "blurry", "noise", "overexposed", "other"]},
+                    {"type": "null"}
+                ]
             },
             "bestMomentStartMs": {
                 "type": ["integer", "null"],
@@ -329,12 +322,13 @@ pub fn output_schema(frame_timestamps: &[u32], clip_duration_ms: u32) -> Value {
                 "maximum": clip_duration_ms
             },
             "thumbnailTimestampMs": {
-                "type": ["integer", "null"],
-                "enum": frame_timestamps
-                    .iter()
-                    .map(|stamp| json!(stamp))
-                    .chain(std::iter::once(Value::Null))
-                    .collect::<Vec<Value>>(),
+                "anyOf": [
+                    {
+                        "type": "integer",
+                        "enum": frame_timestamps.iter().map(|stamp| json!(stamp)).collect::<Vec<Value>>()
+                    },
+                    {"type": "null"}
+                ],
                 "description": "Must be exactly one of the supplied frame timestamps."
             },
             "cameraMovement": {
@@ -495,6 +489,13 @@ mod tests {
     }
 
     #[test]
+    fn the_schema_omits_max_length_for_gemini_compatibility() {
+        let schema = output_schema(&[400], 12_000);
+        assert!(schema["properties"]["title"]["maxLength"].is_null());
+        assert!(schema["properties"]["description"]["maxLength"].is_null());
+    }
+
+    #[test]
     fn the_schema_does_not_offer_a_landmark_field() {
         let schema = output_schema(&[400], 12_000);
         assert!(schema["properties"]["landmarkCandidates"].is_null());
@@ -503,7 +504,7 @@ mod tests {
     #[test]
     fn the_schema_constrains_the_thumbnail_to_the_supplied_frames() {
         let schema = output_schema(&[400, 2_500], 12_000);
-        let allowed = schema["properties"]["thumbnailTimestampMs"]["enum"]
+        let allowed = schema["properties"]["thumbnailTimestampMs"]["anyOf"][0]["enum"]
             .as_array()
             .unwrap()
             .clone();

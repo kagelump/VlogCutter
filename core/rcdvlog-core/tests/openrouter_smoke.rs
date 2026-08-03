@@ -19,8 +19,8 @@ const SMOKE_PROMPT: &str = "Describe this video clip from the supplied frames. \
      usable to false and give an unusableReason.";
 
 use rcdvlog_core::{
-    OpenRouterProvider, ProviderChain, VlmRequest, build_frame_pack, encode_frames, frame_data_uri,
-    output_schema, resolve_api_key, validate_observation,
+    DEFAULT_MODEL, OpenRouterProvider, ProviderChain, VlmProvider, VlmRequest, build_frame_pack,
+    encode_frames, frame_data_uri, output_schema, resolve_api_key, validate_observation,
 };
 
 #[test]
@@ -44,17 +44,39 @@ fn one_real_clip_round_trips_through_the_default_model() {
 
     let key = resolve_api_key().expect("resolve API key");
     let provider = OpenRouterProvider::new(key).expect("client");
-    let mut chain = ProviderChain::new();
+    let chain = ProviderChain::new();
 
     let clip_duration_ms = 12_000;
-    let schema = output_schema(&manifest.timestamps_ms, clip_duration_ms);
+    let simple_schema = std::env::var("RCDVLOG_VLM_SIMPLE_SCHEMA").as_deref() == Ok("1");
+    let schema = if simple_schema {
+        serde_json::json!({
+            "type": "object",
+            "properties": {"title": {"type": "string"}},
+            "required": ["title"],
+            "additionalProperties": false
+        })
+    } else {
+        output_schema(&manifest.timestamps_ms, clip_duration_ms)
+    };
     let request = VlmRequest {
         prompt: SMOKE_PROMPT.to_string(),
         frames,
         schema: schema.clone(),
     };
 
-    let outcome = chain.analyze(&provider, &request).expect("provider chain");
+    let requested_model = std::env::var("RCDVLOG_VLM_MODEL").ok();
+    let outcome = if let Some(model) = requested_model {
+        let response = provider
+            .analyze(&model, &request)
+            .expect("selected provider");
+        rcdvlog_core::ChainOutcome {
+            response,
+            attempts: 1,
+            fell_back: model != DEFAULT_MODEL,
+        }
+    } else {
+        chain.analyze(&provider, &request).expect("provider chain")
+    };
     println!("served by:  {}", outcome.response.model);
     println!("fell back:  {}", outcome.fell_back);
     println!("tokens:     {} in", outcome.response.prompt_tokens);
@@ -62,6 +84,10 @@ fn one_real_clip_round_trips_through_the_default_model() {
     println!("latency:    {} ms", outcome.response.latency_ms);
     println!("raw body:   {}", outcome.response.body);
 
+    if simple_schema {
+        assert!(outcome.response.body.contains("title"));
+        return;
+    }
     let observation = validate_observation(
         &outcome.response.body,
         &manifest.timestamps_ms,
