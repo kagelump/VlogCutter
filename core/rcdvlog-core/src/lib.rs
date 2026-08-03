@@ -36,7 +36,7 @@ use analysis::whisper_engine::{WhisperEngine, read_pcm};
 
 pub use analysis::store::TranscriptStatus;
 pub use analysis::stt::TranscribeOutcome;
-pub use analysis::{STT_RECIPE_KEY, STT_TASK_KEY};
+pub use analysis::{FRAMEPACK_RECIPE_KEY, STT_RECIPE_KEY, STT_TASK_KEY, VLM_PROMPT_VERSION};
 pub use cameras::{
     CAMERA_PATTERNS, CameraIdentity, CameraIdentitySource, CameraPattern, PatternConfidence,
     UNKNOWN_CAMERA, identify_camera, pattern_counter,
