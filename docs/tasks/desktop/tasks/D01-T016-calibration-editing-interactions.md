@@ -7,12 +7,12 @@
   "epic_id": "D01",
   "title": "Calibration editing interactions and impact preview",
   "slug": "calibration-editing-interactions",
-  "status": "complete",
+  "status": "blocked",
   "task_class": "implementation",
   "depends_on": ["D01-T015"],
   "principal_invariant": "No chronology change reaches the catalog without an explicit user apply, and the impact preview shown before apply matches exactly what apply produces.",
   "central_falsification": "Drag an offset across a range, record the previewed impact, apply, and diff the actual derived-time changes against the preview; any difference, and any catalog change observed before apply, falsifies the interaction.",
-  "architecture_decisions_frozen": false,
+  "architecture_decisions_frozen": true,
   "load_bearing_seams": ["calibration interaction -> chronology operations"],
   "documents_by_role": {
     "contract_editor": ["docs/tasks/desktop/CHRONOLOGY_MODEL.md", "docs/tasks/desktop/ARCHITECTURE.md"],
@@ -52,6 +52,17 @@
   ]
 }
 -->
+
+## Current implementation checkpoint
+
+The desktop can preview and explicitly apply one counter-ranged clock epoch,
+clear an epoch, and accept a proposed split. The core/Tauri client already
+exposes merge, clip-exception, trip-phase, and event-order methods, but the UI
+does not. The current preview reports contradictions only, not the exact bounded
+asset ids and before/after values promised by this packet. Clear and split also
+bypass the common preview/queue-anchor flow. Finish D01-T015 first, then complete
+all scopes and route every chronology mutation through one tested preview,
+confirm, apply, refresh, and resume path.
 
 ## Goal
 
@@ -284,8 +295,7 @@ contradiction behavior, the queue resumption result, and the keyboard-only walkt
 result. Include a screenshot of the impact panel before an apply. List any stop
 condition encountered. The implementer does not approve this task.
 
-## Promotion note
+## Readiness note
 
-`draft` until D01-T015 completes. The contract editor confirms that
-`preview_clock_epoch` and `preview_contradictions` are available and share the apply
-path before promoting, since the principal invariant depends on it.
+Blocked on D01-T015. The core and Tauri mutation vocabulary is already present;
+this packet resumes once the expanded view supplies its stable interaction surface.

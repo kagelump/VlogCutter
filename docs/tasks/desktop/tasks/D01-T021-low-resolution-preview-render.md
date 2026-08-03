@@ -7,12 +7,12 @@
   "epic_id": "D01",
   "title": "Low-resolution preview render",
   "slug": "low-resolution-preview-render",
-  "status": "complete",
+  "status": "ready",
   "task_class": "implementation",
-  "depends_on": ["D01-T020"],
+  "depends_on": [],
   "principal_invariant": "A rendered preview contains the plan's clips, in the plan's order, with each clip's source range, and a total duration matching the plan within one frame.",
   "central_falsification": "Render a plan built from clips with distinguishable content, then probe the output and sample frames to confirm order, per-clip durations, and total duration against the plan computed independently.",
-  "architecture_decisions_frozen": false,
+  "architecture_decisions_frozen": true,
   "load_bearing_seams": ["validated edit plan -> FFmpeg preview job"],
   "documents_by_role": {
     "contract_editor": ["docs/tasks/desktop/EDIT_PLAN_MODEL.md", "docs/tasks/desktop/ARCHITECTURE.md"],
@@ -44,6 +44,16 @@
   ]
 }
 -->
+
+## Current implementation checkpoint
+
+The core renders per-clip H.264/AAC segments, concatenates successful segments,
+publishes the final file atomically, and emits progress. Completion is not yet
+established: there is no real-media preview test, output probe, cancellation
+command, or interruption test; the Tauri command runs synchronously instead of
+using `spawn_blocking`; and ETA is ad hoc rather than `batch-estimator`. Finish
+those runtime and media-boundary requirements without changing the frozen preview
+recipe silently.
 
 ## Goal
 
@@ -262,9 +272,7 @@ event sequence, and confirmation that media was untouched. State whether resumpt
 implemented or the render restarts cleanly. List any stop condition encountered. The
 implementer does not approve this task.
 
-## Promotion note
+## Readiness note
 
-`draft` until D01-T019 publishes `docs/tasks/desktop/EDIT_PLAN_MODEL.md` and D01-T020
-lands validation. The contract editor confirms `ValidationReport::renderable()` is
-available before promoting, since the frozen decision that validation precedes render
-depends on it.
+Ready. Validation and the initial render pipeline exist; the checkpoint isolates
+runtime safety, shared ETA, cancellation, and real-media acceptance as the remainder.

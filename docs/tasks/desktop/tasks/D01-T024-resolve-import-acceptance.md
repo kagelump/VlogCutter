@@ -7,9 +7,9 @@
   "epic_id": "D01",
   "title": "DaVinci Resolve 20/21 import acceptance",
   "slug": "resolve-import-acceptance",
-  "status": "draft",
+  "status": "blocked",
   "task_class": "qa",
-  "depends_on": ["D01-T023"],
+  "depends_on": ["D01-T022", "D01-T023"],
   "principal_invariant": "The exported OTIO timeline opens in DaVinci Resolve 20 or 21 with source references, in and out points, clip order, and clip names intact.",
   "central_falsification": "Import the exported timeline into the installed Resolve and compare every clip's resolved source file, timecode in and out, timeline position, and name against the edit plan read independently through the CLI.",
   "architecture_decisions_frozen": true,
@@ -44,6 +44,13 @@
   ]
 }
 -->
+
+## Current implementation checkpoint
+
+No Resolve 20/21 import has been run. This manual gate remains blocked on the
+OTIO golden/cross-process evidence in D01-T022 and the complete export workflow
+in D01-T023. When unblocked, use an export produced through the shipped desktop
+surface and record exact source, order, and range comparisons.
 
 ## Goal
 

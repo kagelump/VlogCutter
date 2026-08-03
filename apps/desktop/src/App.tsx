@@ -2151,6 +2151,7 @@ function App() {
               // A correction can reorder hundreds of clips; resume where the
               // user was rather than snapping them back to the top.
               onQueueResumed={(assetId) => setSelectedId(assetId)}
+              onChronologyChanged={() => refreshAssets(projectId)}
             />
           )}
           {chronologyDrawer === "editPlan" && (

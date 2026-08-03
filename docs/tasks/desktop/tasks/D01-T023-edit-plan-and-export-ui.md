@@ -7,12 +7,12 @@
   "epic_id": "D01",
   "title": "Edit-plan and export desktop UI",
   "slug": "edit-plan-and-export-ui",
-  "status": "complete",
+  "status": "blocked",
   "task_class": "implementation",
   "depends_on": ["D01-T021", "D01-T022"],
   "principal_invariant": "A user can build a plan from their included clips, see its validation findings and staleness, render a preview, and export a timeline, without any invalid plan reaching render or export.",
   "central_falsification": "Drive the whole surface with a plan containing an offline original and a stale script revision, and confirm the error blocks render and export while the warning does not, and that no output file is produced for the blocked case.",
-  "architecture_decisions_frozen": false,
+  "architecture_decisions_frozen": true,
   "load_bearing_seams": ["edit plan core surface -> desktop edit plan UI"],
   "documents_by_role": {
     "contract_editor": ["docs/tasks/desktop/EDIT_PLAN_MODEL.md", "docs/tasks/desktop/ARCHITECTURE.md"],
@@ -52,6 +52,15 @@
   ]
 }
 -->
+
+## Current implementation checkpoint
+
+`EditPlanPanel.tsx` can seed or rebuild a full-range plan from non-removed clips,
+show validation findings, start a preview, display progress text, and request an
+OTIO export. It cannot reorder, trim, remove, or save an edited operation list;
+show script staleness; play the preview; show revisions or export history; use a
+native save dialog; or confirm a digest-guarded overwrite. It also has no pure
+plan helper or component tests. Resume after D01-T021 and D01-T022 are complete.
 
 ## Goal
 
@@ -271,7 +280,7 @@ the keyboard-only walkthrough result. Include screenshots of the plan surface, a
 validation report with a blocked export, and the export history. List any stop condition
 encountered. The implementer does not approve this task.
 
-## Promotion note
+## Readiness note
 
-`draft` until D01-T021 and D01-T022 complete. The contract editor confirms the preview
-progress contract and the export digest guard are available before promoting.
+Blocked on D01-T021 and D01-T022. The initial panel is retained as the starting
+point; complete the editor and export UX once its media/export contracts are gated.

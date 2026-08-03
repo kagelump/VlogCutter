@@ -7,12 +7,12 @@
   "epic_id": "D01",
   "title": "Chronology CLI surface",
   "slug": "chronology-cli-surface",
-  "status": "complete",
+  "status": "ready",
   "task_class": "implementation",
-  "depends_on": ["D01-T014", "D01-T027"],
+  "depends_on": [],
   "principal_invariant": "The CLI reports the same total order and the same derived times as the desktop for the same catalog.",
   "central_falsification": "Produce the ordered asset list and derived times through both the desktop command layer and the CLI for the same catalog, including after a chronology change, and diff them.",
-  "architecture_decisions_frozen": false,
+  "architecture_decisions_frozen": true,
   "load_bearing_seams": ["chronology solution -> CLI JSON envelope"],
   "documents_by_role": {
     "contract_editor": ["docs/tasks/desktop/CHRONOLOGY_MODEL.md", "docs/tasks/desktop/ARCHITECTURE.md"],
@@ -49,6 +49,15 @@
   ]
 }
 -->
+
+## Current implementation checkpoint
+
+All eight read commands and diagnostics list/acknowledge are implemented and
+share the core solver. The packet remains open because none of those public CLI
+commands has a process-level JSON contract test, the desktop/CLI order comparison
+is not automated, and the documented stable error cases are unverified. Preserve
+the command shapes; close the task with the missing cross-boundary tests and
+`docs/agent-cli.md` command reference.
 
 ## Goal
 
@@ -254,8 +263,7 @@ evidence, the error codes per failure path, and confirmation that `clock apply` 
 unchanged. List any stop condition encountered. The implementer does not approve this
 task.
 
-## Promotion note
+## Readiness note
 
-`draft` until D01-T014 completes. The contract editor confirms the core exposes
-everything these commands need, so the forbidden-core constraint does not force a
-stop during implementation.
+Ready. The commands and core reads exist; this packet is now bounded to public
+JSON/error contracts, cross-surface comparison, and documentation.

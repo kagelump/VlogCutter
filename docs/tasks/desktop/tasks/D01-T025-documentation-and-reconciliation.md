@@ -7,9 +7,9 @@
   "epic_id": "D01",
   "title": "Documentation and planning reconciliation",
   "slug": "documentation-and-reconciliation",
-  "status": "draft",
+  "status": "blocked",
   "task_class": "integration",
-  "depends_on": ["D01-T018", "D01-T024"],
+  "depends_on": ["D01-T018", "D01-T024", "D01-T029", "D01-T030"],
   "principal_invariant": "Every canonical document describes what the repository actually does, with no capability claimed that no packet delivered and no delivered capability left undocumented.",
   "central_falsification": "For each capability in the PRD section 21.2 launch-critical list, locate both the code that implements it and the acceptance evidence for it; any claim without both, or any shipped capability absent from the documents, falsifies the reconciliation.",
   "architecture_decisions_frozen": true,
@@ -59,6 +59,14 @@
   ]
 }
 -->
+
+## Current implementation checkpoint
+
+The completion review corrected the top-level implementation checkpoints in
+`AGENTS.md`, `README.md`, `PRD.md`, `docs/agent-cli.md`, and
+`docs/integration-testing.md` so they no longer describe the new domain code as
+absent. Final user documentation, acceptance verdicts, packet reconciliation,
+and epic closure remain blocked on every dependency above.
 
 ## Goal
 

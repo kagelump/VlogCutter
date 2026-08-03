@@ -516,11 +516,20 @@ pub fn activate_edit_plan_revision(
     expected_active_revision_id: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<EditPlanRevision, String> {
-    let revision = state
-        .catalog()?
+    let catalog = state.catalog()?;
+    let candidate = catalog
+        .edit_plan_revision(&revision_id)
+        .map_err(error_message)?;
+    if candidate.project_id != project_id {
+        return Err(format!(
+            "edit plan revision {revision_id} belongs to project {}, not {project_id}",
+            candidate.project_id
+        ));
+    }
+    let revision = catalog
         .activate_edit_plan_revision(&revision_id, expected_active_revision_id.as_deref())
         .map_err(error_message)?;
-    state.sync_manager.wake_project(&project_id);
+    state.sync_manager.wake_project(&revision.project_id);
     Ok(revision)
 }
 
@@ -572,8 +581,17 @@ pub fn export_edit_plan_otio(
     timeline_name: String,
     state: State<'_, AppState>,
 ) -> Result<OtioExportResult, String> {
-    let result = state
-        .catalog()?
+    let catalog = state.catalog()?;
+    let revision = catalog
+        .edit_plan_revision(&revision_id)
+        .map_err(error_message)?;
+    if revision.project_id != project_id {
+        return Err(format!(
+            "edit plan revision {revision_id} belongs to project {}, not {project_id}",
+            revision.project_id
+        ));
+    }
+    let result = catalog
         .export_otio(&OtioExportRequest {
             revision_id,
             output_path,
@@ -581,6 +599,6 @@ pub fn export_edit_plan_otio(
             timeline_name,
         })
         .map_err(error_message)?;
-    state.sync_manager.wake_project(&project_id);
+    state.sync_manager.wake_project(&revision.project_id);
     Ok(result)
 }

@@ -50,6 +50,8 @@ These checks require the actual Mac/Ubuntu/NAS/LAN/Tailscale topology and remain
 - Exercise macOS dialogs, filesystem permissions, native asset-protocol playback, sleep/wake, and clean-machine packaging.
 - Run periodic thousands-of-assets/roughly-100-hour NAS acceptance. The real Expo source fixture is never an automated destructive target.
 
-DaVinci Resolve/OTIO acceptance returns only when the later edit-planning/export stage is implemented.
+The pure-Rust OTIO writer is implemented and covered by deterministic unit
+tests. DaVinci Resolve 20/21 import remains a manual desktop MVP release gate;
+headless tests do not establish editor compatibility.
 
 The authoritative last-run matrix, including every “not run” reason and residual risk, is [Task 19 acceptance](tasks/server/ACCEPTANCE_TASK_19.md). Passing local automation is not permission to relabel those external checks as passed.

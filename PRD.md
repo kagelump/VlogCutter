@@ -9,7 +9,15 @@
 
 ## Current implementation checkpoint — 2026-07-28
 
-The macOS desktop implements the local-first labeling vertical slice: project catalogs, reference-in-place ingest, metadata, notes/labels/reversible removal, fixed clock offsets, thumbnails/proxies, chronology ribbon, typed operations, and JSON CLI diagnostics. It does not yet implement ingest preview/capture-sequence editing, trip-context persistence, expanded chronology calibration, edit planning, preview render, timeline export, relink/cleanup, or AI features.
+The macOS desktop implements the local-first labeling vertical slice plus the
+domain foundation for chronology and edit handoff: project catalogs,
+reference-in-place ingest, metadata, notes/labels/reversible removal,
+thumbnails/proxies, operation-backed chronology facts and deterministic solving,
+durable diagnostics, versioned edit plans, preview generation, deterministic
+OTIO writing, and JSON chronology diagnostics. The expanded calibration and
+edit-plan desktop workflows remain partial, and there is still no ingest
+preview, complete capture-sequence editor, edit-plan CLI, Resolve import
+acceptance, relink/cleanup, or AI feature set.
 
 The optional private Ubuntu companion server is implemented at application `0.1.0`, sync protocol `1.0`, baseline format `1`, project schema `8`, control schema `10`, and backup format `1`. It adds read-only NAS scanning and verified global identity, durable jobs, shared representations, independent server project replicas synchronized by operations, Chrome review/admin, revocable authentication, and verified database backups. It never shares live SQLite files or uploads originals. See [`docs/server/README.md`](docs/server/README.md).
 

@@ -27,6 +27,8 @@ interface Props {
   currentAssetId: string | null;
   /** Called with the asset to resume on after a change reorders the queue. */
   onQueueResumed?: (assetId: string) => void;
+  /** Refreshes the parent review cache after the core rewrites its projection. */
+  onChronologyChanged?: () => void | Promise<void>;
 }
 
 const emptyDiagnostics: DiagnosticsView = {
@@ -51,7 +53,12 @@ function formatRange(epoch: ClockEpoch): string {
     : `${epoch.startCounter}–${epoch.endCounter}`;
 }
 
-export function CalibrationPanel({ projectId, currentAssetId, onQueueResumed }: Props) {
+export function CalibrationPanel({
+  projectId,
+  currentAssetId,
+  onQueueResumed,
+  onChronologyChanged,
+}: Props) {
   const [overview, setOverview] = useState<ChronologyOverview | null>(null);
   const [diagnostics, setDiagnostics] = useState<DiagnosticsView>(emptyDiagnostics);
   const [explanation, setExplanation] = useState<ChronologyExplanation | null>(null);
@@ -84,6 +91,11 @@ export function CalibrationPanel({ projectId, currentAssetId, onQueueResumed }: 
       setError(String(cause));
     }
   }, [projectId]);
+
+  const refreshAfterMutation = useCallback(async () => {
+    await refresh();
+    await onChronologyChanged?.();
+  }, [onChronologyChanged, refresh]);
 
   useEffect(() => {
     void refresh();
@@ -146,7 +158,7 @@ export function CalibrationPanel({ projectId, currentAssetId, onQueueResumed }: 
         : null;
       await chronologyApi.setClockEpoch(projectId, pending.epoch);
       setPending(null);
-      await refresh();
+      await refreshAfterMutation();
       if (position) {
         const resumed = await chronologyApi.restoreQueuePosition(projectId, position);
         if (resumed && onQueueResumed) onQueueResumed(resumed);
@@ -156,21 +168,21 @@ export function CalibrationPanel({ projectId, currentAssetId, onQueueResumed }: 
     } finally {
       setBusy(false);
     }
-  }, [currentAssetId, onQueueResumed, pending, projectId, refresh]);
+  }, [currentAssetId, onQueueResumed, pending, projectId, refreshAfterMutation]);
 
   const clearEpoch = useCallback(
     async (epochId: string) => {
       setBusy(true);
       try {
         await chronologyApi.clearClockEpoch(projectId, epochId);
-        await refresh();
+        await refreshAfterMutation();
       } catch (cause) {
         setError(String(cause));
       } finally {
         setBusy(false);
       }
     },
-    [projectId, refresh],
+    [projectId, refreshAfterMutation],
   );
 
   const applySplit = useCallback(
@@ -183,14 +195,14 @@ export function CalibrationPanel({ projectId, currentAssetId, onQueueResumed }: 
           atCounter,
           `Card from ${atCounter}`,
         );
-        await refresh();
+        await refreshAfterMutation();
       } catch (cause) {
         setError(String(cause));
       } finally {
         setBusy(false);
       }
     },
-    [projectId, refresh],
+    [projectId, refreshAfterMutation],
   );
 
   const acknowledge = useCallback(

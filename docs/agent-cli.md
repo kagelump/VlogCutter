@@ -156,7 +156,10 @@ rcdvlog --catalog /absolute/project/catalog.sqlite3 thumbnails missing --project
 
 Quality 1 is a 480-pixel-wide JPEG sampled at 20% of the clip. It is stored under the project folder at `cache/thumbnails/<asset-id>/q1.v2.jpg`. The original is preferred; an available proxy is used when the original is offline. Qualities 2–10 are reserved and currently rejected.
 
-Rough-cut selection, source ranges, and OTIO export are intentionally absent from this labeling phase. They will return as a separate edit-planning workflow after labeling.
+Rough-cut selection and source ranges remain separate from the labeling phase.
+The core and desktop now have an initial edit-plan/preview/OTIO path, but the
+CLI does not yet expose edit-plan revision, validation, preview, export, or
+history commands. That missing machine-readable surface is tracked by D01-T030.
 
 ## Companion-server commands
 

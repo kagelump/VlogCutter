@@ -7,7 +7,7 @@
   "epic_id": "D01",
   "title": "Antarctica footage chronology acceptance",
   "slug": "antarctica-chronology-acceptance",
-  "status": "ready",
+  "status": "blocked",
   "task_class": "qa",
   "depends_on": ["D01-T016", "D01-T017"],
   "principal_invariant": "The real Antarctica trip footage can be brought to a chronology the owner judges correct, using only the shipped calibration workflow.",
@@ -44,6 +44,15 @@
   ]
 }
 -->
+
+## Current implementation checkpoint
+
+The automated corpus audit is complete and recorded in
+`ACCEPTANCE_CHRONOLOGY.md`: 621 clips, three sequences, no unplaced clips or
+contradictions, stable ordering, and byte-stable OTIO. The owner has not judged
+the chronology, entered trip phases, or made required corrections through the
+desktop. This gate is blocked until D01-T016 and D01-T017 are complete; the
+manual verdict then remains the only work in this packet.
 
 ## Goal
 

@@ -7,12 +7,12 @@
   "epic_id": "D01",
   "title": "Deterministic OTIO export",
   "slug": "deterministic-otio-export",
-  "status": "complete",
+  "status": "ready",
   "task_class": "implementation",
-  "depends_on": ["D01-T020"],
+  "depends_on": [],
   "principal_invariant": "Identical edit-plan input always produces byte-identical OpenTimelineIO output with stable clip and metadata identifiers.",
   "central_falsification": "Export the same plan repeatedly across separate processes, on different machines, and with the plan's rows inserted in different orders, then compare bytes against a committed golden file.",
-  "architecture_decisions_frozen": false,
+  "architecture_decisions_frozen": true,
   "load_bearing_seams": ["edit plan revision -> OTIO document"],
   "documents_by_role": {
     "contract_editor": ["docs/tasks/desktop/EDIT_PLAN_MODEL.md", "docs/tasks/desktop/ARCHITECTURE.md"],
@@ -48,6 +48,15 @@
   ]
 }
 -->
+
+## Current implementation checkpoint
+
+The pure-Rust writer, stable clip identifiers, original-media references,
+digest-guarded overwrite, and append-only export history are implemented. The
+packet remains open because there is no committed golden OTIO fixture, no
+separate-process determinism test, no shuffled-row oracle, and no explicit
+unusable-frame-rate coverage. Close those verification gaps before treating
+Resolve import as meaningful release evidence.
 
 ## Goal
 
@@ -282,8 +291,7 @@ environment-leak grep output. State explicitly that Resolve import fidelity is n
 proven by this packet and remains D01-T024's gate. List any stop condition encountered.
 The implementer does not approve this task.
 
-## Promotion note
+## Readiness note
 
-`draft` until D01-T019 publishes `docs/tasks/desktop/EDIT_PLAN_MODEL.md` and D01-T020
-lands validation. The contract editor confirms `record_edit_plan_export` and the
-`Asset` frame-rate field are available before promoting.
+Ready. The writer and export guard exist; this packet now closes the committed
+golden, shuffled-row, invalid-rate, and cross-process evidence gaps.

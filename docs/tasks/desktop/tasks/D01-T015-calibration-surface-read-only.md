@@ -7,12 +7,12 @@
   "epic_id": "D01",
   "title": "Expanded calibration surface, read-only",
   "slug": "calibration-surface-read-only",
-  "status": "complete",
+  "status": "ready",
   "task_class": "implementation",
-  "depends_on": ["D01-T003", "D01-T014"],
+  "depends_on": [],
   "principal_invariant": "The calibration view renders the chronology solution faithfully, showing every asset in solver order on its own capture-sequence lane under the trip phase that governs its display time.",
   "central_falsification": "Render a project whose solution is known independently and compare every lane assignment, block position, and displayed time against the solver output; any divergence falsifies the view.",
-  "architecture_decisions_frozen": false,
+  "architecture_decisions_frozen": true,
   "load_bearing_seams": ["chronology solution -> calibration render"],
   "documents_by_role": {
     "contract_editor": ["docs/tasks/desktop/CHRONOLOGY_MODEL.md", "docs/tasks/desktop/ARCHITECTURE.md"],
@@ -52,6 +52,16 @@
   ]
 }
 -->
+
+## Current implementation checkpoint
+
+`CalibrationPanel.tsx` now reads the solver overview, explanations,
+contradictions, split proposals, epochs, and durable diagnostics. It is a useful
+summary, but it is not the expanded calibration view described below: there are
+no capture-sequence lanes, trip-phase band, time ruler, per-asset raw/derived
+blocks, dual transit display, uncovered regions, confidence/uncertainty blocks,
+or component tests. The remaining task should extract the present panel into the
+packet's testable structure rather than discarding the working reads.
 
 ## Goal
 
@@ -283,8 +293,7 @@ keyboard traversal result, and the immutability evidence. Include a screenshot o
 the view rendering a multi-sequence multi-phase project. List any stop condition
 encountered. The implementer does not approve this task.
 
-## Promotion note
+## Readiness note
 
-`draft` until D01-T014 completes and `docs/tasks/desktop/CHRONOLOGY_MODEL.md` is
-published. The contract editor confirms the DTO mirrors match the frozen Rust types
-before promoting.
+Ready. The solver DTOs and explanation contract are implemented and frozen; the
+remaining work is the faithful expanded render and its component evidence.

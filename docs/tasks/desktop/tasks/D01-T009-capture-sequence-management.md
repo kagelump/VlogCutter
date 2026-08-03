@@ -7,12 +7,12 @@
   "epic_id": "D01",
   "title": "Capture-sequence management",
   "slug": "capture-sequence-management",
-  "status": "complete",
+  "status": "ready",
   "task_class": "implementation",
-  "depends_on": ["D01-T008", "D01-T028"],
+  "depends_on": [],
   "principal_invariant": "Filename identity is scoped to its capture sequence, so two cards that reuse the same filename counter are never treated as one monotonic chain.",
   "central_falsification": "Ingest two folders from one camera whose filenames both run C0001 to C0100, and confirm the proposal yields two sequences and that a clock epoch on one leaves the other's derived times untouched.",
-  "architecture_decisions_frozen": false,
+  "architecture_decisions_frozen": true,
   "load_bearing_seams": ["ingest metadata -> capture sequence assignment"],
   "documents_by_role": {
     "contract_editor": ["docs/tasks/desktop/CHRONOLOGY_MODEL.md", "docs/tasks/desktop/ARCHITECTURE.md"],
@@ -24,7 +24,7 @@
   "path_ownership": {
     "contract_editor": ["docs/tasks/desktop/tasks/D01-T009-capture-sequence-management.md"],
     "implementer": [
-      "core/rcdvlog-core/src/chronology/sequences.rs",
+      "core/rcdvlog-core/src/chronology/api.rs",
       "core/rcdvlog-core/tests/chronology_sequences.rs"
     ],
     "independent_tester": ["core/rcdvlog-core/tests/chronology_sequences_independent.rs"],
@@ -44,6 +44,15 @@
   ]
 }
 -->
+
+## Current implementation checkpoint
+
+The schema, automatic initial assignment, explicit declare/split/merge methods,
+and counter-reset split proposals are implemented. The packet remains open
+because proposals do not yet use volume changes, folder resets, prefix changes,
+or the named large-discontinuity rule; there is no apply-proposals method or
+per-asset reassignment method; and the two-card counter-reuse oracle has not been
+covered by the dedicated independent tests below.
 
 ## Goal
 
@@ -239,8 +248,7 @@ including the asset-preservation checks, and the counter-collision isolation
 result. List any stop condition encountered. The implementer does not approve this
 task.
 
-## Promotion note
+## Readiness note
 
-`draft` until D01-T007 publishes `docs/tasks/desktop/CHRONOLOGY_MODEL.md`. The
-contract editor then reconciles the interface above with the frozen
-`CaptureSequence` type and `captureSequence*` operation payloads before promoting.
+Ready. The chronology and camera-pattern contracts are frozen; the current
+implementation checkpoint names the remaining bounded proposal/reassignment work.

@@ -86,64 +86,45 @@ flat table of per-camera filename offsets. This epic rebalances that.
 
 | Order | Task | Title | Depends on | Status |
 | ---: | --- | --- | --- | --- |
-| 10 | [D01-T001](tasks/D01-T001-verification-baseline-audit.md) | Verification baseline audit | — | complete |
-| 20 | [D01-T002](tasks/D01-T002-fix-baseline-gate-defects.md) | Fix baseline gate defects | D01-T001 | complete |
-| 30 | [D01-T003](tasks/D01-T003-desktop-frontend-testability-seam.md) | Desktop frontend testability seam | D01-T002 | complete |
-| 40 | [D01-T004](tasks/D01-T004-github-actions-ci.md) | GitHub Actions CI with macOS native build | D01-T003 | complete |
-| 50 | [D01-T005](tasks/D01-T005-native-desktop-smoke-acceptance.md) | Native macOS desktop smoke acceptance | D01-T004 | complete |
-| 60 | [D01-T006](tasks/D01-T006-fix-native-smoke-defects.md) | Fix native smoke defects | D01-T005 | complete |
-| 70 | [D01-T007](tasks/D01-T007-chronology-domain-model.md) | Chronology domain model and operation vocabulary | D01-T006 | complete |
-| 75 | [D01-T027](tasks/D01-T027-diagnostics-and-error-surfacing.md) | Diagnostics and error surfacing | D01-T007 | complete |
-| 80 | [D01-T008](tasks/D01-T008-deterministic-chronology-solver.md) | Deterministic chronology solver | D01-T007 | complete |
-| 85 | [D01-T028](tasks/D01-T028-camera-identification-and-filename-patterns.md) | Camera identification and filename patterns | D01-T007, D01-T027 | complete |
-| 90 | [D01-T009](tasks/D01-T009-capture-sequence-management.md) | Capture-sequence management | D01-T008, D01-T028 | complete |
-| 100 | [D01-T010](tasks/D01-T010-clock-epoch-ranges.md) | Clock epochs over capture-sequence ranges | D01-T009 | complete |
-| 110 | [D01-T011](tasks/D01-T011-clip-time-exceptions.md) | Clip time exceptions | D01-T010 | complete |
-| 120 | [D01-T012](tasks/D01-T012-trip-phases-and-timezone-context.md) | Trip phases and timezone context | D01-T008 | complete |
-| 130 | [D01-T013](tasks/D01-T013-constraints-and-contradiction-reporting.md) | Event-order constraints and contradiction reporting | D01-T011, D01-T012 | complete |
-| 140 | [D01-T014](tasks/D01-T014-chronology-explain-and-queue-stability.md) | Chronology explain and review-queue stability | D01-T013 | complete |
-| 150 | [D01-T015](tasks/D01-T015-calibration-surface-read-only.md) | Expanded calibration surface, read-only | D01-T003, D01-T014 | complete |
-| 160 | [D01-T016](tasks/D01-T016-calibration-editing-interactions.md) | Calibration editing interactions and impact preview | D01-T015 | complete |
-| 170 | [D01-T017](tasks/D01-T017-chronology-cli-surface.md) | Chronology CLI surface | D01-T014, D01-T027 | complete |
-| 180 | [D01-T018](tasks/D01-T018-antarctica-chronology-acceptance.md) | Antarctica footage chronology acceptance | D01-T016, D01-T017 | ready |
-| 190 | [D01-T019](tasks/D01-T019-edit-plan-model.md) | Edit-plan model and revision semantics | D01-T014 | complete |
-| 200 | [D01-T020](tasks/D01-T020-edit-plan-validation.md) | Edit-plan validation | D01-T019 | complete |
-| 210 | [D01-T021](tasks/D01-T021-low-resolution-preview-render.md) | Low-resolution preview render | D01-T020 | complete |
-| 220 | [D01-T022](tasks/D01-T022-deterministic-otio-export.md) | Deterministic OTIO export | D01-T020 | complete |
-| 230 | [D01-T023](tasks/D01-T023-edit-plan-and-export-ui.md) | Edit-plan and export desktop UI | D01-T021, D01-T022 | complete |
-| 240 | [D01-T024](tasks/D01-T024-resolve-import-acceptance.md) | DaVinci Resolve 20/21 import acceptance | D01-T023 | draft |
-| 250 | [D01-T025](tasks/D01-T025-documentation-and-reconciliation.md) | Documentation and planning reconciliation | D01-T018, D01-T024 | draft |
-| 260 | [D01-T026](tasks/D01-T026-check-docs-worktree-skip-regression.md) | Fix check-docs worktree-skip regression | D01-T002 | complete |
+| 90 | [D01-T009](tasks/D01-T009-capture-sequence-management.md) | Complete capture-sequence management | — | ready |
+| 150 | [D01-T015](tasks/D01-T015-calibration-surface-read-only.md) | Complete expanded calibration surface | — | ready |
+| 160 | [D01-T016](tasks/D01-T016-calibration-editing-interactions.md) | Complete calibration editing and impact preview | D01-T015 | blocked |
+| 170 | [D01-T017](tasks/D01-T017-chronology-cli-surface.md) | Finish chronology CLI contract coverage | — | ready |
+| 180 | [D01-T018](tasks/D01-T018-antarctica-chronology-acceptance.md) | Antarctica chronology manual acceptance | D01-T016, D01-T017 | blocked |
+| 210 | [D01-T021](tasks/D01-T021-low-resolution-preview-render.md) | Finish preview runtime and media verification | — | ready |
+| 220 | [D01-T022](tasks/D01-T022-deterministic-otio-export.md) | Finish OTIO golden and cross-process verification | — | ready |
+| 230 | [D01-T023](tasks/D01-T023-edit-plan-and-export-ui.md) | Complete edit-plan and export desktop UI | D01-T021, D01-T022 | blocked |
+| 240 | [D01-T024](tasks/D01-T024-resolve-import-acceptance.md) | DaVinci Resolve 20/21 import acceptance | D01-T022, D01-T023 | blocked |
+| 250 | [D01-T029](tasks/D01-T029-desktop-chronology-edit-plan-regression-suite.md) | Desktop chronology/edit-plan regression suite | D01-T015, D01-T016, D01-T023 | blocked |
+| 260 | [D01-T030](tasks/D01-T030-edit-plan-cli-and-diagnostics.md) | Edit-plan CLI and diagnostics | D01-T021, D01-T022 | blocked |
+| 270 | [D01-T025](tasks/D01-T025-documentation-and-reconciliation.md) | Documentation and planning reconciliation | D01-T018, D01-T024, D01-T029, D01-T030 | blocked |
 
-## Draft promotion protocol
+Completed packets are deleted from this active directory once their acceptance
+surface is delivered; Git history and cycle evidence remain the record. Eighteen
+completed packets were archived this way during the 2026-08-03 completion
+review.
 
-Most of this queue is `draft` on purpose, and the executor must not promote a
-row on its own.
+## Status, 2026-08-03 completion review
 
-| Rows | Blocked on | Promoted by |
+The branch provides a strong domain foundation and the full repository gate is
+green, but the desktop MVP is not complete. Five bounded tasks are immediately
+ready; later workflow and manual gates remain dependency-blocked.
+
+| Finding | Current evidence | Packet |
 | --- | --- | --- |
-| ~~T002~~, T006 | Their path ownership is the set of files named in a defect ledger that does not exist yet. A fix packet cannot exhaustively own paths before the audit that finds the defects. | The contract editor, after T001 / T005 publishes its ledger. |
-| T008–T017 | `architecture_decisions_frozen` would be a false claim: the chronology tables, operation vocabulary, and solver interface are frozen *by* T007, whose packet is the authority for them. | The contract editor, after T007 publishes `CHRONOLOGY_MODEL.md`. |
-| T020–T023 | Same shape: frozen by T019's `EDIT_PLAN_MODEL.md`. | The contract editor, after T019 publishes it. |
-| T024, T025 | Depend on the two contracts above plus the acceptance surface. | The contract editor, after T022 and T018 respectively. |
-| ~~T018~~ | ~~The Antarctica footage path has not been supplied.~~ Resolved 2026-08-02: the product owner confirmed the corpus and the path is supplied at invocation, never committed. See the packet's `## Footage path protocol`. | — |
-| T027, T028 | Their own contracts. T027 freezes the diagnostics model for T015 and T017; T028 amends T007's counter rule and is the authority for the pattern table. Both are foundation-shaped and self-authorizing, so they promote on their own admission gate. | The contract editor, at promotion time. |
+| Capture-sequence proposals cover only counter resets and lack reassignment/apply-proposals. | `chronology/api.rs` split proposal implementation and dedicated test inventory. | D01-T009 |
+| The calibration drawer is a summary/form, not the promised lane/time/phase calibration view, and most mutation scopes have no UI. | Rendered browser review at 1440×900 and 980×680 plus component/source audit. | D01-T015, D01-T016 |
+| Chronology CLI commands exist without process-level JSON contracts. | `apps/cli/src/chronology_commands.rs`; no matching CLI workflow tests. | D01-T017 |
+| Preview generation lacks real-media acceptance, output probing, cooperative desktop cancellation, `spawn_blocking`, and shared ETA estimation. | `editplan/preview.rs` and synchronous Tauri adapter review. | D01-T021 |
+| OTIO output lacks committed golden and separate-process determinism evidence. | `tests/edit_plan.rs` covers in-process stability only. | D01-T022 |
+| The edit-plan drawer cannot reorder/trim/remove, play preview, show staleness/history, or confirm overwrite. | Rendered browser review and `EditPlanPanel.tsx` audit. | D01-T023 |
+| New desktop workflows have no component regression tests. | Desktop Vitest suite contains review order/keymap tests only. | D01-T029 |
+| Agent automation cannot inspect or mutate edit plans through stable JSON. | No `edit-plan` CLI command family. | D01-T030 |
 
-Promotion means re-running the admission gate in
-`.claude/skills/writing-bounded-task-packets/SKILL.md` §5 against the now-frozen
-contract, not editing a status field.
-
-## Status, 2026-08-03
-
-26 of 28 rows are `complete`. The two that are not are the two manual gates the
-epic itself calls load-bearing, and neither can be satisfied by automation:
-
-| Row | State | What remains |
-| --- | --- | --- |
-| D01-T018 | `ready` | The automated half is done and recorded in `ACCEPTANCE_CHRONOLOGY.md`: 621 real clips, 3 correctly separated capture sequences, 0 unplaced, 0 contradictions, a strict total order, byte-stable OTIO referencing camera originals. The manual half — the owner judging the derived chronology correct, after making corrections through the shipped UI — has not been run. |
-| D01-T024 | `draft` | Requires opening an exported `.otio` in DaVinci Resolve 20/21 on a machine with Resolve installed. No fixture, headless suite, or browser-mock walkthrough is evidence for it. |
-
-`D01-T025` remains `draft` because its own reconciliation depends on those two.
+The review fixed two contained integration defects directly: chronology writes
+now refresh the parent review asset cache, and edit-plan activation/export reject
+a mismatched project/revision pair before waking sync. Canonical implementation
+checkpoints were also updated to schema 12 and the actual partial workflow state.
 
 ## Promotion rule
 

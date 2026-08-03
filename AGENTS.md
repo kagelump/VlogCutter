@@ -47,6 +47,13 @@ Implemented now:
 - ffprobe technical/timestamp metadata and ExifTool camera make/model lookup.
 - Label queue, playback, free-form labels, notes, reversible removal, and keyboard shortcuts.
 - Fixed camera offset events from a filename boundary onward.
+- Operation-backed capture sequences, clock epochs, clip-time exceptions, trip
+  phases, event-order constraints, a deterministic chronology solver, and
+  durable diagnostics.
+- Read-only chronology/diagnostics CLI commands and basic desktop chronology
+  and edit-plan drawers.
+- Versioned edit-plan persistence and validation, low-resolution preview
+  generation, and deterministic pure-Rust OTIO writing.
 - Quality-1 thumbnails and one-worker 720p H.264/AAC proxies.
 - Weighted batch progress and ETA with project-persisted rate history.
 - Relative-order “story ribbon” with camera lanes, horizontal scrolling, and zoom.
@@ -63,13 +70,23 @@ Implemented now:
 
 Important gaps; do not accidentally describe these as complete:
 
-- No ingest preview or capture-sequence split/merge workflow.
+- No ingest preview. Capture-sequence split/merge exists, but boundary proposals
+  currently detect only counter resets; volume, folder, prefix, discontinuity,
+  and per-asset reassignment workflows remain incomplete.
 - No relink workflow, mounted-volume inventory, project deletion, or cache cleanup UI.
 - Desktop/CLI full-patch writes still have no transport-level optimistic revision token; cross-node operation sync does not make competing local full patches safe.
 - Search is currently simple filename/camera/label/note filtering, not SQLite FTS.
-- No key moments, chapters, events, scripts, edit-plan revisions, rough-cut selection, timeline export, or preview render.
-- No trip-phase/location/timezone/story-beat persistence or editor. The TypeScript `Asset` context fields and browser mock only make the story-ribbon display contract visible; the Rust model and SQLite schema do not store them yet.
-- No expanded chronology calibration view, clip exceptions, contradiction reporting, or confidence/evidence explanation.
+- No key moments, chapters, events, or scripts. Edit-plan revisions, validation,
+  preview rendering, and OTIO writing exist, but the desktop edit-plan workflow
+  still lacks reordering, trimming, removal, preview playback, export history,
+  and overwrite confirmation; there is no edit-plan CLI yet.
+- Trip phases and timezone display are persisted and solved, but the desktop has
+  no phase editor or full lane/trip-band calibration view. Story beats remain
+  display-only browser-mock fields and are not persisted.
+- The basic chronology drawer can inspect explanations, diagnostics, split
+  proposals, and clock epochs. It does not yet provide the complete calibration
+  interaction contract for clip exceptions, phases, constraints, merges,
+  reassignments, or bounded before/after impact summaries.
 - Web has automated Vitest and Chrome Playwright coverage; desktop React still has no component runner and there is no automated native Tauri UI suite.
 - No macOS signing/notarization or clean-machine packaging acceptance.
 - Native media playback, filesystem permission prompts, sleep/wake, and NAS-scale behavior remain manual acceptance checks. Resolve import returns as a later edit-planning acceptance check.
@@ -251,7 +268,7 @@ Always pass `--catalog` in agent automation, tests, and temporary workflows. A d
 
 SQLite connections enable foreign keys, WAL journal mode, and a five-second busy timeout. Read operations can continue during an uncommitted writer. Project mutations append typed operations with materialized revisions. Adopted projects synchronize bounded operation pages between independent local catalogs; live SQLite/WAL files are never copied or placed on NAS.
 
-Project catalogs use an explicit `schema_migrations` history and are currently at version 9. The server control catalog is version 10; backup format is version 1. Migration definitions have immutable names/source identities and each migration commits atomically. When changing the schema:
+Project catalogs use an explicit `schema_migrations` history and are currently at version 12. The server control catalog is version 10; backup format is version 1. Migration definitions have immutable names/source identities and each migration commits atomically. When changing the schema:
 
 - Preserve existing catalogs; never solve migration issues by deleting the database.
 - Add a forward migration and an upgrade test using an older schema fixture.
@@ -326,9 +343,14 @@ Change the task key when settings change enough that old throughput is no longer
 
 The server persists histories in its control catalog scoped to its stable node and task key. Default caps are one proxy worker, one full-hash worker, and up to two lightweight workers. Durable progress must supply the exact remaining weights and actual worker count; only successful item observations update throughput.
 
-### Deferred edit planning and export
+### Edit planning and export
 
-The labeling phase intentionally has no rough-cut inclusion, source ranges, or OTIO export. Those concepts return in a later edit-planning stage after clips are labeled. Keep any future edit-plan state separate from labels and reversible removal; removal only controls visibility in the labeling workflow.
+Edit-plan revisions are separate from labels and reversible removal. The basic
+desktop action seeds a plan from visible, non-removed clips, while the core owns
+ordered source ranges, validation, preview generation, and OTIO export. Do not
+move rough-cut inclusion or source-range controls back into the labeling phase;
+finish them in the dedicated edit-plan surface. Removal continues to control
+labeling visibility only.
 
 ## 10. Desktop UI conventions
 
