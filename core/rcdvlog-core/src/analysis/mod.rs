@@ -21,6 +21,8 @@ pub mod store;
 #[allow(dead_code)]
 pub mod stt;
 #[allow(dead_code)]
+pub mod whisper_engine;
+#[allow(dead_code)]
 pub mod windows;
 
 /// Identity of the speech-to-text recipe. Changing any component of the
