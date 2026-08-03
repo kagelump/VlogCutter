@@ -13,6 +13,9 @@ pub mod engine;
 pub mod framepack;
 pub mod frames;
 pub mod quality;
+// Consumed by `vlm`, which lands after the provider chain.
+#[allow(dead_code)]
+pub mod schema;
 pub mod store;
 pub mod stt;
 pub mod whisper_engine;
