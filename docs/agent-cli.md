@@ -156,6 +156,26 @@ rcdvlog --catalog /absolute/project/catalog.sqlite3 thumbnails missing --project
 
 Quality 1 is a 480-pixel-wide JPEG sampled at 20% of the clip. It is stored under the project folder at `cache/thumbnails/<asset-id>/q1.v2.jpg`. The original is preferred; an available proxy is used when the original is offline. Qualities 2–10 are reserved and currently rejected.
 
+### Local transcription and cloud clip analysis
+
+```bash
+rcdvlog --catalog /absolute/project/catalog.sqlite3 transcribe generate --asset <asset-id>
+rcdvlog --catalog /absolute/project/catalog.sqlite3 transcribe missing --project <project-id>
+rcdvlog --catalog /absolute/project/catalog.sqlite3 transcribe status --project <project-id>
+
+rcdvlog --catalog /absolute/project/catalog.sqlite3 analyze generate --asset <asset-id>
+rcdvlog --catalog /absolute/project/catalog.sqlite3 analyze missing --project <project-id>
+rcdvlog --catalog /absolute/project/catalog.sqlite3 analyze missing --project <project-id> --force
+rcdvlog --catalog /absolute/project/catalog.sqlite3 analyze status --project <project-id>
+
+rcdvlog --catalog /absolute/project/catalog.sqlite3 labels consolidate --project <project-id>
+rcdvlog --catalog /absolute/project/catalog.sqlite3 labels vocabulary --project <project-id>
+```
+
+Transcription is offline and reads proxies only. Vision analysis reads proxy-derived frame packs and any accepted speech transcript, then calls OpenRouter using `OPENROUTER_API_KEY` or `~/.openrouter.key`. A normal `analyze missing` run is idempotent; `--force` replaces current derived observations and reports how many clips already had non-empty title or description fields before overwrite. Notes remain human-only. OCR is a reviewable suggestion and is not indexed as fact.
+
+`analyze status` and `labels vocabulary` are strictly read-only. Analysis progress is emitted as JSON on stderr. `labels consolidate` makes one text-only request and remaps only labels whose local authorship record says analysis created them; it never changes human-only labels.
+
 Rough-cut selection and source ranges remain separate from the labeling phase.
 The core and desktop now have an initial edit-plan/preview/OTIO path, but the
 CLI does not yet expose edit-plan revision, validation, preview, export, or

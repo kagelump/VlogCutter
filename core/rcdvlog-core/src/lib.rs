@@ -17,6 +17,7 @@ use std::time::Instant;
 use uuid::Uuid;
 use walkdir::WalkDir;
 
+mod analysis;
 mod baseline;
 mod cameras;
 mod chronology;
@@ -27,6 +28,40 @@ mod migrations;
 mod operations;
 mod storage;
 
+use analysis::audio::{AudioExtractor, FfmpegAudioExtractor};
+use analysis::consolidate::{
+    apply_mapping as persist_label_mapping, assets_for_label, consolidation_prompt, mapping_schema,
+    parse_mapping, proposals as label_proposals,
+};
+use analysis::engine::{SttEngine, VAD_MODEL, WHISPER_MODEL, ensure_model, model_dir};
+use analysis::store::{StoredTranscript, is_current, load_transcript, save_transcript};
+use analysis::stt::transcribe_pcm;
+use analysis::vlm::{PromptContext, PromptTranscript, analyze_clip as run_vlm};
+use analysis::vlm_store::{
+    AnalysisStatus, StoredAnalysis, ai_labels_for_asset, analysis_is_current, clear_ai_labels,
+    commit_thumbnail, load_frame_pack, record_ai_labels, save_analysis, save_frame_pack,
+    set_title_and_description,
+};
+use analysis::whisper_engine::{WhisperEngine, read_pcm};
+
+pub use analysis::consolidate::{ConsolidationReport, LabelMapping, LabelProposal};
+pub use analysis::framepack::{FramePackManifest, build_frame_pack, encode_frames};
+pub use analysis::openrouter::{
+    OpenRouterProvider, frame_data_uri, key_file_path, resolve_api_key,
+};
+pub use analysis::provider::{
+    ChainOutcome, DEFAULT_MODEL, FALLBACK_MODEL, MODELS, ModelSpec, ProviderChain, VlmProvider,
+    VlmRequest, VlmResponse, model_spec,
+};
+pub use analysis::schema::{
+    CameraMovement, ClipObservation, DomainError, UnusableReason, output_schema,
+    validate as validate_observation,
+};
+pub use analysis::store::TranscriptStatus;
+pub use analysis::stt::TranscribeOutcome;
+pub use analysis::vlm::AnalysisOutcome;
+pub use analysis::vlm_store::StoredAnalysis as ClipAnalysis;
+pub use analysis::{FRAMEPACK_RECIPE_KEY, STT_RECIPE_KEY, STT_TASK_KEY, VLM_PROMPT_VERSION};
 pub use cameras::{
     CAMERA_PATTERNS, CameraIdentity, CameraIdentitySource, CameraPattern, PatternConfidence,
     UNKNOWN_CAMERA, identify_camera, pattern_counter,
@@ -208,6 +243,10 @@ pub struct Asset {
     pub thumbnail_path: Option<String>,
     pub thumbnail_quality: u8,
     pub notes: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub description: String,
     pub labels: Vec<String>,
     pub removed: bool,
     pub media_object_id: Option<String>,
@@ -261,6 +300,75 @@ pub struct ThumbnailReport {
 #[serde(rename_all = "camelCase")]
 pub struct AssetBatchProgress {
     pub asset: Option<Asset>,
+    pub estimate: BatchEstimate,
+}
+
+/// Progress for a transcription batch, mirroring `AssetBatchProgress`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TranscribeBatchProgress {
+    pub outcome: Option<TranscribeOutcome>,
+    pub estimate: BatchEstimate,
+}
+
+/// Summary of one `transcribe missing` run.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TranscribeReport {
+    pub transcribed: usize,
+    pub skipped: usize,
+    pub outcomes: Vec<TranscribeOutcome>,
+    pub failures: Vec<IngestFailure>,
+}
+
+/// Transcript coverage for a project, counted by terminal status.
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TranscriptCoverage {
+    pub recipe_key: String,
+    pub total: usize,
+    /// Clips with usable speech.
+    pub speech: usize,
+    /// Clips the VAD gate found silent. A success, not a failure.
+    pub no_speech: usize,
+    /// Clips whose decode tripped the hallucination gate.
+    pub rejected: usize,
+    pub failed: usize,
+    /// Clips never transcribed, or whose proxy has since been regenerated.
+    pub missing: usize,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnalysisCoverage {
+    pub recipe_key: String,
+    pub prompt_version: String,
+    pub total: usize,
+    pub ok: usize,
+    pub rejected: usize,
+    pub failed: usize,
+    pub missing: usize,
+    pub cost_usd: f64,
+    pub fallback_served: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnalyzeReport {
+    pub analyzed: usize,
+    pub skipped: usize,
+    pub rejected: usize,
+    pub fallback_served: usize,
+    pub force_overwrite_warnings: usize,
+    pub cost_usd: f64,
+    pub outcomes: Vec<AnalysisOutcome>,
+    pub failures: Vec<IngestFailure>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnalyzeBatchProgress {
+    pub outcome: Option<AnalysisOutcome>,
     pub estimate: BatchEstimate,
 }
 
@@ -801,6 +909,9 @@ impl Catalog {
             "a.media_verification_state",
             "'unlinked'",
         )?;
+        let title = asset_column_expression(&connection, "title", "a.title", "''")?;
+        let description =
+            asset_column_expression(&connection, "description", "a.description", "''")?;
         let (thumbnail_path, thumbnail_quality, thumbnail_join) = if table_exists(
             &connection,
             "asset_thumbnails",
@@ -821,7 +932,7 @@ impl Catalog {
                    {metadata_rotation}, {default_rotation}, {rotation},
                    {orientation_probed}, {thumbnail_path}, {thumbnail_quality},
                    a.notes, {labels}, {removed}, {media_object_id},
-                   {media_verification_state}
+                   {media_verification_state}, {title}, {description}
             FROM assets a
             {thumbnail_join}
             WHERE a.project_id = ?1
@@ -879,6 +990,9 @@ impl Catalog {
             "a.media_verification_state",
             "'unlinked'",
         )?;
+        let title = asset_column_expression(&connection, "title", "a.title", "''")?;
+        let description =
+            asset_column_expression(&connection, "description", "a.description", "''")?;
         let (thumbnail_path, thumbnail_quality, thumbnail_join) = if table_exists(
             &connection,
             "asset_thumbnails",
@@ -899,7 +1013,7 @@ impl Catalog {
                    {metadata_rotation}, {default_rotation}, {rotation},
                    {orientation_probed}, {thumbnail_path}, {thumbnail_quality},
                    a.notes, {labels}, {removed}, {media_object_id},
-                   {media_verification_state}
+                   {media_verification_state}, {title}, {description}
             FROM assets a
             {thumbnail_join}
             WHERE a.id = ?1
@@ -1057,6 +1171,730 @@ impl Catalog {
             estimate: estimator.estimate(&[]),
         });
         result
+    }
+
+    /// Fingerprint of the proxy a transcript would be derived from.
+    ///
+    /// Transcripts are pinned to the proxy file, so regenerating a proxy must
+    /// make its transcript stale. This reuses the same sampled BLAKE3 scheme as
+    /// asset identity rather than introducing a second one.
+    pub fn proxy_fingerprint(&self, asset_id: &str) -> Result<String> {
+        let asset = self.get_asset(asset_id)?;
+        let proxy_path = Self::require_proxy(&asset)?;
+        let size = fs::metadata(&proxy_path)
+            .with_context(|| format!("stat proxy {}", proxy_path.display()))?
+            .len();
+        sampled_fingerprint(&proxy_path, size)
+    }
+
+    fn require_proxy(asset: &Asset) -> Result<PathBuf> {
+        let path = asset
+            .proxy_path
+            .as_deref()
+            .map(PathBuf::from)
+            .filter(|path| path.is_file())
+            .ok_or_else(|| {
+                anyhow!(
+                    "proxy is required to transcribe {}; generate it first",
+                    asset.id
+                )
+            })?;
+        Ok(path)
+    }
+
+    /// Transcribes one clip, replacing any previous transcript.
+    pub fn transcribe_asset(&self, asset_id: &str) -> Result<TranscribeOutcome> {
+        let engine = self.open_stt_engine()?;
+        self.transcribe_with_engine(asset_id, engine.as_ref())
+    }
+
+    fn open_stt_engine(&self) -> Result<Box<dyn SttEngine>> {
+        let directory = model_dir(&self.database_path)?;
+        let whisper = ensure_model(&directory, &WHISPER_MODEL)?;
+        let vad = ensure_model(&directory, &VAD_MODEL)?;
+        Ok(Box::new(WhisperEngine::new(&whisper, &vad)?))
+    }
+
+    fn transcribe_with_engine(
+        &self,
+        asset_id: &str,
+        engine: &dyn SttEngine,
+    ) -> Result<TranscribeOutcome> {
+        let asset = self.get_asset(asset_id)?;
+        let proxy_path = Self::require_proxy(&asset)?;
+        let source_fingerprint = self.proxy_fingerprint(asset_id)?;
+
+        let parent = self
+            .database_path
+            .parent()
+            .ok_or_else(|| anyhow!("catalog has no parent directory"))?;
+        let audio_dir = parent.join("cache").join("audio").join(&asset.project_id);
+        fs::create_dir_all(&audio_dir)?;
+        let pcm_path = audio_dir.join(format!("{asset_id}.16k.wav"));
+
+        let result = (|| -> Result<StoredTranscript> {
+            FfmpegAudioExtractor.extract_pcm16k(&proxy_path, &pcm_path)?;
+            // Read once per clip. The engine receives samples, never a path, so
+            // a multi-window clip does not re-read and re-convert the whole file
+            // for every window.
+            let pcm = read_pcm(&pcm_path)?;
+            transcribe_pcm(engine, asset_id, &source_fingerprint, &pcm)
+        })();
+        // The extracted PCM is scratch, not a retained representation, so it is
+        // removed whether or not the decode succeeded.
+        let _ = fs::remove_file(&pcm_path);
+        let stored = result?;
+
+        save_transcript(&self.connection()?, &stored)?;
+        Ok(TranscribeOutcome {
+            asset_id: asset_id.to_string(),
+            status: stored.status,
+            segment_count: stored.segments.len(),
+            window_count: stored.window_count,
+            speech_seconds: stored.speech_seconds,
+        })
+    }
+
+    pub fn transcribe_missing(&self, project_id: &str) -> Result<TranscribeReport> {
+        self.transcribe_missing_with_progress(project_id, |_| {})
+    }
+
+    /// Transcript coverage for a project, without transcribing anything.
+    ///
+    /// A stored transcript whose proxy fingerprint no longer matches counts as
+    /// `missing`, because that is what a `transcribe missing` run would redo.
+    pub fn transcript_coverage(&self, project_id: &str) -> Result<TranscriptCoverage> {
+        let connection = self.connection()?;
+        let mut coverage = TranscriptCoverage {
+            recipe_key: STT_RECIPE_KEY.to_string(),
+            ..TranscriptCoverage::default()
+        };
+        for asset in self.list_assets(project_id)? {
+            if asset.removed {
+                continue;
+            }
+            coverage.total += 1;
+            let current = match self.proxy_fingerprint(&asset.id) {
+                Ok(fingerprint) => is_current(&connection, &asset.id, &fingerprint)?,
+                Err(_) => false,
+            };
+            if !current {
+                coverage.missing += 1;
+                continue;
+            }
+            match load_transcript(&connection, &asset.id)?.map(|stored| stored.status) {
+                Some(TranscriptStatus::Speech) => coverage.speech += 1,
+                Some(TranscriptStatus::NoSpeech) => coverage.no_speech += 1,
+                Some(TranscriptStatus::Rejected) => coverage.rejected += 1,
+                Some(TranscriptStatus::Failed) => coverage.failed += 1,
+                None => coverage.missing += 1,
+            }
+        }
+        Ok(coverage)
+    }
+
+    /// Transcribes every clip in the project without a current transcript.
+    ///
+    /// Weighting is by clip, not source bytes, because decode cost tracks
+    /// 30-second window count rather than file size. One worker: peak RSS is
+    /// 1.15-1.38 GB and concurrent transcription alongside the four-worker
+    /// proxy pipeline has never been measured.
+    pub fn transcribe_missing_with_progress<F>(
+        &self,
+        project_id: &str,
+        mut on_progress: F,
+    ) -> Result<TranscribeReport>
+    where
+        F: FnMut(TranscribeBatchProgress),
+    {
+        let assets = self.list_assets(project_id)?;
+        let mut pending: Vec<Asset> = Vec::new();
+        let mut skipped = 0_usize;
+        {
+            let connection = self.connection()?;
+            for asset in assets {
+                if asset.removed {
+                    continue;
+                }
+                match self.proxy_fingerprint(&asset.id) {
+                    Ok(fingerprint) => {
+                        if is_current(&connection, &asset.id, &fingerprint)? {
+                            skipped += 1;
+                        } else {
+                            pending.push(asset);
+                        }
+                    }
+                    // A clip with no proxy cannot be transcribed at all. It is
+                    // reported as a failure per clip rather than aborting the
+                    // whole batch.
+                    Err(_) => pending.push(asset),
+                }
+            }
+        }
+
+        let mut report = TranscribeReport {
+            transcribed: 0,
+            skipped,
+            outcomes: Vec::new(),
+            failures: Vec::new(),
+        };
+
+        let task_work: Vec<u64> = vec![1; pending.len()];
+        let mut estimator =
+            BatchEstimator::new(&task_work, 1, self.load_batch_history(STT_TASK_KEY)?);
+        on_progress(TranscribeBatchProgress {
+            outcome: None,
+            estimate: estimator.estimate(&task_work),
+        });
+        if pending.is_empty() {
+            return Ok(report);
+        }
+
+        let engine = self.open_stt_engine()?;
+        for (index, asset) in pending.iter().enumerate() {
+            let started = Instant::now();
+            let result = self.transcribe_with_engine(&asset.id, engine.as_ref());
+            let remaining = &task_work[(index + 1).min(task_work.len())..];
+            match result {
+                Ok(outcome) => {
+                    estimator.record_completion(1, started.elapsed());
+                    report.transcribed += 1;
+                    on_progress(TranscribeBatchProgress {
+                        outcome: Some(outcome.clone()),
+                        estimate: estimator.estimate(remaining),
+                    });
+                    report.outcomes.push(outcome);
+                }
+                Err(error) => {
+                    estimator.record_failure(1);
+                    let message = format!("{error:#}");
+                    // Record the failure so a later run can see why, without
+                    // marking the clip as having a usable transcript.
+                    let stored = StoredTranscript {
+                        asset_id: asset.id.clone(),
+                        recipe_key: STT_RECIPE_KEY.to_string(),
+                        source_fingerprint: String::new(),
+                        status: TranscriptStatus::Failed,
+                        reject_reason: message.clone(),
+                        primary_language: String::new(),
+                        speech_seconds: 0.0,
+                        window_count: 0,
+                        segments: Vec::new(),
+                    };
+                    save_transcript(&self.connection()?, &stored)?;
+                    report.failures.push(IngestFailure {
+                        path: asset.path.clone(),
+                        error: message,
+                    });
+                    on_progress(TranscribeBatchProgress {
+                        outcome: None,
+                        estimate: estimator.estimate(remaining),
+                    });
+                }
+            }
+        }
+
+        self.save_batch_history(STT_TASK_KEY, estimator.history())?;
+        Ok(report)
+    }
+
+    /// Runs cloud vision for one clip. This is an explicit replacement action;
+    /// project-wide idempotence is provided by `analyze_missing`.
+    pub fn analyze_asset(&self, asset_id: &str) -> Result<AnalysisOutcome> {
+        let provider = OpenRouterProvider::new(resolve_api_key()?)?;
+        let chain = ProviderChain::new();
+        self.analyze_asset_with_provider(asset_id, &provider, &chain)
+    }
+
+    fn analysis_frame_pack(&self, asset: &Asset) -> Result<FramePackManifest> {
+        let proxy = Self::require_proxy(asset)?;
+        let fingerprint = self.proxy_fingerprint(&asset.id)?;
+        let connection = self.connection()?;
+        if let Some(manifest) = load_frame_pack(&connection, &asset.id)?
+            && manifest.recipe_key == FRAMEPACK_RECIPE_KEY
+            && manifest.source_fingerprint == fingerprint
+        {
+            return Ok(manifest);
+        }
+        let manifest = build_frame_pack(&proxy, &fingerprint)?;
+        save_frame_pack(&connection, &asset.id, &manifest)?;
+        Ok(manifest)
+    }
+
+    fn prompt_vocabulary(&self, project_id: &str) -> Result<Vec<String>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT display_label FROM label_vocabulary WHERE project_id=?1 ORDER BY usage_count DESC, normalized_label",
+        )?;
+        let vocabulary = statement
+            .query_map([project_id], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<String>>>()?;
+        if !vocabulary.is_empty() {
+            return Ok(vocabulary);
+        }
+        drop(statement);
+        let mut labels = self
+            .list_assets(project_id)?
+            .into_iter()
+            .flat_map(|asset| asset.labels)
+            .collect::<Vec<_>>();
+        labels.sort_by_key(|label| label.to_lowercase());
+        labels.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+        labels.truncate(80);
+        Ok(labels)
+    }
+
+    fn prompt_transcript(&self, asset_id: &str) -> Result<Option<PromptTranscript>> {
+        let Some(transcript) = load_transcript(&self.connection()?, asset_id)? else {
+            return Ok(None);
+        };
+        let text = transcript
+            .segments
+            .iter()
+            .map(|segment| segment.text.trim())
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        Ok(Some(PromptTranscript {
+            status: transcript.status,
+            text,
+        }))
+    }
+
+    fn analyze_asset_with_provider(
+        &self,
+        asset_id: &str,
+        provider: &dyn VlmProvider,
+        chain: &ProviderChain,
+    ) -> Result<AnalysisOutcome> {
+        let asset = self.get_asset(asset_id)?;
+        let proxy = Self::require_proxy(&asset)?;
+        let manifest = self.analysis_frame_pack(&asset)?;
+        let parent = self
+            .database_path
+            .parent()
+            .ok_or_else(|| anyhow!("catalog has no parent directory"))?;
+        let frame_directory = parent
+            .join("cache")
+            .join("framepacks")
+            .join(&asset.project_id)
+            .join(&asset.id)
+            .join(&manifest.source_fingerprint);
+        let frame_paths = encode_frames(&proxy, &manifest, &frame_directory)?;
+        let frames = frame_paths
+            .iter()
+            .map(|path| {
+                std::fs::read(path)
+                    .map(|bytes| frame_data_uri(&bytes))
+                    .with_context(|| format!("read frame {}", path.display()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let transcript = self.prompt_transcript(asset_id)?;
+        let transcript_used = transcript.as_ref().is_some_and(|value| {
+            value.status == TranscriptStatus::Speech && !value.text.is_empty()
+        });
+        let context = PromptContext {
+            frame_timestamps_ms: manifest.timestamps_ms.clone(),
+            clip_duration_ms: (asset.duration_seconds.max(0.0) * 1_000.0).round() as u32,
+            transcript,
+            vocabulary: self.prompt_vocabulary(&asset.project_id)?,
+            trip_context: None,
+        };
+        let outcome = run_vlm(provider, chain, &context, frames)?;
+        let mut stored = if let Some(observation) = &outcome.observation {
+            StoredAnalysis::from_observation(asset_id, &outcome.model, observation)
+        } else {
+            StoredAnalysis {
+                asset_id: asset_id.to_string(),
+                recipe_key: FRAMEPACK_RECIPE_KEY.to_string(),
+                prompt_version: VLM_PROMPT_VERSION.to_string(),
+                provider: "openrouter".to_string(),
+                model: outcome.model.clone(),
+                status: AnalysisStatus::Rejected,
+                reject_reason: outcome.reject_reason.clone(),
+                usable: false,
+                unusable_reason: None,
+                best_moment_start_ms: None,
+                best_moment_end_ms: None,
+                thumbnail_timestamp_ms: None,
+                camera_movement: CameraMovement::Other,
+                ocr_text: Vec::new(),
+                transcript_used,
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                cost_usd: 0.0,
+                latency_ms: 0,
+                attempts: outcome.attempts,
+                created_at: now(),
+            }
+        };
+        stored.transcript_used = transcript_used;
+        stored.prompt_tokens = outcome.prompt_tokens;
+        stored.completion_tokens = outcome.completion_tokens;
+        stored.cost_usd = outcome.cost_usd;
+        stored.latency_ms = outcome.latency_ms;
+        stored.attempts = outcome.attempts;
+
+        if let Some(observation) = &outcome.observation {
+            // Remove only labels whose local authorship side-table says this
+            // stage created. Human labels are never part of this replacement.
+            for label in ai_labels_for_asset(&self.connection()?, asset_id)? {
+                self.remove_label(asset_id, &label)?;
+            }
+            clear_ai_labels(&self.connection()?, asset_id)?;
+            set_title_and_description(
+                &self.connection()?,
+                asset_id,
+                &observation.title,
+                &observation.description,
+            )?;
+            let mut authored = Vec::new();
+            for proposed in &observation.labels {
+                self.add_label(asset_id, proposed)?;
+                authored.push((proposed.clone(), proposed.clone()));
+            }
+            record_ai_labels(&self.connection()?, asset_id, &authored)?;
+            if let Some(timestamp) = observation.thumbnail_timestamp_ms
+                && let Some(source) = frame_paths.iter().find(|path| {
+                    path.file_stem()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name == format!("f{timestamp:08}"))
+                })
+            {
+                let destination = parent
+                    .join("cache")
+                    .join("thumbnails")
+                    .join(asset_id)
+                    .join("q10.v1.jpg");
+                commit_thumbnail(&self.connection()?, asset_id, source, &destination)?;
+            }
+        }
+        save_analysis(&self.connection()?, &stored)?;
+        Ok(outcome)
+    }
+
+    pub fn analysis_coverage(&self, project_id: &str) -> Result<AnalysisCoverage> {
+        let connection = self.connection()?;
+        let mut coverage = AnalysisCoverage {
+            recipe_key: FRAMEPACK_RECIPE_KEY.to_string(),
+            prompt_version: VLM_PROMPT_VERSION.to_string(),
+            ..AnalysisCoverage::default()
+        };
+        for asset in self.list_assets(project_id)? {
+            if asset.removed {
+                continue;
+            }
+            coverage.total += 1;
+            let current = match self.proxy_fingerprint(&asset.id) {
+                Ok(fingerprint) => analysis_is_current(&connection, &asset.id, &fingerprint)?,
+                Err(_) => false,
+            };
+            if !current {
+                coverage.missing += 1;
+                continue;
+            }
+            match analysis::vlm_store::load_analysis(&connection, &asset.id)? {
+                Some(stored) => {
+                    coverage.cost_usd += stored.cost_usd;
+                    if stored.model == FALLBACK_MODEL {
+                        coverage.fallback_served += 1;
+                    }
+                    match stored.status {
+                        AnalysisStatus::Ok => coverage.ok += 1,
+                        AnalysisStatus::Rejected => coverage.rejected += 1,
+                        AnalysisStatus::Failed => coverage.failed += 1,
+                    }
+                }
+                None => coverage.missing += 1,
+            }
+        }
+        Ok(coverage)
+    }
+
+    pub fn analyze_missing(&self, project_id: &str, force: bool) -> Result<AnalyzeReport> {
+        self.analyze_missing_with_progress(project_id, force, |_| {})
+    }
+
+    pub fn analyze_missing_with_progress<F>(
+        &self,
+        project_id: &str,
+        force: bool,
+        mut on_progress: F,
+    ) -> Result<AnalyzeReport>
+    where
+        F: FnMut(AnalyzeBatchProgress),
+    {
+        let provider = OpenRouterProvider::new(resolve_api_key()?)?;
+        self.analyze_missing_with_provider(project_id, force, &provider, &mut on_progress)
+    }
+
+    fn analyze_missing_with_provider<F>(
+        &self,
+        project_id: &str,
+        force: bool,
+        provider: &dyn VlmProvider,
+        on_progress: &mut F,
+    ) -> Result<AnalyzeReport>
+    where
+        F: FnMut(AnalyzeBatchProgress),
+    {
+        let connection = self.connection()?;
+        let mut skipped = 0;
+        let mut force_overwrite_warnings = 0;
+        let mut pending = Vec::new();
+        for asset in self.list_assets(project_id)? {
+            if asset.removed {
+                continue;
+            }
+            let current = self
+                .proxy_fingerprint(&asset.id)
+                .ok()
+                .is_some_and(|fingerprint| {
+                    analysis_is_current(&connection, &asset.id, &fingerprint).unwrap_or(false)
+                });
+            if current && !force {
+                skipped += 1;
+                continue;
+            }
+            if force && current && (!asset.title.is_empty() || !asset.description.is_empty()) {
+                force_overwrite_warnings += 1;
+            }
+            pending.push(asset);
+        }
+        drop(connection);
+
+        // Materialize frame packs first so the estimator's remaining weights
+        // are exact frame counts, not clip-count or byte-size guesses.
+        let mut prepared = Vec::new();
+        let mut failures = Vec::new();
+        for asset in pending {
+            match self.analysis_frame_pack(&asset) {
+                Ok(manifest) => prepared.push((asset, manifest.timestamps_ms.len() as u64)),
+                Err(error) => failures.push(IngestFailure {
+                    path: asset.path,
+                    error: format!("{error:#}"),
+                }),
+            }
+        }
+        let task_work = prepared
+            .iter()
+            .map(|(_, frames)| *frames)
+            .collect::<Vec<_>>();
+        let worker_count = std::env::var("RCDVLOG_VLM_WORKERS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(4)
+            .clamp(1, prepared.len().max(1));
+        let task_key = format!(
+            "vlm.observe-v2.{}-w{worker_count}-v1",
+            DEFAULT_MODEL.replace('/', "-")
+        );
+        let mut estimator = BatchEstimator::new(
+            &task_work,
+            worker_count,
+            self.load_batch_history(&task_key)?,
+        );
+        on_progress(AnalyzeBatchProgress {
+            outcome: None,
+            estimate: estimator.estimate(&task_work),
+        });
+        let mut report = AnalyzeReport {
+            analyzed: 0,
+            skipped,
+            rejected: 0,
+            fallback_served: 0,
+            force_overwrite_warnings,
+            cost_usd: 0.0,
+            outcomes: Vec::new(),
+            failures,
+        };
+        let budget_usd = std::env::var("RCDVLOG_VLM_MAX_COST_USD")
+            .ok()
+            .and_then(|value| value.parse::<f64>().ok())
+            .unwrap_or(f64::INFINITY);
+        let queue = Arc::new(Mutex::new(
+            prepared
+                .into_iter()
+                .enumerate()
+                .map(|(index, (asset, frames))| (index, asset, frames))
+                .collect::<VecDeque<_>>(),
+        ));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let chain = ProviderChain::new();
+        let (sender, receiver) = mpsc::channel();
+        let mut completed = vec![false; task_work.len()];
+        thread::scope(|scope| -> Result<()> {
+            for _ in 0..worker_count {
+                let catalog = self.clone();
+                let queue = Arc::clone(&queue);
+                let stop = Arc::clone(&stop);
+                let sender = sender.clone();
+                let worker_chain = chain.clone();
+                scope.spawn(move || {
+                    loop {
+                        if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                            break;
+                        }
+                        let Some((index, asset, frames)) = queue
+                            .lock()
+                            .expect("VLM work queue lock poisoned")
+                            .pop_front()
+                        else {
+                            break;
+                        };
+                        let started = Instant::now();
+                        let result =
+                            catalog.analyze_asset_with_provider(&asset.id, provider, &worker_chain);
+                        if sender
+                            .send((index, asset, frames, started.elapsed(), result))
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                });
+            }
+            drop(sender);
+            for (index, asset, frames, elapsed, result) in receiver {
+                completed[index] = true;
+                let remaining = task_work
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, weight)| (!completed[index]).then_some(*weight))
+                    .collect::<Vec<_>>();
+                match result {
+                    Ok(outcome) => {
+                        estimator.record_completion(frames, elapsed);
+                        report.analyzed += 1;
+                        report.cost_usd += outcome.cost_usd;
+                        if outcome.observation.is_none() {
+                            report.rejected += 1;
+                        }
+                        if outcome.fell_back {
+                            report.fallback_served += 1;
+                        }
+                        report.outcomes.push(outcome.clone());
+                        on_progress(AnalyzeBatchProgress {
+                            outcome: Some(outcome),
+                            estimate: estimator.estimate(&remaining),
+                        });
+                    }
+                    Err(error) => {
+                        estimator.record_failure(frames);
+                        report.failures.push(IngestFailure {
+                            path: asset.path,
+                            error: format!("{error:#}"),
+                        });
+                        on_progress(AnalyzeBatchProgress {
+                            outcome: None,
+                            estimate: estimator.estimate(&remaining),
+                        });
+                    }
+                }
+                if report.cost_usd >= budget_usd {
+                    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+            Ok(())
+        })?;
+        if stop.load(std::sync::atomic::Ordering::Relaxed) {
+            report.failures.push(IngestFailure {
+                path: project_id.to_string(),
+                error: format!(
+                    "analysis budget exhausted after ${:.6} (limit ${budget_usd:.2})",
+                    report.cost_usd
+                ),
+            });
+        }
+        self.save_batch_history(&task_key, estimator.history())?;
+        Ok(report)
+    }
+
+    pub fn label_vocabulary(&self, project_id: &str) -> Result<Vec<LabelProposal>> {
+        analysis::consolidate::vocabulary(&self.connection()?, project_id)
+    }
+
+    /// Applies an already validated label remap through typed label operations.
+    /// Exposed separately so deterministic tests and future review UI can show
+    /// the proposed mapping before accepting it.
+    pub fn apply_label_mapping(
+        &self,
+        project_id: &str,
+        mappings: &[LabelMapping],
+    ) -> Result<ConsolidationReport> {
+        let connection = self.connection()?;
+        let proposals = label_proposals(&connection, project_id)?;
+        let envelope = serde_json::json!({"mappings": mappings});
+        parse_mapping(&envelope.to_string(), &proposals)?;
+        let actions = mappings
+            .iter()
+            .map(|mapping| {
+                Ok((
+                    mapping.clone(),
+                    assets_for_label(&connection, project_id, &mapping.from)?,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        drop(connection);
+        for (mapping, assets) in &actions {
+            if mapping.from.eq_ignore_ascii_case(&mapping.to) {
+                continue;
+            }
+            for asset_id in assets {
+                self.remove_label(asset_id, &mapping.from)?;
+                self.add_label(asset_id, &mapping.to)?;
+            }
+        }
+        let (remapped_assets, vocabulary_size) =
+            persist_label_mapping(&self.connection()?, project_id, mappings)?;
+        Ok(ConsolidationReport {
+            remapped_assets,
+            vocabulary_size,
+            mappings: mappings.to_vec(),
+            model: String::new(),
+            cost_usd: 0.0,
+        })
+    }
+
+    /// Performs one text-only vocabulary consolidation request, then remaps
+    /// only labels recorded as AI-authored.
+    pub fn consolidate_labels(&self, project_id: &str) -> Result<ConsolidationReport> {
+        let proposals = label_proposals(&self.connection()?, project_id)?;
+        if proposals.is_empty() {
+            return Ok(ConsolidationReport {
+                remapped_assets: 0,
+                vocabulary_size: 0,
+                mappings: Vec::new(),
+                model: String::new(),
+                cost_usd: 0.0,
+            });
+        }
+        let provider = OpenRouterProvider::new(resolve_api_key()?)?;
+        let request = VlmRequest {
+            prompt: consolidation_prompt(&proposals),
+            frames: Vec::new(),
+            schema: mapping_schema(proposals.len()),
+        };
+        let chain = ProviderChain::new();
+        let first = chain.analyze(&provider, &request)?;
+        let (mapping, response, total_cost) = match parse_mapping(&first.response.body, &proposals)
+        {
+            Ok(mapping) => (mapping, first.response.clone(), first.response.cost_usd),
+            Err(default_error) if first.response.model == DEFAULT_MODEL => {
+                chain.record_default_failure();
+                let fallback = provider.analyze(FALLBACK_MODEL, &request)?;
+                let mapping = parse_mapping(&fallback.body, &proposals).with_context(|| {
+                    format!("default mapping was invalid ({default_error:#}); fallback was invalid")
+                })?;
+                let total_cost = first.response.cost_usd + fallback.cost_usd;
+                (mapping, fallback, total_cost)
+            }
+            Err(error) => return Err(error).context("validate consolidation mapping"),
+        };
+        let mut report = self.apply_label_mapping(project_id, &mapping)?;
+        report.model = response.model;
+        report.cost_usd = total_cost;
+        Ok(report)
     }
 
     pub fn generate_missing_proxies(&self, project_id: &str) -> Result<ProxyReport> {
@@ -1614,6 +2452,8 @@ fn row_to_asset(row: &rusqlite::Row<'_>) -> rusqlite::Result<Asset> {
             0
         },
         notes: row.get(22)?,
+        title: row.get(27)?,
+        description: row.get(28)?,
         labels: serde_json::from_str(&row.get::<_, String>(23)?).unwrap_or_default(),
         removed: row.get::<_, i64>(24)? != 0,
         media_object_id: row.get(25)?,
@@ -1635,7 +2475,7 @@ fn is_media(path: &Path) -> bool {
     is_supported_media_path(path)
 }
 
-fn tool_command(name: &str) -> Command {
+pub(crate) fn tool_command(name: &str) -> Command {
     Command::new(resolve_tool(name))
 }
 
@@ -2274,6 +3114,124 @@ mod tests {
         let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).unwrap();
         let project = catalog.create_project("Test project").unwrap();
         (directory, catalog, project)
+    }
+
+    /// Writes a byte-identical stand-in for a generated proxy and points the
+    /// asset at it. Enough for fingerprinting and staleness tests, which never
+    /// decode the file.
+    fn attach_stub_proxy(
+        catalog: &Catalog,
+        asset_id: &str,
+        directory: &Path,
+        bytes: &[u8],
+    ) -> PathBuf {
+        let proxy_path = directory.join(format!("{asset_id}.proxy.mp4"));
+        fs::write(&proxy_path, bytes).unwrap();
+        catalog
+            .connection()
+            .unwrap()
+            .execute(
+                "UPDATE assets SET proxy_path = ?2 WHERE id = ?1",
+                params![asset_id, proxy_path.to_string_lossy()],
+            )
+            .unwrap();
+        proxy_path
+    }
+
+    #[test]
+    fn proxy_fingerprint_changes_when_the_proxy_is_regenerated() {
+        let (directory, catalog, project) = catalog_fixture();
+        insert_asset(
+            &catalog,
+            &project.id,
+            "a1",
+            "DJI_0001.MP4",
+            "DJI Pocket 3",
+            "2026-04-01T09:00:00Z",
+            Path::new("/volumes/nas/DJI_0001.MP4"),
+        );
+        attach_stub_proxy(&catalog, "a1", directory.path(), b"proxy version three");
+        let first = catalog.proxy_fingerprint("a1").unwrap();
+        attach_stub_proxy(&catalog, "a1", directory.path(), b"proxy regenerated anew");
+        let second = catalog.proxy_fingerprint("a1").unwrap();
+        assert_ne!(
+            first, second,
+            "a regenerated proxy must invalidate its transcript"
+        );
+    }
+
+    #[test]
+    fn proxy_fingerprint_fails_clearly_without_a_proxy() {
+        let (_directory, catalog, project) = catalog_fixture();
+        insert_asset(
+            &catalog,
+            &project.id,
+            "a1",
+            "DJI_0001.MP4",
+            "DJI Pocket 3",
+            "2026-04-01T09:00:00Z",
+            Path::new("/volumes/nas/DJI_0001.MP4"),
+        );
+        let error = catalog.proxy_fingerprint("a1").unwrap_err();
+        assert!(error.to_string().contains("proxy is required"), "{error}");
+    }
+
+    #[test]
+    fn transcribe_missing_skips_clips_with_a_current_transcript() {
+        let (directory, catalog, project) = catalog_fixture();
+        insert_asset(
+            &catalog,
+            &project.id,
+            "a1",
+            "DJI_0001.MP4",
+            "DJI Pocket 3",
+            "2026-04-01T09:00:00Z",
+            Path::new("/volumes/nas/DJI_0001.MP4"),
+        );
+        attach_stub_proxy(&catalog, "a1", directory.path(), b"proxy bytes");
+        let fingerprint = catalog.proxy_fingerprint("a1").unwrap();
+        save_transcript(
+            &catalog.connection().unwrap(),
+            &StoredTranscript {
+                asset_id: "a1".to_string(),
+                recipe_key: STT_RECIPE_KEY.to_string(),
+                source_fingerprint: fingerprint,
+                status: TranscriptStatus::NoSpeech,
+                reject_reason: String::new(),
+                primary_language: String::new(),
+                speech_seconds: 0.0,
+                window_count: 0,
+                segments: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        // No models are installed, so reaching the engine would fail. Returning
+        // a clean report proves the clip was skipped before that point.
+        let report = catalog.transcribe_missing(&project.id).unwrap();
+        assert_eq!(report.skipped, 1);
+        assert_eq!(report.transcribed, 0);
+        assert!(report.outcomes.is_empty());
+    }
+
+    #[test]
+    fn transcribe_missing_reports_a_missing_model_rather_than_transcribing() {
+        let (directory, catalog, project) = catalog_fixture();
+        insert_asset(
+            &catalog,
+            &project.id,
+            "a1",
+            "DJI_0001.MP4",
+            "DJI Pocket 3",
+            "2026-04-01T09:00:00Z",
+            Path::new("/volumes/nas/DJI_0001.MP4"),
+        );
+        attach_stub_proxy(&catalog, "a1", directory.path(), b"proxy bytes");
+        let error = catalog.transcribe_missing(&project.id).unwrap_err();
+        assert!(
+            error.to_string().contains("is not installed"),
+            "expected an actionable model error, got: {error}"
+        );
     }
 
     fn insert_asset(

@@ -36,6 +36,82 @@ this; every row here tests something headless runners cannot reach.
 | 15 | Sleep and wake | Sleep the machine with app open mid-batch. Wake after 30+ seconds. | App is responsive. Job state is coherent. No data loss. |
 | 16 | Relaunch integrity | After exercising all rows above, quit and relaunch. | Project state intact: clip count unchanged, labels/notes/removals preserved, rotation preserved, review position preserved, catalog file valid. |
 
+## Transcription (CLI)
+
+Local speech-to-text is CLI-only for now; there is no desktop surface yet. It
+runs fully offline and needs no API key.
+
+Install both models into the project's cache first — a batch deliberately does
+not download them for you:
+
+```bash
+curl -L -o "$PROJECT/cache/models/ggml-silero-v5.1.2.bin" https://huggingface.co/ggml-org/whisper-vad/resolve/main/ggml-silero-v5.1.2.bin
+```
+
+```bash
+curl -L -o "$PROJECT/cache/models/ggml-large-v3-turbo-q5_0.bin" https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin
+```
+
+| # | Check | How | Expected |
+| --- | --- | --- | --- |
+| T1 | Coverage before | `rcdvlog --catalog <c> transcribe status --project <p>` | `total` matches the clip count; everything in `missing`; `recipeKey` is the current STT recipe. |
+| T2 | Missing model is actionable | Move a model aside, run `transcribe missing`. | Fails naming the file, its size, and the directory to put it in. Nothing is written. |
+| T3 | Batch run | `rcdvlog --catalog <c> transcribe missing --project <p>` | JSON envelope on stdout; `transcribe.progress` events on stderr with a live estimate. |
+| T4 | VAD gates silence | Inspect `transcribe status` after the run. | A large fraction land in `noSpeech` — roughly two thirds on travel footage. Zero would mean the gate is broken. |
+| T5 | Idempotent | Re-run `transcribe missing`. | `skipped` equals the clip count, `transcribed` is 0, and no model work happens. |
+| T6 | Proxy regeneration invalidates | Regenerate one clip's proxy, then re-run `transcribe missing`. | That one clip is transcribed again; the rest are skipped. |
+| T7 | Originals untouched | Unmount the source volume, then run `transcribe missing`. | Runs to completion from proxies alone. |
+
+Run the automated end-to-end check against a real project with:
+
+```bash
+RCDVLOG_STT_FIXTURE=$HOME/Movies/VideoProjects/<project> cargo test --release -p rcdvlog-core --test stt_end_to_end -- --ignored --nocapture
+```
+
+Use `--release`. The debug profile leaves the Rust glue unoptimized (ggml itself
+is always built Release by `whisper-rs-sys`) and the same corpus took several
+times longer.
+
+Reference run, 2026-08-03, M3 MacBook Air, 273 clips / 129.1 min of footage:
+31.5 min wall, 131 speech, 135 `no_speech`, 7 rejected, 0 failed, 155 windows
+decoded, 380 segments stored.
+
+## Cloud clip analysis (CLI)
+
+Clip analysis is CLI-only for now. Put the OpenRouter key in
+`~/.openrouter.key` (one line) or set `OPENROUTER_API_KEY`. Analysis reads
+proxies only and may include a current accepted transcript; originals may be
+offline.
+
+| # | Check | How | Expected |
+| --- | --- | --- | --- |
+| V1 | Coverage before | `rcdvlog --catalog <c> analyze status --project <p>` | `total` matches the clip count and stale/missing observations are reported without a network request. |
+| V2 | Budget bound | Set `RCDVLOG_VLM_MAX_COST_USD` to a deliberately tiny amount and run `analyze missing`. | The batch stops before starting another request once returned usage reaches the bound. |
+| V3 | Batch run | Set a suitable cost bound, then run `analyze missing --project <p>`. | JSON envelope on stdout; `analyze.progress` events on stderr; generated title, description, AI labels, and a quality-10 representative thumbnail are persisted. |
+| V4 | Human ownership | Add a human note and human label before analysis and label consolidation. | The note and human label remain byte-for-byte unchanged. Consolidation remaps AI-owned labels only. |
+| V5 | Idempotent | Re-run `analyze missing`. | Every current clip is skipped and no provider call occurs. |
+| V6 | Proxy regeneration invalidates | Regenerate one proxy, then run `analyze status`. | That observation becomes stale; the rest remain current. |
+| V7 | Originals untouched/offline | Unmount the source volume, then analyze a clip with a proxy. | Analysis succeeds from the proxy; source files are unchanged. |
+| V8 | Consolidate labels | Run `labels consolidate --project <p>`, then `labels vocabulary --project <p>`. | One text-only call produces a bounded mapping; vocabulary counts reflect operation-backed AI-label remaps. |
+
+Live controls and a real-project batch are ignored by default:
+
+```bash
+RCDVLOG_VLM_CONTROL_FRAME=/path/to/real-q1-thumbnail.jpg \
+  cargo test -p rcdvlog-core --test vlm_controls -- --ignored --nocapture
+```
+
+```bash
+RCDVLOG_VLM_FIXTURE=/path/to/project \
+RCDVLOG_VLM_MAX_COST_USD=1 \
+  cargo test -p rcdvlog-core --test vlm_end_to_end -- --ignored --nocapture
+```
+
+Reference run, 2026-08-04, M3 MacBook Air, 273 clips: 273 current, 0 failed,
+0 rejected, 131 transcript-fused, one Qwen-to-Gemini fallback, $0.02732851
+stored analysis cost. Twelve black/noise/blur negative controls passed for
+$0.000505. Label consolidation remapped 149 assets into six labels.
+
 ## After each run
 
 1. Record the build path, commit SHA, macOS version, and machine model.

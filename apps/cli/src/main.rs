@@ -97,6 +97,76 @@ enum Commands {
         #[command(subcommand)]
         command: chronology_commands::DiagnosticsCommand,
     },
+    /// Transcribe clips locally with VAD gating. Runs offline, no API key.
+    Transcribe {
+        #[command(subcommand)]
+        command: TranscribeCommand,
+    },
+    /// Analyze clips with bounded cloud vision through OpenRouter.
+    Analyze {
+        #[command(subcommand)]
+        command: AnalyzeCommand,
+    },
+    /// Consolidate or inspect the AI-authored label vocabulary.
+    Labels {
+        #[command(subcommand)]
+        command: LabelsCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum TranscribeCommand {
+    /// Transcribe one clip, replacing any existing transcript.
+    Generate {
+        #[arg(long)]
+        asset: String,
+    },
+    /// Transcribe every clip in the project without a current transcript.
+    Missing {
+        #[arg(long)]
+        project: String,
+    },
+    /// Report transcript coverage without transcribing anything.
+    Status {
+        #[arg(long)]
+        project: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum AnalyzeCommand {
+    /// Analyze one clip, replacing its prior derived observation.
+    Generate {
+        #[arg(long)]
+        asset: String,
+    },
+    /// Analyze clips without a current observation.
+    Missing {
+        #[arg(long)]
+        project: String,
+        /// Re-analyze current clips. The report counts non-empty AI-owned fields before overwrite.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Report analysis coverage without network access or writes.
+    Status {
+        #[arg(long)]
+        project: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum LabelsCommand {
+    /// Make one text-only model call, then remap AI-authored labels only.
+    Consolidate {
+        #[arg(long)]
+        project: String,
+    },
+    /// Read the current consolidated vocabulary and usage counts.
+    Vocabulary {
+        #[arg(long)]
+        project: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -302,6 +372,20 @@ fn command_name(command: &Commands) -> &'static str {
             ProxyCommand::Missing { .. } => "proxy.missing",
             ProxyCommand::Status { .. } => "proxy.status",
         },
+        Commands::Transcribe { command } => match command {
+            TranscribeCommand::Generate { .. } => "transcribe.generate",
+            TranscribeCommand::Missing { .. } => "transcribe.missing",
+            TranscribeCommand::Status { .. } => "transcribe.status",
+        },
+        Commands::Analyze { command } => match command {
+            AnalyzeCommand::Generate { .. } => "analyze.generate",
+            AnalyzeCommand::Missing { .. } => "analyze.missing",
+            AnalyzeCommand::Status { .. } => "analyze.status",
+        },
+        Commands::Labels { command } => match command {
+            LabelsCommand::Consolidate { .. } => "labels.consolidate",
+            LabelsCommand::Vocabulary { .. } => "labels.vocabulary",
+        },
         Commands::Thumbnails { command } => match command {
             ThumbnailCommand::Generate { .. } => "thumbnails.generate",
             ThumbnailCommand::Missing { .. } => "thumbnails.missing",
@@ -357,6 +441,12 @@ fn execute(cli: &Cli) -> Result<Value> {
             command: ClipsCommand::Diagnose { .. }
         } | Commands::Proxy {
             command: ProxyCommand::Status { .. }
+        } | Commands::Transcribe {
+            command: TranscribeCommand::Status { .. }
+        } | Commands::Analyze {
+            command: AnalyzeCommand::Status { .. }
+        } | Commands::Labels {
+            command: LabelsCommand::Vocabulary { .. }
         }
     ) || match &cli.command {
         // The chronology surface never writes; diagnostics only writes to
@@ -488,6 +578,54 @@ fn execute(cli: &Cli) -> Result<Value> {
                 project,
                 limit,
             } => proxy_status(&catalog, asset.as_deref(), project.as_deref(), *limit),
+        },
+        Commands::Transcribe { command } => match command {
+            TranscribeCommand::Generate { asset } => {
+                Ok(serde_json::to_value(catalog.transcribe_asset(asset)?)?)
+            }
+            TranscribeCommand::Missing { project } => Ok(serde_json::to_value(
+                catalog.transcribe_missing_with_progress(project, |progress| {
+                    eprintln!(
+                        "{}",
+                        json!({
+                            "event": "transcribe.progress",
+                            "outcome": progress.outcome,
+                            "estimate": progress.estimate,
+                        })
+                    );
+                })?,
+            )?),
+            TranscribeCommand::Status { project } => {
+                Ok(serde_json::to_value(catalog.transcript_coverage(project)?)?)
+            }
+        },
+        Commands::Analyze { command } => match command {
+            AnalyzeCommand::Generate { asset } => {
+                Ok(serde_json::to_value(catalog.analyze_asset(asset)?)?)
+            }
+            AnalyzeCommand::Missing { project, force } => Ok(serde_json::to_value(
+                catalog.analyze_missing_with_progress(project, *force, |progress| {
+                    eprintln!(
+                        "{}",
+                        json!({
+                            "event": "analyze.progress",
+                            "outcome": progress.outcome,
+                            "estimate": progress.estimate,
+                        })
+                    );
+                })?,
+            )?),
+            AnalyzeCommand::Status { project } => {
+                Ok(serde_json::to_value(catalog.analysis_coverage(project)?)?)
+            }
+        },
+        Commands::Labels { command } => match command {
+            LabelsCommand::Consolidate { project } => {
+                Ok(serde_json::to_value(catalog.consolidate_labels(project)?)?)
+            }
+            LabelsCommand::Vocabulary { project } => {
+                Ok(serde_json::to_value(catalog.label_vocabulary(project)?)?)
+            }
         },
         Commands::Thumbnails { command } => match command {
             ThumbnailCommand::Generate { asset, quality } => Ok(serde_json::to_value(
@@ -1002,9 +1140,82 @@ mod tests {
             "clock",
             "proxy",
             "thumbnails",
+            "transcribe",
+            "analyze",
+            "labels",
         ] {
             assert!(help.contains(command));
         }
+    }
+
+    #[test]
+    fn transcribe_subcommands_parse() {
+        assert!(
+            Cli::try_parse_from(["rcdvlog", "transcribe", "missing", "--project", "p1"]).is_ok()
+        );
+        assert!(
+            Cli::try_parse_from(["rcdvlog", "transcribe", "generate", "--asset", "a1"]).is_ok()
+        );
+        assert!(
+            Cli::try_parse_from(["rcdvlog", "transcribe", "status", "--project", "p1"]).is_ok()
+        );
+    }
+
+    #[test]
+    fn transcribe_generate_requires_an_asset() {
+        assert!(Cli::try_parse_from(["rcdvlog", "transcribe", "generate"]).is_err());
+    }
+
+    #[test]
+    fn transcribe_status_requires_a_project() {
+        assert!(Cli::try_parse_from(["rcdvlog", "transcribe", "status"]).is_err());
+    }
+
+    #[test]
+    fn analysis_and_label_subcommands_parse() {
+        assert!(Cli::try_parse_from(["rcdvlog", "analyze", "missing", "--project", "p1"]).is_ok());
+        assert!(
+            Cli::try_parse_from([
+                "rcdvlog",
+                "analyze",
+                "missing",
+                "--project",
+                "p1",
+                "--force",
+            ])
+            .is_ok()
+        );
+        assert!(Cli::try_parse_from(["rcdvlog", "analyze", "generate", "--asset", "a1"]).is_ok());
+        assert!(Cli::try_parse_from(["rcdvlog", "analyze", "status", "--project", "p1"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["rcdvlog", "labels", "consolidate", "--project", "p1",]).is_ok()
+        );
+        assert!(
+            Cli::try_parse_from(["rcdvlog", "labels", "vocabulary", "--project", "p1",]).is_ok()
+        );
+    }
+
+    #[test]
+    fn transcribe_status_reports_coverage_on_an_empty_project() {
+        let directory = tempdir().unwrap();
+        let catalog_path = directory.path().join("catalog.sqlite3");
+        let catalog = Catalog::open(&catalog_path).unwrap();
+        let project = catalog.create_project("Coverage test").unwrap();
+        let catalog_arg = catalog_path.to_string_lossy().to_string();
+
+        let status = parse(&[
+            "rcdvlog",
+            "--catalog",
+            &catalog_arg,
+            "transcribe",
+            "status",
+            "--project",
+            &project.id,
+        ]);
+        let value = execute(&status).unwrap();
+        assert_eq!(value["total"], 0);
+        assert_eq!(value["missing"], 0);
+        assert_eq!(value["recipeKey"], rcdvlog_core::STT_RECIPE_KEY);
     }
 
     #[test]
