@@ -17,6 +17,7 @@ use std::time::Instant;
 use uuid::Uuid;
 use walkdir::WalkDir;
 
+mod analysis;
 mod baseline;
 mod cameras;
 mod chronology;
@@ -27,6 +28,7 @@ mod migrations;
 mod operations;
 mod storage;
 
+pub use analysis::{STT_RECIPE_KEY, STT_TASK_KEY};
 pub use cameras::{
     CAMERA_PATTERNS, CameraIdentity, CameraIdentitySource, CameraPattern, PatternConfidence,
     UNKNOWN_CAMERA, identify_camera, pattern_counter,
