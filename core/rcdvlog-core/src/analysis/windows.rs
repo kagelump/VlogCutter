@@ -96,6 +96,39 @@ pub fn pack_windows(regions: &[SpeechRegion]) -> Vec<PackedWindow> {
     windows
 }
 
+/// Translates an offset in packed-window time back to clip time.
+///
+/// Returns `None` only for an empty window. An offset past the end of the
+/// packed audio is clamped to the end of the last region, because whisper pads
+/// short windows to a full 30 seconds and will happily return timestamps inside
+/// that padding.
+pub fn window_offset_to_source_ms(window: &PackedWindow, offset_ms: u32) -> Option<u32> {
+    let last = window.regions.last()?;
+    for region in &window.regions {
+        let region_end = region.window_offset_ms + region.duration_ms;
+        // The half-open interval means an offset exactly on a boundary belongs
+        // to the region that starts there, not the one that ends there.
+        if offset_ms >= region.window_offset_ms && offset_ms < region_end {
+            return Some(region.source_start_ms + (offset_ms - region.window_offset_ms));
+        }
+    }
+    Some(last.source_start_ms + last.duration_ms)
+}
+
+/// Translates a window-time span to a clip-time span.
+///
+/// Each end is translated through its own region, so a span crossing dropped
+/// silence widens to cover the real elapsed clip time. The result is ordered.
+pub fn translate_span(
+    window: &PackedWindow,
+    start_offset_ms: u32,
+    end_offset_ms: u32,
+) -> Option<(u32, u32)> {
+    let start = window_offset_to_source_ms(window, start_offset_ms)?;
+    let end = window_offset_to_source_ms(window, end_offset_ms)?;
+    Some((start.min(end), start.max(end)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -164,5 +197,56 @@ mod tests {
         assert_eq!(windows.len(), 1);
         assert_eq!(windows[0].regions.len(), 1);
         assert_eq!(windows[0].regions[0].source_start_ms, 2_000);
+    }
+
+    #[test]
+    fn offset_inside_first_region_maps_to_its_source_time() {
+        let windows = pack_windows(&[region(1_000, 4_000), region(9_000, 12_000)]);
+        let window = &windows[0];
+        assert_eq!(window_offset_to_source_ms(window, 0), Some(1_000));
+        assert_eq!(window_offset_to_source_ms(window, 2_500), Some(3_500));
+    }
+
+    #[test]
+    fn offset_inside_a_later_region_skips_the_dropped_silence() {
+        let windows = pack_windows(&[region(1_000, 4_000), region(9_000, 12_000)]);
+        let window = &windows[0];
+        // Window offset 3000 is the boundary: the first region ended, so this is
+        // the start of the second region at clip time 9000, not 4000.
+        assert_eq!(window_offset_to_source_ms(window, 3_000), Some(9_000));
+        assert_eq!(window_offset_to_source_ms(window, 4_000), Some(10_000));
+    }
+
+    #[test]
+    fn offset_past_the_packed_content_is_clamped_to_the_end() {
+        // whisper pads to a full 30s window, so it can return timestamps beyond
+        // the audio that was actually packed.
+        let windows = pack_windows(&[region(1_000, 4_000)]);
+        let window = &windows[0];
+        assert_eq!(window_offset_to_source_ms(window, 25_000), Some(4_000));
+    }
+
+    #[test]
+    fn empty_window_translates_nothing() {
+        let window = PackedWindow::default();
+        assert_eq!(window_offset_to_source_ms(&window, 0), None);
+    }
+
+    #[test]
+    fn a_span_crossing_a_region_boundary_uses_each_ends_own_region() {
+        let windows = pack_windows(&[region(1_000, 4_000), region(9_000, 12_000)]);
+        let window = &windows[0];
+        // 2000..4000 in window time spans the boundary at 3000.
+        assert_eq!(translate_span(window, 2_000, 4_000), Some((3_000, 10_000)));
+    }
+
+    #[test]
+    fn a_span_never_ends_before_it_starts() {
+        let windows = pack_windows(&[region(5_000, 8_000)]);
+        let window = &windows[0];
+        // Offsets arrive reversed; the translated span is still ordered.
+        let (start, end) = translate_span(window, 2_000, 1_000).unwrap();
+        assert!(start <= end);
+        assert_eq!((start, end), (6_000, 7_000));
     }
 }
