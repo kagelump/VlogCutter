@@ -1637,7 +1637,7 @@ fn is_media(path: &Path) -> bool {
     is_supported_media_path(path)
 }
 
-fn tool_command(name: &str) -> Command {
+pub(crate) fn tool_command(name: &str) -> Command {
     Command::new(resolve_tool(name))
 }
 
