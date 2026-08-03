@@ -12,7 +12,9 @@ pub mod engine;
 #[allow(dead_code)]
 pub mod framepack;
 pub mod frames;
-// Consumed by `vlm`, which lands after the OpenRouter client.
+// Consumed by `vlm`, which lands next.
+#[allow(dead_code)]
+pub mod openrouter;
 #[allow(dead_code)]
 pub mod provider;
 pub mod quality;

@@ -6,12 +6,15 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+base64.workspace = true
 batch-estimator = { path = "../batch-estimator" }
 blake3.workspace = true
 chrono.workspace = true
+dirs.workspace = true
 chrono-tz.workspace = true
 hound = "3.5"
 regex.workspace = true
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
