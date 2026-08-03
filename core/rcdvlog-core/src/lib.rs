@@ -28,6 +28,14 @@ mod migrations;
 mod operations;
 mod storage;
 
+use analysis::audio::{AudioExtractor, FfmpegAudioExtractor};
+use analysis::engine::{SttEngine, VAD_MODEL, WHISPER_MODEL, ensure_model, model_dir};
+use analysis::store::{StoredTranscript, is_current, save_transcript};
+use analysis::stt::transcribe_pcm;
+use analysis::whisper_engine::WhisperEngine;
+
+pub use analysis::store::TranscriptStatus;
+pub use analysis::stt::TranscribeOutcome;
 pub use analysis::{STT_RECIPE_KEY, STT_TASK_KEY};
 pub use cameras::{
     CAMERA_PATTERNS, CameraIdentity, CameraIdentitySource, CameraPattern, PatternConfidence,
@@ -264,6 +272,24 @@ pub struct ThumbnailReport {
 pub struct AssetBatchProgress {
     pub asset: Option<Asset>,
     pub estimate: BatchEstimate,
+}
+
+/// Progress for a transcription batch, mirroring `AssetBatchProgress`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TranscribeBatchProgress {
+    pub outcome: Option<TranscribeOutcome>,
+    pub estimate: BatchEstimate,
+}
+
+/// Summary of one `transcribe missing` run.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TranscribeReport {
+    pub transcribed: usize,
+    pub skipped: usize,
+    pub outcomes: Vec<TranscribeOutcome>,
+    pub failures: Vec<IngestFailure>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1059,6 +1085,193 @@ impl Catalog {
             estimate: estimator.estimate(&[]),
         });
         result
+    }
+
+    /// Fingerprint of the proxy a transcript would be derived from.
+    ///
+    /// Transcripts are pinned to the proxy file, so regenerating a proxy must
+    /// make its transcript stale. This reuses the same sampled BLAKE3 scheme as
+    /// asset identity rather than introducing a second one.
+    pub fn proxy_fingerprint(&self, asset_id: &str) -> Result<String> {
+        let asset = self.get_asset(asset_id)?;
+        let proxy_path = Self::require_proxy(&asset)?;
+        let size = fs::metadata(&proxy_path)
+            .with_context(|| format!("stat proxy {}", proxy_path.display()))?
+            .len();
+        sampled_fingerprint(&proxy_path, size)
+    }
+
+    fn require_proxy(asset: &Asset) -> Result<PathBuf> {
+        let path = asset
+            .proxy_path
+            .as_deref()
+            .map(PathBuf::from)
+            .filter(|path| path.is_file())
+            .ok_or_else(|| {
+                anyhow!(
+                    "proxy is required to transcribe {}; generate it first",
+                    asset.id
+                )
+            })?;
+        Ok(path)
+    }
+
+    /// Transcribes one clip, replacing any previous transcript.
+    pub fn transcribe_asset(&self, asset_id: &str) -> Result<TranscribeOutcome> {
+        let engine = self.open_stt_engine()?;
+        self.transcribe_with_engine(asset_id, engine.as_ref())
+    }
+
+    fn open_stt_engine(&self) -> Result<Box<dyn SttEngine>> {
+        let directory = model_dir(&self.database_path)?;
+        let whisper = ensure_model(&directory, &WHISPER_MODEL)?;
+        let vad = ensure_model(&directory, &VAD_MODEL)?;
+        Ok(Box::new(WhisperEngine::new(&whisper, &vad)?))
+    }
+
+    fn transcribe_with_engine(
+        &self,
+        asset_id: &str,
+        engine: &dyn SttEngine,
+    ) -> Result<TranscribeOutcome> {
+        let asset = self.get_asset(asset_id)?;
+        let proxy_path = Self::require_proxy(&asset)?;
+        let source_fingerprint = self.proxy_fingerprint(asset_id)?;
+
+        let parent = self
+            .database_path
+            .parent()
+            .ok_or_else(|| anyhow!("catalog has no parent directory"))?;
+        let audio_dir = parent.join("cache").join("audio").join(&asset.project_id);
+        fs::create_dir_all(&audio_dir)?;
+        let pcm_path = audio_dir.join(format!("{asset_id}.16k.wav"));
+
+        let result = (|| -> Result<StoredTranscript> {
+            FfmpegAudioExtractor.extract_pcm16k(&proxy_path, &pcm_path)?;
+            transcribe_pcm(engine, asset_id, &source_fingerprint, &pcm_path)
+        })();
+        // The extracted PCM is scratch, not a retained representation, so it is
+        // removed whether or not the decode succeeded.
+        let _ = fs::remove_file(&pcm_path);
+        let stored = result?;
+
+        save_transcript(&self.connection()?, &stored)?;
+        Ok(TranscribeOutcome {
+            asset_id: asset_id.to_string(),
+            status: stored.status,
+            segment_count: stored.segments.len(),
+            window_count: stored.window_count,
+            speech_seconds: stored.speech_seconds,
+        })
+    }
+
+    pub fn transcribe_missing(&self, project_id: &str) -> Result<TranscribeReport> {
+        self.transcribe_missing_with_progress(project_id, |_| {})
+    }
+
+    /// Transcribes every clip in the project without a current transcript.
+    ///
+    /// Weighting is by clip, not source bytes, because decode cost tracks
+    /// 30-second window count rather than file size. One worker: peak RSS is
+    /// 1.15-1.38 GB and concurrent transcription alongside the four-worker
+    /// proxy pipeline has never been measured.
+    pub fn transcribe_missing_with_progress<F>(
+        &self,
+        project_id: &str,
+        mut on_progress: F,
+    ) -> Result<TranscribeReport>
+    where
+        F: FnMut(TranscribeBatchProgress),
+    {
+        let assets = self.list_assets(project_id)?;
+        let mut pending: Vec<Asset> = Vec::new();
+        let mut skipped = 0_usize;
+        {
+            let connection = self.connection()?;
+            for asset in assets {
+                if asset.removed {
+                    continue;
+                }
+                match self.proxy_fingerprint(&asset.id) {
+                    Ok(fingerprint) => {
+                        if is_current(&connection, &asset.id, &fingerprint)? {
+                            skipped += 1;
+                        } else {
+                            pending.push(asset);
+                        }
+                    }
+                    // A clip with no proxy cannot be transcribed at all. It is
+                    // reported as a failure per clip rather than aborting the
+                    // whole batch.
+                    Err(_) => pending.push(asset),
+                }
+            }
+        }
+
+        let mut report = TranscribeReport {
+            transcribed: 0,
+            skipped,
+            outcomes: Vec::new(),
+            failures: Vec::new(),
+        };
+
+        let task_work: Vec<u64> = vec![1; pending.len()];
+        let mut estimator =
+            BatchEstimator::new(&task_work, 1, self.load_batch_history(STT_TASK_KEY)?);
+        on_progress(TranscribeBatchProgress {
+            outcome: None,
+            estimate: estimator.estimate(&task_work),
+        });
+        if pending.is_empty() {
+            return Ok(report);
+        }
+
+        let engine = self.open_stt_engine()?;
+        for (index, asset) in pending.iter().enumerate() {
+            let started = Instant::now();
+            let result = self.transcribe_with_engine(&asset.id, engine.as_ref());
+            let remaining = &task_work[(index + 1).min(task_work.len())..];
+            match result {
+                Ok(outcome) => {
+                    estimator.record_completion(1, started.elapsed());
+                    report.transcribed += 1;
+                    on_progress(TranscribeBatchProgress {
+                        outcome: Some(outcome.clone()),
+                        estimate: estimator.estimate(remaining),
+                    });
+                    report.outcomes.push(outcome);
+                }
+                Err(error) => {
+                    estimator.record_failure(1);
+                    let message = format!("{error:#}");
+                    // Record the failure so a later run can see why, without
+                    // marking the clip as having a usable transcript.
+                    let stored = StoredTranscript {
+                        asset_id: asset.id.clone(),
+                        recipe_key: STT_RECIPE_KEY.to_string(),
+                        source_fingerprint: String::new(),
+                        status: TranscriptStatus::Failed,
+                        reject_reason: message.clone(),
+                        primary_language: String::new(),
+                        speech_seconds: 0.0,
+                        window_count: 0,
+                        segments: Vec::new(),
+                    };
+                    save_transcript(&self.connection()?, &stored)?;
+                    report.failures.push(IngestFailure {
+                        path: asset.path.clone(),
+                        error: message,
+                    });
+                    on_progress(TranscribeBatchProgress {
+                        outcome: None,
+                        estimate: estimator.estimate(remaining),
+                    });
+                }
+            }
+        }
+
+        self.save_batch_history(STT_TASK_KEY, estimator.history())?;
+        Ok(report)
     }
 
     pub fn generate_missing_proxies(&self, project_id: &str) -> Result<ProxyReport> {
@@ -2276,6 +2489,124 @@ mod tests {
         let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).unwrap();
         let project = catalog.create_project("Test project").unwrap();
         (directory, catalog, project)
+    }
+
+    /// Writes a byte-identical stand-in for a generated proxy and points the
+    /// asset at it. Enough for fingerprinting and staleness tests, which never
+    /// decode the file.
+    fn attach_stub_proxy(
+        catalog: &Catalog,
+        asset_id: &str,
+        directory: &Path,
+        bytes: &[u8],
+    ) -> PathBuf {
+        let proxy_path = directory.join(format!("{asset_id}.proxy.mp4"));
+        fs::write(&proxy_path, bytes).unwrap();
+        catalog
+            .connection()
+            .unwrap()
+            .execute(
+                "UPDATE assets SET proxy_path = ?2 WHERE id = ?1",
+                params![asset_id, proxy_path.to_string_lossy()],
+            )
+            .unwrap();
+        proxy_path
+    }
+
+    #[test]
+    fn proxy_fingerprint_changes_when_the_proxy_is_regenerated() {
+        let (directory, catalog, project) = catalog_fixture();
+        insert_asset(
+            &catalog,
+            &project.id,
+            "a1",
+            "DJI_0001.MP4",
+            "DJI Pocket 3",
+            "2026-04-01T09:00:00Z",
+            Path::new("/volumes/nas/DJI_0001.MP4"),
+        );
+        attach_stub_proxy(&catalog, "a1", directory.path(), b"proxy version three");
+        let first = catalog.proxy_fingerprint("a1").unwrap();
+        attach_stub_proxy(&catalog, "a1", directory.path(), b"proxy regenerated anew");
+        let second = catalog.proxy_fingerprint("a1").unwrap();
+        assert_ne!(
+            first, second,
+            "a regenerated proxy must invalidate its transcript"
+        );
+    }
+
+    #[test]
+    fn proxy_fingerprint_fails_clearly_without_a_proxy() {
+        let (_directory, catalog, project) = catalog_fixture();
+        insert_asset(
+            &catalog,
+            &project.id,
+            "a1",
+            "DJI_0001.MP4",
+            "DJI Pocket 3",
+            "2026-04-01T09:00:00Z",
+            Path::new("/volumes/nas/DJI_0001.MP4"),
+        );
+        let error = catalog.proxy_fingerprint("a1").unwrap_err();
+        assert!(error.to_string().contains("proxy is required"), "{error}");
+    }
+
+    #[test]
+    fn transcribe_missing_skips_clips_with_a_current_transcript() {
+        let (directory, catalog, project) = catalog_fixture();
+        insert_asset(
+            &catalog,
+            &project.id,
+            "a1",
+            "DJI_0001.MP4",
+            "DJI Pocket 3",
+            "2026-04-01T09:00:00Z",
+            Path::new("/volumes/nas/DJI_0001.MP4"),
+        );
+        attach_stub_proxy(&catalog, "a1", directory.path(), b"proxy bytes");
+        let fingerprint = catalog.proxy_fingerprint("a1").unwrap();
+        save_transcript(
+            &catalog.connection().unwrap(),
+            &StoredTranscript {
+                asset_id: "a1".to_string(),
+                recipe_key: STT_RECIPE_KEY.to_string(),
+                source_fingerprint: fingerprint,
+                status: TranscriptStatus::NoSpeech,
+                reject_reason: String::new(),
+                primary_language: String::new(),
+                speech_seconds: 0.0,
+                window_count: 0,
+                segments: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        // No models are installed, so reaching the engine would fail. Returning
+        // a clean report proves the clip was skipped before that point.
+        let report = catalog.transcribe_missing(&project.id).unwrap();
+        assert_eq!(report.skipped, 1);
+        assert_eq!(report.transcribed, 0);
+        assert!(report.outcomes.is_empty());
+    }
+
+    #[test]
+    fn transcribe_missing_reports_a_missing_model_rather_than_transcribing() {
+        let (directory, catalog, project) = catalog_fixture();
+        insert_asset(
+            &catalog,
+            &project.id,
+            "a1",
+            "DJI_0001.MP4",
+            "DJI Pocket 3",
+            "2026-04-01T09:00:00Z",
+            Path::new("/volumes/nas/DJI_0001.MP4"),
+        );
+        attach_stub_proxy(&catalog, "a1", directory.path(), b"proxy bytes");
+        let error = catalog.transcribe_missing(&project.id).unwrap_err();
+        assert!(
+            error.to_string().contains("is not installed"),
+            "expected an actionable model error, got: {error}"
+        );
     }
 
     fn insert_asset(
