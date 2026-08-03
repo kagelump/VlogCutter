@@ -7,7 +7,7 @@ use thiserror::Error;
 
 use crate::chronology::forward_migrate_project_chronology;
 
-pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 12;
+pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 13;
 
 const MIGRATION_TABLE_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -155,6 +155,12 @@ pub const PROJECT_CATALOG_MIGRATIONS: &[SqliteMigration] = &[
         name: "edit_plan",
         source_identity: "project-catalog/0012-edit-plan/20260803",
         apply: add_edit_plan,
+    },
+    SqliteMigration {
+        id: 13,
+        name: "transcripts",
+        source_identity: "project-catalog/0013-transcripts/20260803",
+        apply: add_transcripts,
     },
 ];
 
@@ -937,6 +943,51 @@ fn add_edit_plan(transaction: &Transaction<'_>) -> Result<()> {
     Ok(())
 }
 
+/// Migration 13. Local speech-to-text results as derived artifacts.
+///
+/// `asset_transcripts` is one row per asset because a transcript is identified
+/// by its recipe key plus the fingerprint of the proxy it was derived from; a
+/// second recipe supersedes the first rather than coexisting with it.
+///
+/// `status` distinguishes the three non-failure outcomes the pipeline can
+/// produce. `no_speech` is a successful, meaningful result — the VAD gate found
+/// nothing and no model was ever invoked — and must not be confused with
+/// `failed`. Conflating them would retry every silent clip forever, and on the
+/// measured corpus 64% of clips are silent.
+fn add_transcripts(transaction: &Transaction<'_>) -> Result<()> {
+    transaction.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS asset_transcripts (
+            asset_id TEXT PRIMARY KEY REFERENCES assets(id) ON DELETE CASCADE,
+            recipe_key TEXT NOT NULL,
+            source_kind TEXT NOT NULL DEFAULT 'proxy',
+            source_fingerprint TEXT NOT NULL,
+            status TEXT NOT NULL CHECK(status IN ('speech', 'no_speech', 'rejected', 'failed')),
+            reject_reason TEXT NOT NULL DEFAULT '',
+            primary_language TEXT NOT NULL DEFAULT '',
+            speech_seconds REAL NOT NULL DEFAULT 0,
+            window_count INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS transcript_segments (
+            asset_id TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+            segment_index INTEGER NOT NULL,
+            start_ms INTEGER NOT NULL,
+            end_ms INTEGER NOT NULL,
+            language TEXT NOT NULL DEFAULT '',
+            text TEXT NOT NULL,
+            mean_token_probability REAL NOT NULL DEFAULT 0,
+            PRIMARY KEY(asset_id, segment_index)
+        );
+
+        CREATE INDEX IF NOT EXISTS transcript_segments_time
+        ON transcript_segments(asset_id, start_ms);
+        "#,
+    )?;
+    Ok(())
+}
+
 fn backfill_pattern_filename_counters(transaction: &Transaction<'_>) -> Result<()> {
     let pending: Vec<(String, String)> = {
         let mut statement = transaction.prepare(
@@ -1077,6 +1128,66 @@ fn add_chronology_facts(transaction: &Transaction<'_>) -> Result<()> {
 mod tests {
     use super::*;
     use anyhow::bail;
+
+    #[test]
+    fn migration_13_creates_transcript_tables() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        migrate_project_catalog(&mut connection).unwrap();
+
+        let transcript_columns: Vec<String> = connection
+            .prepare("SELECT name FROM pragma_table_info('asset_transcripts')")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<String>>>()
+            .unwrap();
+        assert!(transcript_columns.contains(&"recipe_key".to_string()));
+        assert!(transcript_columns.contains(&"source_fingerprint".to_string()));
+        assert!(transcript_columns.contains(&"status".to_string()));
+
+        let segment_columns: Vec<String> = connection
+            .prepare("SELECT name FROM pragma_table_info('transcript_segments')")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<String>>>()
+            .unwrap();
+        assert!(segment_columns.contains(&"start_ms".to_string()));
+        assert!(segment_columns.contains(&"mean_token_probability".to_string()));
+
+        assert_eq!(PROJECT_CATALOG_SCHEMA_VERSION, 13);
+    }
+
+    #[test]
+    fn transcript_status_rejects_unknown_value() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        migrate_project_catalog(&mut connection).unwrap();
+        connection
+            .execute(
+                "INSERT INTO projects (id, name, created_at)
+                 VALUES ('p1', 'p', '2026-01-01T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO assets (id, project_id, fingerprint, path, filename, size_bytes,
+                 duration_seconds, created_at)
+                 VALUES ('a1', 'p1', 'f1', '/x.mp4', 'x.mp4', 1, 1.0, '2026-01-01T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+        let bad = connection.execute(
+            "INSERT INTO asset_transcripts (asset_id, recipe_key, source_kind, source_fingerprint,
+             status, created_at)
+             VALUES ('a1', 'r', 'proxy', 'pf', 'banana', '2026-01-01T00:00:00Z')",
+            [],
+        );
+        assert!(
+            bad.is_err(),
+            "CHECK constraint should reject unknown status"
+        );
+    }
 
     fn first_test_migration(transaction: &Transaction<'_>) -> Result<()> {
         transaction.execute_batch(
