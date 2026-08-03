@@ -54,7 +54,8 @@ Implemented now:
   and edit-plan drawers.
 - Versioned edit-plan persistence and validation, low-resolution preview
   generation, and deterministic pure-Rust OTIO writing.
-- Quality-1 thumbnails and one-worker 720p H.264/AAC proxies.
+- Quality-1 thumbnails and 720p H.264/AAC proxies with four concurrent
+  VideoToolbox workers on macOS and a one-worker software fallback elsewhere.
 - Weighted batch progress and ETA with project-persisted rate history.
 - Relative-order “story ribbon” with camera lanes, horizontal scrolling, and zoom.
 - A non-interactive JSON CLI for catalog, clip annotation, chronology, and media operations.
@@ -315,12 +316,31 @@ The current compact story ribbon spaces clips by ordinal position, not duration 
 
 ### Proxies
 
-Proxy generation currently uses one local worker and FFmpeg settings equivalent to:
+Proxy generation uses up to four local workers on macOS. Each worker first tries
+VideoToolbox hardware decode and H.264 encode with the CPU scaler retained for
+materially better downscale quality. The hardware settings are equivalent to:
+
+- `-hwaccel videotoolbox` with H.264 `h264_videotoolbox` High profile.
+- VideoToolbox constant quality 36 and `power_efficient=1`.
+- Scale down to at most 1280 px wide while preserving aspect ratio.
+- AAC 128 kb/s and `+faststart`.
+
+If VideoToolbox is unavailable, busy, or rejects an input, the Mac retries the
+existing software recipe automatically. The Ubuntu companion server continues
+to use the software recipe:
 
 - Override the input display rotation to 0 and disable autorotation, preserving raw encoded orientation without copying the camera display matrix.
 - Scale down to at most 1280 px wide while preserving aspect ratio.
 - H.264 `libx264`, `veryfast`, CRF 23, `yuv420p`.
 - AAC 128 kb/s and `+faststart`.
+
+FFmpeg proxy processes emit output-timestamp progress once per second. Convert
+that duration fraction into partial source-byte work so active clips reduce the
+ETA before they finish. Partial work is display/ETA state only and must not
+update persisted throughput; only a successful completed clip contributes its
+full bytes and worker duration. Reset partial work if VideoToolbox fails before
+starting the software fallback, and retain completion-only behavior when FFmpeg
+does not provide a usable timestamp.
 
 Only the original is accepted as proxy input. If the original is offline, proxy generation fails explicitly. Version-3 proxies are written to a temporary file, verified with ffprobe to have 0° display rotation, and then atomically committed asset-by-asset. Version-2 proxies are obsolete because they may retain the source display matrix; a later “missing” run regenerates them and skips only valid current-version paths that still exist.
 
@@ -332,14 +352,16 @@ Only quality 1 is implemented. It is a JPEG at 20% of clip duration, at most 480
 
 All long batch work should use `core/batch-estimator`, not an ad hoc ETA. Callers provide work weights, explicit worker count, optional persisted `RateHistory`, and successful per-worker elapsed observations. The estimator balances remaining weights across workers and reports the slowest shard. Failures advance item completion but do not contaminate throughput.
 
-Current task keys are versioned:
+Current task keys are versioned. macOS proxy generation has its own history
+because VideoToolbox throughput is not comparable to the server/software path:
 
 ```text
-proxy.h264-720p.orientation-v3
+proxy.h264-720p.orientation-v3.macos-videotoolbox-q36-w{1,2,3,4}-v1
+proxy.h264-720p.orientation-v3                 # server/non-macOS fallback history
 thumbnail.q1.orientation-v2
 ```
 
-Change the task key when settings change enough that old throughput is no longer comparable. Proxy and thumbnail weights are source bytes and both currently use one worker. A future cloud/VLM task must pass its real shard concurrency.
+Change the task key when settings or concurrency change enough that old throughput is no longer comparable. Proxy and thumbnail weights are source bytes. macOS proxy batches use up to four workers, single-proxy calls and thumbnails use one, and the non-macOS/server proxy path remains one worker. A future cloud/VLM task must pass its real shard concurrency.
 
 The server persists histories in its control catalog scoped to its stable node and task key. Default caps are one proxy worker, one full-hash worker, and up to two lightweight workers. Durable progress must supply the exact remaining weights and actual worker count; only successful item observations update throughput.
 

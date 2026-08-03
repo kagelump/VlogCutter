@@ -5,11 +5,14 @@ use chrono::{DateTime, Duration, NaiveDateTime, SecondsFormat, Utc};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::VecDeque;
 use std::env;
 use std::fs::{self, File};
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex, mpsc};
+use std::thread;
 use std::time::Instant;
 use uuid::Uuid;
 use walkdir::WalkDir;
@@ -77,12 +80,51 @@ pub use storage::{
 
 const SAMPLE_BYTES: usize = 1024 * 1024;
 const MEDIA_EXTENSIONS: &[&str] = &["mp4", "mov", "m4v", "mts", "m2ts", "avi"];
-const PROXY_TASK_KIND: &str = "proxy.h264-720p.orientation-v3";
 const THUMBNAIL_TASK_KIND: &str = "thumbnail.q1.orientation-v2";
 const PROXY_CACHE_VERSION: &str = "v3";
 const THUMBNAIL_CACHE_VERSION: &str = "v2";
+#[cfg(target_os = "macos")]
+const PROXY_WORKERS: usize = 4;
+#[cfg(not(target_os = "macos"))]
 const PROXY_WORKERS: usize = 1;
 const THUMBNAIL_WORKERS: usize = 1;
+
+#[derive(Clone, Copy)]
+enum ProxyEncoder {
+    Software,
+    #[cfg(target_os = "macos")]
+    VideoToolbox,
+}
+
+enum ProxyWorkerMessage {
+    Progress {
+        index: usize,
+        completed_work_units: u64,
+    },
+    Finished(Box<ProxyWorkerFinished>),
+}
+
+struct ProxyWorkerFinished {
+    index: usize,
+    asset: Asset,
+    elapsed: std::time::Duration,
+    result: Result<Asset>,
+}
+
+#[cfg(target_os = "macos")]
+fn proxy_task_kind(worker_count: usize) -> &'static str {
+    match worker_count {
+        1 => "proxy.h264-720p.orientation-v3.macos-videotoolbox-q36-w1-v1",
+        2 => "proxy.h264-720p.orientation-v3.macos-videotoolbox-q36-w2-v1",
+        3 => "proxy.h264-720p.orientation-v3.macos-videotoolbox-q36-w3-v1",
+        _ => "proxy.h264-720p.orientation-v3.macos-videotoolbox-q36-w4-v1",
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn proxy_task_kind(_worker_count: usize) -> &'static str {
+    "proxy.h264-720p.orientation-v3"
+}
 
 #[derive(Debug, Clone)]
 pub struct Catalog {
@@ -884,7 +926,14 @@ impl Catalog {
         self.create_clock_event_operation(project_id, camera, start_filename, offset_seconds, label)
     }
 
-    fn generate_proxy_untracked(&self, asset_id: &str) -> Result<Asset> {
+    fn generate_proxy_untracked_with_progress<F>(
+        &self,
+        asset_id: &str,
+        mut on_progress: F,
+    ) -> Result<Asset>
+    where
+        F: FnMut(f64),
+    {
         let asset = self.refresh_asset_orientation(asset_id)?;
         if !Path::new(&asset.path).exists() {
             bail!("original is offline: {}", asset.path);
@@ -897,41 +946,12 @@ impl Catalog {
         fs::create_dir_all(&proxy_dir)?;
         let output = proxy_dir.join(format!("{}.{}.mp4", asset.id, PROXY_CACHE_VERSION));
         let temporary = proxy_dir.join(format!("{}.{}.tmp.mp4", asset.id, PROXY_CACHE_VERSION));
-        let status = tool_command("ffmpeg")
-            .args([
-                "-y",
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-display_rotation:v:0",
-                "0",
-                "-noautorotate",
-                "-i",
-            ])
-            .arg(&asset.path)
-            .args([
-                "-vf",
-                "scale='min(1280,iw)':-2:force_original_aspect_ratio=decrease",
-                "-c:v",
-                "libx264",
-                "-preset",
-                "veryfast",
-                "-crf",
-                "23",
-                "-pix_fmt",
-                "yuv420p",
-                "-c:a",
-                "aac",
-                "-b:a",
-                "128k",
-                "-movflags",
-                "+faststart",
-                "-map_metadata",
-                "-1",
-            ])
-            .arg(&temporary)
-            .status()
-            .context("start ffmpeg proxy process")?;
+        let status = run_proxy_ffmpeg(
+            Path::new(&asset.path),
+            &temporary,
+            asset.duration_seconds,
+            &mut on_progress,
+        )?;
         if !status.success() {
             let _ = fs::remove_file(&temporary);
             bail!("ffmpeg proxy generation failed with {status}");
@@ -1006,21 +1026,25 @@ impl Catalog {
     {
         let asset = self.get_asset(asset_id)?;
         let task_work = [asset.size_bytes];
-        let mut estimator = BatchEstimator::new(
-            &task_work,
-            PROXY_WORKERS,
-            self.load_batch_history(PROXY_TASK_KIND)?,
-        );
+        let task_kind = proxy_task_kind(1);
+        let mut estimator = BatchEstimator::new(&task_work, 1, self.load_batch_history(task_kind)?);
         on_progress(AssetBatchProgress {
             asset: None,
             estimate: estimator.estimate(&task_work),
         });
         let started = Instant::now();
-        let result = self.generate_proxy_untracked(asset_id);
+        let result = self.generate_proxy_untracked_with_progress(asset_id, |fraction| {
+            let partial_work = work_units_from_fraction(asset.size_bytes, fraction);
+            let remaining_work = asset.size_bytes.saturating_sub(partial_work);
+            on_progress(AssetBatchProgress {
+                asset: None,
+                estimate: estimator.estimate_with_partial_progress(&[remaining_work], partial_work),
+            });
+        });
         let updated = match &result {
             Ok(updated) => {
                 estimator.record_completion(asset.size_bytes, started.elapsed());
-                self.save_batch_history(PROXY_TASK_KIND, estimator.history())?;
+                self.save_batch_history(task_kind, estimator.history())?;
                 Some(updated.clone())
             }
             Err(_) => {
@@ -1057,38 +1081,121 @@ impl Catalog {
             failures: Vec::new(),
         };
         let task_work: Vec<u64> = pending.iter().map(|asset| asset.size_bytes).collect();
+        let worker_count = pending.len().clamp(1, PROXY_WORKERS);
+        let task_kind = proxy_task_kind(worker_count);
         let mut estimator = BatchEstimator::new(
             &task_work,
-            PROXY_WORKERS,
-            self.load_batch_history(PROXY_TASK_KIND)?,
+            worker_count,
+            self.load_batch_history(task_kind)?,
         );
         on_progress(AssetBatchProgress {
             asset: None,
             estimate: estimator.estimate(&task_work),
         });
-        for (index, asset) in pending.into_iter().enumerate() {
-            let started = Instant::now();
-            let updated = match self.generate_proxy_untracked(&asset.id) {
-                Ok(updated) => {
-                    report.generated += 1;
-                    estimator.record_completion(asset.size_bytes, started.elapsed());
-                    self.save_batch_history(PROXY_TASK_KIND, estimator.history())?;
-                    Some(updated)
-                }
-                Err(error) => {
-                    estimator.record_failure(asset.size_bytes);
-                    report.failures.push(IngestFailure {
-                        path: asset.path,
-                        error: format!("{error:#}"),
-                    });
-                    None
-                }
-            };
-            on_progress(AssetBatchProgress {
-                asset: updated,
-                estimate: estimator.estimate(&task_work[index + 1..]),
-            });
+        if pending.is_empty() {
+            return Ok(report);
         }
+
+        let queue = Arc::new(Mutex::new(
+            pending.into_iter().enumerate().collect::<VecDeque<_>>(),
+        ));
+        let (outcome_sender, outcome_receiver) = mpsc::channel();
+        let mut completed = vec![false; task_work.len()];
+
+        thread::scope(|scope| -> Result<()> {
+            for _ in 0..worker_count {
+                let catalog = self.clone();
+                let queue = Arc::clone(&queue);
+                let outcome_sender = outcome_sender.clone();
+                scope.spawn(move || {
+                    loop {
+                        let Some((index, asset)) = queue
+                            .lock()
+                            .expect("proxy work queue lock poisoned")
+                            .pop_front()
+                        else {
+                            break;
+                        };
+                        let started = Instant::now();
+                        let result =
+                            catalog.generate_proxy_untracked_with_progress(&asset.id, |fraction| {
+                                let _ = outcome_sender.send(ProxyWorkerMessage::Progress {
+                                    index,
+                                    completed_work_units: work_units_from_fraction(
+                                        asset.size_bytes,
+                                        fraction,
+                                    ),
+                                });
+                            });
+                        if outcome_sender
+                            .send(ProxyWorkerMessage::Finished(Box::new(
+                                ProxyWorkerFinished {
+                                    index,
+                                    asset,
+                                    elapsed: started.elapsed(),
+                                    result,
+                                },
+                            )))
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                });
+            }
+            drop(outcome_sender);
+
+            let mut partial_work = vec![0_u64; task_work.len()];
+            for message in outcome_receiver {
+                let updated = match message {
+                    ProxyWorkerMessage::Progress {
+                        index,
+                        completed_work_units,
+                    } => {
+                        partial_work[index] = completed_work_units.min(task_work[index]);
+                        None
+                    }
+                    ProxyWorkerMessage::Finished(finished) => {
+                        let ProxyWorkerFinished {
+                            index,
+                            asset,
+                            elapsed,
+                            result,
+                        } = *finished;
+                        completed[index] = true;
+                        partial_work[index] = 0;
+                        match result {
+                            Ok(updated) => {
+                                report.generated += 1;
+                                estimator.record_completion(asset.size_bytes, elapsed);
+                                self.save_batch_history(task_kind, estimator.history())?;
+                                Some(updated)
+                            }
+                            Err(error) => {
+                                estimator.record_failure(asset.size_bytes);
+                                report.failures.push(IngestFailure {
+                                    path: asset.path,
+                                    error: format!("{error:#}"),
+                                });
+                                None
+                            }
+                        }
+                    }
+                };
+                let remaining_work = residual_work_units(&task_work, &completed, &partial_work);
+                let partial_completed_work = partial_work.iter().copied().sum();
+                on_progress(AssetBatchProgress {
+                    asset: updated,
+                    estimate: estimator
+                        .estimate_with_partial_progress(&remaining_work, partial_completed_work),
+                });
+            }
+            Ok(())
+        })?;
+
+        report
+            .failures
+            .sort_by(|left, right| left.path.cmp(&right.path));
         Ok(report)
     }
 
@@ -1530,6 +1637,168 @@ fn is_media(path: &Path) -> bool {
 
 fn tool_command(name: &str) -> Command {
     Command::new(resolve_tool(name))
+}
+
+fn proxy_ffmpeg_command(source: &Path, output: &Path, encoder: ProxyEncoder) -> Command {
+    let mut command = tool_command("ffmpeg");
+    command.args([
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-stats_period",
+        "1",
+        "-progress",
+        "pipe:1",
+        "-nostats",
+    ]);
+
+    #[cfg(target_os = "macos")]
+    if matches!(encoder, ProxyEncoder::VideoToolbox) {
+        command.args(["-hwaccel", "videotoolbox"]);
+    }
+
+    command
+        .args(["-display_rotation:v:0", "0", "-noautorotate", "-i"])
+        .arg(source)
+        .args([
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a:0?",
+            "-vf",
+            "scale='min(1280,iw)':-2:force_original_aspect_ratio=decrease",
+        ]);
+
+    match encoder {
+        ProxyEncoder::Software => {
+            command.args([
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p",
+            ]);
+        }
+        #[cfg(target_os = "macos")]
+        ProxyEncoder::VideoToolbox => {
+            command.args([
+                "-c:v",
+                "h264_videotoolbox",
+                "-profile:v",
+                "high",
+                "-q:v",
+                "36",
+                "-power_efficient",
+                "1",
+            ]);
+        }
+    }
+
+    command.args([
+        "-c:a",
+        "aac",
+        "-b:a",
+        "128k",
+        "-movflags",
+        "+faststart",
+        "-map_metadata",
+        "-1",
+    ]);
+    command.arg(output);
+    command
+}
+
+fn run_proxy_ffmpeg<F>(
+    source: &Path,
+    output: &Path,
+    duration_seconds: f64,
+    on_progress: &mut F,
+) -> Result<std::process::ExitStatus>
+where
+    F: FnMut(f64),
+{
+    #[cfg(target_os = "macos")]
+    {
+        let hardware_status = run_proxy_ffmpeg_encoder(
+            source,
+            output,
+            ProxyEncoder::VideoToolbox,
+            duration_seconds,
+            on_progress,
+        )
+        .context("start VideoToolbox ffmpeg proxy process")?;
+        if hardware_status.success() {
+            return Ok(hardware_status);
+        }
+        let _ = fs::remove_file(output);
+        on_progress(0.0);
+    }
+
+    run_proxy_ffmpeg_encoder(
+        source,
+        output,
+        ProxyEncoder::Software,
+        duration_seconds,
+        on_progress,
+    )
+    .context("start software ffmpeg proxy process")
+}
+
+fn run_proxy_ffmpeg_encoder<F>(
+    source: &Path,
+    output: &Path,
+    encoder: ProxyEncoder,
+    duration_seconds: f64,
+    on_progress: &mut F,
+) -> Result<std::process::ExitStatus>
+where
+    F: FnMut(f64),
+{
+    let mut command = proxy_ffmpeg_command(source, output, encoder);
+    command.stdout(Stdio::piped());
+    #[cfg(target_os = "macos")]
+    if matches!(encoder, ProxyEncoder::VideoToolbox) {
+        command.stderr(Stdio::null());
+    }
+    let mut child = command.spawn().context("spawn ffmpeg proxy process")?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("ffmpeg progress pipe was not available"))?;
+    for line in BufReader::new(stdout)
+        .lines()
+        .map_while(std::result::Result::ok)
+    {
+        if let Some(fraction) = ffmpeg_progress_fraction(&line, duration_seconds) {
+            on_progress(fraction);
+        }
+    }
+    child.wait().context("wait for ffmpeg proxy process")
+}
+
+fn ffmpeg_progress_fraction(line: &str, duration_seconds: f64) -> Option<f64> {
+    if !duration_seconds.is_finite() || duration_seconds <= 0.0 {
+        return None;
+    }
+    let output_microseconds = line.strip_prefix("out_time_us=")?.parse::<u64>().ok()?;
+    let fraction = output_microseconds as f64 / 1_000_000.0 / duration_seconds;
+    fraction.is_finite().then_some(fraction.clamp(0.0, 1.0))
+}
+
+fn work_units_from_fraction(work_units: u64, fraction: f64) -> u64 {
+    if !fraction.is_finite() || fraction <= 0.0 {
+        return 0;
+    }
+    (work_units as f64 * fraction.clamp(0.0, 1.0))
+        .round()
+        .min(work_units as f64) as u64
+}
+
+fn residual_work_units(task_work: &[u64], completed: &[bool], partial_work: &[u64]) -> Vec<u64> {
+    task_work
+        .iter()
+        .enumerate()
+        .filter_map(|(index, weight)| {
+            (!completed[index]).then_some(weight.saturating_sub(partial_work[index]))
+        })
+        .collect()
 }
 
 /// Resolves a tool executable path from the environment. Returns the command
@@ -2703,6 +2972,137 @@ mod tests {
     }
 
     #[test]
+    fn parses_ffmpeg_timestamp_progress_into_residual_byte_work() {
+        assert_eq!(
+            ffmpeg_progress_fraction("out_time_us=5000000", 10.0),
+            Some(0.5)
+        );
+        assert_eq!(
+            ffmpeg_progress_fraction("out_time_us=12000000", 10.0),
+            Some(1.0)
+        );
+        assert_eq!(ffmpeg_progress_fraction("progress=continue", 10.0), None);
+        assert_eq!(ffmpeg_progress_fraction("out_time_us=1", 0.0), None);
+        assert_eq!(work_units_from_fraction(1_000, 0.25), 250);
+        assert_eq!(
+            residual_work_units(&[1_000, 500], &[false, true], &[250, 0]),
+            vec![750]
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mac_proxy_command_uses_videotoolbox_with_quality_matched_settings() {
+        let command = proxy_ffmpeg_command(
+            Path::new("source.mp4"),
+            Path::new("proxy.mp4"),
+            ProxyEncoder::VideoToolbox,
+        );
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["-hwaccel", "videotoolbox"])
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["-c:v", "h264_videotoolbox"])
+        );
+        assert!(args.windows(2).any(|pair| pair == ["-q:v", "36"]));
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["-power_efficient", "1"])
+        );
+        assert!(args.windows(2).any(|pair| pair == ["-map", "0:v:0"]));
+        assert!(args.windows(2).any(|pair| pair == ["-map", "0:a:0?"]));
+        assert!(args.iter().any(|arg| arg.starts_with("scale=")));
+        assert!(!args.iter().any(|arg| arg.starts_with("scale_vt=")));
+        assert!(args.windows(2).any(|pair| pair == ["-progress", "pipe:1"]));
+        assert!(args.windows(2).any(|pair| pair == ["-stats_period", "1"]));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mac_missing_proxy_batch_uses_four_workers_and_commits_every_asset() {
+        if tool_command("ffmpeg").arg("-version").output().is_err()
+            || tool_command("ffprobe").arg("-version").output().is_err()
+        {
+            eprintln!("ffmpeg or ffprobe is unavailable; skipping media integration test");
+            return;
+        }
+        let directory = tempdir().unwrap();
+        let source_dir = directory.path().join("source");
+        fs::create_dir_all(&source_dir).unwrap();
+        for (index, color) in ["red", "green", "blue", "yellow"].into_iter().enumerate() {
+            let source = source_dir.join(format!("C{index:04}.MP4"));
+            let input = format!("color=c={color}:s=160x90:r=10:d=0.2");
+            let status = tool_command("ffmpeg")
+                .args([
+                    "-y",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &input,
+                    "-c:v",
+                    "libx264",
+                    "-pix_fmt",
+                    "yuv420p",
+                ])
+                .arg(source)
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+
+        let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).unwrap();
+        let project = catalog.create_project("Parallel proxies").unwrap();
+        let ingest = catalog.ingest_folder(&project.id, &source_dir).unwrap();
+        assert_eq!(ingest.imported, 4);
+
+        let mut progress = Vec::new();
+        let report = catalog
+            .generate_missing_proxies_with_progress(&project.id, |event| progress.push(event))
+            .unwrap();
+
+        assert_eq!(report.generated, 4);
+        assert!(report.failures.is_empty());
+        assert!(progress.len() >= 9);
+        assert_eq!(progress[0].estimate.worker_count, 4);
+        assert!(progress.iter().any(|event| {
+            event.estimate.completed_items == 0 && event.estimate.completed_work_units > 0
+        }));
+        assert_eq!(
+            catalog
+                .load_batch_history(proxy_task_kind(4))
+                .unwrap()
+                .samples,
+            4
+        );
+        assert_eq!(
+            progress.last().unwrap().estimate.completed_items,
+            progress.last().unwrap().estimate.total_items
+        );
+        assert!(
+            catalog
+                .list_assets(&project.id)
+                .unwrap()
+                .iter()
+                .all(|asset| {
+                    asset
+                        .proxy_path
+                        .as_deref()
+                        .is_some_and(|path| Path::new(path).is_file())
+                })
+        );
+    }
+
+    #[test]
     fn proxy_v3_clears_the_source_display_rotation() {
         if tool_command("ffmpeg").arg("-version").output().is_err()
             || tool_command("ffprobe").arg("-version").output().is_err()
@@ -2864,20 +3264,29 @@ mod tests {
             })
             .unwrap();
         assert_eq!(first_proxy_report.generated, 1);
-        assert_eq!(proxy_progress.len(), 2);
+        assert!(proxy_progress.len() >= 3);
         assert_eq!(proxy_progress[0].estimate.completed_items, 0);
-        assert_eq!(proxy_progress[1].estimate.completed_items, 1);
-        assert_eq!(proxy_progress[1].estimate.total_items, 1);
-        assert_eq!(proxy_progress[1].estimate.worker_count, 1);
+        assert!(proxy_progress.iter().any(|progress| {
+            progress.estimate.completed_items == 0 && progress.estimate.completed_work_units > 0
+        }));
+        let completed_proxy_progress = proxy_progress.last().unwrap();
+        assert_eq!(completed_proxy_progress.estimate.completed_items, 1);
+        assert_eq!(completed_proxy_progress.estimate.total_items, 1);
+        assert_eq!(completed_proxy_progress.estimate.worker_count, 1);
         assert_eq!(
-            proxy_progress[1].estimate.estimated_remaining_seconds,
+            completed_proxy_progress
+                .estimate
+                .estimated_remaining_seconds,
             Some(0.0)
         );
         assert_eq!(
-            catalog.load_batch_history(PROXY_TASK_KIND).unwrap().samples,
+            catalog
+                .load_batch_history(proxy_task_kind(1))
+                .unwrap()
+                .samples,
             1
         );
-        let proxied = proxy_progress[1].asset.as_ref().unwrap();
+        let proxied = completed_proxy_progress.asset.as_ref().unwrap();
         assert!(Path::new(proxied.proxy_path.as_deref().unwrap()).exists());
         assert!(proxied.proxy_path.as_deref().unwrap().ends_with(".v3.mp4"));
         assert_eq!(
@@ -2900,7 +3309,7 @@ mod tests {
                 single_proxy_progress.push(progress);
             })
             .unwrap();
-        assert_eq!(single_proxy_progress.len(), 2);
+        assert!(single_proxy_progress.len() >= 3);
         assert!(
             single_proxy_progress[0]
                 .estimate
@@ -2908,14 +3317,19 @@ mod tests {
                 .is_some()
         );
         assert_eq!(
-            single_proxy_progress[1]
+            single_proxy_progress
+                .last()
+                .unwrap()
                 .estimate
                 .estimated_remaining_seconds,
             Some(0.0)
         );
         assert!(Path::new(regenerated_proxy.proxy_path.as_deref().unwrap()).is_file());
         assert_eq!(
-            catalog.load_batch_history(PROXY_TASK_KIND).unwrap().samples,
+            catalog
+                .load_batch_history(proxy_task_kind(1))
+                .unwrap()
+                .samples,
             2
         );
 

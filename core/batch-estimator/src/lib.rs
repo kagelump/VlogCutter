@@ -131,6 +131,18 @@ impl BatchEstimator {
     }
 
     pub fn estimate(&self, remaining_task_work_units: &[u64]) -> BatchEstimate {
+        self.estimate_with_partial_progress(remaining_task_work_units, 0)
+    }
+
+    /// Estimates a running batch while some work has been completed inside
+    /// tasks that have not finished yet. The caller supplies only the residual
+    /// weights in `remaining_task_work_units`; partial work affects the progress
+    /// counters but is never recorded as a throughput observation.
+    pub fn estimate_with_partial_progress(
+        &self,
+        remaining_task_work_units: &[u64],
+        partial_completed_work_units: u64,
+    ) -> BatchEstimate {
         let rate = self.history.usable_rate();
         let remaining_seconds = rate.map(|rate| {
             estimated_parallel_work(remaining_task_work_units, self.worker_count) as f64 / rate
@@ -138,7 +150,10 @@ impl BatchEstimator {
         BatchEstimate {
             completed_items: self.completed_items,
             total_items: self.total_items,
-            completed_work_units: self.completed_work_units,
+            completed_work_units: self
+                .completed_work_units
+                .saturating_add(partial_completed_work_units)
+                .min(self.total_work_units),
             total_work_units: self.total_work_units,
             worker_count: self.worker_count,
             work_units_per_worker_second: rate,
@@ -217,6 +232,22 @@ mod tests {
         estimator.record_failure(100);
         assert_eq!(estimator.history(), history);
         assert_eq!(estimator.estimate(&[]).completed_items, 2);
+    }
+
+    #[test]
+    fn partial_progress_reduces_remaining_eta_without_completing_an_item() {
+        let estimator = BatchEstimator::new(
+            &[100, 100],
+            2,
+            RateHistory {
+                work_units_per_worker_second: 10.0,
+                samples: 4,
+            },
+        );
+        let estimate = estimator.estimate_with_partial_progress(&[40, 80], 80);
+        assert_eq!(estimate.completed_items, 0);
+        assert_eq!(estimate.completed_work_units, 80);
+        assert_eq!(estimate.estimated_remaining_seconds, Some(8.0));
     }
 
     #[test]

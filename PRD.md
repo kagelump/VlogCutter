@@ -876,7 +876,7 @@ These are the accepted MVP implementation defaults.
 * SQLite uses WAL mode and explicit revision checks for safe desktop and CLI access.
 * FFmpeg, ffprobe, and ExifTool run as managed child processes; their output and exit state are captured by the Rust core.
 * Long-running proxy operations report progress through Tauri events and persist their result state.
-* Batch progress uses a reusable weighted estimator with persisted per-task throughput history. Proxy and thumbnail weights are source bytes and use one local worker; future cloud inference supplies its own cost weights and worker concurrency. ETA is the estimated slowest worker shard, not a naive division by worker count.
+* Batch progress uses a reusable weighted estimator with persisted per-task throughput history. Proxy and thumbnail weights are source bytes. macOS missing-proxy batches use up to four local workers; single-proxy calls, thumbnails, and the server/non-macOS proxy path use one. Future cloud inference supplies its own cost weights and worker concurrency. ETA is the estimated slowest worker shard, not a naive division by worker count.
 * A tiny, short-lived Python process may be used for OpenTimelineIO export only if direct JSON export proves insufficient.
 * The desktop has no permanent loopback sidecar or embedded Python runtime. The optional companion server is a separate private Linux process with a loopback-only backend.
 
