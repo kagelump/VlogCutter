@@ -384,6 +384,39 @@ touches the network. Design and measurements:
   transfer. Install `ggml-large-v3-turbo-q5_0.bin` and `ggml-silero-v5.1.2.bin`
   into `<project folder>/cache/models/`.
 
+**Measured end to end**, release build, M3 MacBook Air (fanless), one worker,
+273-clip Osaka/Expo project, 129.1 minutes of footage:
+
+| Measure | Value |
+| --- | --- |
+| Wall time | **31.5 min** |
+| Clips with speech | 131 |
+| Clips gated as `no_speech` | 135 (49%) |
+| Rejected by the hallucination gate | 7 (5 repetition, 2 low token probability) |
+| Failures | 0 |
+| Windows decoded | 155 |
+| Speech audio | 15.9 min |
+| Cost per window | ~12.2 s |
+| Transcript segments stored | 380 |
+
+Three of these correct round-1's projections and should be trusted over them:
+
+1. **The corpus needs ~155 windows, not the ~20 round 1 projected.** That
+   projection divided total speech by 30 seconds, but a window cannot span two
+   clips, so the floor is one window per speech-bearing clip. 126 of 131 speech
+   clips used exactly one window. Per-window cost was right; the count was off
+   7x, and with it the "~3.5 minutes for the whole project" figure.
+2. **The VAD gate skips 49% of clips, not 64%.** whisper.cpp's built-in VAD at
+   default parameters gates less aggressively than the tuned Silero ONNX harness
+   round 1 used. That costs decode time and is the safer direction, but the
+   thresholds are worth revisiting.
+3. **12% of speech clips get a language tag outside the supported en/ja/zh set**
+   — 12 Korean, 2 Russian, 1 Polish, 1 Spanish. Round 1 called Korean a
+   hallucination marker on this corpus. A World Expo plausibly contains all of
+   them, so this is unverified either way, but STT language tags are currently
+   **not** domain-validated against a closed vocabulary the way the design
+   requires for model output.
+
 ### Batch estimation
 
 All long batch work should use `core/batch-estimator`, not an ad hoc ETA. Callers provide work weights, explicit worker count, optional persisted `RateHistory`, and successful per-worker elapsed observations. The estimator balances remaining weights across workers and reports the slowest shard. Failures advance item completion but do not contaminate throughput.

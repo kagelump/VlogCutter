@@ -65,8 +65,16 @@ curl -L -o "$PROJECT/cache/models/ggml-large-v3-turbo-q5_0.bin" https://huggingf
 Run the automated end-to-end check against a real project with:
 
 ```bash
-RCDVLOG_STT_FIXTURE=$HOME/Movies/VideoProjects/<project> cargo test -p rcdvlog-core --test stt_end_to_end -- --ignored --nocapture
+RCDVLOG_STT_FIXTURE=$HOME/Movies/VideoProjects/<project> cargo test --release -p rcdvlog-core --test stt_end_to_end -- --ignored --nocapture
 ```
+
+Use `--release`. The debug profile leaves the Rust glue unoptimized (ggml itself
+is always built Release by `whisper-rs-sys`) and the same corpus took several
+times longer.
+
+Reference run, 2026-08-03, M3 MacBook Air, 273 clips / 129.1 min of footage:
+31.5 min wall, 131 speech, 135 `no_speech`, 7 rejected, 0 failed, 155 windows
+decoded, 380 segments stored.
 
 ## After each run
 

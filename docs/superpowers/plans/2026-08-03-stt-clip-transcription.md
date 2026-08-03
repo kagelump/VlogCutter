@@ -33,9 +33,15 @@ Recorded so the plan matches what was actually built.
    Implemented instead as one clip = one work unit. The sweep is not actually
    cheap end to end: it requires FFmpeg audio extraction for every clip up front,
    so it either doubles extraction work or requires retaining every clip's WAV.
-   **Open:** clip-uniform weights skew the ETA, because ~64% of clips are silent
-   and cost near nothing while a speech clip costs one or more full windows.
-   Revisit with the measured window distribution.
+   **Open, now quantified by the Task 13 run:** clip-uniform weights are wrong by
+   roughly two orders of magnitude per clip. A silent clip costs extraction plus
+   ~50 ms of VAD; a one-window clip costs ~12.2 s of decode. 135 of 273 clips are
+   silent and 126 of the 131 speech clips need exactly one window, so the honest
+   weight is simply **window count, which is 0 or 1 for 96% of clips** — i.e. the
+   estimator mostly needs to know "does this clip have speech", which is exactly
+   what the VAD sweep would tell it. A cheap fix that avoids re-extraction:
+   carry each clip's window count forward from its previous run and use it as the
+   weight when re-estimating, falling back to 1 for never-seen clips.
 6. **`transcript_coverage` added to the core.** The plan put a SQL query for
    `transcribe status` in the CLI; domain behavior belongs to the owning crate,
    so the query lives on `Catalog` and the CLI just serializes it.
