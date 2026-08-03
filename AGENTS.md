@@ -28,7 +28,7 @@ Never violate these invariants without explicit user approval:
 - Chronology changes are explicit. Do not silently apply inferred clock or timezone corrections.
 - Rough-cut selection belongs to the later edit-planning stage. Do not add inclusion or source-range controls back to the labeling phase.
 - The accepted finishing target is the latest Resolve release (Resolve 21 in the product decision), while retaining practical compatibility with the user's installed Resolve 20.
-- AI analysis, transcription, embeddings, and VLM inference are out of the current MVP.
+- Local transcription ships (see "Transcription" in section 9). VLM inference, embeddings, and semantic search remain out of scope. Analysis output is a suggestion layer: it never mutates annotations without an explicit accept, and rough-cut selection stays in the edit-planning stage.
 - The desktop must work offline apart from access to its mounted source media. The server is optional and never required to commit local annotations.
 - Server original roots are immutable/read-only. The planned travel archive is a separate future create-only writable logical root, not an exception for existing scan roots.
 - The raw server backend remains loopback-only behind trusted LAN Caddy or Tailscale Serve HTTPS. Never enable Funnel or put credentials in URLs/argv.
@@ -348,6 +348,42 @@ Only the original is accepted as proxy input. If the original is offline, proxy 
 
 Only quality 1 is implemented. It is a JPEG at 20% of clip duration, at most 480 px wide, generated first to `q1.v2.tmp.jpg` and atomically renamed to `q1.v2.jpg`. Input preference is original, then available proxy. Qualities 2–10 are reserved and must continue to fail clearly until intentionally implemented.
 
+### Transcription
+
+Local speech-to-text ships. It runs entirely offline with no API key and never
+touches the network. Design and measurements:
+[spec](docs/superpowers/specs/2026-08-03-stt-vlm-clip-analysis-design.md),
+[round-1 spike](docs/spikes/2026-08-03-stt-analysis-spikes.md).
+
+- **Audio comes from the proxy, never the original.** The original may be
+  offline on the NAS, and transcription must work whenever proxies exist. A clip
+  with no proxy fails explicitly rather than falling back.
+- **Recipe key**: `stt.whisper-large-v3-turbo-q5_0.vad-silero-v5.win30.v1`. A
+  transcript is identified by that key plus the sampled BLAKE3 fingerprint of the
+  proxy it came from, so regenerating a proxy makes its transcript stale.
+- **Batch key**: `stt.whisper-large-v3-turbo-q5_0.vad-silero-v5.win30.v1-w1`,
+  one worker. Peak RSS is 1.15–1.38 GB and concurrent transcription alongside the
+  four-worker VideoToolbox proxy pipeline has never been measured.
+- **CPU-only, deliberately.** Do not enable `whisper-rs`'s `metal` feature: ggml
+  gates `MTLResidencySetDescriptor` on the SDK rather than the deployment target,
+  so a Metal build emits a macOS 15 symbol and will not launch on the documented
+  OS floor. The dependency is declared `default-features = false`.
+- **The VAD gate is a correctness requirement, not an optimization.** Given
+  silence, whisper invents fluent speech at high confidence. A clip with no
+  detected speech is stored as `no_speech` and is never handed to any model.
+  `no_speech` is a success and must never be conflated with `failed`, or every
+  silent clip is retried forever.
+- **Windows are 30 seconds.** whisper bills a full window per decode regardless
+  of content, so speech regions are packed into as few windows as possible. Do
+  not reintroduce the PRD's 8–25 second chunking: measured, it ran 30% slower on
+  39% less audio.
+- **Do not use `no_speech_probability()`** as a quality gate. Measured median
+  0.000 for good and bad transcripts alike. The gate that works is
+  `repetition_ratio >= 0.3 OR mean_token_probability < 0.20`.
+- Models are resolved, not downloaded: a batch must not silently start a 574 MB
+  transfer. Install `ggml-large-v3-turbo-q5_0.bin` and `ggml-silero-v5.1.2.bin`
+  into `<project folder>/cache/models/`.
+
 ### Batch estimation
 
 All long batch work should use `core/batch-estimator`, not an ad hoc ETA. Callers provide work weights, explicit worker count, optional persisted `RateHistory`, and successful per-worker elapsed observations. The estimator balances remaining weights across workers and reports the slowest shard. Failures advance item completion but do not contaminate throughput.
@@ -359,6 +395,7 @@ because VideoToolbox throughput is not comparable to the server/software path:
 proxy.h264-720p.orientation-v3.macos-videotoolbox-q36-w{1,2,3,4}-v1
 proxy.h264-720p.orientation-v3                 # server/non-macOS fallback history
 thumbnail.q1.orientation-v2
+stt.whisper-large-v3-turbo-q5_0.vad-silero-v5.win30.v1-w1
 ```
 
 Change the task key when settings or concurrency change enough that old throughput is no longer comparable. Proxy and thumbnail weights are source bytes. macOS proxy batches use up to four workers, single-proxy calls and thumbnails use one, and the non-macOS/server proxy path remains one worker. A future cloud/VLM task must pass its real shard concurrency.

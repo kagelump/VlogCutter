@@ -36,6 +36,38 @@ this; every row here tests something headless runners cannot reach.
 | 15 | Sleep and wake | Sleep the machine with app open mid-batch. Wake after 30+ seconds. | App is responsive. Job state is coherent. No data loss. |
 | 16 | Relaunch integrity | After exercising all rows above, quit and relaunch. | Project state intact: clip count unchanged, labels/notes/removals preserved, rotation preserved, review position preserved, catalog file valid. |
 
+## Transcription (CLI)
+
+Local speech-to-text is CLI-only for now; there is no desktop surface yet. It
+runs fully offline and needs no API key.
+
+Install both models into the project's cache first — a batch deliberately does
+not download them for you:
+
+```bash
+curl -L -o "$PROJECT/cache/models/ggml-silero-v5.1.2.bin" https://huggingface.co/ggml-org/whisper-vad/resolve/main/ggml-silero-v5.1.2.bin
+```
+
+```bash
+curl -L -o "$PROJECT/cache/models/ggml-large-v3-turbo-q5_0.bin" https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin
+```
+
+| # | Check | How | Expected |
+| --- | --- | --- | --- |
+| T1 | Coverage before | `rcdvlog --catalog <c> transcribe status --project <p>` | `total` matches the clip count; everything in `missing`; `recipeKey` is the current STT recipe. |
+| T2 | Missing model is actionable | Move a model aside, run `transcribe missing`. | Fails naming the file, its size, and the directory to put it in. Nothing is written. |
+| T3 | Batch run | `rcdvlog --catalog <c> transcribe missing --project <p>` | JSON envelope on stdout; `transcribe.progress` events on stderr with a live estimate. |
+| T4 | VAD gates silence | Inspect `transcribe status` after the run. | A large fraction land in `noSpeech` — roughly two thirds on travel footage. Zero would mean the gate is broken. |
+| T5 | Idempotent | Re-run `transcribe missing`. | `skipped` equals the clip count, `transcribed` is 0, and no model work happens. |
+| T6 | Proxy regeneration invalidates | Regenerate one clip's proxy, then re-run `transcribe missing`. | That one clip is transcribed again; the rest are skipped. |
+| T7 | Originals untouched | Unmount the source volume, then run `transcribe missing`. | Runs to completion from proxies alone. |
+
+Run the automated end-to-end check against a real project with:
+
+```bash
+RCDVLOG_STT_FIXTURE=$HOME/Movies/VideoProjects/<project> cargo test -p rcdvlog-core --test stt_end_to_end -- --ignored --nocapture
+```
+
 ## After each run
 
 1. Record the build path, commit SHA, macOS version, and machine model.
