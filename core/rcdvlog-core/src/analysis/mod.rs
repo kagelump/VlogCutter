@@ -5,24 +5,13 @@
 //! source is idempotent, and a changed recipe makes stored results detectably
 //! stale rather than silently mixed.
 
-// The pipeline is assembled bottom-up: the pure-logic units below are built and
-// tested before the orchestration that consumes them exists. This allowance is
-// removed once `stt` wires them together.
-#[allow(dead_code)]
 pub mod audio;
-#[allow(dead_code)]
 pub mod coverage;
-#[allow(dead_code)]
 pub mod engine;
-#[allow(dead_code)]
 pub mod quality;
-#[allow(dead_code)]
 pub mod store;
-#[allow(dead_code)]
 pub mod stt;
-#[allow(dead_code)]
 pub mod whisper_engine;
-#[allow(dead_code)]
 pub mod windows;
 
 /// Identity of the speech-to-text recipe. Changing any component of the

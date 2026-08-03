@@ -8,6 +8,40 @@
 
 **Tech Stack:** Rust, `rusqlite`, `whisper-rs` 0.16 (vendors whisper.cpp + ggml, CPU-only), FFmpeg 7.x as a managed child process, `batch-estimator`, `clap` for CLI.
 
+## Deviations taken during implementation
+
+Recorded so the plan matches what was actually built.
+
+1. **Module visibility.** The plan said `pub mod analysis;`. The crate's
+   convention is a private `mod` plus a curated `pub use`, so `analysis` is
+   private and only `STT_RECIPE_KEY`, `STT_TASK_KEY`, `TranscriptStatus` and
+   `TranscribeOutcome` are re-exported.
+2. **Migration entry point** is `migrate_project_catalog`, not the
+   `apply_project_catalog_migrations` the plan guessed.
+3. **`whisper-rs` API.** The plan's calls were written from the spike's prose and
+   were wrong. The real 0.16 API is object-based: `state.get_segment(i)` returning
+   a `WhisperSegment` with `start_timestamp`/`end_timestamp` (centiseconds),
+   `to_str_lossy`, `n_tokens`, `get_token(i).token_probability()`, plus
+   `full_lang_id_from_state()`. `new_with_params` takes `AsRef<Path>`. Auto-detect
+   is `set_language(None)`.
+4. **`SttEngine` takes samples, not a path.** As planned, `detect_speech` and
+   `decode_window` both received a `&Path` and each re-read the file. On a corpus
+   containing a 19-minute clip that re-reads and re-converts millions of samples
+   per window. The trait now takes `&[f32]` and the pipeline reads once per clip.
+5. **The two-phase batch was not built.** The plan called for a project-wide VAD
+   sweep to produce exact 30-second window counts before weighting the batch.
+   Implemented instead as one clip = one work unit. The sweep is not actually
+   cheap end to end: it requires FFmpeg audio extraction for every clip up front,
+   so it either doubles extraction work or requires retaining every clip's WAV.
+   **Open:** clip-uniform weights skew the ETA, because ~64% of clips are silent
+   and cost near nothing while a speech clip costs one or more full windows.
+   Revisit with the measured window distribution.
+6. **`transcript_coverage` added to the core.** The plan put a SQL query for
+   `transcribe status` in the CLI; domain behavior belongs to the owning crate,
+   so the query lives on `Catalog` and the CLI just serializes it.
+7. **`#[allow(dead_code)]` on the analysis submodules** while the pipeline was
+   assembled bottom-up. Remove once every unit has a consumer.
+
 ## Global Constraints
 
 Copied verbatim from [the design](../specs/2026-08-03-stt-vlm-clip-analysis-design.md) and `AGENTS.md`. Every task's requirements implicitly include this section.
