@@ -34,7 +34,18 @@ use analysis::store::{StoredTranscript, is_current, load_transcript, save_transc
 use analysis::stt::transcribe_pcm;
 use analysis::whisper_engine::{WhisperEngine, read_pcm};
 
-pub use analysis::framepack::{FramePackManifest, build_frame_pack};
+pub use analysis::framepack::{FramePackManifest, build_frame_pack, encode_frames};
+pub use analysis::openrouter::{
+    OpenRouterProvider, frame_data_uri, key_file_path, resolve_api_key,
+};
+pub use analysis::provider::{
+    ChainOutcome, DEFAULT_MODEL, FALLBACK_MODEL, MODELS, ModelSpec, ProviderChain, VlmProvider,
+    VlmRequest, VlmResponse, model_spec,
+};
+pub use analysis::schema::{
+    CameraMovement, ClipObservation, DomainError, UnusableReason, output_schema,
+    validate as validate_observation,
+};
 pub use analysis::store::TranscriptStatus;
 pub use analysis::stt::TranscribeOutcome;
 pub use analysis::{FRAMEPACK_RECIPE_KEY, STT_RECIPE_KEY, STT_TASK_KEY, VLM_PROMPT_VERSION};

@@ -8,18 +8,11 @@
 pub mod audio;
 pub mod coverage;
 pub mod engine;
-// `encode_frames` is consumed by `vlm`, which lands after the provider chain.
-#[allow(dead_code)]
 pub mod framepack;
 pub mod frames;
-// Consumed by `vlm`, which lands next.
-#[allow(dead_code)]
 pub mod openrouter;
-#[allow(dead_code)]
 pub mod provider;
 pub mod quality;
-// Consumed by `vlm`, which lands after the provider chain.
-#[allow(dead_code)]
 pub mod schema;
 pub mod store;
 pub mod stt;
