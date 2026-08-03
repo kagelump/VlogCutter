@@ -9,6 +9,8 @@
 // tested before the orchestration that consumes them exists. This allowance is
 // removed once `stt` wires them together.
 #[allow(dead_code)]
+pub mod quality;
+#[allow(dead_code)]
 pub mod windows;
 
 /// Identity of the speech-to-text recipe. Changing any component of the
