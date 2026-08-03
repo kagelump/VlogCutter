@@ -30,7 +30,7 @@ mod storage;
 
 use analysis::audio::{AudioExtractor, FfmpegAudioExtractor};
 use analysis::engine::{SttEngine, VAD_MODEL, WHISPER_MODEL, ensure_model, model_dir};
-use analysis::store::{StoredTranscript, is_current, save_transcript};
+use analysis::store::{StoredTranscript, is_current, load_transcript, save_transcript};
 use analysis::stt::transcribe_pcm;
 use analysis::whisper_engine::WhisperEngine;
 
@@ -290,6 +290,23 @@ pub struct TranscribeReport {
     pub skipped: usize,
     pub outcomes: Vec<TranscribeOutcome>,
     pub failures: Vec<IngestFailure>,
+}
+
+/// Transcript coverage for a project, counted by terminal status.
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TranscriptCoverage {
+    pub recipe_key: String,
+    pub total: usize,
+    /// Clips with usable speech.
+    pub speech: usize,
+    /// Clips the VAD gate found silent. A success, not a failure.
+    pub no_speech: usize,
+    /// Clips whose decode tripped the hallucination gate.
+    pub rejected: usize,
+    pub failed: usize,
+    /// Clips never transcribed, or whose proxy has since been regenerated.
+    pub missing: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1167,6 +1184,40 @@ impl Catalog {
 
     pub fn transcribe_missing(&self, project_id: &str) -> Result<TranscribeReport> {
         self.transcribe_missing_with_progress(project_id, |_| {})
+    }
+
+    /// Transcript coverage for a project, without transcribing anything.
+    ///
+    /// A stored transcript whose proxy fingerprint no longer matches counts as
+    /// `missing`, because that is what a `transcribe missing` run would redo.
+    pub fn transcript_coverage(&self, project_id: &str) -> Result<TranscriptCoverage> {
+        let connection = self.connection()?;
+        let mut coverage = TranscriptCoverage {
+            recipe_key: STT_RECIPE_KEY.to_string(),
+            ..TranscriptCoverage::default()
+        };
+        for asset in self.list_assets(project_id)? {
+            if asset.removed {
+                continue;
+            }
+            coverage.total += 1;
+            let current = match self.proxy_fingerprint(&asset.id) {
+                Ok(fingerprint) => is_current(&connection, &asset.id, &fingerprint)?,
+                Err(_) => false,
+            };
+            if !current {
+                coverage.missing += 1;
+                continue;
+            }
+            match load_transcript(&connection, &asset.id)?.map(|stored| stored.status) {
+                Some(TranscriptStatus::Speech) => coverage.speech += 1,
+                Some(TranscriptStatus::NoSpeech) => coverage.no_speech += 1,
+                Some(TranscriptStatus::Rejected) => coverage.rejected += 1,
+                Some(TranscriptStatus::Failed) => coverage.failed += 1,
+                None => coverage.missing += 1,
+            }
+        }
+        Ok(coverage)
     }
 
     /// Transcribes every clip in the project without a current transcript.
