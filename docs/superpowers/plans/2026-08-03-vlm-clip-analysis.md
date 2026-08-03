@@ -8,12 +8,33 @@
 
 **Tech Stack:** Rust, `reqwest` 0.12 blocking, `base64`, FFmpeg for frame extraction and JPEG encoding, `rusqlite`.
 
+## Deviations taken during implementation
+
+Recorded so the plan matches what was actually built.
+
+1. **The candidate budget strides; it does not truncate.** The plan's Task 3
+   snippet capped candidates with `.take(MAX_CANDIDATES)` on a 2 fps stream,
+   which keeps only the first 40 frames — the clip's opening 20.4 seconds. Every
+   longer clip would then be titled, labeled, best-momented and thumbnailed from
+   its opening alone, and the corpus contains clips of many minutes. FFmpeg
+   decodes and pipes the whole clip either way, so the frames were being fetched
+   and discarded. `parse_gray_frames` now selects `slot * available / count` for
+   `count = min(available, 40)`, which is deterministic, allocates no more than
+   before, and spans the clip. Recipe key bumped `…max40…v1` →
+   `…stride-max40…v2` so stored packs and analyses go stale.
+2. **Multi-statement writes are transactional.** `analysis::store::save_transcript`
+   and `analysis::consolidate::apply_mapping` each issued a sequence of
+   statements on a bare connection. `apply_mapping` deletes the project's entire
+   `label_vocabulary` before repopulating it, so a mid-sequence failure left no
+   vocabulary at all beside a half-remapped authorship table. Both now wrap their
+   writes in `unchecked_transaction()`.
+
 ## Global Constraints
 
 From the [design](../specs/2026-08-03-stt-vlm-clip-analysis-design.md) and `AGENTS.md`. Verbatim values.
 
 - Frame-packs are built from the **proxy only**, never the original. No proxy → explicit failure.
-- Frame-pack recipe key: `framepack.2fps.skip400ms.max40.win3-8.sharp-bright-motion.dhash8-d5.v1`
+- Frame-pack recipe key: `framepack.2fps.skip400ms.stride-max40.win3-8.sharp-bright-motion.dhash8-d5.v2` (see Deviation 1)
 - Frames are encoded at **768 px** wide. Do not shrink: both Google models bill a flat token count regardless of width, and OCR agreement drops by a third to a half.
 - Frame-pack identity is recipe key **+ representation kind/version + proxy file fingerprint**. A proxy regeneration invalidates stored frame-packs.
 - Prompt version: `vlm.observe.v2`
@@ -563,7 +584,7 @@ git add -A && git commit -m "feat(analysis): deterministic frame scoring and sel
 - `pub fn build_frame_pack(proxy: &Path, fingerprint: &str) -> Result<FramePackManifest>`
 - `pub fn encode_frames(proxy: &Path, manifest: &FramePackManifest, directory: &Path) -> Result<Vec<PathBuf>>`
 
-Sampling contract: 2 fps, first and last 400 ms skipped, at most 40 candidates, 320×180 working size.
+Sampling contract: 2 fps, first and last 400 ms skipped, at most 40 candidates **spread evenly across the whole clip** (see Deviation 1), 320×180 working size.
 
 - [ ] **Step 1: Write the failing test**
 

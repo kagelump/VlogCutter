@@ -62,8 +62,15 @@ pub struct StoredTranscript {
 }
 
 /// Writes a transcript and its segments, replacing any previous result.
+///
+/// The header row, the removal of the previous segments and the new segments
+/// are one transaction: a failure part-way through would otherwise leave a
+/// header claiming `speech` above a truncated or empty segment list, which is
+/// indistinguishable downstream from a genuinely short transcript.
 pub fn save_transcript(connection: &Connection, transcript: &StoredTranscript) -> Result<()> {
     let now = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+    let transaction = connection.unchecked_transaction()?;
+    let connection = &transaction;
     connection
         .execute(
             r#"
@@ -102,22 +109,25 @@ pub fn save_transcript(connection: &Connection, transcript: &StoredTranscript) -
         )
         .context("clear previous transcript segments")?;
 
-    let mut statement = connection.prepare(
-        "INSERT INTO transcript_segments
-            (asset_id, segment_index, start_ms, end_ms, language, text, mean_token_probability)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-    )?;
-    for (index, segment) in transcript.segments.iter().enumerate() {
-        statement.execute(params![
-            transcript.asset_id,
-            index as i64,
-            segment.start_ms,
-            segment.end_ms,
-            segment.language,
-            segment.text,
-            segment.mean_token_probability,
-        ])?;
+    {
+        let mut statement = connection.prepare(
+            "INSERT INTO transcript_segments
+                (asset_id, segment_index, start_ms, end_ms, language, text, mean_token_probability)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        )?;
+        for (index, segment) in transcript.segments.iter().enumerate() {
+            statement.execute(params![
+                transcript.asset_id,
+                index as i64,
+                segment.start_ms,
+                segment.end_ms,
+                segment.language,
+                segment.text,
+                segment.mean_token_probability,
+            ])?;
+        }
     }
+    transaction.commit()?;
     Ok(())
 }
 

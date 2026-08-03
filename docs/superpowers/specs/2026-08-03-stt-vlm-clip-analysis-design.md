@@ -116,8 +116,15 @@ CPU path must keep working regardless.
 
 ### Frame-pack
 
-Recipe `framepack.2fps.skip400ms.max40.win3-8.sharp-bright-motion.dhash8-d5.v1`,
+Recipe
+`framepack.2fps.skip400ms.stride-max40.win3-8.sharp-bright-motion.dhash8-d5.v2`,
 frames encoded as **768 px JPEG**.
+
+The 40-candidate budget is **spread evenly across the whole clip**, not taken
+from its head. FFmpeg decodes the clip in full either way, so a head-truncated
+budget bought nothing and made every clip longer than 20 s describe only its
+opening — title, labels, best moment and representative thumbnail all drawn from
+the first twenty seconds of a multi-minute clip. `v1` truncated; `v2` strides.
 
 Frame-packs are built from the **proxy only**. Round 2 Finding 2 measured the
 proxy at 0.4 s versus 17.6 s for the 4K original on NAS (44x), and — more

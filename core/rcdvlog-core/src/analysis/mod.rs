@@ -36,7 +36,7 @@ pub const STT_TASK_KEY: &str = "stt.whisper-large-v3-turbo-q5_0.vad-silero-v5.wi
 /// original selects different frames, because sharpness and motion are
 /// resolution- and codec-dependent.
 pub const FRAMEPACK_RECIPE_KEY: &str =
-    "framepack.2fps.skip400ms.max40.win3-8.sharp-bright-motion.dhash8-d5.v1";
+    "framepack.2fps.skip400ms.stride-max40.win3-8.sharp-bright-motion.dhash8-d5.v2";
 
 /// Version of the vision prompt. Bumping it makes stored analyses stale.
 pub const VLM_PROMPT_VERSION: &str = "vlm.observe.v2";

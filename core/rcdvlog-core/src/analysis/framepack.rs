@@ -88,6 +88,13 @@ pub fn jpeg_command(proxy: &Path, timestamp_ms: u32, output: &Path) -> Command {
 
 /// Splits the raw stream into frames, stamping each with its sample time.
 ///
+/// The candidate budget is spread evenly across the whole stream rather than
+/// taken from its head. FFmpeg decodes the clip in full either way, so keeping
+/// only the first `MAX_CANDIDATES` bought nothing and made every clip longer
+/// than `MAX_CANDIDATES / fps` seconds describe only its opening: on a
+/// multi-minute clip the title, labels, best moment and representative
+/// thumbnail would all come from the first twenty seconds.
+///
 /// A trailing partial frame is discarded rather than padded: a truncated frame
 /// would score as though its missing rows were black.
 pub fn parse_gray_frames(
@@ -102,15 +109,22 @@ pub fn parse_gray_frames(
         return Vec::new();
     }
     let interval_ms = 1_000 / fps;
-    bytes
-        .chunks_exact(frame_bytes)
-        .take(MAX_CANDIDATES)
-        .enumerate()
-        .map(|(index, chunk)| GrayFrame {
-            timestamp_ms: skip_ms + index as u32 * interval_ms,
-            width,
-            height,
-            pixels: chunk.to_vec(),
+    let available = bytes.len() / frame_bytes;
+    if available == 0 {
+        return Vec::new();
+    }
+    // Integer striding, so the same stream always yields the same candidates.
+    let count = available.min(MAX_CANDIDATES);
+    (0..count)
+        .map(|slot| {
+            let index = slot * available / count;
+            let start = index * frame_bytes;
+            GrayFrame {
+                timestamp_ms: skip_ms + index as u32 * interval_ms,
+                width,
+                height,
+                pixels: bytes[start..start + frame_bytes].to_vec(),
+            }
         })
         .collect()
 }
@@ -271,6 +285,44 @@ mod tests {
     fn candidates_are_capped_at_forty() {
         let bytes = vec![0_u8; 8 * 100];
         assert_eq!(parse_gray_frames(&bytes, 4, 2, 2, 400).len(), 40);
+    }
+
+    #[test]
+    fn candidates_span_the_whole_clip_rather_than_its_opening() {
+        // 600 sampled frames is a five-minute clip at 2 fps. Truncating to the
+        // first 40 would describe only its first twenty seconds.
+        let bytes = vec![0_u8; 8 * 600];
+        let frames = parse_gray_frames(&bytes, 4, 2, 2, 400);
+        assert_eq!(frames.len(), MAX_CANDIDATES);
+        assert_eq!(frames[0].timestamp_ms, 400);
+        // The last candidate sits near the end of the clip, not at 20 s.
+        assert!(
+            frames.last().unwrap().timestamp_ms > 290_000,
+            "last candidate was {}",
+            frames.last().unwrap().timestamp_ms
+        );
+        assert!(
+            frames
+                .windows(2)
+                .all(|pair| pair[0].timestamp_ms < pair[1].timestamp_ms),
+            "candidates must stay ascending and distinct"
+        );
+    }
+
+    #[test]
+    fn striding_is_deterministic_for_the_same_stream() {
+        let bytes: Vec<u8> = (0..8 * 137).map(|index| (index % 251) as u8).collect();
+        let first = parse_gray_frames(&bytes, 4, 2, 2, 400);
+        let second = parse_gray_frames(&bytes, 4, 2, 2, 400);
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn a_short_clip_keeps_every_sampled_frame() {
+        let bytes = vec![0_u8; 8 * 12];
+        let frames = parse_gray_frames(&bytes, 4, 2, 2, 400);
+        assert_eq!(frames.len(), 12);
+        assert_eq!(frames[11].timestamp_ms, 400 + 11 * 500);
     }
 
     #[test]

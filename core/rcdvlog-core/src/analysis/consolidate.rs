@@ -139,6 +139,11 @@ pub fn assets_for_label(
 
 /// Updates AI authorship and rebuilds vocabulary after the catalog has emitted
 /// the corresponding typed label remove/add operations.
+///
+/// Every write is one transaction. The vocabulary rebuild deletes the project's
+/// whole vocabulary before repopulating it, so a failure part-way through an
+/// untransacted run would leave the project with no vocabulary at all and a
+/// half-remapped authorship table.
 pub fn apply_mapping(
     connection: &Connection,
     project_id: &str,
@@ -149,6 +154,8 @@ pub fn apply_mapping(
     let validation = serde_json::json!({"mappings": mappings});
     parse_mapping(&validation.to_string(), &known)?;
 
+    let transaction = connection.unchecked_transaction()?;
+    let connection = &transaction;
     let mut remapped = 0;
     for mapping in mappings {
         let from = normalize_label(&mapping.from);
@@ -210,6 +217,7 @@ pub fn apply_mapping(
         [project_id],
         |row| row.get::<_, i64>(0),
     )? as usize;
+    transaction.commit()?;
     Ok((remapped, vocabulary_size))
 }
 
