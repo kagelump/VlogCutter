@@ -44,15 +44,20 @@ pub const VAD_MODEL: ModelAsset = ModelAsset {
 };
 
 /// Speech detection and decoding, behind one seam.
+///
+/// Both methods take already-decoded samples rather than a path. A clip is read
+/// and converted exactly once by the caller: taking a path here meant every
+/// window re-read the whole file, which on a 19-minute clip is millions of
+/// samples converted per decode.
 pub trait SttEngine {
     /// Detected speech spans in clip time. An empty result means no speech and
     /// is a successful outcome, not a failure.
-    fn detect_speech(&self, pcm_path: &Path) -> Result<Vec<SpeechRegion>>;
+    fn detect_speech(&self, pcm: &[f32]) -> Result<Vec<SpeechRegion>>;
 
     /// Decodes one packed window. The implementation concatenates the window's
-    /// regions from `pcm_path` before decoding. Returned segment timestamps are
-    /// in **window time** and are translated to clip time by the caller.
-    fn decode_window(&self, pcm_path: &Path, window: &PackedWindow) -> Result<Vec<DecodedSegment>>;
+    /// regions out of `pcm` before decoding. Returned segment timestamps are in
+    /// **window time** and are translated to clip time by the caller.
+    fn decode_window(&self, pcm: &[f32], window: &PackedWindow) -> Result<Vec<DecodedSegment>>;
 }
 
 /// Where downloaded models live: project-local cache, never beside originals.

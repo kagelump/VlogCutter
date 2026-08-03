@@ -55,7 +55,10 @@ fn concatenate_regions(pcm: &[f32], window: &PackedWindow) -> Vec<f32> {
     packed
 }
 
-fn read_pcm(path: &Path) -> Result<Vec<f32>> {
+/// Reads a 16 kHz mono WAV into whisper's normalized float samples.
+///
+/// Called once per clip by the pipeline, never per window.
+pub fn read_pcm(path: &Path) -> Result<Vec<f32>> {
     let mut reader =
         hound::WavReader::open(path).with_context(|| format!("open {}", path.display()))?;
     let samples = reader
@@ -85,15 +88,14 @@ impl WhisperEngine {
 }
 
 impl SttEngine for WhisperEngine {
-    fn detect_speech(&self, pcm_path: &Path) -> Result<Vec<SpeechRegion>> {
-        let pcm = read_pcm(pcm_path)?;
+    fn detect_speech(&self, pcm: &[f32]) -> Result<Vec<SpeechRegion>> {
         let mut vad = whisper_rs::WhisperVadContext::new(
             &self.vad_model_path.to_string_lossy(),
             whisper_rs::WhisperVadContextParams::default(),
         )
         .context("load VAD model")?;
         let segments = vad
-            .segments_from_samples(whisper_rs::WhisperVadParams::default(), &pcm)
+            .segments_from_samples(whisper_rs::WhisperVadParams::default(), pcm)
             .context("run VAD")?;
         Ok(segments
             .map(|segment| SpeechRegion {
@@ -104,9 +106,8 @@ impl SttEngine for WhisperEngine {
             .collect())
     }
 
-    fn decode_window(&self, pcm_path: &Path, window: &PackedWindow) -> Result<Vec<DecodedSegment>> {
-        let pcm = read_pcm(pcm_path)?;
-        let packed = concatenate_regions(&pcm, window);
+    fn decode_window(&self, pcm: &[f32], window: &PackedWindow) -> Result<Vec<DecodedSegment>> {
+        let packed = concatenate_regions(pcm, window);
         if packed.is_empty() {
             return Ok(Vec::new());
         }

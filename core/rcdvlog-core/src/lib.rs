@@ -32,7 +32,7 @@ use analysis::audio::{AudioExtractor, FfmpegAudioExtractor};
 use analysis::engine::{SttEngine, VAD_MODEL, WHISPER_MODEL, ensure_model, model_dir};
 use analysis::store::{StoredTranscript, is_current, load_transcript, save_transcript};
 use analysis::stt::transcribe_pcm;
-use analysis::whisper_engine::WhisperEngine;
+use analysis::whisper_engine::{WhisperEngine, read_pcm};
 
 pub use analysis::store::TranscriptStatus;
 pub use analysis::stt::TranscribeOutcome;
@@ -1165,7 +1165,11 @@ impl Catalog {
 
         let result = (|| -> Result<StoredTranscript> {
             FfmpegAudioExtractor.extract_pcm16k(&proxy_path, &pcm_path)?;
-            transcribe_pcm(engine, asset_id, &source_fingerprint, &pcm_path)
+            // Read once per clip. The engine receives samples, never a path, so
+            // a multi-window clip does not re-read and re-convert the whole file
+            // for every window.
+            let pcm = read_pcm(&pcm_path)?;
+            transcribe_pcm(engine, asset_id, &source_fingerprint, &pcm)
         })();
         // The extracted PCM is scratch, not a retained representation, so it is
         // removed whether or not the decode succeeded.

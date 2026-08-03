@@ -8,7 +8,6 @@
 use anyhow::Result;
 use serde::Serialize;
 use std::collections::HashMap;
-use std::path::Path;
 
 use crate::analysis::STT_RECIPE_KEY;
 use crate::analysis::coverage::{needs_resplit, resplit};
@@ -38,9 +37,9 @@ pub fn transcribe_pcm(
     engine: &dyn SttEngine,
     asset_id: &str,
     source_fingerprint: &str,
-    pcm_path: &Path,
+    pcm: &[f32],
 ) -> Result<StoredTranscript> {
-    let regions = engine.detect_speech(pcm_path)?;
+    let regions = engine.detect_speech(pcm)?;
     let speech_ms: u32 = regions.iter().map(SpeechRegion::duration_ms).sum();
 
     if regions.is_empty() || speech_ms == 0 {
@@ -60,7 +59,7 @@ pub fn transcribe_pcm(
 
     for window in &windows {
         window_count += 1;
-        let decoded = engine.decode_window(pcm_path, window)?;
+        let decoded = engine.decode_window(pcm, window)?;
 
         if needs_resplit(window, &decoded) {
             // A whole language's speech went missing. Re-decode each speech
@@ -68,7 +67,7 @@ pub fn transcribe_pcm(
             // likely switch points.
             for narrow in resplit(window) {
                 window_count += 1;
-                let narrow_decoded = engine.decode_window(pcm_path, &narrow)?;
+                let narrow_decoded = engine.decode_window(pcm, &narrow)?;
                 segments.extend(to_clip_time(&narrow, &narrow_decoded));
             }
         } else {
@@ -196,13 +195,13 @@ mod tests {
     }
 
     impl SttEngine for FakeEngine {
-        fn detect_speech(&self, _pcm_path: &Path) -> Result<Vec<SpeechRegion>> {
+        fn detect_speech(&self, _pcm: &[f32]) -> Result<Vec<SpeechRegion>> {
             Ok(self.regions.clone())
         }
 
         fn decode_window(
             &self,
-            _pcm_path: &Path,
+            _pcm: &[f32],
             _window: &PackedWindow,
         ) -> Result<Vec<DecodedSegment>> {
             *self.decode_calls.borrow_mut() += 1;
@@ -227,7 +226,7 @@ mod tests {
     #[test]
     fn silence_is_stored_as_no_speech_and_never_reaches_the_model() {
         let engine = FakeEngine::new(Vec::new(), Vec::new());
-        let stored = transcribe_pcm(&engine, "a1", "fp", Path::new("/tmp/x.wav")).unwrap();
+        let stored = transcribe_pcm(&engine, "a1", "fp", &[]).unwrap();
         assert_eq!(stored.status, TranscriptStatus::NoSpeech);
         assert!(stored.segments.is_empty());
         assert_eq!(stored.window_count, 0);
@@ -248,7 +247,7 @@ mod tests {
             }],
             vec![vec![segment(0, 3_000, "次は新大阪です", 0.73)]],
         );
-        let stored = transcribe_pcm(&engine, "a1", "fp", Path::new("/tmp/x.wav")).unwrap();
+        let stored = transcribe_pcm(&engine, "a1", "fp", &[]).unwrap();
         assert_eq!(stored.status, TranscriptStatus::Speech);
         assert_eq!(stored.segments.len(), 1);
         assert_eq!(stored.segments[0].start_ms, 5_000);
@@ -270,7 +269,7 @@ mod tests {
             }],
             vec![repeats],
         );
-        let stored = transcribe_pcm(&engine, "a1", "fp", Path::new("/tmp/x.wav")).unwrap();
+        let stored = transcribe_pcm(&engine, "a1", "fp", &[]).unwrap();
         assert_eq!(stored.status, TranscriptStatus::Rejected);
         assert_eq!(stored.reject_reason, "repetition");
         assert!(
@@ -300,7 +299,7 @@ mod tests {
                 vec![segment(0, 6_000, "this is english", 0.7)],
             ],
         );
-        let stored = transcribe_pcm(&engine, "a1", "fp", Path::new("/tmp/x.wav")).unwrap();
+        let stored = transcribe_pcm(&engine, "a1", "fp", &[]).unwrap();
         assert_eq!(*engine.decode_calls.borrow(), 3, "1 packed + 2 re-split");
         assert_eq!(stored.segments.len(), 2);
         assert_eq!(stored.segments[0].start_ms, 0);
@@ -327,7 +326,7 @@ mod tests {
                 segment(0, 2_000, "first", 0.7),
             ]],
         );
-        let stored = transcribe_pcm(&engine, "a1", "fp", Path::new("/tmp/x.wav")).unwrap();
+        let stored = transcribe_pcm(&engine, "a1", "fp", &[]).unwrap();
         assert_eq!(stored.segments[0].text, "first");
         assert_eq!(stored.segments[1].text, "second");
     }
@@ -344,7 +343,7 @@ mod tests {
                 segment(2_000, 4_000, "real", 0.7),
             ]],
         );
-        let stored = transcribe_pcm(&engine, "a1", "fp", Path::new("/tmp/x.wav")).unwrap();
+        let stored = transcribe_pcm(&engine, "a1", "fp", &[]).unwrap();
         assert_eq!(stored.segments.len(), 1);
         assert_eq!(stored.segments[0].text, "real");
     }
@@ -358,7 +357,7 @@ mod tests {
             }],
             vec![vec![]],
         );
-        let stored = transcribe_pcm(&engine, "a1", "fp", Path::new("/tmp/x.wav")).unwrap();
+        let stored = transcribe_pcm(&engine, "a1", "fp", &[]).unwrap();
         assert_eq!(stored.status, TranscriptStatus::NoSpeech);
         assert!(stored.reject_reason.is_empty());
     }
@@ -366,7 +365,7 @@ mod tests {
     #[test]
     fn the_stored_recipe_key_is_the_current_one() {
         let engine = FakeEngine::new(Vec::new(), Vec::new());
-        let stored = transcribe_pcm(&engine, "a1", "fp", Path::new("/tmp/x.wav")).unwrap();
+        let stored = transcribe_pcm(&engine, "a1", "fp", &[]).unwrap();
         assert_eq!(stored.recipe_key, STT_RECIPE_KEY);
         assert_eq!(stored.source_fingerprint, "fp");
     }

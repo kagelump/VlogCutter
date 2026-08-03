@@ -68,7 +68,7 @@ fn transcribes_a_real_project_and_reports_its_gate_ratios() {
     println!("windows decoded: {windows}");
     println!("speech audio:    {speech_seconds:.1}s");
     println!("wall time:       {elapsed:?}");
-    for failure in report.outcomes.is_empty().then_some(()).into_iter().flat_map(|()| &report.failures) {
+    for failure in report.failures.iter().take(5) {
         println!("failure: {} -> {}", failure.path, failure.error);
     }
 
