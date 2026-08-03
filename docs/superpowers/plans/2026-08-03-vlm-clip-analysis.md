@@ -1080,9 +1080,19 @@ git add -A && git commit -m "feat(analysis): model registry and provider chain w
 
 **Files:** Create `core/rcdvlog-core/src/analysis/openrouter.rs`; modify `core/rcdvlog-core/Cargo.toml`
 
-**Produces:** `pub struct OpenRouterProvider { base_url: String, api_key: String }` implementing `VlmProvider`, plus `pub fn api_key_from_env() -> Result<String>`.
+**Produces:** `pub struct OpenRouterProvider { base_url: String, api_key: String }` implementing `VlmProvider`, plus `pub fn resolve_api_key() -> Result<String>`.
 
-The only file that performs network I/O. Requests go to the configured base URL and nowhere else. The API key is read from `OPENROUTER_API_KEY` and never logged, never placed in a URL.
+The only file that performs network I/O. Requests go to the configured base URL and nowhere else.
+
+**Credential resolution order**, first match wins:
+
+1. `OPENROUTER_API_KEY` environment variable — the agent/CI path.
+2. `~/.openrouter.key` — a file containing only the key. Trailing whitespace and
+   newlines are trimmed.
+
+An OAuth2 flow is planned and will slot in ahead of both; until then the file is
+the app's normal path. The key is never logged, never placed in a URL or argv,
+and never written into the catalog or any error message.
 
 - [ ] **Step 1: Write the failing test**
 

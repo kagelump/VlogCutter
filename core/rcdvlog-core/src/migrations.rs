@@ -7,7 +7,7 @@ use thiserror::Error;
 
 use crate::chronology::forward_migrate_project_chronology;
 
-pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 13;
+pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 14;
 
 const MIGRATION_TABLE_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -161,6 +161,12 @@ pub const PROJECT_CATALOG_MIGRATIONS: &[SqliteMigration] = &[
         name: "transcripts",
         source_identity: "project-catalog/0013-transcripts/20260803",
         apply: add_transcripts,
+    },
+    SqliteMigration {
+        id: 14,
+        name: "clip_analysis",
+        source_identity: "project-catalog/0014-clip-analysis/20260803",
+        apply: add_clip_analysis,
     },
 ];
 
@@ -988,6 +994,90 @@ fn add_transcripts(transaction: &Transaction<'_>) -> Result<()> {
     Ok(())
 }
 
+/// Migration 14. Cloud vision analysis as derived artifacts.
+///
+/// `title` and `description` live on `assets` beside `notes` rather than inside
+/// the analysis row: they are AI-written but human-editable, and an edit must
+/// survive the analysis being deleted or re-run. `notes` remains human-only and
+/// is never written by analysis.
+///
+/// `analysis_labels` records which labels analysis authored. It is deliberately
+/// local and unsynced — the labels themselves flow through the existing typed
+/// label operation, and adding an origin field to that payload would break
+/// older nodes, whose deserializer denies unknown fields. Consolidation and
+/// forced re-analysis consult this table so they never touch a human's label.
+///
+/// `asset_frame_packs.representation` plus `source_fingerprint` are what make a
+/// stored pack detectably stale: the same recipe over a regenerated proxy does
+/// not select the same frames.
+fn add_clip_analysis(transaction: &Transaction<'_>) -> Result<()> {
+    // Every migration must be replayable: dropping `schema_migrations` re-runs
+    // the whole list against a schema that may already have these columns, and
+    // `ADD COLUMN` is not idempotent the way `CREATE TABLE IF NOT EXISTS` is.
+    for column in ["title", "description"] {
+        if !column_exists(transaction, "assets", column)? {
+            transaction.execute_batch(&format!(
+                "ALTER TABLE assets ADD COLUMN {column} TEXT NOT NULL DEFAULT '';"
+            ))?;
+        }
+    }
+    transaction.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS asset_frame_packs (
+            asset_id TEXT PRIMARY KEY REFERENCES assets(id) ON DELETE CASCADE,
+            recipe_key TEXT NOT NULL,
+            representation TEXT NOT NULL,
+            source_fingerprint TEXT NOT NULL,
+            manifest_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS asset_analyses (
+            asset_id TEXT PRIMARY KEY REFERENCES assets(id) ON DELETE CASCADE,
+            recipe_key TEXT NOT NULL,
+            prompt_version TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            model TEXT NOT NULL,
+            status TEXT NOT NULL CHECK(status IN ('ok', 'rejected', 'failed')),
+            reject_reason TEXT NOT NULL DEFAULT '',
+            usable INTEGER NOT NULL DEFAULT 1,
+            unusable_reason TEXT NOT NULL DEFAULT '',
+            best_moment_start_ms INTEGER,
+            best_moment_end_ms INTEGER,
+            thumbnail_timestamp_ms INTEGER,
+            camera_movement TEXT NOT NULL DEFAULT 'other',
+            ocr_json TEXT NOT NULL DEFAULT '[]',
+            transcript_used INTEGER NOT NULL DEFAULT 0,
+            prompt_tokens INTEGER NOT NULL DEFAULT 0,
+            completion_tokens INTEGER NOT NULL DEFAULT 0,
+            cost_usd REAL NOT NULL DEFAULT 0,
+            latency_ms INTEGER NOT NULL DEFAULT 0,
+            attempts INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS analysis_labels (
+            asset_id TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+            normalized_label TEXT NOT NULL,
+            display_label TEXT NOT NULL,
+            proposed_label TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY(asset_id, normalized_label)
+        );
+
+        CREATE TABLE IF NOT EXISTS label_vocabulary (
+            project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            normalized_label TEXT NOT NULL,
+            display_label TEXT NOT NULL,
+            usage_count INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY(project_id, normalized_label)
+        );
+        "#,
+    )?;
+    Ok(())
+}
+
 fn backfill_pattern_filename_counters(transaction: &Transaction<'_>) -> Result<()> {
     let pending: Vec<(String, String)> = {
         let mut statement = transaction.prepare(
@@ -1154,8 +1244,68 @@ mod tests {
             .unwrap();
         assert!(segment_columns.contains(&"start_ms".to_string()));
         assert!(segment_columns.contains(&"mean_token_probability".to_string()));
+    }
 
-        assert_eq!(PROJECT_CATALOG_SCHEMA_VERSION, 13);
+    #[test]
+    fn migration_14_adds_analysis_tables_and_ai_owned_columns() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        migrate_project_catalog(&mut connection).unwrap();
+        for table in [
+            "asset_frame_packs",
+            "asset_analyses",
+            "analysis_labels",
+            "label_vocabulary",
+        ] {
+            let count: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                    [table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1, "missing table {table}");
+        }
+        let asset_columns: Vec<String> = connection
+            .prepare("SELECT name FROM pragma_table_info('assets')")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<String>>>()
+            .unwrap();
+        assert!(asset_columns.contains(&"title".to_string()));
+        assert!(asset_columns.contains(&"description".to_string()));
+        assert_eq!(PROJECT_CATALOG_SCHEMA_VERSION, 14);
+    }
+
+    #[test]
+    fn analysis_status_rejects_unknown_value() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        migrate_project_catalog(&mut connection).unwrap();
+        connection
+            .execute(
+                "INSERT INTO projects (id, name, created_at)
+                 VALUES ('p1','p','2026-01-01T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO assets (id, project_id, fingerprint, path, filename, size_bytes,
+                 duration_seconds, created_at)
+                 VALUES ('a1','p1','f1','/x.mp4','x.mp4',1,1.0,'2026-01-01T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+        assert!(
+            connection
+                .execute(
+                    "INSERT INTO asset_analyses (asset_id, recipe_key, prompt_version, provider,
+                     model, status, created_at)
+                     VALUES ('a1','r','v2','openrouter','m','banana','2026-01-01T00:00:00Z')",
+                    [],
+                )
+                .is_err()
+        );
     }
 
     #[test]
