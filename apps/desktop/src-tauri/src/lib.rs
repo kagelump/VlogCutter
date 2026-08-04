@@ -9,7 +9,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::io::ErrorKind;
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use tauri::{Emitter, Manager, State};
 
@@ -723,6 +725,7 @@ async fn generate_missing_proxies(
     tauri::async_runtime::spawn_blocking(move || {
         catalog.generate_missing_proxies_with_progress(&project_id, |progress| {
             let _ = app.emit("proxy-progress", progress);
+            ControlFlow::Continue(())
         })
     })
     .await

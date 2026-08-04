@@ -48,7 +48,8 @@ impl TranscriptStatus {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct StoredTranscript {
     pub asset_id: String,
     pub recipe_key: String,

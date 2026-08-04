@@ -9,8 +9,10 @@ use std::collections::VecDeque;
 use std::env;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Instant;
@@ -33,14 +35,17 @@ use analysis::consolidate::{
     apply_mapping as persist_label_mapping, assets_for_label, consolidation_prompt, mapping_schema,
     parse_mapping, proposals as label_proposals,
 };
-use analysis::engine::{SttEngine, VAD_MODEL, WHISPER_MODEL, ensure_model, model_dir};
+use analysis::engine::{
+    SttEngine, VAD_MODEL, WHISPER_MODEL, ensure_model, install_model, model_dir,
+    model_is_installed, shared_model_dir,
+};
 use analysis::store::{StoredTranscript, is_current, load_transcript, save_transcript};
 use analysis::stt::transcribe_pcm;
 use analysis::vlm::{PromptContext, PromptTranscript, analyze_clip as run_vlm};
 use analysis::vlm_store::{
     AnalysisStatus, StoredAnalysis, ai_labels_for_asset, analysis_is_current, clear_ai_labels,
-    commit_thumbnail, load_frame_pack, record_ai_labels, save_analysis, save_frame_pack,
-    set_title_and_description,
+    commit_thumbnail, load_analysis, load_frame_pack, record_ai_labels, save_analysis,
+    save_frame_pack, set_title_and_description,
 };
 use analysis::whisper_engine::{WhisperEngine, read_pcm};
 
@@ -53,11 +58,12 @@ pub use analysis::provider::{
     ChainOutcome, DEFAULT_MODEL, FALLBACK_MODEL, MODELS, ModelSpec, ProviderChain, VlmProvider,
     VlmRequest, VlmResponse, model_spec,
 };
+pub use analysis::quality::DecodedSegment;
 pub use analysis::schema::{
     CameraMovement, ClipObservation, DomainError, UnusableReason, output_schema,
     validate as validate_observation,
 };
-pub use analysis::store::TranscriptStatus;
+pub use analysis::store::{StoredTranscript as ClipTranscript, TranscriptStatus};
 pub use analysis::stt::TranscribeOutcome;
 pub use analysis::vlm::AnalysisOutcome;
 pub use analysis::vlm_store::StoredAnalysis as ClipAnalysis;
@@ -284,6 +290,10 @@ pub struct IngestFailure {
 pub struct ProxyReport {
     pub generated: usize,
     pub skipped: usize,
+    /// True when the caller stopped the batch early. Defaulted so reports
+    /// serialized before cancellation existed still deserialize.
+    #[serde(default)]
+    pub cancelled: bool,
     pub failures: Vec<IngestFailure>,
 }
 
@@ -303,6 +313,116 @@ pub struct AssetBatchProgress {
     pub estimate: BatchEstimate,
 }
 
+/// One clip's observation as the review surface needs it.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AssetAnalysisView {
+    pub analysis: ClipAnalysis,
+    /// Labels this analysis authored, as recorded in the ownership side table.
+    /// Human-added labels are deliberately absent: they live on the asset.
+    pub ai_labels: Vec<String>,
+    /// False when the proxy has been regenerated since this observation, so the
+    /// UI can mark it stale rather than presenting it as a description of the
+    /// clip currently on screen.
+    pub current: bool,
+}
+
+/// Cost per clip used before a project has analyzed anything of its own.
+///
+/// From the 2026-08-04 acceptance run: $0.02732851 across 252 clips on the
+/// 273-clip Osaka/Expo project. It is a starting point that the first real run
+/// replaces with this project's own observed average.
+pub const REFERENCE_COST_PER_CLIP_USD: f64 = 0.02732851 / 252.0;
+
+/// What a finished analysis run did, for the run record.
+#[derive(Debug, Clone, Default)]
+pub struct AnalysisRunOutcome {
+    /// One of `completed`, `cancelled`, or `failed`.
+    pub status: String,
+    pub stage_reached: String,
+    pub proxies_generated: usize,
+    pub clips_transcribed: usize,
+    pub clips_analyzed: usize,
+    pub cost_usd: f64,
+    pub budget_exhausted: bool,
+    pub error: String,
+}
+
+/// Everything a caller needs to decide whether to start an analysis run, and
+/// what it will cost. Computed without touching the network.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnalysisReadiness {
+    pub project_id: String,
+    /// Clips currently in the labeling queue; removed clips are excluded
+    /// because no stage touches them.
+    pub total_clips: usize,
+    pub missing_proxies: usize,
+    pub missing_transcripts: usize,
+    pub missing_analyses: usize,
+    pub models: Vec<ModelStatus>,
+    pub models_ready: bool,
+    /// Whether a key can be resolved at all. The key itself never leaves the
+    /// Keychain or environment, and is never returned here.
+    pub api_key_present: bool,
+    /// Projected spend for `missing_analyses`, in USD.
+    pub estimated_cost_usd: f64,
+    /// Where the projection came from, for display beside the number.
+    pub cost_basis: AnalysisCostBasis,
+    pub observed_cost_per_clip_usd: f64,
+    pub last_run: Option<AnalysisRunRecord>,
+}
+
+/// Whether a cost projection is grounded in this project or in the reference
+/// measurement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AnalysisCostBasis {
+    /// Averaged from clips already analyzed in this project.
+    Observed,
+    /// No clip has been analyzed here yet, so the published measurement is used.
+    Reference,
+}
+
+/// One analysis run, for spend history and resumption context.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnalysisRunRecord {
+    pub id: String,
+    pub project_id: String,
+    pub started_at: String,
+    pub finished_at: String,
+    pub status: String,
+    pub stage_reached: String,
+    pub proxies_generated: usize,
+    pub clips_transcribed: usize,
+    pub clips_analyzed: usize,
+    pub cost_usd: f64,
+    pub budget_exhausted: bool,
+    pub error: String,
+}
+
+/// Whether one speech model is installed, and what installing it would cost.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelStatus {
+    pub name: String,
+    pub installed: bool,
+    pub bytes: u64,
+    pub url: String,
+    /// The directory this catalog reads the model from.
+    pub directory: String,
+}
+
+/// Progress for an explicit model download.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelInstallProgress {
+    pub name: String,
+    pub downloaded_bytes: u64,
+    pub total_bytes: u64,
+}
+
 /// Progress for a transcription batch, mirroring `AssetBatchProgress`.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -317,6 +437,9 @@ pub struct TranscribeBatchProgress {
 pub struct TranscribeReport {
     pub transcribed: usize,
     pub skipped: usize,
+    /// True when the caller stopped the batch early. Distinct from a failure:
+    /// the clips already transcribed are committed and a later run resumes.
+    pub cancelled: bool,
     pub outcomes: Vec<TranscribeOutcome>,
     pub failures: Vec<IngestFailure>,
 }
@@ -361,8 +484,32 @@ pub struct AnalyzeReport {
     pub fallback_served: usize,
     pub force_overwrite_warnings: usize,
     pub cost_usd: f64,
+    /// True when the caller stopped the batch early.
+    pub cancelled: bool,
+    /// True when the batch stopped because the run's cost ceiling was reached.
+    /// Kept separate from `cancelled` so the two stop reasons can be reported
+    /// differently; a budget stop is a spend guard, not a user action.
+    pub budget_exhausted: bool,
     pub outcomes: Vec<AnalysisOutcome>,
     pub failures: Vec<IngestFailure>,
+}
+
+/// Explicit inputs for one cloud analysis run.
+///
+/// The desktop supplies these from its Keychain entry and confirm dialog, while
+/// the CLI leaves them unset and keeps resolving from the environment. Both
+/// adapters therefore reach the same batch through the same method.
+#[derive(Debug, Clone, Default)]
+pub struct AnalysisRunOptions {
+    /// Re-analyze clips whose observation is already current.
+    pub force: bool,
+    /// Overrides `OPENROUTER_API_KEY` / the key file when set.
+    pub api_key: Option<String>,
+    /// Overrides `RCDVLOG_VLM_MAX_COST_USD` when set. Checked against returned
+    /// provider usage before each request.
+    pub budget_usd: Option<f64>,
+    /// Overrides `RCDVLOG_VLM_WORKERS` when set.
+    pub worker_count: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1202,6 +1349,219 @@ impl Catalog {
         Ok(path)
     }
 
+    /// The stored transcript for one clip, if it has one.
+    ///
+    /// `no_speech` is returned as a normal transcript with no segments, not as
+    /// `None`: the difference between "the VAD gate found silence" and "this
+    /// clip was never transcribed" is exactly what a reviewer needs to see.
+    pub fn asset_transcript(&self, asset_id: &str) -> Result<Option<ClipTranscript>> {
+        load_transcript(&self.connection()?, asset_id)
+    }
+
+    /// The stored observation for one clip, with the labels analysis authored.
+    pub fn asset_analysis(&self, asset_id: &str) -> Result<Option<AssetAnalysisView>> {
+        let connection = self.connection()?;
+        let Some(analysis) = load_analysis(&connection, asset_id)? else {
+            return Ok(None);
+        };
+        // Whether the observation still describes the current proxy. A stale
+        // observation is shown rather than hidden, but must be marked: the clip
+        // it describes is not the clip on screen.
+        let current = self
+            .proxy_fingerprint(asset_id)
+            .ok()
+            .is_some_and(|fingerprint| {
+                analysis_is_current(&connection, asset_id, &fingerprint).unwrap_or(false)
+            });
+        Ok(Some(AssetAnalysisView {
+            analysis,
+            ai_labels: ai_labels_for_asset(&connection, asset_id)?,
+            current,
+        }))
+    }
+
+    /// Reports what an analysis run would do, cost, and need, without running it.
+    ///
+    /// Offline and read-only. Every count matches the skip rule of the stage it
+    /// describes, so the dialog cannot promise work the batch will then skip.
+    pub fn analysis_readiness(&self, project_id: &str) -> Result<AnalysisReadiness> {
+        let connection = self.connection()?;
+        let mut readiness = AnalysisReadiness {
+            project_id: project_id.to_string(),
+            total_clips: 0,
+            missing_proxies: 0,
+            missing_transcripts: 0,
+            missing_analyses: 0,
+            models: self.model_status()?,
+            models_ready: false,
+            api_key_present: resolve_api_key().is_ok(),
+            estimated_cost_usd: 0.0,
+            cost_basis: AnalysisCostBasis::Reference,
+            observed_cost_per_clip_usd: 0.0,
+            last_run: self.analysis_runs(project_id, 1)?.into_iter().next(),
+        };
+        readiness.models_ready = readiness.models.iter().all(|model| model.installed);
+
+        for asset in self.list_assets(project_id)? {
+            if asset.removed {
+                continue;
+            }
+            readiness.total_clips += 1;
+            if !has_current_proxy(&asset) && !(!asset.original_available && asset.proxy_available) {
+                readiness.missing_proxies += 1;
+            }
+            // A clip without a current proxy has no current fingerprint, so it
+            // counts as missing for both derived stages: stage zero will make
+            // the proxy and the later stages will then have work to do.
+            match self.proxy_fingerprint(&asset.id) {
+                Ok(fingerprint) => {
+                    if !is_current(&connection, &asset.id, &fingerprint)? {
+                        readiness.missing_transcripts += 1;
+                    }
+                    if !analysis_is_current(&connection, &asset.id, &fingerprint)? {
+                        readiness.missing_analyses += 1;
+                    }
+                }
+                Err(_) => {
+                    readiness.missing_transcripts += 1;
+                    readiness.missing_analyses += 1;
+                }
+            }
+        }
+
+        let observed: Option<f64> = connection
+            .query_row(
+                "SELECT AVG(a.cost_usd) FROM asset_analyses a
+                 JOIN assets s ON s.id = a.asset_id
+                 WHERE s.project_id = ?1 AND a.cost_usd > 0",
+                [project_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        let per_clip = match observed {
+            Some(cost) if cost > 0.0 => {
+                readiness.cost_basis = AnalysisCostBasis::Observed;
+                cost
+            }
+            _ => REFERENCE_COST_PER_CLIP_USD,
+        };
+        readiness.observed_cost_per_clip_usd = per_clip;
+        readiness.estimated_cost_usd = per_clip * readiness.missing_analyses as f64;
+        Ok(readiness)
+    }
+
+    /// Opens a run record so spend is attributable even if the app exits.
+    pub fn begin_analysis_run(&self, project_id: &str) -> Result<String> {
+        let id = Uuid::new_v4().to_string();
+        self.connection()?.execute(
+            "INSERT INTO analysis_runs (id, project_id, started_at, status, stage_reached)
+             VALUES (?1, ?2, ?3, 'running', 'proxies')",
+            params![
+                id,
+                project_id,
+                Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
+            ],
+        )?;
+        Ok(id)
+    }
+
+    /// Closes a run record with what it actually did.
+    pub fn finish_analysis_run(&self, run_id: &str, outcome: &AnalysisRunOutcome) -> Result<()> {
+        self.connection()?.execute(
+            "UPDATE analysis_runs
+             SET finished_at=?2, status=?3, stage_reached=?4, proxies_generated=?5,
+                 clips_transcribed=?6, clips_analyzed=?7, cost_usd=?8, budget_exhausted=?9,
+                 error=?10
+             WHERE id=?1",
+            params![
+                run_id,
+                Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+                outcome.status,
+                outcome.stage_reached,
+                outcome.proxies_generated as i64,
+                outcome.clips_transcribed as i64,
+                outcome.clips_analyzed as i64,
+                outcome.cost_usd,
+                outcome.budget_exhausted as i64,
+                outcome.error,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Most recent runs for a project, newest first.
+    pub fn analysis_runs(&self, project_id: &str, limit: usize) -> Result<Vec<AnalysisRunRecord>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT id, project_id, started_at, finished_at, status, stage_reached,
+                    proxies_generated, clips_transcribed, clips_analyzed, cost_usd,
+                    budget_exhausted, error
+             FROM analysis_runs WHERE project_id=?1
+             ORDER BY started_at DESC, id DESC LIMIT ?2",
+        )?;
+        let runs = statement
+            .query_map(params![project_id, limit as i64], |row| {
+                Ok(AnalysisRunRecord {
+                    id: row.get(0)?,
+                    project_id: row.get(1)?,
+                    started_at: row.get(2)?,
+                    finished_at: row.get(3)?,
+                    status: row.get(4)?,
+                    stage_reached: row.get(5)?,
+                    proxies_generated: row.get::<_, i64>(6)? as usize,
+                    clips_transcribed: row.get::<_, i64>(7)? as usize,
+                    clips_analyzed: row.get::<_, i64>(8)? as usize,
+                    cost_usd: row.get(9)?,
+                    budget_exhausted: row.get::<_, i64>(10)? != 0,
+                    error: row.get(11)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(runs)
+    }
+
+    /// Reports whether each speech model is installed for this catalog.
+    ///
+    /// Read-only and offline: it never downloads and never creates directories.
+    pub fn model_status(&self) -> Result<Vec<ModelStatus>> {
+        let directory = model_dir(&self.database_path)?;
+        Ok([WHISPER_MODEL, VAD_MODEL]
+            .into_iter()
+            .map(|model| ModelStatus {
+                name: model.file_name.to_string(),
+                installed: model_is_installed(&directory, &model),
+                bytes: model.bytes,
+                url: model.url.to_string(),
+                directory: directory.to_string_lossy().into_owned(),
+            })
+            .collect())
+    }
+
+    /// Downloads whichever speech models are missing, into the shared directory.
+    ///
+    /// This is the only path that fetches a model. It exists so installation is
+    /// an explicit user action; no batch calls it.
+    pub fn install_models_with_progress<F>(&self, mut on_progress: F) -> Result<Vec<ModelStatus>>
+    where
+        F: FnMut(ModelInstallProgress) -> ControlFlow<()>,
+    {
+        let directory = shared_model_dir()?;
+        for model in [WHISPER_MODEL, VAD_MODEL] {
+            if model_is_installed(&directory, &model) {
+                continue;
+            }
+            install_model(&directory, &model, |downloaded, total| {
+                on_progress(ModelInstallProgress {
+                    name: model.file_name.to_string(),
+                    downloaded_bytes: downloaded,
+                    total_bytes: total,
+                })
+            })?;
+        }
+        self.model_status()
+    }
+
     /// Transcribes one clip, replacing any previous transcript.
     pub fn transcribe_asset(&self, asset_id: &str) -> Result<TranscribeOutcome> {
         let engine = self.open_stt_engine()?;
@@ -1256,7 +1616,7 @@ impl Catalog {
     }
 
     pub fn transcribe_missing(&self, project_id: &str) -> Result<TranscribeReport> {
-        self.transcribe_missing_with_progress(project_id, |_| {})
+        self.transcribe_missing_with_progress(project_id, |_| ControlFlow::Continue(()))
     }
 
     /// Transcript coverage for a project, without transcribing anything.
@@ -1299,13 +1659,18 @@ impl Catalog {
     /// 30-second window count rather than file size. One worker: peak RSS is
     /// 1.15-1.38 GB and concurrent transcription alongside the four-worker
     /// proxy pipeline has never been measured.
+    ///
+    /// `on_progress` returning `ControlFlow::Break` stops the batch after the
+    /// current clip. The callback is the cancellation point rather than a
+    /// separate flag parameter, so a new progress site cannot be added that
+    /// forgets to check for cancellation.
     pub fn transcribe_missing_with_progress<F>(
         &self,
         project_id: &str,
         mut on_progress: F,
     ) -> Result<TranscribeReport>
     where
-        F: FnMut(TranscribeBatchProgress),
+        F: FnMut(TranscribeBatchProgress) -> ControlFlow<()>,
     {
         let assets = self.list_assets(project_id)?;
         let mut pending: Vec<Asset> = Vec::new();
@@ -1335,6 +1700,7 @@ impl Catalog {
         let mut report = TranscribeReport {
             transcribed: 0,
             skipped,
+            cancelled: false,
             outcomes: Vec::new(),
             failures: Vec::new(),
         };
@@ -1342,24 +1708,28 @@ impl Catalog {
         let task_work: Vec<u64> = vec![1; pending.len()];
         let mut estimator =
             BatchEstimator::new(&task_work, 1, self.load_batch_history(STT_TASK_KEY)?);
-        on_progress(TranscribeBatchProgress {
+        let start = on_progress(TranscribeBatchProgress {
             outcome: None,
             estimate: estimator.estimate(&task_work),
         });
-        if pending.is_empty() {
+        if pending.is_empty() || start.is_break() {
+            report.cancelled = start.is_break();
             return Ok(report);
         }
 
+        // Loading the model costs seconds and over a gigabyte of RSS, so it is
+        // opened only once the batch is known to be non-empty and uncancelled.
         let engine = self.open_stt_engine()?;
         for (index, asset) in pending.iter().enumerate() {
             let started = Instant::now();
             let result = self.transcribe_with_engine(&asset.id, engine.as_ref());
             let remaining = &task_work[(index + 1).min(task_work.len())..];
+            let flow;
             match result {
                 Ok(outcome) => {
                     estimator.record_completion(1, started.elapsed());
                     report.transcribed += 1;
-                    on_progress(TranscribeBatchProgress {
+                    flow = on_progress(TranscribeBatchProgress {
                         outcome: Some(outcome.clone()),
                         estimate: estimator.estimate(remaining),
                     });
@@ -1386,11 +1756,17 @@ impl Catalog {
                         path: asset.path.clone(),
                         error: message,
                     });
-                    on_progress(TranscribeBatchProgress {
+                    flow = on_progress(TranscribeBatchProgress {
                         outcome: None,
                         estimate: estimator.estimate(remaining),
                     });
                 }
+            }
+            if flow.is_break() {
+                // Completed clips are already committed, so a later run resumes
+                // from here rather than repeating them.
+                report.cancelled = true;
+                break;
             }
         }
 
@@ -1612,32 +1988,61 @@ impl Catalog {
     }
 
     pub fn analyze_missing(&self, project_id: &str, force: bool) -> Result<AnalyzeReport> {
-        self.analyze_missing_with_progress(project_id, force, |_| {})
+        self.analyze_missing_with_progress(project_id, force, |_| ControlFlow::Continue(()))
     }
 
     pub fn analyze_missing_with_progress<F>(
         &self,
         project_id: &str,
         force: bool,
+        on_progress: F,
+    ) -> Result<AnalyzeReport>
+    where
+        F: FnMut(AnalyzeBatchProgress) -> ControlFlow<()>,
+    {
+        self.analyze_missing_with_options(
+            project_id,
+            &AnalysisRunOptions {
+                force,
+                ..AnalysisRunOptions::default()
+            },
+            on_progress,
+        )
+    }
+
+    /// Runs the cloud analysis batch with explicit key, budget, and concurrency.
+    ///
+    /// `on_progress` returning `ControlFlow::Break` stops the batch; workers
+    /// observe the stop between clips, so cancelling never abandons a request
+    /// that has already been paid for.
+    pub fn analyze_missing_with_options<F>(
+        &self,
+        project_id: &str,
+        options: &AnalysisRunOptions,
         mut on_progress: F,
     ) -> Result<AnalyzeReport>
     where
-        F: FnMut(AnalyzeBatchProgress),
+        F: FnMut(AnalyzeBatchProgress) -> ControlFlow<()>,
     {
-        let provider = OpenRouterProvider::new(resolve_api_key()?)?;
-        self.analyze_missing_with_provider(project_id, force, &provider, &mut on_progress)
+        let api_key = match options.api_key.clone() {
+            Some(key) => key,
+            None => resolve_api_key()?,
+        };
+        let provider = OpenRouterProvider::new(api_key)?;
+        self.analyze_missing_with_provider(project_id, options, &provider, &mut on_progress)
     }
 
     fn analyze_missing_with_provider<F>(
         &self,
         project_id: &str,
-        force: bool,
+        options: &AnalysisRunOptions,
         provider: &dyn VlmProvider,
         on_progress: &mut F,
     ) -> Result<AnalyzeReport>
     where
-        F: FnMut(AnalyzeBatchProgress),
+        F: FnMut(AnalyzeBatchProgress) -> ControlFlow<()>,
     {
+        let force = options.force;
         let connection = self.connection()?;
         let mut skipped = 0;
         let mut force_overwrite_warnings = 0;
@@ -1680,9 +2085,13 @@ impl Catalog {
             .iter()
             .map(|(_, frames)| *frames)
             .collect::<Vec<_>>();
-        let worker_count = std::env::var("RCDVLOG_VLM_WORKERS")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
+        let worker_count = options
+            .worker_count
+            .or_else(|| {
+                std::env::var("RCDVLOG_VLM_WORKERS")
+                    .ok()
+                    .and_then(|value| value.parse::<usize>().ok())
+            })
             .unwrap_or(4)
             .clamp(1, prepared.len().max(1));
         let task_key = format!(
@@ -1694,7 +2103,7 @@ impl Catalog {
             worker_count,
             self.load_batch_history(&task_key)?,
         );
-        on_progress(AnalyzeBatchProgress {
+        let start = on_progress(AnalyzeBatchProgress {
             outcome: None,
             estimate: estimator.estimate(&task_work),
         });
@@ -1705,12 +2114,21 @@ impl Catalog {
             fallback_served: 0,
             force_overwrite_warnings,
             cost_usd: 0.0,
+            cancelled: start.is_break(),
+            budget_exhausted: false,
             outcomes: Vec::new(),
             failures,
         };
-        let budget_usd = std::env::var("RCDVLOG_VLM_MAX_COST_USD")
-            .ok()
-            .and_then(|value| value.parse::<f64>().ok())
+        if report.cancelled {
+            return Ok(report);
+        }
+        let budget_usd = options
+            .budget_usd
+            .or_else(|| {
+                std::env::var("RCDVLOG_VLM_MAX_COST_USD")
+                    .ok()
+                    .and_then(|value| value.parse::<f64>().ok())
+            })
             .unwrap_or(f64::INFINITY);
         let queue = Arc::new(Mutex::new(
             prepared
@@ -1762,6 +2180,7 @@ impl Catalog {
                     .enumerate()
                     .filter_map(|(index, weight)| (!completed[index]).then_some(*weight))
                     .collect::<Vec<_>>();
+                let flow;
                 match result {
                     Ok(outcome) => {
                         estimator.record_completion(frames, elapsed);
@@ -1774,7 +2193,7 @@ impl Catalog {
                             report.fallback_served += 1;
                         }
                         report.outcomes.push(outcome.clone());
-                        on_progress(AnalyzeBatchProgress {
+                        flow = on_progress(AnalyzeBatchProgress {
                             outcome: Some(outcome),
                             estimate: estimator.estimate(&remaining),
                         });
@@ -1785,19 +2204,26 @@ impl Catalog {
                             path: asset.path,
                             error: format!("{error:#}"),
                         });
-                        on_progress(AnalyzeBatchProgress {
+                        flow = on_progress(AnalyzeBatchProgress {
                             outcome: None,
                             estimate: estimator.estimate(&remaining),
                         });
                     }
                 }
+                if flow.is_break() {
+                    report.cancelled = true;
+                    stop.store(true, Ordering::Relaxed);
+                }
                 if report.cost_usd >= budget_usd {
-                    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                    report.budget_exhausted = true;
+                    stop.store(true, Ordering::Relaxed);
                 }
             }
             Ok(())
         })?;
-        if stop.load(std::sync::atomic::Ordering::Relaxed) {
+        // A budget stop is reported as a failure because the batch did not do
+        // what was asked. Cancellation is not: the user asked it to stop.
+        if report.budget_exhausted {
             report.failures.push(IngestFailure {
                 path: project_id.to_string(),
                 error: format!(
@@ -1898,16 +2324,21 @@ impl Catalog {
     }
 
     pub fn generate_missing_proxies(&self, project_id: &str) -> Result<ProxyReport> {
-        self.generate_missing_proxies_with_progress(project_id, |_| {})
+        self.generate_missing_proxies_with_progress(project_id, |_| ControlFlow::Continue(()))
     }
 
+    /// Generates every missing or stale proxy.
+    ///
+    /// `on_progress` returning `ControlFlow::Break` stops the batch; workers
+    /// finish the clip in flight and then stop claiming new work, so a
+    /// cancelled run still commits whatever it completed.
     pub fn generate_missing_proxies_with_progress<F>(
         &self,
         project_id: &str,
         mut on_progress: F,
     ) -> Result<ProxyReport>
     where
-        F: FnMut(AssetBatchProgress),
+        F: FnMut(AssetBatchProgress) -> ControlFlow<()>,
     {
         let assets = self.list_assets(project_id)?;
         let (ready, pending): (Vec<_>, Vec<_>) = assets.into_iter().partition(|asset| {
@@ -1916,6 +2347,7 @@ impl Catalog {
         let mut report = ProxyReport {
             generated: 0,
             skipped: ready.len(),
+            cancelled: false,
             failures: Vec::new(),
         };
         let task_work: Vec<u64> = pending.iter().map(|asset| asset.size_bytes).collect();
@@ -1926,17 +2358,19 @@ impl Catalog {
             worker_count,
             self.load_batch_history(task_kind)?,
         );
-        on_progress(AssetBatchProgress {
+        let start = on_progress(AssetBatchProgress {
             asset: None,
             estimate: estimator.estimate(&task_work),
         });
-        if pending.is_empty() {
+        if pending.is_empty() || start.is_break() {
+            report.cancelled = start.is_break();
             return Ok(report);
         }
 
         let queue = Arc::new(Mutex::new(
             pending.into_iter().enumerate().collect::<VecDeque<_>>(),
         ));
+        let stop = Arc::new(AtomicBool::new(false));
         let (outcome_sender, outcome_receiver) = mpsc::channel();
         let mut completed = vec![false; task_work.len()];
 
@@ -1944,9 +2378,13 @@ impl Catalog {
             for _ in 0..worker_count {
                 let catalog = self.clone();
                 let queue = Arc::clone(&queue);
+                let stop = Arc::clone(&stop);
                 let outcome_sender = outcome_sender.clone();
                 scope.spawn(move || {
                     loop {
+                        if stop.load(Ordering::Relaxed) {
+                            break;
+                        }
                         let Some((index, asset)) = queue
                             .lock()
                             .expect("proxy work queue lock poisoned")
@@ -2022,11 +2460,15 @@ impl Catalog {
                 };
                 let remaining_work = residual_work_units(&task_work, &completed, &partial_work);
                 let partial_completed_work = partial_work.iter().copied().sum();
-                on_progress(AssetBatchProgress {
+                let flow = on_progress(AssetBatchProgress {
                     asset: updated,
                     estimate: estimator
                         .estimate_with_partial_progress(&remaining_work, partial_completed_work),
                 });
+                if flow.is_break() {
+                    report.cancelled = true;
+                    stop.store(true, Ordering::Relaxed);
+                }
             }
             Ok(())
         })?;
@@ -4025,7 +4467,10 @@ mod tests {
 
         let mut progress = Vec::new();
         let report = catalog
-            .generate_missing_proxies_with_progress(&project.id, |event| progress.push(event))
+            .generate_missing_proxies_with_progress(&project.id, |event| {
+                progress.push(event);
+                ControlFlow::Continue(())
+            })
             .unwrap();
 
         assert_eq!(report.generated, 4);
@@ -4058,6 +4503,223 @@ mod tests {
                         .is_some_and(|path| Path::new(path).is_file())
                 })
         );
+    }
+
+    #[test]
+    fn a_cancelled_proxy_batch_keeps_what_it_finished_and_resumes() {
+        if tool_command("ffmpeg").arg("-version").output().is_err()
+            || tool_command("ffprobe").arg("-version").output().is_err()
+        {
+            eprintln!("ffmpeg or ffprobe is unavailable; skipping media integration test");
+            return;
+        }
+        let directory = tempdir().unwrap();
+        let source_dir = directory.path().join("source");
+        fs::create_dir_all(&source_dir).unwrap();
+        // More clips than workers, so stopping is observable: at the moment the
+        // first clip completes only the in-flight claims can still finish.
+        let clip_count = PROXY_WORKERS * 2;
+        for index in 0..clip_count {
+            let source = source_dir.join(format!("C{index:04}.MP4"));
+            // Each clip needs distinct content: identical bytes share a
+            // fingerprint and ingest would deduplicate them to one asset.
+            let shade = 0x20 + index * 0x10;
+            let input = format!("color=c=0x{shade:02x}{shade:02x}{shade:02x}:s=160x90:r=10:d=0.2");
+            let status = tool_command("ffmpeg")
+                .args([
+                    "-y",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &input,
+                    "-c:v",
+                    "libx264",
+                    "-pix_fmt",
+                    "yuv420p",
+                ])
+                .arg(source)
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+
+        let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).unwrap();
+        let project = catalog.create_project("Cancelled proxies").unwrap();
+        assert_eq!(
+            catalog
+                .ingest_folder(&project.id, &source_dir)
+                .unwrap()
+                .imported,
+            clip_count
+        );
+
+        let report = catalog
+            .generate_missing_proxies_with_progress(&project.id, |event| {
+                // Stop once one clip has actually been committed, not on the
+                // initial zero-progress event.
+                if event.asset.is_some() {
+                    ControlFlow::Break(())
+                } else {
+                    ControlFlow::Continue(())
+                }
+            })
+            .unwrap();
+
+        assert!(report.cancelled);
+        assert!(report.generated >= 1, "the committed clip is kept");
+        assert!(report.failures.is_empty(), "{:?}", report.failures);
+        // How many clips land before the stop takes effect is deliberately not
+        // asserted: workers claim independently of the collector thread that
+        // observes the cancellation, so the exact cut-off is a race. What must
+        // hold is that finished work is committed and the rest is still pending.
+
+        // Re-running resumes rather than repeating.
+        let resumed = catalog.generate_missing_proxies(&project.id).unwrap();
+        assert_eq!(resumed.skipped, report.generated);
+        assert_eq!(resumed.generated, clip_count - report.generated);
+        assert!(!resumed.cancelled);
+        assert!(
+            catalog
+                .list_assets(&project.id)
+                .unwrap()
+                .iter()
+                .all(|asset| asset
+                    .proxy_path
+                    .as_deref()
+                    .is_some_and(|path| Path::new(path).is_file()))
+        );
+    }
+
+    #[test]
+    fn a_silent_clip_reads_back_as_a_transcript_rather_than_as_nothing() {
+        let directory = tempdir().unwrap();
+        let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).unwrap();
+        let project = catalog.create_project("Transcript reads").unwrap();
+        let connection = catalog.connection().unwrap();
+        connection
+            .execute(
+                "INSERT INTO assets(id,project_id,fingerprint,path,filename,size_bytes,
+                                    duration_seconds,created_at)
+                 VALUES ('a1',?1,'f1','/tmp/a1.mp4','a1.mp4',1,1,'2026-08-04T00:00:00Z')",
+                [&project.id],
+            )
+            .unwrap();
+
+        assert!(catalog.asset_transcript("a1").unwrap().is_none());
+
+        save_transcript(
+            &connection,
+            &StoredTranscript {
+                asset_id: "a1".to_string(),
+                recipe_key: STT_RECIPE_KEY.to_string(),
+                source_fingerprint: "proxy-1".to_string(),
+                status: TranscriptStatus::NoSpeech,
+                reject_reason: String::new(),
+                primary_language: String::new(),
+                speech_seconds: 0.0,
+                window_count: 0,
+                segments: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        let transcript = catalog.asset_transcript("a1").unwrap().unwrap();
+        assert_eq!(transcript.status, TranscriptStatus::NoSpeech);
+        assert!(transcript.segments.is_empty());
+        // Silence is a result. Returning None here would make a silent clip
+        // indistinguishable from one that was never transcribed.
+        assert!(catalog.asset_analysis("a1").unwrap().is_none());
+    }
+
+    #[test]
+    fn readiness_projects_from_the_reference_measurement_until_a_project_has_history() {
+        let directory = tempdir().unwrap();
+        let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).unwrap();
+        let project = catalog.create_project("Readiness").unwrap();
+
+        let readiness = catalog.analysis_readiness(&project.id).unwrap();
+        assert_eq!(readiness.total_clips, 0);
+        assert_eq!(readiness.missing_proxies, 0);
+        assert_eq!(readiness.missing_transcripts, 0);
+        assert_eq!(readiness.missing_analyses, 0);
+        assert_eq!(readiness.cost_basis, AnalysisCostBasis::Reference);
+        assert_eq!(
+            readiness.observed_cost_per_clip_usd,
+            REFERENCE_COST_PER_CLIP_USD
+        );
+        // Nothing to analyze means nothing to spend, whatever the per-clip rate.
+        assert_eq!(readiness.estimated_cost_usd, 0.0);
+        assert!(readiness.last_run.is_none());
+        assert_eq!(readiness.models.len(), 2);
+    }
+
+    #[test]
+    fn a_run_record_carries_its_spend_and_stop_reason() {
+        let directory = tempdir().unwrap();
+        let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).unwrap();
+        let project = catalog.create_project("Run accounting").unwrap();
+
+        let run_id = catalog.begin_analysis_run(&project.id).unwrap();
+        let running = catalog.analysis_runs(&project.id, 10).unwrap();
+        assert_eq!(running.len(), 1);
+        assert_eq!(running[0].status, "running");
+        assert_eq!(running[0].finished_at, "");
+
+        catalog
+            .finish_analysis_run(
+                &run_id,
+                &AnalysisRunOutcome {
+                    status: "cancelled".to_string(),
+                    stage_reached: "analysis".to_string(),
+                    proxies_generated: 3,
+                    clips_transcribed: 2,
+                    clips_analyzed: 1,
+                    cost_usd: 0.25,
+                    budget_exhausted: true,
+                    error: String::new(),
+                },
+            )
+            .unwrap();
+
+        let finished = catalog.analysis_runs(&project.id, 10).unwrap();
+        assert_eq!(finished.len(), 1, "finishing updates rather than appends");
+        assert_eq!(finished[0].status, "cancelled");
+        assert_eq!(finished[0].stage_reached, "analysis");
+        assert_eq!(finished[0].proxies_generated, 3);
+        assert_eq!(finished[0].clips_transcribed, 2);
+        assert_eq!(finished[0].clips_analyzed, 1);
+        assert_eq!(finished[0].cost_usd, 0.25);
+        assert!(finished[0].budget_exhausted);
+        assert!(!finished[0].finished_at.is_empty());
+
+        let readiness = catalog.analysis_readiness(&project.id).unwrap();
+        assert_eq!(readiness.last_run.unwrap().status, "cancelled");
+    }
+
+    #[test]
+    fn runs_are_scoped_to_their_project() {
+        let directory = tempdir().unwrap();
+        let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).unwrap();
+        let first = catalog.create_project("First").unwrap();
+        let second = catalog.create_project("Second").unwrap();
+        catalog.begin_analysis_run(&first.id).unwrap();
+        assert_eq!(catalog.analysis_runs(&first.id, 10).unwrap().len(), 1);
+        assert!(catalog.analysis_runs(&second.id, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_batch_cancelled_before_any_work_reports_no_generation() {
+        let directory = tempdir().unwrap();
+        let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).unwrap();
+        let project = catalog.create_project("Immediate cancel").unwrap();
+        let report = catalog
+            .generate_missing_proxies_with_progress(&project.id, |_| ControlFlow::Break(()))
+            .unwrap();
+        assert!(report.cancelled);
+        assert_eq!(report.generated, 0);
     }
 
     #[test]
@@ -4219,6 +4881,7 @@ mod tests {
         let first_proxy_report = catalog
             .generate_missing_proxies_with_progress(&project.id, |progress| {
                 proxy_progress.push(progress);
+                ControlFlow::Continue(())
             })
             .unwrap();
         assert_eq!(first_proxy_report.generated, 1);

@@ -8,6 +8,8 @@
 //! 574 MB, against 9.9 GB free disk on the reference machine.
 
 use anyhow::{Context, Result, anyhow, bail};
+use std::io::{Read, Write};
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 
 use crate::analysis::quality::DecodedSegment;
@@ -60,13 +62,115 @@ pub trait SttEngine {
     fn decode_window(&self, pcm: &[f32], window: &PackedWindow) -> Result<Vec<DecodedSegment>>;
 }
 
-/// Where downloaded models live: project-local cache, never beside originals.
-pub fn model_dir(catalog_path: &Path) -> Result<PathBuf> {
+/// Where installed models live, shared by every project.
+///
+/// The models are large and identical for all projects, so a per-project copy
+/// would cost 574 MB each. They live beside the application's other shared
+/// state rather than in a project folder, and never beside originals.
+pub fn shared_model_dir() -> Result<PathBuf> {
+    let data_dir =
+        dirs::data_dir().ok_or_else(|| anyhow!("cannot resolve application data directory"))?;
+    Ok(data_dir.join("com.rcd.vlogcutter").join("models"))
+}
+
+/// The project-local model directory used before models were shared.
+pub fn legacy_model_dir(catalog_path: &Path) -> Result<PathBuf> {
     let parent = catalog_path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .ok_or_else(|| anyhow!("catalog has no parent directory"))?;
     Ok(parent.join("cache").join("models"))
+}
+
+/// Resolves the directory a model should be read from for this catalog.
+///
+/// The shared directory wins, but a project that already holds the file keeps
+/// working: installs made before models were shared must not silently start a
+/// 574 MB re-download.
+pub fn model_dir(catalog_path: &Path) -> Result<PathBuf> {
+    let shared = shared_model_dir()?;
+    if shared.join(WHISPER_MODEL.file_name).is_file() {
+        return Ok(shared);
+    }
+    let legacy = legacy_model_dir(catalog_path)?;
+    if legacy.join(WHISPER_MODEL.file_name).is_file() {
+        return Ok(legacy);
+    }
+    Ok(shared)
+}
+
+/// Whether a model file is present and, when a digest is published, verifies.
+pub fn model_is_installed(directory: &Path, model: &ModelAsset) -> bool {
+    ensure_model(directory, model).is_ok()
+}
+
+/// Downloads one model into `directory`, verifying it before committing.
+///
+/// This is the only function that fetches a model, and nothing calls it except
+/// an explicit user-initiated install. `on_progress` receives
+/// `(downloaded_bytes, total_bytes)`; returning `ControlFlow::Break` abandons
+/// the transfer and leaves nothing behind.
+pub fn install_model<F>(directory: &Path, model: &ModelAsset, mut on_progress: F) -> Result<PathBuf>
+where
+    F: FnMut(u64, u64) -> ControlFlow<()>,
+{
+    let path = directory.join(model.file_name);
+    if let Ok(existing) = ensure_model(directory, model) {
+        return Ok(existing);
+    }
+    std::fs::create_dir_all(directory)
+        .with_context(|| format!("create model directory {}", directory.display()))?;
+
+    let mut response = reqwest::blocking::Client::builder()
+        .timeout(None)
+        .build()?
+        .get(model.url)
+        .send()
+        .with_context(|| format!("request {}", model.url))?
+        .error_for_status()
+        .with_context(|| format!("download {}", model.file_name))?;
+    let total = response.content_length().unwrap_or(model.bytes);
+
+    // Written beside the destination and renamed only after verification, so an
+    // interrupted or corrupt transfer can never be mistaken for an install.
+    let temporary = directory.join(format!("{}.partial", model.file_name));
+    let mut file = std::fs::File::create(&temporary)
+        .with_context(|| format!("create {}", temporary.display()))?;
+    let mut downloaded = 0_u64;
+    let mut buffer = vec![0_u8; 1 << 20];
+    loop {
+        let read = response
+            .read(&mut buffer)
+            .with_context(|| format!("read {}", model.url))?;
+        if read == 0 {
+            break;
+        }
+        file.write_all(&buffer[..read])
+            .with_context(|| format!("write {}", temporary.display()))?;
+        downloaded += read as u64;
+        if on_progress(downloaded, total).is_break() {
+            drop(file);
+            let _ = std::fs::remove_file(&temporary);
+            bail!("model download cancelled");
+        }
+    }
+    file.sync_all()
+        .with_context(|| format!("flush {}", temporary.display()))?;
+    drop(file);
+
+    if !model.blake3.is_empty() {
+        let digest = blake3_file(&temporary)?;
+        if digest != model.blake3 {
+            let _ = std::fs::remove_file(&temporary);
+            bail!(
+                "downloaded {} failed verification: expected {}, found {digest}",
+                model.file_name,
+                model.blake3
+            );
+        }
+    }
+    std::fs::rename(&temporary, &path).with_context(|| format!("commit {}", path.display()))?;
+    Ok(path)
 }
 
 /// Resolves a model file, verifying it if present.
@@ -110,15 +214,62 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn model_dir_sits_under_the_catalog_cache() {
-        let directory = model_dir(Path::new("/projects/expo/catalog.sqlite3")).unwrap();
+    fn the_legacy_model_dir_sits_under_the_catalog_cache() {
+        let directory = legacy_model_dir(Path::new("/projects/expo/catalog.sqlite3")).unwrap();
         assert!(directory.ends_with("cache/models"));
         assert!(directory.starts_with("/projects/expo"));
     }
 
     #[test]
-    fn model_dir_rejects_a_catalog_path_without_a_parent() {
-        assert!(model_dir(Path::new("catalog.sqlite3")).is_err());
+    fn legacy_model_dir_rejects_a_catalog_path_without_a_parent() {
+        assert!(legacy_model_dir(Path::new("catalog.sqlite3")).is_err());
+    }
+
+    #[test]
+    fn the_shared_model_dir_is_not_project_scoped() {
+        let shared = shared_model_dir().unwrap();
+        assert!(shared.ends_with("com.rcd.vlogcutter/models"));
+        assert!(!shared.starts_with("/projects/expo"));
+    }
+
+    #[test]
+    fn model_dir_prefers_a_project_local_install_over_an_empty_shared_dir() {
+        // A catalog that already holds the model keeps reading it there, so
+        // moving to a shared directory never forces a 574 MB re-download.
+        let project = tempdir().unwrap();
+        let catalog = project.path().join("catalog.sqlite3");
+        let legacy = legacy_model_dir(&catalog).unwrap();
+        fs::create_dir_all(&legacy).unwrap();
+        fs::write(legacy.join(WHISPER_MODEL.file_name), b"installed here").unwrap();
+        assert_eq!(model_dir(&catalog).unwrap(), legacy);
+    }
+
+    #[test]
+    fn model_dir_falls_back_to_the_shared_dir_when_nothing_is_installed() {
+        let project = tempdir().unwrap();
+        let catalog = project.path().join("catalog.sqlite3");
+        assert_eq!(model_dir(&catalog).unwrap(), shared_model_dir().unwrap());
+    }
+
+    #[test]
+    fn model_status_reports_a_missing_model_without_touching_the_network() {
+        let directory = tempdir().unwrap();
+        assert!(!model_is_installed(directory.path(), &WHISPER_MODEL));
+        fs::write(directory.path().join(WHISPER_MODEL.file_name), b"installed").unwrap();
+        assert!(model_is_installed(directory.path(), &WHISPER_MODEL));
+    }
+
+    #[test]
+    fn installing_an_already_present_model_does_not_download() {
+        let directory = tempdir().unwrap();
+        fs::write(directory.path().join(VAD_MODEL.file_name), b"already here").unwrap();
+        // The URL is unreachable in tests, so returning Ok proves no transfer
+        // was attempted.
+        let installed = install_model(directory.path(), &VAD_MODEL, |_, _| {
+            panic!("an installed model must not be downloaded again")
+        })
+        .unwrap();
+        assert_eq!(installed, directory.path().join(VAD_MODEL.file_name));
     }
 
     #[test]

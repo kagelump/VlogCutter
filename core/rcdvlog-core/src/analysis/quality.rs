@@ -11,6 +11,7 @@
 //! They are starting constants to revisit against a larger hand-labeled set,
 //! not measured truth.
 
+use serde::Serialize;
 use std::collections::HashSet;
 
 /// Reject a transcript once this fraction of its segments duplicate an earlier
@@ -22,7 +23,8 @@ const REPETITION_REJECT_RATIO: f32 = 0.3;
 const MIN_MEAN_TOKEN_PROBABILITY: f32 = 0.20;
 
 /// One decoded segment in clip time.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DecodedSegment {
     pub start_ms: u32,
     pub end_ms: u32,

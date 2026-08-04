@@ -7,7 +7,7 @@ use thiserror::Error;
 
 use crate::chronology::forward_migrate_project_chronology;
 
-pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 14;
+pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 15;
 
 const MIGRATION_TABLE_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -167,6 +167,12 @@ pub const PROJECT_CATALOG_MIGRATIONS: &[SqliteMigration] = &[
         name: "clip_analysis",
         source_identity: "project-catalog/0014-clip-analysis/20260803",
         apply: add_clip_analysis,
+    },
+    SqliteMigration {
+        id: 15,
+        name: "analysis_runs",
+        source_identity: "project-catalog/0015-analysis-runs/20260804",
+        apply: add_analysis_runs,
     },
 ];
 
@@ -1010,6 +1016,41 @@ fn add_transcripts(transaction: &Transaction<'_>) -> Result<()> {
 /// `asset_frame_packs.representation` plus `source_fingerprint` are what make a
 /// stored pack detectably stale: the same recipe over a regenerated proxy does
 /// not select the same frames.
+/// Migration 15. Spend and outcome accounting for whole analysis runs.
+///
+/// Per-clip cost already lives in `asset_analyses`, but that cannot answer
+/// "what did the last run cost" once clips are re-analyzed, nor distinguish a
+/// run that was cancelled from one that finished. The desktop projects the cost
+/// of a proposed run from these rows, so a user is told what a batch is likely
+/// to spend before it starts rather than after.
+///
+/// Deliberately local and unsynced, like `analysis_labels`: a run is an event on
+/// one node, not a shared project fact.
+fn add_analysis_runs(transaction: &Transaction<'_>) -> Result<()> {
+    transaction.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS analysis_runs (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            started_at TEXT NOT NULL,
+            finished_at TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL CHECK(status IN ('running', 'completed', 'cancelled', 'failed')),
+            stage_reached TEXT NOT NULL DEFAULT 'proxies',
+            proxies_generated INTEGER NOT NULL DEFAULT 0,
+            clips_transcribed INTEGER NOT NULL DEFAULT 0,
+            clips_analyzed INTEGER NOT NULL DEFAULT 0,
+            cost_usd REAL NOT NULL DEFAULT 0,
+            budget_exhausted INTEGER NOT NULL DEFAULT 0,
+            error TEXT NOT NULL DEFAULT ''
+        );
+
+        CREATE INDEX IF NOT EXISTS analysis_runs_project_started
+            ON analysis_runs(project_id, started_at DESC);
+        "#,
+    )?;
+    Ok(())
+}
+
 fn add_clip_analysis(transaction: &Transaction<'_>) -> Result<()> {
     // Every migration must be replayable: dropping `schema_migrations` re-runs
     // the whole list against a schema that may already have these columns, and
@@ -1274,7 +1315,52 @@ mod tests {
             .unwrap();
         assert!(asset_columns.contains(&"title".to_string()));
         assert!(asset_columns.contains(&"description".to_string()));
-        assert_eq!(PROJECT_CATALOG_SCHEMA_VERSION, 14);
+    }
+
+    #[test]
+    fn migration_15_adds_analysis_run_accounting() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        migrate_project_catalog(&mut connection).unwrap();
+        let columns: Vec<String> = connection
+            .prepare("SELECT name FROM pragma_table_info('analysis_runs')")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<String>>>()
+            .unwrap();
+        for column in ["status", "stage_reached", "cost_usd", "budget_exhausted"] {
+            assert!(columns.contains(&column.to_string()), "missing {column}");
+        }
+        assert_eq!(PROJECT_CATALOG_SCHEMA_VERSION, 15);
+    }
+
+    #[test]
+    fn migration_15_upgrades_a_catalog_stopped_at_the_previous_version() {
+        // Replays every migration except the newest, the way an existing
+        // catalog on disk would be, and then upgrades it.
+        let mut connection = Connection::open_in_memory().unwrap();
+        let previous = &PROJECT_CATALOG_MIGRATIONS[..PROJECT_CATALOG_MIGRATIONS.len() - 1];
+        run_sqlite_migrations(&mut connection, previous).unwrap();
+        let before: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='analysis_runs'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(before, 0);
+
+        migrate_project_catalog(&mut connection).unwrap();
+
+        let after: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='analysis_runs'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(after, 1);
+        validate_project_catalog_migrations(&connection).unwrap();
     }
 
     #[test]

@@ -8,6 +8,7 @@ use rcdvlog_core::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -593,6 +594,7 @@ fn execute(cli: &Cli) -> Result<Value> {
                             "estimate": progress.estimate,
                         })
                     );
+                    ControlFlow::Continue(())
                 })?,
             )?),
             TranscribeCommand::Status { project } => {
@@ -613,6 +615,7 @@ fn execute(cli: &Cli) -> Result<Value> {
                             "estimate": progress.estimate,
                         })
                     );
+                    ControlFlow::Continue(())
                 })?,
             )?),
             AnalyzeCommand::Status { project } => {
