@@ -50,7 +50,7 @@ media menu (`App.tsx:1370`) and in the shortcuts modal.
 Rationale from spec rule 4 — thumbnail generation is a once-per-project setup
 action and does not earn a bare key, while the ribbon toggle is pressed many
 times per session. Proxies keep `⇧P`, analysis keeps `A`, import keeps `M`.
-Task 4 makes this change; Task 12 updates the shortcuts modal and the media
+Task 4 makes this change; Task 11 updates the shortcuts modal and the media
 menu hint.
 
 No other new key collides. `F`, `H`, `D`, `B`, `I` are unbound today.
@@ -89,7 +89,7 @@ No other new key collides. `F`, `H`, `D`, `B`, `I` are unbound today.
 | `src/__independent__/review-keymap.independent.test.ts` | Update where behaviour changed |
 
 **Deleted:** no files. `CalibrationPanel.tsx` and `EditPlanPanel.tsx` are kept
-and rehosted into modes (Task 10).
+and rehosted into modes (Task 9).
 
 ---
 
@@ -848,7 +848,7 @@ In the `reviewAction` switch (`App.tsx:715-735`), add cases for the new kinds.
 For this task, wire only the ones with existing behaviour — `jumpBestMoment`
 seeks to `observation?.analysis.bestMomentStartMs`, and `editTitle` focuses
 `.clip-title-field`. The presentation actions get `break` with a
-`// wired in Task 10/11` comment; Tasks 10 and 11 replace them.
+`// wired in Task 9/10` comment; Tasks 9 and 10 replace them.
 
 - [ ] **Step 7: Run the full suite**
 
@@ -1186,7 +1186,7 @@ leaving `setMessage("Choose a media folder to begin")` for the empty case.
 Make `message` transient: add an effect clearing it 4s after it changes.
 
 Move the chronology drawer (2644-2680) inside `.workbench` for now, so the
-shell has three children; Task 10 removes it entirely. Add
+shell has three children; Task 9 removes it entirely. Add
 `<footer className="story-ribbon">` as the third child wrapping the existing
 `.chronology` markup, moved out of `.viewer-panel`.
 
@@ -1231,13 +1231,22 @@ content was usually a stale '273 clips ready' restating the queue badge."
 
 ---
 
-### Task 7: JudgmentPanel — pinned notes and labels
+### Task 7: The right rail and the evidence shelf
 
-Spec §3.7, rules 1 and 3. This is the task that fixes the reported problem.
+Spec §3.6, §3.7, rules 1 and 3. This is the task that fixes the reported
+problem.
+
+**These two halves ship as one commit.** Emptying the rail (steps 1–4) makes
+description, transcript, source and clock event unreachable; the shelf
+(steps 5–8) is what gives them back. Splitting them would leave a commit in
+which the app is missing fields the user relies on, and this is a daily tool
+that may be pulled mid-plan.
 
 **Files:**
 - Create: `apps/desktop/src/components/JudgmentPanel.tsx`
+- Create: `apps/desktop/src/components/EvidenceShelf.tsx`
 - Create: `apps/desktop/src/components/__tests__/JudgmentPanel.test.tsx`
+- Create: `apps/desktop/src/components/__tests__/EvidenceShelf.test.tsx`
 - Modify: `apps/desktop/src/App.tsx` (inspector render 1789-2015)
 - Modify: `apps/desktop/src/styles.css` (`.inspector-*` 256-323)
 
@@ -1368,7 +1377,7 @@ Carry over from `App.tsx:1813-1839` the label input's existing key handling
 `App.tsx:1956-1975` the notes textarea's focus/blur/keydown wiring — but with
 the §8 key change: `Enter` inserts a newline, `⌘Enter` saves, `⇧Enter` saves
 and advances. Delete the four-shortcut hint strip; it moves to the `?` modal
-in Task 12.
+in Task 11.
 
 CSS, replacing `.inspector-*` and adding the panel:
 
@@ -1398,42 +1407,11 @@ In `App.tsx`, replace the `<aside className="inspector-panel">` block
 Run: `pnpm --dir apps/desktop test JudgmentPanel`
 Expected: PASS, 8 tests.
 
-- [ ] **Step 5: Run the full suite and check**
+- [ ] **Step 5: Write the failing shelf test**
 
-Run: `pnpm --dir apps/desktop test && pnpm --dir apps/desktop check`
-Expected: all pass. Description, transcript, source and clock event are
-temporarily unreachable — Task 8 gives them their home. Note this in the
-commit body rather than leaving it unexplained.
+The rail is now empty of machine output; the shelf is what restores it.
 
-- [ ] **Step 6: Commit**
-
-```bash
-git add apps/desktop/src/components/JudgmentPanel.tsx apps/desktop/src/components/__tests__/JudgmentPanel.test.tsx apps/desktop/src/App.tsx apps/desktop/src/styles.css
-git commit -m "feat(desktop): pin notes and labels in a human-only rail
-
-The inspector held ~1387px of content in a ~750px viewport, so with a
-transcript present the notes field began 81px below the fold and was never
-visible without scrolling.
-
-The rail now holds only what a human authors, with two stated exceptions,
-and a test enforces that rather than leaving it to review. Description,
-transcript, source and clock event are unreachable until the next commit
-lands the evidence shelf."
-```
-
----
-
-### Task 8: EvidenceShelf — machine output under the player
-
-Spec §3.6. Restores everything Task 7 displaced, in the centre column.
-
-**Files:**
-- Create: `apps/desktop/src/components/EvidenceShelf.tsx`
-- Create: `apps/desktop/src/components/__tests__/EvidenceShelf.test.tsx`
-- Modify: `apps/desktop/src/App.tsx`
-- Modify: `apps/desktop/src/styles.css`
-
-**Interfaces:**
+**Shelf interfaces:**
 - Consumes: `transcriptSummary`, `transcriptBadge`, `analysisSummary`,
   `analysisNeedsAttention`, `fileSummary` from Task 5;
   `reduceView`/`ViewState` from Task 3.
@@ -1444,8 +1422,6 @@ Spec §3.6. Restores everything Task 7 displaced, in the centre column.
   onToggleOpen(): void; onSeek(seconds: number): void;
   onChangeAsset(next: Asset): void; onCommitAsset(): void }`, and
   `type ShelfTab = "transcript" | "description" | "analysis" | "file"`.
-
-- [ ] **Step 1: Write the failing test**
 
 Create `apps/desktop/src/components/__tests__/EvidenceShelf.test.tsx`
 asserting:
@@ -1481,12 +1457,12 @@ describe("tab persistence", () => {
 Write these out fully with the same `asset()`/`transcript()` factories used in
 Task 5's test file.
 
-- [ ] **Step 2: Run test to verify it fails**
+- [ ] **Step 6: Run test to verify it fails**
 
 Run: `pnpm --dir apps/desktop test EvidenceShelf`
 Expected: FAIL — module not found.
 
-- [ ] **Step 3: Build the component**
+- [ ] **Step 7: Build the shelf**
 
 Port the transcript list from `App.tsx:1926-1954`, the description editor and
 analysis facts from `App.tsx:1882-1924`, and the source grid from
@@ -1515,34 +1491,37 @@ In `App.tsx`, place `<EvidenceShelf />` as the third row of `.viewer-panel` and
 hold `shelfTab` in state so it persists across clip changes (spec §3.6: it is a
 mode, not per-clip state). Wire `D` from the Task 4 keymap to `toggleShelf`.
 
-- [ ] **Step 4: Run test to verify it passes**
+- [ ] **Step 8: Run both test files and confirm nothing was lost**
 
-Run: `pnpm --dir apps/desktop test EvidenceShelf`
-Expected: PASS.
+Run: `pnpm --dir apps/desktop test JudgmentPanel EvidenceShelf`
+Expected: PASS. The rule-1 test must still pass with the shelf present.
 
-- [ ] **Step 5: Confirm nothing was lost**
+Run `pnpm --dir apps/desktop test && pnpm --dir apps/desktop check`, then check
+by hand in `pnpm --dir apps/desktop dev` that description, transcript, camera,
+codec, size, raw/best time and the clock-event form are all reachable again.
+Nothing the rail used to show may be missing from the app at this commit.
 
-Re-run the Task 7 rule-1 test and confirm it still passes, then manually check
-in `pnpm --dir apps/desktop dev` that description, transcript, camera, codec,
-size, raw/best time and the clock-event form are all reachable again.
-
-- [ ] **Step 6: Commit**
+- [ ] **Step 9: Commit**
 
 ```bash
-git add apps/desktop/src/components/EvidenceShelf.tsx apps/desktop/src/components/__tests__/EvidenceShelf.test.tsx apps/desktop/src/App.tsx apps/desktop/src/styles.css
-git commit -m "feat(desktop): evidence shelf under the player
+git add apps/desktop/src/components/JudgmentPanel.tsx apps/desktop/src/components/EvidenceShelf.tsx apps/desktop/src/components/__tests__ apps/desktop/src/App.tsx apps/desktop/src/styles.css
+git commit -m "feat(desktop): human-only rail, machine output under the player
 
-Transcript segments are seek controls, so they belong beside the transport
-rather than 700px away in the right rail. At 740px a segment fits one line;
-at 400px it wrapped to two or three, which is where half the old inspector
-height went.
+The inspector held ~1387px of content in a ~750px viewport, so with a
+transcript present the notes field began 81px below the fold and was never
+visible without scrolling.
 
-Collapsed by default, so the video stage keeps 640px."
+The rail now holds only what a human authors, with two stated exceptions,
+and a test enforces that rather than leaving it to review. Everything it
+shed lands in a shelf beneath the player: transcript segments are seek
+controls and belong beside the transport, and at 740px a segment fits one
+line where at 400px it wrapped to three. The shelf is collapsed by
+default, so the video stage keeps 640px."
 ```
 
 ---
 
-### Task 9: VideoStage and the permanent TransportBar
+### Task 8: VideoStage and the permanent TransportBar
 
 Spec §3.4, §3.5. Deletes the auto-hiding overlay and the duplicate bar.
 
@@ -1639,7 +1618,7 @@ timestamp as text."
 
 ---
 
-### Task 10: StoryRibbon full-width, and modes
+### Task 9: StoryRibbon full-width, and modes
 
 Spec §3.8, §6. Moves chronology and edit planning out of the drawer.
 
@@ -1657,7 +1636,7 @@ Spec §3.8, §6. Moves chronology and edit planning out of the drawer.
   zoom: number; collapsed: boolean; merged: boolean; contextRuns: ContextRun[];
   onSelect(id: string): void; onZoom(delta: number): void; onCenter(): void;
   onToggleCollapsed(): void }`. `merged` renders the single-lane variant Focus
-  uses (Task 11).
+  uses (Task 10).
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1725,7 +1704,7 @@ at the bottom of the review screen."
 
 ---
 
-### Task 11: The Focus presentation
+### Task 10: The Focus presentation
 
 Spec §3.9.
 
@@ -1738,7 +1717,7 @@ Spec §3.9.
 **Interfaces:**
 - Consumes: `ViewState`, `reduceView`, `focusesNotesOnEntry` from Task 3;
   `JudgmentPanel`'s notes and label subcomponents from Task 7;
-  `StoryRibbon` with `merged` from Task 10.
+  `StoryRibbon` with `merged` from Task 9.
 - Produces: `FocusView` with props
   `{ asset: Asset; view: ViewState; transcript: ClipTranscript | null; … }`
   mirroring the Review handlers.
@@ -1810,7 +1789,7 @@ fullscreen is deliberately not used -- animating to a separate Space over
 
 ---
 
-### Task 12: Density pass and final verification
+### Task 11: Density pass and final verification
 
 Spec §5, §10. Applies the type and spacing scales everywhere and closes out.
 
@@ -1909,29 +1888,29 @@ stated in the scale rather than in chrome."
 ## Self-Review
 
 **Spec coverage.** §1.3 and §7 defects → Task 1 (tokens, disabled buttons,
-select border, Catppuccin/rem port), Task 6 (implicit row, status line), Task 9
-(duplicate transport), Task 10 (hardcoded lanes). §2 rules → Task 3 (rule 4
+select border, Catppuccin/rem port), Task 6 (implicit row, status line), Task 8
+(duplicate transport), Task 9 (hardcoded lanes). §2 rules → Task 3 (rule 4
 sequencing), Task 7 (rules 1 and 3, both test-enforced). §3.1 → Task 6. §3.2 →
-Task 6. §3.3 → Task 12 (queue row geometry). §3.4/§3.5 → Task 9. §3.6 → Tasks 5
-and 8. §3.7 → Task 7. §3.8 → Tasks 2 and 10. §3.9 → Tasks 3 and 11. §4 → the
-task that owns each destination. §5 → Task 12. §6 → Task 10. §8 → Task 4. §9 is
-out of scope by construction. §10 → Task 12 step 6.
+Task 6. §3.3 → Task 11 (queue row geometry). §3.4/§3.5 → Task 8. §3.6 → Tasks 5
+and 7. §3.7 → Task 7. §3.8 → Tasks 2 and 9. §3.9 → Tasks 3 and 10. §4 → the
+task that owns each destination. §5 → Task 11. §6 → Task 9. §8 → Task 4. §9 is
+out of scope by construction. §10 → Task 11 step 6.
 
 **Gap found and closed:** §3.3's queue row spec (52px, 72x40 thumbnail, flag
-column, removed-row hatch) had no owning task; it is now Task 12 step 3. The
+column, removed-row hatch) had no owning task; it is now Task 11 step 3. The
 queue is otherwise unchanged by this plan, so it does not need its own task.
 
-**Placeholder scan.** Tasks 8, 9, 10 and 11 give test intent as commented
-`it()` bodies rather than full assertions. That is deliberate for tests whose
-fixtures depend on the real `AssetAnalysisView` and `ContextRun` shapes in
-`src/types.ts`, which the implementer must read first; each carries an explicit
-instruction to do so. Every other step contains runnable content.
+**Placeholder scan.** Tasks 7 (shelf half), 8, 9 and 10 give test intent as
+commented `it()` bodies rather than full assertions. That is deliberate for
+tests whose fixtures depend on the real `AssetAnalysisView` and `ContextRun`
+shapes in `src/types.ts`, which the implementer must read first; each carries
+an explicit instruction to do so. Every other step contains runnable content.
 
-**Type consistency.** `ShelfTab` is defined in Task 8 and consumed by Task 11.
+**Type consistency.** `ShelfTab` is defined in Task 7 and consumed by Task 10.
 `ViewState`/`ViewAction`/`reduceView` are defined in Task 3 and consumed by
-Tasks 6, 8, 10 and 11 under those exact names. `ribbonHeight`/`ribbonLaneRows`/
-`visibleLaneCount` are defined in Task 2 and consumed by Task 10.
+Tasks 6, 7, 9 and 10 under those exact names. `ribbonHeight`/`ribbonLaneRows`/
+`visibleLaneCount` are defined in Task 2 and consumed by Task 9.
 `transcriptSummary`/`transcriptBadge`/`analysisSummary`/
 `analysisNeedsAttention`/`fileSummary`/`descriptionSummary`/`clockSummary` are
-defined in Task 5 and consumed by Task 8. `toggleShelf` and `toggleRibbon`
+defined in Task 5 and consumed by Task 7. `toggleShelf` and `toggleRibbon`
 carry the same names in the keymap (Task 4) and the reducer (Task 3).
