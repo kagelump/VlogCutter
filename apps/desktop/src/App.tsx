@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent } from "react";
+import { useCallback, useEffect, useMemo, useReducer, useRef, useState, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import { StatusBadge } from "@rcdvlog/review-ui";
 import { api } from "./api";
 import type { AnalysisReadiness, AnalysisStage, Asset, AssetAnalysisIndexEntry, AssetAnalysisView, AssetPatch, AutoplayMode, BaselineImportResult, BaselinePreviewResult, ClipTranscript, DesktopSettings, ModelInstallProgress, ModelStatus, PathAnalysis, Project, ProjectLibrary, ProjectLocation, ProjectPairingStatus, RootMappingEntry, ServerConnectionStatus, ServerVersionInfo, SyncStatus, TranscriptStatus } from "./types";
@@ -7,6 +7,9 @@ import { resolveAction } from "./review/keymap";
 import { CalibrationPanel } from "./CalibrationPanel";
 import { EditPlanPanel } from "./EditPlanPanel";
 import { formatBytes, transcriptStatusLabels } from "./review/summaries";
+import { RIBBON_ZOOM_DEFAULT, RIBBON_ZOOM_MAX, RIBBON_ZOOM_MIN, RIBBON_ZOOM_STEP } from "./review/layout";
+import { StoryRibbon, assetContextKey, type ContextRun } from "./components/StoryRibbon";
+import { INITIAL_VIEW, reduceView, type Mode } from "./review/presentation";
 
 interface OperationProgress {
   kind: "proxy" | "thumbnail" | "analysis";
@@ -55,11 +58,6 @@ const autoplayOptions: Array<{ value: AutoplayMode; label: string; detail: strin
   { value: "proxyAvailable", label: "Only when proxy is available", detail: "Autoplay lightweight review media; keep camera originals paused." },
   { value: "always", label: "Always", detail: "Autoplay whichever version is available, including camera originals." },
 ];
-
-const chronologyZoomMin = 44;
-const chronologyZoomMax = 116;
-const chronologyZoomStep = 12;
-const chronologyZoomDefault = 68;
 
 function formatDuration(seconds: number) {
   const safe = Number.isFinite(seconds) ? Math.max(0, seconds) : 0;
@@ -137,16 +135,11 @@ function renderedRotation(asset: Asset, representationIsRaw: boolean) {
   );
 }
 
-function assetContextKey(asset: Asset) {
-  return [asset.phase, asset.location, asset.timezone, asset.storyBeat]
-    .map((value) => value?.trim() || "")
-    .join("\u0000");
-}
-
 function App() {
-  // D01-T015/T016/T023: the calibration and edit-plan drawers. Closed by
-  // default so the review queue stays the primary surface.
-  const [chronologyDrawer, setChronologyDrawer] = useState<"none" | "calibration" | "editPlan">("none");
+  // Chronology and edit planning are modes, not a drawer: they are global,
+  // sit-down operations that were being asked to work in a strip at the
+  // bottom of the review screen (spec §6).
+  const [view, dispatchView] = useReducer(reduceView, INITIAL_VIEW);
   const [projects, setProjects] = useState<Project[]>([]);
   const [projectId, setProjectId] = useState("");
   const [assets, setAssets] = useState<Asset[]>([]);
@@ -156,7 +149,7 @@ function App() {
   const [labelDraft, setLabelDraft] = useState("");
   const [busy, setBusy] = useState(false);
   const [operationProgress, setOperationProgress] = useState<OperationProgress | null>(null);
-  const [message, setMessage] = useState("Loading catalog…");
+  const [message, setMessage] = useState("");
   const [error, setError] = useState("");
   const [showCreate, setShowCreate] = useState(false);
   const [showMediaMenu, setShowMediaMenu] = useState(false);
@@ -181,7 +174,7 @@ function App() {
   const [isViewerFullscreen, setIsViewerFullscreen] = useState(false);
   const [offsetMinutes, setOffsetMinutes] = useState(0);
   const [offsetLabel, setOffsetLabel] = useState("Camera time change");
-  const [chronologyZoom, setChronologyZoom] = useState(chronologyZoomDefault);
+  const [chronologyZoom, setChronologyZoom] = useState(RIBBON_ZOOM_DEFAULT);
 
   // ── Clip analysis state ────────────────────────────────────────────
   const [analysisIndex, setAnalysisIndex] = useState<Record<string, AssetAnalysisIndexEntry>>({});
@@ -304,7 +297,9 @@ function App() {
     setSelectedId((current) =>
       result.some((asset) => asset.id === current) ? current : result[0]?.id || "",
     );
-    setMessage(result.length ? `${result.length} clips ready` : "Choose a media folder to begin");
+    // A count here would be the third copy of a number the queue badge and the
+    // ribbon already carry; only the empty case says anything new.
+    setMessage(result.length ? "" : "Choose a media folder to begin");
   }, []);
 
   useEffect(() => {
@@ -535,6 +530,14 @@ function App() {
 
   useEffect(() => setLabelDraft(""), [selectedId]);
 
+  // Status messages are transient. The old status line kept the last one on
+  // screen indefinitely, so it was usually stale by the time you read it.
+  useEffect(() => {
+    if (!message) return;
+    const timer = setTimeout(() => setMessage(""), 4000);
+    return () => clearTimeout(timer);
+  }, [message]);
+
   const replaceAsset = (updated: Asset) => {
     setAssets((current) =>
       current
@@ -710,10 +713,10 @@ function App() {
             return;
           case "zoom":
             event.preventDefault();
-            setChronologyZoom((current) =>
+            setChronologyZoom((current: number) =>
               reviewAction.delta < 0
-                ? Math.max(chronologyZoomMin, current - chronologyZoomStep)
-                : Math.min(chronologyZoomMax, current + chronologyZoomStep),
+                ? Math.max(RIBBON_ZOOM_MIN, current - RIBBON_ZOOM_STEP)
+                : Math.min(RIBBON_ZOOM_MAX, current + RIBBON_ZOOM_STEP),
             );
             return;
           case "centerSelection":
@@ -731,15 +734,26 @@ function App() {
             event.preventDefault();
             document.querySelector<HTMLInputElement>(".clip-title-field")?.focus();
             return;
+          case "setMode":
+            event.preventDefault();
+            if (reviewAction.mode === "review" || projectId) {
+              dispatchView({ kind: "setMode", mode: reviewAction.mode });
+            }
+            return;
+          case "toggleRibbon":
+            event.preventDefault();
+            dispatchView({ kind: "toggleRibbon" });
+            return;
+          case "toggleShelf":
+            event.preventDefault();
+            dispatchView({ kind: "toggleShelf" });
+            return;
           case "toggleFocus":
           case "toggleOverlays":
-          case "toggleShelf":
-          case "toggleRibbon":
           case "ribbonOverlay":
-          case "setMode":
-            // Presentations and modes arrive in Tasks 9 and 10. Returning here
-            // rather than falling through keeps these keys inert instead of
-            // reaching the handlers below and firing something unrelated.
+            // The Focus presentation arrives in Task 10. Returning here rather
+            // than falling through keeps these keys inert instead of reaching
+            // the handlers below and firing something unrelated.
             return;
         }
       }
@@ -1340,6 +1354,24 @@ function App() {
             ))}
           </select>
         </label>
+        {/* Visible rather than tucked into a menu: three modes is few enough
+            to show, and hiding them makes them read as settings. */}
+        <nav className="mode-switcher" aria-label="View mode">
+          {([
+            ["review", "Review", "Meta+1"],
+            ["chronology", "Chronology", "Meta+2"],
+            ["editPlan", "Edit plan", "Meta+3"],
+          ] as Array<[Mode, string, string]>).map(([mode, label, shortcut]) => (
+            <button
+              key={mode}
+              className={view.mode === mode ? "active" : ""}
+              aria-pressed={view.mode === mode}
+              aria-keyshortcuts={shortcut}
+              disabled={!projectId && mode !== "review"}
+              onClick={() => dispatchView({ kind: "setMode", mode })}
+            >{label}</button>
+          ))}
+        </nav>
         {api.isDesktop() && <button className="text-button" disabled={busy} onClick={openCatalog} aria-keyshortcuts="Meta+O">Open catalog</button>}
         <button className="text-button" onClick={() => setShowSettings(true)} aria-keyshortcuts="Meta+,">Settings <kbd>⌘,</kbd></button>
         <button className="text-button" onClick={() => setShowCreate(true)} aria-keyshortcuts="Meta+N">New project</button>
@@ -1358,11 +1390,52 @@ function App() {
             <span className="sync-label">{syncStateLabel(syncStatus.state)}</span>
           </button>
         )}
-        <div className="topbar-spacer" />
-        <div className="session-readout">
-          <span>{labeledCount}/{activeAssets.length} labeled</span>
-          <span>{removedCount} removed</span>
+        {/* Empty at idle, and that emptiness is the point: this is the only
+            calm region on screen. It is the whole replacement for the 28px
+            status line that used to be reserved whether or not it had
+            anything to say. */}
+        <div className="operation-slot" data-testid="operation-slot" aria-live="polite">
+          {operationProgress ? (
+            <>
+              <span>
+                {operationProgress.kind === "analysis" && operationProgress.stage
+                  ? `${analysisStageLabels[operationProgress.stage]} · step ${(operationProgress.stageIndex ?? 0) + 1} of ${operationProgress.stageCount ?? 3}`
+                  : operationProgress.kind === "thumbnail"
+                    ? "Generating thumbnails"
+                    : "Generating proxies"}
+              </span>
+              <div
+                className="progress-track"
+                role="progressbar"
+                aria-valuemin={0}
+                aria-valuemax={operationProgress.totalWorkUnits || operationProgress.total}
+                aria-valuenow={operationProgress.totalWorkUnits ? operationProgress.completedWorkUnits : operationProgress.completed}
+              >
+                <span style={{ width: `${operationProgress.totalWorkUnits
+                  ? (operationProgress.completedWorkUnits / operationProgress.totalWorkUnits) * 100
+                  : operationProgress.total
+                    ? (operationProgress.completed / operationProgress.total) * 100
+                    : 0}%` }} />
+              </div>
+              <output>{operationProgress.completed}/{operationProgress.total}</output>
+              <span>
+                {formatEta(operationProgress.estimatedRemainingSeconds)} · {operationProgress.workerCount} worker{operationProgress.workerCount === 1 ? "" : "s"}
+                {operationProgress.kind === "analysis" ? ` · ${formatCost(operationProgress.costUsd ?? 0)} spent` : ""}
+              </span>
+              {operationProgress.kind === "analysis" && (
+                <button className="button ghost progress-cancel" onClick={stopAnalysis}>Cancel</button>
+              )}
+            </>
+          ) : error ? (
+            <span className="error-banner" role="alert">
+              {error}
+              <button className="banner-dismiss" onClick={() => setError("")} aria-label="Dismiss error">×</button>
+            </span>
+          ) : message ? (
+            <span className="toast">{message}</span>
+          ) : null}
         </div>
+        <div className="topbar-spacer" />
         <div className="media-split">
           <button className="button secondary media-split-main" disabled={busy || missingProxyCount === 0} onClick={makeMissingProxies} aria-keyshortcuts="Shift+P">
             {missingProxyCount ? `Make ${missingProxyCount} proxies` : "Proxies ready"}
@@ -1393,45 +1466,29 @@ function App() {
           Add media <kbd>M</kbd>
         </button>
         <button className="shortcut-help-button" onClick={() => setShowShortcuts(true)} aria-label="Keyboard shortcuts" aria-keyshortcuts="?">?</button>
+        {/* Ambient progress for 2px, replacing a 180px readout that said the
+            same thing in words. */}
+        <div className="completion-hairline" aria-hidden="true">
+          <span style={{ width: `${activeAssets.length ? (labeledCount / activeAssets.length) * 100 : 0}%` }} />
+        </div>
       </header>
 
-      <section className="status-line" aria-live="polite">
-        <span className={busy ? "pulse" : "status-dot"} />
-        {operationProgress ? (
-          <div className="operation-progress">
-            <span>
-              {operationProgress.kind === "analysis" && operationProgress.stage
-                ? `${analysisStageLabels[operationProgress.stage]} (step ${(operationProgress.stageIndex ?? 0) + 1} of ${operationProgress.stageCount ?? 3})…`
-                : operationProgress.kind === "thumbnail"
-                  ? "Generating thumbnails…"
-                  : "Generating proxies…"}
-            </span>
-            <div
-              className="progress-track"
-              role="progressbar"
-              aria-valuemin={0}
-              aria-valuemax={operationProgress.totalWorkUnits || operationProgress.total}
-              aria-valuenow={operationProgress.totalWorkUnits ? operationProgress.completedWorkUnits : operationProgress.completed}
-            >
-              <span style={{ width: `${operationProgress.totalWorkUnits
-                ? (operationProgress.completedWorkUnits / operationProgress.totalWorkUnits) * 100
-                : operationProgress.total
-                  ? (operationProgress.completed / operationProgress.total) * 100
-                  : 0}%` }} />
-            </div>
-            <output>{operationProgress.completed}/{operationProgress.total}</output>
-            <span className="progress-eta">
-              {formatEta(operationProgress.estimatedRemainingSeconds)} · {operationProgress.workerCount} worker{operationProgress.workerCount === 1 ? "" : "s"}
-              {operationProgress.kind === "analysis" ? ` · ${formatCost(operationProgress.costUsd ?? 0)} spent` : ""}
-            </span>
-            {operationProgress.kind === "analysis" && (
-              <button className="button ghost progress-cancel" onClick={stopAnalysis}>Cancel</button>
-            )}
-          </div>
-        ) : <span>{message}</span>}
-        {error && <span className="error-message">{error}</span>}
-      </section>
-
+      {view.mode !== "review" && projectId ? (
+        <div className="mode-surface">
+          {view.mode === "chronology" ? (
+            <CalibrationPanel
+              projectId={projectId}
+              currentAssetId={selectedId || null}
+              // A correction can reorder hundreds of clips; resume where the
+              // user was rather than snapping them back to the top.
+              onQueueResumed={(assetId) => setSelectedId(assetId)}
+              onChronologyChanged={() => refreshAssets(projectId)}
+            />
+          ) : (
+            <EditPlanPanel projectId={projectId} assets={assets} />
+          )}
+        </div>
+      ) : (
       <div className="workbench">
         <aside className="queue-panel">
           <div className="panel-heading">
@@ -1679,122 +1736,6 @@ function App() {
               </button>
             )}
           </div>
-
-          <div className="chronology">
-            <div className="chronology-heading">
-              <div>
-                <span className="eyebrow">Story ribbon</span>
-                <strong>{activeAssets.length ? `${activeAssets.length} clips in relative order` : "Relative order across sources"}</strong>
-              </div>
-              <div className="chronology-actions">
-                <span className="chronology-position">
-                  {selected && !selected.removed ? `#${activeAssets.findIndex((asset) => asset.id === selected.id) + 1} · ${formatDate(selected.bestTime)}` : "No active clip selected"}
-                </span>
-                <div className="zoom-control" aria-label="Story ribbon zoom">
-                  <button
-                    onClick={() => setChronologyZoom((current) => Math.max(chronologyZoomMin, current - chronologyZoomStep))}
-                    disabled={chronologyZoom === chronologyZoomMin}
-                    aria-label="Zoom story ribbon out"
-                    aria-keyshortcuts="BracketLeft"
-                  >−<kbd>[</kbd></button>
-                  <input
-                    type="range"
-                    min={chronologyZoomMin}
-                    max={chronologyZoomMax}
-                    step={chronologyZoomStep}
-                    value={chronologyZoom}
-                    onChange={(event) => setChronologyZoom(Number(event.target.value))}
-                    aria-label="Story ribbon zoom level"
-                  />
-                  <button
-                    onClick={() => setChronologyZoom((current) => Math.min(chronologyZoomMax, current + chronologyZoomStep))}
-                    disabled={chronologyZoom === chronologyZoomMax}
-                    aria-label="Zoom story ribbon in"
-                    aria-keyshortcuts="BracketRight"
-                  >+<kbd>]</kbd></button>
-                </div>
-                <button className="center-story-button" onClick={() => centerSelectedInChronology()} aria-keyshortcuts="C">
-                  Center <kbd>C</kbd>
-                </button>
-              </div>
-            </div>
-            {lanes.length > 0 ? (
-              <div className="story-map">
-                <div className="story-labels" aria-hidden="true">
-                  <span className="context-label">Trip context</span>
-                  <span className="order-label">Order</span>
-                  {lanes.map(([camera]) => <span className="lane-name" title={camera} key={camera}>{camera}</span>)}
-                </div>
-                <div
-                  className="story-scroll"
-                  ref={chronologyScrollRef}
-                  onWheel={(event) => {
-                    if (Math.abs(event.deltaY) <= Math.abs(event.deltaX) || event.ctrlKey) return;
-                    event.preventDefault();
-                    event.currentTarget.scrollLeft += event.deltaY;
-                  }}
-                >
-                  <div
-                    className="story-canvas"
-                    style={{
-                      width: `${Math.max(chronologyZoom, activeAssets.length * chronologyZoom)}px`,
-                      minWidth: "100%",
-                      "--clip-step": `${chronologyZoom}px`,
-                    } as React.CSSProperties}
-                  >
-                    <div className="context-track">
-                      {contextRuns.map((run) => {
-                        const primary = run.asset.phase || run.asset.location || "Context not tagged";
-                        const detail = [
-                          run.asset.location && run.asset.location !== primary ? run.asset.location : null,
-                          run.asset.timezone,
-                          run.asset.storyBeat,
-                        ].filter(Boolean).join(" · ") || "Add phase, place, timezone or story beat";
-                        return (
-                          <div
-                            className="context-segment"
-                            key={`${run.start}-${assetContextKey(run.asset)}`}
-                            style={{ left: run.start * chronologyZoom + 3, width: (run.end - run.start + 1) * chronologyZoom - 6 }}
-                            title={`${primary} · ${detail}`}
-                          >
-                            <strong>{primary}</strong>
-                            <span>{detail}</span>
-                          </div>
-                        );
-                      })}
-                    </div>
-                    <div className="order-track" aria-hidden="true">
-                      {activeAssets.map((asset, index) => (
-                        <span className={asset.id === selectedId ? "active" : ""} style={{ left: index * chronologyZoom }} key={asset.id}>
-                          {String(index + 1).padStart(3, "0")}
-                        </span>
-                      ))}
-                    </div>
-                    {lanes.map(([camera, cameraAssets]) => (
-                      <div className="lane-track" key={camera}>
-                        {cameraAssets.map((asset) => {
-                          const index = activeAssets.findIndex((candidate) => candidate.id === asset.id);
-                          return (
-                            <button
-                              key={asset.id}
-                              className={`timeline-clip ${asset.offsetSeconds ? "corrected" : ""} ${asset.id === selectedId ? "active" : ""}`}
-                              style={{ left: index * chronologyZoom + 4, width: chronologyZoom - 8 }}
-                              onClick={() => setSelectedId(asset.id)}
-                              aria-label={`Clip ${index + 1}, ${asset.filename}, ${camera}`}
-                              title={`#${index + 1} · ${asset.filename} · ${formatDate(asset.bestTime)}`}
-                            >
-                              <span>{asset.filename.replace(/\.[^.]+$/, "")}</span>
-                              {asset.labels.length > 0 && <i aria-hidden="true" />}
-                            </button>
-                          );
-                        })}
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              </div>
-            ) : <div className="empty-lanes">Camera lanes appear after ingest.</div>}
-          </div>
         </section>
 
         <aside className="inspector-panel">
@@ -2025,6 +1966,28 @@ function App() {
           )}
         </aside>
       </div>
+      )}
+
+      {/* Third and last shell child. Full width, so the ribbon sees 1440px
+          instead of the viewer column's 863px, and the viewer column stops
+          paying for it. */}
+      {view.mode === "review" && (
+      <footer className="story-ribbon">
+        <StoryRibbon
+          assets={activeAssets}
+          lanes={lanes}
+          contextRuns={contextRuns}
+          selected={selected}
+          selectedId={selectedId}
+          zoom={chronologyZoom}
+          scrollRef={chronologyScrollRef}
+          formatDate={formatDate}
+          onZoomChange={setChronologyZoom}
+          onCenter={() => centerSelectedInChronology()}
+          onSelect={setSelectedId}
+        />
+      </footer>
+      )}
 
       {showCreate && (
         <div className="modal-backdrop" role="presentation">
@@ -2652,43 +2615,6 @@ function App() {
         </div>
       )}
 
-      {projectId && (
-        <div className="chronology-drawer">
-          <nav className="chronology-drawer-tabs" aria-label="Chronology and editing">
-            <button
-              type="button"
-              aria-pressed={chronologyDrawer === "calibration"}
-              onClick={() =>
-                setChronologyDrawer(chronologyDrawer === "calibration" ? "none" : "calibration")
-              }
-            >
-              Chronology
-            </button>
-            <button
-              type="button"
-              aria-pressed={chronologyDrawer === "editPlan"}
-              onClick={() =>
-                setChronologyDrawer(chronologyDrawer === "editPlan" ? "none" : "editPlan")
-              }
-            >
-              Edit plan
-            </button>
-          </nav>
-          {chronologyDrawer === "calibration" && (
-            <CalibrationPanel
-              projectId={projectId}
-              currentAssetId={selectedId || null}
-              // A correction can reorder hundreds of clips; resume where the
-              // user was rather than snapping them back to the top.
-              onQueueResumed={(assetId) => setSelectedId(assetId)}
-              onChronologyChanged={() => refreshAssets(projectId)}
-            />
-          )}
-          {chronologyDrawer === "editPlan" && (
-            <EditPlanPanel projectId={projectId} assets={assets} />
-          )}
-        </div>
-      )}
     </main>
   );
 }

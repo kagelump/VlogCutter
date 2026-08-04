@@ -1,5 +1,11 @@
 /** Story-ribbon geometry (spec §3.8). */
 
+/** Horizontal pixels per clip slot. */
+export const RIBBON_ZOOM_MIN = 44;
+export const RIBBON_ZOOM_MAX = 116;
+export const RIBBON_ZOOM_STEP = 12;
+export const RIBBON_ZOOM_DEFAULT = 68;
+
 export const RIBBON_MAX_LANES = 5;
 export const RIBBON_LANE_HEIGHT = 20;
 /** Control row (22) + trip-context band (20) + position numerals (14). */
