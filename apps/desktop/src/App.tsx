@@ -265,7 +265,7 @@ function App() {
     activeAssets.forEach((asset) => {
       grouped.set(asset.camera, [...(grouped.get(asset.camera) ?? []), asset]);
     });
-    return [...grouped.entries()].slice(0, 5);
+    return [...grouped.entries()];
   }, [activeAssets]);
 
   const contextRuns = useMemo(() => {
@@ -1745,9 +1745,12 @@ function App() {
           zoom={chronologyZoom}
           scrollRef={chronologyScrollRef}
           formatDate={formatDate}
+          collapsed={!view.ribbon}
+          merged={false}
           onZoomChange={setChronologyZoom}
           onCenter={() => centerSelectedInChronology()}
           onSelect={setSelectedId}
+          onToggleCollapsed={() => dispatchView({ kind: "toggleRibbon" })}
         />
       </footer>
       )}

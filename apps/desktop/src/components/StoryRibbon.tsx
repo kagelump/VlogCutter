@@ -4,6 +4,8 @@ import {
   RIBBON_ZOOM_MAX,
   RIBBON_ZOOM_MIN,
   RIBBON_ZOOM_STEP,
+  ribbonHeight,
+  ribbonLaneRows,
 } from "../review/layout";
 
 /** A contiguous run of clips sharing the same trip context. */
@@ -31,11 +33,16 @@ export interface StoryRibbonProps {
   selected: Asset | null;
   selectedId: string;
   zoom: number;
+  /** Collapsed to a 28px strip. */
+  collapsed: boolean;
+  /** One merged lane instead of one per camera — the Focus overlay variant. */
+  merged: boolean;
   scrollRef: RefObject<HTMLDivElement | null>;
   formatDate(value: string | null): string;
   onZoomChange(next: number): void;
   onCenter(): void;
   onSelect(id: string): void;
+  onToggleCollapsed(): void;
 }
 
 /**
@@ -52,19 +59,27 @@ export function StoryRibbon({
   selected,
   selectedId,
   zoom,
+  collapsed,
+  merged,
   scrollRef,
   formatDate,
   onZoomChange,
   onCenter,
   onSelect,
+  onToggleCollapsed,
 }: StoryRibbonProps) {
+  // Merged draws one lane holding every clip; otherwise one lane per camera.
+  const laneRows: Array<[string, Asset[]]> = merged ? [["", assets]] : lanes;
+  const height = ribbonHeight(laneRows.length, collapsed);
+
   return (
-    <div className="chronology">
+    <div className="chronology" style={{ height }}>
       <div className="chronology-heading">
-        <div>
-          <span className="eyebrow">Story ribbon</span>
-          <strong>{assets.length ? `${assets.length} clips in relative order` : "Relative order across sources"}</strong>
-        </div>
+        {/* The old heading spent 45px on an eyebrow plus a line restating the
+            clip count the queue badge already carries. */}
+        <button className="ribbon-collapse" onClick={onToggleCollapsed} aria-expanded={!collapsed} aria-keyshortcuts="T">
+          {collapsed ? "▸" : "▾"} Story ribbon <kbd>T</kbd>
+        </button>
         <div className="chronology-actions">
           <span className="chronology-position">
             {selected && !selected.removed
@@ -99,12 +114,12 @@ export function StoryRibbon({
           </button>
         </div>
       </div>
-      {lanes.length > 0 ? (
-        <div className="story-map">
-          <div className="story-labels" aria-hidden="true">
-            <span className="context-label">Trip context</span>
+      {collapsed ? null : laneRows.length > 0 ? (
+        <div className="story-map" style={{ gridTemplateRows: `20px 14px ${ribbonLaneRows(laneRows.length)}` }}>
+          <div className="story-labels" aria-hidden="true" style={{ gridTemplateRows: `20px 14px ${ribbonLaneRows(laneRows.length)}` }}>
+            <span className="context-label">Context</span>
             <span className="order-label">Order</span>
-            {lanes.map(([camera]) => <span className="lane-name" title={camera} key={camera}>{camera}</span>)}
+            {merged ? null : lanes.map(([camera]) => <span className="lane-name" title={camera} key={camera}>{camera}</span>)}
           </div>
           <div
             className="story-scroll"
@@ -120,6 +135,7 @@ export function StoryRibbon({
               style={{
                 width: `${Math.max(zoom, assets.length * zoom)}px`,
                 minWidth: "100%",
+                gridTemplateRows: `20px 14px ${ribbonLaneRows(laneRows.length)}`,
                 "--clip-step": `${zoom}px`,
               } as CSSProperties}
             >
@@ -151,8 +167,8 @@ export function StoryRibbon({
                   </span>
                 ))}
               </div>
-              {lanes.map(([camera, cameraAssets]) => (
-                <div className="lane-track" key={camera}>
+              {laneRows.map(([camera, cameraAssets]) => (
+                <div className="lane-track" key={camera || "merged"}>
                   {cameraAssets.map((asset) => {
                     const index = assets.findIndex((candidate) => candidate.id === asset.id);
                     return (
