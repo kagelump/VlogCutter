@@ -97,14 +97,25 @@ These are invariants, not preferences. New work is checked against them.
    exists because priority *ordering* decays — it is how the pane reached its
    current state. A categorical rule can be checked.
 
+   In Focus (§3.9) there are no columns, so the split is expressed **per card**
+   instead: human cards (notes, labels) carry a solid border, machine cards
+   (transcript) carry the dim dashed treatment already used for AI label
+   chips. The intent is unchanged — machine content may sit beside the
+   authoring surface but never inside it.
+
 2. **Machine output lives in the centre column**, under the player, in a
    tabbed shelf. Transcript segments are seek controls and belong near the
    transport. At 740px a transcript line fits on one line; at 400px it wraps to
    two or three.
 
-3. **The Notes field has a fixed height and a fixed position.** It never
-   resizes, never moves, and never scrolls out of view. Expanding or collapsing
-   anything else must not shift it.
+3. **The Notes field has a fixed height and a fixed position within a
+   presentation.** It never resizes, never moves, and never scrolls out of
+   view. Expanding or collapsing anything else must not shift it.
+
+   Review and Focus (§3.9) are two presentations, each with its own fixed
+   notes geometry. Moving between them is the single permitted change, it is
+   always user-initiated by an explicit keystroke, and it preserves caret
+   offset, selection and scroll position. Nothing else may move the field.
 
 4. **Permanent pixels are earned by frequency of interaction per clip**, not by
    abstract importance:
@@ -252,8 +263,12 @@ that vanishes during playback is unaimable, and the overlay covered the frame.
 
 Contents, 24px targets on a 32px bar: play/pause · −15 · +15 · `0:12 / 1:47`
 (11px tabular) · scrubber · mute · rotation glyph · PROXY/ORIGINAL badge
-(PROXY dim, ORIGINAL amber) · fullscreen. Previous/next clip buttons are added
-here for mouse use; `J`/`K` are unchanged.
+(PROXY dim, ORIGINAL amber) · `⤢`. Previous/next clip buttons are added here
+for mouse use; `J`/`K` are unchanged.
+
+`⤢` enters Focus (§3.9) with all overlays hidden — the pure-frame state. The
+`.viewer-stage:fullscreen` rules are deleted; Focus is the only fullscreen
+concept in the application.
 
 The scrubber carries a diamond marker at `bestMomentStartMs` (`B` jumps to it)
 and thin ticks at transcript segment starts. This replaces the
@@ -354,6 +369,127 @@ Human-authored content only (rule 1). Content width 376px.
 
 At full width the ribbon shows ~21 clips at the default zoom versus ~12 today.
 
+### 3.9 Focus — the notes-writing presentation
+
+Focus fills the window with the frame and floats only what the writing flow
+needs on top of it. It exists because writing a note is the one task where the
+Review layout's three-column split works against you: the video is 740px in a
+1440px window, and your attention is on one field.
+
+**Focus is a presentation of Review, not a fourth mode.** It carries the same
+clip, the same queue order, the same filter and search. `⌘1`/`⌘2`/`⌘3` from
+inside Focus leave it and go to that mode. Chronology and Edit plan have no
+Focus presentation.
+
+#### Entering and leaving
+
+`F` toggles Focus from Review and back. `Esc` also leaves.
+
+The transition preserves, in both directions: caret offset and selection in the
+notes field, notes scroll position, video `currentTime`, play/pause state, mute
+state, and the selected clip. Dropping into Focus mid-sentence and coming back
+must land the caret on the same character. This is the whole point of the
+feature — a transition that costs you your place is one you stop using.
+
+**Focus does not request macOS fullscreen.** It fills the app window only.
+Native fullscreen animates to a separate Space over roughly 700ms, which
+defeats a toggle meant to be pressed dozens of times per session. The ~56px of
+menu-bar height it would recover is not worth that.
+
+#### Layout — 1440 x 900
+
+```
++------------------------------------------------------------------+
+| #118  Ramen alley night walk            Saved 2s    118/273   36 |
++------------------------------------------------------------------+
+|                                                                  |
+|          video, full-bleed, contain, centred                     |
+|          16:9 -> 1440 x 810      9:16 -> 506 x 900               |
+|                                              +-----------------+ |
+|                                              | LABELS      180 | |
+|                                              | [+ add label  ] | |
+|  +--------------------------------+          | ramen x night x | |
+|  | NOTES              Saved 2s    |          +-----------------+ |
+|  |                                |          | TRANSCRIPT      | |
+|  |   568 x 364, 15/22, 16 lines   |          | (dashed = machine)|
+|  |                                |          | 0:04 we finally | |
+|  |          600 x 420             |          | 0:09 it's like  | |
+|  +--------------------------------+          |      360 x 568  | |
+|                                              +-----------------+ |
++------------------------------------------------------------------+
+| > 0:12/1:47 -----*----------------------------- mute          28 |
++------------------------------------------------------------------+
+| Kansai . Osaka             117 118 119 120 121 122 ...        44 |
++------------------------------------------------------------------+
+```
+
+Video is the background layer, `object-fit: contain`, centred, full-bleed. Every
+other element is an overlay card with a translucent panel background and
+`backdrop-filter: blur(8px)`, matching the treatment `.inspector-title`
+already uses.
+
+| Overlay | Geometry | Default |
+| --- | --- | --- |
+| Top strip | 1440 x 36, top edge | on |
+| Notes card | 600 x 420, 24 left, 16 above the bottom stack | on |
+| Right stack | 360 x 760, 24 right, y 52–812 | **off** |
+| Transport | 1440 x 28, above the ribbon | on |
+| Ribbon overlay | 1440 x 44, bottom edge | on |
+
+Notes card internals: 16 pad, 18 header, 6 gap, **568 x 364 textarea**, 16 pad
+= 420. At 15/22 that is 16 visible lines at a ~75-character measure, against
+Review's 18 lines at ~47. Same type size, wider measure, comparable capacity —
+Focus trades two lines of height for a measure much closer to a comfortable
+reading width for prose.
+
+Right stack internals: labels card 360 x 180, 12 gap, transcript card
+360 x 568 = 760.
+
+- **Top strip** — `#118`, the clip title (editable in place with `I`), the save
+  state, the `⚠` chip when unusable, and `118 / 273`. Nothing else.
+- **Notes card** — identical behaviour to §3.7: 15/22, debounced autosave at
+  600ms plus save on blur and on clip change, `N` focuses. Entering with `F`
+  focuses it immediately, since that is what you came for. Entering with `⤢`
+  does not, because that path starts with every overlay hidden; pressing `H`
+  from there reveals the overlays and focuses the field.
+- **Right stack** — off by default; the user called it optional and the
+  writing flow does not need it. Labels card is the §3.7 input and chip well
+  verbatim. Transcript card follows the playhead, highlighting the current
+  segment and scrolling to it, and clicking a segment seeks. It carries the
+  dashed machine treatment per rule 1.
+- **Transport** — play/pause, `0:12 / 1:47`, scrubber with the best-moment
+  diamond and transcript ticks, mute. No rotation glyph, no PROXY badge, no
+  fullscreen control — those are per-project or per-clip setup, not writing.
+- **Ribbon overlay** — 6 pad, 14px trip-context strip (colour runs plus the
+  current phase name at the left), 18px **single merged lane** with position
+  numerals, 6 pad. Camera lanes are collapsed to one: in this flow the
+  question is "where am I in the trip", not "which camera". The current clip
+  keeps its ring, and clock-corrected clips keep their marker. Click still
+  selects.
+
+#### Keys inside Focus
+
+`T` and `D` keep the meanings they have in Review, so there is one thing to
+remember rather than two:
+
+| Key | Effect |
+| --- | --- |
+| `F`, `Esc` | back to Review |
+| `T` | toggle the ribbon overlay |
+| `D` | toggle the right stack |
+| `H` | toggle **all** overlays — the pure-frame state |
+| `J` / `K`, arrows | previous / next clip, without leaving Focus |
+| `Space`, `B`, `L`, `N`, `I`, `R` | unchanged |
+
+`H` replaces the old `.viewer-stage:fullscreen` special case. The `⤢` control
+in the Review transport bar (§3.5) enters Focus directly in the `H` state — one
+control, one mode, two states, instead of two overlapping fullscreen concepts.
+
+Overlay visibility is **never** driven by hover or by playback state. It
+changes only on an explicit keystroke, for the reason given in §3.5: a control
+that appears on mouse-entry is one you cannot aim at, and a notes field that
+vanishes because you stopped typing is worse.
+
 ## 4. Where every item lives
 
 ### Editable per-clip
@@ -440,6 +576,11 @@ visible while calibrating.
 
 Entry: `⌘1` / `⌘2` / `⌘3`, or the topbar segmented control. Exit: `⌘1` or Esc.
 
+Focus (§3.9) is **not** a fourth mode and does not appear in the segmented
+control. It is a presentation of Review carrying the same clip, filter, search
+and queue order, toggled with `F`. Chronology and Edit plan have no Focus
+presentation; pressing `⌘2` or `⌘3` from inside Focus leaves it first.
+
 Returning to Review restores the exact clip, queue scroll position, ribbon zoom
 and offset, active shelf tab, and cursor position in the notes field. Switching
 modes is a camera move, not a state reset.
@@ -476,8 +617,13 @@ Carried out as part of this work, each traceable to §1.3:
 Unchanged: `J`/`K` and arrows move, `Space` play/pause, `L` label, `R` remove,
 `N` notes, `/` search, `?` help, `C` center, `[` `]` zoom, `Esc` cancel.
 
-New: `⌘1` `⌘2` `⌘3` modes, `D` toggle evidence shelf, `T` collapse ribbon,
-`Shift+T` ribbon overlay, `B` jump to best moment, `I` edit title.
+New: `⌘1` `⌘2` `⌘3` modes, `F` toggle Focus, `D` toggle evidence shelf, `T`
+collapse ribbon, `Shift+T` ribbon overlay, `B` jump to best moment, `I` edit
+title.
+
+`T` and `D` carry the same meaning in Review and in Focus — collapse the
+ribbon, toggle the machine-output surface — so the pair is learned once. `H`
+exists only in Focus, where it hides every overlay.
 
 **Changed — Notes.** `Enter` inserts a newline, `⌘Enter` saves, `⇧Enter` saves
 and advances. This inverts the current mapping at `App.tsx:1971`. Enter-to-save
@@ -522,6 +668,19 @@ against behaviour changes:
   - the topbar operation slot is empty at idle and shows progress, ETA, spend
     and a working Cancel during an analysis run;
   - no control in the topbar shows a mismatched outline.
+- Focus (§3.9), on the same run:
+  - `F` in, type a word mid-sentence, `F` out, `F` in again — the caret lands
+    on the same character each time, and the video has not restarted or
+    changed play state;
+  - `J`/`K` advance clips without leaving Focus;
+  - `H` hides every overlay and restores them; `T` and `D` toggle the ribbon
+    and the right stack independently;
+  - no overlay appears or disappears on mouse movement or on play/pause;
+  - the notes card is focused on entry;
+  - a portrait clip renders 506 x 900 without crop, with overlays still legible
+    against it;
+  - `⌘2` from inside Focus lands in Chronology, and `⌘1` returns to Review —
+    not to Focus.
 - Measured against §1: video stage 460 → 640px, ribbon width 863 → 1440px,
   right pane scroll height 1387 → 700px with no overflow.
 
@@ -541,3 +700,7 @@ scrubber marker, and the permanent transport bar. The audit-derived design
 contributed the defect list in §1.3 and §7, the collapsed-by-default shelf that
 preserves a 640px video stage, the visible mode switcher, and the media split
 button that keeps outstanding-work counts visible.
+
+The Focus presentation in §3.9 was specified by the user after both designs
+were merged. It subsumes the fullscreen control that both designs had kept as
+a separate concept.
