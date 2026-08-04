@@ -1,7 +1,7 @@
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
-import type { Asset, AssetPatch, AutoplayMode, BaselineImportResult, BaselinePreviewResult, DesktopSettings, GenerationProgress, IngestReport, LoadedCatalog, PathAnalysis, Project, ProjectLibrary, ProjectPairingStatus, RootMappingEntry, ServerConnectionStatus, ServerPairingResult, ServerVersionInfo, SyncStatus, ThumbnailReport } from "./types";
+import type { AnalysisProgress, AnalysisReadiness, AnalysisRunRecord, AnalysisRunReport, AnalysisRunRequest, AnalysisStage, Asset, AssetAnalysisIndexEntry, AssetAnalysisView, AssetPatch, AutoplayMode, BaselineImportResult, BaselinePreviewResult, ClipTranscript, DesktopSettings, GenerationProgress, IngestReport, LoadedCatalog, ModelInstallProgress, ModelStatus, PathAnalysis, Project, ProjectLibrary, ProjectPairingStatus, RootMappingEntry, ServerConnectionStatus, ServerPairingResult, ServerVersionInfo, SyncStatus, ThumbnailReport } from "./types";
 
 const inTauri = () => "__TAURI_INTERNALS__" in window;
 
@@ -52,6 +52,14 @@ let mockAssets: Asset[] = [
   thumbnailPath: null,
   thumbnailQuality: 0,
   notes: index === 0 ? "First clean view of the station clock." : index === 3 ? "Good transition into the market." : "",
+  // Analysis fills these in; clips it has not reached keep an empty title and
+  // fall back to the filename in the UI.
+  title: index === 0 ? "Train pulls into Otaru station" : index === 2 ? "Handheld walk past shuttered stalls" : "",
+  description: index === 0
+    ? "A local train slows along the platform as an announcement plays; the camera pans left to follow it past the station clock."
+    : index === 2
+      ? "Unsteady handheld shot down a covered arcade. Heavy motion blur throughout."
+      : "",
   labels: index === 0 ? ["arrival", "establishing"] : index === 1 ? ["train"] : index === 3 ? ["market", "transition"] : [],
   removed: index === 6,
   mediaObjectId: null,
@@ -93,6 +101,185 @@ function writeMockSettings(settings: DesktopSettings) {
   } catch {
     // The browser preview can still use in-memory defaults when storage is unavailable.
   }
+}
+
+// ── Browser-preview mocks for clip analysis ─────────────────────────
+// These exist so layout, focus, progress and cancel behavior can be worked on
+// in the Vite preview. They prove nothing about Keychain access, model
+// downloads, or real media processing.
+
+let mockModels: ModelStatus[] = [
+  { name: "ggml-large-v3-turbo-q5_0.bin", installed: false, bytes: 574_000_000, url: "https://huggingface.co/ggerganov/whisper.cpp", directory: "/Users/demo/Library/Application Support/com.rcd.vlogcutter/models" },
+  { name: "ggml-silero-v5.1.2.bin", installed: true, bytes: 885_000, url: "https://huggingface.co/ggml-org/whisper-vad", directory: "/Users/demo/Library/Application Support/com.rcd.vlogcutter/models" },
+];
+let mockKeyPresent = false;
+let mockAnalysisCancelled = false;
+let mockAnalysisProgress: ((progress: AnalysisProgress) => void) | null = null;
+
+const mockRuns: AnalysisRunRecord[] = [
+  {
+    id: "run_demo_1",
+    projectId: mockProject.id,
+    startedAt: "2026-08-03T11:02:00.000Z",
+    finishedAt: "2026-08-03T11:12:29.000Z",
+    status: "completed",
+    stageReached: "analysis",
+    proxiesGenerated: 0,
+    clipsTranscribed: 4,
+    clipsAnalyzed: 6,
+    costUsd: 0.00065,
+    budgetExhausted: false,
+    error: "",
+  },
+];
+
+const mockTranscripts: Record<string, ClipTranscript> = {
+  asset_demo_0: {
+    assetId: "asset_demo_0",
+    recipeKey: "stt.whisper-large-v3-turbo-q5_0.vad-silero-v5.win30.v1",
+    sourceFingerprint: "proxy-demo-0",
+    status: "speech",
+    rejectReason: "",
+    primaryLanguage: "ja",
+    speechSeconds: 7.4,
+    windowCount: 1,
+    segments: [
+      { startMs: 1200, endMs: 4100, language: "ja", text: "次は小樽、小樽です。", meanTokenProbability: 0.81 },
+      { startMs: 5200, endMs: 8600, language: "ja", text: "お出口は右側です。", meanTokenProbability: 0.77 },
+    ],
+  },
+  asset_demo_1: {
+    assetId: "asset_demo_1",
+    recipeKey: "stt.whisper-large-v3-turbo-q5_0.vad-silero-v5.win30.v1",
+    sourceFingerprint: "proxy-demo-1",
+    status: "no_speech",
+    rejectReason: "",
+    primaryLanguage: "",
+    speechSeconds: 0,
+    windowCount: 0,
+    segments: [],
+  },
+};
+
+const mockAnalyses: Record<string, AssetAnalysisView> = {
+  asset_demo_0: {
+    analysis: {
+      assetId: "asset_demo_0",
+      recipeKey: "framepack.2fps.skip400ms.max40.win3-8.sharp-bright-motion.dhash8-d5.v1",
+      promptVersion: "vlm.observe.v2",
+      provider: "openrouter",
+      model: "qwen/qwen3-vl-flash",
+      status: "ok",
+      rejectReason: "",
+      usable: true,
+      unusableReason: null,
+      bestMomentStartMs: 4200,
+      bestMomentEndMs: 9800,
+      thumbnailTimestampMs: 6100,
+      cameraMovement: "pan",
+      ocrText: ["小樽駅", "OTARU"],
+      transcriptUsed: true,
+      promptTokens: 2411,
+      completionTokens: 188,
+      costUsd: 0.000112,
+      latencyMs: 3820,
+      attempts: 1,
+      createdAt: "2026-08-03T11:04:12.000Z",
+    },
+    aiLabels: ["station", "arrival"],
+    current: true,
+  },
+  asset_demo_2: {
+    analysis: {
+      assetId: "asset_demo_2",
+      recipeKey: "framepack.2fps.skip400ms.max40.win3-8.sharp-bright-motion.dhash8-d5.v1",
+      promptVersion: "vlm.observe.v2",
+      provider: "openrouter",
+      model: "qwen/qwen3-vl-flash",
+      status: "ok",
+      rejectReason: "",
+      usable: false,
+      unusableReason: "blurry",
+      bestMomentStartMs: null,
+      bestMomentEndMs: null,
+      thumbnailTimestampMs: 1400,
+      cameraMovement: "handheld",
+      ocrText: [],
+      transcriptUsed: false,
+      promptTokens: 2180,
+      completionTokens: 96,
+      costUsd: 0.000098,
+      latencyMs: 2910,
+      attempts: 1,
+      createdAt: "2026-08-03T11:05:02.000Z",
+    },
+    aiLabels: [],
+    current: true,
+  },
+};
+
+function mockReadiness(projectId: string): AnalysisReadiness {
+  const active = mockAssets.filter((asset) => !asset.removed);
+  const missingAnalyses = active.filter((asset) => !mockAnalyses[asset.id]).length;
+  return {
+    projectId,
+    totalClips: active.length,
+    missingProxies: active.filter((asset) => !asset.proxyAvailable).length,
+    missingTranscripts: active.filter((asset) => !mockTranscripts[asset.id]).length,
+    missingAnalyses,
+    models: mockModels,
+    modelsReady: mockModels.every((model) => model.installed),
+    apiKeyPresent: mockKeyPresent,
+    estimatedCostUsd: missingAnalyses * 0.0001084,
+    costBasis: "observed",
+    observedCostPerClipUsd: 0.0001084,
+    lastRun: mockRuns[0] ?? null,
+  };
+}
+
+async function mockAnalyzeProject(): Promise<AnalysisRunReport> {
+  mockAnalysisCancelled = false;
+  const stages: AnalysisStage[] = ["proxies", "transcripts", "analysis"];
+  const active = mockAssets.filter((asset) => !asset.removed);
+  let cancelled = false;
+  let costUsd = 0;
+  for (const [stageIndex, stage] of stages.entries()) {
+    for (const [index, asset] of active.entries()) {
+      if (mockAnalysisCancelled) {
+        cancelled = true;
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 140));
+      if (stage === "analysis") costUsd += 0.0001084;
+      mockAnalysisProgress?.({
+        stage,
+        stageIndex,
+        stageCount: stages.length,
+        asset,
+        estimate: {
+          completedItems: index + 1,
+          totalItems: active.length,
+          completedWorkUnits: index + 1,
+          totalWorkUnits: active.length,
+          workerCount: stage === "transcripts" ? 1 : 4,
+          workUnitsPerWorkerSecond: 1.4,
+          elapsedSeconds: (index + 1) * 0.14,
+          estimatedRemainingSeconds: (active.length - index - 1) * 0.14,
+        },
+        costUsd,
+      });
+    }
+    if (cancelled) break;
+  }
+  return {
+    runId: "run_demo_mock",
+    status: cancelled ? "cancelled" : "completed",
+    stageReached: cancelled ? "transcripts" : "analysis",
+    proxies: { generated: 2, skipped: 4, cancelled: false, failures: [] },
+    transcripts: { transcribed: 4, skipped: 2, cancelled, failures: [] },
+    analysis: { analyzed: cancelled ? 0 : 6, skipped: 0, rejected: 0, fallbackServed: 0, costUsd, cancelled, budgetExhausted: false, failures: [] },
+    costUsd,
+  };
 }
 
 export const api = {
@@ -296,6 +483,107 @@ export const api = {
   async onThumbnailProgress(callback: (progress: GenerationProgress) => void): Promise<() => void> {
     if (!inTauri()) return () => {};
     return listen<GenerationProgress>("thumbnail-progress", (event) => callback(event.payload));
+  },
+
+  // ── Clip analysis ───────────────────────────────────────────────
+
+  async analysisReadiness(projectId: string): Promise<AnalysisReadiness> {
+    if (!inTauri()) return mockReadiness(projectId);
+    return invoke("analysis_readiness", { projectId });
+  },
+
+  async analyzeProject(projectId: string, request: AnalysisRunRequest = {}): Promise<AnalysisRunReport> {
+    if (!inTauri()) return mockAnalyzeProject();
+    return invoke("analyze_project", { projectId, request });
+  },
+
+  async cancelAnalysis(): Promise<void> {
+    if (!inTauri()) {
+      mockAnalysisCancelled = true;
+      return;
+    }
+    return invoke("cancel_analysis");
+  },
+
+  async assetTranscript(assetId: string): Promise<ClipTranscript | null> {
+    if (!inTauri()) return mockTranscripts[assetId] ?? null;
+    return invoke("asset_transcript", { assetId });
+  },
+
+  async assetAnalysis(assetId: string): Promise<AssetAnalysisView | null> {
+    if (!inTauri()) return mockAnalyses[assetId] ?? null;
+    return invoke("asset_analysis", { assetId });
+  },
+
+  async setClipSummary(assetId: string, title: string, description: string): Promise<Asset> {
+    if (!inTauri()) {
+      const current = mockAssets.find((asset) => asset.id === assetId);
+      if (!current) throw new Error("Asset not found");
+      const updated = { ...current, title: title.trim(), description: description.trim() };
+      mockAssets = mockAssets.map((asset) => asset.id === assetId ? updated : asset);
+      return updated;
+    }
+    return invoke("set_clip_summary", { assetId, title, description });
+  },
+
+  async projectAnalysisIndex(projectId: string): Promise<AssetAnalysisIndexEntry[]> {
+    if (!inTauri()) {
+      return mockAssets.map((asset) => ({
+        assetId: asset.id,
+        transcriptStatus: mockTranscripts[asset.id]?.status ?? null,
+        transcriptText: (mockTranscripts[asset.id]?.segments ?? []).map((segment) => segment.text).join(" "),
+        analyzed: Boolean(mockAnalyses[asset.id]),
+        usable: mockAnalyses[asset.id]?.analysis.usable ?? true,
+        unusableReason: mockAnalyses[asset.id]?.analysis.unusableReason ?? "",
+      }));
+    }
+    return invoke("project_analysis_index", { projectId });
+  },
+
+  async analysisRuns(projectId: string, limit = 5): Promise<AnalysisRunRecord[]> {
+    if (!inTauri()) return mockRuns;
+    return invoke("analysis_runs", { projectId, limit });
+  },
+
+  async modelStatus(): Promise<ModelStatus[]> {
+    if (!inTauri()) return mockModels;
+    return invoke("model_status");
+  },
+
+  async installAnalysisModels(): Promise<ModelStatus[]> {
+    if (!inTauri()) {
+      mockModels = mockModels.map((model) => ({ ...model, installed: true }));
+      return mockModels;
+    }
+    return invoke("install_analysis_models");
+  },
+
+  async setOpenRouterKey(key: string): Promise<boolean> {
+    if (!inTauri()) {
+      mockKeyPresent = key.trim().length > 0;
+      return mockKeyPresent;
+    }
+    return invoke("set_openrouter_key", { key });
+  },
+
+  async openRouterKeyPresent(): Promise<boolean> {
+    if (!inTauri()) return mockKeyPresent;
+    return invoke("openrouter_key_present");
+  },
+
+  async onAnalysisProgress(callback: (progress: AnalysisProgress) => void): Promise<() => void> {
+    if (!inTauri()) {
+      mockAnalysisProgress = callback;
+      return () => {
+        mockAnalysisProgress = null;
+      };
+    }
+    return listen<AnalysisProgress>("analysis-progress", (event) => callback(event.payload));
+  },
+
+  async onModelInstallProgress(callback: (progress: ModelInstallProgress) => void): Promise<() => void> {
+    if (!inTauri()) return () => {};
+    return listen<ModelInstallProgress>("model-install-progress", (event) => callback(event.payload));
   },
 
   // ── Server pairing ──────────────────────────────────────────────

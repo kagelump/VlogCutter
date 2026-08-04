@@ -89,6 +89,156 @@ export interface Asset {
   storyBeat?: string | null;
 }
 
+// ── Clip analysis ────────────────────────────────────────────────────
+
+export type AnalysisStage = "proxies" | "transcripts" | "analysis";
+
+export type TranscriptStatus = "speech" | "no_speech" | "rejected" | "failed";
+
+export type CameraMovement = "static" | "pan" | "tilt" | "handheld" | "tracking" | "zoom" | "other";
+
+export type UnusableReason = "black" | "blurry" | "noise" | "overexposed" | "other";
+
+export interface TranscriptSegment {
+  startMs: number;
+  endMs: number;
+  language: string;
+  text: string;
+  meanTokenProbability: number;
+}
+
+export interface ClipTranscript {
+  assetId: string;
+  recipeKey: string;
+  sourceFingerprint: string;
+  /** `no_speech` is a success, not a failure: the VAD gate found silence. */
+  status: TranscriptStatus;
+  rejectReason: string;
+  primaryLanguage: string;
+  speechSeconds: number;
+  windowCount: number;
+  segments: TranscriptSegment[];
+}
+
+export interface ClipAnalysis {
+  assetId: string;
+  recipeKey: string;
+  promptVersion: string;
+  provider: string;
+  model: string;
+  status: "ok" | "rejected" | "failed";
+  rejectReason: string;
+  usable: boolean;
+  unusableReason: UnusableReason | null;
+  bestMomentStartMs: number | null;
+  bestMomentEndMs: number | null;
+  thumbnailTimestampMs: number | null;
+  cameraMovement: CameraMovement;
+  ocrText: string[];
+  transcriptUsed: boolean;
+  promptTokens: number;
+  completionTokens: number;
+  costUsd: number;
+  latencyMs: number;
+  attempts: number;
+  createdAt: string;
+}
+
+export interface AssetAnalysisView {
+  analysis: ClipAnalysis;
+  /** Labels the analysis authored; human labels live on the asset. */
+  aiLabels: string[];
+  /** False when the proxy was regenerated after this observation. */
+  current: boolean;
+}
+
+/** The analysis facts a queue row needs, for one clip. */
+export interface AssetAnalysisIndexEntry {
+  assetId: string;
+  transcriptStatus: TranscriptStatus | null;
+  transcriptText: string;
+  analyzed: boolean;
+  usable: boolean;
+  unusableReason: string;
+}
+
+export interface ModelStatus {
+  name: string;
+  installed: boolean;
+  bytes: number;
+  url: string;
+  directory: string;
+}
+
+export interface ModelInstallProgress {
+  name: string;
+  downloadedBytes: number;
+  totalBytes: number;
+}
+
+export interface AnalysisRunRecord {
+  id: string;
+  projectId: string;
+  startedAt: string;
+  finishedAt: string;
+  status: "running" | "completed" | "cancelled" | "failed";
+  stageReached: AnalysisStage;
+  proxiesGenerated: number;
+  clipsTranscribed: number;
+  clipsAnalyzed: number;
+  costUsd: number;
+  budgetExhausted: boolean;
+  error: string;
+}
+
+export interface AnalysisReadiness {
+  projectId: string;
+  totalClips: number;
+  missingProxies: number;
+  missingTranscripts: number;
+  missingAnalyses: number;
+  models: ModelStatus[];
+  modelsReady: boolean;
+  apiKeyPresent: boolean;
+  estimatedCostUsd: number;
+  costBasis: "observed" | "reference";
+  observedCostPerClipUsd: number;
+  lastRun: AnalysisRunRecord | null;
+}
+
+export interface AnalysisProgress {
+  stage: AnalysisStage;
+  stageIndex: number;
+  stageCount: number;
+  asset: Asset | null;
+  estimate: BatchEstimate;
+  costUsd: number;
+}
+
+export interface AnalysisRunReport {
+  runId: string;
+  status: "completed" | "cancelled" | "failed";
+  stageReached: AnalysisStage;
+  proxies: { generated: number; skipped: number; cancelled: boolean; failures: Array<{ path: string; error: string }> };
+  transcripts: { transcribed: number; skipped: number; cancelled: boolean; failures: Array<{ path: string; error: string }> };
+  analysis: {
+    analyzed: number;
+    skipped: number;
+    rejected: number;
+    fallbackServed: number;
+    costUsd: number;
+    cancelled: boolean;
+    budgetExhausted: boolean;
+    failures: Array<{ path: string; error: string }>;
+  };
+  costUsd: number;
+}
+
+export interface AnalysisRunRequest {
+  force?: boolean;
+  budgetUsd?: number | null;
+}
+
 export interface AssetPatch {
   notes: string;
   labels: string[];

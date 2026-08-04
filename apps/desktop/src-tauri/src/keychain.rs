@@ -2,6 +2,45 @@ use anyhow::{Context, Result, anyhow};
 
 const KEYCHAIN_SERVICE: &str = "com.rcd.vlogcutter.server";
 
+/// Separate service from server credentials: this key authorizes third-party
+/// spend, not access to the user's own companion server, and the two should not
+/// be revocable only together.
+const ANALYSIS_KEYCHAIN_SERVICE: &str = "com.rcd.vlogcutter.analysis";
+const OPENROUTER_ACCOUNT: &str = "openrouter";
+
+/// Store the OpenRouter key. It is never written to a project catalog, to
+/// settings, or to any log.
+pub fn store_openrouter_key(key: &str) -> Result<()> {
+    let entry = keyring::Entry::new(ANALYSIS_KEYCHAIN_SERVICE, OPENROUTER_ACCOUNT)
+        .context("create keychain entry for OpenRouter")?;
+    entry
+        .set_password(key)
+        .context("store OpenRouter key in keychain")?;
+    Ok(())
+}
+
+/// Retrieve the OpenRouter key, if one has been stored.
+pub fn get_openrouter_key() -> Result<Option<String>> {
+    let entry = keyring::Entry::new(ANALYSIS_KEYCHAIN_SERVICE, OPENROUTER_ACCOUNT)
+        .context("create keychain entry for OpenRouter")?;
+    match entry.get_password() {
+        Ok(key) => Ok(Some(key)),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(error) => Err(anyhow!("keychain read failed for OpenRouter: {error}")),
+    }
+}
+
+/// Remove the stored OpenRouter key.
+pub fn delete_openrouter_key() -> Result<()> {
+    let entry = keyring::Entry::new(ANALYSIS_KEYCHAIN_SERVICE, OPENROUTER_ACCOUNT)
+        .context("create keychain entry for OpenRouter")?;
+    match entry.delete_credential() {
+        Ok(()) => Ok(()),
+        Err(keyring::Error::NoEntry) => Ok(()),
+        Err(error) => Err(anyhow!("keychain delete failed for OpenRouter: {error}")),
+    }
+}
+
 /// Store a server credential token in macOS Keychain.
 /// The `account` is the stable server node ID.
 /// The `hostname` helps distinguish between LAN and tailnet endpoints.

@@ -1,21 +1,58 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import { StatusBadge } from "@rcdvlog/review-ui";
 import { api } from "./api";
-import type { Asset, AssetPatch, AutoplayMode, BaselineImportResult, BaselinePreviewResult, DesktopSettings, PathAnalysis, Project, ProjectLibrary, ProjectLocation, ProjectPairingStatus, RootMappingEntry, ServerConnectionStatus, ServerVersionInfo, SyncStatus } from "./types";
+import type { AnalysisReadiness, AnalysisStage, Asset, AssetAnalysisIndexEntry, AssetAnalysisView, AssetPatch, AutoplayMode, BaselineImportResult, BaselinePreviewResult, ClipTranscript, DesktopSettings, ModelInstallProgress, ModelStatus, PathAnalysis, Project, ProjectLibrary, ProjectLocation, ProjectPairingStatus, RootMappingEntry, ServerConnectionStatus, ServerVersionInfo, SyncStatus, TranscriptStatus } from "./types";
 import { orderAssets, moveSelection as moveSelectionInOrder } from "./review/order";
 import { resolveAction } from "./review/keymap";
 import { CalibrationPanel } from "./CalibrationPanel";
 import { EditPlanPanel } from "./EditPlanPanel";
 
 interface OperationProgress {
-  kind: "proxy" | "thumbnail";
+  kind: "proxy" | "thumbnail" | "analysis";
   completed: number;
   total: number;
   completedWorkUnits: number;
   totalWorkUnits: number;
   workerCount: number;
   estimatedRemainingSeconds: number | null;
+  /** Analysis only: which stage of the chain is running, and what it has spent. */
+  stage?: AnalysisStage;
+  stageIndex?: number;
+  stageCount?: number;
+  costUsd?: number;
 }
+
+const analysisStageLabels: Record<AnalysisStage, string> = {
+  proxies: "Making proxies",
+  transcripts: "Transcribing",
+  analysis: "Analyzing clips",
+};
+
+/** The clip's display name: what analysis called it, else its filename. */
+function clipTitle(asset: Asset) {
+  return asset.title.trim() || asset.filename;
+}
+
+function formatCost(usd: number) {
+  if (usd <= 0) return "$0.00";
+  if (usd < 0.01) return `<$0.01`;
+  return `$${usd.toFixed(2)}`;
+}
+
+function formatTimecode(ms: number) {
+  const total = Math.max(0, Math.round(ms / 1000));
+  const minutes = Math.floor(total / 60);
+  const seconds = total % 60;
+  return `${minutes}:${seconds.toString().padStart(2, "0")}`;
+}
+
+const transcriptStatusLabels: Record<TranscriptStatus, string> = {
+  speech: "Speech",
+  // Silence is a result, not a failure: roughly half of a real corpus is silent.
+  no_speech: "No speech detected",
+  rejected: "Discarded as unreliable",
+  failed: "Transcription failed",
+};
 
 const autoplayOptions: Array<{ value: AutoplayMode; label: string; detail: string }> = [
   { value: "never", label: "Never", detail: "Keep each clip paused until you press Space." },
@@ -155,6 +192,20 @@ function App() {
   const [offsetLabel, setOffsetLabel] = useState("Camera time change");
   const [chronologyZoom, setChronologyZoom] = useState(chronologyZoomDefault);
 
+  // ── Clip analysis state ────────────────────────────────────────────
+  const [analysisIndex, setAnalysisIndex] = useState<Record<string, AssetAnalysisIndexEntry>>({});
+  const [readiness, setReadiness] = useState<AnalysisReadiness | null>(null);
+  const [showAnalysisDialog, setShowAnalysisDialog] = useState(false);
+  const [budgetInput, setBudgetInput] = useState("1.00");
+  const [forceReanalyze, setForceReanalyze] = useState(false);
+  const [showUnusableOnly, setShowUnusableOnly] = useState(false);
+  const [transcript, setTranscript] = useState<ClipTranscript | null>(null);
+  const [observation, setObservation] = useState<AssetAnalysisView | null>(null);
+  const [models, setModels] = useState<ModelStatus[]>([]);
+  const [modelInstall, setModelInstall] = useState<ModelInstallProgress | null>(null);
+  const [keyPresent, setKeyPresent] = useState(false);
+  const [keyInput, setKeyInput] = useState("");
+
   // ── Server pairing / sync state ────────────────────────────────────
   const [serverStatus, setServerStatus] = useState<ServerConnectionStatus | null>(null);
   const [showPairingWizard, setShowPairingWizard] = useState(false);
@@ -198,15 +249,25 @@ function App() {
   const activeAssets = useMemo(() => orderAssets(assets, { removedVisible: false }), [assets]);
   const filteredAssets = useMemo(() => {
     const needle = query.trim().toLocaleLowerCase();
-    const queueAssets = orderAssets(assets, { removedVisible: showRemoved });
+    let queueAssets = orderAssets(assets, { removedVisible: showRemoved });
+    if (showUnusableOnly) {
+      // Clips with no observation are never hidden here: an unfiltered clip is
+      // one analysis has not judged, not one it approved.
+      queueAssets = queueAssets.filter((asset) => analysisIndex[asset.id]?.usable === false);
+    }
     if (!needle) return queueAssets;
     return queueAssets.filter((asset) =>
-      [asset.filename, asset.camera, asset.notes, ...asset.labels]
+      [asset.filename, asset.title, asset.description, asset.camera, asset.notes, analysisIndex[asset.id]?.transcriptText ?? "", ...asset.labels]
         .join(" ")
         .toLocaleLowerCase()
         .includes(needle),
     );
-  }, [assets, query, showRemoved]);
+  }, [analysisIndex, assets, query, showRemoved, showUnusableOnly]);
+
+  const unusableCount = useMemo(
+    () => assets.filter((asset) => !asset.removed && analysisIndex[asset.id]?.usable === false).length,
+    [analysisIndex, assets],
+  );
 
   const lanes = useMemo(() => {
     const grouped = new Map<string, Asset[]>();
@@ -274,6 +335,60 @@ function App() {
   useEffect(() => {
     refreshAssets(projectId).catch((reason) => setError(String(reason)));
   }, [projectId, refreshAssets]);
+
+  // ── Clip analysis loaders ─────────────────────────────────────────
+
+  const refreshAnalysisIndex = useCallback(async (activeProjectId: string) => {
+    if (!activeProjectId) {
+      setAnalysisIndex({});
+      return;
+    }
+    const entries = await api.projectAnalysisIndex(activeProjectId);
+    setAnalysisIndex(Object.fromEntries(entries.map((entry) => [entry.assetId, entry])));
+  }, []);
+
+  const refreshReadiness = useCallback(async (activeProjectId: string) => {
+    if (!activeProjectId) {
+      setReadiness(null);
+      return;
+    }
+    setReadiness(await api.analysisReadiness(activeProjectId));
+  }, []);
+
+  useEffect(() => {
+    void refreshAnalysisIndex(projectId).catch(() => setAnalysisIndex({}));
+    void refreshReadiness(projectId).catch(() => setReadiness(null));
+  }, [projectId, refreshAnalysisIndex, refreshReadiness]);
+
+  useEffect(() => {
+    void api.modelStatus().then(setModels).catch(() => setModels([]));
+    void api.openRouterKeyPresent().then(setKeyPresent).catch(() => setKeyPresent(false));
+  }, []);
+
+  // Per-clip detail is fetched on selection rather than for the whole project:
+  // segment lists and OCR are large and only one clip is on screen.
+  useEffect(() => {
+    if (!selectedId) {
+      setTranscript(null);
+      setObservation(null);
+      return;
+    }
+    let cancelled = false;
+    void Promise.all([api.assetTranscript(selectedId), api.assetAnalysis(selectedId)])
+      .then(([loadedTranscript, loadedObservation]) => {
+        if (cancelled) return;
+        setTranscript(loadedTranscript);
+        setObservation(loadedObservation);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setTranscript(null);
+        setObservation(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedId, assets]);
 
   // ── Sync status listener ──────────────────────────────────────────
   useEffect(() => {
@@ -376,6 +491,29 @@ function App() {
             });
           }
         }),
+        api.onAnalysisProgress((progress) => {
+          // Replacing the asset as each clip lands is what makes a generated
+          // title appear during the run rather than after it.
+          if (progress.asset) {
+            setAssets((current) => current.map((asset) => asset.id === progress.asset?.id ? progress.asset : asset));
+          }
+          if (activeOperationRef.current === "analysis") {
+            setOperationProgress({
+              kind: "analysis",
+              completed: progress.estimate.completedItems,
+              total: progress.estimate.totalItems,
+              completedWorkUnits: progress.estimate.completedWorkUnits,
+              totalWorkUnits: progress.estimate.totalWorkUnits,
+              workerCount: progress.estimate.workerCount,
+              estimatedRemainingSeconds: progress.estimate.estimatedRemainingSeconds,
+              stage: progress.stage,
+              stageIndex: progress.stageIndex,
+              stageCount: progress.stageCount,
+              costUsd: progress.costUsd,
+            });
+          }
+        }),
+        api.onModelInstallProgress((progress) => setModelInstall(progress)),
       ]);
       if (disposed) listeners.forEach((dispose) => dispose());
       else unlisten.push(...listeners);
@@ -415,6 +553,16 @@ function App() {
         ),
     );
   };
+
+  /// Commits an edited title/description. Separate from `persistAsset` because
+  /// these are not part of the full-replacement `AssetPatch` contract.
+  const saveClipSummary = useCallback(async (asset: Asset) => {
+    try {
+      replaceAsset(await api.setClipSummary(asset.id, asset.title, asset.description));
+    } catch (reason) {
+      setError(String(reason));
+    }
+  }, []);
 
   const persistAsset = useCallback(
     async (asset: Asset, changes: Partial<AssetPatch>) => {
@@ -542,6 +690,7 @@ function App() {
         setShowMediaMenu(false);
         setShowShortcuts(false);
         setShowSettings(false);
+        setShowAnalysisDialog(false);
         if (projects.length > 0) setShowCreate(false);
         return;
       }
@@ -605,6 +754,8 @@ function App() {
         void makeProxy();
       } else if (key === "t") {
         void makeMissingThumbnails();
+      } else if (key === "a") {
+        void openAnalysisDialog();
       } else if (key === "m") {
         void importFolder();
       }
@@ -779,6 +930,95 @@ function App() {
       setOperationProgress(null);
       setBusy(false);
     }
+  }
+
+  async function openAnalysisDialog() {
+    if (!projectId || busy) return;
+    setShowMediaMenu(false);
+    setError("");
+    try {
+      await Promise.all([refreshReadiness(projectId), api.modelStatus().then(setModels), api.openRouterKeyPresent().then(setKeyPresent)]);
+      setShowAnalysisDialog(true);
+    } catch (reason) {
+      setError(String(reason));
+    }
+  }
+
+  async function runAnalysis() {
+    if (!projectId || busy) return;
+    const budget = Number.parseFloat(budgetInput);
+    setShowAnalysisDialog(false);
+    setBusy(true);
+    activeOperationRef.current = "analysis";
+    setOperationProgress({ ...initialProgress("analysis", readiness?.totalClips ?? 0), stage: "proxies", stageIndex: 0, stageCount: 3, costUsd: 0 });
+    setMessage("Analyzing project…");
+    setError("");
+    try {
+      const report = await api.analyzeProject(projectId, {
+        force: forceReanalyze,
+        budgetUsd: Number.isFinite(budget) && budget > 0 ? budget : null,
+      });
+      await Promise.all([refreshAssets(projectId), refreshAnalysisIndex(projectId), refreshReadiness(projectId)]);
+      const spent = formatCost(report.costUsd);
+      if (report.status === "cancelled") {
+        setMessage(`Analysis stopped during ${analysisStageLabels[report.stageReached].toLocaleLowerCase()}; ${report.analysis.analyzed} clips analyzed, ${spent} spent. Run it again to resume.`);
+      } else {
+        setMessage(`Analyzed ${report.analysis.analyzed} clips and transcribed ${report.transcripts.transcribed}; ${spent} spent`);
+      }
+      if (report.analysis.budgetExhausted) {
+        setError(`Stopped at the ${formatCost(budget)} budget for this run. Raise it and run again to continue.`);
+      }
+      const failure = report.proxies.failures[0] ?? report.transcripts.failures[0] ?? report.analysis.failures[0];
+      if (failure && !report.analysis.budgetExhausted) setError(failure.error);
+    } catch (reason) {
+      setError(String(reason));
+    } finally {
+      activeOperationRef.current = null;
+      setOperationProgress(null);
+      setBusy(false);
+    }
+  }
+
+  async function stopAnalysis() {
+    try {
+      await api.cancelAnalysis();
+      setMessage("Stopping after the clip in progress…");
+    } catch (reason) {
+      setError(String(reason));
+    }
+  }
+
+  async function installModels() {
+    setError("");
+    setModelInstall({ name: "", downloadedBytes: 0, totalBytes: 1 });
+    try {
+      setModels(await api.installAnalysisModels());
+      if (projectId) await refreshReadiness(projectId);
+      setMessage("Speech models installed");
+    } catch (reason) {
+      setError(String(reason));
+    } finally {
+      setModelInstall(null);
+    }
+  }
+
+  async function saveOpenRouterKey() {
+    setError("");
+    try {
+      setKeyPresent(await api.setOpenRouterKey(keyInput));
+      setKeyInput("");
+      if (projectId) await refreshReadiness(projectId);
+      setMessage(keyPresent ? "OpenRouter key updated" : "OpenRouter key stored in your Keychain");
+    } catch (reason) {
+      setError(String(reason));
+    }
+  }
+
+  function seekTo(seconds: number) {
+    const video = videoRef.current;
+    if (!video) return;
+    video.currentTime = Math.max(0, seconds);
+    setPlaybackSeconds(video.currentTime);
   }
 
   async function makeMissingThumbnails() {
@@ -1127,6 +1367,11 @@ function App() {
                 <kbd>T</kbd>
                 <small>Quality 1 · frame at 20%</small>
               </button>
+              <button disabled={busy || !projectId} onClick={openAnalysisDialog} aria-keyshortcuts="A">
+                <span>{readiness?.missingAnalyses ? `Analyze ${readiness.missingAnalyses} clips` : "Analysis up to date"}</span>
+                <kbd>A</kbd>
+                <small>Proxies, speech, then cloud vision</small>
+              </button>
             </div>
           )}
         </div>
@@ -1140,7 +1385,13 @@ function App() {
         <span className={busy ? "pulse" : "status-dot"} />
         {operationProgress ? (
           <div className="operation-progress">
-            <span>{operationProgress.kind === "thumbnail" ? "Generating thumbnails…" : "Generating proxies…"}</span>
+            <span>
+              {operationProgress.kind === "analysis" && operationProgress.stage
+                ? `${analysisStageLabels[operationProgress.stage]} (step ${(operationProgress.stageIndex ?? 0) + 1} of ${operationProgress.stageCount ?? 3})…`
+                : operationProgress.kind === "thumbnail"
+                  ? "Generating thumbnails…"
+                  : "Generating proxies…"}
+            </span>
             <div
               className="progress-track"
               role="progressbar"
@@ -1155,7 +1406,13 @@ function App() {
                   : 0}%` }} />
             </div>
             <output>{operationProgress.completed}/{operationProgress.total}</output>
-            <span className="progress-eta">{formatEta(operationProgress.estimatedRemainingSeconds)} · {operationProgress.workerCount} worker{operationProgress.workerCount === 1 ? "" : "s"}</span>
+            <span className="progress-eta">
+              {formatEta(operationProgress.estimatedRemainingSeconds)} · {operationProgress.workerCount} worker{operationProgress.workerCount === 1 ? "" : "s"}
+              {operationProgress.kind === "analysis" ? ` · ${formatCost(operationProgress.costUsd ?? 0)} spent` : ""}
+            </span>
+            {operationProgress.kind === "analysis" && (
+              <button className="button ghost progress-cancel" onClick={stopAnalysis}>Cancel</button>
+            )}
           </div>
         ) : <span>{message}</span>}
         {error && <span className="error-message">{error}</span>}
@@ -1169,6 +1426,14 @@ function App() {
               <h1>{project?.name ?? "No project"}</h1>
             </div>
             <div className="queue-heading-actions">
+              {unusableCount > 0 && !showRemoved && (
+                <button
+                  className={`queue-view-toggle ${showUnusableOnly ? "active" : ""}`}
+                  onClick={() => setShowUnusableOnly((current) => !current)}
+                  aria-pressed={showUnusableOnly}
+                  title="Clips the analysis judged unusable"
+                >{showUnusableOnly ? "All clips" : `Unusable ${unusableCount}`}</button>
+              )}
               {removedCount > 0 && (
                 <button
                   className={`queue-view-toggle ${showRemoved ? "active" : ""}`}
@@ -1185,7 +1450,7 @@ function App() {
               id="queue-search"
               value={query}
               onChange={(event) => setQuery(event.target.value)}
-              placeholder="Filter filename, labels, notes…"
+              placeholder="Filter titles, labels, notes, speech…"
             />
             <kbd>/</kbd>
           </label>
@@ -1214,8 +1479,19 @@ function App() {
                     <span className="queue-index">{String(index + 1).padStart(3, "0")}</span>
                   </span>
                   <span className="queue-main">
-                    <strong>{asset.filename}</strong>
-                    <span>{asset.camera}</span>
+                    <strong>{clipTitle(asset)}</strong>
+                    {/* The filename stays visible but stops being the headline
+                        once analysis has named the clip. The verdict sits on
+                        this line, inside the flexible column, so a long reason
+                        truncates instead of widening the row. */}
+                    <span className="queue-meta">
+                      {analysisIndex[asset.id]?.usable === false && (
+                        <span className="unusable-pip" title={`Analysis flagged this clip: ${analysisIndex[asset.id]?.unusableReason || "unusable"}`}>
+                          {analysisIndex[asset.id]?.unusableReason || "unusable"}
+                        </span>
+                      )}
+                      <span>{asset.title.trim() ? `${asset.filename} · ${asset.camera}` : asset.camera}</span>
+                    </span>
                   </span>
                   <span className="queue-tail">
                     <time>{formatDuration(asset.durationSeconds)}</time>
@@ -1512,7 +1788,20 @@ function App() {
             <>
               <div className="inspector-title">
                 <span className="eyebrow">Clip log</span>
-                <h2>{selected.filename}</h2>
+                {/* Editable in place: a generated title is a suggestion, and an
+                    edit must survive the clip being analyzed again. */}
+                <input
+                  className="clip-title-field"
+                  value={selected.title}
+                  placeholder={selected.filename}
+                  aria-label="Clip title"
+                  onChange={(event) => replaceAsset({ ...selected, title: event.target.value })}
+                  onBlur={() => void saveClipSummary(selected)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") event.currentTarget.blur();
+                  }}
+                />
+                <span className="inspector-filename">{selected.filename}</span>
                 <span className={selected.available ? "availability online" : "availability offline"}>
                   {selected.available ? "Media available" : "Original offline"}
                 </span>
@@ -1586,6 +1875,80 @@ function App() {
                   </button>
                 )}
               </section>
+
+              {observation && (
+                <section className={`inspector-section observation-section ${observation.analysis.usable ? "" : "is-unusable"}`}>
+                  <div className="section-heading-row">
+                    <span className="section-label">Description</span>
+                    <span className="section-note">
+                      {observation.current ? observation.analysis.model : "Stale — proxy changed since"}
+                    </span>
+                  </div>
+                  {!observation.analysis.usable && (
+                    <p className="unusable-callout">
+                      Flagged unusable{observation.analysis.unusableReason ? `: ${observation.analysis.unusableReason}` : ""}.
+                      {" "}Your call — this does not remove the clip.
+                    </p>
+                  )}
+                  <textarea
+                    className="description-field"
+                    value={selected.description}
+                    placeholder="No description yet."
+                    aria-label="Clip description"
+                    onChange={(event) => replaceAsset({ ...selected, description: event.target.value })}
+                    onBlur={() => void saveClipSummary(selected)}
+                  />
+                  <div className="observation-facts">
+                    <span className="chip">{observation.analysis.cameraMovement}</span>
+                    {observation.analysis.transcriptUsed && <span className="chip">speech used</span>}
+                    {observation.aiLabels.map((label) => <span className="chip suggested" key={label}>{label}</span>)}
+                  </div>
+                  {observation.analysis.bestMomentStartMs !== null && (
+                    <button
+                      className="button ghost"
+                      onClick={() => seekTo((observation.analysis.bestMomentStartMs ?? 0) / 1000)}
+                    >
+                      Jump to best moment · {formatTimecode(observation.analysis.bestMomentStartMs)}
+                    </button>
+                  )}
+                  {observation.analysis.ocrText.length > 0 && (
+                    <div className="ocr-list">
+                      <span className="section-note">Text on screen</span>
+                      <p>{observation.analysis.ocrText.join(" · ")}</p>
+                    </div>
+                  )}
+                </section>
+              )}
+
+              {transcript && (
+                <section className="inspector-section transcript-section">
+                  <div className="section-heading-row">
+                    <span className="section-label">Transcript</span>
+                    <span className="section-note">
+                      {transcriptStatusLabels[transcript.status]}
+                      {transcript.status === "speech" ? ` · ${transcript.primaryLanguage || "unknown"}` : ""}
+                    </span>
+                  </div>
+                  {transcript.segments.length === 0 ? (
+                    <p className="transcript-empty">
+                      {transcript.status === "no_speech"
+                        ? "No speech in this clip."
+                        : transcript.rejectReason || "Nothing was transcribed."}
+                    </p>
+                  ) : (
+                    <ol className="transcript-list">
+                      {transcript.segments.map((segment) => (
+                        <li key={`${segment.startMs}-${segment.endMs}`}>
+                          <button onClick={() => seekTo(segment.startMs / 1000)} title="Jump to this moment">
+                            <span className="mono">{formatTimecode(segment.startMs)}</span>
+                            <span>{segment.text}</span>
+                          </button>
+                        </li>
+                      ))}
+                    </ol>
+                  )}
+                </section>
+              )}
 
               <section className="inspector-section notes-section">
                 <label htmlFor="notes" className="section-label">Notes <kbd>N</kbd><kbd>Enter</kbd></label>
@@ -1739,6 +2102,71 @@ function App() {
               </div>
               {api.isDesktop() && <button className="button secondary" disabled={busy} onClick={() => void configureProjectsRoot()}>Change…</button>}
             </div>
+
+            <fieldset className="settings-group analysis-setting">
+              <legend>Clip analysis</legend>
+
+              <div className="settings-row">
+                <div>
+                  <span className="settings-legend">Speech models</span>
+                  <small>
+                    Downloaded once and shared by every project. Nothing else in the app downloads
+                    them: a batch fails with an explanation instead.
+                  </small>
+                  <ul className="model-list">
+                    {models.map((model) => (
+                      <li key={model.name}>
+                        <span className="mono">{model.name}</span>
+                        <span>{model.installed ? "Installed" : `${Math.round(model.bytes / 1_000_000)} MB`}</span>
+                      </li>
+                    ))}
+                  </ul>
+                  {modelInstall && (
+                    <div className="model-progress">
+                      <div className="progress-track" role="progressbar" aria-valuemin={0} aria-valuemax={modelInstall.totalBytes} aria-valuenow={modelInstall.downloadedBytes}>
+                        <span style={{ width: `${modelInstall.totalBytes ? (modelInstall.downloadedBytes / modelInstall.totalBytes) * 100 : 0}%` }} />
+                      </div>
+                      <span className="section-note">
+                        {modelInstall.name || "Starting"} · {formatBytes(modelInstall.downloadedBytes)} of {formatBytes(modelInstall.totalBytes)}
+                      </span>
+                    </div>
+                  )}
+                </div>
+                <button
+                  className="button secondary"
+                  disabled={Boolean(modelInstall) || models.every((model) => model.installed)}
+                  onClick={() => void installModels()}
+                >
+                  {models.every((model) => model.installed) ? "Installed" : modelInstall ? "Downloading…" : "Install"}
+                </button>
+              </div>
+
+              <div className="settings-row">
+                <div>
+                  <span className="settings-legend">OpenRouter key</span>
+                  <small>
+                    Stored in your macOS Keychain, never in a project catalog. Required only for the
+                    cloud analysis step; transcription runs offline without it.
+                  </small>
+                  <label className="field-label">
+                    <span className="sr-only">OpenRouter key</span>
+                    <input
+                      type="password"
+                      value={keyInput}
+                      placeholder={keyPresent ? "A key is stored. Enter a new one to replace it." : "sk-or-…"}
+                      autoComplete="off"
+                      onChange={(event) => setKeyInput(event.target.value)}
+                    />
+                  </label>
+                </div>
+                <div className="settings-row-actions">
+                  <button className="button secondary" disabled={!keyInput.trim()} onClick={() => void saveOpenRouterKey()}>Save</button>
+                  {keyPresent && (
+                    <button className="text-button" onClick={() => { setKeyInput(""); void api.setOpenRouterKey("").then(setKeyPresent); }}>Remove</button>
+                  )}
+                </div>
+              </div>
+            </fieldset>
 
             <div className="settings-group server-setting">
               <div>
@@ -1970,6 +2398,93 @@ function App() {
         </div>
       )}
 
+      {showAnalysisDialog && readiness && (
+        <div className="modal-backdrop" role="presentation">
+          <section className="modal analysis-modal" role="dialog" aria-modal="true" aria-labelledby="analysis-title">
+            <span className="eyebrow">Analyze project</span>
+            <h2 id="analysis-title">{project?.name ?? "This project"}</h2>
+
+            <ol className="stage-plan">
+              <li>
+                <strong>{readiness.missingProxies}</strong>
+                <span>proxies to make</span>
+                <small>Local. Both later steps read the proxy, so this runs first.</small>
+              </li>
+              <li>
+                <strong>{readiness.missingTranscripts}</strong>
+                <span>clips to transcribe</span>
+                <small>Local and offline. No API key, no cost.</small>
+              </li>
+              <li>
+                <strong>{readiness.missingAnalyses}</strong>
+                <span>clips to analyze</span>
+                <small>Cloud vision. This is the step that spends money.</small>
+              </li>
+            </ol>
+
+            <div className="cost-projection">
+              <div>
+                <span>Projected cost</span>
+                <strong>{formatCost(readiness.estimatedCostUsd)}</strong>
+              </div>
+              <p>
+                {readiness.costBasis === "observed"
+                  ? `Based on $${readiness.observedCostPerClipUsd.toFixed(6)} per clip already analyzed in this project.`
+                  : `No clips analyzed here yet, so this uses the reference measurement of $${readiness.observedCostPerClipUsd.toFixed(6)} per clip. The first run replaces it with your own.`}
+                {readiness.lastRun && readiness.lastRun.status !== "running"
+                  ? ` Last run: ${readiness.lastRun.clipsAnalyzed} clips, ${formatCost(readiness.lastRun.costUsd)}.`
+                  : ""}
+              </p>
+            </div>
+
+            <label className="field-label">Stop this run at
+              <input
+                type="number"
+                min="0"
+                step="0.25"
+                value={budgetInput}
+                onChange={(event) => setBudgetInput(event.target.value)}
+                aria-describedby="budget-note"
+              />
+            </label>
+            <p id="budget-note" className="section-note">
+              US dollars. The run stops once returned provider usage reaches this, keeping whatever it finished.
+            </p>
+
+            <label className="checkbox-row">
+              <input type="checkbox" checked={forceReanalyze} onChange={(event) => setForceReanalyze(event.target.checked)} />
+              <span>Re-analyze clips that already have a description. Your edits to titles and descriptions will be overwritten; notes and your own labels are never touched.</span>
+            </label>
+
+            {!readiness.modelsReady && (
+              <p className="blocking-note">
+                Speech models are not installed, so transcription would fail for every clip.
+                {" "}
+                <button className="text-button" onClick={() => { setShowAnalysisDialog(false); setShowSettings(true); }}>Install them in Settings</button>
+              </p>
+            )}
+            {!readiness.apiKeyPresent && (
+              <p className="blocking-note">
+                No OpenRouter key, so clip analysis cannot run.
+                {" "}
+                <button className="text-button" onClick={() => { setShowAnalysisDialog(false); setShowSettings(true); }}>Add one in Settings</button>
+              </p>
+            )}
+
+            <div className="modal-actions">
+              <button className="button ghost" onClick={() => setShowAnalysisDialog(false)}>Cancel</button>
+              <button
+                className="button primary"
+                disabled={!readiness.modelsReady || !readiness.apiKeyPresent || readiness.totalClips === 0}
+                onClick={runAnalysis}
+              >
+                Start
+              </button>
+            </div>
+          </section>
+        </div>
+      )}
+
       {showShortcuts && (
         <div className="modal-backdrop shortcut-backdrop" role="presentation">
           <section className="modal shortcut-modal" role="dialog" aria-modal="true" aria-labelledby="shortcut-title">
@@ -1994,6 +2509,7 @@ function App() {
               <div><kbd>P</kbd><span>Proxy selected clip</span></div>
               <div><kbd>⇧P</kbd><span>Generate missing proxies</span></div>
               <div><kbd>T</kbd><span>Generate missing thumbnails</span></div>
+              <div><kbd>A</kbd><span>Analyze project</span></div>
               <div><kbd>M</kbd><span>Add media</span></div>
               <div><kbd>⌘N</kbd><kbd>⌘O</kbd><span>New / open project</span></div>
               <div><kbd>⌘,</kbd><span>Open global settings</span></div>

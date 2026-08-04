@@ -5,7 +5,7 @@ use chrono::{DateTime, Duration, NaiveDateTime, SecondsFormat, Utc};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
@@ -58,6 +58,8 @@ pub use analysis::provider::{
     ChainOutcome, DEFAULT_MODEL, FALLBACK_MODEL, MODELS, ModelSpec, ProviderChain, VlmProvider,
     VlmRequest, VlmResponse, model_spec,
 };
+pub use batch_estimator::BatchEstimate as BatchProgressEstimate;
+
 pub use analysis::quality::DecodedSegment;
 pub use analysis::schema::{
     CameraMovement, ClipObservation, DomainError, UnusableReason, output_schema,
@@ -313,6 +315,36 @@ pub struct AssetBatchProgress {
     pub estimate: BatchEstimate,
 }
 
+/// The analysis facts a queue row needs, for one clip.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AssetAnalysisIndexEntry {
+    pub asset_id: String,
+    /// Absent when the clip has never been transcribed. `no_speech` is a value,
+    /// not an absence.
+    pub transcript_status: Option<String>,
+    /// Every segment's text joined, for substring search.
+    pub transcript_text: String,
+    pub analyzed: bool,
+    pub usable: bool,
+    pub unusable_reason: String,
+}
+
+impl AssetAnalysisIndexEntry {
+    fn empty(asset_id: &str) -> Self {
+        Self {
+            asset_id: asset_id.to_string(),
+            transcript_status: None,
+            transcript_text: String::new(),
+            analyzed: false,
+            // Defaults to usable so a clip with no observation is never hidden
+            // by the unusable filter.
+            usable: true,
+            unusable_reason: String::new(),
+        }
+    }
+}
+
 /// One clip's observation as the review surface needs it.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -515,6 +547,10 @@ pub struct AnalysisRunOptions {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AnalyzeBatchProgress {
+    /// The clip this event is about. `AnalysisOutcome` describes the model's
+    /// response and does not identify the clip, so a UI updating a row needs
+    /// this separately.
+    pub asset_id: Option<String>,
     pub outcome: Option<AnalysisOutcome>,
     pub estimate: BatchEstimate,
 }
@@ -1349,6 +1385,90 @@ impl Catalog {
         Ok(path)
     }
 
+    /// Replaces a clip's title and description with a human edit.
+    ///
+    /// These are AI-written but human-editable, which is why they live on the
+    /// asset beside `notes` rather than inside the analysis row: an edit has to
+    /// survive the observation being deleted or re-run. Deliberately a separate
+    /// operation rather than part of `AssetPatch`, whose four fields are a
+    /// full-replacement contract shared with the CLI and the browser.
+    ///
+    /// Written directly rather than as a typed operation, matching how analysis
+    /// writes the same columns; neither is synchronized between nodes today.
+    pub fn set_clip_summary(
+        &self,
+        asset_id: &str,
+        title: &str,
+        description: &str,
+    ) -> Result<Asset> {
+        let connection = self.connection()?;
+        set_title_and_description(&connection, asset_id, title.trim(), description.trim())?;
+        drop(connection);
+        self.get_asset(asset_id)
+    }
+
+    /// Per-clip analysis facts the queue needs for every clip at once.
+    ///
+    /// The review queue filters on transcript text and flags unusable clips, so
+    /// it needs these for the whole project. Fetching them per clip would be one
+    /// round trip per row; this is two queries for the project. Only clips with
+    /// something recorded appear.
+    pub fn project_analysis_index(&self, project_id: &str) -> Result<Vec<AssetAnalysisIndexEntry>> {
+        let connection = self.connection()?;
+        let mut entries: HashMap<String, AssetAnalysisIndexEntry> = HashMap::new();
+
+        let mut transcripts = connection.prepare(
+            "SELECT t.asset_id, t.status, COALESCE(GROUP_CONCAT(s.text, ' '), '')
+             FROM asset_transcripts t
+             JOIN assets a ON a.id = t.asset_id
+             LEFT JOIN transcript_segments s ON s.asset_id = t.asset_id
+             WHERE a.project_id = ?1
+             GROUP BY t.asset_id, t.status",
+        )?;
+        let rows = transcripts.query_map([project_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (asset_id, status, text) = row?;
+            let entry = entries
+                .entry(asset_id.clone())
+                .or_insert_with(|| AssetAnalysisIndexEntry::empty(&asset_id));
+            entry.transcript_status = Some(status);
+            entry.transcript_text = text;
+        }
+
+        let mut analyses = connection.prepare(
+            "SELECT n.asset_id, n.usable, n.unusable_reason
+             FROM asset_analyses n
+             JOIN assets a ON a.id = n.asset_id
+             WHERE a.project_id = ?1",
+        )?;
+        let rows = analyses.query_map([project_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)? != 0,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (asset_id, usable, unusable_reason) = row?;
+            let entry = entries
+                .entry(asset_id.clone())
+                .or_insert_with(|| AssetAnalysisIndexEntry::empty(&asset_id));
+            entry.analyzed = true;
+            entry.usable = usable;
+            entry.unusable_reason = unusable_reason;
+        }
+
+        let mut index = entries.into_values().collect::<Vec<_>>();
+        index.sort_by(|left, right| left.asset_id.cmp(&right.asset_id));
+        Ok(index)
+    }
+
     /// The stored transcript for one clip, if it has one.
     ///
     /// `no_speech` is returned as a normal transcript with no segments, not as
@@ -2104,6 +2224,7 @@ impl Catalog {
             self.load_batch_history(&task_key)?,
         );
         let start = on_progress(AnalyzeBatchProgress {
+            asset_id: None,
             outcome: None,
             estimate: estimator.estimate(&task_work),
         });
@@ -2180,6 +2301,8 @@ impl Catalog {
                     .enumerate()
                     .filter_map(|(index, weight)| (!completed[index]).then_some(*weight))
                     .collect::<Vec<_>>();
+                // Captured before the failure arm moves the asset's path.
+                let asset_id = Some(asset.id.clone());
                 let flow;
                 match result {
                     Ok(outcome) => {
@@ -2194,6 +2317,7 @@ impl Catalog {
                         }
                         report.outcomes.push(outcome.clone());
                         flow = on_progress(AnalyzeBatchProgress {
+                            asset_id,
                             outcome: Some(outcome),
                             estimate: estimator.estimate(&remaining),
                         });
@@ -2205,6 +2329,7 @@ impl Catalog {
                             error: format!("{error:#}"),
                         });
                         flow = on_progress(AnalyzeBatchProgress {
+                            asset_id,
                             outcome: None,
                             estimate: estimator.estimate(&remaining),
                         });

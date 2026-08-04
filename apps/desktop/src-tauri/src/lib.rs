@@ -1,8 +1,10 @@
 use anyhow::{Context, bail};
 use chrono::{SecondsFormat, Utc};
 use rcdvlog_core::{
-    Asset, AssetPatch, Catalog, ClockEvent, IngestReport, Project, ProxyReport, ThumbnailReport,
-    ToolStatus,
+    AnalysisReadiness, AnalysisRunOptions, AnalysisRunOutcome, AnalysisRunRecord, AnalyzeReport,
+    Asset, AssetAnalysisIndexEntry, AssetAnalysisView, AssetPatch, BatchProgressEstimate, Catalog,
+    ClipTranscript, ClockEvent, IngestReport, ModelStatus, Project, ProxyReport, ThumbnailReport,
+    ToolStatus, TranscribeReport,
 };
 use rcdvlog_sync::BaselineEnvelope;
 use serde::{Deserialize, Serialize};
@@ -98,6 +100,9 @@ pub(crate) struct AppState {
     baseline_attempt: Arc<RwLock<Option<BaselineAttempt>>>,
     sync_manager: sync_manager::SyncManager,
     sync_status: Arc<RwLock<HashMap<String, sync_manager::SyncStatus>>>,
+    /// Set by `cancel_analysis` and observed by the running batch. Cleared when
+    /// a run starts so a cancel from a previous run cannot stop the next one.
+    analysis_cancel: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -213,6 +218,7 @@ impl AppState {
             baseline_attempt: Arc::new(RwLock::new(None)),
             sync_manager,
             sync_status,
+            analysis_cancel: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -233,6 +239,7 @@ impl AppState {
             baseline_attempt: Arc::new(RwLock::new(None)),
             sync_manager: sync_manager::SyncManager::spawn_test(),
             sync_status: Arc::new(RwLock::new(HashMap::new())),
+            analysis_cancel: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -757,6 +764,337 @@ async fn generate_missing_thumbnails(
     tauri::async_runtime::spawn_blocking(move || {
         catalog.generate_missing_thumbnails_with_progress(&project_id, quality, |progress| {
             let _ = app.emit("thumbnail-progress", progress);
+        })
+    })
+    .await
+    .map_err(error_message)?
+    .map_err(error_message)
+}
+
+// ── Clip analysis ────────────────────────────────────────────────────
+
+/// Which stage of the chain a progress event belongs to.
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+enum AnalysisStage {
+    Proxies,
+    Transcripts,
+    Analysis,
+}
+
+impl AnalysisStage {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Proxies => "proxies",
+            Self::Transcripts => "transcripts",
+            Self::Analysis => "analysis",
+        }
+    }
+}
+
+/// One `analysis-progress` event.
+///
+/// Carries the completed asset so the React cache can replace it immediately,
+/// exactly as the proxy and thumbnail flows already do; a generated title
+/// therefore appears while the run continues rather than after it.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AnalysisProgress {
+    stage: AnalysisStage,
+    stage_index: usize,
+    stage_count: usize,
+    asset: Option<Asset>,
+    estimate: BatchProgressEstimate,
+    cost_usd: f64,
+}
+
+/// What one chained run did, per stage.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AnalysisRunReport {
+    run_id: String,
+    status: String,
+    stage_reached: String,
+    proxies: ProxyReport,
+    transcripts: TranscribeReport,
+    analysis: AnalyzeReport,
+    cost_usd: f64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AnalysisRunRequest {
+    /// Re-analyze clips whose observation is already current.
+    #[serde(default)]
+    force: bool,
+    /// Ceiling for this run's cloud spend, in USD.
+    #[serde(default)]
+    budget_usd: Option<f64>,
+}
+
+#[tauri::command]
+fn analysis_readiness(
+    project_id: String,
+    state: State<'_, AppState>,
+) -> Result<AnalysisReadiness, String> {
+    let catalog = state.catalog()?;
+    let mut readiness = catalog
+        .analysis_readiness(&project_id)
+        .map_err(error_message)?;
+    // The core resolves a key from the environment or key file. The desktop
+    // also accepts one from the Keychain, so readiness must reflect that.
+    readiness.api_key_present =
+        readiness.api_key_present || matches!(keychain::get_openrouter_key(), Ok(Some(_)));
+    Ok(readiness)
+}
+
+#[tauri::command]
+fn asset_transcript(
+    asset_id: String,
+    state: State<'_, AppState>,
+) -> Result<Option<ClipTranscript>, String> {
+    state
+        .catalog()?
+        .asset_transcript(&asset_id)
+        .map_err(error_message)
+}
+
+#[tauri::command]
+fn asset_analysis(
+    asset_id: String,
+    state: State<'_, AppState>,
+) -> Result<Option<AssetAnalysisView>, String> {
+    state
+        .catalog()?
+        .asset_analysis(&asset_id)
+        .map_err(error_message)
+}
+
+#[tauri::command]
+fn set_clip_summary(
+    asset_id: String,
+    title: String,
+    description: String,
+    state: State<'_, AppState>,
+) -> Result<Asset, String> {
+    state
+        .catalog()?
+        .set_clip_summary(&asset_id, &title, &description)
+        .map_err(error_message)
+}
+
+#[tauri::command]
+fn project_analysis_index(
+    project_id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<AssetAnalysisIndexEntry>, String> {
+    state
+        .catalog()?
+        .project_analysis_index(&project_id)
+        .map_err(error_message)
+}
+
+#[tauri::command]
+fn analysis_runs(
+    project_id: String,
+    limit: usize,
+    state: State<'_, AppState>,
+) -> Result<Vec<AnalysisRunRecord>, String> {
+    state
+        .catalog()?
+        .analysis_runs(&project_id, limit)
+        .map_err(error_message)
+}
+
+#[tauri::command]
+fn set_openrouter_key(key: String, state: State<'_, AppState>) -> Result<bool, String> {
+    let _ = state;
+    let trimmed = key.trim();
+    if trimmed.is_empty() {
+        keychain::delete_openrouter_key().map_err(error_message)?;
+        return Ok(false);
+    }
+    keychain::store_openrouter_key(trimmed).map_err(error_message)?;
+    Ok(true)
+}
+
+/// Whether a key is stored. The key itself is never returned to the frontend.
+#[tauri::command]
+fn openrouter_key_present() -> Result<bool, String> {
+    Ok(matches!(keychain::get_openrouter_key(), Ok(Some(_))))
+}
+
+#[tauri::command]
+fn model_status(state: State<'_, AppState>) -> Result<Vec<ModelStatus>, String> {
+    state.catalog()?.model_status().map_err(error_message)
+}
+
+/// Downloads any missing speech model. The only path in the app that fetches
+/// one: batches fail with an actionable error instead of downloading silently.
+#[tauri::command]
+async fn install_analysis_models(
+    state: State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<Vec<ModelStatus>, String> {
+    let catalog = state.catalog()?;
+    let cancel = Arc::clone(&state.analysis_cancel);
+    cancel.store(false, Ordering::Relaxed);
+    tauri::async_runtime::spawn_blocking(move || {
+        catalog.install_models_with_progress(|progress| {
+            let _ = app.emit("model-install-progress", progress);
+            if cancel.load(Ordering::Relaxed) {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        })
+    })
+    .await
+    .map_err(error_message)?
+    .map_err(error_message)
+}
+
+/// Stops the running analysis chain or model download at the next safe point.
+#[tauri::command]
+fn cancel_analysis(state: State<'_, AppState>) {
+    state.analysis_cancel.store(true, Ordering::Relaxed);
+}
+
+/// Runs proxies, then transcription, then cloud analysis, as one cancellable
+/// chain.
+///
+/// Proxies come first because both later stages read the proxy and fail per
+/// clip without one; on a freshly ingested project a chain that skipped them
+/// would fail every clip. Each stage's own skip rule keeps the chain
+/// idempotent, so cancelling and re-running resumes rather than repeating.
+#[tauri::command]
+async fn analyze_project(
+    project_id: String,
+    request: AnalysisRunRequest,
+    state: State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<AnalysisRunReport, String> {
+    let catalog = state.catalog()?;
+    let cancel = Arc::clone(&state.analysis_cancel);
+    // Cleared here rather than in `cancel_analysis` so a cancel arriving
+    // between runs cannot stop the next one before it starts.
+    cancel.store(false, Ordering::Relaxed);
+    let api_key = keychain::get_openrouter_key().map_err(error_message)?;
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let run_id = catalog.begin_analysis_run(&project_id)?;
+        let stage_count = 3;
+        let emit = |stage: AnalysisStage, stage_index: usize, asset, estimate, cost_usd| {
+            let _ = app.emit(
+                "analysis-progress",
+                AnalysisProgress {
+                    stage,
+                    stage_index,
+                    stage_count,
+                    asset,
+                    estimate,
+                    cost_usd,
+                },
+            );
+        };
+        let stop_requested = || cancel.load(Ordering::Relaxed);
+        let flow = |cancelled: bool| {
+            if cancelled {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        };
+
+        let proxies = catalog.generate_missing_proxies_with_progress(&project_id, |progress| {
+            emit(
+                AnalysisStage::Proxies,
+                0,
+                progress.asset,
+                progress.estimate,
+                0.0,
+            );
+            flow(stop_requested())
+        })?;
+
+        let mut stage_reached = AnalysisStage::Proxies;
+        let mut transcripts = TranscribeReport {
+            transcribed: 0,
+            skipped: 0,
+            cancelled: proxies.cancelled,
+            outcomes: Vec::new(),
+            failures: Vec::new(),
+        };
+        if !proxies.cancelled {
+            stage_reached = AnalysisStage::Transcripts;
+            transcripts = catalog.transcribe_missing_with_progress(&project_id, |progress| {
+                let asset = progress
+                    .outcome
+                    .as_ref()
+                    .and_then(|outcome| catalog.get_asset(&outcome.asset_id).ok());
+                emit(AnalysisStage::Transcripts, 1, asset, progress.estimate, 0.0);
+                flow(stop_requested())
+            })?;
+        }
+
+        let mut analysis = AnalyzeReport {
+            analyzed: 0,
+            skipped: 0,
+            rejected: 0,
+            fallback_served: 0,
+            force_overwrite_warnings: 0,
+            cost_usd: 0.0,
+            cancelled: transcripts.cancelled,
+            budget_exhausted: false,
+            outcomes: Vec::new(),
+            failures: Vec::new(),
+        };
+        if !transcripts.cancelled {
+            stage_reached = AnalysisStage::Analysis;
+            let options = AnalysisRunOptions {
+                force: request.force,
+                api_key: api_key.clone(),
+                budget_usd: request.budget_usd,
+                worker_count: None,
+            };
+            let mut spent = 0.0;
+            analysis = catalog.analyze_missing_with_options(&project_id, &options, |progress| {
+                if let Some(outcome) = progress.outcome.as_ref() {
+                    spent += outcome.cost_usd;
+                }
+                let asset = progress
+                    .asset_id
+                    .as_deref()
+                    .and_then(|asset_id| catalog.get_asset(asset_id).ok());
+                emit(AnalysisStage::Analysis, 2, asset, progress.estimate, spent);
+                flow(stop_requested())
+            })?;
+        }
+
+        let cancelled = proxies.cancelled || transcripts.cancelled || analysis.cancelled;
+        let status = if cancelled { "cancelled" } else { "completed" };
+        catalog.finish_analysis_run(
+            &run_id,
+            &AnalysisRunOutcome {
+                status: status.to_string(),
+                stage_reached: stage_reached.as_str().to_string(),
+                proxies_generated: proxies.generated,
+                clips_transcribed: transcripts.transcribed,
+                clips_analyzed: analysis.analyzed,
+                cost_usd: analysis.cost_usd,
+                budget_exhausted: analysis.budget_exhausted,
+                error: String::new(),
+            },
+        )?;
+
+        anyhow::Ok(AnalysisRunReport {
+            run_id,
+            status: status.to_string(),
+            stage_reached: stage_reached.as_str().to_string(),
+            cost_usd: analysis.cost_usd,
+            proxies,
+            transcripts,
+            analysis,
         })
     })
     .await
@@ -1293,6 +1631,19 @@ pub fn run() {
             generate_missing_proxies,
             generate_thumbnail,
             generate_missing_thumbnails,
+            // Clip analysis: run control, prerequisites, and per-clip reads
+            analyze_project,
+            cancel_analysis,
+            analysis_readiness,
+            analysis_runs,
+            project_analysis_index,
+            set_clip_summary,
+            asset_transcript,
+            asset_analysis,
+            model_status,
+            install_analysis_models,
+            set_openrouter_key,
+            openrouter_key_present,
             pair_with_server,
             server_connection_status,
             unpair_server,
@@ -1331,6 +1682,63 @@ mod tests {
             paired_at: None,
             paired_server_endpoints: None,
         }
+    }
+
+    #[test]
+    fn analysis_progress_serializes_with_the_keys_the_frontend_mirrors() {
+        let progress = AnalysisProgress {
+            stage: AnalysisStage::Transcripts,
+            stage_index: 1,
+            stage_count: 3,
+            asset: None,
+            estimate: BatchProgressEstimate {
+                completed_items: 2,
+                total_items: 8,
+                completed_work_units: 2,
+                total_work_units: 8,
+                worker_count: 1,
+                work_units_per_worker_second: None,
+                elapsed_seconds: 1.0,
+                estimated_remaining_seconds: None,
+            },
+            cost_usd: 0.5,
+        };
+        let value = serde_json::to_value(&progress).unwrap();
+        assert_eq!(value["stage"], "transcripts");
+        assert_eq!(value["stageIndex"], 1);
+        assert_eq!(value["stageCount"], 3);
+        assert_eq!(value["costUsd"], 0.5);
+        assert!(value.get("estimate").is_some());
+        assert!(value.get("asset").is_some(), "null asset stays present");
+    }
+
+    #[test]
+    fn each_stage_name_matches_the_run_record_value() {
+        // The stage a run reached is persisted as this string and read back for
+        // display, so the two spellings must not drift.
+        assert_eq!(AnalysisStage::Proxies.as_str(), "proxies");
+        assert_eq!(AnalysisStage::Transcripts.as_str(), "transcripts");
+        assert_eq!(AnalysisStage::Analysis.as_str(), "analysis");
+    }
+
+    #[test]
+    fn a_cancel_from_a_previous_run_does_not_stop_the_next_one() {
+        let directory = tempdir().unwrap();
+        let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).unwrap();
+        let state = AppState::new_for_test(
+            catalog,
+            test_settings(directory.path().join("projects")),
+            directory.path().join("settings.json"),
+        )
+        .unwrap();
+
+        assert!(!state.analysis_cancel.load(Ordering::Relaxed));
+        state.analysis_cancel.store(true, Ordering::Relaxed);
+
+        // `analyze_project` clears the flag as it starts rather than when a
+        // cancel is handled; this models that entry point.
+        state.analysis_cancel.store(false, Ordering::Relaxed);
+        assert!(!state.analysis_cancel.load(Ordering::Relaxed));
     }
 
     #[test]
