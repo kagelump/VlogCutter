@@ -11,6 +11,7 @@
   --panel: #171c20;
   --panel-raised: #1d2328;
   --line: #2a3238;
+  --line-soft: #22292e;
   --line-strong: #3a454c;
   --amber: #e8a84f;
   --amber-soft: #6d4a22;
@@ -57,7 +58,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   min-width: 190px;
   color: var(--ink);
   background: var(--panel-raised);
-  border: 1px solid var(--line);
+  border: 1px solid var(--line-strong);
   border-radius: 5px;
   padding: 7px 28px 7px 9px;
 }
@@ -76,9 +77,15 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   transition: background 120ms ease, border-color 120ms ease, color 120ms ease;
 }
 .button:hover:not(:disabled) { border-color: #68757c; background: #252c31; }
-.button:disabled { opacity: .42; cursor: not-allowed; }
+/* Explicit muted colours rather than opacity: dimming the whole element
+   dimmed its border too, so a disabled button and an enabled one beside it
+   showed different outlines despite sharing a class. */
+.button:disabled { color: var(--quiet); background: var(--panel); border-color: var(--line-strong); cursor: not-allowed; }
 .button.primary { background: var(--amber); border-color: var(--amber); color: #21170c; }
 .button.primary:hover:not(:disabled) { background: #f0b763; border-color: #f0b763; }
+/* .button.primary matches .button:disabled on specificity and wins on source
+   order, so the disabled state needs its own rule or it renders as enabled. */
+.button.primary:disabled { color: #6b5a41; background: #4a3a22; border-color: #4a3a22; }
 .button.secondary { background: #1c2226; }
 .button.label-action { color: #24190b; background: var(--amber); border-color: var(--amber); }
 .button.label-action:hover:not(:disabled) { background: #f0b763; border-color: #f0b763; }
@@ -432,18 +439,18 @@ kbd { padding: 2px 4px; color: #a8b1b6; background: #262d32; border: 1px solid #
   align-items: center;
   gap: 6px;
   padding: 4px 10px;
-  border-radius: 6px;
-  background: none;
-  border: 1px solid var(--border-default);
+  border-radius: 3px;
+  background: transparent;
+  border: 1px solid var(--line-strong);
   cursor: pointer;
   font-size: 12px;
-  color: var(--color-text-muted);
-  transition: border-color 0.2s, background 0.2s;
+  color: var(--muted);
+  transition: border-color 120ms ease, color 120ms ease;
 }
 
 .sync-indicator:hover {
-  border-color: var(--color-accent);
-  background: var(--color-surface-raised);
+  border-color: var(--quiet);
+  color: var(--ink);
 }
 
 .sync-dot {
@@ -485,11 +492,11 @@ kbd { padding: 2px 4px; color: #a8b1b6; background: #262d32; border: 1px solid #
   align-items: flex-start;
   gap: 12px;
   padding: 6px 0;
-  border-bottom: 1px solid var(--border-default);
+  border-bottom: 1px solid var(--line);
 }
 
 .sync-diag-label {
-  color: var(--color-text-muted);
+  color: var(--muted);
   font-size: 13px;
   flex-shrink: 0;
 }
@@ -531,9 +538,9 @@ kbd { padding: 2px 4px; color: #a8b1b6; background: #262d32; border: 1px solid #
 .sync-diag-conflict {
   margin: 6px 0;
   padding: 10px;
-  background: var(--color-surface-2, #1e1e2e);
+  background: var(--panel-raised);
   border-radius: 6px;
-  border: 1px solid var(--color-border, #313244);
+  border: 1px solid var(--line);
 }
 
 .sync-diag-conflict-header {
@@ -554,11 +561,11 @@ kbd { padding: 2px 4px; color: #a8b1b6; background: #262d32; border: 1px solid #
 }
 
 .sync-diag-side-label {
-  font-size: 0.78em;
+  font-size: 10px;
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.04em;
-  color: var(--color-text-muted, #a6adc8);
+  color: var(--muted);
   display: block;
   margin-bottom: 4px;
 }
@@ -567,29 +574,29 @@ kbd { padding: 2px 4px; color: #a8b1b6; background: #262d32; border: 1px solid #
   display: flex;
   flex-direction: column;
   gap: 2px;
-  font-size: 0.85em;
-  color: var(--color-text, #cdd6f4);
+  font-size: 11px;
+  color: var(--ink);
 }
 
 .sync-diag-conflict-meta {
   margin-top: 8px;
-  font-size: 0.78em;
-  color: var(--color-text-muted, #a6adc8);
+  font-size: 10px;
+  color: var(--muted);
 }
 
 /* Chronology calibration and edit-plan drawers (D01-T015, T016, T023).
    Collapsed by default: the review queue stays the primary surface. */
 .chronology-drawer {
-  border-top: 1px solid var(--border, #2a2a33);
-  padding: 0.75rem 1rem 1.25rem;
+  border-top: 1px solid var(--line);
+  padding: 12px 16px 20px;
   overflow-y: auto;
   max-height: 45vh;
 }
 
 .chronology-drawer-tabs {
   display: flex;
-  gap: 0.5rem;
-  margin-bottom: 0.75rem;
+  gap: 8px;
+  margin-bottom: 12px;
 }
 
 .chronology-drawer-tabs button[aria-pressed="true"] {
@@ -599,18 +606,18 @@ kbd { padding: 2px 4px; color: #a8b1b6; background: #262d32; border: 1px solid #
 
 .calibration-panel h3,
 .edit-plan-panel h3 {
-  font-size: 0.85rem;
+  font-size: 13px;
   text-transform: uppercase;
   letter-spacing: 0.04em;
-  margin: 1rem 0 0.4rem;
+  margin: 16px 0 4px;
 }
 
 .calibration-summary,
 .edit-plan-summary {
   display: flex;
   flex-wrap: wrap;
-  gap: 1rem;
-  font-size: 0.85rem;
+  gap: 16px;
+  font-size: 13px;
 }
 
 .calibration-error,
@@ -618,33 +625,33 @@ kbd { padding: 2px 4px; color: #a8b1b6; background: #262d32; border: 1px solid #
 .calibration-contradictions,
 .edit-plan-errors {
   border-left: 3px solid #d0454c;
-  padding-left: 0.75rem;
+  padding-left: 12px;
 }
 
 /* An error is louder than a warning, and both are quieter than the queue. */
 .calibration-diagnostics li[data-severity="error"] { border-left: 3px solid #d0454c; }
 .calibration-diagnostics li[data-severity="warning"] { border-left: 3px solid #d1a24a; }
 .calibration-diagnostics li[data-severity="info"] { border-left: 3px solid #4a7fd1; }
-.calibration-diagnostics li { padding-left: 0.5rem; margin-bottom: 0.35rem; }
+.calibration-diagnostics li { padding-left: 8px; margin-bottom: 4px; }
 
 .calibration-unplaced { color: #d1a24a; }
 
 .calibration-editor label,
 .edit-plan-export label {
   display: block;
-  margin-bottom: 0.4rem;
-  font-size: 0.85rem;
+  margin-bottom: 4px;
+  font-size: 13px;
 }
 
 .calibration-confirm {
-  border: 1px solid var(--border, #2a2a33);
-  padding: 0.75rem;
-  margin-top: 0.75rem;
+  border: 1px solid var(--line);
+  padding: 12px;
+  margin-top: 12px;
 }
 
 .calibration-evidence {
   display: block;
-  font-size: 0.75rem;
+  font-size: 12px;
   opacity: 0.75;
 }
 
@@ -653,12 +660,12 @@ kbd { padding: 2px 4px; color: #a8b1b6; background: #262d32; border: 1px solid #
 .calibration-sequences li,
 .calibration-proposals li {
   display: flex;
-  gap: 0.75rem;
+  gap: 12px;
   align-items: baseline;
-  padding: 0.15rem 0;
+  padding: 2px 0;
 }
 
-.edit-plan-warnings { border-left: 3px solid #d1a24a; padding-left: 0.75rem; }
+.edit-plan-warnings { border-left: 3px solid #d1a24a; padding-left: 12px; }
 
 /* ── Clip analysis ─────────────────────────────────────────────────── */
 
