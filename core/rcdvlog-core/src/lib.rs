@@ -2303,8 +2303,7 @@ impl Catalog {
                     .collect::<Vec<_>>();
                 // Captured before the failure arm moves the asset's path.
                 let asset_id = Some(asset.id.clone());
-                let flow;
-                match result {
+                let flow = match result {
                     Ok(outcome) => {
                         estimator.record_completion(frames, elapsed);
                         report.analyzed += 1;
@@ -2316,11 +2315,11 @@ impl Catalog {
                             report.fallback_served += 1;
                         }
                         report.outcomes.push(outcome.clone());
-                        flow = on_progress(AnalyzeBatchProgress {
+                        on_progress(AnalyzeBatchProgress {
                             asset_id,
                             outcome: Some(outcome),
                             estimate: estimator.estimate(&remaining),
-                        });
+                        })
                     }
                     Err(error) => {
                         estimator.record_failure(frames);
@@ -2328,13 +2327,13 @@ impl Catalog {
                             path: asset.path,
                             error: format!("{error:#}"),
                         });
-                        flow = on_progress(AnalyzeBatchProgress {
+                        on_progress(AnalyzeBatchProgress {
                             asset_id,
                             outcome: None,
                             estimate: estimator.estimate(&remaining),
-                        });
+                        })
                     }
-                }
+                };
                 if flow.is_break() {
                     report.cancelled = true;
                     stop.store(true, Ordering::Relaxed);

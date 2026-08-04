@@ -172,6 +172,25 @@ verification. Installation is the only path that fetches anything.
 Browser-preview passes are not evidence for Keychain access, model download,
 media processing, or persistence; those need a real `pnpm dev` smoke test.
 
+## What implementation added to this design
+
+Three things the design did not anticipate, recorded here because they changed
+the shape of the work:
+
+1. **`project_analysis_index`.** The queue filters on transcript text and badges
+   unusable clips, which needs those facts for every clip, not just the selected
+   one. Per-clip calls would be one round trip per row, so the core exposes a
+   two-query project-wide index instead.
+2. **`set_clip_summary`.** Titles and descriptions had no write path from a
+   human: `AssetPatch` carries only notes, labels, removed, and rotation, and
+   widening that full-replacement contract would touch the CLI and browser
+   client. A dedicated operation was the smaller, clearer change.
+3. **A pre-existing queue-panel layout bug.** `.queue-panel` is a grid with no
+   column template, so its implicit column sized to max-content and every child
+   rendered wider than the 285px panel. This predates the analysis work — the
+   untouched shortcut strip was equally affected — but it clipped the new
+   Unusable toggle, so it is fixed here.
+
 ## Out of scope
 
 Local VLM inference, embeddings, semantic search, per-clip re-analysis from the

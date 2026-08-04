@@ -63,6 +63,11 @@ Implemented now:
 - Proxy-only cloud clip analysis with deterministic frame packs, transcript
   fusion, bounded observations, provider fallback, operation-backed AI labels,
   quality-10 representative thumbnails, and explicit label consolidation.
+- A desktop analysis surface: one cancellable proxies/transcription/analysis
+  chain with a pre-run cost projection and per-run budget ceiling, per-run spend
+  accounting, generated titles as the clip's display name, transcript and
+  observation review panels, transcript-aware queue search, unusable-clip
+  triage, and Keychain-stored OpenRouter credentials.
 - Weighted batch progress and ETA with project-persisted rate history.
 - Relative-order “story ribbon” with camera lanes, horizontal scrolling, and zoom.
 - A non-interactive JSON CLI for catalog, clip annotation, chronology, and media operations.
@@ -97,8 +102,9 @@ Important gaps; do not accidentally describe these as complete:
   reassignments, or bounded before/after impact summaries.
 - Web has automated Vitest and Chrome Playwright coverage; desktop React still has no component runner and there is no automated native Tauri UI suite.
 - No macOS signing/notarization or clean-machine packaging acceptance.
-- Clip analysis is CLI-only and requires an explicitly installed OpenRouter
-  key; there is no desktop review/acceptance surface for generated suggestions.
+- Analysis suggestions are shown and editable in the desktop, but there is no
+  per-suggestion accept/reject workflow: an AI title or description is simply an
+  editable field, and a forced re-run overwrites it.
 - Native media playback, filesystem permission prompts, sleep/wake, and NAS-scale behavior remain manual acceptance checks. Resolve import returns as a later edit-planning acceptance check.
 - Ubuntu/Compose, physical NFS/SMB outage behavior, Caddy/Tailscale HTTPS, native pairing/playback, and target resource/thermal acceptance remain unrun; see `docs/tasks/server/ACCEPTANCE_TASK_19.md`.
 
@@ -278,7 +284,7 @@ Always pass `--catalog` in agent automation, tests, and temporary workflows. A d
 
 SQLite connections enable foreign keys, WAL journal mode, and a five-second busy timeout. Read operations can continue during an uncommitted writer. Project mutations append typed operations with materialized revisions. Adopted projects synchronize bounded operation pages between independent local catalogs; live SQLite/WAL files are never copied or placed on NAS.
 
-Project catalogs use an explicit `schema_migrations` history and are currently at version 12. The server control catalog is version 10; backup format is version 1. Migration definitions have immutable names/source identities and each migration commits atomically. When changing the schema:
+Project catalogs use an explicit `schema_migrations` history and are currently at version 15. The server control catalog is version 10; backup format is version 1. Migration definitions have immutable names/source identities and each migration commits atomically. When changing the schema:
 
 - Preserve existing catalogs; never solve migration issues by deleting the database.
 - Add a forward migration and an upgrade test using an older schema fixture.
@@ -389,9 +395,15 @@ touches the network. Design and measurements:
 - **Do not use `no_speech_probability()`** as a quality gate. Measured median
   0.000 for good and bad transcripts alike. The gate that works is
   `repetition_ratio >= 0.3 OR mean_token_probability < 0.20`.
-- Models are resolved, not downloaded: a batch must not silently start a 574 MB
-  transfer. Install `ggml-large-v3-turbo-q5_0.bin` and `ggml-silero-v5.1.2.bin`
-  into `<project folder>/cache/models/`.
+- **A batch never downloads a model.** It fails with an actionable error naming
+  the file, its size, and where it belongs. Installation is a separate, explicit
+  user action: global settings offers it, and `Catalog::install_models_with_progress`
+  is the only code path that fetches anything. Preserve this split; a 574 MB
+  transfer must never begin as a side effect of pressing Analyze.
+- Models live in a shared application-support directory
+  (`<data dir>/com.rcd.vlogcutter/models/`) so one copy serves every project. The
+  older per-project `<project folder>/cache/models/` location is still read when
+  it holds the model, so existing installs are not re-downloaded.
 
 **Measured end to end**, release build, M3 MacBook Air (fanless), one worker,
 273-clip Osaka/Expo project, 129.1 minutes of footage:
@@ -428,7 +440,8 @@ Three of these correct round-1's projections and should be trusted over them:
 
 ### Clip analysis
 
-Cloud vision analysis is CLI-only and opt-in. It reads proxies, never originals,
+Cloud vision analysis is opt-in and runs from either the CLI or the desktop. It
+reads proxies, never originals,
 and sends a deterministic pack of JPEG frames plus an accepted speech transcript
 when one is current. The OpenRouter key resolves from `OPENROUTER_API_KEY` or
 `~/.openrouter.key`; it is never stored in a project catalog.
@@ -447,13 +460,26 @@ when one is current. The OpenRouter key resolves from `OPENROUTER_API_KEY` or
 - **Ownership**: title, description, and AI labels are suggestions. Human notes
   are never touched; label consolidation remaps only labels recorded in the AI
   ownership side table and commits the resulting label changes as typed project
-  operations.
+  operations. Title and description are human-editable through the dedicated
+  `set_clip_summary` operation; they are deliberately not part of `AssetPatch`,
+  whose four fields are a full-replacement contract shared with the CLI.
 - **Staleness**: analysis is current only for the same frame recipe, prompt
   version, representation, and proxy fingerprint. Regenerating the proxy makes
   the observation stale.
-- **Budget/concurrency**: `RCDVLOG_VLM_MAX_COST_USD` is checked before each
-  request against returned provider usage; `RCDVLOG_VLM_WORKERS` defaults to 4.
-  Progress weights are the exact number of selected frames.
+- **Budget/concurrency**: the cost ceiling and worker count are parameters on
+  `AnalysisRunOptions`, falling back to `RCDVLOG_VLM_MAX_COST_USD` and
+  `RCDVLOG_VLM_WORKERS` (default 4) when unset. The ceiling is checked before
+  each request against returned provider usage. Progress weights are the exact
+  number of selected frames.
+- **Cancellation**: batch progress callbacks return `ControlFlow`. Returning
+  `Break` sets the same stop flag the budget ceiling uses, so workers stop
+  claiming new clips without abandoning a request already paid for. Every stage
+  commits per clip and skips current clips, so a cancelled run resumes.
+- **Run accounting**: `analysis_runs` records one row per desktop run with its
+  stage, counts, spend, and stop reason. The pre-run cost projection comes from
+  this project's own observed cost per clip, falling back to
+  `REFERENCE_COST_PER_CLIP_USD` until the first run. Like `analysis_labels`, the
+  table is local and unsynced.
 
 **Measured end to end**, 2026-08-04, M3 MacBook Air, four workers, 273-clip
 Osaka/Expo project:
@@ -505,7 +531,7 @@ The UI is intentionally keyboard-first and dense, using one main `App.tsx` today
 
 - `apps/desktop/src/api.ts` selects real Tauri calls when `__TAURI_INTERNALS__` exists and mock behavior otherwise.
 - Optimistic asset updates call the core and replace the returned canonical `Asset`; failures roll back and surface an error.
-- Progress events are `proxy-progress` and `thumbnail-progress`. Each carries an optional completed asset plus a batch estimate. Merge a completed asset immediately so thumbnails/proxies appear as they finish.
+- Progress events are `proxy-progress`, `thumbnail-progress`, `analysis-progress`, and `model-install-progress`. Each of the first three carries an optional completed asset plus a batch estimate. Merge a completed asset immediately so thumbnails, proxies, and generated titles appear as they finish. `analysis-progress` additionally carries the current stage and the run's spend so far.
 - Media playback prefers an available proxy, otherwise an available original. Thumbnails are also used as the video's poster frame.
 - Playback controls are custom stage-level UI so they remain horizontal while the media element rotates. Do not re-enable native `<video controls>` unless rotation is moved off the video element; native controls inherit its CSS transform.
 - The React `assets` array is the in-memory metadata cache. Legacy orientation probing uses a two-worker, deduplicated priority queue for current, next, next-next, and previous clips; successful probes persist to SQLite and replace the cached asset.
@@ -523,7 +549,7 @@ Preserve and update both visible hints and the `?` keyboard map when shortcuts c
 - `N`: focus notes. Consume the original `n` key event before focusing so it is not inserted.
 - Notes: Enter saves; Command+Enter inserts a newline; Shift+Enter saves and advances; Escape discards the current editing session and removes focus. After advancing, notes must not remain focused.
 - `/`: focus queue search.
-- `P`: selected proxy; Shift+`P`: missing proxies; `T`: missing thumbnails.
+- `P`: selected proxy; Shift+`P`: missing proxies; `T`: missing thumbnails; `A`: analyze project.
 - `M`: add media.
 - `[`/`]`: story-ribbon zoom; `C`: center selected clip.
 - Command+`N`: new project; Command+`O`: open catalog; Command+`,`: global settings; `?`: keyboard map.

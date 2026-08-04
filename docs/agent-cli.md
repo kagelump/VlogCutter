@@ -174,7 +174,14 @@ rcdvlog --catalog /absolute/project/catalog.sqlite3 labels vocabulary --project 
 
 Transcription is offline and reads proxies only. Vision analysis reads proxy-derived frame packs and any accepted speech transcript, then calls OpenRouter using `OPENROUTER_API_KEY` or `~/.openrouter.key`. A normal `analyze missing` run is idempotent; `--force` replaces current derived observations and reports how many clips already had non-empty title or description fields before overwrite. Notes remain human-only. OCR is a reviewable suggestion and is not indexed as fact.
 
-`analyze status` and `labels vocabulary` are strictly read-only. Analysis progress is emitted as JSON on stderr. `labels consolidate` makes one text-only request and remaps only labels whose local authorship record says analysis created them; it never changes human-only labels.
+`analyze status` and `labels vocabulary` are strictly read-only. Analysis progress is emitted as JSON on stderr.
+
+`transcribe missing` and `analyze missing` reports include a `cancelled` flag,
+and the analysis report also includes `budgetExhausted`. Both are always `false`
+from the CLI, which never stops a batch early; they exist because the desktop
+shares these methods and can. A budget stop additionally appends a failure entry
+naming the ceiling, while a cancellation does not — stopping on request is not a
+failure. `labels consolidate` makes one text-only request and remaps only labels whose local authorship record says analysis created them; it never changes human-only labels.
 
 Rough-cut selection and source ranges remain separate from the labeling phase.
 The core and desktop now have an initial edit-plan/preview/OTIO path, but the
