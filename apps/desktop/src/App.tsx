@@ -34,8 +34,11 @@ function clipTitle(asset: Asset) {
 }
 
 function formatCost(usd: number) {
+  // A non-finite value reaches here when the budget field is empty or garbage;
+  // rendering "$NaN" beside a spend figure is worse than saying nothing.
+  if (!Number.isFinite(usd)) return "the run budget";
   if (usd <= 0) return "$0.00";
-  if (usd < 0.01) return `<$0.01`;
+  if (usd < 0.01) return "<$0.01";
   return `$${usd.toFixed(2)}`;
 }
 
