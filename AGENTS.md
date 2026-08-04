@@ -69,7 +69,20 @@ Implemented now:
   observation review panels, transcript-aware queue search, unusable-clip
   triage, and Keychain-stored OpenRouter credentials.
 - Weighted batch progress and ETA with project-persisted rate history.
-- Relative-order “story ribbon” with camera lanes, horizontal scrolling, and zoom.
+- A main view laid out for a 13" MacBook Air (1440x900). The shell is exactly
+  three rows — topbar, workbench, full-width story ribbon — and two invariants
+  are enforced by tests rather than by review: the right rail holds only
+  human-authored content (notes, labels, title, removal, plus the AI
+  suggestion strip and the unusable chip), and the notes field has fixed
+  geometry that nothing else may move. Machine output lives in a tabbed
+  evidence shelf beneath the player, collapsed by default. Chronology and edit
+  planning are full-window modes on Cmd+1/2/3. A Focus presentation (F) fills
+  the window with the frame and floats the notes card, preserving the caret and
+  the playback position because it restyles the mounted tree rather than
+  replacing it. See `docs/superpowers/specs/2026-08-04-desktop-review-layout-design.md`.
+- Relative-order “story ribbon” with camera lanes sized from the project's
+  actual camera count, horizontal scrolling, zoom, and a merged single-lane
+  variant for Focus.
 - A non-interactive JSON CLI for catalog, clip annotation, chronology, and media operations.
 - Immutable typed project operations for asset membership, notes, labels, removal, rotation, and fixed clock events, with deterministic materialized views and conflict diagnostics.
 - Read-only catalog/project/clip/proxy diagnostics, including the desktop's persisted last-selected catalog, project, and asset breadcrumb.
@@ -100,7 +113,7 @@ Important gaps; do not accidentally describe these as complete:
   proposals, and clock epochs. It does not yet provide the complete calibration
   interaction contract for clip exceptions, phases, constraints, merges,
   reassignments, or bounded before/after impact summaries.
-- Web has automated Vitest and Chrome Playwright coverage; desktop React still has no component runner and there is no automated native Tauri UI suite.
+- Web has automated Vitest and Chrome Playwright coverage. Desktop React now has Vitest + jsdom + Testing Library component tests under `apps/desktop/src/components/__tests__/`, but there is still no automated native Tauri UI suite.
 - No macOS signing/notarization or clean-machine packaging acceptance.
 - Analysis suggestions are shown and editable in the desktop, but there is no
   per-suggestion accept/reject workflow: an AI title or description is simply an

@@ -2292,11 +2292,18 @@ function App() {
               <div><kbd>Space</kbd><span>Play / pause</span></div>
               <div><kbd>L</kbd><span>Focus labels</span></div>
               <div><kbd>R</kbd><span>Remove / restore clip</span></div>
-              <div><kbd>N</kbd><kbd>Enter</kbd><span>Focus notes</span></div>
-              <div><kbd>Enter</kbd><span>Save note</span></div>
+              <div><kbd>N</kbd><span>Focus notes</span></div>
+              <div><kbd>⌘ Enter</kbd><span>Save note</span></div>
               <div><kbd>⇧ Enter</kbd><span>Save note and advance</span></div>
-              <div><kbd>⌘ Enter</kbd><span>Insert a note line break</span></div>
-              <div><kbd>Esc</kbd><span>Cancel note edit</span></div>
+              <div><kbd>Enter</kbd><span>New line in a note</span></div>
+              <div><kbd>Esc</kbd><span>Cancel note edit · leave Focus</span></div>
+              <div><kbd>I</kbd><span>Edit clip title</span></div>
+              <div><kbd>F</kbd><span>Focus writing view</span></div>
+              <div><kbd>H</kbd><span>Hide every overlay in Focus</span></div>
+              <div><kbd>D</kbd><span>Evidence shelf · Focus right stack</span></div>
+              <div><kbd>T</kbd><span>Collapse story ribbon</span></div>
+              <div><kbd>B</kbd><span>Jump to the best moment</span></div>
+              <div><kbd>⌘1</kbd><kbd>⌘2</kbd><kbd>⌘3</kbd><span>Review / Chronology / Edit plan</span></div>
               <div><kbd>/</kbd><span>Search clips</span></div>
               <div><kbd>[</kbd><kbd>]</kbd><span>Zoom story ribbon</span></div>
               <div><kbd>C</kbd><span>Center selected clip in ribbon</span></div>
