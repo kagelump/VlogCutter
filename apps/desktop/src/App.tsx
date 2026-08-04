@@ -10,6 +10,9 @@ import { formatBytes, transcriptStatusLabels } from "./review/summaries";
 import { RIBBON_ZOOM_DEFAULT, RIBBON_ZOOM_MAX, RIBBON_ZOOM_MIN, RIBBON_ZOOM_STEP } from "./review/layout";
 import { StoryRibbon, assetContextKey, type ContextRun } from "./components/StoryRibbon";
 import { INITIAL_VIEW, reduceView, type Mode } from "./review/presentation";
+import { JudgmentPanel, type SaveState } from "./components/JudgmentPanel";
+import { EvidenceShelf, type ShelfTab } from "./components/EvidenceShelf";
+import { TransportBar } from "./components/TransportBar";
 
 interface OperationProgress {
   kind: "proxy" | "thumbnail" | "analysis";
@@ -175,6 +178,10 @@ function App() {
   const [offsetMinutes, setOffsetMinutes] = useState(0);
   const [offsetLabel, setOffsetLabel] = useState("Camera time change");
   const [chronologyZoom, setChronologyZoom] = useState(RIBBON_ZOOM_DEFAULT);
+  // The active shelf tab is a mode, not per-clip state: it persists as you
+  // move through the queue (spec §3.6).
+  const [shelfTab, setShelfTab] = useState<ShelfTab>("transcript");
+  const [saveState, setSaveState] = useState<SaveState>("idle");
 
   // ── Clip analysis state ────────────────────────────────────────────
   const [analysisIndex, setAnalysisIndex] = useState<Record<string, AssetAnalysisIndexEntry>>({});
@@ -562,12 +569,16 @@ function App() {
     async (asset: Asset, changes: Partial<AssetPatch>) => {
       const optimistic = { ...asset, ...changes };
       replaceAsset(optimistic);
+      setSaveState("saving");
       try {
         const updated = await api.updateAsset(asset.id, { ...patchFor(asset), ...changes });
         replaceAsset(updated);
-        setMessage("Clip saved");
+        // The save state word in the panel header replaces both the toast and
+        // the save button this flow used to need.
+        setSaveState("saved");
       } catch (reason) {
         replaceAsset(asset);
+        setSaveState("idle");
         setError(String(reason));
       }
     },
@@ -632,19 +643,15 @@ function App() {
 
     if (event.key !== "Enter" || event.nativeEvent.isComposing) return;
 
+    // Enter inserts a newline; ⌘Enter saves; ⇧Enter saves and advances.
+    // This inverts the old mapping deliberately. Enter-to-save is hostile in
+    // a field sized for 18 lines of prose, and ⌘Enter-for-newline inverts the
+    // macOS convention every other text field on the machine follows.
+    if (!event.metaKey && !event.shiftKey) return;
+
     event.preventDefault();
     event.stopPropagation();
     if (event.repeat || !selected) return;
-
-    if (event.metaKey) {
-      const textarea = event.currentTarget;
-      const selectionStart = textarea.selectionStart;
-      const selectionEnd = textarea.selectionEnd;
-      const notes = `${selected.notes.slice(0, selectionStart)}\n${selected.notes.slice(selectionEnd)}`;
-      replaceAsset({ ...selected, notes });
-      window.requestAnimationFrame(() => textarea.setSelectionRange(selectionStart + 1, selectionStart + 1));
-      return;
-    }
 
     notesEditingRef.current = null;
     event.currentTarget.blur();
@@ -1657,314 +1664,70 @@ function App() {
                 <span>{selected.width}×{selected.height} · {selected.frameRate.toFixed(2)} fps</span>
               </div>
             )}
-            {selected && mediaUrl && selected.orientationProbed && (
-              <div className="viewer-controls" role="group" aria-label="Video playback controls">
-                <button type="button" onClick={() => seekBy(-15)} aria-label="Go back 15 seconds" title="Back 15 seconds">−15</button>
-                <button
-                  type="button"
-                  className="viewer-play"
-                  onClick={togglePlayback}
-                  aria-label={isPlaying ? "Pause" : "Play"}
-                  aria-keyshortcuts="Space"
-                  title={isPlaying ? "Pause (Space)" : "Play (Space)"}
-                >{isPlaying ? "Ⅱ" : "▶"}</button>
-                <button type="button" onClick={() => seekBy(15)} aria-label="Go forward 15 seconds" title="Forward 15 seconds">+15</button>
-                <input
-                  type="range"
-                  min="0"
-                  max={seekMaximum || 0}
-                  step="0.01"
-                  value={Math.min(playbackSeconds, seekMaximum)}
-                  onChange={(event) => {
-                    const seconds = Number(event.currentTarget.value);
-                    if (videoRef.current) videoRef.current.currentTime = seconds;
-                    setPlaybackSeconds(seconds);
-                  }}
-                  aria-label="Video position"
-                  style={{ "--seek-progress": `${seekProgress}%` } as CSSProperties}
-                />
-                <output className="viewer-time" aria-live="off">
-                  {formatDuration(playbackSeconds)} <span>/</span> {formatDuration(seekMaximum)}
-                </output>
-                <button
-                  type="button"
-                  className={isMuted ? "active" : ""}
-                  onClick={toggleMute}
-                  aria-label={isMuted ? "Unmute playback" : "Mute playback"}
-                  aria-pressed={isMuted}
-                  title={isMuted ? "Unmute" : "Mute"}
-                >{isMuted ? "MUTED" : "AUDIO"}</button>
-                <button
-                  type="button"
-                  onClick={() => void toggleViewerFullscreen()}
-                  aria-label={isViewerFullscreen ? "Exit fullscreen" : "Enter fullscreen"}
-                  aria-pressed={isViewerFullscreen}
-                  title={isViewerFullscreen ? "Exit fullscreen" : "Fullscreen"}
-                >{isViewerFullscreen ? "EXIT" : "FULL"}</button>
-              </div>
-            )}
           </div>
 
-          <div className="transport-bar">
-            <button className="transport-button" onClick={() => moveSelection(-1)} aria-label="Previous clip" aria-keyshortcuts="ArrowUp K">←</button>
-            <button
-              className="transport-button play"
-              onClick={togglePlayback}
-              aria-label="Play or pause"
-              aria-keyshortcuts="Space"
-            >{isPlaying ? "Ⅱ" : "▶"}</button>
-            <button className="transport-button" onClick={() => moveSelection(1)} aria-label="Next clip" aria-keyshortcuts="ArrowDown J">→</button>
-            <div className="transport-divider" />
-            <span className="timecode">{selected ? `${formatDuration(playbackSeconds)} / ${formatDuration(seekMaximum)}` : "0:00"}</span>
-            <button
-              className={`transport-audio-button ${isMuted ? "muted" : ""}`}
-              onClick={toggleMute}
-              aria-label={isMuted ? "Unmute playback" : "Mute playback"}
-              aria-pressed={isMuted}
-              title={isMuted ? "Unmute playback for this session" : "Mute playback for this session"}
-            >
-              {isMuted ? "Muted" : "Sound on"}
-            </button>
-            <div className="transport-spacer" />
-            {selected && (
-              <button
-                className="button label-action"
-                onClick={() => document.querySelector<HTMLInputElement>("#label-input")?.focus()}
-                aria-keyshortcuts="L"
-              >
-                Label clip <kbd>L</kbd>
-              </button>
-            )}
-          </div>
+          {selected && (
+          <TransportBar
+            asset={selected}
+            playing={isPlaying}
+            muted={isMuted}
+            positionSeconds={playbackSeconds}
+            durationSeconds={seekMaximum}
+            bestMomentMs={observation?.analysis.bestMomentStartMs ?? null}
+            segmentStartsMs={(transcript?.segments ?? []).map((segment) => segment.startMs)}
+            rotationOverridden={selected.rotationDegrees !== selected.defaultRotationDegrees}
+            onTogglePlay={togglePlayback}
+            onSeek={seekTo}
+            onSeekBy={seekBy}
+            onToggleMute={toggleMute}
+            onStep={moveSelection}
+            onRotate={() => void persistAsset(selected, { rotationDegrees: rotationAfter(selected.rotationDegrees, 90) })}
+            onEnterFocus={() => void toggleViewerFullscreen()}
+          />
+          )}
+
+          {selected && (
+            <EvidenceShelf
+              asset={selected}
+              transcript={transcript}
+              observation={observation}
+              open={view.shelf}
+              tab={shelfTab}
+              formatDate={formatDate}
+              onTabChange={setShelfTab}
+              onToggleOpen={() => dispatchView({ kind: "toggleShelf" })}
+              onSeek={seekTo}
+              onChangeAsset={replaceAsset}
+              onCommitAsset={() => void saveClipSummary(selected)}
+            />
+          )}
         </section>
 
-        <aside className="inspector-panel">
-          {selected ? (
-            <>
-              <div className="inspector-title">
-                <span className="eyebrow">Clip log</span>
-                {/* Editable in place: a generated title is a suggestion, and an
-                    edit must survive the clip being analyzed again. */}
-                <input
-                  className="clip-title-field"
-                  value={selected.title}
-                  placeholder={selected.filename}
-                  aria-label="Clip title"
-                  onChange={(event) => replaceAsset({ ...selected, title: event.target.value })}
-                  onBlur={() => void saveClipSummary(selected)}
-                  onKeyDown={(event) => {
-                    if (event.key === "Enter") event.currentTarget.blur();
-                  }}
-                />
-                <span className="inspector-filename">{selected.filename}</span>
-                <span className={selected.available ? "availability online" : "availability offline"}>
-                  {selected.available ? "Media available" : "Original offline"}
-                </span>
-              </div>
-
-              <section className="inspector-section labels-section">
-                <label htmlFor="label-input" className="section-label">Labels <kbd>L</kbd></label>
-                <div className="label-entry">
-                  <input
-                    id="label-input"
-                    value={labelDraft}
-                    placeholder="Add place, action, subject…"
-                    aria-keyshortcuts="L Enter"
-                    onChange={(event) => setLabelDraft(event.currentTarget.value)}
-                    onKeyDown={(event) => {
-                      if (event.key === "Enter" || event.key === ",") {
-                        event.preventDefault();
-                        addLabel(selected, labelDraft);
-                      } else if (event.key === "Backspace" && !labelDraft && selected.labels.length > 0) {
-                        removeLabel(selected, selected.labels.at(-1) ?? "");
-                      }
-                    }}
-                  />
-                  <button className="label-add-button" disabled={!labelDraft.trim()} onClick={() => addLabel(selected, labelDraft)}>Add</button>
-                </div>
-                <div className={`label-chips ${selected.labels.length ? "" : "empty"}`} aria-label="Clip labels">
-                  {selected.labels.length ? selected.labels.map((label) => (
-                    <button key={label} onClick={() => removeLabel(selected, label)} title={`Remove ${label}`}>
-                      <span>{label}</span><i aria-hidden="true">×</i>
-                    </button>
-                  )) : <span>No labels yet. Add the most useful search terms for this clip.</span>}
-                </div>
-              </section>
-
-              <section className="inspector-section orientation-section">
-                <div className="section-heading-row">
-                  <span className="section-label">Frame orientation</span>
-                  <span>{selected.rotationDegrees === selected.defaultRotationDegrees ? "Landscape (automatic)" : `${selected.rotationDegrees}° override`}</span>
-                </div>
-                <div className="orientation-controls">
-                  <button
-                    className={`orientation-choice portrait ${selected.rotationDegrees === portraitRotation(selected) ? "active" : ""}`}
-                    onClick={() => persistAsset(selected, {
-                      rotationDegrees: selected.rotationDegrees === portraitRotation(selected)
-                        ? selected.defaultRotationDegrees
-                        : portraitRotation(selected),
-                    })}
-                    aria-pressed={selected.rotationDegrees === portraitRotation(selected)}
-                    title="Show this clip vertically"
-                  >
-                    <span className="orientation-thumbnail" aria-hidden="true"><i /></span>
-                    <strong>Portrait</strong>
-                    <small>Show vertical</small>
-                  </button>
-                  <button
-                    className="orientation-choice"
-                    onClick={() => persistAsset(selected, { rotationDegrees: rotationAfter(selected.rotationDegrees, 180) })}
-                    title="Rotate the current view 180 degrees"
-                  >
-                    <span className="orientation-thumbnail upside-down" aria-hidden="true"><i /></span>
-                    <strong>Flip 180°</strong>
-                    <small>Turn current view</small>
-                  </button>
-                </div>
-                {selected.rotationDegrees !== selected.defaultRotationDegrees && (
-                  <button
-                    className="orientation-reset"
-                    onClick={() => persistAsset(selected, { rotationDegrees: selected.defaultRotationDegrees })}
-                  >
-                    Reset automatic landscape
-                  </button>
-                )}
-              </section>
-
-              {observation && (
-                <section className={`inspector-section observation-section ${observation.analysis.usable ? "" : "is-unusable"}`}>
-                  <div className="section-heading-row">
-                    <span className="section-label">Description</span>
-                    <span className="section-note">
-                      {observation.current ? observation.analysis.model : "Stale — proxy changed since"}
-                    </span>
-                  </div>
-                  {!observation.analysis.usable && (
-                    <p className="unusable-callout">
-                      Flagged unusable{observation.analysis.unusableReason ? `: ${observation.analysis.unusableReason}` : ""}.
-                      {" "}Your call — this does not remove the clip.
-                    </p>
-                  )}
-                  <textarea
-                    className="description-field"
-                    value={selected.description}
-                    placeholder="No description yet."
-                    aria-label="Clip description"
-                    onChange={(event) => replaceAsset({ ...selected, description: event.target.value })}
-                    onBlur={() => void saveClipSummary(selected)}
-                  />
-                  <div className="observation-facts">
-                    <span className="chip">{observation.analysis.cameraMovement}</span>
-                    {observation.analysis.transcriptUsed && <span className="chip">speech used</span>}
-                    {observation.aiLabels.map((label) => <span className="chip suggested" key={label}>{label}</span>)}
-                  </div>
-                  {observation.analysis.bestMomentStartMs !== null && (
-                    <button
-                      className="button ghost"
-                      onClick={() => seekTo((observation.analysis.bestMomentStartMs ?? 0) / 1000)}
-                    >
-                      Jump to best moment · {formatTimecode(observation.analysis.bestMomentStartMs)}
-                    </button>
-                  )}
-                  {observation.analysis.ocrText.length > 0 && (
-                    <div className="ocr-list">
-                      <span className="section-note">Text on screen</span>
-                      <p>{observation.analysis.ocrText.join(" · ")}</p>
-                    </div>
-                  )}
-                </section>
-              )}
-
-              {transcript && (
-                <section className="inspector-section transcript-section">
-                  <div className="section-heading-row">
-                    <span className="section-label">Transcript</span>
-                    <span className="section-note">
-                      {transcriptStatusLabels[transcript.status]}
-                      {transcript.status === "speech" ? ` · ${transcript.primaryLanguage || "unknown"}` : ""}
-                    </span>
-                  </div>
-                  {transcript.segments.length === 0 ? (
-                    <p className="transcript-empty">
-                      {transcript.status === "no_speech"
-                        ? "No speech in this clip."
-                        : transcript.rejectReason || "Nothing was transcribed."}
-                    </p>
-                  ) : (
-                    <ol className="transcript-list">
-                      {transcript.segments.map((segment) => (
-                        <li key={`${segment.startMs}-${segment.endMs}`}>
-                          <button onClick={() => seekTo(segment.startMs / 1000)} title="Jump to this moment">
-                            <span className="mono">{formatTimecode(segment.startMs)}</span>
-                            <span>{segment.text}</span>
-                          </button>
-                        </li>
-                      ))}
-                    </ol>
-                  )}
-                </section>
-              )}
-
-              <section className="inspector-section notes-section">
-                <label htmlFor="notes" className="section-label">Notes <kbd>N</kbd><kbd>Enter</kbd></label>
-                <textarea
-                  id="notes"
-                  value={selected.notes}
-                  placeholder="What happens here? What might this cut with?"
-                  aria-keyshortcuts="Enter Shift+Enter Meta+Enter Escape"
-                  onFocus={() => {
-                    notesEditingRef.current = { assetId: selected.id, savedNotes: selected.notes, cancelOnBlur: false };
-                  }}
-                  onChange={(event) => replaceAsset({ ...selected, notes: event.target.value })}
-                  onKeyDown={handleNotesKeyDown}
-                  onBlur={handleNotesBlur}
-                />
-                <div className="notes-shortcuts" aria-label="Notes keyboard shortcuts">
-                  <span><kbd>Enter</kbd> Save</span>
-                  <span><kbd>⇧ Enter</kbd> Save &amp; next</span>
-                  <span><kbd>⌘ Enter</kbd> New line</span>
-                  <span><kbd>Esc</kbd> Cancel</span>
-                </div>
-              </section>
-
-              <section className={`inspector-section remove-section ${selected.removed ? "is-removed" : ""}`}>
-                <div>
-                  <span className="section-label">Queue visibility</span>
-                  <p>{selected.removed ? "Restore this clip to the labeling queue." : "Hide clips that are unusable or clearly accidental."}</p>
-                </div>
-                <button onClick={() => toggleRemoved(selected)} aria-keyshortcuts="R">
-                  {selected.removed ? "Restore clip" : "Remove from labeling"} <kbd>R</kbd>
-                </button>
-              </section>
-
-              <section className="inspector-section metadata-grid">
-                <span className="section-label full-row">Source</span>
-                <div><span>Camera</span><strong>{selected.camera}</strong></div>
-                <div><span>Format</span><strong>{selected.codec.toUpperCase()} · {formatBytes(selected.sizeBytes)}</strong></div>
-                <div><span>Raw time</span><strong className="mono">{formatDate(selected.capturedAtRaw)}</strong></div>
-                <div><span>Best time</span><strong className="mono">{formatDate(selected.bestTime)}</strong></div>
-              </section>
-
-              <section className="inspector-section calibration-section">
-                <div className="section-heading-row">
-                  <span className="section-label">Clock event</span>
-                  <span>From this filename onward</span>
-                </div>
-                <label className="field-label">Offset, minutes
-                  <input type="number" value={offsetMinutes} onChange={(event) => setOffsetMinutes(Number(event.target.value))} />
-                </label>
-                <label className="field-label">Reason
-                  <input value={offsetLabel} onChange={(event) => setOffsetLabel(event.target.value)} />
-                </label>
-                <button className="button calibration-button" disabled={busy} onClick={applyOffset}>
-                  Apply to {selected.camera}
-                </button>
-              </section>
-            </>
-          ) : (
+        {selected ? (
+          <JudgmentPanel
+            asset={selected}
+            index={filteredAssets.findIndex((candidate) => candidate.id === selected.id) + 1}
+            observation={observation}
+            labelDraft={labelDraft}
+            saveState={saveState}
+            onLabelDraftChange={setLabelDraft}
+            onAddLabel={(value) => addLabel(selected, value)}
+            onRemoveLabel={(label) => removeLabel(selected, label)}
+            onPromoteAiLabel={(label) => addLabel(selected, label)}
+            onChangeAsset={replaceAsset}
+            onCommitAsset={() => void saveClipSummary(selected)}
+            onToggleRemoved={() => toggleRemoved(selected)}
+            onNotesFocus={() => {
+              notesEditingRef.current = { assetId: selected.id, savedNotes: selected.notes, cancelOnBlur: false };
+            }}
+            onNotesKeyDown={handleNotesKeyDown}
+            onNotesBlur={handleNotesBlur}
+          />
+        ) : (
+          <aside className="judgment-panel">
             <div className="empty-inspector">Select a clip to log it.</div>
-          )}
-        </aside>
+          </aside>
+        )}
       </div>
       )}
 
