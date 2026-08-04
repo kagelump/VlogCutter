@@ -6,6 +6,7 @@ import { orderAssets, moveSelection as moveSelectionInOrder } from "./review/ord
 import { resolveAction } from "./review/keymap";
 import { CalibrationPanel } from "./CalibrationPanel";
 import { EditPlanPanel } from "./EditPlanPanel";
+import { formatBytes, transcriptStatusLabels } from "./review/summaries";
 
 interface OperationProgress {
   kind: "proxy" | "thumbnail" | "analysis";
@@ -49,14 +50,6 @@ function formatTimecode(ms: number) {
   return `${minutes}:${seconds.toString().padStart(2, "0")}`;
 }
 
-const transcriptStatusLabels: Record<TranscriptStatus, string> = {
-  speech: "Speech",
-  // Silence is a result, not a failure: roughly half of a real corpus is silent.
-  no_speech: "No speech detected",
-  rejected: "Discarded as unreliable",
-  failed: "Transcription failed",
-};
-
 const autoplayOptions: Array<{ value: AutoplayMode; label: string; detail: string }> = [
   { value: "never", label: "Never", detail: "Keep each clip paused until you press Space." },
   { value: "proxyAvailable", label: "Only when proxy is available", detail: "Autoplay lightweight review media; keep camera originals paused." },
@@ -73,11 +66,6 @@ function formatDuration(seconds: number) {
   const minutes = Math.floor(safe / 60);
   const remainder = Math.floor(safe % 60);
   return `${minutes}:${remainder.toString().padStart(2, "0")}`;
-}
-
-function formatBytes(bytes: number) {
-  if (bytes < 1_000_000_000) return `${(bytes / 1_000_000).toFixed(0)} MB`;
-  return `${(bytes / 1_000_000_000).toFixed(1)} GB`;
 }
 
 function formatEta(seconds: number | null) {
