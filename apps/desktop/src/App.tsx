@@ -732,6 +732,27 @@ function App() {
             event.preventDefault();
             centerSelectedInChronology();
             return;
+          case "jumpBestMoment": {
+            const startMs = observation?.analysis.bestMomentStartMs;
+            if (startMs === null || startMs === undefined) return;
+            event.preventDefault();
+            seekTo(startMs / 1000);
+            return;
+          }
+          case "editTitle":
+            event.preventDefault();
+            document.querySelector<HTMLInputElement>(".clip-title-field")?.focus();
+            return;
+          case "toggleFocus":
+          case "toggleOverlays":
+          case "toggleShelf":
+          case "toggleRibbon":
+          case "ribbonOverlay":
+          case "setMode":
+            // Presentations and modes arrive in Tasks 9 and 10. Returning here
+            // rather than falling through keeps these keys inert instead of
+            // reaching the handlers below and firing something unrelated.
+            return;
         }
       }
 
@@ -755,7 +776,9 @@ function App() {
         void makeMissingProxies();
       } else if (key === "p") {
         void makeProxy();
-      } else if (key === "t") {
+      } else if (key === "g" && event.shiftKey) {
+        // Thumbnails gave up bare T to the ribbon toggle: generating them is a
+        // once-per-project setup action, and T is pressed many times a session.
         void makeMissingThumbnails();
       } else if (key === "a") {
         void openAnalysisDialog();
@@ -1365,9 +1388,9 @@ function App() {
           >▾</button>
           {showMediaMenu && (
             <div className="media-menu">
-              <button disabled={busy || missingThumbnailCount === 0} onClick={makeMissingThumbnails} aria-keyshortcuts="T">
+              <button disabled={busy || missingThumbnailCount === 0} onClick={makeMissingThumbnails} aria-keyshortcuts="Shift+G">
                 <span>{missingThumbnailCount ? `Generate ${missingThumbnailCount} thumbnails` : "Thumbnails ready"}</span>
-                <kbd>T</kbd>
+                <kbd>⇧G</kbd>
                 <small>Quality 1 · frame at 20%</small>
               </button>
               <button disabled={busy || !projectId} onClick={openAnalysisDialog} aria-keyshortcuts="A">
@@ -2511,7 +2534,7 @@ function App() {
               <div><kbd>C</kbd><span>Center selected clip in ribbon</span></div>
               <div><kbd>P</kbd><span>Proxy selected clip</span></div>
               <div><kbd>⇧P</kbd><span>Generate missing proxies</span></div>
-              <div><kbd>T</kbd><span>Generate missing thumbnails</span></div>
+              <div><kbd>⇧G</kbd><span>Generate missing thumbnails</span></div>
               <div><kbd>A</kbd><span>Analyze project</span></div>
               <div><kbd>M</kbd><span>Add media</span></div>
               <div><kbd>⌘N</kbd><kbd>⌘O</kbd><span>New / open project</span></div>

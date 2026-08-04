@@ -125,16 +125,90 @@ describe("independent: acceptance oracle case 9 — every current App.tsx review
     // focus, playback, label/notes focus, media generation) and are
     // explicitly out of scope for the extracted review dispatch table per
     // the module's own doc comment.
-    for (const key of ["?", "/", " ", "l", "L", "n", "N", "Enter", "p", "P", "t", "T", "m", "M", "Escape"]) {
+    //
+    // T and Shift+T left this list when the ribbon took the key; thumbnail
+    // generation moved to Shift+G and is still App.tsx's own.
+    for (const key of ["?", "/", " ", "l", "L", "n", "N", "Enter", "p", "P", "m", "M", "Escape", "g", "G"]) {
       expect(resolveAction(plainKeydown(key))).toBeNull();
     }
   });
 });
 
+describe("independent: presentation and mode bindings", () => {
+  it("distinguishes bare T from Shift+T", () => {
+    expect(resolveAction(plainKeydown("t"))).toEqual({ kind: "toggleRibbon" });
+    expect(resolveAction(plainKeydown("T", { shiftKey: true }))).toEqual({ kind: "ribbonOverlay" });
+  });
+
+  it("binds the four remaining presentation letters", () => {
+    const bindings: Array<[string, ReviewAction]> = [
+      ["f", { kind: "toggleFocus" }],
+      ["h", { kind: "toggleOverlays" }],
+      ["d", { kind: "toggleShelf" }],
+      ["b", { kind: "jumpBestMoment" }],
+    ];
+    for (const [key, expected] of bindings) {
+      expect(resolveAction(plainKeydown(key))).toEqual(expected);
+      expect(resolveAction(plainKeydown(key.toLocaleUpperCase(), { shiftKey: true }))).toEqual(expected);
+    }
+  });
+
+  it("binds I to the title without claiming it while typing", () => {
+    expect(resolveAction(plainKeydown("i"))).toEqual({ kind: "editTitle" });
+    expect(resolveAction(editableKeydown("i", "INPUT", false))).toBeNull();
+  });
+
+  it("claims exactly three Meta digits and no other Meta combination", () => {
+    expect(resolveAction(plainKeydown("1", { metaKey: true }))).toEqual({ kind: "setMode", mode: "review" });
+    expect(resolveAction(plainKeydown("2", { metaKey: true }))).toEqual({ kind: "setMode", mode: "chronology" });
+    expect(resolveAction(plainKeydown("3", { metaKey: true }))).toEqual({ kind: "setMode", mode: "editPlan" });
+    for (const key of ["4", "5", "6", "7", "8", "9", "0"]) {
+      expect(resolveAction(plainKeydown(key, { metaKey: true }))).toBeNull();
+    }
+  });
+
+  it("does not claim a mode digit that arrives with an extra modifier", () => {
+    expect(resolveAction(plainKeydown("2", { metaKey: true, shiftKey: true }))).toBeNull();
+    expect(resolveAction(plainKeydown("2", { metaKey: true, altKey: true }))).toBeNull();
+    expect(resolveAction(plainKeydown("2", { metaKey: true, ctrlKey: true }))).toBeNull();
+  });
+
+  it("does not claim a mode digit while a text field has focus", () => {
+    // Built inline rather than through editableKeydown, which hardcodes
+    // metaKey: false and would make this assertion vacuous.
+    expect(
+      resolveAction({
+        key: "1",
+        metaKey: true,
+        ctrlKey: false,
+        altKey: false,
+        shiftKey: false,
+        target: { tagName: "TEXTAREA", isContentEditable: false },
+      }),
+    ).toBeNull();
+  });
+});
+
 describe("independent: resolveAction is a total function returning only known shapes or null", () => {
-  it("never throws and only ever returns one of the four action kinds or null", () => {
-    const validKinds = new Set(["move", "toggleRemoved", "zoom", "centerSelection"]);
-    const probeKeys = ["j", "k", "r", "[", "]", "c", "z", "1", "!", "\t", "", "Tab", "Shift"];
+  it("never throws and only ever returns a known action kind or null", () => {
+    const validKinds = new Set([
+      "move",
+      "toggleRemoved",
+      "zoom",
+      "centerSelection",
+      "toggleFocus",
+      "toggleOverlays",
+      "toggleShelf",
+      "toggleRibbon",
+      "ribbonOverlay",
+      "jumpBestMoment",
+      "editTitle",
+      "setMode",
+    ]);
+    const probeKeys = [
+      "j", "k", "r", "[", "]", "c", "z", "1", "!", "\t", "", "Tab", "Shift",
+      "f", "h", "d", "t", "T", "b", "i", "F1", "Meta", "Dead", "×",
+    ];
     for (const key of probeKeys) {
       let action: ReviewAction | null = null;
       expect(() => {
