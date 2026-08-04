@@ -537,6 +537,14 @@ function App() {
 
   useEffect(() => setLabelDraft(""), [selectedId]);
 
+  // Entering Focus with F puts the caret in the notes field, since writing is
+  // what you came for. Entering bare (the expand control) does not, because
+  // focusing an invisible field would strand the caret.
+  useEffect(() => {
+    if (view.presentation !== "focus" || !view.overlays) return;
+    document.querySelector<HTMLTextAreaElement>("#notes")?.focus();
+  }, [view.presentation, view.overlays]);
+
   // Status messages are transient. The old status line kept the last one on
   // screen indefinitely, so it was usually stale by the time you read it.
   useEffect(() => {
@@ -632,6 +640,19 @@ function App() {
     if (event.key === "Escape") {
       event.preventDefault();
       event.stopPropagation();
+
+      // In Focus the caret starts in this field, so Escape has to be the way
+      // out or the round trip costs two keys and a discarded paragraph. It
+      // saves and leaves. In Review it keeps its cancel meaning: there you
+      // reached the field deliberately and backing out should undo.
+      if (view.presentation === "focus") {
+        notesEditingRef.current = null;
+        event.currentTarget.blur();
+        if (selected) void persistAsset(selected, { notes: selected.notes });
+        dispatchView({ kind: "exitFocus" });
+        return;
+      }
+
       const editing = notesEditingRef.current;
       if (selected && editing?.assetId === selected.id) {
         editing.cancelOnBlur = true;
@@ -688,11 +709,14 @@ function App() {
         return;
       }
       if (event.key === "Escape") {
+        // Modals first, then Focus: Escape should close what is on top.
+        const hadModal = showMediaMenu || showShortcuts || showSettings || showAnalysisDialog;
         setShowMediaMenu(false);
         setShowShortcuts(false);
         setShowSettings(false);
         setShowAnalysisDialog(false);
         if (projects.length > 0) setShowCreate(false);
+        if (!hadModal && view.presentation === "focus") dispatchView({ kind: "exitFocus" });
         return;
       }
       const tag = (event.target as HTMLElement)?.tagName;
@@ -752,15 +776,31 @@ function App() {
             dispatchView({ kind: "toggleRibbon" });
             return;
           case "toggleShelf":
+            // D means "the machine-output surface" in both presentations: the
+            // evidence shelf in Review, the right stack in Focus. One key,
+            // one meaning, learned once.
             event.preventDefault();
-            dispatchView({ kind: "toggleShelf" });
+            dispatchView(
+              view.presentation === "focus"
+                ? { kind: "toggleRightStack" }
+                : { kind: "toggleShelf" },
+            );
             return;
           case "toggleFocus":
+            event.preventDefault();
+            dispatchView(
+              view.presentation === "focus"
+                ? { kind: "exitFocus" }
+                : { kind: "enterFocus", overlays: true },
+            );
+            return;
           case "toggleOverlays":
+            event.preventDefault();
+            dispatchView({ kind: "toggleOverlays" });
+            return;
           case "ribbonOverlay":
-            // The Focus presentation arrives in Task 10. Returning here rather
-            // than falling through keeps these keys inert instead of reaching
-            // the handlers below and firing something unrelated.
+            // Shift+T's expanded overlay is not built; swallow the key rather
+            // than letting it reach an unrelated handler.
             return;
         }
       }
@@ -797,7 +837,7 @@ function App() {
     };
     window.addEventListener("keydown", handleKey);
     return () => window.removeEventListener("keydown", handleKey);
-  }, [busy, centerSelectedInChronology, moveSelection, projectId, projects.length, selected, toggleRemoved]);
+  }, [busy, centerSelectedInChronology, moveSelection, observation, projectId, projects.length, selected, showAnalysisDialog, showMediaMenu, showSettings, showShortcuts, toggleRemoved, view.presentation]);
 
   async function createProject() {
     const name = newProjectName.trim();
@@ -1346,8 +1386,19 @@ function App() {
   const seekMaximum = Math.max(0, mediaDuration || selected?.durationSeconds || 0);
   const seekProgress = seekMaximum > 0 ? Math.min(100, (playbackSeconds / seekMaximum) * 100) : 0;
 
+  // Focus is a presentation, not a separate tree: these classes restyle what
+  // is already mounted. That is what makes the caret and the playback position
+  // survive the transition — the textarea and the video element are never
+  // unmounted, so there is nothing to restore.
+  const shellClass = [
+    "app-shell",
+    view.presentation === "focus" ? "is-focus" : "",
+    view.presentation === "focus" && !view.overlays ? "overlays-hidden" : "",
+    view.presentation === "focus" && view.rightStack ? "show-right-stack" : "",
+  ].filter(Boolean).join(" ");
+
   return (
-    <main className="app-shell">
+    <main className={shellClass}>
       <header className="topbar">
         <div className="wordmark" aria-label="RCD VlogCutter">
           <span className="wordmark-mark">RCD</span>
@@ -1746,7 +1797,7 @@ function App() {
           scrollRef={chronologyScrollRef}
           formatDate={formatDate}
           collapsed={!view.ribbon}
-          merged={false}
+          merged={view.presentation === "focus"}
           onZoomChange={setChronologyZoom}
           onCenter={() => centerSelectedInChronology()}
           onSelect={setSelectedId}

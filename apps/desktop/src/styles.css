@@ -146,6 +146,88 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
    always present; only its pane is conditional. */
 .viewer-panel { min-width: 0; min-height: 0; display: grid; grid-template-rows: minmax(220px, 1fr) auto auto; background: #0b0e10; }
 
+/* ── Focus: the notes-writing presentation (spec §3.9) ────────────────── */
+/* Restyles the mounted tree rather than swapping it, so the caret and the
+   playback position survive the transition with nothing to restore. Native
+   macOS fullscreen is deliberately not used: it animates to a separate Space
+   over ~700ms, which defeats a toggle pressed dozens of times a session. */
+/* The ribbon row is auto: merged it is one lane, so its own height is the
+   right height and a fixed row would clip it. */
+.app-shell.is-focus { grid-template-rows: 36px minmax(0, 1fr) auto; }
+.app-shell.is-focus .queue-panel,
+.app-shell.is-focus .mode-switcher,
+.app-shell.is-focus .wordmark,
+.app-shell.is-focus .project-switcher,
+.app-shell.is-focus .media-split,
+.app-shell.is-focus .shortcut-help-button,
+.app-shell.is-focus .sync-indicator,
+.app-shell.is-focus .completion-hairline,
+.app-shell.is-focus .topbar > .button,
+.app-shell.is-focus .text-button { display: none; }
+/* Positioned, so the notes card anchors to the workbench rather than to the
+   viewport — otherwise it sits over the ribbon. */
+.app-shell.is-focus .workbench { position: relative; grid-template-columns: minmax(0, 1fr); }
+.app-shell.is-focus .topbar { height: 36px; background: rgba(21,26,30,.86); backdrop-filter: blur(8px); }
+
+/* The video is the background layer; everything else floats over it. */
+.app-shell.is-focus .viewer-panel { position: relative; grid-template-rows: minmax(0, 1fr); background: #07090a; }
+.app-shell.is-focus .evidence-shelf { display: none; }
+.app-shell.is-focus .transport { position: absolute; z-index: 3; right: 0; bottom: 0; left: 0; background: rgba(23,28,32,.86); backdrop-filter: blur(8px); border-top: 0; }
+
+/* Notes card: 600 x 420 anchored bottom-left, above the bottom stack. The
+   textarea is the same node as in Review, so growing it cannot reset the
+   selection. */
+.app-shell.is-focus .judgment-panel {
+  position: absolute;
+  z-index: 4;
+  /* Clears the 32px transport plus a 16px gap. */
+  bottom: 48px;
+  left: 24px;
+  width: 600px;
+  height: 420px;
+  /* 28 + 16 + 330 rows, 8 of gaps, 32 of padding = 414, inside 420. */
+  grid-template-rows: 28px 16px 330px;
+  gap: 4px 0;
+  padding: 16px;
+  background: rgba(23,28,32,.86);
+  backdrop-filter: blur(8px);
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+}
+/* The header stays: it is the clip's identity, and the card is the only
+   surface in Focus that can carry it. Labels and the suggestion strip are the
+   optional part, off until D. */
+.app-shell.is-focus .judgment-panel .micro-header ~ .micro-header,
+.app-shell.is-focus .label-field,
+.app-shell.is-focus .chip-well,
+.app-shell.is-focus .ai-strip { display: none; }
+.app-shell.is-focus .header-action { display: none; }
+.app-shell.is-focus .notes-field { height: 330px; }
+
+/* D brings labels back, growing the card downward. Notes keeps its height and
+   its distance from the top of the card, so rule 3 holds within Focus too. */
+.app-shell.is-focus.show-right-stack .judgment-panel {
+  height: 560px;
+  grid-template-rows: 28px 16px 330px 16px 28px 90px 30px;
+}
+.app-shell.is-focus.show-right-stack .judgment-panel .micro-header ~ .micro-header,
+.app-shell.is-focus.show-right-stack .chip-well,
+.app-shell.is-focus.show-right-stack .ai-strip { display: flex; }
+.app-shell.is-focus.show-right-stack .label-field { display: block; }
+.app-shell.is-focus.show-right-stack .chip-well { height: 90px; }
+
+/* Ribbon overlay: one merged lane, because the question here is "where am I
+   in the trip", not "which camera". */
+.app-shell.is-focus .story-ribbon { position: relative; z-index: 3; background: rgba(18,23,26,.9); backdrop-filter: blur(8px); }
+
+/* H hides every overlay: the pure-frame state, and the only thing the expand
+   control opens. Never driven by hover or by playback. */
+.app-shell.overlays-hidden .topbar,
+.app-shell.overlays-hidden .transport,
+.app-shell.overlays-hidden .judgment-panel,
+.app-shell.overlays-hidden .story-ribbon { display: none; }
+.app-shell.overlays-hidden { grid-template-rows: 0 minmax(0, 1fr) 0; }
+
 /* ── Transport: one bar, always present (spec §3.5) ───────────────────── */
 /* Never conditional on hover or playback. The overlay this replaces hid
    itself exactly when you were watching, which is when you scrub. */
