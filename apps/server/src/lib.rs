@@ -4135,6 +4135,14 @@ mod tests {
                 ("RCDVLOG_FFMPEG".to_string(), tool.to_string()),
                 ("RCDVLOG_FFPROBE".to_string(), tool.to_string()),
                 ("RCDVLOG_EXIFTOOL".to_string(), tool.to_string()),
+                // Floor the disk-capacity gate (default 5 GiB) so tests that
+                // exercise representation work never depend on how much free
+                // space the host happens to have. GH ubuntu runners can drop
+                // under the default and turn those endpoints into 507s.
+                (
+                    "RCDVLOG_MINIMUM_FREE_BYTES".to_string(),
+                    (64 * 1024 * 1024).to_string(),
+                ),
             ]))
             .unwrap();
             let foundation = Arc::new(RuntimeFoundation::initialize(config).unwrap());
