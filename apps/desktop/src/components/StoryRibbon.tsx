@@ -7,6 +7,7 @@ import {
   ribbonHeight,
   ribbonLaneRows,
 } from "../review/layout";
+import { formatDate } from "../review/format";
 
 /** A contiguous run of clips sharing the same trip context. */
 export interface ContextRun {
@@ -40,7 +41,6 @@ export interface StoryRibbonProps {
   /** Dragged override; null sizes the ribbon to its own content. */
   height: number | null;
   scrollRef: RefObject<HTMLDivElement | null>;
-  formatDate(value: string | null): string;
   onZoomChange(next: number): void;
   onCenter(): void;
   onSelect(id: string): void;
@@ -65,7 +65,6 @@ export function StoryRibbon({
   merged,
   height: heightOverride,
   scrollRef,
-  formatDate,
   onZoomChange,
   onCenter,
   onSelect,

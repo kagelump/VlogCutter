@@ -5,6 +5,7 @@ import {
   transcriptBadge,
   transcriptStatusLabels,
 } from "../review/summaries";
+import { formatDate, formatTimecode } from "../review/format";
 
 export type ShelfTab = "transcript" | "description" | "analysis" | "file";
 
@@ -14,17 +15,11 @@ export interface EvidenceShelfProps {
   observation: AssetAnalysisView | null;
   open: boolean;
   tab: ShelfTab;
-  formatDate(value: string | null): string;
   onTabChange(tab: ShelfTab): void;
   onToggleOpen(): void;
   onSeek(seconds: number): void;
   onChangeAsset(next: Asset): void;
   onCommitAsset(): void;
-}
-
-function formatTimecode(ms: number) {
-  const total = Math.max(0, Math.round(ms / 1000));
-  return `${Math.floor(total / 60)}:${(total % 60).toString().padStart(2, "0")}`;
 }
 
 /**
@@ -45,7 +40,6 @@ export function EvidenceShelf({
   observation,
   open,
   tab,
-  formatDate,
   onTabChange,
   onToggleOpen,
   onSeek,

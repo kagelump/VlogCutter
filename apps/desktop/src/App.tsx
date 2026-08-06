@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import { StatusBadge } from "@rcdvlog/review-ui";
 import { api } from "./api";
-import type { AnalysisReadiness, AnalysisStage, Asset, AssetAnalysisIndexEntry, AssetAnalysisView, AssetPatch, AutoplayMode, BaselineImportResult, BaselinePreviewResult, ClipTranscript, DesktopSettings, ModelInstallProgress, ModelStatus, PathAnalysis, Project, ProjectLibrary, ProjectLocation, ProjectPairingStatus, RootMappingEntry, ServerConnectionStatus, ServerVersionInfo, SyncStatus, TranscriptStatus } from "./types";
+import type { AnalysisReadiness, Asset, AssetAnalysisIndexEntry, AssetAnalysisView, AssetPatch, AutoplayMode, BaselineImportResult, BaselinePreviewResult, ClipTranscript, DesktopSettings, ModelInstallProgress, ModelStatus, PathAnalysis, Project, ProjectLibrary, ProjectLocation, ProjectPairingStatus, RootMappingEntry, ServerConnectionStatus, ServerVersionInfo, SyncStatus, TranscriptStatus } from "./types";
 import { orderAssets, moveSelection as moveSelectionInOrder } from "./review/order";
 import { resolveAction } from "./review/keymap";
 import { CalibrationPanel } from "./CalibrationPanel";
@@ -21,72 +21,17 @@ import {
 import { JudgmentPanel, type SaveState } from "./components/JudgmentPanel";
 import { EvidenceShelf, type ShelfTab } from "./components/EvidenceShelf";
 import { TransportBar } from "./components/TransportBar";
-
-interface OperationProgress {
-  kind: "proxy" | "thumbnail" | "analysis";
-  completed: number;
-  total: number;
-  completedWorkUnits: number;
-  totalWorkUnits: number;
-  workerCount: number;
-  estimatedRemainingSeconds: number | null;
-  /** Analysis only: which stage of the chain is running, and what it has spent. */
-  stage?: AnalysisStage;
-  stageIndex?: number;
-  stageCount?: number;
-  costUsd?: number;
-}
-
-const analysisStageLabels: Record<AnalysisStage, string> = {
-  proxies: "Making proxies",
-  transcripts: "Transcribing",
-  analysis: "Analyzing clips",
-};
-
-/** The clip's display name: what analysis called it, else its filename. */
-function clipTitle(asset: Asset) {
-  return asset.title.trim() || asset.filename;
-}
-
-function formatCost(usd: number) {
-  // A non-finite value reaches here when the budget field is empty or garbage;
-  // rendering "$NaN" beside a spend figure is worse than saying nothing.
-  if (!Number.isFinite(usd)) return "the run budget";
-  if (usd <= 0) return "$0.00";
-  if (usd < 0.01) return "<$0.01";
-  return `$${usd.toFixed(2)}`;
-}
-
-function formatTimecode(ms: number) {
-  const total = Math.max(0, Math.round(ms / 1000));
-  const minutes = Math.floor(total / 60);
-  const seconds = total % 60;
-  return `${minutes}:${seconds.toString().padStart(2, "0")}`;
-}
+import { QueuePanel } from "./components/QueuePanel";
+import { VideoStage } from "./components/VideoStage";
+import { TopBar, type OperationProgress } from "./components/TopBar";
+import { analysisStageLabels, formatCost, syncStateLabel } from "./review/format";
+import { isRawOrientationProxy, renderedRotation, rotationAfter } from "./review/rotation";
 
 const autoplayOptions: Array<{ value: AutoplayMode; label: string; detail: string }> = [
   { value: "never", label: "Never", detail: "Keep each clip paused until you press Space." },
   { value: "proxyAvailable", label: "Only when proxy is available", detail: "Autoplay lightweight review media; keep camera originals paused." },
   { value: "always", label: "Always", detail: "Autoplay whichever version is available, including camera originals." },
 ];
-
-function formatDuration(seconds: number) {
-  const safe = Number.isFinite(seconds) ? Math.max(0, seconds) : 0;
-  const minutes = Math.floor(safe / 60);
-  const remainder = Math.floor(safe % 60);
-  return `${minutes}:${remainder.toString().padStart(2, "0")}`;
-}
-
-function formatEta(seconds: number | null) {
-  if (seconds === null || !Number.isFinite(seconds)) return "Estimating…";
-  const rounded = Math.max(0, Math.ceil(seconds));
-  if (rounded < 60) return `${rounded}s remaining`;
-  const minutes = Math.ceil(rounded / 60);
-  if (minutes < 60) return `${minutes}m remaining`;
-  const hours = Math.floor(minutes / 60);
-  const remainder = minutes % 60;
-  return `${hours}h ${remainder}m remaining`;
-}
 
 function initialProgress(kind: OperationProgress["kind"], total: number): OperationProgress {
   return {
@@ -100,20 +45,6 @@ function initialProgress(kind: OperationProgress["kind"], total: number): Operat
   };
 }
 
-function formatDate(value: string | null) {
-  if (!value) return "No camera time";
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return value;
-  return new Intl.DateTimeFormat(undefined, {
-    month: "short",
-    day: "numeric",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-    hour12: false,
-  }).format(date);
-}
-
 function patchFor(asset: Asset): AssetPatch {
   return {
     notes: asset.notes,
@@ -121,29 +52,6 @@ function patchFor(asset: Asset): AssetPatch {
     removed: asset.removed,
     rotationDegrees: asset.rotationDegrees,
   };
-}
-
-function rotationAfter(rotationDegrees: number, addition: number) {
-  return ((rotationDegrees + addition) % 360 + 360) % 360;
-}
-
-function portraitRotation(asset: Asset) {
-  return rotationAfter(asset.defaultRotationDegrees, 270);
-}
-
-function isRawOrientationProxy(asset: Asset) {
-  return asset.proxyRepresentation === "raw_v3";
-}
-
-function isRawOrientationThumbnail(asset: Asset) {
-  return Boolean(asset.thumbnailPath?.endsWith(".v2.jpg"));
-}
-
-function renderedRotation(asset: Asset, representationIsRaw: boolean) {
-  return rotationAfter(
-    asset.rotationDegrees,
-    representationIsRaw ? 0 : -asset.metadataRotationDegrees,
-  );
 }
 
 function App() {
@@ -1177,7 +1085,8 @@ function App() {
       .map(({ asset, offset }) => {
         const url = api.mediaUrl(asset);
         const usingProxy = Boolean(asset.proxyAvailable && asset.proxyPath);
-        const rotation = renderedRotation(asset, usingProxy && isRawOrientationProxy(asset));
+        const mediaIsRawOriented = usingProxy && isRawOrientationProxy(asset);
+        const rotation = renderedRotation(asset, mediaIsRawOriented);
         const displayIsQuarterTurn = asset.rotationDegrees % 180 !== 0;
         const displayAspect = (displayIsQuarterTurn ? asset.height / asset.width : asset.width / asset.height) || 16 / 9;
         return {
@@ -1185,7 +1094,7 @@ function App() {
           offset,
           active: asset.id === selectedId,
           url,
-          usingProxy,
+          mediaIsRawOriented,
           rotation,
           displayAspect,
           posterUrl: api.thumbnailUrl(asset),
@@ -1272,22 +1181,6 @@ function App() {
       if (videoRef.current) videoRef.current.muted = next;
       return next;
     });
-  }
-
-  // ── Sync helpers ────────────────────────────────────────────────────
-
-  function syncStateLabel(state: string): string {
-    switch (state) {
-      case "unpaired": return "Unpaired";
-      case "offline": return "Offline";
-      case "connecting": return "Connecting…";
-      case "syncing": return "Syncing…";
-      case "synced": return "Synced";
-      case "attention": return "Needs attention";
-      case "incompatible": return "Incompatible";
-      case "credential_revoked": return "Credential revoked";
-      default: return state;
-    }
   }
 
   // ── Server pairing handlers ─────────────────────────────────────────
@@ -1428,143 +1321,39 @@ function App() {
 
   return (
     <main className={shellClass}>
-      <header className="topbar">
-        <div className="wordmark" aria-label="RCD VlogCutter">
-          <span className="wordmark-mark">RCD</span>
-          <span>VlogCutter</span>
-        </div>
-        <label className="project-switcher">
-          <span className="sr-only">Current project</span>
-          <select value={projectId} onChange={(event) => setProjectId(event.target.value)}>
-            {projects.map((item) => (
-              <option value={item.id} key={item.id}>{item.name}</option>
-            ))}
-          </select>
-        </label>
-        {/* Visible rather than tucked into a menu: three modes is few enough
-            to show, and hiding them makes them read as settings. */}
-        <nav className="mode-switcher" aria-label="View mode">
-          {([
-            ["review", "Review", "Meta+1"],
-            ["chronology", "Chronology", "Meta+2"],
-            ["editPlan", "Edit plan", "Meta+3"],
-          ] as Array<[Mode, string, string]>).map(([mode, label, shortcut]) => (
-            <button
-              key={mode}
-              className={view.mode === mode ? "active" : ""}
-              aria-pressed={view.mode === mode}
-              aria-keyshortcuts={shortcut}
-              disabled={!projectId && mode !== "review"}
-              onClick={() => dispatchView({ kind: "setMode", mode })}
-            >{label}</button>
-          ))}
-        </nav>
-        {api.isDesktop() && <button className="text-button" disabled={busy} onClick={openCatalog} aria-keyshortcuts="Meta+O">Open catalog</button>}
-        <button className="text-button" onClick={() => setShowSettings(true)} aria-keyshortcuts="Meta+,">Settings <kbd>⌘,</kbd></button>
-        <button className="text-button" onClick={() => setShowCreate(true)} aria-keyshortcuts="Meta+N">New project</button>
-        {api.isDesktop() && serverStatus?.paired && projectId && (
-          <button className="text-button" disabled={busy} onClick={() => void handleStartBaselineWizard(projectId)}>
-            Pair with server
-          </button>
-        )}
-        {syncStatus && syncStatus.state !== "unpaired" && (
-          <button
-            className={`sync-indicator sync-${syncStatus.state}`}
-            onClick={() => setShowSyncDiagnostics(true)}
-            title={`Sync: ${syncStatus.state}${syncStatus.lastError ? ` — ${syncStatus.lastError}` : ""}`}
-          >
-            <span className={`sync-dot sync-dot-${syncStatus.state}`} />
-            <span className="sync-label">{syncStateLabel(syncStatus.state)}</span>
-          </button>
-        )}
-        {/* Empty at idle, and that emptiness is the point: this is the only
-            calm region on screen. It is the whole replacement for the 28px
-            status line that used to be reserved whether or not it had
-            anything to say. */}
-        <div className="operation-slot" data-testid="operation-slot" aria-live="polite">
-          {operationProgress ? (
-            <>
-              <span>
-                {operationProgress.kind === "analysis" && operationProgress.stage
-                  ? `${analysisStageLabels[operationProgress.stage]} · step ${(operationProgress.stageIndex ?? 0) + 1} of ${operationProgress.stageCount ?? 3}`
-                  : operationProgress.kind === "thumbnail"
-                    ? "Generating thumbnails"
-                    : "Generating proxies"}
-              </span>
-              <div
-                className="progress-track"
-                role="progressbar"
-                aria-valuemin={0}
-                aria-valuemax={operationProgress.totalWorkUnits || operationProgress.total}
-                aria-valuenow={operationProgress.totalWorkUnits ? operationProgress.completedWorkUnits : operationProgress.completed}
-              >
-                <span style={{ width: `${operationProgress.totalWorkUnits
-                  ? (operationProgress.completedWorkUnits / operationProgress.totalWorkUnits) * 100
-                  : operationProgress.total
-                    ? (operationProgress.completed / operationProgress.total) * 100
-                    : 0}%` }} />
-              </div>
-              <output>{operationProgress.completed}/{operationProgress.total}</output>
-              <span>
-                {formatEta(operationProgress.estimatedRemainingSeconds)} · {operationProgress.workerCount} worker{operationProgress.workerCount === 1 ? "" : "s"}
-                {operationProgress.kind === "analysis" ? ` · ${formatCost(operationProgress.costUsd ?? 0)} spent` : ""}
-              </span>
-              {operationProgress.kind === "analysis" && (
-                <button className="button ghost progress-cancel" onClick={stopAnalysis}>Cancel</button>
-              )}
-            </>
-          ) : error ? (
-            <span className="error-banner" role="alert">
-              {error}
-              <button className="banner-dismiss" onClick={() => setError("")} aria-label="Dismiss error">×</button>
-            </span>
-          ) : message ? (
-            <span className="toast">{message}</span>
-          ) : null}
-        </div>
-        <div className="topbar-spacer" />
-        <div className="media-split">
-          {/* Not rendered when there is nothing to make. "Proxies ready" is a
-              disabled button reporting the absence of work, and it was the
-              source of the mismatched-outline complaint. The count is state
-              worth seeing, so the button returns when work is outstanding. */}
-          {missingProxyCount > 0 && (
-            <button className="button secondary media-split-main" disabled={busy} onClick={makeMissingProxies} aria-keyshortcuts="Shift+P">
-              Make {missingProxyCount} proxies
-            </button>
-          )}
-          <button
-            className="button secondary media-split-toggle"
-            disabled={busy || !projectId}
-            onClick={() => setShowMediaMenu((current) => !current)}
-            aria-label="More media generation actions"
-            aria-expanded={showMediaMenu}
-          >▾</button>
-          {showMediaMenu && (
-            <div className="media-menu">
-              <button disabled={busy || missingThumbnailCount === 0} onClick={makeMissingThumbnails} aria-keyshortcuts="Shift+G">
-                <span>{missingThumbnailCount ? `Generate ${missingThumbnailCount} thumbnails` : "Thumbnails ready"}</span>
-                <kbd>⇧G</kbd>
-                <small>Quality 1 · frame at 20%</small>
-              </button>
-              <button disabled={busy || !projectId} onClick={openAnalysisDialog} aria-keyshortcuts="A">
-                <span>{readiness?.missingAnalyses ? `Analyze ${readiness.missingAnalyses} clips` : "Analysis up to date"}</span>
-                <kbd>A</kbd>
-                <small>Proxies, speech, then cloud vision</small>
-              </button>
-            </div>
-          )}
-        </div>
-        <button className="button primary" disabled={busy || !projectId} onClick={importFolder} aria-keyshortcuts="M">
-          Add media <kbd>M</kbd>
-        </button>
-        <button className="shortcut-help-button" onClick={() => setShowShortcuts(true)} aria-label="Keyboard shortcuts" aria-keyshortcuts="?">?</button>
-        {/* Ambient progress for 2px, replacing a 180px readout that said the
-            same thing in words. */}
-        <div className="completion-hairline" aria-hidden="true">
-          <span style={{ width: `${activeAssets.length ? (labeledCount / activeAssets.length) * 100 : 0}%` }} />
-        </div>
-      </header>
+      <TopBar
+        projects={projects}
+        projectId={projectId}
+        mode={view.mode}
+        isDesktop={api.isDesktop()}
+        busy={busy}
+        canPairWithServer={Boolean(serverStatus?.paired && projectId)}
+        syncStatus={syncStatus}
+        operationProgress={operationProgress}
+        error={error}
+        message={message}
+        missingProxyCount={missingProxyCount}
+        missingThumbnailCount={missingThumbnailCount}
+        missingAnalysisCount={readiness?.missingAnalyses ?? 0}
+        mediaMenuOpen={showMediaMenu}
+        labeledCount={labeledCount}
+        activeCount={activeAssets.length}
+        onProjectChange={setProjectId}
+        onModeChange={(mode) => dispatchView({ kind: "setMode", mode })}
+        onOpenCatalog={openCatalog}
+        onOpenSettings={() => setShowSettings(true)}
+        onOpenCreateProject={() => setShowCreate(true)}
+        onOpenShortcuts={() => setShowShortcuts(true)}
+        onPairWithServer={() => void handleStartBaselineWizard(projectId)}
+        onShowSyncDiagnostics={() => setShowSyncDiagnostics(true)}
+        onCancelAnalysis={stopAnalysis}
+        onDismissError={() => setError("")}
+        onMakeProxies={makeMissingProxies}
+        onToggleMediaMenu={() => setShowMediaMenu((current) => !current)}
+        onMakeThumbnails={makeMissingThumbnails}
+        onOpenAnalysis={openAnalysisDialog}
+        onImportFolder={importFolder}
+      />
 
       {view.mode !== "review" && projectId ? (
         <div className="mode-surface">
@@ -1586,95 +1375,22 @@ function App() {
         className="workbench"
         style={{ gridTemplateColumns: `${panelSizes.queue}px 5px minmax(0, 1fr) 5px ${panelSizes.rail}px` }}
       >
-        <aside className="queue-panel">
-          <div className="panel-heading">
-            <div>
-              <span className="eyebrow">{showRemoved ? "Removed clips" : "Label queue"}</span>
-              <h1>{project?.name ?? "No project"}</h1>
-            </div>
-            <div className="queue-heading-actions">
-              {unusableCount > 0 && !showRemoved && (
-                <button
-                  className={`queue-view-toggle ${showUnusableOnly ? "active" : ""}`}
-                  onClick={() => setShowUnusableOnly((current) => !current)}
-                  aria-pressed={showUnusableOnly}
-                  title="Clips the analysis judged unusable"
-                >{showUnusableOnly ? "All clips" : `Unusable ${unusableCount}`}</button>
-              )}
-              {removedCount > 0 && (
-                <button
-                  className={`queue-view-toggle ${showRemoved ? "active" : ""}`}
-                  onClick={() => setShowRemoved((current) => !current)}
-                  aria-pressed={showRemoved}
-                >{showRemoved ? "Back to labels" : `Removed ${removedCount}`}</button>
-              )}
-              <span className="count-badge">{filteredAssets.length}</span>
-            </div>
-          </div>
-          <label className="search-box">
-            <span className="sr-only">Filter clips</span>
-            <input
-              id="queue-search"
-              value={query}
-              onChange={(event) => setQuery(event.target.value)}
-              placeholder="Filter titles, labels, notes, speech…"
-            />
-            <kbd>/</kbd>
-          </label>
-          <div className="queue-list" ref={queueRef} role="listbox" aria-label="Clips" tabIndex={0}>
-            {filteredAssets.length === 0 ? (
-              <div className="empty-queue">
-                <strong>{showRemoved ? "No removed clips." : "No clips here yet."}</strong>
-                <span>{showRemoved ? "Removed clips can be restored here." : "Add a NAS or drive folder to begin."}</span>
-              </div>
-            ) : filteredAssets.map((asset, index) => {
-              const thumbnailUrl = api.thumbnailUrl(asset);
-              return (
-                <button
-                  className={`queue-item ${asset.id === selectedId ? "selected" : ""}`}
-                  key={asset.id}
-                  onClick={() => setSelectedId(asset.id)}
-                  role="option"
-                  aria-selected={asset.id === selectedId}
-                >
-                  <span className={`label-pip ${asset.labels.length ? "labeled" : ""}`} aria-hidden="true" />
-                  <span
-                    className={`queue-thumbnail ${renderedRotation(asset, isRawOrientationThumbnail(asset)) % 180 !== 0 ? "quarter-turn" : ""}`}
-                    style={{ "--thumbnail-rotation": `${renderedRotation(asset, isRawOrientationThumbnail(asset))}deg` } as CSSProperties}
-                  >
-                    {thumbnailUrl ? <img src={thumbnailUrl} alt="" loading="lazy" /> : <span className="thumbnail-empty">Q0</span>}
-                    <span className="queue-index">{String(index + 1).padStart(3, "0")}</span>
-                  </span>
-                  <span className="queue-main">
-                    <strong>{clipTitle(asset)}</strong>
-                    {/* The filename stays visible but stops being the headline
-                        once analysis has named the clip. The verdict sits on
-                        this line, inside the flexible column, so a long reason
-                        truncates instead of widening the row. */}
-                    <span className="queue-meta">
-                      {analysisIndex[asset.id]?.usable === false && (
-                        <span className="unusable-pip" title={`Analysis flagged this clip: ${analysisIndex[asset.id]?.unusableReason || "unusable"}`}>
-                          {analysisIndex[asset.id]?.unusableReason || "unusable"}
-                        </span>
-                      )}
-                      <span>{asset.title.trim() ? `${asset.filename} · ${asset.camera}` : asset.camera}</span>
-                    </span>
-                  </span>
-                  <span className="queue-tail">
-                    <time>{formatDuration(asset.durationSeconds)}</time>
-                    {asset.labels.length > 0 && <span className="label-count">{asset.labels.length} label{asset.labels.length === 1 ? "" : "s"}</span>}
-                  </span>
-                </button>
-              );
-            })}
-          </div>
-          <div className="shortcut-strip" aria-label="Keyboard shortcuts">
-            <span><kbd>J</kbd><kbd>K</kbd> move</span>
-            <span><kbd>Space</kbd> play</span>
-            <span><kbd>L</kbd> label</span>
-            <span><kbd>R</kbd> remove</span>
-          </div>
-        </aside>
+        <QueuePanel
+          projectName={project?.name ?? null}
+          assets={filteredAssets}
+          selectedId={selectedId}
+          query={query}
+          analysisIndex={analysisIndex}
+          showRemoved={showRemoved}
+          showUnusableOnly={showUnusableOnly}
+          unusableCount={unusableCount}
+          removedCount={removedCount}
+          listRef={queueRef}
+          onQueryChange={setQuery}
+          onSelect={setSelectedId}
+          onToggleRemovedView={() => setShowRemoved((current) => !current)}
+          onToggleUnusableView={() => setShowUnusableOnly((current) => !current)}
+        />
         <Splitter
           orientation="vertical"
           value={panelSizes.queue}
@@ -1686,83 +1402,25 @@ function App() {
         />
 
         <section className="viewer-panel">
-          <div ref={viewerStageRef} className={`viewer-stage ${isPlaying ? "is-playing" : "is-paused"}`}>
-            {selected ? (
-              !selected.orientationProbed && selected.originalAvailable ? (
-                <div className="offline-slate">
-                  <strong>Reading frame orientation…</strong>
-                  <span>{selected.filename}</span>
-                </div>
-              ) : mediaUrl ? (
-                <>
-                  {bufferedMedia.map((entry) => {
-                    const style = {
-                      "--display-aspect": String(entry.displayAspect),
-                      "--inverse-display-aspect": String(1 / entry.displayAspect),
-                      "--viewer-rotation": `${entry.rotation}deg`,
-                    } as CSSProperties;
-                    return (
-                      <div
-                        className={`viewer-media ${entry.active ? "active" : "preloaded"} ${entry.rotation % 180 !== 0 ? "quarter-turn" : ""}`}
-                        style={style}
-                        key={entry.asset.id}
-                        aria-hidden={!entry.active}
-                      >
-                        <video
-                          ref={entry.active ? videoRef : undefined}
-                          data-asset-id={entry.asset.id}
-                          data-cache-slot={entry.active ? "current" : entry.offset < 0 ? "previous" : "next"}
-                          src={entry.url ?? undefined}
-                          poster={entry.active && entry.posterUrl && isRawOrientationThumbnail(entry.asset) === (entry.usingProxy && isRawOrientationProxy(entry.asset)) ? entry.posterUrl : undefined}
-                          preload={entry.active || entry.offset > 0 ? "auto" : "metadata"}
-                          autoPlay={entry.active && shouldAutoplay}
-                          muted={isMuted}
-                          onClick={entry.active ? togglePlayback : undefined}
-                          onLoadStart={() => entry.active && setIsBuffering(true)}
-                          onWaiting={() => entry.active && setIsBuffering(true)}
-                          onCanPlay={() => entry.active && setIsBuffering(false)}
-                          onPlaying={() => entry.active && setIsBuffering(false)}
-                          onPlay={() => entry.active && setIsPlaying(true)}
-                          onPause={() => entry.active && setIsPlaying(false)}
-                          onEnded={() => entry.active && setIsPlaying(false)}
-                          onLoadedMetadata={(event) => {
-                            if (!entry.active) return;
-                            setMediaDuration(Number.isFinite(event.currentTarget.duration) ? event.currentTarget.duration : entry.asset.durationSeconds);
-                            setPlaybackSeconds(event.currentTarget.currentTime);
-                          }}
-                          onDurationChange={(event) => {
-                            if (entry.active && Number.isFinite(event.currentTarget.duration)) setMediaDuration(event.currentTarget.duration);
-                          }}
-                          onTimeUpdate={(event) => entry.active && setPlaybackSeconds(event.currentTarget.currentTime)}
-                        />
-                      </div>
-                    );
-                  })}
-                  {isBuffering && <div className="viewer-buffering" role="status"><span /> Buffering</div>}
-                </>
-              ) : (
-                <div className="offline-slate">
-                  <span className="slate-time">{formatDate(selected.bestTime)}</span>
-                  <strong>{selected.filename}</strong>
-                  <span>{selected.proxyPath && !selected.proxyAvailable ? "Proxy is missing" : "No review proxy yet"}</span>
-                  {api.isDesktop() && selected.available && (
-                    <button className="button primary" disabled={busy} onClick={makeProxy}>Make proxy</button>
-                  )}
-                </div>
-              )
-            ) : (
-              <div className="offline-slate">
-                <strong>Choose a clip</strong>
-                <span>The next frame will appear here.</span>
-              </div>
-            )}
-            {selected && (
-              <div className="viewer-overlay">
-                <span>{selected.proxyAvailable ? "PROXY" : "ORIGINAL"}</span>
-                <span>{selected.width}×{selected.height} · {selected.frameRate.toFixed(2)} fps</span>
-              </div>
-            )}
-          </div>
+          <VideoStage
+            selected={selected}
+            media={bufferedMedia}
+            mediaUrl={mediaUrl}
+            playing={isPlaying}
+            buffering={isBuffering}
+            muted={isMuted}
+            autoplay={shouldAutoplay}
+            canMakeProxy={api.isDesktop() && Boolean(selected?.available)}
+            busy={busy}
+            stageRef={viewerStageRef}
+            videoRef={videoRef}
+            onTogglePlay={togglePlayback}
+            onBufferingChange={setIsBuffering}
+            onPlayingChange={setIsPlaying}
+            onDurationChange={setMediaDuration}
+            onPositionChange={setPlaybackSeconds}
+            onMakeProxy={makeProxy}
+          />
 
           {selected && (
           <TransportBar
@@ -1791,7 +1449,6 @@ function App() {
               observation={observation}
               open={view.shelf}
               tab={shelfTab}
-              formatDate={formatDate}
               onTabChange={setShelfTab}
               onToggleOpen={() => dispatchView({ kind: "toggleShelf" })}
               onSeek={seekTo}
@@ -1865,7 +1522,6 @@ function App() {
           selectedId={selectedId}
           zoom={chronologyZoom}
           scrollRef={chronologyScrollRef}
-          formatDate={formatDate}
           collapsed={!view.ribbon}
           merged={view.presentation === "focus"}
           height={view.presentation === "focus" ? null : panelSizes.ribbon}

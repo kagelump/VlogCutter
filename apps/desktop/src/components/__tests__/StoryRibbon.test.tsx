@@ -36,7 +36,6 @@ function renderRibbon(overrides: Partial<StoryRibbonProps> = {}) {
     merged: false,
     height: null,
     scrollRef: createRef<HTMLDivElement>(),
-    formatDate: () => "no time",
     onZoomChange: vi.fn(),
     onCenter: vi.fn(),
     onSelect: vi.fn(),

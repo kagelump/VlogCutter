@@ -632,6 +632,14 @@ mod tests {
             ("RCDVLOG_FFMPEG".to_string(), tool.to_string()),
             ("RCDVLOG_FFPROBE".to_string(), tool.to_string()),
             ("RCDVLOG_EXIFTOOL".to_string(), tool.to_string()),
+            // Floor the disk-capacity gate (default 5 GiB) so readiness tests
+            // never depend on how much free space the host happens to have.
+            // GH ubuntu runners frequently sit below the default, which turned
+            // the non-optional data/derived disk checks into readiness errors.
+            (
+                "RCDVLOG_MINIMUM_FREE_BYTES".to_string(),
+                (64 * 1024 * 1024).to_string(),
+            ),
         ]))
         .unwrap()
     }

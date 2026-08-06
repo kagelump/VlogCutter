@@ -83,7 +83,6 @@ function renderShelf(overrides: Partial<EvidenceShelfProps> = {}) {
     observation: view(),
     open: true,
     tab: "transcript" as const,
-    formatDate: (value: string | null) => value ?? "no time",
     onTabChange: vi.fn(),
     onToggleOpen: vi.fn(),
     onSeek: vi.fn(),
