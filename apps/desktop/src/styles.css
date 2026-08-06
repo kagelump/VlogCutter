@@ -228,6 +228,18 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .app-shell.overlays-hidden .story-ribbon { display: none; }
 .app-shell.overlays-hidden { grid-template-rows: 0 minmax(0, 1fr) 0; }
 
+/* ── Splitters ────────────────────────────────────────────────────────── */
+/* A 5px track with a wider invisible grab area, so the pointer target is
+   comfortable without the divider itself being a visible bar. Double-click
+   restores the default size; arrow keys nudge it 16px. */
+.splitter { position: relative; z-index: 6; background: var(--line); }
+.splitter::after { position: absolute; content: ""; }
+.splitter:hover, .splitter:focus-visible { background: var(--amber); outline: none; }
+.splitter-vertical { cursor: col-resize; touch-action: none; }
+.splitter-vertical::after { inset: 0 -4px; }
+.splitter-horizontal { height: 5px; cursor: row-resize; touch-action: none; }
+.splitter-horizontal::after { inset: -4px 0; }
+
 /* ── Transport: one bar, always present (spec §3.5) ───────────────────── */
 /* Never conditional on hover or playback. The overlay this replaces hid
    itself exactly when you were watching, which is when you scrub. */
@@ -260,10 +272,15 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .judgment-panel {
   min-height: 0;
   display: grid;
-  grid-template-rows: 32px 18px 400px 18px 28px 120px 30px;
-  align-content: start;
-  /* 646 of rows + 24 of gaps + 28 of padding = 698, inside the 700 the spec
-     budgets for the five-lane case. A uniform 8px gap overflowed by 3px. */
+  /* The chip well is the flexible row and the only one. Everything above the
+     notes field is fixed, so the field keeps both its height and its distance
+     from the top of the panel however tall the rail is — rule 3 holds while
+     the panel is still user-resizable.
+
+     It also absorbs the slack that used to sit as dead space: a fixed 120px
+     well left ~98px empty under two rows of chips, and align-content: start
+     left another ~56px below the suggestion strip. */
+  grid-template-rows: 32px 18px 400px 18px 28px minmax(48px, 1fr) auto;
   gap: 4px 0;
   padding: 12px 12px 16px;
   overflow: hidden;
@@ -293,7 +310,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .label-field::placeholder { color: #566168; }
 .label-field:focus { outline: none; border-color: var(--amber); }
 
-.chip-well { display: flex; flex-wrap: wrap; align-content: start; gap: 4px; height: 120px; overflow-y: auto; }
+.chip-well { display: flex; flex-wrap: wrap; align-content: start; gap: 4px; min-height: 0; overflow-y: auto; }
 .chip-well button { display: inline-flex; align-items: center; gap: 6px; max-width: 100%; height: 22px; padding: 0 6px 0 8px; color: #e4c99f; background: #332719; border: 0; border-radius: 3px; cursor: pointer; font-size: 12px; }
 .chip-well button:hover { color: #fff0d6; }
 .chip-well button span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -301,7 +318,10 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 
 /* The one machine element the rail permits, because clicking it authors a
    human label rather than merely reporting one. */
-.ai-strip { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; height: 30px; overflow: hidden; }
+/* Auto height: four suggestions wrap to two rows and a fixed 30px clipped the
+   second one. */
+.ai-strip { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; min-height: 30px; }
+.ai-strip:empty { display: none; }
 .ai-prefix { color: var(--quiet); font: 10px/12px ui-monospace, SFMono-Regular, Menlo, monospace; }
 .ai-suggestion { height: 22px; padding: 0 8px; color: var(--cyan); background: transparent; border: 1px dashed #2c4c52; border-radius: 3px; cursor: pointer; font-size: 12px; }
 .ai-suggestion:hover { color: var(--ink); border-color: var(--cyan); }
@@ -333,7 +353,8 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 
 /* The ribbon left this column for the shell's third row: full width it sees
    1440px instead of ~863px, and the video no longer pays 244px for it. */
-.story-ribbon { min-width: 0; overflow: hidden; border-top: 1px solid var(--line); }
+.story-ribbon { position: relative; min-width: 0; overflow: hidden; border-top: 1px solid var(--line); }
+.story-ribbon > .splitter-horizontal { position: absolute; top: 0; right: 0; left: 0; }
 
 .panel-heading { display: flex; justify-content: space-between; align-items: end; gap: 8px; padding: 18px 14px 11px; }
 /* The title yields to the view toggles rather than pushing them out of the
@@ -375,7 +396,10 @@ kbd { padding: 2px 4px; color: #a8b1b6; background: #262d32; border: 1px solid #
 
 .media-split { position: relative; display: flex; }
 .media-split-main { border-radius: 5px 0 0 5px; }
-.media-split-toggle { min-width: 29px; padding: 7px 8px; border-left: 0; border-radius: 0 5px 5px 0; }
+/* Rounds on both sides when it stands alone, which it does whenever there is
+   no outstanding proxy work. */
+.media-split-toggle { min-width: 29px; padding: 7px 8px; border-radius: 5px; }
+.media-split-main + .media-split-toggle { border-left: 0; border-radius: 0 5px 5px 0; }
 .media-menu { position: absolute; z-index: 15; top: calc(100% + 6px); right: 0; width: 245px; padding: 4px; background: #1b2125; border: 1px solid var(--line-strong); border-radius: 6px; box-shadow: 0 12px 35px rgba(0,0,0,.45); }
 .media-menu button { width: 100%; display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 4px 8px; padding: 9px; color: var(--ink); background: transparent; border: 0; border-radius: 4px; cursor: pointer; text-align: left; }
 .media-menu button:hover:not(:disabled) { background: #283036; }
@@ -432,7 +456,9 @@ kbd { padding: 2px 4px; color: #a8b1b6; background: #262d32; border: 1px solid #
 .zoom-control kbd, .center-story-button kbd { padding: 1px 3px; font-size: 10px; }
 .center-story-button { height: 25px; padding: 0 7px; border: 1px solid var(--line); border-radius: 4px; background: #171d20; }
 .zoom-control button:hover:not(:disabled), .center-story-button:hover { color: var(--ink); background: #242b2f; }
-.story-map { min-height: 0; flex: 1; display: grid; grid-template-columns: 96px minmax(0, 1fr); overflow: hidden; background: #0c1012; }
+/* Scrolls vertically as one unit, so the camera-name gutter and the lane
+   tracks stay aligned when the ribbon is shorter than its lane stack. */
+.story-map { min-height: 0; flex: 1; display: grid; grid-template-columns: 96px minmax(0, 1fr); overflow-x: hidden; overflow-y: auto; background: #0c1012; }
 .story-labels { position: relative; z-index: 2; display: grid; overflow: hidden; background: #111619; border-right: 1px solid var(--line-strong); }
 .story-labels > span { min-width: 0; display: flex; align-items: center; overflow: hidden; padding: 0 8px; border-bottom: 1px solid #20272b; text-overflow: ellipsis; white-space: nowrap; }
 .context-label, .order-label { color: #748087; font: 10px/12px ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: .1em; text-transform: uppercase; }
@@ -444,10 +470,10 @@ kbd { padding: 2px 4px; color: #a8b1b6; background: #262d32; border: 1px solid #
 .story-canvas { position: relative; display: grid; background: repeating-linear-gradient(90deg, transparent 0, transparent calc(var(--clip-step) - 1px), rgba(113,126,133,.13) calc(var(--clip-step) - 1px), rgba(113,126,133,.13) var(--clip-step)); }
 .context-track, .order-track, .lane-track { position: relative; min-width: 0; border-bottom: 1px solid #20272b; }
 .context-track { background: #101619; }
-.context-segment { position: absolute; top: 2px; height: 16px; min-width: 24px; display: flex; flex-direction: column; justify-content: center; overflow: hidden; padding: 0 9px; color: #bac6ca; background: linear-gradient(90deg, #213037, #1a262b); border-left: 2px solid var(--cyan); border-radius: 3px; white-space: nowrap; }
+.context-segment { position: absolute; top: 2px; height: 16px; min-width: 24px; display: flex; align-items: center; overflow: hidden; padding: 0 9px; color: #bac6ca; background: linear-gradient(90deg, #213037, #1a262b); border-left: 2px solid var(--cyan); border-radius: 3px; white-space: nowrap; }
 .context-segment:nth-child(even) { background: linear-gradient(90deg, #302a25, #28231f); border-left-color: var(--amber); }
-.context-segment strong { overflow: hidden; font-size: 10px; line-height: 1.1; text-overflow: ellipsis; }
-.context-segment span { overflow: hidden; margin-top: 3px; color: #718087; font: 10px/12px ui-monospace, SFMono-Regular, Menlo, monospace; text-overflow: ellipsis; }
+.context-segment strong { max-width: 60%; flex: none; overflow: hidden; font-size: 10px; line-height: 12px; text-overflow: ellipsis; }
+.context-segment span { min-width: 0; flex: 1; overflow: hidden; color: #718087; font: 10px/12px ui-monospace, SFMono-Regular, Menlo, monospace; text-overflow: ellipsis; }
 .order-track { color: #526067; background: #0e1315; font: 10px/14px ui-monospace, SFMono-Regular, Menlo, monospace; }
 .order-track > span { position: absolute; width: var(--clip-step); padding-left: 5px; }
 .order-track > span.active { color: var(--amber); }
@@ -577,10 +603,12 @@ kbd { padding: 2px 4px; color: #a8b1b6; background: #262d32; border: 1px solid #
    stack would overflow by ~79px. Notes stays the largest element and keeps its
    position; it and the chip well give up the difference so the rail still does
    not scroll. */
+/* A 13" MBA at a scaled resolution can be 800px tall, where the fixed part of
+   the stack alone would overflow. Notes stays the largest element and keeps
+   its position; it gives up the difference. */
 @media (max-height: 860px) {
-  .judgment-panel { grid-template-rows: 32px 18px 340px 18px 28px 100px 30px; }
-  .notes-field { height: 340px; }
-  .chip-well { height: 100px; }
+  .judgment-panel { grid-template-rows: 32px 18px 320px 18px 28px minmax(40px, 1fr) auto; }
+  .notes-field { height: 320px; }
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -741,17 +769,20 @@ kbd { padding: 2px 4px; color: #a8b1b6; background: #262d32; border: 1px solid #
 
 /* Chronology calibration and edit-plan drawers (D01-T015, T016, T023).
    Collapsed by default: the review queue stays the primary surface. */
+.chronology-drawer {
   border-top: 1px solid var(--line);
   padding: 12px 16px 20px;
   overflow-y: auto;
   max-height: 45vh;
 }
 
+.chronology-drawer-tabs {
   display: flex;
   gap: 8px;
   margin-bottom: 12px;
 }
 
+.chronology-drawer-tabs button[aria-pressed="true"] {
   font-weight: 600;
   text-decoration: underline;
 }
@@ -874,6 +905,7 @@ kbd { padding: 2px 4px; color: #a8b1b6; background: #262d32; border: 1px solid #
   resize: vertical;
 }
 .description-field:focus { outline: none; border-color: var(--line-strong); }
+.observation-facts .chip {
   padding: 2px 7px;
   color: var(--muted);
   background: #141a1e;
@@ -882,6 +914,7 @@ kbd { padding: 2px 4px; color: #a8b1b6; background: #262d32; border: 1px solid #
   font-size: 11px;
 }
 
+.transcript-list button {
   display: flex;
   width: 100%;
   gap: 8px;

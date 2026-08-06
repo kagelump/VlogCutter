@@ -67,7 +67,12 @@ export function JudgmentPanel({
   onNotesBlur,
 }: JudgmentPanelProps) {
   const unusable = observation && !observation.analysis.usable;
-  const suggestions = observation?.aiLabels ?? [];
+  // A suggestion you already accepted is not a suggestion. Without this every
+  // promoted label stays in the strip, duplicating the chip directly above it.
+  const taken = new Set(asset.labels.map((label) => label.toLocaleLowerCase()));
+  const suggestions = (observation?.aiLabels ?? []).filter(
+    (label) => !taken.has(label.toLocaleLowerCase()),
+  );
 
   return (
     <aside className="judgment-panel">

@@ -132,6 +132,23 @@ describe("rule 1: the rail holds human-authored content only", () => {
     const { container } = renderPanel({ observation: view() });
     expect(container.querySelector(".unusable-chip")).toBeNull();
   });
+
+  it("drops a suggestion once it has been promoted, rather than duplicating the chip", () => {
+    const { container } = renderPanel({
+      asset: asset({ id: "a", labels: ["laptop", "seat"] }),
+      observation: view({ aiLabels: ["laptop", "seat", "train interior"] }),
+    });
+    const remaining = [...container.querySelectorAll(".ai-suggestion")].map((n) => n.textContent);
+    expect(remaining).toEqual(["train interior"]);
+  });
+
+  it("matches a promoted suggestion case-insensitively, as label entry does", () => {
+    const { container } = renderPanel({
+      asset: asset({ id: "a", labels: ["Laptop"] }),
+      observation: view({ aiLabels: ["laptop"] }),
+    });
+    expect(container.querySelectorAll(".ai-suggestion")).toHaveLength(0);
+  });
 });
 
 /** Rule 3: fixed geometry. Nothing may move or resize the notes field. */

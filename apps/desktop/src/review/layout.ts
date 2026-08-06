@@ -6,7 +6,11 @@ export const RIBBON_ZOOM_MAX = 116;
 export const RIBBON_ZOOM_STEP = 12;
 export const RIBBON_ZOOM_DEFAULT = 68;
 
-export const RIBBON_MAX_LANES = 5;
+/**
+ * Lanes the ribbon sizes itself for before it starts scrolling. Past this the
+ * user drags the ribbon taller; the cap only decides the default.
+ */
+export const RIBBON_MAX_LANES = 8;
 export const RIBBON_LANE_HEIGHT = 20;
 /** Control row (22) + trip-context band (20) + position numerals (14). */
 export const RIBBON_CHROME_HEIGHT = 56;

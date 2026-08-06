@@ -13,9 +13,14 @@ describe("ribbonHeight", () => {
     expect(ribbonHeight(5, false)).toBe(156);
   });
 
-  it("caps at five lanes so a six-camera project scrolls instead of growing", () => {
-    expect(ribbonHeight(6, false)).toBe(156);
-    expect(ribbonHeight(12, false)).toBe(156);
+  it("sizes for a five-camera project without scrolling", () => {
+    expect(ribbonHeight(5, false)).toBe(156);
+  });
+
+  it("caps at eight lanes; past that the user drags it taller", () => {
+    expect(ribbonHeight(8, false)).toBe(216);
+    expect(ribbonHeight(9, false)).toBe(216);
+    expect(ribbonHeight(24, false)).toBe(216);
   });
 
   it("is the collapsed height regardless of lane count when collapsed", () => {
@@ -37,8 +42,8 @@ describe("visibleLaneCount", () => {
   it("never exceeds the cap and never goes below zero", () => {
     expect(visibleLaneCount(0)).toBe(0);
     expect(visibleLaneCount(3)).toBe(3);
-    expect(visibleLaneCount(5)).toBe(5);
-    expect(visibleLaneCount(7)).toBe(5);
+    expect(visibleLaneCount(8)).toBe(8);
+    expect(visibleLaneCount(11)).toBe(8);
     expect(visibleLaneCount(-1)).toBe(0);
   });
 });

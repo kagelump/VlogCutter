@@ -7,9 +7,17 @@ import { resolveAction } from "./review/keymap";
 import { CalibrationPanel } from "./CalibrationPanel";
 import { EditPlanPanel } from "./EditPlanPanel";
 import { formatBytes, transcriptStatusLabels } from "./review/summaries";
-import { RIBBON_ZOOM_DEFAULT, RIBBON_ZOOM_MAX, RIBBON_ZOOM_MIN, RIBBON_ZOOM_STEP } from "./review/layout";
+import { RIBBON_ZOOM_DEFAULT, RIBBON_ZOOM_MAX, RIBBON_ZOOM_MIN, RIBBON_ZOOM_STEP, ribbonHeight } from "./review/layout";
 import { StoryRibbon, assetContextKey, type ContextRun } from "./components/StoryRibbon";
 import { INITIAL_VIEW, reduceView, type Mode } from "./review/presentation";
+import { Splitter } from "./components/Splitter";
+import {
+  DEFAULT_PANEL_SIZES,
+  clampPanel,
+  loadPanelSizes,
+  savePanelSizes,
+  type PanelSizes,
+} from "./review/panelSizes";
 import { JudgmentPanel, type SaveState } from "./components/JudgmentPanel";
 import { EvidenceShelf, type ShelfTab } from "./components/EvidenceShelf";
 import { TransportBar } from "./components/TransportBar";
@@ -182,6 +190,23 @@ function App() {
   // move through the queue (spec §3.6).
   const [shelfTab, setShelfTab] = useState<ShelfTab>("transcript");
   const [saveState, setSaveState] = useState<SaveState>("idle");
+  const [panelSizes, setPanelSizes] = useState<PanelSizes>(() =>
+    loadPanelSizes(typeof window === "undefined" ? null : window.localStorage),
+  );
+
+  const resizePanel = useCallback((kind: keyof PanelSizes, value: number) => {
+    const viewport = kind === "ribbon" ? window.innerHeight : window.innerWidth;
+    setPanelSizes((current) => ({ ...current, [kind]: clampPanel(kind, value, viewport) }));
+  }, []);
+
+  // Written on drag end rather than on every pointer move: a drag fires
+  // hundreds of moves and none of the intermediate sizes are worth storing.
+  const commitPanelSizes = useCallback(() => {
+    setPanelSizes((current) => {
+      savePanelSizes(typeof window === "undefined" ? null : window.localStorage, current);
+      return current;
+    });
+  }, []);
 
   // ── Clip analysis state ────────────────────────────────────────────
   const [analysisIndex, setAnalysisIndex] = useState<Record<string, AssetAnalysisIndexEntry>>({});
@@ -1383,6 +1408,10 @@ function App() {
     setBaselineError("");
   }
 
+  // What the ribbon would be tall if nothing had been dragged — the value the
+  // ribbon splitter starts from and the one double-click restores.
+  const ribbonContentHeight = ribbonHeight(lanes.length, !view.ribbon);
+
   const seekMaximum = Math.max(0, mediaDuration || selected?.durationSeconds || 0);
   const seekProgress = seekMaximum > 0 ? Math.min(100, (playbackSeconds / seekMaximum) * 100) : 0;
 
@@ -1495,9 +1524,15 @@ function App() {
         </div>
         <div className="topbar-spacer" />
         <div className="media-split">
-          <button className="button secondary media-split-main" disabled={busy || missingProxyCount === 0} onClick={makeMissingProxies} aria-keyshortcuts="Shift+P">
-            {missingProxyCount ? `Make ${missingProxyCount} proxies` : "Proxies ready"}
-          </button>
+          {/* Not rendered when there is nothing to make. "Proxies ready" is a
+              disabled button reporting the absence of work, and it was the
+              source of the mismatched-outline complaint. The count is state
+              worth seeing, so the button returns when work is outstanding. */}
+          {missingProxyCount > 0 && (
+            <button className="button secondary media-split-main" disabled={busy} onClick={makeMissingProxies} aria-keyshortcuts="Shift+P">
+              Make {missingProxyCount} proxies
+            </button>
+          )}
           <button
             className="button secondary media-split-toggle"
             disabled={busy || !projectId}
@@ -1547,7 +1582,10 @@ function App() {
           )}
         </div>
       ) : (
-      <div className="workbench">
+      <div
+        className="workbench"
+        style={{ gridTemplateColumns: `${panelSizes.queue}px 5px minmax(0, 1fr) 5px ${panelSizes.rail}px` }}
+      >
         <aside className="queue-panel">
           <div className="panel-heading">
             <div>
@@ -1637,6 +1675,15 @@ function App() {
             <span><kbd>R</kbd> remove</span>
           </div>
         </aside>
+        <Splitter
+          orientation="vertical"
+          value={panelSizes.queue}
+          direction={1}
+          label="Resize the clip queue"
+          onResize={(next) => resizePanel("queue", next)}
+          onCommit={commitPanelSizes}
+          onReset={() => { resizePanel("queue", DEFAULT_PANEL_SIZES.queue); commitPanelSizes(); }}
+        />
 
         <section className="viewer-panel">
           <div ref={viewerStageRef} className={`viewer-stage ${isPlaying ? "is-playing" : "is-paused"}`}>
@@ -1754,6 +1801,15 @@ function App() {
           )}
         </section>
 
+        <Splitter
+          orientation="vertical"
+          value={panelSizes.rail}
+          direction={-1}
+          label="Resize the notes panel"
+          onResize={(next) => resizePanel("rail", next)}
+          onCommit={commitPanelSizes}
+          onReset={() => { resizePanel("rail", DEFAULT_PANEL_SIZES.rail); commitPanelSizes(); }}
+        />
         {selected ? (
           <JudgmentPanel
             asset={selected}
@@ -1787,6 +1843,20 @@ function App() {
           paying for it. */}
       {view.mode === "review" && (
       <footer className="story-ribbon">
+        {/* Inside the footer rather than beside it: the shell holds exactly
+            three children, and a fourth would take an implicit grid row —
+            the bug this layout started out fixing. */}
+        {view.ribbon && view.presentation !== "focus" && (
+          <Splitter
+            orientation="horizontal"
+            value={panelSizes.ribbon ?? ribbonContentHeight}
+            direction={-1}
+            label="Resize the story ribbon"
+            onResize={(next) => resizePanel("ribbon", next)}
+            onCommit={commitPanelSizes}
+            onReset={() => { setPanelSizes((current) => ({ ...current, ribbon: null })); commitPanelSizes(); }}
+          />
+        )}
         <StoryRibbon
           assets={activeAssets}
           lanes={lanes}
@@ -1798,6 +1868,7 @@ function App() {
           formatDate={formatDate}
           collapsed={!view.ribbon}
           merged={view.presentation === "focus"}
+          height={view.presentation === "focus" ? null : panelSizes.ribbon}
           onZoomChange={setChronologyZoom}
           onCenter={() => centerSelectedInChronology()}
           onSelect={setSelectedId}

@@ -37,6 +37,8 @@ export interface StoryRibbonProps {
   collapsed: boolean;
   /** One merged lane instead of one per camera — the Focus overlay variant. */
   merged: boolean;
+  /** Dragged override; null sizes the ribbon to its own content. */
+  height: number | null;
   scrollRef: RefObject<HTMLDivElement | null>;
   formatDate(value: string | null): string;
   onZoomChange(next: number): void;
@@ -61,6 +63,7 @@ export function StoryRibbon({
   zoom,
   collapsed,
   merged,
+  height: heightOverride,
   scrollRef,
   formatDate,
   onZoomChange,
@@ -70,7 +73,11 @@ export function StoryRibbon({
 }: StoryRibbonProps) {
   // Merged draws one lane holding every clip; otherwise one lane per camera.
   const laneRows: Array<[string, Asset[]]> = merged ? [["", assets]] : lanes;
-  const height = ribbonHeight(laneRows.length, collapsed);
+  // A dragged height wins over the content height, and the lane stack scrolls
+  // to fit inside it. Collapsed always wins over both.
+  const height = collapsed
+    ? ribbonHeight(laneRows.length, true)
+    : heightOverride ?? ribbonHeight(laneRows.length, false);
 
   return (
     <div className="chronology" style={{ height }}>
@@ -115,7 +122,7 @@ export function StoryRibbon({
         </div>
       </div>
       {collapsed ? null : laneRows.length > 0 ? (
-        <div className="story-map" style={{ gridTemplateRows: `20px 14px ${ribbonLaneRows(laneRows.length)}` }}>
+        <div className="story-map">
           <div className="story-labels" aria-hidden="true" style={{ gridTemplateRows: `20px 14px ${ribbonLaneRows(laneRows.length)}` }}>
             <span className="context-label">Context</span>
             <span className="order-label">Order</span>
@@ -155,7 +162,7 @@ export function StoryRibbon({
                       title={`${primary} · ${detail}`}
                     >
                       <strong>{primary}</strong>
-                      <span>{detail}</span>
+                      <span aria-hidden="true"> · {detail}</span>
                     </div>
                   );
                 })}

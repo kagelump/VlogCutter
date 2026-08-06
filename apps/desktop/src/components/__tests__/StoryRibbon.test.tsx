@@ -34,6 +34,7 @@ function renderRibbon(overrides: Partial<StoryRibbonProps> = {}) {
     zoom: 68,
     collapsed: false,
     merged: false,
+    height: null,
     scrollRef: createRef<HTMLDivElement>(),
     formatDate: () => "no time",
     onZoomChange: vi.fn(),
@@ -60,13 +61,46 @@ describe("adaptive lanes", () => {
     expect(container.querySelectorAll(".lane-name")).toHaveLength(6);
   });
 
-  it("sizes itself from the visible lane count, capped so six cameras do not grow it", () => {
+  it("sizes itself from the lane count, capped at eight", () => {
     const two = renderRibbon().container.querySelector<HTMLElement>(".chronology")!;
-    const lanes = lanesFor(["a", "b", "c", "d", "e", "f"]);
-    const six = renderRibbon({ lanes, assets: lanes.flatMap(([, l]) => l) })
-      .container.querySelector<HTMLElement>(".chronology")!;
     expect(two.style.height).toBe("96px");
-    expect(six.style.height).toBe("156px");
+
+    const six = lanesFor(["a", "b", "c", "d", "e", "f"]);
+    expect(
+      renderRibbon({ lanes: six, assets: six.flatMap(([, l]) => l) })
+        .container.querySelector<HTMLElement>(".chronology")!.style.height,
+    ).toBe("176px");
+
+    const twelve = lanesFor("abcdefghijkl".split(""));
+    expect(
+      renderRibbon({ lanes: twelve, assets: twelve.flatMap(([, l]) => l) })
+        .container.querySelector<HTMLElement>(".chronology")!.style.height,
+    ).toBe("216px");
+  });
+
+  it("lets a dragged height win over the content height", () => {
+    const root = renderRibbon({ height: 320 }).container.querySelector<HTMLElement>(".chronology")!;
+    expect(root.style.height).toBe("320px");
+  });
+
+  it("lets the map fill the ribbon instead of constraining both columns to the context row", () => {
+    const map = renderRibbon().container.querySelector<HTMLElement>(".story-map")!;
+    expect(map.style.gridTemplateRows).toBe("");
+  });
+
+  it("still collapses when collapsed, whatever the dragged height says", () => {
+    const root = renderRibbon({ height: 320, collapsed: true })
+      .container.querySelector<HTMLElement>(".chronology")!;
+    expect(root.style.height).toBe("28px");
+  });
+
+  it("renders trip context as one delimited line", () => {
+    const { container } = renderRibbon({
+      contextRuns: [{ start: 0, end: 0, asset: asset("a", "Sony") }],
+    });
+    const segment = container.querySelector(".context-segment")!;
+    expect(segment.textContent).toContain(" · ");
+    expect(segment.querySelector("strong")?.textContent).toBeTruthy();
   });
 });
 
