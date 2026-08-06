@@ -21,14 +21,10 @@ import {
 import { JudgmentPanel, type SaveState } from "./components/JudgmentPanel";
 import { EvidenceShelf, type ShelfTab } from "./components/EvidenceShelf";
 import { TransportBar } from "./components/TransportBar";
-import { clipTitle, formatCost, formatDate, formatDuration, formatEta, formatTimecode } from "./review/format";
-import {
-  isRawOrientationProxy,
-  isRawOrientationThumbnail,
-  portraitRotation,
-  renderedRotation,
-  rotationAfter,
-} from "./review/rotation";
+import { QueuePanel } from "./components/QueuePanel";
+import { VideoStage } from "./components/VideoStage";
+import { formatCost, formatEta } from "./review/format";
+import { isRawOrientationProxy, renderedRotation, rotationAfter } from "./review/rotation";
 
 interface OperationProgress {
   kind: "proxy" | "thumbnail" | "analysis";
@@ -1109,7 +1105,8 @@ function App() {
       .map(({ asset, offset }) => {
         const url = api.mediaUrl(asset);
         const usingProxy = Boolean(asset.proxyAvailable && asset.proxyPath);
-        const rotation = renderedRotation(asset, usingProxy && isRawOrientationProxy(asset));
+        const mediaIsRawOriented = usingProxy && isRawOrientationProxy(asset);
+        const rotation = renderedRotation(asset, mediaIsRawOriented);
         const displayIsQuarterTurn = asset.rotationDegrees % 180 !== 0;
         const displayAspect = (displayIsQuarterTurn ? asset.height / asset.width : asset.width / asset.height) || 16 / 9;
         return {
@@ -1117,7 +1114,7 @@ function App() {
           offset,
           active: asset.id === selectedId,
           url,
-          usingProxy,
+          mediaIsRawOriented,
           rotation,
           displayAspect,
           posterUrl: api.thumbnailUrl(asset),
@@ -1518,95 +1515,22 @@ function App() {
         className="workbench"
         style={{ gridTemplateColumns: `${panelSizes.queue}px 5px minmax(0, 1fr) 5px ${panelSizes.rail}px` }}
       >
-        <aside className="queue-panel">
-          <div className="panel-heading">
-            <div>
-              <span className="eyebrow">{showRemoved ? "Removed clips" : "Label queue"}</span>
-              <h1>{project?.name ?? "No project"}</h1>
-            </div>
-            <div className="queue-heading-actions">
-              {unusableCount > 0 && !showRemoved && (
-                <button
-                  className={`queue-view-toggle ${showUnusableOnly ? "active" : ""}`}
-                  onClick={() => setShowUnusableOnly((current) => !current)}
-                  aria-pressed={showUnusableOnly}
-                  title="Clips the analysis judged unusable"
-                >{showUnusableOnly ? "All clips" : `Unusable ${unusableCount}`}</button>
-              )}
-              {removedCount > 0 && (
-                <button
-                  className={`queue-view-toggle ${showRemoved ? "active" : ""}`}
-                  onClick={() => setShowRemoved((current) => !current)}
-                  aria-pressed={showRemoved}
-                >{showRemoved ? "Back to labels" : `Removed ${removedCount}`}</button>
-              )}
-              <span className="count-badge">{filteredAssets.length}</span>
-            </div>
-          </div>
-          <label className="search-box">
-            <span className="sr-only">Filter clips</span>
-            <input
-              id="queue-search"
-              value={query}
-              onChange={(event) => setQuery(event.target.value)}
-              placeholder="Filter titles, labels, notes, speech…"
-            />
-            <kbd>/</kbd>
-          </label>
-          <div className="queue-list" ref={queueRef} role="listbox" aria-label="Clips" tabIndex={0}>
-            {filteredAssets.length === 0 ? (
-              <div className="empty-queue">
-                <strong>{showRemoved ? "No removed clips." : "No clips here yet."}</strong>
-                <span>{showRemoved ? "Removed clips can be restored here." : "Add a NAS or drive folder to begin."}</span>
-              </div>
-            ) : filteredAssets.map((asset, index) => {
-              const thumbnailUrl = api.thumbnailUrl(asset);
-              return (
-                <button
-                  className={`queue-item ${asset.id === selectedId ? "selected" : ""}`}
-                  key={asset.id}
-                  onClick={() => setSelectedId(asset.id)}
-                  role="option"
-                  aria-selected={asset.id === selectedId}
-                >
-                  <span className={`label-pip ${asset.labels.length ? "labeled" : ""}`} aria-hidden="true" />
-                  <span
-                    className={`queue-thumbnail ${renderedRotation(asset, isRawOrientationThumbnail(asset)) % 180 !== 0 ? "quarter-turn" : ""}`}
-                    style={{ "--thumbnail-rotation": `${renderedRotation(asset, isRawOrientationThumbnail(asset))}deg` } as CSSProperties}
-                  >
-                    {thumbnailUrl ? <img src={thumbnailUrl} alt="" loading="lazy" /> : <span className="thumbnail-empty">Q0</span>}
-                    <span className="queue-index">{String(index + 1).padStart(3, "0")}</span>
-                  </span>
-                  <span className="queue-main">
-                    <strong>{clipTitle(asset)}</strong>
-                    {/* The filename stays visible but stops being the headline
-                        once analysis has named the clip. The verdict sits on
-                        this line, inside the flexible column, so a long reason
-                        truncates instead of widening the row. */}
-                    <span className="queue-meta">
-                      {analysisIndex[asset.id]?.usable === false && (
-                        <span className="unusable-pip" title={`Analysis flagged this clip: ${analysisIndex[asset.id]?.unusableReason || "unusable"}`}>
-                          {analysisIndex[asset.id]?.unusableReason || "unusable"}
-                        </span>
-                      )}
-                      <span>{asset.title.trim() ? `${asset.filename} · ${asset.camera}` : asset.camera}</span>
-                    </span>
-                  </span>
-                  <span className="queue-tail">
-                    <time>{formatDuration(asset.durationSeconds)}</time>
-                    {asset.labels.length > 0 && <span className="label-count">{asset.labels.length} label{asset.labels.length === 1 ? "" : "s"}</span>}
-                  </span>
-                </button>
-              );
-            })}
-          </div>
-          <div className="shortcut-strip" aria-label="Keyboard shortcuts">
-            <span><kbd>J</kbd><kbd>K</kbd> move</span>
-            <span><kbd>Space</kbd> play</span>
-            <span><kbd>L</kbd> label</span>
-            <span><kbd>R</kbd> remove</span>
-          </div>
-        </aside>
+        <QueuePanel
+          projectName={project?.name ?? null}
+          assets={filteredAssets}
+          selectedId={selectedId}
+          query={query}
+          analysisIndex={analysisIndex}
+          showRemoved={showRemoved}
+          showUnusableOnly={showUnusableOnly}
+          unusableCount={unusableCount}
+          removedCount={removedCount}
+          listRef={queueRef}
+          onQueryChange={setQuery}
+          onSelect={setSelectedId}
+          onToggleRemovedView={() => setShowRemoved((current) => !current)}
+          onToggleUnusableView={() => setShowUnusableOnly((current) => !current)}
+        />
         <Splitter
           orientation="vertical"
           value={panelSizes.queue}
@@ -1618,83 +1542,25 @@ function App() {
         />
 
         <section className="viewer-panel">
-          <div ref={viewerStageRef} className={`viewer-stage ${isPlaying ? "is-playing" : "is-paused"}`}>
-            {selected ? (
-              !selected.orientationProbed && selected.originalAvailable ? (
-                <div className="offline-slate">
-                  <strong>Reading frame orientation…</strong>
-                  <span>{selected.filename}</span>
-                </div>
-              ) : mediaUrl ? (
-                <>
-                  {bufferedMedia.map((entry) => {
-                    const style = {
-                      "--display-aspect": String(entry.displayAspect),
-                      "--inverse-display-aspect": String(1 / entry.displayAspect),
-                      "--viewer-rotation": `${entry.rotation}deg`,
-                    } as CSSProperties;
-                    return (
-                      <div
-                        className={`viewer-media ${entry.active ? "active" : "preloaded"} ${entry.rotation % 180 !== 0 ? "quarter-turn" : ""}`}
-                        style={style}
-                        key={entry.asset.id}
-                        aria-hidden={!entry.active}
-                      >
-                        <video
-                          ref={entry.active ? videoRef : undefined}
-                          data-asset-id={entry.asset.id}
-                          data-cache-slot={entry.active ? "current" : entry.offset < 0 ? "previous" : "next"}
-                          src={entry.url ?? undefined}
-                          poster={entry.active && entry.posterUrl && isRawOrientationThumbnail(entry.asset) === (entry.usingProxy && isRawOrientationProxy(entry.asset)) ? entry.posterUrl : undefined}
-                          preload={entry.active || entry.offset > 0 ? "auto" : "metadata"}
-                          autoPlay={entry.active && shouldAutoplay}
-                          muted={isMuted}
-                          onClick={entry.active ? togglePlayback : undefined}
-                          onLoadStart={() => entry.active && setIsBuffering(true)}
-                          onWaiting={() => entry.active && setIsBuffering(true)}
-                          onCanPlay={() => entry.active && setIsBuffering(false)}
-                          onPlaying={() => entry.active && setIsBuffering(false)}
-                          onPlay={() => entry.active && setIsPlaying(true)}
-                          onPause={() => entry.active && setIsPlaying(false)}
-                          onEnded={() => entry.active && setIsPlaying(false)}
-                          onLoadedMetadata={(event) => {
-                            if (!entry.active) return;
-                            setMediaDuration(Number.isFinite(event.currentTarget.duration) ? event.currentTarget.duration : entry.asset.durationSeconds);
-                            setPlaybackSeconds(event.currentTarget.currentTime);
-                          }}
-                          onDurationChange={(event) => {
-                            if (entry.active && Number.isFinite(event.currentTarget.duration)) setMediaDuration(event.currentTarget.duration);
-                          }}
-                          onTimeUpdate={(event) => entry.active && setPlaybackSeconds(event.currentTarget.currentTime)}
-                        />
-                      </div>
-                    );
-                  })}
-                  {isBuffering && <div className="viewer-buffering" role="status"><span /> Buffering</div>}
-                </>
-              ) : (
-                <div className="offline-slate">
-                  <span className="slate-time">{formatDate(selected.bestTime)}</span>
-                  <strong>{selected.filename}</strong>
-                  <span>{selected.proxyPath && !selected.proxyAvailable ? "Proxy is missing" : "No review proxy yet"}</span>
-                  {api.isDesktop() && selected.available && (
-                    <button className="button primary" disabled={busy} onClick={makeProxy}>Make proxy</button>
-                  )}
-                </div>
-              )
-            ) : (
-              <div className="offline-slate">
-                <strong>Choose a clip</strong>
-                <span>The next frame will appear here.</span>
-              </div>
-            )}
-            {selected && (
-              <div className="viewer-overlay">
-                <span>{selected.proxyAvailable ? "PROXY" : "ORIGINAL"}</span>
-                <span>{selected.width}×{selected.height} · {selected.frameRate.toFixed(2)} fps</span>
-              </div>
-            )}
-          </div>
+          <VideoStage
+            selected={selected}
+            media={bufferedMedia}
+            mediaUrl={mediaUrl}
+            playing={isPlaying}
+            buffering={isBuffering}
+            muted={isMuted}
+            autoplay={shouldAutoplay}
+            canMakeProxy={api.isDesktop() && Boolean(selected?.available)}
+            busy={busy}
+            stageRef={viewerStageRef}
+            videoRef={videoRef}
+            onTogglePlay={togglePlayback}
+            onBufferingChange={setIsBuffering}
+            onPlayingChange={setIsPlaying}
+            onDurationChange={setMediaDuration}
+            onPositionChange={setPlaybackSeconds}
+            onMakeProxy={makeProxy}
+          />
 
           {selected && (
           <TransportBar

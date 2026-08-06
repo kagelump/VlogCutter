@@ -16,10 +16,6 @@ export function rotationAfter(rotationDegrees: number, addition: number) {
   return ((rotationDegrees + addition) % 360 + 360) % 360;
 }
 
-export function portraitRotation(asset: Asset) {
-  return rotationAfter(asset.defaultRotationDegrees, 270);
-}
-
 /** v3 proxies keep the pixels raw and carry rotation as data. */
 export function isRawOrientationProxy(asset: Asset) {
   return asset.proxyRepresentation === "raw_v3";

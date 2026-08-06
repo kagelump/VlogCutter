@@ -3,7 +3,6 @@ import type { Asset } from "../types";
 import {
   isRawOrientationProxy,
   isRawOrientationThumbnail,
-  portraitRotation,
   renderedRotation,
   rotationAfter,
 } from "./rotation";
@@ -25,13 +24,6 @@ describe("rotationAfter", () => {
     expect(rotationAfter(270, 90)).toBe(0);
     expect(rotationAfter(0, -90)).toBe(270);
     expect(rotationAfter(0, -450)).toBe(270);
-  });
-});
-
-describe("portraitRotation", () => {
-  it("is a quarter turn back from the asset's default", () => {
-    expect(portraitRotation(asset({ defaultRotationDegrees: 0 }))).toBe(270);
-    expect(portraitRotation(asset({ defaultRotationDegrees: 90 }))).toBe(0);
   });
 });
 
