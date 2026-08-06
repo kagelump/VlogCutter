@@ -7,6 +7,7 @@ import {
   formatDuration,
   formatEta,
   formatTimecode,
+  syncStateLabel,
 } from "./format";
 
 function asset(overrides: Partial<Asset> = {}): Asset {
@@ -72,6 +73,17 @@ describe("formatEta", () => {
     expect(formatEta(45)).toBe("45s remaining");
     expect(formatEta(90)).toBe("2m remaining");
     expect(formatEta(7_200)).toBe("2h 0m remaining");
+  });
+});
+
+describe("syncStateLabel", () => {
+  it("says each known state the way a person would", () => {
+    expect(syncStateLabel("synced")).toBe("Synced");
+    expect(syncStateLabel("credential_revoked")).toBe("Credential revoked");
+  });
+
+  it("passes an unknown state through rather than blanking it", () => {
+    expect(syncStateLabel("quarantined")).toBe("quarantined");
   });
 });
 

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import { StatusBadge } from "@rcdvlog/review-ui";
 import { api } from "./api";
-import type { AnalysisReadiness, AnalysisStage, Asset, AssetAnalysisIndexEntry, AssetAnalysisView, AssetPatch, AutoplayMode, BaselineImportResult, BaselinePreviewResult, ClipTranscript, DesktopSettings, ModelInstallProgress, ModelStatus, PathAnalysis, Project, ProjectLibrary, ProjectLocation, ProjectPairingStatus, RootMappingEntry, ServerConnectionStatus, ServerVersionInfo, SyncStatus, TranscriptStatus } from "./types";
+import type { AnalysisReadiness, Asset, AssetAnalysisIndexEntry, AssetAnalysisView, AssetPatch, AutoplayMode, BaselineImportResult, BaselinePreviewResult, ClipTranscript, DesktopSettings, ModelInstallProgress, ModelStatus, PathAnalysis, Project, ProjectLibrary, ProjectLocation, ProjectPairingStatus, RootMappingEntry, ServerConnectionStatus, ServerVersionInfo, SyncStatus, TranscriptStatus } from "./types";
 import { orderAssets, moveSelection as moveSelectionInOrder } from "./review/order";
 import { resolveAction } from "./review/keymap";
 import { CalibrationPanel } from "./CalibrationPanel";
@@ -23,29 +23,9 @@ import { EvidenceShelf, type ShelfTab } from "./components/EvidenceShelf";
 import { TransportBar } from "./components/TransportBar";
 import { QueuePanel } from "./components/QueuePanel";
 import { VideoStage } from "./components/VideoStage";
-import { formatCost, formatEta } from "./review/format";
+import { TopBar, type OperationProgress } from "./components/TopBar";
+import { analysisStageLabels, formatCost, syncStateLabel } from "./review/format";
 import { isRawOrientationProxy, renderedRotation, rotationAfter } from "./review/rotation";
-
-interface OperationProgress {
-  kind: "proxy" | "thumbnail" | "analysis";
-  completed: number;
-  total: number;
-  completedWorkUnits: number;
-  totalWorkUnits: number;
-  workerCount: number;
-  estimatedRemainingSeconds: number | null;
-  /** Analysis only: which stage of the chain is running, and what it has spent. */
-  stage?: AnalysisStage;
-  stageIndex?: number;
-  stageCount?: number;
-  costUsd?: number;
-}
-
-const analysisStageLabels: Record<AnalysisStage, string> = {
-  proxies: "Making proxies",
-  transcripts: "Transcribing",
-  analysis: "Analyzing clips",
-};
 
 const autoplayOptions: Array<{ value: AutoplayMode; label: string; detail: string }> = [
   { value: "never", label: "Never", detail: "Keep each clip paused until you press Space." },
@@ -1203,22 +1183,6 @@ function App() {
     });
   }
 
-  // ── Sync helpers ────────────────────────────────────────────────────
-
-  function syncStateLabel(state: string): string {
-    switch (state) {
-      case "unpaired": return "Unpaired";
-      case "offline": return "Offline";
-      case "connecting": return "Connecting…";
-      case "syncing": return "Syncing…";
-      case "synced": return "Synced";
-      case "attention": return "Needs attention";
-      case "incompatible": return "Incompatible";
-      case "credential_revoked": return "Credential revoked";
-      default: return state;
-    }
-  }
-
   // ── Server pairing handlers ─────────────────────────────────────────
 
   async function handleTestServerConnection() {
@@ -1357,143 +1321,39 @@ function App() {
 
   return (
     <main className={shellClass}>
-      <header className="topbar">
-        <div className="wordmark" aria-label="RCD VlogCutter">
-          <span className="wordmark-mark">RCD</span>
-          <span>VlogCutter</span>
-        </div>
-        <label className="project-switcher">
-          <span className="sr-only">Current project</span>
-          <select value={projectId} onChange={(event) => setProjectId(event.target.value)}>
-            {projects.map((item) => (
-              <option value={item.id} key={item.id}>{item.name}</option>
-            ))}
-          </select>
-        </label>
-        {/* Visible rather than tucked into a menu: three modes is few enough
-            to show, and hiding them makes them read as settings. */}
-        <nav className="mode-switcher" aria-label="View mode">
-          {([
-            ["review", "Review", "Meta+1"],
-            ["chronology", "Chronology", "Meta+2"],
-            ["editPlan", "Edit plan", "Meta+3"],
-          ] as Array<[Mode, string, string]>).map(([mode, label, shortcut]) => (
-            <button
-              key={mode}
-              className={view.mode === mode ? "active" : ""}
-              aria-pressed={view.mode === mode}
-              aria-keyshortcuts={shortcut}
-              disabled={!projectId && mode !== "review"}
-              onClick={() => dispatchView({ kind: "setMode", mode })}
-            >{label}</button>
-          ))}
-        </nav>
-        {api.isDesktop() && <button className="text-button" disabled={busy} onClick={openCatalog} aria-keyshortcuts="Meta+O">Open catalog</button>}
-        <button className="text-button" onClick={() => setShowSettings(true)} aria-keyshortcuts="Meta+,">Settings <kbd>⌘,</kbd></button>
-        <button className="text-button" onClick={() => setShowCreate(true)} aria-keyshortcuts="Meta+N">New project</button>
-        {api.isDesktop() && serverStatus?.paired && projectId && (
-          <button className="text-button" disabled={busy} onClick={() => void handleStartBaselineWizard(projectId)}>
-            Pair with server
-          </button>
-        )}
-        {syncStatus && syncStatus.state !== "unpaired" && (
-          <button
-            className={`sync-indicator sync-${syncStatus.state}`}
-            onClick={() => setShowSyncDiagnostics(true)}
-            title={`Sync: ${syncStatus.state}${syncStatus.lastError ? ` — ${syncStatus.lastError}` : ""}`}
-          >
-            <span className={`sync-dot sync-dot-${syncStatus.state}`} />
-            <span className="sync-label">{syncStateLabel(syncStatus.state)}</span>
-          </button>
-        )}
-        {/* Empty at idle, and that emptiness is the point: this is the only
-            calm region on screen. It is the whole replacement for the 28px
-            status line that used to be reserved whether or not it had
-            anything to say. */}
-        <div className="operation-slot" data-testid="operation-slot" aria-live="polite">
-          {operationProgress ? (
-            <>
-              <span>
-                {operationProgress.kind === "analysis" && operationProgress.stage
-                  ? `${analysisStageLabels[operationProgress.stage]} · step ${(operationProgress.stageIndex ?? 0) + 1} of ${operationProgress.stageCount ?? 3}`
-                  : operationProgress.kind === "thumbnail"
-                    ? "Generating thumbnails"
-                    : "Generating proxies"}
-              </span>
-              <div
-                className="progress-track"
-                role="progressbar"
-                aria-valuemin={0}
-                aria-valuemax={operationProgress.totalWorkUnits || operationProgress.total}
-                aria-valuenow={operationProgress.totalWorkUnits ? operationProgress.completedWorkUnits : operationProgress.completed}
-              >
-                <span style={{ width: `${operationProgress.totalWorkUnits
-                  ? (operationProgress.completedWorkUnits / operationProgress.totalWorkUnits) * 100
-                  : operationProgress.total
-                    ? (operationProgress.completed / operationProgress.total) * 100
-                    : 0}%` }} />
-              </div>
-              <output>{operationProgress.completed}/{operationProgress.total}</output>
-              <span>
-                {formatEta(operationProgress.estimatedRemainingSeconds)} · {operationProgress.workerCount} worker{operationProgress.workerCount === 1 ? "" : "s"}
-                {operationProgress.kind === "analysis" ? ` · ${formatCost(operationProgress.costUsd ?? 0)} spent` : ""}
-              </span>
-              {operationProgress.kind === "analysis" && (
-                <button className="button ghost progress-cancel" onClick={stopAnalysis}>Cancel</button>
-              )}
-            </>
-          ) : error ? (
-            <span className="error-banner" role="alert">
-              {error}
-              <button className="banner-dismiss" onClick={() => setError("")} aria-label="Dismiss error">×</button>
-            </span>
-          ) : message ? (
-            <span className="toast">{message}</span>
-          ) : null}
-        </div>
-        <div className="topbar-spacer" />
-        <div className="media-split">
-          {/* Not rendered when there is nothing to make. "Proxies ready" is a
-              disabled button reporting the absence of work, and it was the
-              source of the mismatched-outline complaint. The count is state
-              worth seeing, so the button returns when work is outstanding. */}
-          {missingProxyCount > 0 && (
-            <button className="button secondary media-split-main" disabled={busy} onClick={makeMissingProxies} aria-keyshortcuts="Shift+P">
-              Make {missingProxyCount} proxies
-            </button>
-          )}
-          <button
-            className="button secondary media-split-toggle"
-            disabled={busy || !projectId}
-            onClick={() => setShowMediaMenu((current) => !current)}
-            aria-label="More media generation actions"
-            aria-expanded={showMediaMenu}
-          >▾</button>
-          {showMediaMenu && (
-            <div className="media-menu">
-              <button disabled={busy || missingThumbnailCount === 0} onClick={makeMissingThumbnails} aria-keyshortcuts="Shift+G">
-                <span>{missingThumbnailCount ? `Generate ${missingThumbnailCount} thumbnails` : "Thumbnails ready"}</span>
-                <kbd>⇧G</kbd>
-                <small>Quality 1 · frame at 20%</small>
-              </button>
-              <button disabled={busy || !projectId} onClick={openAnalysisDialog} aria-keyshortcuts="A">
-                <span>{readiness?.missingAnalyses ? `Analyze ${readiness.missingAnalyses} clips` : "Analysis up to date"}</span>
-                <kbd>A</kbd>
-                <small>Proxies, speech, then cloud vision</small>
-              </button>
-            </div>
-          )}
-        </div>
-        <button className="button primary" disabled={busy || !projectId} onClick={importFolder} aria-keyshortcuts="M">
-          Add media <kbd>M</kbd>
-        </button>
-        <button className="shortcut-help-button" onClick={() => setShowShortcuts(true)} aria-label="Keyboard shortcuts" aria-keyshortcuts="?">?</button>
-        {/* Ambient progress for 2px, replacing a 180px readout that said the
-            same thing in words. */}
-        <div className="completion-hairline" aria-hidden="true">
-          <span style={{ width: `${activeAssets.length ? (labeledCount / activeAssets.length) * 100 : 0}%` }} />
-        </div>
-      </header>
+      <TopBar
+        projects={projects}
+        projectId={projectId}
+        mode={view.mode}
+        isDesktop={api.isDesktop()}
+        busy={busy}
+        canPairWithServer={Boolean(serverStatus?.paired && projectId)}
+        syncStatus={syncStatus}
+        operationProgress={operationProgress}
+        error={error}
+        message={message}
+        missingProxyCount={missingProxyCount}
+        missingThumbnailCount={missingThumbnailCount}
+        missingAnalysisCount={readiness?.missingAnalyses ?? 0}
+        mediaMenuOpen={showMediaMenu}
+        labeledCount={labeledCount}
+        activeCount={activeAssets.length}
+        onProjectChange={setProjectId}
+        onModeChange={(mode) => dispatchView({ kind: "setMode", mode })}
+        onOpenCatalog={openCatalog}
+        onOpenSettings={() => setShowSettings(true)}
+        onOpenCreateProject={() => setShowCreate(true)}
+        onOpenShortcuts={() => setShowShortcuts(true)}
+        onPairWithServer={() => void handleStartBaselineWizard(projectId)}
+        onShowSyncDiagnostics={() => setShowSyncDiagnostics(true)}
+        onCancelAnalysis={stopAnalysis}
+        onDismissError={() => setError("")}
+        onMakeProxies={makeMissingProxies}
+        onToggleMediaMenu={() => setShowMediaMenu((current) => !current)}
+        onMakeThumbnails={makeMissingThumbnails}
+        onOpenAnalysis={openAnalysisDialog}
+        onImportFolder={importFolder}
+      />
 
       {view.mode !== "review" && projectId ? (
         <div className="mode-surface">

@@ -1,4 +1,4 @@
-import type { Asset } from "../types";
+import type { AnalysisStage, Asset } from "../types";
 
 /**
  * Display formatters shared by the shell and its components.
@@ -9,6 +9,31 @@ import type { Asset } from "../types";
  * each, tested here, so a change to how a timecode reads is a change in one
  * place.
  */
+
+export const analysisStageLabels: Record<AnalysisStage, string> = {
+  proxies: "Making proxies",
+  transcripts: "Transcribing",
+  analysis: "Analyzing clips",
+};
+
+/**
+ * Sync state as a person would say it. Unknown states pass through rather
+ * than becoming "Unknown": a state the UI has not learned yet is still more
+ * informative named than blanked.
+ */
+export function syncStateLabel(state: string): string {
+  switch (state) {
+    case "unpaired": return "Unpaired";
+    case "offline": return "Offline";
+    case "connecting": return "Connecting…";
+    case "syncing": return "Syncing…";
+    case "synced": return "Synced";
+    case "attention": return "Needs attention";
+    case "incompatible": return "Incompatible";
+    case "credential_revoked": return "Credential revoked";
+    default: return state;
+  }
+}
 
 /** The clip's display name: what analysis called it, else its filename. */
 export function clipTitle(asset: Asset) {
