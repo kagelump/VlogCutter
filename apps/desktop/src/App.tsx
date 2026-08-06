@@ -21,6 +21,14 @@ import {
 import { JudgmentPanel, type SaveState } from "./components/JudgmentPanel";
 import { EvidenceShelf, type ShelfTab } from "./components/EvidenceShelf";
 import { TransportBar } from "./components/TransportBar";
+import { clipTitle, formatCost, formatDate, formatDuration, formatEta, formatTimecode } from "./review/format";
+import {
+  isRawOrientationProxy,
+  isRawOrientationThumbnail,
+  portraitRotation,
+  renderedRotation,
+  rotationAfter,
+} from "./review/rotation";
 
 interface OperationProgress {
   kind: "proxy" | "thumbnail" | "analysis";
@@ -43,50 +51,11 @@ const analysisStageLabels: Record<AnalysisStage, string> = {
   analysis: "Analyzing clips",
 };
 
-/** The clip's display name: what analysis called it, else its filename. */
-function clipTitle(asset: Asset) {
-  return asset.title.trim() || asset.filename;
-}
-
-function formatCost(usd: number) {
-  // A non-finite value reaches here when the budget field is empty or garbage;
-  // rendering "$NaN" beside a spend figure is worse than saying nothing.
-  if (!Number.isFinite(usd)) return "the run budget";
-  if (usd <= 0) return "$0.00";
-  if (usd < 0.01) return "<$0.01";
-  return `$${usd.toFixed(2)}`;
-}
-
-function formatTimecode(ms: number) {
-  const total = Math.max(0, Math.round(ms / 1000));
-  const minutes = Math.floor(total / 60);
-  const seconds = total % 60;
-  return `${minutes}:${seconds.toString().padStart(2, "0")}`;
-}
-
 const autoplayOptions: Array<{ value: AutoplayMode; label: string; detail: string }> = [
   { value: "never", label: "Never", detail: "Keep each clip paused until you press Space." },
   { value: "proxyAvailable", label: "Only when proxy is available", detail: "Autoplay lightweight review media; keep camera originals paused." },
   { value: "always", label: "Always", detail: "Autoplay whichever version is available, including camera originals." },
 ];
-
-function formatDuration(seconds: number) {
-  const safe = Number.isFinite(seconds) ? Math.max(0, seconds) : 0;
-  const minutes = Math.floor(safe / 60);
-  const remainder = Math.floor(safe % 60);
-  return `${minutes}:${remainder.toString().padStart(2, "0")}`;
-}
-
-function formatEta(seconds: number | null) {
-  if (seconds === null || !Number.isFinite(seconds)) return "Estimating…";
-  const rounded = Math.max(0, Math.ceil(seconds));
-  if (rounded < 60) return `${rounded}s remaining`;
-  const minutes = Math.ceil(rounded / 60);
-  if (minutes < 60) return `${minutes}m remaining`;
-  const hours = Math.floor(minutes / 60);
-  const remainder = minutes % 60;
-  return `${hours}h ${remainder}m remaining`;
-}
 
 function initialProgress(kind: OperationProgress["kind"], total: number): OperationProgress {
   return {
@@ -100,20 +69,6 @@ function initialProgress(kind: OperationProgress["kind"], total: number): Operat
   };
 }
 
-function formatDate(value: string | null) {
-  if (!value) return "No camera time";
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return value;
-  return new Intl.DateTimeFormat(undefined, {
-    month: "short",
-    day: "numeric",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-    hour12: false,
-  }).format(date);
-}
-
 function patchFor(asset: Asset): AssetPatch {
   return {
     notes: asset.notes,
@@ -121,29 +76,6 @@ function patchFor(asset: Asset): AssetPatch {
     removed: asset.removed,
     rotationDegrees: asset.rotationDegrees,
   };
-}
-
-function rotationAfter(rotationDegrees: number, addition: number) {
-  return ((rotationDegrees + addition) % 360 + 360) % 360;
-}
-
-function portraitRotation(asset: Asset) {
-  return rotationAfter(asset.defaultRotationDegrees, 270);
-}
-
-function isRawOrientationProxy(asset: Asset) {
-  return asset.proxyRepresentation === "raw_v3";
-}
-
-function isRawOrientationThumbnail(asset: Asset) {
-  return Boolean(asset.thumbnailPath?.endsWith(".v2.jpg"));
-}
-
-function renderedRotation(asset: Asset, representationIsRaw: boolean) {
-  return rotationAfter(
-    asset.rotationDegrees,
-    representationIsRaw ? 0 : -asset.metadataRotationDegrees,
-  );
 }
 
 function App() {
@@ -1791,7 +1723,6 @@ function App() {
               observation={observation}
               open={view.shelf}
               tab={shelfTab}
-              formatDate={formatDate}
               onTabChange={setShelfTab}
               onToggleOpen={() => dispatchView({ kind: "toggleShelf" })}
               onSeek={seekTo}
@@ -1865,7 +1796,6 @@ function App() {
           selectedId={selectedId}
           zoom={chronologyZoom}
           scrollRef={chronologyScrollRef}
-          formatDate={formatDate}
           collapsed={!view.ribbon}
           merged={view.presentation === "focus"}
           height={view.presentation === "focus" ? null : panelSizes.ribbon}

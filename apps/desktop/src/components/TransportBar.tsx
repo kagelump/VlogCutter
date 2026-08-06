@@ -1,5 +1,6 @@
 import type { CSSProperties } from "react";
 import type { Asset } from "../types";
+import { formatDuration } from "../review/format";
 
 export interface TransportBarProps {
   asset: Asset;
@@ -17,11 +18,6 @@ export interface TransportBarProps {
   onStep(delta: number): void;
   onRotate(): void;
   onEnterFocus(): void;
-}
-
-function formatDuration(seconds: number) {
-  const safe = Number.isFinite(seconds) ? Math.max(0, seconds) : 0;
-  return `${Math.floor(safe / 60)}:${Math.floor(safe % 60).toString().padStart(2, "0")}`;
 }
 
 /**
