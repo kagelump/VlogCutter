@@ -25,6 +25,7 @@ mod baseline;
 mod cameras;
 mod cards;
 mod chronology;
+mod copy;
 mod diagnostics;
 mod editplan;
 mod identifiers;
@@ -1129,7 +1130,7 @@ impl Catalog {
     /// Matches one file against this project's assets without ever creating one.
     /// `Imported` here means "not recognized", which is the caller's cue to
     /// count it rather than act on it.
-    fn relink_file(&self, project_id: &str, path: &Path) -> Result<IngestOutcome> {
+    pub(crate) fn relink_file(&self, project_id: &str, path: &Path) -> Result<IngestOutcome> {
         let metadata =
             fs::metadata(path).with_context(|| format!("read metadata for {}", path.display()))?;
         let fingerprint = sampled_fingerprint(path, metadata.len())?;
@@ -1179,7 +1180,7 @@ impl Catalog {
         Ok(())
     }
 
-    fn ingest_file(&self, project_id: &str, path: &Path) -> Result<IngestOutcome> {
+    pub(crate) fn ingest_file(&self, project_id: &str, path: &Path) -> Result<IngestOutcome> {
         let metadata =
             fs::metadata(path).with_context(|| format!("read metadata for {}", path.display()))?;
         let fingerprint = sampled_fingerprint(path, metadata.len())?;

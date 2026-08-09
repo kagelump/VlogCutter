@@ -91,8 +91,8 @@ or deletes source media. I01-T009 reconciles both documents.
 | 30 | I01-T003 | Desktop archive roots and bindings | — | complete |
 | 40 | I01-T004 | Removable volume detection and card session identity | — | complete |
 | 50 | I01-T005 | Ingest preflight and classification | I01-T001, I01-T004 | complete |
-| 60 | I01-T006 | Verified create-only card copy | I01-T003, I01-T005 | ready |
-| 70 | I01-T007 | Import modal and one-click smart ingest | I01-T005, I01-T006 | ready |
+| 60 | I01-T006 | Verified create-only card copy | I01-T003, I01-T005 | complete |
+| 70 | I01-T007 | Import modal and one-click smart ingest | I01-T005, I01-T006 | next |
 | 80 | I01-T008 | Card-mount banner | I01-T004, I01-T007 | ready |
 | 90 | I01-T009 | Import acceptance and documentation reconciliation | I01-T008 | ready |
 

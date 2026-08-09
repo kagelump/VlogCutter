@@ -377,6 +377,177 @@ impl Catalog {
     }
 }
 
+/// What one click of Import actually did.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportOutcome {
+    /// New assets created.
+    pub imported: usize,
+    /// Assets whose offline original was found on this source and reconnected.
+    pub relinked: usize,
+    /// Known content that needed nothing.
+    pub skipped: usize,
+    /// Originals copied into the archive root.
+    pub copied: usize,
+    pub bytes_copied: u64,
+    pub cancelled: bool,
+    pub failures: Vec<crate::IngestFailure>,
+}
+
+/// Where an import has got to, for a dialog that replaces its body with progress.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ImportStage {
+    Copying,
+    Reading,
+}
+
+impl Catalog {
+    /// Executes a preflight plan: copy what is new, register it, reconnect what
+    /// was lost, and leave alone what needs nothing.
+    ///
+    /// Takes the plan rather than re-deriving it so that what the user agreed to
+    /// in the dialog is what runs. Files are handled one at a time and each
+    /// commits atomically, so cancelling stops cleanly and re-running resumes.
+    pub fn run_import<F>(
+        &self,
+        project_id: &str,
+        plan: &ImportPreflight,
+        verify_copies: bool,
+        mut on_progress: F,
+    ) -> Result<ImportOutcome>
+    where
+        F: FnMut(ImportStage, usize, usize, &str) -> bool,
+    {
+        self.require_project(project_id)?;
+        let archive_root_id = plan
+            .destination
+            .archive_root
+            .as_ref()
+            .map(|root| root.id.clone());
+        if plan.destination.copies && !plan.destination.ready {
+            anyhow::bail!("{}", plan.destination.blocked_reason);
+        }
+
+        let actionable: Vec<&PreflightItem> = plan
+            .items
+            .iter()
+            .filter(|item| {
+                matches!(
+                    item.classification,
+                    Classification::New | Classification::KnownRelinkable
+                )
+            })
+            .collect();
+        let total = actionable.len();
+
+        let mut outcome = ImportOutcome {
+            skipped: plan.known_clips + plan.missing_proxies,
+            ..Default::default()
+        };
+
+        for (index, item) in actionable.iter().enumerate() {
+            let stage = if item.classification == Classification::New && plan.destination.copies {
+                ImportStage::Copying
+            } else {
+                ImportStage::Reading
+            };
+            if !on_progress(stage, index, total, &item.filename) {
+                outcome.cancelled = true;
+                break;
+            }
+            match self.import_one(
+                project_id,
+                item,
+                archive_root_id.as_deref(),
+                plan.card.as_ref(),
+                verify_copies,
+            ) {
+                Ok(Some(bytes)) => {
+                    if item.classification == Classification::New {
+                        outcome.imported += 1;
+                        if bytes > 0 {
+                            outcome.copied += 1;
+                            outcome.bytes_copied += bytes;
+                        }
+                    } else {
+                        outcome.relinked += 1;
+                    }
+                }
+                // Cancelled mid-copy.
+                Ok(None) => {
+                    outcome.cancelled = true;
+                    break;
+                }
+                Err(error) => outcome.failures.push(crate::IngestFailure {
+                    path: item.path.clone(),
+                    error: format!("{error:#}"),
+                }),
+            }
+        }
+        Ok(outcome)
+    }
+
+    /// Returns the bytes copied, or `None` when the copy was cancelled.
+    fn import_one(
+        &self,
+        project_id: &str,
+        item: &PreflightItem,
+        archive_root_id: Option<&str>,
+        card: Option<&CardCandidate>,
+        verify_copies: bool,
+    ) -> Result<Option<u64>> {
+        let source = PathBuf::from(&item.path);
+        if item.classification == Classification::KnownRelinkable {
+            // Already-known content: registering where it is found is the whole
+            // job, and it costs no copy.
+            self.relink_file(project_id, &source)?;
+            return Ok(Some(0));
+        }
+
+        // New content. Copy it off the card first when there is somewhere to put
+        // it, then register the asset against wherever it now lives.
+        let (path_to_register, bytes) = match (archive_root_id, card) {
+            (Some(root_id), Some(card)) => {
+                let relative = self.archive_relative_path(project_id, card, &item.relative_path)?;
+                let target = self.resolve_in_archive_root(root_id, &relative)?;
+                match crate::copy::commit_into_archive(&source, &target, verify_copies, |_| true)? {
+                    Some(committed) => (committed.path, committed.size_bytes),
+                    None => return Ok(None),
+                }
+            }
+            // Referenced in place: the original stays exactly where it is.
+            _ => (source, 0),
+        };
+
+        self.ingest_file(project_id, &path_to_register)?;
+
+        // Bind the new asset to the archive root, so relocating the archive later
+        // is one rebind rather than a per-asset repair.
+        if let (Some(root_id), Some(card)) = (archive_root_id, card)
+            && bytes > 0
+            && let Some(asset_id) = self.asset_id_at_path(project_id, &path_to_register)?
+        {
+            let relative = self.archive_relative_path(project_id, card, &item.relative_path)?;
+            let relative = crate::RootRelativePath::parse(relative)
+                .map_err(|error| anyhow::anyhow!("unusable archive path: {error}"))?;
+            self.record_archive_location(&asset_id, root_id, &relative, &path_to_register)?;
+        }
+        Ok(Some(bytes))
+    }
+
+    fn asset_id_at_path(&self, project_id: &str, path: &Path) -> Result<Option<String>> {
+        Ok(self
+            .connection()?
+            .query_row(
+                "SELECT id FROM assets WHERE project_id = ?1 AND path = ?2",
+                params![project_id, path.to_string_lossy()],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+}
+
 fn count(items: &[PreflightItem], classification: Classification) -> usize {
     items
         .iter()
@@ -428,6 +599,34 @@ mod tests {
     use crate::tests::insert_asset_at;
     use std::fs;
     use tempfile::tempdir;
+
+    /// A card holding real, probeable media. Import creates assets, which runs
+    /// ffprobe, so byte blobs will not do here.
+    fn card_fixture_media(root: &Path, clips: &[(&str, &str)]) -> PathBuf {
+        let mount = root.join("DJI_SD");
+        let layout = mount.join("DCIM/100MSDCF");
+        fs::create_dir_all(&layout).unwrap();
+        for (name, color) in clips {
+            let status = crate::tool_command("ffmpeg")
+                .args([
+                    "-y",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &format!("color=c={color}:s=64x64:r=5:d=1"),
+                    "-c:v",
+                    "mpeg4",
+                ])
+                .arg(layout.join(name))
+                .status()
+                .unwrap();
+            assert!(status.success(), "failed to build fixture {name}");
+        }
+        mount
+    }
 
     fn card_fixture(root: &Path, clips: &[(&str, &[u8])]) -> PathBuf {
         let mount = root.join("DJI_SD");
@@ -626,6 +825,203 @@ mod tests {
             .unwrap();
         assert_eq!(preflight.collisions, 1);
         assert_eq!(preflight.new_clips, 0);
+    }
+
+    /// The headline workflow: insert a card, click once, and get verified copies
+    /// in the archive — then insert it again with more footage and copy only the
+    /// new clips.
+    #[test]
+    fn a_card_imports_once_and_then_incrementally() {
+        // Creating an asset probes the media, so this needs the real toolchain.
+        if crate::tool_command("ffprobe")
+            .arg("-version")
+            .output()
+            .is_err()
+        {
+            eprintln!("ffprobe is unavailable; skipping media integration test");
+            return;
+        }
+
+        let directory = tempdir().unwrap();
+        let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).unwrap();
+        let project = catalog.create_project("Spain 2026").unwrap();
+        let mount = card_fixture_media(
+            directory.path(),
+            &[("C0001.MP4", "navy"), ("C0002.MP4", "maroon")],
+        );
+        let archive = directory.path().join("nas/VideoArchive");
+        fs::create_dir_all(&archive).unwrap();
+        let root = catalog.create_archive_root("NAS Video", &archive).unwrap();
+
+        let plan = catalog
+            .preflight_import(&project.id, &mount, Some(&root.id), |_, _, _| {})
+            .unwrap();
+        assert_eq!(plan.new_clips, 2);
+
+        let outcome = catalog
+            .run_import(&project.id, &plan, true, |_, _, _, _| true)
+            .unwrap();
+        assert_eq!(outcome.imported, 2);
+        assert_eq!(outcome.copied, 2);
+        assert!(outcome.bytes_copied > 0);
+        assert!(outcome.failures.is_empty(), "{:?}", outcome.failures);
+
+        // Originals landed under the archive root, keeping the camera's own
+        // folder structure, and the card still has them.
+        let card = plan.card.as_ref().unwrap();
+        let archived = archive
+            .join("Spain 2026")
+            .join(crate::cards::card_session_slug(card))
+            .join("DCIM/100MSDCF/C0001.MP4");
+        assert_eq!(
+            fs::read(&archived).unwrap(),
+            fs::read(mount.join("DCIM/100MSDCF/C0001.MP4")).unwrap(),
+            "the archived original must be byte-identical to the card's"
+        );
+        assert!(mount.join("DCIM/100MSDCF/C0001.MP4").is_file());
+
+        // Assets point at the archive copy, not the card, so ejecting is safe.
+        for asset in catalog.list_assets(&project.id).unwrap() {
+            assert!(asset.path.starts_with(archive.to_string_lossy().as_ref()));
+            assert!(asset.original_available);
+        }
+
+        // Shoot more footage and reinsert the same card.
+        let extra = card_fixture_media(&directory.path().join("more"), &[("C0003.MP4", "olive")]);
+        fs::copy(
+            extra.join("DCIM/100MSDCF/C0003.MP4"),
+            mount.join("DCIM/100MSDCF/C0003.MP4"),
+        )
+        .unwrap();
+        let second_plan = catalog
+            .preflight_import(&project.id, &mount, Some(&root.id), |_, _, _| {})
+            .unwrap();
+        assert_eq!(second_plan.scanned, 3);
+        assert_eq!(second_plan.new_clips, 1, "only the new clip is new");
+        assert!(
+            second_plan.destination.bytes_to_copy > 0,
+            "the second import must state the cost of only the new clip"
+        );
+
+        let second = catalog
+            .run_import(&project.id, &second_plan, true, |_, _, _, _| true)
+            .unwrap();
+        assert_eq!(second.imported, 1);
+        assert_eq!(second.copied, 1, "already-archived clips are not re-copied");
+        assert_eq!(catalog.list_assets(&project.id).unwrap().len(), 3);
+    }
+
+    /// Importing must not start a copy it cannot finish.
+    #[test]
+    fn an_import_refuses_to_run_against_a_blocked_destination() {
+        let directory = tempdir().unwrap();
+        let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).unwrap();
+        let project = catalog.create_project("Spain 2026").unwrap();
+        let mount = card_fixture(directory.path(), &[("C0001.MP4", b"footage")]);
+        let archive = directory.path().join("shuttle");
+        fs::create_dir_all(&archive).unwrap();
+        let root = catalog
+            .create_archive_root("Shuttle SSD", &archive)
+            .unwrap();
+
+        let plan = catalog
+            .preflight_import(&project.id, &mount, Some(&root.id), |_, _, _| {})
+            .unwrap();
+        fs::remove_dir_all(&archive).unwrap();
+        let replanned = catalog
+            .preflight_import(&project.id, &mount, Some(&root.id), |_, _, _| {})
+            .unwrap();
+
+        assert!(
+            catalog
+                .run_import(&project.id, &replanned, true, |_, _, _, _| true)
+                .is_err()
+        );
+        assert!(catalog.list_assets(&project.id).unwrap().is_empty());
+        drop(plan);
+    }
+
+    /// Cancelling stops cleanly, and re-running picks up where it left off.
+    #[test]
+    fn a_cancelled_import_resumes_without_duplicating_work() {
+        // Creating an asset probes the media, so this needs the real toolchain.
+        if crate::tool_command("ffprobe")
+            .arg("-version")
+            .output()
+            .is_err()
+        {
+            eprintln!("ffprobe is unavailable; skipping media integration test");
+            return;
+        }
+
+        let directory = tempdir().unwrap();
+        let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).unwrap();
+        let project = catalog.create_project("Spain 2026").unwrap();
+        let mount = card_fixture_media(
+            directory.path(),
+            &[
+                ("C0001.MP4", "navy"),
+                ("C0002.MP4", "maroon"),
+                ("C0003.MP4", "green"),
+            ],
+        );
+        let archive = directory.path().join("nas");
+        fs::create_dir_all(&archive).unwrap();
+        let root = catalog.create_archive_root("NAS Video", &archive).unwrap();
+
+        let plan = catalog
+            .preflight_import(&project.id, &mount, Some(&root.id), |_, _, _| {})
+            .unwrap();
+        let mut handled = 0;
+        let outcome = catalog
+            .run_import(&project.id, &plan, true, |_, _, _, _| {
+                handled += 1;
+                handled <= 2
+            })
+            .unwrap();
+        assert!(outcome.cancelled);
+        assert_eq!(outcome.imported, 2);
+
+        // Re-planning sees only what is left.
+        let resumed_plan = catalog
+            .preflight_import(&project.id, &mount, Some(&root.id), |_, _, _| {})
+            .unwrap();
+        assert_eq!(resumed_plan.new_clips, 1);
+        let resumed = catalog
+            .run_import(&project.id, &resumed_plan, true, |_, _, _, _| true)
+            .unwrap();
+        assert_eq!(resumed.imported, 1);
+        assert_eq!(catalog.list_assets(&project.id).unwrap().len(), 3);
+    }
+
+    /// Importing a card that holds a clip the project lost track of reconnects
+    /// it instead of importing a second copy.
+    #[test]
+    fn importing_reconnects_lost_originals_rather_than_duplicating_them() {
+        let directory = tempdir().unwrap();
+        let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).unwrap();
+        let project = catalog.create_project("Spain 2026").unwrap();
+        let mount = card_fixture(directory.path(), &[("C0001.MP4", b"the lost clip")]);
+
+        let gone = directory.path().join("old-drive/C0001.MP4");
+        fs::create_dir_all(gone.parent().unwrap()).unwrap();
+        fs::copy(mount.join("DCIM/100MSDCF/C0001.MP4"), &gone).unwrap();
+        insert_asset_at(&catalog, &project.id, "asset_lost", &gone);
+        fs::remove_file(&gone).unwrap();
+
+        let plan = catalog
+            .preflight_import(&project.id, &mount, None, |_, _, _| {})
+            .unwrap();
+        assert_eq!(plan.relinkable, 1);
+        assert_eq!(plan.new_clips, 0);
+
+        let outcome = catalog
+            .run_import(&project.id, &plan, true, |_, _, _, _| true)
+            .unwrap();
+        assert_eq!(outcome.relinked, 1);
+        assert_eq!(outcome.imported, 0);
+        assert_eq!(catalog.list_assets(&project.id).unwrap().len(), 1);
+        assert!(catalog.get_asset("asset_lost").unwrap().original_available);
     }
 
     #[test]
