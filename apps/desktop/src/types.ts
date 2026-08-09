@@ -268,6 +268,8 @@ export interface IngestReport {
   scanned: number;
   imported: number;
   duplicates: number;
+  /** Clips already in the project whose original was offline and has now been found again here. */
+  relinked: number;
   failures: Array<{ path: string; error: string }>;
 }
 

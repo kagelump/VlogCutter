@@ -7,7 +7,7 @@ use thiserror::Error;
 
 use crate::chronology::forward_migrate_project_chronology;
 
-pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 16;
+pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 17;
 
 const MIGRATION_TABLE_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -179,6 +179,12 @@ pub const PROJECT_CATALOG_MIGRATIONS: &[SqliteMigration] = &[
         name: "clip_anchored_trip_phases",
         source_identity: "project-catalog/0016-clip-anchored-trip-phases/20260809",
         apply: add_clip_anchored_trip_phases,
+    },
+    SqliteMigration {
+        id: 17,
+        name: "verified_asset_locations",
+        source_identity: "project-catalog/0016-verified-asset-locations/20260809",
+        apply: add_verified_asset_locations,
     },
 ];
 
@@ -1032,6 +1038,66 @@ fn add_transcripts(transaction: &Transaction<'_>) -> Result<()> {
 ///
 /// Deliberately local and unsynced, like `analysis_labels`: a run is an event on
 /// one node, not a shared project fact.
+/// Gives a node-local media location a verification state, so "the original is
+/// available" can stop meaning "some file exists at that pathname".
+///
+/// Two defects share that root cause. A card that reappears at a different mount
+/// point was reported as a duplicate and the asset was left pointing at the old
+/// offline path, and a reformatted card that reuses a pathname could make an
+/// asset resolve to entirely different bytes. See
+/// `docs/tasks/import/ARCHITECTURE.md` §3.2.
+///
+/// The primary key also relaxes to include the path, because an asset can
+/// legitimately be reachable at more than one place on one node — a mounted card
+/// and the archive copy taken from it.
+fn add_verified_asset_locations(transaction: &Transaction<'_>) -> Result<()> {
+    // Replayable: dropping `schema_migrations` re-runs this against a schema that
+    // may already carry the rebuilt table.
+    if column_exists(
+        transaction,
+        "project_asset_local_locations",
+        "verification_state",
+    )? {
+        return Ok(());
+    }
+    // A table rebuild rather than ALTER, because the primary key changes. Nothing
+    // references this table, so the rename cannot orphan a foreign key.
+    transaction.execute_batch(
+        r#"
+        CREATE TABLE project_asset_local_locations_v2 (
+            asset_id TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+            node_id TEXT NOT NULL,
+            local_path TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            verification_state TEXT NOT NULL DEFAULT 'unverified'
+                CHECK(verification_state IN ('unverified', 'provisional', 'verified', 'mismatch')),
+            verified_fingerprint TEXT,
+            verified_size_bytes INTEGER CHECK(verified_size_bytes IS NULL OR verified_size_bytes >= 0),
+            verified_mtime_millis INTEGER,
+            verified_at TEXT,
+            PRIMARY KEY(asset_id, node_id, local_path)
+        );
+
+        -- Existing rows are trusted enough to keep but not enough to call
+        -- verified: nothing ever checked their bytes. They verify lazily on
+        -- first use.
+        INSERT INTO project_asset_local_locations_v2(
+            asset_id, node_id, local_path, created_at, verification_state
+        )
+        SELECT asset_id, node_id, local_path, created_at, 'unverified'
+        FROM project_asset_local_locations;
+
+        DROP TABLE project_asset_local_locations;
+        ALTER TABLE project_asset_local_locations_v2
+            RENAME TO project_asset_local_locations;
+
+        CREATE INDEX IF NOT EXISTS project_asset_local_locations_asset_state
+            ON project_asset_local_locations(asset_id, verification_state);
+        "#,
+    )?;
+    Ok(())
+}
+
 fn add_analysis_runs(transaction: &Transaction<'_>) -> Result<()> {
     transaction.execute_batch(
         r#"
@@ -1357,15 +1423,12 @@ mod tests {
         for column in ["status", "stage_reached", "cost_usd", "budget_exhausted"] {
             assert!(columns.contains(&column.to_string()), "missing {column}");
         }
-        assert_eq!(PROJECT_CATALOG_SCHEMA_VERSION, 16);
     }
 
     #[test]
     fn migration_16_upgrades_a_catalog_stopped_at_the_previous_version() {
-        // Replays every migration except the newest, the way an existing
-        // catalog on disk would be, and then upgrades it.
         let mut connection = Connection::open_in_memory().unwrap();
-        let previous = &PROJECT_CATALOG_MIGRATIONS[..PROJECT_CATALOG_MIGRATIONS.len() - 1];
+        let previous = &PROJECT_CATALOG_MIGRATIONS[..15];
         run_sqlite_migrations(&mut connection, previous).unwrap();
         let before = column_exists(&connection, "trip_phases", "start_anchor_asset_id").unwrap();
         assert!(!before);
@@ -1375,6 +1438,127 @@ mod tests {
         assert!(column_exists(&connection, "trip_phases", "start_anchor_asset_id").unwrap());
         assert!(column_exists(&connection, "trip_phases", "end_anchor_asset_id").unwrap());
         validate_project_catalog_migrations(&connection).unwrap();
+    }
+
+    #[test]
+    fn the_schema_version_constant_tracks_the_migration_list() {
+        assert_eq!(
+            PROJECT_CATALOG_SCHEMA_VERSION,
+            PROJECT_CATALOG_MIGRATIONS.last().unwrap().id,
+            "bump PROJECT_CATALOG_SCHEMA_VERSION when adding a migration"
+        );
+    }
+
+    #[test]
+    fn migration_17_gives_locations_a_verification_state() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        migrate_project_catalog(&mut connection).unwrap();
+        let columns: Vec<String> = connection
+            .prepare("SELECT name FROM pragma_table_info('project_asset_local_locations')")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<String>>>()
+            .unwrap();
+        for column in [
+            "verification_state",
+            "verified_fingerprint",
+            "verified_size_bytes",
+            "verified_mtime_millis",
+            "verified_at",
+        ] {
+            assert!(columns.contains(&column.to_string()), "missing {column}");
+        }
+    }
+
+    #[test]
+    fn migration_17_keeps_existing_locations_and_admits_they_are_unverified() {
+        // A catalog stopped one migration short, carrying a location row written
+        // before verification existed.
+        let mut connection = Connection::open_in_memory().unwrap();
+        let previous = &PROJECT_CATALOG_MIGRATIONS[..16];
+        run_sqlite_migrations(&mut connection, previous).unwrap();
+        connection
+            .execute_batch(
+                r#"
+                INSERT INTO projects(id, name, created_at)
+                VALUES ('p1', 'Legacy', '2026-01-01T00:00:00Z');
+                INSERT INTO assets(
+                    id, project_id, fingerprint, path, filename, size_bytes,
+                    duration_seconds, created_at
+                ) VALUES (
+                    'a1', 'p1', 'fp', '/Volumes/NAS/C0001.MP4', 'C0001.MP4', 100, 10,
+                    '2026-01-01T00:00:00Z'
+                );
+                INSERT INTO project_asset_local_locations(asset_id, node_id, local_path, created_at)
+                VALUES ('a1', 'node_one', '/Volumes/NAS/C0001.MP4', '2026-01-01T00:00:00Z');
+                "#,
+            )
+            .unwrap();
+
+        migrate_project_catalog(&mut connection).unwrap();
+
+        let (path, state): (String, String) = connection
+            .query_row(
+                "SELECT local_path, verification_state FROM project_asset_local_locations
+                 WHERE asset_id = 'a1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(path, "/Volumes/NAS/C0001.MP4");
+        assert_eq!(
+            state, "unverified",
+            "a location nothing ever checked must not claim to be verified"
+        );
+
+        // The relaxed primary key is what lets one asset hold a card location and
+        // an archive location at the same time.
+        connection
+            .execute(
+                "INSERT INTO project_asset_local_locations(asset_id, node_id, local_path, created_at)
+                 VALUES ('a1', 'node_one', '/Volumes/CARD/C0001.MP4', '2026-01-02T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+        let count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM project_asset_local_locations WHERE asset_id = 'a1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 2);
+    }
+
+    /// A catalog stopped at *any* earlier version upgrades to current. Stated as
+    /// a property rather than against one named migration, so adding the next
+    /// migration does not silently stop exercising the previous ones.
+    #[test]
+    fn a_catalog_stopped_at_any_earlier_version_upgrades_cleanly() {
+        for stopped_after in 0..PROJECT_CATALOG_MIGRATIONS.len() {
+            let mut connection = Connection::open_in_memory().unwrap();
+            run_sqlite_migrations(
+                &mut connection,
+                &PROJECT_CATALOG_MIGRATIONS[..stopped_after],
+            )
+            .unwrap();
+
+            migrate_project_catalog(&mut connection).unwrap();
+
+            validate_project_catalog_migrations(&connection).unwrap();
+            let applied: u32 = connection
+                .query_row(
+                    "SELECT MAX(migration_id) FROM schema_migrations",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                applied, PROJECT_CATALOG_SCHEMA_VERSION,
+                "a catalog stopped after {stopped_after} migrations did not reach current"
+            );
+        }
     }
 
     #[test]

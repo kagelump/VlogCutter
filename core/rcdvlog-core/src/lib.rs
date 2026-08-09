@@ -26,6 +26,7 @@ mod chronology;
 mod diagnostics;
 mod editplan;
 mod identifiers;
+mod locations;
 mod migrations;
 mod operations;
 mod storage;
@@ -278,7 +279,23 @@ pub struct IngestReport {
     pub scanned: usize,
     pub imported: usize,
     pub duplicates: usize,
+    /// Clips already in this project whose original was offline and has now been
+    /// found again at the scanned location.
+    #[serde(default)]
+    pub relinked: usize,
     pub failures: Vec<IngestFailure>,
+}
+
+/// What ingest did with one candidate file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IngestOutcome {
+    /// New content; an asset was created.
+    Imported,
+    /// Already known, and already resolvable somewhere. The discovered location
+    /// is recorded, but the asset was left alone.
+    Duplicate,
+    /// Already known, but its original was offline. The asset now points here.
+    Relinked,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -980,14 +997,16 @@ impl Catalog {
             scanned: candidates.len(),
             imported: 0,
             duplicates: 0,
+            relinked: 0,
             failures: Vec::new(),
         };
 
         let total = candidates.len();
         for (index, path) in candidates.into_iter().enumerate() {
             match self.ingest_file(project_id, &path) {
-                Ok(true) => report.imported += 1,
-                Ok(false) => report.duplicates += 1,
+                Ok(IngestOutcome::Imported) => report.imported += 1,
+                Ok(IngestOutcome::Duplicate) => report.duplicates += 1,
+                Ok(IngestOutcome::Relinked) => report.relinked += 1,
                 Err(error) => {
                     // The transient report is not enough: a rejected file must
                     // still be discoverable after the run, and after relaunch
@@ -1014,18 +1033,24 @@ impl Catalog {
         Ok(report)
     }
 
-    fn ingest_file(&self, project_id: &str, path: &Path) -> Result<bool> {
+    fn ingest_file(&self, project_id: &str, path: &Path) -> Result<IngestOutcome> {
         let metadata =
             fs::metadata(path).with_context(|| format!("read metadata for {}", path.display()))?;
         let fingerprint = sampled_fingerprint(path, metadata.len())?;
         let connection = self.connection()?;
-        let exists: bool = connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM assets WHERE project_id = ?1 AND fingerprint = ?2)",
-            params![project_id, fingerprint],
-            |row| row.get(0),
-        )?;
-        if exists {
-            return Ok(false);
+        let known: Option<(String, String)> = connection
+            .query_row(
+                "SELECT id, path FROM assets WHERE project_id = ?1 AND fingerprint = ?2",
+                params![project_id, fingerprint],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if let Some((asset_id, recorded_path)) = known {
+            // Seeing content we already know is evidence about *where that
+            // content lives*, and throwing it away is how an asset ends up
+            // stranded on a path that no longer exists. Register the discovered
+            // location, and adopt it if the asset has nowhere else to resolve.
+            return self.relink_known_asset(&asset_id, &recorded_path, path, &fingerprint);
         }
 
         let probe = probe_media(path)?;
@@ -1057,7 +1082,56 @@ impl Catalog {
                 created_at: now(),
             },
         )?;
-        Ok(true)
+        Ok(IngestOutcome::Imported)
+    }
+
+    /// Records a rediscovered location for content this project already holds,
+    /// repairing the asset when its recorded path has gone offline.
+    ///
+    /// The fingerprint has already been computed by the caller and matched an
+    /// existing asset, so the discovered path is verified by construction — no
+    /// second hash.
+    fn relink_known_asset(
+        &self,
+        asset_id: &str,
+        recorded_path: &str,
+        discovered: &Path,
+        fingerprint: &str,
+    ) -> Result<IngestOutcome> {
+        let discovered_text = discovered.to_string_lossy().into_owned();
+        let node_id = self.node_id()?;
+        let connection = self.connection()?;
+        locations::record_verification(
+            &connection,
+            asset_id,
+            &node_id,
+            &discovered_text,
+            locations::Verification {
+                state: LocationVerificationState::Verified,
+                fingerprint: Some(fingerprint),
+                guard: locations::LocationGuard::read(discovered),
+                at: &now(),
+            },
+        )?;
+
+        if discovered_text == recorded_path {
+            return Ok(IngestOutcome::Duplicate);
+        }
+        // The asset already resolves somewhere; a second copy is worth knowing
+        // about but is no reason to move the asset off a working location.
+        let recorded_state = locations::recorded_location(&connection, asset_id, recorded_path)?;
+        if locations::location_is_available(
+            recorded_path,
+            recorded_state.map(|recorded| recorded.state),
+            recorded_state.and_then(|recorded| recorded.guard),
+        ) || locations::any_available_location(&connection, asset_id, &discovered_text)?
+            .is_some()
+        {
+            return Ok(IngestOutcome::Duplicate);
+        }
+
+        locations::set_preferred_path(&connection, asset_id, &discovered_text)?;
+        Ok(IngestOutcome::Relinked)
     }
 
     pub fn list_assets(&self, project_id: &str) -> Result<Vec<Asset>> {
@@ -1108,6 +1182,8 @@ impl Catalog {
         } else {
             ("NULL", "0", "")
         };
+        let (location_state, location_size, location_mtime, location_join) =
+            location_columns(&connection)?;
         let sql = format!(
             r#"
             SELECT a.id, a.project_id, a.path, a.filename, a.fingerprint, a.size_bytes,
@@ -1116,9 +1192,11 @@ impl Catalog {
                    {metadata_rotation}, {default_rotation}, {rotation},
                    {orientation_probed}, {thumbnail_path}, {thumbnail_quality},
                    a.notes, {labels}, {removed}, {media_object_id},
-                   {media_verification_state}, {title}, {description}
+                   {media_verification_state}, {title}, {description},
+                   {location_state}, {location_size}, {location_mtime}
             FROM assets a
             {thumbnail_join}
+            {location_join}
             WHERE a.project_id = ?1
             ORDER BY a.best_time IS NULL, a.best_time, a.filename, a.id
             "#
@@ -1189,6 +1267,8 @@ impl Catalog {
         } else {
             ("NULL", "0", "")
         };
+        let (location_state, location_size, location_mtime, location_join) =
+            location_columns(&connection)?;
         let sql = format!(
             r#"
             SELECT a.id, a.project_id, a.path, a.filename, a.fingerprint, a.size_bytes,
@@ -1197,9 +1277,11 @@ impl Catalog {
                    {metadata_rotation}, {default_rotation}, {rotation},
                    {orientation_probed}, {thumbnail_path}, {thumbnail_quality},
                    a.notes, {labels}, {removed}, {media_object_id},
-                   {media_verification_state}, {title}, {description}
+                   {media_verification_state}, {title}, {description},
+                   {location_state}, {location_size}, {location_mtime}
             FROM assets a
             {thumbnail_join}
+            {location_join}
             WHERE a.id = ?1
             "#
         );
@@ -1207,6 +1289,75 @@ impl Catalog {
             .query_row(&sql, [asset_id], row_to_asset)
             .optional()?
             .ok_or_else(|| anyhow!("asset not found: {asset_id}"))
+    }
+
+    /// Returns the path to this asset's original only after proving the bytes
+    /// there are still this asset's bytes.
+    ///
+    /// Every operation that reads original media goes through here. Path
+    /// existence is not enough: a reformatted card can put a different clip at
+    /// the same `.../C0012.MP4`, and transcoding or exporting that would produce
+    /// silently wrong output. See `docs/tasks/import/ARCHITECTURE.md` §3.2.
+    ///
+    /// The fingerprint is computed at most once per file version. A location
+    /// already verified, whose size and modification time are unchanged, is
+    /// returned without touching its contents, so repeated proxy or export runs
+    /// over a large project pay the hash exactly once.
+    pub fn resolve_original(&self, asset_id: &str) -> Result<PathBuf> {
+        let asset = self.get_asset(asset_id)?;
+        locations::require_path(asset_id, &asset.path)?;
+        let path = PathBuf::from(&asset.path);
+        let Some(observed) = locations::LocationGuard::read(&path) else {
+            bail!("original is offline: {}", asset.path);
+        };
+
+        let connection = self.connection()?;
+        let recorded = locations::recorded_location(&connection, asset_id, &asset.path)?;
+        if let Some(recorded) = recorded {
+            match recorded.state {
+                LocationVerificationState::Mismatch => {
+                    return Err(locations::mismatch_error(&asset.path));
+                }
+                LocationVerificationState::Verified if observed.matches(recorded.guard) => {
+                    return Ok(path);
+                }
+                _ => {}
+            }
+        }
+
+        let fingerprint = sampled_fingerprint(&path, observed.size_bytes as u64)?;
+        let verified = fingerprint == asset.fingerprint;
+        let node_id = self.node_id()?;
+        locations::record_verification(
+            &connection,
+            asset_id,
+            &node_id,
+            &asset.path,
+            locations::Verification {
+                state: if verified {
+                    LocationVerificationState::Verified
+                } else {
+                    LocationVerificationState::Mismatch
+                },
+                fingerprint: Some(&fingerprint),
+                guard: Some(observed),
+                at: &now(),
+            },
+        )?;
+        if verified {
+            Ok(path)
+        } else {
+            Err(locations::mismatch_error(&asset.path))
+        }
+    }
+
+    /// This catalog's node identity, creating it on first use.
+    fn node_id(&self) -> Result<String> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let node_id = operations::ensure_node(&transaction)?;
+        transaction.commit()?;
+        Ok(node_id)
     }
 
     pub fn update_asset(&self, asset_id: &str, patch: &AssetPatch) -> Result<Asset> {
@@ -1233,9 +1384,10 @@ impl Catalog {
         F: FnMut(f64),
     {
         let asset = self.refresh_asset_orientation(asset_id)?;
-        if !Path::new(&asset.path).exists() {
-            bail!("original is offline: {}", asset.path);
-        }
+        // Proves the bytes are still this clip's before spending a transcode on
+        // them. A proxy built from a reused pathname would be wrong footage
+        // wearing the right name, and nothing downstream would catch it.
+        self.resolve_original(asset_id)?;
         let parent = self
             .database_path
             .parent()
@@ -1280,14 +1432,14 @@ impl Catalog {
     /// Explicitly refreshes legacy orientation metadata from the immutable original.
     pub fn refresh_asset_orientation(&self, asset_id: &str) -> Result<Asset> {
         let asset = self.get_asset(asset_id)?;
-        if asset.orientation_probed || !Path::new(&asset.path).is_file() {
-            if !Path::new(&asset.path).is_file() && !asset.orientation_probed {
-                bail!("original is offline: {}", asset.path);
-            }
+        if asset.orientation_probed {
             return Ok(asset);
         }
+        // Reading orientation off whatever happens to sit at the path would
+        // rotate this clip by another clip's metadata.
+        let original = self.resolve_original(asset_id)?;
 
-        let probe = probe_media(Path::new(&asset.path))?;
+        let probe = probe_media(&original)?;
         let rotation_degrees = if asset.rotation_degrees != asset.default_rotation_degrees {
             asset.rotation_degrees
         } else {
@@ -2907,6 +3059,33 @@ fn table_exists(connection: &Connection, table: &str) -> Result<bool> {
     )?)
 }
 
+/// Select expressions and the join that carry the verification state of the
+/// location `assets.path` currently points at.
+///
+/// A catalog old enough to predate verification returns literals and no join, so
+/// every asset query keeps working against a legacy schema exactly as the
+/// `asset_column_expression` guards already do elsewhere in this file.
+fn location_columns(
+    connection: &Connection,
+) -> Result<(&'static str, &'static str, &'static str, &'static str)> {
+    if table_column_exists(
+        connection,
+        "project_asset_local_locations",
+        "verification_state",
+    )? {
+        Ok((
+            "l.verification_state",
+            "l.verified_size_bytes",
+            "l.verified_mtime_millis",
+            "LEFT JOIN project_asset_local_locations l \
+             ON l.asset_id = a.id AND l.local_path = a.path \
+             AND l.node_id = (SELECT node_id FROM catalog_identity WHERE singleton_id = 1)",
+        ))
+    } else {
+        Ok(("NULL", "NULL", "NULL", ""))
+    }
+}
+
 fn asset_column_expression(
     connection: &Connection,
     column: &str,
@@ -2990,7 +3169,23 @@ pub fn landscape_default_rotation(width: u32, height: u32, metadata_rotation_deg
 fn row_to_asset(row: &rusqlite::Row<'_>) -> rusqlite::Result<Asset> {
     let path: String = row.get(2)?;
     let proxy_path: Option<String> = row.get(15)?;
-    let original_available = Path::new(&path).is_file();
+    // Advisory availability: cheap enough to run for every row in a list, which
+    // rules out hashing. A location proven to hold the wrong bytes is excluded
+    // outright, and one proven correct is trusted only while its size and mtime
+    // still match. Anything that reads original bytes goes through
+    // `Catalog::resolve_original` instead, which hashes.
+    let location_state = row
+        .get::<_, Option<String>>(29)?
+        .as_deref()
+        .and_then(LocationVerificationState::parse_stored);
+    let location_guard =
+        row.get::<_, Option<i64>>(30)?
+            .map(|size_bytes| locations::LocationGuard {
+                size_bytes,
+                mtime_millis: row.get::<_, Option<i64>>(31).unwrap_or(None),
+            });
+    let original_available =
+        locations::location_is_available(&path, location_state, location_guard);
     let proxy_available = proxy_path
         .as_deref()
         .is_some_and(|path| Path::new(path).is_file());
@@ -3702,6 +3897,240 @@ pub(crate) fn now() -> String {
 mod tests {
     use super::*;
     use tempfile::{TempDir, tempdir};
+
+    /// Inserts an asset whose stored fingerprint is the real sampled fingerprint
+    /// of the file on disk, so location verification has something honest to
+    /// compare against. Deliberately avoids `ingest_folder`, which would probe
+    /// the file and require ffprobe.
+    fn insert_asset_at(catalog: &Catalog, project_id: &str, id: &str, path: &Path) {
+        let size = fs::metadata(path).unwrap().len();
+        let fingerprint = sampled_fingerprint(path, size).unwrap();
+        catalog
+            .connection()
+            .unwrap()
+            .execute(
+                r#"
+                INSERT INTO assets (
+                    id, project_id, fingerprint, path, filename, size_bytes,
+                    duration_seconds, frame_rate, width, height, codec, camera,
+                    captured_at_raw, best_time, source_out, created_at,
+                    orientation_probed
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 10, 30, 1920, 1080,
+                          'h264', 'Sony (C-series)', NULL, NULL, 10, ?7, 1)
+                "#,
+                params![
+                    id,
+                    project_id,
+                    fingerprint,
+                    path.to_string_lossy(),
+                    path.file_name().unwrap().to_string_lossy(),
+                    size as i64,
+                    now(),
+                ],
+            )
+            .unwrap();
+    }
+
+    fn location_state(catalog: &Catalog, asset_id: &str, path: &Path) -> Option<String> {
+        catalog
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT verification_state FROM project_asset_local_locations
+                 WHERE asset_id = ?1 AND local_path = ?2",
+                params![asset_id, path.to_string_lossy()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .unwrap()
+    }
+
+    /// The defect this epic exists to prevent: a card is reformatted and reused,
+    /// a new clip lands at the pathname an old asset remembers, and the old
+    /// asset quietly starts resolving to footage that is not its own.
+    #[test]
+    fn a_reused_pathname_never_binds_an_asset_to_different_content() {
+        let (directory, catalog, project) = catalog_fixture();
+        let card = directory.path().join("CARD/DCIM/100MSDCF");
+        fs::create_dir_all(&card).unwrap();
+        let clip = card.join("C0012.MP4");
+        fs::write(&clip, b"the original clip, shot in Spain").unwrap();
+        insert_asset_at(&catalog, &project.id, "asset_spain", &clip);
+
+        // Verified once, this resolves without complaint.
+        assert!(catalog.resolve_original("asset_spain").is_ok());
+        assert!(catalog.get_asset("asset_spain").unwrap().original_available);
+
+        // The card is reformatted and the camera writes a different clip to the
+        // same DCIM pathname.
+        fs::write(&clip, b"a completely different clip, shot in Iceland later").unwrap();
+
+        assert!(
+            !catalog.get_asset("asset_spain").unwrap().original_available,
+            "an asset must not report an original it can no longer vouch for"
+        );
+        let error = catalog.resolve_original("asset_spain").unwrap_err();
+        assert!(
+            format!("{error:#}").contains("not this clip any more"),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(
+            location_state(&catalog, "asset_spain", &clip).as_deref(),
+            Some("mismatch")
+        );
+    }
+
+    /// A mismatch is a conclusion, not a transient failure. Restoring the right
+    /// bytes must not silently re-arm the location; only an explicit rescan does.
+    #[test]
+    fn a_mismatched_location_is_repaired_only_by_an_explicit_rescan() {
+        let (directory, catalog, project) = catalog_fixture();
+        let card = directory.path().join("CARD");
+        fs::create_dir_all(&card).unwrap();
+        let clip = card.join("C0012.MP4");
+        fs::write(&clip, b"the original clip").unwrap();
+        insert_asset_at(&catalog, &project.id, "asset_one", &clip);
+        catalog.resolve_original("asset_one").unwrap();
+
+        fs::write(&clip, b"different content entirely").unwrap();
+        assert!(catalog.resolve_original("asset_one").is_err());
+
+        // The right file comes back, but nothing has re-checked it yet.
+        fs::write(&clip, b"the original clip").unwrap();
+        assert!(
+            !catalog.get_asset("asset_one").unwrap().original_available,
+            "a location proven wrong must stay untrusted until it is rechecked"
+        );
+
+        // An ingest over the folder is that recheck.
+        let report = catalog.ingest_folder(&project.id, &card).unwrap();
+        assert_eq!(report.imported, 0);
+        assert_eq!(
+            location_state(&catalog, "asset_one", &clip).as_deref(),
+            Some("verified")
+        );
+        assert!(catalog.get_asset("asset_one").unwrap().original_available);
+    }
+
+    /// Content already known to the project, discovered where the asset is not
+    /// currently looking, is the missing original — not a duplicate to discard.
+    #[test]
+    fn a_known_clip_found_at_a_new_path_repairs_the_asset() {
+        let (directory, catalog, project) = catalog_fixture();
+        let first_mount = directory.path().join("Volumes/CARD");
+        let second_mount = directory.path().join("Volumes/CARD 1");
+        fs::create_dir_all(&first_mount).unwrap();
+        fs::create_dir_all(&second_mount).unwrap();
+        let original = first_mount.join("C0001.MP4");
+        fs::write(&original, b"clip bytes that do not change").unwrap();
+        insert_asset_at(&catalog, &project.id, "asset_one", &original);
+
+        // The volume remounts somewhere else, exactly as macOS does when a card
+        // is inserted while the previous mount lingers.
+        let moved = second_mount.join("C0001.MP4");
+        fs::rename(&original, &moved).unwrap();
+        assert!(!catalog.get_asset("asset_one").unwrap().original_available);
+
+        let report = catalog.ingest_folder(&project.id, &second_mount).unwrap();
+        assert_eq!(report.scanned, 1);
+        assert_eq!(
+            report.imported, 0,
+            "repairing must not create a second asset"
+        );
+        assert_eq!(report.relinked, 1);
+        assert_eq!(report.duplicates, 0);
+
+        let repaired = catalog.get_asset("asset_one").unwrap();
+        assert_eq!(repaired.path, moved.to_string_lossy());
+        assert!(repaired.original_available);
+        assert_eq!(catalog.list_assets(&project.id).unwrap().len(), 1);
+    }
+
+    /// A second copy is worth remembering, but it is no reason to move an asset
+    /// off a location that already works.
+    #[test]
+    fn a_second_copy_is_recorded_without_disturbing_a_working_asset() {
+        let (directory, catalog, project) = catalog_fixture();
+        let nas = directory.path().join("nas");
+        let card = directory.path().join("card");
+        fs::create_dir_all(&nas).unwrap();
+        fs::create_dir_all(&card).unwrap();
+        let original = nas.join("C0001.MP4");
+        fs::write(&original, b"clip bytes").unwrap();
+        insert_asset_at(&catalog, &project.id, "asset_one", &original);
+        catalog.resolve_original("asset_one").unwrap();
+
+        let copy = card.join("C0001.MP4");
+        fs::copy(&original, &copy).unwrap();
+        let report = catalog.ingest_folder(&project.id, &card).unwrap();
+        assert_eq!(report.duplicates, 1);
+        assert_eq!(report.relinked, 0);
+
+        let asset = catalog.get_asset("asset_one").unwrap();
+        assert_eq!(
+            asset.path,
+            original.to_string_lossy(),
+            "a working location must not be swapped out from under the asset"
+        );
+        // Both locations are nonetheless known, which is what lets a later
+        // archive step reason about where this content already exists.
+        assert_eq!(
+            location_state(&catalog, "asset_one", &copy).as_deref(),
+            Some("verified")
+        );
+    }
+
+    /// Verification is cached: a second resolve of an unchanged file must not
+    /// re-hash it, or every proxy batch would re-read every original.
+    #[test]
+    fn an_unchanged_verified_location_is_not_rehashed() {
+        let (directory, catalog, project) = catalog_fixture();
+        let clip = directory.path().join("C0001.MP4");
+        fs::write(&clip, b"clip bytes").unwrap();
+        insert_asset_at(&catalog, &project.id, "asset_one", &clip);
+
+        catalog.resolve_original("asset_one").unwrap();
+        let first_verified_at: String = catalog
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT verified_at FROM project_asset_local_locations WHERE asset_id = 'asset_one'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        catalog.resolve_original("asset_one").unwrap();
+        let second_verified_at: String = catalog
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT verified_at FROM project_asset_local_locations WHERE asset_id = 'asset_one'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            first_verified_at, second_verified_at,
+            "an unchanged location must be trusted from its cached verification"
+        );
+    }
+
+    /// An asset carried forward from an older catalog has never been verified.
+    /// It must still be usable, or upgrading would report a whole project
+    /// offline.
+    #[test]
+    fn an_unverified_legacy_location_stays_usable() {
+        let (directory, catalog, project) = catalog_fixture();
+        let clip = directory.path().join("C0001.MP4");
+        fs::write(&clip, b"clip bytes").unwrap();
+        insert_asset_at(&catalog, &project.id, "asset_one", &clip);
+        assert!(
+            location_state(&catalog, "asset_one", &clip).is_none(),
+            "this fixture inserts no location row, standing in for a legacy catalog"
+        );
+        assert!(catalog.get_asset("asset_one").unwrap().original_available);
+    }
 
     fn catalog_fixture() -> (TempDir, Catalog, Project) {
         let directory = tempdir().unwrap();

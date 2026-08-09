@@ -690,7 +690,7 @@ impl Catalog {
         )?;
         let node_id = ensure_node(&transaction)?;
         transaction.execute(
-            "INSERT INTO project_asset_local_locations(asset_id, node_id, local_path, created_at) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(asset_id, node_id) DO UPDATE SET local_path=excluded.local_path",
+            "INSERT INTO project_asset_local_locations(asset_id, node_id, local_path, created_at) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(asset_id, node_id, local_path) DO NOTHING",
             params![asset_id, node_id, local_path, now()],
         )?;
         transaction.execute(

@@ -1041,9 +1041,13 @@ function App() {
       const report = await api.ingestFolder(projectId, path);
       await Promise.all([refreshAssets(projectId), refreshProjects()]);
       setMessage(
-        `Imported ${report.imported}; ${report.duplicates} already present${
-          report.failures.length ? `; ${report.failures.length} failed` : ""
-        }`,
+        [
+          `Imported ${report.imported}`,
+          `${report.duplicates} already present`,
+          // Worth saying out loud: this is footage the project had lost track of.
+          ...(report.relinked ? [`${report.relinked} reconnected to their originals`] : []),
+          ...(report.failures.length ? [`${report.failures.length} failed`] : []),
+        ].join("; "),
       );
       if (report.failures.length) setError(report.failures[0].error);
     } catch (reason) {
