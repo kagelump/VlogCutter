@@ -7,7 +7,7 @@ use thiserror::Error;
 
 use crate::chronology::forward_migrate_project_chronology;
 
-pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 17;
+pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 18;
 
 const MIGRATION_TABLE_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -187,7 +187,7 @@ pub const PROJECT_CATALOG_MIGRATIONS: &[SqliteMigration] = &[
         apply: add_verified_asset_locations,
     },
     SqliteMigration {
-        id: 17,
+        id: 18,
         name: "archive_roots",
         source_identity: "project-catalog/0017-archive-roots/20260809",
         apply: add_archive_roots,
@@ -195,7 +195,86 @@ pub const PROJECT_CATALOG_MIGRATIONS: &[SqliteMigration] = &[
 ];
 
 pub fn migrate_project_catalog(connection: &mut Connection) -> Result<()> {
+    reconcile_divergent_import_migration_history(connection)?;
     run_sqlite_migrations(connection, PROJECT_CATALOG_MIGRATIONS)
+}
+
+/// The import branch and main both allocated migration 16 on 2026-08-09.
+/// Catalogs opened by the import branch before the histories were merged carry
+/// verified locations at 16 and, optionally, archive roots at 17. Preserve
+/// those applied identities by shifting them forward, then install main's
+/// migration 16 in the same transaction. Released/main catalogs already have
+/// the canonical migration 16 and never enter this compatibility path.
+fn reconcile_divergent_import_migration_history(connection: &mut Connection) -> Result<()> {
+    if !table_exists(connection, "schema_migrations")? {
+        return Ok(());
+    }
+
+    let import_16: Option<(String, String)> = connection
+        .query_row(
+            "SELECT name, source_identity FROM schema_migrations WHERE migration_id = 16",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    if import_16
+        .as_ref()
+        .map(|(name, identity)| (name.as_str(), identity.as_str()))
+        != Some((
+            "verified_asset_locations",
+            "project-catalog/0016-verified-asset-locations/20260809",
+        ))
+    {
+        return Ok(());
+    }
+
+    let import_17: Option<(String, String)> = connection
+        .query_row(
+            "SELECT name, source_identity FROM schema_migrations WHERE migration_id = 17",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    if import_17
+        .as_ref()
+        .map(|(name, identity)| (name.as_str(), identity.as_str()))
+        .is_some_and(|migration| {
+            migration
+                != (
+                    "archive_roots",
+                    "project-catalog/0017-archive-roots/20260809",
+                )
+        })
+    {
+        return Ok(());
+    }
+
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .context("begin divergent import migration reconciliation")?;
+    if import_17.is_some() {
+        transaction.execute(
+            "UPDATE schema_migrations SET migration_id = 18 WHERE migration_id = 17",
+            [],
+        )?;
+    }
+    transaction.execute(
+        "UPDATE schema_migrations SET migration_id = 17 WHERE migration_id = 16",
+        [],
+    )?;
+    add_clip_anchored_trip_phases(&transaction)?;
+    transaction.execute(
+        r#"
+        INSERT INTO schema_migrations(migration_id, name, source_identity, applied_at)
+        VALUES (16, 'clip_anchored_trip_phases',
+                'project-catalog/0016-clip-anchored-trip-phases/20260809', ?1)
+        "#,
+        [Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)],
+    )?;
+    transaction
+        .commit()
+        .context("commit divergent import migration reconciliation")?;
+    Ok(())
 }
 
 pub fn inspect_project_catalog_migrations(
@@ -1474,21 +1553,6 @@ mod tests {
     }
 
     #[test]
-    fn migration_16_upgrades_a_catalog_stopped_at_the_previous_version() {
-        let mut connection = Connection::open_in_memory().unwrap();
-        let previous = &PROJECT_CATALOG_MIGRATIONS[..15];
-        run_sqlite_migrations(&mut connection, previous).unwrap();
-        let before = column_exists(&connection, "trip_phases", "start_anchor_asset_id").unwrap();
-        assert!(!before);
-
-        migrate_project_catalog(&mut connection).unwrap();
-
-        assert!(column_exists(&connection, "trip_phases", "start_anchor_asset_id").unwrap());
-        assert!(column_exists(&connection, "trip_phases", "end_anchor_asset_id").unwrap());
-        validate_project_catalog_migrations(&connection).unwrap();
-    }
-
-    #[test]
     fn the_schema_version_constant_tracks_the_migration_list() {
         assert_eq!(
             PROJECT_CATALOG_SCHEMA_VERSION,
@@ -1524,7 +1588,7 @@ mod tests {
         // A catalog stopped one migration short, carrying a location row written
         // before verification existed.
         let mut connection = Connection::open_in_memory().unwrap();
-        let previous = &PROJECT_CATALOG_MIGRATIONS[..16];
+        let previous = &PROJECT_CATALOG_MIGRATIONS[..PROJECT_CATALOG_MIGRATIONS.len() - 1];
         run_sqlite_migrations(&mut connection, previous).unwrap();
         connection
             .execute_batch(
@@ -1607,6 +1671,62 @@ mod tests {
                 "a catalog stopped after {stopped_after} migrations did not reach current"
             );
         }
+    }
+
+    #[test]
+    fn migration_16_upgrades_a_catalog_stopped_at_the_previous_version() {
+        // Replay through migration 15, the way a catalog from before main's
+        // clip-anchor change would be, and then upgrade it.
+        let mut connection = Connection::open_in_memory().unwrap();
+        let previous = &PROJECT_CATALOG_MIGRATIONS[..15];
+        run_sqlite_migrations(&mut connection, previous).unwrap();
+        let before = column_exists(&connection, "trip_phases", "start_anchor_asset_id").unwrap();
+        assert!(!before);
+
+        migrate_project_catalog(&mut connection).unwrap();
+
+        assert!(column_exists(&connection, "trip_phases", "start_anchor_asset_id").unwrap());
+        assert!(column_exists(&connection, "trip_phases", "end_anchor_asset_id").unwrap());
+        validate_project_catalog_migrations(&connection).unwrap();
+    }
+
+    #[test]
+    fn divergent_import_branch_history_is_reconciled_without_replaying_applied_work() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        run_sqlite_migrations(&mut connection, &PROJECT_CATALOG_MIGRATIONS[..15]).unwrap();
+
+        let transaction = connection.transaction().unwrap();
+        add_verified_asset_locations(&transaction).unwrap();
+        transaction
+            .execute(
+                "INSERT INTO schema_migrations(migration_id, name, source_identity, applied_at)
+                 VALUES (16, 'verified_asset_locations',
+                         'project-catalog/0016-verified-asset-locations/20260809',
+                         '2026-08-09T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+        add_archive_roots(&transaction).unwrap();
+        transaction
+            .execute(
+                "INSERT INTO schema_migrations(migration_id, name, source_identity, applied_at)
+                 VALUES (17, 'archive_roots',
+                         'project-catalog/0017-archive-roots/20260809',
+                         '2026-08-09T00:00:01Z')",
+                [],
+            )
+            .unwrap();
+        transaction.commit().unwrap();
+
+        migrate_project_catalog(&mut connection).unwrap();
+        validate_project_catalog_migrations(&connection).unwrap();
+
+        let history = load_applied_migrations(&connection).unwrap();
+        assert_eq!(history.len(), PROJECT_CATALOG_SCHEMA_VERSION as usize);
+        assert_eq!(history[15].name, "clip_anchored_trip_phases");
+        assert_eq!(history[16].name, "verified_asset_locations");
+        assert_eq!(history[17].name, "archive_roots");
+        assert!(column_exists(&connection, "trip_phases", "start_anchor_asset_id").unwrap());
     }
 
     #[test]
