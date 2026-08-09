@@ -7,7 +7,7 @@
   "epic_id": "H01",
   "title": "Review-loop CUJs",
   "slug": "review-loop-cujs",
-  "status": "draft",
+  "status": "ready",
   "task_class": "implementation",
   "depends_on": ["H01-T001"],
   "principal_invariant": "Every review mutation a user can perform is written through the real adapter, is visible in canonical harness state, and survives navigation, filtering, presentation changes, and a renderer remount.",
