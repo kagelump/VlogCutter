@@ -18,6 +18,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # This workspace's debug `target/` is ~14 GB — whisper.cpp, the webkit2gtk
+      # bindings, a bundled SQLite, axum and reqwest, built once per feature
+      # resolution — which does not comfortably fit in the runner image's free
+      # space. Reclaim the SDKs nothing here uses before anything writes to disk.
+      # `/opt/hostedtoolcache` is deliberately untouched: Node lives there.
+      - name: Free disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+            /usr/local/.ghcup /usr/local/share/boost /usr/share/swift || true
+          df -h /
+
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
 

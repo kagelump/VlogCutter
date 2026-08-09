@@ -31,6 +31,31 @@ pinned, so a new stable release can change what `rustfmt` and `clippy` accept
 and turn the gate red without a code change. That is what happened above. If it
 recurs, consider pinning a version here and in `AGENTS.md` §6.
 
+### Disk
+
+The job reclaims disk before it builds anything, and this is load-bearing rather
+than tidy. A full debug `target/` for this workspace is about 14 GB: whisper.cpp
+through `whisper-rs-sys`, the webkit2gtk bindings, a bundled SQLite, axum and
+reqwest — and several of those are built more than once, because each cargo
+invocation that narrows the package graph (`cargo run -p rcdvlog-server`, as
+`check:openapi` does) resolves features differently from `cargo test
+--workspace` and gets its own metadata hash. A local tree carries ten separate
+`whisper-rs-sys` build directories for exactly that reason.
+
+That is close enough to the runner image's free space that a job can finish nine
+gates and then fail on the tenth with `No space left on device` from `ar`, which
+reads as a broken step rather than a full disk. Removing the Android SDK, .NET,
+GHC, Boost and Swift frees roughly 15 GB and is the difference between "barely
+fits" and "comfortable". `/opt/hostedtoolcache` is left alone because Node lives
+there. The step prints `df -h` on both sides so the next disk problem is one
+glance rather than log archaeology.
+
+One known trap is not fixed here. `Cache Rust` keys on `hashFiles('Cargo.lock')`
+with a `${{ runner.os }}-cargo-` fallback, so any change to `Cargo.lock` restores
+the previous cache and then builds on top of it, and the cache saved at the end
+holds both. It grows monotonically. Pruning it, or moving to a cache action that
+prunes, would cost build time and is worth measuring before doing.
+
 ### `macos` job (macos-latest)
 
 Proves what the `ubuntu` job cannot: that the native macOS desktop bundle
