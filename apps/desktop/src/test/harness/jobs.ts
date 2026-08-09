@@ -90,6 +90,15 @@ export class JobController<TStep = any, TOutcome = any> {
     });
   }
 
+  /**
+   * Record that cancellation was asked for, without settling the command. This
+   * is what the production `cancel_*` command does: it asks the run to stop,
+   * and the run finishes on its own terms afterwards.
+   */
+  requestCancel() {
+    this.cancelled = true;
+  }
+
   /** Mark the run cancelled and resolve it with whatever it had reached. */
   async cancel(outcome?: TOutcome): Promise<void> {
     await this.started();

@@ -7,7 +7,7 @@
   "epic_id": "H01",
   "title": "Chronology and edit-plan CUJs",
   "slug": "chronology-and-edit-plan-cujs",
-  "status": "draft",
+  "status": "ready",
   "task_class": "implementation",
   "depends_on": ["H01-T001"],
   "principal_invariant": "The calibration and edit-plan surfaces are exercised against scenario-declared backend outcomes, with preview always preceding a write and queue position always captured before a mutation, and no chronology or edit-plan rule implemented in TypeScript.",

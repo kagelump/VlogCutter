@@ -30,3 +30,4 @@ export type { CommandArgs, CommandHandler, CommandTable, HarnessContext } from "
 export type { JobController } from "./jobs";
 export { MediaController } from "./media";
 export type { GenerationStep, GenerationOutcome } from "./commands/media";
+export type { AnalysisStep, AnalysisOutcome } from "./commands/analysis";
