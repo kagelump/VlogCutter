@@ -1,0 +1,273 @@
+/**
+ * The canonical fake backend state.
+ *
+ * One object, read and written by every command handler. The load-bearing rule
+ * of this harness lives here:
+ *
+ *   A successful mutating command must change this state such that every later
+ *   read observes it.
+ *
+ * The browser-preview mock in `api.ts` reports two generated proxies and changes
+ * no asset, so a later `listAssets` still shows none. A test written against
+ * that would pass against a lie. Nothing in this harness may report work it did
+ * not do.
+ */
+
+import type {
+  AnalysisRunRecord,
+  ArchiveRoot,
+  Asset,
+  AssetAnalysisView,
+  CardCandidate,
+  ClipTranscript,
+  DesktopSettings,
+  ImportPreflight,
+  MediaOrigin,
+  ModelStatus,
+  Project,
+  ServerVersionInfo,
+  SyncStatus,
+} from "../../types";
+import type {
+  ChronologyExplanation,
+  ChronologyOverview,
+  Contradiction,
+  Diagnostic,
+  EditPlanRevision,
+  OtioExportResult,
+  QueuePosition,
+  ValidationReport,
+} from "../../chronologyTypes";
+import { HarnessClock } from "./clock";
+
+/**
+ * Chronology is declared, never computed.
+ *
+ * `rcdvlog-core` owns the solver. A second solver in TypeScript could disagree
+ * with it and would then be a machine for producing false confidence, so a
+ * scenario states the overview the backend returns, and — keyed by a named edit
+ * — the overview it returns afterwards.
+ */
+export interface ChronologyScenarioState {
+  overview: ChronologyOverview;
+  /** Overview to switch to once the named edit is applied. */
+  outcomesByEdit: Record<string, ChronologyOverview>;
+  /** Contradictions a preview returns, keyed by the same edit name. */
+  previewsByEdit: Record<string, Contradiction[]>;
+  explanations: Record<string, ChronologyExplanation>;
+  /** Queue positions captured by the app, so restore can return the same clip. */
+  capturedPositions: QueuePosition[];
+  /** What `restore_queue_position` resolves to, when the scenario overrides it. */
+  restoreTo: string | null;
+}
+
+export interface EditPlanScenarioState {
+  active: EditPlanRevision | null;
+  revisions: EditPlanRevision[];
+  validation: Record<string, ValidationReport>;
+  exportResult: OtioExportResult | null;
+  /** Set when the scenario wants the next write to hit a revision conflict. */
+  conflictMessage: string | null;
+}
+
+export interface PairingScenarioState {
+  serverInfo: ServerVersionInfo;
+  /** Pairing codes the fake server accepts. Anything else is rejected. */
+  acceptedCodes: string[];
+  baselineDigest: string;
+}
+
+export interface ImportScenarioState {
+  /** Preflight results keyed by source path, declared by the scenario. */
+  preflights: Record<string, ImportPreflight>;
+  /** Clips a run will add, keyed by source path. */
+  additions: Record<string, Asset[]>;
+  lastRunSourcePath: string | null;
+}
+
+export interface DesktopHarnessState {
+  settings: DesktopSettings;
+  prerequisites: Array<{ name: string; path: string; available: boolean }>;
+  catalogPath: string;
+
+  projects: Project[];
+  /** Insertion order for `list_assets`; the app does its own ordering on top. */
+  assetOrder: string[];
+  assets: Record<string, Asset>;
+
+  transcripts: Record<string, ClipTranscript>;
+  analyses: Record<string, AssetAnalysisView>;
+  analysisRuns: AnalysisRunRecord[];
+  models: ModelStatus[];
+  openRouterKeyPresent: boolean;
+  openRouterKey: string;
+  /** Per-clip cost the fake charges, so a run's total is derived and not invented. */
+  costPerClipUsd: number;
+
+  chronology: ChronologyScenarioState;
+  diagnostics: Diagnostic[];
+  acknowledgedDiagnostics: string[];
+  editPlans: EditPlanScenarioState;
+
+  archiveRoots: ArchiveRoot[];
+  cards: CardCandidate[];
+  imports: ImportScenarioState;
+
+  pairing: PairingScenarioState;
+  sync: Record<string, SyncStatus>;
+
+  mediaOrigin: MediaOrigin | null;
+  /** Paths a native dialog would return, consumed in order. */
+  dialogResponses: Array<string | null>;
+}
+
+export const EMPTY_CHRONOLOGY_OVERVIEW: ChronologyOverview = {
+  sequences: [],
+  epochs: [],
+  exceptions: [],
+  phases: [],
+  constraints: [],
+  contradictions: [],
+  assets: [],
+  proposedSplits: [],
+  unplacedAssets: 0,
+};
+
+export function createInitialState(clock: HarnessClock): DesktopHarnessState {
+  return {
+    settings: {
+      projectsRoot: "/Users/harness/Movies/VideoProjects",
+      nodeId: "node_desktop_harness",
+      autoplayMode: "proxyAvailable",
+      lastCatalogPath: null,
+      lastProjectId: null,
+      lastAssetId: null,
+      lastContextUpdatedAt: null,
+      makeProxiesOnImport: true,
+      lastImportArchiveRootId: null,
+      pairedServerNodeId: null,
+      pairedServerEndpoint: null,
+      pairedServerLabel: null,
+      pairedAt: null,
+      pairedServerEndpoints: null,
+      mediaOrigin: null,
+    },
+    prerequisites: ["ffmpeg", "ffprobe", "exiftool"].map((name) => ({
+      name,
+      path: `/opt/homebrew/bin/${name}`,
+      available: true,
+    })),
+    catalogPath: "/Users/harness/Movies/VideoProjects/catalog.sqlite3",
+
+    projects: [],
+    assetOrder: [],
+    assets: {},
+
+    transcripts: {},
+    analyses: {},
+    analysisRuns: [],
+    models: [
+      {
+        name: "ggml-large-v3-turbo-q5_0.bin",
+        installed: true,
+        bytes: 574_000_000,
+        url: "https://huggingface.co/ggerganov/whisper.cpp",
+        directory: "/Users/harness/Library/Application Support/com.rcd.vlogcutter/models",
+      },
+      {
+        name: "ggml-silero-v5.1.2.bin",
+        installed: true,
+        bytes: 885_000,
+        url: "https://huggingface.co/ggml-org/whisper-vad",
+        directory: "/Users/harness/Library/Application Support/com.rcd.vlogcutter/models",
+      },
+    ],
+    openRouterKeyPresent: true,
+    openRouterKey: "harness-key",
+    costPerClipUsd: 0.0001084,
+
+    chronology: {
+      overview: EMPTY_CHRONOLOGY_OVERVIEW,
+      outcomesByEdit: {},
+      previewsByEdit: {},
+      explanations: {},
+      capturedPositions: [],
+      restoreTo: null,
+    },
+    diagnostics: [],
+    acknowledgedDiagnostics: [],
+    editPlans: {
+      active: null,
+      revisions: [],
+      validation: {},
+      exportResult: null,
+      conflictMessage: null,
+    },
+
+    archiveRoots: [],
+    cards: [],
+    imports: { preflights: {}, additions: {}, lastRunSourcePath: null },
+
+    pairing: {
+      serverInfo: {
+        nodeId: "node_server_harness",
+        applicationVersion: "0.1.0",
+        protocolMajor: 1,
+        protocolMinor: 0,
+      },
+      acceptedCodes: ["123456"],
+      baselineDigest: "digest_harness_001",
+    },
+    sync: {},
+
+    mediaOrigin: {
+      baseUrl: "http://127.0.0.1:54321",
+      token: "harness-media-token",
+      debugUrl: null,
+    },
+    dialogResponses: [],
+  };
+}
+
+/** The assets of one project, in the order the fake catalog holds them. */
+export function projectAssets(state: DesktopHarnessState, projectId: string): Asset[] {
+  return state.assetOrder
+    .map((id) => state.assets[id])
+    .filter((asset): asset is Asset => Boolean(asset) && asset.projectId === projectId);
+}
+
+/**
+ * Project counts are derived on every read rather than stored, so a mutation
+ * cannot leave a summary disagreeing with the assets it summarises.
+ */
+export function projectSummary(state: DesktopHarnessState, project: Project): Project {
+  const assets = projectAssets(state, project.id);
+  return {
+    ...project,
+    assetCount: assets.length,
+    labeledCount: assets.filter((asset) => asset.labels.length > 0).length,
+    removedCount: assets.filter((asset) => asset.removed).length,
+  };
+}
+
+export function requireAsset(state: DesktopHarnessState, assetId: unknown): Asset {
+  const asset = typeof assetId === "string" ? state.assets[assetId] : undefined;
+  if (!asset) throw new Error(`Asset not found: ${String(assetId)}`);
+  return asset;
+}
+
+/** The single write path for an asset, so no handler can forget the order list. */
+export function putAsset(state: DesktopHarnessState, asset: Asset): Asset {
+  state.assets[asset.id] = asset;
+  if (!state.assetOrder.includes(asset.id)) state.assetOrder.push(asset.id);
+  return asset;
+}
+
+export function patchAsset(
+  state: DesktopHarnessState,
+  assetId: string,
+  patch: Partial<Asset>,
+): Asset {
+  const current = requireAsset(state, assetId);
+  return putAsset(state, { ...current, ...patch });
+}

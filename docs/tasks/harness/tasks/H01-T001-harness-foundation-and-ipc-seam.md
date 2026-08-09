@@ -7,7 +7,7 @@
   "epic_id": "H01",
   "title": "Harness foundation and IPC seam",
   "slug": "harness-foundation-and-ipc-seam",
-  "status": "ready",
+  "status": "complete",
   "task_class": "foundation",
   "depends_on": [],
   "principal_invariant": "The real App boots in jsdom through the real api.ts and chronologyApi.ts adapters, every Tauri call it makes is answered by an explicit harness handler against one canonical state object, and no unhandled command passes silently.",

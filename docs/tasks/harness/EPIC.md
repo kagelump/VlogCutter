@@ -84,8 +84,8 @@ native, media, or topology gate.
 
 | Order | Task | Title | Depends on | Status |
 | ---: | --- | --- | --- | --- |
-| 10 | [H01-T001](tasks/H01-T001-harness-foundation-and-ipc-seam.md) | Harness foundation and IPC seam | — | ready |
-| 20 | [H01-T002](tasks/H01-T002-review-loop-cujs.md) | Review-loop CUJs | H01-T001 | draft |
+| 10 | [H01-T001](tasks/H01-T001-harness-foundation-and-ipc-seam.md) | Harness foundation and IPC seam | — | complete |
+| 20 | [H01-T002](tasks/H01-T002-review-loop-cujs.md) | Review-loop CUJs | H01-T001 | ready |
 | 30 | [H01-T003](tasks/H01-T003-media-state-and-generation-cujs.md) | Media state and generation CUJs | H01-T001 | draft |
 | 40 | [H01-T004](tasks/H01-T004-analysis-cujs.md) | Analysis CUJs | H01-T001 | draft |
 | 50 | [H01-T005](tasks/H01-T005-chronology-and-edit-plan-cujs.md) | Chronology and edit-plan CUJs | H01-T001 | draft |
@@ -94,6 +94,15 @@ native, media, or topology gate.
 | 80 | [H01-T008](tasks/H01-T008-ipc-contract-coverage-suite.md) | IPC contract coverage suite | H01-T004, H01-T005 | draft |
 | 90 | [H01-T009](tasks/H01-T009-ci-wiring-and-documentation.md) | CI wiring and documentation reconciliation | H01-T008 | draft |
 | 100 | [H01-T010](tasks/H01-T010-browser-preview-rationalization.md) | Browser-preview rationalization | H01-T009 | draft |
+
+### Execution note
+
+The packets are written to the bounded-task schema so they can be run through
+the orchestrator, but this epic is being executed directly on one branch with a
+commit per packet. Status therefore moves `ready → complete` on the commit that
+lands the packet's tests, without a separate independent-tester cycle; the
+independent-test charters remain as the falsification agenda for whoever picks
+one up.
 
 ### Sequencing rationale
 
