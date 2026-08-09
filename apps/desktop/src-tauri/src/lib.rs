@@ -18,6 +18,8 @@ use std::sync::{Arc, RwLock};
 use tauri::{Emitter, Manager, State};
 
 mod chronology_commands;
+#[cfg(debug_assertions)]
+mod eval_bridge;
 mod keychain;
 mod server_client;
 mod sync_manager;
@@ -1571,6 +1573,9 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
+            #[cfg(debug_assertions)]
+            eval_bridge::start_if_enabled(app)?;
+
             let app_data = app.path().app_data_dir()?;
             let settings_path = app_data.join("settings.json");
             let default_root = dirs::home_dir()

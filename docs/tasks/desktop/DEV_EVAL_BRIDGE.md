@@ -1,6 +1,6 @@
 # Dev-only eval bridge — drive the running webview from a shell
 
-**Status** proposed. **Depends on** nothing. **Ships** never — dev builds only.
+**Status** implemented. **Depends on** nothing. **Ships** never — dev builds only.
 
 ## The problem
 
@@ -40,16 +40,45 @@ rcdvlog-eval 'document.querySelectorAll("video[data-asset-id]").length'
 - Log every evaluated script to stdout, so a dev session leaves a readable
   trail of what was run.
 
-Roughly 60 lines of Rust plus a thin shell wrapper.
+The implementation is isolated in the debug-only Tauri module
+`apps/desktop/src-tauri/src/eval_bridge.rs`, with the shell-facing client at
+`scripts/rcdvlog-eval`.
+
+## Usage
+
+Start the native desktop app with the explicit opt-in:
+
+```bash
+RCDVLOG_EVAL_BRIDGE=1 pnpm dev
+```
+
+From another shell, evaluate one expression:
+
+```bash
+pnpm eval -- 'document.querySelectorAll("video[data-asset-id]").length'
+```
+
+For a multi-line probe, put the JavaScript in a file:
+
+```bash
+pnpm eval -- --file /absolute/path/to/probe.js
+```
+
+The client prints one JSON value. JavaScript failures print
+`{"error":{"name":...,"message":...,"stack":...}}` and exit non-zero. The
+listener stays available after an evaluation error. The bridge uses the fixed
+address `ws://127.0.0.1:47961` and refuses every WebSocket handshake that has an
+`Origin` header; the repository client deliberately sends none.
 
 ## Gating — this is the part that matters
 
 The feature is a remote code execution channel into the app. It is acceptable
 only because it cannot exist in a shipped binary.
 
-1. **`#[cfg(debug_assertions)]` around the module, the command registration,
-   and the startup call.** Compiled out of release builds entirely — not
-   disabled at runtime by a flag, not behind a setting. Absent.
+1. **`#[cfg(debug_assertions)]` around the module and the startup call.** The
+   bridge uses Tauri's result-bearing webview evaluator and registers no IPC
+   command. It is compiled out of release builds entirely — not disabled at
+   runtime by a flag, not behind a setting. Absent.
 2. **Additionally require an explicit opt-in** in dev — an env var such as
    `RCDVLOG_EVAL_BRIDGE=1` — so a routine `pnpm tauri dev` does not open a
    socket unless asked.
@@ -61,13 +90,19 @@ only because it cannot exist in a shipped binary.
 
 ## Acceptance criteria
 
-- `cargo build --release` produces a binary with no eval endpoint and no
+- [x] `cargo build --release` produces a binary with no eval endpoint and no
   listening socket; verified by a test, not by inspection.
-- With the env var unset, a dev build opens no socket.
-- With it set, a shell round trip returns a JSON result for an expression, and
+- [x] With the env var unset, a dev build opens no socket.
+- [x] With it set, a shell round trip returns a JSON result for an expression, and
   a structured error for a throwing one, without killing the connection.
-- A request with a foreign `Origin` is refused.
-- Every evaluated script appears in the dev server's stdout.
+- [x] A request with a foreign `Origin` is refused.
+- [x] Every evaluated script appears in the dev server's stdout.
+
+The transport, opt-in parser, persistent connection, and origin refusal have
+Rust tests. `release_eval_bridge_absent` scans the built desktop executable for
+a marker emitted by the debug listener: it asserts the marker is present in a
+debug binary and absent under `cargo test --release`, making the compile-time
+gate executable rather than documentary.
 
 ## Non-goals
 

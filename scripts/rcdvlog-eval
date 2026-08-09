@@ -1,0 +1,60 @@
+#!/usr/bin/env node
+
+import { readFile } from "node:fs/promises";
+
+const address = "ws://127.0.0.1:47961";
+const forwardedArgs = process.argv.slice(2);
+const args = forwardedArgs[0] === "--" ? forwardedArgs.slice(1) : forwardedArgs;
+
+function usage() {
+  console.error("Usage: rcdvlog-eval '<javascript>' | rcdvlog-eval --file <path>");
+  process.exit(2);
+}
+
+let script;
+if (args[0] === "--file") {
+  if (args.length !== 2) usage();
+  try {
+    script = await readFile(args[1], "utf8");
+  } catch (error) {
+    console.error(`Could not read ${args[1]}: ${error.message}`);
+    process.exit(2);
+  }
+} else {
+  if (args.length !== 1) usage();
+  script = args[0];
+}
+
+const socket = new WebSocket(address);
+let settled = false;
+const timer = setTimeout(() => {
+  if (settled) return;
+  settled = true;
+  console.error(`Timed out waiting for the eval bridge at ${address}`);
+  socket.close();
+  process.exitCode = 1;
+}, 35_000);
+
+socket.addEventListener("open", () => socket.send(script));
+socket.addEventListener("message", (event) => {
+  if (settled) return;
+  settled = true;
+  clearTimeout(timer);
+  const response = String(event.data);
+  console.log(response);
+  try {
+    if (JSON.parse(response)?.error) process.exitCode = 1;
+  } catch {
+    process.exitCode = 1;
+  }
+  socket.close();
+});
+socket.addEventListener("error", () => {
+  if (settled) return;
+  settled = true;
+  clearTimeout(timer);
+  console.error(
+    `Could not connect to ${address}. Start the desktop app with RCDVLOG_EVAL_BRIDGE=1.`,
+  );
+  process.exitCode = 1;
+});

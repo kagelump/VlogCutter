@@ -4,6 +4,7 @@
   "packageManager": "pnpm@10.17.0",
   "scripts": {
     "dev": "pnpm --dir apps/desktop tauri dev",
+    "eval": "node scripts/rcdvlog-eval",
     "build": "pnpm --dir apps/desktop tauri build",
     "build:web": "pnpm --dir apps/web build",
     "build:cli": "cargo build -p rcdvlog-cli",
