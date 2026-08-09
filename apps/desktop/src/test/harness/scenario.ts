@@ -23,7 +23,14 @@ import {
   type TranscriptSpec,
 } from "./builders";
 import { createInitialState, putAsset, type DesktopHarnessState } from "./state";
-import type { ChronologyOverview } from "../../chronologyTypes";
+import { buildChronologyOverview, type ChronologySpec } from "./chronologyFixtures";
+import type {
+  ChronologyOverview,
+  Contradiction,
+  Diagnostic,
+  OtioExportResult,
+  ValidationReport,
+} from "../../chronologyTypes";
 import type { Asset, DesktopSettings, SyncStatus } from "../../types";
 
 export interface ScenarioOptions {
@@ -35,6 +42,7 @@ export class ScenarioBuilder {
   private readonly clock: HarnessClock;
   private readonly state: DesktopHarnessState;
   private currentProjectId = "";
+  private lastEditSequenceId = "";
 
   constructor(options: ScenarioOptions = {}) {
     this.clock = new HarnessClock(options.now);
@@ -200,9 +208,69 @@ export class ScenarioBuilder {
     return this;
   }
 
-  /** A declared chronology outcome. Nothing here computes an order. */
-  chronology(overview: ChronologyOverview): this {
-    this.state.chronology.overview = overview;
+  /**
+   * A declared chronology outcome. Nothing here computes an order: the spec
+   * states the order the solver produced, and the fixture turns it into the DTO
+   * the backend would return.
+   */
+  chronology(spec: ChronologySpec | ChronologyOverview): this {
+    this.state.chronology.overview = "order" in spec ? buildChronologyOverview(spec) : spec;
+    this.lastEditSequenceId = "";
+    return this;
+  }
+
+  /**
+   * "When the user corrects this sequence's clock…" — names an edit so the
+   * scenario can declare what the backend returns afterwards. Pair with
+   * `thenChronology`.
+   */
+  whenClockEpochApplied(sequenceId: string): this {
+    this.lastEditSequenceId = sequenceId;
+    return this;
+  }
+
+  /** …"the backend then returns this ordering." */
+  thenChronology(spec: ChronologySpec | ChronologyOverview): this {
+    if (!this.lastEditSequenceId) {
+      throw new Error("Call whenClockEpochApplied(sequenceId) before thenChronology(...)");
+    }
+    this.state.chronology.outcomesByEdit[this.lastEditSequenceId] =
+      "order" in spec ? buildChronologyOverview(spec) : spec;
+    return this;
+  }
+
+  /** What previewing an edit to this sequence reports back. */
+  contradictionOnPreview(sequenceId: string, ...contradictions: Contradiction[]): this {
+    this.state.chronology.previewsByEdit[sequenceId] = contradictions;
+    return this;
+  }
+
+  /** Where the backend resumes the queue after a reorder, when not the anchor. */
+  resumesAt(assetId: string): this {
+    this.state.chronology.restoreTo = assetId;
+    return this;
+  }
+
+  diagnostic(diagnostic: Diagnostic): this {
+    this.state.diagnostics.push(diagnostic);
+    return this;
+  }
+
+  /** Findings validation returns for a revision. An undeclared one is clean. */
+  editPlanValidation(revisionId: string, report: ValidationReport): this {
+    this.state.editPlans.validation[revisionId] = report;
+    return this;
+  }
+
+  /** The next edit-plan write is refused as stale, as a concurrent change would. */
+  editPlanConflict(message: string): this {
+    this.state.editPlans.conflictMessage = message;
+    return this;
+  }
+
+  /** An OTIO file already on disk at this path, with this digest. */
+  existingExport(result: OtioExportResult): this {
+    this.state.editPlans.exportResult = result;
     return this;
   }
 
