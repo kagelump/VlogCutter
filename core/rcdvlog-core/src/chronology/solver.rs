@@ -122,6 +122,9 @@ pub enum ContradictionKind {
     IntervalConflict,
     /// A clip exception places a clip against a hard constraint.
     ExceptionConflict,
+    /// A clip-anchored phase can no longer resolve both anchors into a usable
+    /// chronological interval. The stored fallback remains visible.
+    PhaseAnchorConflict,
 }
 
 /// One contradiction, naming the conflicting evidence. Hard contradictions
@@ -345,6 +348,111 @@ fn solve_asset(
             asset_id: asset.asset_id.clone(),
         },
     }
+}
+
+fn apply_phase_context(asset: &mut AssetChronology, phases: &[TripPhase]) {
+    asset.evidence.retain(|entry| entry.kind != "trip_phase");
+    if let Some(placed) = asset.trip_time.as_deref() {
+        match coverage_evidence(phases, placed) {
+            Some((phase_id, true)) => asset.evidence.push(Evidence::new(
+                "trip_phase",
+                format!("{phase_id} supplied the display timezone"),
+                1.0,
+            )),
+            Some((phase_id, false)) => asset.evidence.push(Evidence::new(
+                "trip_phase",
+                format!("{phase_id} named no resolvable timezone; displayed as UTC"),
+                0.5,
+            )),
+            None => asset.evidence.push(Evidence::new(
+                "trip_phase",
+                "no phase covers this trip time; displayed as UTC",
+                0.5,
+            )),
+        }
+    }
+    asset.display_time = display_time(phases, asset.trip_time.as_deref());
+    asset.evidence.sort_by(|left, right| {
+        left.kind
+            .cmp(&right.kind)
+            .then_with(|| left.detail.cmp(&right.detail))
+    });
+    asset
+        .evidence
+        .dedup_by(|left, right| left.kind == right.kind && left.detail == right.detail);
+}
+
+/// Resolves clip-backed boundaries against the current solved chronology.
+/// Fixed-time phases pass through unchanged. If an anchor is missing,
+/// unplaced, or crosses the other boundary, the entire phase keeps its stored
+/// fallback interval and a soft contradiction makes that fallback visible.
+pub fn resolve_anchored_phases(
+    phases: &[TripPhase],
+    assets: &[AssetChronology],
+) -> (Vec<TripPhase>, Vec<Contradiction>) {
+    let mut resolved = Vec::with_capacity(phases.len());
+    let mut contradictions = Vec::new();
+
+    for phase in phases {
+        let mut candidate = phase.clone();
+        let mut failed = Vec::new();
+        if let Some(asset_id) = phase.start_anchor_asset_id.as_deref() {
+            match assets.iter().find(|asset| asset.asset_id == asset_id) {
+                Some(asset) if asset.trip_time.is_some() => {
+                    candidate.start_trip_time = asset.trip_time.clone().unwrap_or_default();
+                }
+                _ => failed.push(format!("start anchor {asset_id} has no placed trip time")),
+            }
+        }
+        if let Some(asset_id) = phase.end_anchor_asset_id.as_deref() {
+            match assets.iter().find(|asset| asset.asset_id == asset_id) {
+                Some(asset) if asset.trip_time.is_some() => {
+                    candidate.end_trip_time = asset.trip_time.clone().unwrap_or_default();
+                }
+                _ => failed.push(format!("end anchor {asset_id} has no placed trip time")),
+            }
+        }
+
+        let bounds_valid = match (
+            parse_utc(&candidate.start_trip_time),
+            parse_utc(&candidate.end_trip_time),
+        ) {
+            (Some(start), Some(end)) if start <= end => true,
+            (Some(_), Some(_)) => {
+                failed.push("start anchor now falls after the end anchor".to_string());
+                false
+            }
+            _ => {
+                failed.push("resolved phase bounds are not valid timestamps".to_string());
+                false
+            }
+        };
+
+        if failed.is_empty() && bounds_valid {
+            resolved.push(candidate);
+        } else {
+            let asset_ids = [
+                phase.start_anchor_asset_id.clone(),
+                phase.end_anchor_asset_id.clone(),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+            contradictions.push(Contradiction {
+                kind: ContradictionKind::PhaseAnchorConflict,
+                strength: ConstraintStrength::Soft,
+                asset_ids,
+                evidence: vec![Evidence::new("phase_anchor", failed.join("; "), 1.0)],
+                message: format!(
+                    "{} kept its last resolved range because its clip boundary needs review",
+                    phase.label
+                ),
+            });
+            resolved.push(phase.clone());
+        }
+    }
+
+    (resolved, contradictions)
 }
 
 /// Reorders solved assets so hard constraints hold, keeping the result as
@@ -571,7 +679,7 @@ pub fn solve(facts: &ChronologyFacts) -> ChronologySolution {
                 &facts.epochs,
                 &facts.exceptions,
                 &exception_index,
-                &facts.phases,
+                &[],
             )
         })
         .collect();
@@ -580,8 +688,19 @@ pub fn solve(facts: &ChronologyFacts) -> ChronologySolution {
     // to chance. `sort_unstable_by` is safe precisely because ties cannot occur.
     assets.sort_unstable_by(|left, right| left.order_key.cmp(&right.order_key));
 
-    let contradictions = detect(facts, &assets);
+    let mut contradictions = detect(facts, &assets);
     apply_hard_constraints(&mut assets, facts);
+    let (resolved_phases, mut phase_contradictions) =
+        resolve_anchored_phases(&facts.phases, &assets);
+    for asset in &mut assets {
+        apply_phase_context(asset, &resolved_phases);
+    }
+    contradictions.append(&mut phase_contradictions);
+    contradictions.sort_by(|left, right| {
+        left.kind
+            .cmp(&right.kind)
+            .then_with(|| left.asset_ids.cmp(&right.asset_ids))
+    });
 
     ChronologySolution {
         assets,
@@ -750,6 +869,8 @@ mod tests {
             id: "phase_1".to_string(),
             label: "Tokyo".to_string(),
             kind: PhaseKind::Location,
+            start_anchor_asset_id: None,
+            end_anchor_asset_id: None,
             start_trip_time: "2026-01-01T00:00:00Z".to_string(),
             end_trip_time: "2026-01-02T00:00:00Z".to_string(),
             timezone: Some("Asia/Tokyo".to_string()),
@@ -837,6 +958,8 @@ mod tests {
             id: "phase_1".to_string(),
             label: "Tokyo".to_string(),
             kind: PhaseKind::Location,
+            start_anchor_asset_id: None,
+            end_anchor_asset_id: None,
             start_trip_time: "2026-01-01T00:00:00Z".to_string(),
             end_trip_time: "2026-02-01T00:00:00Z".to_string(),
             timezone: Some("Asia/Tokyo".to_string()),

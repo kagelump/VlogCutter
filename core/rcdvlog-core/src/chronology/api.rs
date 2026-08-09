@@ -14,7 +14,7 @@ use super::model::{
     EventOrderConstraint, PhaseKind, TripPhase,
 };
 use super::phases::{is_valid_timezone, parse_utc};
-use super::solver::{Contradiction, ContradictionKind, solve};
+use super::solver::{Contradiction, ContradictionKind, resolve_anchored_phases, solve};
 use crate::Catalog;
 use crate::operations::{
     CAPTURE_SEQUENCE_DECLARED, CAPTURE_SEQUENCE_MERGED, CAPTURE_SEQUENCE_SPLIT,
@@ -426,9 +426,32 @@ impl Catalog {
                 return Err(ChronologyError::InvalidTimezone(candidate.to_string()).into());
             }
         }
+        let mut stored = phase.clone();
+        if stored.start_anchor_asset_id.is_some() || stored.end_anchor_asset_id.is_some() {
+            let solution = self.solve_chronology(project_id)?;
+            let resolve = |label: &str, asset_id: &str| -> Result<String> {
+                solution
+                    .assets
+                    .iter()
+                    .find(|asset| asset.asset_id == asset_id)
+                    .and_then(|asset| asset.trip_time.clone())
+                    .ok_or_else(|| {
+                        ChronologyError::InvalidReference(format!(
+                            "{label} phase anchor {asset_id} is not a placed clip in project {project_id}"
+                        ))
+                        .into()
+                    })
+            };
+            if let Some(asset_id) = stored.start_anchor_asset_id.as_deref() {
+                stored.start_trip_time = resolve("start", asset_id)?;
+            }
+            if let Some(asset_id) = stored.end_anchor_asset_id.as_deref() {
+                stored.end_trip_time = resolve("end", asset_id)?;
+            }
+        }
         let (Some(start), Some(end)) = (
-            parse_utc(&phase.start_trip_time),
-            parse_utc(&phase.end_trip_time),
+            parse_utc(&stored.start_trip_time),
+            parse_utc(&stored.end_trip_time),
         ) else {
             return Err(ChronologyError::InvalidInterval(
                 "trip phase bounds must be RFC 3339 timestamps".to_string(),
@@ -438,12 +461,11 @@ impl Catalog {
         if end < start {
             return Err(ChronologyError::InvalidInterval(format!(
                 "trip phase {} ends before it starts",
-                phase.label
+                stored.label
             ))
             .into());
         }
 
-        let mut stored = phase.clone();
         if stored.id.is_empty() {
             stored.id = format!("phase_{}", Uuid::new_v4().simple());
         }
@@ -459,6 +481,8 @@ impl Catalog {
                     phase_id: stored.id.clone(),
                     label: stored.label.clone(),
                     phase_kind: phase_kind_str(stored.kind).to_string(),
+                    start_anchor_asset_id: stored.start_anchor_asset_id.clone(),
+                    end_anchor_asset_id: stored.end_anchor_asset_id.clone(),
                     start_trip_time: stored.start_trip_time.clone(),
                     end_trip_time: stored.end_trip_time.clone(),
                     timezone: stored.timezone.clone(),
@@ -493,7 +517,9 @@ impl Catalog {
 
     /// The trip phases of one project, in a deterministic order.
     pub fn trip_phases(&self, project_id: &str) -> Result<Vec<TripPhase>> {
-        let mut phases = self.chronology_facts(project_id)?.phases;
+        let facts = self.chronology_facts(project_id)?;
+        let solution = solve(&facts);
+        let (mut phases, _) = resolve_anchored_phases(&facts.phases, &solution.assets);
         phases.sort_by(|left, right| {
             left.start_trip_time
                 .cmp(&right.start_trip_time)

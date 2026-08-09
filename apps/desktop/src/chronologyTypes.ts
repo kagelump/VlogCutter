@@ -38,6 +38,8 @@ export interface TripPhase {
   id: string;
   label: string;
   kind: PhaseKind;
+  startAnchorAssetId: string | null;
+  endAnchorAssetId: string | null;
   startTripTime: string;
   endTripTime: string;
   timezone: string | null;
@@ -88,7 +90,11 @@ export interface AssetChronology {
   orderKey: OrderKey;
 }
 
-export type ContradictionKind = "cycle" | "interval_conflict" | "exception_conflict";
+export type ContradictionKind =
+  | "cycle"
+  | "interval_conflict"
+  | "exception_conflict"
+  | "phase_anchor_conflict";
 
 export interface Contradiction {
   kind: ContradictionKind;

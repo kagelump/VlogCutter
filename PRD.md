@@ -458,6 +458,8 @@ It is distinct from camera timestamps.
   "phase_id": "phase_canada",
   "label": "Canada",
   "type": "location",
+  "start_anchor_asset_id": "asset_arrive_canada",
+  "end_anchor_asset_id": "asset_leave_canada",
   "start_trip_time": "…",
   "end_trip_time": "…",
   "timezone": "America/Toronto",
@@ -493,6 +495,14 @@ The MVP should support:
 * Hide or show band
 
 Phase boundaries can remain rough.
+
+Ribbon-created phases persist their first and last clip identities as boundary
+evidence. The UTC bounds remain as a fallback projection, but ordinary solving
+resolves the anchors again so a later correction to another camera moves its
+clips into or out of the phase without detaching the phase from the footage the
+user chose. A missing, unplaced, or crossed anchor retains the last resolved
+range and produces an explicit chronology conflict rather than silently
+swapping boundaries.
 
 ---
 
@@ -1194,6 +1204,8 @@ The following decisions were accepted for the MVP on 2026-07-18.
 14. **Server storage and network:** original scan roots are immutable and read-only. Derived media and backups use distinct writable roots. The backend binds loopback and is exposed only through trusted LAN Caddy or Tailscale Serve; public Funnel is forbidden.
 
 15. **Project creation and travel successor:** current project creation is desktop-only, but that is no longer permanent product law. The planned [Travel Ingest T5](docs/tasks/travel/TASK_T5_server_origin_projects_and_desktop_adoption.md) adds server-origin project creation and desktop adoption. Its planned archive is a distinct create-only writable logical root; existing original scan roots remain immutable.
+
+16. **Trip-context boundaries (accepted 2026-08-09):** ribbon-created trip phases are anchored to specific clips, inclusive at both ends. The phase follows those clip identities when later camera chronology corrections change solved order. Fixed UTC bounds remain supported for existing and explicitly time-based phases; story beats remain a separate unresolved range model.
 
 ## 25.2 Remaining reversible workflow questions
 

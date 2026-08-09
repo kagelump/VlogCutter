@@ -353,6 +353,13 @@ Human-authored content only (rule 1). Content width 376px.
   colour-only blocks below 60px of run width. A timezone change draws a 1px
   vertical rule through the full ribbon height — the visual explanation for
   disagreeing clocks.
+- Untagged columns expose a one-clip ghost block on hover. Clicking it moves the
+  explicit `Add through here` / `Add from here` choice into the control row;
+  the chosen range is previewed before a location or transit phase is saved.
+  The saved boundaries reference the first and last clip identities, so later
+  camera corrections reflow membership without leaving stale fixed ranges.
+  Clicking an existing phase segment edits that phase. Story beats do not use
+  this editor and remain an independent future range model.
 - **Position numeral row, 14px** — 11px tabular, thinned to every 5th below
   16px per clip.
 - **Lanes** — 96px sticky gutter with the camera name at 11px, then the track.

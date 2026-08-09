@@ -5,10 +5,12 @@ import type { AnalysisReadiness, Asset, AssetAnalysisIndexEntry, AssetAnalysisVi
 import { orderAssets, moveSelection as moveSelectionInOrder } from "./review/order";
 import { resolveAction } from "./review/keymap";
 import { CalibrationPanel } from "./CalibrationPanel";
+import { chronologyApi } from "./chronologyApi";
+import type { ChronologyOverview, TripPhase } from "./chronologyTypes";
 import { EditPlanPanel } from "./EditPlanPanel";
 import { formatBytes, transcriptStatusLabels } from "./review/summaries";
 import { RIBBON_ZOOM_DEFAULT, RIBBON_ZOOM_MAX, RIBBON_ZOOM_MIN, RIBBON_ZOOM_STEP, ribbonHeight } from "./review/layout";
-import { StoryRibbon, assetContextKey, type ContextRun } from "./components/StoryRibbon";
+import { StoryRibbon, assetContextKey, type ContextDirection, type ContextRun } from "./components/StoryRibbon";
 import { INITIAL_VIEW, reduceView, type Mode } from "./review/presentation";
 import { Splitter } from "./components/Splitter";
 import {
@@ -24,6 +26,7 @@ import { TransportBar } from "./components/TransportBar";
 import { QueuePanel } from "./components/QueuePanel";
 import { VideoStage } from "./components/VideoStage";
 import { TopBar, type OperationProgress } from "./components/TopBar";
+import { TripPhaseDialog, type TripPhaseFormValue } from "./components/TripPhaseDialog";
 import { analysisStageLabels, formatCost, syncStateLabel } from "./review/format";
 import { isRawOrientationProxy, renderedRotation, rotationAfter } from "./review/rotation";
 
@@ -32,6 +35,12 @@ const autoplayOptions: Array<{ value: AutoplayMode; label: string; detail: strin
   { value: "proxyAvailable", label: "Only when proxy is available", detail: "Autoplay lightweight review media; keep camera originals paused." },
   { value: "always", label: "Always", detail: "Autoplay whichever version is available, including camera originals." },
 ];
+
+interface PhaseDialogState {
+  phase: TripPhase | null;
+  startIndex: number;
+  endIndex: number;
+}
 
 function initialProgress(kind: OperationProgress["kind"], total: number): OperationProgress {
   return {
@@ -94,6 +103,10 @@ function App() {
   const [offsetMinutes, setOffsetMinutes] = useState(0);
   const [offsetLabel, setOffsetLabel] = useState("Camera time change");
   const [chronologyZoom, setChronologyZoom] = useState(RIBBON_ZOOM_DEFAULT);
+  const [chronologyOverview, setChronologyOverview] = useState<ChronologyOverview | null>(null);
+  const [phaseDialog, setPhaseDialog] = useState<PhaseDialogState | null>(null);
+  const [phaseDialogBusy, setPhaseDialogBusy] = useState(false);
+  const [phaseDialogError, setPhaseDialogError] = useState("");
   // The active shelf tab is a mode, not per-clip state: it persists as you
   // move through the queue (spec §3.6).
   const [shelfTab, setShelfTab] = useState<ShelfTab>("transcript");
@@ -201,18 +214,55 @@ function App() {
     return [...grouped.entries()];
   }, [activeAssets]);
 
+  const chronologyAssetsById = useMemo(
+    () => new Map((chronologyOverview?.assets ?? []).map((asset) => [asset.assetId, asset])),
+    [chronologyOverview],
+  );
+  const phasesById = useMemo(
+    () => new Map((chronologyOverview?.phases ?? []).map((phase) => [phase.id, phase])),
+    [chronologyOverview],
+  );
+  const phaseIdByAsset = useMemo(() => {
+    const index = new Map<string, string>();
+    chronologyAssetsById.forEach((chronology, assetId) => {
+      if (chronology.displayTime?.phaseId) index.set(assetId, chronology.displayTime.phaseId);
+    });
+    return index;
+  }, [chronologyAssetsById]);
+
   const contextRuns = useMemo(() => {
-    const runs: Array<{ start: number; end: number; asset: Asset }> = [];
+    const runs: ContextRun[] = [];
+    let previousKey = "";
     activeAssets.forEach((asset, index) => {
+      const phaseId = phaseIdByAsset.get(asset.id) ?? null;
+      const phase = phaseId ? phasesById.get(phaseId) : null;
+      const hasLegacyContext = [asset.phase, asset.location, asset.timezone, asset.storyBeat]
+        .some((value) => Boolean(value?.trim()));
+      if (!phase && !hasLegacyContext) {
+        previousKey = "";
+        return;
+      }
+      const displayTimezone = chronologyAssetsById.get(asset.id)?.displayTime?.timezone ?? null;
+      const contextAsset = phase
+        ? {
+            ...asset,
+            phase: phase.label,
+            location: phase.kind === "location" ? phase.label : null,
+            timezone: displayTimezone ?? phase.timezone,
+            storyBeat: null,
+          }
+        : asset;
+      const key = phase ? `phase:${phase.id}` : `legacy:${assetContextKey(asset)}`;
       const previous = runs.at(-1);
-      if (previous && assetContextKey(previous.asset) === assetContextKey(asset)) {
+      if (previous && previousKey === key && previous.end === index - 1) {
         previous.end = index;
       } else {
-        runs.push({ start: index, end: index, asset });
+        runs.push({ start: index, end: index, asset: contextAsset, phaseId });
       }
+      previousKey = key;
     });
     return runs;
-  }, [activeAssets]);
+  }, [activeAssets, chronologyAssetsById, phaseIdByAsset, phasesById]);
 
   const refreshProjects = useCallback(async () => {
     const result = await api.listProjects();
@@ -242,6 +292,14 @@ function App() {
     setMessage(result.length ? "" : "Choose a media folder to begin");
   }, []);
 
+  const refreshChronology = useCallback(async (activeProjectId: string) => {
+    if (!activeProjectId) {
+      setChronologyOverview(null);
+      return;
+    }
+    setChronologyOverview(await chronologyApi.overview(activeProjectId));
+  }, []);
+
   useEffect(() => {
     Promise.all([refreshProjects(), refreshLibrary(), api.prerequisiteStatus(), api.desktopSettings()])
       .then(([, , tools, desktopSettings]) => {
@@ -260,7 +318,8 @@ function App() {
 
   useEffect(() => {
     refreshAssets(projectId).catch((reason) => setError(String(reason)));
-  }, [projectId, refreshAssets]);
+    refreshChronology(projectId).catch(() => setChronologyOverview(null));
+  }, [projectId, refreshAssets, refreshChronology]);
 
   // ── Clip analysis loaders ─────────────────────────────────────────
 
@@ -572,6 +631,100 @@ function App() {
   useEffect(() => {
     centerSelectedInChronology("smooth");
   }, [centerSelectedInChronology]);
+
+  const openContextRange = useCallback((assetId: string, direction: ContextDirection) => {
+    const anchor = activeAssets.findIndex((asset) => asset.id === assetId);
+    if (anchor < 0) return;
+    const hasPlacedTime = (index: number) => {
+      const asset = activeAssets[index];
+      return Boolean(asset && (chronologyAssetsById.get(asset.id)?.tripTime || asset.bestTime));
+    };
+    if (!hasPlacedTime(anchor)) {
+      setError("Place this clip in Chronology before using it as a context boundary.");
+      return;
+    }
+    if (direction === "through") {
+      const previous = contextRuns.filter((run) => run.end < anchor).at(-1);
+      let startIndex = previous ? previous.end + 1 : 0;
+      while (startIndex < anchor && !hasPlacedTime(startIndex)) startIndex += 1;
+      setPhaseDialog({ phase: null, startIndex, endIndex: anchor });
+    } else {
+      const next = contextRuns.find((run) => run.start > anchor);
+      let endIndex = next ? next.start - 1 : activeAssets.length - 1;
+      while (endIndex > anchor && !hasPlacedTime(endIndex)) endIndex -= 1;
+      setPhaseDialog({
+        phase: null,
+        startIndex: anchor,
+        endIndex,
+      });
+    }
+    setPhaseDialogError("");
+  }, [activeAssets, chronologyAssetsById, contextRuns]);
+
+  const openExistingContext = useCallback((phaseId: string, startIndex: number, endIndex: number) => {
+    const phase = phasesById.get(phaseId);
+    if (!phase) return;
+    setPhaseDialog({ phase, startIndex, endIndex });
+    setPhaseDialogError("");
+  }, [phasesById]);
+
+  async function saveTripPhase(value: TripPhaseFormValue) {
+    if (!phaseDialog || !projectId) return;
+    const start = activeAssets[phaseDialog.startIndex];
+    const end = activeAssets[phaseDialog.endIndex];
+    if (!start || !end) return;
+    const existing = phaseDialog.phase;
+    setPhaseDialogBusy(true);
+    setPhaseDialogError("");
+    try {
+      const stored = await chronologyApi.setTripPhase(projectId, {
+        id: existing?.id ?? "",
+        label: value.label,
+        kind: value.kind,
+        startAnchorAssetId: existing
+          ? existing.startAnchorAssetId
+          : start.id,
+        endAnchorAssetId: existing
+          ? existing.endAnchorAssetId
+          : end.id,
+        startTripTime: existing?.startTripTime ?? start.bestTime ?? start.capturedAtRaw ?? "",
+        endTripTime: existing?.endTripTime ?? end.bestTime ?? end.capturedAtRaw ?? "",
+        timezone: value.timezone,
+        originTimezone: value.originTimezone,
+        destinationTimezone: value.destinationTimezone,
+        displayMode: value.kind === "location" ? "local" : value.displayMode,
+      });
+      if (!stored && !api.isDesktop()) {
+        setPhaseDialog(null);
+        setMessage("Browser preview only — open the desktop app to save trip context.");
+        return;
+      }
+      await refreshChronology(projectId);
+      setPhaseDialog(null);
+      setMessage(existing ? `Updated ${value.label}` : `Added ${value.label} to the story ribbon`);
+    } catch (reason) {
+      setPhaseDialogError(String(reason));
+    } finally {
+      setPhaseDialogBusy(false);
+    }
+  }
+
+  async function removeTripPhase() {
+    const phase = phaseDialog?.phase;
+    if (!phase || !projectId) return;
+    setPhaseDialogBusy(true);
+    setPhaseDialogError("");
+    try {
+      await chronologyApi.removeTripPhase(projectId, phase.id);
+      await refreshChronology(projectId);
+      setPhaseDialog(null);
+      setMessage(`Removed ${phase.label} from the story ribbon`);
+    } catch (reason) {
+      setPhaseDialogError(String(reason));
+    } finally {
+      setPhaseDialogBusy(false);
+    }
+  }
 
   const handleNotesKeyDown = (event: ReactKeyboardEvent<HTMLTextAreaElement>) => {
     if (event.key === "Escape") {
@@ -1415,7 +1568,7 @@ function App() {
               // A correction can reorder hundreds of clips; resume where the
               // user was rather than snapping them back to the top.
               onQueueResumed={(assetId) => setSelectedId(assetId)}
-              onChronologyChanged={() => refreshAssets(projectId)}
+              onChronologyChanged={() => Promise.all([refreshAssets(projectId), refreshChronology(projectId)]).then(() => undefined)}
             />
           ) : (
             <EditPlanPanel projectId={projectId} assets={assets} />
@@ -1581,9 +1734,27 @@ function App() {
           onCenter={() => centerSelectedInChronology()}
           onSelect={setSelectedId}
           onToggleCollapsed={() => dispatchView({ kind: "toggleRibbon" })}
+          onRequestContext={openContextRange}
+          onEditContext={openExistingContext}
           onRenameCamera={(from, to) => { void renameCamera(from, to); }}
         />
       </footer>
+      )}
+
+      {phaseDialog && activeAssets[phaseDialog.startIndex] && activeAssets[phaseDialog.endIndex] && (
+        <TripPhaseDialog
+          key={`${phaseDialog.phase?.id ?? "new"}:${phaseDialog.startIndex}:${phaseDialog.endIndex}`}
+          phase={phaseDialog.phase}
+          start={activeAssets[phaseDialog.startIndex]}
+          end={activeAssets[phaseDialog.endIndex]}
+          startPosition={phaseDialog.startIndex}
+          endPosition={phaseDialog.endIndex}
+          busy={phaseDialogBusy}
+          error={phaseDialogError}
+          onCancel={() => setPhaseDialog(null)}
+          onSave={(value) => { void saveTripPhase(value); }}
+          onRemove={phaseDialog.phase ? () => { void removeTripPhase(); } : undefined}
+        />
       )}
 
       {showCreate && (

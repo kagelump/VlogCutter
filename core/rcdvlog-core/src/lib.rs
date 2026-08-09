@@ -79,7 +79,8 @@ pub use chronology::{
     ChronologyExplanation, ChronologyFacts, ChronologySolution, ClipTimeException, ClockEpoch,
     ConstraintStrength, Contradiction, ContradictionKind, DisplayMode, DisplayTime,
     EventOrderConstraint, Evidence, OrderKey, PhaseKind, QuarantinedOperation, QueuePosition,
-    SplitProposal, TripPhase, covering_phase, display_time, is_valid_timezone, solve,
+    SplitProposal, TripPhase, covering_phase, display_time, is_valid_timezone,
+    resolve_anchored_phases, solve,
 };
 pub use diagnostics::{
     Diagnostic, DiagnosticCounts, DiagnosticFilter, DiagnosticRecord, DiagnosticSeverity,

@@ -330,6 +330,8 @@ fn trip_phases_validate_timezones_and_removal_retimes_nothing() {
                 id: String::new(),
                 label: "nowhere".to_string(),
                 kind: PhaseKind::Location,
+                start_anchor_asset_id: None,
+                end_anchor_asset_id: None,
                 start_trip_time: "2026-01-01T00:00:00Z".to_string(),
                 end_trip_time: "2026-02-01T00:00:00Z".to_string(),
                 timezone: Some("Mars/Olympus_Mons".to_string()),
@@ -359,6 +361,8 @@ fn trip_phases_validate_timezones_and_removal_retimes_nothing() {
                 id: String::new(),
                 label: "Tokyo".to_string(),
                 kind: PhaseKind::Location,
+                start_anchor_asset_id: None,
+                end_anchor_asset_id: None,
                 start_trip_time: "2026-01-01T00:00:00Z".to_string(),
                 end_trip_time: "2026-02-01T00:00:00Z".to_string(),
                 timezone: Some("Asia/Tokyo".to_string()),
@@ -393,6 +397,115 @@ fn trip_phases_validate_timezones_and_removal_retimes_nothing() {
     assert_eq!(
         uncovered.assets[0].display_time.as_ref().unwrap().phase_id,
         None
+    );
+}
+
+#[test]
+fn clip_anchored_phase_reflows_when_another_camera_is_corrected() {
+    let fixture = fixture(&[
+        ("A0001.MP4", "Sony", "2026-01-15T09:00:00Z"),
+        ("A0002.MP4", "Sony", "2026-01-15T10:00:00Z"),
+        ("D0001.MP4", "DJI", "2026-01-15T11:00:00Z"),
+    ]);
+    let before = fixture
+        .catalog
+        .solve_chronology(&fixture.project_id)
+        .unwrap();
+    let start = before.assets[0].asset_id.clone();
+    let end = before.assets[1].asset_id.clone();
+    let moving = before.assets[2].asset_id.clone();
+
+    let phase = fixture
+        .catalog
+        .set_trip_phase(
+            &fixture.project_id,
+            &TripPhase {
+                id: String::new(),
+                label: "Tokyo morning".to_string(),
+                kind: PhaseKind::Location,
+                start_anchor_asset_id: Some(start.clone()),
+                end_anchor_asset_id: Some(end.clone()),
+                start_trip_time: String::new(),
+                end_trip_time: String::new(),
+                timezone: Some("Asia/Tokyo".to_string()),
+                origin_timezone: None,
+                destination_timezone: None,
+                display_mode: DisplayMode::Local,
+            },
+        )
+        .unwrap();
+    assert_eq!(phase.start_anchor_asset_id.as_deref(), Some(start.as_str()));
+    assert_eq!(phase.end_anchor_asset_id.as_deref(), Some(end.as_str()));
+    assert_eq!(phase.start_trip_time, "2026-01-15T09:00:00.000Z");
+    assert_eq!(phase.end_trip_time, "2026-01-15T10:00:00.000Z");
+
+    let initially_uncovered = fixture
+        .catalog
+        .solve_chronology(&fixture.project_id)
+        .unwrap();
+    assert_eq!(
+        initially_uncovered
+            .assets
+            .iter()
+            .find(|asset| asset.asset_id == moving)
+            .unwrap()
+            .display_time
+            .as_ref()
+            .unwrap()
+            .phase_id,
+        None
+    );
+
+    let dji = fixture
+        .catalog
+        .capture_sequences(&fixture.project_id)
+        .unwrap()
+        .into_iter()
+        .find(|sequence| sequence.camera_key == "DJI")
+        .unwrap();
+    fixture
+        .catalog
+        .set_clock_epoch(
+            &fixture.project_id,
+            &ClockEpoch {
+                id: String::new(),
+                capture_sequence_id: dji.id,
+                start_counter: 0,
+                end_counter: None,
+                offset_seconds: -5400,
+                confidence: 1.0,
+                evidence: vec!["user_set".to_string()],
+                label: "DJI ran ninety minutes fast".to_string(),
+            },
+        )
+        .unwrap();
+
+    let corrected = fixture
+        .catalog
+        .solve_chronology(&fixture.project_id)
+        .unwrap();
+    let resolved_phase = fixture
+        .catalog
+        .trip_phases(&fixture.project_id)
+        .unwrap()
+        .into_iter()
+        .find(|candidate| candidate.id == phase.id)
+        .unwrap();
+    assert_eq!(resolved_phase.start_trip_time, "2026-01-15T09:00:00.000Z");
+    assert_eq!(resolved_phase.end_trip_time, "2026-01-15T10:00:00.000Z");
+    assert_eq!(
+        corrected
+            .assets
+            .iter()
+            .find(|asset| asset.asset_id == moving)
+            .unwrap()
+            .display_time
+            .as_ref()
+            .unwrap()
+            .phase_id
+            .as_deref(),
+        Some(phase.id.as_str()),
+        "the other camera joins the phase after its corrected time crosses the clip anchors"
     );
 }
 

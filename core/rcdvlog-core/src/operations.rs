@@ -364,6 +364,10 @@ pub(crate) struct TripPhaseSetPayload {
     pub(crate) phase_id: String,
     pub(crate) label: String,
     pub(crate) phase_kind: String,
+    #[serde(default)]
+    pub(crate) start_anchor_asset_id: Option<String>,
+    #[serde(default)]
+    pub(crate) end_anchor_asset_id: Option<String>,
     pub(crate) start_trip_time: String,
     pub(crate) end_trip_time: String,
     pub(crate) timezone: Option<String>,
@@ -2269,12 +2273,14 @@ fn materialize_trip_phase_set(
         return Ok(ApplyOperationResult::Conflict);
     }
     transaction.execute(
-        "INSERT INTO trip_phases(id, project_id, label, phase_kind, start_trip_time, end_trip_time, timezone, origin_timezone, destination_timezone, display_mode, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) ON CONFLICT(id) DO UPDATE SET label=excluded.label, phase_kind=excluded.phase_kind, start_trip_time=excluded.start_trip_time, end_trip_time=excluded.end_trip_time, timezone=excluded.timezone, origin_timezone=excluded.origin_timezone, destination_timezone=excluded.destination_timezone, display_mode=excluded.display_mode",
+        "INSERT INTO trip_phases(id, project_id, label, phase_kind, start_anchor_asset_id, end_anchor_asset_id, start_trip_time, end_trip_time, timezone, origin_timezone, destination_timezone, display_mode, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) ON CONFLICT(id) DO UPDATE SET label=excluded.label, phase_kind=excluded.phase_kind, start_anchor_asset_id=excluded.start_anchor_asset_id, end_anchor_asset_id=excluded.end_anchor_asset_id, start_trip_time=excluded.start_trip_time, end_trip_time=excluded.end_trip_time, timezone=excluded.timezone, origin_timezone=excluded.origin_timezone, destination_timezone=excluded.destination_timezone, display_mode=excluded.display_mode",
         params![
             payload.phase_id,
             operation.project_id,
             payload.label,
             payload.phase_kind,
+            payload.start_anchor_asset_id,
+            payload.end_anchor_asset_id,
             payload.start_trip_time,
             payload.end_trip_time,
             payload.timezone,

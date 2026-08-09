@@ -86,6 +86,17 @@ pub struct TripPhase {
     pub id: String,
     pub label: String,
     pub kind: PhaseKind,
+    /// Optional clip identities that keep the phase boundary attached to the
+    /// user's footage evidence when later clock corrections reorder cameras.
+    /// The start includes the anchor clip; the end includes its anchor clip.
+    /// Legacy phases leave these null and continue to use their fixed times.
+    #[serde(default)]
+    pub start_anchor_asset_id: Option<String>,
+    #[serde(default)]
+    pub end_anchor_asset_id: Option<String>,
+    /// Last successfully resolved UTC bounds. For fixed phases these are the
+    /// authority; for anchored phases they are a durable fallback when an
+    /// anchor temporarily cannot be placed.
     pub start_trip_time: String,
     pub end_trip_time: String,
     pub timezone: Option<String>,

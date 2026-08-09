@@ -51,9 +51,10 @@ Implemented now:
 - ffprobe technical/timestamp metadata and ExifTool camera make/model lookup.
 - Label queue, playback, free-form labels, notes, reversible removal, and keyboard shortcuts.
 - Fixed camera offset events from a filename boundary onward.
-- Operation-backed capture sequences, clock epochs, clip-time exceptions, trip
-  phases, event-order constraints, a deterministic chronology solver, and
-  durable diagnostics.
+- Operation-backed capture sequences, clock epochs, clip-time exceptions,
+  clip-anchored trip phases, event-order constraints, a deterministic
+  chronology solver, and durable diagnostics. A ribbon phase boundary follows
+  its anchor clip when later camera-clock corrections change solved order.
 - Read-only chronology/diagnostics CLI commands and basic desktop chronology
   and edit-plan drawers.
 - Versioned edit-plan persistence and validation, low-resolution preview
@@ -110,9 +111,11 @@ Important gaps; do not accidentally describe these as complete:
   preview rendering, and OTIO writing exist, but the desktop edit-plan workflow
   still lacks reordering, trimming, removal, preview playback, export history,
   and overwrite confirmation; there is no edit-plan CLI yet.
-- Trip phases and timezone display are persisted and solved, but the desktop has
-  no phase editor or full lane/trip-band calibration view. Story beats remain
-  display-only browser-mock fields and are not persisted.
+- Trip phases and timezone display are persisted and solved, and the ribbon can
+  add a location/transit phase forward or backward from a hovered clip and edit
+  an existing phase. It still lacks boundary dragging and the full
+  lane/trip-band calibration view. Story beats remain display-only browser-mock
+  fields and are not persisted.
 - The basic chronology drawer can inspect explanations, diagnostics, split
   proposals, and clock epochs. It does not yet provide the complete calibration
   interaction contract for clip exceptions, phases, constraints, merges,
@@ -772,6 +775,7 @@ Scale acceptance should cover thousands of assets, offline behavior, progress re
 ## 15. Safety and working-tree discipline
 
 - Inspect `git status` before editing. The repository may contain uncommitted or untracked user work; preserve it.
+- After completing and verifying a meaningful milestone, commit the full scoped change set unless the user explicitly asks not to. Leave the repository clean so milestones remain easy to inspect or revert.
 - Keep edits scoped. Do not reformat large unrelated files, especially the current large single-file Rust core and React app.
 - Never delete catalogs, source media, project folders, proxies, thumbnails, or exports unless the user explicitly requests the exact destructive action.
 - Tests must use `tempfile`/temporary directories. Never point destructive test setup at `~/Movies/VideoProjects`, `/Volumes`, or the repository root.

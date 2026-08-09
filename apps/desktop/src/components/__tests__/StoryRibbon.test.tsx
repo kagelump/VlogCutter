@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { createRef } from "react";
 import { describe, expect, it, vi } from "vitest";
@@ -40,6 +40,8 @@ function renderRibbon(overrides: Partial<StoryRibbonProps> = {}) {
     onCenter: vi.fn(),
     onSelect: vi.fn(),
     onToggleCollapsed: vi.fn(),
+    onRequestContext: vi.fn(),
+    onEditContext: vi.fn(),
     onRenameCamera: vi.fn(),
     ...overrides,
   };
@@ -178,5 +180,36 @@ describe("selection", () => {
     const { props } = renderRibbon();
     await userEvent.click(screen.getByLabelText(/zoom story ribbon in/i));
     expect(props.onZoomChange).toHaveBeenCalledWith(80);
+  });
+});
+
+describe("trip context anchoring", () => {
+  it("turns an untagged clip column into the two directional choices", async () => {
+    const { container } = renderRibbon();
+    const track = container.querySelector<HTMLElement>(".context-track")!;
+    fireEvent.pointerMove(track, { clientX: 10 });
+    await userEvent.click(screen.getByRole("button", { name: "Add context at clip 1" }));
+    expect(screen.getByRole("button", { name: "Add through here" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Add from here" })).toBeTruthy();
+  });
+
+  it("reports the chosen clip identity instead of a copied timestamp", async () => {
+    const { props, container } = renderRibbon();
+    fireEvent.pointerMove(container.querySelector<HTMLElement>(".context-track")!, { clientX: 75 });
+    await userEvent.click(screen.getByRole("button", { name: "Add context at clip 2" }));
+    await userEvent.click(screen.getByRole("button", { name: "Add from here" }));
+    expect(props.onRequestContext).toHaveBeenCalledWith("a1", "from");
+  });
+
+  it("opens a persisted phase for editing when its segment is clicked", async () => {
+    const tagged = asset("a", "Sony");
+    tagged.phase = "Osaka";
+    const { props } = renderRibbon({
+      assets: [tagged],
+      lanes: [["Sony", [tagged]]],
+      contextRuns: [{ start: 0, end: 0, asset: tagged, phaseId: "phase_osaka" }],
+    });
+    await userEvent.click(screen.getByRole("button", { name: "Edit Osaka context" }));
+    expect(props.onEditContext).toHaveBeenCalledWith("phase_osaka", 0, 0);
   });
 });

@@ -22,7 +22,7 @@ pub(crate) use phases::parse_utc;
 pub use phases::{DisplayTime, covering_phase, display_time, is_valid_timezone};
 pub use solver::{
     AssetChronology, ChronologySolution, Contradiction, ContradictionKind, Evidence, OrderKey,
-    solve,
+    resolve_anchored_phases, solve,
 };
 
 use crate::operations::{
@@ -261,8 +261,9 @@ pub fn load_chronology_facts(connection: &Connection, project_id: &str) -> Resul
 
     let mut phases_statement = connection.prepare(
         r#"
-        SELECT id, label, phase_kind, start_trip_time, end_trip_time,
-               timezone, origin_timezone, destination_timezone, display_mode
+        SELECT id, label, phase_kind, start_anchor_asset_id, end_anchor_asset_id,
+               start_trip_time, end_trip_time, timezone, origin_timezone,
+               destination_timezone, display_mode
         FROM trip_phases
         WHERE project_id = ?1
         ORDER BY id
@@ -281,13 +282,13 @@ pub fn load_chronology_facts(connection: &Connection, project_id: &str) -> Resul
                     ));
                 }
             };
-            let display_mode = match row.get::<_, String>(8)?.as_str() {
+            let display_mode = match row.get::<_, String>(10)?.as_str() {
                 "local" => DisplayMode::Local,
                 "dual" => DisplayMode::Dual,
                 "utc" => DisplayMode::Utc,
                 value => {
                     return Err(rusqlite::Error::FromSqlConversionFailure(
-                        8,
+                        10,
                         rusqlite::types::Type::Text,
                         format!("invalid display mode: {value}").into(),
                     ));
@@ -297,11 +298,13 @@ pub fn load_chronology_facts(connection: &Connection, project_id: &str) -> Resul
                 id: row.get(0)?,
                 label: row.get(1)?,
                 kind: phase_kind,
-                start_trip_time: row.get(3)?,
-                end_trip_time: row.get(4)?,
-                timezone: row.get(5)?,
-                origin_timezone: row.get(6)?,
-                destination_timezone: row.get(7)?,
+                start_anchor_asset_id: row.get(3)?,
+                end_anchor_asset_id: row.get(4)?,
+                start_trip_time: row.get(5)?,
+                end_trip_time: row.get(6)?,
+                timezone: row.get(7)?,
+                origin_timezone: row.get(8)?,
+                destination_timezone: row.get(9)?,
                 display_mode,
             })
         })?

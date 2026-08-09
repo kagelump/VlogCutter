@@ -228,6 +228,8 @@ fn all_five_correction_kinds_are_reported_in_application_order() {
                 id: String::new(),
                 label: "Ushuaia".to_string(),
                 kind: PhaseKind::Location,
+                start_anchor_asset_id: None,
+                end_anchor_asset_id: None,
                 start_trip_time: "2026-01-01T00:00:00Z".to_string(),
                 end_trip_time: "2026-01-02T00:00:00Z".to_string(),
                 timezone: Some("America/Argentina/Ushuaia".to_string()),

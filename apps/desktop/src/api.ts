@@ -65,10 +65,12 @@ let mockAssets: Asset[] = [
   mediaObjectId: null,
   mediaVerificationState: "unlinked",
   available: index < 5,
-  phase: index < 3 ? "Arrival" : "Market morning",
-  location: index < 3 ? "Otaru" : "Sapporo",
-  timezone: "Asia/Tokyo",
-  storyBeat: index < 3 ? "Finding our bearings" : "First discoveries",
+  // Leave the final active clip untagged so the browser preview exercises the
+  // ribbon's real add-context affordance instead of showing only finished runs.
+  phase: index < 3 ? "Arrival" : index < 5 ? "Market morning" : null,
+  location: index < 3 ? "Otaru" : index < 5 ? "Sapporo" : null,
+  timezone: index < 5 ? "Asia/Tokyo" : null,
+  storyBeat: index < 3 ? "Finding our bearings" : index < 5 ? "First discoveries" : null,
 })) as Asset[];
 
 const defaultDesktopSettings: DesktopSettings = {

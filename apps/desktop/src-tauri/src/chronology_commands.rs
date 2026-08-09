@@ -17,7 +17,7 @@ use rcdvlog_core::{
     ClockEpoch, ConstraintStrength, Contradiction, Diagnostic, DiagnosticCounts, DiagnosticFilter,
     DiagnosticSeverity, DisplayMode, EditPlanOperation, EditPlanRevision, EventOrderConstraint,
     OtioExportRequest, OtioExportResult, PhaseKind, PreviewProgress, PreviewRequest, PreviewResult,
-    QueuePosition, TripPhase, ValidationReport,
+    QueuePosition, TripPhase, ValidationReport, resolve_anchored_phases,
 };
 use serde::{Deserialize, Serialize};
 use tauri::State;
@@ -56,6 +56,10 @@ pub struct TripPhaseInput {
     pub id: String,
     pub label: String,
     pub kind: String,
+    #[serde(default)]
+    pub start_anchor_asset_id: Option<String>,
+    #[serde(default)]
+    pub end_anchor_asset_id: Option<String>,
     pub start_trip_time: String,
     pub end_trip_time: String,
     pub timezone: Option<String>,
@@ -73,6 +77,8 @@ impl TripPhaseInput {
                 "transit" => PhaseKind::Transit,
                 _ => PhaseKind::Location,
             },
+            start_anchor_asset_id: self.start_anchor_asset_id,
+            end_anchor_asset_id: self.end_anchor_asset_id,
             start_trip_time: self.start_trip_time,
             end_trip_time: self.end_trip_time,
             timezone: self.timezone,
@@ -144,11 +150,12 @@ pub fn chronology_overview(
         .iter()
         .filter(|entry| entry.trip_time.is_none())
         .count() as u32;
+    let (phases, _) = resolve_anchored_phases(&facts.phases, &solution.assets);
     Ok(ChronologyOverview {
         sequences: facts.sequences,
         epochs: facts.epochs,
         exceptions: facts.exceptions,
-        phases: facts.phases,
+        phases,
         constraints: facts.constraints,
         contradictions: solution.contradictions,
         assets: solution.assets,

@@ -15,7 +15,11 @@ export interface ContextRun {
   start: number;
   end: number;
   asset: Asset;
+  /** Present for persisted trip phases; absent for browser-demo context. */
+  phaseId?: string | null;
 }
+
+export type ContextDirection = "through" | "from";
 
 /**
  * The identity of a clip's trip context. Two adjacent clips with the same key
@@ -46,6 +50,8 @@ export interface StoryRibbonProps {
   onCenter(): void;
   onSelect(id: string): void;
   onToggleCollapsed(): void;
+  onRequestContext(assetId: string, direction: ContextDirection): void;
+  onEditContext(phaseId: string, start: number, end: number): void;
   /** Corrects the camera identification for every clip in a lane. */
   onRenameCamera(from: string, to: string): void;
 }
@@ -72,12 +78,16 @@ export function StoryRibbon({
   onCenter,
   onSelect,
   onToggleCollapsed,
+  onRequestContext,
+  onEditContext,
   onRenameCamera,
 }: StoryRibbonProps) {
   // The lane whose name is being corrected, and the draft. Only one at a time:
   // the gutter is 96px, so a second open field would have nowhere to go.
   const [editingLane, setEditingLane] = useState<string | null>(null);
   const [laneDraft, setLaneDraft] = useState("");
+  const [hoveredContextIndex, setHoveredContextIndex] = useState<number | null>(null);
+  const [contextAnchorIndex, setContextAnchorIndex] = useState<number | null>(null);
 
   // Enter and blur both commit, so a rename survives clicking away. An empty or
   // unchanged draft closes the field without a write.
@@ -93,6 +103,20 @@ export function StoryRibbon({
   const height = collapsed
     ? ribbonHeight(laneRows.length, true)
     : heightOverride ?? ribbonHeight(laneRows.length, false);
+  const contextAnchor = contextAnchorIndex === null ? null : assets[contextAnchorIndex] ?? null;
+
+  function contextIndexAt(clientX: number, track: HTMLDivElement) {
+    const index = Math.floor((clientX - track.getBoundingClientRect().left) / zoom);
+    if (index < 0 || index >= assets.length) return null;
+    return contextRuns.some((run) => index >= run.start && index <= run.end) ? null : index;
+  }
+
+  function chooseContext(direction: ContextDirection) {
+    if (!contextAnchor) return;
+    onRequestContext(contextAnchor.id, direction);
+    setContextAnchorIndex(null);
+    setHoveredContextIndex(null);
+  }
 
   return (
     <div className="chronology" style={{ height }}>
@@ -103,11 +127,20 @@ export function StoryRibbon({
           {collapsed ? "▸" : "▾"} Story ribbon <kbd>T</kbd>
         </button>
         <div className="chronology-actions">
-          <span className="chronology-position">
-            {selected && !selected.removed
-              ? `#${assets.findIndex((asset) => asset.id === selected.id) + 1} · ${formatDate(selected.bestTime)}`
-              : "No active clip selected"}
-          </span>
+          {contextAnchor ? (
+            <div className="context-anchor-choice" role="group" aria-label={`Add context at clip ${contextAnchorIndex! + 1}`}>
+              <span>#{contextAnchorIndex! + 1}</span>
+              <button type="button" onClick={() => chooseContext("through")}>Add through here</button>
+              <button type="button" onClick={() => chooseContext("from")}>Add from here</button>
+              <button type="button" className="context-choice-close" aria-label="Cancel adding context" onClick={() => setContextAnchorIndex(null)}>×</button>
+            </div>
+          ) : (
+            <span className="chronology-position">
+              {selected && !selected.removed
+                ? `#${assets.findIndex((asset) => asset.id === selected.id) + 1} · ${formatDate(selected.bestTime)}`
+                : "No active clip selected"}
+            </span>
+          )}
           <div className="zoom-control" aria-label="Story ribbon zoom">
             <button
               onClick={() => onZoomChange(Math.max(RIBBON_ZOOM_MIN, zoom - RIBBON_ZOOM_STEP))}
@@ -191,7 +224,16 @@ export function StoryRibbon({
                 "--clip-step": `${zoom}px`,
               } as CSSProperties}
             >
-              <div className="context-track">
+              <div
+                className="context-track"
+                onPointerMove={(event) => {
+                  if (contextAnchorIndex !== null) return;
+                  setHoveredContextIndex(contextIndexAt(event.clientX, event.currentTarget));
+                }}
+                onPointerLeave={() => {
+                  if (contextAnchorIndex === null) setHoveredContextIndex(null);
+                }}
+              >
                 {contextRuns.map((run) => {
                   const primary = run.asset.phase || run.asset.location || "Context not tagged";
                   const detail = [
@@ -200,17 +242,34 @@ export function StoryRibbon({
                     run.asset.storyBeat,
                   ].filter(Boolean).join(" · ") || "Add phase, place, timezone or story beat";
                   return (
-                    <div
+                    <button
+                      type="button"
                       className="context-segment"
                       key={`${run.start}-${assetContextKey(run.asset)}`}
                       style={{ left: run.start * zoom + 3, width: (run.end - run.start + 1) * zoom - 6 }}
                       title={`${primary} · ${detail}`}
+                      onClick={() => {
+                        if (run.phaseId) onEditContext(run.phaseId, run.start, run.end);
+                      }}
+                      aria-label={run.phaseId ? `Edit ${primary} context` : `${primary} context`}
                     >
                       <strong>{primary}</strong>
                       <span aria-hidden="true"> · {detail}</span>
-                    </div>
+                    </button>
                   );
                 })}
+                {(hoveredContextIndex !== null || contextAnchorIndex !== null) && (
+                  <button
+                    type="button"
+                    className={`context-ghost ${contextAnchorIndex !== null ? "is-anchored" : ""}`}
+                    style={{ left: (contextAnchorIndex ?? hoveredContextIndex ?? 0) * zoom + 3, width: Math.max(18, zoom - 6) }}
+                    aria-label={`Add context at clip ${(contextAnchorIndex ?? hoveredContextIndex ?? 0) + 1}`}
+                    onPointerMove={(event) => event.stopPropagation()}
+                    onClick={() => setContextAnchorIndex(contextAnchorIndex ?? hoveredContextIndex)}
+                  >
+                    <span aria-hidden="true">+</span>
+                  </button>
+                )}
               </div>
               <div className="order-track" aria-hidden="true">
                 {assets.map((asset, index) => (

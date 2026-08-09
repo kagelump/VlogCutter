@@ -7,7 +7,7 @@ use thiserror::Error;
 
 use crate::chronology::forward_migrate_project_chronology;
 
-pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 15;
+pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 16;
 
 const MIGRATION_TABLE_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -173,6 +173,12 @@ pub const PROJECT_CATALOG_MIGRATIONS: &[SqliteMigration] = &[
         name: "analysis_runs",
         source_identity: "project-catalog/0015-analysis-runs/20260804",
         apply: add_analysis_runs,
+    },
+    SqliteMigration {
+        id: 16,
+        name: "clip_anchored_trip_phases",
+        source_identity: "project-catalog/0016-clip-anchored-trip-phases/20260809",
+        apply: add_clip_anchored_trip_phases,
     },
 ];
 
@@ -1051,6 +1057,26 @@ fn add_analysis_runs(transaction: &Transaction<'_>) -> Result<()> {
     Ok(())
 }
 
+/// Migration 16. A phase can now retain the clips the user chose as its rough
+/// start and end evidence. The existing timestamp columns remain required so
+/// every older phase stays valid and an anchored phase has a durable fallback
+/// if one of its anchors temporarily cannot be placed.
+fn add_clip_anchored_trip_phases(transaction: &Transaction<'_>) -> Result<()> {
+    add_column_if_missing(
+        transaction,
+        "trip_phases",
+        "start_anchor_asset_id",
+        "TEXT REFERENCES assets(id) ON DELETE RESTRICT",
+    )?;
+    add_column_if_missing(
+        transaction,
+        "trip_phases",
+        "end_anchor_asset_id",
+        "TEXT REFERENCES assets(id) ON DELETE RESTRICT",
+    )?;
+    Ok(())
+}
+
 fn add_clip_analysis(transaction: &Transaction<'_>) -> Result<()> {
     // Every migration must be replayable: dropping `schema_migrations` re-runs
     // the whole list against a schema that may already have these columns, and
@@ -1331,35 +1357,23 @@ mod tests {
         for column in ["status", "stage_reached", "cost_usd", "budget_exhausted"] {
             assert!(columns.contains(&column.to_string()), "missing {column}");
         }
-        assert_eq!(PROJECT_CATALOG_SCHEMA_VERSION, 15);
+        assert_eq!(PROJECT_CATALOG_SCHEMA_VERSION, 16);
     }
 
     #[test]
-    fn migration_15_upgrades_a_catalog_stopped_at_the_previous_version() {
+    fn migration_16_upgrades_a_catalog_stopped_at_the_previous_version() {
         // Replays every migration except the newest, the way an existing
         // catalog on disk would be, and then upgrades it.
         let mut connection = Connection::open_in_memory().unwrap();
         let previous = &PROJECT_CATALOG_MIGRATIONS[..PROJECT_CATALOG_MIGRATIONS.len() - 1];
         run_sqlite_migrations(&mut connection, previous).unwrap();
-        let before: i64 = connection
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='analysis_runs'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(before, 0);
+        let before = column_exists(&connection, "trip_phases", "start_anchor_asset_id").unwrap();
+        assert!(!before);
 
         migrate_project_catalog(&mut connection).unwrap();
 
-        let after: i64 = connection
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='analysis_runs'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(after, 1);
+        assert!(column_exists(&connection, "trip_phases", "start_anchor_asset_id").unwrap());
+        assert!(column_exists(&connection, "trip_phases", "end_anchor_asset_id").unwrap());
         validate_project_catalog_migrations(&connection).unwrap();
     }
 
