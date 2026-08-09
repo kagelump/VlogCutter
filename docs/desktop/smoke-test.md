@@ -4,6 +4,20 @@ Repeatable checklist for exercising the implemented portion of the `PRD.md`
 §21.1 user journey against the real native macOS application. CI cannot do
 this; every row here tests something headless runners cannot reach.
 
+The frontend half of these journeys — which command each action issues, what
+the backend then holds, and what the interface shows afterwards — is now covered
+automatically by the fast CUJ suite (`pnpm test:desktop:cuj`). No row below is
+retired by it: each one is here for the native evidence a fake IPC destination
+cannot produce — real persistence across a relaunch, real playback, a real
+volume ejection, a real card. Treat the fast suite as the reason you should not
+be finding *frontend* bugs here, and this checklist as the only place the native
+claims are established.
+
+One row to read carefully: row 12 expects the review position to be restored on
+relaunch. The frontend records it on every selection change and never reads it
+back (`docs/tasks/harness/FINDINGS.md` §2), so if that row passes, something on
+the Rust side is doing it — record which.
+
 ## Preconditions
 
 1. Build: `pnpm --dir apps/desktop tauri build` produces

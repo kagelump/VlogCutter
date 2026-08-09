@@ -10,6 +10,7 @@ The repository uses real process, SQLite, HTTP, browser, and media-tool boundari
 | Desktop CLI processes | Stable JSON stdout/stderr, explicit catalogs, WAL reads, real FFmpeg ingest/metadata/dedup, labels/notes/removal/clock, thumbnails/proxies, and offline-original review |
 | Card-import domain/UI | Preflight purity and classification, removable-card identity, create-only atomic copy, full-file verification, cancellation/resume, archive-root remount, modal destination/capacity blocking, and review-only card banner |
 | Independent server processes | Separate Mac/server SQLite files, real authenticated HTTP baseline/reconcile, duplicate delivery, browser-origin mutation, restart, and restore sequence recovery |
+| Fast desktop CUJ | Whole-`App` journeys in jsdom against a fake Tauri IPC destination: review and annotation, search/filtering, generation accounting, analysis gating/progress/cancellation, chronology preview-before-write, edit-plan lifecycle, card import, failure and retry, and IPC command/argument contract |
 | Web unit/build | Typed client integration, loading/error/empty states, library/project review, annotations, and administration |
 | Chrome Playwright | Local-only bootstrap login, admin mutation, concurrent same-origin tabs, and durable 5-second polling when one WebSocket is disabled |
 | Scale/fault fixtures | 2,000-asset baseline, 2,000-row library/scan pages, 10,000 jobs, sequence gaps/lost acknowledgements, leases/retry/cancel, media cancellation/restart, and byte ranges |
@@ -30,6 +31,30 @@ pnpm check:docs
 ```
 
 `pnpm test:integration` runs the desktop CLI/media process suite. FFmpeg and ffprobe are required for its media case; absence skips media rather than pretending a mock passed. `pnpm check` combines frontend type checking with Rust workspace tests.
+
+## What the fast desktop CUJ suite proves
+
+`apps/desktop/src/test/cuj` boots the production `App` in jsdom and installs a
+deterministic in-memory backend at `window.__TAURI_INTERNALS__`, so the real
+`api.ts`, `chronologyApi.ts`, command names, argument shapes, and event
+subscriptions are all under test while only the destination is faked. Its
+contract is `docs/tasks/harness/ARCHITECTURE.md`; the production findings it has
+produced so far are recorded in `docs/tasks/harness/FINDINGS.md`.
+
+It does validate: that a reported write reached the backend and is visible to
+the next read, that reported generation counts equal the assets actually
+changed, that a cancelled analysis cannot present itself as a completed one,
+that chronology previews before it writes and captures the user's place before
+mutating, that an import adds exactly the clips its preflight classified as new,
+and that every command the frontend can issue is handled and registered.
+
+It does not validate — and may never be cited for — WKWebView behavior, video
+decoding or first-frame paint, loopback media transport, filesystem permissions,
+native dialogs, Keychain, sleep/wake, NAS behavior, FFmpeg, the chronology
+solver, edit-plan generation, OTIO contents, or SQLite persistence and
+migrations. Its media is logical playback state driven by DOM events, its
+chronology and validation results are scenario-declared outcomes, and its import
+copies no bytes.
 
 ## What browser modes prove
 
