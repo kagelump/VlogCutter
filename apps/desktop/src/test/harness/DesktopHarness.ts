@@ -224,6 +224,11 @@ export class DesktopHarness {
     };
   }
 
+  /** Reads better than `command(...)` when the fault is meant to persist. */
+  always(command: string) {
+    return this.command(command);
+  }
+
   /** Let a delayed command through. */
   release(command: string) {
     this.faults.releaseGate(command);

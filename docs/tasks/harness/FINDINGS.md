@@ -1,0 +1,93 @@
+# H01 findings
+
+Production observations made while writing the fast CUJ suite. None of these
+were fixed here: the epic's non-goals put behavior changes outside its scope, so
+each is recorded with the test that pins the current behavior. A test that pins
+a defect names it, so the fix flips a red test rather than silently changing an
+untested one.
+
+Nothing in this file is a chronology, media, or native claim; see
+`docs/tasks/harness/ARCHITECTURE.md` §9 for what this tier may and may not be
+cited for.
+
+## 1. Six API adapters have no callers
+
+`api.createNoteRevision`, `api.addLabel`, `api.removeLabel`, `api.setRemoved`,
+`api.setRotation`, `api.generateThumbnail`, and `api.ingestFolder` are exported
+and reachable, and nothing in the desktop frontend calls any of them.
+
+Every review judgment goes through `persistAsset`, which sends the whole
+`AssetPatch` via `update_asset`. So the narrower commands — including
+`create_note_revision`, which exists precisely so a note becomes a revision
+rather than a field overwrite — are only exercised by the CLI and by Rust tests.
+
+Worth a decision either way: route the frontend through the narrow commands, or
+delete the adapters. Today's arrangement makes it look as though the desktop
+uses note revisions when it does not.
+
+Pinned by: `review.cuj.test.tsx` ("sends the whole patch, because rotation is
+part of the asset contract"), which asserts the `update_asset` payload.
+
+## 2. The desktop records where you were and never takes you back
+
+`record_desktop_context` fires on every selection change, and
+`DesktopSettings.lastAssetId` is faithfully stored. On launch, `App` restores
+the project and then selects `result[0]` — the first clip in the queue. The
+recorded clip is never read.
+
+Pinned by: `review.cuj.test.tsx` (CUJ 12), which asserts judgments are restored
+and the selection lands on the first clip.
+
+## 3. `generate_proxy` is unreachable through the interface
+
+The single-clip "Make proxy" button lives on the stage's offline slate, which
+renders only when the selected clip has **no** playable URL. A clip with no URL
+has no original either — and `generate_proxy` needs the original. The only state
+that shows the button and could succeed is "the loopback media origin failed to
+bind", where making a proxy does not help.
+
+The batch (`generate_missing_proxies`) covers the real need, so this is a dead
+affordance rather than a missing capability.
+
+Pinned by: `generation.cuj.test.tsx`, which exercises `generate_proxy` at the
+command boundary and says why.
+
+## 4. A finished analysis run does not refresh the clip you are looking at
+
+`runAnalysis` refreshes assets, the analysis index, and readiness. The per-clip
+transcript and observation read is keyed on `selectedId`, so the evidence rail
+for the clip already on screen stays empty until the selection moves. The queue
+row's verdict updates; the rail beside it does not.
+
+Pinned by: `analysis.cuj.test.tsx` ("reports each stage as it happens…"), which
+asserts the empty rail and then that moving away and back fills it.
+
+## 5. A failed project load has no way back in
+
+`refreshAssets` runs when the open project changes. If that read fails — a
+locked catalog, a busy volume — the error is shown and the queue stays empty,
+and there is no "try again" anywhere in the interface. Switching modes does not
+re-read. Relaunching the app does.
+
+Pinned by: `recovery.cuj.test.tsx` ("a project that will not open"), which
+asserts the gap and then the relaunch recovery.
+
+## 6. A failed save keeps the draft, but nothing retries it
+
+Better than expected, and worth stating because the opposite is the usual bug:
+`persistAsset` rolls back to the asset it was given, which already carries the
+user's typed text, so a rejected note save leaves the paragraph on screen. There
+is no automatic retry — the save is driven by leaving the field — so the user
+must touch the field again for it to land. That is defensible; it is also
+invisible, since the error message does not say so.
+
+Pinned by: `recovery.cuj.test.tsx` ("keeps the draft on screen and saves it when
+the user tries again").
+
+## 7. One pre-existing flaky test
+
+`components/__tests__/judgmentRail.test.tsx` — "does not read the observation
+again on every keystroke" — installs its spy after `renderApp` resolves, and a
+selection effect can still be in flight. It failed once under the added parallel
+load of the new suite and has passed every run since. The fix is to assert on
+calls made after a settled point rather than on a zero count.
