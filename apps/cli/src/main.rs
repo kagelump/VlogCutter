@@ -60,6 +60,13 @@ enum Commands {
         #[arg(long)]
         folder: PathBuf,
     },
+    /// Find originals this project has lost track of. Never imports new media.
+    Relink {
+        #[arg(long)]
+        project: String,
+        #[arg(long)]
+        folder: PathBuf,
+    },
     /// Read or mutate clips.
     Clips {
         #[command(subcommand)]
@@ -360,6 +367,7 @@ fn command_name(command: &Commands) -> &'static str {
             ProjectCommand::Diagnose { .. } => "project.diagnose",
         },
         Commands::Ingest { .. } => "ingest",
+        Commands::Relink { .. } => "relink",
         Commands::Clips { command } => match command {
             ClipsCommand::List { .. } => "clips.list",
             ClipsCommand::Get { .. } => "clips.get",
@@ -493,6 +501,23 @@ fn execute(cli: &Cli) -> Result<Value> {
                 }
             })?,
         )?),
+        Commands::Relink { project, folder } => Ok(serde_json::to_value(catalog.relink_folder(
+            project,
+            folder,
+            |completed, total, path| {
+                if completed == total || completed % 25 == 0 {
+                    eprintln!(
+                        "{}",
+                        json!({
+                            "event": "relink.progress",
+                            "completed": completed,
+                            "total": total,
+                            "path": path,
+                        })
+                    );
+                }
+            },
+        )?)?),
         Commands::Clips { command } => match command {
             ClipsCommand::List {
                 project,

@@ -286,6 +286,24 @@ pub struct IngestReport {
     pub failures: Vec<IngestFailure>,
 }
 
+/// The result of pointing the app at a folder and asking it to find originals
+/// the project has lost track of.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RelinkReport {
+    pub scanned: usize,
+    /// Assets whose original was offline and now resolves again.
+    pub repaired: usize,
+    /// Clips found here that the project could already reach elsewhere.
+    pub already_online: usize,
+    /// Media in this folder that belongs to no asset in this project. Counted,
+    /// never imported.
+    pub unrecognized: usize,
+    /// Assets whose original is still not reachable anywhere after the search.
+    pub still_missing: usize,
+    pub failures: Vec<IngestFailure>,
+}
+
 /// What ingest did with one candidate file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IngestOutcome {
@@ -1031,6 +1049,124 @@ impl Catalog {
             on_progress(index + 1, total, &path);
         }
         Ok(report)
+    }
+
+    /// Finds originals this project has lost track of, somewhere the user points
+    /// us at.
+    ///
+    /// Deliberately not `ingest_folder`: locating moved media must never quietly
+    /// enlarge the project. Content this project does not already know is
+    /// counted and left alone, so pointing at the wrong folder is a no-op the
+    /// user can read rather than an import they have to undo.
+    ///
+    /// Matching is by content. Filenames and folder structure are not evidence —
+    /// two cards legitimately both contain `C0001.MP4` (`PRD.md` §8.2).
+    pub fn relink_folder<F>(
+        &self,
+        project_id: &str,
+        root: impl AsRef<Path>,
+        mut on_progress: F,
+    ) -> Result<RelinkReport>
+    where
+        F: FnMut(usize, usize, &Path),
+    {
+        self.require_project(project_id)?;
+        let root = root.as_ref();
+        if !root.is_dir() {
+            bail!("search path is not a directory: {}", root.display());
+        }
+
+        let candidates: Vec<PathBuf> = WalkDir::new(root)
+            .follow_links(false)
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_file())
+            .map(|entry| entry.into_path())
+            .filter(|path| is_media(path))
+            .collect();
+
+        let missing_before = self.offline_asset_count(project_id)?;
+        let total = candidates.len();
+        let mut report = RelinkReport {
+            scanned: total,
+            repaired: 0,
+            already_online: 0,
+            unrecognized: 0,
+            still_missing: missing_before,
+            failures: Vec::new(),
+        };
+
+        for (index, path) in candidates.into_iter().enumerate() {
+            match self.relink_file(project_id, &path) {
+                Ok(IngestOutcome::Relinked) => report.repaired += 1,
+                Ok(IngestOutcome::Duplicate) => report.already_online += 1,
+                Ok(IngestOutcome::Imported) => report.unrecognized += 1,
+                Err(error) => report.failures.push(IngestFailure {
+                    path: path.to_string_lossy().into_owned(),
+                    error: format!("{error:#}"),
+                }),
+            }
+            on_progress(index + 1, total, &path);
+        }
+
+        report.still_missing = self.offline_asset_count(project_id)?;
+        // Whatever is reachable again should stop being reported as offline, and
+        // whatever is still missing should be restated with its new count.
+        self.resolve_offline_volume_diagnostics(project_id)?;
+        Ok(report)
+    }
+
+    /// Matches one file against this project's assets without ever creating one.
+    /// `Imported` here means "not recognized", which is the caller's cue to
+    /// count it rather than act on it.
+    fn relink_file(&self, project_id: &str, path: &Path) -> Result<IngestOutcome> {
+        let metadata =
+            fs::metadata(path).with_context(|| format!("read metadata for {}", path.display()))?;
+        let fingerprint = sampled_fingerprint(path, metadata.len())?;
+        let known: Option<(String, String)> = self
+            .connection()?
+            .query_row(
+                "SELECT id, path FROM assets WHERE project_id = ?1 AND fingerprint = ?2",
+                params![project_id, fingerprint],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        match known {
+            Some((asset_id, recorded_path)) => {
+                self.relink_known_asset(&asset_id, &recorded_path, path, &fingerprint)
+            }
+            None => Ok(IngestOutcome::Imported),
+        }
+    }
+
+    fn offline_asset_count(&self, project_id: &str) -> Result<usize> {
+        Ok(self
+            .list_assets(project_id)?
+            .iter()
+            .filter(|asset| !asset.original_available)
+            .count())
+    }
+
+    /// Re-states which volumes are offline after a repair pass.
+    ///
+    /// Diagnostics are acknowledged rather than deleted, per this module's
+    /// "acknowledge, don't delete" rule: a volume that comes back and later goes
+    /// away again resurfaces with its history intact.
+    fn resolve_offline_volume_diagnostics(&self, project_id: &str) -> Result<()> {
+        let still_offline = self.detect_offline_volumes(project_id)?;
+        let unresolved: Vec<&str> = still_offline
+            .iter()
+            .map(|diagnostic| diagnostic.dedupe_key.as_str())
+            .collect();
+        let existing = self.diagnostics(project_id, &DiagnosticFilter::default())?;
+        for diagnostic in existing {
+            if diagnostic.kind == "media.volume_offline"
+                && !unresolved.contains(&diagnostic.dedupe_key.as_str())
+            {
+                self.acknowledge_diagnostic(project_id, &diagnostic.id)?;
+            }
+        }
+        Ok(())
     }
 
     fn ingest_file(&self, project_id: &str, path: &Path) -> Result<IngestOutcome> {
@@ -4077,6 +4213,103 @@ mod tests {
         assert_eq!(
             location_state(&catalog, "asset_one", &copy).as_deref(),
             Some("verified")
+        );
+    }
+
+    /// The whole point of the repair flow: the user moved their footage, points
+    /// at where it went, and the project reconnects without gaining anything it
+    /// did not already have.
+    #[test]
+    fn locating_moved_originals_repairs_them_without_importing_anything_new() {
+        let (directory, catalog, project) = catalog_fixture();
+        let old_home = directory.path().join("local/footage");
+        let new_home = directory.path().join("Volumes/Shuttle/footage");
+        fs::create_dir_all(&old_home).unwrap();
+        fs::create_dir_all(&new_home).unwrap();
+
+        for (id, name, bytes) in [
+            ("asset_one", "C0001.MP4", b"first clip ".as_slice()),
+            ("asset_two", "C0002.MP4", b"second clip".as_slice()),
+        ] {
+            let path = old_home.join(name);
+            fs::write(&path, bytes).unwrap();
+            insert_asset_at(&catalog, &project.id, id, &path);
+        }
+
+        // The user drags the folder to an external drive behind the app's back,
+        // and something unrelated to this project is sitting there too.
+        for name in ["C0001.MP4", "C0002.MP4"] {
+            fs::rename(old_home.join(name), new_home.join(name)).unwrap();
+        }
+        fs::write(new_home.join("SOMEONE_ELSES.MP4"), b"not this project").unwrap();
+
+        catalog.detect_offline_volumes(&project.id).unwrap();
+        assert_eq!(catalog.offline_asset_count(&project.id).unwrap(), 2);
+
+        let report = catalog
+            .relink_folder(&project.id, &new_home, |_, _, _| {})
+            .unwrap();
+
+        assert_eq!(report.scanned, 3);
+        assert_eq!(report.repaired, 2);
+        assert_eq!(
+            report.unrecognized, 1,
+            "media belonging to no asset here must be counted, never imported"
+        );
+        assert_eq!(report.still_missing, 0);
+        assert_eq!(
+            catalog.list_assets(&project.id).unwrap().len(),
+            2,
+            "locating must not enlarge the project"
+        );
+        for asset in catalog.list_assets(&project.id).unwrap() {
+            assert!(asset.original_available);
+            assert!(
+                asset
+                    .path
+                    .starts_with(&new_home.to_string_lossy().to_string())
+            );
+        }
+
+        // The offline-volume diagnostic that sent the user here is resolved.
+        let unacknowledged = catalog
+            .diagnostics(&project.id, &DiagnosticFilter::default())
+            .unwrap();
+        assert!(
+            !unacknowledged
+                .iter()
+                .any(|diagnostic| diagnostic.kind == "media.volume_offline"),
+            "a volume that came back must stop being reported as offline"
+        );
+    }
+
+    /// Pointing at the wrong folder has to be a no-op the user can read, not an
+    /// import they have to undo.
+    #[test]
+    fn locating_against_an_unrelated_folder_changes_nothing() {
+        let (directory, catalog, project) = catalog_fixture();
+        let home = directory.path().join("footage");
+        let elsewhere = directory.path().join("holiday-snaps");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&elsewhere).unwrap();
+        let clip = home.join("C0001.MP4");
+        fs::write(&clip, b"the missing clip").unwrap();
+        insert_asset_at(&catalog, &project.id, "asset_one", &clip);
+        fs::remove_file(&clip).unwrap();
+        fs::write(elsewhere.join("VACATION.MP4"), b"unrelated footage").unwrap();
+
+        let report = catalog
+            .relink_folder(&project.id, &elsewhere, |_, _, _| {})
+            .unwrap();
+
+        assert_eq!(report.repaired, 0);
+        assert_eq!(report.unrecognized, 1);
+        assert_eq!(report.still_missing, 1);
+        assert_eq!(catalog.list_assets(&project.id).unwrap().len(), 1);
+        assert_eq!(
+            catalog.get_asset("asset_one").unwrap().path,
+            clip.to_string_lossy(),
+            "a failed search must leave the asset pointing where it was"
         );
     }
 

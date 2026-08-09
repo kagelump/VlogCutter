@@ -3,8 +3,8 @@ use chrono::{SecondsFormat, Utc};
 use rcdvlog_core::{
     AnalysisReadiness, AnalysisRunOptions, AnalysisRunOutcome, AnalysisRunRecord, AnalyzeReport,
     Asset, AssetAnalysisIndexEntry, AssetAnalysisView, AssetPatch, BatchProgressEstimate, Catalog,
-    ClipTranscript, ClockEvent, IngestReport, ModelStatus, Project, ProxyReport, ThumbnailReport,
-    ToolStatus, TranscribeReport,
+    ClipTranscript, ClockEvent, IngestReport, ModelStatus, Project, ProxyReport, RelinkReport,
+    ThumbnailReport, ToolStatus, TranscribeReport,
 };
 use rcdvlog_sync::BaselineEnvelope;
 use serde::{Deserialize, Serialize};
@@ -764,6 +764,27 @@ async fn ingest_folder(
         .await
         .map_err(error_message)?
         .map_err(error_message)?;
+    state.sync_manager.wake_project(&project_id);
+    Ok(report)
+}
+
+/// Points the app at a folder and asks it to reconnect originals the project has
+/// lost track of. Never imports: content this project does not know is counted
+/// and left alone.
+#[tauri::command]
+async fn relink_folder(
+    project_id: String,
+    path: String,
+    state: State<'_, AppState>,
+) -> Result<RelinkReport, String> {
+    let catalog = state.catalog()?;
+    let pid = project_id.clone();
+    let report = tauri::async_runtime::spawn_blocking(move || {
+        catalog.relink_folder(&pid, path, |_, _, _| {})
+    })
+    .await
+    .map_err(error_message)?
+    .map_err(error_message)?;
     state.sync_manager.wake_project(&project_id);
     Ok(report)
 }
@@ -1827,6 +1848,7 @@ pub fn run() {
             list_projects,
             create_project,
             ingest_folder,
+            relink_folder,
             list_assets,
             refresh_asset_orientation,
             update_asset,

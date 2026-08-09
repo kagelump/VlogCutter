@@ -11,6 +11,7 @@
 //      by a preview and a queue-position capture.
 
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { api } from "./api";
 import { chronologyApi } from "./chronologyApi";
 import type {
   ChronologyExplanation,
@@ -213,6 +214,41 @@ export function CalibrationPanel({
     [projectId, refresh],
   );
 
+  // Originals move: a card remounts elsewhere, or the user relocates footage
+  // from the laptop to an external drive to the NAS. The app cannot follow that
+  // on its own, so the repair is to ask where it went and match by content.
+  const [relinkResult, setRelinkResult] = useState<string | null>(null);
+  const locateOriginals = useCallback(
+    async (diagnostic: Diagnostic) => {
+      const volumeHint = String(
+        (diagnostic.context as { volumeHint?: string } | null)?.volumeHint ?? "these clips",
+      );
+      const folder = await api.chooseRelinkFolder(volumeHint);
+      if (!folder) return;
+      setBusy(true);
+      setRelinkResult(null);
+      setError(null);
+      try {
+        const report = await api.relinkFolder(projectId, folder);
+        setRelinkResult(
+          report.repaired > 0
+            ? `Reconnected ${report.repaired} clip(s)` +
+                (report.stillMissing > 0 ? `; ${report.stillMissing} still missing` : "")
+            : `No clips from ${volumeHint} were found there` +
+                (report.unrecognized > 0
+                  ? ` (${report.unrecognized} file(s) there belong to another project)`
+                  : ""),
+        );
+        await refreshAfterMutation();
+      } catch (cause) {
+        setError(String(cause));
+      } finally {
+        setBusy(false);
+      }
+    },
+    [projectId, refreshAfterMutation],
+  );
+
   const hardContradictions = useMemo(
     () => overview?.contradictions.filter((found) => found.strength === "hard") ?? [],
     [overview],
@@ -263,12 +299,23 @@ export function CalibrationPanel({
               <li key={found.id} data-severity={found.severity} data-kind={found.kind}>
                 <span>{found.message}</span>
                 {found.occurrenceCount > 1 && <em> ({found.occurrenceCount} times)</em>}
+                {/* Offline media has a repair, not just an acknowledgement. */}
+                {found.kind === "media.volume_offline" && (
+                  <button
+                    type="button"
+                    disabled={busy}
+                    onClick={() => void locateOriginals(found)}
+                  >
+                    Locate…
+                  </button>
+                )}
                 <button type="button" onClick={() => void acknowledge(found)}>
                   Acknowledge
                 </button>
               </li>
             ))}
           </ul>
+          {relinkResult && <p className="calibration-relink-result">{relinkResult}</p>}
         </div>
       )}
 

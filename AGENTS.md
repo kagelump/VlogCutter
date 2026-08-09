@@ -47,7 +47,11 @@ Implemented now:
 - Configurable projects root, defaulting to `~/Movies/VideoProjects`.
 - Project library discovery and loading an existing catalog.
 - Reference-in-place recursive ingest of supported media extensions.
-- Sampled fingerprint deduplication within a project.
+- Sampled fingerprint deduplication within a project, with rediscovered content
+  repairing an asset whose original went offline rather than being discarded.
+- Verified node-local media locations: availability requires that the bytes were
+  checked, so a reformatted card reusing a pathname cannot bind an old asset to
+  new footage.
 - ffprobe technical/timestamp metadata and ExifTool camera make/model lookup.
 - Label queue, playback, free-form labels, notes, reversible removal, and keyboard shortcuts.
 - Fixed camera offset events from a filename boundary onward.
@@ -104,7 +108,11 @@ Important gaps; do not accidentally describe these as complete:
 - No ingest preview. Capture-sequence split/merge exists, but boundary proposals
   currently detect only counter resets; volume, folder, prefix, discontinuity,
   and per-asset reassignment workflows remain incomplete.
-- No relink workflow, mounted-volume inventory, project deletion, or cache cleanup UI.
+- No mounted-volume inventory, project deletion, or cache cleanup UI. Relink now
+  exists: media locations carry a verification state, ingest repairs an asset
+  whose original it rediscovers, and an offline-volume diagnostic offers
+  `Locate…` (CLI: `relink`). Card detection and an import preview remain
+  unbuilt; see `docs/tasks/import/EPIC.md`.
 - Desktop/CLI full-patch writes still have no transport-level optimistic revision token; cross-node operation sync does not make competing local full patches safe.
 - Search is currently simple filename/camera/label/note filtering, not SQLite FTS.
 - No key moments, chapters, events, or scripts. Edit-plan revisions, validation,

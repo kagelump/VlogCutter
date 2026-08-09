@@ -1,7 +1,7 @@
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
-import type { AnalysisProgress, AnalysisReadiness, AnalysisRunRecord, AnalysisRunReport, AnalysisRunRequest, AnalysisStage, Asset, AssetAnalysisIndexEntry, AssetAnalysisView, AssetPatch, AutoplayMode, BaselineImportResult, BaselinePreviewResult, ClipTranscript, DesktopSettings, GenerationProgress, IngestReport, LoadedCatalog, MediaOrigin, ModelInstallProgress, ModelStatus, PathAnalysis, Project, ProjectLibrary, ProjectPairingStatus, RootMappingEntry, ServerConnectionStatus, ServerPairingResult, ServerVersionInfo, SyncStatus, ThumbnailReport } from "./types";
+import type { AnalysisProgress, AnalysisReadiness, AnalysisRunRecord, AnalysisRunReport, AnalysisRunRequest, AnalysisStage, Asset, AssetAnalysisIndexEntry, AssetAnalysisView, AssetPatch, AutoplayMode, BaselineImportResult, BaselinePreviewResult, ClipTranscript, DesktopSettings, GenerationProgress, IngestReport, LoadedCatalog, MediaOrigin, ModelInstallProgress, ModelStatus, PathAnalysis, Project, ProjectLibrary, ProjectPairingStatus, RelinkReport, RootMappingEntry, ServerConnectionStatus, ServerPairingResult, ServerVersionInfo, SyncStatus, ThumbnailReport } from "./types";
 
 const inTauri = () => "__TAURI_INTERNALS__" in window;
 
@@ -436,6 +436,21 @@ export const api = {
 
   async ingestFolder(projectId: string, path: string): Promise<IngestReport> {
     return invoke("ingest_folder", { projectId, path });
+  },
+
+  /** Asks where a volume's originals went now. Prompts for a folder; null if dismissed. */
+  async chooseRelinkFolder(volumeHint: string): Promise<string | null> {
+    if (!inTauri()) return null;
+    const path = await open({
+      directory: true,
+      multiple: false,
+      title: `Where is the footage from ${volumeHint} now?`,
+    });
+    return typeof path === "string" ? path : null;
+  },
+
+  async relinkFolder(projectId: string, path: string): Promise<RelinkReport> {
+    return invoke("relink_folder", { projectId, path });
   },
 
   async listAssets(projectId: string): Promise<Asset[]> {

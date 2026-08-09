@@ -273,6 +273,20 @@ export interface IngestReport {
   failures: Array<{ path: string; error: string }>;
 }
 
+/** The result of pointing the app at a folder to find originals it has lost track of. */
+export interface RelinkReport {
+  scanned: number;
+  /** Assets whose original was offline and now resolves again. */
+  repaired: number;
+  /** Clips found there that the project could already reach elsewhere. */
+  alreadyOnline: number;
+  /** Media in that folder belonging to no asset in this project. Counted, never imported. */
+  unrecognized: number;
+  /** Assets whose original is still not reachable anywhere after the search. */
+  stillMissing: number;
+  failures: Array<{ path: string; error: string }>;
+}
+
 export interface ThumbnailReport {
   quality: number;
   generated: number;

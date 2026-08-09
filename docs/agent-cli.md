@@ -100,6 +100,31 @@ rcdvlog --catalog /absolute/project/catalog.sqlite3 ingest \
 
 Ingest references media in place and is idempotent within a project by sampled fingerprint.
 
+Known content found somewhere new is not discarded. Ingest records the discovered
+location, and repairs the asset when its recorded original had gone offline — so
+re-running ingest against a card that remounted elsewhere reconnects it. The
+report separates `imported`, `duplicates`, and `relinked`.
+
+### Relink
+
+```bash
+rcdvlog --catalog /absolute/project/catalog.sqlite3 relink \
+  --project <project-id> --folder "/Volumes/Shuttle/Trip Footage"
+```
+
+Finds originals a project has lost track of, after the user moved footage between
+a laptop, an external drive, and a NAS. Matching is by content, never by filename
+or path — two cards legitimately both contain `C0001.MP4`.
+
+Unlike `ingest`, relink **never creates an asset**. Media in the folder belonging
+to no asset in this project is counted as `unrecognized` and left alone, so
+pointing at the wrong folder is a readable no-op rather than an import to undo.
+Emits `relink.progress` events to stderr on the same 25-asset cadence as ingest.
+
+`stillMissing` reports how many originals remain unreachable after the search,
+and offline-volume diagnostics that the search resolved are acknowledged
+automatically.
+
 ### Clips
 
 ```bash
