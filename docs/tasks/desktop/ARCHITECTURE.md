@@ -187,7 +187,7 @@ workflow, because a green badge over an unenforced gate is worse than no badge.
 ### 5.2 What CI cannot prove
 
 Per `AGENTS.md` §12, CI is not evidence for: DaVinci Resolve import, macOS
-dialogs and filesystem permission prompts, Tauri asset-protocol playback,
+dialogs and filesystem permission prompts, native media playback,
 sleep/wake, source-volume disconnect and reconnect, expo-scale NAS performance,
 or target-laptop thermal behavior. Those require the manual acceptance packets
 in this epic and are tracked as such.

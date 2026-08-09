@@ -32,7 +32,7 @@ pnpm check:docs
 
 ## What browser modes prove
 
-The desktop Vite preview at port 1420 uses in-memory mocks and is appropriate only for layout, focus, keyboard, and scrolling checks. It cannot validate Tauri commands, Keychain, asset-protocol playback, filesystem permission prompts, persistence, media processes, or sync.
+The desktop Vite preview at port 1420 uses in-memory mocks and is appropriate only for layout, focus, keyboard, and scrolling checks. It cannot validate Tauri commands, Keychain, native media playback, filesystem permission prompts, persistence, media processes, or sync.
 
 The web Playwright suite uses a real disposable server and Chrome. It does validate browser authentication, API mutation, multi-tab convergence, WebSocket loss, and polling recovery on one host. It does not validate Caddy certificates, Tailscale ACLs/routing, physical LAN latency, or NAS behavior.
 
@@ -47,7 +47,7 @@ These checks require the actual Mac/Ubuntu/NAS/LAN/Tailscale topology and remain
 - Disconnect/reconnect NAS during scan/hash/proxy; queue Mac-only work; download a proxy and review with NAS unavailable.
 - Record server CPU, RSS, throughput, temperature, and throttling on the target laptop under representative media load.
 - Repeat backup/restore in Compose and reconnect a retained Mac history.
-- Exercise macOS dialogs, filesystem permissions, native asset-protocol playback, sleep/wake, and clean-machine packaging.
+- Exercise macOS dialogs, filesystem permissions, native media playback, sleep/wake, and clean-machine packaging.
 - Run periodic thousands-of-assets/roughly-100-hour NAS acceptance. The real Expo source fixture is never an automated destructive target.
 
 The pure-Rust OTIO writer is implemented and covered by deterministic unit
