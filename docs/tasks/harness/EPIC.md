@@ -94,7 +94,7 @@ native, media, or topology gate.
 | 70 | [H01-T007](tasks/H01-T007-import-and-card-cujs.md) | Import and card CUJs | H01-T003 | complete |
 | 80 | [H01-T008](tasks/H01-T008-ipc-contract-coverage-suite.md) | IPC contract coverage suite | H01-T004, H01-T005 | complete |
 | 90 | [H01-T009](tasks/H01-T009-ci-wiring-and-documentation.md) | CI wiring and documentation reconciliation | H01-T008 | complete |
-| 100 | [H01-T010](tasks/H01-T010-browser-preview-rationalization.md) | Browser-preview rationalization | H01-T009 | draft |
+| 100 | [H01-T010](tasks/H01-T010-browser-preview-rationalization.md) | Browser-preview rationalization | H01-T009 | design_required |
 
 ### Execution note
 
@@ -144,6 +144,11 @@ last because that is a convenience refactor riding on a proven harness.
 
 The epic is promoted only when every implementation, contract, and documentation
 packet is complete. One task cycle never promotes unrelated work.
+
+**Status at the H01-T009 landing:** T001–T009 are complete; T010 is
+`design_required` with its analysis recorded in the packet. The epic is
+therefore not promoted — one fake too many still exists, even though every
+criterion below is met.
 
 Concretely, this epic is complete when:
 

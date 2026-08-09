@@ -7,7 +7,7 @@
   "epic_id": "H01",
   "title": "Browser-preview rationalization",
   "slug": "browser-preview-rationalization",
-  "status": "draft",
+  "status": "design_required",
   "task_class": "implementation",
   "depends_on": ["H01-T009"],
   "principal_invariant": "The repository holds one desktop fake-backend state machine, reached by two front doors — the Vite preview and the CUJ harness — or a recorded decision explaining why two are worth their maintenance cost.",
@@ -137,6 +137,54 @@ pnpm --dir apps/desktop test
 pnpm --dir apps/desktop check
 pnpm --dir apps/desktop build
 ```
+
+## Analysis recorded 2026-08-09 (T001–T009 complete, not yet executed)
+
+Unification is the right end state and is **not blocked by anything
+architectural**. It is blocked on one dependency edge and one thing this branch
+could not verify, both stated here so whoever picks it up starts from facts
+rather than from a survey.
+
+### What already works in its favour
+
+Installing the harness outside Tauri would flip `inTauri()` to true, so every
+`!inTauri()` branch in `api.ts` becomes unreachable the moment the preview
+installs it. The branches would not need to be *replaced* — they would need to
+be *deleted*, which is a mechanical diff against dead code rather than a
+behavior change. `chronologyApi.ts`'s empty-result branches go the same way, and
+the preview would gain the calibration and edit-plan surfaces it has never had,
+served by declared outcomes rather than by an invented solver.
+
+### The one edge that has to be cut first
+
+`DesktopHarness` imports `act` from `@testing-library/react` to wrap
+harness-initiated React updates (events, job steps, media events). A preview
+that imports the harness would drag a devDependency toward the shipped bundle.
+
+The fix is small and known: make the act wrapper injectable — a constructor
+option defaulting to a passthrough, with `renderApp` supplying the act version —
+and load the preview backend through a dynamic `import()` behind the
+`!inTauri()` check so it lands in its own chunk and never in the desktop app.
+Roughly twenty lines in `DesktopHarness.ts` and `renderApp.tsx`, plus a new
+`src/preview/` module.
+
+### Why it was not done on this branch
+
+The acceptance oracle requires the Vite preview at port 1420 to be opened and
+exercised — progress, cancel, playback states, the import modal. That is a
+visual check on a running app, and this branch had no way to perform it. Landing
+a production refactor of the preview path without ever looking at the preview
+would be the same mistake the epic exists to correct: shipping a change whose
+evidence is "the tests still pass" when the tests were never the thing at risk.
+
+### Cost of waiting
+
+Two fakes remain, and they can disagree. The risk is bounded and one-directional:
+the preview's mocks are not evidence for anything (`docs/integration-testing.md`
+says so), and the harness is now the tier that gates CI. The concrete cost is
+that a behavior change made in the harness does not reach the preview, so the
+preview drifts further from the app over time — which is an argument for doing
+this sooner rather than a reason to reopen the decision.
 
 ## Handoff
 
