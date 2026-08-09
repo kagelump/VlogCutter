@@ -3233,6 +3233,7 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "dirs",
+ "fs2",
  "hound",
  "proptest",
  "regex",

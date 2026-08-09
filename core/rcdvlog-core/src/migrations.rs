@@ -186,6 +186,12 @@ pub const PROJECT_CATALOG_MIGRATIONS: &[SqliteMigration] = &[
         source_identity: "project-catalog/0016-verified-asset-locations/20260809",
         apply: add_verified_asset_locations,
     },
+    SqliteMigration {
+        id: 17,
+        name: "archive_roots",
+        source_identity: "project-catalog/0017-archive-roots/20260809",
+        apply: add_archive_roots,
+    },
 ];
 
 pub fn migrate_project_catalog(connection: &mut Connection) -> Result<()> {
@@ -1038,6 +1044,48 @@ fn add_transcripts(transaction: &Transaction<'_>) -> Result<()> {
 ///
 /// Deliberately local and unsynced, like `analysis_labels`: a run is an event on
 /// one node, not a shared project fact.
+/// Names the places imported originals are allowed to land, so a destination can
+/// be moved without stranding what is in it.
+///
+/// An archive root is a name the user recognizes ("NAS Video", "Shuttle SSD").
+/// Its binding is where that root is mounted on this node right now. Storing an
+/// absolute path on the asset instead would recreate the offline defect at
+/// archive scale, because an external drive is itself a thing that remounts
+/// elsewhere. See `docs/tasks/import/ARCHITECTURE.md` §4.1.
+fn add_archive_roots(transaction: &Transaction<'_>) -> Result<()> {
+    transaction.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS archive_roots (
+            archive_root_id TEXT PRIMARY KEY,
+            display_name TEXT NOT NULL CHECK(length(display_name) > 0),
+            created_at TEXT NOT NULL
+        );
+
+        -- One binding per node: where this root is reachable on this machine.
+        -- Rebinding is the whole repair when an archive drive moves.
+        CREATE TABLE IF NOT EXISTS archive_root_bindings (
+            archive_root_id TEXT NOT NULL REFERENCES archive_roots(archive_root_id) ON DELETE CASCADE,
+            node_id TEXT NOT NULL,
+            local_mount_path TEXT NOT NULL CHECK(length(local_mount_path) > 0),
+            bound_at TEXT NOT NULL,
+            PRIMARY KEY(archive_root_id, node_id)
+        );
+        "#,
+    )?;
+    // A location inside an archive root is stored as root plus relative path.
+    // `local_path` stays populated as the resolved absolute path so every
+    // existing reader is unchanged, but it is derived, not authoritative.
+    for (column, definition) in [("archive_root_id", "TEXT"), ("root_relative_path", "TEXT")] {
+        add_column_if_missing(
+            transaction,
+            "project_asset_local_locations",
+            column,
+            definition,
+        )?;
+    }
+    Ok(())
+}
+
 /// Gives a node-local media location a verification state, so "the original is
 /// available" can stop meaning "some file exists at that pathname".
 ///

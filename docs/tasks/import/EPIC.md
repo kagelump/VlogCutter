@@ -88,7 +88,7 @@ or deletes source media. I01-T009 reconciles both documents.
 | ---: | --- | --- | --- | --- |
 | 10 | I01-T001 | Verified location identity and relink | — | complete |
 | 20 | I01-T002 | Offline-volume Locate… repair flow | I01-T001 | complete |
-| 30 | I01-T003 | Desktop archive roots and bindings | — | in progress |
+| 30 | I01-T003 | Desktop archive roots and bindings | — | complete |
 | 40 | I01-T004 | Removable volume detection and card session identity | — | ready |
 | 50 | I01-T005 | Ingest preflight and classification | I01-T001, I01-T004 | ready |
 | 60 | I01-T006 | Verified create-only card copy | I01-T003, I01-T005 | ready |

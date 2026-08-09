@@ -20,6 +20,7 @@ use uuid::Uuid;
 use walkdir::WalkDir;
 
 mod analysis;
+mod archive;
 mod baseline;
 mod cameras;
 mod chronology;
@@ -59,6 +60,7 @@ pub use analysis::provider::{
     ChainOutcome, DEFAULT_MODEL, FALLBACK_MODEL, MODELS, ModelSpec, ProviderChain, VlmProvider,
     VlmRequest, VlmResponse, model_spec,
 };
+pub use archive::ArchiveRoot;
 pub use batch_estimator::BatchEstimate as BatchProgressEstimate;
 
 pub use analysis::quality::DecodedSegment;
@@ -4038,7 +4040,7 @@ mod tests {
     /// of the file on disk, so location verification has something honest to
     /// compare against. Deliberately avoids `ingest_folder`, which would probe
     /// the file and require ffprobe.
-    fn insert_asset_at(catalog: &Catalog, project_id: &str, id: &str, path: &Path) {
+    pub(crate) fn insert_asset_at(catalog: &Catalog, project_id: &str, id: &str, path: &Path) {
         let size = fs::metadata(path).unwrap().len();
         let fingerprint = sampled_fingerprint(path, size).unwrap();
         catalog

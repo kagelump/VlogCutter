@@ -12,6 +12,7 @@ blake3.workspace = true
 chrono.workspace = true
 dirs.workspace = true
 chrono-tz.workspace = true
+fs2.workspace = true
 hound = "3.5"
 regex.workspace = true
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
