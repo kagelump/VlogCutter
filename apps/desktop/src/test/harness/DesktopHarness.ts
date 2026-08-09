@@ -21,6 +21,8 @@ import { analysisCommands } from "./commands/analysis";
 import { chronologyCommands } from "./commands/chronology";
 import { serverCommands } from "./commands/server";
 import { importCommands } from "./commands/import";
+import { mediaCommands } from "./commands/media";
+import { MediaController } from "./media";
 import type { Asset } from "../../types";
 
 export interface CommandLogEntry {
@@ -37,6 +39,7 @@ export const commandTable: CommandTable = mergeTables(
   chronologyCommands,
   serverCommands,
   importCommands,
+  mediaCommands,
 );
 
 /** Commands served by the event plugin rather than by a handler module. */
@@ -228,6 +231,14 @@ export class DesktopHarness {
     this.faults.clear();
   }
 
+  /**
+   * Drive the mounted media element for one clip. Real DOM events at the real
+   * element; never evidence that anything decoded.
+   */
+  media(assetId: string): MediaController {
+    return new MediaController(assetId, (action) => this.inAct(action));
+  }
+
   /** Direct state edits that read like the condition they represent. */
   asset(assetId: string) {
     const harness = this;
@@ -236,19 +247,16 @@ export class DesktopHarness {
         return requireAsset(harness.state, assetId);
       },
       setOriginalAvailable(available: boolean) {
-        const asset = requireAsset(harness.state, assetId);
-        patchAsset(harness.state, assetId, {
-          originalAvailable: available,
-          available: available || asset.proxyAvailable,
-        });
+        requireAsset(harness.state, assetId);
+        patchAsset(harness.state, assetId, { originalAvailable: available });
         return this;
       },
       setProxyAvailable(available: boolean) {
         const asset = requireAsset(harness.state, assetId);
         patchAsset(harness.state, assetId, {
           proxyAvailable: available,
-          proxyPath: available ? asset.proxyPath ?? `/Users/harness/Movies/proxies/${assetId}.mp4` : asset.proxyPath,
-          available: available || asset.originalAvailable,
+          proxyPath: available ? asset.proxyPath ?? `/Users/harness/Movies/proxies/${assetId}.v3.mp4` : asset.proxyPath,
+          proxyRepresentation: available ? asset.proxyRepresentation ?? "raw_v3" : asset.proxyRepresentation,
         });
         return this;
       },

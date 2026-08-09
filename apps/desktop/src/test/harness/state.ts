@@ -112,6 +112,8 @@ export interface DesktopHarnessState {
   archiveRoots: ArchiveRoot[];
   cards: CardCandidate[];
   imports: ImportScenarioState;
+  /** Asset ids a relink at a given folder would actually find. */
+  relinkable: Record<string, string[]>;
 
   pairing: PairingScenarioState;
   sync: Record<string, SyncStatus>;
@@ -207,6 +209,7 @@ export function createInitialState(clock: HarnessClock): DesktopHarnessState {
     archiveRoots: [],
     cards: [],
     imports: { preflights: {}, additions: {}, lastRunSourcePath: null },
+    relinkable: {},
 
     pairing: {
       serverInfo: {
@@ -275,11 +278,20 @@ export function requireAsset(state: DesktopHarnessState, assetId: unknown): Asse
   return asset;
 }
 
-/** The single write path for an asset, so no handler can forget the order list. */
+/**
+ * The single write path for an asset, so no handler can forget the order list
+ * or leave `available` disagreeing with the representations.
+ *
+ * `available` is derived here for the same reason the catalog derives it
+ * (`core/rcdvlog-core`: `let available = original_available || proxy_available`):
+ * a clip whose original is on a disconnected volume is still reviewable from
+ * its proxy, and that is the whole point of making proxies.
+ */
 export function putAsset(state: DesktopHarnessState, asset: Asset): Asset {
-  state.assets[asset.id] = asset;
-  if (!state.assetOrder.includes(asset.id)) state.assetOrder.push(asset.id);
-  return asset;
+  const stored: Asset = { ...asset, available: asset.originalAvailable || asset.proxyAvailable };
+  state.assets[stored.id] = stored;
+  if (!state.assetOrder.includes(stored.id)) state.assetOrder.push(stored.id);
+  return stored;
 }
 
 export function patchAsset(

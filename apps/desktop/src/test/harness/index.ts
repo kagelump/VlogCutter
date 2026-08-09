@@ -28,3 +28,5 @@ export {
 } from "./state";
 export type { CommandArgs, CommandHandler, CommandTable, HarnessContext } from "./registry";
 export type { JobController } from "./jobs";
+export { MediaController } from "./media";
+export type { GenerationStep, GenerationOutcome } from "./commands/media";

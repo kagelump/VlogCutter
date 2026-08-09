@@ -7,7 +7,7 @@
   "epic_id": "H01",
   "title": "Media state and generation CUJs",
   "slug": "media-state-and-generation-cujs",
-  "status": "ready",
+  "status": "complete",
   "task_class": "implementation",
   "depends_on": ["H01-T001"],
   "principal_invariant": "Proxy and thumbnail generation change per-asset availability in canonical state as each item finishes, reported counts equal the changes made, and media availability transitions are visible to the review surface without a reload.",
