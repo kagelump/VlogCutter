@@ -1407,6 +1407,29 @@ impl Catalog {
         self.get_asset(asset_id)
     }
 
+    /// Renames a camera across every clip in a project.
+    ///
+    /// The camera on an asset is a guess: `identify_camera` reads a filename
+    /// pattern and whatever EXIF survived the card, and `UNKNOWN_CAMERA` is a
+    /// routine outcome. The ribbon's lane gutter is where that guess becomes
+    /// visible, so it is also where it gets corrected.
+    ///
+    /// Written directly rather than as a typed operation, for the same reason
+    /// as `set_clip_summary`: a human edit of a derived field, not synchronized
+    /// between nodes today. Returns the number of clips moved to the new lane.
+    pub fn rename_camera(&self, project_id: &str, from: &str, to: &str) -> Result<usize> {
+        let to = to.trim();
+        if to.is_empty() {
+            bail!("a camera name cannot be empty");
+        }
+        let connection = self.connection()?;
+        let changed = connection.execute(
+            "UPDATE assets SET camera=?3 WHERE project_id=?1 AND camera=?2",
+            params![project_id, from, to],
+        )?;
+        Ok(changed)
+    }
+
     /// Per-clip analysis facts the queue needs for every clip at once.
     ///
     /// The review queue filters on transcript text and flags unusable clips, so
@@ -3834,6 +3857,63 @@ mod tests {
                 ],
             )
             .unwrap();
+    }
+
+    #[test]
+    fn rename_camera_moves_only_the_named_lane_in_the_named_project() {
+        let (_directory, catalog, project) = catalog_fixture();
+        let other = catalog.create_project("Another trip").unwrap();
+        for (id, camera) in [("a1", UNKNOWN_CAMERA), ("a2", UNKNOWN_CAMERA), ("a3", "GoPro")] {
+            insert_asset(
+                &catalog,
+                &project.id,
+                id,
+                &format!("{id}.MP4"),
+                camera,
+                "2026-04-01T09:00:00Z",
+                Path::new("/volumes/nas/clip.MP4"),
+            );
+        }
+        insert_asset(
+            &catalog,
+            &other.id,
+            "b1",
+            "b1.MP4",
+            UNKNOWN_CAMERA,
+            "2026-04-01T09:00:00Z",
+            Path::new("/volumes/nas/other.MP4"),
+        );
+
+        let changed = catalog
+            .rename_camera(&project.id, UNKNOWN_CAMERA, "  DJI Pocket 3  ")
+            .unwrap();
+
+        assert_eq!(changed, 2);
+        let cameras = |id: &str| catalog.get_asset(id).unwrap().camera;
+        assert_eq!(cameras("a1"), "DJI Pocket 3", "trims the typed name");
+        assert_eq!(cameras("a2"), "DJI Pocket 3");
+        assert_eq!(cameras("a3"), "GoPro", "another lane is untouched");
+        assert_eq!(
+            cameras("b1"),
+            UNKNOWN_CAMERA,
+            "the same lane in another project is untouched"
+        );
+    }
+
+    #[test]
+    fn rename_camera_refuses_an_empty_name() {
+        let (_directory, catalog, project) = catalog_fixture();
+        insert_asset(
+            &catalog,
+            &project.id,
+            "a1",
+            "a1.MP4",
+            "GoPro",
+            "2026-04-01T09:00:00Z",
+            Path::new("/volumes/nas/clip.MP4"),
+        );
+        assert!(catalog.rename_camera(&project.id, "GoPro", "   ").is_err());
+        assert_eq!(catalog.get_asset("a1").unwrap().camera, "GoPro");
     }
 
     #[test]

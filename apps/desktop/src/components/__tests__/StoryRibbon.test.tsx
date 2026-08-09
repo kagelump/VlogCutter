@@ -40,6 +40,7 @@ function renderRibbon(overrides: Partial<StoryRibbonProps> = {}) {
     onCenter: vi.fn(),
     onSelect: vi.fn(),
     onToggleCollapsed: vi.fn(),
+    onRenameCamera: vi.fn(),
     ...overrides,
   };
   return { props, ...render(<StoryRibbon {...props} />) };
@@ -100,6 +101,47 @@ describe("adaptive lanes", () => {
     const segment = container.querySelector(".context-segment")!;
     expect(segment.textContent).toContain(" · ");
     expect(segment.querySelector("strong")?.textContent).toBeTruthy();
+  });
+});
+
+describe("renaming a camera", () => {
+  async function openLaneEditor(name: string) {
+    const rendered = renderRibbon();
+    await userEvent.click(screen.getByRole("button", { name: new RegExp(`^${name}$`) }));
+    return { ...rendered, field: screen.getByRole("textbox", { name: `Rename camera ${name}` }) };
+  }
+
+  it("commits the new name on Enter", async () => {
+    const { props, field } = await openLaneEditor("Sony");
+    await userEvent.clear(field);
+    await userEvent.type(field, "A7S III{Enter}");
+    expect(props.onRenameCamera).toHaveBeenCalledWith("Sony", "A7S III");
+  });
+
+  it("commits on blur, so clicking away does not lose the edit", async () => {
+    const { props, field } = await openLaneEditor("DJI");
+    await userEvent.clear(field);
+    await userEvent.type(field, "Pocket 3");
+    await userEvent.tab();
+    expect(props.onRenameCamera).toHaveBeenCalledWith("DJI", "Pocket 3");
+  });
+
+  it("abandons the edit on Escape", async () => {
+    const { props, field } = await openLaneEditor("Sony");
+    await userEvent.clear(field);
+    await userEvent.type(field, "typo{Escape}");
+    expect(props.onRenameCamera).not.toHaveBeenCalled();
+    expect(screen.getByRole("button", { name: /^Sony$/ })).toBeTruthy();
+  });
+
+  it("writes nothing when the name is unchanged or blank", async () => {
+    const { props, field } = await openLaneEditor("Sony");
+    await userEvent.type(field, "{Enter}");
+    await userEvent.click(screen.getByRole("button", { name: /^Sony$/ }));
+    const reopened = screen.getByRole("textbox", { name: "Rename camera Sony" });
+    await userEvent.clear(reopened);
+    await userEvent.type(reopened, "   {Enter}");
+    expect(props.onRenameCamera).not.toHaveBeenCalled();
   });
 });
 

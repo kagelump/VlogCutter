@@ -526,6 +526,24 @@ export const api = {
     return invoke("set_clip_summary", { assetId, title, description });
   },
 
+  /// Renames a camera across a whole project. The camera on an asset is a guess
+  /// from the filename and EXIF, so the ribbon's lane gutter lets you correct
+  /// it. Returns the number of clips that moved lanes.
+  async renameCamera(projectId: string, from: string, to: string): Promise<number> {
+    const next = to.trim();
+    if (!next) throw new Error("A camera name cannot be empty");
+    if (!inTauri()) {
+      let changed = 0;
+      mockAssets = mockAssets.map((asset) => {
+        if (asset.projectId !== projectId || asset.camera !== from) return asset;
+        changed += 1;
+        return { ...asset, camera: next };
+      });
+      return changed;
+    }
+    return invoke("rename_camera", { projectId, from, to: next });
+  },
+
   async projectAnalysisIndex(projectId: string): Promise<AssetAnalysisIndexEntry[]> {
     if (!inTauri()) {
       return mockAssets.map((asset) => ({

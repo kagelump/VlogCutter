@@ -884,6 +884,19 @@ fn set_clip_summary(
 }
 
 #[tauri::command]
+fn rename_camera(
+    project_id: String,
+    from: String,
+    to: String,
+    state: State<'_, AppState>,
+) -> Result<usize, String> {
+    state
+        .catalog()?
+        .rename_camera(&project_id, &from, &to)
+        .map_err(error_message)
+}
+
+#[tauri::command]
 fn project_analysis_index(
     project_id: String,
     state: State<'_, AppState>,
@@ -1638,6 +1651,7 @@ pub fn run() {
             analysis_runs,
             project_analysis_index,
             set_clip_summary,
+            rename_camera,
             asset_transcript,
             asset_analysis,
             model_status,

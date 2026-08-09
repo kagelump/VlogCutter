@@ -1029,6 +1029,23 @@ function App() {
     setPlaybackSeconds(video.currentTime);
   }
 
+  // The lane gutter corrects a camera guess for every clip that shares it, so
+  // the whole queue is refreshed rather than a single asset replaced.
+  async function renameCamera(from: string, to: string) {
+    if (!projectId || busy) return;
+    setBusy(true);
+    setError("");
+    try {
+      const moved = await api.renameCamera(projectId, from, to);
+      await refreshAssets(projectId);
+      setMessage(`Renamed ${from} to ${to} on ${moved} ${moved === 1 ? "clip" : "clips"}`);
+    } catch (reason) {
+      setError(String(reason));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function makeMissingThumbnails() {
     if (!projectId || busy) return;
     setShowMediaMenu(false);
@@ -1529,6 +1546,7 @@ function App() {
           onCenter={() => centerSelectedInChronology()}
           onSelect={setSelectedId}
           onToggleCollapsed={() => dispatchView({ kind: "toggleRibbon" })}
+          onRenameCamera={(from, to) => { void renameCamera(from, to); }}
         />
       </footer>
       )}

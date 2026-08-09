@@ -1,3 +1,4 @@
+import { useState } from "react";
 import type { CSSProperties, RefObject } from "react";
 import type { Asset } from "../types";
 import {
@@ -45,6 +46,8 @@ export interface StoryRibbonProps {
   onCenter(): void;
   onSelect(id: string): void;
   onToggleCollapsed(): void;
+  /** Corrects the camera identification for every clip in a lane. */
+  onRenameCamera(from: string, to: string): void;
 }
 
 /**
@@ -69,7 +72,20 @@ export function StoryRibbon({
   onCenter,
   onSelect,
   onToggleCollapsed,
+  onRenameCamera,
 }: StoryRibbonProps) {
+  // The lane whose name is being corrected, and the draft. Only one at a time:
+  // the gutter is 96px, so a second open field would have nowhere to go.
+  const [editingLane, setEditingLane] = useState<string | null>(null);
+  const [laneDraft, setLaneDraft] = useState("");
+
+  // Enter and blur both commit, so a rename survives clicking away. An empty or
+  // unchanged draft closes the field without a write.
+  function commitLaneRename(camera: string) {
+    const next = laneDraft.trim();
+    setEditingLane(null);
+    if (next && next !== camera) onRenameCamera(camera, next);
+  }
   // Merged draws one lane holding every clip; otherwise one lane per camera.
   const laneRows: Array<[string, Asset[]]> = merged ? [["", assets]] : lanes;
   // A dragged height wins over the content height, and the lane stack scrolls
@@ -122,10 +138,40 @@ export function StoryRibbon({
       </div>
       {collapsed ? null : laneRows.length > 0 ? (
         <div className="story-map">
-          <div className="story-labels" aria-hidden="true" style={{ gridTemplateRows: `20px 14px ${ribbonLaneRows(laneRows.length)}` }}>
-            <span className="context-label">Context</span>
-            <span className="order-label">Order</span>
-            {merged ? null : lanes.map(([camera]) => <span className="lane-name" title={camera} key={camera}>{camera}</span>)}
+          <div className="story-labels" style={{ gridTemplateRows: `20px 14px ${ribbonLaneRows(laneRows.length)}` }}>
+            <span className="context-label" aria-hidden="true">Context</span>
+            <span className="order-label" aria-hidden="true">Order</span>
+            {/* The gutter is interactive, so it cannot be aria-hidden wholesale
+                the way the tracks are. */}
+            {merged ? null : lanes.map(([camera]) => (
+              <span className="lane-name" key={camera}>
+                {editingLane === camera ? (
+                  <input
+                    className="lane-name-field"
+                    autoFocus
+                    value={laneDraft}
+                    aria-label={`Rename camera ${camera}`}
+                    onChange={(event) => setLaneDraft(event.target.value)}
+                    onBlur={() => {
+                      commitLaneRename(camera);
+                    }}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter") commitLaneRename(camera);
+                      else if (event.key === "Escape") setEditingLane(null);
+                    }}
+                  />
+                ) : (
+                  <button
+                    className="lane-name-button"
+                    title={`${camera} — click to rename`}
+                    onClick={() => {
+                      setLaneDraft(camera);
+                      setEditingLane(camera);
+                    }}
+                  >{camera}</button>
+                )}
+              </span>
+            ))}
           </div>
           <div
             className="story-scroll"

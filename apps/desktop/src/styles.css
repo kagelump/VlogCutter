@@ -1,5 +1,11 @@
 :root {
   font-family: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  /* The base every unsized element falls back to. It used to be the browser
+     default of 16px, which is off the top of the type scale: the wordmark, the
+     project switcher and the slate copy all rendered a step and a half larger
+     than anything sized on purpose, and the switcher clipped its own project
+     name. 13px is the scale's body size, so unsized text now matches sized. */
+  font-size: 13px;
   color: #edf1f2;
   background: #111518;
   font-synthesis: none;
@@ -155,6 +161,9 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
    right height and a fixed row would clip it. */
 .app-shell.is-focus { grid-template-rows: 36px minmax(0, 1fr) auto; }
 .app-shell.is-focus .queue-panel,
+/* The splitters go with the panels they resize: left behind in a one-column
+   grid they become rows, and each takes 5px off the frame. */
+.app-shell.is-focus .workbench > .splitter,
 .app-shell.is-focus .mode-switcher,
 .app-shell.is-focus .wordmark,
 .app-shell.is-focus .project-switcher,
@@ -272,18 +281,24 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .judgment-panel {
   min-height: 0;
   display: grid;
-  /* The chip well is the flexible row and the only one. Everything above the
-     notes field is fixed, so the field keeps both its height and its distance
-     from the top of the panel however tall the rail is — rule 3 holds while
-     the panel is still user-resizable.
+  /* Notes takes the spare room and the chip well gives it up. Everything above
+     the notes field is fixed, so it keeps its distance from the top of the
+     panel — rule 3 — and its height answers to the window rather than to how
+     many chips a clip carries.
 
-     It also absorbs the slack that used to sit as dead space: a fixed 120px
-     well left ~98px empty under two rows of chips, and align-content: start
-     left another ~56px below the suggestion strip. */
-  grid-template-rows: 32px 18px 400px 18px 28px minmax(48px, 1fr) auto;
+     The chip well held the 1fr before this, which put every spare pixel in the
+     rail under the labels as dead space — ~350px of it on a tall window.
+
+     Both flexible rows can be squeezed to nothing, in that order, because the
+     alternative is what this panel did on a short window: the fixed rows
+     overflowed a box with `overflow: hidden` and the suggestion strip was
+     silently cut off the bottom with no way to scroll to it. Below ~300px even
+     that is not enough, and then the rail scrolls rather than hiding a row. */
+  grid-template-rows: 32px 18px minmax(120px, 1fr) 18px 28px minmax(0, 96px) auto;
   gap: 4px 0;
   padding: 12px 12px 16px;
-  overflow: hidden;
+  overflow-x: hidden;
+  overflow-y: auto;
   background: var(--panel);
   border-left: 1px solid var(--line);
 }
@@ -302,7 +317,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 
 /* The only 15px in the application. The hierarchy is stated in the type
    scale rather than in chrome. */
-.notes-field { width: 100%; height: 400px; resize: none; padding: 12px; color: var(--ink); background: var(--graphite); border: 1px solid var(--line); border-radius: 3px; font: 15px/22px inherit; }
+.notes-field { width: 100%; height: 100%; resize: none; padding: 12px; color: var(--ink); background: var(--graphite); border: 1px solid var(--line); border-radius: 3px; font: 15px/22px inherit; }
 .notes-field::placeholder { color: #566168; }
 .notes-field:focus { outline: none; border-color: var(--amber); }
 
@@ -310,6 +325,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .label-field::placeholder { color: #566168; }
 .label-field:focus { outline: none; border-color: var(--amber); }
 
+/* Fixed and scrolling: a growing well would eat the notes field above it. */
 .chip-well { display: flex; flex-wrap: wrap; align-content: start; gap: 4px; min-height: 0; overflow-y: auto; }
 .chip-well button { display: inline-flex; align-items: center; gap: 6px; max-width: 100%; height: 22px; padding: 0 6px 0 8px; color: #e4c99f; background: #332719; border: 0; border-radius: 3px; cursor: pointer; font-size: 12px; }
 .chip-well button:hover { color: #fff0d6; }
@@ -353,16 +369,23 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 
 /* The ribbon left this column for the shell's third row: full width it sees
    1440px instead of ~863px, and the video no longer pays 244px for it. */
-.story-ribbon { position: relative; min-width: 0; overflow: hidden; border-top: 1px solid var(--line); }
-.story-ribbon > .splitter-horizontal { position: absolute; top: 0; right: 0; left: 0; }
+/* The padding is what the absolutely-positioned splitter sits in. Without it
+   the drag handle overlapped the heading beneath it, and "Story ribbon" and
+   its keycap were drawn half under a 5px bar. */
+.story-ribbon { position: relative; min-width: 0; padding-top: 3px; overflow: hidden; border-top: 1px solid var(--line); }
+.story-ribbon > .splitter-horizontal { position: absolute; top: 0; right: 0; left: 0; height: 3px; }
 
 .panel-heading { display: flex; justify-content: space-between; align-items: end; gap: 8px; padding: 18px 14px 11px; }
 /* The title yields to the view toggles rather than pushing them out of the
    panel: with both Unusable and Removed present there is no room for a fixed
    title width. */
 .panel-heading > div:first-child { min-width: 0; }
-.panel-heading h1 { margin: 3px 0 0; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 17px; letter-spacing: -.025em; }
-.eyebrow, .section-label { display: block; color: var(--muted); font: 11px/14px ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: .13em; text-transform: uppercase; }
+/* 13px rather than 17: the project name is long and the column is 300px, so
+   the larger size only bought a longer ellipsis. */
+.panel-heading h1 { margin: 3px 0 0; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; letter-spacing: -.025em; }
+/* Two words, one line: the queue's heading column is narrow enough that
+   "Label queue" wrapped and pushed the project name down a row. */
+.eyebrow, .section-label { display: block; color: var(--muted); font: 11px/14px ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: .13em; text-transform: uppercase; white-space: nowrap; }
 .count-badge { min-width: 27px; padding: 3px 6px; color: var(--muted); background: #101417; border: 1px solid var(--line); border-radius: 10px; text-align: center; font: 10px/1.2 ui-monospace, SFMono-Regular, Menlo, monospace; }
 .queue-heading-actions { display: flex; flex: none; align-items: center; gap: 8px; }
 .queue-view-toggle { padding: 3px 6px; color: var(--quiet); background: transparent; border: 0; border-bottom: 1px solid #465158; cursor: pointer; font-size: 11px; }
@@ -435,8 +458,12 @@ kbd { padding: 2px 4px; color: #a8b1b6; background: #262d32; border: 1px solid #
 .viewer-time span { color: #657177; }
 .viewer-buffering { position: absolute; z-index: 3; top: 11px; left: 50%; display: flex; align-items: center; gap: 6px; padding: 5px 8px; color: #cbd3d6; background: rgba(15,19,21,.86); border: 1px solid rgba(95,106,112,.55); border-radius: 4px; font: 10px/12px ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: .08em; text-transform: uppercase; transform: translateX(-50%); pointer-events: none; }
 .viewer-buffering span { width: 5px; height: 5px; background: var(--amber); border-radius: 50%; animation: pulse 900ms ease-in-out infinite; }
+/* WKWebView matches only the prefixed selector, and a selector list is dropped
+   whole when one of its parts does not parse — so these stay separate rules. */
 .viewer-stage:fullscreen { width: 100vw; height: 100vh; background: #050607; }
 .viewer-stage:fullscreen .viewer-controls { right: 18px; bottom: 16px; left: 18px; }
+.viewer-stage:-webkit-full-screen { width: 100vw; height: 100vh; background: #050607; }
+.viewer-stage:-webkit-full-screen .viewer-controls { right: 18px; bottom: 16px; left: 18px; }
 
 .timecode { color: #c7cfd2; font: 11px/1 ui-monospace, SFMono-Regular, Menlo, monospace; }
 
@@ -462,7 +489,15 @@ kbd { padding: 2px 4px; color: #a8b1b6; background: #262d32; border: 1px solid #
 .story-labels { position: relative; z-index: 2; display: grid; overflow: hidden; background: #111619; border-right: 1px solid var(--line-strong); }
 .story-labels > span { min-width: 0; display: flex; align-items: center; overflow: hidden; padding: 0 8px; border-bottom: 1px solid #20272b; text-overflow: ellipsis; white-space: nowrap; }
 .context-label, .order-label { color: #748087; font: 10px/12px ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: .1em; text-transform: uppercase; }
-.story-labels .lane-name { color: var(--muted); font: 11px/14px ui-monospace, SFMono-Regular, Menlo, monospace; }
+/* The camera is a guess made from the filename and whatever EXIF survived the
+   card, so the gutter that displays it is also where it gets corrected: click
+   the name to edit it, Enter or blur to commit, Escape to abandon. */
+.story-labels .lane-name { padding: 0; color: var(--muted); font: 11px/14px ui-monospace, SFMono-Regular, Menlo, monospace; }
+.lane-name-button, .lane-name-field { width: 100%; min-width: 0; height: 100%; padding: 0 8px; font: inherit; }
+.lane-name-button { overflow: hidden; color: inherit; background: transparent; border: 0; border-bottom: 1px solid transparent; cursor: text; text-align: left; text-overflow: ellipsis; white-space: nowrap; }
+.lane-name-button:hover { color: var(--ink); border-bottom-color: var(--line-strong); }
+.lane-name-field { color: var(--ink); background: var(--graphite); border: 1px solid var(--amber); border-radius: 3px; }
+.lane-name-field:focus { outline: none; }
 .story-scroll { min-width: 0; overflow-x: auto; overflow-y: hidden; overscroll-behavior-x: contain; scrollbar-color: #48535a #111619; scrollbar-width: thin; }
 .story-scroll::-webkit-scrollbar { height: 8px; }
 .story-scroll::-webkit-scrollbar-track { background: #111619; }
@@ -599,17 +634,10 @@ kbd { padding: 2px 4px; color: #a8b1b6; background: #262d32; border: 1px solid #
   .workbench { grid-template-columns: 260px minmax(400px, 1fr) 340px; }
 }
 
-/* A 13" MBA at a scaled resolution can be 800px tall, where the panel's fixed
-   stack would overflow by ~79px. Notes stays the largest element and keeps its
-   position; it and the chip well give up the difference so the rail still does
-   not scroll. */
-/* A 13" MBA at a scaled resolution can be 800px tall, where the fixed part of
-   the stack alone would overflow. Notes stays the largest element and keeps
-   its position; it gives up the difference. */
-@media (max-height: 860px) {
-  .judgment-panel { grid-template-rows: 32px 18px 320px 18px 28px minmax(40px, 1fr) auto; }
-  .notes-field { height: 320px; }
-}
+/* A 13" MBA at a scaled resolution can be 800px tall. Nothing to declare here
+   any more: notes and the chip well are both flexible, so they give up the
+   difference on their own at every height, which is what the two fixed
+   variants this rule used to swap between could not do. */
 
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; }
@@ -876,22 +904,9 @@ kbd { padding: 2px 4px; color: #a8b1b6; background: #262d32; border: 1px solid #
   text-transform: uppercase;
 }
 
-/* The title is the clip's name now, so it reads as a heading until focused. */
-.clip-title-field {
-  width: 100%;
-  margin: 7px 0 3px;
-  padding: 2px 0;
-  color: var(--ink);
-  background: transparent;
-  border: 0;
-  border-bottom: 1px solid transparent;
-  font-size: 21px;
-  font-weight: 600;
-  letter-spacing: -.03em;
-}
-.clip-title-field::placeholder { color: var(--muted); font-weight: 500; }
-.clip-title-field:hover { border-bottom-color: var(--line); }
-.clip-title-field:focus { outline: none; border-bottom-color: var(--amber); }
+/* The clip title is styled once, beside the rest of the judgment panel. A
+   second block here used to override it to 21px — off the top of the scale for
+   a field 400px wide, where it clipped its own value mid-word. */
 
 .description-field {
   min-height: 68px;
