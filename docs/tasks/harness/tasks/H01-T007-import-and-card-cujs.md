@@ -7,7 +7,7 @@
   "epic_id": "H01",
   "title": "Import and card CUJs",
   "slug": "import-and-card-cujs",
-  "status": "draft",
+  "status": "ready",
   "task_class": "implementation",
   "depends_on": ["H01-T003"],
   "principal_invariant": "The card-import journey — detect, preflight, choose a destination, run, and review the result — is exercised through the production commands, and a completed import adds exactly the clips its preflight classified as new.",
