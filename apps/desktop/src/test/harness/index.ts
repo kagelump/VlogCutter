@@ -1,7 +1,7 @@
 export { DesktopHarness, commandTable, EVENT_COMMANDS, type CommandLogEntry } from "./DesktopHarness";
 export { desktopScenario, ScenarioBuilder, type ScenarioOptions } from "./scenario";
 export { HarnessClock } from "./clock";
-export { renderApp, settle, queueFilenames, type BootedApp } from "./renderApp";
+export { renderApp, settle, queueFilenames, queueHeadlines, queueRows, selectedRow, type BootedApp } from "./renderApp";
 export {
   buildAnalysis,
   buildArchiveRoot,
