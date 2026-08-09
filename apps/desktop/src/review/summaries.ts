@@ -18,6 +18,7 @@ export const transcriptStatusLabels: Record<TranscriptStatus, string> = {
 
 export function formatBytes(bytes: number) {
   if (bytes < 1_000_000_000) return `${(bytes / 1_000_000).toFixed(0)} MB`;
+  if (bytes >= 1_000_000_000_000) return `${(bytes / 1_000_000_000_000).toFixed(1)} TB`;
   return `${(bytes / 1_000_000_000).toFixed(1)} GB`;
 }
 

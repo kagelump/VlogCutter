@@ -58,6 +58,8 @@ export interface DesktopSettings {
   lastProjectId: string | null;
   lastAssetId: string | null;
   lastContextUpdatedAt: string | null;
+  makeProxiesOnImport: boolean;
+  lastImportArchiveRootId: string | null;
   pairedServerNodeId?: string | null;
   pairedServerEndpoint?: string | null;
   pairedServerLabel?: string | null;
@@ -271,6 +273,100 @@ export interface IngestReport {
   /** Clips already in the project whose original was offline and has now been found again here. */
   relinked: number;
   failures: Array<{ path: string; error: string }>;
+}
+
+export interface CardCandidate {
+  sessionId: string;
+  label: string;
+  mountPath: string;
+  cameraHint: string;
+  clipCount: number;
+  totalBytes: number;
+}
+
+export interface ArchiveRoot {
+  id: string;
+  displayName: string;
+  localMountPath: string | null;
+  available: boolean;
+  availableBytes: number | null;
+  createdAt: string;
+}
+
+export type ImportClassification =
+  | "new"
+  | "knownVerified"
+  | "knownRelinkable"
+  | "knownMissingProxy"
+  | "pathCollision"
+  | "unreadable";
+
+export interface PreflightItem {
+  path: string;
+  relativePath: string;
+  filename: string;
+  sizeBytes: number;
+  classification: ImportClassification;
+  assetId: string | null;
+  error: string;
+}
+
+export interface ImportDestination {
+  copies: boolean;
+  archiveRoot: ArchiveRoot | null;
+  resolvedPath: string;
+  summary: string;
+  bytesToCopy: number;
+  availableBytes: number | null;
+  ready: boolean;
+  blockedReason: string;
+}
+
+export interface ImportPreflight {
+  sourcePath: string;
+  card: CardCandidate | null;
+  destination: ImportDestination;
+  scanned: number;
+  newClips: number;
+  knownClips: number;
+  relinkable: number;
+  missingProxies: number;
+  collisions: number;
+  unreadable: number;
+  items: PreflightItem[];
+}
+
+export type ImportStage = "scanning" | "copying" | "reading" | "proxies" | "complete";
+
+export interface ImportProgress {
+  stage: ImportStage;
+  completed: number;
+  total: number;
+  currentFile: string;
+  completedBytes: number;
+  totalBytes: number;
+}
+
+export interface ImportOutcome {
+  imported: number;
+  relinked: number;
+  skipped: number;
+  copied: number;
+  bytesCopied: number;
+  cancelled: boolean;
+  failures: Array<{ path: string; error: string }>;
+}
+
+export interface ProxyReport {
+  generated: number;
+  skipped: number;
+  cancelled: boolean;
+  failures: Array<{ path: string; error: string }>;
+}
+
+export interface ImportRunReport {
+  outcome: ImportOutcome;
+  proxies: ProxyReport | null;
 }
 
 /** The result of pointing the app at a folder to find originals it has lost track of. */

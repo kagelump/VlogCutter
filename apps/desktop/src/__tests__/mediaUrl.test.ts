@@ -20,6 +20,8 @@ const settings = (mediaOrigin: MediaOrigin | null): DesktopSettings => ({
   lastProjectId: null,
   lastAssetId: null,
   lastContextUpdatedAt: null,
+  makeProxiesOnImport: true,
+  lastImportArchiveRootId: null,
   mediaOrigin,
 });
 

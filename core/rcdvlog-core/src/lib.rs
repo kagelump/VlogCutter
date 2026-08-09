@@ -69,7 +69,8 @@ pub use cards::{
     CardCandidate, MountedVolumes, VolumeSource, card_session_slug, detect_cards, inspect_card,
 };
 pub use preflight::{
-    Classification, ImportDestination, ImportPreflight, PreflightItem, human_bytes,
+    Classification, ImportDestination, ImportOutcome, ImportPreflight, ImportProgress, ImportStage,
+    PreflightItem, human_bytes,
 };
 
 pub use analysis::quality::DecodedSegment;

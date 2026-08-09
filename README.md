@@ -1,8 +1,8 @@
 # RCD VlogCutter
 
-RCD VlogCutter is a local-first, single-user footage labeling system. The macOS desktop references immutable originals on NAS, removable storage, or local disk and remains fully useful offline. An optional private Ubuntu companion server adds a global media library, durable scans/media jobs, operation-based project synchronization, shared representations, Chrome review/admin, and verified backups.
+RCD VlogCutter is a local-first, single-user footage labeling system. The macOS desktop references immutable originals on NAS or local disk, and its explicit card workflow copies from read-only removable media into a named create-only archive root. It remains fully useful offline. An optional private Ubuntu companion server adds a global media library, durable scans/media jobs, operation-based project synchronization, shared representations, Chrome review/admin, and verified backups.
 
-The current product supports desktop project creation/opening, ingest, metadata probing, labels, notes, reversible removal, thumbnails, H.264 proxies, operation-backed chronology facts and deterministic solving, durable diagnostics, versioned edit plans, low-resolution preview generation, deterministic OTIO writing, a stable JSON CLI, server project adoption/sync, browser review/annotation, storage/job administration, and recovery diagnostics. The expanded chronology and edit-plan desktop workflows remain partial; edit-plan CLI commands, Resolve import acceptance, AI analysis, original upload, and the planned travel-ingest archive are not implemented.
+The current product supports desktop project creation/opening, preflighted card import and reference-in-place folder ingest, verified media locations and archive-root rebinding, metadata probing, labels, notes, reversible removal, thumbnails, H.264 proxies, local transcription and bounded cloud clip analysis, operation-backed chronology facts and deterministic solving, durable diagnostics, versioned edit plans, low-resolution preview generation, deterministic OTIO writing, a stable JSON CLI, server project adoption/sync, browser review/annotation, storage/job administration, and recovery diagnostics. The expanded chronology and edit-plan desktop workflows remain partial; edit-plan CLI commands, Resolve import acceptance, and the planned travel-ingest archive are not implemented.
 
 ## Prerequisites
 
@@ -70,4 +70,4 @@ Commands emit one JSON success envelope on stdout or one JSON error envelope on 
 - [Batch ETA semantics](docs/batch-estimation.md)
 - [Integration and manual acceptance boundaries](docs/integration-testing.md)
 
-Originals are immutable. Never move, rename, rewrite, or delete source media, and never copy live SQLite/WAL files between nodes.
+Originals are immutable. Never move, rename, rewrite, or delete source media. The removable-card workflow only creates new verified archive copies and never overwrites them. Never copy live SQLite/WAL files between nodes.

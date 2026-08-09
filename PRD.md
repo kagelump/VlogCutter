@@ -895,7 +895,10 @@ This keeps domain behavior identical across the desktop and CLI while minimizing
 ## 22.2 Source-of-truth rules
 
 * SQLite is canonical for catalog, project, chronology, annotation, job, and revision state.
-* Originals are immutable and referenced in place.
+* Originals are immutable. Non-removable sources are referenced in place. The
+  accepted removable-card workflow may copy from a read-only card into a named
+  create-only archive root; it never moves, rewrites, renames, deletes, or
+  overwrites original media.
 * Generated representations are disposable, versioned cache artifacts.
 * Workspace files are stable projections or versioned inputs, not an independent competing database.
 * Importing a changed workspace artifact requires explicit validation and creates a new revision.
@@ -1183,7 +1186,7 @@ The following decisions were accepted for the MVP on 2026-07-18.
 
 4. **Source formats:** actual Sony, DJI, iPhone, and Insta360 files form the acceptance set. H.264/H.265 MP4/MOV at up to 4K/60 are the baseline; other ffprobe-readable formats are best effort with explicit per-file errors.
 
-5. **Proxy storage:** originals remain on NAS or removable storage; proxies live on the laptop until project completion. Review, notes, search, and chronology should work offline from proxies whenever possible. MVP cleanup is explicit rather than automatic eviction.
+5. **Proxy storage:** originals remain on NAS or local storage; footage on a removable camera card is copied into a named archive root before the card disappears. Proxies live on the laptop until project completion. Review, notes, search, and chronology should work offline from proxies whenever possible. MVP cleanup is explicit rather than automatic eviction.
 
 6. **Trip time:** a datetime. The core stores normalized RFC 3339 datetimes and preserves raw camera timestamp text. Camera/timezone change events apply a fixed offset to a contiguous filename range; local display can be derived later from trip context.
 
@@ -1207,13 +1210,25 @@ The following decisions were accepted for the MVP on 2026-07-18.
 
 16. **Trip-context boundaries (accepted 2026-08-09):** ribbon-created trip phases are anchored to specific clips, inclusive at both ends. The phase follows those clip identities when later camera chronology corrections change solved order. Fixed UTC bounds remain supported for existing and explicitly time-based phases; story beats remain a separate unresolved range model.
 
+17. **Removable-card import (accepted 2026-08-09):** removable cards are
+    read-only sources copied by the desktop into a named create-only archive
+    root after a non-mutating, project-scoped preflight. Non-removable folders
+    remain referenced in place. Copy verification uses full-file BLAKE3;
+    identity/relink uses the sampled fingerprint. Archive relocation is one
+    logical-root rebind. The app never formats, deletes, or claims a card is
+    safe to erase. See `docs/tasks/import/ARCHITECTURE.md`.
+
 ## 25.2 Remaining reversible workflow questions
 
 1. **Is CLI plus workspace access sufficient for Claude and Codex?** Or is an MCP server required later? Proposed MVP behavior: CLI and files only; reads and version-creating writes are allowed, while activation and destructive changes require explicit revision checks.
 
 2. **Is lexical search sufficient for the MVP?** Proposed MVP behavior: filename and notes filtering first; SQLite FTS can follow after the review loop is validated.
 
-3. **What should happen when the same physical media is available at multiple paths?** Proposed MVP behavior: retain the first ingested location, deduplicate within a project by sampled fingerprint, and add explicit relinking after the main loop is validated.
+3. **Resolved 2026-08-09 — same physical media at multiple paths:** retain
+   multiple verified node-local locations, prefer a verified reachable
+   location, and repair an offline asset when its sampled fingerprint is found
+   elsewhere. Paths remain node-local and are never synchronized as project
+   operations.
 
 4. **How are events and chapters created?** Proposed MVP behavior: defer both. Notes and chronological order are sufficient for the first workflow validation.
 

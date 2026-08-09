@@ -8,6 +8,7 @@ The repository uses real process, SQLite, HTTP, browser, and media-tool boundari
 | --- | --- |
 | Rust workspace | Migrations, catalog/domain operations, sync/conflicts, storage identity, scans, jobs, representations, auth/security, backup/restore, health, and diagnostics |
 | Desktop CLI processes | Stable JSON stdout/stderr, explicit catalogs, WAL reads, real FFmpeg ingest/metadata/dedup, labels/notes/removal/clock, thumbnails/proxies, and offline-original review |
+| Card-import domain/UI | Preflight purity and classification, removable-card identity, create-only atomic copy, full-file verification, cancellation/resume, archive-root remount, modal destination/capacity blocking, and review-only card banner |
 | Independent server processes | Separate Mac/server SQLite files, real authenticated HTTP baseline/reconcile, duplicate delivery, browser-origin mutation, restart, and restore sequence recovery |
 | Web unit/build | Typed client integration, loading/error/empty states, library/project review, annotations, and administration |
 | Chrome Playwright | Local-only bootstrap login, admin mutation, concurrent same-origin tabs, and durable 5-second polling when one WebSocket is disabled |
@@ -48,6 +49,11 @@ These checks require the actual Mac/Ubuntu/NAS/LAN/Tailscale topology and remain
 - Record server CPU, RSS, throughput, temperature, and throttling on the target laptop under representative media load.
 - Repeat backup/restore in Compose and reconnect a retained Mac history.
 - Exercise macOS dialogs, filesystem permissions, native media playback, sleep/wake, and clean-machine packaging.
+- Insert one real camera card twice with additional footage between insertions;
+  prove only the added clips copy on the second pass. Relocate the resulting
+  archive between two physical volumes, rebind it once, and prove every asset
+  resolves while the card and both archive trees remain byte/metadata
+  unchanged except for newly created destination files.
 - Run periodic thousands-of-assets/roughly-100-hour NAS acceptance. The real Expo source fixture is never an automated destructive target.
 
 The pure-Rust OTIO writer is implemented and covered by deterministic unit

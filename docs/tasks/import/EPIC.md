@@ -92,9 +92,9 @@ or deletes source media. I01-T009 reconciles both documents.
 | 40 | I01-T004 | Removable volume detection and card session identity | — | complete |
 | 50 | I01-T005 | Ingest preflight and classification | I01-T001, I01-T004 | complete |
 | 60 | I01-T006 | Verified create-only card copy | I01-T003, I01-T005 | complete |
-| 70 | I01-T007 | Import modal and one-click smart ingest | I01-T005, I01-T006 | next |
-| 80 | I01-T008 | Card-mount banner | I01-T004, I01-T007 | ready |
-| 90 | I01-T009 | Import acceptance and documentation reconciliation | I01-T008 | ready |
+| 70 | I01-T007 | Import modal and one-click smart ingest | I01-T005, I01-T006 | complete |
+| 80 | I01-T008 | Card-mount banner | I01-T004, I01-T007 | complete |
+| 90 | I01-T009 | Import acceptance and documentation reconciliation | I01-T008 | next |
 
 ### Sequencing rationale
 
@@ -127,6 +127,28 @@ criteria and I01-T009 records evidence from a real card — inserted twice, with
 footage added between insertions — and a real archive relocation between two
 physical volumes. A folder import of synthetic fixtures does not constitute
 completion.
+
+### T009 evidence recorded 2026-08-09
+
+Automated implementation evidence is complete:
+
+- Core tests cover preflight purity/classification, reformatted-card identity,
+  create-only atomic copy, full-file verification, cancellation/resume,
+  incremental second import, and archive-root rebinding.
+- Desktop component tests assert the named/resolved destination, copy byte cost,
+  free space, insufficient-space blocking, first-run archive setup,
+  reference-in-place wording, and review/dismiss-only card banner.
+- The production desktop frontend builds and the 1440×900 browser layout was
+  inspected with the modal, completion ledger, and post-close “Review last
+  import” path visible without clipping.
+- `AGENTS.md`, `PRD.md`, `README.md`, and `docs/integration-testing.md` now carry
+  the accepted removable-card amendment and distinguish implemented automation
+  from the unrun hardware gate.
+
+The remaining stop condition is intentionally physical: insert one real card
+twice with footage added between insertions, then relocate the archive between
+two physical volumes and rebind it. Synthetic folders are useful regression
+coverage but cannot promote this epic under the frozen rule above.
 
 ## Cross-cutting verification
 

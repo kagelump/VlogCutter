@@ -1,9 +1,10 @@
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
-import type { AnalysisProgress, AnalysisReadiness, AnalysisRunRecord, AnalysisRunReport, AnalysisRunRequest, AnalysisStage, Asset, AssetAnalysisIndexEntry, AssetAnalysisView, AssetPatch, AutoplayMode, BaselineImportResult, BaselinePreviewResult, ClipTranscript, DesktopSettings, GenerationProgress, IngestReport, LoadedCatalog, MediaOrigin, ModelInstallProgress, ModelStatus, PathAnalysis, Project, ProjectLibrary, ProjectPairingStatus, RelinkReport, RootMappingEntry, ServerConnectionStatus, ServerPairingResult, ServerVersionInfo, SyncStatus, ThumbnailReport } from "./types";
+import type { AnalysisProgress, AnalysisReadiness, AnalysisRunRecord, AnalysisRunReport, AnalysisRunRequest, AnalysisStage, ArchiveRoot, Asset, AssetAnalysisIndexEntry, AssetAnalysisView, AssetPatch, AutoplayMode, BaselineImportResult, BaselinePreviewResult, CardCandidate, ClipTranscript, DesktopSettings, GenerationProgress, ImportPreflight, ImportProgress, ImportRunReport, IngestReport, LoadedCatalog, MediaOrigin, ModelInstallProgress, ModelStatus, PathAnalysis, Project, ProjectLibrary, ProjectPairingStatus, RelinkReport, RootMappingEntry, ServerConnectionStatus, ServerPairingResult, ServerVersionInfo, SyncStatus, ThumbnailReport } from "./types";
 
 const inTauri = () => "__TAURI_INTERNALS__" in window;
+const inAutomatedTest = () => typeof navigator !== "undefined" && navigator.userAgent.includes("jsdom");
 
 const mockProject: Project = {
   id: "project_demo",
@@ -81,12 +82,65 @@ const defaultDesktopSettings: DesktopSettings = {
   lastProjectId: null,
   lastAssetId: null,
   lastContextUpdatedAt: null,
+  makeProxiesOnImport: true,
+  lastImportArchiveRootId: null,
   pairedServerNodeId: null,
   pairedServerEndpoint: null,
   pairedServerLabel: null,
   pairedAt: null,
   pairedServerEndpoints: null,
 };
+
+const mockCard: CardCandidate = {
+  sessionId: "card_4f2a9c7d",
+  label: "DJI_SD",
+  mountPath: "/Volumes/DJI_SD",
+  cameraHint: "DJI Pocket 3",
+  clipCount: 243,
+  totalBytes: 80_000_000_000,
+};
+
+const mockArchiveRoot: ArchiveRoot = {
+  id: "archive_nas_video",
+  displayName: "NAS Video",
+  localMountPath: "/Volumes/nas/VideoArchive",
+  available: true,
+  availableBytes: 1_200_000_000_000,
+  createdAt: "2026-08-09T09:00:00Z",
+};
+
+function mockImportPreflight(sourcePath: string): ImportPreflight {
+  return {
+    sourcePath,
+    card: mockCard,
+    destination: {
+      copies: true,
+      archiveRoot: mockArchiveRoot,
+      resolvedPath: "/Volumes/nas/VideoArchive/hokkaido-field-test/DJI_SD-4f2a9c7d",
+      summary: "Originals are copied to “NAS Video”, and stay on the card too",
+      bytesToCopy: 62_400_000_000,
+      availableBytes: mockArchiveRoot.availableBytes,
+      ready: true,
+      blockedReason: "",
+    },
+    scanned: 243,
+    newClips: 18,
+    knownClips: 212,
+    relinkable: 0,
+    missingProxies: 31,
+    collisions: 0,
+    unreadable: 0,
+    items: Array.from({ length: 8 }, (_, index) => ({
+      path: `${sourcePath}/DCIM/100MEDIA/DJI_${String(index + 1).padStart(4, "0")}.MP4`,
+      relativePath: `DCIM/100MEDIA/DJI_${String(index + 1).padStart(4, "0")}.MP4`,
+      filename: `DJI_${String(index + 1).padStart(4, "0")}.MP4`,
+      sizeBytes: 3_466_666_666,
+      classification: index < 3 ? "new" : "knownVerified",
+      assetId: index < 3 ? null : `asset_demo_${index}`,
+      error: "",
+    })),
+  };
+}
 
 function readMockSettings(): DesktopSettings {
   try {
@@ -429,9 +483,73 @@ export const api = {
   },
 
   async chooseFolder(): Promise<string | null> {
-    if (!inTauri()) return null;
+    if (!inTauri()) return inAutomatedTest() ? null : mockCard.mountPath;
     const path = await open({ directory: true, multiple: false, title: "Choose a media folder" });
     return typeof path === "string" ? path : null;
+  },
+
+  async chooseArchiveFolder(title = "Choose an archive destination"): Promise<string | null> {
+    if (!inTauri()) return null;
+    const path = await open({ directory: true, multiple: false, title });
+    return typeof path === "string" ? path : null;
+  },
+
+  async inspectImportSource(path: string): Promise<CardCandidate | null> {
+    if (!inTauri()) return path === mockCard.mountPath ? mockCard : null;
+    return invoke("inspect_import_source", { path });
+  },
+
+  async detectMountedCards(): Promise<CardCandidate[]> {
+    if (!inTauri()) return inAutomatedTest() ? [] : [mockCard];
+    return invoke("detect_mounted_cards");
+  },
+
+  async listArchiveRoots(): Promise<ArchiveRoot[]> {
+    if (!inTauri()) return [mockArchiveRoot];
+    return invoke("list_archive_roots");
+  },
+
+  async createArchiveRoot(displayName: string, path: string): Promise<ArchiveRoot> {
+    if (!inTauri()) {
+      return { id: "archive_mock", displayName, localMountPath: path, available: true, availableBytes: 1_000_000_000_000, createdAt: new Date().toISOString() };
+    }
+    return invoke("create_archive_root", { displayName, path });
+  },
+
+  async bindArchiveRoot(archiveRootId: string, path: string): Promise<ArchiveRoot> {
+    if (!inTauri()) return { ...mockArchiveRoot, id: archiveRootId, localMountPath: path, available: true };
+    return invoke("bind_archive_root", { archiveRootId, path });
+  },
+
+  async setImportPreferences(makeProxies: boolean, archiveRootId: string | null): Promise<DesktopSettings> {
+    if (!inTauri()) {
+      const updated = { ...readMockSettings(), makeProxiesOnImport: makeProxies, lastImportArchiveRootId: archiveRootId };
+      writeMockSettings(updated);
+      return updated;
+    }
+    return rememberMediaOrigin(await invoke<DesktopSettings>("set_import_preferences", { makeProxies, archiveRootId }));
+  },
+
+  async preflightImport(projectId: string, sourcePath: string, archiveRootId: string | null): Promise<ImportPreflight> {
+    if (!inTauri()) return mockImportPreflight(sourcePath);
+    return invoke("preflight_import", { projectId, sourcePath, archiveRootId });
+  },
+
+  async runSmartImport(projectId: string, plan: ImportPreflight, verifyCopies: boolean, makeProxies: boolean): Promise<ImportRunReport> {
+    if (!inTauri()) return {
+      outcome: { imported: plan.newClips, relinked: plan.relinkable, skipped: plan.knownClips + plan.missingProxies - plan.newClips, copied: plan.newClips, bytesCopied: plan.destination.bytesToCopy, cancelled: false, failures: [] },
+      proxies: makeProxies ? { generated: plan.missingProxies, skipped: plan.knownClips, cancelled: false, failures: [] } : null,
+    };
+    return invoke("run_smart_import", { projectId, plan, verifyCopies, makeProxies });
+  },
+
+  async cancelImport(): Promise<void> {
+    if (inTauri()) return invoke("cancel_import");
+  },
+
+  async onImportProgress(callback: (progress: ImportProgress) => void): Promise<() => void> {
+    if (!inTauri()) return () => {};
+    return listen<ImportProgress>("import-progress", (event) => callback(event.payload));
   },
 
   async ingestFolder(projectId: string, path: string): Promise<IngestReport> {

@@ -122,7 +122,7 @@ impl Catalog {
         mut on_progress: F,
     ) -> Result<ImportPreflight>
     where
-        F: FnMut(usize, usize, &Path),
+        F: FnMut(usize, usize, &Path) -> bool,
     {
         self.require_project(project_id)?;
         let source = source.as_ref();
@@ -144,7 +144,9 @@ impl Catalog {
         let mut items = Vec::with_capacity(total);
         for (index, path) in candidates.iter().enumerate() {
             items.push(self.classify(project_id, source, path, archive_root_id, card.as_ref()));
-            on_progress(index + 1, total, path);
+            if !on_progress(index + 1, total, path) {
+                anyhow::bail!("import preflight cancelled");
+            }
         }
 
         let bytes_to_copy = items
@@ -167,7 +169,8 @@ impl Catalog {
             new_clips: count(&items, Classification::New),
             known_clips: count(&items, Classification::KnownVerified),
             relinkable: count(&items, Classification::KnownRelinkable),
-            missing_proxies: count(&items, Classification::KnownMissingProxy),
+            missing_proxies: count(&items, Classification::KnownMissingProxy)
+                + count(&items, Classification::New),
             collisions: count(&items, Classification::PathCollision),
             unreadable: count(&items, Classification::Unreadable),
             destination,
@@ -402,6 +405,19 @@ pub enum ImportStage {
     Reading,
 }
 
+/// Fine-grained import progress. Byte work includes the verification re-read,
+/// so a verified copy has twice its source size as total work.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportProgress {
+    pub stage: ImportStage,
+    pub completed_items: usize,
+    pub total_items: usize,
+    pub current_file: String,
+    pub completed_bytes: u64,
+    pub total_bytes: u64,
+}
+
 impl Catalog {
     /// Executes a preflight plan: copy what is new, register it, reconnect what
     /// was lost, and leave alone what needs nothing.
@@ -417,7 +433,7 @@ impl Catalog {
         mut on_progress: F,
     ) -> Result<ImportOutcome>
     where
-        F: FnMut(ImportStage, usize, usize, &str) -> bool,
+        F: FnMut(ImportProgress) -> bool,
     {
         self.require_project(project_id)?;
         let archive_root_id = plan
@@ -440,9 +456,15 @@ impl Catalog {
             })
             .collect();
         let total = actionable.len();
+        let total_bytes = plan
+            .destination
+            .bytes_to_copy
+            .saturating_mul(if verify_copies { 2 } else { 1 });
+        let mut completed_bytes = 0_u64;
 
         let mut outcome = ImportOutcome {
-            skipped: plan.known_clips + plan.missing_proxies,
+            skipped: count(&plan.items, Classification::KnownVerified)
+                + count(&plan.items, Classification::KnownMissingProxy),
             ..Default::default()
         };
 
@@ -452,16 +474,34 @@ impl Catalog {
             } else {
                 ImportStage::Reading
             };
-            if !on_progress(stage, index, total, &item.filename) {
+            if !on_progress(ImportProgress {
+                stage,
+                completed_items: index,
+                total_items: total,
+                current_file: item.filename.clone(),
+                completed_bytes,
+                total_bytes,
+            }) {
                 outcome.cancelled = true;
                 break;
             }
+            let completed_before_file = completed_bytes;
             match self.import_one(
                 project_id,
                 item,
                 archive_root_id.as_deref(),
                 plan.card.as_ref(),
                 verify_copies,
+                |file_bytes| {
+                    on_progress(ImportProgress {
+                        stage,
+                        completed_items: index,
+                        total_items: total,
+                        current_file: item.filename.clone(),
+                        completed_bytes: completed_before_file.saturating_add(file_bytes),
+                        total_bytes,
+                    })
+                },
             ) {
                 Ok(Some(bytes)) => {
                     if item.classification == Classification::New {
@@ -469,6 +509,9 @@ impl Catalog {
                         if bytes > 0 {
                             outcome.copied += 1;
                             outcome.bytes_copied += bytes;
+                            completed_bytes = completed_bytes.saturating_add(
+                                bytes.saturating_mul(if verify_copies { 2 } else { 1 }),
+                            );
                         }
                     } else {
                         outcome.relinked += 1;
@@ -484,19 +527,34 @@ impl Catalog {
                     error: format!("{error:#}"),
                 }),
             }
+            if !on_progress(ImportProgress {
+                stage,
+                completed_items: index + 1,
+                total_items: total,
+                current_file: item.filename.clone(),
+                completed_bytes,
+                total_bytes,
+            }) {
+                outcome.cancelled = index + 1 < total;
+                break;
+            }
         }
         Ok(outcome)
     }
 
     /// Returns the bytes copied, or `None` when the copy was cancelled.
-    fn import_one(
+    fn import_one<F>(
         &self,
         project_id: &str,
         item: &PreflightItem,
         archive_root_id: Option<&str>,
         card: Option<&CardCandidate>,
         verify_copies: bool,
-    ) -> Result<Option<u64>> {
+        mut on_copy_bytes: F,
+    ) -> Result<Option<u64>>
+    where
+        F: FnMut(u64) -> bool,
+    {
         let source = PathBuf::from(&item.path);
         if item.classification == Classification::KnownRelinkable {
             // Already-known content: registering where it is found is the whole
@@ -511,7 +569,12 @@ impl Catalog {
             (Some(root_id), Some(card)) => {
                 let relative = self.archive_relative_path(project_id, card, &item.relative_path)?;
                 let target = self.resolve_in_archive_root(root_id, &relative)?;
-                match crate::copy::commit_into_archive(&source, &target, verify_copies, |_| true)? {
+                match crate::copy::commit_into_archive(
+                    &source,
+                    &target,
+                    verify_copies,
+                    &mut on_copy_bytes,
+                )? {
                     Some(committed) => (committed.path, committed.size_bytes),
                     None => return Ok(None),
                 }
@@ -669,14 +732,14 @@ mod tests {
         fs::remove_file(&lost).unwrap();
 
         let preflight = catalog
-            .preflight_import(&project.id, &mount, None, |_, _, _| {})
+            .preflight_import(&project.id, &mount, None, |_, _, _| true)
             .unwrap();
 
         assert_eq!(preflight.scanned, 3);
         assert_eq!(preflight.new_clips, 1);
         assert_eq!(preflight.relinkable, 1);
-        // Known and reachable, but it has no proxy yet.
-        assert_eq!(preflight.missing_proxies, 1);
+        // The known reachable clip and the new clip both need a proxy after import.
+        assert_eq!(preflight.missing_proxies, 2);
         assert_eq!(preflight.unreadable, 0);
         assert_eq!(
             preflight
@@ -707,7 +770,7 @@ mod tests {
         let operations_before = catalog.list_operations(&project.id).unwrap().len();
 
         catalog
-            .preflight_import(&project.id, &mount, None, |_, _, _| {})
+            .preflight_import(&project.id, &mount, None, |_, _, _| true)
             .unwrap();
 
         assert_eq!(catalog.list_assets(&project.id).unwrap().len(), before);
@@ -730,7 +793,7 @@ mod tests {
         let root = catalog.create_archive_root("NAS Video", &archive).unwrap();
 
         let preflight = catalog
-            .preflight_import(&project.id, &mount, Some(&root.id), |_, _, _| {})
+            .preflight_import(&project.id, &mount, Some(&root.id), |_, _, _| true)
             .unwrap();
 
         let destination = &preflight.destination;
@@ -756,7 +819,7 @@ mod tests {
         fs::write(folder.join("C0001.MP4"), b"nas footage").unwrap();
 
         let preflight = catalog
-            .preflight_import(&project.id, &folder, None, |_, _, _| {})
+            .preflight_import(&project.id, &folder, None, |_, _, _| true)
             .unwrap();
 
         assert!(!preflight.destination.copies);
@@ -788,7 +851,7 @@ mod tests {
 
         fs::remove_dir_all(&archive).unwrap();
         let preflight = catalog
-            .preflight_import(&project.id, &mount, Some(&root.id), |_, _, _| {})
+            .preflight_import(&project.id, &mount, Some(&root.id), |_, _, _| true)
             .unwrap();
         assert!(!preflight.destination.ready);
         assert!(
@@ -821,7 +884,7 @@ mod tests {
         fs::write(&target, b"different bytes entirely").unwrap();
 
         let preflight = catalog
-            .preflight_import(&project.id, &mount, Some(&root.id), |_, _, _| {})
+            .preflight_import(&project.id, &mount, Some(&root.id), |_, _, _| true)
             .unwrap();
         assert_eq!(preflight.collisions, 1);
         assert_eq!(preflight.new_clips, 0);
@@ -854,12 +917,12 @@ mod tests {
         let root = catalog.create_archive_root("NAS Video", &archive).unwrap();
 
         let plan = catalog
-            .preflight_import(&project.id, &mount, Some(&root.id), |_, _, _| {})
+            .preflight_import(&project.id, &mount, Some(&root.id), |_, _, _| true)
             .unwrap();
         assert_eq!(plan.new_clips, 2);
 
         let outcome = catalog
-            .run_import(&project.id, &plan, true, |_, _, _, _| true)
+            .run_import(&project.id, &plan, true, |_| true)
             .unwrap();
         assert_eq!(outcome.imported, 2);
         assert_eq!(outcome.copied, 2);
@@ -894,7 +957,7 @@ mod tests {
         )
         .unwrap();
         let second_plan = catalog
-            .preflight_import(&project.id, &mount, Some(&root.id), |_, _, _| {})
+            .preflight_import(&project.id, &mount, Some(&root.id), |_, _, _| true)
             .unwrap();
         assert_eq!(second_plan.scanned, 3);
         assert_eq!(second_plan.new_clips, 1, "only the new clip is new");
@@ -904,7 +967,7 @@ mod tests {
         );
 
         let second = catalog
-            .run_import(&project.id, &second_plan, true, |_, _, _, _| true)
+            .run_import(&project.id, &second_plan, true, |_| true)
             .unwrap();
         assert_eq!(second.imported, 1);
         assert_eq!(second.copied, 1, "already-archived clips are not re-copied");
@@ -925,16 +988,16 @@ mod tests {
             .unwrap();
 
         let plan = catalog
-            .preflight_import(&project.id, &mount, Some(&root.id), |_, _, _| {})
+            .preflight_import(&project.id, &mount, Some(&root.id), |_, _, _| true)
             .unwrap();
         fs::remove_dir_all(&archive).unwrap();
         let replanned = catalog
-            .preflight_import(&project.id, &mount, Some(&root.id), |_, _, _| {})
+            .preflight_import(&project.id, &mount, Some(&root.id), |_, _, _| true)
             .unwrap();
 
         assert!(
             catalog
-                .run_import(&project.id, &replanned, true, |_, _, _, _| true)
+                .run_import(&project.id, &replanned, true, |_| true)
                 .is_err()
         );
         assert!(catalog.list_assets(&project.id).unwrap().is_empty());
@@ -970,13 +1033,11 @@ mod tests {
         let root = catalog.create_archive_root("NAS Video", &archive).unwrap();
 
         let plan = catalog
-            .preflight_import(&project.id, &mount, Some(&root.id), |_, _, _| {})
+            .preflight_import(&project.id, &mount, Some(&root.id), |_, _, _| true)
             .unwrap();
-        let mut handled = 0;
         let outcome = catalog
-            .run_import(&project.id, &plan, true, |_, _, _, _| {
-                handled += 1;
-                handled <= 2
+            .run_import(&project.id, &plan, true, |progress| {
+                progress.completed_items < 2
             })
             .unwrap();
         assert!(outcome.cancelled);
@@ -984,11 +1045,11 @@ mod tests {
 
         // Re-planning sees only what is left.
         let resumed_plan = catalog
-            .preflight_import(&project.id, &mount, Some(&root.id), |_, _, _| {})
+            .preflight_import(&project.id, &mount, Some(&root.id), |_, _, _| true)
             .unwrap();
         assert_eq!(resumed_plan.new_clips, 1);
         let resumed = catalog
-            .run_import(&project.id, &resumed_plan, true, |_, _, _, _| true)
+            .run_import(&project.id, &resumed_plan, true, |_| true)
             .unwrap();
         assert_eq!(resumed.imported, 1);
         assert_eq!(catalog.list_assets(&project.id).unwrap().len(), 3);
@@ -1010,13 +1071,13 @@ mod tests {
         fs::remove_file(&gone).unwrap();
 
         let plan = catalog
-            .preflight_import(&project.id, &mount, None, |_, _, _| {})
+            .preflight_import(&project.id, &mount, None, |_, _, _| true)
             .unwrap();
         assert_eq!(plan.relinkable, 1);
         assert_eq!(plan.new_clips, 0);
 
         let outcome = catalog
-            .run_import(&project.id, &plan, true, |_, _, _, _| true)
+            .run_import(&project.id, &plan, true, |_| true)
             .unwrap();
         assert_eq!(outcome.relinked, 1);
         assert_eq!(outcome.imported, 0);

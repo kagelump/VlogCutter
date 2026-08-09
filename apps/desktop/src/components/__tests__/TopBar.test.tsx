@@ -37,6 +37,7 @@ function renderBar(overrides: Partial<TopBarProps> = {}) {
     missingThumbnailCount: 0,
     missingAnalysisCount: 0,
     mediaMenuOpen: false,
+    hasLastImport: false,
     labeledCount: 0,
     activeCount: 0,
     onProjectChange: vi.fn(),
@@ -54,6 +55,7 @@ function renderBar(overrides: Partial<TopBarProps> = {}) {
     onMakeThumbnails: vi.fn(),
     onOpenAnalysis: vi.fn(),
     onImportFolder: vi.fn(),
+    onReviewLastImport: vi.fn(),
     ...overrides,
   };
   return { props, ...render(<TopBar {...props} />) };

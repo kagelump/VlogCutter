@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import { StatusBadge } from "@rcdvlog/review-ui";
 import { api } from "./api";
-import type { AnalysisReadiness, Asset, AssetAnalysisIndexEntry, AssetAnalysisView, AssetPatch, AutoplayMode, BaselineImportResult, BaselinePreviewResult, ClipTranscript, DesktopSettings, ModelInstallProgress, ModelStatus, PathAnalysis, Project, ProjectLibrary, ProjectLocation, ProjectPairingStatus, RootMappingEntry, ServerConnectionStatus, ServerVersionInfo, SyncStatus, TranscriptStatus } from "./types";
+import type { AnalysisReadiness, ArchiveRoot, Asset, AssetAnalysisIndexEntry, AssetAnalysisView, AssetPatch, AutoplayMode, BaselineImportResult, BaselinePreviewResult, CardCandidate, ClipTranscript, DesktopSettings, ImportPreflight, ImportProgress, ImportRunReport, ModelInstallProgress, ModelStatus, PathAnalysis, Project, ProjectLibrary, ProjectLocation, ProjectPairingStatus, RootMappingEntry, ServerConnectionStatus, ServerVersionInfo, SyncStatus, TranscriptStatus } from "./types";
 import { orderAssets, moveSelection as moveSelectionInOrder } from "./review/order";
 import { resolveAction } from "./review/keymap";
 import { CalibrationPanel } from "./CalibrationPanel";
@@ -27,6 +27,8 @@ import { QueuePanel } from "./components/QueuePanel";
 import { VideoStage } from "./components/VideoStage";
 import { TopBar, type OperationProgress } from "./components/TopBar";
 import { TripPhaseDialog, type TripPhaseFormValue } from "./components/TripPhaseDialog";
+import { ImportDialog } from "./components/ImportDialog";
+import { CardBanner } from "./components/CardBanner";
 import { analysisStageLabels, formatCost, syncStateLabel } from "./review/format";
 import { isRawOrientationProxy, renderedRotation, rotationAfter } from "./review/rotation";
 
@@ -93,6 +95,8 @@ function App() {
     lastProjectId: null,
     lastAssetId: null,
     lastContextUpdatedAt: null,
+    makeProxiesOnImport: true,
+    lastImportArchiveRootId: null,
   });
   const [isMuted, setIsMuted] = useState(true);
   const [isPlaying, setIsPlaying] = useState(false);
@@ -107,6 +111,21 @@ function App() {
   const [phaseDialog, setPhaseDialog] = useState<PhaseDialogState | null>(null);
   const [phaseDialogBusy, setPhaseDialogBusy] = useState(false);
   const [phaseDialogError, setPhaseDialogError] = useState("");
+  const [showImportDialog, setShowImportDialog] = useState(false);
+  const [importSource, setImportSource] = useState("");
+  const [importCard, setImportCard] = useState<CardCandidate | null>(null);
+  const [archiveRoots, setArchiveRoots] = useState<ArchiveRoot[]>([]);
+  const [selectedArchiveRootId, setSelectedArchiveRootId] = useState("");
+  const [importPlan, setImportPlan] = useState<ImportPreflight | null>(null);
+  const [importProgress, setImportProgress] = useState<ImportProgress | null>(null);
+  const [importReport, setImportReport] = useState<ImportRunReport | null>(null);
+  const [importLoading, setImportLoading] = useState(false);
+  const [importRunning, setImportRunning] = useState(false);
+  const [importError, setImportError] = useState("");
+  const [verifyImportCopies, setVerifyImportCopies] = useState(true);
+  const [makeImportProxies, setMakeImportProxies] = useState(true);
+  const [mountedCard, setMountedCard] = useState<CardCandidate | null>(null);
+  const dismissedCardSessionsRef = useRef(new Set<string>());
   // The active shelf tab is a mode, not per-clip state: it persists as you
   // move through the queue (spec §3.6).
   const [shelfTab, setShelfTab] = useState<ShelfTab>("transcript");
@@ -304,6 +323,7 @@ function App() {
     Promise.all([refreshProjects(), refreshLibrary(), api.prerequisiteStatus(), api.desktopSettings()])
       .then(([, , tools, desktopSettings]) => {
         setSettings(desktopSettings);
+        setMakeImportProxies(desktopSettings.makeProxiesOnImport);
         api.serverConnectionStatus().then(setServerStatus).catch(() => {});
         const missing = tools.filter((tool) => !tool.available).map((tool) => tool.name);
         if (missing.length) {
@@ -503,6 +523,7 @@ function App() {
           }
         }),
         api.onModelInstallProgress((progress) => setModelInstall(progress)),
+        api.onImportProgress((progress) => setImportProgress(progress)),
       ]);
       if (disposed) listeners.forEach((dispose) => dispose());
       else unlisten.push(...listeners);
@@ -513,6 +534,31 @@ function App() {
       unlisten.forEach((dispose) => dispose());
     };
   }, []);
+
+  // Mount detection is deliberately low-frequency and listing-only. It offers
+  // a review action; hashing and probing begin only after that click.
+  useEffect(() => {
+    if (!api.isDesktop() || !projectId) {
+      setMountedCard(null);
+      return;
+    }
+    let disposed = false;
+    const poll = async () => {
+      try {
+        const cards = await api.detectMountedCards();
+        if (disposed || showImportDialog) return;
+        setMountedCard(cards.find((card) => !dismissedCardSessionsRef.current.has(card.sessionId)) ?? null);
+      } catch {
+        if (!disposed) setMountedCard(null);
+      }
+    };
+    void poll();
+    const timer = window.setInterval(() => void poll(), 15_000);
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+    };
+  }, [projectId, showImportDialog]);
 
   useEffect(() => {
     if (selected) {
@@ -1035,26 +1081,121 @@ function App() {
       if (!api.isDesktop()) setMessage("Folder import is available in the desktop build");
       return;
     }
-    setBusy(true);
-    setMessage("Reading media metadata…");
+    await openImportForPath(path);
+  }
+
+  async function openImportForPath(path: string, knownCard?: CardCandidate) {
+    setShowImportDialog(true);
+    setImportSource(path);
+    setImportPlan(null);
+    setImportProgress(null);
+    setImportReport(null);
+    setImportError("");
+    setImportLoading(true);
     try {
-      const report = await api.ingestFolder(projectId, path);
-      await Promise.all([refreshAssets(projectId), refreshProjects()]);
-      setMessage(
-        [
-          `Imported ${report.imported}`,
-          `${report.duplicates} already present`,
-          // Worth saying out loud: this is footage the project had lost track of.
-          ...(report.relinked ? [`${report.relinked} reconnected to their originals`] : []),
-          ...(report.failures.length ? [`${report.failures.length} failed`] : []),
-        ].join("; "),
-      );
-      if (report.failures.length) setError(report.failures[0].error);
+      const [card, roots] = await Promise.all([
+        knownCard ? Promise.resolve(knownCard) : api.inspectImportSource(path),
+        api.listArchiveRoots(),
+      ]);
+      setImportCard(card);
+      setArchiveRoots(roots);
+      const remembered = roots.find((root) => root.id === settings.lastImportArchiveRootId);
+      const selectedRoot = card ? (remembered ?? roots.find((root) => root.available) ?? roots[0] ?? null) : null;
+      const rootId = selectedRoot?.id ?? "";
+      setSelectedArchiveRootId(rootId);
+      if (!card || rootId) {
+        setImportPlan(await api.preflightImport(projectId, path, rootId || null));
+      }
     } catch (reason) {
-      setError(String(reason));
+      if (!String(reason).includes("preflight cancelled")) setImportError(String(reason));
     } finally {
-      setBusy(false);
+      setImportLoading(false);
     }
+  }
+
+  async function refreshImportPlan(rootId: string) {
+    if (!projectId || !importSource || (importCard && !rootId)) {
+      setImportPlan(null);
+      return;
+    }
+    setSelectedArchiveRootId(rootId);
+    setImportLoading(true);
+    setImportError("");
+    setImportProgress(null);
+    try {
+      setImportPlan(await api.preflightImport(projectId, importSource, rootId || null));
+    } catch (reason) {
+      if (!String(reason).includes("preflight cancelled")) setImportError(String(reason));
+    } finally {
+      setImportLoading(false);
+    }
+  }
+
+  async function createImportArchive(name: string) {
+    const path = await api.chooseArchiveFolder(`Where should “${name}” live?`);
+    if (!path) return;
+    setImportLoading(true);
+    try {
+      const root = await api.createArchiveRoot(name, path);
+      setArchiveRoots((current) => [root, ...current.filter((item) => item.id !== root.id)]);
+      await refreshImportPlan(root.id);
+    } catch (reason) {
+      setImportError(String(reason));
+      setImportLoading(false);
+    }
+  }
+
+  async function locateImportArchive(root: ArchiveRoot) {
+    const path = await api.chooseArchiveFolder(`Where is “${root.displayName}” mounted now?`);
+    if (!path) return;
+    setImportLoading(true);
+    try {
+      const rebound = await api.bindArchiveRoot(root.id, path);
+      setArchiveRoots((current) => current.map((item) => item.id === rebound.id ? rebound : item));
+      await refreshImportPlan(rebound.id);
+    } catch (reason) {
+      setImportError(String(reason));
+      setImportLoading(false);
+    }
+  }
+
+  async function runSmartImport() {
+    if (!projectId || !importPlan || importRunning) return;
+    setImportRunning(true);
+    setImportProgress(null);
+    setImportError("");
+    try {
+      const nextSettings = await api.setImportPreferences(makeImportProxies, selectedArchiveRootId || null);
+      setSettings(nextSettings);
+      const report = await api.runSmartImport(projectId, importPlan, verifyImportCopies, makeImportProxies);
+      setImportReport(report);
+      await Promise.all([refreshAssets(projectId), refreshProjects(), refreshReadiness(projectId)]);
+      const failures = report.outcome.failures.length + (report.proxies?.failures.length ?? 0);
+      if (failures) setImportError(`${failures} file${failures === 1 ? "" : "s"} need attention in the import ledger.`);
+    } catch (reason) {
+      setImportError(String(reason));
+    } finally {
+      setImportRunning(false);
+    }
+  }
+
+  function reviewMountedCard() {
+    if (!mountedCard) return;
+    dismissedCardSessionsRef.current.add(mountedCard.sessionId);
+    const card = mountedCard;
+    setMountedCard(null);
+    void openImportForPath(card.mountPath, card);
+  }
+
+  function dismissMountedCard() {
+    if (mountedCard) dismissedCardSessionsRef.current.add(mountedCard.sessionId);
+    setMountedCard(null);
+  }
+
+  function closeImportDialog() {
+    if (importRunning) return;
+    if (importLoading) void api.cancelImport();
+    setShowImportDialog(false);
   }
 
   async function makeProxy() {
@@ -1529,6 +1670,9 @@ function App() {
 
   return (
     <main className={shellClass}>
+      {mountedCard && !showImportDialog && (
+        <CardBanner card={mountedCard} onReview={reviewMountedCard} onDismiss={dismissMountedCard} />
+      )}
       <TopBar
         projects={projects}
         projectId={projectId}
@@ -1544,6 +1688,7 @@ function App() {
         missingThumbnailCount={missingThumbnailCount}
         missingAnalysisCount={readiness?.missingAnalyses ?? 0}
         mediaMenuOpen={showMediaMenu}
+        hasLastImport={Boolean(importReport)}
         labeledCount={labeledCount}
         activeCount={activeAssets.length}
         onProjectChange={setProjectId}
@@ -1561,6 +1706,7 @@ function App() {
         onMakeThumbnails={makeMissingThumbnails}
         onOpenAnalysis={openAnalysisDialog}
         onImportFolder={importFolder}
+        onReviewLastImport={() => { setShowMediaMenu(false); setShowImportDialog(true); }}
       />
 
       {view.mode !== "review" && projectId ? (
@@ -2392,6 +2538,32 @@ function App() {
             </div>
           </section>
         </div>
+      )}
+
+      {showImportDialog && (
+        <ImportDialog
+          projectName={project?.name ?? "this project"}
+          sourcePath={importSource}
+          card={importCard}
+          roots={archiveRoots}
+          selectedRootId={selectedArchiveRootId}
+          plan={importPlan}
+          loading={importLoading}
+          running={importRunning}
+          progress={importProgress}
+          report={importReport}
+          error={importError}
+          verifyCopies={verifyImportCopies}
+          makeProxies={makeImportProxies}
+          onSelectRoot={(id) => void refreshImportPlan(id)}
+          onCreateRoot={(name) => void createImportArchive(name)}
+          onLocateRoot={(root) => void locateImportArchive(root)}
+          onVerifyCopies={setVerifyImportCopies}
+          onMakeProxies={setMakeImportProxies}
+          onImport={() => void runSmartImport()}
+          onCancel={() => void api.cancelImport()}
+          onClose={closeImportDialog}
+        />
       )}
 
     </main>

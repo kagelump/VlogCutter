@@ -44,9 +44,10 @@ pub(crate) struct CommittedCopy {
 
 /// Copies one original into the archive, atomically and verified.
 ///
-/// `on_bytes` reports progress as bytes land, so a multi-gigabyte clip is not a
-/// frozen dialog. Returning `false` from it cancels: the temp file is removed
-/// and nothing is committed.
+/// `on_bytes` reports cumulative I/O bytes for this file. With verification on,
+/// the total reaches twice the file size: one pass writes and one pass re-reads.
+/// Returning `false` cancels during either pass: the temp file is removed and
+/// nothing is committed.
 pub(crate) fn commit_into_archive<F>(
     source: &Path,
     target: &Path,
@@ -124,7 +125,9 @@ where
 
     let written = hasher.finalize().to_hex().to_string();
     if verify {
-        let observed = hash_file(temp)?;
+        let Some(observed) = hash_file_with_progress(temp, size_bytes, on_bytes)? else {
+            return Ok(None);
+        };
         if observed != written {
             bail!(
                 "verification failed for {} — the copy does not match what was read",
@@ -150,18 +153,35 @@ where
 
 /// Full-file BLAKE3. Distinct from the sampled fingerprint used for identity,
 /// which reads only the ends of a file and cannot detect a corrupted middle.
+#[cfg(test)]
 fn hash_file(path: &Path) -> Result<String> {
+    hash_file_with_progress(path, 0, &mut |_| true)?.context("hash callback unexpectedly cancelled")
+}
+
+fn hash_file_with_progress<F>(
+    path: &Path,
+    progress_offset: u64,
+    on_bytes: &mut F,
+) -> Result<Option<String>>
+where
+    F: FnMut(u64) -> bool,
+{
     let mut file = File::open(path)?;
     let mut hasher = Hasher::new();
     let mut buffer = vec![0u8; COPY_CHUNK];
+    let mut bytes_read = 0_u64;
     loop {
         let read = file.read(&mut buffer)?;
         if read == 0 {
             break;
         }
         hasher.update(&buffer[..read]);
+        bytes_read += read as u64;
+        if !on_bytes(progress_offset.saturating_add(bytes_read)) {
+            return Ok(None);
+        }
     }
-    Ok(hasher.finalize().to_hex().to_string())
+    Ok(Some(hasher.finalize().to_hex().to_string()))
 }
 
 #[cfg(test)]

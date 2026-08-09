@@ -38,6 +38,7 @@ export interface TopBarProps {
   missingThumbnailCount: number;
   missingAnalysisCount: number;
   mediaMenuOpen: boolean;
+  hasLastImport: boolean;
 
   /** The completion hairline. */
   labeledCount: number;
@@ -58,6 +59,7 @@ export interface TopBarProps {
   onMakeThumbnails(): void;
   onOpenAnalysis(): void;
   onImportFolder(): void;
+  onReviewLastImport(): void;
 }
 
 const modes: Array<[Mode, string, string]> = [
@@ -89,6 +91,7 @@ export function TopBar({
   missingThumbnailCount,
   missingAnalysisCount,
   mediaMenuOpen,
+  hasLastImport,
   labeledCount,
   activeCount,
   onProjectChange,
@@ -106,6 +109,7 @@ export function TopBar({
   onMakeThumbnails,
   onOpenAnalysis,
   onImportFolder,
+  onReviewLastImport,
 }: TopBarProps) {
   return (
     <header className="topbar">
@@ -218,6 +222,12 @@ export function TopBar({
         >▾</button>
         {mediaMenuOpen && (
           <div className="media-menu">
+            {hasLastImport && (
+              <button onClick={onReviewLastImport}>
+                <span>Review last import</span>
+                <small>File-by-file results from this session</small>
+              </button>
+            )}
             <button disabled={busy || missingThumbnailCount === 0} onClick={onMakeThumbnails} aria-keyshortcuts="Shift+G">
               <span>{missingThumbnailCount ? `Generate ${missingThumbnailCount} thumbnails` : "Thumbnails ready"}</span>
               <kbd>⇧G</kbd>

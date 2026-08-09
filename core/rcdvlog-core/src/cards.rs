@@ -125,10 +125,44 @@ impl VolumeSource for MountedVolumes {
             .filter_map(|entry| entry.ok())
             .map(|entry| entry.path())
             .filter(|path| path.is_dir())
+            .filter(|path| !cfg!(target_os = "macos") || macos_volume_is_removable(path))
             .collect();
         volumes.sort();
         volumes.dedup();
         volumes
+    }
+}
+
+/// `diskutil` is the macOS source of truth for whether a mounted volume is
+/// removable/ejectable. Folder shape alone identifies a camera layout, not the
+/// physical lifecycle: a NAS share can also contain a DCIM directory.
+fn macos_volume_is_removable(path: &Path) -> bool {
+    if !cfg!(target_os = "macos") {
+        return true;
+    }
+    let Ok(output) = std::process::Command::new("/usr/sbin/diskutil")
+        .arg("info")
+        .arg("-plist")
+        .arg(path)
+        .output()
+    else {
+        return false;
+    };
+    output.status.success()
+        && (plist_boolean(&output.stdout, "RemovableMedia") == Some(true)
+            || plist_boolean(&output.stdout, "Ejectable") == Some(true))
+}
+
+fn plist_boolean(bytes: &[u8], key: &str) -> Option<bool> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let key_marker = format!("<key>{key}</key>");
+    let tail = text.split_once(&key_marker)?.1.trim_start();
+    if tail.starts_with("<true/>") {
+        Some(true)
+    } else if tail.starts_with("<false/>") {
+        Some(false)
+    } else {
+        None
     }
 }
 
@@ -281,6 +315,18 @@ mod tests {
         assert_eq!(card.label, "DJI_SD");
         assert_eq!(card.clip_count, 2);
         assert_eq!(card.total_bytes, 10);
+    }
+
+    #[test]
+    fn diskutil_plist_removable_flags_are_read_without_guessing_from_paths() {
+        let plist = br#"<?xml version="1.0"?><plist><dict>
+          <key>Internal</key><false/>
+          <key>RemovableMedia</key><true/>
+          <key>Ejectable</key><true/>
+        </dict></plist>"#;
+        assert_eq!(plist_boolean(plist, "RemovableMedia"), Some(true));
+        assert_eq!(plist_boolean(plist, "Internal"), Some(false));
+        assert_eq!(plist_boolean(plist, "Missing"), None);
     }
 
     #[test]

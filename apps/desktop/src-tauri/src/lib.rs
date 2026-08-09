@@ -2,9 +2,11 @@ use anyhow::{Context, bail};
 use chrono::{SecondsFormat, Utc};
 use rcdvlog_core::{
     AnalysisReadiness, AnalysisRunOptions, AnalysisRunOutcome, AnalysisRunRecord, AnalyzeReport,
-    Asset, AssetAnalysisIndexEntry, AssetAnalysisView, AssetPatch, BatchProgressEstimate, Catalog,
-    ClipTranscript, ClockEvent, IngestReport, ModelStatus, Project, ProxyReport, RelinkReport,
-    ThumbnailReport, ToolStatus, TranscribeReport,
+    ArchiveRoot, Asset, AssetAnalysisIndexEntry, AssetAnalysisView, AssetPatch,
+    BatchProgressEstimate, CardCandidate, Catalog, ClipTranscript, ClockEvent, ImportOutcome,
+    ImportPreflight, ImportProgress as CoreImportProgress, ImportStage as CoreImportStage,
+    IngestReport, ModelStatus, MountedVolumes, Project, ProxyReport, RelinkReport, ThumbnailReport,
+    ToolStatus, TranscribeReport, detect_cards, inspect_card,
 };
 use rcdvlog_sync::BaselineEnvelope;
 use serde::{Deserialize, Serialize};
@@ -106,6 +108,8 @@ pub(crate) struct AppState {
     /// Set by `cancel_analysis` and observed by the running batch. Cleared when
     /// a run starts so a cancel from a previous run cannot stop the next one.
     analysis_cancel: Arc<AtomicBool>,
+    /// Shared by preflight, copy/verification, and the optional proxy tail.
+    import_cancel: Arc<AtomicBool>,
     /// Resolves asset ids to on-disk media for the loopback origin. Held here so
     /// a restarted origin reads the same live catalog and settings.
     media_catalog: Arc<CatalogMedia>,
@@ -177,6 +181,14 @@ struct DesktopSettings {
     paired_at: Option<String>,
     #[serde(default)]
     paired_server_endpoints: Option<Vec<ServerEndpoint>>,
+    #[serde(default = "default_true")]
+    make_proxies_on_import: bool,
+    #[serde(default)]
+    last_import_archive_root_id: Option<String>,
+}
+
+const fn default_true() -> bool {
+    true
 }
 
 /// `DesktopSettings` plus the things the frontend needs but must never be
@@ -294,6 +306,7 @@ impl AppState {
             sync_manager,
             sync_status,
             analysis_cancel: Arc::new(AtomicBool::new(false)),
+            import_cancel: Arc::new(AtomicBool::new(false)),
             media_catalog,
             media_server: Arc::new(RwLock::new(None)),
             media_restarted: Arc::new(AtomicBool::new(false)),
@@ -323,6 +336,7 @@ impl AppState {
             sync_manager: sync_manager::SyncManager::spawn_test(),
             sync_status: Arc::new(RwLock::new(HashMap::new())),
             analysis_cancel: Arc::new(AtomicBool::new(false)),
+            import_cancel: Arc::new(AtomicBool::new(false)),
             media_catalog: Arc::new(CatalogMedia {
                 catalog,
                 settings,
@@ -622,6 +636,8 @@ fn load_settings(settings_path: &Path, default_root: PathBuf) -> DesktopSettings
             paired_server_label: None,
             paired_at: None,
             paired_server_endpoints: None,
+            make_proxies_on_import: true,
+            last_import_archive_root_id: None,
         })
 }
 
@@ -750,6 +766,234 @@ fn create_project(
     state: State<'_, AppState>,
 ) -> std::result::Result<Project, String> {
     state.create_project(&name).map_err(error_message)
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+enum DesktopImportStage {
+    Scanning,
+    Copying,
+    Reading,
+    Proxies,
+    Complete,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DesktopImportProgress {
+    stage: DesktopImportStage,
+    completed: usize,
+    total: usize,
+    current_file: String,
+    completed_bytes: u64,
+    total_bytes: u64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ImportRunReport {
+    outcome: ImportOutcome,
+    proxies: Option<ProxyReport>,
+}
+
+#[tauri::command]
+async fn inspect_import_source(path: String) -> Result<Option<CardCandidate>, String> {
+    tauri::async_runtime::spawn_blocking(move || inspect_card(Path::new(&path)))
+        .await
+        .map_err(error_message)?
+        .map_err(error_message)
+}
+
+#[tauri::command]
+async fn detect_mounted_cards() -> Result<Vec<CardCandidate>, String> {
+    tauri::async_runtime::spawn_blocking(move || detect_cards(&MountedVolumes))
+        .await
+        .map_err(error_message)
+}
+
+#[tauri::command]
+fn list_archive_roots(state: State<'_, AppState>) -> Result<Vec<ArchiveRoot>, String> {
+    state.catalog()?.list_archive_roots().map_err(error_message)
+}
+
+#[tauri::command]
+fn create_archive_root(
+    display_name: String,
+    path: String,
+    state: State<'_, AppState>,
+) -> Result<ArchiveRoot, String> {
+    state
+        .catalog()?
+        .create_archive_root(&display_name, Path::new(&path))
+        .map_err(error_message)
+}
+
+#[tauri::command]
+fn bind_archive_root(
+    archive_root_id: String,
+    path: String,
+    state: State<'_, AppState>,
+) -> Result<ArchiveRoot, String> {
+    state
+        .catalog()?
+        .bind_archive_root(&archive_root_id, Path::new(&path))
+        .map_err(error_message)
+}
+
+#[tauri::command]
+fn set_import_preferences(
+    make_proxies: bool,
+    archive_root_id: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<DesktopSettingsView, String> {
+    let mut settings = state
+        .settings
+        .write()
+        .map_err(|_| "desktop settings are unavailable".to_string())?;
+    let updated = DesktopSettings {
+        make_proxies_on_import: make_proxies,
+        last_import_archive_root_id: archive_root_id,
+        ..settings.clone()
+    };
+    write_settings(&state.settings_path, &updated).map_err(error_message)?;
+    *settings = updated.clone();
+    Ok(state.settings_view(updated))
+}
+
+#[tauri::command]
+async fn preflight_import(
+    project_id: String,
+    source_path: String,
+    archive_root_id: Option<String>,
+    state: State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<ImportPreflight, String> {
+    let catalog = state.catalog()?;
+    let cancel = state.import_cancel.clone();
+    cancel.store(false, Ordering::SeqCst);
+    tauri::async_runtime::spawn_blocking(move || {
+        // A caller may offer the remembered archive root before it knows what
+        // kind of source was picked. Non-card folders always remain in place.
+        let is_card = inspect_card(Path::new(&source_path))?.is_some();
+        let archive_root_id = is_card.then_some(archive_root_id).flatten();
+        catalog.preflight_import(
+            &project_id,
+            &source_path,
+            archive_root_id.as_deref(),
+            |completed, total, path| {
+                let _ = app.emit(
+                    "import-progress",
+                    DesktopImportProgress {
+                        stage: DesktopImportStage::Scanning,
+                        completed,
+                        total,
+                        current_file: path
+                            .file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_default(),
+                        completed_bytes: 0,
+                        total_bytes: 0,
+                    },
+                );
+                !cancel.load(Ordering::SeqCst)
+            },
+        )
+    })
+    .await
+    .map_err(error_message)?
+    .map_err(error_message)
+}
+
+#[tauri::command]
+async fn run_smart_import(
+    project_id: String,
+    plan: ImportPreflight,
+    verify_copies: bool,
+    make_proxies: bool,
+    state: State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<ImportRunReport, String> {
+    let catalog = state.catalog()?;
+    let cancel = state.import_cancel.clone();
+    cancel.store(false, Ordering::SeqCst);
+    let pid = project_id.clone();
+    let report =
+        tauri::async_runtime::spawn_blocking(move || -> anyhow::Result<ImportRunReport> {
+            let outcome = catalog.run_import(
+                &pid,
+                &plan,
+                verify_copies,
+                |progress: CoreImportProgress| {
+                    let stage = match progress.stage {
+                        CoreImportStage::Copying => DesktopImportStage::Copying,
+                        CoreImportStage::Reading => DesktopImportStage::Reading,
+                    };
+                    let _ = app.emit(
+                        "import-progress",
+                        DesktopImportProgress {
+                            stage,
+                            completed: progress.completed_items,
+                            total: progress.total_items,
+                            current_file: progress.current_file,
+                            completed_bytes: progress.completed_bytes,
+                            total_bytes: progress.total_bytes,
+                        },
+                    );
+                    !cancel.load(Ordering::SeqCst)
+                },
+            )?;
+
+            let proxies = if make_proxies && !outcome.cancelled {
+                Some(
+                    catalog.generate_missing_proxies_with_progress(&pid, |progress| {
+                        let _ = app.emit(
+                            "import-progress",
+                            DesktopImportProgress {
+                                stage: DesktopImportStage::Proxies,
+                                completed: progress.estimate.completed_items,
+                                total: progress.estimate.total_items,
+                                current_file: progress
+                                    .asset
+                                    .as_ref()
+                                    .map(|asset| asset.filename.clone())
+                                    .unwrap_or_default(),
+                                completed_bytes: progress.estimate.completed_work_units,
+                                total_bytes: progress.estimate.total_work_units,
+                            },
+                        );
+                        if cancel.load(Ordering::SeqCst) {
+                            ControlFlow::Break(())
+                        } else {
+                            ControlFlow::Continue(())
+                        }
+                    })?,
+                )
+            } else {
+                None
+            };
+            let _ = app.emit(
+                "import-progress",
+                DesktopImportProgress {
+                    stage: DesktopImportStage::Complete,
+                    completed: plan.scanned,
+                    total: plan.scanned,
+                    current_file: String::new(),
+                    completed_bytes: outcome.bytes_copied,
+                    total_bytes: outcome.bytes_copied,
+                },
+            );
+            Ok(ImportRunReport { outcome, proxies })
+        })
+        .await
+        .map_err(error_message)?
+        .map_err(error_message)?;
+    state.sync_manager.wake_project(&project_id);
+    Ok(report)
+}
+
+#[tauri::command]
+fn cancel_import(state: State<'_, AppState>) {
+    state.import_cancel.store(true, Ordering::SeqCst);
 }
 
 #[tauri::command]
@@ -1847,6 +2091,15 @@ pub fn run() {
             record_desktop_context,
             list_projects,
             create_project,
+            inspect_import_source,
+            detect_mounted_cards,
+            list_archive_roots,
+            create_archive_root,
+            bind_archive_root,
+            set_import_preferences,
+            preflight_import,
+            run_smart_import,
+            cancel_import,
             ingest_folder,
             relink_folder,
             list_assets,
@@ -1921,6 +2174,8 @@ mod tests {
             paired_server_label: None,
             paired_at: None,
             paired_server_endpoints: None,
+            make_proxies_on_import: true,
+            last_import_archive_root_id: None,
         }
     }
 

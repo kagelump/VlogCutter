@@ -4,7 +4,7 @@ This file is the operational handoff for agents working on RCD VlogCutter. It ap
 
 ## 1. Product in one paragraph
 
-RCD VlogCutter is a local-first, single-user footage labeling system. The macOS desktop references immutable originals in place and keeps one laptop-local SQLite catalog per project. The optional private Ubuntu companion server keeps its own local-SSD control catalog and project replicas, indexes read-only NAS roots, runs durable media jobs, serves Chrome review/admin, synchronizes immutable project operations, and creates verified backups. The Mac remains useful offline and neither node shares live SQLite files.
+RCD VlogCutter is a local-first, single-user footage labeling system. The macOS desktop references immutable originals in place, except that its explicit card-import workflow may copy from a read-only removable card into a named create-only archive root, and keeps one laptop-local SQLite catalog per project. The optional private Ubuntu companion server keeps its own local-SSD control catalog and project replicas, indexes read-only NAS roots, runs durable media jobs, serves Chrome review/admin, synchronizes immutable project operations, and creates verified backups. The Mac remains useful offline and neither node shares live SQLite files.
 
 The target workload is roughly 100 hours, thousands of mostly 4K/60 clips, and about five cameras (Sony, DJI, iPhone, Insta360, and similar). Optimize data structures and UI choices for that scale even when tests use tiny fixtures.
 
@@ -20,7 +20,11 @@ Use these sources in this order when they differ:
 
 Never violate these invariants without explicit user approval:
 
-- Originals are immutable and referenced in place. Never move, rename, rewrite, or delete source media.
+- Originals are immutable. Non-removable media is referenced in place. The
+  explicit removable-card workflow may copy source bytes into a named,
+  create-only archive root; it never moves, renames, rewrites, or deletes card
+  media, and never overwrites an archived original. See
+  `docs/tasks/import/ARCHITECTURE.md` §2.1.
 - SQLite is canonical. Portable project catalogs own project operations; the server's local-SSD control catalog owns server jobs/library/auth and its local replicas. Do not introduce a competing JSON store, share SQLite/WAL across nodes, or add a permanent Python service.
 - The owning Rust crate controls domain behavior. Desktop, web, HTTP, Tauri, and CLI adapters must not implement competing ingest, sync, job, storage, chronology, or representation logic.
 - Generated outputs live in project-local caches or the configured server derived root, never beside originals.
@@ -47,6 +51,14 @@ Implemented now:
 - Configurable projects root, defaulting to `~/Movies/VideoProjects`.
 - Project library discovery and loading an existing catalog.
 - Reference-in-place recursive ingest of supported media extensions.
+- A desktop smart-ingest dialog that classifies a source before mutation,
+  states the project-scoped delta and resolved destination, checks copy size
+  against free space, creates/rebinds named archive roots, copies removable
+  cards atomically with optional full-file verification, remembers the proxy
+  preference, supports cancellation/resume, and keeps a file ledger available
+  after the dialog closes.
+- Low-frequency macOS removable-card detection with a review/dismiss banner;
+  it lists and counts only until the user asks to review the import.
 - Sampled fingerprint deduplication within a project, with rediscovered content
   repairing an asset whose original went offline rather than being discarded.
 - Verified node-local media locations: availability requires that the bytes were
@@ -105,14 +117,17 @@ Implemented now:
 
 Important gaps; do not accidentally describe these as complete:
 
-- No ingest preview. Capture-sequence split/merge exists, but boundary proposals
+- Import preflight exists, but the capture-sequence portion of ingest preview is
+  incomplete. Capture-sequence split/merge exists, while boundary proposals
   currently detect only counter resets; volume, folder, prefix, discontinuity,
   and per-asset reassignment workflows remain incomplete.
-- No mounted-volume inventory, project deletion, or cache cleanup UI. Relink now
+- No general mounted-volume inventory, project deletion, or cache cleanup UI.
+  Relink now
   exists: media locations carry a verification state, ingest repairs an asset
   whose original it rediscovers, and an offline-volume diagnostic offers
-  `Locate…` (CLI: `relink`). Card detection and an import preview remain
-  unbuilt; see `docs/tasks/import/EPIC.md`.
+  `Locate…` (CLI: `relink`). Removable-card detection and archive-root rebinding
+  are implemented; see `docs/tasks/import/EPIC.md` for the remaining physical
+  card/volume acceptance gate.
 - Desktop/CLI full-patch writes still have no transport-level optimistic revision token; cross-node operation sync does not make competing local full patches safe.
 - Search is currently simple filename/camera/label/note filtering, not SQLite FTS.
 - No key moments, chapters, events, or scripts. Edit-plan revisions, validation,
@@ -347,7 +362,7 @@ Always pass `--catalog` in agent automation, tests, and temporary workflows. A d
 
 SQLite connections enable foreign keys, WAL journal mode, and a five-second busy timeout. Read operations can continue during an uncommitted writer. Project mutations append typed operations with materialized revisions. Adopted projects synchronize bounded operation pages between independent local catalogs; live SQLite/WAL files are never copied or placed on NAS.
 
-Project catalogs use an explicit `schema_migrations` history and are currently at version 15. The server control catalog is version 10; backup format is version 1. Migration definitions have immutable names/source identities and each migration commits atomically. When changing the schema:
+Project catalogs use an explicit `schema_migrations` history and are currently at version 18. The server control catalog is version 10; backup format is version 1. Migration definitions have immutable names/source identities and each migration commits atomically. Migration 18 includes a one-time compatibility reconciliation for catalogs created on the import feature branch before its migration IDs were merged with main. When changing the schema:
 
 - Preserve existing catalogs; never solve migration issues by deleting the database.
 - Add a forward migration and an upgrade test using an older schema fixture.
@@ -361,7 +376,8 @@ Project catalogs use an explicit `schema_migrations` history and are currently a
 
 `Asset` is defined canonically in `core/rcdvlog-core/src/lib.rs` and mirrored in `apps/desktop/src/types.ts`. Availability is computed on read:
 
-- `originalAvailable`: original path currently exists.
+- `originalAvailable`: at least one node-local location exists and its sampled
+  fingerprint has been verified against the asset identity.
 - `proxyAvailable`: stored proxy path currently exists.
 - `available`: original or proxy is available.
 - Thumbnail path/quality are returned only when the stored file exists.

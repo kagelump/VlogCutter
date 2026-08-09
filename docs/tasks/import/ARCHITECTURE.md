@@ -1,6 +1,6 @@
 # Card Import Architecture
 
-**Status:** Accepted design for implementation planning
+**Status:** Implemented; awaiting the physical-card/physical-volume acceptance gate
 **Date:** 2026-08-09
 **Scope:** Desktop SD-card import, physical location identity, and relink
 **Depends on:** [Desktop Architecture](../desktop/ARCHITECTURE.md)

@@ -331,7 +331,10 @@ mod tests {
         catalog.bind_archive_root(&root.id, &nas).unwrap();
 
         let asset = catalog.get_asset("asset_one").unwrap();
-        assert_eq!(asset.path, moved_clip.to_string_lossy());
+        assert_eq!(
+            Path::new(&asset.path).canonicalize().unwrap(),
+            moved_clip.canonicalize().unwrap()
+        );
         assert!(
             asset.original_available,
             "one rebind must reconnect everything stored under the root"
