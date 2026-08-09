@@ -50,11 +50,38 @@ fits" and "comfortable". `/opt/hostedtoolcache` is left alone because Node lives
 there. The step prints `df -h` on both sides so the next disk problem is one
 glance rather than log archaeology.
 
-One known trap is not fixed here. `Cache Rust` keys on `hashFiles('Cargo.lock')`
-with a `${{ runner.os }}-cargo-` fallback, so any change to `Cargo.lock` restores
-the previous cache and then builds on top of it, and the cache saved at the end
-holds both. It grows monotonically. Pruning it, or moving to a cache action that
-prunes, would cost build time and is worth measuring before doing.
+### The Rust cache
+
+`Cache Rust` is `Swatinem/rust-cache`, not a bare `actions/cache` over
+`target/`, and the difference is that it prunes before it saves.
+
+A plain cache of `target/` only grows. It restores under a `Cargo.lock` hash
+with a broad fallback key, so any lockfile change restores the *previous*
+target directory, builds the new artifacts alongside the old ones, and saves
+both. Nothing ever removes the artifacts of a dependency version no longer in
+the graph, and nothing removes the workspace's own binaries, which are rebuilt
+every run anyway and are the largest single thing in the tree — a local
+`target/debug/deps` holds 5.3 GB of them across 190 files, including three
+separate ~300 MB `rcdvlog_desktop` test binaries left over from earlier builds
+and one 891 MB `librcdvlog_desktop_lib.a`. GitHub caps a repository at 10 GB of
+cache and evicts least-recently-used entries to stay under it, so an
+ever-growing Rust entry does not just waste space, it pushes every other cache
+out and eventually cannot be stored at all.
+
+`rust-cache` cleans the target directory in its post step: it drops workspace
+member artifacts, `examples`, incremental state, and dependency artifacts that
+are no longer in the resolved graph, keeping the expensive external builds —
+`whisper-rs-sys`'s compiled whisper.cpp among them. Its key also includes the
+rustc version, so a toolchain bump gets a fresh entry instead of layering on an
+incompatible one.
+
+`cache-on-failure: true` is set deliberately. Now that every gate runs even
+after one fails, a single red gate would otherwise cost the following run its
+cache as well, turning one failure into two slow runs.
+
+Expect the first run after this change to be slow: it starts from a cold cache
+under a new key. The disk reclaim above stays regardless — the working
+`target/` is still ~14 GB during a run whatever ends up cached.
 
 ### `macos` job (macos-latest)
 
