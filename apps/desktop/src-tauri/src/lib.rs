@@ -2065,6 +2065,7 @@ pub fn run() {
             chronology_commands::set_clip_time_exception,
             chronology_commands::clear_clip_time_exception,
             chronology_commands::set_trip_phase,
+            chronology_commands::split_trip_phase,
             chronology_commands::remove_trip_phase,
             chronology_commands::set_event_order_constraint,
             chronology_commands::clear_event_order_constraint,

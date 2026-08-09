@@ -16,8 +16,9 @@ use rcdvlog_core::{
     AssetChronology, CaptureSequence, ChronologyExplanation, ChronologySolution, ClipTimeException,
     ClockEpoch, ConstraintStrength, Contradiction, Diagnostic, DiagnosticCounts, DiagnosticFilter,
     DiagnosticSeverity, DisplayMode, EditPlanOperation, EditPlanRevision, EventOrderConstraint,
-    OtioExportRequest, OtioExportResult, PhaseKind, PreviewProgress, PreviewRequest, PreviewResult,
-    QueuePosition, TripPhase, ValidationReport, resolve_anchored_phases,
+    OtioExportRequest, OtioExportResult, PhaseKind, PhaseSplitDirection, PreviewProgress,
+    PreviewRequest, PreviewResult, QueuePosition, TripPhase, ValidationReport,
+    resolve_anchored_phases,
 };
 use serde::{Deserialize, Serialize};
 use tauri::State;
@@ -310,6 +311,29 @@ pub fn set_trip_phase(
     let stored = state
         .catalog()?
         .set_trip_phase(&project_id, &phase.into_phase())
+        .map_err(error_message)?;
+    state.sync_manager.wake_project(&project_id);
+    Ok(stored)
+}
+
+#[tauri::command]
+pub fn split_trip_phase(
+    project_id: String,
+    existing_phase_id: String,
+    boundary_asset_id: String,
+    direction: PhaseSplitDirection,
+    new_phase: TripPhaseInput,
+    state: State<'_, AppState>,
+) -> Result<TripPhase, String> {
+    let stored = state
+        .catalog()?
+        .split_trip_phase(
+            &project_id,
+            &existing_phase_id,
+            &boundary_asset_id,
+            direction,
+            &new_phase.into_phase(),
+        )
         .map_err(error_message)?;
     state.sync_manager.wake_project(&project_id);
     Ok(stored)

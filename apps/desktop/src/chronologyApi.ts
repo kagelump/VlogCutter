@@ -25,6 +25,7 @@ import type {
   OtioExportResult,
   PreviewProgress,
   PreviewResult,
+  PhaseSplitDirection,
   QueuePosition,
   TripPhase,
   ValidationReport,
@@ -126,6 +127,23 @@ export const chronologyApi = {
   async setTripPhase(projectId: string, phase: TripPhase): Promise<TripPhase | null> {
     if (!inTauri()) return null;
     return invoke<TripPhase>("set_trip_phase", { projectId, phase });
+  },
+
+  async splitTripPhase(
+    projectId: string,
+    existingPhaseId: string,
+    boundaryAssetId: string,
+    direction: PhaseSplitDirection,
+    newPhase: TripPhase,
+  ): Promise<TripPhase | null> {
+    if (!inTauri()) return null;
+    return invoke<TripPhase>("split_trip_phase", {
+      projectId,
+      existingPhaseId,
+      boundaryAssetId,
+      direction,
+      newPhase,
+    });
   },
 
   async removeTripPhase(projectId: string, phaseId: string): Promise<void> {

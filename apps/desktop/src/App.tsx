@@ -42,6 +42,11 @@ interface PhaseDialogState {
   phase: TripPhase | null;
   startIndex: number;
   endIndex: number;
+  split?: {
+    existingPhaseId: string;
+    boundaryAssetId: string;
+    direction: ContextDirection;
+  };
 }
 
 function initialProgress(kind: OperationProgress["kind"], total: number): OperationProgress {
@@ -678,7 +683,7 @@ function App() {
     centerSelectedInChronology("smooth");
   }, [centerSelectedInChronology]);
 
-  const openContextRange = useCallback((assetId: string, direction: ContextDirection) => {
+  const openContextRange = useCallback((assetId: string, direction: ContextDirection, source: ContextRun | null) => {
     const anchor = activeAssets.findIndex((asset) => asset.id === assetId);
     if (anchor < 0) return;
     const hasPlacedTime = (index: number) => {
@@ -687,6 +692,20 @@ function App() {
     };
     if (!hasPlacedTime(anchor)) {
       setError("Place this clip in Chronology before using it as a context boundary.");
+      return;
+    }
+    if (source?.phaseId) {
+      setPhaseDialog({
+        phase: null,
+        startIndex: direction === "through" ? source.start : anchor,
+        endIndex: direction === "through" ? anchor : source.end,
+        split: {
+          existingPhaseId: source.phaseId,
+          boundaryAssetId: assetId,
+          direction,
+        },
+      });
+      setPhaseDialogError("");
       return;
     }
     if (direction === "through") {
@@ -723,7 +742,7 @@ function App() {
     setPhaseDialogBusy(true);
     setPhaseDialogError("");
     try {
-      const stored = await chronologyApi.setTripPhase(projectId, {
+      const draft: TripPhase = {
         id: existing?.id ?? "",
         label: value.label,
         kind: value.kind,
@@ -739,7 +758,16 @@ function App() {
         originTimezone: value.originTimezone,
         destinationTimezone: value.destinationTimezone,
         displayMode: value.kind === "location" ? "local" : value.displayMode,
-      });
+      };
+      const stored = phaseDialog.split
+        ? await chronologyApi.splitTripPhase(
+            projectId,
+            phaseDialog.split.existingPhaseId,
+            phaseDialog.split.boundaryAssetId,
+            phaseDialog.split.direction,
+            draft,
+          )
+        : await chronologyApi.setTripPhase(projectId, draft);
       if (!stored && !api.isDesktop()) {
         setPhaseDialog(null);
         setMessage("Browser preview only — open the desktop app to save trip context.");
@@ -747,7 +775,11 @@ function App() {
       }
       await refreshChronology(projectId);
       setPhaseDialog(null);
-      setMessage(existing ? `Updated ${value.label}` : `Added ${value.label} to the story ribbon`);
+      setMessage(existing
+        ? `Updated ${value.label}`
+        : phaseDialog.split
+          ? `Split the ribbon with ${value.label}`
+          : `Added ${value.label} to the story ribbon`);
     } catch (reason) {
       setPhaseDialogError(String(reason));
     } finally {

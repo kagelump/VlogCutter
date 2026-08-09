@@ -33,6 +33,7 @@ export interface ClipTimeException {
 
 export type PhaseKind = "location" | "transit";
 export type DisplayMode = "local" | "dual" | "utc";
+export type PhaseSplitDirection = "through" | "from";
 
 export interface TripPhase {
   id: string;

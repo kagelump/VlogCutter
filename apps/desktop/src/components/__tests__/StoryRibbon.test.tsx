@@ -216,7 +216,27 @@ describe("trip context anchoring", () => {
     fireEvent.pointerMove(container.querySelector<HTMLElement>(".context-track")!, { clientX: 75 });
     await userEvent.click(screen.getByRole("button", { name: "Add context at clip 2" }));
     await userEvent.click(screen.getByRole("button", { name: "Add from here" }));
-    expect(props.onRequestContext).toHaveBeenCalledWith("a1", "from");
+    expect(props.onRequestContext).toHaveBeenCalledWith("a1", "from", null);
+  });
+
+  it("offers both cuts and editing when the hovered clip already has context", async () => {
+    const tagged = asset("a", "Sony");
+    tagged.phase = "Osaka";
+    const run = { start: 0, end: 0, asset: tagged, phaseId: "phase_osaka" };
+    const { props, container } = renderRibbon({
+      assets: [tagged],
+      lanes: [["Sony", [tagged]]],
+      contextRuns: [run],
+    });
+    fireEvent.pointerMove(container.querySelector<HTMLElement>(".context-track")!, { clientX: 10 });
+    await userEvent.click(screen.getByRole("button", { name: "Split context at clip 1" }));
+
+    expect(screen.getByRole("button", { name: "New through here" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Edit this context" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "New from here" })).toBeTruthy();
+
+    await userEvent.click(screen.getByRole("button", { name: "New from here" }));
+    expect(props.onRequestContext).toHaveBeenCalledWith("a", "from", run);
   });
 
   it("opens a persisted phase for editing when its segment is clicked", async () => {

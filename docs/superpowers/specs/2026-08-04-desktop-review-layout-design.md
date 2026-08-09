@@ -353,9 +353,12 @@ Human-authored content only (rule 1). Content width 376px.
   colour-only blocks below 60px of run width. A timezone change draws a 1px
   vertical rule through the full ribbon height — the visual explanation for
   disagreeing clocks.
-- Untagged columns expose a one-clip ghost block on hover. Clicking it moves the
-  explicit `Add through here` / `Add from here` choice into the control row;
-  the chosen range is previewed before a location or transit phase is saved.
+- Every column exposes a one-clip ghost block on hover. Clicking an untagged
+  column opens `Add through here` / `Add from here` directly above that clip.
+  Clicking inside a saved segment adds `New through here`, `Edit this context`,
+  and `New from here`. A new-side action previews the proposed range before a
+  location or transit phase is saved; saving atomically shortens the old phase,
+  while cancelling changes nothing.
   The saved boundaries reference the first and last clip identities, so later
   camera corrections reflow membership without leaving stale fixed ranges.
   Clicking an existing phase segment edits that phase. Story beats do not use

@@ -77,6 +77,15 @@ pub enum DisplayMode {
     Utc,
 }
 
+/// Which side of an existing visible phase becomes the newly authored phase
+/// when the user cuts context at one clip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PhaseSplitDirection {
+    Through,
+    From,
+}
+
 /// Where the user physically was, with timezone context (`PRD.md` §10).
 /// Local display time derives from the covering phase, never from camera
 /// metadata timezone (architecture contract §3.4).

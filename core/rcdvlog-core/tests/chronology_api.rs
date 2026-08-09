@@ -8,7 +8,7 @@
 
 use rcdvlog_core::{
     Catalog, ChronologyError, ClockEpoch, ConstraintStrength, DisplayMode, PhaseKind,
-    ProjectAssetAddedPayload, TripPhase,
+    PhaseSplitDirection, ProjectAssetAddedPayload, TripPhase,
 };
 use tempfile::tempdir;
 
@@ -397,6 +397,153 @@ fn trip_phases_validate_timezones_and_removal_retimes_nothing() {
     assert_eq!(
         uncovered.assets[0].display_time.as_ref().unwrap().phase_id,
         None
+    );
+}
+
+#[test]
+fn a_visible_trip_phase_can_be_cut_from_either_side_atomically() {
+    let fixture = fixture(&[
+        ("C0001.MP4", "DJIPocket3", "2026-01-15T03:00:00Z"),
+        ("C0002.MP4", "DJIPocket3", "2026-01-15T04:00:00Z"),
+        ("C0003.MP4", "DJIPocket3", "2026-01-15T05:00:00Z"),
+        ("C0004.MP4", "DJIPocket3", "2026-01-15T06:00:00Z"),
+    ]);
+    let ids = asset_ids_in_order(&fixture);
+    let phase = fixture
+        .catalog
+        .set_trip_phase(
+            &fixture.project_id,
+            &TripPhase {
+                id: String::new(),
+                label: "Tokyo".to_string(),
+                kind: PhaseKind::Location,
+                start_anchor_asset_id: Some(ids[0].clone()),
+                end_anchor_asset_id: Some(ids[3].clone()),
+                start_trip_time: String::new(),
+                end_trip_time: String::new(),
+                timezone: Some("Asia/Tokyo".to_string()),
+                origin_timezone: None,
+                destination_timezone: None,
+                display_mode: DisplayMode::Local,
+            },
+        )
+        .unwrap();
+
+    let operation_count = fixture
+        .catalog
+        .list_operations(&fixture.project_id)
+        .unwrap()
+        .len();
+    fixture
+        .catalog
+        .split_trip_phase(
+            &fixture.project_id,
+            &phase.id,
+            "asset_not_in_the_phase",
+            PhaseSplitDirection::From,
+            &TripPhase {
+                id: String::new(),
+                label: "Invalid".to_string(),
+                kind: PhaseKind::Location,
+                start_anchor_asset_id: None,
+                end_anchor_asset_id: None,
+                start_trip_time: String::new(),
+                end_trip_time: String::new(),
+                timezone: None,
+                origin_timezone: None,
+                destination_timezone: None,
+                display_mode: DisplayMode::Local,
+            },
+        )
+        .unwrap_err();
+    assert_eq!(
+        fixture
+            .catalog
+            .list_operations(&fixture.project_id)
+            .unwrap()
+            .len(),
+        operation_count,
+        "an invalid split writes neither side"
+    );
+
+    let snow = fixture
+        .catalog
+        .split_trip_phase(
+            &fixture.project_id,
+            &phase.id,
+            &ids[2],
+            PhaseSplitDirection::From,
+            &TripPhase {
+                id: String::new(),
+                label: "Snow festival".to_string(),
+                kind: PhaseKind::Location,
+                start_anchor_asset_id: None,
+                end_anchor_asset_id: None,
+                start_trip_time: String::new(),
+                end_trip_time: String::new(),
+                timezone: Some("Asia/Tokyo".to_string()),
+                origin_timezone: None,
+                destination_timezone: None,
+                display_mode: DisplayMode::Local,
+            },
+        )
+        .unwrap();
+    let arrival = fixture
+        .catalog
+        .split_trip_phase(
+            &fixture.project_id,
+            &phase.id,
+            &ids[0],
+            PhaseSplitDirection::Through,
+            &TripPhase {
+                id: String::new(),
+                label: "Arrival".to_string(),
+                kind: PhaseKind::Location,
+                start_anchor_asset_id: None,
+                end_anchor_asset_id: None,
+                start_trip_time: String::new(),
+                end_trip_time: String::new(),
+                timezone: Some("Asia/Tokyo".to_string()),
+                origin_timezone: None,
+                destination_timezone: None,
+                display_mode: DisplayMode::Local,
+            },
+        )
+        .unwrap();
+
+    let solved = fixture
+        .catalog
+        .solve_chronology(&fixture.project_id)
+        .unwrap();
+    let phase_ids: Vec<_> = solved
+        .assets
+        .iter()
+        .map(|asset| {
+            asset
+                .display_time
+                .as_ref()
+                .and_then(|display| display.phase_id.as_deref())
+        })
+        .collect();
+    assert_eq!(
+        phase_ids,
+        vec![
+            Some(arrival.id.as_str()),
+            Some(phase.id.as_str()),
+            Some(snow.id.as_str()),
+            Some(snow.id.as_str()),
+        ]
+    );
+
+    let phases = fixture.catalog.trip_phases(&fixture.project_id).unwrap();
+    let remaining = phases.iter().find(|item| item.id == phase.id).unwrap();
+    assert_eq!(
+        remaining.start_anchor_asset_id.as_deref(),
+        Some(ids[1].as_str())
+    );
+    assert_eq!(
+        remaining.end_anchor_asset_id.as_deref(),
+        Some(ids[1].as_str())
     );
 }
 

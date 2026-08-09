@@ -26,6 +26,7 @@ interface ContextAnchor {
   index: number;
   x: number;
   top: number;
+  run: ContextRun | null;
 }
 
 /**
@@ -57,7 +58,7 @@ export interface StoryRibbonProps {
   onCenter(): void;
   onSelect(id: string): void;
   onToggleCollapsed(): void;
-  onRequestContext(assetId: string, direction: ContextDirection): void;
+  onRequestContext(assetId: string, direction: ContextDirection, source: ContextRun | null): void;
   onEditContext(phaseId: string, start: number, end: number): void;
   /** Corrects the camera identification for every clip in a lane. */
   onRenameCamera(from: string, to: string): void;
@@ -112,6 +113,9 @@ export function StoryRibbon({
     ? ribbonHeight(laneRows.length, true)
     : heightOverride ?? ribbonHeight(laneRows.length, false);
   const contextAnchorAsset = contextAnchor === null ? null : assets[contextAnchor.index] ?? null;
+  const hoveredContextRun = hoveredContextIndex === null
+    ? null
+    : contextRuns.find((run) => hoveredContextIndex >= run.start && hoveredContextIndex <= run.end) ?? null;
 
   useEffect(() => {
     if (!contextAnchor) return;
@@ -135,12 +139,20 @@ export function StoryRibbon({
   function contextIndexAt(clientX: number, track: HTMLDivElement) {
     const index = Math.floor((clientX - track.getBoundingClientRect().left) / zoom);
     if (index < 0 || index >= assets.length) return null;
-    return contextRuns.some((run) => index >= run.start && index <= run.end) ? null : index;
+    return index;
   }
 
   function chooseContext(direction: ContextDirection) {
     if (!contextAnchorAsset) return;
-    onRequestContext(contextAnchorAsset.id, direction);
+    onRequestContext(contextAnchorAsset.id, direction, contextAnchor?.run ?? null);
+    setContextAnchor(null);
+    setHoveredContextIndex(null);
+  }
+
+  function editAnchoredContext() {
+    const run = contextAnchor?.run;
+    if (!run?.phaseId) return;
+    onEditContext(run.phaseId, run.start, run.end);
     setContextAnchor(null);
     setHoveredContextIndex(null);
   }
@@ -281,17 +293,20 @@ export function StoryRibbon({
                     type="button"
                     className={`context-ghost ${contextAnchor !== null ? "is-anchored" : ""}`}
                     style={{ left: (contextAnchor?.index ?? hoveredContextIndex ?? 0) * zoom + 3, width: Math.max(18, zoom - 6) }}
-                    aria-label={`Add context at clip ${(contextAnchor?.index ?? hoveredContextIndex ?? 0) + 1}`}
+                    aria-label={`${(contextAnchor?.run ?? hoveredContextRun)?.phaseId ? "Split" : "Add"} context at clip ${(contextAnchor?.index ?? hoveredContextIndex ?? 0) + 1}`}
                     onPointerMove={(event) => event.stopPropagation()}
                     onClick={(event) => {
                       const index = contextAnchor?.index ?? hoveredContextIndex;
                       if (index === null) return;
                       const rect = event.currentTarget.getBoundingClientRect();
                       const clickX = event.clientX || rect.left + rect.width / 2;
+                      const run = contextRuns.find((candidate) => index >= candidate.start && index <= candidate.end) ?? null;
+                      const halfWidth = run?.phaseId ? 218 : 158;
                       setContextAnchor({
                         index,
-                        x: Math.min(window.innerWidth - 158, Math.max(158, clickX)),
+                        x: Math.min(window.innerWidth - halfWidth, Math.max(halfWidth, clickX)),
                         top: rect.top,
+                        run,
                       });
                     }}
                   >
@@ -333,19 +348,22 @@ export function StoryRibbon({
       {contextAnchor && typeof document !== "undefined" && createPortal(
         <div
           ref={contextPopoverRef}
-          className="context-anchor-popover"
+          className={`context-anchor-popover ${contextAnchor.run?.phaseId ? "has-context" : ""}`}
           role="group"
-          aria-label={`Add context at clip ${contextAnchor.index + 1}`}
+          aria-label={`${contextAnchor.run?.phaseId ? "Split" : "Add"} context at clip ${contextAnchor.index + 1}`}
           style={{ left: contextAnchor.x, top: Math.max(8, contextAnchor.top - 8) }}
         >
           <div className="context-popover-heading">
             <span>Clip #{contextAnchor.index + 1}</span>
-            <strong>Set context boundary</strong>
+            <strong>{contextAnchor.run?.phaseId ? contextAnchor.run.asset.phase || "Edit context boundary" : "Set context boundary"}</strong>
             <button type="button" aria-label="Cancel adding context" onClick={() => setContextAnchor(null)}>×</button>
           </div>
-          <div className="context-popover-actions">
-            <button type="button" className="context-direction-button" onClick={() => chooseContext("through")}><span aria-hidden="true">←</span> Add through here</button>
-            <button type="button" className="context-direction-button" onClick={() => chooseContext("from")}>Add from here <span aria-hidden="true">→</span></button>
+          <div className={`context-popover-actions ${contextAnchor.run?.phaseId ? "three-way" : ""}`}>
+            <button type="button" className="context-direction-button" onClick={() => chooseContext("through")}><span aria-hidden="true">←</span> {contextAnchor.run?.phaseId ? "New through here" : "Add through here"}</button>
+            {contextAnchor.run?.phaseId && (
+              <button type="button" className="context-edit-button" onClick={editAnchoredContext}>Edit this context</button>
+            )}
+            <button type="button" className="context-direction-button" onClick={() => chooseContext("from")}>{contextAnchor.run?.phaseId ? "New from here" : "Add from here"} <span aria-hidden="true">→</span></button>
           </div>
         </div>,
         document.body,

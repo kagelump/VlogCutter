@@ -1208,7 +1208,7 @@ The following decisions were accepted for the MVP on 2026-07-18.
 
 15. **Project creation and travel successor:** current project creation is desktop-only, but that is no longer permanent product law. The planned [Travel Ingest T5](docs/tasks/travel/TASK_T5_server_origin_projects_and_desktop_adoption.md) adds server-origin project creation and desktop adoption. Its planned archive is a distinct create-only writable logical root; existing original scan roots remain immutable.
 
-16. **Trip-context boundaries (accepted 2026-08-09):** ribbon-created trip phases are anchored to specific clips, inclusive at both ends. The phase follows those clip identities when later camera chronology corrections change solved order. Fixed UTC bounds remain supported for existing and explicitly time-based phases; story beats remain a separate unresolved range model.
+16. **Trip-context boundaries (accepted 2026-08-09):** ribbon-created trip phases are anchored to specific clips, inclusive at both ends. The phase follows those clip identities when later camera chronology corrections change solved order. A person may cut a new phase through or from any clip inside an existing phase; saving the new side and shortening/removing the old side is one atomic local operation batch, while cancelling writes nothing. Fixed UTC bounds remain supported for existing and explicitly time-based phases; story beats remain a separate unresolved range model.
 
 17. **Removable-card import (accepted 2026-08-09):** removable cards are
     read-only sources copied by the desktop into a named create-only archive

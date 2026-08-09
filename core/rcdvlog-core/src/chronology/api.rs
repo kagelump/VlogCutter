@@ -11,7 +11,7 @@
 
 use super::model::{
     CaptureSequence, ClipTimeException, ClockEpoch, ConstraintStrength, DisplayMode,
-    EventOrderConstraint, PhaseKind, TripPhase,
+    EventOrderConstraint, PhaseKind, PhaseSplitDirection, TripPhase,
 };
 use super::phases::{is_valid_timezone, parse_utc};
 use super::solver::{Contradiction, ContradictionKind, resolve_anchored_phases, solve};
@@ -68,6 +68,28 @@ fn display_mode_str(mode: DisplayMode) -> &'static str {
         DisplayMode::Dual => "dual",
         DisplayMode::Utc => "utc",
     }
+}
+
+fn trip_phase_set_operation(phase: &TripPhase, revision: u64) -> Result<NewOperation> {
+    Ok(NewOperation {
+        aggregate_type: "tripPhase",
+        aggregate_id: phase.id.clone(),
+        operation_type: TRIP_PHASE_SET,
+        base_revision: Some(revision),
+        payload: serde_json::to_value(TripPhaseSetPayload {
+            phase_id: phase.id.clone(),
+            label: phase.label.clone(),
+            phase_kind: phase_kind_str(phase.kind).to_string(),
+            start_anchor_asset_id: phase.start_anchor_asset_id.clone(),
+            end_anchor_asset_id: phase.end_anchor_asset_id.clone(),
+            start_trip_time: phase.start_trip_time.clone(),
+            end_trip_time: phase.end_trip_time.clone(),
+            timezone: phase.timezone.clone(),
+            origin_timezone: phase.origin_timezone.clone(),
+            destination_timezone: phase.destination_timezone.clone(),
+            display_mode: display_mode_str(phase.display_mode).to_string(),
+        })?,
+    })
 }
 
 fn strength_str(strength: ConstraintStrength) -> &'static str {
@@ -409,10 +431,7 @@ impl Catalog {
 
     // --- D01-T012: trip phases ---------------------------------------------
 
-    /// Adds or replaces a trip phase. Timezones are validated as resolvable
-    /// IANA identifiers *before* anything is written, so an invalid identifier
-    /// can never reach the database.
-    pub fn set_trip_phase(&self, project_id: &str, phase: &TripPhase) -> Result<TripPhase> {
+    fn prepare_trip_phase(&self, project_id: &str, phase: &TripPhase) -> Result<TripPhase> {
         self.require_project(project_id)?;
         for candidate in [
             phase.timezone.as_deref(),
@@ -469,30 +488,140 @@ impl Catalog {
         if stored.id.is_empty() {
             stored.id = format!("phase_{}", Uuid::new_v4().simple());
         }
+        Ok(stored)
+    }
+
+    /// Adds or replaces a trip phase. Timezones are validated as resolvable
+    /// IANA identifiers *before* anything is written, so an invalid identifier
+    /// can never reach the database.
+    pub fn set_trip_phase(&self, project_id: &str, phase: &TripPhase) -> Result<TripPhase> {
+        let stored = self.prepare_trip_phase(project_id, phase)?;
         let revision = current_revision(&self.connection()?, project_id, "tripPhase", &stored.id)?;
         self.commit_local(
             project_id,
-            vec![NewOperation {
-                aggregate_type: "tripPhase",
-                aggregate_id: stored.id.clone(),
-                operation_type: TRIP_PHASE_SET,
-                base_revision: Some(revision),
-                payload: serde_json::to_value(TripPhaseSetPayload {
-                    phase_id: stored.id.clone(),
-                    label: stored.label.clone(),
-                    phase_kind: phase_kind_str(stored.kind).to_string(),
-                    start_anchor_asset_id: stored.start_anchor_asset_id.clone(),
-                    end_anchor_asset_id: stored.end_anchor_asset_id.clone(),
-                    start_trip_time: stored.start_trip_time.clone(),
-                    end_trip_time: stored.end_trip_time.clone(),
-                    timezone: stored.timezone.clone(),
-                    origin_timezone: stored.origin_timezone.clone(),
-                    destination_timezone: stored.destination_timezone.clone(),
-                    display_mode: display_mode_str(stored.display_mode).to_string(),
-                })?,
-            }],
+            vec![trip_phase_set_operation(&stored, revision)?],
         )?;
         Ok(stored)
+    }
+
+    /// Atomically cuts one visible phase at a clip. The newly authored phase
+    /// takes the requested side, while the old phase keeps the other side. If
+    /// the new side covers the whole phase, the old aggregate is removed.
+    /// Nothing is written until both resulting intervals validate.
+    pub fn split_trip_phase(
+        &self,
+        project_id: &str,
+        existing_phase_id: &str,
+        boundary_asset_id: &str,
+        direction: PhaseSplitDirection,
+        new_phase: &TripPhase,
+    ) -> Result<TripPhase> {
+        self.require_project(project_id)?;
+        let solution = self.solve_chronology(project_id)?;
+        let covered_indices: Vec<usize> = solution
+            .assets
+            .iter()
+            .enumerate()
+            .filter_map(|(index, asset)| {
+                (asset
+                    .display_time
+                    .as_ref()
+                    .and_then(|display| display.phase_id.as_deref())
+                    == Some(existing_phase_id))
+                .then_some(index)
+            })
+            .collect();
+        let Some(&first_index) = covered_indices.first() else {
+            return Err(ChronologyError::InvalidReference(format!(
+                "trip phase {existing_phase_id} has no visible clips to split"
+            ))
+            .into());
+        };
+        let last_index = *covered_indices
+            .last()
+            .expect("a non-empty phase has a last clip");
+        if !covered_indices
+            .windows(2)
+            .all(|pair| pair[1] == pair[0] + 1)
+        {
+            return Err(ChronologyError::InvalidInterval(format!(
+                "trip phase {existing_phase_id} is interrupted by overlapping context"
+            ))
+            .into());
+        }
+        let boundary_index = solution
+            .assets
+            .iter()
+            .position(|asset| asset.asset_id == boundary_asset_id)
+            .filter(|index| *index >= first_index && *index <= last_index)
+            .ok_or_else(|| {
+                ChronologyError::InvalidReference(format!(
+                    "clip {boundary_asset_id} is not inside trip phase {existing_phase_id}"
+                ))
+            })?;
+
+        let mut existing = self
+            .trip_phases(project_id)?
+            .into_iter()
+            .find(|phase| phase.id == existing_phase_id)
+            .ok_or_else(|| {
+                ChronologyError::InvalidReference(format!(
+                    "trip phase not found: {existing_phase_id}"
+                ))
+            })?;
+        let mut authored = new_phase.clone();
+        authored.id.clear();
+
+        let asset_id_at = |index: usize| solution.assets[index].asset_id.clone();
+        let keeps_existing = match direction {
+            PhaseSplitDirection::Through => {
+                authored.start_anchor_asset_id = Some(asset_id_at(first_index));
+                authored.end_anchor_asset_id = Some(asset_id_at(boundary_index));
+                if boundary_index < last_index {
+                    existing.start_anchor_asset_id = Some(asset_id_at(boundary_index + 1));
+                    existing.end_anchor_asset_id = Some(asset_id_at(last_index));
+                    true
+                } else {
+                    false
+                }
+            }
+            PhaseSplitDirection::From => {
+                authored.start_anchor_asset_id = Some(asset_id_at(boundary_index));
+                authored.end_anchor_asset_id = Some(asset_id_at(last_index));
+                if boundary_index > first_index {
+                    existing.start_anchor_asset_id = Some(asset_id_at(first_index));
+                    existing.end_anchor_asset_id = Some(asset_id_at(boundary_index - 1));
+                    true
+                } else {
+                    false
+                }
+            }
+        };
+
+        let authored = self.prepare_trip_phase(project_id, &authored)?;
+        let connection = self.connection()?;
+        let existing_revision =
+            current_revision(&connection, project_id, "tripPhase", existing_phase_id)?;
+        let mut operations = Vec::with_capacity(2);
+        if keeps_existing {
+            let existing = self.prepare_trip_phase(project_id, &existing)?;
+            operations.push(trip_phase_set_operation(&existing, existing_revision)?);
+        } else {
+            operations.push(NewOperation {
+                aggregate_type: "tripPhase",
+                aggregate_id: existing_phase_id.to_string(),
+                operation_type: TRIP_PHASE_REMOVED,
+                base_revision: Some(existing_revision),
+                payload: serde_json::to_value(TripPhaseRemovedPayload {
+                    phase_id: existing_phase_id.to_string(),
+                })?,
+            });
+        }
+        let authored_revision =
+            current_revision(&connection, project_id, "tripPhase", &authored.id)?;
+        operations.push(trip_phase_set_operation(&authored, authored_revision)?);
+        self.commit_local(project_id, operations)?;
+        Ok(authored)
     }
 
     /// Removes a trip phase. No asset is retimed and none is deleted: the

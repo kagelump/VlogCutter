@@ -91,8 +91,8 @@ pub use chronology::{
     AppliedCorrection, AssetChronology, AssetTimeHypothesis, CaptureSequence, ChronologyError,
     ChronologyExplanation, ChronologyFacts, ChronologySolution, ClipTimeException, ClockEpoch,
     ConstraintStrength, Contradiction, ContradictionKind, DisplayMode, DisplayTime,
-    EventOrderConstraint, Evidence, OrderKey, PhaseKind, QuarantinedOperation, QueuePosition,
-    SplitProposal, TripPhase, covering_phase, display_time, is_valid_timezone,
+    EventOrderConstraint, Evidence, OrderKey, PhaseKind, PhaseSplitDirection, QuarantinedOperation,
+    QueuePosition, SplitProposal, TripPhase, covering_phase, display_time, is_valid_timezone,
     resolve_anchored_phases, solve,
 };
 pub use diagnostics::{

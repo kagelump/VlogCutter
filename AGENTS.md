@@ -135,8 +135,9 @@ Important gaps; do not accidentally describe these as complete:
   still lacks reordering, trimming, removal, preview playback, export history,
   and overwrite confirmation; there is no edit-plan CLI yet.
 - Trip phases and timezone display are persisted and solved, and the ribbon can
-  add a location/transit phase forward or backward from a hovered clip and edit
-  an existing phase. It still lacks boundary dragging and the full
+  add a location/transit phase forward or backward from a hovered clip, edit an
+  existing phase, and atomically cut a new phase from either side of a filled
+  segment. It still lacks boundary dragging and the full
   lane/trip-band calibration view. Story beats remain display-only browser-mock
   fields and are not persisted.
 - The basic chronology drawer can inspect explanations, diagnostics, split
