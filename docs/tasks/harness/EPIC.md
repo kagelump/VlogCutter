@@ -91,9 +91,9 @@ native, media, or topology gate.
 | 40 | [H01-T004](tasks/H01-T004-analysis-cujs.md) | Analysis CUJs | H01-T001 | complete |
 | 50 | [H01-T005](tasks/H01-T005-chronology-and-edit-plan-cujs.md) | Chronology and edit-plan CUJs | H01-T001 | complete |
 | 60 | [H01-T006](tasks/H01-T006-failure-and-recovery-matrix.md) | Failure and recovery matrix | H01-T002, H01-T003 | complete |
-| 70 | [H01-T007](tasks/H01-T007-import-and-card-cujs.md) | Import and card CUJs | H01-T003 | ready |
-| 80 | [H01-T008](tasks/H01-T008-ipc-contract-coverage-suite.md) | IPC contract coverage suite | H01-T004, H01-T005 | draft |
-| 90 | [H01-T009](tasks/H01-T009-ci-wiring-and-documentation.md) | CI wiring and documentation reconciliation | H01-T008 | draft |
+| 70 | [H01-T007](tasks/H01-T007-import-and-card-cujs.md) | Import and card CUJs | H01-T003 | complete |
+| 80 | [H01-T008](tasks/H01-T008-ipc-contract-coverage-suite.md) | IPC contract coverage suite | H01-T004, H01-T005 | complete |
+| 90 | [H01-T009](tasks/H01-T009-ci-wiring-and-documentation.md) | CI wiring and documentation reconciliation | H01-T008 | ready |
 | 100 | [H01-T010](tasks/H01-T010-browser-preview-rationalization.md) | Browser-preview rationalization | H01-T009 | draft |
 
 ### Execution note

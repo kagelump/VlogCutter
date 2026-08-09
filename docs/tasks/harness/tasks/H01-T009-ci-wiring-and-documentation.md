@@ -7,7 +7,7 @@
   "epic_id": "H01",
   "title": "CI wiring and documentation reconciliation",
   "slug": "ci-wiring-and-documentation",
-  "status": "draft",
+  "status": "ready",
   "task_class": "integration",
   "depends_on": ["H01-T008"],
   "principal_invariant": "The repository's testing authorities describe the tier that actually exists — what it runs, what it gates, and what it may never be cited as evidence for — and the CI workflow encodes exactly that.",
