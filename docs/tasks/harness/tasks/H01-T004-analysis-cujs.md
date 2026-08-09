@@ -7,7 +7,7 @@
   "epic_id": "H01",
   "title": "Analysis CUJs",
   "slug": "analysis-cujs",
-  "status": "ready",
+  "status": "complete",
   "task_class": "implementation",
   "depends_on": ["H01-T001"],
   "principal_invariant": "The analysis readiness gate, run progress, cancellation, and result surfacing are driven entirely by test-scripted events against canonical state, with no wall-clock delay and no completion the test did not grant.",
