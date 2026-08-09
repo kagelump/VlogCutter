@@ -250,6 +250,23 @@ Open a specific existing catalog at startup:
 RCDVLOG_CATALOG=/absolute/path/to/catalog.sqlite3 pnpm dev
 ```
 
+For defects that only reproduce inside the live native webview, the desktop has
+a dev-only eval bridge. It is a remote-code-execution surface and must remain
+compiled out under `#[cfg(debug_assertions)]`, disabled unless the exact opt-in
+is present, bound to fixed loopback port `127.0.0.1:47961`, and closed to every
+WebSocket handshake carrying an `Origin` header. Never turn it into a release
+diagnostic, runtime setting, or non-loopback listener.
+
+```bash
+RCDVLOG_EVAL_BRIDGE=1 pnpm dev
+pnpm eval -- 'document.readyState'
+pnpm eval -- --file /absolute/path/to/probe.js
+```
+
+The client prints JSON values and structured JavaScript errors. Every probe is
+logged by the running app. See `docs/tasks/desktop/DEV_EVAL_BRIDGE.md` for the
+contract, tests, and release-binary absence check.
+
 The Vite-only browser preview is useful for fast layout and interaction work:
 
 ```bash
