@@ -365,8 +365,14 @@ container, or on a laptop.
 
 ## 11. Relationship to the browser preview
 
-Phase 7 of the epic decides whether `api.ts`'s preview branches are rebuilt on
+H01-T010 decides whether `api.ts`'s preview branches are rebuilt on
 `DesktopHarnessState` or kept separate. The preferred outcome is one state
 machine with two front doors, so the preview stops being a second, subtly
-different fake. That decision is deliberately last: the harness must be proven
-by real tests before the preview is made to depend on it.
+different fake.
+
+As of the H01-T009 landing this is analysed but not executed, and the reasons
+are recorded in that packet: the harness's `act` import has to be made
+injectable first so no devDependency drifts toward the shipped bundle, and the
+acceptance check is a visual pass over the running preview that this branch
+could not perform. Until then the two fakes coexist, and the preview remains
+what it has always been — evidence for nothing.
