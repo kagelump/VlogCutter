@@ -7,7 +7,7 @@
   "epic_id": "H01",
   "title": "Failure and recovery matrix",
   "slug": "failure-and-recovery-matrix",
-  "status": "draft",
+  "status": "ready",
   "task_class": "qa",
   "depends_on": ["H01-T002", "H01-T003"],
   "principal_invariant": "Every backend failure the desktop can encounter leaves the user's unsaved work intact, their place in the queue intact, and an accurate, actionable statement of what failed — and a retry after the fault clears succeeds.",

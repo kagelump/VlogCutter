@@ -22,6 +22,7 @@ import { chronologyCommands } from "./commands/chronology";
 import { serverCommands } from "./commands/server";
 import { importCommands } from "./commands/import";
 import { mediaCommands } from "./commands/media";
+import { editPlanCommands } from "./commands/editPlan";
 import { MediaController } from "./media";
 import type { Asset } from "../../types";
 
@@ -40,6 +41,7 @@ export const commandTable: CommandTable = mergeTables(
   serverCommands,
   importCommands,
   mediaCommands,
+  editPlanCommands,
 );
 
 /** Commands served by the event plugin rather than by a handler module. */

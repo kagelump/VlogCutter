@@ -31,3 +31,10 @@ export type { JobController } from "./jobs";
 export { MediaController } from "./media";
 export type { GenerationStep, GenerationOutcome } from "./commands/media";
 export type { AnalysisStep, AnalysisOutcome } from "./commands/analysis";
+export type { PreviewStep } from "./commands/editPlan";
+export {
+  buildChronologyOverview,
+  buildContradiction,
+  buildDiagnostic,
+  type ChronologySpec,
+} from "./chronologyFixtures";
