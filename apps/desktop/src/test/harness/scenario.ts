@@ -70,9 +70,8 @@ export class ScenarioBuilder {
       putAsset(this.state, {
         ...asset,
         proxyAvailable: true,
-        proxyPath: `/Users/harness/Movies/proxies/${assetId}.mp4`,
-        proxyRepresentation: "metadata_baked_v1",
-        available: true,
+        proxyPath: `/Users/harness/Movies/proxies/${assetId}.v3.mp4`,
+        proxyRepresentation: "raw_v3",
       });
     }
     return this;
@@ -86,7 +85,6 @@ export class ScenarioBuilder {
         proxyAvailable: false,
         proxyPath: null,
         proxyRepresentation: null,
-        available: asset.originalAvailable,
       });
     }
     return this;
@@ -95,12 +93,40 @@ export class ScenarioBuilder {
   offlineOriginal(...assetIds: string[]): this {
     for (const assetId of assetIds) {
       const asset = this.requireAsset(assetId);
+      // `putAsset` re-derives `available`: with a proxy the clip stays
+      // reviewable, without one it goes dark.
+      putAsset(this.state, { ...asset, originalAvailable: false });
+    }
+    return this;
+  }
+
+  /**
+   * A proxy made by an older recipe. It plays, but the app counts it as work
+   * outstanding and regenerates it — the same as the backend's
+   * `has_current_proxy`.
+   */
+  withStaleProxy(...assetIds: string[]): this {
+    for (const assetId of assetIds) {
+      const asset = this.requireAsset(assetId);
       putAsset(this.state, {
         ...asset,
-        originalAvailable: false,
-        available: asset.proxyAvailable,
+        proxyAvailable: true,
+        proxyPath: `/Users/harness/Movies/proxies/${assetId}.mp4`,
+        proxyRepresentation: "metadata_baked_v1",
       });
     }
+    return this;
+  }
+
+  /** The loopback media origin failed to bind, so nothing has a URL to play. */
+  withoutMediaOrigin(): this {
+    this.state.mediaOrigin = null;
+    return this;
+  }
+
+  /** Clips a relink at this folder would actually find. */
+  relinkableAt(path: string, ...assetIds: string[]): this {
+    this.state.relinkable[path] = [...(this.state.relinkable[path] ?? []), ...assetIds];
     return this;
   }
 

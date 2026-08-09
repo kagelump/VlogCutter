@@ -116,8 +116,11 @@ export function buildCameraAssets({ projectId, camera, spec }: BuildAssetsOption
       capturedAtRaw: capturedAt,
       bestTime: capturedAt,
       offsetSeconds: 0,
-      proxyPath: hasProxy ? `/Users/harness/Movies/proxies/${id}.mp4` : null,
-      proxyRepresentation: hasProxy ? "metadata_baked_v1" : null,
+      // A current proxy is `raw_v3`, and the recipe encodes that in the path
+      // (`core/rcdvlog-core`: `has_current_proxy`, `proxy_representation`).
+      // Anything older counts as missing and is regenerated.
+      proxyPath: hasProxy ? `/Users/harness/Movies/proxies/${id}.v3.mp4` : null,
+      proxyRepresentation: hasProxy ? "raw_v3" : null,
       metadataRotationDegrees: spec.metadataRotationDegrees ?? 0,
       defaultRotationDegrees: spec.metadataRotationDegrees ?? 0,
       rotationDegrees: spec.metadataRotationDegrees ?? 0,
@@ -136,6 +139,8 @@ export function buildCameraAssets({ projectId, camera, spec }: BuildAssetsOption
       removed: false,
       mediaObjectId: null,
       mediaVerificationState: "verified",
+      // Derived, exactly as the catalog derives it: a proxy keeps a clip
+      // reviewable when its original is on a volume that is not mounted.
       available: originalAvailable || hasProxy,
       phase: null,
       location: null,

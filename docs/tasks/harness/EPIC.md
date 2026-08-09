@@ -86,8 +86,8 @@ native, media, or topology gate.
 | ---: | --- | --- | --- | --- |
 | 10 | [H01-T001](tasks/H01-T001-harness-foundation-and-ipc-seam.md) | Harness foundation and IPC seam | — | complete |
 | 20 | [H01-T002](tasks/H01-T002-review-loop-cujs.md) | Review-loop CUJs | H01-T001 | complete |
-| 30 | [H01-T003](tasks/H01-T003-media-state-and-generation-cujs.md) | Media state and generation CUJs | H01-T001 | ready |
-| 40 | [H01-T004](tasks/H01-T004-analysis-cujs.md) | Analysis CUJs | H01-T001 | draft |
+| 30 | [H01-T003](tasks/H01-T003-media-state-and-generation-cujs.md) | Media state and generation CUJs | H01-T001 | complete |
+| 40 | [H01-T004](tasks/H01-T004-analysis-cujs.md) | Analysis CUJs | H01-T001 | ready |
 | 50 | [H01-T005](tasks/H01-T005-chronology-and-edit-plan-cujs.md) | Chronology and edit-plan CUJs | H01-T001 | draft |
 | 60 | [H01-T006](tasks/H01-T006-failure-and-recovery-matrix.md) | Failure and recovery matrix | H01-T002, H01-T003 | draft |
 | 70 | [H01-T007](tasks/H01-T007-import-and-card-cujs.md) | Import and card CUJs | H01-T003 | draft |
