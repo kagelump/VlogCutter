@@ -193,6 +193,24 @@ describe("trip context anchoring", () => {
     expect(screen.getByRole("button", { name: "Add from here" })).toBeTruthy();
   });
 
+  it("positions the choices directly above the clicked ghost block", () => {
+    const { container } = renderRibbon();
+    const track = container.querySelector<HTMLElement>(".context-track")!;
+    fireEvent.pointerMove(track, { clientX: 10 });
+    const ghost = screen.getByRole("button", { name: "Add context at clip 1" });
+    ghost.getBoundingClientRect = () => ({
+      x: 380, y: 640, left: 380, top: 640, right: 448, bottom: 656,
+      width: 68, height: 16, toJSON: () => ({}),
+    });
+
+    fireEvent.click(ghost, { clientX: 412 });
+
+    const chooser = screen.getByRole("group", { name: "Add context at clip 1" });
+    expect(chooser.style.left).toBe("412px");
+    expect(chooser.style.top).toBe("632px");
+    expect(container.querySelector(".context-anchor-popover")).toBeNull();
+  });
+
   it("reports the chosen clip identity instead of a copied timestamp", async () => {
     const { props, container } = renderRibbon();
     fireEvent.pointerMove(container.querySelector<HTMLElement>(".context-track")!, { clientX: 75 });

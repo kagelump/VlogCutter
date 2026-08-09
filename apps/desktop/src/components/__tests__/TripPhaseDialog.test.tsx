@@ -73,4 +73,26 @@ describe("TripPhaseDialog", () => {
       displayMode: "dual",
     }));
   });
+
+  it("keeps the scrolling fields separate from the fixed actions and closes on Escape", async () => {
+    const onCancel = vi.fn();
+    const { container } = render(
+      <TripPhaseDialog
+        phase={null}
+        start={asset("a", "A0001_WITH_A_LONG_CAMERA_FILENAME.MP4")}
+        end={asset("b", "A0099_WITH_A_LONG_CAMERA_FILENAME.MP4")}
+        startPosition={0}
+        endPosition={98}
+        busy={false}
+        error=""
+        onCancel={onCancel}
+        onSave={vi.fn()}
+      />,
+    );
+
+    expect(container.querySelector(".context-modal-body")?.contains(screen.getByLabelText("Selected clip range"))).toBe(true);
+    expect(container.querySelector(".context-modal-actions")?.contains(screen.getByRole("button", { name: "Cancel" }))).toBe(true);
+    await userEvent.keyboard("{Escape}");
+    expect(onCancel).toHaveBeenCalledOnce();
+  });
 });

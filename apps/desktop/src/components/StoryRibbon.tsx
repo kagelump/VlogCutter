@@ -1,4 +1,5 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import type { CSSProperties, RefObject } from "react";
 import type { Asset } from "../types";
 import {
@@ -20,6 +21,12 @@ export interface ContextRun {
 }
 
 export type ContextDirection = "through" | "from";
+
+interface ContextAnchor {
+  index: number;
+  x: number;
+  top: number;
+}
 
 /**
  * The identity of a clip's trip context. Two adjacent clips with the same key
@@ -87,7 +94,8 @@ export function StoryRibbon({
   const [editingLane, setEditingLane] = useState<string | null>(null);
   const [laneDraft, setLaneDraft] = useState("");
   const [hoveredContextIndex, setHoveredContextIndex] = useState<number | null>(null);
-  const [contextAnchorIndex, setContextAnchorIndex] = useState<number | null>(null);
+  const [contextAnchor, setContextAnchor] = useState<ContextAnchor | null>(null);
+  const contextPopoverRef = useRef<HTMLDivElement>(null);
 
   // Enter and blur both commit, so a rename survives clicking away. An empty or
   // unchanged draft closes the field without a write.
@@ -103,7 +111,26 @@ export function StoryRibbon({
   const height = collapsed
     ? ribbonHeight(laneRows.length, true)
     : heightOverride ?? ribbonHeight(laneRows.length, false);
-  const contextAnchor = contextAnchorIndex === null ? null : assets[contextAnchorIndex] ?? null;
+  const contextAnchorAsset = contextAnchor === null ? null : assets[contextAnchor.index] ?? null;
+
+  useEffect(() => {
+    if (!contextAnchor) return;
+    contextPopoverRef.current?.querySelector<HTMLButtonElement>(".context-direction-button")?.focus();
+
+    function dismissOnPointerDown(event: PointerEvent) {
+      if (!contextPopoverRef.current?.contains(event.target as Node)) setContextAnchor(null);
+    }
+    function dismissOnEscape(event: KeyboardEvent) {
+      if (event.key === "Escape") setContextAnchor(null);
+    }
+
+    document.addEventListener("pointerdown", dismissOnPointerDown);
+    document.addEventListener("keydown", dismissOnEscape);
+    return () => {
+      document.removeEventListener("pointerdown", dismissOnPointerDown);
+      document.removeEventListener("keydown", dismissOnEscape);
+    };
+  }, [contextAnchor]);
 
   function contextIndexAt(clientX: number, track: HTMLDivElement) {
     const index = Math.floor((clientX - track.getBoundingClientRect().left) / zoom);
@@ -112,9 +139,9 @@ export function StoryRibbon({
   }
 
   function chooseContext(direction: ContextDirection) {
-    if (!contextAnchor) return;
-    onRequestContext(contextAnchor.id, direction);
-    setContextAnchorIndex(null);
+    if (!contextAnchorAsset) return;
+    onRequestContext(contextAnchorAsset.id, direction);
+    setContextAnchor(null);
     setHoveredContextIndex(null);
   }
 
@@ -127,20 +154,11 @@ export function StoryRibbon({
           {collapsed ? "▸" : "▾"} Story ribbon <kbd>T</kbd>
         </button>
         <div className="chronology-actions">
-          {contextAnchor ? (
-            <div className="context-anchor-choice" role="group" aria-label={`Add context at clip ${contextAnchorIndex! + 1}`}>
-              <span>#{contextAnchorIndex! + 1}</span>
-              <button type="button" onClick={() => chooseContext("through")}>Add through here</button>
-              <button type="button" onClick={() => chooseContext("from")}>Add from here</button>
-              <button type="button" className="context-choice-close" aria-label="Cancel adding context" onClick={() => setContextAnchorIndex(null)}>×</button>
-            </div>
-          ) : (
-            <span className="chronology-position">
-              {selected && !selected.removed
-                ? `#${assets.findIndex((asset) => asset.id === selected.id) + 1} · ${formatDate(selected.bestTime)}`
-                : "No active clip selected"}
-            </span>
-          )}
+          <span className="chronology-position">
+            {selected && !selected.removed
+              ? `#${assets.findIndex((asset) => asset.id === selected.id) + 1} · ${formatDate(selected.bestTime)}`
+              : "No active clip selected"}
+          </span>
           <div className="zoom-control" aria-label="Story ribbon zoom">
             <button
               onClick={() => onZoomChange(Math.max(RIBBON_ZOOM_MIN, zoom - RIBBON_ZOOM_STEP))}
@@ -227,11 +245,11 @@ export function StoryRibbon({
               <div
                 className="context-track"
                 onPointerMove={(event) => {
-                  if (contextAnchorIndex !== null) return;
+                  if (contextAnchor !== null) return;
                   setHoveredContextIndex(contextIndexAt(event.clientX, event.currentTarget));
                 }}
                 onPointerLeave={() => {
-                  if (contextAnchorIndex === null) setHoveredContextIndex(null);
+                  if (contextAnchor === null) setHoveredContextIndex(null);
                 }}
               >
                 {contextRuns.map((run) => {
@@ -258,14 +276,24 @@ export function StoryRibbon({
                     </button>
                   );
                 })}
-                {(hoveredContextIndex !== null || contextAnchorIndex !== null) && (
+                {(hoveredContextIndex !== null || contextAnchor !== null) && (
                   <button
                     type="button"
-                    className={`context-ghost ${contextAnchorIndex !== null ? "is-anchored" : ""}`}
-                    style={{ left: (contextAnchorIndex ?? hoveredContextIndex ?? 0) * zoom + 3, width: Math.max(18, zoom - 6) }}
-                    aria-label={`Add context at clip ${(contextAnchorIndex ?? hoveredContextIndex ?? 0) + 1}`}
+                    className={`context-ghost ${contextAnchor !== null ? "is-anchored" : ""}`}
+                    style={{ left: (contextAnchor?.index ?? hoveredContextIndex ?? 0) * zoom + 3, width: Math.max(18, zoom - 6) }}
+                    aria-label={`Add context at clip ${(contextAnchor?.index ?? hoveredContextIndex ?? 0) + 1}`}
                     onPointerMove={(event) => event.stopPropagation()}
-                    onClick={() => setContextAnchorIndex(contextAnchorIndex ?? hoveredContextIndex)}
+                    onClick={(event) => {
+                      const index = contextAnchor?.index ?? hoveredContextIndex;
+                      if (index === null) return;
+                      const rect = event.currentTarget.getBoundingClientRect();
+                      const clickX = event.clientX || rect.left + rect.width / 2;
+                      setContextAnchor({
+                        index,
+                        x: Math.min(window.innerWidth - 158, Math.max(158, clickX)),
+                        top: rect.top,
+                      });
+                    }}
                   >
                     <span aria-hidden="true">+</span>
                   </button>
@@ -302,6 +330,26 @@ export function StoryRibbon({
           </div>
         </div>
       ) : <div className="empty-lanes">Camera lanes appear after ingest.</div>}
+      {contextAnchor && typeof document !== "undefined" && createPortal(
+        <div
+          ref={contextPopoverRef}
+          className="context-anchor-popover"
+          role="group"
+          aria-label={`Add context at clip ${contextAnchor.index + 1}`}
+          style={{ left: contextAnchor.x, top: Math.max(8, contextAnchor.top - 8) }}
+        >
+          <div className="context-popover-heading">
+            <span>Clip #{contextAnchor.index + 1}</span>
+            <strong>Set context boundary</strong>
+            <button type="button" aria-label="Cancel adding context" onClick={() => setContextAnchor(null)}>×</button>
+          </div>
+          <div className="context-popover-actions">
+            <button type="button" className="context-direction-button" onClick={() => chooseContext("through")}><span aria-hidden="true">←</span> Add through here</button>
+            <button type="button" className="context-direction-button" onClick={() => chooseContext("from")}>Add from here <span aria-hidden="true">→</span></button>
+          </div>
+        </div>,
+        document.body,
+      )}
     </div>
   );
 }
