@@ -86,6 +86,9 @@ async fn serve<E: ScriptEvaluator>(listener: TcpListener, evaluator: Arc<E>) {
     }
 }
 
+// The handshake callback's error type is `tungstenite`'s, not ours: the
+// rejection must be a whole HTTP response, and there is nothing here to box.
+#[allow(clippy::result_large_err)]
 async fn serve_connection<E: ScriptEvaluator>(
     stream: TcpStream,
     evaluator: Arc<E>,

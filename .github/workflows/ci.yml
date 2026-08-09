@@ -1,3 +1,9 @@
+# Every gate step carries `if: ${{ !cancelled() }}` so that one red step
+# reports one failure rather than hiding every later one. Before this, a
+# formatting nit in `cargo fmt` skipped clippy, the whole test suite, both
+# frontend suites and every docs check, and main stayed red for six days
+# looking like a single trivial problem. Keep the guard on any gate added here.
+
 name: ci
 
 on:
@@ -45,30 +51,39 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: cargo clippy --workspace --all-targets -- -D warnings
+        if: ${{ !cancelled() }}
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: cargo test --workspace
+        if: ${{ !cancelled() }}
         run: cargo test --workspace
 
       - name: pnpm check:frontend
+        if: ${{ !cancelled() }}
         run: pnpm check:frontend
 
       - name: pnpm test:desktop
+        if: ${{ !cancelled() }}
         run: pnpm test:desktop
 
       - name: pnpm test:web
+        if: ${{ !cancelled() }}
         run: pnpm test:web
 
       - name: pnpm test:integration
+        if: ${{ !cancelled() }}
         run: pnpm test:integration
 
       - name: pnpm check:openapi
+        if: ${{ !cancelled() }}
         run: pnpm check:openapi
 
       - name: pnpm check:docs
+        if: ${{ !cancelled() }}
         run: pnpm check:docs
 
       - name: pnpm check:deployment
+        if: ${{ !cancelled() }}
         run: pnpm check:deployment
 
   macos:
@@ -109,4 +124,5 @@ jobs:
         run: cargo test -p rcdvlog-desktop
 
       - name: pnpm --dir apps/desktop tauri build
+        if: ${{ !cancelled() }}
         run: pnpm --dir apps/desktop tauri build
