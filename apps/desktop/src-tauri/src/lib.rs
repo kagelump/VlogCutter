@@ -21,6 +21,7 @@ mod chronology_commands;
 #[cfg(debug_assertions)]
 mod eval_bridge;
 mod keychain;
+mod media_server;
 mod server_client;
 mod sync_manager;
 
@@ -105,6 +106,15 @@ pub(crate) struct AppState {
     /// Set by `cancel_analysis` and observed by the running batch. Cleared when
     /// a run starts so a cancel from a previous run cannot stop the next one.
     analysis_cancel: Arc<AtomicBool>,
+    /// Resolves asset ids to on-disk media for the loopback origin. Held here so
+    /// a restarted origin reads the same live catalog and settings.
+    media_catalog: Arc<CatalogMedia>,
+    /// `None` until the origin binds, and again if it could not be restarted.
+    /// Media falls back to nothing rather than to a weaker transport.
+    media_server: Arc<RwLock<Option<media_server::MediaServer>>>,
+    /// The origin is restarted at most once per session, so a listener that
+    /// cannot bind does not turn into a retry loop behind every media error.
+    media_restarted: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -169,6 +179,63 @@ struct DesktopSettings {
     paired_server_endpoints: Option<Vec<ServerEndpoint>>,
 }
 
+/// `DesktopSettings` plus the things the frontend needs but must never be
+/// written to disk. The settings themselves are flattened so the TypeScript
+/// shape stays one object.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DesktopSettingsView {
+    #[serde(flatten)]
+    settings: DesktopSettings,
+    /// `None` when the loopback origin could not bind. The stage then shows the
+    /// offline slate instead of an element that would never paint.
+    media_origin: Option<media_server::MediaOrigin>,
+}
+
+/// Resolves asset ids to media paths for the loopback origin, reading the
+/// catalog and settings the app currently has open rather than a snapshot, so
+/// opening another project does not strand the origin on the previous one.
+struct CatalogMedia {
+    catalog: Arc<RwLock<Catalog>>,
+    settings: Arc<RwLock<DesktopSettings>>,
+    app_data_dir: PathBuf,
+}
+
+impl media_server::MediaCatalog for CatalogMedia {
+    fn locate(&self, asset_id: &str) -> Option<media_server::AssetMedia> {
+        let catalog = self.catalog.read().ok()?.clone();
+        let asset = catalog.get_asset(asset_id).ok()?;
+        Some(media_server::AssetMedia {
+            original: Some(PathBuf::from(asset.path)),
+            proxy: asset.proxy_path.map(PathBuf::from),
+        })
+    }
+
+    /// The roots review media is allowed to live under. This mirrors the asset
+    /// protocol scope in `tauri.conf.json` — cache, home, mounted volumes, and
+    /// the temporary fixture root — plus wherever the open catalog and the
+    /// projects folder actually are, since either can be moved by settings or
+    /// by `RCDVLOG_CATALOG`.
+    fn storage_roots(&self) -> Vec<PathBuf> {
+        let mut roots = vec![self.app_data_dir.clone(), std::env::temp_dir()];
+        if let Some(home) = dirs::home_dir() {
+            roots.push(home);
+        }
+        if cfg!(target_os = "macos") {
+            roots.push(PathBuf::from("/Volumes"));
+        }
+        if let Ok(settings) = self.settings.read() {
+            roots.push(settings.projects_root.clone());
+        }
+        if let Ok(catalog) = self.catalog.read()
+            && let Some(parent) = catalog.database_path().parent()
+        {
+            roots.push(parent.to_path_buf());
+        }
+        roots
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ServerPairingResult {
@@ -199,6 +266,7 @@ impl AppState {
         catalog: Catalog,
         settings: DesktopSettings,
         settings_path: PathBuf,
+        app_data_dir: PathBuf,
     ) -> anyhow::Result<Self> {
         fs::create_dir_all(&settings.projects_root).with_context(|| {
             format!("create project folder {}", settings.projects_root.display())
@@ -213,6 +281,11 @@ impl AppState {
             settings.clone(),
             sync_status.clone(),
         );
+        let media_catalog = Arc::new(CatalogMedia {
+            catalog: catalog.clone(),
+            settings: settings.clone(),
+            app_data_dir,
+        });
         Ok(Self {
             catalog,
             settings,
@@ -221,6 +294,9 @@ impl AppState {
             sync_manager,
             sync_status,
             analysis_cancel: Arc::new(AtomicBool::new(false)),
+            media_catalog,
+            media_server: Arc::new(RwLock::new(None)),
+            media_restarted: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -234,15 +310,74 @@ impl AppState {
             format!("create project folder {}", settings.projects_root.display())
         })?;
         catalog.set_local_node_id(&settings.node_id)?;
+        let catalog = Arc::new(RwLock::new(catalog));
+        let settings = Arc::new(RwLock::new(settings));
+        let app_data_dir = settings_path
+            .parent()
+            .map_or_else(std::env::temp_dir, Path::to_path_buf);
         Ok(Self {
-            catalog: Arc::new(RwLock::new(catalog)),
-            settings: Arc::new(RwLock::new(settings)),
+            catalog: catalog.clone(),
+            settings: settings.clone(),
             settings_path,
             baseline_attempt: Arc::new(RwLock::new(None)),
             sync_manager: sync_manager::SyncManager::spawn_test(),
             sync_status: Arc::new(RwLock::new(HashMap::new())),
             analysis_cancel: Arc::new(AtomicBool::new(false)),
+            media_catalog: Arc::new(CatalogMedia {
+                catalog,
+                settings,
+                app_data_dir,
+            }),
+            media_server: Arc::new(RwLock::new(None)),
+            media_restarted: Arc::new(AtomicBool::new(false)),
         })
+    }
+
+    /// Bind the loopback media origin. Called once at startup; a failure here is
+    /// surfaced immediately rather than at the first playback attempt.
+    fn start_media_origin(&self) -> anyhow::Result<media_server::MediaOrigin> {
+        let server = media_server::MediaServer::start(self.media_catalog.clone())?;
+        let origin = server.origin();
+        *self
+            .media_server
+            .write()
+            .map_err(|_| anyhow::anyhow!("media origin state is unavailable"))? = Some(server);
+        Ok(origin)
+    }
+
+    fn media_origin(&self) -> Option<media_server::MediaOrigin> {
+        self.media_server
+            .read()
+            .ok()?
+            .as_ref()
+            .map(media_server::MediaServer::origin)
+    }
+
+    /// Restart the origin, at most once per session. Returns the new origin, or
+    /// the error that stopped it, so the frontend can report either.
+    fn restart_media_origin(&self) -> anyhow::Result<media_server::MediaOrigin> {
+        if self.media_restarted.swap(true, Ordering::SeqCst) {
+            bail!("the media origin has already been restarted once this session");
+        }
+        // Dropping the old server releases its port and its token.
+        *self
+            .media_server
+            .write()
+            .map_err(|_| anyhow::anyhow!("media origin state is unavailable"))? = None;
+        self.start_media_origin()
+    }
+
+    fn stop_media_origin(&self) {
+        if let Ok(mut server) = self.media_server.write() {
+            *server = None;
+        }
+    }
+
+    fn settings_view(&self, settings: DesktopSettings) -> DesktopSettingsView {
+        DesktopSettingsView {
+            settings,
+            media_origin: self.media_origin(),
+        }
     }
 
     fn catalog(&self) -> Result<Catalog, String> {
@@ -532,17 +667,23 @@ fn set_projects_root(
 }
 
 #[tauri::command]
-fn desktop_settings(state: State<'_, AppState>) -> std::result::Result<DesktopSettings, String> {
-    state.desktop_settings().map_err(error_message)
+fn desktop_settings(
+    state: State<'_, AppState>,
+) -> std::result::Result<DesktopSettingsView, String> {
+    state
+        .desktop_settings()
+        .map(|settings| state.settings_view(settings))
+        .map_err(error_message)
 }
 
 #[tauri::command]
 fn set_autoplay_mode(
     autoplay_mode: AutoplayMode,
     state: State<'_, AppState>,
-) -> std::result::Result<DesktopSettings, String> {
+) -> std::result::Result<DesktopSettingsView, String> {
     state
         .set_autoplay_mode(autoplay_mode)
+        .map(|settings| state.settings_view(settings))
         .map_err(error_message)
 }
 
@@ -551,10 +692,51 @@ fn record_desktop_context(
     project_id: String,
     asset_id: Option<String>,
     state: State<'_, AppState>,
-) -> std::result::Result<DesktopSettings, String> {
+) -> std::result::Result<DesktopSettingsView, String> {
     state
         .record_desktop_context(project_id, asset_id)
+        .map(|settings| state.settings_view(settings))
         .map_err(error_message)
+}
+
+/// Health-check the loopback media origin and restart it once if it is gone.
+///
+/// The frontend calls this when a media element reports an error it cannot
+/// explain, which is the only cheap signal that the origin died mid-session.
+/// A healthy origin is returned unchanged, so a genuine decode failure does not
+/// invalidate every URL on screen.
+#[tauri::command]
+async fn recover_media_origin(
+    state: State<'_, AppState>,
+) -> std::result::Result<Option<media_server::MediaOrigin>, String> {
+    let Some(origin) = state.media_origin() else {
+        return state
+            .start_media_origin()
+            .map(Some)
+            .map_err(|error| format!("media origin is unavailable: {error}"));
+    };
+    if media_origin_healthy(&origin).await {
+        return Ok(Some(origin));
+    }
+    state
+        .restart_media_origin()
+        .map(Some)
+        .map_err(|error| format!("media origin could not be restarted: {error}"))
+}
+
+async fn media_origin_healthy(origin: &media_server::MediaOrigin) -> bool {
+    let Ok(client) = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()
+    else {
+        return false;
+    };
+    client
+        .get(format!("{}/healthz", origin.base_url))
+        .query(&[("t", origin.token.as_str())])
+        .send()
+        .await
+        .is_ok_and(|response| response.status().is_success())
 }
 
 #[tauri::command]
@@ -1593,7 +1775,16 @@ pub fn run() {
                 catalog,
                 settings,
                 settings_path,
+                app_data.clone(),
             )?);
+
+            // Review media is served over loopback HTTP rather than the asset
+            // protocol; see `media_server`. Binding failure is reported here
+            // because the alternative is media that silently never paints.
+            let state = app.state::<AppState>();
+            if let Err(error) = state.start_media_origin() {
+                eprintln!("[media-origin] could not start: {error:#}");
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -1676,9 +1867,17 @@ pub fn run() {
             sync_status,
             sync_now,
             sync_all_status,
+            recover_media_origin,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running RCD VlogCutter");
+        .build(tauri::generate_context!())
+        .expect("error while running RCD VlogCutter")
+        .run(|app, event| {
+            // Requirement 8: the origin stops with the app, and the session
+            // token goes with it.
+            if matches!(event, tauri::RunEvent::Exit) {
+                app.state::<AppState>().stop_media_origin();
+            }
+        });
 }
 
 #[cfg(test)]
@@ -1880,5 +2079,131 @@ mod tests {
         let settings = load_settings(&settings_path, PathBuf::from("fallback"));
         assert_eq!(settings.projects_root, projects_root);
         assert_eq!(settings.autoplay_mode, AutoplayMode::ProxyAvailable);
+    }
+
+    #[test]
+    fn the_media_origin_reaches_the_frontend_but_never_the_settings_file() {
+        let directory = tempdir().unwrap();
+        let settings_path = directory.path().join("settings.json");
+        let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).unwrap();
+        let state = AppState::new_for_test(
+            catalog,
+            test_settings(directory.path().join("projects")),
+            settings_path.clone(),
+        )
+        .unwrap();
+
+        // Before the origin binds, the frontend is told there is none rather
+        // than being handed a URL that would never answer.
+        let view = state.settings_view(state.desktop_settings().unwrap());
+        assert_eq!(view.media_origin, None);
+
+        let origin = state.start_media_origin().unwrap();
+        assert!(origin.base_url.starts_with("http://127.0.0.1:"));
+        assert!(!origin.base_url.ends_with(":0"));
+        assert!(origin.token.len() >= 22);
+
+        let view =
+            serde_json::to_value(state.settings_view(state.desktop_settings().unwrap())).unwrap();
+        assert_eq!(view["mediaOrigin"]["baseUrl"], origin.base_url);
+        assert_eq!(view["mediaOrigin"]["token"], origin.token);
+        // The flattened settings still carry every field the frontend reads.
+        assert_eq!(view["nodeId"], "node_desktop_test");
+        assert!(view.get("projectsRoot").is_some());
+
+        // Requirement: the token never touches disk.
+        state.set_autoplay_mode(AutoplayMode::Always).unwrap();
+        let persisted = fs::read_to_string(&settings_path).unwrap();
+        assert!(
+            !persisted.contains(&origin.token),
+            "the session token was written to settings.json"
+        );
+        assert!(!persisted.contains("mediaOrigin"));
+    }
+
+    #[test]
+    fn the_media_origin_restarts_at_most_once_a_session() {
+        let directory = tempdir().unwrap();
+        let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).unwrap();
+        let state = AppState::new_for_test(
+            catalog,
+            test_settings(directory.path().join("projects")),
+            directory.path().join("settings.json"),
+        )
+        .unwrap();
+
+        let first = state.start_media_origin().unwrap();
+        let second = state.restart_media_origin().unwrap();
+        // A new port and, more importantly, a new token: the old one is gone.
+        assert_ne!(first.token, second.token);
+        assert_ne!(first.base_url, second.base_url);
+        assert_eq!(state.media_origin(), Some(second));
+
+        assert!(
+            state.restart_media_origin().is_err(),
+            "a second restart would turn a failing listener into a retry loop"
+        );
+
+        state.stop_media_origin();
+        assert_eq!(state.media_origin(), None);
+    }
+
+    #[test]
+    fn storage_roots_cover_project_media_and_exclude_the_rest() {
+        use media_server::MediaCatalog as _;
+
+        let directory = tempdir().unwrap();
+        let projects_root = directory.path().join("VideoProjects");
+        let catalog_path = directory.path().join("elsewhere").join("catalog.sqlite3");
+        fs::create_dir_all(catalog_path.parent().unwrap()).unwrap();
+        let catalog = Catalog::open(&catalog_path).unwrap();
+        let state = AppState::new_for_test(
+            catalog,
+            test_settings(projects_root.clone()),
+            directory.path().join("settings.json"),
+        )
+        .unwrap();
+
+        let roots = state.media_catalog.storage_roots();
+        assert!(
+            roots.contains(&projects_root),
+            "the projects folder is a root"
+        );
+        assert!(
+            roots.contains(&catalog_path.parent().unwrap().to_path_buf()),
+            "a catalog opened outside the projects folder is still reachable"
+        );
+        assert!(
+            !roots.iter().any(|root| root == Path::new("/")),
+            "the whole filesystem is never a root"
+        );
+        assert!(!roots.iter().any(|root| root == Path::new("/etc")));
+    }
+
+    #[test]
+    fn media_paths_come_from_the_catalog_not_the_caller() {
+        use media_server::MediaCatalog as _;
+
+        let directory = tempdir().unwrap();
+        let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).unwrap();
+        let project = catalog.create_project("Media").unwrap();
+        let state = AppState::new_for_test(
+            catalog,
+            test_settings(directory.path().join("projects")),
+            directory.path().join("settings.json"),
+        )
+        .unwrap();
+
+        // An id that is not in the open catalog resolves to nothing, which the
+        // origin reports as 404 without ever touching the filesystem.
+        assert_eq!(state.media_catalog.locate("asset_not_here"), None);
+        assert!(
+            state
+                .catalog()
+                .unwrap()
+                .list_assets(&project.id)
+                .unwrap()
+                .is_empty()
+        );
     }
 }

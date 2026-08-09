@@ -1,7 +1,7 @@
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
-import type { AnalysisProgress, AnalysisReadiness, AnalysisRunRecord, AnalysisRunReport, AnalysisRunRequest, AnalysisStage, Asset, AssetAnalysisIndexEntry, AssetAnalysisView, AssetPatch, AutoplayMode, BaselineImportResult, BaselinePreviewResult, ClipTranscript, DesktopSettings, GenerationProgress, IngestReport, LoadedCatalog, ModelInstallProgress, ModelStatus, PathAnalysis, Project, ProjectLibrary, ProjectPairingStatus, RootMappingEntry, ServerConnectionStatus, ServerPairingResult, ServerVersionInfo, SyncStatus, ThumbnailReport } from "./types";
+import type { AnalysisProgress, AnalysisReadiness, AnalysisRunRecord, AnalysisRunReport, AnalysisRunRequest, AnalysisStage, Asset, AssetAnalysisIndexEntry, AssetAnalysisView, AssetPatch, AutoplayMode, BaselineImportResult, BaselinePreviewResult, ClipTranscript, DesktopSettings, GenerationProgress, IngestReport, LoadedCatalog, MediaOrigin, ModelInstallProgress, ModelStatus, PathAnalysis, Project, ProjectLibrary, ProjectPairingStatus, RootMappingEntry, ServerConnectionStatus, ServerPairingResult, ServerVersionInfo, SyncStatus, ThumbnailReport } from "./types";
 
 const inTauri = () => "__TAURI_INTERNALS__" in window;
 
@@ -101,6 +101,39 @@ function writeMockSettings(settings: DesktopSettings) {
   } catch {
     // The browser preview can still use in-memory defaults when storage is unavailable.
   }
+}
+
+/**
+ * The loopback origin review media is served from. Held in memory only: it is
+ * minted per session by the desktop app and is meaningless to a later one.
+ * `mediaUrl` is synchronous, so it reads this rather than awaiting a command.
+ */
+let mediaOrigin: MediaOrigin | null = null;
+
+function rememberMediaOrigin(settings: DesktopSettings): DesktopSettings {
+  mediaOrigin = settings.mediaOrigin ?? null;
+  publishDevMediaHandle();
+  return settings;
+}
+
+/**
+ * The dev-only agent seam.
+ *
+ * An agent debugging media through the eval bridge otherwise has no way to
+ * learn the origin's ephemeral port or its session token, and so cannot ask the
+ * app why a clip will not play. `debugUrl` is set only by a debug build started
+ * with `RCDVLOG_MEDIA_DEBUG=1`, which is what keeps this handle out of a
+ * shipped app:
+ *
+ *     RCDVLOG_EVAL_BRIDGE=1 RCDVLOG_MEDIA_DEBUG=1 pnpm dev
+ *     pnpm eval -- 'window.__RCDVLOG_MEDIA_ORIGIN__.debugUrl'
+ *
+ * See `docs/tasks/desktop/MEDIA_DELIVERY.md`.
+ */
+function publishDevMediaHandle() {
+  const global = window as unknown as Record<string, unknown>;
+  if (mediaOrigin?.debugUrl) global.__RCDVLOG_MEDIA_ORIGIN__ = mediaOrigin;
+  else delete global.__RCDVLOG_MEDIA_ORIGIN__;
 }
 
 // ── Browser-preview mocks for clip analysis ─────────────────────────
@@ -337,18 +370,37 @@ export const api = {
   },
 
   async desktopSettings(): Promise<DesktopSettings> {
-    return inTauri() ? invoke("desktop_settings") : readMockSettings();
+    if (!inTauri()) return readMockSettings();
+    return rememberMediaOrigin(await invoke<DesktopSettings>("desktop_settings"));
   },
 
   async setAutoplayMode(autoplayMode: AutoplayMode): Promise<DesktopSettings> {
-    if (inTauri()) return invoke("set_autoplay_mode", { autoplayMode });
+    if (inTauri()) {
+      return rememberMediaOrigin(await invoke<DesktopSettings>("set_autoplay_mode", { autoplayMode }));
+    }
     const settings = { ...readMockSettings(), autoplayMode };
     writeMockSettings(settings);
     return settings;
   },
 
+  /**
+   * Re-check the loopback media origin after a media element failed for a
+   * reason it could not name, and restart it once if it has died. A healthy
+   * origin comes back unchanged, so an ordinary decode failure does not
+   * invalidate every URL on screen.
+   */
+  async recoverMediaOrigin(): Promise<MediaOrigin | null> {
+    if (!inTauri()) return null;
+    const origin = await invoke<MediaOrigin | null>("recover_media_origin");
+    mediaOrigin = origin ?? null;
+    publishDevMediaHandle();
+    return mediaOrigin;
+  },
+
   async recordDesktopContext(projectId: string, assetId: string | null): Promise<DesktopSettings> {
-    if (inTauri()) return invoke("record_desktop_context", { projectId, assetId });
+    if (inTauri()) {
+      return rememberMediaOrigin(await invoke<DesktopSettings>("record_desktop_context", { projectId, assetId }));
+    }
     const settings = {
       ...readMockSettings(),
       lastCatalogPath: "/Users/demo/Movies/VideoProjects/Hokkaido field test/catalog.sqlite3",
@@ -780,14 +832,31 @@ export const api = {
     return listen<SyncStatus>("sync-status-changed", (event) => callback(event.payload));
   },
 
+  /**
+   * The URL the stage plays a clip from.
+   *
+   * Review media is served from the app's own loopback HTTP origin rather than
+   * the asset protocol, because `WKWebView` will not produce video frames for a
+   * custom scheme: an un-played clip has no first frame to paint, and neither
+   * would a hover scrub, a filmstrip, or a contact sheet. See
+   * `docs/tasks/desktop/MEDIA_DELIVERY.md`.
+   *
+   * The proxy-versus-original choice is unchanged and stays here, on the side
+   * that also decides rotation and poster agreement; it rides along as `rep` so
+   * the origin serves exactly the representation this asset was measured
+   * against. The origin resolves the id through the catalog — no path is ever
+   * sent — and refuses the request outright without the session token.
+   */
   mediaUrl(asset: Asset): string | null {
     if (!inTauri()) return null;
-    const path = asset.proxyAvailable && asset.proxyPath
-      ? asset.proxyPath
+    const representation = asset.proxyAvailable && asset.proxyPath
+      ? "proxy"
       : asset.originalAvailable
-        ? asset.path
+        ? "original"
         : null;
-    return path ? convertFileSrc(path) : null;
+    if (!representation || !mediaOrigin) return null;
+    const query = new URLSearchParams({ rep: representation, t: mediaOrigin.token });
+    return `${mediaOrigin.baseUrl}/media/${encodeURIComponent(asset.id)}?${query}`;
   },
 
   thumbnailUrl(asset: Asset): string | null {

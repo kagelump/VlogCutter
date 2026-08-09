@@ -223,6 +223,28 @@ describe("playback reporting", () => {
     await userEvent.click(document.querySelector("video")!);
     expect(props.onTogglePlay).toHaveBeenCalled();
   });
+
+  it("reports an element error once, from the active element only", () => {
+    // The shell reads this as "the media origin may have died" and checks it.
+    // A preloaded neighbour failing says nothing about what is on screen.
+    const onMediaError = vi.fn();
+    const { props } = renderStage({
+      onMediaError,
+      media: [
+        media({ asset: asset({ id: "cur" }), active: true }),
+        media({ asset: asset({ id: "next" }), offset: 1, active: false, url: "blob:next" }),
+      ],
+    });
+    const videos = [...document.querySelectorAll("video")];
+
+    fireEvent.error(videos[1]);
+    expect(onMediaError).not.toHaveBeenCalled();
+
+    fireEvent.error(videos[0]);
+    expect(onMediaError).toHaveBeenCalledTimes(1);
+    // The spinner is cleared: an element that failed is not still loading.
+    expect(props.onBufferingChange).toHaveBeenLastCalledWith(false);
+  });
 });
 
 describe("stage chrome", () => {

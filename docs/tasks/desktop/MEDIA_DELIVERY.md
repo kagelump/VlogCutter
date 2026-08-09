@@ -1,7 +1,11 @@
 # Media delivery — replace the asset protocol with a loopback HTTP origin
 
-**Status** proposed. **Depends on** nothing. **Supersedes** the current
-`convertFileSrc` path in `apps/desktop/src/api.ts`.
+**Status** implemented 2026-08-09, except for the three acceptance criteria that
+can only be observed in a live `WKWebView` — see [What shipped](#what-shipped)
+and [What is still unverified](#what-is-still-unverified). **Depends on**
+nothing. **Supersedes** the `convertFileSrc` path in `apps/desktop/src/api.ts`
+for video; thumbnails and posters still use the asset protocol, because images
+were never affected.
 
 ## The problem
 
@@ -107,6 +111,96 @@ some request shapes, by any web page the user has open. These are not optional.
 
 Rollback is one function body, which is the main argument for doing this behind
 `api.mediaUrl` rather than threading URLs through the component tree.
+
+## What shipped
+
+| Piece | Where |
+| --- | --- |
+| The origin: bind, guard, resolve, range-stream, shut down | `apps/desktop/src-tauri/src/media_server.rs` |
+| Catalog-backed resolution and the storage roots it validates against | `CatalogMedia` in `apps/desktop/src-tauri/src/lib.rs` |
+| Startup bind, `RunEvent::Exit` shutdown, restart-once recovery | `run()` and `recover_media_origin` in the same file |
+| Base URL and token handed to the frontend | `desktop_settings` (and the two other settings commands), as `mediaOrigin` |
+| URL construction | `api.mediaUrl` in `apps/desktop/src/api.ts` |
+| Media-error signal that triggers the health check | `onMediaError` in `apps/desktop/src/components/VideoStage.tsx` |
+| Dev-only agent diagnostics | the `dev` module in `media_server.rs`, and `publishDevMediaHandle` in `api.ts` |
+
+Three decisions are worth knowing before changing any of it:
+
+- **The frontend names the representation.** `mediaUrl` appends `rep=proxy` or
+  `rep=original`, resolved by exactly the rule it used before. The origin honours
+  it rather than choosing for itself, because the same asset row also decides
+  rotation and whether the poster's orientation agrees; a server that picked
+  differently would put the two out of step. Omitting `rep` is allowed and
+  applies the same preference, falling back to the original when a recorded proxy
+  is missing.
+- **`mediaOrigin` rides on the settings DTO, not on `DesktopSettings` itself.**
+  `DesktopSettingsView` flattens the persisted settings and adds the origin, so
+  the token reaches the frontend without ever reaching `settings.json`. There is
+  a test that reads the file back and asserts the token is not in it.
+- **The origin restarts at most once per session.** A listener that cannot bind
+  must not become a retry loop behind every media error, so the second attempt
+  returns an error the frontend reports.
+
+Every security requirement above has a test in `media_server.rs` or `lib.rs`:
+token-before-anything, foreign `Origin`, rebound `Host`, unknown asset id,
+write methods, paths outside the storage roots, traversal dressed up as a
+catalog row, and unreachability after shutdown.
+
+## Debugging it from an agent
+
+The origin binds an ephemeral port and mints a token that never touches disk, so
+an agent looking at a screenshot has no way to reach it — and a 404 on a black
+frame says nothing about *why*. A dev-only mode closes that gap. It is held to
+the same rules as the eval bridge, because it reports full media paths, which
+requirement 7 keeps out of ordinary logs: compiled out unless `debug_assertions`,
+dormant unless `RCDVLOG_MEDIA_DEBUG` is exactly `1`, behind the same token,
+`Host` and `Origin` guard as the media route, read-only, and bounded to the last
+50 requests. `apps/desktop/src-tauri/tests/release_dev_seams_absent.rs` proves
+both seams are absent from a release binary.
+
+```bash
+RCDVLOG_EVAL_BRIDGE=1 RCDVLOG_MEDIA_DEBUG=1 pnpm dev
+
+# The origin publishes itself on `window` only when diagnostics are on.
+pnpm eval -- 'window.__RCDVLOG_MEDIA_ORIGIN__.debugUrl'
+
+# What has the origin been asked for, and what did it do?
+curl -s '<that url>' | jq
+
+# Why will this specific clip not play?
+curl -s '<that url>&asset=<asset id>&rep=proxy' | jq .probe
+```
+
+`GET /debug/media` reports the origin's uptime, its resolved storage roots, a
+tally of outcomes, and the last 50 requests with their asset id, representation,
+`Range`, status, resolved path, planned bytes and elapsed time. Adding
+`&asset=<id>` adds a `probe`: whether the id is in the open catalog, the paths
+the catalog holds for it, and the outcome resolution would reach —
+`ok`, `unknown_asset`, `no_representation`, `missing`, `not_a_file` or
+`outside_roots`. Those are the same reasons the media route collapses into a
+bare 404 on the wire.
+
+The recipe composes with the eval bridge rather than adding a second listener,
+and it never prints the token except on the one startup line the mode asks for.
+`docs/tasks/desktop/DEV_EVAL_BRIDGE.md` covers the bridge itself.
+
+## What is still unverified
+
+These need a real `WKWebView` and are the reason this task existed; they cannot
+be observed from a headless test, and none of them has been run:
+
+- A never-played clip shows its first frame on a project with no proxies and no
+  thumbnails.
+- `drawImage` on the active element returns non-zero alpha before any `play()`.
+- Seeking to an unbuffered region of an unplayed clip renders that frame.
+
+Check them with `RCDVLOG_EVAL_BRIDGE=1 pnpm dev` and `pnpm eval`, on a project
+with thumbnails removed, and record the result in
+`docs/tasks/desktop/SMOKE_LEDGER.md`. Two things to confirm at the same time,
+because both are macOS-specific and neither is testable on Linux: that App
+Transport Security permits the loopback load from the `tauri://localhost` origin
+(it should — ATS has exempted loopback since macOS 10.12, well below the 13.0
+floor), and that neighbour preloading still holds its three-slot window.
 
 ## Out of scope
 

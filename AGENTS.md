@@ -69,6 +69,10 @@ Implemented now:
   observation review panels, transcript-aware queue search, unusable-clip
   triage, and Keychain-stored OpenRouter credentials.
 - Weighted batch progress and ETA with project-persisted rate history.
+- Review video served from a token-guarded loopback HTTP origin the desktop app
+  binds at startup, replacing the Tauri asset protocol for video so an un-played
+  clip has a frame to paint. Range-streamed from disk, resolved by asset id
+  through the open catalog, and stopped with the app.
 - A main view laid out for a 13" MacBook Air (1440x900). The shell is exactly
   three rows — topbar, workbench, full-width story ribbon — and two invariants
   are enforced by tests rather than by review: the right rail holds only
@@ -118,7 +122,7 @@ Important gaps; do not accidentally describe these as complete:
 - Analysis suggestions are shown and editable in the desktop, but there is no
   per-suggestion accept/reject workflow: an AI title or description is simply an
   editable field, and a forced re-run overwrites it.
-- Native media playback, filesystem permission prompts, sleep/wake, and NAS-scale behavior remain manual acceptance checks. Resolve import returns as a later edit-planning acceptance check.
+- Native media playback, filesystem permission prompts, sleep/wake, and NAS-scale behavior remain manual acceptance checks. The loopback media origin's three webview-observable acceptance criteria — an un-played clip's first frame, non-zero `drawImage` alpha before `play()`, and seeking to an unbuffered region — have not been run. Resolve import returns as a later edit-planning acceptance check.
 - Ubuntu/Compose, physical NFS/SMB outage behavior, Caddy/Tailscale HTTPS, native pairing/playback, and target resource/thermal acceptance remain unrun; see `docs/tasks/server/ACCEPTANCE_TASK_19.md`.
 
 Before implementing persisted trip context, resolve the domain question of whether story beats are independent overlapping ranges or must be nested under physical phases. The current recommendation is independent ranges because narrative beats may cross a location or timezone transition.
@@ -263,6 +267,24 @@ pnpm eval -- 'document.readyState'
 pnpm eval -- --file /absolute/path/to/probe.js
 ```
 
+The loopback media origin has a second, narrower dev-only seam under the same
+rules, for the case where a clip will not play and the app is the only thing
+that knows why. `RCDVLOG_MEDIA_DEBUG=1` mounts `GET /debug/media` on the origin
+— behind its existing token, `Host` and `Origin` guard — and publishes the
+origin on `window` so the eval bridge can find its ephemeral port and token.
+
+```bash
+RCDVLOG_EVAL_BRIDGE=1 RCDVLOG_MEDIA_DEBUG=1 pnpm dev
+pnpm eval -- 'window.__RCDVLOG_MEDIA_ORIGIN__.debugUrl'
+curl -s '<that url>&asset=<asset id>' | jq .probe
+```
+
+It reports the last 50 requests and, for a named asset, exactly why resolution
+would fail — `unknown_asset`, `no_representation`, `missing`, `not_a_file` or
+`outside_roots` — which the media route flattens into a bare 404. It reports
+full media paths, so it must stay compiled out of release like the eval bridge;
+`apps/desktop/src-tauri/tests/release_dev_seams_absent.rs` proves both are.
+
 The client prints JSON values and structured JavaScript errors. Every probe is
 logged by the running app. See `docs/tasks/desktop/DEV_EVAL_BRIDGE.md` for the
 contract, tests, and release-binary absence check.
@@ -273,7 +295,7 @@ The Vite-only browser preview is useful for fast layout and interaction work:
 pnpm --dir apps/desktop dev --host 127.0.0.1
 ```
 
-It runs at `http://127.0.0.1:1420/` and uses in-memory mock projects/assets from `apps/desktop/src/api.ts`. It cannot validate native dialogs, Tauri commands/events, asset-protocol media URLs, FFmpeg child processes, persistence, or filesystem permissions. Never treat a browser-only pass as an end-to-end media test.
+It runs at `http://127.0.0.1:1420/` and uses in-memory mock projects/assets from `apps/desktop/src/api.ts`. It cannot validate native dialogs, Tauri commands/events, the loopback media origin, FFmpeg child processes, persistence, or filesystem permissions. `api.mediaUrl` returns `null` outside Tauri, so the preview has no video at all. Never treat a browser-only pass as an end-to-end media test.
 
 Build outputs:
 
@@ -563,6 +585,8 @@ The UI is intentionally keyboard-first and dense, using one main `App.tsx` today
 - Optimistic asset updates call the core and replace the returned canonical `Asset`; failures roll back and surface an error.
 - Progress events are `proxy-progress`, `thumbnail-progress`, `analysis-progress`, and `model-install-progress`. Each of the first three carries an optional completed asset plus a batch estimate. Merge a completed asset immediately so thumbnails, proxies, and generated titles appear as they finish. `analysis-progress` additionally carries the current stage and the run's spend so far.
 - Media playback prefers an available proxy, otherwise an available original. Thumbnails are also used as the video's poster frame.
+- `api.mediaUrl` builds a URL against the loopback media origin, passing the asset id and the representation it chose (`rep=proxy` or `rep=original`) plus the session token. The base URL and token arrive on `mediaOrigin`, returned by `desktopSettings` and the other settings commands and held in memory only. Keep the proxy-versus-original decision here, next to rotation and poster agreement, rather than moving it into the origin.
+- When a mounted element fires `error`, the shell calls `api.recoverMediaOrigin()`, which health-checks the origin and restarts it once per session. A healthy origin is returned unchanged so an ordinary decode failure does not invalidate every URL on screen.
 - Playback controls are custom stage-level UI so they remain horizontal while the media element rotates. Do not re-enable native `<video controls>` unless rotation is moved off the video element; native controls inherit its CSS transform.
 - The React `assets` array is the in-memory metadata cache. Legacy orientation probing uses a two-worker, deduplicated priority queue for current, next, next-next, and previous clips; successful probes persist to SQLite and replace the cached asset.
 - Playback uses a bounded three-slot sliding window (previous/current/next). The next available representation is preloaded automatically (proxy preferred, otherwise one original), the previous slot stays mounted but requests metadata only, and clips outside the window are unmounted. Preserve these bounds unless memory, file-handle, and NAS-read measurements justify a wider cache.
@@ -594,7 +618,23 @@ The ribbon already accepts optional TypeScript fields `phase`, `location`, `time
 
 The app has a minimum 980×680 window and a three-column workbench. Review queue and inspector scroll independently; the player and story ribbon occupy the center. Preserve visible focus styles, semantic labels, `aria-keyshortcuts`, and reduced-clutter dark editing-bench aesthetic. Test at the configured 1440×900 default and the 980×680 minimum.
 
-The Tauri asset protocol currently permits app-data cache paths, `$HOME/**`, `/Volumes/**`, and temporary RCD VlogCutter cache fixtures. If media paths outside these scopes are introduced, update permissions deliberately and validate on macOS; do not disable security globally as a shortcut.
+Review video is **not** served over the Tauri asset protocol. `WKWebView` never
+produces a video frame for media delivered through a custom scheme, so an
+un-played clip has no first frame; the app binds its own loopback HTTP origin at
+startup and `api.mediaUrl` points at that instead. See
+`apps/desktop/src-tauri/src/media_server.rs`, `docs/tasks/desktop/MEDIA_DELIVERY.md`,
+and the evidence in `docs/desktop/HARD_LESSONS.md`. Its eight security
+requirements — loopback bind, session token, asset ids rather than paths,
+storage-root re-validation, `Host`/`Origin` checks, `GET`/`HEAD` only, no token
+or path in logs, stop with the app — are acceptance criteria with tests, not
+prose. Do not weaken one to make a surface easier to build, and never widen the
+bind address.
+
+Thumbnails and posters still use the asset protocol, which permits app-data
+cache paths, `$HOME/**`, `/Volumes/**`, and temporary RCD VlogCutter cache
+fixtures. If media paths outside these scopes are introduced, update both that
+scope and the loopback origin's storage roots deliberately, validate on macOS,
+and do not disable security globally as a shortcut.
 
 ## 11. CLI contract for agents
 
@@ -663,7 +703,7 @@ Do not replace these real process/media boundaries with mocks. Conversely, do no
 
 - DaVinci Resolve import.
 - macOS dialogs and filesystem permission prompts.
-- Tauri asset-protocol playback.
+- Native media playback, including whether an un-played clip paints its first frame.
 - Sleep/wake or source-volume disconnect/reconnect.
 - Expo-scale NAS performance.
 - Ubuntu/Compose restart and real NFS/SMB mount behavior.

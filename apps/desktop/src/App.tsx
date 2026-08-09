@@ -1097,6 +1097,7 @@ function App() {
     }
   }
 
+  const mediaOrigin = settings.mediaOrigin ?? null;
   const bufferedMedia = useMemo(() => {
     const selectedIndex = filteredAssets.findIndex((asset) => asset.id === selectedId);
     if (selectedIndex < 0) return [];
@@ -1122,9 +1123,38 @@ function App() {
         };
       })
       .filter((entry) => Boolean(entry.url));
-  }, [filteredAssets, selectedId]);
+    // The loopback origin is part of every media URL, so a restarted origin has
+    // to rebuild them; `api.mediaUrl` reads it from the last settings response.
+  }, [filteredAssets, selectedId, mediaOrigin?.baseUrl, mediaOrigin?.token]);
   const activeMedia = bufferedMedia.find((entry) => entry.active) ?? null;
   const mediaUrl = activeMedia?.url ?? null;
+
+  /**
+   * A media element failing is the only cheap signal that the loopback origin
+   * serving review media has died. Check it, and take a new origin if the app
+   * managed to restart one — every URL on screen is rebuilt from it. A healthy
+   * origin means the failure was the file's, not the transport's, and nothing
+   * here disturbs it.
+   */
+  const mediaRecoveryInFlight = useRef(false);
+  const handleMediaError = useCallback(async () => {
+    if (mediaRecoveryInFlight.current || !api.isDesktop()) return;
+    mediaRecoveryInFlight.current = true;
+    try {
+      const origin = await api.recoverMediaOrigin();
+      if (!origin) {
+        setError("Review media is unavailable: the local media server did not start. Relaunch the app.");
+        return;
+      }
+      if (origin.baseUrl === mediaOrigin?.baseUrl && origin.token === mediaOrigin.token) return;
+      setSettings((current) => ({ ...current, mediaOrigin: origin }));
+      setMessage("Reconnected to the local media server");
+    } catch (reason) {
+      setError(String(reason));
+    } finally {
+      mediaRecoveryInFlight.current = false;
+    }
+  }, [mediaOrigin]);
   const shouldAutoplay = Boolean(
     selected && mediaUrl && (
       settings.autoplayMode === "always"
@@ -1441,6 +1471,7 @@ function App() {
             onDurationChange={setMediaDuration}
             onPositionChange={setPlaybackSeconds}
             onMakeProxy={makeProxy}
+            onMediaError={handleMediaError}
           />
 
           {selected && (

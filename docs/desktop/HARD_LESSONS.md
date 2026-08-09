@@ -82,6 +82,19 @@ Two details that will otherwise waste an hour:
 - Assume this affects every future media surface — hover scrub, filmstrips,
   multi-clip contact sheets — not just the stage.
 
+### What was done about it
+
+Video now comes from a loopback HTTP origin the app binds at startup
+(`apps/desktop/src-tauri/src/media_server.rs`); `api.mediaUrl` addresses it by
+asset id with a per-session token. Thumbnails and posters still use
+`convertFileSrc`, because the limitation is video-only.
+
+The row that matters in the A/B above — `http://127.0.0.1`, identical bytes,
+paints — is the whole reason for the change, and it has **not yet been
+re-confirmed in the app itself**. Until someone opens a project with no
+thumbnails and sees a first frame, treat the fix as reasoned rather than
+observed.
+
 ### What this was not
 
 Six explanations were tested and falsified before the real one. They are

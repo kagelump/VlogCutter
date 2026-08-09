@@ -48,7 +48,7 @@ are not and cannot be proven by CI:
 
 - DaVinci Resolve import
 - macOS dialogs and filesystem permission prompts
-- Tauri asset-protocol playback
+- Native media playback in the Tauri webview
 - Sleep/wake or source-volume disconnect/reconnect
 - Expo-scale NAS performance
 - Ubuntu/Compose restart and real NFS/SMB mount behavior

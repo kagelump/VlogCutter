@@ -34,6 +34,22 @@ export interface ServerEndpoint {
   label: string;
 }
 
+/**
+ * The loopback HTTP origin review media is served from, and the token that
+ * opens it. Minted per session by the desktop app, never persisted, and gone
+ * when the process is. See `docs/tasks/desktop/MEDIA_DELIVERY.md`.
+ */
+export interface MediaOrigin {
+  baseUrl: string;
+  token: string;
+  /**
+   * A ready-to-fetch diagnostics URL, token included. Present only in a debug
+   * build started with `RCDVLOG_MEDIA_DEBUG=1`; a release app always leaves it
+   * null, which is how `api.ts` knows not to publish its dev window handle.
+   */
+  debugUrl?: string | null;
+}
+
 export interface DesktopSettings {
   projectsRoot: string;
   nodeId: string;
@@ -47,6 +63,8 @@ export interface DesktopSettings {
   pairedServerLabel?: string | null;
   pairedAt?: string | null;
   pairedServerEndpoints?: ServerEndpoint[] | null;
+  /** Null when the origin could not bind; the stage then shows its slate. */
+  mediaOrigin?: MediaOrigin | null;
 }
 
 export interface Asset {

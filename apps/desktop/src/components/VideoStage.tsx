@@ -48,6 +48,11 @@ export interface VideoStageProps {
   onDurationChange(seconds: number): void;
   onPositionChange(seconds: number): void;
   onMakeProxy(): void;
+  /**
+   * The active element could not load or decode its source. The shell uses this
+   * to check whether the loopback origin serving review media is still alive.
+   */
+  onMediaError?(): void;
 }
 
 /**
@@ -77,6 +82,7 @@ export function VideoStage({
   onDurationChange,
   onPositionChange,
   onMakeProxy,
+  onMediaError,
 }: VideoStageProps) {
   return (
     <div ref={stageRef} className={`viewer-stage ${playing ? "is-playing" : "is-paused"}`}>
@@ -137,6 +143,11 @@ export function VideoStage({
                       }
                     }}
                     onTimeUpdate={(event) => entry.active && onPositionChange(event.currentTarget.currentTime)}
+                    onError={() => {
+                      if (!entry.active) return;
+                      onBufferingChange(false);
+                      onMediaError?.();
+                    }}
                   />
                 </div>
               );
