@@ -23,6 +23,7 @@ mod analysis;
 mod archive;
 mod baseline;
 mod cameras;
+mod cards;
 mod chronology;
 mod diagnostics;
 mod editplan;
@@ -62,6 +63,9 @@ pub use analysis::provider::{
 };
 pub use archive::ArchiveRoot;
 pub use batch_estimator::BatchEstimate as BatchProgressEstimate;
+pub use cards::{
+    CardCandidate, MountedVolumes, VolumeSource, card_session_slug, detect_cards, inspect_card,
+};
 
 pub use analysis::quality::DecodedSegment;
 pub use analysis::schema::{
