@@ -274,8 +274,45 @@ export class ScenarioBuilder {
     return this;
   }
 
-  cardInserted(label: string, spec: CardSpec = {}): this {
-    this.state.cards.push(buildCard(label, spec));
+  /**
+   * A card in the slot, and the clips that are on it. `newClips` of them are
+   * not yet in the project; the rest are already known, which is what makes the
+   * second-insertion case testable.
+   */
+  cardInserted(label: string, spec: CardSpec & { clips?: number; newClips?: number; camera?: string } = {}): this {
+    const projectId = this.requireProject();
+    const card = buildCard(label, { clipCount: spec.clips, ...spec });
+    this.state.cards.push(card);
+
+    const total = spec.clips ?? 0;
+    if (total === 0) return this;
+    const camera = spec.camera ?? spec.cameraHint ?? label;
+    const onCard = buildCameraAssets({
+      projectId,
+      camera,
+      spec: { clips: total, startAt: "2026-02-09T08:00:00.000Z", volume: card.mountPath },
+    });
+    const newClips = spec.newClips ?? total;
+    // The clips the project already has are in the catalog; the additions are
+    // only on the card until an import brings them over.
+    for (const asset of onCard.slice(0, total - newClips)) putAsset(this.state, asset);
+    this.state.imports.additions[card.mountPath] = onCard;
+    return this;
+  }
+
+  /** More footage on a card the project has already seen once. */
+  cardGainedClips(mountPath: string, clips: number): this {
+    const projectId = this.requireProject();
+    const existing = this.state.imports.additions[mountPath] ?? [];
+    const card = this.state.cards.find((candidate) => candidate.mountPath === mountPath);
+    if (!card) throw new Error(`No card is mounted at ${mountPath}`);
+    const camera = existing[0]?.camera ?? card.label;
+    const grown = buildCameraAssets({
+      projectId,
+      camera,
+      spec: { clips: existing.length + clips, startAt: "2026-02-09T08:00:00.000Z", volume: mountPath },
+    });
+    this.state.imports.additions[mountPath] = grown;
     return this;
   }
 

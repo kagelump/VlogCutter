@@ -7,7 +7,7 @@
   "epic_id": "H01",
   "title": "IPC contract coverage suite",
   "slug": "ipc-contract-coverage-suite",
-  "status": "draft",
+  "status": "complete",
   "task_class": "qa",
   "depends_on": ["H01-T004", "H01-T005"],
   "principal_invariant": "Every Tauri command the desktop frontend can issue is either handled explicitly by the harness or listed with a stated reason, and the set of commands the frontend issues is checked against the set the Rust side registers.",
