@@ -294,11 +294,13 @@ function App() {
   // Per-clip detail is fetched on selection rather than for the whole project:
   // segment lists and OCR are large and only one clip is on screen.
   useEffect(() => {
-    if (!selectedId) {
-      setTranscript(null);
-      setObservation(null);
-      return;
-    }
+    // Cleared before the read starts, not after it resolves. The rail renders
+    // under the newly selected clip's title from the moment the selection
+    // changes, and whatever is still in state until then belongs to the clip
+    // that was on screen a frame ago.
+    setTranscript(null);
+    setObservation(null);
+    if (!selectedId) return;
     let cancelled = false;
     void Promise.all([api.assetTranscript(selectedId), api.assetAnalysis(selectedId)])
       .then(([loadedTranscript, loadedObservation]) => {
@@ -314,7 +316,9 @@ function App() {
     return () => {
       cancelled = true;
     };
-  }, [selectedId, assets]);
+    // Deliberately not keyed on `assets`: every note keystroke rewrites that
+    // list, and this read is two IPC calls and two SQLite opens.
+  }, [selectedId]);
 
   // ── Sync status listener ──────────────────────────────────────────
   useEffect(() => {
