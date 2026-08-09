@@ -31,6 +31,7 @@ mod identifiers;
 mod locations;
 mod migrations;
 mod operations;
+mod preflight;
 mod storage;
 
 use analysis::audio::{AudioExtractor, FfmpegAudioExtractor};
@@ -65,6 +66,9 @@ pub use archive::ArchiveRoot;
 pub use batch_estimator::BatchEstimate as BatchProgressEstimate;
 pub use cards::{
     CardCandidate, MountedVolumes, VolumeSource, card_session_slug, detect_cards, inspect_card,
+};
+pub use preflight::{
+    Classification, ImportDestination, ImportPreflight, PreflightItem, human_bytes,
 };
 
 pub use analysis::quality::DecodedSegment;
