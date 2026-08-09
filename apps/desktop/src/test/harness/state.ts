@@ -229,11 +229,30 @@ export function createInitialState(clock: HarnessClock): DesktopHarnessState {
   };
 }
 
-/** The assets of one project, in the order the fake catalog holds them. */
+/**
+ * The assets of one project, in the order the catalog returns them.
+ *
+ * `orderAssets` in the app filters but never sorts — the queue's order *is*
+ * this read's order — so the fake reproduces the catalog's clause exactly:
+ *
+ *   ORDER BY best_time IS NULL, best_time, filename, id
+ *
+ * (`core/rcdvlog-core/src/lib.rs`, `list_assets`). Returning insertion order
+ * instead would quietly give every CUJ a different queue than the real app.
+ */
 export function projectAssets(state: DesktopHarnessState, projectId: string): Asset[] {
   return state.assetOrder
     .map((id) => state.assets[id])
-    .filter((asset): asset is Asset => Boolean(asset) && asset.projectId === projectId);
+    .filter((asset): asset is Asset => Boolean(asset) && asset.projectId === projectId)
+    .sort((left, right) => {
+      const leftMissing = left.bestTime === null ? 1 : 0;
+      const rightMissing = right.bestTime === null ? 1 : 0;
+      if (leftMissing !== rightMissing) return leftMissing - rightMissing;
+      const byTime = (left.bestTime ?? "").localeCompare(right.bestTime ?? "");
+      if (byTime !== 0) return byTime;
+      const byFilename = left.filename.localeCompare(right.filename);
+      return byFilename !== 0 ? byFilename : left.id.localeCompare(right.id);
+    });
 }
 
 /**

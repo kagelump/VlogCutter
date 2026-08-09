@@ -7,7 +7,7 @@
  */
 
 import { afterEach, expect } from "vitest";
-import { cleanup, render, screen, waitFor, type RenderResult } from "@testing-library/react";
+import { cleanup, render, screen, waitFor, within, type RenderResult } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import App from "../../App";
 import type { DesktopHarness } from "./DesktopHarness";
@@ -71,10 +71,38 @@ export async function settle(harness: DesktopHarness) {
   }
 }
 
-/** The queue rows currently on screen, in order. */
+/**
+ * The review queue's rows, in order.
+ *
+ * Scoped to the "Clips" listbox on purpose: the project picker is a listbox of
+ * options too, and an unscoped `getAllByRole("option")` silently includes it.
+ */
+export function queueRows(): HTMLElement[] {
+  return within(screen.getByRole("listbox", { name: "Clips" })).queryAllByRole("option");
+}
+
+/**
+ * The filename shown on each queue row, in order.
+ *
+ * A row leads with the clip's title once analysis or the user has named it, and
+ * demotes the filename to the meta line as `filename · camera`; an unnamed clip
+ * leads with the filename and shows only the camera below. Both cases are read
+ * here so a CUJ can talk about clips by filename regardless of naming.
+ */
 export function queueFilenames(): string[] {
-  return screen
-    .getAllByRole("option")
-    .map((row) => row.querySelector(".queue-filename")?.textContent ?? row.textContent ?? "")
-    .map((text) => text.trim());
+  return queueRows().map((row) => {
+    const meta = row.querySelector(".queue-meta")?.textContent ?? "";
+    const separated = meta.split(" · ");
+    if (separated.length > 1) return separated[0].trim();
+    return row.querySelector(".queue-main strong")?.textContent?.trim() ?? "";
+  });
+}
+
+/** The headline each queue row leads with: the clip's title, or its filename. */
+export function queueHeadlines(): string[] {
+  return queueRows().map((row) => row.querySelector(".queue-main strong")?.textContent?.trim() ?? "");
+}
+
+export function selectedRow(): HTMLElement | undefined {
+  return queueRows().find((row) => row.getAttribute("aria-selected") === "true");
 }
