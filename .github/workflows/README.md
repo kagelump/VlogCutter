@@ -18,6 +18,19 @@ Proves the full headless verification gate passes on Linux:
 - Documentation: OpenAPI spec freshness, link and fence validation in
   Markdown, and deployment configuration checks
 
+Every gate step after the first carries `if: ${{ !cancelled() }}`. A gate that
+fails still fails the job, but it no longer skips the gates behind it, so one
+run reports every problem instead of the first one. This is not cosmetic: a
+`cargo fmt` nit left `main` red from 2026-08-03 to 2026-08-09 while nine later
+checks — clippy, the whole workspace test suite, both frontend suites, the CLI
+integration test and every docs check — reported nothing at all. Add the guard
+to any gate step added here.
+
+The Rust toolchain is `dtolnay/rust-toolchain@stable` and is therefore not
+pinned, so a new stable release can change what `rustfmt` and `clippy` accept
+and turn the gate red without a code change. That is what happened above. If it
+recurs, consider pinning a version here and in `AGENTS.md` §6.
+
 ### `macos` job (macos-latest)
 
 Proves what the `ubuntu` job cannot: that the native macOS desktop bundle

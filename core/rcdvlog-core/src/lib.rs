@@ -1550,7 +1550,11 @@ impl Catalog {
                 continue;
             }
             readiness.total_clips += 1;
-            if !has_current_proxy(&asset) && !(!asset.original_available && asset.proxy_available) {
+            // A clip whose original is offline but whose proxy is present is not
+            // "missing a proxy": there is no input to make a better one from.
+            let proxy_is_the_only_representation =
+                !asset.original_available && asset.proxy_available;
+            if !has_current_proxy(&asset) && !proxy_is_the_only_representation {
                 readiness.missing_proxies += 1;
             }
             // A clip without a current proxy has no current fingerprint, so it
@@ -3863,7 +3867,11 @@ mod tests {
     fn rename_camera_moves_only_the_named_lane_in_the_named_project() {
         let (_directory, catalog, project) = catalog_fixture();
         let other = catalog.create_project("Another trip").unwrap();
-        for (id, camera) in [("a1", UNKNOWN_CAMERA), ("a2", UNKNOWN_CAMERA), ("a3", "GoPro")] {
+        for (id, camera) in [
+            ("a1", UNKNOWN_CAMERA),
+            ("a2", UNKNOWN_CAMERA),
+            ("a3", "GoPro"),
+        ] {
             insert_asset(
                 &catalog,
                 &project.id,
