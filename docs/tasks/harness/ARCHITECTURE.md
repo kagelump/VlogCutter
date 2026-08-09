@@ -1,6 +1,6 @@
 # Desktop CUJ test harness — architecture
 
-Status: accepted design, implementation in progress (epic `H01`).
+Status: accepted design, implemented (epic `H01`, tasks T001–T009).
 Scope: `apps/desktop`. Nothing here changes `core/`, `apps/server`, or
 `apps/cli`.
 
@@ -140,10 +140,14 @@ apps/desktop/src/test/
     faults.ts             per-command rejection, delay, release
     media.ts              synthetic media-element events by asset id
     builders.ts           deterministic Asset/Project/transcript builders
+    chronologyFixtures.ts declared chronology outcomes, never computed ones
+    scenario.ts           the scenario builder
+    renderApp.tsx         boot the real App and read the queue back
+    contract.ts           the three command surfaces, extracted not listed
     commands/             one module per command family, all explicit
-    scenarios/            named, reusable situations
   cuj/
     *.cuj.test.tsx        full-App journeys
+    contract.test.ts      the ratchet: no unhandled or unregistered command
 ```
 
 ### 4.1 One canonical state
@@ -317,9 +321,9 @@ user sees; a CUJ whose only assertion is a command log is testing the harness.
 ## 8. Test tiers and their responsibility boundary
 
 ```text
-pure/unit           hundreds      review/*.test.ts
-component           hundreds      components/__tests__/*
-fast full-App CUJ   50-150        cuj/*.cuj.test.tsx      ← this epic
+pure/unit           ~250          review/*.test.ts
+component           ~120          components/__tests__/*
+fast full-App CUJ   131           cuj/*.cuj.test.tsx      ← this epic
 real browser        < 30          layout, scroll, real focus, real media element
 native Tauri        < 20          real IPC, Keychain, dialogs, WKWebView frames
 real media/manual   small         FFmpeg, NAS, sleep/wake, Resolve
@@ -347,10 +351,13 @@ rather than reassigning existing ones.
 ## 10. CI
 
 ```text
-pnpm test:desktop        unit + component + CUJ (every PR, seconds)
-pnpm test:desktop:cuj    the CUJ tier alone (iteration)
-pnpm test:desktop:native cargo test -p rcdvlog-desktop (macOS job)
+pnpm test:desktop        unit + component + CUJ (every PR)
+pnpm test:desktop:cuj    the CUJ tier alone (iteration, and its own CI step)
+cargo test -p rcdvlog-desktop   the Tauri command layer (macOS job)
 ```
+
+As built: 131 CUJ scenarios across 14 files, ~24s on their own and ~38s inside
+the full desktop suite of 505 tests.
 
 The CUJ tier is jsdom-only: no Chromium download, no Tauri toolchain, no
 FFmpeg, no network. It runs unchanged on the existing ubuntu CI job, in a

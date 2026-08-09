@@ -77,6 +77,13 @@ jobs:
         if: ${{ !cancelled() }}
         run: pnpm test:desktop
 
+      # The fast CUJ tier also runs inside `test:desktop` above. It has its own
+      # step so a failure in the full-journey layer is legible at a glance
+      # rather than buried among four hundred unit and component tests.
+      - name: pnpm test:desktop:cuj
+        if: ${{ !cancelled() }}
+        run: pnpm test:desktop:cuj
+
       - name: pnpm test:web
         if: ${{ !cancelled() }}
         run: pnpm test:web

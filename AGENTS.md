@@ -707,6 +707,7 @@ Run the narrowest useful tests while iterating, then the full gate before handof
 | Change area | Fast check | Required broader check |
 | --- | --- | --- |
 | React/TypeScript/CSS | `pnpm --dir apps/desktop check` | `pnpm --dir apps/desktop build` plus interaction/visual check |
+| Desktop user journeys | `pnpm test:desktop:cuj` | `pnpm test:desktop` plus interaction/visual check |
 | Rust core | `cargo test -p rcdvlog-core` | `cargo test --workspace` |
 | ETA library | `cargo test -p batch-estimator` | `cargo test --workspace` |
 | CLI parsing/JSON | `cargo test -p rcdvlog-cli` | `pnpm test:integration` |
@@ -726,6 +727,15 @@ corresponding named step to the workflow. When a gate command is removed or
 demoted, remove or adjust its CI step. The table and the workflow must not
 drift apart.
 
+The fast desktop CUJ suite (`apps/desktop/src/test/cuj`) boots the real `App`
+in jsdom and answers its Tauri calls from a deterministic in-memory backend
+installed at `window.__TAURI_INTERNALS__`; `docs/tasks/harness/ARCHITECTURE.md`
+is its contract. It runs the real `api.ts`, the real command names and argument
+shapes, and the real event subscriptions, so it catches adapter and workflow
+regressions cheaply. It runs no browser engine, no Tauri process, no FFmpeg,
+and no network, and it is therefore never evidence for any of the boundaries
+listed immediately below.
+
 Do not replace these real process/media boundaries with mocks. Conversely, do not pretend headless tests validate:
 
 - DaVinci Resolve import.
@@ -736,6 +746,10 @@ Do not replace these real process/media boundaries with mocks. Conversely, do no
 - Ubuntu/Compose restart and real NFS/SMB mount behavior.
 - LAN Caddy trust, Tailscale Serve/ACLs, and endpoint failover.
 - Target-laptop CPU/RSS/thermal behavior.
+- Anything a fast CUJ appears to show about media, chronology, or import:
+  that tier fakes the IPC destination, so its media is logical playback
+  state, its chronology is a declared outcome, and its import copies
+  nothing.
 
 For frontend interaction changes, use the Vite browser preview for focus, keyboard, scrolling, progress, and layout behavior, then use Tauri when the change depends on native APIs. Inspect the actual rendered UI; a passing TypeScript build does not catch focus propagation, overflow, or unreadable density.
 
