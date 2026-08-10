@@ -174,7 +174,7 @@ describe("CUJ 9 — the source goes offline", () => {
 
     harness.asset("asset_sony_a7c_ii_001").setOriginalAvailable(false);
     // The app learns about it on the read it already performs after a write.
-    await app.user.click(screen.getByLabelText("Frame orientation"));
+    await app.user.keyboard("o");
 
     await waitFor(() => expect(harness.state.assets.asset_sony_a7c_ii_001.originalAvailable).toBe(false));
     expect(currentSource()).toContain("rep=proxy");
@@ -187,7 +187,7 @@ describe("CUJ 9 — the source goes offline", () => {
     await app.user.click(screen.getByText("SONY_003.MP4"));
     harness.asset("asset_sony_a7c_ii_003").setOriginalAvailable(false);
     // Any write refreshes that asset, which is how the app finds out.
-    await app.user.click(screen.getByLabelText("Frame orientation"));
+    await app.user.keyboard("o");
 
     expect(await screen.findByText("No review proxy yet")).toBeVisible();
     expect(document.querySelector('video[data-cache-slot="current"]')).toBeNull();

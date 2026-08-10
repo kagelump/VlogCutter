@@ -173,6 +173,51 @@ export const chronologyCommands: CommandTable = {
     return stored;
   },
 
+  split_trip_phase: (args, { state }) => {
+    requireString(args, "projectId");
+    const existingPhaseId = requireString(args, "existingPhaseId");
+    const boundaryAssetId = requireString(args, "boundaryAssetId");
+    const direction = requireString(args, "direction");
+    if (direction !== "through" && direction !== "from") {
+      throw new Error(`Unknown phase split direction: ${direction}`);
+    }
+    const phase = args.newPhase as ChronologyOverview["phases"][number];
+    if (!phase || typeof phase !== "object") throw new Error("A new trip phase object is required");
+
+    const existing = state.chronology.overview.phases.find((found) => found.id === existingPhaseId);
+    if (!existing) throw new Error(`Unknown trip phase: ${existingPhaseId}`);
+    const orderedIds = state.chronology.overview.assets.map((asset) => asset.assetId);
+    const first = existing.startAnchorAssetId ? orderedIds.indexOf(existing.startAnchorAssetId) : -1;
+    const last = existing.endAnchorAssetId ? orderedIds.indexOf(existing.endAnchorAssetId) : -1;
+    const boundary = orderedIds.indexOf(boundaryAssetId);
+    if (first < 0 || last < first || boundary < first || boundary > last) {
+      throw new Error(`Clip ${boundaryAssetId} is not inside trip phase ${existingPhaseId}`);
+    }
+
+    const authored = {
+      ...phase,
+      id: `phase_${state.chronology.overview.phases.length + 1}`,
+      startAnchorAssetId: direction === "through" ? orderedIds[first] : orderedIds[boundary],
+      endAnchorAssetId: direction === "through" ? orderedIds[boundary] : orderedIds[last],
+    };
+    const existingRemainder = direction === "through"
+      ? boundary < last
+        ? { ...existing, startAnchorAssetId: orderedIds[boundary + 1], endAnchorAssetId: orderedIds[last] }
+        : null
+      : boundary > first
+        ? { ...existing, startAnchorAssetId: orderedIds[first], endAnchorAssetId: orderedIds[boundary - 1] }
+        : null;
+    state.chronology.overview = {
+      ...state.chronology.overview,
+      phases: [
+        ...state.chronology.overview.phases.filter((found) => found.id !== existingPhaseId),
+        ...(existingRemainder ? [existingRemainder] : []),
+        authored,
+      ],
+    };
+    return authored;
+  },
+
   remove_trip_phase: (args, { state }) => {
     requireString(args, "projectId");
     const phaseId = requireString(args, "phaseId");
