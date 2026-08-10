@@ -1204,6 +1204,10 @@ impl Catalog {
         if let Some((asset_id, recorded_path, membership_removed)) = known {
             if membership_removed {
                 drop(connection);
+                // Undo only brings the asset back into the materialized project
+                // view. The file we just fingerprinted may be a remounted card
+                // or a freshly committed archive copy, so record it first.
+                self.relink_known_asset(&asset_id, &recorded_path, path, &fingerprint)?;
                 self.restore_project_asset_membership(project_id, &asset_id)?;
                 return Ok(IngestOutcome::Imported);
             }

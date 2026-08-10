@@ -226,15 +226,15 @@ impl Catalog {
         let size_bytes = std::fs::metadata(path)?.len();
         let fingerprint = sampled_media_fingerprint(path, size_bytes)?;
         let connection = self.connection()?;
-        let known: Option<(String, String)> = connection
+        let known: Option<(String, String, bool)> = connection
             .query_row(
-                "SELECT id, path FROM assets WHERE project_id = ?1 AND fingerprint = ?2 AND COALESCE(membership_removed, 0) = 0",
+                "SELECT id, path, COALESCE(membership_removed, 0) FROM assets WHERE project_id = ?1 AND fingerprint = ?2",
                 params![project_id, fingerprint],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()?;
 
-        let Some((asset_id, recorded_path)) = known else {
+        let Some((asset_id, recorded_path, membership_removed)) = known else {
             // New content. The only remaining question is whether it can land
             // where it would be written.
             if let (Some(root_id), Some(card)) = (archive_root_id, card) {
@@ -247,6 +247,26 @@ impl Catalog {
             }
             return Ok((Classification::New, None, size_bytes));
         };
+
+        if membership_removed {
+            // A rollback preserves identity and every verified location. On a
+            // reference import, treat the rediscovery as a new membership. For
+            // an archive import, keep the archive create-only: a retained
+            // matching copy is reused at execution time, otherwise copy to an
+            // empty target and never overwrite a collision. It remains `New`
+            // so this new membership can itself be rolled back.
+            if let (Some(root_id), Some(card)) = (archive_root_id, card) {
+                let target = self.archive_target(project_id, root_id, card, relative_path)?;
+                if target.is_file() {
+                    let target_size = std::fs::metadata(&target)?.len();
+                    if sampled_media_fingerprint(&target, target_size)? == fingerprint {
+                        return Ok((Classification::New, Some(asset_id), size_bytes));
+                    }
+                    return Ok((Classification::PathCollision, None, size_bytes));
+                }
+            }
+            return Ok((Classification::New, Some(asset_id), size_bytes));
+        }
 
         // Known content. Can the asset actually reach an original right now?
         let recorded = locations::recorded_location(&connection, &asset_id, &recorded_path)?;
@@ -565,7 +585,10 @@ impl Catalog {
         if item.classification == Classification::KnownRelinkable {
             // Already-known content: registering where it is found is the whole
             // job, and it costs no copy.
-            self.relink_file(project_id, &source)?;
+            // Go through ingest rather than the Locate-only relink flow: this
+            // smart-import path is allowed to reactivate a membership that was
+            // rolled back, after first recording the freshly verified source.
+            self.ingest_file(project_id, &source)?;
             let asset_id = self.asset_id_at_path(project_id, &source)?.ok_or_else(|| {
                 anyhow::anyhow!("relinked asset was not found at {}", source.display())
             })?;
@@ -578,6 +601,34 @@ impl Catalog {
             (Some(root_id), Some(card)) => {
                 let relative = self.archive_relative_path(project_id, card, &item.relative_path)?;
                 let target = self.resolve_in_archive_root(root_id, &relative)?;
+                if item.asset_id.is_some() && target.is_file() {
+                    // This is a membership rollback being imported again. The
+                    // retained archive copy belongs to the earlier session and
+                    // must never be overwritten. Recheck it now because the
+                    // preview's sampled fingerprint is only a planning fact.
+                    let source_size = std::fs::metadata(&source)?.len();
+                    let source_fingerprint = sampled_media_fingerprint(&source, source_size)?;
+                    let target_size = std::fs::metadata(&target)?.len();
+                    let target_fingerprint = sampled_media_fingerprint(&target, target_size)?;
+                    if source_fingerprint != target_fingerprint {
+                        anyhow::bail!(
+                            "archive target already exists with different content: {}",
+                            target.display()
+                        );
+                    }
+                    // Smart import, unlike Locate, intentionally restores
+                    // membership. Ingest the freshly verified source so it is
+                    // registered before that restoration happens.
+                    self.ingest_file(project_id, &source)?;
+                    let asset_id =
+                        self.asset_id_at_path(project_id, &source)?.ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "reactivated asset was not found at {}",
+                                source.display()
+                            )
+                        })?;
+                    return Ok(Some((0, asset_id)));
+                }
                 match crate::copy::commit_into_archive(
                     &source,
                     &target,
@@ -606,7 +657,6 @@ impl Catalog {
         // is one rebind rather than a per-asset repair.
         if let (Some(root_id), Some(card)) = (archive_root_id, card)
             && bytes > 0
-            && let Some(asset_id) = self.asset_id_at_path(project_id, &path_to_register)?
         {
             let relative = self.archive_relative_path(project_id, card, &item.relative_path)?;
             let relative = crate::RootRelativePath::parse(relative)
@@ -620,7 +670,27 @@ impl Catalog {
         Ok(self
             .connection()?
             .query_row(
-                "SELECT id FROM assets WHERE project_id = ?1 AND path = ?2",
+                r#"
+                SELECT a.id
+                FROM assets a
+                WHERE a.project_id = ?1
+                  AND COALESCE(a.membership_removed, 0) = 0
+                  AND (
+                    a.path = ?2
+                    OR EXISTS(
+                        SELECT 1
+                        FROM project_asset_local_locations l
+                        WHERE l.asset_id = a.id
+                          AND l.local_path = ?2
+                          AND l.verification_state = 'verified'
+                          AND l.node_id = (
+                              SELECT node_id FROM catalog_identity WHERE singleton_id = 1
+                          )
+                    )
+                  )
+                ORDER BY a.path = ?2 DESC
+                LIMIT 1
+                "#,
                 params![project_id, path.to_string_lossy()],
                 |row| row.get(0),
             )
@@ -1105,6 +1175,202 @@ mod tests {
         assert!(outcome.imported_asset_ids.is_empty());
         assert_eq!(catalog.list_assets(&project.id).unwrap().len(), 1);
         assert!(catalog.get_asset("asset_lost").unwrap().original_available);
+    }
+
+    #[test]
+    fn reference_import_reactivates_a_rolled_back_asset_at_its_current_location() {
+        let directory = tempdir().unwrap();
+        let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).unwrap();
+        let project = catalog.create_project("Spain 2026").unwrap();
+        let mount = card_fixture(directory.path(), &[("C0001.MP4", b"returned footage")]);
+        let current = mount.join("DCIM/100MSDCF/C0001.MP4");
+        let old = directory.path().join("old-drive/C0001.MP4");
+        fs::create_dir_all(old.parent().unwrap()).unwrap();
+        fs::copy(&current, &old).unwrap();
+        insert_asset_at(&catalog, &project.id, "asset_rolled_back", &old);
+        catalog
+            .remove_project_asset_membership(&project.id, &["asset_rolled_back".to_string()])
+            .unwrap();
+        fs::remove_file(&old).unwrap();
+
+        let plan = catalog
+            .preflight_import(&project.id, &mount, None, |_, _, _| true)
+            .unwrap();
+        assert_eq!(plan.new_clips, 1);
+        assert_eq!(plan.items[0].asset_id.as_deref(), Some("asset_rolled_back"));
+
+        let outcome = catalog
+            .run_import(&project.id, &plan, true, |_| true)
+            .unwrap();
+        assert_eq!(outcome.imported_asset_ids, ["asset_rolled_back"]);
+        assert_eq!(catalog.list_assets(&project.id).unwrap().len(), 1);
+        let asset = catalog.get_asset("asset_rolled_back").unwrap();
+        assert_eq!(asset.path, current.to_string_lossy());
+        assert!(asset.original_available);
+    }
+
+    #[test]
+    fn locate_does_not_reactivate_a_rolled_back_membership() {
+        let directory = tempdir().unwrap();
+        let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).unwrap();
+        let project = catalog.create_project("Spain 2026").unwrap();
+        let mount = card_fixture(directory.path(), &[("C0001.MP4", b"returned footage")]);
+        let current = mount.join("DCIM/100MSDCF/C0001.MP4");
+        insert_asset_at(&catalog, &project.id, "asset_rolled_back", &current);
+        catalog
+            .remove_project_asset_membership(&project.id, &["asset_rolled_back".to_string()])
+            .unwrap();
+
+        let report = catalog
+            .relink_folder(&project.id, &mount, |_, _, _| {})
+            .unwrap();
+        assert_eq!(report.repaired, 0);
+        assert_eq!(report.unrecognized, 1);
+        assert!(catalog.list_assets(&project.id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn archive_import_reactivates_and_continues_a_rolled_back_asset_without_a_duplicate() {
+        let directory = tempdir().unwrap();
+        let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).unwrap();
+        let project = catalog.create_project("Spain 2026").unwrap();
+        let mount = card_fixture(directory.path(), &[("C0001.MP4", b"returned footage")]);
+        let current = mount.join("DCIM/100MSDCF/C0001.MP4");
+        let old = directory.path().join("old-drive/C0001.MP4");
+        fs::create_dir_all(old.parent().unwrap()).unwrap();
+        fs::copy(&current, &old).unwrap();
+        insert_asset_at(&catalog, &project.id, "asset_rolled_back", &old);
+        catalog
+            .remove_project_asset_membership(&project.id, &["asset_rolled_back".to_string()])
+            .unwrap();
+        fs::remove_file(&old).unwrap();
+
+        let archive = directory.path().join("archive");
+        fs::create_dir_all(&archive).unwrap();
+        let root = catalog.create_archive_root("Archive", &archive).unwrap();
+        let plan = catalog
+            .preflight_import(&project.id, &mount, Some(&root.id), |_, _, _| true)
+            .unwrap();
+        assert_eq!(plan.new_clips, 1, "an absent archive copy must be created");
+
+        let first = catalog
+            .run_import(&project.id, &plan, true, |_| true)
+            .unwrap();
+        assert_eq!(first.imported_asset_ids, ["asset_rolled_back"]);
+        assert_eq!(first.copied, 1);
+        let asset = catalog.get_asset("asset_rolled_back").unwrap();
+        assert!(asset.path.starts_with(archive.to_string_lossy().as_ref()));
+        assert!(asset.original_available);
+        assert_eq!(catalog.list_assets(&project.id).unwrap().len(), 1);
+        let archive_binding: Option<String> = catalog
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT archive_root_id FROM project_asset_local_locations WHERE asset_id = ?1 AND local_path = ?2",
+                rusqlite::params!["asset_rolled_back", asset.path],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(archive_binding.as_deref(), Some(root.id.as_str()));
+
+        // The rollback leaves archive bytes in place. A later smart-import run
+        // reuses that matching copy without overwriting it, records the
+        // currently mounted source, and makes the new membership rollbackable.
+        catalog
+            .remove_project_asset_membership(&project.id, &["asset_rolled_back".to_string()])
+            .unwrap();
+        let matching_plan = catalog
+            .preflight_import(&project.id, &mount, Some(&root.id), |_, _, _| true)
+            .unwrap();
+        let archive_path = PathBuf::from(&asset.path);
+        let mut target_replaced = false;
+        let changed_after_preflight = catalog
+            .run_import(&project.id, &matching_plan, true, |_| {
+                if !target_replaced {
+                    fs::write(&archive_path, b"replaced footage").unwrap();
+                    target_replaced = true;
+                }
+                true
+            })
+            .unwrap();
+        assert_eq!(changed_after_preflight.failures.len(), 1);
+        assert!(
+            changed_after_preflight.failures[0]
+                .error
+                .contains("archive target already exists with different content")
+        );
+        assert!(catalog.list_assets(&project.id).unwrap().is_empty());
+        fs::write(&archive_path, b"returned footage").unwrap();
+
+        let original_mtime = fs::metadata(&current).unwrap().modified().unwrap();
+        // The card session anchor contains pathname, size, and mtime. Preserve
+        // those values while changing the bytes to prove the archive target is
+        // protected even when a reused pathname looks like the same card.
+        fs::write(&current, b"replaced footage").unwrap();
+        fs::File::open(&current)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(original_mtime))
+            .unwrap();
+        let collision = catalog
+            .preflight_import(&project.id, &mount, Some(&root.id), |_, _, _| true)
+            .unwrap();
+        assert_eq!(collision.collisions, 1);
+        assert_eq!(collision.new_clips, 0);
+        assert_eq!(collision.relinkable, 0);
+        assert!(
+            catalog.list_assets(&project.id).unwrap().is_empty(),
+            "different bytes at a reused pathname must not reactivate the old asset"
+        );
+
+        fs::write(&current, b"returned footage").unwrap();
+        fs::File::open(&current)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(original_mtime))
+            .unwrap();
+        let continued = catalog
+            .preflight_import(&project.id, &mount, Some(&root.id), |_, _, _| true)
+            .unwrap();
+        assert_eq!(continued.new_clips, 1);
+        assert_eq!(continued.relinkable, 0);
+        assert_eq!(continued.collisions, 0);
+        let resumed = catalog
+            .run_import(&project.id, &continued, true, |_| true)
+            .unwrap();
+        assert_eq!(resumed.imported_asset_ids, ["asset_rolled_back"]);
+        assert_eq!(resumed.copied, 0);
+        assert_eq!(catalog.list_assets(&project.id).unwrap().len(), 1);
+        assert!(
+            catalog
+                .get_asset("asset_rolled_back")
+                .unwrap()
+                .original_available
+        );
+
+        let current_location_count: i64 = catalog
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM project_asset_local_locations WHERE asset_id = ?1 AND local_path = ?2 AND verification_state = 'verified'",
+                rusqlite::params!["asset_rolled_back", current.to_string_lossy()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(current_location_count, 1);
+
+        let session = catalog
+            .record_import_session(&project.id, &continued, &resumed)
+            .unwrap();
+        let preview = catalog
+            .import_rollback_preview(&project.id, &session.entry.id)
+            .unwrap();
+        assert_eq!(preview.removable_asset_count, 1);
+        catalog
+            .rollback_import_membership(&project.id, &session.entry.id)
+            .unwrap();
+        assert!(
+            catalog.list_assets(&project.id).unwrap().is_empty(),
+            "the reactivated membership belongs to this new import session"
+        );
     }
 
     #[test]
