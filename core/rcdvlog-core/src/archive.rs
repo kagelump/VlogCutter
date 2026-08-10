@@ -341,8 +341,12 @@ mod tests {
         );
         // And the relocated bytes are still verified before anything reads them.
         assert_eq!(
-            catalog.resolve_original("asset_one").unwrap(),
-            moved_clip.canonicalize().unwrap_or(moved_clip)
+            catalog
+                .resolve_original("asset_one")
+                .unwrap()
+                .canonicalize()
+                .unwrap(),
+            moved_clip.canonicalize().unwrap()
         );
     }
 
