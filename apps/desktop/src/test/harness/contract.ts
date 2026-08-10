@@ -97,3 +97,52 @@ export const contractExemptions: Array<{ command: string; reason: string }> = [
 export function exemptCommands(): Set<string> {
   return new Set(contractExemptions.map((entry) => entry.command));
 }
+
+/**
+ * Commands Rust registers that no frontend call reaches, each with the decision
+ * that left it that way. This is an inventory rather than a failure: the CLI and
+ * the Rust tests are legitimate callers. What it prevents is a command drifting
+ * out of the interface unnoticed — the state the narrow asset writers were in
+ * for as long as `persistAsset` sent the whole patch while seven adapters sat
+ * beside it implying otherwise (#19).
+ */
+export const uncalledBackendCommands: Array<{ command: string; reason: string }> = [
+  {
+    command: "add_label",
+    reason:
+      "Decided in #19: the desktop writes a judgment as one whole AssetPatch through update_asset, and the mutation lifecycle owns that single path. The adapter was removed; the command stays for the CLI.",
+  },
+  {
+    command: "chronology_solution",
+    reason:
+      "The solved-order dump is a CLI diagnostic. The desktop reads chronology_overview, which carries what the ribbon and the calibration panel render.",
+  },
+  {
+    command: "create_note_revision",
+    reason:
+      "Decided in #19: notes are written as part of the whole patch, so the desktop does not create note revisions. Removing the adapter stops the frontend implying a revision history it never wrote. Routing notes through this command is a product decision, not a refactor.",
+  },
+  {
+    command: "generate_thumbnail",
+    reason:
+      "Only the batch is reachable in the interface (generate_missing_thumbnails); a single-clip thumbnail has no affordance, so the adapter was removed rather than left as a dead export.",
+  },
+  {
+    command: "ingest_folder",
+    reason:
+      "Superseded by the smart-import flow: the desktop classifies a source with preflight_import and writes with run_smart_import. The bare recursive ingest remains a CLI entry point.",
+  },
+  {
+    command: "remove_label",
+    reason: "Same decision as add_label: one whole-patch write path through update_asset.",
+  },
+  {
+    command: "set_removed",
+    reason: "Same decision as add_label: removal rides in the AssetPatch the lifecycle sends.",
+  },
+  {
+    command: "set_rotation",
+    reason:
+      "Same decision as add_label: rotation is part of the asset contract and is sent with the patch, which review.cuj.test.tsx asserts directly.",
+  },
+];

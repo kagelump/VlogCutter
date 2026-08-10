@@ -10,9 +10,18 @@
  * real success path through the same production call.
  */
 
+import type { CommandArgs } from "./registry";
+
 export interface Fault {
   kind: "reject" | "delay";
   message?: string;
+  /**
+   * Which calls this fault applies to. A command is usually named once per
+   * test, but a session race needs the same command treated differently
+   * depending on its arguments — project A's `list_assets` held while project
+   * B's is answered.
+   */
+  match?(args: CommandArgs): boolean;
 }
 
 class Deferred<T> {
@@ -30,8 +39,9 @@ class Deferred<T> {
 
 export class FaultRegistry {
   private oneShot = new Map<string, Fault[]>();
-  private persistent = new Map<string, Fault>();
-  private gates = new Map<string, Deferred<void>>();
+  private persistent = new Map<string, Fault[]>();
+  /** Every call currently held at a gate, so releasing frees all of them. */
+  private gates = new Map<string, Deferred<void>[]>();
 
   queue(command: string, fault: Fault) {
     const queued = this.oneShot.get(command) ?? [];
@@ -40,7 +50,10 @@ export class FaultRegistry {
   }
 
   always(command: string, fault: Fault) {
-    this.persistent.set(command, fault);
+    const existing = this.persistent.get(command) ?? [];
+    // A narrower fault is added rather than replacing what is there: two
+    // argument-matched faults on one command is the whole point of matching.
+    this.persistent.set(command, fault.match ? [...existing, fault] : [fault]);
   }
 
   clearCommand(command: string) {
@@ -58,32 +71,37 @@ export class FaultRegistry {
   /**
    * Consume the fault that applies to this call, if any. One-shot faults are
    * taken in the order they were queued; a persistent fault applies to every
-   * call until cleared.
+   * matching call until cleared. A fault with a matcher is skipped for calls it
+   * does not match, so an unmatched call runs the real handler.
    */
-  take(command: string): Fault | null {
+  take(command: string, args: CommandArgs = {}): Fault | null {
     const queued = this.oneShot.get(command);
     if (queued?.length) {
-      const fault = queued.shift()!;
-      if (!queued.length) this.oneShot.delete(command);
-      return fault;
+      const index = queued.findIndex((fault) => !fault.match || fault.match(args));
+      if (index >= 0) {
+        const [fault] = queued.splice(index, 1);
+        if (!queued.length) this.oneShot.delete(command);
+        return fault;
+      }
     }
-    return this.persistent.get(command) ?? null;
+    return (this.persistent.get(command) ?? []).find((fault) => !fault.match || fault.match(args)) ?? null;
   }
 
-  /** The promise a delayed command waits on. Created lazily so `release` before `invoke` is legal. */
+  /**
+   * The promise a delayed call waits on. One per held call rather than one per
+   * command, so two calls to the same command can be held at once and released
+   * together.
+   */
   gate(command: string): Promise<void> {
-    let deferred = this.gates.get(command);
-    if (!deferred) {
-      deferred = new Deferred<void>();
-      this.gates.set(command, deferred);
-    }
+    const deferred = new Deferred<void>();
+    this.gates.set(command, [...(this.gates.get(command) ?? []), deferred]);
     return deferred.promise;
   }
 
   releaseGate(command: string) {
-    const deferred = this.gates.get(command);
-    if (!deferred) return;
+    const held = this.gates.get(command);
+    if (!held) return;
     this.gates.delete(command);
-    deferred.resolve();
+    held.forEach((deferred) => deferred.resolve());
   }
 }

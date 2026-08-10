@@ -19,6 +19,12 @@ export interface QueuePanelProps {
   removedCount: number;
   /** The shell scrolls the selection into view through this. */
   listRef: RefObject<HTMLDivElement | null>;
+  /** The project's reads are in flight. */
+  loading: boolean;
+  /** Why the queue could not be read; empty when it was read. */
+  loadError: string;
+  /** Read the project again — the only way back from a failed load. */
+  onReload(): void;
   onQueryChange(value: string): void;
   onSelect(id: string): void;
   onToggleRemovedView(): void;
@@ -44,6 +50,9 @@ export function QueuePanel({
   unusableCount,
   removedCount,
   listRef,
+  loading,
+  loadError,
+  onReload,
   onQueryChange,
   onSelect,
   onToggleRemovedView,
@@ -57,6 +66,18 @@ export function QueuePanel({
           <h1>{projectName ?? "No project"}</h1>
         </div>
         <div className="queue-heading-actions">
+          {/* The project's reads have an owner that can be asked to run them
+              again, so the interface offers it. Without this control a read
+              that failed — a locked catalog, a volume still spinning up — left
+              the session empty until the app was relaunched, and a change made
+              elsewhere could only be noticed by writing something. */}
+          <button
+            className="queue-reload"
+            onClick={onReload}
+            disabled={loading}
+            aria-label="Reload clips"
+            title="Read this project again"
+          >⟳</button>
           {unusableCount > 0 && !showRemoved && (
             <button
               className={`queue-view-toggle ${showUnusableOnly ? "active" : ""}`}
@@ -86,7 +107,13 @@ export function QueuePanel({
         <kbd>/</kbd>
       </label>
       <div className="queue-list" ref={listRef} role="listbox" aria-label="Clips" tabIndex={0}>
-        {assets.length === 0 ? (
+        {assets.length === 0 && loadError ? (
+          <div className="empty-queue">
+            <strong>This project could not be read.</strong>
+            <span>{loadError}</span>
+            <button className="button secondary" onClick={onReload} disabled={loading}>Try again</button>
+          </div>
+        ) : assets.length === 0 ? (
           <div className="empty-queue">
             <strong>{showRemoved ? "No removed clips." : "No clips here yet."}</strong>
             <span>{showRemoved ? "Removed clips can be restored here." : "Add a NAS or drive folder to begin."}</span>

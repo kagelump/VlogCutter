@@ -1,7 +1,9 @@
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import { StatusBadge } from "@rcdvlog/review-ui";
 import { api } from "./api";
-import type { AnalysisReadiness, ArchiveRoot, Asset, AssetAnalysisIndexEntry, AssetAnalysisView, AssetPatch, AutoplayMode, BaselineImportResult, BaselinePreviewResult, CardCandidate, ClipTranscript, DesktopSettings, ImportHistoryEntry, ImportPreflight, ImportProgress, ImportRollbackPreview, ImportRunReport, ImportSessionDetail, ModelInstallProgress, ModelStatus, PathAnalysis, Project, ProjectLibrary, ProjectLocation, ProjectPairingStatus, RootMappingEntry, ServerConnectionStatus, ServerVersionInfo, SyncStatus, TranscriptStatus } from "./types";
+import type { ArchiveRoot, Asset, AssetPatch, AutoplayMode, BaselineImportResult, BaselinePreviewResult, CardCandidate, DesktopSettings, ImportHistoryEntry, ImportPreflight, ImportProgress, ImportRollbackPreview, ImportRunReport, ImportSessionDetail, ModelInstallProgress, ModelStatus, PathAnalysis, Project, ProjectLibrary, ProjectLocation, ProjectPairingStatus, RootMappingEntry, ServerConnectionStatus, ServerVersionInfo, SyncStatus, TranscriptStatus } from "./types";
+import { useProjectSession } from "./session/projectSession";
+import { useAssetMutations } from "./session/assetMutations";
 import { orderAssets, moveSelection as moveSelectionInOrder } from "./review/order";
 import { resolveAction } from "./review/keymap";
 import { CalibrationPanel } from "./CalibrationPanel";
@@ -20,7 +22,7 @@ import {
   savePanelSizes,
   type PanelSizes,
 } from "./review/panelSizes";
-import { JudgmentPanel, type SaveState } from "./components/JudgmentPanel";
+import { JudgmentPanel } from "./components/JudgmentPanel";
 import { EvidenceShelf, type ShelfTab } from "./components/EvidenceShelf";
 import { TransportBar } from "./components/TransportBar";
 import { QueuePanel } from "./components/QueuePanel";
@@ -62,15 +64,6 @@ function initialProgress(kind: OperationProgress["kind"], total: number): Operat
   };
 }
 
-function patchFor(asset: Asset): AssetPatch {
-  return {
-    notes: asset.notes,
-    labels: asset.labels,
-    removed: asset.removed,
-    rotationDegrees: asset.rotationDegrees,
-  };
-}
-
 function App() {
   // Chronology and edit planning are modes, not a drawer: they are global,
   // sit-down operations that were being asked to work in a strip at the
@@ -78,7 +71,6 @@ function App() {
   const [view, dispatchView] = useReducer(reduceView, INITIAL_VIEW);
   const [projects, setProjects] = useState<Project[]>([]);
   const [projectId, setProjectId] = useState("");
-  const [assets, setAssets] = useState<Asset[]>([]);
   const [selectedId, setSelectedId] = useState("");
   const [query, setQuery] = useState("");
   const [showRemoved, setShowRemoved] = useState(false);
@@ -114,7 +106,6 @@ function App() {
   const [offsetMinutes, setOffsetMinutes] = useState(0);
   const [offsetLabel, setOffsetLabel] = useState("Camera time change");
   const [chronologyZoom, setChronologyZoom] = useState(RIBBON_ZOOM_DEFAULT);
-  const [chronologyOverview, setChronologyOverview] = useState<ChronologyOverview | null>(null);
   const [phaseDialog, setPhaseDialog] = useState<PhaseDialogState | null>(null);
   const [phaseDialogBusy, setPhaseDialogBusy] = useState(false);
   const [phaseDialogError, setPhaseDialogError] = useState("");
@@ -141,7 +132,6 @@ function App() {
   // The active shelf tab is a mode, not per-clip state: it persists as you
   // move through the queue (spec §3.6).
   const [shelfTab, setShelfTab] = useState<ShelfTab>("transcript");
-  const [saveState, setSaveState] = useState<SaveState>("idle");
   const [panelSizes, setPanelSizes] = useState<PanelSizes>(() =>
     loadPanelSizes(typeof window === "undefined" ? null : window.localStorage),
   );
@@ -161,14 +151,10 @@ function App() {
   }, []);
 
   // ── Clip analysis state ────────────────────────────────────────────
-  const [analysisIndex, setAnalysisIndex] = useState<Record<string, AssetAnalysisIndexEntry>>({});
-  const [readiness, setReadiness] = useState<AnalysisReadiness | null>(null);
   const [showAnalysisDialog, setShowAnalysisDialog] = useState(false);
   const [budgetInput, setBudgetInput] = useState("1.00");
   const [forceReanalyze, setForceReanalyze] = useState(false);
   const [showUnusableOnly, setShowUnusableOnly] = useState(false);
-  const [transcript, setTranscript] = useState<ClipTranscript | null>(null);
-  const [observation, setObservation] = useState<AssetAnalysisView | null>(null);
   const [models, setModels] = useState<ModelStatus[]>([]);
   const [modelInstall, setModelInstall] = useState<ModelInstallProgress | null>(null);
   const [keyPresent, setKeyPresent] = useState(false);
@@ -202,14 +188,53 @@ function App() {
   const viewerStageRef = useRef<HTMLDivElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const assetsRef = useRef<Asset[]>([]);
-  const projectIdRef = useRef("");
   const selectedIdRef = useRef("");
   const orientationQueueRef = useRef<string[]>([]);
   const orientationActiveRef = useRef(new Set<string>());
 
+  // One owner for the open project's reads, and the only thing that may write
+  // them: a response from a project the user has since left is dropped rather
+  // than allowed to overwrite the session on screen.
+  const session = useProjectSession({
+    projectId,
+    selectedId,
+    onError: setError,
+    onAssetsRead: useCallback((loaded: Asset[]) => {
+      // Applied with the queue rather than in a following effect, so the panel
+      // and the queue arrive in the same render.
+      setSelectedId((current) =>
+        loaded.some((asset) => asset.id === current) ? current : loaded[0]?.id || "",
+      );
+      // A count here would be the third copy of a number the queue badge and
+      // the ribbon already carry; only the empty case says anything new.
+      setMessage(loaded.length ? "" : "Choose a media folder to begin");
+    }, []),
+  });
+  const { analysisIndex, readiness, transcript, observation, patchAssets } = session;
+  const applyAssetToQueue = session.applyAsset;
+  const chronologyOverview = session.chronology;
+  const reloadSession = session.reload;
+  const reloadSessionAssets = session.reloadAssets;
+
+  // One owner for the write path: optimistic apply, the stated failure policy,
+  // save state, and the double-submit guard.
+  const mutations = useAssetMutations({
+    update: useCallback((assetId: string, patch: AssetPatch) => api.updateAsset(assetId, patch), []),
+    applyAsset: applyAssetToQueue,
+    onError: setError,
+  });
+
+  // An unsaved note draft is not in the catalog, so it is written back over
+  // whatever a read returns. Without this a reload would quietly replace the
+  // user's paragraph with the value the backend still holds.
+  const { lifecycle: mutationLifecycle } = mutations;
+  const assets = useMemo(
+    () => mutationLifecycle.withDrafts(session.assets),
+    [mutationLifecycle, mutations.drafts, session.assets],
+  );
+
   const selected = assets.find((asset) => asset.id === selectedId) ?? null;
   const project = projects.find((item) => item.id === projectId) ?? null;
-  projectIdRef.current = projectId;
 
   useEffect(() => {
     assetsRef.current = assets;
@@ -310,32 +335,6 @@ function App() {
     return result;
   }, []);
 
-  const refreshAssets = useCallback(async (activeProjectId: string) => {
-    if (!activeProjectId) {
-      setAssets([]);
-      return;
-    }
-    const result = await api.listAssets(activeProjectId);
-    // Background jobs may finish after the user has changed projects. Never
-    // paint their old project's assets into the newly-selected queue.
-    if (projectIdRef.current !== activeProjectId) return;
-    setAssets(result);
-    setSelectedId((current) =>
-      result.some((asset) => asset.id === current) ? current : result[0]?.id || "",
-    );
-    // A count here would be the third copy of a number the queue badge and the
-    // ribbon already carry; only the empty case says anything new.
-    setMessage(result.length ? "" : "Choose a media folder to begin");
-  }, []);
-
-  const refreshChronology = useCallback(async (activeProjectId: string) => {
-    if (!activeProjectId) {
-      setChronologyOverview(null);
-      return;
-    }
-    setChronologyOverview(await chronologyApi.overview(activeProjectId));
-  }, []);
-
   useEffect(() => {
     Promise.all([refreshProjects(), refreshLibrary(), api.prerequisiteStatus(), api.desktopSettings()])
       .then(([, , tools, desktopSettings]) => {
@@ -354,68 +353,13 @@ function App() {
   }, [refreshLibrary, refreshProjects]);
 
   useEffect(() => {
-    refreshAssets(projectId).catch((reason) => setError(String(reason)));
-    refreshChronology(projectId).catch(() => setChronologyOverview(null));
     api.listImportSessions(projectId).then(setImportSessions).catch(() => setImportSessions([]));
-  }, [projectId, refreshAssets, refreshChronology]);
-
-  // ── Clip analysis loaders ─────────────────────────────────────────
-
-  const refreshAnalysisIndex = useCallback(async (activeProjectId: string) => {
-    if (!activeProjectId) {
-      setAnalysisIndex({});
-      return;
-    }
-    const entries = await api.projectAnalysisIndex(activeProjectId);
-    setAnalysisIndex(Object.fromEntries(entries.map((entry) => [entry.assetId, entry])));
-  }, []);
-
-  const refreshReadiness = useCallback(async (activeProjectId: string) => {
-    if (!activeProjectId) {
-      setReadiness(null);
-      return;
-    }
-    setReadiness(await api.analysisReadiness(activeProjectId));
-  }, []);
-
-  useEffect(() => {
-    void refreshAnalysisIndex(projectId).catch(() => setAnalysisIndex({}));
-    void refreshReadiness(projectId).catch(() => setReadiness(null));
-  }, [projectId, refreshAnalysisIndex, refreshReadiness]);
+  }, [projectId]);
 
   useEffect(() => {
     void api.modelStatus().then(setModels).catch(() => setModels([]));
     void api.openRouterKeyPresent().then(setKeyPresent).catch(() => setKeyPresent(false));
   }, []);
-
-  // Per-clip detail is fetched on selection rather than for the whole project:
-  // segment lists and OCR are large and only one clip is on screen.
-  useEffect(() => {
-    // Cleared before the read starts, not after it resolves. The rail renders
-    // under the newly selected clip's title from the moment the selection
-    // changes, and whatever is still in state until then belongs to the clip
-    // that was on screen a frame ago.
-    setTranscript(null);
-    setObservation(null);
-    if (!selectedId) return;
-    let cancelled = false;
-    void Promise.all([api.assetTranscript(selectedId), api.assetAnalysis(selectedId)])
-      .then(([loadedTranscript, loadedObservation]) => {
-        if (cancelled) return;
-        setTranscript(loadedTranscript);
-        setObservation(loadedObservation);
-      })
-      .catch(() => {
-        if (cancelled) return;
-        setTranscript(null);
-        setObservation(null);
-      });
-    return () => {
-      cancelled = true;
-    };
-    // Deliberately not keyed on `assets`: every note keystroke rewrites that
-    // list, and this read is two IPC calls and two SQLite opens.
-  }, [selectedId]);
 
   // ── Sync status listener ──────────────────────────────────────────
   useEffect(() => {
@@ -457,7 +401,7 @@ function App() {
       orientationActiveRef.current.add(assetId);
       void api.refreshAssetOrientation(assetId)
         .then((updated) => {
-          setAssets((current) => current.map((candidate) => candidate.id === updated.id ? updated : candidate));
+          patchAssets((current) => current.map((candidate) => candidate.id === updated.id ? updated : candidate));
         })
         .catch((reason) => {
           if (selectedIdRef.current === assetId) setError(String(reason));
@@ -467,7 +411,7 @@ function App() {
           pumpOrientationQueue();
         });
     }
-  }, []);
+  }, [patchAssets]);
 
   useEffect(() => {
     const selectedIndex = filteredAssets.findIndex((asset) => asset.id === selectedId);
@@ -488,7 +432,7 @@ function App() {
       const listeners = await Promise.all([
         api.onProxyProgress((progress) => {
           if (progress.asset) {
-            setAssets((current) => current.map((asset) => asset.id === progress.asset?.id ? progress.asset : asset));
+            patchAssets((current) => current.map((asset) => asset.id === progress.asset?.id ? progress.asset : asset));
           }
           if (activeOperationRef.current === "proxy") {
             setOperationProgress({
@@ -504,7 +448,7 @@ function App() {
         }),
         api.onThumbnailProgress((progress) => {
           if (progress.asset) {
-            setAssets((current) => current.map((asset) => asset.id === progress.asset?.id ? progress.asset : asset));
+            patchAssets((current) => current.map((asset) => asset.id === progress.asset?.id ? progress.asset : asset));
           }
           if (activeOperationRef.current === "thumbnail") {
             setOperationProgress({
@@ -522,7 +466,7 @@ function App() {
           // Replacing the asset as each clip lands is what makes a generated
           // title appear during the run rather than after it.
           if (progress.asset) {
-            setAssets((current) => current.map((asset) => asset.id === progress.asset?.id ? progress.asset : asset));
+            patchAssets((current) => current.map((asset) => asset.id === progress.asset?.id ? progress.asset : asset));
           }
           if (activeOperationRef.current === "analysis") {
             setOperationProgress({
@@ -566,7 +510,7 @@ function App() {
       disposed = true;
       unlisten.forEach((dispose) => dispose());
     };
-  }, []);
+  }, [patchAssets]);
 
   // Mount detection is deliberately low-frequency and listing-only. It offers
   // a review action; hashing and probing begin only after that click.
@@ -628,44 +572,40 @@ function App() {
     return () => clearTimeout(timer);
   }, [message]);
 
-  const replaceAsset = (updated: Asset) => {
-    setAssets((current) =>
-      current
-        .map((asset) => (asset.id === updated.id ? updated : asset))
-        .sort((a, b) =>
-          (a.bestTime ?? `z${a.filename}`).localeCompare(b.bestTime ?? `z${b.filename}`),
-        ),
-    );
-  };
+  /**
+   * Put an asset on screen without writing it: a local edit, a progress event,
+   * or an optimistic value. An asset carrying an unsaved note revises that
+   * draft rather than being overwritten by it, so typing into a field whose
+   * last save was refused still changes what a retry would send.
+   */
+  const replaceAsset = useCallback((updated: Asset) => {
+    applyAssetToQueue(updated);
+    mutationLifecycle.reviseDraft(updated);
+  }, [applyAssetToQueue, mutationLifecycle]);
 
-  /// Commits an edited title/description. Separate from `persistAsset` because
-  /// these are not part of the full-replacement `AssetPatch` contract.
+  /// Commits an edited title/description. Separate from the mutation lifecycle
+  /// because these are not part of the full-replacement `AssetPatch` contract.
   const saveClipSummary = useCallback(async (asset: Asset) => {
     try {
       replaceAsset(await api.setClipSummary(asset.id, asset.title, asset.description));
     } catch (reason) {
       setError(String(reason));
     }
-  }, []);
+  }, [replaceAsset]);
 
   const persistAsset = useCallback(
     async (asset: Asset, changes: Partial<AssetPatch>) => {
-      const optimistic = { ...asset, ...changes };
-      replaceAsset(optimistic);
-      setSaveState("saving");
-      try {
-        const updated = await api.updateAsset(asset.id, { ...patchFor(asset), ...changes });
-        replaceAsset(updated);
-        // The save state word in the panel header replaces both the toast and
-        // the save button this flow used to need.
-        setSaveState("saved");
-      } catch (reason) {
-        replaceAsset(asset);
-        setSaveState("idle");
-        setError(String(reason));
-      }
+      await mutationLifecycle.submit(asset, changes);
     },
-    [],
+    [mutationLifecycle],
+  );
+
+  /** A note save: the draft stays on screen and stays marked if it is refused. */
+  const persistNotes = useCallback(
+    async (asset: Asset) => {
+      await mutationLifecycle.saveNotes(asset);
+    },
+    [mutationLifecycle],
   );
 
   const addLabel = useCallback((asset: Asset, value: string) => {
@@ -787,16 +727,18 @@ function App() {
         destinationTimezone: value.destinationTimezone,
         displayMode: value.kind === "location" ? "local" : value.displayMode,
       };
-      const stored = phaseDialog.split
-        ? await chronologyApi.splitTripPhase(
-            projectId,
-            phaseDialog.split.existingPhaseId,
-            phaseDialog.split.boundaryAssetId,
-            phaseDialog.split.direction,
-            draft,
-          )
-        : await chronologyApi.setTripPhase(projectId, draft);
-      await refreshChronology(projectId);
+      if (phaseDialog.split) {
+        await chronologyApi.splitTripPhase(
+          projectId,
+          phaseDialog.split.existingPhaseId,
+          phaseDialog.split.boundaryAssetId,
+          phaseDialog.split.direction,
+          draft,
+        );
+      } else {
+        await chronologyApi.setTripPhase(projectId, draft);
+      }
+      await session.reloadChronology();
       setPhaseDialog(null);
       setMessage(existing
         ? `Updated ${value.label}`
@@ -817,7 +759,7 @@ function App() {
     setPhaseDialogError("");
     try {
       await chronologyApi.removeTripPhase(projectId, phase.id);
-      await refreshChronology(projectId);
+      await session.reloadChronology();
       setPhaseDialog(null);
       setMessage(`Removed ${phase.label} from the story ribbon`);
     } catch (reason) {
@@ -839,7 +781,7 @@ function App() {
       if (view.presentation === "focus") {
         notesEditingRef.current = null;
         event.currentTarget.blur();
-        if (selected) void persistAsset(selected, { notes: selected.notes });
+        if (selected) void persistNotes(selected);
         dispatchView({ kind: "exitFocus" });
         return;
       }
@@ -867,7 +809,7 @@ function App() {
 
     notesEditingRef.current = null;
     event.currentTarget.blur();
-    void persistAsset(selected, { notes: selected.notes });
+    void persistNotes(selected);
 
     if (event.shiftKey) {
       moveSelection(1);
@@ -878,7 +820,7 @@ function App() {
     const editing = notesEditingRef.current;
     notesEditingRef.current = null;
     if (!selected || editing?.assetId !== selected.id || editing.cancelOnBlur) return;
-    void persistAsset(selected, { notes: selected.notes });
+    void persistNotes(selected);
   };
 
   useEffect(() => {
@@ -1064,7 +1006,6 @@ function App() {
       const loaded = await api.loadCatalog(location.catalogPath);
       setProjects(loaded.projects);
       setProjectId(location.project.id);
-      setAssets([]);
       setSelectedId("");
       setShowCreate(false);
       setMessage(`Loaded ${location.project.name}`);
@@ -1116,7 +1057,6 @@ function App() {
       const loaded = await api.loadCatalog(path);
       setProjects(loaded.projects);
       setProjectId(loaded.projects[0]?.id ?? "");
-      setAssets([]);
       setSelectedId("");
       setShowCreate(loaded.projects.length === 0);
       setMessage(
@@ -1238,8 +1178,8 @@ function App() {
       setSettings(nextSettings);
       const report = await api.runSmartImport(projectId, importPlan, verifyImportCopies, makeImportProxies);
       setImportReport(report);
-      setImportSessions((current) => report.session ? [report.session, ...current.filter((session) => session.id !== report.session!.id)] : current);
-      await Promise.all([refreshAssets(projectId), refreshProjects(), refreshReadiness(projectId)]);
+      setImportSessions((current) => report.session ? [report.session, ...current.filter((entry) => entry.id !== report.session!.id)] : current);
+      await Promise.all([reloadSessionAssets(), refreshProjects(), session.reloadReadiness()]);
       const failures = report.outcome.failures.length + (report.proxies?.failures.length ?? 0);
       if (failures) {
         const failureMessage = `${failures} file${failures === 1 ? "" : "s"} need attention in the import ledger.`;
@@ -1302,7 +1242,7 @@ function App() {
   async function rollbackImportSession(sessionId: string) {
     if (!projectId) return;
     await api.rollbackImportMembership(projectId, sessionId);
-    await Promise.all([refreshAssets(projectId), api.listImportSessions(projectId).then(setImportSessions)]);
+    await Promise.all([reloadSessionAssets(), api.listImportSessions(projectId).then(setImportSessions)]);
     setImportRollback(null);
     setImportSessionDetail(await api.importSession(projectId, sessionId));
     setMessage("Import membership removed; original media was left untouched");
@@ -1336,7 +1276,7 @@ function App() {
     setError("");
     try {
       const report = await api.generateMissingProxies(projectId);
-      await refreshAssets(projectId);
+      await reloadSessionAssets();
       setMessage(
         `Made ${report.generated} proxies; ${report.skipped} already ready${
           report.failures.length ? `; ${report.failures.length} failed` : ""
@@ -1357,7 +1297,7 @@ function App() {
     setShowMediaMenu(false);
     setError("");
     try {
-      await Promise.all([refreshReadiness(projectId), api.modelStatus().then(setModels), api.openRouterKeyPresent().then(setKeyPresent)]);
+      await Promise.all([session.reloadReadiness(), api.modelStatus().then(setModels), api.openRouterKeyPresent().then(setKeyPresent)]);
       setShowAnalysisDialog(true);
     } catch (reason) {
       setError(String(reason));
@@ -1378,7 +1318,10 @@ function App() {
         force: forceReanalyze,
         budgetUsd: Number.isFinite(budget) && budget > 0 ? budget : null,
       });
-      await Promise.all([refreshAssets(projectId), refreshAnalysisIndex(projectId), refreshReadiness(projectId)]);
+      // Everything the run touched, including the evidence for the clip the
+      // user is sitting on: the queue row's verdict and the rail beside it now
+      // come from the same read.
+      await reloadSession();
       const spent = formatCost(report.costUsd);
       if (report.status === "cancelled") {
         setMessage(`Analysis stopped during ${analysisStageLabels[report.stageReached].toLocaleLowerCase()}; ${report.analysis.analyzed} clips analyzed, ${spent} spent. Run it again to resume.`);
@@ -1413,7 +1356,7 @@ function App() {
     setModelInstall({ name: "", downloadedBytes: 0, totalBytes: 1 });
     try {
       setModels(await api.installAnalysisModels());
-      if (projectId) await refreshReadiness(projectId);
+      if (projectId) await session.reloadReadiness();
       setMessage("Speech models installed");
     } catch (reason) {
       setError(String(reason));
@@ -1427,7 +1370,7 @@ function App() {
     try {
       setKeyPresent(await api.setOpenRouterKey(keyInput));
       setKeyInput("");
-      if (projectId) await refreshReadiness(projectId);
+      if (projectId) await session.reloadReadiness();
       setMessage(keyPresent ? "OpenRouter key updated" : "OpenRouter key stored in your Keychain");
     } catch (reason) {
       setError(String(reason));
@@ -1449,7 +1392,7 @@ function App() {
     setError("");
     try {
       const moved = await api.renameCamera(projectId, from, to);
-      await refreshAssets(projectId);
+      await reloadSessionAssets();
       setMessage(`Renamed ${from} to ${to} on ${moved} ${moved === 1 ? "clip" : "clips"}`);
     } catch (reason) {
       setError(String(reason));
@@ -1468,7 +1411,7 @@ function App() {
     setError("");
     try {
       const report = await api.generateMissingThumbnails(projectId, 1);
-      await refreshAssets(projectId);
+      await reloadSessionAssets();
       setMessage(
         `Generated ${report.generated} thumbnails; ${report.skipped} already ready${
           report.failures.length ? `; ${report.failures.length} failed` : ""
@@ -1496,7 +1439,7 @@ function App() {
         offsetMinutes * 60,
         offsetLabel,
       );
-      await refreshAssets(projectId);
+      await reloadSessionAssets();
       setMessage(`Reordered ${selected.camera} from ${selected.filename}`);
     } catch (reason) {
       setError(String(reason));
@@ -1829,7 +1772,7 @@ function App() {
               // A correction can reorder hundreds of clips; resume where the
               // user was rather than snapping them back to the top.
               onQueueResumed={(assetId) => setSelectedId(assetId)}
-              onChronologyChanged={() => Promise.all([refreshAssets(projectId), refreshChronology(projectId)]).then(() => undefined)}
+              onChronologyChanged={() => Promise.all([reloadSessionAssets(), session.reloadChronology()]).then(() => undefined)}
             />
           ) : (
             <EditPlanPanel projectId={projectId} assets={assets} />
@@ -1851,6 +1794,9 @@ function App() {
           unusableCount={unusableCount}
           removedCount={removedCount}
           listRef={queueRef}
+          loading={session.loading}
+          loadError={session.loadError}
+          onReload={() => { void reloadSession(); }}
           onQueryChange={setQuery}
           onSelect={setSelectedId}
           onToggleRemovedView={() => setShowRemoved((current) => !current)}
@@ -1940,7 +1886,9 @@ function App() {
             index={filteredAssets.findIndex((candidate) => candidate.id === selected.id) + 1}
             observation={observation}
             labelDraft={labelDraft}
-            saveState={saveState}
+            saveState={mutations.saveStateFor(selected.id)}
+            saveError={mutations.drafts[selected.id]?.error ?? ""}
+            onRetrySave={() => { void mutations.retryDraft(selected); }}
             onLabelDraftChange={setLabelDraft}
             onAddLabel={(value) => addLabel(selected, value)}
             onRemoveLabel={(label) => removeLabel(selected, label)}

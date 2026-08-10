@@ -327,7 +327,12 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .header-action:hover { color: var(--red); }
 
 .micro-header { display: flex; align-items: baseline; justify-content: space-between; color: var(--muted); font: 600 10px/12px ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: .06em; text-transform: uppercase; }
-.save-state { color: var(--quiet); text-transform: none; letter-spacing: 0; }
+.save-state { display: flex; align-items: baseline; gap: 6px; color: var(--quiet); text-transform: none; letter-spacing: 0; }
+/* An unsaved draft is the one save state worth colouring: it is a claim about
+   where the user's words are, not a progress word. The retry sits inside the
+   same row so rule 3 holds — nothing below it moves. */
+.save-state.unsaved { color: var(--amber); }
+.save-retry { padding: 0; color: var(--amber); background: transparent; border: 0; font: inherit; text-decoration: underline; cursor: pointer; }
 
 /* The only 15px in the application. The hierarchy is stated in the type
    scale rather than in chrome. */
@@ -404,6 +409,9 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .queue-heading-actions { display: flex; flex: none; align-items: center; gap: 8px; }
 .queue-view-toggle { padding: 3px 6px; color: var(--quiet); background: transparent; border: 0; border-bottom: 1px solid #465158; cursor: pointer; font-size: 11px; }
 .queue-view-toggle:hover, .queue-view-toggle.active { color: var(--amber); border-color: var(--amber); }
+.queue-reload { padding: 0 4px; color: var(--quiet); background: transparent; border: 0; font-size: 13px; line-height: 1; cursor: pointer; }
+.queue-reload:hover:not(:disabled) { color: var(--ink); }
+.queue-reload:disabled { opacity: .4; cursor: default; }
 
 .search-box { position: relative; display: block; margin: 0 10px 10px; }
 .search-box input { width: 100%; padding: 8px 40px 8px 10px; color: var(--ink); background: #101417; border: 1px solid var(--line); border-radius: 4px; font-size: 11px; }
@@ -447,6 +455,7 @@ kbd { padding: 2px 4px; color: #a8b1b6; background: #262d32; border: 1px solid #
 
 .empty-queue, .empty-inspector { display: flex; flex-direction: column; gap: 4px; padding: 24px 15px; color: var(--muted); font-size: 12px; }
 .empty-queue strong { color: var(--ink); }
+.empty-queue .button { margin-top: 10px; align-self: flex-start; }
 
 .viewer-stage { position: relative; min-height: 0; display: grid; place-items: center; overflow: hidden; container-type: size; background: #07090a; }
 .viewer-stage::before { content: ""; position: absolute; inset: 0; pointer-events: none; background-image: linear-gradient(rgba(255,255,255,.018) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,.018) 1px, transparent 1px); background-size: 40px 40px; }

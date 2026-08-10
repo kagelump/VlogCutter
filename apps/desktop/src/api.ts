@@ -1,7 +1,7 @@
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
-import type { AnalysisProgress, AnalysisReadiness, AnalysisRunRecord, AnalysisRunReport, AnalysisRunRequest, ArchiveRoot, Asset, AssetAnalysisIndexEntry, AssetAnalysisView, AssetPatch, AutoplayMode, BaselineImportResult, BaselinePreviewResult, CardCandidate, ClipTranscript, DesktopSettings, GenerationProgress, ImportHistoryEntry, ImportPreflight, ImportProgress, ImportRollbackPreview, ImportRunReport, ImportSessionDetail, IngestReport, LoadedCatalog, MediaOrigin, ModelInstallProgress, ModelStatus, PathAnalysis, Project, ProjectLibrary, ProjectPairingStatus, RelinkReport, RootMappingEntry, ServerConnectionStatus, ServerPairingResult, ServerVersionInfo, SyncStatus, ThumbnailReport } from "./types";
+import type { AnalysisProgress, AnalysisReadiness, AnalysisRunRecord, AnalysisRunReport, AnalysisRunRequest, AnalysisStage, ArchiveRoot, Asset, AssetAnalysisIndexEntry, AssetAnalysisView, AssetPatch, AutoplayMode, BaselineImportResult, BaselinePreviewResult, CardCandidate, ClipTranscript, DesktopSettings, GenerationProgress, ImportHistoryEntry, ImportPreflight, ImportProgress, ImportRollbackPreview, ImportRunReport, ImportSessionDetail, LoadedCatalog, MediaOrigin, ModelInstallProgress, ModelStatus, PathAnalysis, Project, ProjectLibrary, ProjectPairingStatus, RelinkReport, RootMappingEntry, ServerConnectionStatus, ServerPairingResult, ServerVersionInfo, SyncStatus, ThumbnailReport } from "./types";
 
 /**
  * Whether a backend is answering behind `@tauri-apps/api`.
@@ -184,10 +184,6 @@ export const api = {
     return listen<ImportProgress>("import-progress", (event) => callback(event.payload));
   },
 
-  async ingestFolder(projectId: string, path: string): Promise<IngestReport> {
-    return invoke("ingest_folder", { projectId, path });
-  },
-
   /** Asks where a volume's originals went now. Prompts for a folder; null if dismissed. */
   async chooseRelinkFolder(volumeHint: string): Promise<string | null> {
     const path = await open({
@@ -206,28 +202,21 @@ export const api = {
     return invoke("list_assets", { projectId });
   },
 
+  /**
+   * The one write path for a clip's judgment.
+   *
+   * The narrow adapters that used to sit beside this one — `create_note_revision`,
+   * `add_label`, `remove_label`, `set_removed`, `set_rotation` — had no callers,
+   * and their presence implied a desktop that wrote note revisions and single
+   * fields when in fact every judgment has always been a whole-`AssetPatch`
+   * write through here. They were removed rather than routed through: the
+   * mutation lifecycle in `session/assetMutations.ts` owns this path, and one
+   * write path is the property that made its failure policy stateable. The Rust
+   * commands remain registered for the CLI and for a future revision-aware
+   * frontend; `src/test/cuj/contract.test.ts` keeps that gap visible.
+   */
   async updateAsset(assetId: string, patch: AssetPatch): Promise<Asset> {
     return invoke("update_asset", { assetId, patch });
-  },
-
-  async createNoteRevision(assetId: string, text: string): Promise<Asset> {
-    return invoke("create_note_revision", { assetId, text });
-  },
-
-  async addLabel(assetId: string, label: string): Promise<Asset> {
-    return invoke("add_label", { assetId, label });
-  },
-
-  async removeLabel(assetId: string, label: string): Promise<Asset> {
-    return invoke("remove_label", { assetId, label });
-  },
-
-  async setRemoved(assetId: string, removed: boolean): Promise<Asset> {
-    return invoke("set_removed", { assetId, removed });
-  },
-
-  async setRotation(assetId: string, rotationDegrees: number): Promise<Asset> {
-    return invoke("set_rotation", { assetId, rotationDegrees });
   },
 
   async applyClockEvent(
@@ -246,10 +235,6 @@ export const api = {
 
   async generateMissingProxies(projectId: string): Promise<{ generated: number; skipped: number; failures: Array<{ path: string; error: string }> }> {
     return invoke("generate_missing_proxies", { projectId });
-  },
-
-  async generateThumbnail(assetId: string, quality = 1): Promise<Asset> {
-    return invoke("generate_thumbnail", { assetId, quality });
   },
 
   async generateMissingThumbnails(projectId: string, quality = 1): Promise<ThumbnailReport> {

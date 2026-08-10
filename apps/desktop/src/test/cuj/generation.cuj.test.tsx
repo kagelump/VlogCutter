@@ -173,8 +173,9 @@ describe("CUJ 9 — the source goes offline", () => {
     const app = await renderApp(harness);
 
     harness.asset("asset_sony_a7c_ii_001").setOriginalAvailable(false);
-    // The app learns about it on the read it already performs after a write.
-    await app.user.keyboard("o");
+    // The queue is asked to read the project again, which is how the app finds
+    // out that a volume went away: no write is needed to force it.
+    await app.user.click(screen.getByLabelText("Reload clips"));
 
     await waitFor(() => expect(harness.state.assets.asset_sony_a7c_ii_001.originalAvailable).toBe(false));
     expect(currentSource()).toContain("rep=proxy");
@@ -186,8 +187,7 @@ describe("CUJ 9 — the source goes offline", () => {
 
     await app.user.click(screen.getByText("SONY_003.MP4"));
     harness.asset("asset_sony_a7c_ii_003").setOriginalAvailable(false);
-    // Any write refreshes that asset, which is how the app finds out.
-    await app.user.keyboard("o");
+    await app.user.click(screen.getByLabelText("Reload clips"));
 
     expect(await screen.findByText("No review proxy yet")).toBeVisible();
     expect(document.querySelector('video[data-cache-slot="current"]')).toBeNull();
