@@ -277,7 +277,7 @@ impl Catalog {
             connection.query_row(&format!("SELECT COUNT(*) FROM trip_phases WHERE start_anchor_asset_id IN ({placeholders}) OR end_anchor_asset_id IN ({placeholders})"), rusqlite::params_from_iter(imported_ids.iter().chain(imported_ids.iter())), |row| row.get::<_, i64>(0))? as usize
         };
         let already_removed = entry.rolled_back_asset_count.saturating_sub(removable);
-        Ok(ImportRollbackPreview { session_id: session_id.to_string(), removable_asset_count: removable, already_removed_asset_count: already_removed, modified_clips, affected_phase_count, message: "This removes only project membership created by this import. Original files and archive copies stay untouched. Clip annotations and database records for derived review media are removed with the membership; cached bytes may remain until cache cleanup.".to_string() })
+        Ok(ImportRollbackPreview { session_id: session_id.to_string(), removable_asset_count: removable, already_removed_asset_count: already_removed, modified_clips, affected_phase_count, message: "This removes only project membership created by this import. Original files, archive copies, annotations, and derived review records remain in the catalog and return if the membership is restored. Cached bytes remain until cache cleanup.".to_string() })
     }
 
     pub fn rollback_import_membership(
@@ -337,7 +337,8 @@ fn row_to_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<ImportHistoryEntry>
 mod tests {
     use super::*;
     use crate::operations::ProjectAssetAddedPayload;
-    use crate::{ImportDestination, ImportPreflight, PreflightItem};
+    use crate::{AssetPatch, ImportDestination, ImportPreflight, PreflightItem};
+    use std::fs;
     use tempfile::tempdir;
 
     #[test]
@@ -420,6 +421,40 @@ mod tests {
         add_asset(&catalog, &project.id, "asset_new");
         add_asset(&catalog, &project.id, "asset_relinked");
         add_asset(&catalog, &project.id, "asset_existing");
+        catalog
+            .update_asset(
+                "asset_new",
+                &AssetPatch {
+                    notes: "Keep this annotation".to_string(),
+                    labels: vec!["hero shot".to_string()],
+                    removed: false,
+                    rotation_degrees: 0,
+                },
+            )
+            .unwrap();
+        let proxy = directory.path().join("asset_new.proxy.mp4");
+        let thumbnail = directory.path().join("asset_new.representative.jpg");
+        fs::write(&proxy, b"derived proxy").unwrap();
+        fs::write(&thumbnail, b"derived thumbnail").unwrap();
+        let connection = catalog.connection().unwrap();
+        connection
+            .execute(
+                "UPDATE assets SET proxy_path = ?2 WHERE id = ?1",
+                rusqlite::params!["asset_new", proxy.to_string_lossy()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO asset_thumbnails(asset_id, quality, path, created_at) VALUES (?1, 10, ?2, ?3)",
+                rusqlite::params!["asset_new", thumbnail.to_string_lossy(), now()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO asset_analyses(asset_id, recipe_key, prompt_version, provider, model, status, best_moment_start_ms, best_moment_end_ms, thumbnail_timestamp_ms, created_at) VALUES (?1, 'test.recipe', 'test.prompt', 'test', 'test-model', 'ok', 1000, 2000, 1500, ?2)",
+                rusqlite::params!["asset_new", now()],
+            )
+            .unwrap();
         let plan = ImportPreflight {
             source_path: "/Volumes/CARD".to_string(),
             card: None,
@@ -500,6 +535,12 @@ mod tests {
             .import_rollback_preview(&project.id, &detail.entry.id)
             .unwrap();
         assert_eq!(before.removable_asset_count, 1);
+        assert!(before.message.contains("remain in the catalog"));
+        assert_eq!(before.modified_clips.len(), 1);
+        assert_eq!(
+            before.modified_clips[0].reasons,
+            vec!["notes", "labels", "derived review media"]
+        );
         let after_first = catalog
             .rollback_import_membership(&project.id, &detail.entry.id)
             .unwrap();
@@ -532,9 +573,32 @@ mod tests {
             vec!["asset_existing", "asset_relinked"],
             "a fresh peer baseline must not revive rolled-back membership"
         );
+        let hidden = catalog.get_asset("asset_new").unwrap();
+        assert_eq!(hidden.notes, "Keep this annotation");
+        assert_eq!(hidden.labels, ["hero shot"]);
+        assert_eq!(hidden.proxy_path.as_deref(), proxy.to_str());
+        assert_eq!(hidden.thumbnail_path.as_deref(), thumbnail.to_str());
+        assert_eq!(hidden.thumbnail_quality, 10);
+        let hidden_analysis = catalog.asset_analysis("asset_new").unwrap().unwrap();
+        assert_eq!(hidden_analysis.analysis.best_moment_start_ms, Some(1_000));
+        assert_eq!(hidden_analysis.analysis.best_moment_end_ms, Some(2_000));
+        assert_eq!(hidden_analysis.analysis.thumbnail_timestamp_ms, Some(1_500));
         catalog
             .restore_project_asset_membership(&project.id, "asset_new")
             .unwrap();
         assert_eq!(catalog.count_project_assets(&project.id).unwrap(), 3);
+        let restored = catalog.get_asset("asset_new").unwrap();
+        assert_eq!(restored.notes, "Keep this annotation");
+        assert_eq!(restored.labels, ["hero shot"]);
+        assert_eq!(restored.proxy_path.as_deref(), proxy.to_str());
+        assert_eq!(restored.thumbnail_path.as_deref(), thumbnail.to_str());
+        assert_eq!(restored.thumbnail_quality, 10);
+        let restored_analysis = catalog.asset_analysis("asset_new").unwrap().unwrap();
+        assert_eq!(restored_analysis.analysis.best_moment_start_ms, Some(1_000));
+        assert_eq!(restored_analysis.analysis.best_moment_end_ms, Some(2_000));
+        assert_eq!(
+            restored_analysis.analysis.thumbnail_timestamp_ms,
+            Some(1_500)
+        );
     }
 }

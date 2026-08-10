@@ -12,14 +12,15 @@ const session = {
 };
 
 describe("ImportHistoryDialog", () => {
-  it("requires a second explicit confirmation and explains preservation/modified clips", async () => {
+  it("requires a second explicit confirmation and truthfully explains preserved clip records", async () => {
     const onUndo = vi.fn();
     const user = userEvent.setup();
     const view = render(<ImportHistoryDialog sessions={[session]} detail={session} preview={null} onOpen={vi.fn()} onPreview={vi.fn()} onUndo={onUndo} onClose={vi.fn()} />);
     await user.click(screen.getByRole("button", { name: /remove from project/i }));
     expect(onUndo).not.toHaveBeenCalled();
-    view.rerender(<ImportHistoryDialog sessions={[session]} detail={session} preview={{ sessionId: "import_1", removableAssetCount: 2, alreadyRemovedAssetCount: 0, modifiedClips: [{ assetId: "asset_1", filename: "edited.MP4", reasons: ["notes"] }], affectedPhaseCount: 0, message: "Derived records are removed." }} onOpen={vi.fn()} onPreview={vi.fn()} onUndo={onUndo} onClose={vi.fn()} />);
-    expect(screen.getByText(/Original files and archive copies will not be changed/i)).toBeTruthy();
+    view.rerender(<ImportHistoryDialog sessions={[session]} detail={session} preview={{ sessionId: "import_1", removableAssetCount: 2, alreadyRemovedAssetCount: 0, modifiedClips: [{ assetId: "asset_1", filename: "edited.MP4", reasons: ["notes"] }], affectedPhaseCount: 0, message: "Annotations and derived records remain in the catalog." }} onOpen={vi.fn()} onPreview={vi.fn()} onUndo={onUndo} onClose={vi.fn()} />);
+    expect(screen.getByText(/annotations, and derived review records will be preserved/i)).toBeTruthy();
+    expect(screen.getByText(/will be hidden from this project with their preserved annotations/i)).toBeTruthy();
     expect(screen.getByText(/edited.MP4/)).toBeTruthy();
     await user.click(screen.getByRole("button", { name: /confirm remove from project/i }));
     expect(onUndo).toHaveBeenCalledWith("import_1");
