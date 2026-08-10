@@ -102,6 +102,7 @@ function App() {
     lastContextUpdatedAt: null,
     makeProxiesOnImport: true,
     lastImportArchiveRootId: null,
+    importArchiveRootIdsByCardSession: {},
   });
   const [isMuted, setIsMuted] = useState(true);
   const [isPlaying, setIsPlaying] = useState(false);
@@ -117,6 +118,7 @@ function App() {
   const [phaseDialogBusy, setPhaseDialogBusy] = useState(false);
   const [phaseDialogError, setPhaseDialogError] = useState("");
   const [showImportDialog, setShowImportDialog] = useState(false);
+  const [importProjectName, setImportProjectName] = useState("");
   const [importSource, setImportSource] = useState("");
   const [importCard, setImportCard] = useState<CardCandidate | null>(null);
   const [archiveRoots, setArchiveRoots] = useState<ArchiveRoot[]>([]);
@@ -195,12 +197,14 @@ function App() {
   const viewerStageRef = useRef<HTMLDivElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const assetsRef = useRef<Asset[]>([]);
+  const projectIdRef = useRef("");
   const selectedIdRef = useRef("");
   const orientationQueueRef = useRef<string[]>([]);
   const orientationActiveRef = useRef(new Set<string>());
 
   const selected = assets.find((asset) => asset.id === selectedId) ?? null;
   const project = projects.find((item) => item.id === projectId) ?? null;
+  projectIdRef.current = projectId;
 
   useEffect(() => {
     assetsRef.current = assets;
@@ -307,6 +311,9 @@ function App() {
       return;
     }
     const result = await api.listAssets(activeProjectId);
+    // Background jobs may finish after the user has changed projects. Never
+    // paint their old project's assets into the newly-selected queue.
+    if (projectIdRef.current !== activeProjectId) return;
     setAssets(result);
     setSelectedId((current) =>
       result.some((asset) => asset.id === current) ? current : result[0]?.id || "",
@@ -528,7 +535,22 @@ function App() {
           }
         }),
         api.onModelInstallProgress((progress) => setModelInstall(progress)),
-        api.onImportProgress((progress) => setImportProgress(progress)),
+        api.onImportProgress((progress) => {
+          setImportProgress(progress);
+          if (activeOperationRef.current === "import" && progress.stage !== "complete") {
+            setOperationProgress({
+              kind: "import",
+              completed: progress.completed,
+              total: progress.total,
+              completedWorkUnits: progress.completedBytes,
+              totalWorkUnits: progress.totalBytes,
+              workerCount: 1,
+              estimatedRemainingSeconds: null,
+              importStage: progress.stage,
+              currentFile: progress.currentFile,
+            });
+          }
+        }),
       ]);
       if (disposed) listeners.forEach((dispose) => dispose());
       else unlisten.push(...listeners);
@@ -1125,6 +1147,7 @@ function App() {
 
   async function openImportForPath(path: string, knownCard?: CardCandidate) {
     setShowImportDialog(true);
+    setImportProjectName(project?.name ?? "this project");
     setImportSource(path);
     setImportPlan(null);
     setImportProgress(null);
@@ -1138,7 +1161,11 @@ function App() {
       ]);
       setImportCard(card);
       setArchiveRoots(roots);
-      const remembered = roots.find((root) => root.id === settings.lastImportArchiveRootId);
+      const mappedRootId = card
+        ? settings.importArchiveRootIdsByCardSession[card.sessionId]
+        : null;
+      const remembered = roots.find((root) => root.id === mappedRootId)
+        ?? roots.find((root) => root.id === settings.lastImportArchiveRootId);
       const selectedRoot = card ? (remembered ?? roots.find((root) => root.available) ?? roots[0] ?? null) : null;
       const rootId = selectedRoot?.id ?? "";
       setSelectedArchiveRootId(rootId);
@@ -1199,22 +1226,41 @@ function App() {
   }
 
   async function runSmartImport() {
-    if (!projectId || !importPlan || importRunning) return;
+    if (!projectId || !importPlan || importRunning || busy) return;
     setImportRunning(true);
+    setBusy(true);
     setImportProgress(null);
     setImportError("");
+    activeOperationRef.current = "import";
+    setOperationProgress(initialProgress("import", importPlan.newClips + importPlan.relinkable));
+    setShowImportDialog(false);
     try {
-      const nextSettings = await api.setImportPreferences(makeImportProxies, selectedArchiveRootId || null);
+      const nextSettings = await api.setImportPreferences(
+        makeImportProxies,
+        selectedArchiveRootId || null,
+        importCard?.sessionId ?? null,
+      );
       setSettings(nextSettings);
       const report = await api.runSmartImport(projectId, importPlan, verifyImportCopies, makeImportProxies);
       setImportReport(report);
       await Promise.all([refreshAssets(projectId), refreshProjects(), refreshReadiness(projectId)]);
       const failures = report.outcome.failures.length + (report.proxies?.failures.length ?? 0);
-      if (failures) setImportError(`${failures} file${failures === 1 ? "" : "s"} need attention in the import ledger.`);
+      if (failures) {
+        const failureMessage = `${failures} file${failures === 1 ? "" : "s"} need attention in the import ledger.`;
+        setImportError(failureMessage);
+        setError(failureMessage);
+      } else if (report.outcome.cancelled) {
+        setMessage("Import stopped cleanly; finished files were kept");
+      } else {
+        setMessage(`Import complete · ${report.outcome.imported} clip${report.outcome.imported === 1 ? "" : "s"} added`);
+      }
     } catch (reason) {
-      setImportError(String(reason));
+      setError(String(reason));
     } finally {
+      activeOperationRef.current = null;
+      setOperationProgress(null);
       setImportRunning(false);
+      setBusy(false);
     }
   }
 
@@ -1739,6 +1785,7 @@ function App() {
         onPairWithServer={() => void handleStartBaselineWizard(projectId)}
         onShowSyncDiagnostics={() => setShowSyncDiagnostics(true)}
         onCancelAnalysis={stopAnalysis}
+        onCancelImport={() => void api.cancelImport()}
         onDismissError={() => setError("")}
         onMakeProxies={makeMissingProxies}
         onToggleMediaMenu={() => setShowMediaMenu((current) => !current)}
@@ -2584,7 +2631,7 @@ function App() {
 
       {showImportDialog && (
         <ImportDialog
-          projectName={project?.name ?? "this project"}
+          projectName={importProjectName || "this project"}
           sourcePath={importSource}
           card={importCard}
           roots={archiveRoots}

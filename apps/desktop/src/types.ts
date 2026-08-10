@@ -60,6 +60,8 @@ export interface DesktopSettings {
   lastContextUpdatedAt: string | null;
   makeProxiesOnImport: boolean;
   lastImportArchiveRootId: string | null;
+  /** Stable card-session fingerprint to the archive previously chosen for it. */
+  importArchiveRootIdsByCardSession: Record<string, string>;
   pairedServerNodeId?: string | null;
   pairedServerEndpoint?: string | null;
   pairedServerLabel?: string | null;
@@ -367,6 +369,11 @@ export interface ProxyReport {
 export interface ImportRunReport {
   outcome: ImportOutcome;
   proxies: ProxyReport | null;
+  files: Array<{
+    path: string;
+    timestamp: string | null;
+    durationSeconds: number | null;
+  }>;
 }
 
 /** The result of pointing the app at a folder to find originals it has lost track of. */

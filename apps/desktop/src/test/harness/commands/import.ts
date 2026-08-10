@@ -110,7 +110,7 @@ function stepProgress(state: DesktopHarnessState, tally: RunTally, plan: ImportP
   };
 }
 
-function runReport(tally: RunTally, plan: ImportPreflight, cancelled: boolean, makeProxies: boolean): ImportRunReport {
+function runReport(state: DesktopHarnessState, tally: RunTally, plan: ImportPreflight, cancelled: boolean, makeProxies: boolean): ImportRunReport {
   return {
     outcome: {
       imported: tally.imported.length,
@@ -124,6 +124,15 @@ function runReport(tally: RunTally, plan: ImportPreflight, cancelled: boolean, m
     proxies: makeProxies
       ? { generated: tally.imported.length, skipped: 0, cancelled, failures: [] }
       : null,
+    files: plan.items.map((item) => {
+      const asset = (item.assetId ? state.assets[item.assetId] : undefined)
+        ?? Object.values(state.assets).find((candidate) => candidate.filename === item.filename && candidate.sizeBytes === item.sizeBytes);
+      return {
+        path: item.path,
+        timestamp: asset?.bestTime ?? asset?.capturedAtRaw ?? null,
+        durationSeconds: asset?.durationSeconds ?? null,
+      };
+    }),
   };
 }
 
@@ -162,6 +171,13 @@ export const importCommands: CommandTable = {
       throw new Error("set_import_preferences archiveRootId must be a string or null");
     }
     state.settings.lastImportArchiveRootId = archiveRootId;
+    const cardSessionId = args.cardSessionId;
+    if (cardSessionId !== null && typeof cardSessionId !== "string") {
+      throw new Error("set_import_preferences cardSessionId must be a string or null");
+    }
+    if (cardSessionId && archiveRootId) {
+      state.settings.importArchiveRootIdsByCardSession[cardSessionId] = archiveRootId;
+    }
     return { ...state.settings, mediaOrigin: state.mediaOrigin };
   },
 
@@ -193,7 +209,7 @@ export const importCommands: CommandTable = {
     const controller = context.jobs.claimed("run_smart_import");
     if (!controller) {
       while (tally.pending.length > 0) stepProgress(context.state, tally, plan);
-      return runReport(tally, plan, false, makeProxies);
+      return runReport(context.state, tally, plan, false, makeProxies);
     }
 
     const binding: JobBinding<void, { cancelled?: boolean }, ImportRunReport> = {
@@ -201,7 +217,7 @@ export const importCommands: CommandTable = {
       args: { sourcePath: plan.sourcePath },
       event: "import-progress",
       progress: () => stepProgress(context.state, tally, plan),
-      result: (outcome) => runReport(tally, plan, Boolean(outcome?.cancelled) || controller.isCancelled, makeProxies),
+      result: (outcome) => runReport(context.state, tally, plan, Boolean(outcome?.cancelled) || controller.isCancelled, makeProxies),
     };
     return controller.bind(binding);
   },

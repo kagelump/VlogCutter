@@ -1,10 +1,10 @@
-import type { AnalysisStage, Project, SyncStatus } from "../types";
+import type { AnalysisStage, ImportStage, Project, SyncStatus } from "../types";
 import type { Mode } from "../review/presentation";
 import { analysisStageLabels, formatCost, formatEta, syncStateLabel } from "../review/format";
 
 /** A long-running background job, as the topbar reports it. */
 export interface OperationProgress {
-  kind: "proxy" | "thumbnail" | "analysis";
+  kind: "proxy" | "thumbnail" | "analysis" | "import";
   completed: number;
   total: number;
   completedWorkUnits: number;
@@ -16,6 +16,9 @@ export interface OperationProgress {
   stageIndex?: number;
   stageCount?: number;
   costUsd?: number;
+  /** Import only: copying, metadata, or proxy generation. */
+  importStage?: ImportStage;
+  currentFile?: string;
 }
 
 export interface TopBarProps {
@@ -28,7 +31,7 @@ export interface TopBarProps {
   canPairWithServer: boolean;
   syncStatus: SyncStatus | null;
 
-  /** The operation slot: at most one of these three is shown, in this order. */
+  /** The operation slot: one background media/import operation at a time. */
   operationProgress: OperationProgress | null;
   error: string;
   message: string;
@@ -53,6 +56,7 @@ export interface TopBarProps {
   onPairWithServer(): void;
   onShowSyncDiagnostics(): void;
   onCancelAnalysis(): void;
+  onCancelImport(): void;
   onDismissError(): void;
   onMakeProxies(): void;
   onToggleMediaMenu(): void;
@@ -103,6 +107,7 @@ export function TopBar({
   onPairWithServer,
   onShowSyncDiagnostics,
   onCancelAnalysis,
+  onCancelImport,
   onDismissError,
   onMakeProxies,
   onToggleMediaMenu,
@@ -167,6 +172,14 @@ export function TopBar({
             <span>
               {operationProgress.kind === "analysis" && operationProgress.stage
                 ? `${analysisStageLabels[operationProgress.stage]} · step ${(operationProgress.stageIndex ?? 0) + 1} of ${operationProgress.stageCount ?? 3}`
+                : operationProgress.kind === "import"
+                  ? operationProgress.importStage === "copying"
+                    ? "Copying and verifying originals"
+                    : operationProgress.importStage === "reading"
+                      ? "Reading clip metadata"
+                      : operationProgress.importStage === "proxies"
+                        ? "Making import proxies"
+                        : "Importing media"
                 : operationProgress.kind === "thumbnail"
                   ? "Generating thumbnails"
                   : "Generating proxies"}
@@ -184,13 +197,16 @@ export function TopBar({
                   ? (operationProgress.completed / operationProgress.total) * 100
                   : 0}%` }} />
             </div>
-            <output>{operationProgress.completed}/{operationProgress.total}</output>
+            <output title={operationProgress.currentFile}>{operationProgress.completed}/{operationProgress.total}</output>
             <span>
               {formatEta(operationProgress.estimatedRemainingSeconds)} · {operationProgress.workerCount} worker{operationProgress.workerCount === 1 ? "" : "s"}
               {operationProgress.kind === "analysis" ? ` · ${formatCost(operationProgress.costUsd ?? 0)} spent` : ""}
             </span>
             {operationProgress.kind === "analysis" && (
               <button className="button ghost progress-cancel" onClick={onCancelAnalysis}>Cancel</button>
+            )}
+            {operationProgress.kind === "import" && (
+              <button className="button ghost progress-cancel" onClick={onCancelImport}>Stop</button>
             )}
           </>
         ) : error ? (
