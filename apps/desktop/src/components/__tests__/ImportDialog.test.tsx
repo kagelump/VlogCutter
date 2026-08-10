@@ -1,7 +1,7 @@
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
-import type { ArchiveRoot, CardCandidate, ImportPreflight } from "../../types";
+import type { ArchiveRoot, CardCandidate, ImportPreflight, ImportRunReport } from "../../types";
 import { ImportDialog, type ImportDialogProps } from "../ImportDialog";
 
 const card: CardCandidate = {
@@ -79,11 +79,12 @@ function renderDialog(overrides: Partial<ImportDialogProps> = {}) {
 describe("card import preflight", () => {
   it("puts destination, copy cost, free space, and delta before the action", () => {
     renderDialog();
-    expect(screen.getAllByText("NAS Video")).toHaveLength(2);
+    expect(screen.getByText("NAS Video")).toBeTruthy();
     expect(screen.getByText(/62.4 GB/)).toBeTruthy();
     expect(screen.getByText(/1.2 TB free/)).toBeTruthy();
     expect(screen.getByText("new to Spain 2026").previousElementSibling?.textContent).toBe("18");
     expect(screen.getByRole("button", { name: "Import 18 clips" })).toBeTruthy();
+    expect(screen.getByRole("option", { name: `NAS Video — ${root.localMountPath}` })).toBeTruthy();
   });
 
   it("blocks import when the destination cannot hold the copy", () => {
@@ -123,5 +124,28 @@ describe("card import preflight", () => {
     renderDialog({ card: null, sourcePath: "/Volumes/NAS/Spain", roots: [], selectedRootId: "", plan: folderPlan });
     expect(screen.getByText("Stay in place")).toBeTruthy();
     expect(screen.getByText("No originals are copied")).toBeTruthy();
+  });
+
+  it("shows filename, capture timestamp, and duration in the completed file ledger", async () => {
+    const item = {
+      path: `${card.mountPath}/DCIM/DJI_001.MP4`,
+      relativePath: "DCIM/DJI_001.MP4",
+      filename: "DJI_001.MP4",
+      sizeBytes: 100,
+      classification: "new" as const,
+      assetId: null,
+      error: "",
+    };
+    const report: ImportRunReport = {
+      outcome: { imported: 1, relinked: 0, skipped: 0, copied: 1, bytesCopied: 100, cancelled: false, failures: [] },
+      proxies: null,
+      files: [{ path: item.path, timestamp: "2026-08-09T08:14:15Z", durationSeconds: 65.8 }],
+    };
+    renderDialog({ plan: plan({ scanned: 1, newClips: 1, items: [item] }), report });
+
+    await userEvent.click(screen.getByText("Review every file"));
+    expect(screen.getByText("DJI_001.MP4")).toBeTruthy();
+    expect(screen.getByText("1:05")).toBeTruthy();
+    expect(document.querySelector('time[datetime="2026-08-09T08:14:15Z"]')).toBeTruthy();
   });
 });

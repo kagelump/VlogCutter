@@ -149,8 +149,10 @@ export const api = {
     return invoke("bind_archive_root", { archiveRootId, path });
   },
 
-  async setImportPreferences(makeProxies: boolean, archiveRootId: string | null): Promise<DesktopSettings> {
-    return rememberMediaOrigin(await invoke<DesktopSettings>("set_import_preferences", { makeProxies, archiveRootId }));
+  async setImportPreferences(makeProxies: boolean, archiveRootId: string | null, cardSessionId: string | null): Promise<DesktopSettings> {
+    return rememberMediaOrigin(
+      await invoke<DesktopSettings>("set_import_preferences", { makeProxies, archiveRootId, cardSessionId }),
+    );
   },
 
   async preflightImport(projectId: string, sourcePath: string, archiveRootId: string | null): Promise<ImportPreflight> {

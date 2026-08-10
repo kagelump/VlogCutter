@@ -713,8 +713,10 @@ kbd { padding: 2px 4px; color: #a8b1b6; background: #262d32; border: 1px solid #
 .import-file-ledger { margin-top: 14px; color: var(--quiet); font-size: 10px; }
 .import-file-ledger summary { cursor: pointer; color: var(--cyan); }
 .import-file-ledger ul { display: grid; max-height: 180px; margin: 9px 0 0; padding: 0; overflow-y: auto; list-style: none; border-top: 1px solid var(--line); }
-.import-file-ledger li { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 2px 16px; padding: 7px 4px; border-bottom: 1px solid var(--line); }
-.import-file-ledger li > span:first-child { color: var(--ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.import-file-ledger li { display: grid; grid-template-columns: minmax(0, 1fr) auto auto auto; gap: 2px 16px; align-items: baseline; padding: 7px 4px; border-bottom: 1px solid var(--line); }
+.import-file-ledger .import-file-name { color: var(--ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.import-file-ledger time, .import-file-ledger .import-file-duration { color: var(--quiet); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.import-file-ledger .import-file-status { white-space: nowrap; }
 .import-file-ledger li small { grid-column: 1 / -1; color: var(--red); }
 .import-actions { gap: 16px; }
 .import-actions > span { min-width: 0; color: var(--quiet); font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

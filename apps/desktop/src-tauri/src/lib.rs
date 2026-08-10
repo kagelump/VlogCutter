@@ -185,6 +185,9 @@ struct DesktopSettings {
     make_proxies_on_import: bool,
     #[serde(default)]
     last_import_archive_root_id: Option<String>,
+    /// Stable card-session fingerprint to the logical archive chosen for it.
+    #[serde(default)]
+    import_archive_root_ids_by_card_session: HashMap<String, String>,
 }
 
 const fn default_true() -> bool {
@@ -638,6 +641,7 @@ fn load_settings(settings_path: &Path, default_root: PathBuf) -> DesktopSettings
             paired_server_endpoints: None,
             make_proxies_on_import: true,
             last_import_archive_root_id: None,
+            import_archive_root_ids_by_card_session: HashMap::new(),
         })
 }
 
@@ -794,6 +798,15 @@ struct DesktopImportProgress {
 struct ImportRunReport {
     outcome: ImportOutcome,
     proxies: Option<ProxyReport>,
+    files: Vec<ImportFileMetadata>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ImportFileMetadata {
+    path: String,
+    timestamp: Option<String>,
+    duration_seconds: Option<f64>,
 }
 
 #[tauri::command]
@@ -844,15 +857,24 @@ fn bind_archive_root(
 fn set_import_preferences(
     make_proxies: bool,
     archive_root_id: Option<String>,
+    card_session_id: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<DesktopSettingsView, String> {
     let mut settings = state
         .settings
         .write()
         .map_err(|_| "desktop settings are unavailable".to_string())?;
+    let mut import_archive_root_ids_by_card_session =
+        settings.import_archive_root_ids_by_card_session.clone();
+    if let (Some(card_session_id), Some(archive_root_id)) =
+        (card_session_id, archive_root_id.as_ref())
+    {
+        import_archive_root_ids_by_card_session.insert(card_session_id, archive_root_id.clone());
+    }
     let updated = DesktopSettings {
         make_proxies_on_import: make_proxies,
         last_import_archive_root_id: archive_root_id,
+        import_archive_root_ids_by_card_session,
         ..settings.clone()
     };
     write_settings(&state.settings_path, &updated).map_err(error_message)?;
@@ -982,7 +1004,52 @@ async fn run_smart_import(
                     total_bytes: outcome.bytes_copied,
                 },
             );
-            Ok(ImportRunReport { outcome, proxies })
+            // Import has now run ffprobe for every successfully-added clip. Build
+            // the durable ledger from catalog facts instead of making preflight
+            // probe hundreds of card files merely because its disclosure exists.
+            let assets = catalog.list_assets(&pid)?;
+            let assets_by_id: HashMap<&str, &Asset> = assets
+                .iter()
+                .map(|asset| (asset.id.as_str(), asset))
+                .collect();
+            let assets_by_path: HashMap<&str, &Asset> = assets
+                .iter()
+                .map(|asset| (asset.path.as_str(), asset))
+                .collect();
+            let files = plan
+                .items
+                .iter()
+                .map(|item| {
+                    let expected_path = if plan.destination.copies {
+                        Path::new(&plan.destination.resolved_path)
+                            .join(&item.relative_path)
+                            .to_string_lossy()
+                            .into_owned()
+                    } else {
+                        item.path.clone()
+                    };
+                    let asset = item
+                        .asset_id
+                        .as_deref()
+                        .and_then(|id| assets_by_id.get(id).copied())
+                        .or_else(|| assets_by_path.get(expected_path.as_str()).copied());
+                    ImportFileMetadata {
+                        path: item.path.clone(),
+                        timestamp: asset.and_then(|asset| {
+                            asset
+                                .best_time
+                                .clone()
+                                .or_else(|| asset.captured_at_raw.clone())
+                        }),
+                        duration_seconds: asset.map(|asset| asset.duration_seconds),
+                    }
+                })
+                .collect();
+            Ok(ImportRunReport {
+                outcome,
+                proxies,
+                files,
+            })
         })
         .await
         .map_err(error_message)?
@@ -2177,6 +2244,7 @@ mod tests {
             paired_server_endpoints: None,
             make_proxies_on_import: true,
             last_import_archive_root_id: None,
+            import_archive_root_ids_by_card_session: HashMap::new(),
         }
     }
 
@@ -2357,6 +2425,7 @@ mod tests {
         let settings = load_settings(&settings_path, PathBuf::from("fallback"));
         assert_eq!(settings.projects_root, projects_root);
         assert_eq!(settings.autoplay_mode, AutoplayMode::ProxyAvailable);
+        assert!(settings.import_archive_root_ids_by_card_session.is_empty());
     }
 
     #[test]

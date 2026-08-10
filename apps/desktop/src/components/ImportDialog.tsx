@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import type { ArchiveRoot, CardCandidate, ImportPreflight, ImportProgress, ImportRunReport } from "../types";
 import { formatBytes } from "../review/summaries";
+import { formatDuration } from "../review/format";
 
 export interface ImportDialogProps {
   projectName: string;
@@ -176,7 +177,11 @@ export function ImportDialog({
                     <span>Originals destination</span>
                     <select value={selectedRootId} disabled={loading} onChange={(event) => onSelectRoot(event.target.value)}>
                       <option value="">Choose an archive…</option>
-                      {roots.map((root) => <option key={root.id} value={root.id}>{root.displayName}{root.available ? "" : " — not connected"}</option>)}
+                      {roots.map((root) => (
+                        <option key={root.id} value={root.id}>
+                          {root.displayName} — {root.localMountPath || "Not connected"}{root.available ? "" : " (not connected)"}
+                        </option>
+                      ))}
                     </select>
                   </label>
                 )}
@@ -234,15 +239,42 @@ export function ImportDialog({
 function FileLedger({ plan, report }: { plan: ImportPreflight | null; report?: ImportRunReport }) {
   if (!plan) return <p>No file plan is available.</p>;
   const failed = new Map(report?.outcome.failures.map((failure) => [failure.path, failure.error]));
+  const metadata = new Map(report?.files.map((file) => [file.path, file]));
   return (
     <ul>
       {plan.items.map((item) => (
         <li key={item.path}>
-          <span>{item.filename}</span>
-          <span>{failed.has(item.path) ? "failed" : item.classification.replace(/([A-Z])/g, " $1").toLowerCase()}</span>
+          <span className="import-file-name">{item.filename}</span>
+          {report && (
+            <>
+              <time dateTime={metadata.get(item.path)?.timestamp ?? undefined}>
+                {formatImportTimestamp(metadata.get(item.path)?.timestamp ?? null)}
+              </time>
+              <span className="import-file-duration">
+                {metadata.get(item.path)?.durationSeconds != null
+                  ? formatDuration(metadata.get(item.path)!.durationSeconds!)
+                  : "—"}
+              </span>
+            </>
+          )}
+          <span className="import-file-status">{failed.has(item.path) ? "failed" : item.classification.replace(/([A-Z])/g, " $1").toLowerCase()}</span>
           {(failed.get(item.path) || item.error) && <small>{failed.get(item.path) || item.error}</small>}
         </li>
       ))}
     </ul>
   );
+}
+
+function formatImportTimestamp(value: string | null) {
+  if (!value) return "—";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return date.toLocaleString(undefined, {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
 }
