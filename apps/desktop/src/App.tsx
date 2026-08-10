@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import { StatusBadge } from "@rcdvlog/review-ui";
 import { api } from "./api";
-import type { AnalysisReadiness, ArchiveRoot, Asset, AssetAnalysisIndexEntry, AssetAnalysisView, AssetPatch, AutoplayMode, BaselineImportResult, BaselinePreviewResult, CardCandidate, ClipTranscript, DesktopSettings, ImportPreflight, ImportProgress, ImportRunReport, ModelInstallProgress, ModelStatus, PathAnalysis, Project, ProjectLibrary, ProjectLocation, ProjectPairingStatus, RootMappingEntry, ServerConnectionStatus, ServerVersionInfo, SyncStatus, TranscriptStatus } from "./types";
+import type { AnalysisReadiness, ArchiveRoot, Asset, AssetAnalysisIndexEntry, AssetAnalysisView, AssetPatch, AutoplayMode, BaselineImportResult, BaselinePreviewResult, CardCandidate, ClipTranscript, DesktopSettings, ImportHistoryEntry, ImportPreflight, ImportProgress, ImportRollbackPreview, ImportRunReport, ImportSessionDetail, ModelInstallProgress, ModelStatus, PathAnalysis, Project, ProjectLibrary, ProjectLocation, ProjectPairingStatus, RootMappingEntry, ServerConnectionStatus, ServerVersionInfo, SyncStatus, TranscriptStatus } from "./types";
 import { orderAssets, moveSelection as moveSelectionInOrder } from "./review/order";
 import { resolveAction } from "./review/keymap";
 import { CalibrationPanel } from "./CalibrationPanel";
@@ -28,6 +28,7 @@ import { VideoStage } from "./components/VideoStage";
 import { TopBar, type OperationProgress } from "./components/TopBar";
 import { TripPhaseDialog, type TripPhaseFormValue } from "./components/TripPhaseDialog";
 import { ImportDialog } from "./components/ImportDialog";
+import { ImportHistoryDialog } from "./components/ImportHistoryDialog";
 import { CardBanner } from "./components/CardBanner";
 import { analysisStageLabels, formatCost, syncStateLabel } from "./review/format";
 import { isRawOrientationProxy, renderedRotation, rotationAfter } from "./review/rotation";
@@ -128,6 +129,10 @@ function App() {
   const [importReport, setImportReport] = useState<ImportRunReport | null>(null);
   const [importLoading, setImportLoading] = useState(false);
   const [importRunning, setImportRunning] = useState(false);
+  const [showImportHistory, setShowImportHistory] = useState(false);
+  const [importSessions, setImportSessions] = useState<ImportHistoryEntry[]>([]);
+  const [importSessionDetail, setImportSessionDetail] = useState<ImportSessionDetail | null>(null);
+  const [importRollback, setImportRollback] = useState<ImportRollbackPreview | null>(null);
   const [importError, setImportError] = useState("");
   const [verifyImportCopies, setVerifyImportCopies] = useState(true);
   const [makeImportProxies, setMakeImportProxies] = useState(true);
@@ -351,6 +356,7 @@ function App() {
   useEffect(() => {
     refreshAssets(projectId).catch((reason) => setError(String(reason)));
     refreshChronology(projectId).catch(() => setChronologyOverview(null));
+    api.listImportSessions(projectId).then(setImportSessions).catch(() => setImportSessions([]));
   }, [projectId, refreshAssets, refreshChronology]);
 
   // ── Clip analysis loaders ─────────────────────────────────────────
@@ -1232,6 +1238,7 @@ function App() {
       setSettings(nextSettings);
       const report = await api.runSmartImport(projectId, importPlan, verifyImportCopies, makeImportProxies);
       setImportReport(report);
+      setImportSessions((current) => report.session ? [report.session, ...current.filter((session) => session.id !== report.session!.id)] : current);
       await Promise.all([refreshAssets(projectId), refreshProjects(), refreshReadiness(projectId)]);
       const failures = report.outcome.failures.length + (report.proxies?.failures.length ?? 0);
       if (failures) {
@@ -1270,6 +1277,35 @@ function App() {
     if (importRunning) return;
     if (importLoading) void api.cancelImport();
     setShowImportDialog(false);
+  }
+
+  async function openImportHistory() {
+    if (!projectId) return;
+    setShowMediaMenu(false);
+    setImportSessionDetail(null);
+    setImportRollback(null);
+    setImportSessions(await api.listImportSessions(projectId));
+    setShowImportHistory(true);
+  }
+
+  async function openImportSession(sessionId: string) {
+    if (!projectId) return;
+    setImportRollback(null);
+    setImportSessionDetail(await api.importSession(projectId, sessionId));
+  }
+
+  async function previewImportRollback(sessionId: string) {
+    if (!projectId) return;
+    setImportRollback(await api.importRollbackPreview(projectId, sessionId));
+  }
+
+  async function rollbackImportSession(sessionId: string) {
+    if (!projectId) return;
+    await api.rollbackImportMembership(projectId, sessionId);
+    await Promise.all([refreshAssets(projectId), api.listImportSessions(projectId).then(setImportSessions)]);
+    setImportRollback(null);
+    setImportSessionDetail(await api.importSession(projectId, sessionId));
+    setMessage("Import membership removed; original media was left untouched");
   }
 
   async function makeProxy() {
@@ -1762,7 +1798,7 @@ function App() {
         missingThumbnailCount={missingThumbnailCount}
         missingAnalysisCount={readiness?.missingAnalyses ?? 0}
         mediaMenuOpen={showMediaMenu}
-        hasLastImport={Boolean(importReport)}
+        hasLastImport={Boolean(importReport) || importSessions.length > 0}
         labeledCount={labeledCount}
         activeCount={activeAssets.length}
         onProjectChange={setProjectId}
@@ -1781,7 +1817,7 @@ function App() {
         onMakeThumbnails={makeMissingThumbnails}
         onOpenAnalysis={openAnalysisDialog}
         onImportFolder={importFolder}
-        onReviewLastImport={() => { setShowMediaMenu(false); setShowImportDialog(true); }}
+        onReviewLastImport={() => importReport ? (setShowMediaMenu(false), setShowImportDialog(true)) : void openImportHistory()}
       />
 
       {view.mode !== "review" && projectId ? (
@@ -2641,6 +2677,17 @@ function App() {
           onImport={() => void runSmartImport()}
           onCancel={() => void api.cancelImport()}
           onClose={closeImportDialog}
+        />
+      )}
+      {showImportHistory && (
+        <ImportHistoryDialog
+          sessions={importSessions}
+          detail={importSessionDetail}
+          preview={importRollback}
+          onOpen={(id) => void openImportSession(id)}
+          onPreview={(id) => void previewImportRollback(id)}
+          onUndo={(id) => void rollbackImportSession(id)}
+          onClose={() => setShowImportHistory(false)}
         />
       )}
 

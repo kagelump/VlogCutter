@@ -17,7 +17,9 @@ import type {
   CardCandidate,
   ImportPreflight,
   ImportProgress,
+  ImportRollbackPreview,
   ImportRunReport,
+  ImportSessionDetail,
   PreflightItem,
 } from "../../../types";
 import { buildArchiveRoot } from "../builders";
@@ -111,6 +113,19 @@ function stepProgress(state: DesktopHarnessState, tally: RunTally, plan: ImportP
 }
 
 function runReport(state: DesktopHarnessState, tally: RunTally, plan: ImportPreflight, cancelled: boolean, makeProxies: boolean): ImportRunReport {
+  const sessionId = `import_${Object.keys(state.imports.sessions).length + 1}`;
+  const session: ImportSessionDetail = {
+    id: sessionId, projectId: "project_hokkaido", sourcePath: plan.sourcePath,
+    destinationMode: plan.destination.copies ? "archive_copy" : "reference",
+    destinationRootId: plan.destination.archiveRoot?.id ?? null,
+    destinationName: plan.destination.archiveRoot?.displayName ?? "Originals stay in place",
+    destinationPath: plan.destination.resolvedPath,
+    imported: tally.imported.length, relinked: 0, skipped: plan.knownClips, copied: tally.imported.length,
+    bytesCopied: tally.bytesCopied, cancelled, failures: [], rolledBackAt: null, rolledBackAssetCount: 0,
+    createdAt: "2026-08-10T12:00:00.000Z",
+    files: plan.items.map((item) => ({ assetId: tally.imported.find((id) => state.assets[id]?.filename === item.filename) ?? item.assetId ?? null, path: item.path, filename: item.filename, classification: item.classification, result: item.classification === "new" ? "completed" : "left_alone", timestamp: null, durationSeconds: null, error: null })),
+  };
+  state.imports.sessions[sessionId] = session;
   return {
     outcome: {
       imported: tally.imported.length,
@@ -135,6 +150,7 @@ function runReport(state: DesktopHarnessState, tally: RunTally, plan: ImportPref
         durationSeconds: asset?.durationSeconds ?? null,
       };
     }),
+    session,
   };
 }
 
@@ -227,5 +243,41 @@ export const importCommands: CommandTable = {
   cancel_import: (_args, { jobs }) => {
     jobs.claimed("run_smart_import")?.requestCancel();
     return null;
+  },
+
+  list_import_sessions: (args, { state }) => {
+    requireString(args, "projectId");
+    return Object.values(state.imports.sessions).map(({ files: _files, ...entry }) => entry);
+  },
+
+  import_session: (args, { state }): ImportSessionDetail => {
+    requireString(args, "projectId");
+    const sessionId = requireString(args, "sessionId");
+    const session = state.imports.sessions[sessionId];
+    if (!session) throw new Error(`Unknown import session: ${sessionId}`);
+    return session;
+  },
+
+  import_rollback_preview: (args, { state }): ImportRollbackPreview => {
+    requireString(args, "projectId");
+    const sessionId = requireString(args, "sessionId");
+    const session = state.imports.sessions[sessionId];
+    if (!session) throw new Error(`Unknown import session: ${sessionId}`);
+    const removable = session.files.filter((file) => file.classification === "new" && file.result === "completed" && file.assetId && state.assets[file.assetId]).length;
+    return { sessionId, removableAssetCount: removable, alreadyRemovedAssetCount: session.rolledBackAssetCount, modifiedClips: [], affectedPhaseCount: 0, message: "Original files and archive copies stay untouched." };
+  },
+
+  rollback_import_membership: (args, { state }): ImportRollbackPreview => {
+    requireString(args, "projectId");
+    const sessionId = requireString(args, "sessionId");
+    const session = state.imports.sessions[sessionId];
+    if (!session) throw new Error(`Unknown import session: ${sessionId}`);
+    for (const file of session.files) {
+      if (file.classification === "new" && file.result === "completed" && file.assetId) delete state.assets[file.assetId];
+    }
+    state.assetOrder = state.assetOrder.filter((id) => Boolean(state.assets[id]));
+    session.rolledBackAt ??= "2026-08-10T12:01:00.000Z";
+    session.rolledBackAssetCount = session.imported;
+    return { sessionId, removableAssetCount: 0, alreadyRemovedAssetCount: session.rolledBackAssetCount, modifiedClips: [], affectedPhaseCount: 0, message: "Original files and archive copies stay untouched." };
   },
 };

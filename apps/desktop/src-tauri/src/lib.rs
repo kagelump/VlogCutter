@@ -3,10 +3,11 @@ use chrono::{SecondsFormat, Utc};
 use rcdvlog_core::{
     AnalysisReadiness, AnalysisRunOptions, AnalysisRunOutcome, AnalysisRunRecord, AnalyzeReport,
     ArchiveRoot, Asset, AssetAnalysisIndexEntry, AssetAnalysisView, AssetPatch,
-    BatchProgressEstimate, CardCandidate, Catalog, ClipTranscript, ClockEvent, ImportOutcome,
-    ImportPreflight, ImportProgress as CoreImportProgress, ImportStage as CoreImportStage,
-    IngestReport, ModelStatus, MountedVolumes, Project, ProxyReport, RelinkReport, ThumbnailReport,
-    ToolStatus, TranscribeReport, detect_cards, inspect_card,
+    BatchProgressEstimate, CardCandidate, Catalog, ClipTranscript, ClockEvent, ImportHistoryEntry,
+    ImportOutcome, ImportPreflight, ImportProgress as CoreImportProgress, ImportRollbackPreview,
+    ImportSessionDetail, ImportStage as CoreImportStage, IngestReport, ModelStatus, MountedVolumes,
+    Project, ProxyReport, RelinkReport, ThumbnailReport, ToolStatus, TranscribeReport,
+    detect_cards, inspect_card,
 };
 use rcdvlog_sync::BaselineEnvelope;
 use serde::{Deserialize, Serialize};
@@ -848,6 +849,7 @@ struct ImportRunReport {
     outcome: ImportOutcome,
     proxies: Option<ProxyReport>,
     files: Vec<ImportFileMetadata>,
+    session: ImportSessionDetail,
 }
 
 #[derive(Debug, Serialize)]
@@ -1054,6 +1056,7 @@ async fn run_smart_import(
                     total_bytes: outcome.bytes_copied,
                 },
             );
+            let session = catalog.record_import_session(&pid, &plan, &outcome)?;
             // Import has now run ffprobe for every successfully-added clip. Build
             // the durable ledger from catalog facts instead of making preflight
             // probe hundreds of card files merely because its disclosure exists.
@@ -1099,6 +1102,7 @@ async fn run_smart_import(
                 outcome,
                 proxies,
                 files,
+                session,
             })
         })
         .await
@@ -1119,6 +1123,55 @@ async fn run_smart_import(
         app,
     );
     Ok(report)
+}
+
+#[tauri::command]
+fn list_import_sessions(
+    project_id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<ImportHistoryEntry>, String> {
+    state
+        .catalog()?
+        .list_import_sessions(&project_id)
+        .map_err(error_message)
+}
+
+#[tauri::command]
+fn import_session(
+    project_id: String,
+    session_id: String,
+    state: State<'_, AppState>,
+) -> Result<ImportSessionDetail, String> {
+    state
+        .catalog()?
+        .import_session(&project_id, &session_id)
+        .map_err(error_message)
+}
+
+#[tauri::command]
+fn import_rollback_preview(
+    project_id: String,
+    session_id: String,
+    state: State<'_, AppState>,
+) -> Result<ImportRollbackPreview, String> {
+    state
+        .catalog()?
+        .import_rollback_preview(&project_id, &session_id)
+        .map_err(error_message)
+}
+
+#[tauri::command]
+fn rollback_import_membership(
+    project_id: String,
+    session_id: String,
+    state: State<'_, AppState>,
+) -> Result<ImportRollbackPreview, String> {
+    let result = state
+        .catalog()?
+        .rollback_import_membership(&project_id, &session_id)
+        .map_err(error_message)?;
+    state.sync_manager.wake_project(&project_id);
+    Ok(result)
 }
 
 fn schedule_background_thumbnails(
@@ -2295,6 +2348,10 @@ pub fn run() {
             preflight_import,
             run_smart_import,
             cancel_import,
+            list_import_sessions,
+            import_session,
+            import_rollback_preview,
+            rollback_import_membership,
             ingest_folder,
             relink_folder,
             list_assets,

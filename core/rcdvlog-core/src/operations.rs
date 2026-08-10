@@ -16,6 +16,7 @@ pub const LABEL_REMOVED: &str = "labelRemoved";
 pub const REMOVED_SET: &str = "removedSet";
 pub const ROTATION_SET: &str = "rotationSet";
 pub const PROJECT_ASSET_ADDED: &str = "projectAssetAdded";
+pub const PROJECT_ASSET_MEMBERSHIP_SET: &str = "projectAssetMembershipSet";
 pub const PROJECT_ASSET_MEDIA_LINKED: &str = "projectAssetMediaLinked";
 pub const CLOCK_EVENT_CREATED: &str = "clockEventCreated";
 pub const CAPTURE_SEQUENCE_DECLARED: &str = "captureSequenceDeclared";
@@ -64,6 +65,7 @@ pub(crate) const KNOWN_OPERATION_TYPES: &[&str] = &[
     REMOVED_SET,
     ROTATION_SET,
     PROJECT_ASSET_ADDED,
+    PROJECT_ASSET_MEMBERSHIP_SET,
     PROJECT_ASSET_MEDIA_LINKED,
     CLOCK_EVENT_CREATED,
     CAPTURE_SEQUENCE_DECLARED,
@@ -262,6 +264,12 @@ struct RotationPayload {
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct MembershipPayload {
+    present: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ClockPayload {
     event_id: String,
     camera: String,
@@ -407,6 +415,46 @@ pub(crate) struct NewOperation {
 }
 
 impl Catalog {
+    /// Tombstones project membership without touching the asset identity,
+    /// original locations, or operation history. This is deliberately a
+    /// synced operation instead of a SQL delete: peers must not replay an old
+    /// add operation and silently bring a rolled-back import back into view.
+    pub fn remove_project_asset_membership(
+        &self,
+        project_id: &str,
+        asset_ids: &[String],
+    ) -> Result<()> {
+        let operations = asset_ids
+            .iter()
+            .map(|asset_id| {
+                Ok(NewOperation {
+                    aggregate_type: "projectAsset",
+                    aggregate_id: asset_id.clone(),
+                    operation_type: PROJECT_ASSET_MEMBERSHIP_SET,
+                    base_revision: None,
+                    payload: serde_json::to_value(MembershipPayload { present: false })?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.commit_local(project_id, operations)
+    }
+
+    pub(crate) fn restore_project_asset_membership(
+        &self,
+        project_id: &str,
+        asset_id: &str,
+    ) -> Result<()> {
+        self.commit_local(
+            project_id,
+            vec![NewOperation {
+                aggregate_type: "projectAsset",
+                aggregate_id: asset_id.to_string(),
+                operation_type: PROJECT_ASSET_MEMBERSHIP_SET,
+                base_revision: None,
+                payload: serde_json::to_value(MembershipPayload { present: true })?,
+            }],
+        )
+    }
     /// Seeds the stable local node identity supplied by an installation adapter.
     /// A catalog that has already acknowledged operations cannot be reassigned.
     pub fn set_local_node_id(&self, node_id: &str) -> Result<()> {
@@ -1218,7 +1266,7 @@ impl Catalog {
     pub fn count_project_assets(&self, project_id: &str) -> Result<u64> {
         let connection = self.connection()?;
         let count: i64 = connection.query_row(
-            "SELECT COUNT(*) FROM assets WHERE project_id = ?1",
+            "SELECT COUNT(*) FROM assets WHERE project_id = ?1 AND COALESCE(membership_removed, 0) = 0",
             [project_id],
             |row| row.get(0),
         )?;
@@ -1236,7 +1284,7 @@ impl Catalog {
         let connection = self.connection()?;
         let asset_id = connection
             .query_row(
-                "SELECT id FROM assets WHERE project_id = ?1 AND media_object_id = ?2 ORDER BY id LIMIT 1",
+                "SELECT id FROM assets WHERE project_id = ?1 AND media_object_id = ?2 AND COALESCE(membership_removed, 0) = 0 ORDER BY id LIMIT 1",
                 params![project_id, media_object_id],
                 |row| row.get::<_, String>(0),
             )
@@ -1416,6 +1464,7 @@ pub(crate) fn reconcile_asset_baseline(
             },
         ),
         ("rotationDegrees", current.3.to_string()),
+        ("membershipPresent", "true".to_string()),
     ] {
         transaction.execute(
             "INSERT INTO lww_registers(project_id, aggregate_type, aggregate_id, field_name, value_json, operation_id, hlc_wall_millis, hlc_counter, origin_node_id) VALUES (?1, 'projectAsset', ?2, ?3, ?4, NULL, 0, 0, 'baseline') ON CONFLICT DO NOTHING",
@@ -1640,6 +1689,7 @@ pub(crate) fn materialize_operation(
         LABEL_REMOVED => materialize_label_remove(transaction, operation)?,
         REMOVED_SET => materialize_register(transaction, operation, "removed")?,
         ROTATION_SET => materialize_register(transaction, operation, "rotationDegrees")?,
+        PROJECT_ASSET_MEMBERSHIP_SET => materialize_membership_set(transaction, operation)?,
         PROJECT_ASSET_ADDED => materialize_asset_add(transaction, operation)?,
         PROJECT_ASSET_MEDIA_LINKED => materialize_media_link(transaction, operation)?,
         CLOCK_EVENT_CREATED => return materialize_clock(transaction, operation),
@@ -1765,6 +1815,10 @@ fn materialize_register(
             }
             serde_json::to_value(rotation)?
         }
+        "membershipRemoved" => serde_json::Value::Bool(true),
+        "membershipPresent" => {
+            serde_json::to_value(payload::<MembershipPayload>(operation)?.present)?
+        }
         _ => unreachable!(),
     };
     let wins = transaction.query_row(
@@ -1789,6 +1843,18 @@ fn materialize_register(
                 transaction.execute(
                     "UPDATE assets SET rotation_degrees=?2 WHERE id=?1",
                     params![operation.aggregate_id, value.as_u64().unwrap() as i64],
+                )?;
+            }
+            "membershipRemoved" => {
+                transaction.execute(
+                    "UPDATE assets SET membership_removed=1 WHERE id=?1",
+                    params![operation.aggregate_id],
+                )?;
+            }
+            "membershipPresent" => {
+                transaction.execute(
+                    "UPDATE assets SET membership_removed=?2 WHERE id=?1",
+                    params![operation.aggregate_id, !value.as_bool().unwrap()],
                 )?;
             }
             _ => unreachable!(),
@@ -1851,11 +1917,22 @@ fn materialize_asset_add(
             "rotationDegrees",
             payload.default_rotation_degrees.to_string(),
         ),
+        ("membershipPresent", "true".to_string()),
     ] {
         transaction.execute("INSERT INTO lww_registers(project_id, aggregate_type, aggregate_id, field_name, value_json, operation_id, hlc_wall_millis, hlc_counter, origin_node_id) VALUES (?1, 'projectAsset', ?2, ?3, ?4, NULL, 0, 0, 'baseline')",
             params![operation.project_id, operation.aggregate_id, field, value])?;
     }
     Ok(true)
+}
+
+fn materialize_membership_set(
+    transaction: &Transaction<'_>,
+    operation: &ProjectOperation,
+) -> Result<bool> {
+    if operation.aggregate_type != "projectAsset" {
+        bail!("projectAssetMembershipSet requires a projectAsset aggregate");
+    }
+    materialize_register(transaction, operation, "membershipPresent")
 }
 
 fn materialize_media_link(

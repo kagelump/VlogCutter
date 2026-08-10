@@ -7,7 +7,7 @@ use thiserror::Error;
 
 use crate::chronology::forward_migrate_project_chronology;
 
-pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 18;
+pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 19;
 
 const MIGRATION_TABLE_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -191,6 +191,12 @@ pub const PROJECT_CATALOG_MIGRATIONS: &[SqliteMigration] = &[
         name: "archive_roots",
         source_identity: "project-catalog/0017-archive-roots/20260809",
         apply: add_archive_roots,
+    },
+    SqliteMigration {
+        id: 19,
+        name: "import_history",
+        source_identity: "project-catalog/0019-import-history/20260810",
+        apply: add_import_history,
     },
 ];
 
@@ -1162,6 +1168,61 @@ fn add_archive_roots(transaction: &Transaction<'_>) -> Result<()> {
             definition,
         )?;
     }
+    Ok(())
+}
+
+/// Durable, project-local evidence for a smart-import run. Asset ids are kept
+/// as plain text in the ledger deliberately: undoing membership must preserve
+/// the audit record after the asset row (and its project-only derivatives) is
+/// gone.
+fn add_import_history(transaction: &Transaction<'_>) -> Result<()> {
+    add_column_if_missing(
+        transaction,
+        "assets",
+        "membership_removed",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    transaction.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS import_sessions (
+            session_id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            source_path TEXT NOT NULL,
+            destination_mode TEXT NOT NULL CHECK(destination_mode IN ('reference', 'archive_copy')),
+            destination_root_id TEXT,
+            destination_name TEXT NOT NULL DEFAULT '',
+            destination_path TEXT NOT NULL DEFAULT '',
+            imported_count INTEGER NOT NULL,
+            relinked_count INTEGER NOT NULL,
+            skipped_count INTEGER NOT NULL,
+            copied_count INTEGER NOT NULL,
+            bytes_copied INTEGER NOT NULL,
+            cancelled INTEGER NOT NULL DEFAULT 0,
+            failures_json TEXT NOT NULL DEFAULT '[]',
+            rolled_back_at TEXT,
+            rolled_back_asset_count INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS import_sessions_project_created
+            ON import_sessions(project_id, created_at DESC);
+
+        CREATE TABLE IF NOT EXISTS import_session_files (
+            session_id TEXT NOT NULL REFERENCES import_sessions(session_id) ON DELETE CASCADE,
+            ordinal INTEGER NOT NULL,
+            asset_id TEXT,
+            path TEXT NOT NULL,
+            filename TEXT NOT NULL,
+            classification TEXT NOT NULL,
+            result TEXT NOT NULL,
+            timestamp TEXT,
+            duration_seconds REAL,
+            error TEXT,
+            PRIMARY KEY(session_id, ordinal)
+        );
+        CREATE INDEX IF NOT EXISTS import_session_files_asset
+            ON import_session_files(session_id, asset_id);
+        "#,
+    )?;
     Ok(())
 }
 
