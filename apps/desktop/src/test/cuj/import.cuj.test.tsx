@@ -97,6 +97,41 @@ describe("importing from a card", () => {
     expect(Object.keys(harness.state.assets)).toHaveLength(7);
   });
 
+  it("finishes import before background thumbnails progressively update the queue", async () => {
+    const harness = cardInSlot();
+    const app = await renderApp(harness);
+    const dialog = await openImport(app);
+
+    await app.user.click(within(dialog).getByRole("button", { name: /Import 3 clips/ }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+
+    const imported = Object.values(harness.state.assets).find((asset) => asset.filename === "DJI_003.MP4");
+    expect(imported).toBeDefined();
+    const row = screen.getByText("DJI_003.MP4").closest("button");
+    expect(row).not.toBeNull();
+    expect(within(row!).getByText("Q0")).toBeVisible();
+
+    const withThumbnail = {
+      ...imported!,
+      thumbnailPath: `/tmp/rcdvlog-demo/thumbnails/${imported!.id}/q1.v2.jpg`,
+      thumbnailQuality: 1,
+    };
+    await harness.emit("thumbnail-progress", {
+      asset: withThumbnail,
+      estimate: {
+        completedItems: 1,
+        totalItems: 3,
+        completedWorkUnits: imported!.sizeBytes,
+        totalWorkUnits: imported!.sizeBytes * 3,
+        workerCount: 1,
+        estimatedRemainingSeconds: 1,
+      },
+    });
+
+    await waitFor(() => expect(within(row!).queryByText("Q0")).toBeNull());
+    expect(row!.querySelector("img")).toBeVisible();
+  });
+
   it("reports counts that match the state diff", async () => {
     const harness = cardInSlot();
     const app = await renderApp(harness);

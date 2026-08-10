@@ -386,8 +386,12 @@ impl Catalog {
 pub struct ImportOutcome {
     /// New assets created.
     pub imported: usize,
+    /// Stable ids for the assets created by this run, in completion order.
+    pub imported_asset_ids: Vec<String>,
     /// Assets whose offline original was found on this source and reconnected.
     pub relinked: usize,
+    /// Stable ids for the assets reconnected by this run, in completion order.
+    pub relinked_asset_ids: Vec<String>,
     /// Known content that needed nothing.
     pub skipped: usize,
     /// Originals copied into the archive root.
@@ -503,9 +507,10 @@ impl Catalog {
                     })
                 },
             ) {
-                Ok(Some(bytes)) => {
+                Ok(Some((bytes, asset_id))) => {
                     if item.classification == Classification::New {
                         outcome.imported += 1;
+                        outcome.imported_asset_ids.push(asset_id);
                         if bytes > 0 {
                             outcome.copied += 1;
                             outcome.bytes_copied += bytes;
@@ -515,6 +520,7 @@ impl Catalog {
                         }
                     } else {
                         outcome.relinked += 1;
+                        outcome.relinked_asset_ids.push(asset_id);
                     }
                 }
                 // Cancelled mid-copy.
@@ -542,7 +548,7 @@ impl Catalog {
         Ok(outcome)
     }
 
-    /// Returns the bytes copied, or `None` when the copy was cancelled.
+    /// Returns the bytes copied and stable asset id, or `None` when the copy was cancelled.
     fn import_one<F>(
         &self,
         project_id: &str,
@@ -551,7 +557,7 @@ impl Catalog {
         card: Option<&CardCandidate>,
         verify_copies: bool,
         mut on_copy_bytes: F,
-    ) -> Result<Option<u64>>
+    ) -> Result<Option<(u64, String)>>
     where
         F: FnMut(u64) -> bool,
     {
@@ -560,7 +566,10 @@ impl Catalog {
             // Already-known content: registering where it is found is the whole
             // job, and it costs no copy.
             self.relink_file(project_id, &source)?;
-            return Ok(Some(0));
+            let asset_id = self.asset_id_at_path(project_id, &source)?.ok_or_else(|| {
+                anyhow::anyhow!("relinked asset was not found at {}", source.display())
+            })?;
+            return Ok(Some((0, asset_id)));
         }
 
         // New content. Copy it off the card first when there is somewhere to put
@@ -584,6 +593,14 @@ impl Catalog {
         };
 
         self.ingest_file(project_id, &path_to_register)?;
+        let asset_id = self
+            .asset_id_at_path(project_id, &path_to_register)?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "imported asset was not found at {}",
+                    path_to_register.display()
+                )
+            })?;
 
         // Bind the new asset to the archive root, so relocating the archive later
         // is one rebind rather than a per-asset repair.
@@ -596,7 +613,7 @@ impl Catalog {
                 .map_err(|error| anyhow::anyhow!("unusable archive path: {error}"))?;
             self.record_archive_location(&asset_id, root_id, &relative, &path_to_register)?;
         }
-        Ok(Some(bytes))
+        Ok(Some((bytes, asset_id)))
     }
 
     fn asset_id_at_path(&self, project_id: &str, path: &Path) -> Result<Option<String>> {
@@ -925,6 +942,8 @@ mod tests {
             .run_import(&project.id, &plan, true, |_| true)
             .unwrap();
         assert_eq!(outcome.imported, 2);
+        assert_eq!(outcome.imported_asset_ids.len(), 2);
+        assert!(outcome.relinked_asset_ids.is_empty());
         assert_eq!(outcome.copied, 2);
         assert!(outcome.bytes_copied > 0);
         assert!(outcome.failures.is_empty(), "{:?}", outcome.failures);
@@ -970,6 +989,7 @@ mod tests {
             .run_import(&project.id, &second_plan, true, |_| true)
             .unwrap();
         assert_eq!(second.imported, 1);
+        assert_eq!(second.imported_asset_ids.len(), 1);
         assert_eq!(second.copied, 1, "already-archived clips are not re-copied");
         assert_eq!(catalog.list_assets(&project.id).unwrap().len(), 3);
     }
@@ -1081,6 +1101,8 @@ mod tests {
             .unwrap();
         assert_eq!(outcome.relinked, 1);
         assert_eq!(outcome.imported, 0);
+        assert_eq!(outcome.relinked_asset_ids, ["asset_lost"]);
+        assert!(outcome.imported_asset_ids.is_empty());
         assert_eq!(catalog.list_assets(&project.id).unwrap().len(), 1);
         assert!(catalog.get_asset("asset_lost").unwrap().original_available);
     }

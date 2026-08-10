@@ -137,7 +137,7 @@ describe("card import preflight", () => {
       error: "",
     };
     const report: ImportRunReport = {
-      outcome: { imported: 1, relinked: 0, skipped: 0, copied: 1, bytesCopied: 100, cancelled: false, failures: [] },
+      outcome: { imported: 1, importedAssetIds: ["asset_new"], relinked: 0, relinkedAssetIds: [], skipped: 0, copied: 1, bytesCopied: 100, cancelled: false, failures: [] },
       proxies: null,
       files: [{ path: item.path, timestamp: "2026-08-09T08:14:15Z", durationSeconds: 65.8 }],
     };

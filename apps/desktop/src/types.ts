@@ -351,7 +351,9 @@ export interface ImportProgress {
 
 export interface ImportOutcome {
   imported: number;
+  importedAssetIds: string[];
   relinked: number;
+  relinkedAssetIds: string[];
   skipped: number;
   copied: number;
   bytesCopied: number;

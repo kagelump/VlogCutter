@@ -10,13 +10,13 @@ use rcdvlog_core::{
 };
 use rcdvlog_sync::BaselineEnvelope;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::ErrorKind;
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use tauri::{Emitter, Manager, State};
 
 mod chronology_commands;
@@ -110,6 +110,10 @@ pub(crate) struct AppState {
     analysis_cancel: Arc<AtomicBool>,
     /// Shared by preflight, copy/verification, and the optional proxy tail.
     import_cancel: Arc<AtomicBool>,
+    /// Session-local ownership for thumbnail output paths. Import-triggered
+    /// work and explicit repair batches share it so they cannot write the same
+    /// temporary/output file concurrently.
+    thumbnail_coordinator: Arc<ThumbnailCoordinator>,
     /// Resolves asset ids to on-disk media for the loopback origin. Held here so
     /// a restarted origin reads the same live catalog and settings.
     media_catalog: Arc<CatalogMedia>,
@@ -119,6 +123,49 @@ pub(crate) struct AppState {
     /// The origin is restarted at most once per session, so a listener that
     /// cannot bind does not turn into a retry loop behind every media error.
     media_restarted: Arc<AtomicBool>,
+}
+
+#[derive(Default)]
+struct ThumbnailCoordinator {
+    in_flight: Mutex<HashSet<String>>,
+    /// Serializes batches as well as per-asset ownership, preserving the
+    /// measured one-worker policy across overlapping command invocations.
+    execution: Mutex<()>,
+}
+
+impl ThumbnailCoordinator {
+    fn claim(self: &Arc<Self>, asset_ids: impl IntoIterator<Item = String>) -> ThumbnailClaims {
+        let mut in_flight = self
+            .in_flight
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut claimed = Vec::new();
+        for asset_id in asset_ids {
+            if in_flight.insert(asset_id.clone()) {
+                claimed.push(asset_id);
+            }
+        }
+        drop(in_flight);
+        ThumbnailClaims {
+            coordinator: self.clone(),
+            asset_ids: claimed,
+        }
+    }
+}
+
+struct ThumbnailClaims {
+    coordinator: Arc<ThumbnailCoordinator>,
+    asset_ids: Vec<String>,
+}
+
+impl Drop for ThumbnailClaims {
+    fn drop(&mut self) {
+        if let Ok(mut in_flight) = self.coordinator.in_flight.lock() {
+            for asset_id in &self.asset_ids {
+                in_flight.remove(asset_id);
+            }
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -310,6 +357,7 @@ impl AppState {
             sync_status,
             analysis_cancel: Arc::new(AtomicBool::new(false)),
             import_cancel: Arc::new(AtomicBool::new(false)),
+            thumbnail_coordinator: Arc::new(ThumbnailCoordinator::default()),
             media_catalog,
             media_server: Arc::new(RwLock::new(None)),
             media_restarted: Arc::new(AtomicBool::new(false)),
@@ -340,6 +388,7 @@ impl AppState {
             sync_status: Arc::new(RwLock::new(HashMap::new())),
             analysis_cancel: Arc::new(AtomicBool::new(false)),
             import_cancel: Arc::new(AtomicBool::new(false)),
+            thumbnail_coordinator: Arc::new(ThumbnailCoordinator::default()),
             media_catalog: Arc::new(CatalogMedia {
                 catalog,
                 settings,
@@ -939,6 +988,7 @@ async fn run_smart_import(
     let cancel = state.import_cancel.clone();
     cancel.store(false, Ordering::SeqCst);
     let pid = project_id.clone();
+    let import_app = app.clone();
     let report =
         tauri::async_runtime::spawn_blocking(move || -> anyhow::Result<ImportRunReport> {
             let outcome = catalog.run_import(
@@ -950,7 +1000,7 @@ async fn run_smart_import(
                         CoreImportStage::Copying => DesktopImportStage::Copying,
                         CoreImportStage::Reading => DesktopImportStage::Reading,
                     };
-                    let _ = app.emit(
+                    let _ = import_app.emit(
                         "import-progress",
                         DesktopImportProgress {
                             stage,
@@ -968,7 +1018,7 @@ async fn run_smart_import(
             let proxies = if make_proxies && !outcome.cancelled {
                 Some(
                     catalog.generate_missing_proxies_with_progress(&pid, |progress| {
-                        let _ = app.emit(
+                        let _ = import_app.emit(
                             "import-progress",
                             DesktopImportProgress {
                                 stage: DesktopImportStage::Proxies,
@@ -993,7 +1043,7 @@ async fn run_smart_import(
             } else {
                 None
             };
-            let _ = app.emit(
+            let _ = import_app.emit(
                 "import-progress",
                 DesktopImportProgress {
                     stage: DesktopImportStage::Complete,
@@ -1055,7 +1105,49 @@ async fn run_smart_import(
         .map_err(error_message)?
         .map_err(error_message)?;
     state.sync_manager.wake_project(&project_id);
+    let touched_asset_ids = report
+        .outcome
+        .imported_asset_ids
+        .iter()
+        .chain(&report.outcome.relinked_asset_ids)
+        .cloned()
+        .collect();
+    schedule_background_thumbnails(
+        state.catalog()?,
+        state.thumbnail_coordinator.clone(),
+        touched_asset_ids,
+        app,
+    );
     Ok(report)
+}
+
+fn schedule_background_thumbnails(
+    catalog: Catalog,
+    coordinator: Arc<ThumbnailCoordinator>,
+    asset_ids: Vec<String>,
+    app: tauri::AppHandle,
+) {
+    let claims = coordinator.claim(asset_ids);
+    if claims.asset_ids.is_empty() {
+        return;
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let _claims = claims;
+        let _execution = _claims
+            .coordinator
+            .execution
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Import success is already final. Individual failures stay in this
+        // quiet report and the explicit backfill action remains the recovery path.
+        let _ = catalog.generate_thumbnails_for_assets_with_progress(
+            &_claims.asset_ids,
+            1,
+            |progress| {
+                let _ = app.emit("thumbnail-progress", progress);
+            },
+        );
+    });
 }
 
 #[tauri::command]
@@ -1263,10 +1355,24 @@ async fn generate_thumbnail(
     state: State<'_, AppState>,
 ) -> Result<Asset, String> {
     let catalog = state.catalog()?;
-    tauri::async_runtime::spawn_blocking(move || catalog.generate_thumbnail(&asset_id, quality))
-        .await
-        .map_err(error_message)?
-        .map_err(error_message)
+    let claims = state
+        .thumbnail_coordinator
+        .claim(std::iter::once(asset_id.clone()));
+    if claims.asset_ids.is_empty() {
+        return catalog.get_asset(&asset_id).map_err(error_message);
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let _claims = claims;
+        let _execution = _claims
+            .coordinator
+            .execution
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        catalog.generate_thumbnail(&asset_id, quality)
+    })
+    .await
+    .map_err(error_message)?
+    .map_err(error_message)
 }
 
 #[tauri::command]
@@ -1277,10 +1383,31 @@ async fn generate_missing_thumbnails(
     app: tauri::AppHandle,
 ) -> Result<ThumbnailReport, String> {
     let catalog = state.catalog()?;
-    tauri::async_runtime::spawn_blocking(move || {
-        catalog.generate_missing_thumbnails_with_progress(&project_id, quality, |progress| {
-            let _ = app.emit("thumbnail-progress", progress);
-        })
+    let asset_ids = catalog
+        .list_assets(&project_id)
+        .map_err(error_message)?
+        .into_iter()
+        .map(|asset| asset.id)
+        .collect::<Vec<_>>();
+    let total = asset_ids.len();
+    let claims = state.thumbnail_coordinator.claim(asset_ids);
+    let already_in_flight = total.saturating_sub(claims.asset_ids.len());
+    tauri::async_runtime::spawn_blocking(move || -> anyhow::Result<ThumbnailReport> {
+        let _claims = claims;
+        let _execution = _claims
+            .coordinator
+            .execution
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut report = catalog.generate_thumbnails_for_assets_with_progress(
+            &_claims.asset_ids,
+            quality,
+            |progress| {
+                let _ = app.emit("thumbnail-progress", progress);
+            },
+        )?;
+        report.skipped += already_in_flight;
+        Ok(report)
     })
     .await
     .map_err(error_message)?
@@ -2227,6 +2354,20 @@ pub fn run() {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn thumbnail_coordinator_deduplicates_overlapping_batches_until_release() {
+        let coordinator = Arc::new(ThumbnailCoordinator::default());
+        let first = coordinator.claim(["asset_a".to_string(), "asset_b".to_string()]);
+        assert_eq!(first.asset_ids, ["asset_a", "asset_b"]);
+
+        let overlap = coordinator.claim(["asset_b".to_string(), "asset_c".to_string()]);
+        assert_eq!(overlap.asset_ids, ["asset_c"]);
+        drop(first);
+
+        let resumed = coordinator.claim(["asset_a".to_string(), "asset_b".to_string()]);
+        assert_eq!(resumed.asset_ids, ["asset_a", "asset_b"]);
+    }
 
     fn test_settings(projects_root: PathBuf) -> DesktopSettings {
         DesktopSettings {

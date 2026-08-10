@@ -541,7 +541,7 @@ export const api = {
 
   async runSmartImport(projectId: string, plan: ImportPreflight, verifyCopies: boolean, makeProxies: boolean): Promise<ImportRunReport> {
     if (!inTauri()) return {
-      outcome: { imported: plan.newClips, relinked: plan.relinkable, skipped: plan.knownClips + plan.missingProxies - plan.newClips, copied: plan.newClips, bytesCopied: plan.destination.bytesToCopy, cancelled: false, failures: [] },
+      outcome: { imported: plan.newClips, importedAssetIds: [], relinked: plan.relinkable, relinkedAssetIds: [], skipped: plan.knownClips + plan.missingProxies - plan.newClips, copied: plan.newClips, bytesCopied: plan.destination.bytesToCopy, cancelled: false, failures: [] },
       proxies: makeProxies ? { generated: plan.missingProxies, skipped: plan.knownClips, cancelled: false, failures: [] } : null,
       files: plan.items.map((item) => ({ path: item.path, timestamp: null, durationSeconds: null })),
     };
