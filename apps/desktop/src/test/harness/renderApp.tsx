@@ -7,12 +7,27 @@
  */
 
 import { afterEach, expect } from "vitest";
-import { cleanup, render, screen, waitFor, within, type RenderResult } from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor, within, type RenderResult } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import App from "../../App";
-import type { DesktopHarness } from "./DesktopHarness";
+import type { ActWrapper, DesktopHarness } from "./DesktopHarness";
 
 let activeHarness: DesktopHarness | null = null;
+
+/**
+ * The test-side act wrapper.
+ *
+ * The harness itself has no static import of `@testing-library/react` — the
+ * browser preview installs the same harness and must not carry a devDependency
+ * — so the version that flushes React lives here, on the door only tests use.
+ */
+const actWrapper: ActWrapper = async (action) => {
+  let result!: Awaited<ReturnType<typeof action>>;
+  await act(async () => {
+    result = await action();
+  });
+  return result;
+};
 
 // Registered when a test file imports this helper, so a harness can never leak
 // its window globals into the next test.
@@ -35,6 +50,7 @@ export interface BootedApp extends RenderResult {
 
 /** Boot and wait until the shell and the first clip are on screen. */
 export async function renderApp(harness: DesktopHarness): Promise<BootedApp> {
+  harness.useActWrapper(actWrapper);
   if (!harness.installed) harness.install();
   activeHarness = harness;
 

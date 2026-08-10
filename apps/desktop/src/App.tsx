@@ -790,11 +790,6 @@ function App() {
             draft,
           )
         : await chronologyApi.setTripPhase(projectId, draft);
-      if (!stored && !api.isDesktop()) {
-        setPhaseDialog(null);
-        setMessage("Browser preview only — open the desktop app to save trip context.");
-        return;
-      }
       await refreshChronology(projectId);
       setPhaseDialog(null);
       setMessage(existing
@@ -1109,10 +1104,7 @@ function App() {
     setError("");
     try {
       const path = await api.chooseCatalog();
-      if (!path) {
-        if (!api.isDesktop()) setMessage("Opening a catalog is available in the desktop build");
-        return;
-      }
+      if (!path) return;
       setBusy(true);
       setMessage("Opening catalog…");
       const loaded = await api.loadCatalog(path);
@@ -1138,10 +1130,7 @@ function App() {
     if (!projectId) return;
     setError("");
     const path = await api.chooseFolder();
-    if (!path) {
-      if (!api.isDesktop()) setMessage("Folder import is available in the desktop build");
-      return;
-    }
+    if (!path) return;
     await openImportForPath(path);
   }
 

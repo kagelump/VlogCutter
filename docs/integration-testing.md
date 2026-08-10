@@ -58,7 +58,7 @@ copies no bytes.
 
 ## What browser modes prove
 
-The desktop Vite preview at port 1420 uses in-memory mocks and is appropriate only for layout, focus, keyboard, and scrolling checks. It cannot validate Tauri commands, Keychain, native media playback, filesystem permission prompts, persistence, media processes, or sync.
+The desktop Vite preview at port 1420 runs the same in-memory fake backend as the CUJ harness: `main.tsx` installs it from `apps/desktop/src/preview/` when the app boots outside Tauri, so there is one fake to keep honest rather than two. It is appropriate for layout, focus, keyboard, scrolling, and for watching progress and cancellation behave. It cannot validate Tauri commands reaching Rust, Keychain, native media playback, filesystem permission prompts, persistence, media processes, or sync — and it has no media origin, so no clip plays.
 
 The web Playwright suite uses a real disposable server and Chrome. It does validate browser authentication, API mutation, multi-tab convergence, WebSocket loss, and polling recovery on one host. It does not validate Caddy certificates, Tailscale ACLs/routing, physical LAN latency, or NAS behavior.
 

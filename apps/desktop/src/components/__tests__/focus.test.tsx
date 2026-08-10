@@ -1,7 +1,22 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { act, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it } from "vitest";
-import App from "../../App";
+import { desktopScenario, renderApp } from "../../test/harness";
+
+/**
+ * Focus is exercised against the CUJ harness rather than against demo data
+ * inside an adapter: two cameras, proxies on both, and a clip already selected,
+ * which is the least that makes every assertion below reachable.
+ */
+function bootApp() {
+  const harness = desktopScenario()
+    .project("Hokkaido field test")
+    .camera("Sony A7C II", { clips: 2, startAt: "2026-02-08T00:14:08.000Z", withProxy: true })
+    .camera("DJI Pocket 3", { clips: 2, startAt: "2026-02-08T00:18:41.000Z", withProxy: true })
+    .selectedClip("asset_sony_a7c_ii_001")
+    .build();
+  return renderApp(harness);
+}
 
 async function ready(container: HTMLElement) {
   await screen.findByTestId("operation-slot");
@@ -20,7 +35,11 @@ async function enterFocus(container: HTMLElement) {
 }
 
 async function blurNotes(container: HTMLElement) {
-  container.querySelector<HTMLTextAreaElement>("#notes")?.blur();
+  // Blurring the textarea takes the panel out of its editing state, so it is a
+  // React update like any other and belongs inside `act`.
+  await act(async () => {
+    container.querySelector<HTMLTextAreaElement>("#notes")?.blur();
+  });
   await waitFor(() => expect(document.activeElement?.id).not.toBe("notes"));
 }
 
@@ -32,7 +51,7 @@ async function blurNotes(container: HTMLElement) {
  */
 describe("entering and leaving Focus", () => {
   it("marks the shell rather than swapping the tree, so nothing unmounts", async () => {
-    const { container } = render(<App />);
+    const { container } = await bootApp();
     await ready(container);
     const notesBefore = container.querySelector("#notes");
     const videoBefore = container.querySelector("video");
@@ -45,13 +64,13 @@ describe("entering and leaving Focus", () => {
   });
 
   it("puts the caret in the notes field on entry, since writing is why you came", async () => {
-    const { container } = render(<App />);
+    const { container } = await bootApp();
     await enterFocus(container);
     expect(document.activeElement?.id).toBe("notes");
   });
 
   it("leaves on a second F once the notes field no longer has the caret", async () => {
-    const { container } = render(<App />);
+    const { container } = await bootApp();
     const shell = await enterFocus(container);
     await blurNotes(container);
     await userEvent.keyboard("f");
@@ -59,7 +78,7 @@ describe("entering and leaving Focus", () => {
   });
 
   it("types rather than leaving when F is pressed inside the notes field", async () => {
-    const { container } = render(<App />);
+    const { container } = await bootApp();
     const shell = await enterFocus(container);
     const notes = container.querySelector<HTMLTextAreaElement>("#notes")!;
     const before = notes.value;
@@ -71,7 +90,7 @@ describe("entering and leaving Focus", () => {
   });
 
   it("leaves on Escape straight from the notes field, keeping what was typed", async () => {
-    const { container } = render(<App />);
+    const { container } = await bootApp();
     const shell = await enterFocus(container);
     const notes = container.querySelector<HTMLTextAreaElement>("#notes")!;
 
@@ -87,13 +106,13 @@ describe("entering and leaving Focus", () => {
 
 describe("overlays", () => {
   it("hides the right stack by default", async () => {
-    const { container } = render(<App />);
+    const { container } = await bootApp();
     const shell = await enterFocus(container);
     expect(shell).not.toHaveClass("show-right-stack");
   });
 
   it("toggles every overlay with H", async () => {
-    const { container } = render(<App />);
+    const { container } = await bootApp();
     const shell = await enterFocus(container);
     await blurNotes(container);
 
@@ -104,7 +123,7 @@ describe("overlays", () => {
   });
 
   it("toggles the right stack with D, the same key the shelf uses in Review", async () => {
-    const { container } = render(<App />);
+    const { container } = await bootApp();
     const shell = await enterFocus(container);
     await blurNotes(container);
 
@@ -113,7 +132,7 @@ describe("overlays", () => {
   });
 
   it("never changes overlay visibility on pointer movement", async () => {
-    const { container } = render(<App />);
+    const { container } = await bootApp();
     const shell = await enterFocus(container);
     await blurNotes(container);
 
@@ -124,7 +143,7 @@ describe("overlays", () => {
   });
 
   it("renders the ribbon as a single merged lane", async () => {
-    const { container } = render(<App />);
+    const { container } = await bootApp();
     await enterFocus(container);
     await waitFor(() => expect(container.querySelectorAll(".lane-track")).toHaveLength(1));
     expect(container.querySelectorAll(".lane-name")).toHaveLength(0);
@@ -133,7 +152,7 @@ describe("overlays", () => {
 
 describe("queue navigation stays available", () => {
   it("advances clips without leaving Focus", async () => {
-    const { container } = render(<App />);
+    const { container } = await bootApp();
     const shell = await enterFocus(container);
     await blurNotes(container);
 
@@ -148,7 +167,7 @@ describe("queue navigation stays available", () => {
 
 describe("frame orientation stays keyboard-first", () => {
   it("rotates with O and flips with Shift+O outside text fields", async () => {
-    const { container } = render(<App />);
+    const { container } = await bootApp();
     await ready(container);
     const orientation = screen.getByRole("button", { name: "Frame orientation" });
 
@@ -162,7 +181,7 @@ describe("frame orientation stays keyboard-first", () => {
 
 describe("modes leave Focus", () => {
   it("lands in Chronology rather than a focused Chronology", async () => {
-    const { container } = render(<App />);
+    const { container } = await bootApp();
     const shell = await enterFocus(container);
     await blurNotes(container);
 

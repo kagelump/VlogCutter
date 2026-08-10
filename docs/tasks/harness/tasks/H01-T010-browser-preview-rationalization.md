@@ -7,12 +7,12 @@
   "epic_id": "H01",
   "title": "Browser-preview rationalization",
   "slug": "browser-preview-rationalization",
-  "status": "design_required",
+  "status": "complete",
   "task_class": "implementation",
   "depends_on": ["H01-T009"],
   "principal_invariant": "The repository holds one desktop fake-backend state machine, reached by two front doors — the Vite preview and the CUJ harness — or a recorded decision explaining why two are worth their maintenance cost.",
   "central_falsification": "Change one behavior in the shared state model and prove both the preview and the CUJ suite observe the change, with no second implementation left that could disagree.",
-  "architecture_decisions_frozen": false,
+  "architecture_decisions_frozen": true,
   "load_bearing_seams": [
     "api.ts preview branches -> shared scenario state"
   ],
@@ -185,6 +185,70 @@ says so), and the harness is now the tier that gates CI. The concrete cost is
 that a behavior change made in the harness does not reach the preview, so the
 preview drifts further from the app over time — which is an argument for doing
 this sooner rather than a reason to reopen the decision.
+
+## Outcome (landed)
+
+**Decision: unify.** The preview runs on `DesktopHarnessState`. Everything the
+analysis above predicted held, including that the branches needed deleting
+rather than replacing.
+
+### What changed
+
+- `src/preview/` is new: `demoScenario.ts` (the demo project, declared through
+  `ScenarioBuilder`), `liveJobs.ts` (timer-driven progress for the scriptable
+  jobs), and `index.ts`, which builds the harness and installs it.
+- `main.tsx` loads that module through a dynamic `import()` behind the
+  `!inTauri()` check and installs the backend before it mounts `App`. It lands
+  in its own chunk: the desktop bundle went from 339 kB to 326 kB, and the
+  preview backend is a separate 59 kB file the desktop never fetches.
+- `DesktopHarness` no longer imports `act`. It takes an `ActWrapper` defaulting
+  to a passthrough, and `renderApp` calls `useActWrapper` with the
+  `@testing-library/react` version before mounting.
+- Every `!inTauri()` branch in `api.ts` and `chronologyApi.ts` is deleted, along
+  with the demo data behind them and the three now-unreachable
+  `!api.isDesktop()` branches in `App.tsx` (two "available in the desktop build"
+  messages and one "browser preview only" message).
+
+### Tests that now cover what the preview branches used to provide
+
+- `shell.test.tsx`, `focus.test.tsx`, and `judgmentRail.test.tsx` boot against a
+  declared scenario through `renderApp` instead of against `api.ts` demo data.
+- `src/__independent__/preview-parity.independent.test.ts` is the parity charter:
+  no environment branch survives in the adapters, the preview serves exactly the
+  harness's command table and still throws on an unknown command, a proxy batch
+  run through the preview's own door changes the assets it reports, the
+  chronology it shows is declared rather than solved, and nothing a CUJ loads
+  reaches preview code, a real timer, or ambient identity.
+- `mediaUrl.test.ts` lost its "outside Tauri" case — there is no such case any
+  more. The state it protected (no origin, so no URL) is still covered.
+
+### Verified visually
+
+`pnpm --dir apps/desktop build` succeeds, and the preview was driven at port
+1420 in both `vite dev` and `vite preview` (the built output), through headless
+Chromium with screenshots read back:
+
+- boot: the demo project opens with its queue, notes, labels, AI chips,
+  transcript tab, story ribbon lanes, and the card-detected banner;
+- progress: "Make 4 proxies" animates 1/4 → 4/4 with an ETA and worker count,
+  and the button then reads "Make 2 proxies" — the run's writes are observable,
+  which is exactly what the old mock could not do;
+- cancel: an analysis run stops mid-transcription and reports "Analysis stopped
+  during transcribing; 0 clips analyzed", rather than claiming work it did not do;
+- import: the smart-ingest dialog states 6 scanned / 3 new / 4 known, copies with
+  a progress bar and a stop control, and the queue grows from 10 to 13;
+- chronology and edit plan: both surfaces have content in the preview for the
+  first time — sequences, phases, a diagnostic, a preview-then-apply clock
+  correction with a declared post-edit ordering, and an edit plan with a
+  validation finding.
+
+### Reported, not fixed
+
+With no media origin the stage's slate reads "No review proxy yet" even for a
+clip that has a proxy. The slate infers the reason from the clip rather than
+from why the URL is missing, so the desktop shows the same wrong sentence when
+the loopback origin fails to bind. That is a production message gap this task
+found and did not touch; fixing it is separate work.
 
 ## Handoff
 

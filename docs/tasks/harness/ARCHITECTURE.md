@@ -17,11 +17,11 @@ and `pnpm test:integration` prove the domain — catalog, ingest, chronology,
 persistence, media processing — against real SQLite, real processes, and real
 FFmpeg.
 
-Between them there is a single suite that renders the whole `App`
-(`shell.test.tsx`, `focus.test.tsx`, `judgmentRail.test.tsx`), and it runs
-against whatever demo data happens to live inside `api.ts`'s `if (!inTauri())`
-branches. Those branches exist for the Vite preview at port 1420. They were
-never designed as a test contract, and they behave in ways a test contract must
+Between them there was a single suite that rendered the whole `App`
+(`shell.test.tsx`, `focus.test.tsx`, `judgmentRail.test.tsx`), and it ran
+against whatever demo data happened to live inside `api.ts`'s `if (!inTauri())`
+branches. Those branches existed for the Vite preview at port 1420. They were
+never designed as a test contract, and they behaved in ways a test contract must
 not:
 
 - `generateMissingProxies` reports `{ generated: 2, skipped: 5 }` and changes no
@@ -37,10 +37,16 @@ not:
 - `ingestFolder`, `generateProxy`, and `relinkFolder` call `invoke` with no
   browser branch at all, so they throw in jsdom.
 
-The result is that the questions users actually ask cannot be tested cheaply:
+The result was that the questions users actually ask could not be tested
+cheaply:
 
 > Open a project, review several clips, add a note, label one, remove another,
 > switch filters, come back — is everything still coherent?
+
+**Those branches are gone.** H01-T010 deleted them: the preview installs this
+harness at startup (§11), the three whole-`App` component suites boot against a
+declared scenario, and every list above is now a description of history rather
+than of `api.ts`.
 
 ## 2. Design principle
 
@@ -100,10 +106,10 @@ and invokes `plugin:event|unlisten`. `@tauri-apps/plugin-dialog`'s `open()` is
 `invoke('plugin:dialog|open', { options })`. So installing one object gives the
 harness commands, events, dialogs, and asset URLs through the same door.
 
-Installing `__TAURI_INTERNALS__` also flips `api.ts`'s own
-`inTauri()` check, which means **the browser-preview branches are not executed
-by a CUJ test at all**. The harness does not depend on them, and they stay free
-to serve the Vite preview.
+Installing `__TAURI_INTERNALS__` also flips `api.ts`'s own `inTauri()` check.
+That is what let H01-T010 delete the browser-preview branches outright instead
+of replacing them: the preview installs the harness through this same seam, so
+the adapters have one path in every environment (§11).
 
 ### 3.1 Why not mock `api.ts`
 
@@ -365,14 +371,31 @@ container, or on a laptop.
 
 ## 11. Relationship to the browser preview
 
-H01-T010 decides whether `api.ts`'s preview branches are rebuilt on
-`DesktopHarnessState` or kept separate. The preferred outcome is one state
-machine with two front doors, so the preview stops being a second, subtly
-different fake.
+There is one fake backend, reached through two front doors.
 
-As of the H01-T009 landing this is analysed but not executed, and the reasons
-are recorded in that packet: the harness's `act` import has to be made
-injectable first so no devDependency drifts toward the shipped bundle, and the
-acceptance check is a visual pass over the running preview that this branch
-could not perform. Until then the two fakes coexist, and the preview remains
-what it has always been — evidence for nothing.
+`main.tsx` checks for `__TAURI_INTERNALS__` and, when it is absent, loads
+`src/preview/` through a dynamic `import()` and installs a `DesktopHarness`
+built from a declared scenario. From that moment `inTauri()` is true, so the
+preview runs the real adapters against the real command table — the same one the
+CUJ suite drives. A behaviour change in `src/test/harness/commands/` is
+observable from both doors, and neither `api.ts` nor `chronologyApi.ts` has an
+environment branch left to disagree with itself.
+
+Three rules keep the preview out of the test tier:
+
+- **The harness never imports the preview.** The dependency runs one way, and
+  `src/__independent__/preview-parity.independent.test.ts` asserts it.
+- **`act` is injected, not imported.** `DesktopHarness` takes an `ActWrapper`
+  that defaults to a passthrough, and `renderApp` supplies the
+  `@testing-library/react` version. That keeps a devDependency out of the
+  shipped bundle, and it is why the dynamic `import()` matters: the preview
+  backend is its own chunk, which the desktop build never fetches.
+- **Preview-only non-determinism lives in `src/preview/liveJobs.ts`.** It claims
+  the same scriptable jobs a CUJ claims and releases their steps on real timers,
+  which is what makes progress and cancel worth looking at. Nothing a CUJ loads
+  contains a `setTimeout`.
+
+What the preview still is not: evidence. It proves nothing about SQLite,
+WKWebView, Keychain, native dialogs, or FFmpeg. Its settings deliberately carry
+no media origin, because nothing is serving those bytes — so every clip reports
+no URL, which is the state the desktop is in when the origin fails to bind.
