@@ -1180,11 +1180,38 @@ fn schedule_background_thumbnails(
     asset_ids: Vec<String>,
     app: tauri::AppHandle,
 ) {
+    schedule_background_thumbnails_with(
+        catalog,
+        coordinator,
+        asset_ids,
+        move |progress| {
+            let _ = app.emit("thumbnail-progress", progress);
+        },
+        |task| {
+            tauri::async_runtime::spawn_blocking(move || {
+                let _ = task();
+            });
+        },
+    );
+}
+
+/// Schedules the detached post-import Q1 task. The launch boundary stays
+/// injectable so this production path can be tested without a native app.
+fn schedule_background_thumbnails_with<F, S>(
+    catalog: Catalog,
+    coordinator: Arc<ThumbnailCoordinator>,
+    asset_ids: Vec<String>,
+    mut on_progress: F,
+    start: S,
+) where
+    F: FnMut(rcdvlog_core::AssetBatchProgress) + Send + 'static,
+    S: FnOnce(Box<dyn FnOnce() -> anyhow::Result<ThumbnailReport> + Send>),
+{
     let claims = coordinator.claim(asset_ids);
     if claims.asset_ids.is_empty() {
         return;
     }
-    tauri::async_runtime::spawn_blocking(move || {
+    start(Box::new(move || {
         let _claims = claims;
         let _execution = _claims
             .coordinator
@@ -1193,14 +1220,21 @@ fn schedule_background_thumbnails(
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         // Import success is already final. Individual failures stay in this
         // quiet report and the explicit backfill action remains the recovery path.
-        let _ = catalog.generate_thumbnails_for_assets_with_progress(
-            &_claims.asset_ids,
-            1,
-            |progress| {
-                let _ = app.emit("thumbnail-progress", progress);
-            },
-        );
-    });
+        generate_detached_q1_thumbnails(&catalog, &_claims.asset_ids, &mut on_progress)
+    }));
+}
+
+/// The post-import Q1 task deliberately has no bearing on the completed import
+/// report. A failed clip stays eligible for the explicit thumbnail backfill.
+fn generate_detached_q1_thumbnails<F>(
+    catalog: &Catalog,
+    asset_ids: &[String],
+    on_progress: F,
+) -> anyhow::Result<ThumbnailReport>
+where
+    F: FnMut(rcdvlog_core::AssetBatchProgress),
+{
+    catalog.generate_thumbnails_for_assets_with_progress(asset_ids, 1, on_progress)
 }
 
 #[tauri::command]
@@ -2410,6 +2444,7 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
     use tempfile::tempdir;
 
     #[test]
@@ -2424,6 +2459,96 @@ mod tests {
 
         let resumed = coordinator.claim(["asset_a".to_string(), "asset_b".to_string()]);
         assert_eq!(resumed.asset_ids, ["asset_a", "asset_b"]);
+    }
+
+    #[test]
+    fn detached_q1_failure_does_not_revoke_a_completed_smart_import_and_can_be_repaired() {
+        if Command::new("ffmpeg").arg("-version").output().is_err() {
+            eprintln!("ffmpeg is unavailable; skipping media integration test");
+            return;
+        }
+
+        let directory = tempdir().unwrap();
+        let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).unwrap();
+        let project = catalog.create_project("Thumbnail recovery").unwrap();
+        let source_dir = directory.path().join("source");
+        fs::create_dir_all(&source_dir).unwrap();
+        let source = source_dir.join("C0001.MP4");
+        let status = Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=navy:s=64x64:r=5:d=1",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                source.to_str().unwrap(),
+            ])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let backup = directory.path().join("C0001.backup.mp4");
+        fs::copy(&source, &backup).unwrap();
+
+        let plan = catalog
+            .preflight_import(&project.id, &source_dir, None, |_, _, _| true)
+            .unwrap();
+        let outcome = catalog
+            .run_import(&project.id, &plan, true, |_| true)
+            .unwrap();
+        assert_eq!(outcome.imported, 1);
+        assert!(!outcome.cancelled);
+        let imported_ids = outcome.imported_asset_ids.clone();
+        let session = catalog
+            .record_import_session(&project.id, &plan, &outcome)
+            .unwrap();
+
+        // The import has already reported success when its detached Q1 task
+        // sees the original disappear and records a recoverable failure.
+        fs::remove_file(&source).unwrap();
+        let mut automatic_report = None;
+        schedule_background_thumbnails_with(
+            catalog.clone(),
+            Arc::new(ThumbnailCoordinator::default()),
+            imported_ids.clone(),
+            |_| {},
+            |task| automatic_report = Some(task().unwrap()),
+        );
+        let failed = automatic_report.unwrap();
+        assert_eq!(failed.generated, 0);
+        assert_eq!(failed.failures.len(), 1);
+        assert_eq!(
+            outcome.imported, 1,
+            "thumbnail work cannot revise the import outcome"
+        );
+        assert_eq!(
+            catalog
+                .import_session(&project.id, &session.entry.id)
+                .unwrap()
+                .entry
+                .imported,
+            1,
+            "the completed import ledger remains available after detached failure"
+        );
+        assert_eq!(catalog.list_assets(&project.id).unwrap().len(), 1);
+
+        fs::copy(&backup, &source).unwrap();
+        let repaired = catalog.generate_missing_thumbnails(&project.id, 1).unwrap();
+        assert_eq!(repaired.generated, 1);
+        assert!(repaired.failures.is_empty());
+        assert_eq!(
+            catalog
+                .get_asset(&imported_ids[0])
+                .unwrap()
+                .thumbnail_quality,
+            1
+        );
     }
 
     fn test_settings(projects_root: PathBuf) -> DesktopSettings {
