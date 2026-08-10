@@ -261,6 +261,20 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .transport-time { flex: none; min-width: 76px; color: #c7cfd2; font: 11px/14px ui-monospace, SFMono-Regular, Menlo, monospace; text-align: center; }
 .transport-toggle { padding: 0 8px; font-size: 11px; }
 .transport-toggle.on { color: var(--amber); }
+.orientation-menu { position: fixed; z-index: 40; width: 232px; padding: 6px; color: var(--muted); border: 1px solid #536168; border-radius: 6px; background: #151b1e; box-shadow: 0 10px 32px rgba(0,0,0,.55); transform: translate(-100%, -100%); }
+.orientation-menu::after { position: absolute; right: 10px; bottom: -6px; width: 10px; height: 10px; background: #151b1e; border-right: 1px solid #536168; border-bottom: 1px solid #536168; content: ""; transform: rotate(45deg); }
+.orientation-menu-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; padding: 3px 5px 7px; border-bottom: 1px solid var(--line); }
+.orientation-menu-heading strong { color: #c8d0d3; font: 11px/14px ui-monospace, SFMono-Regular, Menlo, monospace; font-weight: 600; }
+.orientation-menu-heading span { color: var(--amber); font: 10px/12px ui-monospace, SFMono-Regular, Menlo, monospace; white-space: nowrap; }
+.orientation-menu > button { width: 100%; min-height: 34px; display: grid; grid-template-columns: 1fr auto; align-items: center; gap: 8px; padding: 5px 7px; color: #c8d0d3; background: transparent; border: 0; border-radius: 3px; cursor: pointer; text-align: left; }
+.orientation-menu > button:hover, .orientation-menu > button:focus-visible { color: #161b1d; background: var(--amber); outline: none; }
+.orientation-menu > button[aria-checked="true"]::after { color: var(--amber); content: "✓"; }
+.orientation-menu > button[aria-checked="true"]:hover::after, .orientation-menu > button[aria-checked="true"]:focus-visible::after { color: #161b1d; }
+.orientation-menu > button span { font-size: 11px; line-height: 14px; }
+.orientation-menu > button small { grid-column: 1; color: var(--quiet); font: 10px/11px ui-monospace, SFMono-Regular, Menlo, monospace; }
+.orientation-menu > button:hover small, .orientation-menu > button:focus-visible small { color: #4d3a24; }
+.orientation-menu > button kbd { min-width: 17px; grid-column: 2; grid-row: 1 / span 2; padding: 1px 3px; color: var(--quiet); background: #20272b; border: 1px solid #3a454b; border-radius: 3px; text-align: center; }
+.orientation-menu > button:hover kbd, .orientation-menu > button:focus-visible kbd { color: #161b1d; background: rgba(255,255,255,.22); border-color: rgba(22,27,29,.28); }
 .source-badge { flex: none; padding: 0 6px; color: var(--quiet); font: 10px/12px ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: .06em; }
 /* Amber when you are hitting the source drive rather than a proxy. */
 .source-badge.original { color: var(--amber); }

@@ -1,3 +1,5 @@
+import { useEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import type { CSSProperties } from "react";
 import type { Asset } from "../types";
 import { formatDuration } from "../review/format";
@@ -16,7 +18,8 @@ export interface TransportBarProps {
   onSeekBy(delta: number): void;
   onToggleMute(): void;
   onStep(delta: number): void;
-  onRotate(): void;
+  onRotate(addition: 90 | 180): void;
+  onResetRotation(): void;
   onEnterFocus(): void;
 }
 
@@ -46,11 +49,45 @@ export function TransportBar({
   onToggleMute,
   onStep,
   onRotate,
+  onResetRotation,
   onEnterFocus,
 }: TransportBarProps) {
+  const [orientationOpen, setOrientationOpen] = useState(false);
+  const orientationButtonRef = useRef<HTMLButtonElement>(null);
+  const orientationMenuRef = useRef<HTMLDivElement>(null);
   const max = Math.max(0, durationSeconds);
   const progress = max > 0 ? Math.min(100, (positionSeconds / max) * 100) : 0;
   const at = (ms: number) => (max > 0 ? Math.min(100, (ms / 1000 / max) * 100) : 0);
+
+  useEffect(() => {
+    if (!orientationOpen) return;
+    orientationMenuRef.current?.querySelector<HTMLButtonElement>("button")?.focus();
+
+    function dismissOnPointerDown(event: PointerEvent) {
+      const target = event.target as Node;
+      if (!orientationMenuRef.current?.contains(target) && !orientationButtonRef.current?.contains(target)) {
+        setOrientationOpen(false);
+      }
+    }
+    function dismissOnEscape(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        setOrientationOpen(false);
+        orientationButtonRef.current?.focus();
+      }
+    }
+
+    document.addEventListener("pointerdown", dismissOnPointerDown);
+    document.addEventListener("keydown", dismissOnEscape);
+    return () => {
+      document.removeEventListener("pointerdown", dismissOnPointerDown);
+      document.removeEventListener("keydown", dismissOnEscape);
+    };
+  }, [orientationOpen]);
+
+  function chooseRotation(action: () => void) {
+    action();
+    setOrientationOpen(false);
+  }
 
   return (
     <div className="transport">
@@ -96,11 +133,61 @@ export function TransportBar({
       {/* One glyph, and a popover behind it. The illustrated two-card control
           this replaces cost 107px of permanent rail for a rare action. */}
       <button
+        ref={orientationButtonRef}
         className={`transport-toggle ${rotationOverridden ? "on" : ""}`}
-        onClick={onRotate}
+        onClick={() => setOrientationOpen((open) => !open)}
         aria-label="Frame orientation"
-        title={rotationOverridden ? `Rotation overridden — ${asset.rotationDegrees}°` : "Landscape (automatic)"}
+        aria-haspopup="menu"
+        aria-expanded={orientationOpen}
+        title={rotationOverridden
+          ? `Rotation overridden — ${asset.rotationDegrees}° · O rotates · ⇧O flips`
+          : "Automatic orientation · O rotates · ⇧O flips"}
       >⟳</button>
+      {orientationOpen && typeof document !== "undefined" && createPortal(
+        <div
+          ref={orientationMenuRef}
+          className="orientation-menu"
+          role="menu"
+          aria-label="Frame orientation"
+          style={{
+            left: Math.min(window.innerWidth - 8, orientationButtonRef.current?.getBoundingClientRect().right ?? window.innerWidth - 8),
+            top: Math.max(8, (orientationButtonRef.current?.getBoundingClientRect().top ?? 8) - 6),
+          }}
+        >
+          <div className="orientation-menu-heading">
+            <strong>Frame orientation</strong>
+            <span>{rotationOverridden ? `Current: ${asset.rotationDegrees}° override` : `Automatic: ${asset.defaultRotationDegrees}°`}</span>
+          </div>
+          <button
+            type="button"
+            role="menuitemradio"
+            aria-checked={!rotationOverridden}
+            onClick={() => chooseRotation(onResetRotation)}
+          >
+            <span>Automatic</span>
+            <small>Use camera metadata</small>
+          </button>
+          <button
+            type="button"
+            role="menuitem"
+            aria-keyshortcuts="O"
+            onClick={() => chooseRotation(() => onRotate(90))}
+          >
+            <span>Rotate 90° clockwise</span>
+            <kbd aria-hidden="true">O</kbd>
+          </button>
+          <button
+            type="button"
+            role="menuitem"
+            aria-keyshortcuts="Shift+O"
+            onClick={() => chooseRotation(() => onRotate(180))}
+          >
+            <span>Flip 180°</span>
+            <kbd aria-hidden="true">⇧O</kbd>
+          </button>
+        </div>,
+        document.body,
+      )}
       <span className={`source-badge ${asset.proxyAvailable ? "" : "original"}`}>
         {asset.proxyAvailable ? "PROXY" : "ORIGINAL"}
       </span>

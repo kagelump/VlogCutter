@@ -129,6 +129,24 @@ describe("resolveAction — presentation shortcuts", () => {
   });
 });
 
+describe("resolveAction — frame orientation", () => {
+  it("maps O to a clockwise quarter-turn", () => {
+    expect(resolveAction(keyEvent({ key: "o" }))).toEqual({ kind: "rotate", addition: 90 });
+  });
+
+  it("maps Shift+O to a direct 180-degree flip", () => {
+    expect(resolveAction(keyEvent({ key: "O", shiftKey: true }))).toEqual({ kind: "rotate", addition: 180 });
+  });
+
+  it("does not rotate while typing or shadow the system shortcut", () => {
+    expect(resolveAction(keyEvent({
+      key: "o",
+      target: { tagName: "TEXTAREA", isContentEditable: false },
+    }))).toBeNull();
+    expect(resolveAction(keyEvent({ key: "o", metaKey: true }))).toBeNull();
+  });
+});
+
 describe("resolveAction — modes", () => {
   it("maps Cmd+1/2/3 to modes", () => {
     expect(resolveAction(keyEvent({ key: "1", metaKey: true }))).toEqual({ kind: "setMode", mode: "review" });

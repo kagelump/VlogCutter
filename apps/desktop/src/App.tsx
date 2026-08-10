@@ -933,6 +933,13 @@ function App() {
             event.preventDefault();
             document.querySelector<HTMLInputElement>(".clip-title-field")?.focus();
             return;
+          case "rotate":
+            if (!selected) return;
+            event.preventDefault();
+            void persistAsset(selected, {
+              rotationDegrees: rotationAfter(selected.rotationDegrees, reviewAction.addition),
+            });
+            return;
           case "setMode":
             event.preventDefault();
             if (reviewAction.mode === "review" || projectId) {
@@ -1005,7 +1012,7 @@ function App() {
     };
     window.addEventListener("keydown", handleKey);
     return () => window.removeEventListener("keydown", handleKey);
-  }, [busy, centerSelectedInChronology, moveSelection, observation, projectId, projects.length, selected, showAnalysisDialog, showMediaMenu, showSettings, showShortcuts, toggleRemoved, view.presentation]);
+  }, [busy, centerSelectedInChronology, moveSelection, observation, persistAsset, projectId, projects.length, selected, showAnalysisDialog, showMediaMenu, showSettings, showShortcuts, toggleRemoved, view.presentation]);
 
   async function createProject() {
     const name = newProjectName.trim();
@@ -1824,7 +1831,8 @@ function App() {
             onSeekBy={seekBy}
             onToggleMute={toggleMute}
             onStep={moveSelection}
-            onRotate={() => void persistAsset(selected, { rotationDegrees: rotationAfter(selected.rotationDegrees, 90) })}
+            onRotate={(addition) => void persistAsset(selected, { rotationDegrees: rotationAfter(selected.rotationDegrees, addition) })}
+            onResetRotation={() => void persistAsset(selected, { rotationDegrees: selected.defaultRotationDegrees })}
             onEnterFocus={() => void toggleViewerFullscreen()}
           />
           )}
@@ -2431,6 +2439,8 @@ function App() {
               <div><kbd>Enter</kbd><span>New line in a note</span></div>
               <div><kbd>Esc</kbd><span>Cancel note edit · leave Focus</span></div>
               <div><kbd>I</kbd><span>Edit clip title</span></div>
+              <div><kbd>O</kbd><span>Rotate 90° clockwise</span></div>
+              <div><kbd>⇧O</kbd><span>Flip 180°</span></div>
               <div><kbd>F</kbd><span>Focus writing view</span></div>
               <div><kbd>H</kbd><span>Hide every overlay in Focus</span></div>
               <div><kbd>D</kbd><span>Evidence shelf · Focus right stack</span></div>

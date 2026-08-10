@@ -634,6 +634,7 @@ Preserve and update both visible hints and the `?` keyboard map when shortcuts c
 - `P`: selected proxy; Shift+`P`: missing proxies; `T`: missing thumbnails; `A`: analyze project.
 - `M`: add media.
 - `[`/`]`: story-ribbon zoom; `C`: center selected clip.
+- `O`: rotate the selected clip 90° clockwise; Shift+`O`: flip it 180°.
 - Command+`N`: new project; Command+`O`: open catalog; Command+`,`: global settings; `?`: keyboard map.
 
 Global shortcuts must return early for text inputs, textareas, and selects, except modal-level Escape handling. Any shortcut that moves focus must call `preventDefault()` before focusing the destination.

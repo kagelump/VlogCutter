@@ -146,6 +146,20 @@ describe("queue navigation stays available", () => {
   });
 });
 
+describe("frame orientation stays keyboard-first", () => {
+  it("rotates with O and flips with Shift+O outside text fields", async () => {
+    const { container } = render(<App />);
+    await ready(container);
+    const orientation = screen.getByRole("button", { name: "Frame orientation" });
+
+    await userEvent.keyboard("o");
+    await waitFor(() => expect(orientation.getAttribute("title")).toContain("90°"));
+
+    await userEvent.keyboard("{Shift>}o{/Shift}");
+    await waitFor(() => expect(orientation.getAttribute("title")).toContain("270°"));
+  });
+});
+
 describe("modes leave Focus", () => {
   it("lands in Chronology rather than a focused Chronology", async () => {
     const { container } = render(<App />);

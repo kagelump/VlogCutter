@@ -10,6 +10,7 @@ export type ReviewAction =
   | { kind: "ribbonOverlay" }
   | { kind: "jumpBestMoment" }
   | { kind: "editTitle" }
+  | { kind: "rotate"; addition: 90 | 180 }
   | { kind: "setMode"; mode: "review" | "chronology" | "editPlan" };
 
 export interface KeyEventLike {
@@ -29,7 +30,7 @@ export interface KeyEventLike {
  * toggleRemoved (R), zoom (`[`/`]`), centerSelection (C) — plus the
  * presentation and mode shortcuts: Focus (F), overlays (H), the evidence
  * shelf (D), the ribbon (T, Shift+T), the best moment (B), the title (I),
- * and the three modes (Cmd+1/2/3).
+ * orientation (O, Shift+O), and the three modes (Cmd+1/2/3).
  *
  * Every other shortcut the handler implements (new project, open catalog,
  * settings, help, search focus, playback, label/notes focus, media
@@ -77,6 +78,9 @@ export function resolveAction(event: KeyEventLike): ReviewAction | null {
   if (key === "t") return event.shiftKey ? { kind: "ribbonOverlay" } : { kind: "toggleRibbon" };
   if (key === "b") return { kind: "jumpBestMoment" };
   if (key === "i") return { kind: "editTitle" };
+  // R already owns remove/restore. O keeps rotation mnemonic without putting
+  // a destructive queue action and a frame correction on the same key.
+  if (key === "o") return { kind: "rotate", addition: event.shiftKey ? 180 : 90 };
 
   return null;
 }
