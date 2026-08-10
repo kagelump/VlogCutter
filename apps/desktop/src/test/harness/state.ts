@@ -147,6 +147,7 @@ export function createInitialState(clock: HarnessClock): DesktopHarnessState {
       lastContextUpdatedAt: null,
       makeProxiesOnImport: true,
       lastImportArchiveRootId: null,
+      importArchiveRootIdsByCardSession: {},
       pairedServerNodeId: null,
       pairedServerEndpoint: null,
       pairedServerLabel: null,

@@ -84,6 +84,7 @@ const defaultDesktopSettings: DesktopSettings = {
   lastContextUpdatedAt: null,
   makeProxiesOnImport: true,
   lastImportArchiveRootId: null,
+  importArchiveRootIdsByCardSession: {},
   pairedServerNodeId: null,
   pairedServerEndpoint: null,
   pairedServerLabel: null,
@@ -521,13 +522,16 @@ export const api = {
     return invoke("bind_archive_root", { archiveRootId, path });
   },
 
-  async setImportPreferences(makeProxies: boolean, archiveRootId: string | null): Promise<DesktopSettings> {
+  async setImportPreferences(makeProxies: boolean, archiveRootId: string | null, cardSessionId: string | null): Promise<DesktopSettings> {
     if (!inTauri()) {
-      const updated = { ...readMockSettings(), makeProxiesOnImport: makeProxies, lastImportArchiveRootId: archiveRootId };
+      const current = readMockSettings();
+      const importArchiveRootIdsByCardSession = { ...current.importArchiveRootIdsByCardSession };
+      if (cardSessionId && archiveRootId) importArchiveRootIdsByCardSession[cardSessionId] = archiveRootId;
+      const updated = { ...current, makeProxiesOnImport: makeProxies, lastImportArchiveRootId: archiveRootId, importArchiveRootIdsByCardSession };
       writeMockSettings(updated);
       return updated;
     }
-    return rememberMediaOrigin(await invoke<DesktopSettings>("set_import_preferences", { makeProxies, archiveRootId }));
+    return rememberMediaOrigin(await invoke<DesktopSettings>("set_import_preferences", { makeProxies, archiveRootId, cardSessionId }));
   },
 
   async preflightImport(projectId: string, sourcePath: string, archiveRootId: string | null): Promise<ImportPreflight> {
@@ -539,6 +543,7 @@ export const api = {
     if (!inTauri()) return {
       outcome: { imported: plan.newClips, relinked: plan.relinkable, skipped: plan.knownClips + plan.missingProxies - plan.newClips, copied: plan.newClips, bytesCopied: plan.destination.bytesToCopy, cancelled: false, failures: [] },
       proxies: makeProxies ? { generated: plan.missingProxies, skipped: plan.knownClips, cancelled: false, failures: [] } : null,
+      files: plan.items.map((item) => ({ path: item.path, timestamp: null, durationSeconds: null })),
     };
     return invoke("run_smart_import", { projectId, plan, verifyCopies, makeProxies });
   },

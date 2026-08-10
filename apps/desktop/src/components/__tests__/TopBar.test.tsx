@@ -49,6 +49,7 @@ function renderBar(overrides: Partial<TopBarProps> = {}) {
     onPairWithServer: vi.fn(),
     onShowSyncDiagnostics: vi.fn(),
     onCancelAnalysis: vi.fn(),
+    onCancelImport: vi.fn(),
     onDismissError: vi.fn(),
     onMakeProxies: vi.fn(),
     onToggleMediaMenu: vi.fn(),
@@ -111,7 +112,7 @@ describe("the operation slot", () => {
     expect(within(slot).getByText(/\$0\.42 spent/)).toBeTruthy();
   });
 
-  it("offers cancel for analysis only — the other two are cheap and finish", async () => {
+  it("offers cancellation for analysis and imports", async () => {
     const { props } = renderBar({ operationProgress: progress({ kind: "analysis", stage: "analysis" }) });
     await userEvent.click(screen.getByRole("button", { name: "Cancel" }));
     expect(props.onCancelAnalysis).toHaveBeenCalled();
@@ -119,6 +120,12 @@ describe("the operation slot", () => {
     document.body.innerHTML = "";
     renderBar({ operationProgress: progress({ kind: "thumbnail" }) });
     expect(screen.queryByRole("button", { name: "Cancel" })).toBeNull();
+
+    document.body.innerHTML = "";
+    const importing = renderBar({ operationProgress: progress({ kind: "import", importStage: "copying" }) });
+    expect(screen.getByText("Copying and verifying originals")).toBeTruthy();
+    await userEvent.click(screen.getByRole("button", { name: "Stop" }));
+    expect(importing.props.onCancelImport).toHaveBeenCalled();
   });
 
   it("measures the bar in work units when it has them, and in clips otherwise", () => {

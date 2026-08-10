@@ -22,6 +22,7 @@ const settings = (mediaOrigin: MediaOrigin | null): DesktopSettings => ({
   lastContextUpdatedAt: null,
   makeProxiesOnImport: true,
   lastImportArchiveRootId: null,
+  importArchiveRootIdsByCardSession: {},
   mediaOrigin,
 });
 

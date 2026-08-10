@@ -32,6 +32,12 @@ async function openImport(app: Awaited<ReturnType<typeof renderApp>>) {
   return screen.findByRole("dialog", { name: /DJI_SD|Import/i });
 }
 
+async function openLastImport(app: Awaited<ReturnType<typeof renderApp>>) {
+  await app.user.click(screen.getByRole("button", { name: "More media generation actions" }));
+  await app.user.click(await screen.findByRole("button", { name: /Review last import/ }));
+  return screen.findByRole("dialog", { name: /DJI_SD|Import/i });
+}
+
 describe("importing from a card", () => {
   it("offers the card that is in the slot", async () => {
     const harness = cardInSlot();
@@ -75,7 +81,8 @@ describe("importing from a card", () => {
 
     await app.user.click(within(dialog).getByRole("button", { name: /Import 3 clips/ }));
 
-    await waitFor(() => expect(screen.getByText(/Import complete/)).toBeVisible());
+    await waitFor(() => expect(Object.keys(harness.state.assets)).toHaveLength(7));
+    expect(screen.queryByRole("dialog")).toBeNull();
     // Two Sony clips and the two DJI clips already known, plus the three new
     // ones — and nothing else.
     expect(queueFilenames()).toEqual([
@@ -98,14 +105,15 @@ describe("importing from a card", () => {
 
     await app.user.click(within(dialog).getByRole("button", { name: /Import 3 clips/ }));
 
-    await waitFor(() => expect(screen.getByText(/Import complete/)).toBeVisible());
+    await waitFor(() => expect(Object.keys(harness.state.assets)).toHaveLength(7));
     // The plan the run was given, the run's own summary, and the state diff all
     // say three. The browser mock could report any of the three without the
     // other two agreeing.
     const added = Object.keys(harness.state.assets).length - before;
     expect(added).toBe(3);
     expect(harness.calls("run_smart_import")[0]).toMatchObject({ plan: { newClips: 3, knownClips: 2 } });
-    expect(within(dialog).getByText(/Import complete/)).toBeVisible();
+    const reportDialog = await openLastImport(app);
+    expect(within(reportDialog).getByText(/Import complete/)).toBeVisible();
   });
 
   it("remembers where the originals go for next time", async () => {
@@ -116,7 +124,25 @@ describe("importing from a card", () => {
     await app.user.click(within(dialog).getByRole("button", { name: /Import 3 clips/ }));
 
     await waitFor(() => expect(harness.state.settings.lastImportArchiveRootId).toBe("archive_nas_video"));
+    expect(harness.state.settings.importArchiveRootIdsByCardSession.card_dji_sd).toBe("archive_nas_video");
     expect(harness.state.settings.makeProxiesOnImport).toBe(true);
+  });
+
+  it("prefers the destination remembered for this card over the most recent destination", async () => {
+    const harness = desktopScenario({ now: "2026-08-09T12:00:00.000Z" })
+      .project("Hokkaido field test", { id: "project_hokkaido" })
+      .archiveRoot("NAS Video", { availableBytes: 1_200_000_000_000 })
+      .archiveRoot("Travel SSD", { availableBytes: 500_000_000_000 })
+      .cardInserted("DJI_SD", { clips: 2, newClips: 2, camera: "DJI Pocket 3" })
+      .build();
+    const card = harness.state.cards[0];
+    harness.state.settings.lastImportArchiveRootId = "archive_travel_ssd";
+    harness.state.settings.importArchiveRootIdsByCardSession[card.sessionId] = "archive_nas_video";
+    const app = await renderApp(harness);
+
+    await openImport(app);
+
+    expect(harness.calls("preflight_import")[0]).toMatchObject({ archiveRootId: "archive_nas_video" });
   });
 
   it("imports only the additions when the same card comes back with more", async () => {
@@ -173,11 +199,14 @@ describe("importing from a card", () => {
     await run.progress();
     await run.progress();
 
-    await app.user.click(within(dialog).getByRole("button", { name: "Stop import" }));
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(screen.getByText("Copying and verifying originals")).toBeVisible();
+    await app.user.click(screen.getByRole("button", { name: "Stop" }));
     expect(harness.calls("cancel_import")).toHaveLength(1);
     await run.cancel();
 
-    await waitFor(() => expect(within(dialog).getByText(/Stopped cleanly/)).toBeVisible());
+    const reportDialog = await openLastImport(app);
+    await waitFor(() => expect(within(reportDialog).getByText(/Stopped cleanly/)).toBeVisible());
     // The two it finished are in the project; the third is not.
     expect(Object.keys(harness.state.assets)).toHaveLength(6);
     expect(harness.state.assets.asset_dji_pocket_3_005).toBeUndefined();
