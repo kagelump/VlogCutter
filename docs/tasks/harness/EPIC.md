@@ -30,10 +30,12 @@ left holding only what genuinely needs a browser or a Mac.
 
 `apps/desktop` has hundreds of unit and component tests and a large native and
 Rust suite, and almost nothing between them. Three files render the whole `App`,
-and they run against the `if (!inTauri())` demo branches in `api.ts` — a preview
-convenience that reports proxy generation it never performed, returns `null` for
-every media URL, returns empty results for the entire chronology surface, and
-sleeps on real timers for 140 ms per clip per stage.
+and they ran against the `if (!inTauri())` demo branches in `api.ts` — a preview
+convenience that reported proxy generation it never performed, returned `null`
+for every media URL, returned empty results for the entire chronology surface,
+and slept on real timers for 140 ms per clip per stage. (H01-T010 deleted those
+branches and put the preview on this harness; the three files now boot against a
+declared scenario.)
 
 So the cheap tier cannot express "open a project, review clips, annotate, filter,
 come back, and check everything still agrees", and cannot express any failure
@@ -77,9 +79,11 @@ native, media, or topology gate.
   FFmpeg, or NAS behavior.
 - **Deterministic identity.** No `crypto.randomUUID()`, `new Date()`, or
   `Math.random()` in harness or scenario code.
-- **The preview branches stay.** `api.ts`'s `!inTauri()` paths keep serving the
-  Vite preview until H01-T010 decides their fate; no task deletes them as a side
-  effect.
+- **The preview branches stay until T010.** `api.ts`'s `!inTauri()` paths kept
+  serving the Vite preview until H01-T010 decided their fate; no other task
+  deleted them as a side effect. T010 removed them and installed this harness in
+  the preview instead, so the constraint is now: **there is one fake backend**,
+  and nothing may add a second.
 
 ## Queue
 
@@ -94,7 +98,7 @@ native, media, or topology gate.
 | 70 | [H01-T007](tasks/H01-T007-import-and-card-cujs.md) | Import and card CUJs | H01-T003 | complete |
 | 80 | [H01-T008](tasks/H01-T008-ipc-contract-coverage-suite.md) | IPC contract coverage suite | H01-T004, H01-T005 | complete |
 | 90 | [H01-T009](tasks/H01-T009-ci-wiring-and-documentation.md) | CI wiring and documentation reconciliation | H01-T008 | complete |
-| 100 | [H01-T010](tasks/H01-T010-browser-preview-rationalization.md) | Browser-preview rationalization | H01-T009 | design_required |
+| 100 | [H01-T010](tasks/H01-T010-browser-preview-rationalization.md) | Browser-preview rationalization | H01-T009 | complete |
 
 ### Execution note
 
@@ -145,10 +149,9 @@ last because that is a convenience refactor riding on a proven harness.
 The epic is promoted only when every implementation, contract, and documentation
 packet is complete. One task cycle never promotes unrelated work.
 
-**Status at the H01-T009 landing:** T001–T009 are complete; T010 is
-`design_required` with its analysis recorded in the packet. The epic is
-therefore not promoted — one fake too many still exists, even though every
-criterion below is met.
+**Status at the H01-T010 landing:** T001–T010 are complete. The second fake is
+gone: the Vite preview installs the harness at startup, so the repository holds
+one desktop fake-backend state machine with two front doors.
 
 Concretely, this epic is complete when:
 

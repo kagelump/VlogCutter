@@ -91,3 +91,22 @@ again on every keystroke" — installs its spy after `renderApp` resolves, and a
 selection effect can still be in flight. It failed once under the added parallel
 load of the new suite and has passed every run since. The fix is to assert on
 calls made after a settled point rather than on a zero count.
+
+## 8. The offline slate blames a missing proxy for a missing origin
+
+The stage renders its slate whenever the selected clip has no playable URL, and
+the slate's sentence is chosen from the clip: "Proxy is missing" when a proxy
+path is recorded but unavailable, otherwise "No review proxy yet". It never
+considers the third reason a URL can be absent — that the app has no media
+origin to build one from.
+
+So a clip with a perfectly good proxy is told it has none. On the desktop that
+is what the user sees when the loopback origin fails to bind; in the browser
+preview, which has no origin by design, it is what every clip says. The
+adjacent "Make proxy" button then offers a repair that cannot help, which is
+finding 3 arriving from the other direction.
+
+Found by: the H01-T010 visual pass over the preview. Pinned by:
+`mediaUrl.test.ts` ("has no URL to give until the origin has been handed over"),
+which fixes the adapter's half of the behaviour; the slate's wording is
+untested and unchanged.

@@ -7,7 +7,7 @@
  */
 
 import { HarnessClock } from "./clock";
-import { DesktopHarness } from "./DesktopHarness";
+import { DesktopHarness, type HarnessOptions } from "./DesktopHarness";
 import {
   buildAnalysis,
   buildArchiveRoot,
@@ -350,8 +350,8 @@ export class ScenarioBuilder {
     return this;
   }
 
-  build(): DesktopHarness {
-    return new DesktopHarness(this.state, this.clock);
+  build(options: HarnessOptions = {}): DesktopHarness {
+    return new DesktopHarness(this.state, this.clock, options);
   }
 
   private requireProject(): string {

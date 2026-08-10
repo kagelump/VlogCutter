@@ -40,14 +40,18 @@ function asset(overrides: Partial<Asset> = {}): Asset {
   } as unknown as Asset;
 }
 
-/** A fresh module instance, because the media origin is module-level state. */
-async function loadApi(desktop: boolean) {
+/**
+ * A fresh module instance, because the media origin is module-level state.
+ *
+ * There is no "outside Tauri" case to load any more: the browser preview
+ * installs the shared fake backend, so these adapters have one path everywhere.
+ * A preview clip has no URL because its settings carry no origin — the state
+ * covered below by "has no URL to give until the origin has been handed over" —
+ * rather than because `api.ts` branched on the environment.
+ */
+async function loadApi() {
   vi.resetModules();
-  if (desktop) {
-    (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {};
-  } else {
-    delete (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__;
-  }
+  (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {};
   return (await import("../api")).api;
 }
 
@@ -63,19 +67,9 @@ afterEach(() => {
 /** The dev-only handle the eval bridge reads. */
 const devHandle = () => (window as unknown as Record<string, unknown>).__RCDVLOG_MEDIA_ORIGIN__;
 
-describe("api.mediaUrl outside Tauri", () => {
-  it("stays null so the browser preview keeps its mock path", async () => {
-    const api = await loadApi(false);
-    expect(api.mediaUrl(asset())).toBeNull();
-    expect(api.mediaUrl(asset({ proxyPath: "/tmp/p.mp4", proxyAvailable: true }))).toBeNull();
-    expect(await api.recoverMediaOrigin()).toBeNull();
-    expect(invoke).not.toHaveBeenCalled();
-  });
-});
-
-describe("api.mediaUrl on the desktop", () => {
+describe("api.mediaUrl", () => {
   it("addresses the loopback origin by asset id, never by path", async () => {
-    const api = await loadApi(true);
+    const api = await loadApi();
     invoke.mockResolvedValueOnce(settings(origin));
     await api.desktopSettings();
 
@@ -89,7 +83,7 @@ describe("api.mediaUrl on the desktop", () => {
   });
 
   it("keeps the proxy-versus-original choice the review queue already makes", async () => {
-    const api = await loadApi(true);
+    const api = await loadApi();
     invoke.mockResolvedValueOnce(settings(origin));
     await api.desktopSettings();
 
@@ -105,7 +99,7 @@ describe("api.mediaUrl on the desktop", () => {
   });
 
   it("has no URL to give until the origin has been handed over", async () => {
-    const api = await loadApi(true);
+    const api = await loadApi();
     expect(api.mediaUrl(asset())).toBeNull();
 
     // An origin that failed to bind is reported as absent rather than as a URL
@@ -116,7 +110,7 @@ describe("api.mediaUrl on the desktop", () => {
   });
 
   it("rebuilds URLs from a restarted origin", async () => {
-    const api = await loadApi(true);
+    const api = await loadApi();
     invoke.mockResolvedValueOnce(settings(origin));
     await api.desktopSettings();
     expect(api.mediaUrl(asset())).toContain(origin.token);
@@ -132,7 +126,7 @@ describe("api.mediaUrl on the desktop", () => {
   });
 
   it("drops every URL when the origin could not be restarted", async () => {
-    const api = await loadApi(true);
+    const api = await loadApi();
     invoke.mockResolvedValueOnce(settings(origin));
     await api.desktopSettings();
 
@@ -142,7 +136,7 @@ describe("api.mediaUrl on the desktop", () => {
   });
 
   it("publishes the dev handle only when the app offers a debug URL", async () => {
-    const api = await loadApi(true);
+    const api = await loadApi();
     invoke.mockResolvedValueOnce(settings(origin));
     await api.desktopSettings();
     // A release app never sets `debugUrl`, so the eval bridge sees nothing.
@@ -162,7 +156,7 @@ describe("api.mediaUrl on the desktop", () => {
   it("still serves thumbnails through the asset protocol", async () => {
     // Images are unaffected by the WKWebView limitation, so posters keep the
     // transport they already had; this task moves video only.
-    const api = await loadApi(true);
+    const api = await loadApi();
     expect(api.thumbnailUrl(asset({ thumbnailPath: "/cache/thumbnails/asset_1/q1.v2.jpg" })))
       .toBe("asset://localhost/%2Fcache%2Fthumbnails%2Fasset_1%2Fq1.v2.jpg");
     expect(api.thumbnailUrl(asset())).toBeNull();

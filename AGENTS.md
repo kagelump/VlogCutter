@@ -322,7 +322,9 @@ The Vite-only browser preview is useful for fast layout and interaction work:
 pnpm --dir apps/desktop dev --host 127.0.0.1
 ```
 
-It runs at `http://127.0.0.1:1420/` and uses in-memory mock projects/assets from `apps/desktop/src/api.ts`. It cannot validate native dialogs, Tauri commands/events, the loopback media origin, FFmpeg child processes, persistence, or filesystem permissions. `api.mediaUrl` returns `null` outside Tauri, so the preview has no video at all. Never treat a browser-only pass as an end-to-end media test.
+It runs at `http://127.0.0.1:1420/`. Outside Tauri, `main.tsx` installs the CUJ harness (`apps/desktop/src/preview/`) as the backend, so the preview exercises the real adapters against the same fake backend the CUJ suite drives. `api.ts` and `chronologyApi.ts` have no environment branches left, and a behaviour change in `apps/desktop/src/test/harness/commands/` shows up in both the preview and the CUJ suite. Progress and cancellation are driven on real timers by `src/preview/liveJobs.ts`, which only the preview loads.
+
+It still cannot validate native dialogs, Tauri commands reaching Rust, the loopback media origin, FFmpeg child processes, persistence, or filesystem permissions. The preview has no media origin, so no clip plays. Never treat a browser-only pass as an end-to-end media test.
 
 Build outputs:
 
@@ -801,7 +803,7 @@ Scale acceptance should cover thousands of assets, offline behavior, progress re
 ### Add or change project settings
 
 1. Update Rust `DesktopSettings` with a Serde default so older settings files remain valid.
-2. Update the TypeScript mirror and browser mock storage.
+2. Update the TypeScript mirror and the harness settings fixture (`apps/desktop/src/test/harness/state.ts`), which the browser preview reads too.
 3. Persist atomically where practical and test a missing/older/corrupt settings file.
 4. Expose the control in global settings, not per-project UI, unless the setting truly belongs in the catalog.
 
@@ -820,7 +822,7 @@ Scale acceptance should cover thousands of assets, offline behavior, progress re
 - Never delete catalogs, source media, project folders, proxies, thumbnails, or exports unless the user explicitly requests the exact destructive action.
 - Tests must use `tempfile`/temporary directories. Never point destructive test setup at `~/Movies/VideoProjects`, `/Volumes`, or the repository root.
 - Do not edit SQLite by hand to achieve product behavior. Add a domain operation and migration.
-- Do not use the browser mock as evidence that persistence or media processing works.
+- Do not use the browser preview or the CUJ harness as evidence that persistence or media processing works.
 - Do not use local Playwright as evidence that Caddy, Tailscale, Ubuntu, native Tauri, or NAS checks passed.
 - Avoid adding always-running services, network dependencies, analytics, or credential storage.
 - Keep child-process arguments structured with `Command`; do not build shell strings from media paths.

@@ -7,7 +7,6 @@
  * all real; this replaces only where the call lands.
  */
 
-import { act } from "@testing-library/react";
 import { HarnessClock } from "./clock";
 import { EventBus } from "./events";
 import { FaultRegistry } from "./faults";
@@ -47,6 +46,24 @@ export const commandTable: CommandTable = mergeTables(
 /** Commands served by the event plugin rather than by a handler module. */
 export const EVENT_COMMANDS = ["plugin:event|listen", "plugin:event|unlisten"] as const;
 
+/**
+ * How a harness-initiated React update is wrapped.
+ *
+ * Under Vitest this is `act` from `@testing-library/react`, supplied by
+ * `renderApp`. It is injected rather than imported here because the browser
+ * preview installs this same harness (`src/preview/`), and a static import of a
+ * devDependency would drag the testing library into the shipped bundle. The
+ * default is a passthrough: outside a test there is nothing to flush.
+ */
+export type ActWrapper = <T>(action: () => Promise<T> | T) => Promise<T>;
+
+const passthrough: ActWrapper = async (action) => action();
+
+export interface HarnessOptions {
+  /** Wrapper for updates the harness pushes into React. Defaults to a passthrough. */
+  act?: ActWrapper;
+}
+
 export class DesktopHarness {
   readonly clock: HarnessClock;
   readonly state: DesktopHarnessState;
@@ -56,10 +73,12 @@ export class DesktopHarness {
 
   private log: CommandLogEntry[] = [];
   private uninstallRuntime: (() => void) | null = null;
+  private actWrapper: ActWrapper;
 
-  constructor(state: DesktopHarnessState, clock: HarnessClock) {
+  constructor(state: DesktopHarnessState, clock: HarnessClock, options: HarnessOptions = {}) {
     this.state = state;
     this.clock = clock;
+    this.actWrapper = options.act ?? passthrough;
     this.jobs = new JobRegistry(
       (event, payload) => this.events.emit(event, payload),
       (action) => this.inAct(action),
@@ -67,6 +86,15 @@ export class DesktopHarness {
   }
 
   // ── lifecycle ──────────────────────────────────────────────────────
+
+  /**
+   * Wrap harness-initiated updates. `renderApp` calls this with `act` before it
+   * mounts, which is the only place the testing library is reached from.
+   */
+  useActWrapper(wrapper: ActWrapper): this {
+    this.actWrapper = wrapper;
+    return this;
+  }
 
   install(): this {
     this.uninstallRuntime = installTauriRuntime({
@@ -172,14 +200,11 @@ export class DesktopHarness {
   /**
    * Anything the harness pushes into the application — an event, a job step —
    * is a React update originating outside a user interaction, so it is wrapped
-   * here rather than in every test.
+   * here rather than in every test. The wrapper itself is injected; see
+   * `ActWrapper`.
    */
-  private async inAct<T>(action: () => Promise<T> | T): Promise<T> {
-    let result!: T;
-    await act(async () => {
-      result = await action();
-    });
-    return result;
+  private inAct<T>(action: () => Promise<T> | T): Promise<T> {
+    return this.actWrapper(action);
   }
 
   /** Emit a Tauri event to the application's live listeners. Returns how many were reached. */
