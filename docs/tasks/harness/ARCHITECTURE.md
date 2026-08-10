@@ -252,9 +252,16 @@ races and "still running" UI states testable at all.
 ### 5.3 Faults are first class
 
 ```ts
-harness.next("create_note_revision").reject("database is locked");
+harness.next("update_asset").reject("database is locked");
 harness.command("sync_now").delayUntilReleased();
 harness.asset("asset_sony_003").setOriginalAvailable(false);
+
+// Argument-matched, so one project's read can be held while another's is
+// answered — the session race in #28, staged exactly rather than with timers.
+harness.command("list_assets", (args) => args.projectId === "project_a").delayUntilReleased();
+harness.command("list_assets", (args) => args.projectId === "project_a")
+  .delayThenReject("catalog unavailable");
+harness.release("list_assets"); // frees every call held for that command
 ```
 
 Failure paths are the strongest argument for this harness: a note-save failure

@@ -20,6 +20,7 @@ import {
   exemptCommands,
   frontendCommands,
   harnessCommands,
+  uncalledBackendCommands,
 } from "../harness/contract";
 
 describe("the frontend's command surface", () => {
@@ -103,6 +104,12 @@ describe("the backend's command surface", () => {
     // command may land before the UI that uses it. This is a visible inventory
     // so the gap is a decision rather than an accident.
     const uncalled = [...backendCommands()].filter((command) => !frontendCommands().has(command)).sort();
-    expect(uncalled).toEqual(["chronology_solution"]);
+    expect(uncalled).toEqual(uncalledBackendCommands.map((entry) => entry.command));
+  });
+
+  it("states the decision behind every command the interface does not reach", () => {
+    for (const entry of uncalledBackendCommands) {
+      expect(entry.reason.trim().length, `no decision recorded for ${entry.command}`).toBeGreaterThan(40);
+    }
   });
 });

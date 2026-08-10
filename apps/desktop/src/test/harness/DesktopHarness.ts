@@ -133,7 +133,7 @@ export class DesktopHarness {
     const entry: CommandLogEntry = { command, args, outcome: "resolved" };
     this.log.push(entry);
 
-    const fault = this.faults.take(command);
+    const fault = this.faults.take(command, args);
     if (fault?.kind === "reject") {
       entry.outcome = "rejected";
       entry.error = fault.message ?? command;
@@ -141,6 +141,14 @@ export class DesktopHarness {
     }
     if (fault?.kind === "delay") {
       await this.faults.gate(command);
+      // A held call that fails when it is finally answered: the late rejection
+      // is a different thing from a late success, and both have to be shown
+      // not to reach a session that has moved on.
+      if (fault.message) {
+        entry.outcome = "rejected";
+        entry.error = fault.message;
+        throw new Error(fault.message);
+      }
     }
 
     if (command === "plugin:event|listen") {
@@ -218,28 +226,46 @@ export class DesktopHarness {
   }
 
   /** Fail the next call to a command. One-shot, so the retry runs the success path. */
-  next(command: string) {
+  next(command: string, match?: (args: CommandArgs) => boolean) {
     return {
       reject: (message: string) => {
-        this.faults.queue(command, { kind: "reject", message });
+        this.faults.queue(command, { kind: "reject", message, match });
         return this;
       },
       delayUntilReleased: () => {
-        this.faults.queue(command, { kind: "delay" });
+        this.faults.queue(command, { kind: "delay", match });
+        return this;
+      },
+      /** Hold the call, then fail it when released. */
+      delayThenReject: (message: string) => {
+        this.faults.queue(command, { kind: "delay", message, match });
         return this;
       },
     };
   }
 
-  /** Fail or delay every call to a command until cleared. */
-  command(command: string) {
+  /**
+   * Fail or delay every call to a command until cleared.
+   *
+   * The optional matcher narrows the fault to the calls whose arguments satisfy
+   * it, which is how one project's read is held while another's is answered:
+   *
+   *     harness.command("list_assets", (args) => args.projectId === "project_a")
+   *       .delayUntilReleased();
+   */
+  command(command: string, match?: (args: CommandArgs) => boolean) {
     return {
       reject: (message: string) => {
-        this.faults.always(command, { kind: "reject", message });
+        this.faults.always(command, { kind: "reject", message, match });
         return this;
       },
       delayUntilReleased: () => {
-        this.faults.always(command, { kind: "delay" });
+        this.faults.always(command, { kind: "delay", match });
+        return this;
+      },
+      /** Hold every matching call, then fail them when released. */
+      delayThenReject: (message: string) => {
+        this.faults.always(command, { kind: "delay", message, match });
         return this;
       },
       clear: () => {
@@ -250,8 +276,8 @@ export class DesktopHarness {
   }
 
   /** Reads better than `command(...)` when the fault is meant to persist. */
-  always(command: string) {
-    return this.command(command);
+  always(command: string, match?: (args: CommandArgs) => boolean) {
+    return this.command(command, match);
   }
 
   /** Let a delayed command through. */

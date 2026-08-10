@@ -229,4 +229,26 @@ describe("save state", () => {
     expect(screen.getByText(/saving/i)).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /^save$/i })).toBeNull();
   });
+
+  it("marks a draft the backend refused, and says why on the retry", async () => {
+    const user = userEvent.setup();
+    const { props } = renderPanel({
+      saveState: "unsaved",
+      saveError: "database is locked",
+      onRetrySave: vi.fn(),
+    });
+
+    // An unmarked draft reads exactly like saved text; this is the difference.
+    expect(screen.getByText("Unsaved")).toBeInTheDocument();
+    const retry = screen.getByRole("button", { name: "Retry" });
+    expect(retry).toHaveAttribute("title", "Not saved: database is locked");
+
+    await user.click(retry);
+    expect(props.onRetrySave).toHaveBeenCalledTimes(1);
+  });
+
+  it("offers no retry while nothing is unsaved", () => {
+    renderPanel({ saveState: "saved", onRetrySave: vi.fn() });
+    expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+  });
 });

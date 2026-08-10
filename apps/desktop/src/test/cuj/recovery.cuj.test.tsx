@@ -27,7 +27,7 @@ function session() {
 const first = "asset_sony_a7c_ii_001";
 
 describe("a save that fails", () => {
-  it("keeps the draft on screen and saves it when the user tries again", async () => {
+  it("keeps the draft on screen, marks it unsaved, and retries it unchanged", async () => {
     const harness = session();
     const app = await renderApp(harness);
     harness.next("update_asset").reject("database is locked");
@@ -39,16 +39,44 @@ describe("a save that fails", () => {
     expect(await screen.findByText(/database is locked/)).toBeVisible();
     expect(harness.state.assets[first].notes).toBe("");
 
-    // The draft survives: the rollback restores the edited asset, not the
-    // last-persisted one, so the paragraph is still there on return.
+    // The draft survives, and says so. The failure policy for human prose is
+    // retain-draft: the paragraph stays, marked as not in the catalog rather
+    // than sitting there looking saved.
     await app.user.click(screen.getByText("SONY_001.MP4"));
     await waitFor(() => expect(screen.getByLabelText("Notes")).toHaveValue("The light turns about here"));
+    expect(screen.getByText("Unsaved")).toBeVisible();
 
-    // Nothing retries on its own — the save is driven by leaving the field —
-    // so the user touches it again and it lands.
-    await app.user.click(screen.getByLabelText("Notes"));
-    await app.user.click(screen.getByText("SONY_002.MP4"));
+    // The same draft is sent again, with no edit to retrigger a blur.
+    await app.user.click(screen.getByRole("button", { name: "Retry" }));
     await waitFor(() => expect(harness.state.assets[first].notes).toBe("The light turns about here"));
+    expect(screen.queryByText("Unsaved")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+  });
+
+  it("does not claim a draft is saved while the backend still holds the old note", async () => {
+    const harness = session();
+    const app = await renderApp(harness);
+    harness.always("update_asset").reject("database is locked");
+
+    await app.user.type(screen.getByLabelText("Notes"), "Snow starts here");
+    await app.user.click(screen.getByText("SONY_002.MP4"));
+    await screen.findByText(/database is locked/);
+
+    // Away and back inside the same renderer session: still the draft, still
+    // marked. Nothing in the interface says "Saved".
+    await app.user.click(screen.getByText("SONY_003.MP4"));
+    await app.user.click(screen.getByText("SONY_001.MP4"));
+    await waitFor(() => expect(screen.getByLabelText("Notes")).toHaveValue("Snow starts here"));
+    expect(screen.getByText("Unsaved")).toBeVisible();
+    expect(screen.queryByText("Saved")).toBeNull();
+    expect(harness.state.assets[first].notes).toBe("");
+
+    // A reload answers with what the catalog holds, which is not the draft —
+    // and the draft is still the thing on screen.
+    await app.user.click(screen.getByLabelText("Reload clips"));
+    await waitFor(() => expect(harness.calls("list_assets").length).toBeGreaterThan(1));
+    expect(screen.getByLabelText("Notes")).toHaveValue("Snow starts here");
+    expect(screen.getByText("Unsaved")).toBeVisible();
   });
 
   it("does not leave a label showing that the backend refused", async () => {
@@ -69,7 +97,7 @@ describe("a save that fails", () => {
 });
 
 describe("a project that will not open", () => {
-  it("says the catalog is unavailable and recovers when it comes back", async () => {
+  it("says the catalog is unavailable and recovers on the retry it offers", async () => {
     const harness = desktopScenario({ now: "2026-08-09T12:00:00.000Z" })
       .project("Hokkaido field test", { id: "project_hokkaido" })
       .camera("Sony A7C II", { clips: 3, withProxy: true })
@@ -78,20 +106,37 @@ describe("a project that will not open", () => {
 
     const app = await renderApp(harness);
 
-    expect(await screen.findByText(/catalog unavailable/)).toBeVisible();
+    expect(await screen.findAllByText(/catalog unavailable/)).not.toHaveLength(0);
     expect(queueFilenames()).toEqual([]);
 
-    // GAP, recorded rather than fixed: the asset read happens when the open
-    // project changes, and there is no in-app "try again". Switching modes and
-    // back does not re-read, so a transient catalog failure leaves the session
-    // empty until the app is relaunched.
+    // The failure leaves a way back in: the project's reads have an owner, and
+    // the empty queue offers to run them again. Relaunching the app is no
+    // longer the only recovery from a locked catalog.
     harness.clearFaults();
-    await app.user.click(screen.getByRole("button", { name: "Chronology" }));
-    await app.user.click(screen.getByRole("button", { name: "Review" }));
+    await app.user.click(screen.getByRole("button", { name: "Try again" }));
+
+    await waitFor(() => expect(queueFilenames()).toHaveLength(3));
+    expect(screen.queryByRole("button", { name: "Try again" })).toBeNull();
+  });
+
+  it("keeps offering the retry until it succeeds", async () => {
+    const harness = desktopScenario({ now: "2026-08-09T12:00:00.000Z" })
+      .project("Hokkaido field test", { id: "project_hokkaido" })
+      .camera("Sony A7C II", { clips: 3, withProxy: true })
+      .build();
+    harness.always("list_assets").reject("catalog unavailable: database is locked");
+
+    const app = await renderApp(harness);
+    await screen.findByRole("button", { name: "Try again" });
+
+    // The fault has not cleared, so the retry fails and the offer stands.
+    await app.user.click(screen.getByRole("button", { name: "Try again" }));
+    await waitFor(() => expect(harness.calls("list_assets").length).toBeGreaterThan(1));
+    expect(screen.getByRole("button", { name: "Try again" })).toBeVisible();
     expect(queueFilenames()).toEqual([]);
 
-    // Relaunching does recover, which is what the user is left with today.
-    await app.remount();
+    harness.clearFaults();
+    await app.user.click(screen.getByRole("button", { name: "Try again" }));
     await waitFor(() => expect(queueFilenames()).toHaveLength(3));
   });
 });
@@ -145,10 +190,11 @@ describe("the source volume disappears mid-session", () => {
 
     await app.user.click(screen.getByText("SONY_003.MP4"));
     harness.asset("asset_sony_a7c_ii_003").setOriginalAvailable(false);
-    // The write the user was about to make anyway is what refreshes the clip.
-    await app.user.type(screen.getByLabelText("Add label"), "checkpoint{Enter}");
+    // A read, asked for as a read: the backend changed underneath the session
+    // and the queue is told to look again. No write is needed to notice it.
+    await app.user.click(screen.getByLabelText("Reload clips"));
 
-    await waitFor(() => expect(harness.state.assets.asset_sony_a7c_ii_003.labels).toEqual(["checkpoint"]));
+    await waitFor(() => expect(harness.state.assets.asset_sony_a7c_ii_003.originalAvailable).toBe(false));
     expect(selectedRow()?.textContent).toContain("SONY_003.MP4");
     expect(queueFilenames()).toHaveLength(4);
     expect(await screen.findByText("No review proxy yet")).toBeVisible();

@@ -101,6 +101,24 @@ Implemented now:
   the window with the frame and floats the notes card, preserving the caret and
   the playback position because it restyles the mounted tree rather than
   replacing it. See `docs/superpowers/specs/2026-08-04-desktop-review-layout-design.md`.
+- One owner for the open project's reads (`apps/desktop/src/session/projectSession.ts`):
+  the queue, chronology overview, analysis index, readiness, and the selected
+  clip's evidence, with explicit `reload`/`reloadAssets`/`reloadChronology`/
+  `reloadReadiness`/`reloadEvidence` invalidation. Every read carries the
+  session that started it, so a response for a project the user has left cannot
+  write state — including its error and loading state. A failed queue read is
+  retryable in the interface (queue heading reload control, and *Try again* in
+  the empty queue) rather than only by relaunching.
+- One owner for the asset write path
+  (`apps/desktop/src/session/assetMutations.ts`): optimistic apply, a stated
+  failure policy per mutation — `rollback` for labels, removal, and rotation;
+  `retain-draft` for human-authored notes — save state, a double-submit guard
+  that refuses an identical in-flight write, and error surfacing. A note whose
+  save was refused stays on screen marked *Unsaved* with a *Retry* that sends
+  the same draft, and survives reloads because retained drafts are written back
+  over what a read returns. Judgments are still one whole-`AssetPatch` write
+  through `update_asset`; the narrow single-field adapters were removed and the
+  decision is recorded in `apps/desktop/src/test/harness/contract.ts`.
 - Relative-order “story ribbon” with camera lanes sized from the project's
   actual camera count, horizontal scrolling, zoom, and a merged single-lane
   variant for Focus.

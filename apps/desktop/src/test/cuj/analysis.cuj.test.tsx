@@ -109,13 +109,10 @@ describe("CUJ 6 — analysing a project", () => {
     expect(harness.state.analyses[clips[0]].aiLabels).toEqual(["station"]);
     expect(await screen.findByRole("button", { name: /Unusable 1/ })).toBeVisible();
 
-    // Observed behavior, recorded rather than asserted as desirable: the
-    // per-clip evidence read is keyed on the selection, so the clip the user is
-    // sitting on keeps its empty rail until the selection moves. The queue
-    // above already shows the verdict.
-    expect(screen.queryByRole("button", { name: "station" })).toBeNull();
-
-    await app.user.keyboard("jk");
+    // The clip the user is sitting on is refreshed too. A finished run
+    // invalidates the whole project session, so the evidence beside the queue
+    // row comes from the same read as the verdict inside it — no selection
+    // change needed to see what the run just wrote.
     expect(await screen.findByRole("button", { name: "station" })).toBeVisible();
   });
 

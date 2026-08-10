@@ -1,7 +1,8 @@
 import type { KeyboardEvent as ReactKeyboardEvent } from "react";
 import type { Asset, AssetAnalysisView } from "../types";
+import type { SaveState } from "../session/assetMutations";
 
-export type SaveState = "idle" | "saving" | "saved";
+export type { SaveState };
 
 export interface JudgmentPanelProps {
   asset: Asset;
@@ -11,6 +12,10 @@ export interface JudgmentPanelProps {
   observation: AssetAnalysisView | null;
   labelDraft: string;
   saveState: SaveState;
+  /** Why the last save was refused, shown as the unsaved state's reason. */
+  saveError?: string;
+  /** Send the retained draft again, unchanged. */
+  onRetrySave?(): void;
   onLabelDraftChange(value: string): void;
   onAddLabel(value: string): void;
   onRemoveLabel(label: string): void;
@@ -27,6 +32,9 @@ const saveStateLabels: Record<SaveState, string> = {
   idle: "",
   saving: "Saving…",
   saved: "Saved",
+  // Not "Error": what the user needs to know is where their paragraph stands,
+  // which is on screen and not in the catalog.
+  unsaved: "Unsaved",
 };
 
 /**
@@ -55,6 +63,8 @@ export function JudgmentPanel({
   observation,
   labelDraft,
   saveState,
+  saveError = "",
+  onRetrySave,
   onLabelDraftChange,
   onAddLabel,
   onRemoveLabel,
@@ -104,9 +114,22 @@ export function JudgmentPanel({
         >{asset.removed ? "Restore" : "Remove"}</button>
       </div>
 
+      {/* A refused save leaves the draft on screen, so the header has to say
+          so: an unmarked draft reads exactly like saved text, and the user
+          would close the app believing it was written. The retry sends the
+          same draft, with no edit needed to retrigger a blur. */}
       <div className="micro-header">
         <span>Notes</span>
-        <span className="save-state">{saveStateLabels[saveState]}</span>
+        <span className={`save-state ${saveState === "unsaved" ? "unsaved" : ""}`}>
+          {saveStateLabels[saveState]}
+          {saveState === "unsaved" && onRetrySave && (
+            <button
+              className="save-retry"
+              onClick={onRetrySave}
+              title={saveError ? `Not saved: ${saveError}` : "Save this note again"}
+            >Retry</button>
+          )}
+        </span>
       </div>
       {/* The largest element on screen, and the only thing in the app at
           15px: the hierarchy is stated in the type scale rather than in
