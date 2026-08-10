@@ -96,7 +96,7 @@ impl Catalog {
             [project_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
         )?;
         let mut statement = connection.prepare(
-            "SELECT id, fingerprint, filename, size_bytes, duration_seconds, frame_rate, width, height, codec, camera, captured_at_raw, best_time, offset_seconds, metadata_rotation_degrees, default_rotation_degrees, orientation_probed, notes, labels_json, removed, rotation_degrees, media_object_id, media_verification_state, created_at FROM assets WHERE project_id=?1 ORDER BY id",
+            "SELECT id, fingerprint, filename, size_bytes, duration_seconds, frame_rate, width, height, codec, camera, captured_at_raw, best_time, offset_seconds, metadata_rotation_degrees, default_rotation_degrees, orientation_probed, notes, labels_json, removed, rotation_degrees, media_object_id, media_verification_state, created_at FROM assets WHERE project_id=?1 AND COALESCE(membership_removed, 0) = 0 ORDER BY id",
         )?;
         let rows = statement
             .query_map([project_id], |row| {

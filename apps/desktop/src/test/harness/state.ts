@@ -22,6 +22,7 @@ import type {
   ClipTranscript,
   DesktopSettings,
   ImportPreflight,
+  ImportSessionDetail,
   MediaOrigin,
   ModelStatus,
   Project,
@@ -83,6 +84,8 @@ export interface ImportScenarioState {
   /** Clips a run will add, keyed by source path. */
   additions: Record<string, Asset[]>;
   lastRunSourcePath: string | null;
+  /** Durable import history, keyed by its deterministic harness id. */
+  sessions: Record<string, ImportSessionDetail>;
 }
 
 export interface DesktopHarnessState {
@@ -209,7 +212,7 @@ export function createInitialState(clock: HarnessClock): DesktopHarnessState {
 
     archiveRoots: [],
     cards: [],
-    imports: { preflights: {}, additions: {}, lastRunSourcePath: null },
+    imports: { preflights: {}, additions: {}, lastRunSourcePath: null, sessions: {} },
     relinkable: {},
 
     pairing: {

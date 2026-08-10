@@ -228,7 +228,7 @@ impl Catalog {
         let connection = self.connection()?;
         let known: Option<(String, String)> = connection
             .query_row(
-                "SELECT id, path FROM assets WHERE project_id = ?1 AND fingerprint = ?2",
+                "SELECT id, path FROM assets WHERE project_id = ?1 AND fingerprint = ?2 AND COALESCE(membership_removed, 0) = 0",
                 params![project_id, fingerprint],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )

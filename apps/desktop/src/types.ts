@@ -376,7 +376,19 @@ export interface ImportRunReport {
     timestamp: string | null;
     durationSeconds: number | null;
   }>;
+  session?: ImportSessionDetail;
 }
+
+export interface ImportHistoryEntry {
+  id: string; projectId: string; sourcePath: string; destinationMode: "reference" | "archive_copy";
+  destinationRootId: string | null; destinationName: string; destinationPath: string;
+  imported: number; relinked: number; skipped: number; copied: number; bytesCopied: number;
+  cancelled: boolean; failures: Array<{ path: string; error: string }>;
+  rolledBackAt: string | null; rolledBackAssetCount: number; createdAt: string;
+}
+export interface ImportSessionFile { assetId: string | null; path: string; filename: string; classification: string; result: string; timestamp: string | null; durationSeconds: number | null; error: string | null; }
+export interface ImportSessionDetail extends ImportHistoryEntry { files: ImportSessionFile[]; }
+export interface ImportRollbackPreview { sessionId: string; removableAssetCount: number; alreadyRemovedAssetCount: number; modifiedClips: Array<{ assetId: string; filename: string; reasons: string[] }>; affectedPhaseCount: number; message: string; }
 
 /** The result of pointing the app at a folder to find originals it has lost track of. */
 export interface RelinkReport {

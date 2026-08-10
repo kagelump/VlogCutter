@@ -29,6 +29,7 @@ mod copy;
 mod diagnostics;
 mod editplan;
 mod identifiers;
+mod import_history;
 mod locations;
 mod migrations;
 mod operations;
@@ -67,6 +68,10 @@ pub use archive::ArchiveRoot;
 pub use batch_estimator::BatchEstimate as BatchProgressEstimate;
 pub use cards::{
     CardCandidate, MountedVolumes, VolumeSource, card_session_slug, detect_cards, inspect_card,
+};
+pub use import_history::{
+    ImportHistoryEntry, ImportRollbackModifiedClip, ImportRollbackPreview, ImportSessionDetail,
+    ImportSessionFile,
 };
 pub use preflight::{
     Classification, ImportDestination, ImportOutcome, ImportPreflight, ImportProgress, ImportStage,
@@ -973,7 +978,7 @@ impl Catalog {
                    COALESCE(SUM(CASE WHEN {removed} = 1 THEN 1 ELSE 0 END), 0),
                    {origin_node_id}, {paired_server_node_id}, {paired_at}
             FROM projects p
-            LEFT JOIN assets a ON a.project_id = p.id
+            LEFT JOIN assets a ON a.project_id = p.id AND COALESCE(a.membership_removed, 0) = 0
             GROUP BY p.id
             ORDER BY p.created_at DESC
             "#
@@ -1135,16 +1140,19 @@ impl Catalog {
         let metadata =
             fs::metadata(path).with_context(|| format!("read metadata for {}", path.display()))?;
         let fingerprint = sampled_fingerprint(path, metadata.len())?;
-        let known: Option<(String, String)> = self
+        let known: Option<(String, String, bool)> = self
             .connection()?
             .query_row(
-                "SELECT id, path FROM assets WHERE project_id = ?1 AND fingerprint = ?2",
+                "SELECT id, path, COALESCE(membership_removed, 0) FROM assets WHERE project_id = ?1 AND fingerprint = ?2",
                 params![project_id, fingerprint],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()?;
         match known {
-            Some((asset_id, recorded_path)) => {
+            Some((asset_id, recorded_path, membership_removed)) => {
+                if membership_removed {
+                    return Ok(IngestOutcome::Imported);
+                }
                 self.relink_known_asset(&asset_id, &recorded_path, path, &fingerprint)
             }
             None => Ok(IngestOutcome::Imported),
@@ -1186,14 +1194,19 @@ impl Catalog {
             fs::metadata(path).with_context(|| format!("read metadata for {}", path.display()))?;
         let fingerprint = sampled_fingerprint(path, metadata.len())?;
         let connection = self.connection()?;
-        let known: Option<(String, String)> = connection
+        let known: Option<(String, String, bool)> = connection
             .query_row(
-                "SELECT id, path FROM assets WHERE project_id = ?1 AND fingerprint = ?2",
+                "SELECT id, path, COALESCE(membership_removed, 0) FROM assets WHERE project_id = ?1 AND fingerprint = ?2",
                 params![project_id, fingerprint],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()?;
-        if let Some((asset_id, recorded_path)) = known {
+        if let Some((asset_id, recorded_path, membership_removed)) = known {
+            if membership_removed {
+                drop(connection);
+                self.restore_project_asset_membership(project_id, &asset_id)?;
+                return Ok(IngestOutcome::Imported);
+            }
             // Seeing content we already know is evidence about *where that
             // content lives*, and throwing it away is how an asset ends up
             // stranded on a path that no longer exists. Register the discovered
@@ -1345,7 +1358,7 @@ impl Catalog {
             FROM assets a
             {thumbnail_join}
             {location_join}
-            WHERE a.project_id = ?1
+            WHERE a.project_id = ?1 AND COALESCE(a.membership_removed, 0) = 0
             ORDER BY a.best_time IS NULL, a.best_time, a.filename, a.id
             "#
         );
@@ -1746,7 +1759,7 @@ impl Catalog {
              FROM asset_transcripts t
              JOIN assets a ON a.id = t.asset_id
              LEFT JOIN transcript_segments s ON s.asset_id = t.asset_id
-             WHERE a.project_id = ?1
+             WHERE a.project_id = ?1 AND COALESCE(a.membership_removed, 0) = 0
              GROUP BY t.asset_id, t.status",
         )?;
         let rows = transcripts.query_map([project_id], |row| {
@@ -1769,7 +1782,7 @@ impl Catalog {
             "SELECT n.asset_id, n.usable, n.unusable_reason
              FROM asset_analyses n
              JOIN assets a ON a.id = n.asset_id
-             WHERE a.project_id = ?1",
+             WHERE a.project_id = ?1 AND COALESCE(a.membership_removed, 0) = 0",
         )?;
         let rows = analyses.query_map([project_id], |row| {
             Ok((

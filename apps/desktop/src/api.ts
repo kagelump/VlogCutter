@@ -1,7 +1,7 @@
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
-import type { AnalysisProgress, AnalysisReadiness, AnalysisRunRecord, AnalysisRunReport, AnalysisRunRequest, ArchiveRoot, Asset, AssetAnalysisIndexEntry, AssetAnalysisView, AssetPatch, AutoplayMode, BaselineImportResult, BaselinePreviewResult, CardCandidate, ClipTranscript, DesktopSettings, GenerationProgress, ImportPreflight, ImportProgress, ImportRunReport, IngestReport, LoadedCatalog, MediaOrigin, ModelInstallProgress, ModelStatus, PathAnalysis, Project, ProjectLibrary, ProjectPairingStatus, RelinkReport, RootMappingEntry, ServerConnectionStatus, ServerPairingResult, ServerVersionInfo, SyncStatus, ThumbnailReport } from "./types";
+import type { AnalysisProgress, AnalysisReadiness, AnalysisRunRecord, AnalysisRunReport, AnalysisRunRequest, ArchiveRoot, Asset, AssetAnalysisIndexEntry, AssetAnalysisView, AssetPatch, AutoplayMode, BaselineImportResult, BaselinePreviewResult, CardCandidate, ClipTranscript, DesktopSettings, GenerationProgress, ImportHistoryEntry, ImportPreflight, ImportProgress, ImportRollbackPreview, ImportRunReport, ImportSessionDetail, IngestReport, LoadedCatalog, MediaOrigin, ModelInstallProgress, ModelStatus, PathAnalysis, Project, ProjectLibrary, ProjectPairingStatus, RelinkReport, RootMappingEntry, ServerConnectionStatus, ServerPairingResult, ServerVersionInfo, SyncStatus, ThumbnailReport } from "./types";
 
 /**
  * Whether a backend is answering behind `@tauri-apps/api`.
@@ -165,6 +165,19 @@ export const api = {
 
   async cancelImport(): Promise<void> {
     return invoke("cancel_import");
+  },
+
+  async listImportSessions(projectId: string): Promise<ImportHistoryEntry[]> {
+    return inTauri() ? invoke("list_import_sessions", { projectId }) : [];
+  },
+  async importSession(projectId: string, sessionId: string): Promise<ImportSessionDetail> {
+    return invoke("import_session", { projectId, sessionId });
+  },
+  async importRollbackPreview(projectId: string, sessionId: string): Promise<ImportRollbackPreview> {
+    return invoke("import_rollback_preview", { projectId, sessionId });
+  },
+  async rollbackImportMembership(projectId: string, sessionId: string): Promise<ImportRollbackPreview> {
+    return invoke("rollback_import_membership", { projectId, sessionId });
   },
 
   async onImportProgress(callback: (progress: ImportProgress) => void): Promise<() => void> {
