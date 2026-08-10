@@ -5952,7 +5952,7 @@ mod tests {
         fs::remove_file(regenerated_proxy.proxy_path.as_deref().unwrap()).unwrap();
         fs::write(&source, b"different footage at a reused card path").unwrap();
         let mismatch = catalog
-            .generate_thumbnails_for_assets(&[asset.id.clone()], 1)
+            .generate_thumbnails_for_assets(std::slice::from_ref(&asset.id), 1)
             .unwrap();
         assert_eq!(mismatch.generated, 0);
         assert_eq!(mismatch.failures.len(), 1);
