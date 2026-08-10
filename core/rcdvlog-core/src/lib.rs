@@ -5,7 +5,7 @@ use chrono::{DateTime, Duration, NaiveDateTime, SecondsFormat, Utc};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
@@ -2936,16 +2936,14 @@ impl Catalog {
             bail!("invalid thumbnail quality {quality}; MVP supports quality 1");
         }
         let asset = self.get_asset(asset_id)?;
-        let input = if Path::new(&asset.path).is_file() {
-            PathBuf::from(&asset.path)
-        } else if let Some(proxy) = asset
+        let input = if let Some(proxy) = asset
             .proxy_path
             .as_deref()
-            .filter(|path| Path::new(path).is_file())
+            .filter(|path| has_current_proxy(&asset) && Path::new(path).is_file())
         {
             PathBuf::from(proxy)
         } else {
-            bail!("media is offline and no proxy is available: {}", asset.path);
+            self.resolve_original(asset_id)?
         };
         let parent = self
             .database_path
@@ -3008,6 +3006,33 @@ impl Catalog {
         &self,
         project_id: &str,
         quality: u8,
+        on_progress: F,
+    ) -> Result<ThumbnailReport>
+    where
+        F: FnMut(AssetBatchProgress),
+    {
+        let asset_ids = self
+            .list_assets(project_id)?
+            .into_iter()
+            .map(|asset| asset.id)
+            .collect::<Vec<_>>();
+        self.generate_thumbnails_for_assets_with_progress(&asset_ids, quality, on_progress)
+    }
+
+    pub fn generate_thumbnails_for_assets(
+        &self,
+        asset_ids: &[String],
+        quality: u8,
+    ) -> Result<ThumbnailReport> {
+        self.generate_thumbnails_for_assets_with_progress(asset_ids, quality, |_| {})
+    }
+
+    /// Generates a thumbnail batch for exactly the supplied assets. Duplicate
+    /// ids are coalesced and an existing current-version Q1 is left untouched.
+    pub fn generate_thumbnails_for_assets_with_progress<F>(
+        &self,
+        asset_ids: &[String],
+        quality: u8,
         mut on_progress: F,
     ) -> Result<ThumbnailReport>
     where
@@ -3016,15 +3041,28 @@ impl Catalog {
         if quality != 1 {
             bail!("invalid thumbnail quality {quality}; MVP supports quality 1");
         }
-        let assets = self.list_assets(project_id)?;
-        let (ready, pending): (Vec<_>, Vec<_>) = assets
-            .into_iter()
-            .partition(|asset| has_current_thumbnail(asset, quality));
+        let mut seen = HashSet::new();
+        let mut pending = Vec::new();
+        let mut skipped = 0;
+        let mut failures = Vec::new();
+        for asset_id in asset_ids {
+            if !seen.insert(asset_id.clone()) {
+                continue;
+            }
+            match self.get_asset(asset_id) {
+                Ok(asset) if self.has_current_thumbnail(&asset.id, quality)? => skipped += 1,
+                Ok(asset) => pending.push(asset),
+                Err(error) => failures.push(IngestFailure {
+                    path: asset_id.clone(),
+                    error: format!("{error:#}"),
+                }),
+            }
+        }
         let mut report = ThumbnailReport {
             quality,
             generated: 0,
-            skipped: ready.len(),
-            failures: Vec::new(),
+            skipped,
+            failures,
         };
         let task_work: Vec<u64> = pending.iter().map(|asset| asset.size_bytes).collect();
         let mut estimator = BatchEstimator::new(
@@ -3060,6 +3098,21 @@ impl Catalog {
             });
         }
         Ok(report)
+    }
+
+    fn has_current_thumbnail(&self, asset_id: &str, quality: u8) -> Result<bool> {
+        let path = self
+            .connection()?
+            .query_row(
+                "SELECT path FROM asset_thumbnails WHERE asset_id = ?1 AND quality = ?2",
+                params![asset_id, quality],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        Ok(path.is_some_and(|path| {
+            Path::new(&path).is_file()
+                && path.ends_with(&format!("q{quality}.{THUMBNAIL_CACHE_VERSION}.jpg"))
+        }))
     }
 
     fn require_project(&self, project_id: &str) -> Result<()> {
@@ -3274,14 +3327,6 @@ pub fn proxy_representation(path: impl AsRef<Path>) -> ProxyRepresentation {
     } else {
         ProxyRepresentation::MetadataBakedV1
     }
-}
-
-fn has_current_thumbnail(asset: &Asset, quality: u8) -> bool {
-    asset.thumbnail_quality >= quality
-        && asset.thumbnail_path.as_deref().is_some_and(|path| {
-            Path::new(path).is_file()
-                && path.ends_with(&format!("q{quality}.{THUMBNAIL_CACHE_VERSION}.jpg"))
-        })
 }
 
 fn normalize_rotation(degrees: f64) -> u16 {
@@ -5875,5 +5920,46 @@ mod tests {
         let thumbnail_report = catalog.generate_missing_thumbnails(&project.id, 1).unwrap();
         assert_eq!(thumbnail_report.generated, 0);
         assert_eq!(thumbnail_report.skipped, 1);
+
+        // A targeted import tail must not sweep unrelated old Q0 assets.
+        insert_asset(
+            &catalog,
+            &project.id,
+            "asset_old_offline",
+            "OLD.MP4",
+            "Sony",
+            "2026-07-18T10:00:00Z",
+            &directory.path().join("offline/OLD.MP4"),
+        );
+        fs::remove_file(&thumbnail_path).unwrap();
+        let targeted = catalog
+            .generate_thumbnails_for_assets(&[asset.id.clone(), asset.id.clone()], 1)
+            .unwrap();
+        assert_eq!(targeted.generated, 1, "duplicate target ids are coalesced");
+        assert!(targeted.failures.is_empty());
+        assert_eq!(
+            catalog
+                .get_asset("asset_old_offline")
+                .unwrap()
+                .thumbnail_quality,
+            0,
+            "an unrelated offline asset is never swept"
+        );
+
+        // Without a current proxy, fallback must verify original identity rather
+        // than trusting that the old pathname happens to exist again.
+        fs::remove_file(&thumbnail_path).unwrap();
+        fs::remove_file(regenerated_proxy.proxy_path.as_deref().unwrap()).unwrap();
+        fs::write(&source, b"different footage at a reused card path").unwrap();
+        let mismatch = catalog
+            .generate_thumbnails_for_assets(&[asset.id.clone()], 1)
+            .unwrap();
+        assert_eq!(mismatch.generated, 0);
+        assert_eq!(mismatch.failures.len(), 1);
+        assert!(
+            mismatch.failures[0]
+                .error
+                .contains("not this clip any more")
+        );
     }
 }

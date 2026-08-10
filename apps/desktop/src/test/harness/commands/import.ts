@@ -114,7 +114,9 @@ function runReport(state: DesktopHarnessState, tally: RunTally, plan: ImportPref
   return {
     outcome: {
       imported: tally.imported.length,
+      importedAssetIds: [...tally.imported],
       relinked: 0,
+      relinkedAssetIds: [],
       skipped: plan.knownClips,
       copied: tally.imported.length,
       bytesCopied: tally.bytesCopied,
