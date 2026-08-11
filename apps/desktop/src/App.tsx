@@ -34,6 +34,7 @@ import { KeyboardShortcutsModal } from "./components/KeyboardShortcutsModal";
 import { AnalysisDialog } from "./components/AnalysisDialog";
 import { SyncDiagnosticsModal } from "./components/SyncDiagnosticsModal";
 import { NewProjectModal } from "./components/NewProjectModal";
+import { PairingWizardModal } from "./components/PairingWizardModal";
 import { CardBanner } from "./components/CardBanner";
 import { analysisStageLabels, formatCost } from "./review/format";
 import { isRawOrientationProxy, renderedRotation, rotationAfter } from "./review/rotation";
@@ -2147,83 +2148,21 @@ function App() {
 
       {/* ── Pairing wizard ─────────────────────────────────────────── */}
       {showPairingWizard && (
-        <div className="modal-backdrop pairing-backdrop" role="presentation" onKeyDown={(event) => { if (event.key === "Escape") { setShowPairingWizard(false); setPairingWizardStep("endpoint"); setPairingCode(""); setServerIdentity(null); }}}>
-          <section className="modal pairing-modal" role="dialog" aria-modal="true" aria-labelledby="pairing-title">
-            <span className="eyebrow">Connect to server</span>
-            <div className="settings-modal-heading">
-              <h2 id="pairing-title">
-                {pairingWizardStep === "endpoint" && "Enter server address"}
-                {pairingWizardStep === "code" && "Enter pairing code"}
-                {pairingWizardStep === "connecting" && "Connecting…"}
-              </h2>
-              <button className="text-button" onClick={() => { setShowPairingWizard(false); setPairingWizardStep("endpoint"); setPairingCode(""); setServerIdentity(null); }}>Cancel <kbd>Esc</kbd></button>
-            </div>
-
-            {pairingWizardStep === "endpoint" && (
-              <div className="wizard-step">
-                <p>Enter the HTTPS URL of your RCD VlogCutter server on the home network or Tailscale.</p>
-                <label className="field">
-                  <span>Server URL</span>
-                  <input
-                    type="text"
-                    className="mono"
-                    placeholder="https://rcdvlog.local"
-                    value={serverEndpoint}
-                    onChange={(e) => setServerEndpoint(e.target.value)}
-                    onKeyDown={(e) => { if (e.key === "Enter") void handleTestServerConnection(); }}
-                    autoFocus
-                  />
-                </label>
-                <div className="modal-actions">
-                  <button className="button primary" disabled={busy || !serverEndpoint.trim()} onClick={() => void handleTestServerConnection()}>Test connection</button>
-                </div>
-              </div>
-            )}
-
-            {pairingWizardStep === "code" && serverIdentity && (
-              <div className="wizard-step">
-                <div className="server-identity">
-                  <span className="server-dot connected"></span>
-                  <span>Server: <strong>{serverIdentity.nodeId.slice(0, 16)}…</strong></span>
-                  <span className="mono quiet">v{serverIdentity.applicationVersion} · protocol {serverIdentity.protocolMajor}.{serverIdentity.protocolMinor}</span>
-                </div>
-                <p>Open the RCD VlogCutter web interface in Chrome, go to <strong>Settings → Devices</strong>, and generate a pairing code. Paste it below:</p>
-                <label className="field">
-                  <span>Pairing code</span>
-                  <input
-                    type="text"
-                    className="mono"
-                    placeholder="ABCDEFGHIJKLMNOP"
-                    value={pairingCode}
-                    onChange={(e) => setPairingCode(e.target.value)}
-                    onKeyDown={(e) => { if (e.key === "Enter") void handlePairWithServer(); }}
-                    autoFocus
-                    maxLength={20}
-                  />
-                </label>
-                <label className="field">
-                  <span>This device label</span>
-                  <input
-                    type="text"
-                    value={deviceLabel}
-                    onChange={(e) => setDeviceLabel(e.target.value)}
-                    placeholder="MacBook Pro"
-                  />
-                </label>
-                <div className="modal-actions">
-                  <button className="button secondary" onClick={() => setPairingWizardStep("endpoint")}>Back</button>
-                  <button className="button primary" disabled={busy || !pairingCode.trim()} onClick={() => void handlePairWithServer()}>Pair with server</button>
-                </div>
-              </div>
-            )}
-
-            {pairingWizardStep === "connecting" && (
-              <div className="wizard-step">
-                <p>Connecting to server…</p>
-              </div>
-            )}
-          </section>
-        </div>
+        <PairingWizardModal
+          step={pairingWizardStep}
+          serverEndpoint={serverEndpoint}
+          serverIdentity={serverIdentity}
+          pairingCode={pairingCode}
+          deviceLabel={deviceLabel}
+          busy={busy}
+          onServerEndpointChange={setServerEndpoint}
+          onTestConnection={() => void handleTestServerConnection()}
+          onPairingCodeChange={setPairingCode}
+          onDeviceLabelChange={setDeviceLabel}
+          onPair={() => void handlePairWithServer()}
+          onBack={() => setPairingWizardStep("endpoint")}
+          onCancel={() => { setShowPairingWizard(false); setPairingWizardStep("endpoint"); setPairingCode(""); setServerIdentity(null); }}
+        />
       )}
 
       {/* ── Baseline pairing wizard ────────────────────────────────── */}
