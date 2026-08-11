@@ -126,6 +126,57 @@ describe("reload paths", () => {
     expect(result.current.assets).toEqual([{ id: "asset_1" }]);
   });
 
+  it("drop a stale readiness rejection rather than reporting it against the current project", async () => {
+    const { rerender, result, onError } = renderSession("project_a");
+    await waitFor(() => expect(analysisReadiness).toHaveBeenCalledWith("project_a"));
+
+    // Readiness is the one read that rethrows, so its rejection reaches a
+    // caller whose `catch` writes the global error. It still must not do that
+    // on behalf of a project the user has left.
+    const held = deferred<never>();
+    analysisReadiness.mockImplementationOnce(() => held.promise);
+    let outcome = "pending";
+    let settled!: Promise<void>;
+    act(() => {
+      settled = result.current.reloadReadiness().then(
+        () => { outcome = "resolved"; },
+        () => { outcome = "rejected"; },
+      );
+    });
+
+    analysisReadiness.mockResolvedValue({ projectId: "project_b", totalClips: 2 });
+    rerender({ project: "project_b" });
+    await waitFor(() =>
+      expect(result.current.readiness).toEqual({ projectId: "project_b", totalClips: 2 }),
+    );
+
+    await act(async () => {
+      held.reject(new Error("readiness unavailable"));
+      await settled;
+    });
+
+    expect(outcome).toBe("resolved");
+    expect(result.current.readiness).toEqual({ projectId: "project_b", totalClips: 2 });
+    expect(onError).not.toHaveBeenCalled();
+  });
+
+  it("still rethrow a readiness failure from the project the user is in", async () => {
+    const { result } = renderSession("project_a");
+    await waitFor(() => expect(analysisReadiness).toHaveBeenCalledWith("project_a"));
+
+    analysisReadiness.mockRejectedValueOnce(new Error("readiness unavailable"));
+    let caught: unknown = null;
+    await act(async () => {
+      await result.current.reloadReadiness().catch((reason) => {
+        caught = reason;
+      });
+    });
+
+    // The analysis dialog is gated on this read: a current failure has to reach
+    // the caller rather than opening a dialog that understates the work.
+    expect(String(caught)).toContain("readiness unavailable");
+  });
+
   it("drop a stale queue rejection rather than blanking the current project", async () => {
     const held = deferred<never>();
     listAssets.mockImplementationOnce(() => held.promise);

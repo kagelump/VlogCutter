@@ -306,7 +306,18 @@ export function useProjectSession({
     // Unlike the others this one rethrows: the analysis dialog is gated on
     // readiness, and its caller reports the failure rather than opening a
     // dialog that would silently understate the work.
-    const next = await api.analysisReadiness(activeProjectId);
+    //
+    // The rethrow is session-checked all the same. A caller reports what it
+    // catches by calling `setError`, which is global, so an obsolete rejection
+    // escaping here would put the abandoned project's failure on the current
+    // one — the same defect as an obsolete success, and #28 rules out both.
+    let next: AnalysisReadiness;
+    try {
+      next = await api.analysisReadiness(activeProjectId);
+    } catch (reason) {
+      if (!isCurrent(token)) return;
+      throw reason;
+    }
     if (!isCurrent(token)) return;
     setReadiness(next);
   }, [begin, isCurrent]);
