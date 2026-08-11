@@ -134,6 +134,30 @@ describe("CUJ 12 — the renderer restarts", () => {
     expect(harness.state.assets.asset_sony_a7c_ii_001.rotationDegrees).toBe(90);
   });
 
+  it("comes back to the clip the user was last on, not the first in the queue", async () => {
+    const harness = trip();
+    let app = await renderApp(harness);
+
+    // Two clips in, to SONY_002 — well clear of the boot default (SONY_001).
+    await app.user.keyboard("jj");
+    await waitFor(() => expect(selectedRow()?.textContent).toContain("SONY_002.MP4"));
+    await waitFor(() => expect(harness.state.settings.lastAssetId).toBe("asset_sony_a7c_ii_002"));
+
+    app = await app.remount();
+
+    // Restored to the recorded position rather than falling back to SONY_001.
+    await waitFor(() => expect(selectedRow()?.textContent).toContain("SONY_002.MP4"));
+  });
+
+  it("falls back to the first clip when the recorded clip is gone, without an error", async () => {
+    const harness = trip();
+    harness.state.settings.lastAssetId = "asset_that_no_longer_exists";
+    await renderApp(harness);
+
+    expect(selectedRow()?.textContent).toContain("SONY_001.MP4");
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
   it("keeps the autoplay setting the user chose", async () => {
     const harness = trip();
     let app = await renderApp(harness);

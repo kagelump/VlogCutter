@@ -189,6 +189,11 @@ function App() {
   const videoRef = useRef<HTMLVideoElement>(null);
   const assetsRef = useRef<Asset[]>([]);
   const selectedIdRef = useRef("");
+  // The clip to land on when a queue arrives with no live selection yet — the
+  // review position recorded on last exit. Held in a ref so the assets read can
+  // consult it without a dependency, and left in place: once the selection is
+  // live, `onAssetsRead` keeps it and never consults this again.
+  const restoreAssetIdRef = useRef("");
   const orientationQueueRef = useRef<string[]>([]);
   const orientationActiveRef = useRef(new Set<string>());
 
@@ -201,10 +206,15 @@ function App() {
     onError: setError,
     onAssetsRead: useCallback((loaded: Asset[]) => {
       // Applied with the queue rather than in a following effect, so the panel
-      // and the queue arrive in the same render.
-      setSelectedId((current) =>
-        loaded.some((asset) => asset.id === current) ? current : loaded[0]?.id || "",
-      );
+      // and the queue arrive in the same render. With no live selection yet,
+      // prefer the recorded review position when it is still in this queue, and
+      // fall back to the first clip when it is gone or belongs elsewhere.
+      setSelectedId((current) => {
+        if (loaded.some((asset) => asset.id === current)) return current;
+        const restore = restoreAssetIdRef.current;
+        if (restore && loaded.some((asset) => asset.id === restore)) return restore;
+        return loaded[0]?.id || "";
+      });
       // A count here would be the third copy of a number the queue badge and
       // the ribbon already carry; only the empty case says anything new.
       setMessage(loaded.length ? "" : "Choose a media folder to begin");
@@ -339,6 +349,9 @@ function App() {
     Promise.all([refreshProjects(), refreshLibrary(), api.prerequisiteStatus(), api.desktopSettings()])
       .then(([, , tools, desktopSettings]) => {
         setSettings(desktopSettings);
+        // Set before the assets read commits, so the first queue can land on
+        // the recorded clip rather than the first one.
+        restoreAssetIdRef.current = desktopSettings.lastAssetId ?? "";
         setMakeImportProxies(desktopSettings.makeProxiesOnImport);
         api.serverConnectionStatus().then(setServerStatus).catch(() => {});
         const missing = tools.filter((tool) => !tool.available).map((tool) => tool.name);

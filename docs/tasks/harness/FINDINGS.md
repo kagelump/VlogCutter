@@ -36,15 +36,22 @@ uncalled command so the gap cannot drift back into an accident.
 Pinned by: `review.cuj.test.tsx` ("sends the whole patch, because rotation is
 part of the asset contract"), which asserts the `update_asset` payload.
 
-## 2. The desktop records where you were and never takes you back
+## 2. The desktop records where you were and never takes you back — RESOLVED (#24)
 
 `record_desktop_context` fires on every selection change, and
-`DesktopSettings.lastAssetId` is faithfully stored. On launch, `App` restores
-the project and then selects `result[0]` — the first clip in the queue. The
-recorded clip is never read.
+`DesktopSettings.lastAssetId` is faithfully stored. On launch, `App` restored
+the project and then selected `result[0]` — the first clip in the queue. The
+recorded clip was never read.
 
-Pinned by: `review.cuj.test.tsx` (CUJ 12), which asserts judgments are restored
-and the selection lands on the first clip.
+Fixed: `App` holds the recorded `lastAssetId` in `restoreAssetIdRef` when
+settings load, and `onAssetsRead` lands the first queue on that clip when it is
+still present, falling back to the first clip when it is gone or belongs to
+another project. Once a selection is live, subsequent reads keep it.
+
+Pinned by: `review.cuj.test.tsx` (CUJ 12), which now asserts the opposite — a
+remount comes back to the clip the user was last on ("comes back to the clip the
+user was last on, not the first in the queue"), and a recorded clip that no
+longer exists falls back to the first clip without an error.
 
 ## 3. `generate_proxy` is unreachable through the interface
 
