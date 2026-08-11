@@ -53,19 +53,24 @@ remount comes back to the clip the user was last on ("comes back to the clip the
 user was last on, not the first in the queue"), and a recorded clip that no
 longer exists falls back to the first clip without an error.
 
-## 3. `generate_proxy` is unreachable through the interface
+## 3. The single-clip "Make proxy" button was unreachable — RESOLVED (#25)
 
-The single-clip "Make proxy" button lives on the stage's offline slate, which
-renders only when the selected clip has **no** playable URL. A clip with no URL
-has no original either — and `generate_proxy` needs the original. The only state
-that shows the button and could succeed is "the loopback media origin failed to
+The "Make proxy" button lived on the stage's offline slate, which renders only
+when the selected clip has **no** playable URL. A clip with no URL has no
+original either — and `generate_proxy` needs the original. The only state that
+showed the button and could succeed was "the loopback media origin failed to
 bind", where making a proxy does not help.
 
-The batch (`generate_missing_proxies`) covers the real need, so this is a dead
-affordance rather than a missing capability.
+Fixed: the dead button was removed from the slate (the slate now only explains
+the unplayable clip). `generate_proxy` keeps its real, documented trigger — the
+`P` keyboard shortcut on a playable clip that lacks a proxy, where it succeeds —
+and the batch (`generate_missing_proxies`) still covers "this project needs
+proxies".
 
-Pinned by: `generation.cuj.test.tsx`, which exercises `generate_proxy` at the
-command boundary and says why.
+Pinned by: `generation.cuj.test.tsx` ("makes the selected clip's proxy from the
+keyboard (P)"), which drives the real reachable path, and
+`VideoStage.test.tsx` ("never offers a proxy control from the slate"), which
+holds the slate to explanation rather than repair.
 
 ## 4. A finished analysis run does not refresh the clip you are looking at — RESOLVED (#18)
 

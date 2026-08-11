@@ -134,20 +134,21 @@ describe("CUJ 8 — making the missing proxies", () => {
     );
   });
 
-  it("generates a single clip's proxy through its own command", async () => {
-    // `generate_proxy` is reachable in production only from the stage's slate,
-    // which appears when the selected clip has no playable URL at all — so it
-    // is exercised here at the command boundary rather than through a screen
-    // the fixture cannot legitimately reach.
+  it("makes the selected clip's proxy from the keyboard (P)", async () => {
+    // `generate_proxy` reaches production through the documented P shortcut on a
+    // playable clip that lacks a proxy — where it succeeds. (The dead offline-
+    // slate button that once nominally triggered it was removed in #25.)
     const harness = halfProxied();
-    await renderApp(harness);
+    const app = await renderApp(harness);
 
-    const updated = (await window.__TAURI_INTERNALS__!.invoke("generate_proxy", {
-      assetId: "asset_sony_a7c_ii_004",
-    })) as { proxyAvailable: boolean; proxyRepresentation: string };
+    // Select a clip that plays off its original and has no proxy yet.
+    await app.user.click(screen.getByText("SONY_004.MP4"));
+    await waitFor(() => expect(currentSource()).toContain("rep=original"));
 
-    expect(updated).toMatchObject({ proxyAvailable: true, proxyRepresentation: "raw_v3" });
-    expect(harness.state.assets.asset_sony_a7c_ii_004.proxyAvailable).toBe(true);
+    await app.user.keyboard("p");
+
+    await waitFor(() => expect(harness.state.assets.asset_sony_a7c_ii_004.proxyAvailable).toBe(true));
+    expect(harness.state.assets.asset_sony_a7c_ii_004.proxyRepresentation).toBe("raw_v3");
     expect(proxiedCount(harness)).toBe(3);
   });
 

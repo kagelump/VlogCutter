@@ -36,9 +36,6 @@ export interface VideoStageProps {
   buffering: boolean;
   muted: boolean;
   autoplay: boolean;
-  /** Desktop, with the original in reach. */
-  canMakeProxy: boolean;
-  busy: boolean;
   stageRef: RefObject<HTMLDivElement | null>;
   /** Attached to the active element only; the shell drives playback through it. */
   videoRef: RefObject<HTMLVideoElement | null>;
@@ -47,7 +44,6 @@ export interface VideoStageProps {
   onPlayingChange(playing: boolean): void;
   onDurationChange(seconds: number): void;
   onPositionChange(seconds: number): void;
-  onMakeProxy(): void;
   /**
    * The active element could not load or decode its source. The shell uses this
    * to check whether the loopback origin serving review media is still alive.
@@ -72,8 +68,6 @@ export function VideoStage({
   buffering,
   muted,
   autoplay,
-  canMakeProxy,
-  busy,
   stageRef,
   videoRef,
   onTogglePlay,
@@ -81,7 +75,6 @@ export function VideoStage({
   onPlayingChange,
   onDurationChange,
   onPositionChange,
-  onMakeProxy,
   onMediaError,
 }: VideoStageProps) {
   return (
@@ -159,9 +152,6 @@ export function VideoStage({
             <span className="slate-time">{formatDate(selected.bestTime)}</span>
             <strong>{selected.filename}</strong>
             <span>{selected.proxyPath && !selected.proxyAvailable ? "Proxy is missing" : "No review proxy yet"}</span>
-            {canMakeProxy && (
-              <button className="button primary" disabled={busy} onClick={onMakeProxy}>Make proxy</button>
-            )}
           </div>
         )
       ) : (

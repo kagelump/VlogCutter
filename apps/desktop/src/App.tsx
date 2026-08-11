@@ -1834,8 +1834,6 @@ function App() {
             buffering={isBuffering}
             muted={isMuted}
             autoplay={shouldAutoplay}
-            canMakeProxy={api.isDesktop() && Boolean(selected?.available)}
-            busy={busy}
             stageRef={viewerStageRef}
             videoRef={videoRef}
             onTogglePlay={togglePlayback}
@@ -1843,7 +1841,6 @@ function App() {
             onPlayingChange={setIsPlaying}
             onDurationChange={setMediaDuration}
             onPositionChange={setPlaybackSeconds}
-            onMakeProxy={makeProxy}
             onMediaError={handleMediaError}
           />
 

@@ -42,8 +42,6 @@ function renderStage(overrides: Partial<VideoStageProps> = {}) {
     buffering: false,
     muted: false,
     autoplay: false,
-    canMakeProxy: false,
-    busy: false,
     stageRef: createRef<HTMLDivElement>(),
     videoRef: createRef<HTMLVideoElement>(),
     onTogglePlay: vi.fn(),
@@ -51,7 +49,6 @@ function renderStage(overrides: Partial<VideoStageProps> = {}) {
     onPlayingChange: vi.fn(),
     onDurationChange: vi.fn(),
     onPositionChange: vi.fn(),
-    onMakeProxy: vi.fn(),
     ...overrides,
   };
   return { props, ...render(<VideoStage {...props} />) };
@@ -86,14 +83,11 @@ describe("placeholder states", () => {
     expect(screen.getByText("Proxy is missing")).toBeTruthy();
   });
 
-  it("offers to make a proxy only where one can be made", async () => {
-    renderStage({ selected: asset(), media: [], mediaUrl: null, canMakeProxy: false });
+  it("never offers a proxy control from the slate, which cannot repair an unplayable clip", () => {
+    // Proxy generation is a keyboard action (P) on a playable clip; the slate,
+    // which appears only when there is no playable URL, is explanation not repair.
+    renderStage({ selected: asset(), media: [], mediaUrl: null });
     expect(screen.queryByRole("button", { name: "Make proxy" })).toBeNull();
-
-    document.body.innerHTML = "";
-    const { props } = renderStage({ selected: asset(), media: [], mediaUrl: null, canMakeProxy: true });
-    await userEvent.click(screen.getByRole("button", { name: "Make proxy" }));
-    expect(props.onMakeProxy).toHaveBeenCalled();
   });
 });
 
