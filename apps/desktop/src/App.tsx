@@ -35,6 +35,7 @@ import { AnalysisDialog } from "./components/AnalysisDialog";
 import { SyncDiagnosticsModal } from "./components/SyncDiagnosticsModal";
 import { NewProjectModal } from "./components/NewProjectModal";
 import { PairingWizardModal } from "./components/PairingWizardModal";
+import { BaselineWizardModal } from "./components/BaselineWizardModal";
 import { CardBanner } from "./components/CardBanner";
 import { analysisStageLabels, formatCost } from "./review/format";
 import { isRawOrientationProxy, renderedRotation, rotationAfter } from "./review/rotation";
@@ -2167,117 +2168,20 @@ function App() {
 
       {/* ── Baseline pairing wizard ────────────────────────────────── */}
       {showBaselineWizard && (
-        <div className="modal-backdrop pairing-backdrop" role="presentation" onKeyDown={(event) => { if (event.key === "Escape") handleCancelBaselineWizard(); }}>
-          <section className="modal baseline-modal" role="dialog" aria-modal="true" aria-labelledby="baseline-title">
-            <span className="eyebrow">Pair project with server</span>
-            <div className="settings-modal-heading">
-              <h2 id="baseline-title">
-                {baselineStep === "root_mapping" && "Step 1: Map media paths"}
-                {baselineStep === "preview" && "Step 2: Review baseline preview"}
-                {baselineStep === "confirming" && "Uploading baseline…"}
-                {baselineStep === "complete" && "Project paired!"}
-                {baselineStep === "error" && "Pairing issue"}
-              </h2>
-              <button className="text-button" onClick={handleCancelBaselineWizard}>Cancel <kbd>Esc</kbd></button>
-            </div>
-
-            {baselineError && <p className="error-message" role="alert">{baselineError}</p>}
-
-            {/* Step 1: Root mapping */}
-            {baselineStep === "root_mapping" && pathAnalysis && (
-              <div className="wizard-step">
-                <p>Your project has <strong>{pathAnalysis.absolutePathCount}</strong> assets with absolute paths. Map each source folder to a logical storage root that the server can recognize.</p>
-                {pathAnalysis.commonPrefixes.length === 0 ? (
-                  <p className="quiet">No absolute-path assets found — skipping root mapping.</p>
-                ) : (
-                  <div className="root-mapping-table">
-                    <div className="root-mapping-header">
-                      <span>Local path</span>
-                      <span>Assets</span>
-                      <span>Storage root ID</span>
-                    </div>
-                    {rootMappings.map((mapping, i) => (
-                      <div className="root-mapping-row" key={i}>
-                        <span className="mono" title={mapping.localPrefix}>{mapping.localPrefix}</span>
-                        <span>{pathAnalysis.commonPrefixes[i]?.assetCount ?? "?"}</span>
-                        <span className="mono">{mapping.storageRootId}</span>
-                      </div>
-                    ))}
-                  </div>
-                )}
-                <p className="quiet">No original media will be uploaded during baseline pairing.</p>
-                <div className="modal-actions">
-                  <button className="button secondary" onClick={handleCancelBaselineWizard}>Cancel</button>
-                  <button className="button primary" disabled={busy} onClick={() => void handleProceedToPreview()}>Preview baseline</button>
-                </div>
-              </div>
-            )}
-
-            {/* Step 2: Baseline preview */}
-            {baselineStep === "preview" && baselinePreview && (
-              <div className="wizard-step">
-                <p>Server preview of <strong>{baselinePreview.preview.projectName}</strong>:</p>
-                <div className="baseline-stats">
-                  <div className="baseline-stat">
-                    <span className="baseline-stat-value">{baselinePreview.preview.assetCount}</span>
-                    <span className="baseline-stat-label">Assets</span>
-                  </div>
-                  <div className="baseline-stat">
-                    <span className="baseline-stat-value">{baselinePreview.preview.operationCount}</span>
-                    <span className="baseline-stat-label">Operations</span>
-                  </div>
-                  <div className="baseline-stat">
-                    <span className="baseline-stat-value">{baselinePreview.preview.conflictCount}</span>
-                    <span className="baseline-stat-label">Conflicts</span>
-                  </div>
-                  <div className="baseline-stat">
-                    <span className="baseline-stat-value">{baselinePreview.preview.rootMappingCount}</span>
-                    <span className="baseline-stat-label">Root mappings</span>
-                  </div>
-                  <div className="baseline-stat">
-                    <span className="baseline-stat-value">{baselinePreview.preview.linkedMediaCount}</span>
-                    <span className="baseline-stat-label">Linked media</span>
-                  </div>
-                </div>
-                <p className="quiet">Baseline digest: <span className="mono">{baselinePreview.digest.slice(0, 16)}…</span></p>
-                <p className="quiet">This operation will NOT upload any original media files. Only project metadata and manifests are transferred.</p>
-                <div className="modal-actions">
-                  <button className="button secondary" onClick={() => setBaselineStep("root_mapping")}>Back</button>
-                  <button className="button primary" disabled={busy} onClick={() => void handleConfirmBaseline()}>Confirm &amp; upload baseline</button>
-                </div>
-              </div>
-            )}
-
-            {/* Step 3: Confirming */}
-            {baselineStep === "confirming" && (
-              <div className="wizard-step">
-                <p>Uploading baseline to server…</p>
-              </div>
-            )}
-
-            {/* Step 4: Complete */}
-            {baselineStep === "complete" && (
-              <div className="wizard-step">
-                <p className="success">Project is now paired with the server!</p>
-                <p>The server has a replica of your project. Background sync will begin automatically.</p>
-                <div className="modal-actions">
-                  <button className="button primary" autoFocus onClick={() => { setShowBaselineWizard(false); setBaselineStep("root_mapping"); setPathAnalysis(null); setRootMappings([]); setBaselinePreview(null); }}>Done</button>
-                </div>
-              </div>
-            )}
-
-            {/* Error state */}
-            {baselineStep === "error" && (
-              <div className="wizard-step">
-                <p>The baseline operation did not complete. You can retry safely — no data has been lost.</p>
-                <div className="modal-actions">
-                  <button className="button secondary" onClick={handleCancelBaselineWizard}>Abandon</button>
-                  <button className="button primary" onClick={() => void handleRetryBaseline()}>Retry</button>
-                </div>
-              </div>
-            )}
-          </section>
-        </div>
+        <BaselineWizardModal
+          step={baselineStep}
+          error={baselineError}
+          pathAnalysis={pathAnalysis}
+          rootMappings={rootMappings}
+          preview={baselinePreview}
+          busy={busy}
+          onPreview={() => void handleProceedToPreview()}
+          onBack={() => setBaselineStep("root_mapping")}
+          onConfirm={() => void handleConfirmBaseline()}
+          onRetry={() => void handleRetryBaseline()}
+          onDone={() => { setShowBaselineWizard(false); setBaselineStep("root_mapping"); setPathAnalysis(null); setRootMappings([]); setBaselinePreview(null); }}
+          onCancel={handleCancelBaselineWizard}
+        />
       )}
 
       {showAnalysisDialog && readiness && (
