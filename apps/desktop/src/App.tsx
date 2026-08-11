@@ -33,6 +33,7 @@ import { ImportHistoryDialog } from "./components/ImportHistoryDialog";
 import { KeyboardShortcutsModal } from "./components/KeyboardShortcutsModal";
 import { AnalysisDialog } from "./components/AnalysisDialog";
 import { SyncDiagnosticsModal } from "./components/SyncDiagnosticsModal";
+import { NewProjectModal } from "./components/NewProjectModal";
 import { CardBanner } from "./components/CardBanner";
 import { analysisStageLabels, formatCost } from "./review/format";
 import { isRawOrientationProxy, renderedRotation, rotationAfter } from "./review/rotation";
@@ -1988,52 +1989,19 @@ function App() {
       )}
 
       {showCreate && (
-        <div className="modal-backdrop" role="presentation">
-          <section className="modal" role="dialog" aria-modal="true" aria-labelledby="new-project-title">
-            <span className="eyebrow">Trip projects</span>
-            <h2 id="new-project-title">Open or create a working set</h2>
-            <div className="project-library-heading">
-              <span className="section-label">Projects folder</span>
-              {api.isDesktop() && <button className="text-button" disabled={busy} onClick={configureProjectsRoot}>Change…</button>}
-            </div>
-            <div className="project-root mono" title={library.rootPath}>{library.rootPath || "Loading…"}</div>
-            {library.projects.length > 0 ? (
-              <div className="project-library-list">
-                {library.projects.map((location) => (
-                  <button
-                    className="project-library-item"
-                    disabled={busy}
-                    key={`${location.catalogPath}:${location.project.id}`}
-                    onClick={() => openLibraryProject(location)}
-                  >
-                    <strong>{location.project.name}</strong>
-                    <span>{location.project.assetCount} clips · {location.project.labeledCount} labeled</span>
-                  </button>
-                ))}
-              </div>
-            ) : (
-              <p className="project-library-empty">No VlogCutter projects found in this folder.</p>
-            )}
-            <div className="modal-divider"><span>New project</span></div>
-            <p>Originals stay where they are. The catalog, proxies, and thumbnails will live in this project’s folder.</p>
-            <input
-              autoFocus
-              value={newProjectName}
-              onChange={(event) => setNewProjectName(event.target.value)}
-              onKeyDown={(event) => event.key === "Enter" && void createProject()}
-              placeholder="e.g. Hokkaido winter 2026"
-            />
-            <div className="modal-actions">
-              {api.isDesktop() && (
-                <button className="button secondary" disabled={busy} onClick={openCatalog}>
-                  Open existing project…
-                </button>
-              )}
-              {projects.length > 0 && <button className="button secondary" onClick={() => setShowCreate(false)}>Cancel</button>}
-              <button className="button primary" disabled={busy || !newProjectName.trim()} onClick={createProject}>Create project</button>
-            </div>
-          </section>
-        </div>
+        <NewProjectModal
+          library={library}
+          isDesktop={api.isDesktop()}
+          busy={busy}
+          newProjectName={newProjectName}
+          canCancel={projects.length > 0}
+          onChangeRoot={configureProjectsRoot}
+          onOpenProject={openLibraryProject}
+          onNewProjectNameChange={setNewProjectName}
+          onOpenCatalog={openCatalog}
+          onCancel={() => setShowCreate(false)}
+          onCreate={() => void createProject()}
+        />
       )}
 
       {showSettings && (
