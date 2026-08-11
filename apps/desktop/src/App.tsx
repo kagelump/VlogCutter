@@ -1,5 +1,4 @@
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent } from "react";
-import { StatusBadge } from "@rcdvlog/review-ui";
 import { api } from "./api";
 import type { ArchiveRoot, Asset, AssetPatch, AutoplayMode, BaselineImportResult, BaselinePreviewResult, CardCandidate, DesktopSettings, ImportHistoryEntry, ImportPreflight, ImportProgress, ImportRollbackPreview, ImportRunReport, ImportSessionDetail, ModelInstallProgress, ModelStatus, PathAnalysis, Project, ProjectLibrary, ProjectLocation, ProjectPairingStatus, RootMappingEntry, ServerConnectionStatus, ServerVersionInfo, SyncStatus, TranscriptStatus } from "./types";
 import { useProjectSession } from "./session/projectSession";
@@ -33,8 +32,9 @@ import { ImportDialog } from "./components/ImportDialog";
 import { ImportHistoryDialog } from "./components/ImportHistoryDialog";
 import { KeyboardShortcutsModal } from "./components/KeyboardShortcutsModal";
 import { AnalysisDialog } from "./components/AnalysisDialog";
+import { SyncDiagnosticsModal } from "./components/SyncDiagnosticsModal";
 import { CardBanner } from "./components/CardBanner";
-import { analysisStageLabels, formatCost, syncStateLabel } from "./review/format";
+import { analysisStageLabels, formatCost } from "./review/format";
 import { isRawOrientationProxy, renderedRotation, rotationAfter } from "./review/rotation";
 
 const autoplayOptions: Array<{ value: AutoplayMode; label: string; detail: string }> = [
@@ -2390,121 +2390,11 @@ function App() {
       {showShortcuts && <KeyboardShortcutsModal onClose={() => setShowShortcuts(false)} />}
       {/* ── Sync diagnostics ─────────────────────────────────────── */}
       {showSyncDiagnostics && syncStatus && (
-        <div className="modal-backdrop" role="presentation" onKeyDown={(event) => { if (event.key === "Escape") setShowSyncDiagnostics(false); }}>
-          <section className="modal sync-diagnostics-modal" role="dialog" aria-modal="true" aria-labelledby="sync-diag-title">
-            <span className="eyebrow">Sync status</span>
-            <div className="settings-modal-heading">
-              <h2 id="sync-diag-title">{syncStateLabel(syncStatus.state)}</h2>
-              <button className="text-button" onClick={() => setShowSyncDiagnostics(false)}>Close</button>
-            </div>
-            <div className="sync-diag-grid">
-              <div className="sync-diag-row">
-                <span className="sync-diag-label">State</span>
-                <StatusBadge
-                  className={`sync-state-badge sync-state-${syncStatus.state}`}
-                  label={syncStateLabel(syncStatus.state)}
-                  tone={syncStatus.state === "synced" ? "positive" : syncStatus.state === "attention" ? "warning" : "neutral"}
-                />
-              </div>
-              {syncStatus.lastSyncAt && (
-                <div className="sync-diag-row">
-                  <span className="sync-diag-label">Last sync</span>
-                  <span>{new Date(syncStatus.lastSyncAt).toLocaleString()}</span>
-                </div>
-              )}
-              {syncStatus.activeEndpoint && (
-                <div className="sync-diag-row">
-                  <span className="sync-diag-label">Endpoint</span>
-                  <span className="endpoint-tag">{syncStatus.activeEndpoint}</span>
-                </div>
-              )}
-              <div className="sync-diag-row">
-                <span className="sync-diag-label">Pending (local → server)</span>
-                <span>{syncStatus.localPendingOperations}</span>
-              </div>
-              <div className="sync-diag-row">
-                <span className="sync-diag-label">Pending (server → local)</span>
-                <span>{syncStatus.remotePendingOperations}</span>
-              </div>
-              {syncStatus.conflictCount > 0 && (
-                <div className="sync-diag-section">
-                  <div className="sync-diag-row sync-diag-warn">
-                    <span className="sync-diag-label">Conflicts</span>
-                    <span>{syncStatus.conflictCount} unresolved</span>
-                  </div>
-                  {syncStatus.conflictDetails?.map((detail) => (
-                    <div key={detail.conflictId} className="sync-diag-conflict">
-                      <div className="sync-diag-conflict-header">
-                        <span className="sync-diag-label">{detail.conflictType.replace(/_/g, ' ')}</span>
-                        <span className="sync-diag-label">on {detail.aggregateId}</span>
-                      </div>
-                      <div className="sync-diag-conflict-sides">
-                        {detail.incomingOperationSummary && (
-                          <div className="sync-diag-conflict-side">
-                            <span className="sync-diag-side-label">Incoming (conflicting)</span>
-                            <div className="sync-diag-conflict-detail">
-                              <span>Node: {detail.incomingOperationSummary.originNodeId}</span>
-                              {detail.incomingOperationSummary.camera && (
-                                <span>Camera: {detail.incomingOperationSummary.camera}</span>
-                              )}
-                              {detail.incomingOperationSummary.startFilename && (
-                                <span>File: {detail.incomingOperationSummary.startFilename}</span>
-                              )}
-                              {detail.incomingOperationSummary.offsetSeconds != null && (
-                                <span>Offset: {detail.incomingOperationSummary.offsetSeconds}s</span>
-                              )}
-                              {detail.incomingOperationSummary.label && (
-                                <span>Label: {detail.incomingOperationSummary.label}</span>
-                              )}
-                            </div>
-                          </div>
-                        )}
-                        {detail.activeOperationSummary && (
-                          <div className="sync-diag-conflict-side">
-                            <span className="sync-diag-side-label">Active (currently applied)</span>
-                            <div className="sync-diag-conflict-detail">
-                              <span>Node: {detail.activeOperationSummary.originNodeId}</span>
-                              {detail.activeOperationSummary.camera && (
-                                <span>Camera: {detail.activeOperationSummary.camera}</span>
-                              )}
-                              {detail.activeOperationSummary.startFilename && (
-                                <span>File: {detail.activeOperationSummary.startFilename}</span>
-                              )}
-                              {detail.activeOperationSummary.offsetSeconds != null && (
-                                <span>Offset: {detail.activeOperationSummary.offsetSeconds}s</span>
-                              )}
-                              {detail.activeOperationSummary.label && (
-                                <span>Label: {detail.activeOperationSummary.label}</span>
-                              )}
-                            </div>
-                          </div>
-                        )}
-                      </div>
-                      <div className="sync-diag-conflict-meta">
-                        <span>Expected revision: {detail.expectedBaseRevision ?? "—"} → Actual: {detail.actualRevision}</span>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              )}
-              {syncStatus.lastError && (
-                <div className="sync-diag-row sync-diag-error">
-                  <span className="sync-diag-label">Last error</span>
-                  <span>{syncStatus.lastError}</span>
-                </div>
-              )}
-              {syncStatus.backoffUntil && (
-                <div className="sync-diag-row">
-                  <span className="sync-diag-label">Next retry</span>
-                  <span>{new Date(syncStatus.backoffUntil).toLocaleString()}</span>
-                </div>
-              )}
-            </div>
-            <div className="sync-diag-actions">
-              <button className="button secondary" onClick={() => { api.syncNow(syncStatus.projectId).catch(() => {}); }}>Sync now</button>
-            </div>
-          </section>
-        </div>
+        <SyncDiagnosticsModal
+          status={syncStatus}
+          onSyncNow={() => { api.syncNow(syncStatus.projectId).catch(() => {}); }}
+          onClose={() => setShowSyncDiagnostics(false)}
+        />
       )}
 
       {showImportDialog && (
