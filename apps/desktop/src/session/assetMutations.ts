@@ -72,8 +72,29 @@ const EMPTY_SNAPSHOT: MutationSnapshot = { saveState: "idle", activeAssetId: nul
 export class AssetMutationLifecycle {
   private readonly effects: AssetMutationEffects;
   private snapshotValue: MutationSnapshot = EMPTY_SNAPSHOT;
-  /** assetId → the payload of the write currently in flight for it. */
-  private readonly inFlight = new Map<string, string>();
+  /**
+   * assetId → the payload of the write outstanding for it, in flight or waiting
+   * its turn. What the double-submit guard compares against.
+   */
+  private readonly outstanding = new Map<string, string>();
+  /**
+   * assetId → the tail of that asset's write chain.
+   *
+   * `update_asset` takes a whole `AssetPatch` and the transport carries no
+   * revision token, so the backend cannot reconcile two overlapping writes: the
+   * one that happens to land second wins, whichever the user asked for first.
+   * Two rotations completing in reverse order left the catalog — and the queue,
+   * since the reply is applied — showing the older angle. So writes to one asset
+   * are run one after another; writes to different assets stay concurrent.
+   */
+  private readonly chain = new Map<string, Promise<void>>();
+  /**
+   * assetId → the newest value known for it while writes are outstanding,
+   * optimistic or backend-confirmed. A queued write builds its patch from this
+   * at send time, so it carries what the write ahead of it changed instead of
+   * the values those fields held when the user asked for this one.
+   */
+  private readonly latest = new Map<string, Asset>();
 
   constructor(effects: AssetMutationEffects) {
     this.effects = effects;
@@ -96,34 +117,79 @@ export class AssetMutationLifecycle {
   /**
    * Write `changes` to an asset.
    *
-   * Refuses a second identical submit while the first is still in flight: that
-   * is the double-submit case (a blur that fires twice, a keyboard save landing
-   * on the same text), and it is refused rather than queued because sending the
-   * same bytes twice is never what the user meant. A different value for the
-   * same field is a new intention and goes through — holding one would break
-   * rotation, where each press is a distinct write.
+   * Refuses a second identical submit while the first is outstanding: that is
+   * the double-submit case (a blur that fires twice, a keyboard save landing on
+   * the same text), and it is refused rather than queued because sending the
+   * same bytes twice is never what the user meant. A different value is a new
+   * intention and is kept — holding one would break rotation, where each press
+   * is a distinct write — but it is queued behind the write already going out
+   * rather than raced against it, so the last intention is the one that lands.
    */
   async submit(
     asset: Asset,
     changes: Partial<AssetPatch>,
     policy: FailurePolicy = "rollback",
   ): Promise<MutationResult> {
-    const payload = JSON.stringify({ ...patchFor(asset), ...changes });
-    if (this.inFlight.get(asset.id) === payload) return "refused";
-    this.inFlight.set(asset.id, payload);
+    // While writes are outstanding the newest value is the one they produced;
+    // with nothing outstanding it is the caller's, which a reload may have
+    // refreshed underneath us.
+    const base = this.latest.get(asset.id) ?? asset;
+    const payload = JSON.stringify({ ...patchFor(base), ...changes });
+    if (this.outstanding.get(asset.id) === payload) return "refused";
 
-    const optimistic = { ...asset, ...changes };
-    this.effects.applyAsset(optimistic);
-    this.update({ saveState: "saving", activeAssetId: asset.id });
+    this.outstanding.set(asset.id, payload);
+    this.latest.set(asset.id, base);
+
+    const queued = (this.chain.get(asset.id) ?? Promise.resolve()).then(() =>
+      this.write(asset.id, changes, policy),
+    );
+    // The tail must settle whatever happened, or one rejection would strand
+    // every write queued behind it. `write` already resolves on failure; this
+    // covers the enqueue itself.
+    const tail = queued.then(() => undefined, () => undefined);
+    this.chain.set(asset.id, tail);
 
     try {
-      const updated = await this.effects.update(asset.id, { ...patchFor(asset), ...changes });
-      this.effects.applyAsset(updated);
+      return await queued;
+    } finally {
+      if (this.outstanding.get(asset.id) === payload) this.outstanding.delete(asset.id);
+      // Last one out forgets the asset, so the next submit starts from what the
+      // caller is rendering rather than from a value a reload has superseded.
+      if (this.chain.get(asset.id) === tail) {
+        this.chain.delete(asset.id);
+        this.latest.delete(asset.id);
+      }
+    }
+  }
+
+  /**
+   * Send one write, once its turn comes.
+   *
+   * The patch is built here rather than at `submit`: a write that waited behind
+   * another must carry that one's result in the fields it is not itself
+   * changing, or the whole-patch contract would silently undo it.
+   */
+  private async write(
+    assetId: string,
+    changes: Partial<AssetPatch>,
+    policy: FailurePolicy,
+  ): Promise<MutationResult> {
+    const base = this.latest.get(assetId);
+    // Only reachable if the chain outlived its own bookkeeping; nothing to write.
+    if (!base) return "refused";
+
+    const optimistic = { ...base, ...changes };
+    this.apply(optimistic);
+    this.update({ saveState: "saving", activeAssetId: assetId });
+
+    try {
+      const updated = await this.effects.update(assetId, { ...patchFor(base), ...changes });
+      this.apply(updated);
       // A write carrying the retained draft is the draft being saved, whatever
       // else prompted it: the backend now holds that text, so the unsaved mark
       // would be a lie.
-      const drafts = this.clearDraftIfWritten(asset.id, updated);
-      this.update({ saveState: "saved", activeAssetId: asset.id, drafts });
+      const drafts = this.clearDraftIfWritten(assetId, updated);
+      this.update({ saveState: "saved", activeAssetId: assetId, drafts });
       return "saved";
     } catch (reason) {
       const message = String(reason);
@@ -131,24 +197,28 @@ export class AssetMutationLifecycle {
         // The draft stays on screen and stays marked, so the user can send the
         // same text again without retyping it or touching the field to
         // retrigger a blur.
-        this.effects.applyAsset(optimistic);
+        this.apply(optimistic);
         this.update({
           saveState: "unsaved",
-          activeAssetId: asset.id,
+          activeAssetId: assetId,
           drafts: {
             ...this.snapshotValue.drafts,
-            [asset.id]: { assetId: asset.id, notes: optimistic.notes, error: message },
+            [assetId]: { assetId, notes: optimistic.notes, error: message },
           },
         });
       } else {
-        this.effects.applyAsset(asset);
-        this.update({ saveState: "idle", activeAssetId: asset.id });
+        this.apply(base);
+        this.update({ saveState: "idle", activeAssetId: assetId });
       }
       this.effects.onError(message);
       return "failed";
-    } finally {
-      if (this.inFlight.get(asset.id) === payload) this.inFlight.delete(asset.id);
     }
+  }
+
+  /** Publish an asset value and remember it as the base for anything queued behind. */
+  private apply(asset: Asset) {
+    if (this.latest.has(asset.id)) this.latest.set(asset.id, asset);
+    this.effects.applyAsset(asset);
   }
 
   /** Save the notes currently on the asset, keeping them on screen if the write fails. */

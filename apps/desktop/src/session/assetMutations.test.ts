@@ -248,4 +248,136 @@ describe("two submits at once", () => {
     expect(await second).toBe("saved");
     expect(harness.update).toHaveBeenCalledTimes(2);
   });
+
+  it("sends them one at a time, so the backend cannot answer them out of order", async () => {
+    const releases: Array<() => void> = [];
+    const harness = lifecycleFor(async (assetId, patch) => {
+      await new Promise<void>((resolve) => releases.push(resolve));
+      return asset({ id: assetId, ...patch });
+    });
+    const clip = asset();
+
+    const first = harness.lifecycle.submit(clip, { rotationDegrees: 90 });
+    const second = harness.lifecycle.submit(clip, { rotationDegrees: 180 });
+    await Promise.resolve();
+
+    // The second write has not been sent: there is nothing for the backend to
+    // complete in the wrong order.
+    expect(harness.update).toHaveBeenCalledTimes(1);
+
+    releases[0]();
+    expect(await first).toBe("saved");
+    releases[1]();
+    expect(await second).toBe("saved");
+
+    expect(harness.update.mock.calls.map((call) => call[1].rotationDegrees)).toEqual([90, 180]);
+  });
+
+  it("leaves the user's latest intention in place when writes finish in reverse order", async () => {
+    // The backend answers the *second* write first — the reverse completion the
+    // old racing path allowed, which left the catalog holding 90 after the user
+    // had asked for 180.
+    const pending: Array<{ patch: AssetPatch; resolve: (value: Asset) => void }> = [];
+    const harness = lifecycleFor(
+      (assetId, patch) =>
+        new Promise<Asset>((resolve) => {
+          pending.push({ patch, resolve: (value) => resolve(value) });
+        }),
+    );
+    const clip = asset();
+
+    const first = harness.lifecycle.submit(clip, { rotationDegrees: 90 });
+    const second = harness.lifecycle.submit(clip, { rotationDegrees: 180 });
+    await Promise.resolve();
+
+    // Only the first is out, so answering "second first" is not expressible:
+    // the queue holds it until 90 has landed.
+    expect(pending).toHaveLength(1);
+    pending[0].resolve(asset({ id: "asset_1", ...pending[0].patch }));
+    expect(await first).toBe("saved");
+
+    await Promise.resolve();
+    expect(pending).toHaveLength(2);
+    pending[1].resolve(asset({ id: "asset_1", ...pending[1].patch }));
+    expect(await second).toBe("saved");
+
+    // Both the write that reached the backend last and the value left on screen
+    // are the user's latest intention.
+    expect(harness.update.mock.calls.at(-1)?.[1].rotationDegrees).toBe(180);
+    expect(harness.applied.at(-1)?.rotationDegrees).toBe(180);
+  });
+
+  it("composes queued writes rather than letting a whole patch undo the one ahead of it", async () => {
+    const releases: Array<() => void> = [];
+    const harness = lifecycleFor(async (assetId, patch) => {
+      await new Promise<void>((resolve) => releases.push(resolve));
+      return asset({ id: assetId, ...patch });
+    });
+    const clip = asset();
+
+    // Two different fields, submitted from the same stale asset object. The
+    // second patch is built when it is sent, so it carries the first's label
+    // instead of the empty list `clip` still shows.
+    const first = harness.lifecycle.submit(clip, { labels: ["arrival"] });
+    const second = harness.lifecycle.submit(clip, { rotationDegrees: 180 });
+    await Promise.resolve();
+
+    releases[0]();
+    await first;
+    await Promise.resolve();
+    releases[1]();
+    await second;
+
+    expect(harness.update.mock.calls.at(-1)?.[1]).toEqual({
+      notes: "",
+      labels: ["arrival"],
+      removed: false,
+      rotationDegrees: 180,
+    });
+    expect(harness.applied.at(-1)?.labels).toEqual(["arrival"]);
+    expect(harness.applied.at(-1)?.rotationDegrees).toBe(180);
+  });
+
+  it("still runs writes to different clips at the same time", async () => {
+    const releases: Array<() => void> = [];
+    const harness = lifecycleFor(async (assetId, patch) => {
+      await new Promise<void>((resolve) => releases.push(resolve));
+      return asset({ id: assetId, ...patch });
+    });
+
+    const first = harness.lifecycle.submit(asset({ id: "asset_1" }), { rotationDegrees: 90 });
+    const second = harness.lifecycle.submit(asset({ id: "asset_2" }), { rotationDegrees: 90 });
+    await Promise.resolve();
+
+    // Serialization is per clip: one slow write must not hold up another clip's.
+    expect(harness.update).toHaveBeenCalledTimes(2);
+    releases.forEach((release) => release());
+    expect(await first).toBe("saved");
+    expect(await second).toBe("saved");
+  });
+
+  it("keeps the queue moving after a write in it fails", async () => {
+    let refuse = true;
+    const releases: Array<() => void> = [];
+    const harness = lifecycleFor(async (assetId, patch) => {
+      await new Promise<void>((resolve) => releases.push(resolve));
+      if (refuse) throw new Error("database is locked");
+      return asset({ id: assetId, ...patch });
+    });
+    const clip = asset();
+
+    const first = harness.lifecycle.submit(clip, { rotationDegrees: 90 });
+    const second = harness.lifecycle.submit(clip, { rotationDegrees: 180 });
+    await Promise.resolve();
+
+    releases[0]();
+    expect(await first).toBe("failed");
+    refuse = false;
+    await Promise.resolve();
+    releases[1]();
+
+    // The rejection rolled the first back; the write behind it is not stranded.
+    expect(await second).toBe("saved");
+    expect(harness.applied.at(-1)?.rotationDegrees).toBe(180);
+  });
 });
