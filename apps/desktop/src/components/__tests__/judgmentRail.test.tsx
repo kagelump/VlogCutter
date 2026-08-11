@@ -64,8 +64,12 @@ describe("clip detail follows the selection", () => {
 
 describe("clip detail is not refetched by unrelated asset writes", () => {
   it("does not read the observation again on every keystroke in the notes field", async () => {
-    await bootApp();
     const analysis = vi.spyOn(api, "assetAnalysis");
+    await bootApp();
+    // The selection read is part of boot. Take the baseline only after the
+    // visible suggestions prove that read has settled; asserting a global
+    // zero here races the effect that populates the rail.
+    const settledCalls = analysis.mock.calls.length;
     const notes = screen.getByLabelText("Notes");
 
     for (const value of ["a", "ab", "abc", "abcd", "abcde"]) {
@@ -75,13 +79,17 @@ describe("clip detail is not refetched by unrelated asset writes", () => {
 
     // Each keystroke rewrites the asset list. Keyed on that list, this was two
     // IPC calls and two SQLite opens per character typed.
-    expect(analysis).not.toHaveBeenCalled();
+    expect(analysis).toHaveBeenCalledTimes(settledCalls);
   });
 
   it("still reads it again when the selection changes", async () => {
-    await bootApp();
     const analysis = vi.spyOn(api, "assetAnalysis");
+    await bootApp();
+    const settledCalls = analysis.mock.calls.length;
     fireEvent.click(screen.getByText("DJI_001.MP4"));
-    await waitFor(() => expect(analysis).toHaveBeenCalledWith(UNOBSERVED));
+    await waitFor(() => {
+      expect(analysis).toHaveBeenCalledWith(UNOBSERVED);
+      expect(analysis).toHaveBeenCalledTimes(settledCalls + 1);
+    });
   });
 });

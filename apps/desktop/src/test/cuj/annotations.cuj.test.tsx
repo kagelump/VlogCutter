@@ -6,7 +6,7 @@
  * it is invisible to a test that asserts on a spy.
  */
 
-import { screen, waitFor, within } from "@testing-library/react";
+import { act, screen, waitFor, within } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 import { desktopScenario, queueFilenames, renderApp, selectedRow } from "../harness";
 
@@ -156,7 +156,11 @@ describe("CUJ 3 — writing through Focus", () => {
     await app.user.keyboard("The light changes about here");
 
     // F is a review shortcut, so leave the field before pressing it.
-    notes.blur();
+    // Native focus changes trigger the textarea's blur handler. Keep that
+    // state update inside React's test transaction, just like a user event.
+    await act(async () => {
+      notes.blur();
+    });
     await app.user.keyboard("f");
     await waitFor(() => expect(document.querySelector(".app-shell")).toHaveClass("is-focus"));
 

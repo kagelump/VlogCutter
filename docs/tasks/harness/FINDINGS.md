@@ -105,15 +105,7 @@ unsaved, and retries it unchanged") and the unit tests in
 `src/session/assetMutations.test.ts`, which ask what survives a rejection with
 nothing rendered.
 
-## 7. One pre-existing flaky test
-
-`components/__tests__/judgmentRail.test.tsx` — "does not read the observation
-again on every keystroke" — installs its spy after `renderApp` resolves, and a
-selection effect can still be in flight. It failed once under the added parallel
-load of the new suite and has passed every run since. The fix is to assert on
-calls made after a settled point rather than on a zero count.
-
-## 8. The offline slate blames a missing proxy for a missing origin
+## 7. The offline slate blames a missing proxy for a missing origin
 
 The stage renders its slate whenever the selected clip has no playable URL, and
 the slate's sentence is chosen from the clip: "Proxy is missing" when a proxy
