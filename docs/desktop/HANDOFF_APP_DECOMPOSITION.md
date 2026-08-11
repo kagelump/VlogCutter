@@ -75,10 +75,9 @@ Match these or change them everywhere — do not add a third style.
 
 ## Known open items
 
-- **`focus.test.tsx` and `shell.test.tsx` emit React `act(...)` warnings.**
-  345 tests pass and no assertion is affected, but the warnings are real: both
-  suites drive `App` through global key events whose state updates land
-  outside `act`. Worth fixing before the suites grow.
+- **~~`focus.test.tsx` and `shell.test.tsx` emit React `act(...)` warnings.~~**
+  Resolved (#26). Both suites drive `App` through `userEvent`/`act`-wrapped key
+  events; the full desktop suite now emits no `act(...)` warnings.
 - **Spec §10 verification at 1280×800 has no recorded evidence.** The layout
   commits record measurements at 1440×900 only. Whether the 1280×800 pass was
   run and not written down, or not run, cannot be determined from the repo.

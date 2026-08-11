@@ -65,10 +65,13 @@ describe("clip detail follows the selection", () => {
 describe("clip detail is not refetched by unrelated asset writes", () => {
   it("does not read the observation again on every keystroke in the notes field", async () => {
     const analysis = vi.spyOn(api, "assetAnalysis");
-    await bootApp();
+    const { container } = await bootApp();
     // The selection read is part of boot. Take the baseline only after the
-    // visible suggestions prove that read has settled; asserting a global
-    // zero here races the effect that populates the rail.
+    // visible suggestions prove that read has resolved — boot waits for the
+    // title, which lands before the rail — so no in-flight read can settle
+    // during the keystroke loop and inflate the count. Asserting a global zero
+    // here raced that effect.
+    await waitFor(() => expect(suggestions(container)).toContain("station"));
     const settledCalls = analysis.mock.calls.length;
     const notes = screen.getByLabelText("Notes");
 
@@ -84,7 +87,10 @@ describe("clip detail is not refetched by unrelated asset writes", () => {
 
   it("still reads it again when the selection changes", async () => {
     const analysis = vi.spyOn(api, "assetAnalysis");
-    await bootApp();
+    const { container } = await bootApp();
+    // Same settled baseline: the observed clip's read must be counted before the
+    // selection change, or the +1 below races an in-flight boot read.
+    await waitFor(() => expect(suggestions(container)).toContain("station"));
     const settledCalls = analysis.mock.calls.length;
     fireEvent.click(screen.getByText("DJI_001.MP4"));
     await waitFor(() => {
