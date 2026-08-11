@@ -15,32 +15,41 @@ each with a test file under `__tests__/`. Pure logic lives in
 `apps/desktop/src/review/`: `layout`, `presentation`, `summaries`, `keymap`,
 `order`, `panelSizes`, `tokens`, `format`, `rotation`.
 
-`App.tsx` keeps state, effects, handlers, and the shell's three-row tree. What
-remains of its render tree is **seven modals, lines 1536–2168** — roughly 630
-of the file's 2173 lines:
+`App.tsx` keeps state, effects, handlers, and the shell's three-row tree. The
+seven modals it used to render inline were **extracted in #20**; each is now a
+component in `src/components/` with its own test file:
 
-| Line | Modal | Note |
-| --- | --- | --- |
-| 1536 | New project / project library | |
-| 1585 | Settings | ~140 lines, the largest |
-| 1727 | Pairing wizard | multi-step, own Escape handler |
-| 1808 | Baseline wizard | multi-step, own Escape handler |
-| 1922 | Analysis dialog | gated on `readiness` |
-| 2009 | Keyboard shortcuts | |
-| 2051 | Sync diagnostics | own Escape handler |
+| Component | Note |
+| --- | --- |
+| `NewProjectModal` | project library + create |
+| `SettingsModal` | the largest; owns the `autoplayOptions` it renders |
+| `PairingWizardModal` | three-step, receives its step |
+| `BaselineWizardModal` | five-step, receives its step |
+| `AnalysisDialog` | gated on `readiness` |
+| `KeyboardShortcutsModal` | presentational |
+| `SyncDiagnosticsModal` | own backdrop Escape |
 
-**This is the obvious next extraction and it was never planned for**, so it has
-no design behind it. Two things to settle before starting rather than during:
+### Decisions settled in #20 (applied to all seven)
 
-1. The wizards own multi-step local state (`pairingWizardStep`, `pairingCode`,
-   `serverIdentity`, and the baseline equivalents) that currently lives in
-   `App`. A wizard component that owns its own step state is a different
-   design from one that receives it, and the choice should be made once and
-   applied to both.
-2. Four of the seven handle Escape inline on the backdrop while the global
-   keymap in `review/keymap.ts` also resolves Escape against a modal list
-   (`App.tsx:646`). That duplication predates this work; extracting modals is
-   the moment it either gets unified or gets deliberately left alone.
+1. **Wizards receive their step state; they do not own it.** `pairingWizardStep`,
+   `pairingCode`, `serverIdentity`, and the baseline equivalents stay in `App`
+   and arrive as flat props. This kept the shell as the single owner of the
+   reset each wizard needs, so Cancel and backdrop Escape both resolve to one
+   `onCancel` callback rather than to state scattered across a component and its
+   parent.
+2. **Backdrop Escape was left as-is, deliberately.** The four modals that handled
+   Escape inline on their backdrop still do — the handler moved into the
+   component unchanged (now calling the injected `onCancel`/`onClose`). The
+   global keymap's modal-list Escape resolution was **not** unified into it;
+   that is a separate change with its own risk, and folding it into a
+   markup-only extraction would have coupled two unrelated refactors.
+
+Conventions followed: flat props (no grouped objects); a component owns the type
+of the data it renders (`SettingsModal` carries `autoplayOptions`,
+`PairingWizardModal` exports `PairingWizardStep`, `BaselineWizardModal` exports
+`BaselineStep`); shared pure helpers stayed in `src/review/` (`formatCost`,
+`formatBytes`, `syncStateLabel`); one test file per component. The CSS bundle
+hash was unchanged across the whole extraction.
 
 ## Conventions the extracted components follow
 
