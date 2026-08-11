@@ -32,6 +32,7 @@ import { TripPhaseDialog, type TripPhaseFormValue } from "./components/TripPhase
 import { ImportDialog } from "./components/ImportDialog";
 import { ImportHistoryDialog } from "./components/ImportHistoryDialog";
 import { KeyboardShortcutsModal } from "./components/KeyboardShortcutsModal";
+import { AnalysisDialog } from "./components/AnalysisDialog";
 import { CardBanner } from "./components/CardBanner";
 import { analysisStageLabels, formatCost, syncStateLabel } from "./review/format";
 import { isRawOrientationProxy, renderedRotation, rotationAfter } from "./review/rotation";
@@ -2373,90 +2374,17 @@ function App() {
       )}
 
       {showAnalysisDialog && readiness && (
-        <div className="modal-backdrop" role="presentation">
-          <section className="modal analysis-modal" role="dialog" aria-modal="true" aria-labelledby="analysis-title">
-            <span className="eyebrow">Analyze project</span>
-            <h2 id="analysis-title">{project?.name ?? "This project"}</h2>
-
-            <ol className="stage-plan">
-              <li>
-                <strong>{readiness.missingProxies}</strong>
-                <span>proxies to make</span>
-                <small>Local. Both later steps read the proxy, so this runs first.</small>
-              </li>
-              <li>
-                <strong>{readiness.missingTranscripts}</strong>
-                <span>clips to transcribe</span>
-                <small>Local and offline. No API key, no cost.</small>
-              </li>
-              <li>
-                <strong>{readiness.missingAnalyses}</strong>
-                <span>clips to analyze</span>
-                <small>Cloud vision. This is the step that spends money.</small>
-              </li>
-            </ol>
-
-            <div className="cost-projection">
-              <div>
-                <span>Projected cost</span>
-                <strong>{formatCost(readiness.estimatedCostUsd)}</strong>
-              </div>
-              <p>
-                {readiness.costBasis === "observed"
-                  ? `Based on $${readiness.observedCostPerClipUsd.toFixed(6)} per clip already analyzed in this project.`
-                  : `No clips analyzed here yet, so this uses the reference measurement of $${readiness.observedCostPerClipUsd.toFixed(6)} per clip. The first run replaces it with your own.`}
-                {readiness.lastRun && readiness.lastRun.status !== "running"
-                  ? ` Last run: ${readiness.lastRun.clipsAnalyzed} clips, ${formatCost(readiness.lastRun.costUsd)}.`
-                  : ""}
-              </p>
-            </div>
-
-            <label className="field-label">Stop this run at
-              <input
-                type="number"
-                min="0"
-                step="0.25"
-                value={budgetInput}
-                onChange={(event) => setBudgetInput(event.target.value)}
-                aria-describedby="budget-note"
-              />
-            </label>
-            <p id="budget-note" className="section-note">
-              US dollars. The run stops once returned provider usage reaches this, keeping whatever it finished.
-            </p>
-
-            <label className="checkbox-row">
-              <input type="checkbox" checked={forceReanalyze} onChange={(event) => setForceReanalyze(event.target.checked)} />
-              <span>Re-analyze clips that already have a description. Your edits to titles and descriptions will be overwritten; notes and your own labels are never touched.</span>
-            </label>
-
-            {!readiness.modelsReady && (
-              <p className="blocking-note">
-                Speech models are not installed, so transcription would fail for every clip.
-                {" "}
-                <button className="text-button" onClick={() => { setShowAnalysisDialog(false); setShowSettings(true); }}>Install them in Settings</button>
-              </p>
-            )}
-            {!readiness.apiKeyPresent && (
-              <p className="blocking-note">
-                No OpenRouter key, so clip analysis cannot run.
-                {" "}
-                <button className="text-button" onClick={() => { setShowAnalysisDialog(false); setShowSettings(true); }}>Add one in Settings</button>
-              </p>
-            )}
-
-            <div className="modal-actions">
-              <button className="button ghost" onClick={() => setShowAnalysisDialog(false)}>Cancel</button>
-              <button
-                className="button primary"
-                disabled={!readiness.modelsReady || !readiness.apiKeyPresent || readiness.totalClips === 0}
-                onClick={runAnalysis}
-              >
-                Start
-              </button>
-            </div>
-          </section>
-        </div>
+        <AnalysisDialog
+          projectName={project?.name ?? "This project"}
+          readiness={readiness}
+          budget={budgetInput}
+          forceReanalyze={forceReanalyze}
+          onBudgetChange={setBudgetInput}
+          onForceReanalyzeChange={setForceReanalyze}
+          onOpenSettings={() => { setShowAnalysisDialog(false); setShowSettings(true); }}
+          onCancel={() => setShowAnalysisDialog(false)}
+          onStart={runAnalysis}
+        />
       )}
 
       {showShortcuts && <KeyboardShortcutsModal onClose={() => setShowShortcuts(false)} />}
