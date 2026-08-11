@@ -84,6 +84,18 @@ jobs:
         if: ${{ !cancelled() }}
         run: pnpm test:desktop:cuj
 
+      # The desktop real-browser tier (issue #22) needs a Chromium and its
+      # system libraries; the gate step below drives it through the Vite
+      # preview. Kept as its own install so a browser-download failure is
+      # legible rather than folded into the gate.
+      - name: Install Playwright Chromium (desktop)
+        if: ${{ !cancelled() }}
+        run: pnpm --dir apps/desktop exec playwright install --with-deps chromium
+
+      - name: pnpm test:desktop:browser
+        if: ${{ !cancelled() }}
+        run: pnpm test:desktop:browser
+
       - name: pnpm test:web
         if: ${{ !cancelled() }}
         run: pnpm test:web

@@ -7,6 +7,8 @@ export default defineConfig({
     environment: "jsdom",
     globals: true,
     setupFiles: "./src/test/setup.ts",
-    exclude: ["node_modules/**", "dist/**", "src-tauri/**"],
+    // `e2e/` is the Playwright browser tier (`pnpm test:browser`); its *.spec.ts
+    // files import @playwright/test and must never be collected by Vitest.
+    exclude: ["node_modules/**", "dist/**", "src-tauri/**", "e2e/**"],
   },
 });

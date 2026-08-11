@@ -1794,7 +1794,15 @@ function App() {
       ) : (
       <div
         className="workbench"
-        style={{ gridTemplateColumns: `${panelSizes.queue}px 5px minmax(0, 1fr) 5px ${panelSizes.rail}px` }}
+        // Focus collapses the workbench to one column (styles.css); the panel
+        // sizes only apply in Review. Applying them inline in Focus too would
+        // silently win over that rule and strand the viewer between an empty
+        // queue column and an empty rail column.
+        style={
+          view.presentation === "focus"
+            ? undefined
+            : { gridTemplateColumns: `${panelSizes.queue}px 5px minmax(0, 1fr) 5px ${panelSizes.rail}px` }
+        }
       >
         <QueuePanel
           projectName={project?.name ?? null}

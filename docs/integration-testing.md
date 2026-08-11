@@ -11,6 +11,7 @@ The repository uses real process, SQLite, HTTP, browser, and media-tool boundari
 | Card-import domain/UI | Preflight purity and classification, removable-card identity, create-only atomic copy, full-file verification, cancellation/resume, archive-root remount, modal destination/capacity blocking, and review-only card banner |
 | Independent server processes | Separate Mac/server SQLite files, real authenticated HTTP baseline/reconcile, duplicate delivery, browser-origin mutation, restart, and restore sequence recovery |
 | Fast desktop CUJ | Whole-`App` journeys in jsdom against a fake Tauri IPC destination: review and annotation, search/filtering, generation accounting, analysis gating/progress/cancellation, chronology preview-before-write, edit-plan lifecycle, card import, failure and retry, and IPC command/argument contract |
+| Desktop real-browser | Headless Chromium over the Vite preview: shell layout at 1280×800 and 1440×900, no region taking an implicit grid row, no body scroll, Focus reflow with real DOM focus and caret, selected-row scroll-into-view, splitter pointer-drag/reset/keyboard, and queue accessibility-tree and keyboard navigation |
 | Web unit/build | Typed client integration, loading/error/empty states, library/project review, annotations, and administration |
 | Chrome Playwright | Local-only bootstrap login, admin mutation, concurrent same-origin tabs, and durable 5-second polling when one WebSocket is disabled |
 | Scale/fault fixtures | 2,000-asset baseline, 2,000-row library/scan pages, 10,000 jobs, sequence gaps/lost acknowledgements, leases/retry/cancel, media cancellation/restart, and byte ranges |
@@ -25,6 +26,7 @@ cargo fmt --all -- --check
 pnpm check:frontend
 pnpm test:web
 pnpm test:web:e2e
+pnpm test:desktop:browser
 pnpm check:openapi
 pnpm check:deployment
 pnpm check:docs
@@ -59,6 +61,8 @@ copies no bytes.
 ## What browser modes prove
 
 The desktop Vite preview at port 1420 runs the same in-memory fake backend as the CUJ harness: `main.tsx` installs it from `apps/desktop/src/preview/` when the app boots outside Tauri, so there is one fake to keep honest rather than two. It is appropriate for layout, focus, keyboard, scrolling, and for watching progress and cancellation behave. It cannot validate Tauri commands reaching Rust, Keychain, native media playback, filesystem permission prompts, persistence, media processes, or sync — and it has no media origin, so no clip plays.
+
+The desktop real-browser tier (`pnpm test:desktop:browser`, `apps/desktop/e2e/`) drives that preview in headless Chromium through Playwright. Every scenario proves a property a jsdom CUJ cannot: a resolved grid track, a real scroll position, genuine DOM focus and caret, real pointer-capture drags, and Chromium's own accessibility tree — which is why it is deliberately under thirty scenarios and never re-runs the CUJ matrix. It shares the fast tier's boundary exactly: a real engine is still not WKWebView, so it is never evidence for native media, IPC, Keychain, dialogs, or persistence. It found the Focus-mode workbench keeping its Review column widths (an inline style outranking the stylesheet), which was fixed rather than pinned because it is a live layout defect.
 
 The web Playwright suite uses a real disposable server and Chrome. It does validate browser authentication, API mutation, multi-tab convergence, WebSocket loss, and polling recovery on one host. It does not validate Caddy certificates, Tailscale ACLs/routing, physical LAN latency, or NAS behavior.
 
