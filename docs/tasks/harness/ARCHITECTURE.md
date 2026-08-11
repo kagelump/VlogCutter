@@ -337,7 +337,7 @@ user sees; a CUJ whose only assertion is a command log is testing the harness.
 pure/unit           ~250          review/*.test.ts
 component           ~120          components/__tests__/*
 fast full-App CUJ   131           cuj/*.cuj.test.tsx      ← this epic
-real browser        < 30          layout, scroll, real focus, real media element
+real browser        18            e2e/*.spec.ts           ← built (#22)
 native Tauri        < 20          real IPC, Keychain, dialogs, WKWebView frames
 real media/manual   small         FFmpeg, NAS, sleep/wake, Resolve
 ```
@@ -366,6 +366,7 @@ rather than reassigning existing ones.
 ```text
 pnpm test:desktop        unit + component + CUJ (every PR)
 pnpm test:desktop:cuj    the CUJ tier alone (iteration, and its own CI step)
+pnpm test:desktop:browser  the real-browser tier in headless Chromium (#22)
 cargo test -p rcdvlog-desktop   the Tauri command layer (macOS job)
 ```
 
