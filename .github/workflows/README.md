@@ -17,6 +17,9 @@ Proves the full headless verification gate passes on Linux:
   and offline-original review
 - Documentation: OpenAPI spec freshness, link and fence validation in
   Markdown, and deployment configuration checks
+- Repository tooling: the `node --test` suites under `scripts/`, covering the
+  docs checker and the eval-bridge address resolution that `pnpm eval` and the
+  desktop harness share
 
 Every gate step after the first carries `if: ${{ !cancelled() }}`. A gate that
 fails still fails the job, but it no longer skips the gates behind it, so one
@@ -26,10 +29,53 @@ checks — clippy, the whole workspace test suite, both frontend suites, the CLI
 integration test and every docs check — reported nothing at all. Add the guard
 to any gate step added here.
 
-The Rust toolchain is `dtolnay/rust-toolchain@stable` and is therefore not
-pinned, so a new stable release can change what `rustfmt` and `clippy` accept
-and turn the gate red without a code change. That is what happened above. If it
-recurs, consider pinning a version here and in `AGENTS.md` §6.
+### Pinning, and why everything here is immutable
+
+Two kinds of drift can turn this gate red without anyone changing the code, and
+both are closed.
+
+**The toolchain.** `dtolnay/rust-toolchain@stable` followed whatever stable
+release existed at run time, so a new `rustfmt` or `clippy` could reject code
+that was fine the day before — which is exactly the six-day breakage above. The
+version is now the `RUST_TOOLCHAIN` env value at the top of `ci.yml`, used by
+both jobs. Raise it deliberately: run the gate locally on the new toolchain
+first, change it in its own commit, and keep `AGENTS.md` §6 in step. The pin
+also makes `components: rustfmt, clippy` load-bearing — the action installs a
+minimal profile, and a pinned version is one the runner image does not already
+carry with those components attached.
+
+The other remedy the D01-T004 review offered for this — a root
+`rust-toolchain.toml` read by the action — was not taken. It would pin every
+contributor's local `cargo` to one version as a side effect of hardening CI,
+which contradicts the `Rust 1.85+` floor in `AGENTS.md` §6 and is a wider
+decision than this gate should make on its own. The env value keeps the pin
+where the drift was.
+
+**The actions.** Every `uses:` is a commit SHA with the human-readable version
+in a trailing comment. A tag is mutable: whoever owns the action's repository
+can repoint `v4` at new code, and a workflow that trusts a tag runs whatever
+that account publishes next, with this repository's checkout in front of it. A
+SHA cannot be repointed. `.github/dependabot.yml` proposes the upgrades so the
+pins do not quietly rot; it rewrites both the SHA and the version comment.
+
+### Untrusted pull requests
+
+The repository's destination is public, so anyone can fork it and open a pull
+request, and PR code must be treated as untrusted.
+
+- The trigger stays `pull_request`. It runs fork code with a token scoped to
+  the fork and no access to this repository's secrets. `pull_request_target`
+  runs the same untrusted code with the *base* repository's write-capable
+  token; do not introduce it here for any convenience.
+- `permissions: contents: read` is declared at the workflow level, so the
+  token is read-only even on `main` pushes. Nothing in this gate writes to the
+  repository. A future step that genuinely needs more takes it at the job
+  level, at the smallest scope that works.
+- No step reads a secret, so there is nothing for a fork PR to exfiltrate
+  through a build script or a test.
+- Caches are written by the base repository's runs and are read-only to fork
+  PRs, so a fork cannot poison a cache entry that a later trusted run restores.
+- Artifacts are per-run, and this workflow uploads none.
 
 ### Disk
 

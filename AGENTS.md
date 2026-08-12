@@ -255,7 +255,9 @@ Minimum documented environment:
 
 - Apple Silicon Mac, macOS 13+
 - Xcode command-line tools
-- Rust 1.85+ and Cargo
+- Rust 1.85+ and Cargo (CI pins one version: `RUST_TOOLCHAIN` in
+  `.github/workflows/ci.yml`, currently 1.97.1 — raise it there and here
+  together, in its own commit, after running the gate on the new toolchain)
 - Node.js 22+
 - pnpm 10
 - FFmpeg 7+ and ffprobe on `PATH`

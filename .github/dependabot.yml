@@ -1,0 +1,26 @@
+# Actions in `ci.yml` are pinned to immutable commit SHAs, which is the point:
+# a moving tag is a standing grant to whoever owns it. The cost of pinning is
+# that upgrades stop arriving on their own, and a pin nobody revisits ages into
+# a stale, unpatched action. This is the mechanism that revisits them — a pull
+# request that bumps the SHA and rewrites the trailing version comment, which
+# goes through review and the normal gate like any other change.
+#
+# The Rust toolchain is not covered here: it is the `RUST_TOOLCHAIN` env value
+# in `ci.yml`, raised by hand after the gate has been run locally on the new
+# version. See that file's comment and `AGENTS.md` §6.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: ci
+    labels:
+      - dependencies
+    groups:
+      # One pull request for all of them. These move together and are reviewed
+      # the same way; five separate PRs a month is how this gets ignored.
+      actions:
+        patterns:
+          - "*"

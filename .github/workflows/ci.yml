@@ -12,11 +12,35 @@ on:
   pull_request:
     branches: [main]
 
+# Anyone can fork a public repository and open a pull request, so PR code is
+# untrusted code. `pull_request` runs it with a token scoped to the fork and no
+# access to this repository's secrets; `pull_request_target` would run the same
+# code against the base repository's write-capable token, which is the one thing
+# this workflow must never do. Keep the trigger, and keep the token read-only —
+# nothing here writes to the repository, publishes a package, or posts a review.
+permissions:
+  contents: read
+
+env:
+  # Pinned deliberately. Following the `stable` channel left `main` red for six
+  # days when a new release changed what `rustfmt` accepted, with no code change
+  # to explain it. Raise this on purpose, in its own commit, after running the
+  # gate locally on the new version; keep it in step with `AGENTS.md` §6.
+  RUST_TOOLCHAIN: "1.97.1"
+  NODE_VERSION: "24.11.0"
+  PNPM_VERSION: "10.17.0"
+
 jobs:
   ubuntu:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      # Every action below is pinned to an immutable commit rather than a
+      # moving tag: a tag can be repointed at new code by whoever owns it, and
+      # a workflow that trusts one is running whatever that account decides to
+      # publish. The trailing comment is the human-readable version, and is
+      # what Dependabot rewrites when it proposes an upgrade — see
+      # `.github/dependabot.yml`.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       # This workspace's debug `target/` is ~14 GB — whisper.cpp, the webkit2gtk
       # bindings, a bundled SQLite, axum and reqwest, built once per feature
@@ -30,18 +54,24 @@ jobs:
             /usr/local/.ghcup /usr/local/share/boost /usr/share/swift || true
           df -h /
 
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+      # `components` is explicit because this pin installs a toolchain the
+      # runner image does not already carry, under a minimal profile: without
+      # it the first two gates below fail on a missing rustfmt and clippy.
+      - name: Install Rust ${{ env.RUST_TOOLCHAIN }}
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: rustfmt, clippy
 
       - name: Install Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: "24.11.0"
+          node-version: ${{ env.NODE_VERSION }}
 
       - name: Install pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
         with:
-          version: "10.17.0"
+          version: ${{ env.PNPM_VERSION }}
 
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y ffmpeg libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev
@@ -49,9 +79,10 @@ jobs:
       # Prunes the target directory before saving, which plain `actions/cache`
       # cannot do — see the workflow README. `cache-on-failure` matters here
       # because every gate runs now: one red gate should not also cost the next
-      # run its cache.
+      # run its cache. A fork PR reads the base repository's cache and cannot
+      # write to it, so nothing a fork builds is ever restored into a later run.
       - name: Cache Rust
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
         with:
           cache-on-failure: true
 
@@ -125,20 +156,23 @@ jobs:
   macos:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust ${{ env.RUST_TOOLCHAIN }}
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: rustfmt, clippy
 
       - name: Install Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: "24.11.0"
+          node-version: ${{ env.NODE_VERSION }}
 
       - name: Install pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
         with:
-          version: "10.17.0"
+          version: ${{ env.PNPM_VERSION }}
 
       - name: Install system dependencies
         run: brew install ffmpeg
@@ -148,7 +182,7 @@ jobs:
       # because every gate runs now: one red gate should not also cost the next
       # run its cache.
       - name: Cache Rust
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
         with:
           cache-on-failure: true
 
