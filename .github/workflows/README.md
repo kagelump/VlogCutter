@@ -20,6 +20,12 @@ Proves the full headless verification gate passes on Linux:
 - Repository tooling: the `node --test` suites under `scripts/`, covering the
   docs checker and the eval-bridge address resolution that `pnpm eval` and the
   desktop harness share
+- Desktop coverage: the vitest suite again under v8 instrumentation, against
+  the floor in `apps/desktop/vitest.config.ts`. It exists because coverage was
+  unmeasured until it was added, and the first measurement found whole features
+  — import rollback, project creation, the baseline wizard — with no journey
+  test at all. Raise the thresholds as the suite improves; lowering them to
+  turn a run green defeats the point
 
 Every gate step after the first carries `if: ${{ !cancelled() }}`. A gate that
 fails still fails the job, but it no longer skips the gates behind it, so one

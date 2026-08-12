@@ -750,6 +750,7 @@ Run the narrowest useful tests while iterating, then the full gate before handof
 | --- | --- | --- |
 | React/TypeScript/CSS | `pnpm --dir apps/desktop check` | `pnpm --dir apps/desktop build` plus interaction/visual check |
 | Desktop user journeys | `pnpm test:desktop:cuj` | `pnpm test:desktop` plus interaction/visual check |
+| Desktop coverage floor | `pnpm test:desktop:coverage` | thresholds in `apps/desktop/vitest.config.ts`; raise them, never lower them to go green |
 | Desktop layout/scroll/focus | `pnpm test:desktop:browser` | headless-Chromium tier; real-engine layout, scrolling, focus, pointer, and a11y only — never native evidence |
 | Rust core | `cargo test -p rcdvlog-core` | `cargo test --workspace` |
 | ETA library | `cargo test -p batch-estimator` | `cargo test --workspace` |

@@ -115,6 +115,14 @@ jobs:
         if: ${{ !cancelled() }}
         run: pnpm test:desktop:cuj
 
+      # Coverage runs the same vitest suite again with instrumentation and a
+      # floor, so a change that adds an unexercised branch is visible in the
+      # run that introduced it rather than a quarter later. The thresholds live
+      # in `apps/desktop/vitest.config.ts`.
+      - name: pnpm test:desktop:coverage
+        if: ${{ !cancelled() }}
+        run: pnpm test:desktop:coverage
+
       # The desktop real-browser tier (issue #22) needs a Chromium and its
       # system libraries; the gate step below drives it through the Vite
       # preview. Kept as its own install so a browser-download failure is
