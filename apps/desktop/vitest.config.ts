@@ -21,6 +21,12 @@ export default defineConfig({
      * whole features were hiding — import rollback, project creation, the
      * baseline wizard — so `functions` is the threshold worth watching.
      *
+     * The chronology desk then landed as the least-covered code in the app and
+     * pulled the whole project under this floor — 87.4% of statements against
+     * 77.9% of functions — with every test still green, which is exactly the
+     * failure the floor exists to catch. Covering the desk's correction tools,
+     * the canvas, and the geometry it draws from brought it back over.
+     *
      * The numbers below sit a little under what the suite currently reaches, so
      * an ordinary change does not fail on rounding. Raise them when the suite
      * moves up; do not lower them to make a red run green.
@@ -45,10 +51,10 @@ export default defineConfig({
         "src/chronologyTypes.ts",
       ],
       thresholds: {
-        statements: 89,
+        statements: 92,
         branches: 84,
-        functions: 81,
-        lines: 89,
+        functions: 83,
+        lines: 92,
       },
     },
   },
