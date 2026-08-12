@@ -1,17 +1,20 @@
 /**
- * CUJ 10 and 11: correcting a camera clock, and being stopped from doing damage.
+ * The desktop chronology CUJ.
  *
- * Every chronology value here is declared by the scenario. Whether a 60-minute
- * epoch correction really produces the ordering the scenario states is proven by
- * `cargo test -p rcdvlog-core` and by nothing in this file.
- *
- * What this file proves is the frontend's safety contract, which is entirely a
- * frontend property: preview before write, capture the user's place before
- * mutating, refresh after, and put them back where they were.
+ * Solver results are scenario declarations. These tests exercise only the
+ * frontend contract: problems are discoverable from Review, entry and return
+ * preserve the user's place, previews precede explicit writes, and duplicate
+ * intent cannot produce duplicate operations.
  */
 
-import { screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, screen, waitFor, within } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
+import type {
+  CaptureSequenceReassignmentPreview,
+  ChronologyImpact,
+  ClockEpoch,
+  VisualPlacementPreview,
+} from "../../chronologyTypes";
 import {
   buildContradiction,
   buildDiagnostic,
@@ -23,30 +26,104 @@ import {
 const sony = ["asset_sony_a7c_ii_001", "asset_sony_a7c_ii_002"];
 const dji = ["asset_dji_pocket_3_001"];
 
-/**
- * A trip where the Sony's clock never left home time. The declared "after"
- * ordering is what the solver returns once the correction is applied.
- */
-function miscalibrated() {
+const clockImpact: ChronologyImpact = {
+  changes: [
+    {
+      assetId: sony[0],
+      before: "2026-02-08T00:10:00.000Z",
+      after: "2026-02-08T01:10:00.000Z",
+      beforePosition: 0,
+      afterPosition: 1,
+    },
+    {
+      assetId: sony[1],
+      before: "2026-02-08T00:15:00.000Z",
+      after: "2026-02-08T01:15:00.000Z",
+      beforePosition: 1,
+      afterPosition: 2,
+    },
+  ],
+  contradictions: [],
+  blocked: false,
+};
+
+const sequences = [
+  {
+    id: "sequence_sony",
+    cameraKey: "Sony A7C II",
+    label: "Sony travel card",
+    volumeHint: "/Volumes/Travel",
+    assetIds: sony,
+  },
+  {
+    id: "sequence_dji",
+    cameraKey: "DJI Pocket 3",
+    label: "DJI day card",
+    assetIds: dji,
+  },
+];
+
+const clockEpoch: ClockEpoch = {
+  id: "epoch_preview_sony",
+  captureSequenceId: "sequence_sony",
+  startCounter: 0,
+  endCounter: null,
+  offsetSeconds: 3_600,
+  confidence: 1,
+  evidence: ["user_set"],
+  label: "Clock never left home time",
+};
+
+const visualPlacementPreview: VisualPlacementPreview = {
+  epoch: {
+    ...clockEpoch,
+    id: "epoch_visual_sony",
+    offsetSeconds: 600,
+    label: "Placed visually in Chronology",
+  },
+  factsToken: "facts-visual-sony",
+  impact: clockImpact,
+};
+
+const singleReassignment: CaptureSequenceReassignmentPreview = {
+  fromSequenceId: "sequence_sony",
+  intoSequenceId: "sequence_dji",
+  assetIds: [sony[0]],
+  factsToken: "facts-reassign-single",
+  impact: { changes: [clockImpact.changes[0]], contradictions: [], blocked: false },
+};
+
+const followingReassignment: CaptureSequenceReassignmentPreview = {
+  fromSequenceId: "sequence_sony",
+  intoSequenceId: "sequence_dji",
+  assetIds: sony,
+  factsToken: "facts-reassign-following",
+  impact: clockImpact,
+};
+
+function chronologyTrip() {
   return desktopScenario({ now: "2026-08-09T12:00:00.000Z" })
     .project("Hokkaido field test", { id: "project_hokkaido" })
     .camera("Sony A7C II", { clips: 2, withProxy: true, startAt: "2026-02-08T00:10:00.000Z" })
     .camera("DJI Pocket 3", { clips: 1, withProxy: true, startAt: "2026-02-08T00:20:00.000Z" })
-    .chronology({
-      order: [sony[0], sony[1], dji[0]],
-      sequences: [
-        { id: "sequence_sony", cameraKey: "Sony A7C II", label: "Sony A7C II", volumeHint: "/Volumes/Travel" },
-        { id: "sequence_dji", cameraKey: "DJI Pocket 3", label: "DJI Pocket 3" },
-      ],
-    })
+    .chronology({ order: [sony[0], sony[1], dji[0]], sequences })
+    .impactOnClockPreview("sequence_sony", { epoch: clockEpoch, factsToken: "facts-clock-sony", impact: clockImpact })
     .whenClockEpochApplied("sequence_sony")
-    .thenChronology({
-      order: [dji[0], sony[0], sony[1]],
-      sequences: [
-        { id: "sequence_sony", cameraKey: "Sony A7C II", label: "Sony A7C II", volumeHint: "/Volumes/Travel" },
-        { id: "sequence_dji", cameraKey: "DJI Pocket 3", label: "DJI Pocket 3" },
-      ],
-    });
+    .thenChronology({ order: [dji[0], sony[0], sony[1]], sequences });
+}
+
+function chronologyWithProblem() {
+  return chronologyTrip().chronology({
+    order: [sony[0], sony[1], dji[0]],
+    sequences,
+    contradictions: [
+      buildContradiction({
+        strength: "soft",
+        assetIds: [dji[0]],
+        message: "DJI_001 may sit before the ferry boarding sequence",
+      }),
+    ],
+  });
 }
 
 async function enterChronology(app: Awaited<ReturnType<typeof renderApp>>) {
@@ -54,259 +131,307 @@ async function enterChronology(app: Awaited<ReturnType<typeof renderApp>>) {
   return screen.findByRole("region", { name: "Chronology calibration" });
 }
 
-async function fillCorrection(app: Awaited<ReturnType<typeof renderApp>>, panel: HTMLElement) {
-  await app.user.selectOptions(within(panel).getByLabelText(/Capture sequence/), "sequence_sony");
-  await app.user.clear(within(panel).getByLabelText(/Shift by/));
-  await app.user.type(within(panel).getByLabelText(/Shift by/), "60");
-  await app.user.type(within(panel).getByLabelText("Why"), "Clock never left home time");
-  await app.user.click(within(panel).getByRole("button", { name: "Preview impact" }));
-  return screen.findByRole("dialog", { name: "Confirm chronology change" });
+async function previewClockCorrection(
+  app: Awaited<ReturnType<typeof renderApp>>,
+  panel: HTMLElement,
+) {
+  await app.user.click(within(panel).getByRole("button", { name: "Clock" }));
+  await app.user.selectOptions(within(panel).getByLabelText(/Card \/ capture sequence/), "sequence_sony");
+  await app.user.clear(within(panel).getByLabelText("Shift by minutes"));
+  await app.user.type(within(panel).getByLabelText("Shift by minutes"), "60");
+  await app.user.type(within(panel).getByLabelText("Reason"), "Clock never left home time");
+  await app.user.click(within(panel).getByRole("button", { name: "Preview correction" }));
+  return screen.findByRole("dialog", { name: "Chronology impact preview" });
 }
 
-describe("CUJ 10 — correcting a camera clock", () => {
-  it("loads the chronology the backend declared", async () => {
-    const harness = miscalibrated().build();
-    const app = await renderApp(harness);
-
-    const panel = await enterChronology(app);
-    expect(within(panel).getByText("3 clips")).toBeVisible();
-    expect(within(panel).getByText("2 capture sequences")).toBeVisible();
-    expect(within(panel).getByText("No clock corrections yet.")).toBeVisible();
+describe("Review entry and stable return", () => {
+  it("keeps Review free of chronology chrome when there are no problems", async () => {
+    await renderApp(chronologyTrip().build());
+    expect(screen.queryByRole("button", { name: /chronology problem/i })).toBeNull();
   });
 
-  it("previews before it writes, and writes only on confirmation", async () => {
-    const harness = miscalibrated().build();
+  it("shows a problem chip and deep-links to the first affected clip", async () => {
+    const app = await renderApp(chronologyWithProblem().build());
+    const chip = await screen.findByRole("button", { name: /1 chronology problem.*Fix/i });
+
+    await app.user.click(chip);
+
+    const panel = await screen.findByRole("region", { name: "Chronology calibration" });
+    const rail = within(panel).getByRole("complementary", { name: "Chronology problems" });
+    expect(within(rail).getByText(/DJI_001 may sit before/)).toBeVisible();
+    const inspector = within(panel).getByRole("complementary", { name: "Chronology inspector" });
+    expect(within(inspector).getByRole("heading", { name: "DJI_001.MP4" })).toBeVisible();
+  });
+
+  it("opens with Shift+T and restores selection, ribbon zoom/scroll, and queue scroll", async () => {
+    const app = await renderApp(chronologyTrip().build());
+    await app.user.click(screen.getByText("SONY_002.MP4"));
+    await app.user.click(screen.getByLabelText("Zoom story ribbon in"));
+
+    const reviewRibbon = document.querySelector<HTMLDivElement>(".story-scroll")!;
+    const reviewQueue = screen.getByRole("listbox", { name: "Clips" }) as HTMLDivElement;
+    reviewRibbon.scrollLeft = 173;
+    reviewQueue.scrollTop = 61;
+
+    await app.user.keyboard("{Shift>}T{/Shift}");
+
+    const panel = await screen.findByRole("region", { name: "Chronology calibration" });
+    expect(within(panel).getByRole("button", { name: "Back to SONY_002.MP4" })).toBeVisible();
+    const expandedScroll = panel.querySelector<HTMLDivElement>(".chronology-canvas-scroll")!;
+    const expandedCanvas = panel.querySelector<HTMLElement>(".chronology-canvas")!;
+    await waitFor(() => expect(expandedScroll.scrollLeft).toBe(173));
+    expect(expandedCanvas.style.getPropertyValue("--chronology-column")).toBe("80px");
+    await app.user.click(within(panel).getByRole("button", { name: "Back to SONY_002.MP4" }));
+
+    await waitFor(() => expect(selectedRow()?.textContent).toContain("SONY_002.MP4"));
+    await waitFor(() => {
+      expect((document.querySelector(".story-scroll") as HTMLDivElement).scrollLeft).toBe(173);
+      expect((screen.getByRole("listbox", { name: "Clips" }) as HTMLDivElement).scrollTop).toBe(61);
+    });
+    expect(screen.getByLabelText("Story ribbon zoom level")).toHaveValue("80");
+  });
+});
+
+describe("Chronology desk", () => {
+  it("presents the problem rail and one visual lane per declared capture sequence", async () => {
+    const app = await renderApp(chronologyWithProblem().build());
+    const panel = await enterChronology(app);
+
+    expect(within(panel).getByRole("heading", { name: "Needs a look" })).toBeVisible();
+    const lanes = panel.querySelectorAll(".chronology-sequence-lane");
+    expect(lanes).toHaveLength(2);
+    expect(within(lanes[0] as HTMLElement).getByText("Sony travel card")).toBeVisible();
+    expect(within(lanes[0] as HTMLElement).getAllByRole("button", { name: /SONY_/ })).toHaveLength(2);
+    expect(within(lanes[1] as HTMLElement).getByText("DJI day card")).toBeVisible();
+    expect(within(lanes[1] as HTMLElement).getByRole("button", { name: /DJI_001/ })).toBeVisible();
+  });
+
+  it("shows exact impact, cancels without a write, then applies once and restores the queue", async () => {
+    const harness = chronologyTrip().build();
     const app = await renderApp(harness);
+    await app.user.click(screen.getByText("SONY_002.MP4"));
     const panel = await enterChronology(app);
     harness.clearLog();
 
-    const confirm = await fillCorrection(app, panel);
+    let impact = await previewClockCorrection(app, panel);
+    expect(within(impact).getByText("Nothing has changed yet")).toBeVisible();
+    expect(impact.querySelector(".chronology-impact-summary p")).toHaveTextContent("2 clips move");
+    expect(within(impact).getByText("#1 → #2")).toBeVisible();
+    expect(within(impact).getByText("#2 → #3")).toBeVisible();
+    expect(harness.calls("preview_clock_epoch_impact")).toHaveLength(1);
+    expect(harness.calls("set_clock_epoch")).toHaveLength(0);
 
-    // Previewed, and nothing written yet.
-    expect(harness.commandNames()).toContain("preview_clock_epoch");
-    expect(harness.commandNames()).not.toContain("set_clock_epoch");
-    expect(within(confirm).getByText("No contradictions.")).toBeVisible();
+    await app.user.click(within(impact).getByRole("button", { name: "Cancel" }));
+    expect(screen.queryByRole("dialog", { name: "Chronology impact preview" })).toBeNull();
+    expect(harness.calls("set_clock_epoch")).toHaveLength(0);
 
-    await app.user.click(within(confirm).getByRole("button", { name: "Apply" }));
-
-    await waitFor(() => expect(harness.calls("set_clock_epoch")).toHaveLength(1));
-    // The safety ordering, in the order it must happen. Consecutive repeats are
-    // collapsed: the panel and the shell each refresh after the write, and how
-    // many reads that costs is not the contract.
-    const ordering = harness
-      .commandNames()
-      .filter((command) =>
-        ["preview_clock_epoch", "capture_queue_position", "set_clock_epoch", "chronology_overview", "restore_queue_position"].includes(
-          command,
-        ),
-      )
-      .filter((command, index, all) => command !== all[index - 1]);
-    expect(ordering).toEqual([
-      "preview_clock_epoch",
-      "capture_queue_position",
-      "set_clock_epoch",
-      "chronology_overview",
-      "restore_queue_position",
-    ]);
-  });
-
-  it("sends the correction the user described", async () => {
-    const harness = miscalibrated().build();
-    const app = await renderApp(harness);
-    const panel = await enterChronology(app);
-
-    const confirm = await fillCorrection(app, panel);
-    await app.user.click(within(confirm).getByRole("button", { name: "Apply" }));
+    impact = await previewClockCorrection(app, panel);
+    await app.user.click(within(impact).getByRole("button", { name: "Apply change" }));
 
     await waitFor(() => expect(harness.calls("set_clock_epoch")).toHaveLength(1));
-    expect(harness.calls("set_clock_epoch")[0]).toMatchObject({
+    expect(harness.calls("set_clock_epoch")[0]).toEqual({
       projectId: "project_hokkaido",
-      epoch: {
-        captureSequenceId: "sequence_sony",
-        offsetSeconds: 3_600,
-        label: "Clock never left home time",
-      },
+      preview: { epoch: clockEpoch, factsToken: "facts-clock-sony", impact: clockImpact },
     });
-  });
-
-  it("refreshes to the declared ordering and records the correction", async () => {
-    const harness = miscalibrated().build();
-    const app = await renderApp(harness);
-    const panel = await enterChronology(app);
-
-    const confirm = await fillCorrection(app, panel);
-    await app.user.click(within(confirm).getByRole("button", { name: "Apply" }));
-
-    await waitFor(() =>
-      expect(harness.state.chronology.overview.assets.map((asset) => asset.assetId)).toEqual([
-        dji[0],
-        sony[0],
-        sony[1],
-      ]),
-    );
-    expect(await within(panel).findByText(/Clock never left home time — \+1h 0m/)).toBeVisible();
-  });
-
-  it("returns the user to review on the clip they were on", async () => {
-    const harness = miscalibrated().build();
-    const app = await renderApp(harness);
-
-    await app.user.click(screen.getByText("SONY_002.MP4"));
-    await waitFor(() => expect(selectedRow()?.textContent).toContain("SONY_002.MP4"));
-
-    const panel = await enterChronology(app);
-    const confirm = await fillCorrection(app, panel);
-    await app.user.click(within(confirm).getByRole("button", { name: "Apply" }));
-
     await waitFor(() => expect(harness.calls("restore_queue_position")).toHaveLength(1));
     expect(harness.calls("capture_queue_position")[0]).toEqual({
       projectId: "project_hokkaido",
       currentAssetId: sony[1],
     });
+    expect(harness.state.chronology.overview.assets.map((asset) => asset.assetId)).toEqual([
+      dji[0],
+      sony[0],
+      sony[1],
+    ]);
 
-    await app.user.click(screen.getByRole("button", { name: "Review" }));
-    expect(selectedRow()?.textContent).toContain("SONY_002.MP4");
+    const safetyOrder = harness.commandNames().filter((command) => [
+      "preview_clock_epoch_impact",
+      "capture_queue_position",
+      "set_clock_epoch",
+      "restore_queue_position",
+    ].includes(command));
+    expect(safetyOrder).toEqual([
+      "preview_clock_epoch_impact",
+      "preview_clock_epoch_impact",
+      "capture_queue_position",
+      "set_clock_epoch",
+      "restore_queue_position",
+    ]);
   });
 
-  it("follows the backend when the reorder resumes somewhere else", async () => {
-    const harness = miscalibrated().resumesAt(dji[0]).build();
-    const app = await renderApp(harness);
-
-    const panel = await enterChronology(app);
-    const confirm = await fillCorrection(app, panel);
-    await app.user.click(within(confirm).getByRole("button", { name: "Apply" }));
-
-    await waitFor(() => expect(harness.calls("restore_queue_position")).toHaveLength(1));
-    await app.user.click(screen.getByRole("button", { name: "Review" }));
-    await waitFor(() => expect(selectedRow()?.textContent).toContain("DJI_001.MP4"));
-  });
-
-  it("removes a correction the user no longer wants", async () => {
-    const harness = miscalibrated().build();
-    const app = await renderApp(harness);
-    const panel = await enterChronology(app);
-
-    const confirm = await fillCorrection(app, panel);
-    await app.user.click(within(confirm).getByRole("button", { name: "Apply" }));
-    await within(panel).findByText(/Clock never left home time/);
-
-    await app.user.click(within(panel).getByRole("button", { name: "Remove" }));
-
-    await waitFor(() => expect(harness.state.chronology.overview.epochs).toHaveLength(0));
-    expect(await within(panel).findByText("No clock corrections yet.")).toBeVisible();
-  });
-});
-
-describe("CUJ 11 — a correction that would contradict the evidence", () => {
-  it("shows the contradiction, disables Apply, and issues no write", async () => {
-    const harness = miscalibrated()
-      .contradictionOnPreview(
-        "sequence_sony",
-        buildContradiction({
-          strength: "hard",
-          assetIds: [sony[0], dji[0]],
-          message: "SONY_001 would land after DJI_001, which its GPS fix contradicts",
-          evidence: ["gps fix at 00:12", "camera clock at 01:10"],
-        }),
-      )
+  it("selects a contiguous card run and previews its visual placement on the canvas", async () => {
+    const harness = chronologyTrip()
+      .visualPlacementPreview(sony, dji[0], "before", visualPlacementPreview)
       .build();
     const app = await renderApp(harness);
     const panel = await enterChronology(app);
-    harness.clearLog();
 
-    const confirm = await fillCorrection(app, panel);
+    const secondSony = within(panel).getByRole("button", { name: /SONY_002.MP4, clip 2/ });
+    fireEvent.click(secondSony, { shiftKey: true });
+    await app.user.click(within(panel).getByRole("button", { name: `Place selected run before ${dji[0]}` }));
 
-    expect(within(confirm).getByText(/This would create 1 contradiction/)).toBeVisible();
-    expect(within(confirm).getByText(/its GPS fix contradicts/)).toBeVisible();
-    expect(within(confirm).getByRole("button", { name: "Apply" })).toBeDisabled();
+    const impact = await screen.findByRole("dialog", { name: "Chronology impact preview" });
+    expect(within(impact).getByRole("heading", { name: "Move selected run" })).toBeVisible();
+    expect(panel.querySelectorAll(".chronology-ghost-block")).toHaveLength(2);
+    expect(panel.querySelectorAll(".chronology-block.will-move")).toHaveLength(2);
+    expect(harness.calls("preview_visual_placement")).toEqual([{
+      projectId: "project_hokkaido",
+      assetIds: sony,
+      targetAssetId: dji[0],
+      side: "before",
+      label: "Placed visually in Chronology",
+    }]);
 
-    // The one assertion the command log exists for: nothing was written.
-    expect(harness.commandNames()).not.toContain("set_clock_epoch");
-    expect(harness.commandNames()).not.toContain("capture_queue_position");
-    expect(harness.state.chronology.overview.epochs).toHaveLength(0);
+    await app.user.click(within(impact).getByRole("button", { name: "Cancel" }));
+    expect(harness.calls("set_clock_epoch")).toHaveLength(0);
   });
 
-  it("lets the user back out without writing", async () => {
-    const harness = miscalibrated().build();
-    const app = await renderApp(harness);
-    const panel = await enterChronology(app);
-
-    const confirm = await fillCorrection(app, panel);
-    await app.user.click(within(confirm).getByRole("button", { name: "Cancel" }));
-
-    await waitFor(() => expect(screen.queryByRole("dialog", { name: "Confirm chronology change" })).toBeNull());
-    expect(harness.commandNames()).not.toContain("set_clock_epoch");
-  });
-
-  it("names the contradictions already blocking the project", async () => {
-    const harness = miscalibrated()
-      .chronology({
+  it("offers exact single-clip and clip-and-following card reassignment", async () => {
+    const singleOutcomeSequences = [
+      { ...sequences[0], assetIds: [sony[1]] },
+      { ...sequences[1], assetIds: [dji[0], sony[0]] },
+    ];
+    const followingOutcomeSequences = [
+      { ...sequences[0], assetIds: [] },
+      { ...sequences[1], assetIds: [dji[0], ...sony] },
+    ];
+    const harness = chronologyTrip()
+      .captureSequenceReassignment(sony[0], "sequence_dji", singleReassignment, {
         order: [sony[0], sony[1], dji[0]],
-        sequences: [{ id: "sequence_sony", cameraKey: "Sony A7C II" }],
-        contradictions: [
-          buildContradiction({ strength: "hard", message: "Two clips claim the same instant" }),
-          buildContradiction({ strength: "soft", message: "A gap longer than the trip" }),
-        ],
+        sequences: singleOutcomeSequences,
+      })
+      .captureSequenceReassignment(sony[0], "sequence_dji", followingReassignment, {
+        order: [sony[0], sony[1], dji[0]],
+        sequences: followingOutcomeSequences,
       })
       .build();
     const app = await renderApp(harness);
-
     const panel = await enterChronology(app);
-    // Only the hard one blocks, and it says which evidence disagrees.
-    expect(within(panel).getByText("1 contradiction(s) block changes")).toBeVisible();
-    expect(within(panel).getByText("Two clips claim the same instant")).toBeVisible();
-    expect(within(panel).queryByText("A gap longer than the trip")).toBeNull();
+
+    await app.user.click(within(panel).getByRole("button", { name: "Card" }));
+    await app.user.click(within(panel).getByRole("radio", { name: "This clip only" }));
+    await app.user.selectOptions(within(panel).getByLabelText("Destination card"), "sequence_dji");
+    await app.user.click(within(panel).getByRole("button", { name: "Preview card move" }));
+    let impact = await screen.findByRole("dialog", { name: "Chronology impact preview" });
+    expect(within(impact).getByRole("heading", { name: "Move this clip to another card" })).toBeVisible();
+    expect(harness.calls("preview_capture_sequence_assets")[0]).toEqual({
+      projectId: "project_hokkaido",
+      fromSequenceId: "sequence_sony",
+      intoSequenceId: "sequence_dji",
+      assetIds: [sony[0]],
+    });
+    await app.user.click(within(impact).getByRole("button", { name: "Cancel" }));
+
+    await app.user.click(within(panel).getByRole("radio", { name: "This clip and following" }));
+    await app.user.click(within(panel).getByRole("button", { name: "Preview card move" }));
+    impact = await screen.findByRole("dialog", { name: "Chronology impact preview" });
+    expect(within(impact).getByRole("heading", { name: "Move clip run to another card" })).toBeVisible();
+    await app.user.click(within(impact).getByRole("button", { name: "Apply change" }));
+
+    await waitFor(() => expect(harness.calls("reassign_capture_sequence_assets")).toEqual([{
+      projectId: "project_hokkaido",
+      preview: followingReassignment,
+    }]));
+    expect(harness.state.chronology.overview.assets
+      .filter((asset) => asset.orderKey.captureSequenceId === "sequence_dji")
+      .map((asset) => asset.assetId))
+      .toEqual([sony[0], sony[1], dji[0]]);
+  });
+
+  it("turns a rapid double click into one chronology write", async () => {
+    const harness = chronologyTrip().build();
+    const app = await renderApp(harness);
+    const panel = await enterChronology(app);
+    const impact = await previewClockCorrection(app, panel);
+    harness.next("set_clock_epoch").delayUntilReleased();
+    harness.clearLog();
+
+    const apply = within(impact).getByRole("button", { name: "Apply change" });
+    fireEvent.click(apply);
+    fireEvent.click(apply);
+
+    await waitFor(() => expect(harness.calls("set_clock_epoch")).toHaveLength(1));
+    expect(harness.calls("capture_queue_position")).toHaveLength(1);
+    expect(apply).toBeDisabled();
+
+    await act(async () => harness.release("set_clock_epoch"));
+    await waitFor(() => expect(harness.calls("restore_queue_position")).toHaveLength(1));
+    expect(harness.calls("set_clock_epoch")).toHaveLength(1);
+  });
+
+  it("blocks a solver-declared contradiction and never captures a queue position", async () => {
+    const contradiction = buildContradiction({
+      strength: "hard",
+      assetIds: [sony[0], dji[0]],
+      message: "The candidate order conflicts with the ferry GPS fix",
+    });
+    const harness = chronologyTrip()
+      .impactOnClockPreview("sequence_sony", {
+        epoch: clockEpoch,
+        factsToken: "facts-clock-sony-blocked",
+        impact: {
+          changes: clockImpact.changes,
+          contradictions: [contradiction],
+          blocked: true,
+        },
+      })
+      .build();
+    const app = await renderApp(harness);
+    const panel = await enterChronology(app);
+
+    const impact = await previewClockCorrection(app, panel);
+    expect(within(impact).getByText(/ferry GPS fix/)).toBeVisible();
+    expect(within(impact).getByRole("button", { name: "Apply change" })).toBeDisabled();
+    expect(harness.calls("set_clock_epoch")).toHaveLength(0);
+    expect(harness.calls("capture_queue_position")).toHaveLength(0);
   });
 });
 
-describe("diagnostics", () => {
-  it("shows what needs attention and stops showing it once acknowledged", async () => {
-    const harness = miscalibrated()
-      .diagnostic(
-        buildDiagnostic({
-          id: "diagnostic_offline_travel",
-          severity: "error",
-          message: "3 clips on /Volumes/Travel are unreachable",
-          volumeHint: "/Volumes/Travel",
-          assetIds: [sony[0]],
-        }),
-      )
+describe("chronology-adjacent diagnostics", () => {
+  it("acknowledges a media note from its separate disclosure", async () => {
+    const harness = chronologyTrip()
+      .diagnostic(buildDiagnostic({
+        id: "diagnostic_offline_travel",
+        severity: "error",
+        message: "3 clips on /Volumes/Travel are unreachable",
+        volumeHint: "/Volumes/Travel",
+        assetIds: [sony[0]],
+      }))
       .offlineOriginal(sony[0])
       .build();
     const app = await renderApp(harness);
-
     const panel = await enterChronology(app);
-    expect(within(panel).getByText(/Needs attention — 1 error/)).toBeVisible();
-    expect(within(panel).getByText(/unreachable/)).toBeVisible();
 
+    await app.user.click(within(panel).getByText("Media and catalog notes · 1"));
+    expect(within(panel).getByText(/unreachable/)).toBeVisible();
     await app.user.click(within(panel).getByRole("button", { name: "Acknowledge" }));
 
     await waitFor(() => expect(harness.state.diagnostics[0].acknowledgedAt).toBe("2026-08-09T12:00:00.000Z"));
-    await waitFor(() => expect(within(panel).queryByText(/Needs attention/)).toBeNull());
+    await waitFor(() => expect(within(panel).queryByText("Media and catalog notes · 1")).toBeNull());
   });
 
-  it("offers Locate… for offline media and repairs what the folder contains", async () => {
-    const harness = miscalibrated()
-      .diagnostic(
-        buildDiagnostic({
-          id: "diagnostic_offline_travel",
-          severity: "error",
-          message: "Clips on /Volumes/Travel are unreachable",
-          volumeHint: "/Volumes/Travel",
-          assetIds: [sony[0], sony[1]],
-        }),
-      )
+  it("relinks offline media without mixing it into the chronology worklist", async () => {
+    const harness = chronologyTrip()
+      .diagnostic(buildDiagnostic({
+        id: "diagnostic_offline_travel",
+        severity: "error",
+        message: "Clips on /Volumes/Travel are unreachable",
+        volumeHint: "/Volumes/Travel",
+        assetIds: [sony[0], sony[1]],
+      }))
       .offlineOriginal(sony[0], sony[1])
       .relinkableAt("/Volumes/Travel2", sony[0], sony[1])
       .dialogAnswers("/Volumes/Travel2")
       .build();
     const app = await renderApp(harness);
-
     const panel = await enterChronology(app);
-    await app.user.click(within(panel).getByRole("button", { name: "Locate…" }));
+
+    expect(within(panel).getByRole("heading", { name: "All in order" })).toBeVisible();
+    await app.user.click(within(panel).getByText("Media and catalog notes · 1"));
+    await app.user.click(within(panel).getByRole("button", { name: "Locate originals…" }));
 
     await waitFor(() => expect(harness.state.assets[sony[0]].originalAvailable).toBe(true));
     expect(harness.state.assets[sony[1]].originalAvailable).toBe(true);
-    expect(await within(panel).findByText(/Reconnected 2 clip\(s\)/)).toBeVisible();
+    expect(await within(panel).findByText("Reconnected 2 clips")).toBeVisible();
   });
 });

@@ -1,3 +1,4 @@
+import { useEffect, useRef, useState } from "react";
 import type { AnalysisStage, ImportStage, Project, SyncStatus } from "../types";
 import type { Mode } from "../review/presentation";
 import { analysisStageLabels, formatCost, formatEta, syncStateLabel } from "../review/format";
@@ -116,6 +117,27 @@ export function TopBar({
   onImportFolder,
   onReviewLastImport,
 }: TopBarProps) {
+  const [projectMenuOpen, setProjectMenuOpen] = useState(false);
+  const projectMenuRef = useRef<HTMLDivElement>(null);
+  const runProjectAction = (action: () => void) => {
+    setProjectMenuOpen(false);
+    action();
+  };
+  useEffect(() => {
+    if (!projectMenuOpen) return;
+    const closeOutside = (event: PointerEvent) => {
+      if (!projectMenuRef.current?.contains(event.target as Node)) setProjectMenuOpen(false);
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setProjectMenuOpen(false);
+    };
+    document.addEventListener("pointerdown", closeOutside);
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.removeEventListener("pointerdown", closeOutside);
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [projectMenuOpen]);
   return (
     <header className="topbar">
       <div className="wordmark" aria-label="RCD VlogCutter">
@@ -144,14 +166,25 @@ export function TopBar({
           >{label}</button>
         ))}
       </nav>
-      {isDesktop && <button className="text-button" disabled={busy} onClick={onOpenCatalog} aria-keyshortcuts="Meta+O">Open catalog</button>}
-      <button className="text-button" onClick={onOpenSettings} aria-keyshortcuts="Meta+,">Settings <kbd>⌘,</kbd></button>
-      <button className="text-button" onClick={onOpenCreateProject} aria-keyshortcuts="Meta+N">New project</button>
+      {isDesktop && <button className="text-button desktop-lifecycle-action" disabled={busy} onClick={onOpenCatalog} aria-keyshortcuts="Meta+O">Open catalog</button>}
+      <button className="text-button desktop-lifecycle-action" onClick={onOpenSettings} aria-keyshortcuts="Meta+,">Settings <kbd>⌘,</kbd></button>
+      <button className="text-button desktop-lifecycle-action" onClick={onOpenCreateProject} aria-keyshortcuts="Meta+N">New project</button>
       {isDesktop && canPairWithServer && (
-        <button className="text-button" disabled={busy} onClick={onPairWithServer}>
+        <button className="text-button desktop-lifecycle-action" disabled={busy} onClick={onPairWithServer}>
           Pair with server
         </button>
       )}
+      <div className="topbar-overflow" ref={projectMenuRef}>
+        <button type="button" aria-label="Project actions" aria-expanded={projectMenuOpen} onClick={() => setProjectMenuOpen((open) => !open)}>•••</button>
+        {projectMenuOpen && (
+          <div>
+            {isDesktop && <button disabled={busy} onClick={() => runProjectAction(onOpenCatalog)}>Open catalog</button>}
+            <button onClick={() => runProjectAction(onOpenSettings)}>Settings</button>
+            <button onClick={() => runProjectAction(onOpenCreateProject)}>New project</button>
+            {isDesktop && canPairWithServer && <button disabled={busy} onClick={() => runProjectAction(onPairWithServer)}>Pair with server</button>}
+          </div>
+        )}
+      </div>
       {syncStatus && syncStatus.state !== "unpaired" && (
         <button
           className={`sync-indicator sync-${syncStatus.state}`}

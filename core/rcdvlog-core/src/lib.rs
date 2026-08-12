@@ -2,7 +2,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use batch_estimator::{BatchEstimate, BatchEstimator, RateHistory};
 use blake3::Hasher;
 use chrono::{DateTime, Duration, NaiveDateTime, SecondsFormat, Utc};
-use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -74,8 +74,10 @@ pub use import_history::{
     ImportSessionFile,
 };
 pub use preflight::{
-    Classification, ImportDestination, ImportOutcome, ImportPreflight, ImportProgress, ImportStage,
-    PreflightItem, human_bytes,
+    Classification, ImportDestination, ImportOutcome, ImportPreflight, ImportProgress,
+    ImportSequenceBoundary, ImportSequenceBoundaryEvidence, ImportSequencePreview,
+    ImportSequenceRunDecision, ImportSequenceRunPreview, ImportStage,
+    LARGE_CAPTURE_SEQUENCE_GAP_SECONDS, PreflightItem, human_bytes,
 };
 
 pub use analysis::quality::DecodedSegment;
@@ -93,11 +95,14 @@ pub use cameras::{
     UNKNOWN_CAMERA, identify_camera, pattern_counter,
 };
 pub use chronology::{
-    AppliedCorrection, AssetChronology, AssetTimeHypothesis, CaptureSequence, ChronologyError,
-    ChronologyExplanation, ChronologyFacts, ChronologySolution, ClipTimeException, ClockEpoch,
-    ConstraintStrength, Contradiction, ContradictionKind, DisplayMode, DisplayTime,
-    EventOrderConstraint, Evidence, OrderKey, PhaseKind, PhaseSplitDirection, QuarantinedOperation,
-    QueuePosition, SplitProposal, TripPhase, covering_phase, display_time, is_valid_timezone,
+    AppliedCorrection, AssetChronology, AssetTimeHypothesis, CaptureSequence,
+    CaptureSequenceMergePreview, CaptureSequenceReassignmentPreview, CaptureSequenceSplitPreview,
+    ChronologyError, ChronologyExplanation, ChronologyFacts, ChronologyImpact,
+    ChronologyImpactChange, ChronologySnapshot, ChronologySolution, ClipTimeException, ClockEpoch,
+    ClockEpochClearPreview, ClockEpochImpactPreview, ConstraintStrength, Contradiction,
+    ContradictionKind, DisplayMode, DisplayTime, EventOrderConstraint, Evidence, OrderKey,
+    PhaseKind, PhaseSplitDirection, QuarantinedOperation, QueuePosition, SplitProposal, TripPhase,
+    VisualPlacementPreview, VisualPlacementSide, covering_phase, display_time, is_valid_timezone,
     resolve_anchored_phases, solve,
 };
 pub use diagnostics::{
@@ -111,15 +116,16 @@ pub use editplan::{
 };
 pub use operations::{
     ApplyOperationResult, AssetRevisionDiagnostics, CAPTURE_SEQUENCE_DECLARED,
-    CAPTURE_SEQUENCE_MERGED, CAPTURE_SEQUENCE_SPLIT, CLIP_TIME_EXCEPTION_CLEARED,
-    CLIP_TIME_EXCEPTION_SET, CLOCK_EPOCH_CLEARED, CLOCK_EPOCH_SET, CLOCK_EVENT_CREATED,
-    ConflictProjection, EDIT_PLAN_EXPORT_RECORDED, EDIT_PLAN_REVISION_ACTIVATED,
-    EDIT_PLAN_REVISION_CREATED, EVENT_ORDER_CONSTRAINT_CLEARED, EVENT_ORDER_CONSTRAINT_SET,
-    HybridLogicalTime, LABEL_ADDED, LABEL_REMOVED, MAX_REMOTE_HLC_FUTURE_SKEW_MILLIS,
-    NOTE_REVISION_CREATED, NoteRevisionProjection, OperationBatchResult, OperationDiagnostics,
-    PROJECT_ASSET_ADDED, PROJECT_ASSET_MEDIA_LINKED, ProjectAssetAddedPayload, ProjectAssetItem,
-    ProjectAssetPage, ProjectOperation, REMOVED_SET, ROTATION_SET, SequenceRecoveryProjection,
-    SequenceRecoveryState, TRIP_PHASE_REMOVED, TRIP_PHASE_SET,
+    CAPTURE_SEQUENCE_MERGED, CAPTURE_SEQUENCE_REASSIGNED, CAPTURE_SEQUENCE_SPLIT,
+    CAPTURE_SEQUENCE_SPLIT_EXACT, CLIP_TIME_EXCEPTION_CLEARED, CLIP_TIME_EXCEPTION_SET,
+    CLOCK_EPOCH_CLEARED, CLOCK_EPOCH_SET, CLOCK_EVENT_CREATED, ConflictProjection,
+    EDIT_PLAN_EXPORT_RECORDED, EDIT_PLAN_REVISION_ACTIVATED, EDIT_PLAN_REVISION_CREATED,
+    EVENT_ORDER_CONSTRAINT_CLEARED, EVENT_ORDER_CONSTRAINT_SET, HybridLogicalTime, LABEL_ADDED,
+    LABEL_REMOVED, MAX_REMOTE_HLC_FUTURE_SKEW_MILLIS, NOTE_REVISION_CREATED,
+    NoteRevisionProjection, OperationBatchResult, OperationDiagnostics, PROJECT_ASSET_ADDED,
+    PROJECT_ASSET_MEDIA_LINKED, ProjectAssetAddedPayload, ProjectAssetItem, ProjectAssetPage,
+    ProjectOperation, REMOVED_SET, ROTATION_SET, SequenceRecoveryProjection, SequenceRecoveryState,
+    TRIP_PHASE_REMOVED, TRIP_PHASE_SET, operation_affects_chronology_projection,
 };
 
 pub use baseline::{PortableAssetBaseline, PortableRootMapping, ProjectBaselineSnapshot};
@@ -3176,6 +3182,17 @@ impl Catalog {
         self.require_project(project_id)?;
         let mut connection = self.connection()?;
         let transaction = connection.transaction()?;
+        let written =
+            Self::project_chronology_solution_on_connection(&transaction, project_id, solution)?;
+        transaction.commit()?;
+        Ok(written)
+    }
+
+    fn project_chronology_solution_on_connection(
+        connection: &Connection,
+        project_id: &str,
+        solution: &ChronologySolution,
+    ) -> Result<usize> {
         let mut written = 0usize;
         for asset in &solution.assets {
             // The offset is the derived shift from the camera's own claim, so
@@ -3189,20 +3206,55 @@ impl Catalog {
                 }
                 _ => 0,
             };
-            written += transaction.execute(
+            written += connection.execute(
                 "UPDATE assets SET best_time = ?1, offset_seconds = ?2 WHERE id = ?3 AND project_id = ?4",
                 params![asset.trip_time, offset_seconds, asset.asset_id, project_id],
             )?;
         }
-        transaction.commit()?;
         Ok(written)
     }
 
-    /// Solves and projects in one step, the ordinary path after any chronology
-    /// change.
+    pub(crate) fn project_current_chronology_in_transaction(
+        transaction: &rusqlite::Transaction<'_>,
+        project_id: &str,
+    ) -> Result<ChronologySolution> {
+        let facts = chronology::load_chronology_facts(transaction, project_id)?;
+        let solution = solve(&facts);
+        Self::project_chronology_solution_on_connection(transaction, project_id, &solution)?;
+        Ok(solution)
+    }
+
+    /// Solves and projects under one immediate transaction, the ordinary path
+    /// after any chronology change. Acquiring the write reservation before
+    /// loading facts prevents an older solve from projecting after a newer
+    /// chronology operation commits on another connection.
     pub fn resolve_chronology(&self, project_id: &str) -> Result<ChronologySolution> {
-        let solution = self.solve_chronology(project_id)?;
-        self.project_chronology_solution(project_id, &solution)?;
+        self.resolve_chronology_with_hook(project_id, || {})
+    }
+
+    fn resolve_chronology_with_hook<F>(
+        &self,
+        project_id: &str,
+        after_solve: F,
+    ) -> Result<ChronologySolution>
+    where
+        F: FnOnce(),
+    {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let exists: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM projects WHERE id = ?1)",
+            [project_id],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            bail!("project not found: {project_id}");
+        }
+        let facts = chronology::load_chronology_facts(&transaction, project_id)?;
+        let solution = solve(&facts);
+        after_solve();
+        Self::project_chronology_solution_on_connection(&transaction, project_id, &solution)?;
+        transaction.commit()?;
         Ok(solution)
     }
 
@@ -4444,6 +4496,61 @@ mod tests {
         let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).unwrap();
         let project = catalog.create_project("Test project").unwrap();
         (directory, catalog, project)
+    }
+
+    #[test]
+    fn chronology_resolution_reserves_the_writer_before_loading_facts() {
+        let (_directory, catalog, project) = catalog_fixture();
+        catalog
+            .add_portable_project_asset(
+                &project.id,
+                ProjectAssetAddedPayload {
+                    id: "asset_chronology_lock".to_string(),
+                    fingerprint: "fingerprint_chronology_lock".to_string(),
+                    filename: "C0001.MP4".to_string(),
+                    size_bytes: 100,
+                    duration_seconds: 10.0,
+                    frame_rate: 30.0,
+                    width: 1920,
+                    height: 1080,
+                    codec: "h264".to_string(),
+                    camera: "Sony".to_string(),
+                    captured_at_raw: Some("2026-01-01T09:00:00Z".to_string()),
+                    best_time: Some("2026-01-01T09:00:00Z".to_string()),
+                    metadata_rotation_degrees: 0,
+                    default_rotation_degrees: 0,
+                    created_at: "2026-01-01T00:00:00Z".to_string(),
+                },
+            )
+            .unwrap();
+        let catalog_path = catalog.database_path().to_path_buf();
+        let mut observed_reservation = false;
+
+        let solution = catalog
+            .resolve_chronology_with_hook(&project.id, || {
+                let competing = Connection::open(&catalog_path).unwrap();
+                competing.busy_timeout(std::time::Duration::ZERO).unwrap();
+                let error = competing
+                    .execute_batch("BEGIN IMMEDIATE")
+                    .expect_err("a competing writer must wait until projection commits");
+                assert!(
+                    error.to_string().contains("locked"),
+                    "unexpected competing-writer error: {error}"
+                );
+                observed_reservation = true;
+            })
+            .unwrap();
+
+        assert!(observed_reservation);
+        assert_eq!(solution.assets.len(), 1);
+        assert_eq!(
+            catalog
+                .get_asset("asset_chronology_lock")
+                .unwrap()
+                .best_time
+                .as_deref(),
+            solution.assets[0].trip_time.as_deref()
+        );
     }
 
     /// Writes a byte-identical stand-in for a generated proxy and points the

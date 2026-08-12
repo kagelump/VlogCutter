@@ -324,6 +324,48 @@ export interface ImportDestination {
   blockedReason: string;
 }
 
+export type ImportSequenceBoundaryEvidence =
+  | { kind: "volumeChange"; from: string; to: string }
+  | { kind: "counterReset"; previous: number; next: number }
+  | { kind: "folderReset"; from: string; to: string }
+  | { kind: "prefixChange"; from: string; to: string }
+  | { kind: "largeDiscontinuity"; gapSeconds: number };
+
+export interface ImportSequenceBoundary {
+  beforeRelativePath: string;
+  afterRelativePath: string;
+  affectedClipCount: number;
+  evidence: ImportSequenceBoundaryEvidence[];
+}
+
+export type ImportSequenceRunDecision = "extendExisting" | "proposeNew";
+
+export interface ImportSequenceRunPreview {
+  firstRelativePath: string;
+  lastRelativePath: string;
+  clipCount: number;
+  cameraKey: string;
+  volumeHint: string;
+  filenamePrefix: string;
+  decision: ImportSequenceRunDecision;
+  matchedExistingSequenceId: string | null;
+  matchedExistingSequenceLabel: string | null;
+  comparedExistingSequenceId: string | null;
+  comparedExistingSequenceLabel: string | null;
+  reason: string;
+  evidence: ImportSequenceBoundaryEvidence[];
+}
+
+export interface ImportSequencePreview {
+  newClipCount: number;
+  existingSequenceCount: number;
+  proposedSequenceCount: number;
+  matchedExistingSequenceCount: number;
+  suggestedNewSequenceCount: number;
+  boundaries: ImportSequenceBoundary[];
+  runs: ImportSequenceRunPreview[];
+}
+
 export interface ImportPreflight {
   sourcePath: string;
   card: CardCandidate | null;
@@ -335,6 +377,8 @@ export interface ImportPreflight {
   missingProxies: number;
   collisions: number;
   unreadable: number;
+  /** Optional only for compatibility with older CUJ fixtures. Production preflight always sends it. */
+  sequencePreview?: ImportSequencePreview;
   items: PreflightItem[];
 }
 

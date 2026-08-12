@@ -1,8 +1,15 @@
-import type { CSSProperties, RefObject } from "react";
+import { useLayoutEffect, useMemo, useState } from "react";
+import type { CSSProperties, RefObject, UIEvent } from "react";
 import { api } from "../api";
 import type { Asset, AssetAnalysisIndexEntry } from "../types";
 import { clipTitle, formatDuration } from "../review/format";
 import { isRawOrientationThumbnail, renderedRotation } from "../review/rotation";
+import { QUEUE_ROW_HEIGHT, queueWindow, scrollTopForQueueIndex } from "./queueWindow";
+
+// The first browser render happens before ResizeObserver can report the real
+// workbench height. This estimate is intentionally generous while still
+// bounding a 10,000-clip project's initial DOM to a few dozen rows.
+const INITIAL_QUEUE_VIEWPORT_HEIGHT = 720;
 
 export interface QueuePanelProps {
   projectName: string | null;
@@ -58,6 +65,122 @@ export function QueuePanel({
   onToggleRemovedView,
   onToggleUnusableView,
 }: QueuePanelProps) {
+  // ResizeObserver is available in the desktop webview and modern browsers.
+  // A layoutless or older engine falls back to the complete list, preserving
+  // correctness when it cannot provide a trustworthy viewport measurement.
+  const [viewportHeight, setViewportHeight] = useState(() => (
+    typeof ResizeObserver === "undefined" ? Number.POSITIVE_INFINITY : INITIAL_QUEUE_VIEWPORT_HEIGHT
+  ));
+  const [scrollTop, setScrollTop] = useState(0);
+
+  useLayoutEffect(() => {
+    const list = listRef.current;
+    if (!list || typeof ResizeObserver === "undefined") return;
+
+    const measure = (height: number) => {
+      // Focus presentation hides the mounted queue with display:none. Keep the
+      // last useful viewport in that state so navigation performed in Focus
+      // still lands on a visible row when the queue returns.
+      if (height <= 0) return;
+      const next = height;
+      setViewportHeight((current) => current === next ? current : next);
+    };
+    const observer = new ResizeObserver((entries) => {
+      measure(entries[0]?.contentRect.height ?? list.clientHeight);
+    });
+    observer.observe(list);
+    if (list.clientHeight > 0) measure(list.clientHeight);
+    return () => observer.disconnect();
+  }, [listRef]);
+
+  const assetIndexById = useMemo(
+    () => new Map(assets.map((asset, index) => [asset.id, index])),
+    [assets],
+  );
+  const selectedIndex = assetIndexById.get(selectedId) ?? -1;
+
+  // Unlike DOM scrollIntoView, this can move to a selected row that has not
+  // been mounted yet. The App's existing scrollIntoView effect then remains
+  // the final nearest-edge adjustment once the row is present.
+  useLayoutEffect(() => {
+    const list = listRef.current;
+    if (!list || selectedIndex < 0) return;
+    const measuredHeight = list.clientHeight > 0 ? list.clientHeight : viewportHeight;
+    const next = scrollTopForQueueIndex({
+      index: selectedIndex,
+      itemCount: assets.length,
+      scrollTop: list.scrollTop,
+      viewportHeight: measuredHeight,
+    });
+    if (Math.abs(next - list.scrollTop) < 1) return;
+    list.scrollTop = next;
+    setScrollTop(next);
+  }, [assets.length, listRef, selectedId, selectedIndex]);
+
+  const window = queueWindow({
+    itemCount: assets.length,
+    scrollTop,
+    viewportHeight,
+  });
+  const visibleAssets = assets.slice(window.start, window.end);
+  const isVirtualized = window.start > 0 || window.end < assets.length;
+
+  const onListScroll = (event: UIEvent<HTMLDivElement>) => {
+    const next = event.currentTarget.scrollTop;
+    setScrollTop((current) => current === next ? current : next);
+  };
+
+  const rows = visibleAssets.map((asset, visibleIndex) => {
+    const index = window.start + visibleIndex;
+    const thumbnailUrl = api.thumbnailUrl(asset);
+    const rotation = renderedRotation(asset, isRawOrientationThumbnail(asset));
+    const verdict = analysisIndex[asset.id];
+    return (
+      <button
+        className={`queue-item ${asset.id === selectedId ? "selected" : ""}`}
+        key={asset.id}
+        onClick={() => onSelect(asset.id)}
+        role="option"
+        aria-selected={asset.id === selectedId}
+        aria-posinset={index + 1}
+        aria-setsize={assets.length}
+        style={isVirtualized ? {
+          position: "absolute",
+          top: index * QUEUE_ROW_HEIGHT,
+          left: 0,
+        } : undefined}
+      >
+        <span className={`label-pip ${asset.labels.length ? "labeled" : ""}`} aria-hidden="true" />
+        <span
+          className={`queue-thumbnail ${rotation % 180 !== 0 ? "quarter-turn" : ""}`}
+          style={{ "--thumbnail-rotation": `${rotation}deg` } as CSSProperties}
+        >
+          {thumbnailUrl ? <img src={thumbnailUrl} alt="" loading="lazy" /> : <span className="thumbnail-empty">Q0</span>}
+          <span className="queue-index">{String(index + 1).padStart(3, "0")}</span>
+        </span>
+        <span className="queue-main">
+          <strong>{clipTitle(asset)}</strong>
+          {/* The filename stays visible but stops being the headline
+              once analysis has named the clip. The verdict sits on
+              this line, inside the flexible column, so a long reason
+              truncates instead of widening the row. */}
+          <span className="queue-meta">
+            {verdict?.usable === false && (
+              <span className="unusable-pip" title={`Analysis flagged this clip: ${verdict.unusableReason || "unusable"}`}>
+                {verdict.unusableReason || "unusable"}
+              </span>
+            )}
+            <span>{asset.title.trim() ? `${asset.filename} · ${asset.camera}` : asset.camera}</span>
+          </span>
+        </span>
+        <span className="queue-tail">
+          <time>{formatDuration(asset.durationSeconds)}</time>
+          {asset.labels.length > 0 && <span className="label-count">{asset.labels.length} label{asset.labels.length === 1 ? "" : "s"}</span>}
+        </span>
+      </button>
+    );
+  });
+
   return (
     <aside className="queue-panel">
       <div className="panel-heading">
@@ -106,7 +229,14 @@ export function QueuePanel({
         />
         <kbd>/</kbd>
       </label>
-      <div className="queue-list" ref={listRef} role="listbox" aria-label="Clips" tabIndex={0}>
+      <div
+        className="queue-list"
+        ref={listRef}
+        role="listbox"
+        aria-label="Clips"
+        tabIndex={0}
+        onScroll={onListScroll}
+      >
         {assets.length === 0 && loadError ? (
           <div className="empty-queue">
             <strong>This project could not be read.</strong>
@@ -118,48 +248,11 @@ export function QueuePanel({
             <strong>{showRemoved ? "No removed clips." : "No clips here yet."}</strong>
             <span>{showRemoved ? "Removed clips can be restored here." : "Add a NAS or drive folder to begin."}</span>
           </div>
-        ) : assets.map((asset, index) => {
-          const thumbnailUrl = api.thumbnailUrl(asset);
-          const rotation = renderedRotation(asset, isRawOrientationThumbnail(asset));
-          const verdict = analysisIndex[asset.id];
-          return (
-            <button
-              className={`queue-item ${asset.id === selectedId ? "selected" : ""}`}
-              key={asset.id}
-              onClick={() => onSelect(asset.id)}
-              role="option"
-              aria-selected={asset.id === selectedId}
-            >
-              <span className={`label-pip ${asset.labels.length ? "labeled" : ""}`} aria-hidden="true" />
-              <span
-                className={`queue-thumbnail ${rotation % 180 !== 0 ? "quarter-turn" : ""}`}
-                style={{ "--thumbnail-rotation": `${rotation}deg` } as CSSProperties}
-              >
-                {thumbnailUrl ? <img src={thumbnailUrl} alt="" loading="lazy" /> : <span className="thumbnail-empty">Q0</span>}
-                <span className="queue-index">{String(index + 1).padStart(3, "0")}</span>
-              </span>
-              <span className="queue-main">
-                <strong>{clipTitle(asset)}</strong>
-                {/* The filename stays visible but stops being the headline
-                    once analysis has named the clip. The verdict sits on
-                    this line, inside the flexible column, so a long reason
-                    truncates instead of widening the row. */}
-                <span className="queue-meta">
-                  {verdict?.usable === false && (
-                    <span className="unusable-pip" title={`Analysis flagged this clip: ${verdict.unusableReason || "unusable"}`}>
-                      {verdict.unusableReason || "unusable"}
-                    </span>
-                  )}
-                  <span>{asset.title.trim() ? `${asset.filename} · ${asset.camera}` : asset.camera}</span>
-                </span>
-              </span>
-              <span className="queue-tail">
-                <time>{formatDuration(asset.durationSeconds)}</time>
-                {asset.labels.length > 0 && <span className="label-count">{asset.labels.length} label{asset.labels.length === 1 ? "" : "s"}</span>}
-              </span>
-            </button>
-          );
-        })}
+        ) : isVirtualized ? (
+          <div role="presentation" style={{ position: "relative", height: window.totalHeight }}>
+            {rows}
+          </div>
+        ) : rows}
       </div>
       <div className="shortcut-strip" aria-label="Keyboard shortcuts">
         <span><kbd>J</kbd><kbd>K</kbd> move</span>

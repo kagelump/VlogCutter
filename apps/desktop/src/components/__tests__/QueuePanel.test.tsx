@@ -1,7 +1,7 @@
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { createRef } from "react";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Asset, AssetAnalysisIndexEntry } from "../../types";
 import { QueuePanel, type QueuePanelProps } from "../QueuePanel";
 
@@ -43,6 +43,39 @@ function renderPanel(overrides: Partial<QueuePanelProps> = {}) {
   return { props, ...render(<QueuePanel {...props} />) };
 }
 
+function manyAssets(count: number): Asset[] {
+  return Array.from({ length: count }, (_, index) => asset({
+    id: `asset-${index}`,
+    fingerprint: `fingerprint-${index}`,
+    filename: `C${String(index + 1).padStart(5, "0")}.MP4`,
+  }));
+}
+
+function measureQueueAt(height: number) {
+  vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockReturnValue(height);
+
+  class ImmediateResizeObserver implements ResizeObserver {
+    constructor(private readonly callback: ResizeObserverCallback) {}
+
+    observe(target: Element) {
+      this.callback([{
+        target,
+        contentRect: { height } as DOMRectReadOnly,
+      } as ResizeObserverEntry], this);
+    }
+
+    unobserve() {}
+    disconnect() {}
+  }
+
+  vi.stubGlobal("ResizeObserver", ImmediateResizeObserver);
+}
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+  vi.restoreAllMocks();
+});
+
 describe("the clip list", () => {
   it("numbers rows by queue position, not by asset id", () => {
     const { container } = renderPanel({
@@ -82,6 +115,56 @@ describe("the clip list", () => {
     renderPanel({ assets: [asset({ durationSeconds: 75, labels: ["ramen"] })] });
     expect(screen.getByText("1:15")).toBeTruthy();
     expect(screen.getByText("1 label")).toBeTruthy();
+  });
+
+  it("mounts only the viewport around a ten-thousand-clip queue", () => {
+    measureQueueAt(260);
+    const { container } = renderPanel({ assets: manyAssets(10_000) });
+
+    const options = screen.getAllByRole("option");
+    expect(options).toHaveLength(11);
+    expect(options[0]).toHaveAttribute("aria-posinset", "1");
+    expect(options[0]).toHaveAttribute("aria-setsize", "10000");
+    expect(container.querySelector('[role="presentation"]')).toHaveStyle({ height: "520000px" });
+  });
+
+  it("keeps global queue numbers and accessibility positions while scrolling", () => {
+    measureQueueAt(260);
+    const { props } = renderPanel({ assets: manyAssets(10_000) });
+    const list = screen.getByRole("listbox", { name: "Clips" });
+
+    fireEvent.scroll(list, { target: { scrollTop: 5_000 * 52 } });
+
+    expect(screen.getByText("5001")).toBeTruthy();
+    const middle = screen.getByText("5001").closest('[role="option"]');
+    expect(middle).toHaveAttribute("aria-posinset", "5001");
+    expect(screen.getAllByRole("option").length).toBeLessThanOrEqual(17);
+    fireEvent.click(middle!);
+    expect(props.onSelect).toHaveBeenCalledWith("asset-5000");
+  });
+
+  it("reveals a remembered selection that starts outside the mounted window", () => {
+    measureQueueAt(260);
+    renderPanel({ assets: manyAssets(10_000), selectedId: "asset-9000" });
+
+    const selected = screen.getByRole("option", { selected: true });
+    expect(selected).toHaveAttribute("aria-posinset", "9001");
+    expect(selected).toHaveTextContent("C09001.MP4");
+    expect((screen.getByRole("listbox", { name: "Clips" }) as HTMLDivElement).scrollTop)
+      .toBeGreaterThan(0);
+  });
+
+  it("resets positions to the filtered queue without retaining thousands of rows", () => {
+    measureQueueAt(260);
+    const all = manyAssets(10_000);
+    const rendered = renderPanel({ assets: all, selectedId: "asset-5000" });
+
+    rendered.rerender(<QueuePanel {...rendered.props} assets={[all[5_000]]} query="C05001" />);
+
+    expect(screen.getAllByRole("option")).toHaveLength(1);
+    expect(screen.getByRole("option")).toHaveAttribute("aria-posinset", "1");
+    expect(screen.getByRole("option")).toHaveAttribute("aria-setsize", "1");
+    expect(screen.getByText("001")).toBeTruthy();
   });
 });
 

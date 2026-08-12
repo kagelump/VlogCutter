@@ -7,6 +7,7 @@ import { orderAssets, moveSelection as moveSelectionInOrder } from "./review/ord
 import { resolveAction } from "./review/keymap";
 import { CalibrationPanel } from "./CalibrationPanel";
 import { chronologyApi } from "./chronologyApi";
+import { formatChronologyTime } from "./chronology/geometry";
 import type { ChronologyOverview, TripPhase } from "./chronologyTypes";
 import { EditPlanPanel } from "./EditPlanPanel";
 import { RIBBON_ZOOM_DEFAULT, RIBBON_ZOOM_MAX, RIBBON_ZOOM_MIN, RIBBON_ZOOM_STEP, ribbonHeight } from "./review/layout";
@@ -106,6 +107,7 @@ function App() {
   const [offsetMinutes, setOffsetMinutes] = useState(0);
   const [offsetLabel, setOffsetLabel] = useState("Camera time change");
   const [chronologyZoom, setChronologyZoom] = useState(RIBBON_ZOOM_DEFAULT);
+  const [chronologyFocusAssetId, setChronologyFocusAssetId] = useState<string | null>(null);
   const [phaseDialog, setPhaseDialog] = useState<PhaseDialogState | null>(null);
   const [phaseDialogBusy, setPhaseDialogBusy] = useState(false);
   const [phaseDialogError, setPhaseDialogError] = useState("");
@@ -184,6 +186,10 @@ function App() {
   const activeOperationRef = useRef<OperationProgress["kind"] | null>(null);
   const notesEditingRef = useRef<{ assetId: string; savedNotes: string; cancelOnBlur: boolean } | null>(null);
   const chronologyScrollRef = useRef<HTMLDivElement>(null);
+  const reviewRibbonScrollLeftRef = useRef(0);
+  const reviewQueueScrollTopRef = useRef(0);
+  const chronologyReviewSnapshotRef = useRef(false);
+  const chronologyPreserveRibbonViewportRef = useRef(false);
   const queueRef = useRef<HTMLDivElement>(null);
   const viewerStageRef = useRef<HTMLDivElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -290,6 +296,15 @@ function App() {
     () => new Map((chronologyOverview?.phases ?? []).map((phase) => [phase.id, phase])),
     [chronologyOverview],
   );
+  const chronologyProblemCount = (chronologyOverview?.contradictions.length ?? 0)
+    + (chronologyOverview?.proposedSplits.length ?? 0)
+    + ((chronologyOverview?.unplacedAssets ?? 0) > 0 ? 1 : 0);
+  const firstChronologyProblemAssetId = chronologyOverview?.contradictions
+    .find((problem) => problem.assetIds.length > 0)?.assetIds[0]
+    ?? chronologyOverview?.assets.find((asset) => !asset.tripTime)?.assetId
+    ?? chronologyOverview?.proposedSplits.find((proposal) => proposal.affectedAssetIds.length > 0)?.affectedAssetIds[0]
+    ?? selectedId
+    ?? null;
   const phaseIdByAsset = useMemo(() => {
     const index = new Map<string, string>();
     chronologyAssetsById.forEach((chronology, assetId) => {
@@ -660,6 +675,35 @@ function App() {
     scroll.scrollTo({ left: Math.max(0, clipCenter - scroll.clientWidth / 2), behavior });
   }, [activeAssets, chronologyZoom, selectedId]);
 
+  const openChronology = useCallback((assetId?: string | null, preserveViewport = true) => {
+    if (view.mode === "review") {
+      reviewRibbonScrollLeftRef.current = chronologyScrollRef.current?.scrollLeft ?? 0;
+      reviewQueueScrollTopRef.current = queueRef.current?.scrollTop ?? 0;
+      chronologyReviewSnapshotRef.current = true;
+      chronologyPreserveRibbonViewportRef.current = preserveViewport;
+    } else if (view.mode !== "chronology") {
+      chronologyPreserveRibbonViewportRef.current = false;
+    }
+    setChronologyFocusAssetId(assetId || selectedId || null);
+    if (view.mode !== "chronology") dispatchView({ kind: "setMode", mode: "chronology" });
+  }, [selectedId, view.mode]);
+
+  const returnToReview = useCallback(() => {
+    if (view.mode === "review") return;
+    const restoreChronologySnapshot = view.mode === "chronology" && chronologyReviewSnapshotRef.current;
+    dispatchView({ kind: "setMode", mode: "review" });
+    if (!restoreChronologySnapshot) return;
+    chronologyReviewSnapshotRef.current = false;
+    window.requestAnimationFrame(() => {
+      if (chronologyScrollRef.current) {
+        chronologyScrollRef.current.scrollLeft = reviewRibbonScrollLeftRef.current;
+      }
+      if (queueRef.current) {
+        queueRef.current.scrollTop = reviewQueueScrollTopRef.current;
+      }
+    });
+  }, [view.mode]);
+
   useEffect(() => {
     centerSelectedInChronology("smooth");
   }, [centerSelectedInChronology]);
@@ -714,10 +758,13 @@ function App() {
     setPhaseDialogError("");
   }, [phasesById]);
 
-  async function saveTripPhase(value: TripPhaseFormValue) {
+  async function saveTripPhase(
+    value: TripPhaseFormValue,
+    range?: { startPosition: number; endPosition: number },
+  ) {
     if (!phaseDialog || !projectId) return;
-    const start = activeAssets[phaseDialog.startIndex];
-    const end = activeAssets[phaseDialog.endIndex];
+    const start = activeAssets[range?.startPosition ?? phaseDialog.startIndex];
+    const end = activeAssets[range?.endPosition ?? phaseDialog.endIndex];
     if (!start || !end) return;
     const existing = phaseDialog.phase;
     setPhaseDialogBusy(true);
@@ -727,14 +774,10 @@ function App() {
         id: existing?.id ?? "",
         label: value.label,
         kind: value.kind,
-        startAnchorAssetId: existing
-          ? existing.startAnchorAssetId
-          : start.id,
-        endAnchorAssetId: existing
-          ? existing.endAnchorAssetId
-          : end.id,
-        startTripTime: existing?.startTripTime ?? start.bestTime ?? start.capturedAtRaw ?? "",
-        endTripTime: existing?.endTripTime ?? end.bestTime ?? end.capturedAtRaw ?? "",
+        startAnchorAssetId: start.id,
+        endAnchorAssetId: end.id,
+        startTripTime: start.bestTime ?? start.capturedAtRaw ?? existing?.startTripTime ?? "",
+        endTripTime: end.bestTime ?? end.capturedAtRaw ?? existing?.endTripTime ?? "",
         timezone: value.timezone,
         originTimezone: value.originTimezone,
         destinationTimezone: value.destinationTimezone,
@@ -863,6 +906,7 @@ function App() {
         setShowAnalysisDialog(false);
         if (projects.length > 0) setShowCreate(false);
         if (!hadModal && view.presentation === "focus") dispatchView({ kind: "exitFocus" });
+        else if (!hadModal && view.mode === "chronology") returnToReview();
         return;
       }
       const tag = (event.target as HTMLElement)?.tagName;
@@ -921,7 +965,9 @@ function App() {
           case "setMode":
             event.preventDefault();
             if (reviewAction.mode === "review" || projectId) {
-              dispatchView({ kind: "setMode", mode: reviewAction.mode });
+              if (reviewAction.mode === "chronology") openChronology();
+              else if (reviewAction.mode === "review") returnToReview();
+              else dispatchView({ kind: "setMode", mode: reviewAction.mode });
             }
             return;
           case "toggleRibbon":
@@ -952,8 +998,9 @@ function App() {
             dispatchView({ kind: "toggleOverlays" });
             return;
           case "ribbonOverlay":
-            // Shift+T's expanded overlay is not built; swallow the key rather
-            // than letting it reach an unrelated handler.
+            event.preventDefault();
+            if (view.mode === "chronology") returnToReview();
+            else openChronology();
             return;
         }
       }
@@ -990,7 +1037,7 @@ function App() {
     };
     window.addEventListener("keydown", handleKey);
     return () => window.removeEventListener("keydown", handleKey);
-  }, [busy, centerSelectedInChronology, moveSelection, observation, persistAsset, projectId, projects.length, selected, showAnalysisDialog, showMediaMenu, showSettings, showShortcuts, toggleRemoved, view.presentation]);
+  }, [busy, centerSelectedInChronology, moveSelection, observation, openChronology, persistAsset, projectId, projects.length, returnToReview, selected, showAnalysisDialog, showMediaMenu, showSettings, showShortcuts, toggleRemoved, view.mode, view.presentation]);
 
   async function createProject() {
     const name = newProjectName.trim();
@@ -1736,7 +1783,7 @@ function App() {
 
   return (
     <main className={shellClass}>
-      {mountedCard && !showImportDialog && (
+      {mountedCard && !showImportDialog && view.mode === "review" && (
         <CardBanner card={mountedCard} onReview={reviewMountedCard} onDismiss={dismissMountedCard} />
       )}
       <TopBar
@@ -1758,7 +1805,11 @@ function App() {
         labeledCount={labeledCount}
         activeCount={activeAssets.length}
         onProjectChange={setProjectId}
-        onModeChange={(mode) => dispatchView({ kind: "setMode", mode })}
+        onModeChange={(mode) => {
+          if (mode === "chronology") openChronology();
+          else if (mode === "review") returnToReview();
+          else dispatchView({ kind: "setMode", mode });
+        }}
         onOpenCatalog={openCatalog}
         onOpenSettings={() => setShowSettings(true)}
         onOpenCreateProject={() => setShowCreate(true)}
@@ -1777,11 +1828,20 @@ function App() {
       />
 
       {view.mode !== "review" && projectId ? (
-        <div className="mode-surface">
+        <div className={`mode-surface mode-${view.mode}`}>
           {view.mode === "chronology" ? (
             <CalibrationPanel
               projectId={projectId}
               currentAssetId={selectedId || null}
+              assets={assets}
+              overview={chronologyOverview}
+              overviewError={session.chronologyError}
+              reviewZoom={chronologyZoom}
+              reviewScrollLeft={chronologyPreserveRibbonViewportRef.current
+                ? reviewRibbonScrollLeftRef.current
+                : undefined}
+              focusAssetId={chronologyFocusAssetId}
+              onBackToReview={returnToReview}
               // A correction can reorder hundreds of clips; resume where the
               // user was rather than snapping them back to the top.
               onQueueResumed={(assetId) => setSelectedId(assetId)}
@@ -1953,6 +2013,12 @@ function App() {
           contextRuns={contextRuns}
           selected={selected}
           selectedId={selectedId}
+          selectedTimeLabel={selected
+            ? formatChronologyTime(
+                chronologyAssetsById.get(selected.id)?.displayTime?.primary ?? selected.bestTime,
+                chronologyAssetsById.get(selected.id)?.displayTime?.timezone,
+              )
+            : null}
           zoom={chronologyZoom}
           scrollRef={chronologyScrollRef}
           collapsed={!view.ribbon}
@@ -1964,6 +2030,9 @@ function App() {
           onToggleCollapsed={() => dispatchView({ kind: "toggleRibbon" })}
           onRequestContext={openContextRange}
           onEditContext={openExistingContext}
+          chronologyProblemCount={chronologyProblemCount}
+          onOpenChronologyProblems={() => openChronology(firstChronologyProblemAssetId, false)}
+          onOpenExpanded={() => openChronology(selectedId, true)}
           onRenameCamera={(from, to) => { void renameCamera(from, to); }}
         />
       </footer>
@@ -1975,12 +2044,13 @@ function App() {
           phase={phaseDialog.phase}
           start={activeAssets[phaseDialog.startIndex]}
           end={activeAssets[phaseDialog.endIndex]}
+          assets={activeAssets}
           startPosition={phaseDialog.startIndex}
           endPosition={phaseDialog.endIndex}
           busy={phaseDialogBusy}
           error={phaseDialogError}
           onCancel={() => setPhaseDialog(null)}
-          onSave={(value) => { void saveTripPhase(value); }}
+          onSave={(value, range) => { void saveTripPhase(value, range); }}
           onRemove={phaseDialog.phase ? () => { void removeTripPhase(); } : undefined}
         />
       )}

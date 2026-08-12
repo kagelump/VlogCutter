@@ -7,9 +7,13 @@
 //! materializer that disagrees with the write API fails here.
 
 use rcdvlog_core::{
-    Catalog, ChronologyError, ClockEpoch, ConstraintStrength, DisplayMode, PhaseKind,
-    PhaseSplitDirection, ProjectAssetAddedPayload, TripPhase,
+    ApplyOperationResult, CAPTURE_SEQUENCE_MERGED, CAPTURE_SEQUENCE_REASSIGNED,
+    CAPTURE_SEQUENCE_SPLIT_EXACT, Catalog, ChronologyError, ChronologyImpactChange,
+    ChronologySolution, ClockEpoch, ClockEpochImpactPreview, ConstraintStrength, DisplayMode,
+    PhaseKind, PhaseSplitDirection, ProjectAssetAddedPayload, TripPhase, VisualPlacementSide,
+    solve,
 };
+use serde_json::json;
 use tempfile::tempdir;
 
 struct Fixture {
@@ -68,6 +72,72 @@ fn asset_ids_in_order(fixture: &Fixture) -> Vec<String> {
         .collect()
 }
 
+fn chronology_error_code(error: &anyhow::Error) -> &'static str {
+    error
+        .downcast_ref::<ChronologyError>()
+        .expect("chronology methods return a typed chronology error")
+        .code()
+}
+
+fn impact_changes(
+    before: &ChronologySolution,
+    after: &ChronologySolution,
+) -> Vec<ChronologyImpactChange> {
+    after
+        .assets
+        .iter()
+        .enumerate()
+        .filter_map(|(after_position, asset)| {
+            let (before_position, previous) = before
+                .assets
+                .iter()
+                .enumerate()
+                .find(|(_, candidate)| candidate.asset_id == asset.asset_id)?;
+            (before_position != after_position || previous.trip_time != asset.trip_time).then(
+                || ChronologyImpactChange {
+                    asset_id: asset.asset_id.clone(),
+                    before: previous.trip_time.clone(),
+                    after: asset.trip_time.clone(),
+                    before_position,
+                    after_position,
+                },
+            )
+        })
+        .collect()
+}
+
+fn add_portable_asset(
+    fixture: &Fixture,
+    id: &str,
+    filename: &str,
+    camera: &str,
+    captured_at_raw: &str,
+) {
+    fixture
+        .catalog
+        .add_portable_project_asset(
+            &fixture.project_id,
+            ProjectAssetAddedPayload {
+                id: id.to_string(),
+                fingerprint: format!("fingerprint_{id}"),
+                filename: filename.to_string(),
+                size_bytes: 1024,
+                duration_seconds: 4.0,
+                frame_rate: 30.0,
+                width: 1920,
+                height: 1080,
+                codec: "h264".to_string(),
+                camera: camera.to_string(),
+                captured_at_raw: Some(captured_at_raw.to_string()),
+                best_time: Some(captured_at_raw.to_string()),
+                metadata_rotation_degrees: 0,
+                default_rotation_degrees: 0,
+                created_at: "2026-07-20T00:00:00.000Z".to_string(),
+            },
+        )
+        .unwrap();
+}
+
 /// D01-T009: a second card whose counter restarts is proposed as a split, and
 /// applying the split moves exactly the clips at or above the counter.
 #[test]
@@ -86,6 +156,11 @@ fn a_restarting_counter_is_proposed_as_a_split_and_splits_cleanly() {
         .unwrap();
     assert_eq!(proposals.len(), 1, "{proposals:?}");
     assert_eq!(proposals[0].at_counter, 1);
+    assert_eq!(
+        proposals[0].affected_asset_ids,
+        ["asset_C0001_2".to_string(), "asset_C0002_3".to_string()],
+        "a restarted counter selects the later card, not matching counters from both cards"
+    );
 
     let sequences = fixture
         .catalog
@@ -152,6 +227,638 @@ fn merging_capture_sequences_unions_the_assets() {
             .iter()
             .all(|asset| asset.capture_sequence_id.as_deref() == Some(sequences[0].id.as_str())),
         "every asset lands in the destination sequence"
+    );
+}
+
+#[test]
+fn exact_split_preview_is_read_only_and_applies_the_previewed_card_and_identity() {
+    let fixture = fixture(&[
+        ("C0001.MP4", "DJIPocket3", "2026-01-01T09:00:00Z"),
+        ("C0002.MP4", "DJIPocket3", "2026-01-01T10:00:00Z"),
+        ("C0001.MP4", "DJIPocket3", "2026-01-02T09:00:00Z"),
+        ("C0002.MP4", "DJIPocket3", "2026-01-02T10:00:00Z"),
+    ]);
+    let proposal = fixture
+        .catalog
+        .propose_capture_sequence_splits(&fixture.project_id)
+        .unwrap()
+        .remove(0);
+    let source = fixture
+        .catalog
+        .capture_sequences(&fixture.project_id)
+        .unwrap()
+        .remove(0);
+    fixture
+        .catalog
+        .set_clock_epoch(
+            &fixture.project_id,
+            &ClockEpoch {
+                id: "epoch_before_exact_split".to_string(),
+                capture_sequence_id: source.id.clone(),
+                start_counter: 1,
+                end_counter: Some(2),
+                offset_seconds: 3_600,
+                confidence: 1.0,
+                evidence: vec!["user_set".to_string()],
+                label: "both cards inherited one offset".to_string(),
+            },
+        )
+        .unwrap();
+    let facts_before = fixture
+        .catalog
+        .chronology_facts(&fixture.project_id)
+        .unwrap();
+    let solution_before = solve(&facts_before);
+    let operations_before = fixture
+        .catalog
+        .list_operations(&fixture.project_id)
+        .unwrap();
+
+    let preview = fixture
+        .catalog
+        .preview_capture_sequence_split(
+            &fixture.project_id,
+            &source.id,
+            proposal.at_counter,
+            "second card",
+            &proposal.affected_asset_ids,
+        )
+        .unwrap();
+    assert_eq!(preview.source_sequence_id, source.id);
+    assert_eq!(preview.at_counter, 1);
+    assert_eq!(preview.asset_ids, proposal.affected_asset_ids);
+    assert_eq!(preview.created_sequence.label, "second card");
+    assert_ne!(preview.created_sequence.id, source.id);
+    assert!(!preview.impact.changes.is_empty());
+    assert_eq!(
+        fixture
+            .catalog
+            .chronology_facts(&fixture.project_id)
+            .unwrap(),
+        facts_before,
+        "split preview must not create a sequence or move a clip"
+    );
+    assert_eq!(
+        fixture
+            .catalog
+            .list_operations(&fixture.project_id)
+            .unwrap(),
+        operations_before,
+        "split preview must not emit an operation"
+    );
+
+    let created = fixture
+        .catalog
+        .apply_capture_sequence_split(&fixture.project_id, &preview)
+        .unwrap();
+    assert_eq!(created, preview.created_sequence);
+    let facts_after = fixture
+        .catalog
+        .chronology_facts(&fixture.project_id)
+        .unwrap();
+    let moved: Vec<_> = facts_after
+        .assets
+        .iter()
+        .filter(|asset| asset.capture_sequence_id.as_deref() == Some(created.id.as_str()))
+        .map(|asset| asset.asset_id.as_str())
+        .collect();
+    assert_eq!(moved, ["asset_C0001_2", "asset_C0002_3"]);
+    for asset_id in ["asset_C0001_0", "asset_C0002_1"] {
+        assert_eq!(
+            facts_after
+                .assets
+                .iter()
+                .find(|asset| asset.asset_id == asset_id)
+                .unwrap()
+                .capture_sequence_id
+                .as_deref(),
+            Some(source.id.as_str()),
+            "matching counters from the first card must stay in the source"
+        );
+    }
+    let solution_after = solve(&facts_after);
+    assert_eq!(
+        impact_changes(&solution_before, &solution_after),
+        preview.impact.changes,
+        "the applied split must produce exactly the previewed solver diff"
+    );
+    let operations_after = fixture
+        .catalog
+        .list_operations(&fixture.project_id)
+        .unwrap();
+    let new_operations = &operations_after[operations_before.len()..];
+    assert_eq!(new_operations.len(), 1);
+    assert_eq!(
+        new_operations[0].operation_type,
+        CAPTURE_SEQUENCE_SPLIT_EXACT
+    );
+    assert_eq!(new_operations[0].aggregate_id, source.id);
+    assert_eq!(new_operations[0].payload["newSequenceId"], created.id);
+    assert_eq!(
+        new_operations[0].payload["assetIds"],
+        json!(preview.asset_ids),
+        "the durable split expansion is the exact confirmed identity set"
+    );
+
+    let replay_fixture = crate::fixture(&[
+        ("C0001.MP4", "DJIPocket3", "2026-01-01T09:00:00Z"),
+        ("C0002.MP4", "DJIPocket3", "2026-01-01T10:00:00Z"),
+        ("C0001.MP4", "DJIPocket3", "2026-01-02T09:00:00Z"),
+        ("C0002.MP4", "DJIPocket3", "2026-01-02T10:00:00Z"),
+    ]);
+    let replay_source = replay_fixture
+        .catalog
+        .capture_sequences(&replay_fixture.project_id)
+        .unwrap()
+        .remove(0);
+    add_portable_asset(
+        &replay_fixture,
+        "asset_C0002_discovered_later",
+        "C0002.MP4",
+        "DJIPocket3",
+        "2026-01-03T10:00:00Z",
+    );
+    let mut replay = new_operations[0].clone();
+    replay.operation_id = "operation_replayed_exact_split".to_string();
+    replay.project_id = replay_fixture.project_id.clone();
+    replay.aggregate_id = replay_source.id.clone();
+    assert_eq!(
+        replay_fixture.catalog.apply_operation(&replay).unwrap(),
+        ApplyOperationResult::Applied
+    );
+    assert_eq!(
+        replay_fixture.catalog.apply_operation(&replay).unwrap(),
+        ApplyOperationResult::Duplicate
+    );
+    let replayed = replay_fixture
+        .catalog
+        .chronology_facts(&replay_fixture.project_id)
+        .unwrap();
+    assert_eq!(
+        replayed
+            .assets
+            .iter()
+            .find(|asset| asset.asset_id == "asset_C0002_discovered_later")
+            .unwrap()
+            .capture_sequence_id
+            .as_deref(),
+        Some(replay_source.id.as_str()),
+        "replay must not sweep a later matching counter into the confirmed card"
+    );
+    for asset_id in ["asset_C0001_2", "asset_C0002_3"] {
+        assert_eq!(
+            replayed
+                .assets
+                .iter()
+                .find(|asset| asset.asset_id == asset_id)
+                .unwrap()
+                .capture_sequence_id
+                .as_deref(),
+            Some(created.id.as_str())
+        );
+    }
+}
+
+#[test]
+fn exact_split_confirmation_refuses_changed_facts_without_partial_writes() {
+    let fixture = fixture(&[
+        ("C0001.MP4", "Sony", "2026-01-01T09:00:00Z"),
+        ("C0002.MP4", "Sony", "2026-01-01T10:00:00Z"),
+    ]);
+    let source = fixture
+        .catalog
+        .capture_sequences(&fixture.project_id)
+        .unwrap()
+        .remove(0);
+    let preview = fixture
+        .catalog
+        .preview_capture_sequence_split(
+            &fixture.project_id,
+            &source.id,
+            2,
+            "card two",
+            &["asset_C0002_1".to_string()],
+        )
+        .unwrap();
+    add_portable_asset(
+        &fixture,
+        "asset_C0003_after_preview",
+        "C0003.MP4",
+        "Sony",
+        "2026-01-01T11:00:00Z",
+    );
+    let operations_before_apply = fixture
+        .catalog
+        .list_operations(&fixture.project_id)
+        .unwrap();
+
+    let error = fixture
+        .catalog
+        .apply_capture_sequence_split(&fixture.project_id, &preview)
+        .unwrap_err();
+    assert_eq!(
+        chronology_error_code(&error),
+        "chronology.invalid_reference"
+    );
+    assert!(format!("{error:#}").contains("preview is stale"));
+    let facts = fixture
+        .catalog
+        .chronology_facts(&fixture.project_id)
+        .unwrap();
+    assert!(
+        facts
+            .sequences
+            .iter()
+            .all(|sequence| sequence.id != preview.created_sequence.id),
+        "a stale confirmation must not leave its declared sequence behind"
+    );
+    assert!(
+        facts
+            .assets
+            .iter()
+            .all(|asset| { asset.capture_sequence_id.as_deref() == Some(source.id.as_str()) })
+    );
+    assert_eq!(
+        fixture
+            .catalog
+            .list_operations(&fixture.project_id)
+            .unwrap(),
+        operations_before_apply,
+        "a stale exact split writes neither half of its transaction"
+    );
+}
+
+#[test]
+fn exact_split_materialization_refuses_an_invalid_identity_atomically() {
+    let clips = [
+        ("C0001.MP4", "Sony", "2026-01-01T09:00:00Z"),
+        ("C0002.MP4", "Sony", "2026-01-01T10:00:00Z"),
+    ];
+    let author = fixture(&clips);
+    let author_source = author
+        .catalog
+        .capture_sequences(&author.project_id)
+        .unwrap()
+        .remove(0);
+    let preview = author
+        .catalog
+        .preview_capture_sequence_split(
+            &author.project_id,
+            &author_source.id,
+            2,
+            "card two",
+            &["asset_C0002_1".to_string()],
+        )
+        .unwrap();
+    author
+        .catalog
+        .apply_capture_sequence_split(&author.project_id, &preview)
+        .unwrap();
+    let operation = author
+        .catalog
+        .list_operations(&author.project_id)
+        .unwrap()
+        .into_iter()
+        .find(|operation| operation.operation_type == CAPTURE_SEQUENCE_SPLIT_EXACT)
+        .unwrap();
+
+    let replica = crate::fixture(&clips);
+    let replica_source = replica
+        .catalog
+        .capture_sequences(&replica.project_id)
+        .unwrap()
+        .remove(0);
+    let operations_before = replica
+        .catalog
+        .list_operations(&replica.project_id)
+        .unwrap();
+    let mut invalid = operation;
+    invalid.operation_id = "operation_invalid_exact_split".to_string();
+    invalid.project_id = replica.project_id.clone();
+    invalid.aggregate_id = replica_source.id.clone();
+    invalid.payload["assetIds"] = json!(["asset_C0002_1", "asset_missing"]);
+
+    let error = replica.catalog.apply_operation(&invalid).unwrap_err();
+    assert!(format!("{error:#}").contains("asset_missing"));
+    let facts = replica
+        .catalog
+        .chronology_facts(&replica.project_id)
+        .unwrap();
+    assert_eq!(
+        facts.sequences.as_slice(),
+        std::slice::from_ref(&replica_source)
+    );
+    assert!(
+        facts
+            .assets
+            .iter()
+            .all(|asset| asset.capture_sequence_id.as_deref() == Some(replica_source.id.as_str()))
+    );
+    assert_eq!(
+        replica
+            .catalog
+            .list_operations(&replica.project_id)
+            .unwrap(),
+        operations_before,
+        "the rejected operation row and every partial materialization roll back together"
+    );
+}
+
+#[test]
+fn exact_merge_preview_is_read_only_and_apply_matches_assets_epochs_and_impact() {
+    let fixture = fixture(&[
+        ("C0001.MP4", "Sony", "2026-01-01T09:00:00Z"),
+        ("D0001.MP4", "DJI", "2026-01-01T10:00:00Z"),
+    ]);
+    let sequences = fixture
+        .catalog
+        .capture_sequences(&fixture.project_id)
+        .unwrap();
+    let source = sequences
+        .iter()
+        .find(|sequence| sequence.camera_key == "Sony")
+        .unwrap();
+    let destination = sequences
+        .iter()
+        .find(|sequence| sequence.camera_key == "DJI")
+        .unwrap();
+    let epoch = fixture
+        .catalog
+        .set_clock_epoch(
+            &fixture.project_id,
+            &ClockEpoch {
+                id: "epoch_merge_source".to_string(),
+                capture_sequence_id: source.id.clone(),
+                start_counter: 1,
+                end_counter: None,
+                offset_seconds: 3_600,
+                confidence: 1.0,
+                evidence: vec!["user_set".to_string()],
+                label: "Sony clock".to_string(),
+            },
+        )
+        .unwrap();
+    let facts_before = fixture
+        .catalog
+        .chronology_facts(&fixture.project_id)
+        .unwrap();
+    let solution_before = solve(&facts_before);
+    let operations_before = fixture
+        .catalog
+        .list_operations(&fixture.project_id)
+        .unwrap();
+
+    let preview = fixture
+        .catalog
+        .preview_capture_sequence_merge(&fixture.project_id, &source.id, &destination.id)
+        .unwrap();
+    assert_eq!(preview.asset_ids, ["asset_C0001_0"]);
+    assert_eq!(
+        preview.epoch_ids.as_slice(),
+        std::slice::from_ref(&epoch.id)
+    );
+    assert!(!preview.impact.changes.is_empty());
+    assert_eq!(
+        fixture
+            .catalog
+            .chronology_facts(&fixture.project_id)
+            .unwrap(),
+        facts_before
+    );
+    assert_eq!(
+        fixture
+            .catalog
+            .list_operations(&fixture.project_id)
+            .unwrap(),
+        operations_before
+    );
+
+    fixture
+        .catalog
+        .apply_capture_sequence_merge(&fixture.project_id, &preview)
+        .unwrap();
+    let facts_after = fixture
+        .catalog
+        .chronology_facts(&fixture.project_id)
+        .unwrap();
+    assert!(
+        facts_after
+            .sequences
+            .iter()
+            .all(|sequence| sequence.id != source.id)
+    );
+    assert!(
+        facts_after
+            .assets
+            .iter()
+            .all(|asset| { asset.capture_sequence_id.as_deref() == Some(destination.id.as_str()) })
+    );
+    assert_eq!(facts_after.epochs[0].capture_sequence_id, destination.id);
+    assert_eq!(
+        impact_changes(&solution_before, &solve(&facts_after)),
+        preview.impact.changes
+    );
+    let operations_after = fixture
+        .catalog
+        .list_operations(&fixture.project_id)
+        .unwrap();
+    assert_eq!(operations_after.len(), operations_before.len() + 1);
+    let operation = operations_after.last().unwrap();
+    assert_eq!(operation.operation_type, CAPTURE_SEQUENCE_MERGED);
+    assert_eq!(
+        operation.payload,
+        json!({
+            "fromSequenceId": source.id,
+            "intoSequenceId": destination.id,
+            "assetIds": preview.asset_ids,
+            "epochIds": preview.epoch_ids,
+        }),
+        "the durable merge records exactly the facts the user confirmed"
+    );
+
+    let replica = crate::fixture(&[
+        ("C0001.MP4", "Sony", "2026-01-01T09:00:00Z"),
+        ("D0001.MP4", "DJI", "2026-01-01T10:00:00Z"),
+    ]);
+    let replica_sequences = replica
+        .catalog
+        .capture_sequences(&replica.project_id)
+        .unwrap();
+    let replica_source = replica_sequences
+        .iter()
+        .find(|sequence| sequence.camera_key == "Sony")
+        .unwrap();
+    let replica_destination = replica_sequences
+        .iter()
+        .find(|sequence| sequence.camera_key == "DJI")
+        .unwrap();
+    replica
+        .catalog
+        .set_clock_epoch(
+            &replica.project_id,
+            &ClockEpoch {
+                id: "epoch_merge_source".to_string(),
+                capture_sequence_id: replica_source.id.clone(),
+                start_counter: 1,
+                end_counter: None,
+                offset_seconds: 3_600,
+                confidence: 1.0,
+                evidence: vec!["user_set".to_string()],
+                label: "Sony clock".to_string(),
+            },
+        )
+        .unwrap();
+    add_portable_asset(
+        &replica,
+        "asset_C0002_discovered_later",
+        "C0002.MP4",
+        "Sony",
+        "2026-01-01T11:00:00Z",
+    );
+    replica
+        .catalog
+        .set_clock_epoch(
+            &replica.project_id,
+            &ClockEpoch {
+                id: "epoch_merge_discovered_later".to_string(),
+                capture_sequence_id: replica_source.id.clone(),
+                start_counter: 2,
+                end_counter: None,
+                offset_seconds: 120,
+                confidence: 1.0,
+                evidence: vec!["later".to_string()],
+                label: "later fact".to_string(),
+            },
+        )
+        .unwrap();
+    let mut replay = operation.clone();
+    replay.operation_id = "operation_replayed_exact_merge".to_string();
+    replay.project_id = replica.project_id.clone();
+    replay.aggregate_id = replica_destination.id.clone();
+    replay.payload["fromSequenceId"] = json!(replica_source.id);
+    replay.payload["intoSequenceId"] = json!(replica_destination.id);
+    assert_eq!(
+        replica.catalog.apply_operation(&replay).unwrap(),
+        ApplyOperationResult::Applied
+    );
+    let replayed = replica
+        .catalog
+        .chronology_facts(&replica.project_id)
+        .unwrap();
+    assert_eq!(
+        replayed
+            .assets
+            .iter()
+            .find(|asset| asset.asset_id == "asset_C0001_0")
+            .unwrap()
+            .capture_sequence_id
+            .as_deref(),
+        Some(replica_destination.id.as_str())
+    );
+    assert_eq!(
+        replayed
+            .assets
+            .iter()
+            .find(|asset| asset.asset_id == "asset_C0002_discovered_later")
+            .unwrap()
+            .capture_sequence_id
+            .as_deref(),
+        Some(replica_source.id.as_str()),
+        "a later asset stays in the source instead of being swept into an older merge"
+    );
+    assert_eq!(
+        replayed
+            .epochs
+            .iter()
+            .find(|epoch| epoch.id == "epoch_merge_source")
+            .unwrap()
+            .capture_sequence_id,
+        replica_destination.id
+    );
+    assert_eq!(
+        replayed
+            .epochs
+            .iter()
+            .find(|epoch| epoch.id == "epoch_merge_discovered_later")
+            .unwrap()
+            .capture_sequence_id,
+        replica_source.id
+    );
+    assert!(
+        replayed
+            .sequences
+            .iter()
+            .any(|sequence| sequence.id == replica_source.id),
+        "the source sequence remains while later unconfirmed facts still belong to it"
+    );
+}
+
+#[test]
+fn exact_merge_confirmation_refuses_a_stale_preview() {
+    let fixture = fixture(&[
+        ("C0001.MP4", "Sony", "2026-01-01T09:00:00Z"),
+        ("D0001.MP4", "DJI", "2026-01-01T10:00:00Z"),
+    ]);
+    let sequences = fixture
+        .catalog
+        .capture_sequences(&fixture.project_id)
+        .unwrap();
+    let source = sequences
+        .iter()
+        .find(|sequence| sequence.camera_key == "Sony")
+        .unwrap();
+    let destination = sequences
+        .iter()
+        .find(|sequence| sequence.camera_key == "DJI")
+        .unwrap();
+    let preview = fixture
+        .catalog
+        .preview_capture_sequence_merge(&fixture.project_id, &source.id, &destination.id)
+        .unwrap();
+    fixture
+        .catalog
+        .set_clock_epoch(
+            &fixture.project_id,
+            &ClockEpoch {
+                id: "epoch_after_merge_preview".to_string(),
+                capture_sequence_id: source.id.clone(),
+                start_counter: 1,
+                end_counter: None,
+                offset_seconds: 60,
+                confidence: 1.0,
+                evidence: vec!["user_set".to_string()],
+                label: "late evidence".to_string(),
+            },
+        )
+        .unwrap();
+    let operations_before_apply = fixture
+        .catalog
+        .list_operations(&fixture.project_id)
+        .unwrap();
+
+    let error = fixture
+        .catalog
+        .apply_capture_sequence_merge(&fixture.project_id, &preview)
+        .unwrap_err();
+    assert_eq!(
+        chronology_error_code(&error),
+        "chronology.invalid_reference"
+    );
+    assert!(format!("{error:#}").contains("preview is stale"));
+    assert_eq!(
+        fixture
+            .catalog
+            .list_operations(&fixture.project_id)
+            .unwrap(),
+        operations_before_apply
+    );
+    assert!(
+        fixture
+            .catalog
+            .capture_sequences(&fixture.project_id)
+            .unwrap()
+            .iter()
+            .any(|sequence| sequence.id == source.id)
     );
 }
 
@@ -259,6 +966,39 @@ fn an_inverted_epoch_range_is_refused() {
             .epochs
             .is_empty(),
         "a refused epoch writes nothing"
+    );
+
+    let operations_before = fixture
+        .catalog
+        .list_operations(&fixture.project_id)
+        .unwrap();
+    let preview_error = fixture
+        .catalog
+        .preview_clock_epoch_impact(
+            &fixture.project_id,
+            &ClockEpoch {
+                id: String::new(),
+                capture_sequence_id: sequences[0].id.clone(),
+                start_counter: 10,
+                end_counter: Some(2),
+                offset_seconds: 0,
+                confidence: 1.0,
+                evidence: Vec::new(),
+                label: String::new(),
+            },
+        )
+        .unwrap_err();
+    assert_eq!(
+        chronology_error_code(&preview_error),
+        "chronology.invalid_interval"
+    );
+    assert_eq!(
+        fixture
+            .catalog
+            .list_operations(&fixture.project_id)
+            .unwrap(),
+        operations_before,
+        "a refused preview allocates neither epoch identity nor operation"
     );
 }
 
@@ -788,12 +1528,1381 @@ fn the_impact_preview_writes_nothing() {
             .is_empty(),
         "a preview writes nothing"
     );
+    let operations_before = fixture
+        .catalog
+        .list_operations(&fixture.project_id)
+        .unwrap();
+    let error = fixture
+        .catalog
+        .set_clock_epoch(&fixture.project_id, &candidate)
+        .unwrap_err();
+    assert_eq!(
+        chronology_error_code(&error),
+        "chronology.hard_contradiction"
+    );
+    assert_eq!(
+        fixture
+            .catalog
+            .list_operations(&fixture.project_id)
+            .unwrap(),
+        operations_before,
+        "a hard-blocked apply writes nothing even if an adapter bypasses the preview UI"
+    );
 }
 
-/// The projection helper is the sole writer of `best_time` and
-/// `offset_seconds`, and re-solving is idempotent.
 #[test]
-fn projection_writes_the_solution_and_is_idempotent() {
+fn clock_epoch_impact_names_every_exact_time_and_position_change_without_writing() {
+    let fixture = fixture(&[
+        ("C0001.MP4", "DJIPocket3", "2026-01-01T09:00:00Z"),
+        ("C0002.MP4", "DJIPocket3", "2026-01-01T10:00:00Z"),
+        ("C0003.MP4", "DJIPocket3", "2026-01-01T11:00:00Z"),
+    ]);
+    let sequence = fixture
+        .catalog
+        .capture_sequences(&fixture.project_id)
+        .unwrap()
+        .remove(0);
+    let facts_before = fixture
+        .catalog
+        .chronology_facts(&fixture.project_id)
+        .unwrap();
+    let solution_before = solve(&facts_before);
+    let operations_before = fixture
+        .catalog
+        .list_operations(&fixture.project_id)
+        .unwrap();
+
+    let preview = fixture
+        .catalog
+        .preview_clock_epoch_impact(
+            &fixture.project_id,
+            &ClockEpoch {
+                id: String::new(),
+                capture_sequence_id: sequence.id.clone(),
+                start_counter: 2,
+                end_counter: Some(2),
+                offset_seconds: 7_200,
+                confidence: 1.0,
+                evidence: vec!["user_preview".to_string()],
+                label: "move the middle clip".to_string(),
+            },
+        )
+        .unwrap();
+    assert!(preview.epoch.id.starts_with("epoch_"));
+    assert_eq!(preview.epoch.capture_sequence_id, sequence.id);
+    let impact = &preview.impact;
+
+    assert_eq!(
+        impact.changes,
+        vec![
+            ChronologyImpactChange {
+                asset_id: "asset_C0003_2".to_string(),
+                before: Some("2026-01-01T11:00:00.000Z".to_string()),
+                after: Some("2026-01-01T11:00:00.000Z".to_string()),
+                before_position: 2,
+                after_position: 1,
+            },
+            ChronologyImpactChange {
+                asset_id: "asset_C0002_1".to_string(),
+                before: Some("2026-01-01T10:00:00.000Z".to_string()),
+                after: Some("2026-01-01T12:00:00.000Z".to_string()),
+                before_position: 1,
+                after_position: 2,
+            },
+        ]
+    );
+    assert!(impact.contradictions.is_empty());
+    assert!(!impact.blocked);
+    assert_eq!(
+        fixture
+            .catalog
+            .chronology_facts(&fixture.project_id)
+            .unwrap(),
+        facts_before,
+        "previewing must not persist the candidate epoch"
+    );
+    assert_eq!(
+        fixture
+            .catalog
+            .list_operations(&fixture.project_id)
+            .unwrap(),
+        operations_before,
+        "previewing must not allocate an operation or node sequence"
+    );
+
+    fixture
+        .catalog
+        .apply_clock_epoch_preview(&fixture.project_id, &preview)
+        .unwrap();
+    let solution_after = fixture
+        .catalog
+        .solve_chronology(&fixture.project_id)
+        .unwrap();
+    let actual_changes: Vec<_> = solution_after
+        .assets
+        .iter()
+        .enumerate()
+        .filter_map(|(after_position, asset)| {
+            let (before_position, previous) = solution_before
+                .assets
+                .iter()
+                .enumerate()
+                .find(|(_, candidate)| candidate.asset_id == asset.asset_id)?;
+            (before_position != after_position || previous.trip_time != asset.trip_time).then(
+                || ChronologyImpactChange {
+                    asset_id: asset.asset_id.clone(),
+                    before: previous.trip_time.clone(),
+                    after: asset.trip_time.clone(),
+                    before_position,
+                    after_position,
+                },
+            )
+        })
+        .collect();
+    assert_eq!(actual_changes, preview.impact.changes);
+}
+
+#[test]
+fn clear_epoch_preview_reveals_the_underlying_epoch_and_matches_apply_without_writing() {
+    let fixture = fixture(&[
+        ("C0001.MP4", "DJIPocket3", "2026-01-01T09:00:00Z"),
+        ("C0002.MP4", "DJIPocket3", "2026-01-01T10:00:00Z"),
+    ]);
+    let sequence = fixture
+        .catalog
+        .capture_sequences(&fixture.project_id)
+        .unwrap()
+        .remove(0);
+    fixture
+        .catalog
+        .set_clock_epoch(
+            &fixture.project_id,
+            &ClockEpoch {
+                id: "epoch_broad".to_string(),
+                capture_sequence_id: sequence.id.clone(),
+                start_counter: 0,
+                end_counter: None,
+                offset_seconds: 3_600,
+                confidence: 1.0,
+                evidence: vec!["broad".to_string()],
+                label: "broad correction".to_string(),
+            },
+        )
+        .unwrap();
+    fixture
+        .catalog
+        .set_clock_epoch(
+            &fixture.project_id,
+            &ClockEpoch {
+                id: "epoch_narrow".to_string(),
+                capture_sequence_id: sequence.id,
+                start_counter: 2,
+                end_counter: Some(2),
+                offset_seconds: 7_200,
+                confidence: 1.0,
+                evidence: vec!["narrow".to_string()],
+                label: "narrow correction".to_string(),
+            },
+        )
+        .unwrap();
+    let before = fixture
+        .catalog
+        .solve_chronology(&fixture.project_id)
+        .unwrap();
+    assert_eq!(
+        before
+            .assets
+            .iter()
+            .find(|asset| asset.asset_id == "asset_C0002_1")
+            .unwrap()
+            .trip_time
+            .as_deref(),
+        Some("2026-01-01T12:00:00.000Z")
+    );
+    let facts_before = fixture
+        .catalog
+        .chronology_facts(&fixture.project_id)
+        .unwrap();
+    let operations_before = fixture
+        .catalog
+        .list_operations(&fixture.project_id)
+        .unwrap();
+
+    let preview = fixture
+        .catalog
+        .preview_clear_clock_epoch_impact(&fixture.project_id, "epoch_narrow")
+        .unwrap();
+    assert_eq!(
+        preview.impact.changes,
+        [ChronologyImpactChange {
+            asset_id: "asset_C0002_1".to_string(),
+            before: Some("2026-01-01T12:00:00.000Z".to_string()),
+            after: Some("2026-01-01T11:00:00.000Z".to_string()),
+            before_position: 1,
+            after_position: 1,
+        }]
+    );
+    assert_eq!(
+        fixture
+            .catalog
+            .chronology_facts(&fixture.project_id)
+            .unwrap(),
+        facts_before
+    );
+    assert_eq!(
+        fixture
+            .catalog
+            .list_operations(&fixture.project_id)
+            .unwrap(),
+        operations_before
+    );
+
+    fixture
+        .catalog
+        .apply_clear_clock_epoch_preview(&fixture.project_id, &preview)
+        .unwrap();
+    let after = fixture
+        .catalog
+        .solve_chronology(&fixture.project_id)
+        .unwrap();
+    assert_eq!(
+        after
+            .assets
+            .iter()
+            .find(|asset| asset.asset_id == "asset_C0002_1")
+            .unwrap()
+            .trip_time
+            .as_deref(),
+        preview.impact.changes[0].after.as_deref()
+    );
+}
+
+#[test]
+fn clock_set_clear_and_visual_confirmation_refuse_changed_facts() {
+    let set_fixture = fixture(&[
+        ("C0001.MP4", "Sony", "2026-01-01T09:00:00Z"),
+        ("D0001.MP4", "DJI", "2026-01-01T12:00:00Z"),
+    ]);
+    let set_sequences = set_fixture
+        .catalog
+        .capture_sequences(&set_fixture.project_id)
+        .unwrap();
+    let set_source = set_sequences
+        .iter()
+        .find(|sequence| sequence.camera_key == "Sony")
+        .unwrap();
+    let set_other = set_sequences
+        .iter()
+        .find(|sequence| sequence.camera_key == "DJI")
+        .unwrap();
+    let set_preview = set_fixture
+        .catalog
+        .preview_clock_epoch_impact(
+            &set_fixture.project_id,
+            &ClockEpoch {
+                id: String::new(),
+                capture_sequence_id: set_source.id.clone(),
+                start_counter: 1,
+                end_counter: None,
+                offset_seconds: 300,
+                confidence: 1.0,
+                evidence: vec!["preview".to_string()],
+                label: "Sony correction".to_string(),
+            },
+        )
+        .unwrap();
+    assert!(!set_preview.facts_token.is_empty());
+    set_fixture
+        .catalog
+        .set_clock_epoch(
+            &set_fixture.project_id,
+            &ClockEpoch {
+                id: "epoch_unrelated_set".to_string(),
+                capture_sequence_id: set_other.id.clone(),
+                start_counter: 1,
+                end_counter: None,
+                offset_seconds: 60,
+                confidence: 1.0,
+                evidence: vec!["other".to_string()],
+                label: "DJI correction".to_string(),
+            },
+        )
+        .unwrap();
+    let operations_before_set_apply = set_fixture
+        .catalog
+        .list_operations(&set_fixture.project_id)
+        .unwrap();
+    let error = set_fixture
+        .catalog
+        .apply_clock_epoch_preview(&set_fixture.project_id, &set_preview)
+        .unwrap_err();
+    assert_eq!(
+        chronology_error_code(&error),
+        "chronology.invalid_reference"
+    );
+    assert!(format!("{error:#}").contains("preview is stale"));
+    assert_eq!(
+        set_fixture
+            .catalog
+            .list_operations(&set_fixture.project_id)
+            .unwrap(),
+        operations_before_set_apply
+    );
+
+    let clear_fixture = fixture(&[
+        ("C0001.MP4", "Sony", "2026-01-01T09:00:00Z"),
+        ("D0001.MP4", "DJI", "2026-01-01T12:00:00Z"),
+    ]);
+    let clear_sequences = clear_fixture
+        .catalog
+        .capture_sequences(&clear_fixture.project_id)
+        .unwrap();
+    let clear_source = clear_sequences
+        .iter()
+        .find(|sequence| sequence.camera_key == "Sony")
+        .unwrap();
+    let clear_other = clear_sequences
+        .iter()
+        .find(|sequence| sequence.camera_key == "DJI")
+        .unwrap();
+    clear_fixture
+        .catalog
+        .set_clock_epoch(
+            &clear_fixture.project_id,
+            &ClockEpoch {
+                id: "epoch_to_clear_exactly".to_string(),
+                capture_sequence_id: clear_source.id.clone(),
+                start_counter: 1,
+                end_counter: None,
+                offset_seconds: 300,
+                confidence: 1.0,
+                evidence: vec!["preview".to_string()],
+                label: "Sony correction".to_string(),
+            },
+        )
+        .unwrap();
+    let clear_preview = clear_fixture
+        .catalog
+        .preview_clear_clock_epoch_impact(&clear_fixture.project_id, "epoch_to_clear_exactly")
+        .unwrap();
+    assert!(!clear_preview.facts_token.is_empty());
+    clear_fixture
+        .catalog
+        .set_clock_epoch(
+            &clear_fixture.project_id,
+            &ClockEpoch {
+                id: "epoch_unrelated_clear".to_string(),
+                capture_sequence_id: clear_other.id.clone(),
+                start_counter: 1,
+                end_counter: None,
+                offset_seconds: 60,
+                confidence: 1.0,
+                evidence: vec!["other".to_string()],
+                label: "DJI correction".to_string(),
+            },
+        )
+        .unwrap();
+    let operations_before_clear_apply = clear_fixture
+        .catalog
+        .list_operations(&clear_fixture.project_id)
+        .unwrap();
+    let error = clear_fixture
+        .catalog
+        .apply_clear_clock_epoch_preview(&clear_fixture.project_id, &clear_preview)
+        .unwrap_err();
+    assert_eq!(
+        chronology_error_code(&error),
+        "chronology.invalid_reference"
+    );
+    assert!(format!("{error:#}").contains("preview is stale"));
+    assert_eq!(
+        clear_fixture
+            .catalog
+            .list_operations(&clear_fixture.project_id)
+            .unwrap(),
+        operations_before_clear_apply
+    );
+    assert!(
+        clear_fixture
+            .catalog
+            .chronology_facts(&clear_fixture.project_id)
+            .unwrap()
+            .epochs
+            .iter()
+            .any(|epoch| epoch.id == "epoch_to_clear_exactly")
+    );
+
+    let visual_fixture = fixture(&[
+        ("A0001.MP4", "Sony", "2026-01-01T09:00:00Z"),
+        ("D0001.MP4", "DJI", "2026-01-01T12:00:00Z"),
+    ]);
+    let visual_other = visual_fixture
+        .catalog
+        .capture_sequences(&visual_fixture.project_id)
+        .unwrap()
+        .into_iter()
+        .find(|sequence| sequence.camera_key == "DJI")
+        .unwrap();
+    let visual_preview = visual_fixture
+        .catalog
+        .preview_visual_placement(
+            &visual_fixture.project_id,
+            &["asset_A0001_0".to_string()],
+            "asset_D0001_1",
+            VisualPlacementSide::Before,
+            "place Sony",
+        )
+        .unwrap();
+    assert!(!visual_preview.facts_token.is_empty());
+    visual_fixture
+        .catalog
+        .set_clock_epoch(
+            &visual_fixture.project_id,
+            &ClockEpoch {
+                id: "epoch_unrelated_visual".to_string(),
+                capture_sequence_id: visual_other.id,
+                start_counter: 1,
+                end_counter: None,
+                offset_seconds: 60,
+                confidence: 1.0,
+                evidence: vec!["other".to_string()],
+                label: "DJI correction".to_string(),
+            },
+        )
+        .unwrap();
+    let visual_as_clock = ClockEpochImpactPreview {
+        epoch: visual_preview.epoch,
+        facts_token: visual_preview.facts_token,
+        impact: visual_preview.impact,
+    };
+    let operations_before_visual_apply = visual_fixture
+        .catalog
+        .list_operations(&visual_fixture.project_id)
+        .unwrap();
+    let error = visual_fixture
+        .catalog
+        .apply_clock_epoch_preview(&visual_fixture.project_id, &visual_as_clock)
+        .unwrap_err();
+    assert_eq!(
+        chronology_error_code(&error),
+        "chronology.invalid_reference"
+    );
+    assert!(format!("{error:#}").contains("preview is stale"));
+    assert_eq!(
+        visual_fixture
+            .catalog
+            .list_operations(&visual_fixture.project_id)
+            .unwrap(),
+        operations_before_visual_apply
+    );
+}
+
+#[test]
+fn visual_placement_derives_a_raw_relative_epoch_and_apply_matches_the_preview() {
+    let fixture = fixture(&[
+        ("A0001.MP4", "Sony", "2026-01-01T09:00:00Z"),
+        ("A0002.MP4", "Sony", "2026-01-01T10:00:00Z"),
+        ("D0001.MP4", "DJI", "2026-01-01T12:00:00Z"),
+    ]);
+    let sony = fixture
+        .catalog
+        .capture_sequences(&fixture.project_id)
+        .unwrap()
+        .into_iter()
+        .find(|sequence| sequence.camera_key == "Sony")
+        .unwrap();
+    fixture
+        .catalog
+        .set_clock_epoch(
+            &fixture.project_id,
+            &ClockEpoch {
+                id: "epoch_existing".to_string(),
+                capture_sequence_id: sony.id.clone(),
+                start_counter: 0,
+                end_counter: None,
+                offset_seconds: 3_600,
+                confidence: 1.0,
+                evidence: vec!["user_set".to_string()],
+                label: "existing correction".to_string(),
+            },
+        )
+        .unwrap();
+    let selected = vec!["asset_A0001_0".to_string(), "asset_A0002_1".to_string()];
+    let before = fixture
+        .catalog
+        .solve_chronology(&fixture.project_id)
+        .unwrap();
+    let facts_before = fixture
+        .catalog
+        .chronology_facts(&fixture.project_id)
+        .unwrap();
+    let operations_before = fixture
+        .catalog
+        .list_operations(&fixture.project_id)
+        .unwrap();
+
+    let preview = fixture
+        .catalog
+        .preview_visual_placement(
+            &fixture.project_id,
+            &selected,
+            "asset_D0001_2",
+            VisualPlacementSide::Before,
+            "  Sony belongs before DJI  ",
+        )
+        .unwrap();
+
+    assert!(
+        !preview.epoch.id.is_empty(),
+        "the exact previewed epoch identity must survive confirmation"
+    );
+    assert_eq!(preview.epoch.capture_sequence_id, sony.id);
+    assert_eq!(preview.epoch.start_counter, 1);
+    assert_eq!(preview.epoch.end_counter, Some(2));
+    assert_eq!(
+        preview.epoch.offset_seconds, 7_195,
+        "clock epochs are offsets from raw camera time, not deltas from the current correction"
+    );
+    assert_eq!(preview.epoch.label, "Sony belongs before DJI");
+    assert_eq!(preview.epoch.evidence, ["user_visual_placement"]);
+    assert_eq!(
+        preview
+            .impact
+            .changes
+            .iter()
+            .map(|change| (
+                change.asset_id.as_str(),
+                change.before.as_deref(),
+                change.after.as_deref(),
+                change.before_position,
+                change.after_position,
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                "asset_A0001_0",
+                Some("2026-01-01T10:00:00.000Z"),
+                Some("2026-01-01T10:59:55.000Z"),
+                0,
+                0,
+            ),
+            (
+                "asset_A0002_1",
+                Some("2026-01-01T11:00:00.000Z"),
+                Some("2026-01-01T11:59:55.000Z"),
+                1,
+                1,
+            ),
+        ]
+    );
+    assert!(!preview.impact.blocked);
+    assert_eq!(
+        fixture
+            .catalog
+            .chronology_facts(&fixture.project_id)
+            .unwrap(),
+        facts_before
+    );
+    assert_eq!(
+        fixture
+            .catalog
+            .list_operations(&fixture.project_id)
+            .unwrap(),
+        operations_before
+    );
+
+    let stored = fixture
+        .catalog
+        .apply_clock_epoch_preview(
+            &fixture.project_id,
+            &ClockEpochImpactPreview {
+                epoch: preview.epoch.clone(),
+                facts_token: preview.facts_token.clone(),
+                impact: preview.impact.clone(),
+            },
+        )
+        .unwrap();
+    assert_eq!(stored, preview.epoch);
+    let after = fixture
+        .catalog
+        .solve_chronology(&fixture.project_id)
+        .unwrap();
+    let actual_changes: Vec<_> = after
+        .assets
+        .iter()
+        .enumerate()
+        .filter_map(|(after_position, asset)| {
+            let (before_position, previous) = before
+                .assets
+                .iter()
+                .enumerate()
+                .find(|(_, candidate)| candidate.asset_id == asset.asset_id)?;
+            (before_position != after_position || previous.trip_time != asset.trip_time).then(
+                || ChronologyImpactChange {
+                    asset_id: asset.asset_id.clone(),
+                    before: previous.trip_time.clone(),
+                    after: asset.trip_time.clone(),
+                    before_position,
+                    after_position,
+                },
+            )
+        })
+        .collect();
+    assert_eq!(actual_changes, preview.impact.changes);
+}
+
+#[test]
+fn visual_placement_rejects_candidates_an_epoch_cannot_represent() {
+    let fixture = fixture(&[
+        ("A0001.MP4", "Sony", "2026-01-01T09:00:00Z"),
+        ("D0001.MP4", "DJI", "2026-01-01T10:00:00Z"),
+        ("A0002.MP4", "Sony", "2026-01-01T11:00:00Z"),
+        ("D0002.MP4", "DJI", "2026-01-01T12:00:00Z"),
+        ("clip.MP4", "Sony", "2026-01-01T13:00:00Z"),
+    ]);
+    let operations_before = fixture
+        .catalog
+        .list_operations(&fixture.project_id)
+        .unwrap();
+
+    let invalid_cases = [
+        (
+            Vec::<String>::new(),
+            "asset_D0002_3",
+            "select at least one clip",
+        ),
+        (
+            vec!["asset_A0001_0".to_string()],
+            "asset_A0001_0",
+            "destination inside the selected run",
+        ),
+        (
+            vec!["asset_A0001_0".to_string(), "asset_A0001_0".to_string()],
+            "asset_D0002_3",
+            "duplicate selected identity",
+        ),
+        (
+            vec!["asset_not_here".to_string()],
+            "asset_D0002_3",
+            "unknown selected clip",
+        ),
+        (
+            vec!["asset_A0001_0".to_string(), "asset_A0002_2".to_string()],
+            "asset_D0002_3",
+            "non-contiguous solved run",
+        ),
+        (
+            vec!["asset_A0001_0".to_string(), "asset_D0001_1".to_string()],
+            "asset_D0002_3",
+            "run crossing capture sequences",
+        ),
+        (
+            vec!["asset_clip_4".to_string()],
+            "asset_D0002_3",
+            "clip without a filename counter",
+        ),
+    ];
+    for (asset_ids, target, context) in invalid_cases {
+        let error = fixture
+            .catalog
+            .preview_visual_placement(
+                &fixture.project_id,
+                &asset_ids,
+                target,
+                VisualPlacementSide::Before,
+                "invalid",
+            )
+            .expect_err(context);
+        assert_eq!(
+            chronology_error_code(&error),
+            "chronology.invalid_reference"
+        );
+    }
+    assert_eq!(
+        fixture
+            .catalog
+            .list_operations(&fixture.project_id)
+            .unwrap(),
+        operations_before,
+        "every refused visual candidate is read-only"
+    );
+}
+
+#[test]
+fn explicit_sequence_preview_can_scope_the_move_to_one_clip_and_matches_apply() {
+    let fixture = fixture(&[
+        ("C0001.MP4", "Sony", "2026-01-01T09:00:00Z"),
+        ("C0002.MP4", "Sony", "2026-01-01T10:00:00Z"),
+        ("C0003.MP4", "Sony", "2026-01-01T11:00:00Z"),
+        ("D0001.MP4", "DJI", "2026-01-01T12:00:00Z"),
+    ]);
+    let sequences = fixture
+        .catalog
+        .capture_sequences(&fixture.project_id)
+        .unwrap();
+    let source = sequences
+        .iter()
+        .find(|sequence| sequence.camera_key == "Sony")
+        .unwrap();
+    let destination = sequences
+        .iter()
+        .find(|sequence| sequence.camera_key == "DJI")
+        .unwrap();
+    let facts_before = fixture
+        .catalog
+        .chronology_facts(&fixture.project_id)
+        .unwrap();
+    let operations_before = fixture
+        .catalog
+        .list_operations(&fixture.project_id)
+        .unwrap();
+    let selected = ["asset_C0002_1".to_string()];
+
+    let preview = fixture
+        .catalog
+        .preview_capture_sequence_assets(
+            &fixture.project_id,
+            &source.id,
+            &destination.id,
+            &selected,
+        )
+        .unwrap();
+    assert_eq!(preview.from_sequence_id, source.id);
+    assert_eq!(preview.into_sequence_id, destination.id);
+    assert_eq!(preview.asset_ids, selected);
+    assert_eq!(
+        fixture
+            .catalog
+            .chronology_facts(&fixture.project_id)
+            .unwrap(),
+        facts_before
+    );
+    assert_eq!(
+        fixture
+            .catalog
+            .list_operations(&fixture.project_id)
+            .unwrap(),
+        operations_before,
+        "an explicit preview writes nothing"
+    );
+
+    let moved = fixture
+        .catalog
+        .apply_capture_sequence_reassignment(&fixture.project_id, &preview)
+        .unwrap();
+    assert_eq!(moved, selected);
+    let facts_after = fixture
+        .catalog
+        .chronology_facts(&fixture.project_id)
+        .unwrap();
+    assert_eq!(
+        facts_after
+            .assets
+            .iter()
+            .find(|asset| asset.asset_id == "asset_C0002_1")
+            .unwrap()
+            .capture_sequence_id
+            .as_deref(),
+        Some(destination.id.as_str())
+    );
+    assert_eq!(
+        facts_after
+            .assets
+            .iter()
+            .find(|asset| asset.asset_id == "asset_C0003_2")
+            .unwrap()
+            .capture_sequence_id
+            .as_deref(),
+        Some(source.id.as_str()),
+        "single-clip scope never expands to following counters"
+    );
+}
+
+#[test]
+fn explicit_sequence_preview_and_apply_share_membership_validation() {
+    let fixture = fixture(&[
+        ("C0001.MP4", "Sony", "2026-01-01T09:00:00Z"),
+        ("D0001.MP4", "DJI", "2026-01-01T10:00:00Z"),
+    ]);
+    let sequences = fixture
+        .catalog
+        .capture_sequences(&fixture.project_id)
+        .unwrap();
+    let source = &sequences
+        .iter()
+        .find(|sequence| sequence.camera_key == "Sony")
+        .unwrap()
+        .id;
+    let destination = &sequences
+        .iter()
+        .find(|sequence| sequence.camera_key == "DJI")
+        .unwrap()
+        .id;
+    let operations_before = fixture
+        .catalog
+        .list_operations(&fixture.project_id)
+        .unwrap();
+    let invalid_sets = [
+        Vec::<String>::new(),
+        vec!["asset_C0001_0".to_string(), "asset_C0001_0".to_string()],
+        vec!["asset_D0001_1".to_string()],
+        vec!["asset_not_here".to_string()],
+    ];
+    for asset_ids in invalid_sets {
+        let preview_error = fixture
+            .catalog
+            .preview_capture_sequence_assets(&fixture.project_id, source, destination, &asset_ids)
+            .unwrap_err();
+        let apply_error = fixture
+            .catalog
+            .reassign_capture_sequence_assets(&fixture.project_id, source, destination, &asset_ids)
+            .unwrap_err();
+        assert_eq!(
+            chronology_error_code(&preview_error),
+            "chronology.invalid_reference"
+        );
+        assert_eq!(format!("{preview_error:#}"), format!("{apply_error:#}"));
+    }
+    assert_eq!(
+        fixture
+            .catalog
+            .list_operations(&fixture.project_id)
+            .unwrap(),
+        operations_before,
+        "invalid preview and apply candidates are both read-only"
+    );
+}
+
+#[test]
+fn following_reassignment_uses_the_actual_suffix_after_a_counter_restart() {
+    let fixture = fixture(&[
+        ("C0001.MP4", "Sony", "2026-01-01T09:00:00Z"),
+        ("C0002.MP4", "Sony", "2026-01-01T10:00:00Z"),
+        ("C0001.MP4", "Sony", "2026-01-02T09:00:00Z"),
+        ("C0002.MP4", "Sony", "2026-01-02T10:00:00Z"),
+        ("D0001.MP4", "DJI", "2026-01-03T09:00:00Z"),
+    ]);
+    let destination = fixture
+        .catalog
+        .capture_sequences(&fixture.project_id)
+        .unwrap()
+        .into_iter()
+        .find(|sequence| sequence.camera_key == "DJI")
+        .unwrap();
+
+    let preview = fixture
+        .catalog
+        .preview_capture_sequence_reassignment(
+            &fixture.project_id,
+            "asset_C0001_2",
+            &destination.id,
+        )
+        .unwrap();
+    assert_eq!(
+        preview.asset_ids,
+        ["asset_C0001_2".to_string(), "asset_C0002_3".to_string()],
+        "matching C0001/C0002 counters from the earlier card are before the anchor, not following it"
+    );
+}
+
+#[test]
+fn reassignment_confirmation_refuses_an_unrelated_chronology_change() {
+    let fixture = fixture(&[
+        ("C0001.MP4", "Sony", "2026-01-01T09:00:00Z"),
+        ("D0001.MP4", "DJI", "2026-01-01T10:00:00Z"),
+    ]);
+    let sequences = fixture
+        .catalog
+        .capture_sequences(&fixture.project_id)
+        .unwrap();
+    let source = sequences
+        .iter()
+        .find(|sequence| sequence.camera_key == "Sony")
+        .unwrap();
+    let destination = sequences
+        .iter()
+        .find(|sequence| sequence.camera_key == "DJI")
+        .unwrap();
+    let preview = fixture
+        .catalog
+        .preview_capture_sequence_assets(
+            &fixture.project_id,
+            &source.id,
+            &destination.id,
+            &["asset_C0001_0".to_string()],
+        )
+        .unwrap();
+    fixture
+        .catalog
+        .set_clock_epoch(
+            &fixture.project_id,
+            &ClockEpoch {
+                id: "epoch_unrelated_reassignment_change".to_string(),
+                capture_sequence_id: destination.id.clone(),
+                start_counter: 1,
+                end_counter: None,
+                offset_seconds: 60,
+                confidence: 1.0,
+                evidence: vec!["other calibration".to_string()],
+                label: "DJI adjustment".to_string(),
+            },
+        )
+        .unwrap();
+    let operations_before_apply = fixture
+        .catalog
+        .list_operations(&fixture.project_id)
+        .unwrap();
+
+    let error = fixture
+        .catalog
+        .apply_capture_sequence_reassignment(&fixture.project_id, &preview)
+        .unwrap_err();
+    assert_eq!(
+        chronology_error_code(&error),
+        "chronology.invalid_reference"
+    );
+    assert!(format!("{error:#}").contains("preview is stale"));
+    assert_eq!(
+        fixture
+            .catalog
+            .list_operations(&fixture.project_id)
+            .unwrap(),
+        operations_before_apply
+    );
+    assert_eq!(
+        fixture
+            .catalog
+            .chronology_facts(&fixture.project_id)
+            .unwrap()
+            .assets
+            .into_iter()
+            .find(|asset| asset.asset_id == "asset_C0001_0")
+            .unwrap()
+            .capture_sequence_id
+            .as_deref(),
+        Some(source.id.as_str())
+    );
+}
+
+#[test]
+fn reassignment_previews_and_applies_the_same_explicit_asset_identities() {
+    let clips = [
+        ("C0001.MP4", "Sony", "2026-01-01T09:00:00Z"),
+        ("C0002.MP4", "Sony", "2026-01-01T10:00:00Z"),
+        ("C0003.MP4", "Sony", "2026-01-01T11:00:00Z"),
+        ("D0001.MP4", "DJI", "2026-01-01T12:00:00Z"),
+    ];
+    let fixture = fixture(&clips);
+    let sequences = fixture
+        .catalog
+        .capture_sequences(&fixture.project_id)
+        .unwrap();
+    let source = sequences
+        .iter()
+        .find(|sequence| sequence.camera_key == "Sony")
+        .unwrap();
+    let destination = sequences
+        .iter()
+        .find(|sequence| sequence.camera_key == "DJI")
+        .unwrap();
+    let facts_before = fixture
+        .catalog
+        .chronology_facts(&fixture.project_id)
+        .unwrap();
+    let operations_before = fixture
+        .catalog
+        .list_operations(&fixture.project_id)
+        .unwrap();
+
+    let preview = fixture
+        .catalog
+        .preview_capture_sequence_reassignment(
+            &fixture.project_id,
+            "asset_C0002_1",
+            &destination.id,
+        )
+        .unwrap();
+    assert_eq!(preview.from_sequence_id, source.id);
+    assert_eq!(preview.into_sequence_id, destination.id);
+    assert_eq!(
+        preview.asset_ids,
+        ["asset_C0002_1".to_string(), "asset_C0003_2".to_string()]
+    );
+    assert_eq!(
+        fixture
+            .catalog
+            .chronology_facts(&fixture.project_id)
+            .unwrap(),
+        facts_before,
+        "preview must not move memberships"
+    );
+    assert_eq!(
+        fixture
+            .catalog
+            .list_operations(&fixture.project_id)
+            .unwrap(),
+        operations_before,
+        "preview must not emit an operation"
+    );
+
+    add_portable_asset(
+        &fixture,
+        "asset_C0004_between",
+        "C0004.MP4",
+        "Sony",
+        "2026-01-01T13:00:00Z",
+    );
+
+    let operations_before_stale_apply = fixture
+        .catalog
+        .list_operations(&fixture.project_id)
+        .unwrap();
+    let stale_error = fixture
+        .catalog
+        .apply_capture_sequence_reassignment(&fixture.project_id, &preview)
+        .unwrap_err();
+    assert_eq!(
+        chronology_error_code(&stale_error),
+        "chronology.invalid_reference"
+    );
+    assert!(format!("{stale_error:#}").contains("preview is stale"));
+    assert_eq!(
+        fixture
+            .catalog
+            .list_operations(&fixture.project_id)
+            .unwrap(),
+        operations_before_stale_apply,
+        "an intervening chronology fact invalidates confirmation without writing"
+    );
+
+    // The lower-level explicit identity seam remains useful to operation/CLI
+    // callers and demonstrates that durable replay never expands identities.
+    let moved = fixture
+        .catalog
+        .reassign_capture_sequence_assets(
+            &fixture.project_id,
+            &preview.from_sequence_id,
+            &destination.id,
+            &preview.asset_ids,
+        )
+        .unwrap();
+    assert_eq!(moved, preview.asset_ids);
+    let after = fixture
+        .catalog
+        .chronology_facts(&fixture.project_id)
+        .unwrap();
+    for asset_id in &moved {
+        assert_eq!(
+            after
+                .assets
+                .iter()
+                .find(|asset| &asset.asset_id == asset_id)
+                .unwrap()
+                .capture_sequence_id
+                .as_deref(),
+            Some(destination.id.as_str())
+        );
+    }
+    assert_eq!(
+        after
+            .assets
+            .iter()
+            .find(|asset| asset.asset_id == "asset_C0001_0")
+            .unwrap()
+            .capture_sequence_id
+            .as_deref(),
+        Some(source.id.as_str())
+    );
+    assert_eq!(
+        after
+            .assets
+            .iter()
+            .find(|asset| asset.asset_id == "asset_C0004_between")
+            .unwrap()
+            .capture_sequence_id
+            .as_deref(),
+        Some(source.id.as_str()),
+        "a clip imported after preview is not silently added at confirmation"
+    );
+
+    let operation = fixture
+        .catalog
+        .list_operations(&fixture.project_id)
+        .unwrap()
+        .into_iter()
+        .find(|operation| operation.operation_type == CAPTURE_SEQUENCE_REASSIGNED)
+        .unwrap();
+    assert_eq!(operation.aggregate_type, "captureSequence");
+    assert_eq!(operation.aggregate_id, source.id);
+    assert_eq!(
+        operation.payload,
+        json!({
+            "fromSequenceId": source.id,
+            "intoSequenceId": destination.id,
+            "assetIds": preview.asset_ids,
+        })
+    );
+
+    // Replay can arrive after a later import on another replica. The explicit
+    // payload must move only the identities that were confirmed, never expand
+    // the old counter range to include that newly discovered clip.
+    let replay_fixture = crate::fixture(&clips);
+    let replay_sequences = replay_fixture
+        .catalog
+        .capture_sequences(&replay_fixture.project_id)
+        .unwrap();
+    let replay_source = replay_sequences
+        .iter()
+        .find(|sequence| sequence.camera_key == "Sony")
+        .unwrap();
+    let replay_destination = replay_sequences
+        .iter()
+        .find(|sequence| sequence.camera_key == "DJI")
+        .unwrap();
+    add_portable_asset(
+        &replay_fixture,
+        "asset_C0004_later",
+        "C0004.MP4",
+        "Sony",
+        "2026-01-01T13:00:00Z",
+    );
+    let mut replay = operation.clone();
+    replay.operation_id = "operation_replayed_reassignment".to_string();
+    replay.project_id = replay_fixture.project_id.clone();
+    replay.aggregate_id = replay_source.id.clone();
+    replay.payload = json!({
+        "fromSequenceId": replay_source.id,
+        "intoSequenceId": replay_destination.id,
+        "assetIds": moved,
+    });
+    assert_eq!(
+        replay_fixture.catalog.apply_operation(&replay).unwrap(),
+        ApplyOperationResult::Applied
+    );
+    assert_eq!(
+        replay_fixture.catalog.apply_operation(&replay).unwrap(),
+        ApplyOperationResult::Duplicate,
+        "replaying the same operation is idempotent"
+    );
+    let mut stale = replay.clone();
+    stale.operation_id = "operation_stale_reassignment".to_string();
+    stale.origin_sequence += 1;
+    stale.payload = json!({
+        "fromSequenceId": replay_source.id,
+        "intoSequenceId": replay_destination.id,
+        "assetIds": ["asset_C0001_0"],
+    });
+    assert_eq!(
+        replay_fixture.catalog.apply_operation(&stale).unwrap(),
+        ApplyOperationResult::Conflict,
+        "a stale source-sequence revision cannot move a second set"
+    );
+    let replayed = replay_fixture
+        .catalog
+        .chronology_facts(&replay_fixture.project_id)
+        .unwrap();
+    assert_eq!(
+        replayed
+            .assets
+            .iter()
+            .find(|asset| asset.asset_id == "asset_C0004_later")
+            .unwrap()
+            .capture_sequence_id
+            .as_deref(),
+        Some(replay_source.id.as_str()),
+        "later imports are not swept into an older confirmed reassignment"
+    );
+    assert_eq!(
+        replayed
+            .assets
+            .iter()
+            .find(|asset| asset.asset_id == "asset_C0001_0")
+            .unwrap()
+            .capture_sequence_id
+            .as_deref(),
+        Some(replay_source.id.as_str()),
+        "the stale replay leaves source membership untouched"
+    );
+}
+
+#[test]
+fn reassignment_confirmation_refuses_a_stale_preview_as_one_atomic_write() {
+    let fixture = fixture(&[
+        ("C0001.MP4", "Sony", "2026-01-01T09:00:00Z"),
+        ("C0002.MP4", "Sony", "2026-01-01T10:00:00Z"),
+        ("D0001.MP4", "DJI", "2026-01-01T11:00:00Z"),
+    ]);
+    let sequences = fixture
+        .catalog
+        .capture_sequences(&fixture.project_id)
+        .unwrap();
+    let source = sequences
+        .iter()
+        .find(|sequence| sequence.camera_key == "Sony")
+        .unwrap();
+    let destination = sequences
+        .iter()
+        .find(|sequence| sequence.camera_key == "DJI")
+        .unwrap();
+    let preview = fixture
+        .catalog
+        .preview_capture_sequence_reassignment(
+            &fixture.project_id,
+            "asset_C0001_0",
+            &destination.id,
+        )
+        .unwrap();
+    assert_eq!(
+        preview.asset_ids,
+        ["asset_C0001_0".to_string(), "asset_C0002_1".to_string()]
+    );
+
+    fixture
+        .catalog
+        .reassign_capture_sequence_assets(
+            &fixture.project_id,
+            &source.id,
+            &destination.id,
+            &["asset_C0002_1".to_string()],
+        )
+        .unwrap();
+    let operations_before_stale_confirmation = fixture
+        .catalog
+        .list_operations(&fixture.project_id)
+        .unwrap();
+    let error = fixture
+        .catalog
+        .apply_capture_sequence_reassignment(&fixture.project_id, &preview)
+        .unwrap_err();
+    assert_eq!(
+        chronology_error_code(&error),
+        "chronology.invalid_reference"
+    );
+    assert!(format!("{error:#}").contains("preview is stale"));
+    assert_eq!(
+        fixture
+            .catalog
+            .chronology_facts(&fixture.project_id)
+            .unwrap()
+            .assets
+            .into_iter()
+            .find(|asset| asset.asset_id == "asset_C0001_0")
+            .unwrap()
+            .capture_sequence_id
+            .as_deref(),
+        Some(source.id.as_str()),
+        "the still-valid identity must not move when a sibling identity is stale"
+    );
+    assert_eq!(
+        fixture
+            .catalog
+            .list_operations(&fixture.project_id)
+            .unwrap(),
+        operations_before_stale_confirmation,
+        "a stale confirmation must not emit an operation"
+    );
+}
+
+#[test]
+fn reassignment_materialization_refuses_an_invalid_identity_atomically() {
+    let fixture = fixture(&[
+        ("C0001.MP4", "Sony", "2026-01-01T09:00:00Z"),
+        ("C0002.MP4", "Sony", "2026-01-01T10:00:00Z"),
+        ("D0001.MP4", "DJI", "2026-01-01T11:00:00Z"),
+    ]);
+    let sequences = fixture
+        .catalog
+        .capture_sequences(&fixture.project_id)
+        .unwrap();
+    let source = sequences
+        .iter()
+        .find(|sequence| sequence.camera_key == "Sony")
+        .unwrap();
+    let destination = sequences
+        .iter()
+        .find(|sequence| sequence.camera_key == "DJI")
+        .unwrap();
+    let template = fixture
+        .catalog
+        .list_operations(&fixture.project_id)
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    let mut invalid = template;
+    invalid.operation_id = "operation_invalid_reassignment".to_string();
+    invalid.origin_sequence += 10_000;
+    invalid.aggregate_type = "captureSequence".to_string();
+    invalid.aggregate_id = source.id.clone();
+    invalid.operation_type = CAPTURE_SEQUENCE_REASSIGNED.to_string();
+    invalid.base_revision = Some(0);
+    invalid.payload = json!({
+        "fromSequenceId": source.id,
+        "intoSequenceId": destination.id,
+        "assetIds": ["asset_C0002_1", "asset_not_in_source"],
+    });
+    let operations_before = fixture
+        .catalog
+        .list_operations(&fixture.project_id)
+        .unwrap();
+
+    let error = fixture.catalog.apply_operation(&invalid).unwrap_err();
+    assert!(format!("{error:#}").contains("asset_not_in_source is not in source sequence"));
+    let facts = fixture
+        .catalog
+        .chronology_facts(&fixture.project_id)
+        .unwrap();
+    assert_eq!(
+        facts
+            .assets
+            .iter()
+            .find(|asset| asset.asset_id == "asset_C0002_1")
+            .unwrap()
+            .capture_sequence_id
+            .as_deref(),
+        Some(source.id.as_str()),
+        "valid identities before the bad one must not move partially"
+    );
+    assert_eq!(
+        fixture
+            .catalog
+            .list_operations(&fixture.project_id)
+            .unwrap(),
+        operations_before,
+        "a rejected materialization must roll back its operation row"
+    );
+}
+
+#[test]
+fn chronology_snapshot_derives_solution_and_proposals_from_its_returned_facts() {
+    let fixture = fixture(&[
+        ("C0001.MP4", "DJIPocket3", "2026-01-01T09:00:00Z"),
+        ("C0002.MP4", "DJIPocket3", "2026-01-01T10:00:00Z"),
+        ("C0001.MP4", "DJIPocket3", "2026-01-02T09:00:00Z"),
+        ("C0002.MP4", "DJIPocket3", "2026-01-02T10:00:00Z"),
+    ]);
+
+    let snapshot = fixture
+        .catalog
+        .chronology_snapshot(&fixture.project_id)
+        .unwrap();
+    assert_eq!(snapshot.solution, solve(&snapshot.facts));
+    assert_eq!(
+        snapshot.proposed_splits,
+        fixture
+            .catalog
+            .propose_capture_sequence_splits(&fixture.project_id)
+            .unwrap()
+    );
+    assert_eq!(snapshot.proposed_splits.len(), 1);
+    assert_eq!(snapshot.proposed_splits[0].at_counter, 1);
+    assert_eq!(snapshot.facts.assets.len(), snapshot.solution.assets.len());
+}
+
+/// Confirmed chronology changes refresh `best_time` and `offset_seconds`
+/// before returning, and a later explicit re-solve is idempotent.
+#[test]
+fn confirmed_clock_change_projects_atomically_and_resolve_is_idempotent() {
     let fixture = fixture(&[
         ("C0001.MP4", "DJIPocket3", "2026-01-01T09:00:00Z"),
         ("C0009.MP4", "DJIPocket3", "2026-01-01T10:00:00Z"),
@@ -820,10 +2929,6 @@ fn projection_writes_the_solution_and_is_idempotent() {
         .unwrap();
 
     let ordered_before = asset_ids_in_order(&fixture);
-    fixture
-        .catalog
-        .resolve_chronology(&fixture.project_id)
-        .unwrap();
     let shifted = fixture
         .catalog
         .list_assets(&fixture.project_id)
@@ -837,6 +2942,7 @@ fn projection_writes_the_solution_and_is_idempotent() {
     );
     assert_eq!(shifted.offset_seconds, -3600);
 
+    // The mutation already projected the new facts in its own transaction.
     // Projecting again changes nothing, so the columns stay reproducible.
     fixture
         .catalog

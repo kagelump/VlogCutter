@@ -12,7 +12,12 @@ pub mod model;
 pub mod phases;
 pub mod solver;
 
-pub use api::{ChronologyError, SplitProposal};
+pub use api::{
+    CaptureSequenceMergePreview, CaptureSequenceReassignmentPreview, CaptureSequenceSplitPreview,
+    ChronologyError, ChronologyImpact, ChronologyImpactChange, ChronologySnapshot,
+    ClockEpochClearPreview, ClockEpochImpactPreview, SplitProposal, VisualPlacementPreview,
+    VisualPlacementSide,
+};
 pub use explain::{AppliedCorrection, ChronologyExplanation, QueuePosition};
 pub use model::{
     AssetTimeHypothesis, CaptureSequence, ChronologyFacts, ClipTimeException, ClockEpoch,
@@ -409,7 +414,7 @@ fn table_exists(connection: &Connection, table: &str) -> Result<bool> {
 ///
 /// A row qualifies only when all of these hold:
 ///
-/// - its operation type is one of the eleven chronology types this task added
+/// - its operation type is one of the chronology types this domain owns
 ///   (legacy types are never re-dispatched: a persisted legacy row is not a
 ///   signal that materialization is missing, so replaying them would rewrite
 ///   the legacy log);

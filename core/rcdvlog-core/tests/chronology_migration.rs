@@ -986,7 +986,7 @@ struct RoundTripCase {
 }
 
 #[test]
-fn eleven_operation_round_trips_materialize_once_and_refuse_stale_bases() {
+fn original_chronology_operations_round_trip_once_and_refuse_stale_bases() {
     let (directory, path, project_id) = project_with_asset();
     let catalog = Catalog::open_existing(&path).unwrap();
     let connection = open_connection(&path);

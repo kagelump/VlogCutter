@@ -21,7 +21,9 @@ pub const PROJECT_ASSET_MEDIA_LINKED: &str = "projectAssetMediaLinked";
 pub const CLOCK_EVENT_CREATED: &str = "clockEventCreated";
 pub const CAPTURE_SEQUENCE_DECLARED: &str = "captureSequenceDeclared";
 pub const CAPTURE_SEQUENCE_SPLIT: &str = "captureSequenceSplit";
+pub const CAPTURE_SEQUENCE_SPLIT_EXACT: &str = "captureSequenceSplitExact";
 pub const CAPTURE_SEQUENCE_MERGED: &str = "captureSequenceMerged";
+pub const CAPTURE_SEQUENCE_REASSIGNED: &str = "captureSequenceReassigned";
 pub const CLOCK_EPOCH_SET: &str = "clockEpochSet";
 pub const CLOCK_EPOCH_CLEARED: &str = "clockEpochCleared";
 pub const CLIP_TIME_EXCEPTION_SET: &str = "clipTimeExceptionSet";
@@ -35,14 +37,16 @@ pub const EDIT_PLAN_REVISION_ACTIVATED: &str = "editPlanRevisionActivated";
 pub const EDIT_PLAN_EXPORT_RECORDED: &str = "editPlanExportRecorded";
 pub const MAX_REMOTE_HLC_FUTURE_SKEW_MILLIS: i64 = 5 * 60 * 1000;
 
-/// The eleven chronology operation types D01-T007 added. The re-dispatch seam
+/// The chronology operation types known to the re-dispatch seam. The seam
 /// on writable catalog open is scoped to exactly these: for the legacy
 /// vocabulary a persisted row is never a signal that materialization is
 /// missing, so replaying them would rewrite the legacy log.
 pub(crate) const CHRONOLOGY_OPERATION_TYPES: &[&str] = &[
     CAPTURE_SEQUENCE_DECLARED,
     CAPTURE_SEQUENCE_SPLIT,
+    CAPTURE_SEQUENCE_SPLIT_EXACT,
     CAPTURE_SEQUENCE_MERGED,
+    CAPTURE_SEQUENCE_REASSIGNED,
     CLOCK_EPOCH_SET,
     CLOCK_EPOCH_CLEARED,
     CLIP_TIME_EXCEPTION_SET,
@@ -70,7 +74,9 @@ pub(crate) const KNOWN_OPERATION_TYPES: &[&str] = &[
     CLOCK_EVENT_CREATED,
     CAPTURE_SEQUENCE_DECLARED,
     CAPTURE_SEQUENCE_SPLIT,
+    CAPTURE_SEQUENCE_SPLIT_EXACT,
     CAPTURE_SEQUENCE_MERGED,
+    CAPTURE_SEQUENCE_REASSIGNED,
     CLOCK_EPOCH_SET,
     CLOCK_EPOCH_CLEARED,
     CLIP_TIME_EXCEPTION_SET,
@@ -86,6 +92,16 @@ pub(crate) const KNOWN_OPERATION_TYPES: &[&str] = &[
 
 pub(crate) fn is_known_operation_type(value: &str) -> bool {
     KNOWN_OPERATION_TYPES.contains(&value)
+}
+
+/// Whether materializing this operation can change the reproducible
+/// `assets.best_time`/`offset_seconds` projection. Synchronization calls this
+/// after a successful remote page so queue reads immediately reflect the same
+/// chronology the solver does.
+pub fn operation_affects_chronology_projection(value: &str) -> bool {
+    value == PROJECT_ASSET_ADDED
+        || value == CLOCK_EVENT_CREATED
+        || CHRONOLOGY_OPERATION_TYPES.contains(&value)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -331,9 +347,38 @@ pub(crate) struct CaptureSequenceSplitPayload {
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct CaptureSequenceSplitExactPayload {
+    pub(crate) new_sequence_id: String,
+    pub(crate) camera_key: String,
+    pub(crate) label: String,
+    pub(crate) volume_hint: String,
+    pub(crate) filename_prefix: String,
+    pub(crate) at_counter: u64,
+    pub(crate) asset_ids: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct CaptureSequenceMergedPayload {
     pub(crate) from_sequence_id: String,
     pub(crate) into_sequence_id: String,
+    /// New merge operations carry the exact facts the user confirmed. `None`
+    /// remains the backwards-compatible meaning for legacy payloads authored
+    /// before exact previews existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) asset_ids: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) epoch_ids: Option<Vec<String>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct CaptureSequenceReassignedPayload {
+    pub(crate) from_sequence_id: String,
+    pub(crate) into_sequence_id: String,
+    /// Explicit identities make replay deterministic even when later imports
+    /// introduce clips whose counters fall inside the originally selected run.
+    pub(crate) asset_ids: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -881,6 +926,7 @@ impl Catalog {
             .optional()?
             .unwrap_or(0) as u64;
         let mut quarantined: Vec<(String, String, String)> = Vec::new();
+        let mut chronology_projects = BTreeSet::new();
         let mut result = OperationBatchResult {
             origin_node_id: origin_node_id.to_string(),
             committed_sequence: cursor,
@@ -893,6 +939,9 @@ impl Catalog {
             validate_operation(operation)?;
             if operation.origin_node_id != origin_node_id {
                 bail!("operation origin does not match batch origin");
+            }
+            if operation_affects_chronology_projection(&operation.operation_type) {
+                chronology_projects.insert(operation.project_id.clone());
             }
             if operation.origin_sequence <= cursor {
                 if !operation_matches_acknowledged_sequence(&transaction, operation)? {
@@ -926,6 +975,15 @@ impl Catalog {
             }
             receive_hlc(&transaction, operation)?;
             cursor = operation.origin_sequence;
+        }
+        // Facts, their derived asset projection, and the durable origin cursor
+        // advance together. Otherwise a projection failure after commit could
+        // acknowledge the operation permanently while leaving queue reads on
+        // the old best_time/order. Including duplicate chronology operations
+        // also makes an idempotent retry repair a projection left by an older
+        // build that did not yet own this invariant.
+        for project_id in chronology_projects {
+            Self::project_current_chronology_in_transaction(&transaction, &project_id)?;
         }
         transaction.execute(
             "INSERT INTO sync_origin_cursors(origin_node_id, committed_sequence, updated_at) VALUES (?1, ?2, ?3) ON CONFLICT(origin_node_id) DO UPDATE SET committed_sequence=excluded.committed_sequence, updated_at=excluded.updated_at",
@@ -1384,7 +1442,7 @@ fn label_add_operation(asset_id: &str, label: String) -> Result<NewOperation> {
     })
 }
 
-fn commit_local_in_transaction(
+pub(crate) fn commit_local_in_transaction(
     transaction: &Transaction<'_>,
     project_id: &str,
     operations: Vec<NewOperation>,
@@ -1699,8 +1757,14 @@ pub(crate) fn materialize_operation(
         CAPTURE_SEQUENCE_SPLIT => {
             return materialize_capture_sequence_split(transaction, operation);
         }
+        CAPTURE_SEQUENCE_SPLIT_EXACT => {
+            return materialize_capture_sequence_split_exact(transaction, operation);
+        }
         CAPTURE_SEQUENCE_MERGED => {
             return materialize_capture_sequence_merged(transaction, operation);
+        }
+        CAPTURE_SEQUENCE_REASSIGNED => {
+            return materialize_capture_sequence_reassigned(transaction, operation);
         }
         CLOCK_EPOCH_SET => return materialize_clock_epoch_set(transaction, operation),
         CLOCK_EPOCH_CLEARED => return materialize_clock_epoch_cleared(transaction, operation),
@@ -2164,6 +2228,114 @@ fn materialize_capture_sequence_split(
     Ok(ApplyOperationResult::Applied)
 }
 
+fn materialize_capture_sequence_split_exact(
+    transaction: &Transaction<'_>,
+    operation: &ProjectOperation,
+) -> Result<ApplyOperationResult> {
+    let payload: CaptureSequenceSplitExactPayload = payload(operation)?;
+    if operation.aggregate_type != "captureSequence"
+        || operation.aggregate_id == payload.new_sequence_id
+    {
+        bail!("captureSequenceSplitExact aggregate must be the source capture sequence");
+    }
+    validate_id("capture sequence ID", &payload.new_sequence_id)?;
+    if payload.asset_ids.is_empty() {
+        bail!("captureSequenceSplitExact requires at least one asset");
+    }
+    if payload.asset_ids.iter().collect::<BTreeSet<_>>().len() != payload.asset_ids.len() {
+        bail!("captureSequenceSplitExact requires unique asset identities");
+    }
+    let destination_exists: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM capture_sequences WHERE id=?1)",
+        [&payload.new_sequence_id],
+        |row| row.get(0),
+    )?;
+    if destination_exists {
+        bail!("captureSequenceSplitExact destination sequence already exists");
+    }
+    if !revision_guard_passes(transaction, operation)? {
+        return Ok(ApplyOperationResult::Conflict);
+    }
+    let source_details = transaction
+        .query_row(
+            "SELECT camera_key, volume_hint, filename_prefix FROM capture_sequences WHERE id=?1 AND project_id=?2",
+            params![operation.aggregate_id, operation.project_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or_else(|| {
+            anyhow!(
+                "captureSequenceSplitExact source sequence not found: {}",
+                operation.aggregate_id
+            )
+        })?;
+    if source_details
+        != (
+            payload.camera_key.clone(),
+            payload.volume_hint.clone(),
+            payload.filename_prefix.clone(),
+        )
+    {
+        bail!("captureSequenceSplitExact destination details do not match the source sequence");
+    }
+    let boundary_counter = i64::try_from(payload.at_counter)
+        .map_err(|_| anyhow!("captureSequenceSplitExact counter exceeds SQLite integer range"))?;
+    let mut includes_boundary = false;
+    for asset_id in &payload.asset_ids {
+        let counter = transaction
+            .query_row(
+                "SELECT filename_counter FROM asset_capture_sequence WHERE asset_id=?1 AND project_id=?2 AND capture_sequence_id=?3",
+                params![asset_id, operation.project_id, operation.aggregate_id],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .optional()?
+            .ok_or_else(|| {
+                anyhow!(
+                    "captureSequenceSplitExact asset {asset_id} is not in source sequence {}",
+                    operation.aggregate_id
+                )
+            })?;
+        includes_boundary |= counter == Some(boundary_counter);
+    }
+    if !includes_boundary {
+        bail!(
+            "captureSequenceSplitExact selected assets do not include counter {}",
+            payload.at_counter
+        );
+    }
+    transaction.execute(
+        "INSERT INTO capture_sequences(id, project_id, camera_key, label, volume_hint, filename_prefix, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            payload.new_sequence_id,
+            operation.project_id,
+            payload.camera_key,
+            payload.label,
+            payload.volume_hint,
+            payload.filename_prefix,
+            now(),
+        ],
+    )?;
+    for asset_id in &payload.asset_ids {
+        transaction.execute(
+            "UPDATE asset_capture_sequence SET capture_sequence_id=?1 WHERE asset_id=?2 AND project_id=?3 AND capture_sequence_id=?4",
+            params![
+                payload.new_sequence_id,
+                asset_id,
+                operation.project_id,
+                operation.aggregate_id,
+            ],
+        )?;
+    }
+    advance_revision(transaction, operation)?;
+    Ok(ApplyOperationResult::Applied)
+}
+
 fn materialize_capture_sequence_merged(
     transaction: &Transaction<'_>,
     operation: &ProjectOperation,
@@ -2180,6 +2352,19 @@ fn materialize_capture_sequence_merged(
     // (cascades declared in migrations.rs).
     if payload.from_sequence_id == payload.into_sequence_id {
         bail!("captureSequenceMerged requires two distinct capture sequences");
+    }
+    let exact_identities = match (&payload.asset_ids, &payload.epoch_ids) {
+        (Some(asset_ids), Some(epoch_ids)) => Some((asset_ids, epoch_ids)),
+        (None, None) => None,
+        _ => bail!("captureSequenceMerged exact payload requires both assetIds and epochIds"),
+    };
+    if let Some((asset_ids, epoch_ids)) = exact_identities {
+        if asset_ids.iter().collect::<BTreeSet<_>>().len() != asset_ids.len() {
+            bail!("captureSequenceMerged requires unique asset identities");
+        }
+        if epoch_ids.iter().collect::<BTreeSet<_>>().len() != epoch_ids.len() {
+            bail!("captureSequenceMerged requires unique epoch identities");
+        }
     }
     if !revision_guard_passes(transaction, operation)? {
         return Ok(ApplyOperationResult::Conflict);
@@ -2206,20 +2391,147 @@ fn materialize_capture_sequence_merged(
             payload.from_sequence_id
         );
     }
-    transaction.execute(
-        "UPDATE asset_capture_sequence SET capture_sequence_id=?1 WHERE project_id=?2 AND capture_sequence_id=?3",
-        params![payload.into_sequence_id, operation.project_id, payload.from_sequence_id],
+    if let Some((asset_ids, epoch_ids)) = exact_identities {
+        // Validate every confirmed identity before the first write so one
+        // stale/malformed identity cannot produce a partial merge.
+        for asset_id in asset_ids {
+            let belongs_to_source: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM asset_capture_sequence WHERE asset_id=?1 AND project_id=?2 AND capture_sequence_id=?3)",
+                params![asset_id, operation.project_id, payload.from_sequence_id],
+                |row| row.get(0),
+            )?;
+            if !belongs_to_source {
+                bail!(
+                    "captureSequenceMerged asset {asset_id} is not in source sequence {}",
+                    payload.from_sequence_id
+                );
+            }
+        }
+        for epoch_id in epoch_ids {
+            let belongs_to_source: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM clock_epochs WHERE id=?1 AND project_id=?2 AND capture_sequence_id=?3)",
+                params![epoch_id, operation.project_id, payload.from_sequence_id],
+                |row| row.get(0),
+            )?;
+            if !belongs_to_source {
+                bail!(
+                    "captureSequenceMerged epoch {epoch_id} is not in source sequence {}",
+                    payload.from_sequence_id
+                );
+            }
+        }
+        for asset_id in asset_ids {
+            transaction.execute(
+                "UPDATE asset_capture_sequence SET capture_sequence_id=?1 WHERE asset_id=?2 AND project_id=?3 AND capture_sequence_id=?4",
+                params![
+                    payload.into_sequence_id,
+                    asset_id,
+                    operation.project_id,
+                    payload.from_sequence_id,
+                ],
+            )?;
+        }
+        for epoch_id in epoch_ids {
+            transaction.execute(
+                "UPDATE clock_epochs SET capture_sequence_id=?1 WHERE id=?2 AND project_id=?3 AND capture_sequence_id=?4",
+                params![
+                    payload.into_sequence_id,
+                    epoch_id,
+                    operation.project_id,
+                    payload.from_sequence_id,
+                ],
+            )?;
+        }
+        // Concurrent/later facts that were not in the preview stay in their
+        // source sequence. Delete it only when the exact move emptied it.
+        let source_has_facts: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM asset_capture_sequence WHERE project_id=?1 AND capture_sequence_id=?2 UNION ALL SELECT 1 FROM clock_epochs WHERE project_id=?1 AND capture_sequence_id=?2)",
+            params![operation.project_id, payload.from_sequence_id],
+            |row| row.get(0),
+        )?;
+        if !source_has_facts {
+            transaction.execute(
+                "DELETE FROM capture_sequences WHERE id=?1 AND project_id=?2",
+                params![payload.from_sequence_id, operation.project_id],
+            )?;
+        }
+    } else {
+        // Legacy counter-era merge operations intentionally retain their
+        // original whole-sequence semantics for deterministic old-log replay.
+        transaction.execute(
+            "UPDATE asset_capture_sequence SET capture_sequence_id=?1 WHERE project_id=?2 AND capture_sequence_id=?3",
+            params![payload.into_sequence_id, operation.project_id, payload.from_sequence_id],
+        )?;
+        transaction.execute(
+            "UPDATE clock_epochs SET capture_sequence_id=?1 WHERE project_id=?2 AND capture_sequence_id=?3",
+            params![payload.into_sequence_id, operation.project_id, payload.from_sequence_id],
+        )?;
+        transaction.execute(
+            "DELETE FROM capture_sequences WHERE id=?1 AND project_id=?2",
+            params![payload.from_sequence_id, operation.project_id],
+        )?;
+    }
+    advance_revision(transaction, operation)?;
+    Ok(ApplyOperationResult::Applied)
+}
+
+fn materialize_capture_sequence_reassigned(
+    transaction: &Transaction<'_>,
+    operation: &ProjectOperation,
+) -> Result<ApplyOperationResult> {
+    let payload: CaptureSequenceReassignedPayload = payload(operation)?;
+    if operation.aggregate_type != "captureSequence"
+        || operation.aggregate_id != payload.from_sequence_id
+    {
+        bail!("captureSequenceReassigned aggregate must be the source capture sequence");
+    }
+    if payload.from_sequence_id == payload.into_sequence_id {
+        bail!("captureSequenceReassigned requires two distinct capture sequences");
+    }
+    if payload.asset_ids.is_empty() {
+        bail!("captureSequenceReassigned requires at least one asset");
+    }
+    if payload.asset_ids.iter().collect::<BTreeSet<_>>().len() != payload.asset_ids.len() {
+        bail!("captureSequenceReassigned requires unique asset identities");
+    }
+    if !revision_guard_passes(transaction, operation)? {
+        return Ok(ApplyOperationResult::Conflict);
+    }
+    let destination_exists: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM capture_sequences WHERE id=?1 AND project_id=?2)",
+        params![payload.into_sequence_id, operation.project_id],
+        |row| row.get(0),
     )?;
-    // Epochs ride their capture sequence; merging unions the asset sets, so
-    // the consumed sequence's epochs follow its assets into the destination.
-    transaction.execute(
-        "UPDATE clock_epochs SET capture_sequence_id=?1 WHERE project_id=?2 AND capture_sequence_id=?3",
-        params![payload.into_sequence_id, operation.project_id, payload.from_sequence_id],
-    )?;
-    transaction.execute(
-        "DELETE FROM capture_sequences WHERE id=?1 AND project_id=?2",
-        params![payload.from_sequence_id, operation.project_id],
-    )?;
+    if !destination_exists {
+        bail!(
+            "captureSequenceReassigned destination sequence not found: {}",
+            payload.into_sequence_id
+        );
+    }
+    for asset_id in &payload.asset_ids {
+        let belongs_to_source: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM asset_capture_sequence WHERE asset_id=?1 AND project_id=?2 AND capture_sequence_id=?3)",
+            params![asset_id, operation.project_id, payload.from_sequence_id],
+            |row| row.get(0),
+        )?;
+        if !belongs_to_source {
+            bail!(
+                "captureSequenceReassigned asset {asset_id} is not in source sequence {}",
+                payload.from_sequence_id
+            );
+        }
+    }
+    for asset_id in &payload.asset_ids {
+        transaction.execute(
+            "UPDATE asset_capture_sequence SET capture_sequence_id=?1 WHERE asset_id=?2 AND project_id=?3 AND capture_sequence_id=?4",
+            params![
+                payload.into_sequence_id,
+                asset_id,
+                operation.project_id,
+                payload.from_sequence_id,
+            ],
+        )?;
+    }
     advance_revision(transaction, operation)?;
     Ok(ApplyOperationResult::Applied)
 }

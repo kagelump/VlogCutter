@@ -13,12 +13,14 @@
 
 use crate::{AppState, error_message};
 use rcdvlog_core::{
-    AssetChronology, CaptureSequence, ChronologyExplanation, ChronologySolution, ClipTimeException,
-    ClockEpoch, ConstraintStrength, Contradiction, Diagnostic, DiagnosticCounts, DiagnosticFilter,
-    DiagnosticSeverity, DisplayMode, EditPlanOperation, EditPlanRevision, EventOrderConstraint,
-    OtioExportRequest, OtioExportResult, PhaseKind, PhaseSplitDirection, PreviewProgress,
-    PreviewRequest, PreviewResult, QueuePosition, TripPhase, ValidationReport,
-    resolve_anchored_phases,
+    AssetChronology, CaptureSequence, CaptureSequenceMergePreview,
+    CaptureSequenceReassignmentPreview, CaptureSequenceSplitPreview, ChronologyExplanation,
+    ChronologySolution, ClipTimeException, ClockEpoch, ClockEpochClearPreview,
+    ClockEpochImpactPreview, ConstraintStrength, Contradiction, Diagnostic, DiagnosticCounts,
+    DiagnosticFilter, DiagnosticSeverity, DisplayMode, EditPlanOperation, EditPlanRevision,
+    EventOrderConstraint, OtioExportRequest, OtioExportResult, PhaseKind, PhaseSplitDirection,
+    PreviewProgress, PreviewRequest, PreviewResult, QueuePosition, TripPhase, ValidationReport,
+    VisualPlacementPreview, VisualPlacementSide, resolve_anchored_phases,
 };
 use serde::{Deserialize, Serialize};
 use tauri::State;
@@ -70,14 +72,22 @@ pub struct TripPhaseInput {
 }
 
 impl TripPhaseInput {
-    fn into_phase(self) -> TripPhase {
-        TripPhase {
+    fn into_phase(self) -> Result<TripPhase, String> {
+        let kind = match self.kind.as_str() {
+            "location" => PhaseKind::Location,
+            "transit" => PhaseKind::Transit,
+            other => return Err(format!("unknown trip phase kind: {other}")),
+        };
+        let display_mode = match self.display_mode.as_str() {
+            "local" => DisplayMode::Local,
+            "dual" => DisplayMode::Dual,
+            "utc" => DisplayMode::Utc,
+            other => return Err(format!("unknown trip phase display mode: {other}")),
+        };
+        Ok(TripPhase {
             id: self.id,
             label: self.label,
-            kind: match self.kind.as_str() {
-                "transit" => PhaseKind::Transit,
-                _ => PhaseKind::Location,
-            },
+            kind,
             start_anchor_asset_id: self.start_anchor_asset_id,
             end_anchor_asset_id: self.end_anchor_asset_id,
             start_trip_time: self.start_trip_time,
@@ -85,12 +95,8 @@ impl TripPhaseInput {
             timezone: self.timezone,
             origin_timezone: self.origin_timezone,
             destination_timezone: self.destination_timezone,
-            display_mode: match self.display_mode.as_str() {
-                "dual" => DisplayMode::Dual,
-                "utc" => DisplayMode::Utc,
-                _ => DisplayMode::Local,
-            },
-        }
+            display_mode,
+        })
     }
 }
 
@@ -122,11 +128,69 @@ impl ClockEpochInput {
     }
 }
 
-fn strength_from(value: &str) -> ConstraintStrength {
+fn strength_from(value: &str) -> Result<ConstraintStrength, String> {
     match value {
-        "hard" => ConstraintStrength::Hard,
-        _ => ConstraintStrength::Soft,
+        "hard" => Ok(ConstraintStrength::Hard),
+        "soft" => Ok(ConstraintStrength::Soft),
+        other => Err(format!("unknown event-order constraint strength: {other}")),
     }
+}
+
+#[cfg(test)]
+mod transport_input_tests {
+    use super::*;
+
+    fn phase_input(kind: &str, display_mode: &str) -> TripPhaseInput {
+        TripPhaseInput {
+            id: "phase_1".to_string(),
+            label: "Flight".to_string(),
+            kind: kind.to_string(),
+            start_anchor_asset_id: Some("asset_a".to_string()),
+            end_anchor_asset_id: Some("asset_b".to_string()),
+            start_trip_time: "2026-02-08T00:00:00Z".to_string(),
+            end_trip_time: "2026-02-08T01:00:00Z".to_string(),
+            timezone: None,
+            origin_timezone: Some("Asia/Tokyo".to_string()),
+            destination_timezone: Some("Europe/Madrid".to_string()),
+            display_mode: display_mode.to_string(),
+        }
+    }
+
+    #[test]
+    fn chronology_transport_rejects_unknown_enums_instead_of_coercing_them() {
+        assert!(phase_input("journey", "local").into_phase().is_err());
+        assert!(phase_input("transit", "guess").into_phase().is_err());
+        assert!(strength_from("advisory").is_err());
+    }
+
+    #[test]
+    fn chronology_transport_accepts_each_declared_enum_value() {
+        assert!(matches!(
+            phase_input("location", "local").into_phase().unwrap().kind,
+            PhaseKind::Location
+        ));
+        let transit = phase_input("transit", "dual").into_phase().unwrap();
+        assert!(matches!(transit.kind, PhaseKind::Transit));
+        assert!(matches!(transit.display_mode, DisplayMode::Dual));
+        assert!(matches!(
+            strength_from("soft").unwrap(),
+            ConstraintStrength::Soft
+        ));
+        assert!(matches!(
+            strength_from("hard").unwrap(),
+            ConstraintStrength::Hard
+        ));
+    }
+}
+
+fn refresh_asset_projection(
+    catalog: &rcdvlog_core::Catalog,
+    project_id: &str,
+) -> Result<(), String> {
+    catalog
+        .resolve_chronology(project_id)
+        .map(|_| ())
+        .map_err(error_message)
 }
 
 // --- D01-T015: read-only calibration surface --------------------------------
@@ -137,15 +201,12 @@ pub fn chronology_overview(
     state: State<'_, AppState>,
 ) -> Result<ChronologyOverview, String> {
     let catalog = state.catalog()?;
-    let facts = catalog
-        .chronology_facts(&project_id)
+    let snapshot = catalog
+        .chronology_snapshot(&project_id)
         .map_err(error_message)?;
-    let solution = catalog
-        .solve_chronology(&project_id)
-        .map_err(error_message)?;
-    let proposals = catalog
-        .propose_capture_sequence_splits(&project_id)
-        .map_err(error_message)?;
+    let facts = snapshot.facts;
+    let solution = snapshot.solution;
+    let proposals = snapshot.proposed_splits;
     let unplaced = solution
         .assets
         .iter()
@@ -214,14 +275,58 @@ pub fn preview_clock_epoch(
 }
 
 #[tauri::command]
-pub fn set_clock_epoch(
+pub fn preview_clock_epoch_impact(
     project_id: String,
     epoch: ClockEpochInput,
     state: State<'_, AppState>,
-) -> Result<ClockEpoch, String> {
-    let stored = state
+) -> Result<ClockEpochImpactPreview, String> {
+    state
         .catalog()?
-        .set_clock_epoch(&project_id, &epoch.into_epoch())
+        .preview_clock_epoch_impact(&project_id, &epoch.into_epoch())
+        .map_err(error_message)
+}
+
+#[tauri::command]
+pub fn preview_clear_clock_epoch_impact(
+    project_id: String,
+    epoch_id: String,
+    state: State<'_, AppState>,
+) -> Result<ClockEpochClearPreview, String> {
+    state
+        .catalog()?
+        .preview_clear_clock_epoch_impact(&project_id, &epoch_id)
+        .map_err(error_message)
+}
+
+#[tauri::command]
+pub fn preview_visual_placement(
+    project_id: String,
+    asset_ids: Vec<String>,
+    target_asset_id: String,
+    side: String,
+    label: String,
+    state: State<'_, AppState>,
+) -> Result<VisualPlacementPreview, String> {
+    let side = match side.as_str() {
+        "before" => VisualPlacementSide::Before,
+        "after" => VisualPlacementSide::After,
+        _ => return Err("placement side must be before or after".to_string()),
+    };
+    state
+        .catalog()?
+        .preview_visual_placement(&project_id, &asset_ids, &target_asset_id, side, &label)
+        .map_err(error_message)
+}
+
+#[tauri::command]
+pub fn set_clock_epoch(
+    project_id: String,
+    preview: ClockEpochImpactPreview,
+    state: State<'_, AppState>,
+) -> Result<ClockEpoch, String> {
+    let catalog = state.catalog()?;
+    let stored = catalog
+        .apply_clock_epoch_preview(&project_id, &preview)
         .map_err(error_message)?;
     state.sync_manager.wake_project(&project_id);
     Ok(stored)
@@ -230,15 +335,50 @@ pub fn set_clock_epoch(
 #[tauri::command]
 pub fn clear_clock_epoch(
     project_id: String,
-    epoch_id: String,
+    preview: ClockEpochClearPreview,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    state
-        .catalog()?
-        .clear_clock_epoch(&project_id, &epoch_id)
+    let catalog = state.catalog()?;
+    catalog
+        .apply_clear_clock_epoch_preview(&project_id, &preview)
         .map_err(error_message)?;
     state.sync_manager.wake_project(&project_id);
     Ok(())
+}
+
+#[tauri::command]
+pub fn preview_capture_sequence_split(
+    project_id: String,
+    source_sequence_id: String,
+    at_counter: u64,
+    label: String,
+    asset_ids: Vec<String>,
+    state: State<'_, AppState>,
+) -> Result<CaptureSequenceSplitPreview, String> {
+    state
+        .catalog()?
+        .preview_capture_sequence_split(
+            &project_id,
+            &source_sequence_id,
+            at_counter,
+            &label,
+            &asset_ids,
+        )
+        .map_err(error_message)
+}
+
+#[tauri::command]
+pub fn apply_capture_sequence_split(
+    project_id: String,
+    preview: CaptureSequenceSplitPreview,
+    state: State<'_, AppState>,
+) -> Result<CaptureSequence, String> {
+    let catalog = state.catalog()?;
+    let created = catalog
+        .apply_capture_sequence_split(&project_id, &preview)
+        .map_err(error_message)?;
+    state.sync_manager.wake_project(&project_id);
+    Ok(created)
 }
 
 #[tauri::command]
@@ -249,10 +389,11 @@ pub fn split_capture_sequence(
     label: String,
     state: State<'_, AppState>,
 ) -> Result<CaptureSequence, String> {
-    let created = state
-        .catalog()?
+    let catalog = state.catalog()?;
+    let created = catalog
         .split_capture_sequence(&project_id, &source_sequence_id, at_counter, &label)
         .map_err(error_message)?;
+    refresh_asset_projection(&catalog, &project_id)?;
     state.sync_manager.wake_project(&project_id);
     Ok(created)
 }
@@ -264,12 +405,85 @@ pub fn merge_capture_sequences(
     into_sequence_id: String,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    state
-        .catalog()?
+    let catalog = state.catalog()?;
+    catalog
         .merge_capture_sequences(&project_id, &from_sequence_id, &into_sequence_id)
         .map_err(error_message)?;
     state.sync_manager.wake_project(&project_id);
     Ok(())
+}
+
+#[tauri::command]
+pub fn preview_capture_sequence_merge(
+    project_id: String,
+    from_sequence_id: String,
+    into_sequence_id: String,
+    state: State<'_, AppState>,
+) -> Result<CaptureSequenceMergePreview, String> {
+    state
+        .catalog()?
+        .preview_capture_sequence_merge(&project_id, &from_sequence_id, &into_sequence_id)
+        .map_err(error_message)
+}
+
+#[tauri::command]
+pub fn apply_capture_sequence_merge(
+    project_id: String,
+    preview: CaptureSequenceMergePreview,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let catalog = state.catalog()?;
+    catalog
+        .apply_capture_sequence_merge(&project_id, &preview)
+        .map_err(error_message)?;
+    state.sync_manager.wake_project(&project_id);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn preview_capture_sequence_reassignment(
+    project_id: String,
+    anchor_asset_id: String,
+    into_sequence_id: String,
+    state: State<'_, AppState>,
+) -> Result<CaptureSequenceReassignmentPreview, String> {
+    state
+        .catalog()?
+        .preview_capture_sequence_reassignment(&project_id, &anchor_asset_id, &into_sequence_id)
+        .map_err(error_message)
+}
+
+#[tauri::command]
+pub fn preview_capture_sequence_assets(
+    project_id: String,
+    from_sequence_id: String,
+    into_sequence_id: String,
+    asset_ids: Vec<String>,
+    state: State<'_, AppState>,
+) -> Result<CaptureSequenceReassignmentPreview, String> {
+    state
+        .catalog()?
+        .preview_capture_sequence_assets(
+            &project_id,
+            &from_sequence_id,
+            &into_sequence_id,
+            &asset_ids,
+        )
+        .map_err(error_message)
+}
+
+#[tauri::command]
+pub fn reassign_capture_sequence_assets(
+    project_id: String,
+    preview: CaptureSequenceReassignmentPreview,
+    state: State<'_, AppState>,
+) -> Result<Vec<String>, String> {
+    let catalog = state.catalog()?;
+    let moved = catalog
+        .apply_capture_sequence_reassignment(&project_id, &preview)
+        .map_err(error_message)?;
+    state.sync_manager.wake_project(&project_id);
+    Ok(moved)
 }
 
 #[tauri::command]
@@ -280,10 +494,11 @@ pub fn set_clip_time_exception(
     reason: String,
     state: State<'_, AppState>,
 ) -> Result<ClipTimeException, String> {
-    let stored = state
-        .catalog()?
+    let catalog = state.catalog()?;
+    let stored = catalog
         .set_clip_time_exception(&asset_id, &trip_time, &reason)
         .map_err(error_message)?;
+    refresh_asset_projection(&catalog, &project_id)?;
     state.sync_manager.wake_project(&project_id);
     Ok(stored)
 }
@@ -294,10 +509,11 @@ pub fn clear_clip_time_exception(
     asset_id: String,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    state
-        .catalog()?
+    let catalog = state.catalog()?;
+    catalog
         .clear_clip_time_exception(&asset_id)
         .map_err(error_message)?;
+    refresh_asset_projection(&catalog, &project_id)?;
     state.sync_manager.wake_project(&project_id);
     Ok(())
 }
@@ -308,10 +524,12 @@ pub fn set_trip_phase(
     phase: TripPhaseInput,
     state: State<'_, AppState>,
 ) -> Result<TripPhase, String> {
-    let stored = state
-        .catalog()?
-        .set_trip_phase(&project_id, &phase.into_phase())
+    let phase = phase.into_phase()?;
+    let catalog = state.catalog()?;
+    let stored = catalog
+        .set_trip_phase(&project_id, &phase)
         .map_err(error_message)?;
+    refresh_asset_projection(&catalog, &project_id)?;
     state.sync_manager.wake_project(&project_id);
     Ok(stored)
 }
@@ -325,16 +543,18 @@ pub fn split_trip_phase(
     new_phase: TripPhaseInput,
     state: State<'_, AppState>,
 ) -> Result<TripPhase, String> {
-    let stored = state
-        .catalog()?
+    let new_phase = new_phase.into_phase()?;
+    let catalog = state.catalog()?;
+    let stored = catalog
         .split_trip_phase(
             &project_id,
             &existing_phase_id,
             &boundary_asset_id,
             direction,
-            &new_phase.into_phase(),
+            &new_phase,
         )
         .map_err(error_message)?;
+    refresh_asset_projection(&catalog, &project_id)?;
     state.sync_manager.wake_project(&project_id);
     Ok(stored)
 }
@@ -345,10 +565,11 @@ pub fn remove_trip_phase(
     phase_id: String,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    state
-        .catalog()?
+    let catalog = state.catalog()?;
+    catalog
         .remove_trip_phase(&project_id, &phase_id)
         .map_err(error_message)?;
+    refresh_asset_projection(&catalog, &project_id)?;
     state.sync_manager.wake_project(&project_id);
     Ok(())
 }
@@ -362,16 +583,18 @@ pub fn set_event_order_constraint(
     source: String,
     state: State<'_, AppState>,
 ) -> Result<EventOrderConstraint, String> {
-    let stored = state
-        .catalog()?
+    let strength = strength_from(&strength)?;
+    let catalog = state.catalog()?;
+    let stored = catalog
         .set_event_order_constraint(
             &project_id,
             &earlier_asset_id,
             &later_asset_id,
-            strength_from(&strength),
+            strength,
             &source,
         )
         .map_err(error_message)?;
+    refresh_asset_projection(&catalog, &project_id)?;
     state.sync_manager.wake_project(&project_id);
     Ok(stored)
 }
@@ -382,10 +605,11 @@ pub fn clear_event_order_constraint(
     constraint_id: String,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    state
-        .catalog()?
+    let catalog = state.catalog()?;
+    catalog
         .clear_event_order_constraint(&project_id, &constraint_id)
         .map_err(error_message)?;
+    refresh_asset_projection(&catalog, &project_id)?;
     state.sync_manager.wake_project(&project_id);
     Ok(())
 }

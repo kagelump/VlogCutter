@@ -18,6 +18,7 @@ const assetAnalysis = vi.fn();
 const projectAnalysisIndex = vi.fn();
 const analysisReadiness = vi.fn();
 const overview = vi.fn();
+const detectOfflineVolumes = vi.fn();
 
 vi.mock("../api", () => ({
   api: {
@@ -30,7 +31,10 @@ vi.mock("../api", () => ({
 }));
 
 vi.mock("../chronologyApi", () => ({
-  chronologyApi: { overview: (...args: unknown[]) => overview(...args) },
+  chronologyApi: {
+    overview: (...args: unknown[]) => overview(...args),
+    detectOfflineVolumes: (...args: unknown[]) => detectOfflineVolumes(...args),
+  },
 }));
 
 /** A promise the test decides the timing of. */
@@ -56,6 +60,7 @@ beforeEach(() => {
   projectAnalysisIndex.mockResolvedValue([]);
   analysisReadiness.mockResolvedValue(null);
   overview.mockImplementation(async (projectId: string) => chronologyFor(projectId));
+  detectOfflineVolumes.mockResolvedValue([]);
 });
 
 function renderSession(projectId: string) {

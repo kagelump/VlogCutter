@@ -12,10 +12,16 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type {
   CaptureSequence,
+  CaptureSequenceMergePreview,
+  CaptureSequenceReassignmentPreview,
+  CaptureSequenceSplitPreview,
   ChronologyExplanation,
+  ChronologyImpact,
   ChronologyOverview,
   ClipTimeException,
   ClockEpoch,
+  ClockEpochClearPreview,
+  ClockEpochImpactPreview,
   Contradiction,
   Diagnostic,
   DiagnosticsView,
@@ -28,6 +34,7 @@ import type {
   QueuePosition,
   TripPhase,
   ValidationReport,
+  VisualPlacementPreview,
 } from "./chronologyTypes";
 
 const inTauri = () => "__TAURI_INTERNALS__" in window;
@@ -54,12 +61,45 @@ export const chronologyApi = {
     return invoke<Contradiction[]>("preview_clock_epoch", { projectId, epoch });
   },
 
-  async setClockEpoch(projectId: string, epoch: ClockEpoch): Promise<ClockEpoch | null> {
-    return invoke<ClockEpoch>("set_clock_epoch", { projectId, epoch });
+  async previewClockEpochImpact(
+    projectId: string,
+    epoch: ClockEpoch,
+  ): Promise<ClockEpochImpactPreview> {
+    return invoke<ClockEpochImpactPreview>("preview_clock_epoch_impact", { projectId, epoch });
   },
 
-  async clearClockEpoch(projectId: string, epochId: string): Promise<void> {
-    await invoke("clear_clock_epoch", { projectId, epochId });
+  async previewClearClockEpochImpact(
+    projectId: string,
+    epochId: string,
+  ): Promise<ClockEpochClearPreview> {
+    return invoke<ClockEpochClearPreview>("preview_clear_clock_epoch_impact", { projectId, epochId });
+  },
+
+  async previewVisualPlacement(
+    projectId: string,
+    assetIds: string[],
+    targetAssetId: string,
+    side: "before" | "after",
+    label: string,
+  ): Promise<VisualPlacementPreview> {
+    return invoke<VisualPlacementPreview>("preview_visual_placement", {
+      projectId,
+      assetIds,
+      targetAssetId,
+      side,
+      label,
+    });
+  },
+
+  async setClockEpoch(
+    projectId: string,
+    preview: ClockEpochImpactPreview | VisualPlacementPreview,
+  ): Promise<ClockEpoch | null> {
+    return invoke<ClockEpoch>("set_clock_epoch", { projectId, preview });
+  },
+
+  async clearClockEpoch(projectId: string, preview: ClockEpochClearPreview): Promise<void> {
+    await invoke("clear_clock_epoch", { projectId, preview });
   },
 
   async splitCaptureSequence(
@@ -76,12 +116,85 @@ export const chronologyApi = {
     });
   },
 
+  async previewCaptureSequenceSplit(
+    projectId: string,
+    sourceSequenceId: string,
+    atCounter: number,
+    label: string,
+    assetIds: string[],
+  ): Promise<CaptureSequenceSplitPreview> {
+    return invoke<CaptureSequenceSplitPreview>("preview_capture_sequence_split", {
+      projectId,
+      sourceSequenceId,
+      atCounter,
+      label,
+      assetIds,
+    });
+  },
+
+  async applyCaptureSequenceSplit(
+    projectId: string,
+    preview: CaptureSequenceSplitPreview,
+  ): Promise<CaptureSequence> {
+    return invoke<CaptureSequence>("apply_capture_sequence_split", { projectId, preview });
+  },
+
   async mergeCaptureSequences(
     projectId: string,
     fromSequenceId: string,
     intoSequenceId: string,
   ): Promise<void> {
     await invoke("merge_capture_sequences", { projectId, fromSequenceId, intoSequenceId });
+  },
+
+  async previewCaptureSequenceMerge(
+    projectId: string,
+    fromSequenceId: string,
+    intoSequenceId: string,
+  ): Promise<CaptureSequenceMergePreview> {
+    return invoke<CaptureSequenceMergePreview>("preview_capture_sequence_merge", {
+      projectId,
+      fromSequenceId,
+      intoSequenceId,
+    });
+  },
+
+  async applyCaptureSequenceMerge(
+    projectId: string,
+    preview: CaptureSequenceMergePreview,
+  ): Promise<void> {
+    await invoke("apply_capture_sequence_merge", { projectId, preview });
+  },
+
+  async previewCaptureSequenceReassignment(
+    projectId: string,
+    anchorAssetId: string,
+    intoSequenceId: string,
+  ): Promise<CaptureSequenceReassignmentPreview> {
+    return invoke<CaptureSequenceReassignmentPreview>("preview_capture_sequence_reassignment",
+      { projectId, anchorAssetId, intoSequenceId },
+    );
+  },
+
+  async previewCaptureSequenceAssets(
+    projectId: string,
+    fromSequenceId: string,
+    intoSequenceId: string,
+    assetIds: string[],
+  ): Promise<CaptureSequenceReassignmentPreview> {
+    return invoke<CaptureSequenceReassignmentPreview>("preview_capture_sequence_assets", {
+      projectId,
+      fromSequenceId,
+      intoSequenceId,
+      assetIds,
+    });
+  },
+
+  async reassignCaptureSequenceAssets(
+    projectId: string,
+    preview: CaptureSequenceReassignmentPreview,
+  ): Promise<string[]> {
+    return invoke<string[]>("reassign_capture_sequence_assets", { projectId, preview });
   },
 
   async setClipTimeException(

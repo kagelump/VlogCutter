@@ -135,10 +135,10 @@ Implemented now:
 
 Important gaps; do not accidentally describe these as complete:
 
-- Import preflight exists, but the capture-sequence portion of ingest preview is
-  incomplete. Capture-sequence split/merge exists, while boundary proposals
-  currently detect only counter resets; volume, folder, prefix, discontinuity,
-  and per-asset reassignment workflows remain incomplete.
+- Import preflight includes a read-only, per-run capture-sequence decision with
+  volume, folder, filename-prefix, counter-reset, and time-discontinuity
+  evidence. The Chronology desk supports explicit split/merge and single-clip
+  or clip-and-following reassignment; preflight never applies those proposals.
 - No general mounted-volume inventory, project deletion, or cache cleanup UI.
   Relink now
   exists: media locations carry a verification state, ingest repairs an asset
@@ -155,13 +155,16 @@ Important gaps; do not accidentally describe these as complete:
 - Trip phases and timezone display are persisted and solved, and the ribbon can
   add a location/transit phase forward or backward from a hovered clip, edit an
   existing phase, and atomically cut a new phase from either side of a filled
-  segment. It still lacks boundary dragging and the full
-  lane/trip-band calibration view. Story beats remain display-only browser-mock
-  fields and are not persisted.
-- The basic chronology drawer can inspect explanations, diagnostics, split
-  proposals, and clock epochs. It does not yet provide the complete calibration
-  interaction contract for clip exceptions, phases, constraints, merges,
-  reassignments, or bounded before/after impact summaries.
+  segment. The Chronology desk adds identity-snapped pointer and keyboard
+  boundary adjustment for both phase kinds, plus a full sequence-lane/trip-band
+  view. Story beats remain display-only browser-mock fields and are not
+  persisted.
+- The Chronology desk surfaces conflicts, explanations, diagnostics, clock
+  epochs, phase boundaries, split/merge, single/following reassignment, and
+  bounded solver-owned before/after impact summaries. The compact Review ribbon
+  deep-links into it and Shift+T opens it with the Review zoom and viewport.
+  Dedicated clip-exception and event-order-constraint controls remain domain/API
+  capabilities rather than first-class desk tools.
 - Web has automated Vitest and Chrome Playwright coverage. Desktop React now has Vitest + jsdom + Testing Library component tests under `apps/desktop/src/components/__tests__/`, but there is still no automated native Tauri UI suite.
 - No macOS signing/notarization or clean-machine packaging acceptance.
 - Analysis suggestions are shown and editable in the desktop, but there is no

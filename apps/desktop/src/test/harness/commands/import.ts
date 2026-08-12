@@ -49,6 +49,12 @@ function preflight(
   const bytesToCopy = newClips.reduce((total, asset) => total + asset.sizeBytes, 0);
   const availableBytes = archiveRoot?.availableBytes ?? null;
   const roomless = availableBytes !== null && availableBytes < bytesToCopy;
+  const newCamera = newClips[0]?.camera ?? card?.cameraHint ?? "Unknown camera";
+  const existingCameras = new Set(known.map((asset) => asset.camera));
+  const matchesExistingSequence = newClips.length > 0 && existingCameras.has(newCamera);
+  const sequenceLabel = `${newCamera} card`;
+  const firstNew = newClips[0];
+  const lastNew = newClips.at(-1);
 
   const items: PreflightItem[] = additions.map((asset) => ({
     path: `${sourcePath}/${asset.filename}`,
@@ -86,6 +92,31 @@ function preflight(
     missingProxies: known.filter((asset) => !asset.proxyAvailable).length,
     collisions: 0,
     unreadable: 0,
+    sequencePreview: {
+      newClipCount: newClips.length,
+      existingSequenceCount: existingCameras.size,
+      proposedSequenceCount: newClips.length > 0 ? 1 : 0,
+      matchedExistingSequenceCount: matchesExistingSequence ? 1 : 0,
+      suggestedNewSequenceCount: newClips.length > 0 && !matchesExistingSequence ? 1 : 0,
+      boundaries: [],
+      runs: newClips.length > 0 ? [{
+        firstRelativePath: firstNew!.filename,
+        lastRelativePath: lastNew!.filename,
+        clipCount: newClips.length,
+        cameraKey: newCamera,
+        volumeHint: card?.sessionId ?? sourcePath,
+        filenamePrefix: newCamera.split(" ")[0].toUpperCase(),
+        decision: matchesExistingSequence ? "extendExisting" : "proposeNew",
+        matchedExistingSequenceId: matchesExistingSequence ? `sequence_${newCamera.toLowerCase().replaceAll(" ", "_")}` : null,
+        matchedExistingSequenceLabel: matchesExistingSequence ? sequenceLabel : null,
+        comparedExistingSequenceId: null,
+        comparedExistingSequenceLabel: null,
+        reason: matchesExistingSequence
+          ? `This run matches the camera, card, and filename evidence for “${sequenceLabel}”.`
+          : `No existing capture sequence is available for ${newCamera}.`,
+        evidence: [],
+      }] : [],
+    },
     items,
   };
 }

@@ -475,6 +475,7 @@ mod tests {
             missing_proxies: 0,
             collisions: 0,
             unreadable: 0,
+            sequence_preview: Default::default(),
             items: vec![
                 PreflightItem {
                     path: "/Volumes/CARD/new.MP4".to_string(),

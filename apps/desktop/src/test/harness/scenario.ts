@@ -23,13 +23,28 @@ import {
   type TranscriptSpec,
 } from "./builders";
 import { createInitialState, putAsset, type DesktopHarnessState } from "./state";
-import { buildChronologyOverview, type ChronologySpec } from "./chronologyFixtures";
+import {
+  buildChronologyOverview,
+  reassignmentPreviewRequestKey,
+  reassignmentWriteRequestKey,
+  sequenceMergeRequestKey,
+  sequenceSplitRequestKey,
+  visualPlacementRequestKey,
+  type ChronologySpec,
+} from "./chronologyFixtures";
 import type {
+  CaptureSequenceMergePreview,
+  CaptureSequenceReassignmentPreview,
+  CaptureSequenceSplitPreview,
+  ChronologyImpact,
   ChronologyOverview,
+  ClockEpochClearPreview,
+  ClockEpochImpactPreview,
   Contradiction,
   Diagnostic,
   OtioExportResult,
   ValidationReport,
+  VisualPlacementPreview,
 } from "../../chronologyTypes";
 import type { Asset, DesktopSettings, SyncStatus } from "../../types";
 
@@ -242,6 +257,81 @@ export class ScenarioBuilder {
   /** What previewing an edit to this sequence reports back. */
   contradictionOnPreview(sequenceId: string, ...contradictions: Contradiction[]): this {
     this.state.chronology.previewsByEdit[sequenceId] = contradictions;
+    return this;
+  }
+
+  /** Exact impact the Rust solver reports for a candidate clock correction. */
+  impactOnClockPreview(sequenceId: string, preview: ClockEpochImpactPreview): this {
+    this.state.chronology.impactsByEdit[sequenceId] = preview;
+    return this;
+  }
+
+  /** Exact impact the Rust solver reports before removing a persisted epoch. */
+  impactOnClearClockEpochPreview(epochId: string, impact: ChronologyImpact): this {
+    const preview: ClockEpochClearPreview = {
+      epochId,
+      factsToken: `facts-clear-${epochId}`,
+      impact,
+    };
+    this.state.chronology.clearEpochImpacts[epochId] = preview;
+    return this;
+  }
+
+  /** Exact Rust response for placing a selected contiguous run in the visual canvas. */
+  visualPlacementPreview(
+    assetIds: string[],
+    targetAssetId: string,
+    side: "before" | "after",
+    preview: VisualPlacementPreview,
+  ): this {
+    this.state.chronology.visualPlacementPreviews[
+      visualPlacementRequestKey(assetIds, targetAssetId, side)
+    ] = preview;
+    return this;
+  }
+
+  /** Exact preview and post-write overview for moving a declared run between cards. */
+  captureSequenceReassignment(
+    anchorAssetId: string,
+    intoSequenceId: string,
+    preview: CaptureSequenceReassignmentPreview,
+    outcome: ChronologySpec | ChronologyOverview,
+  ): this {
+    this.state.chronology.reassignmentPreviews[
+      reassignmentPreviewRequestKey(anchorAssetId, intoSequenceId)
+    ] = preview;
+    this.state.chronology.reassignmentPreviews[
+      reassignmentWriteRequestKey(preview.fromSequenceId, preview.intoSequenceId, preview.assetIds)
+    ] = preview;
+    this.state.chronology.reassignmentOutcomes[
+      reassignmentWriteRequestKey(preview.fromSequenceId, preview.intoSequenceId, preview.assetIds)
+    ] = "order" in outcome ? buildChronologyOverview(outcome) : outcome;
+    return this;
+  }
+
+  /** Exact preview and post-write overview for splitting a declared card run. */
+  captureSequenceSplit(
+    preview: CaptureSequenceSplitPreview,
+    outcome: ChronologySpec | ChronologyOverview,
+  ): this {
+    this.state.chronology.sequenceSplitPreviews[
+      sequenceSplitRequestKey(preview.sourceSequenceId, preview.atCounter, preview.assetIds)
+    ] = preview;
+    this.state.chronology.sequenceSplitOutcomes[preview.factsToken] =
+      "order" in outcome ? buildChronologyOverview(outcome) : outcome;
+    return this;
+  }
+
+  /** Exact preview and post-write overview for merging one whole card into another. */
+  captureSequenceMerge(
+    preview: CaptureSequenceMergePreview,
+    outcome: ChronologySpec | ChronologyOverview,
+  ): this {
+    this.state.chronology.sequenceMergePreviews[
+      sequenceMergeRequestKey(preview.fromSequenceId, preview.intoSequenceId)
+    ] = preview;
+    this.state.chronology.sequenceMergeOutcomes[preview.factsToken] =
+      "order" in outcome ? buildChronologyOverview(outcome) : outcome;
     return this;
   }
 

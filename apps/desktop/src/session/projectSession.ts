@@ -48,6 +48,8 @@ export interface ProjectSessionOptions {
 export interface ProjectSession {
   assets: Asset[];
   chronology: ChronologyOverview | null;
+  /** A chronology-only read failure; Review stays usable and Chronology can retry it. */
+  chronologyError: string;
   analysisIndex: Record<string, AssetAnalysisIndexEntry>;
   readiness: AnalysisReadiness | null;
   transcript: ClipTranscript | null;
@@ -98,6 +100,7 @@ export function useProjectSession({
 }: ProjectSessionOptions): ProjectSession {
   const [assets, setAssets] = useState<Asset[]>([]);
   const [chronology, setChronology] = useState<ChronologyOverview | null>(null);
+  const [chronologyError, setChronologyError] = useState("");
   const [analysisIndex, setAnalysisIndex] = useState<Record<string, AssetAnalysisIndexEntry>>({});
   const [readiness, setReadiness] = useState<AnalysisReadiness | null>(null);
   const [transcript, setTranscript] = useState<ClipTranscript | null>(null);
@@ -187,6 +190,19 @@ export function useProjectSession({
     }
   }, [isCurrent]);
 
+  const loadChronology = useCallback(async (token: ReadToken, activeProjectId: string) => {
+    try {
+      const result = await chronologyApi.overview(activeProjectId);
+      if (!isCurrent(token)) return;
+      setChronology(result);
+      setChronologyError("");
+    } catch (reason) {
+      if (!isCurrent(token)) return;
+      setChronology(null);
+      setChronologyError(String(reason));
+    }
+  }, [isCurrent]);
+
   /**
    * The summaries beside the queue. Each fails to its empty value on its own: a
    * chronology the solver cannot produce should not blank the queue, and never
@@ -217,6 +233,7 @@ export function useProjectSession({
         if (assetsToken.session !== sessionRef.current) return;
         setAssets([]);
         setChronology(null);
+        setChronologyError("");
         setAnalysisIndex({});
         setReadiness(null);
         setLoadError("");
@@ -226,7 +243,11 @@ export function useProjectSession({
       setLoading(true);
       await Promise.all([
         loadAssets(assetsToken, activeProjectId),
-        settleRead(chronologyToken, () => chronologyApi.overview(activeProjectId), setChronology, null),
+        loadChronology(chronologyToken, activeProjectId),
+        // Volume diagnostics belong to project bootstrap. Running this from
+        // the Chronology surface made opening a supposedly read-only desk
+        // perform a durable write and duplicated work on every mode switch.
+        chronologyApi.detectOfflineVolumes(activeProjectId).catch(() => []),
         settleRead(
           analysisToken,
           async () => indexAnalyses(await api.projectAnalysisIndex(activeProjectId)),
@@ -239,7 +260,7 @@ export function useProjectSession({
       if (assetsToken.session !== sessionRef.current) return;
       setLoading(false);
     },
-    [begin, loadAssets, loadEvidence, settleRead],
+    [begin, loadAssets, loadChronology, loadEvidence, settleRead],
   );
 
   useEffect(() => {
@@ -250,6 +271,7 @@ export function useProjectSession({
     // in state belongs to the project that was open a frame ago.
     setAssets([]);
     setChronology(null);
+    setChronologyError("");
     setAnalysisIndex({});
     setReadiness(null);
     setLoadError("");
@@ -293,8 +315,8 @@ export function useProjectSession({
       setChronology(null);
       return;
     }
-    await settleRead(token, () => chronologyApi.overview(activeProjectId), setChronology, null);
-  }, [begin, settleRead]);
+    await loadChronology(token, activeProjectId);
+  }, [begin, loadChronology]);
 
   const reloadReadiness = useCallback(async () => {
     const token = begin("readiness");
@@ -337,6 +359,7 @@ export function useProjectSession({
   return {
     assets,
     chronology,
+    chronologyError,
     analysisIndex,
     readiness,
     transcript,
