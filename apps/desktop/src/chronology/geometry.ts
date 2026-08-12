@@ -21,7 +21,11 @@ export function chronologyLanes(overview: ChronologyOverview): ChronologyLane[] 
   const bySequence = new Map<string, AssetChronology[]>();
   for (const asset of overview.assets) {
     const id = asset.orderKey.captureSequenceId;
-    bySequence.set(id, [...(bySequence.get(id) ?? []), asset]);
+    // Append in place. Rebuilding the lane array per clip is quadratic, and an
+    // expo-scale project puts thousands of clips on one card.
+    const lane = bySequence.get(id);
+    if (lane) lane.push(asset);
+    else bySequence.set(id, [asset]);
   }
   const declared = overview.sequences.map((sequence) => ({
     sequence,
@@ -51,7 +55,9 @@ export function ordinalWindow(
   overscanColumns = 8,
 ): OrdinalWindow {
   if (total <= 0 || zoom <= 0) return { start: 0, end: 0 };
-  const start = Math.max(0, Math.floor(scrollLeft / zoom) - overscanColumns);
+  // Clamped to `total` as well as to 0: the result is always a valid slice, so
+  // a caller cannot be handed a window that starts past the end of the list.
+  const start = Math.min(total, Math.max(0, Math.floor(scrollLeft / zoom) - overscanColumns));
   const end = Math.min(
     total,
     Math.ceil((scrollLeft + Math.max(0, viewportWidth)) / zoom) + overscanColumns,

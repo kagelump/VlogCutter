@@ -43,6 +43,14 @@ interface Props {
 const COLUMN = 92;
 const GUTTER = 160;
 
+/**
+ * Only used until the container reports its own width, and in engines with no
+ * `ResizeObserver`. It is deliberately generous: painting a few columns nobody
+ * looks at costs one frame, while painting too few leaves a maximised desk
+ * visibly blank down its right-hand side.
+ */
+const FALLBACK_VIEWPORT = 2560;
+
 export function ChronologyCanvas({
   overview,
   assetsById,
@@ -68,9 +76,9 @@ export function ChronologyCanvas({
   const boundaryDragRef = useRef<BoundaryDrag | null>(null);
   const suppressBoundaryClick = useRef(false);
   const skipInitialCenterRef = useRef(initialScrollLeft !== undefined);
-  const [viewport, setViewport] = useState({ left: 0, width: 900 });
+  const [viewport, setViewport] = useState({ left: 0, width: FALLBACK_VIEWPORT });
   const [boundaryDrag, setBoundaryDrag] = useState<BoundaryDrag | null>(null);
-  const window = ordinalWindow(
+  const visibleWindow = ordinalWindow(
     overview.assets.length,
     columnWidth,
     Math.max(0, viewport.left - GUTTER),
@@ -78,8 +86,8 @@ export function ChronologyCanvas({
     6,
   );
   const visibleIds = useMemo(
-    () => new Set(overview.assets.slice(window.start, window.end).map((asset) => asset.assetId)),
-    [overview.assets, window.end, window.start],
+    () => new Set(overview.assets.slice(visibleWindow.start, visibleWindow.end).map((asset) => asset.assetId)),
+    [overview.assets, visibleWindow.end, visibleWindow.start],
   );
   const selected = new Set(selectedIds);
   const impactExtent = changedOrdinalExtent(impact);
@@ -92,11 +100,29 @@ export function ChronologyCanvas({
     else if (selectedIds.length === 0) selectionAnchor.current = null;
   }, [selectedIds]);
 
+  // Measure the real container rather than assuming a width. Without this the
+  // virtual window is sized from the fallback alone, so on any desk wider than
+  // it the right-hand columns stay unpainted until the first scroll event —
+  // and a canvas opened on its first clip never gets one.
+  useEffect(() => {
+    const scroll = scrollRef.current;
+    if (!scroll) return;
+    const measure = () => setViewport({
+      left: scroll.scrollLeft,
+      width: scroll.clientWidth || FALLBACK_VIEWPORT,
+    });
+    measure();
+    if (typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(measure);
+    observer.observe(scroll);
+    return () => observer.disconnect();
+  }, []);
+
   useLayoutEffect(() => {
     const scroll = scrollRef.current;
     if (initialScrollLeft === undefined || !scroll) return;
     scroll.scrollLeft = Math.max(0, initialScrollLeft);
-    setViewport({ left: scroll.scrollLeft, width: scroll.clientWidth || 900 });
+    setViewport({ left: scroll.scrollLeft, width: scroll.clientWidth || FALLBACK_VIEWPORT });
   }, [initialScrollLeft]);
 
   useEffect(() => {
@@ -236,7 +262,7 @@ export function ChronologyCanvas({
             const range = boundaryDrag?.phase.id === phase.id
               ? { start: boundaryDrag.startIndex, end: boundaryDrag.endIndex }
               : solvedRange;
-            if (!range || range.end < window.start || range.start >= window.end) return null;
+            if (!range || range.end < visibleWindow.start || range.start >= visibleWindow.end) return null;
             const startAsset = overview.assets[range.start];
             const endAsset = overview.assets[range.end];
             return (
@@ -266,6 +292,9 @@ export function ChronologyCanvas({
                   type="button"
                   className="chronology-phase-label"
                   disabled={disabled}
+                  // The label and timezone are adjacent flex children, so the
+                  // derived name runs them together ("TokyoAsia/Tokyo").
+                  aria-label={`Edit ${phase.label}`}
                   onClick={() => onAdjustPhase({ phase, startIndex: range.start, endIndex: range.end })}
                 >
                   <strong>{phase.label}</strong>
@@ -293,8 +322,8 @@ export function ChronologyCanvas({
 
         <div className="chronology-ruler" aria-hidden="true">
           <span className="chronology-sticky-label">Solved order</span>
-          {overview.assets.slice(window.start, window.end).map((asset, offset) => {
-            const index = window.start + offset;
+          {overview.assets.slice(visibleWindow.start, visibleWindow.end).map((asset, offset) => {
+            const index = visibleWindow.start + offset;
             return (
               <span key={asset.assetId} style={{ left: GUTTER + index * columnWidth }}>
                 {String(index + 1).padStart(3, "0")}
@@ -347,7 +376,7 @@ export function ChronologyCanvas({
               })}
               {selectedIds.length > 0 && lane.assets.some((asset) => selected.has(asset.assetId)) && (
                 <div className="chronology-placement-targets" aria-label="Place selected run">
-                  {overview.assets.slice(window.start, window.end).filter((asset) => !selected.has(asset.assetId)).map((asset) => {
+                  {overview.assets.slice(visibleWindow.start, visibleWindow.end).filter((asset) => !selected.has(asset.assetId)).map((asset) => {
                     const index = indexById.get(asset.assetId) ?? 0;
                     return (
                       <span key={asset.assetId} style={{ left: index * columnWidth }}>
