@@ -2,30 +2,9 @@ import type { CSSProperties, RefObject } from "react";
 import type { Asset } from "../types";
 import { formatDate } from "../review/format";
 import { isRawOrientationThumbnail } from "../review/rotation";
+import type { BufferedMedia } from "../review/mediaBuffer";
 
-/**
- * One clip mounted in the stage: the selected one and its two neighbours.
- *
- * The neighbours exist so that J and K do not pay a load. The shell builds
- * these because only it knows the queue order; the stage only draws them.
- */
-export interface BufferedMedia {
-  asset: Asset;
-  /** -1, 0, or 1 relative to the selection. */
-  offset: number;
-  active: boolean;
-  url: string | null;
-  /**
-   * Whether the media behind `url` leaves the pixels raw and carries rotation
-   * as data. Resolved by the shell, because it depends on which of the proxy
-   * and the original the URL points at.
-   */
-  mediaIsRawOriented: boolean;
-  /** Degrees to turn the frame, already resolved against the representation. */
-  rotation: number;
-  displayAspect: number;
-  posterUrl: string | null;
-}
+export type { BufferedMedia } from "../review/mediaBuffer";
 
 export interface VideoStageProps {
   selected: Asset | null;

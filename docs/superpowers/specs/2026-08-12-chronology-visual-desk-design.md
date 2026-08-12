@@ -94,6 +94,15 @@ tick, and the time otherwise. Wall-clock fields are read from `displayTime.prima
 without `Date` round-tripping, for the reason `formatChronologyTime` documents: Rust
 owns timezone resolution and reparsing would relabel a Tokyo clip in the laptop's zone.
 
+**Timezone markers.** Running the desk against the real 2026 Eclipse project found a
+defect in the design above. That trip flies Tokyo → Madrid, so the *displayed* wall
+clock jumps backwards across the transit and the ruler read `16:46 … 14:25` — the
+solver appearing to contradict itself. A ruler of bare times is only honest inside one
+zone. `chronologyTimeTicks` therefore forces a tick wherever `displayTime.timezone`
+changes, and each tick carries a `zone` field — the city, set only where it changes —
+which the canvas renders as an amber chip. Day boundaries and zone changes both
+displace a regular tick that would collide with them.
+
 ## Testing
 
 - `src/review/mediaBuffer.test.ts` — ordering, missing proxy, rotation against

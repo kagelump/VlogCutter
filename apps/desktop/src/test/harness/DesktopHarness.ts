@@ -62,6 +62,12 @@ const passthrough: ActWrapper = async (action) => action();
 export interface HarnessOptions {
   /** Wrapper for updates the harness pushes into React. Defaults to a passthrough. */
   act?: ActWrapper;
+  /**
+   * Thumbnail URL builder. The default asset-protocol stub is a URL nothing can
+   * fetch, which is all a CUJ needs; the browser preview overrides it so the
+   * chronology canvas has frames to draw.
+   */
+  convertFileSrc?: (filePath: string, protocol?: string) => string;
 }
 
 export class DesktopHarness {
@@ -74,11 +80,13 @@ export class DesktopHarness {
   private log: CommandLogEntry[] = [];
   private uninstallRuntime: (() => void) | null = null;
   private actWrapper: ActWrapper;
+  private convertFileSrc: HarnessOptions["convertFileSrc"];
 
   constructor(state: DesktopHarnessState, clock: HarnessClock, options: HarnessOptions = {}) {
     this.state = state;
     this.clock = clock;
     this.actWrapper = options.act ?? passthrough;
+    this.convertFileSrc = options.convertFileSrc;
     this.jobs = new JobRegistry(
       (event, payload) => this.events.emit(event, payload),
       (action) => this.inAct(action),
@@ -101,6 +109,7 @@ export class DesktopHarness {
       invoke: (command, args) => this.invoke(command, args ?? {}),
       transformCallback: (callback, once) => this.events.transformCallback(callback, once),
       unregisterListener: (event, eventId) => this.events.unlisten(event, eventId),
+      convertFileSrc: this.convertFileSrc,
     });
     return this;
   }

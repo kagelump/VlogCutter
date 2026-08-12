@@ -187,6 +187,10 @@ export function previewScenario(): ScenarioBuilder {
       totalBytes: 80_000_000_000,
     })
     .withProxy(DJI[0], DJI[1])
+    // Every clip but the last DJI one has a frame. The gap is deliberate: the
+    // chronology canvas has to stay readable on a project mid-generation, and
+    // the preview is where that fallback is easiest to eyeball.
+    .withThumbnail(...SONY, ...IPHONE, ...INSTA, DJI[0], DJI[1])
     .archiveRoot("NAS Video", { localMountPath: ARCHIVE_MOUNT, availableBytes: 1_200_000_000_000 });
 
   return scenario

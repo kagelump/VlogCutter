@@ -206,6 +206,46 @@ describe("Chronology desk", () => {
     expect(within(lanes[1] as HTMLElement).getByRole("button", { name: /DJI_001/ })).toBeVisible();
   });
 
+  it("puts the focused clip and its solved-order neighbours on the compare deck", async () => {
+    // The desk's whole subject is the interleave between cards, and SONY_002
+    // sits between a Sony clip and a DJI one. Before the deck existed a user
+    // judged that from two filenames and a timestamp.
+    const app = await renderApp(chronologyTrip().withThumbnail(...sony, ...dji).build());
+    await app.user.click(screen.getByText("SONY_002.MP4"));
+    const panel = await enterChronology(app);
+
+    const deck = within(panel).getByRole("region", { name: "Compare deck" });
+    expect(within(deck).getByText("Clip 2 of 3")).toBeVisible();
+    expect(within(deck).getByRole("group", { name: /Focused clip SONY_002\.MP4/ })).toBeVisible();
+    expect(within(deck).getByRole("button", { name: /Previous in order: SONY_001\.MP4/ })).toBeVisible();
+    expect(within(deck).getByRole("button", { name: /Next in order: DJI_001\.MP4/ })).toBeVisible();
+  });
+
+  it("moves the desk's focus when a neighbour on the deck is chosen", async () => {
+    const app = await renderApp(chronologyTrip().withThumbnail(...sony, ...dji).build());
+    await app.user.click(screen.getByText("SONY_002.MP4"));
+    const panel = await enterChronology(app);
+
+    const deck = within(panel).getByRole("region", { name: "Compare deck" });
+    await app.user.click(within(deck).getByRole("button", { name: /Next in order: DJI_001\.MP4/ }));
+
+    expect(within(deck).getByRole("group", { name: /Focused clip DJI_001\.MP4/ })).toBeVisible();
+    // The inspector follows the deck, so "Why here" explains the clip on screen
+    // rather than the one the user last touched on the canvas.
+    const inspector = within(panel).getByRole("complementary", { name: "Chronology inspector" });
+    expect(within(inspector).getByRole("heading", { name: "DJI_001.MP4" })).toBeVisible();
+  });
+
+  it("draws each clip as a frame and keeps its name and time reachable", async () => {
+    const app = await renderApp(chronologyTrip().withThumbnail(...sony, ...dji).build());
+    const panel = await enterChronology(app);
+
+    const tile = within(panel).getByRole("button", { name: /SONY_001\.MP4, clip 1/ });
+    expect(tile.querySelector("img")).toBeInTheDocument();
+    expect(tile).toHaveAttribute("title", expect.stringContaining("SONY_001.MP4"));
+    expect(tile.querySelector(".chronology-block-ordinal")).toHaveTextContent("001");
+  });
+
   it("shows exact impact, cancels without a write, then applies once and restores the queue", async () => {
     const harness = chronologyTrip().build();
     const app = await renderApp(harness);

@@ -1108,12 +1108,65 @@ kbd { padding: 2px 4px; color: #a8b1b6; background: #262d32; border: 1px solid #
 .chronology-media-problems p { margin: 0 0 6px; }
 .chronology-media-problems button { margin-right: 8px; padding: 0; color: var(--cyan); border: 0; background: transparent; cursor: pointer; font-size: 10px; }
 
-.chronology-canvas-panel { min-width: 0; min-height: 0; display: grid; grid-template-rows: 62px minmax(0, 1fr); overflow: hidden; background: #0b0f11; }
+.chronology-canvas-panel { min-width: 0; min-height: 0; display: grid; grid-template-rows: 62px auto minmax(0, 1fr); overflow: hidden; background: #0b0f11; }
 .chronology-canvas-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 0 16px; border-bottom: 1px solid var(--line); background: #12171a; }
 .chronology-canvas-heading h2 { margin: 3px 0 0; font-size: 13px; }
-.chronology-canvas-heading p { max-width: 340px; margin: 0; color: var(--quiet); font-size: 10px; text-align: right; }
+.chronology-canvas-heading p { max-width: 280px; margin: 0; color: var(--quiet); font-size: 10px; text-align: right; }
+.chronology-zoom { display: flex; align-items: center; gap: 6px; }
+.chronology-zoom button { width: 20px; height: 20px; padding: 0; color: #aeb9bd; border: 1px solid var(--line-strong); border-radius: 3px; background: #1a2124; cursor: pointer; font-size: 11px; }
+.chronology-zoom button:disabled { opacity: .38; cursor: default; }
+.chronology-zoom input { width: 84px; accent-color: var(--cyan); }
+
+/* ── The compare deck ────────────────────────────────────────────────
+   The frame, back on a desk that used to be entirely typographic. Its
+   flanks are the clips the solver placed either side of the focused one,
+   which is the comparison the whole surface exists to support. */
+.chronology-deck { border-bottom: 1px solid var(--line-strong); background: #0e1315; }
+.chronology-deck-header { height: 26px; display: flex; align-items: center; gap: 12px; padding: 0 12px; border-bottom: 1px solid var(--line); background: #12171a; }
+.chronology-deck.is-collapsed .chronology-deck-header { border-bottom: 0; }
+.chronology-deck-toggle { display: flex; align-items: center; gap: 6px; padding: 0; color: #aeb9bd; border: 0; background: transparent; cursor: pointer; font: 10px/1 ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: .1em; text-transform: uppercase; }
+.chronology-deck-position { color: #68767d; font: 10px/1 ui-monospace, SFMono-Regular, Menlo, monospace; }
+.chronology-deck-hint { margin-left: auto; color: #4f5c63; font: 10px/1 ui-monospace, SFMono-Regular, Menlo, monospace; }
+/* The focused clip is the point, so it takes the space: the flanks are
+   there to be recognised, not studied. Height tracks the window rather
+   than being fixed, because a 216px deck on a 1440px-tall display wastes
+   the one surface the user is actually looking at. */
+.chronology-deck-body { height: clamp(196px, 26vh, 320px); display: grid; grid-template-columns: minmax(0, 0.72fr) minmax(0, 2.6fr) minmax(0, 0.72fr); gap: 8px; padding: 8px 12px; }
+.chronology-deck-body.is-empty { height: auto; display: block; padding: 18px 12px; color: var(--quiet); font-size: 11px; text-align: center; }
+
+.chronology-deck-neighbour { min-width: 0; display: grid; grid-template-rows: auto auto auto auto; align-content: start; gap: 4px; overflow: hidden; padding: 6px; color: #8d9aa1; border: 1px solid var(--line); border-radius: 5px; background: #12181b; cursor: pointer; text-align: left; }
+.chronology-deck-neighbour:hover:not(:disabled) { border-color: #6d7b82; background: #182023; }
+.chronology-deck-neighbour:disabled { opacity: .5; cursor: default; }
+.chronology-deck-neighbour.is-empty { display: grid; place-items: center; border-style: dashed; background: transparent; color: #3f4a50; font: 10px/1 ui-monospace, SFMono-Regular, Menlo, monospace; }
+.chronology-deck-neighbour-label { color: #5f6d74; font: 10px/1 ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: .08em; text-transform: uppercase; }
+.chronology-deck-neighbour strong { overflow: hidden; color: #c3ced2; font: 10px/12px ui-monospace, SFMono-Regular, Menlo, monospace; text-overflow: ellipsis; white-space: nowrap; }
+.chronology-deck-neighbour em { overflow: hidden; color: #5f6d74; font: 10px/12px ui-monospace, SFMono-Regular, Menlo, monospace; font-style: normal; text-overflow: ellipsis; white-space: nowrap; }
+/* Held at the shape of a frame. Letting it absorb the card's leftover
+   height turned a 16:9 still into a portrait crop of its own middle. */
+.chronology-deck-still { position: relative; aspect-ratio: 16 / 9; min-height: 0; display: grid; place-items: center; overflow: hidden; border-radius: 3px; background: #07090a; }
+.chronology-deck-still img { width: 100%; height: 100%; object-fit: cover; transform: rotate(var(--thumbnail-rotation)); }
+.chronology-deck-still.quarter-turn img { object-fit: contain; }
+
+.chronology-deck-focus { min-width: 0; display: grid; grid-template-rows: minmax(0, 1fr) 24px auto; gap: 4px; }
+.chronology-deck-focus .viewer-stage { border: 1px solid #2b3438; border-radius: 5px; }
+/* The review stage keeps its overlay clear of the transport that sits
+   inside it; the deck's transport is a sibling, so the gap is not wanted. */
+.chronology-deck-focus .viewer-overlay { bottom: 8px; font-size: 10px; }
+.chronology-deck-focus .offline-slate { padding: 12px; font-size: 11px; }
+.chronology-deck-focus .offline-slate strong { font-size: 11px; }
+.chronology-deck-transport { display: flex; align-items: center; gap: 8px; }
+.chronology-deck-transport button { width: 22px; height: 22px; padding: 0; color: #c3ced2; border: 1px solid var(--line-strong); border-radius: 3px; background: #1a2124; cursor: pointer; font-size: 10px; }
+.chronology-deck-transport button:disabled { opacity: .4; cursor: default; }
+.chronology-deck-transport input { flex: 1; min-width: 0; accent-color: var(--amber); }
+.chronology-deck-elapsed { color: #68767d; font: 10px/1 ui-monospace, SFMono-Regular, Menlo, monospace; font-variant-numeric: tabular-nums; }
+.chronology-deck-caption { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.chronology-deck-caption strong { overflow: hidden; color: var(--ink); font: 11px/14px ui-monospace, SFMono-Regular, Menlo, monospace; text-overflow: ellipsis; white-space: nowrap; }
+.chronology-deck-caption em { flex: none; color: #68767d; font: 10px/14px ui-monospace, SFMono-Regular, Menlo, monospace; font-style: normal; }
 .chronology-canvas-scroll { min-width: 0; min-height: 0; overflow: auto; overscroll-behavior: contain; scrollbar-color: #48535a #111619; scrollbar-width: thin; }
-.chronology-canvas { position: relative; min-height: 100%; --chronology-column: 92px; --chronology-gutter: 160px; background: repeating-linear-gradient(90deg, transparent 0, transparent calc(var(--chronology-column) - 1px), rgba(114,131,139,.12) calc(var(--chronology-column) - 1px), rgba(114,131,139,.12) var(--chronology-column)); background-position-x: var(--chronology-gutter); }
+/* Tile geometry is derived from the column so the frame keeps a roughly 16:9
+   shape across the whole 44–116px zoom range, with a floor that keeps the
+   smallest tiles legible rather than letterbox-thin. */
+.chronology-canvas { position: relative; min-height: 100%; --chronology-column: 92px; --chronology-gutter: 160px; --chronology-tile-width: calc(var(--chronology-column) - 10px); --chronology-tile-bar: 14px; --chronology-frame-height: max(30px, calc(var(--chronology-tile-width) * 0.5625)); --chronology-tile-height: calc(var(--chronology-frame-height) + var(--chronology-tile-bar)); --chronology-lane-height: calc(var(--chronology-tile-height) + 15px); background: repeating-linear-gradient(90deg, transparent 0, transparent calc(var(--chronology-column) - 1px), rgba(114,131,139,.12) calc(var(--chronology-column) - 1px), rgba(114,131,139,.12) var(--chronology-column)); background-position-x: var(--chronology-gutter); }
 .chronology-sticky-label { position: sticky; z-index: 6; left: 0; width: var(--chronology-gutter); height: 100%; display: flex; align-items: center; padding: 0 12px; color: #68767d; border-right: 1px solid var(--line-strong); background: #111619; font: 10px/1 ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: .1em; text-transform: uppercase; }
 .chronology-phase-band { position: relative; height: 38px; border-bottom: 1px solid var(--line-strong); background: #101518; }
 .chronology-phase-band > .chronology-sticky-label, .chronology-ruler > .chronology-sticky-label { position: sticky; top: 0; }
@@ -1126,22 +1179,44 @@ kbd { padding: 2px 4px; color: #a8b1b6; background: #262d32; border: 1px solid #
 .phase-boundary { width: 24px; margin: 0; padding: 0; border: 8px solid transparent; background: currentColor; background-clip: content-box; opacity: .45; cursor: ew-resize; touch-action: none; }
 .phase-boundary:hover, .phase-boundary:focus-visible { opacity: 1; }
 .chronology-ruler { position: relative; height: 23px; color: #58656c; border-bottom: 1px solid var(--line); background: #0e1315; font: 10px/22px ui-monospace, SFMono-Regular, Menlo, monospace; }
-.chronology-ruler > span:not(.chronology-sticky-label) { position: absolute; width: var(--chronology-column); padding-left: 7px; }
-.chronology-sequence-lane { height: 73px; display: grid; grid-template-columns: var(--chronology-gutter) minmax(0, 1fr); border-bottom: 1px solid #242c30; }
+/* Time ticks, not clip numbers: the ordinals moved onto the tiles when the
+   tiles started carrying frames. Auto width because "Feb 8" and "14:31" are
+   wider than a narrow column, and the ticks are spaced far enough apart
+   (`chronologyTimeTicks`) that overflowing the column cannot collide. */
+.chronology-ruler > span:not(.chronology-sticky-label) { position: absolute; width: auto; padding-left: 7px; border-left: 1px solid #232b2f; white-space: nowrap; }
+.chronology-ruler > span.is-day { color: #b8c6cb; border-left-color: #46545b; }
+.chronology-ruler > span.is-zone { color: #e8dcc4; border-left-color: var(--amber); }
+.chronology-ruler > span.is-zone b { margin-right: 6px; padding: 1px 4px; color: #2a1e0d; background: var(--amber); border-radius: 2px; font-weight: 600; }
+.chronology-sequence-lane { height: var(--chronology-lane-height); display: grid; grid-template-columns: var(--chronology-gutter) minmax(0, 1fr); border-bottom: 1px solid #242c30; }
 .chronology-lane-label { position: sticky; z-index: 5; left: 0; min-width: 0; display: flex; flex-direction: column; justify-content: center; gap: 4px; overflow: hidden; padding: 0 12px; border-right: 1px solid var(--line-strong); background: #111619; }
 .chronology-lane-label strong, .chronology-lane-label span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .chronology-lane-label strong { color: #aeb9bd; font-size: 10px; }
 .chronology-lane-label span { color: #58656c; font: 10px/1 ui-monospace, SFMono-Regular, Menlo, monospace; }
 .chronology-lane-track { position: relative; min-width: 0; background: rgba(19,25,28,.5); }
-.chronology-block, .chronology-ghost-block { position: absolute; top: 7px; width: calc(var(--chronology-column) - 10px); height: 58px; }
-.chronology-block { z-index: 2; display: grid; grid-template-rows: auto auto 1fr; gap: 2px; overflow: hidden; padding: 6px 7px; color: #aeb8bc; border: 1px solid #465259; border-radius: 4px; background: #242d31; cursor: pointer; text-align: left; transition: left 140ms ease, border-color 100ms ease, background 100ms ease; }
-.chronology-block:hover { border-color: #6d7b82; background: #2b353a; }
-.chronology-block.is-selected { border-color: var(--amber); background: #392c1d; box-shadow: inset 0 0 0 1px rgba(232,168,79,.2); }
+.chronology-block, .chronology-ghost-block { position: absolute; top: 7px; width: var(--chronology-tile-width); height: var(--chronology-tile-height); }
+.chronology-block { z-index: 2; display: block; overflow: hidden; padding: 0; color: #aeb8bc; border: 1px solid #465259; border-radius: 4px; background: #1a2124; cursor: pointer; text-align: left; transition: left 140ms ease, border-color 100ms ease, background 100ms ease; }
+.chronology-block:hover { border-color: #6d7b82; }
+.chronology-block.is-selected { border-color: var(--amber); box-shadow: inset 0 0 0 1px rgba(232,168,79,.35); }
 .chronology-block.is-focused { outline: 2px solid #f2c47d; outline-offset: 2px; }
-.chronology-block.will-move { z-index: 4; color: #25190b; border-color: var(--amber); background: var(--amber); box-shadow: 0 8px 20px rgba(0,0,0,.38); }
-.chronology-block strong { overflow: hidden; font: 10px/12px ui-monospace, SFMono-Regular, Menlo, monospace; text-overflow: ellipsis; white-space: nowrap; }
-.chronology-block span { color: currentColor; opacity: .66; font: 10px/10px ui-monospace, SFMono-Regular, Menlo, monospace; }
-.chronology-block time { align-self: end; overflow: hidden; color: currentColor; font: 10px/10px ui-monospace, SFMono-Regular, Menlo, monospace; text-overflow: ellipsis; white-space: nowrap; }
+.chronology-block.will-move { z-index: 4; border-color: var(--amber); box-shadow: 0 8px 20px rgba(0,0,0,.38); }
+
+/* The frame is the tile. Everything else rides on top of it, because at a
+   68px column there is no room for a frame *and* a column of text — which
+   is exactly how the old tile ended up showing two ellipsised strings. */
+.chronology-block-frame { position: absolute; inset: 0 0 var(--chronology-tile-bar) 0; display: grid; place-items: center; overflow: hidden; background: #0b0e10; }
+.chronology-block-frame img { width: 100%; height: 100%; object-fit: cover; transform: rotate(var(--thumbnail-rotation)); }
+.chronology-block-frame.quarter-turn img { object-fit: contain; }
+.chronology-block-fallback { overflow: hidden; padding: 0 4px; color: #5d6b72; font: 10px/12px ui-monospace, SFMono-Regular, Menlo, monospace; text-align: center; overflow-wrap: anywhere; }
+.chronology-block-ordinal { position: absolute; right: 0; bottom: 0; left: 0; height: var(--chronology-tile-bar); padding: 0 5px; color: #7f8d94; background: #1a2124; font: 10px/var(--chronology-tile-bar) ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: .06em; }
+.chronology-block.is-selected .chronology-block-ordinal { color: #2a1e0d; background: var(--amber); }
+.chronology-block.will-move .chronology-block-ordinal { color: #25190b; background: var(--amber); }
+/* Revealed on pointer hover and on keyboard focus. The full value — date,
+   seconds, zone — stays in `title` and in the accessible name, so nothing
+   was actually taken away by moving it out of the tile's body. */
+.chronology-block-time { position: absolute; right: 0; bottom: var(--chronology-tile-bar); left: 0; padding: 2px 4px; color: #eef3f4; background: rgba(6,9,10,.82); font: 10px/12px ui-monospace, SFMono-Regular, Menlo, monospace; text-align: center; opacity: 0; transition: opacity 90ms ease; pointer-events: none; }
+.chronology-block:hover .chronology-block-time,
+.chronology-block:focus-visible .chronology-block-time,
+.chronology-block.is-focused .chronology-block-time { opacity: 1; }
 .chronology-ghost-block { z-index: 1; border: 1px dashed #8c744d; border-radius: 4px; background: rgba(232,168,79,.05); }
 .chronology-placement-targets { position: absolute; z-index: 3; inset: 0; pointer-events: none; }
 .chronology-placement-targets > span { position: absolute; top: 0; width: var(--chronology-column); height: 100%; display: flex; justify-content: space-between; pointer-events: none; }

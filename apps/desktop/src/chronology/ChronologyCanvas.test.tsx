@@ -1,7 +1,8 @@
 import { fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Asset } from "../types";
 import { buildChronologyOverview } from "../test/harness/chronologyFixtures";
+import { installTauriRuntime } from "../test/harness/ipc";
 import { ChronologyCanvas } from "./ChronologyCanvas";
 
 function asset(id: string, filename: string): Asset {
@@ -84,6 +85,113 @@ describe("ChronologyCanvas virtual window", () => {
     );
 
     expect(screen.getByRole("button", { name: /A025\.MP4/ })).toBeInTheDocument();
+  });
+});
+
+describe("ChronologyCanvas tiles", () => {
+  let uninstall: (() => void) | null = null;
+  beforeEach(() => {
+    // Thumbnails resolve through Tauri's asset protocol, which jsdom lacks.
+    uninstall = installTauriRuntime({
+      invoke: () => Promise.resolve(null),
+      transformCallback: () => 0,
+      unregisterListener: () => {},
+    });
+  });
+  afterEach(() => {
+    uninstall?.();
+    uninstall = null;
+  });
+
+  function renderTiles(assets: Asset[]) {
+    const order = assets.map((item) => item.id);
+    const overview = buildChronologyOverview({
+      order,
+      sequences: [{ id: "card-a", cameraKey: "Sony", label: "Sony card", assetIds: order }],
+      startAt: "2026-02-08T00:10:00.000Z",
+      spacingSeconds: 600,
+    });
+    return render(
+      <ChronologyCanvas
+        overview={overview}
+        assetsById={new Map(assets.map((item) => [item.id, item]))}
+        focusedAssetId={order[0]}
+        selectedIds={[order[0]]}
+        impact={null}
+        onFocusAsset={vi.fn()}
+        onSelectRange={vi.fn()}
+        onPlaceSelection={vi.fn()}
+        onAdjustPhase={vi.fn()}
+      />,
+    );
+  }
+
+  it("shows the frame rather than a truncated filename", () => {
+    // The whole point of the overhaul: at a 92px column a filename and a
+    // timestamp both ellipsise into uselessness, but a frame reads instantly.
+    const { container } = renderTiles([
+      { ...asset("a", "C0901.MP4"), thumbnailPath: "/thumbs/a.v2.jpg", thumbnailQuality: 1 },
+    ]);
+    const image = container.querySelector<HTMLImageElement>(".chronology-block img");
+    expect(image?.getAttribute("src")).toContain("a.v2.jpg");
+    expect(image).toHaveAttribute("alt", "");
+  });
+
+  it("keeps the filename and the full placed time reachable without showing them", () => {
+    renderTiles([{ ...asset("a", "C0901.MP4"), thumbnailPath: "/thumbs/a.v2.jpg" }]);
+    const tile = screen.getByRole("button", { name: /C0901\.MP4/ });
+    expect(tile).toHaveAccessibleName(expect.stringContaining("Feb 8"));
+    expect(tile).toHaveAttribute("title", expect.stringContaining("C0901.MP4"));
+  });
+
+  it("stamps each tile with its ordinal, now that the ruler no longer numbers them", () => {
+    renderTiles([
+      { ...asset("a", "C0901.MP4"), thumbnailPath: "/thumbs/a.v2.jpg" },
+      { ...asset("b", "C0902.MP4"), thumbnailPath: "/thumbs/b.v2.jpg" },
+    ]);
+    const tiles = document.querySelectorAll(".chronology-block");
+    expect(tiles[0].querySelector(".chronology-block-ordinal")).toHaveTextContent("001");
+    expect(tiles[1].querySelector(".chronology-block-ordinal")).toHaveTextContent("002");
+  });
+
+  it("carries a time overlay for hover and keyboard focus to reveal", () => {
+    renderTiles([{ ...asset("a", "C0901.MP4"), thumbnailPath: "/thumbs/a.v2.jpg" }]);
+    // Present in the markup, hidden by CSS until :hover / :focus-visible —
+    // jsdom lays nothing out, so presence and content are what can be checked.
+    expect(document.querySelector(".chronology-block-time")).toHaveTextContent("00:10");
+  });
+
+  it("falls back to the filename when a clip has no thumbnail yet", () => {
+    // A freshly imported project has no thumbnails at all, and a canvas of
+    // empty grey boxes would be worse than the text tiles it replaced.
+    const { container } = renderTiles([asset("a", "C0901.MP4")]);
+    expect(container.querySelector(".chronology-block img")).toBeNull();
+    expect(container.querySelector(".chronology-block-fallback")).toHaveTextContent("C0901");
+  });
+
+  it("turns a thumbnail whose pixels are stored unrotated", () => {
+    const { container } = renderTiles([{
+      ...asset("a", "C0901.MP4"),
+      thumbnailPath: "/thumbs/a.v2.jpg",
+      rotationDegrees: 90,
+      metadataRotationDegrees: 90,
+    }]);
+    const frame = container.querySelector<HTMLElement>(".chronology-block-frame");
+    expect(frame?.style.getPropertyValue("--thumbnail-rotation")).toBe("90deg");
+    expect(frame?.className).toContain("quarter-turn");
+  });
+
+  it("dates the ruler instead of numbering it", () => {
+    const assets = Array.from({ length: 9 }, (_, index) =>
+      ({ ...asset(`a${index}`, `C09${index}.MP4`), thumbnailPath: `/thumbs/a${index}.v2.jpg` }));
+    renderTiles(assets);
+    const ticks = [...document.querySelectorAll(".chronology-ruler > span:not(.chronology-sticky-label)")]
+      .map((tick) => tick.textContent);
+    // Opens with the city and the date, then reads as elapsed time. The
+    // ordinals moved onto the tiles, so no tick is a clip number any more.
+    expect(ticks[0]).toBe("TokyoFeb 8");
+    expect(ticks.slice(1).every((label) => /^\d{2}:\d{2}$/.test(label ?? ""))).toBe(true);
+    expect(ticks).not.toContain("001");
   });
 });
 

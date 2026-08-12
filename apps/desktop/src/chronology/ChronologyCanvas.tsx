@@ -1,11 +1,15 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties } from "react";
+import { api } from "../api";
+import { isRawOrientationThumbnail, renderedRotation } from "../review/rotation";
 import type { Asset } from "../types";
 import type { ChronologyImpact, ChronologyOverview, TripPhase } from "../chronologyTypes";
 import {
   changedOrdinalExtent,
   chronologyLanes,
+  chronologyTimeTicks,
   contiguousRange,
+  formatChronologyClock,
   formatChronologyTime,
   ordinalWindow,
   phaseOrdinalRange,
@@ -91,6 +95,10 @@ export function ChronologyCanvas({
   );
   const selected = new Set(selectedIds);
   const impactExtent = changedOrdinalExtent(impact);
+  const timeTicks = useMemo(
+    () => chronologyTimeTicks(overview.assets, columnWidth, visibleWindow),
+    [columnWidth, overview.assets, visibleWindow.end, visibleWindow.start],
+  );
 
   useEffect(() => {
     // The desk opens with the focused problem/Review clip preselected. Make it
@@ -320,16 +328,23 @@ export function ChronologyCanvas({
           })}
         </div>
 
+        {/* The ordinals moved onto the tiles when the tiles started carrying
+            frames instead of text. What the strip owes the reader now is
+            elapsed time, which no per-clip label could fit legibly. */}
         <div className="chronology-ruler" aria-hidden="true">
           <span className="chronology-sticky-label">Solved order</span>
-          {overview.assets.slice(visibleWindow.start, visibleWindow.end).map((asset, offset) => {
-            const index = visibleWindow.start + offset;
-            return (
-              <span key={asset.assetId} style={{ left: GUTTER + index * columnWidth }}>
-                {String(index + 1).padStart(3, "0")}
-              </span>
-            );
-          })}
+          {timeTicks.map((tick) => (
+            <span
+              key={tick.index}
+              className={`${tick.isDayBoundary ? "is-day" : ""} ${tick.zone ? "is-zone" : ""}`}
+              style={{ left: GUTTER + tick.index * columnWidth }}
+            >
+              {/* Without this the clock appears to run backwards wherever the
+                  trip crosses a timezone. */}
+              {tick.zone && <b>{tick.zone}</b>}
+              {tick.label}
+            </span>
+          ))}
         </div>
 
         {lanes.map((lane) => (
@@ -344,6 +359,14 @@ export function ChronologyCanvas({
                 const file = assetsById.get(asset.assetId);
                 const moved = impact?.changes.find((change) => change.assetId === asset.assetId);
                 const displayIndex = moved?.afterPosition ?? index;
+                const filename = file?.filename ?? asset.orderKey.filename;
+                const stamp = asset.displayTime?.primary ?? asset.tripTime;
+                const fullTime = formatChronologyTime(stamp, asset.displayTime?.timezone);
+                const thumbnailUrl = file ? api.thumbnailUrl(file) : null;
+                // The thumbnail's own representation decides the turn, not the
+                // clip's: a `.v2.jpg` stores raw pixels, an older one baked the
+                // camera rotation in.
+                const rotation = file ? renderedRotation(file, isRawOrientationThumbnail(file)) : 0;
                 return (
                   <div key={asset.assetId}>
                     {moved && (
@@ -360,15 +383,32 @@ export function ChronologyCanvas({
                       onClick={(event) => choose(asset.assetId, event.shiftKey)}
                       aria-pressed={selected.has(asset.assetId)}
                       disabled={disabled}
-                      aria-label={`${file?.filename ?? asset.orderKey.filename}, clip ${index + 1}, ${Math.round(asset.confidence * 100)} percent confidence`}
+                      title={`${filename} · ${fullTime}`}
+                      aria-label={`${filename}, clip ${index + 1}, ${fullTime}, ${Math.round(asset.confidence * 100)} percent confidence`}
                     >
-                      <strong>{file?.filename.replace(/\.[^.]+$/, "") ?? asset.orderKey.filename}</strong>
-                      <span>{asset.orderKey.filenameCounter === null ? "no counter" : `#${asset.orderKey.filenameCounter}`}</span>
-                      <time dateTime={asset.displayTime?.primary ?? asset.tripTime ?? undefined}>
-                        {formatChronologyTime(
-                          asset.displayTime?.primary ?? asset.tripTime,
-                          asset.displayTime?.timezone,
-                        )}
+                      <span
+                        className={`chronology-block-frame ${rotation % 180 !== 0 ? "quarter-turn" : ""}`}
+                        style={{ "--thumbnail-rotation": `${rotation}deg` } as CSSProperties}
+                      >
+                        {thumbnailUrl
+                          ? <img src={thumbnailUrl} alt="" loading="lazy" />
+                          : (
+                            // No thumbnail generated yet. A grid of blank grey
+                            // boxes would read worse than the text tile this
+                            // replaced, so the name comes back for these.
+                            <span className="chronology-block-fallback">
+                              {filename.replace(/\.[^.]+$/, "")}
+                            </span>
+                          )}
+                      </span>
+                      <span className="chronology-block-ordinal">{String(index + 1).padStart(3, "0")}</span>
+                      {/* Revealed on hover and keyboard focus. The full value
+                          with date and zone stays in `title` and the label. */}
+                      <time
+                        className="chronology-block-time"
+                        dateTime={stamp ?? undefined}
+                      >
+                        {formatChronologyClock(stamp) ?? "no time"}
                       </time>
                     </button>
                   </div>

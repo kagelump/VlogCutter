@@ -113,6 +113,39 @@ export function changedOrdinalExtent(impact: ChronologyImpact | null) {
   return { start: Math.min(...positions), end: Math.max(...positions) };
 }
 
+const WALL_CLOCK =
+  /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(Z|[+-]\d{2}:\d{2})$/;
+
+interface WallClock {
+  year: string;
+  month: string;
+  day: string;
+  hour: string;
+  minute: string;
+  second: string;
+  offset: string;
+}
+
+/**
+ * Splits a solver timestamp into the fields it literally carries.
+ *
+ * Deliberately not `Date`: see `formatChronologyTime` below for why the
+ * serialized wall clock is the only trustworthy reading of these values.
+ */
+function parseWallClock(value: string | null): WallClock | null {
+  const found = value?.match(WALL_CLOCK);
+  if (!found) return null;
+  const [, year, month, day, hour, minute, second, offset] = found;
+  return { year, month, day, hour, minute, second, offset };
+}
+
+/** "Feb 8", from wall-clock fields rather than a reparsed instant. */
+function formatWallClockDate(clock: WallClock): string {
+  const monthName = new Intl.DateTimeFormat(undefined, { month: "short", timeZone: "UTC" })
+    .format(new Date(Date.UTC(Number(clock.year), Number(clock.month) - 1, Number(clock.day))));
+  return `${monthName} ${Number(clock.day)}`;
+}
+
 /**
  * Renders the wall-clock value Rust already resolved for the trip phase.
  *
@@ -123,15 +156,10 @@ export function changedOrdinalExtent(impact: ChronologyImpact | null) {
  */
 export function formatChronologyTime(value: string | null, timezone?: string | null): string {
   if (!value) return "No camera time";
-  const wallClock = value.match(
-    /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(Z|[+-]\d{2}:\d{2})$/,
-  );
-  if (wallClock) {
-    const [, year, month, day, hour, minute, second, offset] = wallClock;
-    const monthName = new Intl.DateTimeFormat(undefined, { month: "short", timeZone: "UTC" })
-      .format(new Date(Date.UTC(Number(year), Number(month) - 1, Number(day))));
-    const zone = timezone?.trim() || (offset === "Z" ? "UTC" : `UTC${offset}`);
-    return `${monthName} ${Number(day)}, ${hour}:${minute}:${second} · ${zone}`;
+  const clock = parseWallClock(value);
+  if (clock) {
+    const zone = timezone?.trim() || (clock.offset === "Z" ? "UTC" : `UTC${clock.offset}`);
+    return `${formatWallClockDate(clock)}, ${clock.hour}:${clock.minute}:${clock.second} · ${zone}`;
   }
   const parsed = new Date(value);
   if (Number.isNaN(parsed.valueOf())) return value;
@@ -142,4 +170,112 @@ export function formatChronologyTime(value: string | null, timezone?: string | n
     minute: "2-digit",
     second: "2-digit",
   }).format(parsed);
+}
+
+/** Shorter form for the ruler: no seconds, no zone, no date. */
+export function formatChronologyClock(value: string | null): string | null {
+  const clock = parseWallClock(value);
+  return clock ? `${clock.hour}:${clock.minute}` : null;
+}
+
+export interface TimeTick {
+  /** The ordinal column the tick is drawn at. */
+  index: number;
+  /** "Feb 8" at a day boundary, "14:31" otherwise. */
+  label: string;
+  isDayBoundary: boolean;
+  /**
+   * The city the clips from here on are displayed in, set only where that
+   * changes. Without it the ruler is a liar on any trip that crosses zones:
+   * a Tokyo-to-Madrid flight makes the wall clock jump *backwards* across the
+   * transit, and a reader with no marker there sees the solver's order
+   * contradicting itself.
+   */
+  zone: string | null;
+}
+
+/** "Europe/Madrid" → "Madrid". Left alone when there is no region prefix. */
+function shortZone(timezone: string | null | undefined): string | null {
+  const trimmed = timezone?.trim();
+  if (!trimmed) return null;
+  return (trimmed.split("/").pop() ?? trimmed).replace(/_/g, " ");
+}
+
+/**
+ * Date and time markers for the ruler above the lanes.
+ *
+ * The ruler exists because the tiles no longer carry a timestamp: they carry a
+ * frame. Elapsed time therefore has to be legible from the canvas itself, and a
+ * per-clip label at 68px columns is exactly the truncated mess the tiles were.
+ *
+ * Two kinds of tick. Regular ones land on absolute multiples of a stride
+ * derived from `minSpacingPx`, so they stay put while the window scrolls over
+ * them rather than sliding about. Forced ticks are emitted wherever the
+ * calendar date or the display timezone changes, however close to a regular
+ * tick they fall: those two are the most useful things this ruler can say, and
+ * they always win the collision.
+ *
+ * Only `assets` inside `window` are considered, but the comparisons reach one
+ * clip further back so a change is not missed at the window's left edge.
+ */
+export function chronologyTimeTicks(
+  assets: AssetChronology[],
+  columnWidth: number,
+  window: OrdinalWindow,
+  minSpacingPx = 140,
+): TimeTick[] {
+  if (columnWidth <= 0 || assets.length === 0) return [];
+  const stride = Math.max(1, Math.ceil(minSpacingPx / columnWidth));
+  const clockAt = (index: number) =>
+    parseWallClock(assets[index]?.displayTime?.primary ?? assets[index]?.tripTime ?? null);
+  const dayAt = (index: number) => {
+    const clock = clockAt(index);
+    return clock ? `${clock.year}-${clock.month}-${clock.day}` : null;
+  };
+
+  const ticks: TimeTick[] = [];
+  let previousDay: string | null = null;
+  let previousZone: string | null = null;
+  // Walk back for the last placed clip before the window, so the first visible
+  // tick knows whether it is opening a new day or continuing one.
+  for (let index = Math.min(window.start, assets.length) - 1; index >= 0; index -= 1) {
+    previousDay = dayAt(index);
+    if (previousDay) {
+      previousZone = shortZone(assets[index]?.displayTime?.timezone);
+      break;
+    }
+  }
+  let firstInWindow = true;
+
+  for (let index = Math.max(0, window.start); index < Math.min(window.end, assets.length); index += 1) {
+    const clock = clockAt(index);
+    if (!clock) continue;
+    const day = `${clock.year}-${clock.month}-${clock.day}`;
+    const zone = shortZone(assets[index]?.displayTime?.timezone);
+    // The window's own first placed clip is dated and named too: a ruler that
+    // opened on a bare "14:31" would leave the user guessing which day — and
+    // which city — they scrolled into.
+    const isDayBoundary = day !== previousDay || firstInWindow;
+    const zoneChanged = zone !== previousZone || firstInWindow;
+    previousDay = day;
+    previousZone = zone;
+    firstInWindow = false;
+
+    const last = ticks[ticks.length - 1];
+    if (isDayBoundary || zoneChanged) {
+      // A forced tick displaces a regular one sitting right on top of it.
+      if (last && index - last.index < stride && !last.isDayBoundary && !last.zone) ticks.pop();
+      ticks.push({
+        index,
+        label: isDayBoundary ? formatWallClockDate(clock) : `${clock.hour}:${clock.minute}`,
+        isDayBoundary,
+        zone: zoneChanged ? zone : null,
+      });
+      continue;
+    }
+    if (index % stride !== 0) continue;
+    if (last && index - last.index < stride) continue;
+    ticks.push({ index, label: `${clock.hour}:${clock.minute}`, isDayBoundary: false, zone: null });
+  }
+  return ticks;
 }

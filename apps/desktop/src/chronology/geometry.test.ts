@@ -1,8 +1,9 @@
 import { describe, expect, it } from "vitest";
-import type { ChronologyImpact, ChronologyOverview, TripPhase } from "../chronologyTypes";
+import type { AssetChronology, ChronologyImpact, ChronologyOverview, TripPhase } from "../chronologyTypes";
 import {
   changedOrdinalExtent,
   chronologyLanes,
+  chronologyTimeTicks,
   contiguousRange,
   formatChronologyTime,
   ordinalWindow,
@@ -150,6 +151,133 @@ describe("chronology geometry", () => {
     it("has no extent to highlight when nothing is pending or nothing moves", () => {
       expect(changedOrdinalExtent(null)).toBeNull();
       expect(changedOrdinalExtent(impact([]))).toBeNull();
+    });
+  });
+
+  describe("the time ruler", () => {
+    /** `count` clips, one every `spacingMinutes`, from a fixed Tokyo instant. */
+    function placed(count: number, spacingMinutes = 10, startHour = 9): AssetChronology[] {
+      const base = Date.UTC(2026, 1, 8, startHour - 9, 0, 0);
+      return Array.from({ length: count }, (_, index) => {
+        const at = new Date(base + index * spacingMinutes * 60_000);
+        const local = new Date(at.valueOf() + 9 * 3_600_000);
+        const stamp = `${local.toISOString().slice(0, 19)}+09:00`;
+        return {
+          assetId: `a${index}`,
+          rawTime: stamp,
+          tripTime: stamp,
+          displayTime: { primary: stamp, secondary: null, timezone: "Asia/Tokyo", phaseId: null },
+          confidence: 1,
+          evidence: [],
+          uncertaintySeconds: 0,
+          orderKey: {
+            tripTimeMillis: at.valueOf(),
+            captureSequenceId: "card-a",
+            filenameCounter: index,
+            filename: `a${index}.mp4`,
+            assetId: `a${index}`,
+          },
+        };
+      });
+    }
+
+    it("spaces ticks by the requested pixel gap rather than by clip", () => {
+      // 140px of gap over 68px columns is one tick every three clips.
+      const ticks = chronologyTimeTicks(placed(12), 68, { start: 0, end: 12 }, 140);
+      expect(ticks.map((tick) => tick.index)).toEqual([0, 3, 6, 9]);
+      expect(ticks.map((tick) => tick.label)).toEqual(["Feb 8", "09:30", "10:00", "10:30"]);
+    });
+
+    it("keeps tick positions stable as the window scrolls past them", () => {
+      // Anchored to absolute ordinals, not to the window: a ruler whose ticks
+      // slid around under scrolling would be unreadable.
+      const ticks = chronologyTimeTicks(placed(24), 68, { start: 9, end: 18 }, 140);
+      expect(ticks.map((tick) => tick.index)).toEqual([9, 12, 15]);
+    });
+
+    it("marks the day rolling over even between two stride ticks", () => {
+      // Six clips an hour apart across midnight; the boundary lands at index 4,
+      // which no stride tick would have covered.
+      const ticks = chronologyTimeTicks(placed(6, 60, 20), 68, { start: 0, end: 6 }, 140);
+      const boundary = ticks.find((tick) => tick.isDayBoundary && tick.index > 0);
+      expect(boundary).toMatchObject({ index: 4, label: "Feb 9" });
+    });
+
+    it("suppresses a stride tick that would collide with a day boundary", () => {
+      // The stride tick at 3 sits one 68px column from the midnight boundary at
+      // 4. Both labels cannot fit there, and the new day is the more useful of
+      // the two, so the regular tick gives way rather than overprinting it.
+      const ticks = chronologyTimeTicks(placed(6, 60, 20), 68, { start: 0, end: 6 }, 140);
+      expect(ticks.map((tick) => tick.index)).toEqual([0, 4]);
+      expect(ticks.map((tick) => tick.isDayBoundary)).toEqual([true, true]);
+    });
+
+    it("labels the first tick with a date, so the ruler is never undated", () => {
+      const [first] = chronologyTimeTicks(placed(12), 68, { start: 6, end: 12 }, 140);
+      expect(first).toMatchObject({ index: 6, label: "Feb 8", isDayBoundary: true });
+    });
+
+    it("skips clips the solver could not place rather than labelling them", () => {
+      const assets = placed(9);
+      for (const index of [3, 4, 5]) {
+        assets[index].displayTime = null;
+        assets[index].tripTime = null;
+      }
+      const ticks = chronologyTimeTicks(assets, 68, { start: 0, end: 9 }, 140);
+      expect(ticks.map((tick) => tick.index)).toEqual([0, 6]);
+    });
+
+    it("falls back to trip time when no display time was resolved", () => {
+      const assets = placed(4);
+      for (const asset of assets) asset.displayTime = null;
+      expect(chronologyTimeTicks(assets, 68, { start: 0, end: 4 }, 140)[0].label).toBe("Feb 8");
+    });
+
+    it("names the city where the display timezone changes", () => {
+      // Found on the real 2026 Eclipse project: the trip flies Tokyo → Madrid,
+      // so the displayed wall clock jumps *backwards* across the transit and a
+      // ruler reading "16:46 … 14:25" looks like the solver contradicting
+      // itself. The zone marker is what makes the drop legible.
+      const assets = placed(9);
+      for (let index = 5; index < 9; index += 1) {
+        const clock = assets[index].displayTime!.primary.replace("+09:00", "+02:00");
+        assets[index].displayTime = {
+          primary: clock.replace(/T(\d{2})/, (_, hour) => `T${String(Number(hour) - 7).padStart(2, "0")}`),
+          secondary: null,
+          timezone: "Europe/Madrid",
+          phaseId: null,
+        };
+      }
+      const ticks = chronologyTimeTicks(assets, 68, { start: 0, end: 9 }, 140);
+      const arrival = ticks.find((tick) => tick.index === 5);
+      expect(arrival).toMatchObject({ zone: "Madrid" });
+      // And nothing before the change is labelled with a city it is not in.
+      expect(ticks.filter((tick) => tick.index < 5).every((tick) => tick.zone === null || tick.zone === "Tokyo"))
+        .toBe(true);
+      expect(ticks.filter((tick) => tick.index > 5).every((tick) => tick.zone === null)).toBe(true);
+    });
+
+    it("expands an underscored zone into something readable", () => {
+      const assets = placed(3);
+      for (const asset of assets) {
+        asset.displayTime = { ...asset.displayTime!, timezone: "America/Los_Angeles" };
+      }
+      expect(chronologyTimeTicks(assets, 68, { start: 0, end: 3 }, 140)[0].zone).toBe("Los Angeles");
+    });
+
+    it("says nothing about zones on a trip that never leaves one", () => {
+      const ticks = chronologyTimeTicks(placed(12), 68, { start: 0, end: 12 }, 140);
+      expect(ticks.slice(1).every((tick) => tick.zone === null)).toBe(true);
+    });
+
+    it("draws no ruler for an empty project or a zero-width column", () => {
+      expect(chronologyTimeTicks([], 68, { start: 0, end: 0 }, 140)).toEqual([]);
+      expect(chronologyTimeTicks(placed(9), 0, { start: 0, end: 9 }, 140)).toEqual([]);
+    });
+
+    it("never asks for a stride below one clip, however wide the columns get", () => {
+      const ticks = chronologyTimeTicks(placed(4), 400, { start: 0, end: 4 }, 140);
+      expect(ticks.map((tick) => tick.index)).toEqual([0, 1, 2, 3]);
     });
   });
 

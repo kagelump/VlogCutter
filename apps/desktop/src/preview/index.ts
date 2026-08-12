@@ -18,6 +18,7 @@
 
 import { DesktopHarness } from "../test/harness/DesktopHarness";
 import { previewScenario } from "./demoScenario";
+import { previewConvertFileSrc } from "./previewFrames";
 import { startPreviewJobs } from "./liveJobs";
 
 declare global {
@@ -28,7 +29,7 @@ declare global {
 }
 
 export function installPreviewBackend(): DesktopHarness {
-  const harness = previewScenario().build();
+  const harness = previewScenario().build({ convertFileSrc: previewConvertFileSrc });
   harness.install();
   startPreviewJobs(harness);
   window.__RCDVLOG_PREVIEW__ = harness;

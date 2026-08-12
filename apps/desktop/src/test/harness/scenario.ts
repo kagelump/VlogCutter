@@ -100,6 +100,23 @@ export class ScenarioBuilder {
     return this;
   }
 
+  /**
+   * Give clips a generated thumbnail. `.v2.jpg` is the raw-oriented naming the
+   * rotation helpers key off, so a clip given one here rotates the way a real
+   * current thumbnail would.
+   */
+  withThumbnail(...assetIds: string[]): this {
+    for (const assetId of assetIds) {
+      const asset = this.requireAsset(assetId);
+      putAsset(this.state, {
+        ...asset,
+        thumbnailPath: `/Users/harness/Movies/thumbnails/${assetId}/q1.v2.jpg`,
+        thumbnailQuality: 1,
+      });
+    }
+    return this;
+  }
+
   withoutProxy(...assetIds: string[]): this {
     for (const assetId of assetIds) {
       const asset = this.requireAsset(assetId);

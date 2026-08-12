@@ -39,7 +39,8 @@ import { BaselineWizardModal } from "./components/BaselineWizardModal";
 import { SettingsModal } from "./components/SettingsModal";
 import { CardBanner } from "./components/CardBanner";
 import { analysisStageLabels, formatCost } from "./review/format";
-import { isRawOrientationProxy, renderedRotation, rotationAfter } from "./review/rotation";
+import { rotationAfter } from "./review/rotation";
+import { buildMediaBuffer } from "./review/mediaBuffer";
 
 
 interface PhaseDialogState {
@@ -1509,34 +1510,12 @@ function App() {
   }
 
   const mediaOrigin = settings.mediaOrigin ?? null;
-  const bufferedMedia = useMemo(() => {
-    const selectedIndex = filteredAssets.findIndex((asset) => asset.id === selectedId);
-    if (selectedIndex < 0) return [];
-    return [-1, 0, 1]
-      .map((offset) => ({ asset: filteredAssets[selectedIndex + offset], offset }))
-      .filter((entry): entry is { asset: Asset; offset: number } => Boolean(entry.asset?.orientationProbed && entry.asset.available))
-      .map(({ asset, offset }) => {
-        const url = api.mediaUrl(asset);
-        const usingProxy = Boolean(asset.proxyAvailable && asset.proxyPath);
-        const mediaIsRawOriented = usingProxy && isRawOrientationProxy(asset);
-        const rotation = renderedRotation(asset, mediaIsRawOriented);
-        const displayIsQuarterTurn = asset.rotationDegrees % 180 !== 0;
-        const displayAspect = (displayIsQuarterTurn ? asset.height / asset.width : asset.width / asset.height) || 16 / 9;
-        return {
-          asset,
-          offset,
-          active: asset.id === selectedId,
-          url,
-          mediaIsRawOriented,
-          rotation,
-          displayAspect,
-          posterUrl: api.thumbnailUrl(asset),
-        };
-      })
-      .filter((entry) => Boolean(entry.url));
-    // The loopback origin is part of every media URL, so a restarted origin has
-    // to rebuild them; `api.mediaUrl` reads it from the last settings response.
-  }, [filteredAssets, selectedId, mediaOrigin?.baseUrl, mediaOrigin?.token]);
+  // The loopback origin is part of every media URL, so a restarted origin has
+  // to rebuild them — hence the origin in the dependency list as well as here.
+  const bufferedMedia = useMemo(
+    () => buildMediaBuffer(filteredAssets, selectedId, mediaOrigin, api.thumbnailUrl),
+    [filteredAssets, selectedId, mediaOrigin],
+  );
   const activeMedia = bufferedMedia.find((entry) => entry.active) ?? null;
   const mediaUrl = activeMedia?.url ?? null;
 
@@ -1841,6 +1820,8 @@ function App() {
                 ? reviewRibbonScrollLeftRef.current
                 : undefined}
               focusAssetId={chronologyFocusAssetId}
+              mediaOrigin={mediaOrigin}
+              onZoomChange={setChronologyZoom}
               onBackToReview={returnToReview}
               // A correction can reorder hundreds of clips; resume where the
               // user was rather than snapping them back to the top.

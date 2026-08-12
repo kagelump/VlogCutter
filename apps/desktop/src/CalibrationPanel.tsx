@@ -8,7 +8,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "./api";
 import { chronologyApi } from "./chronologyApi";
-import type { Asset } from "./types";
+import { RIBBON_ZOOM_DEFAULT, RIBBON_ZOOM_MAX, RIBBON_ZOOM_MIN, RIBBON_ZOOM_STEP } from "./review/layout";
+import type { Asset, MediaOrigin } from "./types";
 import type {
   CaptureSequenceReassignmentPreview,
   CaptureSequenceMergePreview,
@@ -29,6 +30,7 @@ import {
   ChronologyCanvas,
   type PhaseBoundaryDraft,
 } from "./chronology/ChronologyCanvas";
+import { CompareDeck } from "./chronology/CompareDeck";
 import { formatChronologyTime } from "./chronology/geometry";
 import { TripPhaseDialog, type TripPhaseFormValue } from "./components/TripPhaseDialog";
 
@@ -41,9 +43,13 @@ interface Props {
   reviewZoom?: number;
   reviewScrollLeft?: number;
   focusAssetId?: string | null;
+  /** Null in the browser preview, and whenever the loopback origin is down. */
+  mediaOrigin?: MediaOrigin | null;
   onBackToReview?(): void;
   onQueueResumed?: (assetId: string) => void;
   onChronologyChanged?: () => void | Promise<void>;
+  /** Shared with the Review ribbon, so the two surfaces keep one viewport. */
+  onZoomChange?(zoom: number): void;
 }
 
 type PendingChange =
@@ -80,9 +86,11 @@ export function CalibrationPanel({
   reviewZoom,
   reviewScrollLeft,
   focusAssetId = null,
+  mediaOrigin = null,
   onBackToReview,
   onQueueResumed,
   onChronologyChanged,
+  onZoomChange,
 }: Props) {
   const sessionOwnsOverview = sessionOverview !== undefined;
   const [localOverview, setLocalOverview] = useState<ChronologyOverview | null>(sessionOverview ?? null);
@@ -104,6 +112,7 @@ export function CalibrationPanel({
   const [sequenceScope, setSequenceScope] = useState<"single" | "following">("following");
   const [mergeTarget, setMergeTarget] = useState("");
   const [activeProblemIndex, setActiveProblemIndex] = useState(0);
+  const [deckCollapsed, setDeckCollapsed] = useState(false);
   const activeProblemIdRef = useRef<string | null>(null);
   const refreshRequestRef = useRef(0);
   const explanationRequestRef = useRef(0);
@@ -497,6 +506,7 @@ export function CalibrationPanel({
   }
 
   const focusedAsset = assetsById.get(focusedId) ?? assets[0];
+  const zoom = reviewZoom ?? RIBBON_ZOOM_DEFAULT;
   const focusedIndex = overview.assets.findIndex((asset) => asset.assetId === focusedId);
   const currentSequence = focusedChronology?.orderKey.captureSequenceId ?? "";
   const focusedPhase = overview.phases.find(
@@ -595,7 +605,42 @@ export function CalibrationPanel({
             <h2>{selectedIds.length > 1 ? `${selectedIds.length} clips selected` : focusedAsset?.filename ?? "Select a clip"}</h2>
           </div>
           <p>Shift-click clips on one card, then choose a cyan gap to place the run.</p>
+          {onZoomChange && (
+            <div className="chronology-zoom" aria-label="Tile size">
+              <button
+                type="button"
+                aria-label="Smaller tiles"
+                disabled={zoom <= RIBBON_ZOOM_MIN}
+                onClick={() => onZoomChange(Math.max(RIBBON_ZOOM_MIN, zoom - RIBBON_ZOOM_STEP))}
+              >−</button>
+              <input
+                type="range"
+                min={RIBBON_ZOOM_MIN}
+                max={RIBBON_ZOOM_MAX}
+                step={RIBBON_ZOOM_STEP}
+                value={zoom}
+                aria-label="Tile size"
+                onChange={(event) => onZoomChange(Number(event.target.value))}
+              />
+              <button
+                type="button"
+                aria-label="Larger tiles"
+                disabled={zoom >= RIBBON_ZOOM_MAX}
+                onClick={() => onZoomChange(Math.min(RIBBON_ZOOM_MAX, zoom + RIBBON_ZOOM_STEP))}
+              >+</button>
+            </div>
+          )}
         </div>
+        <CompareDeck
+          overview={overview}
+          assetsById={assetsById}
+          focusedAssetId={focusedId || null}
+          mediaOrigin={mediaOrigin}
+          collapsed={deckCollapsed}
+          disabled={busy || Boolean(pending)}
+          onFocusAsset={(assetId) => { setFocusedId(assetId); setSelectedIds([assetId]); }}
+          onToggleCollapsed={() => setDeckCollapsed((current) => !current)}
+        />
         <ChronologyCanvas
           overview={overview}
           assetsById={assetsById}
