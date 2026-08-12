@@ -116,6 +116,35 @@ export const chronologyApi = {
     });
   },
 
+  /**
+   * Records "no, that counter restart is not a card change".
+   *
+   * No impact preview, unlike every other chronology write on this surface:
+   * the clips were already in one sequence and stay there, so there is no
+   * placement change to show. `restoreCaptureSequenceSplit` reverses it.
+   */
+  async declineCaptureSequenceSplit(
+    projectId: string,
+    captureSequenceId: string,
+    atCounter: number,
+    reason: string,
+  ): Promise<void> {
+    await invoke("decline_capture_sequence_split", {
+      projectId,
+      captureSequenceId,
+      atCounter,
+      reason,
+    });
+  },
+
+  async restoreCaptureSequenceSplit(
+    projectId: string,
+    captureSequenceId: string,
+    atCounter: number,
+  ): Promise<void> {
+    await invoke("restore_capture_sequence_split", { projectId, captureSequenceId, atCounter });
+  },
+
   async previewCaptureSequenceSplit(
     projectId: string,
     sourceSequenceId: string,

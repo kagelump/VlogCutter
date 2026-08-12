@@ -65,6 +65,12 @@ export interface StoryRibbonProps {
   onEditContext(phaseId: string, start: number, end: number): void;
   /** Normally absent. Opens the first actionable chronology problem. */
   chronologyProblemCount?: number;
+  /**
+   * Open questions rather than faults — today, counter restarts that may or may
+   * not be a card change. Shown in a neutral chip so the ribbon stops reporting
+   * a problem with footage that is usually fine.
+   */
+  chronologyQuestionCount?: number;
   onOpenChronologyProblems?(): void;
   onOpenExpanded?(): void;
   /** Corrects the camera identification for every clip in a lane. */
@@ -97,6 +103,7 @@ export function StoryRibbon({
   onRequestContext,
   onEditContext,
   chronologyProblemCount = 0,
+  chronologyQuestionCount = 0,
   onOpenChronologyProblems,
   onOpenExpanded,
   onRenameCamera,
@@ -219,6 +226,17 @@ export function StoryRibbon({
               <span aria-hidden="true">⚠</span>
               {chronologyProblemCount} chronology {chronologyProblemCount === 1 ? "problem" : "problems"}
               <strong>Fix</strong>
+            </button>
+          )}
+          {chronologyProblemCount === 0 && chronologyQuestionCount > 0 && onOpenChronologyProblems && (
+            <button
+              type="button"
+              className="chronology-question-chip"
+              onClick={onOpenChronologyProblems}
+            >
+              <span aria-hidden="true">◧</span>
+              {chronologyQuestionCount} card {chronologyQuestionCount === 1 ? "boundary" : "boundaries"} to confirm
+              <strong>Review</strong>
             </button>
           )}
           <span className="chronology-position">

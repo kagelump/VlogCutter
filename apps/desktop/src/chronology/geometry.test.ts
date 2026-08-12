@@ -39,7 +39,7 @@ function overview(): ChronologyOverview {
   return {
     sequences,
     epochs: [], exceptions: [], phases: [], constraints: [], contradictions: [],
-    proposedSplits: [], unplacedAssets: 0,
+    proposedSplits: [], declinedSplits: [], unplacedAssets: 0,
     assets: ["a", "b", "c"].map((assetId, index) => ({
       assetId, rawTime: null, tripTime: null, displayTime: null, confidence: 0,
       evidence: [], uncertaintySeconds: 0,

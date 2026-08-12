@@ -126,6 +126,40 @@ function chronologyWithProblem() {
   });
 }
 
+/**
+ * One camera, two cards: the DJI counter restarts, which is what an SD swap
+ * looks like — and also what a camera that simply rolls its counter over looks
+ * like. The desk cannot tell the difference, which is why it asks.
+ */
+function chronologyWithCardBoundary() {
+  const proposal = {
+    captureSequenceId: "sequence_dji",
+    atCounter: 1,
+    reason:
+      "the filename counter restarts at 1 partway through this sequence, which is what a second card looks like",
+    affectedAssetIds: dji,
+  };
+  return chronologyTrip()
+    .chronology({ order: [sony[0], sony[1], dji[0]], sequences, proposedSplits: [proposal] })
+    .captureSequenceSplit(
+      {
+        sourceSequenceId: "sequence_dji",
+        atCounter: 1,
+        createdSequence: {
+          id: "sequence_dji_card_two",
+          cameraKey: "DJI Pocket 3",
+          label: "DJI day card · new card",
+          volumeHint: "",
+          filenamePrefix: "DJI",
+        },
+        assetIds: dji,
+        factsToken: "facts-split-dji",
+        impact: { changes: [], contradictions: [], blocked: false },
+      },
+      { order: [sony[0], sony[1], dji[0]], sequences },
+    );
+}
+
 async function enterChronology(app: Awaited<ReturnType<typeof renderApp>>) {
   await app.user.click(screen.getByRole("button", { name: "Chronology" }));
   return screen.findByRole("region", { name: "Chronology calibration" });
@@ -244,6 +278,112 @@ describe("Chronology desk", () => {
     expect(tile.querySelector("img")).toBeInTheDocument();
     expect(tile).toHaveAttribute("title", expect.stringContaining("SONY_001.MP4"));
     expect(tile.querySelector(".chronology-block-ordinal")).toHaveTextContent("001");
+  });
+
+  it("asks whether a counter restart was a card change, and shows both answers", async () => {
+    // Swapping SD cards through one camera is ordinary practice, so this is a
+    // question rather than an error. Before, the row said only what the solver
+    // noticed and the action was buried in the Card tab.
+    const app = await renderApp(chronologyWithCardBoundary().build());
+    const panel = await enterChronology(app);
+    const boundary = within(panel).getByRole("group", { name: /card boundary/i });
+
+    expect(within(boundary).getByText(/did you change cards here\?/i)).toBeVisible();
+    expect(within(boundary).getByRole("button", { name: /yes.*new card/i })).toBeVisible();
+    expect(within(boundary).getByRole("button", { name: /no.*one card/i })).toBeVisible();
+  });
+
+  it("does not call an unanswered card boundary a problem, in Review or on the desk", async () => {
+    // A counter restart is a question with two ordinary answers. Calling it a
+    // problem — the warning chip, the "N problems" heading — told the user
+    // something was wrong with footage that is usually completely fine.
+    const app = await renderApp(chronologyWithCardBoundary().build());
+
+    expect(screen.queryByRole("button", { name: /chronology problem/i })).toBeNull();
+    const chip = await screen.findByRole("button", { name: /1 card boundary.*confirm/i });
+
+    await app.user.click(chip);
+    const panel = await screen.findByRole("region", { name: "Chronology calibration" });
+    expect(within(panel).getByText(/1 card boundary to confirm/i)).toBeVisible();
+    expect(within(panel).queryByText(/order looks trustworthy/i)).toBeNull();
+  });
+
+  it("still calls a real contradiction a problem", async () => {
+    // The softer framing is for counter restarts only; a solver contradiction
+    // is genuinely wrong and keeps the warning chip.
+    await renderApp(chronologyWithProblem().build());
+    expect(await screen.findByRole("button", { name: /1 chronology problem.*Fix/i })).toBeVisible();
+  });
+
+  it("puts the clips either side of the boundary on the deck as the evidence", async () => {
+    // The question is answerable by eye — a card swap looks like a scene
+    // change — so opening the boundary focuses the first clip of the new run
+    // and the deck shows the last clip of the old one beside it.
+    const harness = chronologyWithCardBoundary().withThumbnail(...sony, ...dji).build();
+    const app = await renderApp(harness);
+    const panel = await enterChronology(app);
+
+    await app.user.click(within(panel).getByRole("button", { name: /review this boundary/i }));
+
+    const deck = within(panel).getByRole("region", { name: "Compare deck" });
+    expect(within(deck).getByRole("group", { name: /Focused clip DJI_001\.MP4/ })).toBeVisible();
+    expect(within(deck).getByRole("button", { name: /Previous in order: SONY_002\.MP4/ })).toBeVisible();
+  });
+
+  it("records same-card without a preview, and the question stops being asked", async () => {
+    // Nothing moves, so there is nothing to preview — unlike every other write
+    // on this surface. The answer still has to be durable.
+    const harness = chronologyWithCardBoundary().build();
+    const app = await renderApp(harness);
+    const panel = await enterChronology(app);
+    harness.clearLog();
+
+    await app.user.click(within(panel).getByRole("button", { name: /no.*one card/i }));
+
+    expect(harness.commandNames()).toContain("decline_capture_sequence_split");
+    expect(harness.calls("decline_capture_sequence_split")[0]).toMatchObject({
+      captureSequenceId: "sequence_dji",
+      atCounter: 1,
+    });
+    expect(harness.commandNames()).not.toContain("preview_capture_sequence_split");
+    await waitFor(() => {
+      expect(within(panel).queryByRole("group", { name: /card boundary/i })).toBeNull();
+    });
+  });
+
+  it("keeps the same-card answer reversible", async () => {
+    const harness = chronologyWithCardBoundary().build();
+    const app = await renderApp(harness);
+    const panel = await enterChronology(app);
+    await app.user.click(within(panel).getByRole("button", { name: /no.*one card/i }));
+    await waitFor(() => {
+      expect(within(panel).queryByRole("group", { name: /card boundary/i })).toBeNull();
+    });
+
+    await app.user.click(within(panel).getByRole("button", { name: "Card" }));
+    await app.user.click(
+      within(panel).getByRole("button", { name: /ask about the restart at 1 again/i }),
+    );
+
+    expect(harness.commandNames()).toContain("restore_capture_sequence_split");
+    await waitFor(() => {
+      expect(within(panel).getByRole("group", { name: /card boundary/i })).toBeVisible();
+    });
+  });
+
+  it("routes the yes answer through the same preview-then-confirm every write uses", async () => {
+    const harness = chronologyWithCardBoundary().build();
+    const app = await renderApp(harness);
+    const panel = await enterChronology(app);
+    harness.clearLog();
+
+    await app.user.click(within(panel).getByRole("button", { name: /yes.*new card/i }));
+
+    const dock = await screen.findByRole("dialog", { name: "Chronology impact preview" });
+    expect(dock).toBeVisible();
+    // Previewed, not written: the desk never mutates before an explicit confirm.
+    expect(harness.commandNames()).toContain("preview_capture_sequence_split");
+    expect(harness.commandNames()).not.toContain("apply_capture_sequence_split");
   });
 
   it("shows exact impact, cancels without a write, then applies once and restores the queue", async () => {

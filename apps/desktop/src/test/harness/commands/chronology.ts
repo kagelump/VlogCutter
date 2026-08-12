@@ -213,6 +213,60 @@ export const chronologyCommands: CommandTable = {
     return preview.createdSequence;
   },
 
+  /**
+   * Declining and restoring are the two chronology writes with no preview, so
+   * unlike the split/merge handlers above there is nothing for a scenario to
+   * declare: the handler moves the boundary between `proposedSplits` and
+   * `declinedSplits` exactly as `rcdvlog-core` does.
+   */
+  decline_capture_sequence_split: (args, { state, clock }) => {
+    requireString(args, "projectId");
+    const captureSequenceId = requireString(args, "captureSequenceId");
+    const atCounter = requireNumber(args, "atCounter");
+    const reason = typeof args.reason === "string" ? args.reason : "";
+    const overview = state.chronology.overview;
+    state.chronology.overview = {
+      ...overview,
+      proposedSplits: overview.proposedSplits.filter(
+        (proposal) =>
+          !(proposal.captureSequenceId === captureSequenceId && proposal.atCounter === atCounter),
+      ),
+      declinedSplits: [
+        ...overview.declinedSplits.filter(
+          (entry) =>
+            !(entry.captureSequenceId === captureSequenceId && entry.atCounter === atCounter),
+        ),
+        { captureSequenceId, atCounter, reason, declinedAt: clock.iso() },
+      ],
+    };
+    return null;
+  },
+
+  restore_capture_sequence_split: (args, { state }) => {
+    requireString(args, "projectId");
+    const captureSequenceId = requireString(args, "captureSequenceId");
+    const atCounter = requireNumber(args, "atCounter");
+    const overview = state.chronology.overview;
+    const restored = overview.declinedSplits.find(
+      (entry) => entry.captureSequenceId === captureSequenceId && entry.atCounter === atCounter,
+    );
+    if (!restored) throw new Error(`No declined boundary ${captureSequenceId}@${atCounter}`);
+    state.chronology.overview = {
+      ...overview,
+      declinedSplits: overview.declinedSplits.filter((entry) => entry !== restored),
+      proposedSplits: [
+        ...overview.proposedSplits,
+        {
+          captureSequenceId,
+          atCounter,
+          reason: `the filename counter restarts at ${atCounter} partway through this sequence, which is what a second card looks like`,
+          affectedAssetIds: [],
+        },
+      ],
+    };
+    return null;
+  },
+
   preview_capture_sequence_merge: (args, { state }): CaptureSequenceMergePreview => {
     requireString(args, "projectId");
     const fromSequenceId = requireString(args, "fromSequenceId");

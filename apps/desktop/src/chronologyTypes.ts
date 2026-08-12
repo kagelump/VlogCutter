@@ -130,6 +130,14 @@ export interface ProposedSplit {
   affectedAssetIds: string[];
 }
 
+/** A counter restart the user has answered "same card" to. */
+export interface DeclinedSplit {
+  captureSequenceId: string;
+  atCounter: number;
+  reason: string;
+  declinedAt: string;
+}
+
 export interface ChronologyOverview {
   sequences: CaptureSequence[];
   epochs: ClockEpoch[];
@@ -139,6 +147,8 @@ export interface ChronologyOverview {
   contradictions: Contradiction[];
   assets: AssetChronology[];
   proposedSplits: ProposedSplit[];
+  /** Boundaries already answered "same card"; listed so the answer is reversible. */
+  declinedSplits: DeclinedSplit[];
   unplacedAssets: number;
 }
 

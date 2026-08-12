@@ -20,10 +20,12 @@ use super::solver::{
 use crate::Catalog;
 use crate::operations::{
     CAPTURE_SEQUENCE_DECLARED, CAPTURE_SEQUENCE_MERGED, CAPTURE_SEQUENCE_REASSIGNED,
-    CAPTURE_SEQUENCE_SPLIT, CAPTURE_SEQUENCE_SPLIT_EXACT, CLIP_TIME_EXCEPTION_CLEARED,
+    CAPTURE_SEQUENCE_SPLIT, CAPTURE_SEQUENCE_SPLIT_DECLINED, CAPTURE_SEQUENCE_SPLIT_EXACT,
+    CAPTURE_SEQUENCE_SPLIT_RESTORED, CLIP_TIME_EXCEPTION_CLEARED,
     CLIP_TIME_EXCEPTION_SET, CLOCK_EPOCH_CLEARED, CLOCK_EPOCH_SET, CaptureSequenceDeclaredPayload,
     CaptureSequenceMergedPayload, CaptureSequenceReassignedPayload,
-    CaptureSequenceSplitExactPayload, CaptureSequenceSplitPayload, ClipTimeExceptionSetPayload,
+    CaptureSequenceSplitDeclinedPayload, CaptureSequenceSplitExactPayload,
+    CaptureSequenceSplitPayload, CaptureSequenceSplitRestoredPayload, ClipTimeExceptionSetPayload,
     ClockEpochClearedPayload, ClockEpochSetPayload, EVENT_ORDER_CONSTRAINT_CLEARED,
     EVENT_ORDER_CONSTRAINT_SET, EventOrderConstraintClearedPayload, EventOrderConstraintSetPayload,
     NewOperation, TRIP_PHASE_REMOVED, TRIP_PHASE_SET, TripPhaseRemovedPayload, TripPhaseSetPayload,
@@ -140,6 +142,9 @@ pub struct ChronologySnapshot {
     pub facts: super::model::ChronologyFacts,
     pub solution: ChronologySolution,
     pub proposed_splits: Vec<SplitProposal>,
+    /// Boundaries the user has already answered "same card" to. Carried so the
+    /// desk can list and reverse those answers; they never affect the solve.
+    pub declined_splits: Vec<DeclinedSplit>,
 }
 
 /// The conditions a chronology write refuses on, each with a stable code so the
@@ -277,6 +282,16 @@ pub struct SplitProposal {
     pub at_counter: u64,
     pub reason: String,
     pub affected_asset_ids: Vec<String>,
+}
+
+/// A counter restart the user has answered "no" to: same card, keep it whole.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeclinedSplit {
+    pub capture_sequence_id: String,
+    pub at_counter: u64,
+    pub reason: String,
+    pub declined_at: String,
 }
 
 impl Catalog {
@@ -1027,6 +1042,7 @@ impl Catalog {
     /// contain the same counters.
     fn proposed_capture_sequence_splits(
         facts: &super::model::ChronologyFacts,
+        declined: &BTreeSet<(String, u64)>,
     ) -> Vec<SplitProposal> {
         let mut proposals: Vec<SplitProposal> = Vec::new();
         for sequence in &facts.sequences {
@@ -1044,9 +1060,16 @@ impl Catalog {
                 .collect();
             timeline.sort_unstable();
 
+            // The first restart the user has *not* already answered. Scanning
+            // past declined ones is what lets a three-card trip surface its
+            // second boundary once the first is settled; stopping at the first
+            // restart outright would silence the sequence for good.
             let Some(boundary_index) = timeline
                 .windows(2)
-                .position(|pair| pair[1].1 < pair[0].1)
+                .position(|pair| {
+                    pair[1].1 < pair[0].1
+                        && !declined.contains(&(sequence.id.clone(), pair[1].1))
+                })
                 .map(|index| index + 1)
             else {
                 continue;
@@ -1080,7 +1103,93 @@ impl Catalog {
 
     pub fn propose_capture_sequence_splits(&self, project_id: &str) -> Result<Vec<SplitProposal>> {
         let facts = self.chronology_facts(project_id)?;
-        Ok(Self::proposed_capture_sequence_splits(&facts))
+        let declined = self.declined_split_boundaries(project_id)?;
+        Ok(Self::proposed_capture_sequence_splits(&facts, &declined))
+    }
+
+    /// The boundaries the user has answered "same card" to, as a lookup set.
+    fn declined_split_boundaries(&self, project_id: &str) -> Result<BTreeSet<(String, u64)>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT capture_sequence_id, at_counter FROM declined_capture_sequence_splits WHERE project_id=?1",
+        )?;
+        let rows = statement.query_map([project_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<BTreeSet<_>>>()?)
+    }
+
+    /// Every "same card" answer in the project, newest boundary last.
+    pub fn declined_capture_sequence_splits(
+        &self,
+        project_id: &str,
+    ) -> Result<Vec<DeclinedSplit>> {
+        self.require_project(project_id)?;
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT capture_sequence_id, at_counter, reason, declined_at \
+             FROM declined_capture_sequence_splits WHERE project_id=?1 \
+             ORDER BY capture_sequence_id, at_counter",
+        )?;
+        let rows = statement.query_map([project_id], |row| {
+            Ok(DeclinedSplit {
+                capture_sequence_id: row.get(0)?,
+                at_counter: row.get::<_, i64>(1)? as u64,
+                reason: row.get(2)?,
+                declined_at: row.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Answers "no, that counter restart is not a card change" for one boundary.
+    ///
+    /// Nothing about the solve changes — the clips were already in one sequence
+    /// and stay there. What changes is that the desk stops asking.
+    pub fn decline_capture_sequence_split(
+        &self,
+        project_id: &str,
+        capture_sequence_id: &str,
+        at_counter: u64,
+        reason: &str,
+    ) -> Result<()> {
+        self.require_project(project_id)?;
+        self.commit_local(
+            project_id,
+            vec![NewOperation {
+                aggregate_type: "captureSequence",
+                aggregate_id: capture_sequence_id.to_string(),
+                operation_type: CAPTURE_SEQUENCE_SPLIT_DECLINED,
+                base_revision: None,
+                payload: serde_json::to_value(CaptureSequenceSplitDeclinedPayload {
+                    at_counter,
+                    reason: reason.trim().to_string(),
+                })?,
+            }],
+        )?;
+        Ok(())
+    }
+
+    /// Reverses [`Catalog::decline_capture_sequence_split`], so the boundary is
+    /// proposed again.
+    pub fn restore_capture_sequence_split(
+        &self,
+        project_id: &str,
+        capture_sequence_id: &str,
+        at_counter: u64,
+    ) -> Result<()> {
+        self.require_project(project_id)?;
+        self.commit_local(
+            project_id,
+            vec![NewOperation {
+                aggregate_type: "captureSequence",
+                aggregate_id: capture_sequence_id.to_string(),
+                operation_type: CAPTURE_SEQUENCE_SPLIT_RESTORED,
+                base_revision: None,
+                payload: serde_json::to_value(CaptureSequenceSplitRestoredPayload { at_counter })?,
+            }],
+        )?;
+        Ok(())
     }
 
     /// Loads chronology evidence once, then derives every surface read from
@@ -1092,12 +1201,33 @@ impl Catalog {
         let transaction = connection.transaction()?;
         let facts = super::load_chronology_facts(&transaction, project_id)?;
         let solution = solve(&facts);
-        let proposed_splits = Self::proposed_capture_sequence_splits(&facts);
+        let mut declined_statement = transaction.prepare(
+            "SELECT capture_sequence_id, at_counter, reason, declined_at \
+             FROM declined_capture_sequence_splits WHERE project_id=?1 \
+             ORDER BY capture_sequence_id, at_counter",
+        )?;
+        let declined_splits = declined_statement
+            .query_map([project_id], |row| {
+                Ok(DeclinedSplit {
+                    capture_sequence_id: row.get(0)?,
+                    at_counter: row.get::<_, i64>(1)? as u64,
+                    reason: row.get(2)?,
+                    declined_at: row.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(declined_statement);
+        let declined_lookup: BTreeSet<(String, u64)> = declined_splits
+            .iter()
+            .map(|entry| (entry.capture_sequence_id.clone(), entry.at_counter))
+            .collect();
+        let proposed_splits = Self::proposed_capture_sequence_splits(&facts, &declined_lookup);
         transaction.commit()?;
         Ok(ChronologySnapshot {
             facts,
             solution,
             proposed_splits,
+            declined_splits,
         })
     }
 

@@ -167,8 +167,10 @@ describe("Card grouping corrections", () => {
     const panel = await enterChronology(app);
     harness.clearLog();
 
-    await app.user.click(within(panel).getByRole("button", { name: "Card" }));
-    await app.user.click(within(panel).getByRole("button", { name: /Counter restarts at 1/ }));
+    // Answered from the boundary question itself rather than the Card tab: the
+    // suggestion is a question with two answers, and "yes" is the one that
+    // still has to go through preview-then-confirm like every other write.
+    await app.user.click(within(panel).getByRole("button", { name: /Yes — new card/ }));
 
     const dock = await impactDock();
     expect(within(dock).getByRole("heading", { name: /Create Sony travel card · new card/ }))

@@ -24,6 +24,8 @@ pub const CAPTURE_SEQUENCE_SPLIT: &str = "captureSequenceSplit";
 pub const CAPTURE_SEQUENCE_SPLIT_EXACT: &str = "captureSequenceSplitExact";
 pub const CAPTURE_SEQUENCE_MERGED: &str = "captureSequenceMerged";
 pub const CAPTURE_SEQUENCE_REASSIGNED: &str = "captureSequenceReassigned";
+pub const CAPTURE_SEQUENCE_SPLIT_DECLINED: &str = "captureSequenceSplitDeclined";
+pub const CAPTURE_SEQUENCE_SPLIT_RESTORED: &str = "captureSequenceSplitRestored";
 pub const CLOCK_EPOCH_SET: &str = "clockEpochSet";
 pub const CLOCK_EPOCH_CLEARED: &str = "clockEpochCleared";
 pub const CLIP_TIME_EXCEPTION_SET: &str = "clipTimeExceptionSet";
@@ -47,6 +49,8 @@ pub(crate) const CHRONOLOGY_OPERATION_TYPES: &[&str] = &[
     CAPTURE_SEQUENCE_SPLIT_EXACT,
     CAPTURE_SEQUENCE_MERGED,
     CAPTURE_SEQUENCE_REASSIGNED,
+    CAPTURE_SEQUENCE_SPLIT_DECLINED,
+    CAPTURE_SEQUENCE_SPLIT_RESTORED,
     CLOCK_EPOCH_SET,
     CLOCK_EPOCH_CLEARED,
     CLIP_TIME_EXCEPTION_SET,
@@ -77,6 +81,8 @@ pub(crate) const KNOWN_OPERATION_TYPES: &[&str] = &[
     CAPTURE_SEQUENCE_SPLIT_EXACT,
     CAPTURE_SEQUENCE_MERGED,
     CAPTURE_SEQUENCE_REASSIGNED,
+    CAPTURE_SEQUENCE_SPLIT_DECLINED,
+    CAPTURE_SEQUENCE_SPLIT_RESTORED,
     CLOCK_EPOCH_SET,
     CLOCK_EPOCH_CLEARED,
     CLIP_TIME_EXCEPTION_SET,
@@ -379,6 +385,24 @@ pub(crate) struct CaptureSequenceReassignedPayload {
     /// Explicit identities make replay deterministic even when later imports
     /// introduce clips whose counters fall inside the originally selected run.
     pub(crate) asset_ids: Vec<String>,
+}
+
+/// "That counter restart is not a card change." Carries the boundary rather
+/// than a proposal id, because proposals are derived and have no identity that
+/// survives a resolve.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct CaptureSequenceSplitDeclinedPayload {
+    pub(crate) at_counter: u64,
+    #[serde(default)]
+    pub(crate) reason: String,
+}
+
+/// Undoes the above, putting the boundary back in front of the user.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct CaptureSequenceSplitRestoredPayload {
+    pub(crate) at_counter: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1766,6 +1790,12 @@ pub(crate) fn materialize_operation(
         CAPTURE_SEQUENCE_REASSIGNED => {
             return materialize_capture_sequence_reassigned(transaction, operation);
         }
+        CAPTURE_SEQUENCE_SPLIT_DECLINED => {
+            return materialize_capture_sequence_split_declined(transaction, operation);
+        }
+        CAPTURE_SEQUENCE_SPLIT_RESTORED => {
+            return materialize_capture_sequence_split_restored(transaction, operation);
+        }
         CLOCK_EPOCH_SET => return materialize_clock_epoch_set(transaction, operation),
         CLOCK_EPOCH_CLEARED => return materialize_clock_epoch_cleared(transaction, operation),
         CLIP_TIME_EXCEPTION_SET => {
@@ -2225,6 +2255,72 @@ fn materialize_capture_sequence_split(
         ],
     )?;
     advance_revision(transaction, operation)?;
+    Ok(ApplyOperationResult::Applied)
+}
+
+/// The operation's wall clock as RFC 3339, for columns that record *when a
+/// decision was made* rather than when a replay happened.
+fn hlc_timestamp(logical_time: &HybridLogicalTime) -> String {
+    chrono::DateTime::from_timestamp_millis(logical_time.wall_millis)
+        .unwrap_or_else(chrono::Utc::now)
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
+/// Records the user's "this restart is not a card change" for one boundary.
+///
+/// Idempotent by primary key: replaying the log, or two devices declining the
+/// same boundary, converges on one row. The decision is deliberately keyed by
+/// counter rather than by the affected clip identities — a later import can add
+/// clips on either side of the boundary, and the user's answer was about the
+/// boundary, not about the clips that happened to be there when they gave it.
+fn materialize_capture_sequence_split_declined(
+    transaction: &Transaction<'_>,
+    operation: &ProjectOperation,
+) -> Result<ApplyOperationResult> {
+    let payload: CaptureSequenceSplitDeclinedPayload = payload(operation)?;
+    if operation.aggregate_type != "captureSequence" {
+        bail!("captureSequenceSplitDeclined aggregate must be a capture sequence");
+    }
+    if !revision_guard_passes(transaction, operation)? {
+        return Ok(ApplyOperationResult::Conflict);
+    }
+    transaction.execute(
+        "INSERT INTO declined_capture_sequence_splits(project_id, capture_sequence_id, at_counter, reason, declined_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5) \
+         ON CONFLICT(project_id, capture_sequence_id, at_counter) DO UPDATE SET reason=excluded.reason, declined_at=excluded.declined_at",
+        rusqlite::params![
+            &operation.project_id,
+            &operation.aggregate_id,
+            payload.at_counter as i64,
+            payload.reason.trim(),
+            // The operation's own clock, not the replaying machine's: two
+            // devices materializing the same log must land on the same row.
+            hlc_timestamp(&operation.logical_time),
+        ],
+    )?;
+    Ok(ApplyOperationResult::Applied)
+}
+
+/// Puts a declined boundary back in front of the user.
+fn materialize_capture_sequence_split_restored(
+    transaction: &Transaction<'_>,
+    operation: &ProjectOperation,
+) -> Result<ApplyOperationResult> {
+    let payload: CaptureSequenceSplitRestoredPayload = payload(operation)?;
+    if operation.aggregate_type != "captureSequence" {
+        bail!("captureSequenceSplitRestored aggregate must be a capture sequence");
+    }
+    if !revision_guard_passes(transaction, operation)? {
+        return Ok(ApplyOperationResult::Conflict);
+    }
+    transaction.execute(
+        "DELETE FROM declined_capture_sequence_splits WHERE project_id=?1 AND capture_sequence_id=?2 AND at_counter=?3",
+        rusqlite::params![
+            &operation.project_id,
+            &operation.aggregate_id,
+            payload.at_counter as i64,
+        ],
+    )?;
     Ok(ApplyOperationResult::Applied)
 }
 

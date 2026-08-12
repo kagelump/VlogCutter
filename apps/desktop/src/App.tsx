@@ -298,8 +298,14 @@ function App() {
     [chronologyOverview],
   );
   const chronologyProblemCount = (chronologyOverview?.contradictions.length ?? 0)
-    + (chronologyOverview?.proposedSplits.length ?? 0)
     + ((chronologyOverview?.unplacedAssets ?? 0) > 0 ? 1 : 0);
+  /**
+   * Counter restarts are counted apart from problems and never as one. Swapping
+   * cards through a camera is ordinary practice, so a warning chip over it
+   * reports a fault in footage that is usually perfectly fine — while still
+   * needing to be reachable, because only the user knows the answer.
+   */
+  const chronologyQuestionCount = chronologyOverview?.proposedSplits.length ?? 0;
   const firstChronologyProblemAssetId = chronologyOverview?.contradictions
     .find((problem) => problem.assetIds.length > 0)?.assetIds[0]
     ?? chronologyOverview?.assets.find((asset) => !asset.tripTime)?.assetId
@@ -2012,6 +2018,7 @@ function App() {
           onRequestContext={openContextRange}
           onEditContext={openExistingContext}
           chronologyProblemCount={chronologyProblemCount}
+          chronologyQuestionCount={chronologyQuestionCount}
           onOpenChronologyProblems={() => openChronology(firstChronologyProblemAssetId, false)}
           onOpenExpanded={() => openChronology(selectedId, true)}
           onRenameCamera={(from, to) => { void renameCamera(from, to); }}

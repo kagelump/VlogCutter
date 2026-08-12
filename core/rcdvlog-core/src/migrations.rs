@@ -7,7 +7,7 @@ use thiserror::Error;
 
 use crate::chronology::forward_migrate_project_chronology;
 
-pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 19;
+pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 20;
 
 const MIGRATION_TABLE_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -197,6 +197,12 @@ pub const PROJECT_CATALOG_MIGRATIONS: &[SqliteMigration] = &[
         name: "import_history",
         source_identity: "project-catalog/0019-import-history/20260810",
         apply: add_import_history,
+    },
+    SqliteMigration {
+        id: 20,
+        name: "declined_capture_sequence_splits",
+        source_identity: "project-catalog/0020-declined-capture-sequence-splits/20260812",
+        apply: add_declined_capture_sequence_splits,
     },
 ];
 
@@ -1175,6 +1181,31 @@ fn add_archive_roots(transaction: &Transaction<'_>) -> Result<()> {
 /// as plain text in the ledger deliberately: undoing membership must preserve
 /// the audit record after the asset row (and its project-only derivatives) is
 /// gone.
+/// Records that a filename-counter restart is *not* a card change.
+///
+/// Split proposals are derived from the facts on every solve, so without a
+/// durable "no" the same question comes back forever and the only way to
+/// silence it is to accept a split the user does not want. Swapping several
+/// cards through one camera is ordinary practice, and so is a camera that
+/// simply rolls its counter over.
+fn add_declined_capture_sequence_splits(transaction: &Transaction<'_>) -> Result<()> {
+    transaction.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS declined_capture_sequence_splits (
+            project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            capture_sequence_id TEXT NOT NULL,
+            at_counter INTEGER NOT NULL,
+            reason TEXT NOT NULL DEFAULT '',
+            declined_at TEXT NOT NULL,
+            PRIMARY KEY(project_id, capture_sequence_id, at_counter)
+        );
+        CREATE INDEX IF NOT EXISTS declined_splits_by_sequence
+            ON declined_capture_sequence_splits(capture_sequence_id);
+        "#,
+    )?;
+    Ok(())
+}
+
 fn add_import_history(transaction: &Transaction<'_>) -> Result<()> {
     add_column_if_missing(
         transaction,

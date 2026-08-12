@@ -25,6 +25,8 @@ const desktopRoot = resolve(here, "../../..");
 
 export const ADAPTER_SOURCES = ["src/api.ts", "src/chronologyApi.ts"] as const;
 export const BACKEND_SOURCE = "src-tauri/src/lib.rs";
+export const CHRONOLOGY_COMMANDS_SOURCE = "src-tauri/src/chronology_commands.rs";
+export const CHRONOLOGY_TYPES_SOURCE = "src/chronologyTypes.ts";
 
 function read(relativePath: string): string {
   return readFileSync(resolve(desktopRoot, relativePath), "utf8");
@@ -146,3 +148,44 @@ export const uncalledBackendCommands: Array<{ command: string; reason: string }>
       "Same decision as add_label: rotation is part of the asset contract and is sent with the patch, which review.cuj.test.tsx asserts directly.",
   },
 ];
+
+// ── DTO shape ────────────────────────────────────────────────────────
+//
+// `invoke<T>()` is an unchecked cast: the T is a promise the compiler takes on
+// faith, so a field Rust stopped sending — or never sent — is `undefined` at
+// runtime with no type error anywhere. The harness cannot catch it either,
+// because the harness builds its payloads from the TypeScript type and so
+// always agrees with it.
+//
+// This compares the two definitions directly. It is deliberately narrow: one
+// struct, matched by name, fields only.
+
+function snakeToCamel(value: string): string {
+  return value.replace(/_([a-z])/g, (_, letter: string) => letter.toUpperCase());
+}
+
+/** Field names of a `#[serde(rename_all = "camelCase")]` struct, camelCased. */
+export function rustStructFields(source: string, structName: string): Set<string> {
+  const body = read(source).match(
+    new RegExp(`pub struct ${structName}\\s*\\{([^}]*)\\}`),
+  )?.[1];
+  if (!body) throw new Error(`Rust struct ${structName} not found in ${source}`);
+  const fields = new Set<string>();
+  for (const match of body.matchAll(/^\s*pub\s+([a-z_0-9]+)\s*:/gm)) {
+    fields.add(snakeToCamel(match[1]));
+  }
+  return fields;
+}
+
+/** Property names of a TypeScript interface. */
+export function typescriptInterfaceFields(source: string, interfaceName: string): Set<string> {
+  const body = read(source).match(
+    new RegExp(`export interface ${interfaceName}\\s*\\{([^}]*)\\}`),
+  )?.[1];
+  if (!body) throw new Error(`TypeScript interface ${interfaceName} not found in ${source}`);
+  const fields = new Set<string>();
+  for (const match of body.matchAll(/^\s*([A-Za-z_0-9]+)\??\s*:/gm)) {
+    fields.add(match[1]);
+  }
+  return fields;
+}

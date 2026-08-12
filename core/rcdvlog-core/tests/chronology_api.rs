@@ -138,6 +138,153 @@ fn add_portable_asset(
         .unwrap();
 }
 
+/// Swapping several cards through one camera is ordinary practice, and so is a
+/// camera that simply rolls its counter over. Declining a boundary has to be a
+/// durable answer, or the desk asks the same question forever and the only way
+/// to silence it is to accept a split the user does not want.
+#[test]
+fn a_declined_counter_restart_stops_being_proposed() {
+    let fixture = fixture(&[
+        ("C0001.MP4", "DJIPocket3", "2026-01-01T09:00:00Z"),
+        ("C0002.MP4", "DJIPocket3", "2026-01-01T10:00:00Z"),
+        ("C0001.MP4", "DJIPocket3", "2026-01-02T09:00:00Z"),
+        ("C0002.MP4", "DJIPocket3", "2026-01-02T10:00:00Z"),
+    ]);
+    let sequence_id = fixture.catalog.capture_sequences(&fixture.project_id).unwrap()[0]
+        .id
+        .clone();
+
+    fixture
+        .catalog
+        .decline_capture_sequence_split(&fixture.project_id, &sequence_id, 1, "one card, counter rolled over")
+        .unwrap();
+
+    assert!(
+        fixture
+            .catalog
+            .propose_capture_sequence_splits(&fixture.project_id)
+            .unwrap()
+            .is_empty(),
+        "a declined boundary must not come back"
+    );
+
+    let declined = fixture
+        .catalog
+        .declined_capture_sequence_splits(&fixture.project_id)
+        .unwrap();
+    assert_eq!(declined.len(), 1);
+    assert_eq!(declined[0].at_counter, 1);
+    assert_eq!(declined[0].reason, "one card, counter rolled over");
+    assert_eq!(declined[0].capture_sequence_id, sequence_id);
+}
+
+/// The decision must be reversible: it is one click, and the user who makes it
+/// by mistake needs a way back that does not involve editing the catalog.
+#[test]
+fn a_declined_counter_restart_can_be_restored() {
+    let fixture = fixture(&[
+        ("C0001.MP4", "DJIPocket3", "2026-01-01T09:00:00Z"),
+        ("C0002.MP4", "DJIPocket3", "2026-01-01T10:00:00Z"),
+        ("C0001.MP4", "DJIPocket3", "2026-01-02T09:00:00Z"),
+    ]);
+    let sequence_id = fixture.catalog.capture_sequences(&fixture.project_id).unwrap()[0]
+        .id
+        .clone();
+
+    fixture
+        .catalog
+        .decline_capture_sequence_split(&fixture.project_id, &sequence_id, 1, "")
+        .unwrap();
+    fixture
+        .catalog
+        .restore_capture_sequence_split(&fixture.project_id, &sequence_id, 1)
+        .unwrap();
+
+    let proposals = fixture
+        .catalog
+        .propose_capture_sequence_splits(&fixture.project_id)
+        .unwrap();
+    assert_eq!(proposals.len(), 1);
+    assert_eq!(proposals[0].at_counter, 1);
+    assert!(
+        fixture
+            .catalog
+            .declined_capture_sequence_splits(&fixture.project_id)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// A trip that burns three cards through one camera has two restarts. Declining
+/// the first has to reveal the second rather than silencing the sequence: the
+/// scan stops at the first *undeclined* boundary, not the first boundary.
+#[test]
+fn declining_one_boundary_reveals_the_next_restart() {
+    let fixture = fixture(&[
+        ("C0001.MP4", "DJIPocket3", "2026-01-01T09:00:00Z"),
+        ("C0002.MP4", "DJIPocket3", "2026-01-01T10:00:00Z"),
+        // Card two.
+        ("C0001.MP4", "DJIPocket3", "2026-01-02T09:00:00Z"),
+        ("C0005.MP4", "DJIPocket3", "2026-01-02T10:00:00Z"),
+        // Card three restarts again, at a different counter.
+        ("C0003.MP4", "DJIPocket3", "2026-01-03T09:00:00Z"),
+    ]);
+    let sequence_id = fixture.catalog.capture_sequences(&fixture.project_id).unwrap()[0]
+        .id
+        .clone();
+
+    assert_eq!(
+        fixture
+            .catalog
+            .propose_capture_sequence_splits(&fixture.project_id)
+            .unwrap()[0]
+            .at_counter,
+        1
+    );
+
+    fixture
+        .catalog
+        .decline_capture_sequence_split(&fixture.project_id, &sequence_id, 1, "same card")
+        .unwrap();
+
+    let next = fixture
+        .catalog
+        .propose_capture_sequence_splits(&fixture.project_id)
+        .unwrap();
+    assert_eq!(next.len(), 1, "the later restart is now the open question: {next:?}");
+    assert_eq!(next[0].at_counter, 3);
+    assert_eq!(next[0].affected_asset_ids, ["asset_C0003_4".to_string()]);
+}
+
+/// Two devices declining the same boundary, or one log replayed twice, must
+/// converge on a single decision rather than erroring or duplicating.
+#[test]
+fn declining_the_same_boundary_twice_is_idempotent() {
+    let fixture = fixture(&[
+        ("C0001.MP4", "DJIPocket3", "2026-01-01T09:00:00Z"),
+        ("C0001.MP4", "DJIPocket3", "2026-01-02T09:00:00Z"),
+    ]);
+    let sequence_id = fixture.catalog.capture_sequences(&fixture.project_id).unwrap()[0]
+        .id
+        .clone();
+
+    fixture
+        .catalog
+        .decline_capture_sequence_split(&fixture.project_id, &sequence_id, 1, "first answer")
+        .unwrap();
+    fixture
+        .catalog
+        .decline_capture_sequence_split(&fixture.project_id, &sequence_id, 1, "same answer again")
+        .unwrap();
+
+    let declined = fixture
+        .catalog
+        .declined_capture_sequence_splits(&fixture.project_id)
+        .unwrap();
+    assert_eq!(declined.len(), 1);
+    assert_eq!(declined[0].reason, "same answer again");
+}
+
 /// D01-T009: a second card whose counter restarts is proposed as a split, and
 /// applying the split moves exactly the clips at or above the counter.
 #[test]

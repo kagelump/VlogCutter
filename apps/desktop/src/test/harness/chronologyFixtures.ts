@@ -17,6 +17,7 @@ import type {
   ContradictionKind,
   Diagnostic,
   DiagnosticSeverity,
+  DeclinedSplit,
   ProposedSplit,
   TripPhase,
 } from "../../chronologyTypes";
@@ -40,6 +41,7 @@ export interface ChronologySpec {
   phases?: TripPhase[];
   contradictions?: Contradiction[];
   proposedSplits?: ProposedSplit[];
+  declinedSplits?: DeclinedSplit[];
   unplacedAssets?: number;
   /** First clip's placed time; later clips follow at `spacingSeconds`. */
   startAt?: string;
@@ -96,6 +98,7 @@ export function buildChronologyOverview(spec: ChronologySpec): ChronologyOvervie
     phases: spec.phases ?? [],
     contradictions: spec.contradictions ?? [],
     proposedSplits: spec.proposedSplits ?? [],
+    declinedSplits: spec.declinedSplits ?? [],
     unplacedAssets: spec.unplacedAssets ?? 0,
     assets,
   };

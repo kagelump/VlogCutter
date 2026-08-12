@@ -2350,6 +2350,8 @@ pub fn run() {
             chronology_commands::clear_clock_epoch,
             chronology_commands::preview_capture_sequence_split,
             chronology_commands::apply_capture_sequence_split,
+            chronology_commands::decline_capture_sequence_split,
+            chronology_commands::restore_capture_sequence_split,
             chronology_commands::split_capture_sequence,
             chronology_commands::preview_capture_sequence_merge,
             chronology_commands::apply_capture_sequence_merge,

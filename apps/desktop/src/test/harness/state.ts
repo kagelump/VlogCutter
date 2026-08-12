@@ -160,6 +160,7 @@ export const EMPTY_CHRONOLOGY_OVERVIEW: ChronologyOverview = {
   contradictions: [],
   assets: [],
   proposedSplits: [],
+  declinedSplits: [],
   unplacedAssets: 0,
 };
 

@@ -138,14 +138,18 @@ export function CalibrationPanel({
       assetIds: overview.assets.filter((asset) => !asset.tripTime).map((asset) => asset.assetId),
       kind: "chronology",
     }] : []),
-    ...(overview?.proposedSplits ?? []).map((proposal) => ({
-      id: `split-${proposal.captureSequenceId}-${proposal.atCounter}`,
-      severity: "info",
-      message: proposal.reason,
-      assetIds: proposal.affectedAssetIds,
-      kind: "sequence",
-    })),
   ], [overview]);
+  /**
+   * Counter restarts are not listed with the problems above. They are not
+   * problems: swapping cards through one camera is ordinary practice, and so
+   * is a camera that rolls its counter over. The desk cannot tell those apart,
+   * so it asks — and a question needs its answers next to it, not a row that
+   * only moves the focus and an action buried in the Card tab.
+   */
+  const cardBoundary = overview?.proposedSplits[0] ?? null;
+  const boundarySequence = overview?.sequences.find(
+    (sequence) => sequence.id === cardBoundary?.captureSequenceId,
+  );
   const focusedProblemIndex = actionableProblems.length
     ? Math.min(activeProblemIndex, actionableProblems.length - 1)
     : -1;
@@ -473,6 +477,65 @@ export function CalibrationPanel({
     }
   }
 
+  /**
+   * "Yes, new card." Goes through the same preview-then-confirm every other
+   * chronology write uses; the split really does move clips to a new sequence.
+   */
+  async function acceptCardBoundary() {
+    if (!cardBoundary) return;
+    await previewSplit(cardBoundary);
+  }
+
+  /**
+   * "No, one card." Records the answer and nothing else.
+   *
+   * No impact preview, deliberately: the clips were already in one sequence and
+   * stay there, so there is no placement change to show and a confirm dialog
+   * would be ceremony over nothing. It stays reversible from the Card tab.
+   */
+  async function declineCardBoundary() {
+    if (!cardBoundary) return;
+    setBusy(true);
+    setError("");
+    try {
+      await chronologyApi.declineCaptureSequenceSplit(
+        projectId,
+        cardBoundary.captureSequenceId,
+        cardBoundary.atCounter,
+        "Same card — the counter restarted on its own",
+      );
+      await refreshAfterMutation();
+      setNotice("Kept as one card. Reopen it from the Card tab if that was wrong.");
+    } catch (cause) {
+      setError(String(cause));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function restoreCardBoundary(captureSequenceId: string, atCounter: number) {
+    setBusy(true);
+    setError("");
+    try {
+      await chronologyApi.restoreCaptureSequenceSplit(projectId, captureSequenceId, atCounter);
+      await refreshAfterMutation();
+      setNotice(`Asking about the restart at ${atCounter} again`);
+    } catch (cause) {
+      setError(String(cause));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  /** Focuses the first clip of the run after the restart, so the deck pairs it
+   *  with the last clip before it — the comparison that answers the question. */
+  function reviewCardBoundary() {
+    const first = cardBoundary?.affectedAssetIds[0];
+    if (!first) return;
+    setFocusedId(first);
+    setSelectedIds([first]);
+  }
+
   async function acknowledge(diagnostic: Diagnostic) {
     await chronologyApi.acknowledgeDiagnostic(projectId, diagnostic.id);
     await refresh();
@@ -522,7 +585,11 @@ export function CalibrationPanel({
         </button>
         <div className="chronology-title">
           <span>Chronology desk</span>
-          <strong>{actionableProblems.length ? `${actionableProblems.length} ${actionableProblems.length === 1 ? "problem" : "problems"}` : "Order looks trustworthy"}</strong>
+          <strong>{actionableProblems.length
+            ? `${actionableProblems.length} ${actionableProblems.length === 1 ? "problem" : "problems"}`
+            : cardBoundary
+              ? "1 card boundary to confirm"
+              : "Order looks trustworthy"}</strong>
         </div>
         <div className="chronology-trust-summary" aria-label="Chronology summary">
           {actionableProblems.length > 0 && (
@@ -584,6 +651,46 @@ export function CalibrationPanel({
             ))}
           </ol>
         )}
+        {cardBoundary && (
+          <div className="chronology-card-boundary" role="group" aria-label="Card boundary question">
+            <span className="eyebrow">Card boundary</span>
+            <h3>Did you change cards here?</h3>
+            <p>
+              The filename counter restarts at <strong>{cardBoundary.atCounter}</strong> partway
+              through {boundarySequence?.label || boundarySequence?.cameraKey || "this card"}.
+              That is what a second card looks like — and also what a camera that rolls its own
+              counter over looks like.
+            </p>
+            <button
+              type="button"
+              className="chronology-boundary-review"
+              disabled={Boolean(pending) || busy}
+              onClick={reviewCardBoundary}
+            >
+              Review this boundary on the deck
+              <em>{cardBoundary.affectedAssetIds.length} clips follow it</em>
+            </button>
+            <div className="chronology-boundary-actions">
+              <button
+                type="button"
+                className="button primary"
+                disabled={Boolean(pending) || busy}
+                onClick={() => void acceptCardBoundary()}
+              >
+                Yes — new card
+              </button>
+              <button
+                type="button"
+                className="button"
+                disabled={Boolean(pending) || busy}
+                onClick={() => void declineCardBoundary()}
+              >
+                No — one card
+              </button>
+            </div>
+          </div>
+        )}
+
         {diagnostics.diagnostics.length > 0 && (
           <details className="chronology-media-problems">
             <summary>Media and catalog notes · {diagnostics.diagnostics.length}</summary>
@@ -737,7 +844,26 @@ export function CalibrationPanel({
             <button type="button" className="button primary" disabled={busy || Boolean(pending) || !focusedId || !sequenceTarget} onClick={() => void previewReassignment()}>Preview card move</button>
             <label>Merge this whole card into<select value={mergeTarget} onChange={(event) => setMergeTarget(event.target.value)}><option value="">Choose a card…</option>{overview.sequences.filter((sequence) => sequence.id !== currentSequence).map((sequence) => <option key={sequence.id} value={sequence.id}>{sequence.label || sequence.cameraKey}</option>)}</select></label>
             <button type="button" className="button" disabled={busy || Boolean(pending) || !currentSequence || !mergeTarget} onClick={() => void previewMerge()}>Preview whole-card merge</button>
-            {overview.proposedSplits.length > 0 && <div className="chronology-existing-facts"><h3>Suggested card boundaries</h3>{overview.proposedSplits.map((proposal) => <button type="button" disabled={Boolean(pending)} key={`${proposal.captureSequenceId}-${proposal.atCounter}`} onClick={() => void previewSplit(proposal)}><span>Counter restarts at {proposal.atCounter}</span><em>{proposal.affectedAssetIds.length} clips · preview split</em></button>)}</div>}
+            {overview.declinedSplits.length > 0 && (
+              <div className="chronology-existing-facts">
+                <h3>Counter restarts you kept as one card</h3>
+                {overview.declinedSplits.map((declined) => {
+                  const sequence = overview.sequences.find((item) => item.id === declined.captureSequenceId);
+                  return (
+                    <button
+                      type="button"
+                      disabled={Boolean(pending) || busy}
+                      key={`${declined.captureSequenceId}-${declined.atCounter}`}
+                      aria-label={`Ask about the restart at ${declined.atCounter} again`}
+                      onClick={() => void restoreCardBoundary(declined.captureSequenceId, declined.atCounter)}
+                    >
+                      <span>{sequence?.label || sequence?.cameraKey || "Card"} · restart at {declined.atCounter}</span>
+                      <em>Ask again…</em>
+                    </button>
+                  );
+                })}
+              </div>
+            )}
           </div>
         )}
       </aside>

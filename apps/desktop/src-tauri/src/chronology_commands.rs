@@ -40,7 +40,19 @@ pub struct ChronologyOverview {
     pub contradictions: Vec<Contradiction>,
     pub assets: Vec<AssetChronology>,
     pub proposed_splits: Vec<ProposedSplit>,
+    pub declined_splits: Vec<DeclinedSplit>,
     pub unplaced_assets: u32,
+}
+
+/// A counter restart the user answered "same card" to. Carried on the overview
+/// so the desk can list those answers and take them back.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeclinedSplit {
+    pub capture_sequence_id: String,
+    pub at_counter: u64,
+    pub reason: String,
+    pub declined_at: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -207,6 +219,7 @@ pub fn chronology_overview(
     let facts = snapshot.facts;
     let solution = snapshot.solution;
     let proposals = snapshot.proposed_splits;
+    let declined = snapshot.declined_splits;
     let unplaced = solution
         .assets
         .iter()
@@ -228,6 +241,15 @@ pub fn chronology_overview(
                 at_counter: proposal.at_counter,
                 reason: proposal.reason,
                 affected_asset_ids: proposal.affected_asset_ids,
+            })
+            .collect(),
+        declined_splits: declined
+            .into_iter()
+            .map(|entry| DeclinedSplit {
+                capture_sequence_id: entry.capture_sequence_id,
+                at_counter: entry.at_counter,
+                reason: entry.reason,
+                declined_at: entry.declined_at,
             })
             .collect(),
         unplaced_assets: unplaced,
@@ -379,6 +401,42 @@ pub fn apply_capture_sequence_split(
         .map_err(error_message)?;
     state.sync_manager.wake_project(&project_id);
     Ok(created)
+}
+
+/// "No, that counter restart is not a card change."
+///
+/// Unlike a split this changes no placement, so it needs no impact preview:
+/// there is nothing to preview. It is reversible through
+/// `restore_capture_sequence_split`.
+#[tauri::command]
+pub fn decline_capture_sequence_split(
+    project_id: String,
+    capture_sequence_id: String,
+    at_counter: u64,
+    reason: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let catalog = state.catalog()?;
+    catalog
+        .decline_capture_sequence_split(&project_id, &capture_sequence_id, at_counter, &reason)
+        .map_err(error_message)?;
+    state.sync_manager.wake_project(&project_id);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn restore_capture_sequence_split(
+    project_id: String,
+    capture_sequence_id: String,
+    at_counter: u64,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let catalog = state.catalog()?;
+    catalog
+        .restore_capture_sequence_split(&project_id, &capture_sequence_id, at_counter)
+        .map_err(error_message)?;
+    state.sync_manager.wake_project(&project_id);
+    Ok(())
 }
 
 #[tauri::command]

@@ -14,12 +14,16 @@
 import { describe, expect, it } from "vitest";
 import { desktopScenario } from "../harness";
 import {
+  CHRONOLOGY_COMMANDS_SOURCE,
+  CHRONOLOGY_TYPES_SOURCE,
   backendCommands,
   contractExemptions,
   dynamicInvocations,
   exemptCommands,
   frontendCommands,
   harnessCommands,
+  rustStructFields,
+  typescriptInterfaceFields,
   uncalledBackendCommands,
 } from "../harness/contract";
 
@@ -111,5 +115,25 @@ describe("the backend's command surface", () => {
     for (const entry of uncalledBackendCommands) {
       expect(entry.reason.trim().length, `no decision recorded for ${entry.command}`).toBeGreaterThan(40);
     }
+  });
+});
+
+describe("the chronology overview DTO", () => {
+  // Caught for real: `declinedSplits` was added to the TypeScript type and to
+  // the harness but never to the Rust struct, so the field arrived `undefined`
+  // and reading `.length` blanked the whole app. No type error, and the CUJs
+  // passed because the harness builds its payload from the TypeScript side.
+  it("has the same fields in Rust and in TypeScript", () => {
+    const rust = rustStructFields(CHRONOLOGY_COMMANDS_SOURCE, "ChronologyOverview");
+    const typescript = typescriptInterfaceFields(CHRONOLOGY_TYPES_SOURCE, "ChronologyOverview");
+
+    expect(
+      [...typescript].filter((field) => !rust.has(field)).sort(),
+      "the frontend reads these but Rust never sends them",
+    ).toEqual([]);
+    expect(
+      [...rust].filter((field) => !typescript.has(field)).sort(),
+      "Rust sends these but the frontend type does not declare them",
+    ).toEqual([]);
   });
 });

@@ -34,6 +34,13 @@ const STAGING_DIRECTORY_PREFIX: &str = ".rcdvlog-backup-staging-";
 const BACKUP_PAGE_STEP: i32 = 128;
 const BACKUP_STEP_PAUSE: Duration = Duration::from_millis(10);
 const BACKUP_ATTEMPT_BUDGET: Duration = Duration::from_secs(60);
+/// Consecutive steps that lower no page count before the copy stops yielding.
+///
+/// A paced copy against a steadily-written catalog livelocks: the 10ms pause
+/// between steps is long enough for the writer to dirty pages again, so the
+/// last few never drain and `remaining` sits still while the budget burns.
+/// Past this many idle steps the copy takes the whole database in one call.
+const BACKUP_STALLED_STEPS: u32 = 8;
 
 #[derive(Debug, Error)]
 pub enum BackupError {
@@ -970,6 +977,12 @@ where
     let mut target_connection = Connection::open(target)?;
     let backup = Backup::new(&source, &mut target_connection)?;
     let deadline = Instant::now() + BACKUP_ATTEMPT_BUDGET;
+    // Pacing exists so a routine backup does not monopolise a live catalog, and
+    // it is kept for as long as it is actually making headway. `remaining` is
+    // the honest progress signal: a run of steps that never lowers it means the
+    // pauses are losing a race with the writer rather than being polite.
+    let mut best_remaining = i32::MAX;
+    let mut stalled_steps = 0_u32;
     loop {
         if canceled() {
             return Err(BackupError::Canceled);
@@ -977,9 +990,26 @@ where
         if Instant::now() > deadline {
             return Err(BackupError::BusyTimeout);
         }
-        match backup.step(BACKUP_PAGE_STEP)? {
+        let pages = if stalled_steps >= BACKUP_STALLED_STEPS {
+            // Everything in one call. This holds the source for the duration,
+            // which is the cost the paced path was avoiding — but a backup that
+            // never finishes is worse than one that briefly blocks.
+            -1
+        } else {
+            BACKUP_PAGE_STEP
+        };
+        match backup.step(pages)? {
             StepResult::Done => break,
-            StepResult::More => thread::sleep(BACKUP_STEP_PAUSE),
+            StepResult::More => {
+                let remaining = backup.progress().remaining;
+                if remaining < best_remaining {
+                    best_remaining = remaining;
+                    stalled_steps = 0;
+                } else {
+                    stalled_steps += 1;
+                }
+                thread::sleep(BACKUP_STEP_PAUSE);
+            }
             StepResult::Busy | StepResult::Locked => thread::sleep(Duration::from_millis(25)),
             _ => {
                 return Err(BackupError::Verification(
@@ -1780,6 +1810,26 @@ mod tests {
                 "CREATE TABLE backup_writer_fixture(value INTEGER NOT NULL); INSERT INTO backup_writer_fixture VALUES(0);",
             )
             .unwrap();
+        // Padded past one BACKUP_PAGE_STEP on purpose. A catalog that fits in a
+        // single step finishes before the writer can dirty anything, so without
+        // this the test only exercised the livelock by accident — and stopped
+        // doing so whenever the baseline schema drifted under 128 pages.
+        connection
+            .execute_batch("CREATE TABLE backup_padding(value BLOB NOT NULL);")
+            .unwrap();
+        let filler = vec![0_u8; 4096];
+        for _ in 0..200 {
+            connection
+                .execute("INSERT INTO backup_padding VALUES(?1)", [&filler])
+                .unwrap();
+        }
+        let pages: i64 = connection
+            .query_row("PRAGMA page_count", [], |row| row.get(0))
+            .unwrap();
+        assert!(
+            pages > i64::from(BACKUP_PAGE_STEP),
+            "fixture must span more than one backup step: {pages} pages"
+        );
         drop(connection);
         let stop = Arc::new(AtomicBool::new(false));
         let committed = Arc::new(AtomicUsize::new(0));
