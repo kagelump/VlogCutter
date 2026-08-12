@@ -157,3 +157,35 @@ values in every API that reports health, and the truth visible only to a probe
 someone has to write while looking at the live object. The cost of that
 investigation scales with the round-trip latency of getting one expression
 evaluated. This collapses that to a shell command.
+
+## Limits worth knowing before you use it
+
+**The completion value is serialized as-is; promises are not awaited.** An
+async IIFE therefore returns `{}` — the JSON form of a pending `Promise` — and
+whatever it eventually resolved to is lost. For anything asynchronous, stash the
+result on a global and read it with a second call:
+
+```bash
+rcdvlog-eval --file probe.js      # sets window.__probe, returns immediately
+sleep 5
+rcdvlog-eval 'JSON.stringify(window.__probe)'
+```
+
+**Do not click controls that open native dialogs.** "Open catalog" opens a real
+`NSOpenPanel`; nothing in the webview can dismiss it, patching
+`window.__TAURI_INTERNALS__.invoke` does not intercept it, and it stays in front
+of the window until the app is restarted. Reach a project through the "New
+project" modal instead, which lists every project under the projects root.
+
+**Window controls are not granted to the webview**, so `plugin:window|*` calls
+for position, size, and focus are refused by the capability set — correctly, for
+a shipped app. If the window is off-screen or occluded, capture it by id rather
+than by screen region:
+
+```bash
+screencapture -x -o -l"$WINDOW_ID" out.png
+```
+
+`screencapture -l` captures off-screen and occluded windows. Window ids come
+from `CGWindowListCopyWindowInfo`, reachable through the `/usr/bin/swift`
+interpreter without adding a dependency.

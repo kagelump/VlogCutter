@@ -2,7 +2,7 @@
 
 Backups contain a consistent online snapshot of the control catalog and every registered project replica, plus a manifest with versions, cursors, sizes, checksums, and redacted configuration. They exclude originals, derived blobs, temp files, plaintext credentials, and one-time codes. Defaults are one scheduled run per 86,400 seconds, 14 daily restore points, and 8 weekly restore points.
 
-Backup jobs stage a new directory, use bounded SQLite online backup, verify integrity/checksums, and publish the manifest last. A partial set is not a restore point. Retention deletes only validated backup directories inside the configured backup root. Do not copy live SQLite or WAL files with filesystem tools.
+Backup jobs stage a new directory, use bounded SQLite online backup, verify integrity/checksums, and publish the manifest last. The copy is paced — a fixed number of pages per step, with a pause between steps — so a routine backup does not monopolise a live catalog. Pacing is abandoned when it stops paying: SQLite re-dirties pages written through another connection, so against a steadily-written catalog larger than one step the pause is long enough for the writer to undo each step and the copy never converges. After a run of steps that lowers no page count, the copy takes the whole database in one call instead. That briefly holds the source, which is the cost pacing was avoiding, but a backup that cannot finish is worse than one that briefly blocks. A partial set is not a restore point. Retention deletes only validated backup directories inside the configured backup root. Do not copy live SQLite or WAL files with filesystem tools.
 
 Create or inspect backups remotely:
 

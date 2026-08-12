@@ -139,6 +139,11 @@ Important gaps; do not accidentally describe these as complete:
   volume, folder, filename-prefix, counter-reset, and time-discontinuity
   evidence. The Chronology desk supports explicit split/merge and single-clip
   or clip-and-following reassignment; preflight never applies those proposals.
+  A counter restart is presented on the desk as a question with two answers —
+  split into a new card, or record "same card" durably — rather than as a
+  problem, because swapping cards through one camera is ordinary practice. The
+  "same card" answer is an operation (`captureSequenceSplitDeclined`) and is
+  reversible from the desk's Card tab.
 - No general mounted-volume inventory, project deletion, or cache cleanup UI.
   Relink now
   exists: media locations carry a verification state, ingest repairs an asset
@@ -165,6 +170,14 @@ Important gaps; do not accidentally describe these as complete:
   deep-links into it and Shift+T opens it with the Review zoom and viewport.
   Dedicated clip-exception and event-order-constraint controls remain domain/API
   capabilities rather than first-class desk tools.
+- The desk shows the footage. A compare deck plays the focused clip with the
+  clips the solver placed either side of it — either side in *solved* order,
+  across cards — as stills that promote to focus on click or with the arrow
+  keys. Canvas tiles are thumbnails carrying an ordinal, with the time revealed
+  on hover and focus and the full value in `title` and the accessible name; a
+  clip with no thumbnail keeps a text tile. The ordinal strip above the lanes is
+  a time ruler, marking day changes and timezone changes, the latter because a
+  trip crossing zones makes the displayed wall clock run backwards.
 - Web has automated Vitest and Chrome Playwright coverage. Desktop React now has Vitest + jsdom + Testing Library component tests under `apps/desktop/src/components/__tests__/`, but there is still no automated native Tauri UI suite.
 - No macOS signing/notarization or clean-machine packaging acceptance.
 - Analysis suggestions are shown and editable in the desktop, but there is no

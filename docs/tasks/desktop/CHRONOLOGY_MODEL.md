@@ -102,6 +102,8 @@ pub const CAPTURE_SEQUENCE_SPLIT: &str = "captureSequenceSplit";
 pub const CAPTURE_SEQUENCE_SPLIT_EXACT: &str = "captureSequenceSplitExact";
 pub const CAPTURE_SEQUENCE_MERGED: &str = "captureSequenceMerged";
 pub const CAPTURE_SEQUENCE_REASSIGNED: &str = "captureSequenceReassigned";
+pub const CAPTURE_SEQUENCE_SPLIT_DECLINED: &str = "captureSequenceSplitDeclined";
+pub const CAPTURE_SEQUENCE_SPLIT_RESTORED: &str = "captureSequenceSplitRestored";
 pub const CLOCK_EPOCH_SET: &str = "clockEpochSet";
 pub const CLOCK_EPOCH_CLEARED: &str = "clockEpochCleared";
 pub const CLIP_TIME_EXCEPTION_SET: &str = "clipTimeExceptionSet";
@@ -119,6 +121,11 @@ pub const EVENT_ORDER_CONSTRAINT_CLEARED: &str = "eventOrderConstraintCleared";
 | `clipTimeException*` | `projectAsset` | asset id |
 | `tripPhase*` | `tripPhase` | trip phase id |
 | `eventOrderConstraint*` | `eventOrderConstraint` | constraint id |
+
+`captureSequenceSplitDeclined` and `captureSequenceSplitRestored` are covered
+by the `captureSequence*` row above; their `aggregate_id` is the sequence whose
+counter restarts, not a proposal id, because proposals are derived and have no
+identity that survives a resolve.
 
 `CLOCK_EVENT_CREATED` remains a recognized operation type forever, materializing
 into `clock_epochs` through the same path migration 9 uses. Replaying an
@@ -327,6 +334,30 @@ must never write them.
   the preview stay there, and keep the source sequence alive. Legacy merge
   payloads without identity lists retain their original whole-sequence
   semantics.
+- A counter restart inside one sequence is *proposed* as a split, never
+  applied as one. The proposal is derived from the facts on every solve and has
+  no persisted identity.
+
+  **Amendment (2026-08-12, migration 20).** A derived proposal with no way to
+  say "no" is a question that cannot be closed: swapping several cards through
+  one camera is ordinary practice, and so is a camera that rolls its own
+  counter over, so for many real projects the only way to silence the proposal
+  was to accept a split the user did not want.
+  `captureSequenceSplitDeclined` records that answer against the boundary and
+  `captureSequenceSplitRestored` withdraws it. Both ride the `captureSequence`
+  aggregate and materialize into `declined_capture_sequence_splits`.
+
+  The decision is keyed by `(project_id, capture_sequence_id, at_counter)` and
+  deliberately *not* by the affected clip identities, unlike a split or a
+  merge. A split needs exact identities because it moves clips and a later
+  import could change which clips a counter predicate selects. A decline moves
+  nothing; the user's answer was about the boundary, and it stays correct
+  however the clips around it change.
+
+  Proposal derivation scans for the first counter restart that has **not** been
+  declined, rather than the first restart. A trip that burns three cards
+  through one camera therefore surfaces its second boundary once the first is
+  settled, instead of going silent after one answer.
 
 ### Clock epochs
 

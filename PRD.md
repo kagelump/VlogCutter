@@ -152,10 +152,13 @@ Expanded overlay or full-window mode.
 Contains:
 
 * Trip-context band
-* Time ruler
+* Time ruler, marking day and timezone changes
 * Camera/card lanes
-* Filename blocks
+* Thumbnail clip tiles, with the ordinal always visible and the time on hover
+* Compare deck: the focused clip playing, flanked by the clips placed either
+  side of it in solved order
 * Raw and best-local timestamps
+* Card-boundary confirmation
 * Selected adjustment scope
 * Offset controls
 * Drag interaction
@@ -340,6 +343,11 @@ Possible boundaries:
 * Filename prefix change
 * Large discontinuity
 * Explicit user split
+
+These are signals, not conclusions. A counter reset is equally consistent with a
+card swap and with a camera rolling its own counter over, so the product asks
+rather than assumes, and records the answer either way — a split, or a durable
+"same card" that stops the question returning.
 
 Example:
 
