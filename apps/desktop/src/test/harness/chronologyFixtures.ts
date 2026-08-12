@@ -28,6 +28,8 @@ export interface SequenceSpec {
   label?: string;
   volumeHint?: string;
   filenamePrefix?: string;
+  /** Clip identities the backend assigned to this sequence. */
+  assetIds?: string[];
 }
 
 export interface ChronologySpec {
@@ -57,6 +59,12 @@ export function buildSequence(spec: SequenceSpec): CaptureSequence {
 
 export function buildChronologyOverview(spec: ChronologySpec): ChronologyOverview {
   const sequences = (spec.sequences ?? []).map(buildSequence);
+  const sequenceByAssetId = new Map<string, string>();
+  for (const sequence of spec.sequences ?? []) {
+    for (const assetId of sequence.assetIds ?? []) {
+      sequenceByAssetId.set(assetId, sequence.id);
+    }
+  }
   const start = Date.parse(spec.startAt ?? "2026-02-08T00:10:00.000Z");
   const spacing = (spec.spacingSeconds ?? 300) * 1000;
   const timezone = spec.timezone ?? "Asia/Tokyo";
@@ -73,7 +81,7 @@ export function buildChronologyOverview(spec: ChronologySpec): ChronologyOvervie
       uncertaintySeconds: 0,
       orderKey: {
         tripTimeMillis: start + index * spacing,
-        captureSequenceId: sequences[0]?.id ?? "sequence_1",
+        captureSequenceId: sequenceByAssetId.get(assetId) ?? sequences[0]?.id ?? "sequence_1",
         filenameCounter: index + 1,
         filename: assetId,
         assetId,
@@ -91,6 +99,39 @@ export function buildChronologyOverview(spec: ChronologySpec): ChronologyOvervie
     unplacedAssets: spec.unplacedAssets ?? 0,
     assets,
   };
+}
+
+/** Stable request keys for declared fake-backend responses. */
+export function visualPlacementRequestKey(
+  assetIds: string[],
+  targetAssetId: string,
+  side: "before" | "after",
+): string {
+  return `${assetIds.join("\u0000")}|${side}|${targetAssetId}`;
+}
+
+export function reassignmentPreviewRequestKey(anchorAssetId: string, intoSequenceId: string): string {
+  return `${anchorAssetId}|${intoSequenceId}`;
+}
+
+export function reassignmentWriteRequestKey(
+  fromSequenceId: string,
+  intoSequenceId: string,
+  assetIds: string[],
+): string {
+  return `${fromSequenceId}|${intoSequenceId}|${assetIds.join("\u0000")}`;
+}
+
+export function sequenceSplitRequestKey(
+  sourceSequenceId: string,
+  atCounter: number,
+  assetIds: string[],
+): string {
+  return `${sourceSequenceId}|${atCounter}|${assetIds.join("\u0000")}`;
+}
+
+export function sequenceMergeRequestKey(fromSequenceId: string, intoSequenceId: string): string {
+  return `${fromSequenceId}|${intoSequenceId}`;
 }
 
 /** The order the overview declares, as the CUJs read it back. */

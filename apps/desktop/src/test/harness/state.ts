@@ -30,14 +30,21 @@ import type {
   SyncStatus,
 } from "../../types";
 import type {
+  CaptureSequenceMergePreview,
+  CaptureSequenceReassignmentPreview,
+  CaptureSequenceSplitPreview,
   ChronologyExplanation,
+  ChronologyImpact,
   ChronologyOverview,
+  ClockEpochClearPreview,
+  ClockEpochImpactPreview,
   Contradiction,
   Diagnostic,
   EditPlanRevision,
   OtioExportResult,
   QueuePosition,
   ValidationReport,
+  VisualPlacementPreview,
 } from "../../chronologyTypes";
 import { HarnessClock } from "./clock";
 
@@ -55,6 +62,24 @@ export interface ChronologyScenarioState {
   outcomesByEdit: Record<string, ChronologyOverview>;
   /** Contradictions a preview returns, keyed by the same edit name. */
   previewsByEdit: Record<string, Contradiction[]>;
+  /** Exact solver-declared preview of a candidate epoch, keyed by capture sequence. */
+  impactsByEdit: Record<string, ClockEpochImpactPreview>;
+  /** Exact solver-declared impact of removing an epoch, keyed by epoch id. */
+  clearEpochImpacts: Record<string, ClockEpochClearPreview>;
+  /** Exact solver-declared response for a visual placement request. */
+  visualPlacementPreviews: Record<string, VisualPlacementPreview>;
+  /** Exact solver-declared response for a card reassignment request. */
+  reassignmentPreviews: Record<string, CaptureSequenceReassignmentPreview>;
+  /** Overview returned after a declared card reassignment is applied. */
+  reassignmentOutcomes: Record<string, ChronologyOverview>;
+  /** Exact solver-declared response for a card split request. */
+  sequenceSplitPreviews: Record<string, CaptureSequenceSplitPreview>;
+  /** Overview returned after an exact split preview is applied, keyed by facts token. */
+  sequenceSplitOutcomes: Record<string, ChronologyOverview>;
+  /** Exact solver-declared response for a whole-card merge request. */
+  sequenceMergePreviews: Record<string, CaptureSequenceMergePreview>;
+  /** Overview returned after an exact merge preview is applied, keyed by facts token. */
+  sequenceMergeOutcomes: Record<string, ChronologyOverview>;
   explanations: Record<string, ChronologyExplanation>;
   /** Queue positions captured by the app, so restore can return the same clip. */
   capturedPositions: QueuePosition[];
@@ -196,6 +221,15 @@ export function createInitialState(clock: HarnessClock): DesktopHarnessState {
       overview: EMPTY_CHRONOLOGY_OVERVIEW,
       outcomesByEdit: {},
       previewsByEdit: {},
+      impactsByEdit: {},
+      clearEpochImpacts: {},
+      visualPlacementPreviews: {},
+      reassignmentPreviews: {},
+      reassignmentOutcomes: {},
+      sequenceSplitPreviews: {},
+      sequenceSplitOutcomes: {},
+      sequenceMergePreviews: {},
+      sequenceMergeOutcomes: {},
       explanations: {},
       capturedPositions: [],
       restoreTo: null,

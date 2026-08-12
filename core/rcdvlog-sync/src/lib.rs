@@ -827,7 +827,7 @@ pub fn stored_baseline_digest(path: &std::path::Path) -> Result<Option<String>> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rcdvlog_core::{MediaVerificationState, ProjectAssetAddedPayload};
+    use rcdvlog_core::{ClockEpoch, MediaVerificationState, ProjectAssetAddedPayload};
     use serde_json::json;
     use tempfile::TempDir;
 
@@ -889,6 +889,20 @@ mod tests {
             metadata_rotation_degrees: 0,
             default_rotation_degrees: 0,
             created_at: "2026-07-23T00:00:00Z".to_string(),
+        }
+    }
+
+    fn timed_asset(
+        id: &str,
+        filename: &str,
+        camera: &str,
+        captured_at: &str,
+    ) -> ProjectAssetAddedPayload {
+        ProjectAssetAddedPayload {
+            camera: camera.to_string(),
+            captured_at_raw: Some(captured_at.to_string()),
+            best_time: Some(captured_at.to_string()),
+            ..asset(id, filename)
         }
     }
 
@@ -1009,6 +1023,85 @@ mod tests {
             mac.list_operations(&project.id).unwrap().len(),
             server.list_operations(&project.id).unwrap().len()
         );
+    }
+
+    #[test]
+    fn remote_chronology_reconciliation_refreshes_projected_times_and_queue_order() {
+        let root = TempDir::new().unwrap();
+        let mac = new_catalog(&root, "chronology-mac.sqlite3", "node_mac");
+        let project = mac.create_project("Chronology sync").unwrap();
+        mac.add_portable_project_asset(
+            &project.id,
+            timed_asset("asset_sony", "A0001.MP4", "Sony", "2026-01-01T10:00:00Z"),
+        )
+        .unwrap();
+        mac.add_portable_project_asset(
+            &project.id,
+            timed_asset("asset_dji", "D0001.MP4", "DJI", "2026-01-01T11:00:00Z"),
+        )
+        .unwrap();
+        let baseline = BaselineEnvelope::export(&mac, &project.id, vec![], vec![]).unwrap();
+        let server = Catalog::import_project_baseline(
+            root.path().join("chronology-server.sqlite3"),
+            &baseline.payload.project,
+            "node_server",
+            BASELINE_VERSION,
+            &baseline.digest,
+        )
+        .unwrap();
+        let dji_sequence = server
+            .capture_sequences(&project.id)
+            .unwrap()
+            .into_iter()
+            .find(|sequence| sequence.camera_key == "DJI")
+            .unwrap();
+        server
+            .set_clock_epoch(
+                &project.id,
+                &ClockEpoch {
+                    id: "epoch_remote_dji".to_string(),
+                    capture_sequence_id: dji_sequence.id,
+                    start_counter: 0,
+                    end_counter: None,
+                    offset_seconds: -7_200,
+                    confidence: 1.0,
+                    evidence: vec!["remote_user".to_string()],
+                    label: "DJI was two hours fast".to_string(),
+                },
+            )
+            .unwrap();
+        let remote_operations: Vec<_> = server
+            .list_operations(&project.id)
+            .unwrap()
+            .into_iter()
+            .filter(|operation| operation.origin_node_id == "node_server")
+            .collect();
+        assert_eq!(remote_operations.len(), 1);
+        assert_eq!(
+            mac.list_assets(&project.id)
+                .unwrap()
+                .into_iter()
+                .map(|asset| asset.id)
+                .collect::<Vec<_>>(),
+            ["asset_sony", "asset_dji"]
+        );
+
+        apply_reconcile_operations(&mac, &remote_operations).unwrap();
+
+        let ordered = mac.list_assets(&project.id).unwrap();
+        assert_eq!(
+            ordered
+                .iter()
+                .map(|asset| asset.id.as_str())
+                .collect::<Vec<_>>(),
+            ["asset_dji", "asset_sony"],
+            "queue reads use the corrected projected time immediately after sync"
+        );
+        assert_eq!(
+            ordered[0].best_time.as_deref(),
+            Some("2026-01-01T09:00:00.000Z")
+        );
+        assert_eq!(ordered[0].offset_seconds, -7_200);
     }
 
     #[test]

@@ -99,7 +99,9 @@ adding an unused table now would be reserved schema for deferred work.
 ```rust
 pub const CAPTURE_SEQUENCE_DECLARED: &str = "captureSequenceDeclared";
 pub const CAPTURE_SEQUENCE_SPLIT: &str = "captureSequenceSplit";
+pub const CAPTURE_SEQUENCE_SPLIT_EXACT: &str = "captureSequenceSplitExact";
 pub const CAPTURE_SEQUENCE_MERGED: &str = "captureSequenceMerged";
+pub const CAPTURE_SEQUENCE_REASSIGNED: &str = "captureSequenceReassigned";
 pub const CLOCK_EPOCH_SET: &str = "clockEpochSet";
 pub const CLOCK_EPOCH_CLEARED: &str = "clockEpochCleared";
 pub const CLIP_TIME_EXCEPTION_SET: &str = "clipTimeExceptionSet";
@@ -315,6 +317,16 @@ must never write them.
   unions the asset sets into the destination sequence, deletes the source
   sequence, and re-points the source sequence's epochs at the destination
   (merging unions the facts). Neither ever drops an asset.
+- The desktop's exact-preview split uses `captureSequenceSplitExact`, which
+  carries the confirmed asset identities as well as the counter. This is
+  necessary when a second card restarts at `C0001`: a counter-only predicate
+  would also select `C0001` from the first card. Arbitrary reassignment uses
+  the same explicit-identity rule through `captureSequenceReassigned`.
+- New merge operations likewise carry the exact confirmed asset and epoch
+  identities. Replay moves only those facts; facts added to the source after
+  the preview stay there, and keep the source sequence alive. Legacy merge
+  payloads without identity lists retain their original whole-sequence
+  semantics.
 
 ### Clock epochs
 
@@ -363,7 +375,9 @@ must never write them.
 | --- | --- |
 | `captureSequenceDeclared` | `sequenceId`, `cameraKey`, `label`, `volumeHint`, `filenamePrefix` |
 | `captureSequenceSplit` | `newSequenceId`, `cameraKey`, `label`, `volumeHint`, `filenamePrefix`, `atCounter` |
-| `captureSequenceMerged` | `fromSequenceId`, `intoSequenceId` |
+| `captureSequenceSplitExact` | `newSequenceId`, `cameraKey`, `label`, `volumeHint`, `filenamePrefix`, `atCounter`, `assetIds` |
+| `captureSequenceMerged` | `fromSequenceId`, `intoSequenceId`, `assetIds?`, `epochIds?` |
+| `captureSequenceReassigned` | `fromSequenceId`, `intoSequenceId`, `assetIds` |
 | `clockEpochSet` | `epochId`, `captureSequenceId`, `startCounter`, `endCounter?`, `offsetSeconds`, `label`, `confidence?`, `evidence?` |
 | `clockEpochCleared` | `epochId` |
 | `clipTimeExceptionSet` | `tripTime`, `reason` |
@@ -410,10 +424,10 @@ its own legacy guard (`stale_clock_base_revision`).
 ### Re-dispatch seam
 
 On every writable catalog open, after migration, the operation log is scanned
-for persisted-but-never-applied rows of the eleven chronology operation types,
+for persisted-but-never-applied rows of the recognized chronology operation types,
 and each is re-dispatched through the normal materializer dispatch:
 
-- Scope: only the eleven chronology operation types, with `payload_version`
+- Scope: only the recognized chronology operation types, with `payload_version`
   1. Legacy and pre-existing operation types are never re-dispatched.
 - A row is a candidate only when it has no `operation_conflicts` row and is
   not the `last_operation_id` of its aggregate's `materialized_revisions` row.

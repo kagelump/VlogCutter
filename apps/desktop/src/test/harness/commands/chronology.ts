@@ -13,16 +13,30 @@
  */
 
 import type {
+  CaptureSequenceMergePreview,
+  CaptureSequenceReassignmentPreview,
+  CaptureSequenceSplitPreview,
+  ChronologyImpact,
   ChronologyOverview,
+  ClockEpochClearPreview,
   ClockEpoch,
+  ClockEpochImpactPreview,
   Contradiction,
   Diagnostic,
   DiagnosticsView,
   QueuePosition,
+  VisualPlacementPreview,
 } from "../../../chronologyTypes";
 import { projectAssets, type DesktopHarnessState } from "../state";
 import type { CommandTable } from "../registry";
 import { requireNumber, requireString } from "../registry";
+import {
+  reassignmentPreviewRequestKey,
+  reassignmentWriteRequestKey,
+  sequenceMergeRequestKey,
+  sequenceSplitRequestKey,
+  visualPlacementRequestKey,
+} from "../chronologyFixtures";
 
 function overviewOf(state: DesktopHarnessState): ChronologyOverview {
   return state.chronology.overview;
@@ -78,9 +92,47 @@ export const chronologyCommands: CommandTable = {
     return state.chronology.previewsByEdit[epoch.captureSequenceId] ?? [];
   },
 
-  set_clock_epoch: (args, { state }): ClockEpoch => {
+  preview_clock_epoch_impact: (args, { state }): ClockEpochImpactPreview => {
     requireString(args, "projectId");
     const epoch = epochFrom(args.epoch);
+    const impact = state.chronology.impactsByEdit[epoch.captureSequenceId];
+    if (!impact) {
+      throw new Error(
+        `Scenario did not declare a clock impact for capture sequence ${epoch.captureSequenceId}`,
+      );
+    }
+    return impact;
+  },
+
+  preview_clear_clock_epoch_impact: (args, { state }): ClockEpochClearPreview => {
+    requireString(args, "projectId");
+    const epochId = requireString(args, "epochId");
+    const preview = state.chronology.clearEpochImpacts[epochId];
+    if (!preview) throw new Error(`Scenario did not declare a clear-epoch impact for ${epochId}`);
+    return preview;
+  },
+
+  preview_visual_placement: (args, { state }): VisualPlacementPreview => {
+    requireString(args, "projectId");
+    const assetIds = args.assetIds;
+    if (!Array.isArray(assetIds) || assetIds.some((assetId) => typeof assetId !== "string")) {
+      throw new Error("Visual placement needs an array of asset identities");
+    }
+    const targetAssetId = requireString(args, "targetAssetId");
+    const side = requireString(args, "side");
+    requireString(args, "label");
+    if (side !== "before" && side !== "after") throw new Error(`Unknown placement side: ${side}`);
+    const key = visualPlacementRequestKey(assetIds, targetAssetId, side);
+    const preview = state.chronology.visualPlacementPreviews[key];
+    if (!preview) throw new Error(`Scenario did not declare visual placement ${key}`);
+    return preview;
+  },
+
+  set_clock_epoch: (args, { state }): ClockEpoch => {
+    requireString(args, "projectId");
+    const preview = args.preview as ClockEpochImpactPreview | VisualPlacementPreview | undefined;
+    if (!preview?.factsToken) throw new Error("An exact clock preview is required");
+    const epoch = epochFrom(preview.epoch);
     const stored: ClockEpoch = {
       ...epoch,
       id: epoch.id || `epoch_${epoch.captureSequenceId}_${state.chronology.overview.epochs.length + 1}`,
@@ -97,7 +149,9 @@ export const chronologyCommands: CommandTable = {
 
   clear_clock_epoch: (args, { state }) => {
     requireString(args, "projectId");
-    const epochId = requireString(args, "epochId");
+    const preview = args.preview as ClockEpochClearPreview | undefined;
+    if (!preview?.factsToken) throw new Error("An exact clear-epoch preview is required");
+    const epochId = preview.epochId;
     state.chronology.overview = {
       ...state.chronology.overview,
       epochs: state.chronology.overview.epochs.filter((epoch) => epoch.id !== epochId),
@@ -132,6 +186,87 @@ export const chronologyCommands: CommandTable = {
       sequences: state.chronology.overview.sequences.filter((sequence) => sequence.id !== fromSequenceId),
     };
     return null;
+  },
+
+  preview_capture_sequence_split: (args, { state }): CaptureSequenceSplitPreview => {
+    requireString(args, "projectId");
+    const sourceSequenceId = requireString(args, "sourceSequenceId");
+    const atCounter = requireNumber(args, "atCounter");
+    requireString(args, "label");
+    const assetIds = args.assetIds;
+    if (!Array.isArray(assetIds) || assetIds.some((assetId) => typeof assetId !== "string")) {
+      throw new Error("Capture-sequence split preview needs an array of asset identities");
+    }
+    const key = sequenceSplitRequestKey(sourceSequenceId, atCounter, assetIds);
+    const preview = state.chronology.sequenceSplitPreviews[key];
+    if (!preview) throw new Error(`Scenario did not declare capture-sequence split ${key}`);
+    return preview;
+  },
+
+  apply_capture_sequence_split: (args, { state }) => {
+    requireString(args, "projectId");
+    const preview = args.preview as CaptureSequenceSplitPreview | undefined;
+    if (!preview?.factsToken) throw new Error("An exact capture-sequence split preview is required");
+    const outcome = state.chronology.sequenceSplitOutcomes[preview.factsToken];
+    if (!outcome) throw new Error(`Scenario did not declare split outcome ${preview.factsToken}`);
+    state.chronology.overview = outcome;
+    return preview.createdSequence;
+  },
+
+  preview_capture_sequence_merge: (args, { state }): CaptureSequenceMergePreview => {
+    requireString(args, "projectId");
+    const fromSequenceId = requireString(args, "fromSequenceId");
+    const intoSequenceId = requireString(args, "intoSequenceId");
+    const key = sequenceMergeRequestKey(fromSequenceId, intoSequenceId);
+    const preview = state.chronology.sequenceMergePreviews[key];
+    if (!preview) throw new Error(`Scenario did not declare capture-sequence merge ${key}`);
+    return preview;
+  },
+
+  apply_capture_sequence_merge: (args, { state }) => {
+    requireString(args, "projectId");
+    const preview = args.preview as CaptureSequenceMergePreview | undefined;
+    if (!preview?.factsToken) throw new Error("An exact capture-sequence merge preview is required");
+    const outcome = state.chronology.sequenceMergeOutcomes[preview.factsToken];
+    if (!outcome) throw new Error(`Scenario did not declare merge outcome ${preview.factsToken}`);
+    state.chronology.overview = outcome;
+    return null;
+  },
+
+  preview_capture_sequence_reassignment: (args, { state }): CaptureSequenceReassignmentPreview => {
+    requireString(args, "projectId");
+    const anchorAssetId = requireString(args, "anchorAssetId");
+    const intoSequenceId = requireString(args, "intoSequenceId");
+    const key = reassignmentPreviewRequestKey(anchorAssetId, intoSequenceId);
+    const preview = state.chronology.reassignmentPreviews[key];
+    if (!preview) throw new Error(`Scenario did not declare capture-sequence reassignment ${key}`);
+    return preview;
+  },
+
+  preview_capture_sequence_assets: (args, { state }): CaptureSequenceReassignmentPreview => {
+    requireString(args, "projectId");
+    const fromSequenceId = requireString(args, "fromSequenceId");
+    const intoSequenceId = requireString(args, "intoSequenceId");
+    const assetIds = args.assetIds;
+    if (!Array.isArray(assetIds) || assetIds.some((assetId) => typeof assetId !== "string")) {
+      throw new Error("Capture-sequence preview needs an array of asset identities");
+    }
+    const key = reassignmentWriteRequestKey(fromSequenceId, intoSequenceId, assetIds);
+    const preview = state.chronology.reassignmentPreviews[key];
+    if (!preview) throw new Error(`Scenario did not declare capture-sequence asset preview ${key}`);
+    return preview;
+  },
+
+  reassign_capture_sequence_assets: (args, { state }): string[] => {
+    requireString(args, "projectId");
+    const preview = args.preview as CaptureSequenceReassignmentPreview | undefined;
+    if (!preview?.factsToken) throw new Error("An exact capture-sequence reassignment preview is required");
+    const { fromSequenceId, intoSequenceId, assetIds } = preview;
+    const key = reassignmentWriteRequestKey(fromSequenceId, intoSequenceId, assetIds);
+    const outcome = state.chronology.reassignmentOutcomes[key];
+    if (!outcome) throw new Error(`Scenario did not declare capture-sequence reassignment outcome ${key}`);
+    state.chronology.overview = outcome;
+    return assetIds;
   },
 
   set_clip_time_exception: (args, { state }) => {

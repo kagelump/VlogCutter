@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import type { ArchiveRoot, CardCandidate, ImportPreflight, ImportProgress, ImportRunReport } from "../types";
+import type { ArchiveRoot, CardCandidate, ImportPreflight, ImportProgress, ImportRunReport, ImportSequenceBoundaryEvidence } from "../types";
 import { formatBytes } from "../review/summaries";
 import { formatDuration } from "../review/format";
 
@@ -170,6 +170,10 @@ export function ImportDialog({
               </div>
             </div>
 
+            {plan?.sequencePreview && plan.sequencePreview.newClipCount > 0 && (
+              <SequencePreview preview={plan.sequencePreview} />
+            )}
+
             {card && (
               <div className="import-destination-controls">
                 {roots.length > 0 && (
@@ -233,6 +237,78 @@ export function ImportDialog({
         </footer>
       </section>
     </div>
+  );
+}
+
+function evidenceLabel(evidence: ImportSequenceBoundaryEvidence) {
+  switch (evidence.kind) {
+    case "volumeChange": return "Volume";
+    case "counterReset": return "Counter";
+    case "folderReset": return "Folder";
+    case "prefixChange": return "Prefix";
+    case "largeDiscontinuity": return "Time gap";
+  }
+}
+
+function evidenceDescription(evidence: ImportSequenceBoundaryEvidence) {
+  switch (evidence.kind) {
+    case "volumeChange": return `card or volume identity differs (${evidence.from} → ${evidence.to})`;
+    case "counterReset": return `filename counter restarts ${evidence.previous} → ${evidence.next}`;
+    case "folderReset": return `folder resets ${evidence.from || "root"} → ${evidence.to || "root"}`;
+    case "prefixChange": return `filename prefix changes ${evidence.from || "none"} → ${evidence.to || "none"}`;
+    case "largeDiscontinuity": {
+      const hours = evidence.gapSeconds / 3_600;
+      return `${hours >= 24 ? `${(hours / 24).toFixed(hours % 24 === 0 ? 0 : 1)} day` : `${hours.toFixed(hours % 1 === 0 ? 0 : 1)} hour`} file timestamp gap`;
+    }
+  }
+}
+
+function SequencePreview({ preview }: { preview: NonNullable<ImportPreflight["sequencePreview"]> }) {
+  const matched = preview.matchedExistingSequenceCount > 0 && preview.suggestedNewSequenceCount === 0;
+  return (
+    <section className="import-sequence-preview" aria-label="Capture sequence preview">
+      <div className="import-sequence-heading">
+        <div>
+          <span className="import-route-kicker">Chronology preflight</span>
+          <strong>{noun(preview.proposedSequenceCount, "incoming card run")}</strong>
+        </div>
+        <span className={preview.suggestedNewSequenceCount > 0 ? "is-new" : "is-matched"}>
+          {matched ? "Fits the project" : noun(preview.suggestedNewSequenceCount, "new sequence")}
+        </span>
+      </div>
+      <p>
+        {matched
+          ? `${noun(preview.newClipCount, "new clip")} fit the named capture sequences below.`
+          : `${noun(preview.newClipCount, "new clip")} are grouped below from card, folder, filename, and timestamp evidence.`}
+      </p>
+      <ol className="import-sequence-runs">
+        {preview.runs.map((run) => {
+          const first = run.firstRelativePath.split("/").at(-1);
+          const last = run.lastRelativePath.split("/").at(-1);
+          const extendsExisting = run.decision === "extendExisting";
+          return (
+            <li key={`${run.firstRelativePath}:${run.lastRelativePath}`} data-decision={run.decision}>
+              <div className="import-sequence-evidence">
+                {run.evidence.map((evidence, index) => (
+                  <span key={`${evidence.kind}:${index}`} title={evidenceDescription(evidence)}>{evidenceLabel(evidence)}</span>
+                ))}
+              </div>
+              <div className="import-sequence-run-copy">
+                <strong>
+                  {extendsExisting
+                    ? <>Extends “{run.matchedExistingSequenceLabel}” by {noun(run.clipCount, "clip")}</>
+                    : <>Proposes a new sequence for {noun(run.clipCount, "clip")}</>}
+                </strong>
+                <small>{run.cameraKey} · {first}{first === last ? "" : ` → ${last}`}</small>
+                <p>{run.reason}</p>
+              </div>
+              <em>{extendsExisting ? "Existing sequence" : "Review in Chronology"}</em>
+            </li>
+          );
+        })}
+      </ol>
+      <footer>Suggestions only — importing never changes chronology until you confirm it in Chronology.</footer>
+    </section>
   );
 }
 

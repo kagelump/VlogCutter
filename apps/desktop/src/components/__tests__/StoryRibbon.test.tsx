@@ -183,6 +183,74 @@ describe("selection", () => {
   });
 });
 
+describe("chronology entry", () => {
+  it("renders no problem chip when Review has nothing actionable", () => {
+    renderRibbon({ chronologyProblemCount: 0, onOpenChronologyProblems: vi.fn() });
+    expect(screen.queryByRole("button", { name: /chronology problem/i })).toBeNull();
+  });
+
+  it("opens the problem worklist and the expanded desk from distinct controls", async () => {
+    const onOpenChronologyProblems = vi.fn();
+    const onOpenExpanded = vi.fn();
+    renderRibbon({
+      chronologyProblemCount: 3,
+      onOpenChronologyProblems,
+      onOpenExpanded,
+    });
+
+    await userEvent.click(screen.getByRole("button", { name: /3 chronology problems.*Fix/i }));
+    expect(onOpenChronologyProblems).toHaveBeenCalledOnce();
+    await userEvent.click(screen.getByRole("button", { name: /Expand/ }));
+    expect(onOpenExpanded).toHaveBeenCalledOnce();
+  });
+});
+
+describe("large-project windowing", () => {
+  it("mounts only the visible slice of a 3,000-clip ribbon and follows horizontal scroll", () => {
+    const clips = Array.from({ length: 3_000 }, (_, index) =>
+      asset(`clip_${String(index).padStart(4, "0")}`, "Sony"),
+    );
+    const { container } = renderRibbon({ assets: clips, lanes: [["Sony", clips]] });
+
+    expect(container.querySelectorAll(".timeline-clip").length).toBeLessThan(60);
+    expect(container.querySelectorAll(".order-track > span").length).toBeLessThan(60);
+    expect(screen.getByRole("button", { name: "Clip 1, clip_0000.MP4, Sony" })).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Clip 3000, clip_2999.MP4, Sony" })).toBeNull();
+
+    const scroll = container.querySelector<HTMLDivElement>(".story-scroll")!;
+    Object.defineProperty(scroll, "clientWidth", { configurable: true, value: 680 });
+    fireEvent.scroll(scroll, { target: { scrollLeft: 2_000 * 68 } });
+
+    expect(screen.queryByRole("button", { name: "Clip 1, clip_0000.MP4, Sony" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Clip 2001, clip_2000.MP4, Sony" })).toBeVisible();
+    expect(container.querySelectorAll(".timeline-clip").length).toBeLessThan(60);
+  });
+
+  it("windows project-sized context segments with the clip viewport", () => {
+    const clips = Array.from({ length: 3_000 }, (_, index) =>
+      asset(`clip_${String(index).padStart(4, "0")}`, "Sony"),
+    );
+    const contextRuns = clips.map((item, index) => ({
+      start: index,
+      end: index,
+      asset: { ...item, phase: `Place ${index}` },
+      phaseId: `phase-${index}`,
+    }));
+    const { container } = renderRibbon({ assets: clips, lanes: [["Sony", clips]], contextRuns });
+
+    expect(container.querySelectorAll(".context-segment").length).toBeLessThan(60);
+    expect(screen.getByRole("button", { name: "Edit Place 0 context" })).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Edit Place 2999 context" })).toBeNull();
+
+    const scroll = container.querySelector<HTMLDivElement>(".story-scroll")!;
+    Object.defineProperty(scroll, "clientWidth", { configurable: true, value: 680 });
+    fireEvent.scroll(scroll, { target: { scrollLeft: 2_000 * 68 } });
+    expect(screen.queryByRole("button", { name: "Edit Place 0 context" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Edit Place 2000 context" })).toBeVisible();
+    expect(container.querySelectorAll(".context-segment").length).toBeLessThan(60);
+  });
+});
+
 describe("trip context anchoring", () => {
   it("turns an untagged clip column into the two directional choices", async () => {
     const { container } = renderRibbon();

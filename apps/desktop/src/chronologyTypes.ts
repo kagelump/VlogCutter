@@ -142,6 +142,64 @@ export interface ChronologyOverview {
   unplacedAssets: number;
 }
 
+export interface ChronologyImpactChange {
+  assetId: string;
+  before: string | null;
+  after: string | null;
+  beforePosition: number;
+  afterPosition: number;
+}
+
+export interface ChronologyImpact {
+  changes: ChronologyImpactChange[];
+  contradictions: Contradiction[];
+  blocked: boolean;
+}
+
+export interface ClockEpochImpactPreview {
+  epoch: ClockEpoch;
+  factsToken: string;
+  impact: ChronologyImpact;
+}
+
+export interface ClockEpochClearPreview {
+  epochId: string;
+  factsToken: string;
+  impact: ChronologyImpact;
+}
+
+export interface VisualPlacementPreview {
+  epoch: ClockEpoch;
+  factsToken: string;
+  impact: ChronologyImpact;
+}
+
+export interface CaptureSequenceReassignmentPreview {
+  fromSequenceId: string;
+  intoSequenceId: string;
+  assetIds: string[];
+  factsToken: string;
+  impact: ChronologyImpact;
+}
+
+export interface CaptureSequenceSplitPreview {
+  sourceSequenceId: string;
+  atCounter: number;
+  createdSequence: CaptureSequence;
+  assetIds: string[];
+  factsToken: string;
+  impact: ChronologyImpact;
+}
+
+export interface CaptureSequenceMergePreview {
+  fromSequenceId: string;
+  intoSequenceId: string;
+  assetIds: string[];
+  epochIds: string[];
+  factsToken: string;
+  impact: ChronologyImpact;
+}
+
 /** A place in the review queue that survives a reorder. */
 export interface QueuePosition {
   anchorAssetId: string;

@@ -18,13 +18,113 @@
 use anyhow::Result;
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
 use walkdir::WalkDir;
 
 use crate::cards::{CardCandidate, card_session_slug, inspect_card};
 use crate::{
     ArchiveRoot, Catalog, has_current_proxy, is_media, locations, sampled_media_fingerprint,
 };
+
+/// Twelve hours is long enough to separate shooting sessions without treating
+/// an ordinary meal, battery change, or timezone correction as a new card run.
+/// It remains proposal evidence only: the user decides whether the gap is a
+/// real capture-sequence boundary.
+pub const LARGE_CAPTURE_SEQUENCE_GAP_SECONDS: u64 = 12 * 60 * 60;
+
+/// Observable evidence for one suggested capture-sequence boundary. These are
+/// exactly the automatic evidence kinds allowed by the chronology contract;
+/// no suggestion is ever applied by preflight.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", tag = "kind")]
+pub enum ImportSequenceBoundaryEvidence {
+    VolumeChange { from: String, to: String },
+    CounterReset { previous: u64, next: u64 },
+    FolderReset { from: String, to: String },
+    PrefixChange { from: String, to: String },
+    LargeDiscontinuity { gap_seconds: u64 },
+}
+
+/// One place where preflight suggests beginning a new card run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportSequenceBoundary {
+    pub before_relative_path: String,
+    pub after_relative_path: String,
+    /// Clips in the suggested run beginning at `after_relative_path`.
+    pub affected_clip_count: usize,
+    pub evidence: Vec<ImportSequenceBoundaryEvidence>,
+}
+
+/// Whether one incoming filename run continues a named project sequence or
+/// needs a new sequence proposed for later confirmation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ImportSequenceRunDecision {
+    ExtendExisting,
+    ProposeNew,
+}
+
+/// One incoming monotonic filename run and the core-owned decision behind its
+/// preview. A proposed-new run may name the deterministic existing sequence it
+/// was compared with, but never claims to have matched it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportSequenceRunPreview {
+    pub first_relative_path: String,
+    pub last_relative_path: String,
+    pub clip_count: usize,
+    pub camera_key: String,
+    pub volume_hint: String,
+    pub filename_prefix: String,
+    pub decision: ImportSequenceRunDecision,
+    pub matched_existing_sequence_id: Option<String>,
+    pub matched_existing_sequence_label: Option<String>,
+    /// The same-camera sequence used to explain a mismatch, if there was one.
+    pub compared_existing_sequence_id: Option<String>,
+    pub compared_existing_sequence_label: Option<String>,
+    pub reason: String,
+    pub evidence: Vec<ImportSequenceBoundaryEvidence>,
+}
+
+/// Capture-sequence impact shown alongside the copy/reference delta. It is a
+/// suggestion layer only; accepting an import never accepts these boundaries.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportSequencePreview {
+    pub new_clip_count: usize,
+    pub existing_sequence_count: usize,
+    pub proposed_sequence_count: usize,
+    pub matched_existing_sequence_count: usize,
+    pub suggested_new_sequence_count: usize,
+    pub boundaries: Vec<ImportSequenceBoundary>,
+    #[serde(default)]
+    pub runs: Vec<ImportSequenceRunPreview>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ImportSequenceCandidate {
+    relative_path: String,
+    camera_key: String,
+    volume_hint: String,
+    folder: String,
+    prefix: String,
+    counter: Option<u64>,
+    observed_millis: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProposedImportRun {
+    camera_key: String,
+    volume_hint: String,
+    prefix: String,
+    first_relative_path: String,
+    last_relative_path: String,
+    clip_count: usize,
+    boundary_evidence: Vec<ImportSequenceBoundaryEvidence>,
+}
 
 /// What import would do with one candidate file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -104,8 +204,204 @@ pub struct ImportPreflight {
     pub missing_proxies: usize,
     pub collisions: usize,
     pub unreadable: usize,
+    /// Suggested card runs and their evidence. Preflight never applies them.
+    #[serde(default)]
+    pub sequence_preview: ImportSequencePreview,
     /// Every file, so the result stays inspectable after the dialog closes.
     pub items: Vec<PreflightItem>,
+}
+
+fn filename_prefix(filename: &str) -> String {
+    let stem = filename
+        .rsplit_once('.')
+        .map_or(filename, |(stem, _extension)| stem);
+    let prefix = stem
+        .split_once(|character: char| character.is_ascii_digit())
+        .map_or(stem, |(prefix, _)| prefix)
+        .trim_matches(|character: char| matches!(character, '_' | '-' | ' ' | '.'));
+    if prefix.is_empty() {
+        stem.to_uppercase()
+    } else {
+        prefix.to_uppercase()
+    }
+}
+
+fn sequence_candidate(
+    source: &Path,
+    path: &Path,
+    card: Option<&CardCandidate>,
+) -> ImportSequenceCandidate {
+    let relative_path = path
+        .strip_prefix(source)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/");
+    let filename = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let inferred = crate::identify_camera(None, &filename).camera;
+    let camera_key = if inferred == crate::UNKNOWN_CAMERA {
+        card.map(|candidate| candidate.camera_hint.trim())
+            .filter(|hint| !hint.is_empty())
+            .unwrap_or(inferred.as_str())
+            .to_string()
+    } else {
+        inferred
+    };
+    let folder = Path::new(&relative_path)
+        .parent()
+        .map(|parent| parent.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_default();
+    let observed_millis = std::fs::metadata(path)
+        .ok()
+        .and_then(|metadata| metadata.modified().ok())
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .and_then(|duration| u64::try_from(duration.as_millis()).ok());
+    ImportSequenceCandidate {
+        relative_path,
+        camera_key,
+        volume_hint: card
+            .map(|candidate| candidate.session_id.clone())
+            .unwrap_or_else(|| source.to_string_lossy().into_owned()),
+        folder,
+        prefix: filename_prefix(&filename),
+        counter: crate::chronology::parse_filename_counter(&filename),
+        observed_millis,
+    }
+}
+
+fn boundary_evidence(
+    before: &ImportSequenceCandidate,
+    after: &ImportSequenceCandidate,
+) -> Vec<ImportSequenceBoundaryEvidence> {
+    let mut evidence = Vec::new();
+    if before.volume_hint != after.volume_hint {
+        evidence.push(ImportSequenceBoundaryEvidence::VolumeChange {
+            from: before.volume_hint.clone(),
+            to: after.volume_hint.clone(),
+        });
+    }
+    if before.prefix != after.prefix {
+        evidence.push(ImportSequenceBoundaryEvidence::PrefixChange {
+            from: before.prefix.clone(),
+            to: after.prefix.clone(),
+        });
+    }
+    if let (Some(previous), Some(next)) = (before.counter, after.counter) {
+        if next < previous {
+            evidence.push(ImportSequenceBoundaryEvidence::CounterReset { previous, next });
+        }
+        if before.folder != after.folder && next <= previous {
+            evidence.push(ImportSequenceBoundaryEvidence::FolderReset {
+                from: before.folder.clone(),
+                to: after.folder.clone(),
+            });
+        }
+    } else if before.folder != after.folder {
+        evidence.push(ImportSequenceBoundaryEvidence::FolderReset {
+            from: before.folder.clone(),
+            to: after.folder.clone(),
+        });
+    }
+    if let (Some(before_millis), Some(after_millis)) =
+        (before.observed_millis, after.observed_millis)
+    {
+        let gap_seconds = after_millis.saturating_sub(before_millis) / 1_000;
+        if gap_seconds >= LARGE_CAPTURE_SEQUENCE_GAP_SECONDS {
+            evidence.push(ImportSequenceBoundaryEvidence::LargeDiscontinuity { gap_seconds });
+        }
+    }
+    evidence
+}
+
+fn propose_import_runs(
+    mut candidates: Vec<ImportSequenceCandidate>,
+) -> (
+    Vec<ImportSequenceCandidate>,
+    Vec<ProposedImportRun>,
+    Vec<ImportSequenceBoundary>,
+) {
+    candidates.sort_by(|left, right| {
+        left.camera_key
+            .cmp(&right.camera_key)
+            .then_with(|| left.observed_millis.cmp(&right.observed_millis))
+            .then_with(|| left.folder.cmp(&right.folder))
+            .then_with(|| left.counter.cmp(&right.counter))
+            .then_with(|| left.relative_path.cmp(&right.relative_path))
+    });
+    if candidates.is_empty() {
+        return (candidates, Vec::new(), Vec::new());
+    }
+
+    let mut starts = vec![0usize];
+    let mut evidence_at_start: Vec<Vec<ImportSequenceBoundaryEvidence>> = vec![Vec::new()];
+    for index in 1..candidates.len() {
+        let before = &candidates[index - 1];
+        let after = &candidates[index];
+        let evidence = boundary_evidence(before, after);
+        // Camera identity is itself a sequence partition. Pattern-derived
+        // identities also carry a prefix change, so the displayed evidence
+        // remains one of the frozen boundary kinds.
+        if before.camera_key != after.camera_key || !evidence.is_empty() {
+            starts.push(index);
+            evidence_at_start.push(evidence);
+        }
+    }
+
+    let mut runs = Vec::with_capacity(starts.len());
+    let mut boundaries = Vec::with_capacity(starts.len().saturating_sub(1));
+    for (run_index, start) in starts.iter().copied().enumerate() {
+        let end = starts
+            .get(run_index + 1)
+            .copied()
+            .unwrap_or(candidates.len());
+        let first = &candidates[start];
+        runs.push(ProposedImportRun {
+            camera_key: first.camera_key.clone(),
+            volume_hint: first.volume_hint.clone(),
+            prefix: first.prefix.clone(),
+            first_relative_path: first.relative_path.clone(),
+            last_relative_path: candidates[end - 1].relative_path.clone(),
+            clip_count: end - start,
+            boundary_evidence: evidence_at_start[run_index].clone(),
+        });
+        if run_index > 0 {
+            boundaries.push(ImportSequenceBoundary {
+                before_relative_path: candidates[start - 1].relative_path.clone(),
+                after_relative_path: first.relative_path.clone(),
+                affected_clip_count: end - start,
+                evidence: evidence_at_start[run_index].clone(),
+            });
+        }
+    }
+    (candidates, runs, boundaries)
+}
+
+fn sequence_matches_run(sequence: &crate::CaptureSequence, run: &ProposedImportRun) -> bool {
+    sequence.camera_key == run.camera_key
+        && (sequence.volume_hint.is_empty() || sequence.volume_hint == run.volume_hint)
+        && (sequence.filename_prefix.is_empty() || sequence.filename_prefix == run.prefix)
+}
+
+fn existing_mismatch_evidence(
+    sequence: &crate::CaptureSequence,
+    run: &ProposedImportRun,
+) -> Vec<ImportSequenceBoundaryEvidence> {
+    let mut evidence = Vec::new();
+    if !sequence.volume_hint.is_empty() && sequence.volume_hint != run.volume_hint {
+        evidence.push(ImportSequenceBoundaryEvidence::VolumeChange {
+            from: sequence.volume_hint.clone(),
+            to: run.volume_hint.clone(),
+        });
+    }
+    if !sequence.filename_prefix.is_empty() && sequence.filename_prefix != run.prefix {
+        evidence.push(ImportSequenceBoundaryEvidence::PrefixChange {
+            from: sequence.filename_prefix.clone(),
+            to: run.prefix.clone(),
+        });
+    }
+    evidence
 }
 
 impl Catalog {
@@ -131,7 +427,7 @@ impl Catalog {
         }
         let card = inspect_card(source)?;
 
-        let candidates: Vec<PathBuf> = WalkDir::new(source)
+        let mut candidates: Vec<PathBuf> = WalkDir::new(source)
             .follow_links(false)
             .into_iter()
             .filter_map(Result::ok)
@@ -139,6 +435,7 @@ impl Catalog {
             .map(|entry| entry.into_path())
             .filter(|path| is_media(path))
             .collect();
+        candidates.sort();
 
         let total = candidates.len();
         let mut items = Vec::with_capacity(total);
@@ -161,6 +458,12 @@ impl Catalog {
             card.as_ref(),
             bytes_to_copy,
         )?;
+        let sequence_candidates = items
+            .iter()
+            .filter(|item| item.classification == Classification::New)
+            .map(|item| sequence_candidate(source, Path::new(&item.path), card.as_ref()))
+            .collect();
+        let sequence_preview = self.import_sequence_preview(project_id, sequence_candidates)?;
 
         Ok(ImportPreflight {
             source_path: source.to_string_lossy().into_owned(),
@@ -173,8 +476,126 @@ impl Catalog {
                 + count(&items, Classification::New),
             collisions: count(&items, Classification::PathCollision),
             unreadable: count(&items, Classification::Unreadable),
+            sequence_preview,
             destination,
             items,
+        })
+    }
+
+    fn import_sequence_preview(
+        &self,
+        project_id: &str,
+        candidates: Vec<ImportSequenceCandidate>,
+    ) -> Result<ImportSequencePreview> {
+        let new_clip_count = candidates.len();
+        let (_ordered, proposed_runs, boundaries) = propose_import_runs(candidates);
+        let mut existing = self.capture_sequences(project_id)?;
+        existing.sort_by(|left, right| left.id.cmp(&right.id));
+        let mut used_existing = BTreeSet::new();
+        let mut runs = Vec::with_capacity(proposed_runs.len());
+        for run in proposed_runs {
+            let matching = existing.iter().enumerate().find(|(index, sequence)| {
+                !used_existing.contains(index) && sequence_matches_run(sequence, &run)
+            });
+            if let Some((index, sequence)) = matching {
+                used_existing.insert(index);
+                runs.push(ImportSequenceRunPreview {
+                    first_relative_path: run.first_relative_path,
+                    last_relative_path: run.last_relative_path,
+                    clip_count: run.clip_count,
+                    camera_key: run.camera_key,
+                    volume_hint: run.volume_hint,
+                    filename_prefix: run.prefix,
+                    decision: ImportSequenceRunDecision::ExtendExisting,
+                    matched_existing_sequence_id: Some(sequence.id.clone()),
+                    matched_existing_sequence_label: Some(sequence.label.clone()),
+                    compared_existing_sequence_id: None,
+                    compared_existing_sequence_label: None,
+                    reason: format!(
+                        "This run matches the camera, card, and filename evidence for \"{}\".",
+                        sequence.label
+                    ),
+                    evidence: run.boundary_evidence,
+                });
+                continue;
+            }
+
+            // Explain a rejection against a stable same-camera candidate. An
+            // unused candidate comes first; if every matching-camera sequence
+            // is already claimed by another incoming run, compare against the
+            // first by id so the reason remains deterministic.
+            let compared = existing
+                .iter()
+                .enumerate()
+                .find(|(index, sequence)| {
+                    !used_existing.contains(index) && sequence.camera_key == run.camera_key
+                })
+                .or_else(|| {
+                    existing
+                        .iter()
+                        .enumerate()
+                        .find(|(_, sequence)| sequence.camera_key == run.camera_key)
+                });
+            let mismatch = compared
+                .map(|(_, sequence)| existing_mismatch_evidence(sequence, &run))
+                .unwrap_or_default();
+            let has_mismatch = !mismatch.is_empty();
+            let mut evidence = run.boundary_evidence;
+            for found in mismatch {
+                if !evidence.contains(&found) {
+                    evidence.push(found);
+                }
+            }
+            let reason = match compared {
+                Some((_, sequence)) if has_mismatch => {
+                    format!(
+                        "This run differs from \"{}\" on card or filename evidence.",
+                        sequence.label
+                    )
+                }
+                Some((index, sequence)) if used_existing.contains(&index) => format!(
+                    "Another incoming run already extends \"{}\"; this distinct run stays separate.",
+                    sequence.label
+                ),
+                Some((_, sequence)) => format!(
+                    "Boundary evidence keeps this run separate from \"{}\".",
+                    sequence.label
+                ),
+                None => format!(
+                    "No existing capture sequence is available for {}.",
+                    run.camera_key
+                ),
+            };
+            runs.push(ImportSequenceRunPreview {
+                first_relative_path: run.first_relative_path,
+                last_relative_path: run.last_relative_path,
+                clip_count: run.clip_count,
+                camera_key: run.camera_key,
+                volume_hint: run.volume_hint,
+                filename_prefix: run.prefix,
+                decision: ImportSequenceRunDecision::ProposeNew,
+                matched_existing_sequence_id: None,
+                matched_existing_sequence_label: None,
+                compared_existing_sequence_id: compared.map(|(_, sequence)| sequence.id.clone()),
+                compared_existing_sequence_label: compared
+                    .map(|(_, sequence)| sequence.label.clone()),
+                reason,
+                evidence,
+            });
+        }
+        let matched_existing_sequence_count = runs
+            .iter()
+            .filter(|run| run.decision == ImportSequenceRunDecision::ExtendExisting)
+            .count();
+        let suggested_new_sequence_count = runs.len() - matched_existing_sequence_count;
+        Ok(ImportSequencePreview {
+            new_clip_count,
+            existing_sequence_count: existing.len(),
+            proposed_sequence_count: runs.len(),
+            matched_existing_sequence_count,
+            suggested_new_sequence_count,
+            boundaries,
+            runs,
         })
     }
 
@@ -750,6 +1171,312 @@ mod tests {
     use std::fs;
     use tempfile::tempdir;
 
+    fn sequence_hint(
+        relative_path: &str,
+        camera_key: &str,
+        volume_hint: &str,
+        folder: &str,
+        prefix: &str,
+        counter: Option<u64>,
+        observed_seconds: Option<u64>,
+    ) -> ImportSequenceCandidate {
+        ImportSequenceCandidate {
+            relative_path: relative_path.to_string(),
+            camera_key: camera_key.to_string(),
+            volume_hint: volume_hint.to_string(),
+            folder: folder.to_string(),
+            prefix: prefix.to_string(),
+            counter,
+            observed_millis: observed_seconds.map(|seconds| seconds * 1_000),
+        }
+    }
+
+    fn proposal_evidence(
+        candidates: Vec<ImportSequenceCandidate>,
+    ) -> Vec<ImportSequenceBoundaryEvidence> {
+        let (_, _, boundaries) = propose_import_runs(candidates);
+        assert_eq!(boundaries.len(), 1);
+        boundaries.into_iter().next().unwrap().evidence
+    }
+
+    #[test]
+    fn sequence_detector_covers_every_frozen_boundary_kind() {
+        let volume = proposal_evidence(vec![
+            sequence_hint("A/C0001.MP4", "Sony", "card-a", "A", "C", Some(1), Some(1)),
+            sequence_hint("B/C0002.MP4", "Sony", "card-b", "B", "C", Some(2), Some(2)),
+        ]);
+        assert!(matches!(
+            volume.as_slice(),
+            [ImportSequenceBoundaryEvidence::VolumeChange { .. }]
+        ));
+
+        let counter = proposal_evidence(vec![
+            sequence_hint("A/C0241.MP4", "Sony", "card", "A", "C", Some(241), Some(1)),
+            sequence_hint("A/C0001.MP4", "Sony", "card", "A", "C", Some(1), Some(2)),
+        ]);
+        assert!(counter.iter().any(|found| matches!(
+            found,
+            ImportSequenceBoundaryEvidence::CounterReset {
+                previous: 241,
+                next: 1
+            }
+        )));
+
+        let folder = proposal_evidence(vec![
+            sequence_hint("A/C0042.MP4", "Sony", "card", "A", "C", Some(42), Some(1)),
+            sequence_hint("B/C0001.MP4", "Sony", "card", "B", "C", Some(1), Some(2)),
+        ]);
+        assert!(folder.iter().any(|found| matches!(
+            found,
+            ImportSequenceBoundaryEvidence::FolderReset { from, to }
+                if from == "A" && to == "B"
+        )));
+
+        let prefix = proposal_evidence(vec![
+            sequence_hint("A/C0001.MP4", "Camera", "card", "A", "C", Some(1), Some(1)),
+            sequence_hint(
+                "A/DJI_0002.MP4",
+                "Camera",
+                "card",
+                "A",
+                "DJI",
+                Some(2),
+                Some(2),
+            ),
+        ]);
+        assert!(matches!(
+            prefix.as_slice(),
+            [ImportSequenceBoundaryEvidence::PrefixChange { .. }]
+        ));
+
+        let discontinuity = proposal_evidence(vec![
+            sequence_hint("A/C0001.MP4", "Sony", "card", "A", "C", Some(1), Some(1)),
+            sequence_hint(
+                "A/C0002.MP4",
+                "Sony",
+                "card",
+                "A",
+                "C",
+                Some(2),
+                Some(1 + LARGE_CAPTURE_SEQUENCE_GAP_SECONDS),
+            ),
+        ]);
+        assert!(matches!(
+            discontinuity.as_slice(),
+            [ImportSequenceBoundaryEvidence::LargeDiscontinuity { gap_seconds }]
+                if *gap_seconds == LARGE_CAPTURE_SEQUENCE_GAP_SECONDS
+        ));
+    }
+
+    #[test]
+    fn sequence_proposals_are_deterministic_and_count_the_affected_run() {
+        let candidates = vec![
+            sequence_hint("A/C0001.MP4", "Sony", "card", "A", "C", Some(1), Some(1)),
+            sequence_hint("A/C0002.MP4", "Sony", "card", "A", "C", Some(2), Some(2)),
+            sequence_hint("B/C0001.MP4", "Sony", "card", "B", "C", Some(1), Some(3)),
+            sequence_hint("B/C0002.MP4", "Sony", "card", "B", "C", Some(2), Some(4)),
+        ];
+        let mut reversed = candidates.clone();
+        reversed.reverse();
+        let (ordered, runs, boundaries) = propose_import_runs(candidates);
+        let (reordered, reruns, reboundaries) = propose_import_runs(reversed);
+        assert_eq!(ordered, reordered);
+        assert_eq!(runs, reruns);
+        assert_eq!(boundaries, reboundaries);
+        assert_eq!(runs.len(), 2);
+        assert_eq!(boundaries[0].affected_clip_count, 2);
+        assert_eq!(boundaries[0].after_relative_path, "B/C0001.MP4");
+    }
+
+    #[test]
+    fn import_preflight_surfaces_folder_and_counter_boundary_evidence() {
+        let directory = tempdir().unwrap();
+        let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).unwrap();
+        let project = catalog.create_project("Spain 2026").unwrap();
+        let mount = directory.path().join("SONY_SD");
+        let first_folder = mount.join("DCIM/100MSDCF");
+        let second_folder = mount.join("DCIM/101MSDCF");
+        fs::create_dir_all(&first_folder).unwrap();
+        fs::create_dir_all(&second_folder).unwrap();
+        let first = first_folder.join("C0241.MP4");
+        let second = second_folder.join("C0001.MP4");
+        fs::write(&first, b"first card run").unwrap();
+        fs::write(&second, b"second card run").unwrap();
+        let base = UNIX_EPOCH + std::time::Duration::from_secs(100);
+        fs::File::open(&first)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(base))
+            .unwrap();
+        fs::File::open(&second)
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new().set_modified(base + std::time::Duration::from_secs(1)),
+            )
+            .unwrap();
+
+        let plan = catalog
+            .preflight_import(&project.id, &mount, None, |_, _, _| true)
+            .unwrap();
+
+        assert_eq!(plan.sequence_preview.new_clip_count, 2);
+        assert_eq!(plan.sequence_preview.proposed_sequence_count, 2);
+        assert_eq!(plan.sequence_preview.suggested_new_sequence_count, 2);
+        assert_eq!(plan.sequence_preview.boundaries.len(), 1);
+        let boundary = &plan.sequence_preview.boundaries[0];
+        assert_eq!(boundary.after_relative_path, "DCIM/101MSDCF/C0001.MP4");
+        assert_eq!(boundary.affected_clip_count, 1);
+        assert!(boundary.evidence.iter().any(|found| matches!(
+            found,
+            ImportSequenceBoundaryEvidence::CounterReset {
+                previous: 241,
+                next: 1
+            }
+        )));
+        assert!(
+            boundary
+                .evidence
+                .iter()
+                .any(|found| matches!(found, ImportSequenceBoundaryEvidence::FolderReset { .. }))
+        );
+        assert_eq!(plan.sequence_preview.runs.len(), 2);
+        assert_eq!(
+            plan.sequence_preview.runs[1].decision,
+            ImportSequenceRunDecision::ProposeNew
+        );
+        assert_eq!(plan.sequence_preview.runs[1].clip_count, 1);
+        assert_eq!(
+            plan.sequence_preview.runs[1].first_relative_path,
+            "DCIM/101MSDCF/C0001.MP4"
+        );
+        assert_eq!(
+            plan.sequence_preview.runs[1].last_relative_path,
+            "DCIM/101MSDCF/C0001.MP4"
+        );
+        assert!(
+            plan.sequence_preview.runs[1]
+                .evidence
+                .iter()
+                .any(|found| matches!(found, ImportSequenceBoundaryEvidence::CounterReset { .. }))
+        );
+        assert!(catalog.list_assets(&project.id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn import_preflight_names_the_existing_sequence_a_run_would_extend() {
+        let directory = tempdir().unwrap();
+        let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).unwrap();
+        let project = catalog.create_project("Spain 2026").unwrap();
+        let mount = card_fixture(
+            directory.path(),
+            &[("C0101.MP4", b"one"), ("C0102.MP4", b"two")],
+        );
+        let card = inspect_card(&mount).unwrap().unwrap();
+        let existing = catalog
+            .declare_capture_sequence(
+                &project.id,
+                "Sony (C-series)",
+                "Sony SD-A",
+                &card.session_id,
+                "C",
+            )
+            .unwrap();
+        let operations_before = catalog.list_operations(&project.id).unwrap().len();
+
+        let plan = catalog
+            .preflight_import(&project.id, &mount, None, |_, _, _| true)
+            .unwrap();
+
+        assert_eq!(plan.sequence_preview.runs.len(), 1);
+        let run = &plan.sequence_preview.runs[0];
+        assert_eq!(run.decision, ImportSequenceRunDecision::ExtendExisting);
+        assert_eq!(
+            run.matched_existing_sequence_id.as_deref(),
+            Some(existing.id.as_str())
+        );
+        assert_eq!(
+            run.matched_existing_sequence_label.as_deref(),
+            Some("Sony SD-A")
+        );
+        assert_eq!(run.compared_existing_sequence_id, None);
+        assert_eq!(run.first_relative_path, "DCIM/100MSDCF/C0101.MP4");
+        assert_eq!(run.last_relative_path, "DCIM/100MSDCF/C0102.MP4");
+        assert_eq!(run.clip_count, 2);
+        assert_eq!(run.camera_key, "Sony (C-series)");
+        assert!(run.reason.contains("Sony SD-A"));
+        assert_eq!(
+            catalog.list_operations(&project.id).unwrap().len(),
+            operations_before
+        );
+        assert!(catalog.list_assets(&project.id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn import_preflight_explains_volume_and_prefix_mismatch_against_a_named_sequence() {
+        let directory = tempdir().unwrap();
+        let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).unwrap();
+        let project = catalog.create_project("Spain 2026").unwrap();
+        let mount = card_fixture(directory.path(), &[("C0101.MP4", b"new card")]);
+        let card = inspect_card(&mount).unwrap().unwrap();
+        let first_existing = catalog
+            .declare_capture_sequence(
+                &project.id,
+                "Sony (C-series)",
+                "Sony SD-A",
+                "card_previous_session",
+                "SONY",
+            )
+            .unwrap();
+        let second_existing = catalog
+            .declare_capture_sequence(
+                &project.id,
+                "Sony (C-series)",
+                "Sony SD-B",
+                "card_other_session",
+                "CX",
+            )
+            .unwrap();
+        let compared = if first_existing.id < second_existing.id {
+            &first_existing
+        } else {
+            &second_existing
+        };
+        let operations_before = catalog.list_operations(&project.id).unwrap().len();
+
+        let plan = catalog
+            .preflight_import(&project.id, &mount, None, |_, _, _| true)
+            .unwrap();
+
+        let run = &plan.sequence_preview.runs[0];
+        assert_eq!(run.decision, ImportSequenceRunDecision::ProposeNew);
+        assert_eq!(run.matched_existing_sequence_id, None);
+        assert_eq!(
+            run.compared_existing_sequence_id.as_deref(),
+            Some(compared.id.as_str())
+        );
+        assert_eq!(
+            run.compared_existing_sequence_label.as_deref(),
+            Some(compared.label.as_str())
+        );
+        assert!(run.evidence.iter().any(|found| matches!(
+            found,
+            ImportSequenceBoundaryEvidence::VolumeChange { from, to }
+                if from == &compared.volume_hint && to == &card.session_id
+        )));
+        assert!(run.evidence.iter().any(|found| matches!(
+            found,
+            ImportSequenceBoundaryEvidence::PrefixChange { from, to }
+                if from == &compared.filename_prefix && to == "C"
+        )));
+        assert!(run.reason.contains(&compared.label));
+        assert_eq!(plan.sequence_preview.matched_existing_sequence_count, 0);
+        assert_eq!(plan.sequence_preview.suggested_new_sequence_count, 1);
+        assert_eq!(
+            catalog.list_operations(&project.id).unwrap().len(),
+            operations_before
+        );
+        assert!(catalog.list_assets(&project.id).unwrap().is_empty());
+    }
+
     /// A card holding real, probeable media. Import creates assets, which runs
     /// ffprobe, so byte blobs will not do here.
     fn card_fixture_media(root: &Path, clips: &[(&str, &str)]) -> PathBuf {
@@ -828,6 +1555,9 @@ mod tests {
         // The known reachable clip and the new clip both need a proxy after import.
         assert_eq!(preflight.missing_proxies, 2);
         assert_eq!(preflight.unreadable, 0);
+        assert_eq!(preflight.sequence_preview.new_clip_count, 1);
+        assert_eq!(preflight.sequence_preview.proposed_sequence_count, 1);
+        assert_eq!(preflight.sequence_preview.suggested_new_sequence_count, 1);
         assert_eq!(
             preflight
                 .card

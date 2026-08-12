@@ -126,6 +126,71 @@ describe("card import preflight", () => {
     expect(screen.getByText("No originals are copied")).toBeTruthy();
   });
 
+  it("shows suggested card-run boundaries with evidence before import", async () => {
+    renderDialog({
+      plan: plan({
+        sequencePreview: {
+          newClipCount: 18,
+          existingSequenceCount: 1,
+          proposedSequenceCount: 2,
+          matchedExistingSequenceCount: 1,
+          suggestedNewSequenceCount: 1,
+          boundaries: [{
+            beforeRelativePath: "DCIM/100MSDCF/C0241.MP4",
+            afterRelativePath: "DCIM/101MSDCF/C0001.MP4",
+            affectedClipCount: 7,
+            evidence: [
+              { kind: "folderReset", from: "DCIM/100MSDCF", to: "DCIM/101MSDCF" },
+              { kind: "counterReset", previous: 241, next: 1 },
+            ],
+          }],
+          runs: [{
+            firstRelativePath: "DCIM/100MSDCF/C0231.MP4",
+            lastRelativePath: "DCIM/100MSDCF/C0241.MP4",
+            clipCount: 11,
+            cameraKey: "Sony A7C II",
+            volumeHint: "card_4f2a0000",
+            filenamePrefix: "C",
+            decision: "extendExisting",
+            matchedExistingSequenceId: "sequence_sony_a",
+            matchedExistingSequenceLabel: "Sony SD-A",
+            comparedExistingSequenceId: null,
+            comparedExistingSequenceLabel: null,
+            reason: "This run matches the camera, card, and filename evidence for “Sony SD-A”.",
+            evidence: [],
+          }, {
+            firstRelativePath: "DCIM/101MSDCF/C0001.MP4",
+            lastRelativePath: "DCIM/101MSDCF/C0007.MP4",
+            clipCount: 7,
+            cameraKey: "Sony A7C II",
+            volumeHint: "card_new",
+            filenamePrefix: "C",
+            decision: "proposeNew",
+            matchedExistingSequenceId: null,
+            matchedExistingSequenceLabel: null,
+            comparedExistingSequenceId: "sequence_sony_a",
+            comparedExistingSequenceLabel: "Sony SD-A",
+            reason: "This run differs from “Sony SD-A” on card or filename evidence.",
+            evidence: [
+              { kind: "folderReset", from: "DCIM/100MSDCF", to: "DCIM/101MSDCF" },
+              { kind: "counterReset", previous: 241, next: 1 },
+              { kind: "volumeChange", from: "card_old", to: "card_new" },
+            ],
+          }],
+        },
+      }),
+    });
+
+    expect(screen.getByLabelText("Capture sequence preview").textContent).toContain("2 incoming card runs");
+    expect(screen.getByText("Extends “Sony SD-A” by 11 clips")).toBeTruthy();
+    expect(screen.getByText("Proposes a new sequence for 7 clips")).toBeTruthy();
+    expect(screen.getByText(/C0001.MP4 → C0007.MP4/)).toBeTruthy();
+    expect(screen.getByText("Folder").getAttribute("title")).toContain("100MSDCF");
+    expect(screen.getByText("Counter").getAttribute("title")).toContain("241 → 1");
+    expect(screen.getByText("Volume").getAttribute("title")).toContain("card_old → card_new");
+    expect(screen.getByText(/importing never changes chronology/)).toBeTruthy();
+  });
+
   it("shows filename, capture timestamp, and duration in the completed file ledger", async () => {
     const item = {
       path: `${card.mountPath}/DCIM/DJI_001.MP4`,

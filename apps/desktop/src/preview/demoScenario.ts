@@ -13,7 +13,7 @@
 
 import { desktopScenario, type ScenarioBuilder } from "../test/harness/scenario";
 import { buildContradiction, buildDiagnostic } from "../test/harness/chronologyFixtures";
-import type { EditPlanRevision, TripPhase } from "../chronologyTypes";
+import type { ChronologyImpact, ClockEpoch, EditPlanRevision, TripPhase } from "../chronologyTypes";
 
 const PROJECT = "Hokkaido field test";
 const PROJECT_ID = "project_hokkaido_field_test";
@@ -41,6 +41,26 @@ const CHRONOLOGY_ORDER = [
 ];
 const CHRONOLOGY_START = "2026-02-08T00:14:08.000Z";
 const CHRONOLOGY_SPACING = 600;
+const INSTA_CORRECTION: ClockEpoch = {
+  id: "epoch_preview_insta",
+  captureSequenceId: "sequence_insta",
+  startCounter: 0,
+  endCounter: null,
+  offsetSeconds: 15 * 60,
+  confidence: 1,
+  evidence: ["user_set"],
+  label: "Insta360 clock was fifteen minutes slow",
+};
+const INSTA_CORRECTION_IMPACT: ChronologyImpact = {
+  changes: [
+    { assetId: INSTA[0], before: placedAt(3), after: new Date(Date.parse(placedAt(3)) + 15 * 60_000).toISOString(), beforePosition: 3, afterPosition: 4 },
+    { assetId: SONY[2], before: placedAt(4), after: placedAt(4), beforePosition: 4, afterPosition: 3 },
+    { assetId: INSTA[1], before: placedAt(7), after: new Date(Date.parse(placedAt(7)) + 15 * 60_000).toISOString(), beforePosition: 7, afterPosition: 8 },
+    { assetId: DJI[0], before: placedAt(8), after: placedAt(8), beforePosition: 8, afterPosition: 7 },
+  ],
+  contradictions: [],
+  blocked: false,
+};
 
 /** The trip time the overview gives the clip at `index` in the declared order. */
 function placedAt(index: number): string {
@@ -82,10 +102,11 @@ function chronologyBase(order: string[]) {
     spacingSeconds: CHRONOLOGY_SPACING,
     timezone: "Asia/Tokyo",
     sequences: [
-      { id: "sequence_sony", cameraKey: "Sony A7C II", label: "Sony A7C II", volumeHint: "Travel", filenamePrefix: "SONY" },
-      { id: "sequence_iphone", cameraKey: "Apple iPhone 17 Pro", label: "iPhone 17 Pro", volumeHint: "Travel", filenamePrefix: "APPLE" },
-      { id: "sequence_insta", cameraKey: "Insta360 X5", label: "Insta360 X5", volumeHint: "Travel", filenamePrefix: "INSTA360" },
-      { id: "sequence_dji", cameraKey: "DJI Pocket 3", label: "DJI Pocket 3", volumeHint: "DJI_SD", filenamePrefix: "DJI" },
+      { id: "sequence_sony_a", cameraKey: "Sony A7C II", label: "Sony A7C II · card A", volumeHint: "Travel/A001", filenamePrefix: "SONY", assetIds: SONY.slice(0, 2) },
+      { id: "sequence_sony_b", cameraKey: "Sony A7C II", label: "Sony A7C II · card B", volumeHint: "Travel/A002", filenamePrefix: "SONY", assetIds: SONY.slice(2) },
+      { id: "sequence_iphone", cameraKey: "Apple iPhone 17 Pro", label: "iPhone 17 Pro", volumeHint: "Travel", filenamePrefix: "APPLE", assetIds: IPHONE },
+      { id: "sequence_insta", cameraKey: "Insta360 X5", label: "Insta360 X5", volumeHint: "Travel", filenamePrefix: "INSTA360", assetIds: INSTA },
+      { id: "sequence_dji", cameraKey: "DJI Pocket 3", label: "DJI Pocket 3", volumeHint: "DJI_SD", filenamePrefix: "DJI", assetIds: DJI },
     ],
     phases: [
       phase({ id: "phase_otaru", label: "Otaru", kind: "location", from: 0, to: 3, timezone: "Asia/Tokyo" }),
@@ -210,18 +231,23 @@ export function previewScenario(): ScenarioBuilder {
           kind: "interval_conflict",
           strength: "soft",
           assetIds: [INSTA[0], SONY[2]],
-          message: "The Insta360 clock runs about four minutes ahead of the Sony.",
+          message: "The Insta360 clock runs about fifteen minutes behind the Sony.",
           evidence: ["camera clock comparison"],
         }),
       ],
     })
     // Correcting the Insta360's clock is the one edit the preview has a declared
-    // outcome for: the Insta360 clip moves after the Sony one, and the
+    // outcome for: both Insta360 clips move after their nearby comparison, and the
     // contradiction goes away. The sequences and phases come along unchanged,
     // because a clock correction does not dissolve them.
+    .impactOnClockPreview("sequence_insta", {
+      epoch: INSTA_CORRECTION,
+      factsToken: "facts-preview-insta",
+      impact: INSTA_CORRECTION_IMPACT,
+    })
     .whenClockEpochApplied("sequence_insta")
     .thenChronology(
-      chronologyBase([SONY[0], SONY[1], IPHONE[0], SONY[2], INSTA[0], IPHONE[1], SONY[3], INSTA[1], ...DJI]),
+      chronologyBase([SONY[0], SONY[1], IPHONE[0], SONY[2], INSTA[0], IPHONE[1], SONY[3], DJI[0], INSTA[1], DJI[1], DJI[2]]),
     )
     .editPlanValidation("revision_2", {
       findings: [

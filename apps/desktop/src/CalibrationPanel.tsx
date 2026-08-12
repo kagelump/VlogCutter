@@ -1,513 +1,742 @@
-// The calibration surface (D01-T015 read-only, D01-T016 editing) and the
-// diagnostics surface (D01-T027 consumer).
+// The chronology desk: a visual, solver-faithful correction workflow.
 //
-// Two rules shape this component:
-//
-//   1. It displays what the solver decided. It never sorts, re-derives a time,
-//      or computes a confidence of its own — the desktop and the CLI must not
-//      be able to disagree about order.
-//   2. No chronology change is applied without explicit user confirmation, and
-//      the confirmation shows the *impact* first. Every write here is preceded
-//      by a preview and a queue-position capture.
+// Every preview comes from Rust. The UI selects identities and expresses intent;
+// it never derives times, counters, or order. Every write is explicitly
+// confirmed after the preview, captures Review's queue position first, and
+// restores it afterwards.
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "./api";
 import { chronologyApi } from "./chronologyApi";
+import type { Asset } from "./types";
 import type {
+  CaptureSequenceReassignmentPreview,
+  CaptureSequenceMergePreview,
+  CaptureSequenceSplitPreview,
   ChronologyExplanation,
+  ChronologyImpact,
   ChronologyOverview,
   ClockEpoch,
+  ClockEpochClearPreview,
+  ClockEpochImpactPreview,
   Contradiction,
   Diagnostic,
   DiagnosticsView,
+  TripPhase,
+  VisualPlacementPreview,
 } from "./chronologyTypes";
+import {
+  ChronologyCanvas,
+  type PhaseBoundaryDraft,
+} from "./chronology/ChronologyCanvas";
+import { formatChronologyTime } from "./chronology/geometry";
+import { TripPhaseDialog, type TripPhaseFormValue } from "./components/TripPhaseDialog";
 
 interface Props {
   projectId: string;
-  /** The clip the review queue is standing on, so a change can resume there. */
   currentAssetId: string | null;
-  /** Called with the asset to resume on after a change reorders the queue. */
+  assets: Asset[];
+  overview?: ChronologyOverview | null;
+  overviewError?: string;
+  reviewZoom?: number;
+  reviewScrollLeft?: number;
+  focusAssetId?: string | null;
+  onBackToReview?(): void;
   onQueueResumed?: (assetId: string) => void;
-  /** Refreshes the parent review cache after the core rewrites its projection. */
   onChronologyChanged?: () => void | Promise<void>;
 }
+
+type PendingChange =
+  | { kind: "epoch"; label: string; preview: ClockEpochImpactPreview | VisualPlacementPreview; impact: ChronologyImpact }
+  | { kind: "reassign"; label: string; preview: CaptureSequenceReassignmentPreview; impact: ChronologyImpact }
+  | { kind: "split"; label: string; preview: CaptureSequenceSplitPreview; impact: ChronologyImpact }
+  | { kind: "merge"; label: string; preview: CaptureSequenceMergePreview; impact: ChronologyImpact }
+  | { kind: "removeEpoch"; label: string; preview: ClockEpochClearPreview; impact: ChronologyImpact };
 
 const emptyDiagnostics: DiagnosticsView = {
   diagnostics: [],
   counts: { errors: 0, warnings: 0, infos: 0 },
 };
 
+function hard(contradictions: Contradiction[]) {
+  return contradictions.some((found) => found.strength === "hard");
+}
+
 function formatOffset(seconds: number): string {
   const sign = seconds < 0 ? "−" : "+";
   const total = Math.abs(seconds);
   const hours = Math.floor(total / 3600);
   const minutes = Math.floor((total % 3600) / 60);
-  const rest = total % 60;
-  if (hours > 0) return `${sign}${hours}h ${minutes}m`;
-  if (minutes > 0) return `${sign}${minutes}m ${rest}s`;
-  return `${sign}${rest}s`;
-}
-
-function formatRange(epoch: ClockEpoch): string {
-  return epoch.endCounter === null
-    ? `${epoch.startCounter} and up`
-    : `${epoch.startCounter}–${epoch.endCounter}`;
+  if (hours) return `${sign}${hours}h ${minutes}m`;
+  return `${sign}${minutes}m`;
 }
 
 export function CalibrationPanel({
   projectId,
   currentAssetId,
+  assets,
+  overview: sessionOverview,
+  overviewError = "",
+  reviewZoom,
+  reviewScrollLeft,
+  focusAssetId = null,
+  onBackToReview,
   onQueueResumed,
   onChronologyChanged,
 }: Props) {
-  const [overview, setOverview] = useState<ChronologyOverview | null>(null);
+  const sessionOwnsOverview = sessionOverview !== undefined;
+  const [localOverview, setLocalOverview] = useState<ChronologyOverview | null>(sessionOverview ?? null);
+  const overview = sessionOwnsOverview ? sessionOverview : localOverview;
   const [diagnostics, setDiagnostics] = useState<DiagnosticsView>(emptyDiagnostics);
+  const [focusedId, setFocusedId] = useState(focusAssetId || currentAssetId || "");
+  const [selectedIds, setSelectedIds] = useState<string[]>(focusedId ? [focusedId] : []);
   const [explanation, setExplanation] = useState<ChronologyExplanation | null>(null);
+  const [pending, setPending] = useState<PendingChange | null>(null);
+  const [phaseDraft, setPhaseDraft] = useState<PhaseBoundaryDraft | null>(null);
+  const [phaseBusy, setPhaseBusy] = useState(false);
+  const [phaseError, setPhaseError] = useState("");
   const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
+  const [activeTool, setActiveTool] = useState<"why" | "clock" | "sequence">("why");
+  const [clockDraft, setClockDraft] = useState({ sequenceId: "", start: "0", end: "", minutes: "0", label: "" });
+  const [sequenceTarget, setSequenceTarget] = useState("");
+  const [sequenceScope, setSequenceScope] = useState<"single" | "following">("following");
+  const [mergeTarget, setMergeTarget] = useState("");
+  const [activeProblemIndex, setActiveProblemIndex] = useState(0);
+  const activeProblemIdRef = useRef<string | null>(null);
+  const refreshRequestRef = useRef(0);
+  const explanationRequestRef = useRef(0);
+  const applyingRef = useRef(false);
+  const previewRequestRef = useRef(0);
+  const impactDockRef = useRef<HTMLElement>(null);
+  const previewOriginRef = useRef<HTMLElement | null>(null);
 
-  // A pending epoch and the contradictions it would create. The user confirms
-  // against this, never against a bare form.
-  const [pending, setPending] = useState<{ epoch: ClockEpoch; impact: Contradiction[] } | null>(
-    null,
-  );
-  const [draft, setDraft] = useState({
-    sequenceId: "",
-    startCounter: "0",
-    endCounter: "",
-    offsetMinutes: "0",
-    label: "",
-  });
+  const assetsById = useMemo(() => new Map(assets.map((asset) => [asset.id, asset])), [assets]);
+  const focusedChronology = overview?.assets.find((asset) => asset.assetId === focusedId) ?? null;
+  const actionableProblems = useMemo(() => [
+    ...(overview?.contradictions ?? []).map((item, index) => ({
+      id: `contradiction-${index}`,
+      severity: item.strength === "hard" ? "error" : "warning",
+      message: item.message,
+      assetIds: item.assetIds,
+      kind: "chronology",
+    })),
+    ...(overview?.unplacedAssets ? [{
+      id: "unplaced",
+      severity: "warning",
+      message: `${overview.unplacedAssets} clips have no usable time`,
+      assetIds: overview.assets.filter((asset) => !asset.tripTime).map((asset) => asset.assetId),
+      kind: "chronology",
+    }] : []),
+    ...(overview?.proposedSplits ?? []).map((proposal) => ({
+      id: `split-${proposal.captureSequenceId}-${proposal.atCounter}`,
+      severity: "info",
+      message: proposal.reason,
+      assetIds: proposal.affectedAssetIds,
+      kind: "sequence",
+    })),
+  ], [overview]);
+  const focusedProblemIndex = actionableProblems.length
+    ? Math.min(activeProblemIndex, actionableProblems.length - 1)
+    : -1;
+
+  useEffect(() => {
+    const activeProblemId = activeProblemIdRef.current;
+    if (!activeProblemId) return;
+    const nextIndex = actionableProblems.findIndex((problem) => problem.id === activeProblemId);
+    if (nextIndex >= 0) {
+      setActiveProblemIndex(nextIndex);
+      return;
+    }
+    activeProblemIdRef.current = null;
+    setActiveProblemIndex(-1);
+  }, [actionableProblems]);
+
+  function visitProblem(delta: number) {
+    if (!actionableProblems.length) return;
+    const base = focusedProblemIndex >= 0 ? focusedProblemIndex : (delta > 0 ? -1 : 0);
+    const nextIndex = (base + delta + actionableProblems.length) % actionableProblems.length;
+    const next = actionableProblems[nextIndex];
+    setActiveProblemIndex(nextIndex);
+    activeProblemIdRef.current = next?.id ?? null;
+    const assetId = next?.assetIds[0];
+    if (assetId) {
+      setFocusedId(assetId);
+      setSelectedIds([assetId]);
+    }
+  }
 
   const refresh = useCallback(async () => {
-    setError(null);
+    const request = ++refreshRequestRef.current;
+    setError("");
     try {
       const [next, found] = await Promise.all([
-        chronologyApi.overview(projectId),
+        sessionOwnsOverview ? Promise.resolve(null) : chronologyApi.overview(projectId),
         chronologyApi.diagnostics(projectId),
       ]);
-      setOverview(next);
+      if (request !== refreshRequestRef.current) return;
+      if (next) setLocalOverview(next);
       setDiagnostics(found);
     } catch (cause) {
-      setError(String(cause));
+      if (request === refreshRequestRef.current) setError(String(cause));
     }
-  }, [projectId]);
-
-  const refreshAfterMutation = useCallback(async () => {
-    await refresh();
-    await onChronologyChanged?.();
-  }, [onChronologyChanged, refresh]);
+  }, [projectId, sessionOwnsOverview]);
 
   useEffect(() => {
+    setPending(null);
+    setPhaseDraft(null);
+    setActiveProblemIndex(0);
+    activeProblemIdRef.current = null;
+    setFocusedId(focusAssetId || currentAssetId || "");
+    setSelectedIds(focusAssetId || currentAssetId ? [focusAssetId || currentAssetId || ""] : []);
     void refresh();
-    // Detecting offline volumes on open is what makes an unmounted card a
-    // visible condition instead of a mystery about missing thumbnails.
-    void chronologyApi.detectOfflineVolumes(projectId).then((found) => {
-      if (found.length > 0) void refresh();
-    });
-  }, [projectId, refresh]);
+    return () => {
+      refreshRequestRef.current += 1;
+      explanationRequestRef.current += 1;
+      previewRequestRef.current += 1;
+    };
+  }, [currentAssetId, focusAssetId, projectId, refresh]);
 
   useEffect(() => {
-    if (!currentAssetId) {
+    const request = ++explanationRequestRef.current;
+    if (!focusedId) {
       setExplanation(null);
       return;
     }
-    void chronologyApi.explain(currentAssetId).then(setExplanation).catch(() => setExplanation(null));
-  }, [currentAssetId, overview]);
+    void chronologyApi.explain(focusedId).then((next) => {
+      if (request === explanationRequestRef.current) setExplanation(next);
+    }).catch(() => {
+      if (request === explanationRequestRef.current) setExplanation(null);
+    });
+  }, [focusedId, overview]);
 
-  const buildEpoch = useCallback((): ClockEpoch => {
-    const end = draft.endCounter.trim();
-    return {
-      id: "",
-      captureSequenceId: draft.sequenceId,
-      startCounter: Number(draft.startCounter) || 0,
-      endCounter: end === "" ? null : Number(end),
-      offsetSeconds: Math.round((Number(draft.offsetMinutes) || 0) * 60),
-      confidence: 1,
-      evidence: ["user_set"],
-      label: draft.label,
-    };
-  }, [draft]);
-
-  const previewChange = useCallback(async () => {
-    setError(null);
-    setBusy(true);
-    try {
-      const epoch = buildEpoch();
-      const impact = await chronologyApi.previewClockEpoch(projectId, epoch);
-      setPending({ epoch, impact });
-    } catch (cause) {
-      setError(String(cause));
-    } finally {
-      setBusy(false);
-    }
-  }, [buildEpoch, projectId]);
-
-  /**
-   * Applies the previewed change.
-   *
-   * The queue position is captured *before* the write and restored after, so a
-   * correction that reorders hundreds of clips does not lose the user's place.
-   */
-  const applyChange = useCallback(async () => {
+  useEffect(() => {
     if (!pending) return;
-    setError(null);
+    window.requestAnimationFrame(() => {
+      impactDockRef.current?.querySelector<HTMLButtonElement>(".chronology-impact-actions .primary")?.focus();
+    });
+    function cancelPreview(event: KeyboardEvent) {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      event.stopPropagation();
+      cancelPending();
+    }
+    document.addEventListener("keydown", cancelPreview);
+    return () => document.removeEventListener("keydown", cancelPreview);
+  }, [pending]);
+
+  function rememberPreviewOrigin() {
+    previewOriginRef.current = document.activeElement instanceof HTMLElement
+      ? document.activeElement
+      : null;
+  }
+
+  function cancelPending() {
+    previewRequestRef.current += 1;
+    setPending(null);
+    window.requestAnimationFrame(() => previewOriginRef.current?.focus());
+  }
+
+  async function refreshAfterMutation() {
+    await onChronologyChanged?.();
+    await refresh();
+  }
+
+  async function applyPending() {
+    if (!pending || applyingRef.current || pending.impact.blocked) return;
+    applyingRef.current = true;
     setBusy(true);
+    setError("");
     try {
       const position = currentAssetId
         ? await chronologyApi.captureQueuePosition(projectId, currentAssetId)
         : null;
-      await chronologyApi.setClockEpoch(projectId, pending.epoch);
+      if (pending.kind === "epoch") {
+        await chronologyApi.setClockEpoch(projectId, pending.preview);
+      } else if (pending.kind === "reassign") {
+        await chronologyApi.reassignCaptureSequenceAssets(projectId, pending.preview);
+      } else if (pending.kind === "split") {
+        await chronologyApi.applyCaptureSequenceSplit(projectId, pending.preview);
+      } else if (pending.kind === "merge") {
+        await chronologyApi.applyCaptureSequenceMerge(projectId, pending.preview);
+      } else {
+        await chronologyApi.clearClockEpoch(projectId, pending.preview);
+      }
+      const changed = pending.impact.changes.length;
       setPending(null);
       await refreshAfterMutation();
       if (position) {
         const resumed = await chronologyApi.restoreQueuePosition(projectId, position);
-        if (resumed && onQueueResumed) onQueueResumed(resumed);
+        if (resumed) onQueueResumed?.(resumed);
       }
+      setNotice(`${pending.label} · ${changed} ${changed === 1 ? "clip" : "clips"} affected`);
+    } catch (cause) {
+      setError(String(cause));
+    } finally {
+      applyingRef.current = false;
+      setBusy(false);
+    }
+  }
+
+  async function previewClock() {
+    if (!clockDraft.sequenceId) return;
+    rememberPreviewOrigin();
+    setBusy(true);
+    setError("");
+    const request = ++previewRequestRef.current;
+    const epoch: ClockEpoch = {
+      id: "",
+      captureSequenceId: clockDraft.sequenceId,
+      startCounter: Number(clockDraft.start) || 0,
+      endCounter: clockDraft.end.trim() ? Number(clockDraft.end) : null,
+      offsetSeconds: Math.round((Number(clockDraft.minutes) || 0) * 60),
+      confidence: 1,
+      evidence: ["user_set"],
+      label: clockDraft.label.trim() || "Camera clock correction",
+    };
+    try {
+      const preview = await chronologyApi.previewClockEpochImpact(projectId, epoch);
+      if (request === previewRequestRef.current) {
+        setPending({ kind: "epoch", label: preview.epoch.label, preview, impact: preview.impact });
+      }
+    } catch (cause) {
+      if (request === previewRequestRef.current) setError(String(cause));
+    } finally {
+      if (request === previewRequestRef.current) setBusy(false);
+    }
+  }
+
+  async function previewVisualPlacement(targetAssetId: string, side: "before" | "after") {
+    if (!selectedIds.length) return;
+    rememberPreviewOrigin();
+    setBusy(true);
+    setError("");
+    const request = ++previewRequestRef.current;
+    try {
+      const preview: VisualPlacementPreview = await chronologyApi.previewVisualPlacement(
+        projectId,
+        selectedIds,
+        targetAssetId,
+        side,
+        "Placed visually in Chronology",
+      );
+      if (request === previewRequestRef.current) {
+        setPending({ kind: "epoch", label: "Move selected run", preview, impact: preview.impact });
+      }
+    } catch (cause) {
+      if (request === previewRequestRef.current) {
+        setError(`${String(cause)}. Try pinning one clip or choosing a run from one card.`);
+      }
+    } finally {
+      if (request === previewRequestRef.current) setBusy(false);
+    }
+  }
+
+  async function previewReassignment() {
+    if (!focusedId || !sequenceTarget) return;
+    rememberPreviewOrigin();
+    setBusy(true);
+    setError("");
+    const request = ++previewRequestRef.current;
+    try {
+      const preview = sequenceScope === "single"
+        ? await chronologyApi.previewCaptureSequenceAssets(
+            projectId,
+            currentSequence,
+            sequenceTarget,
+            [focusedId],
+          )
+        : await chronologyApi.previewCaptureSequenceReassignment(
+            projectId,
+            focusedId,
+            sequenceTarget,
+          );
+      if (request === previewRequestRef.current) {
+        setPending({
+          kind: "reassign",
+          label: sequenceScope === "single" ? "Move this clip to another card" : "Move clip run to another card",
+          preview,
+          impact: preview.impact,
+        });
+      }
+    } catch (cause) {
+      if (request === previewRequestRef.current) setError(String(cause));
+    } finally {
+      if (request === previewRequestRef.current) setBusy(false);
+    }
+  }
+
+  async function previewSplit(proposal: ChronologyOverview["proposedSplits"][number]) {
+    rememberPreviewOrigin();
+    setBusy(true);
+    setError("");
+    const request = ++previewRequestRef.current;
+    try {
+      const source = overview?.sequences.find((sequence) => sequence.id === proposal.captureSequenceId);
+      const label = `${source?.label || source?.cameraKey || "Card"} · new card`;
+      const preview = await chronologyApi.previewCaptureSequenceSplit(
+        projectId,
+        proposal.captureSequenceId,
+        proposal.atCounter,
+        label,
+        proposal.affectedAssetIds,
+      );
+      if (request === previewRequestRef.current) {
+        setPending({ kind: "split", label: `Create ${preview.createdSequence.label}`, preview, impact: preview.impact });
+      }
+    } catch (cause) {
+      if (request === previewRequestRef.current) setError(String(cause));
+    } finally {
+      if (request === previewRequestRef.current) setBusy(false);
+    }
+  }
+
+  async function previewMerge() {
+    if (!currentSequence || !mergeTarget) return;
+    rememberPreviewOrigin();
+    setBusy(true);
+    setError("");
+    const request = ++previewRequestRef.current;
+    try {
+      const preview = await chronologyApi.previewCaptureSequenceMerge(projectId, currentSequence, mergeTarget);
+      const target = overview?.sequences.find((sequence) => sequence.id === mergeTarget);
+      if (request === previewRequestRef.current) {
+        setPending({ kind: "merge", label: `Merge into ${target?.label || target?.cameraKey || "card"}`, preview, impact: preview.impact });
+      }
+    } catch (cause) {
+      if (request === previewRequestRef.current) setError(String(cause));
+    } finally {
+      if (request === previewRequestRef.current) setBusy(false);
+    }
+  }
+
+  async function previewRemoveEpoch(epoch: ClockEpoch) {
+    const label = `Remove ${epoch.label || "correction"}`;
+    rememberPreviewOrigin();
+    setBusy(true);
+    const request = ++previewRequestRef.current;
+    try {
+      const preview = await chronologyApi.previewClearClockEpochImpact(projectId, epoch.id);
+      if (request === previewRequestRef.current) {
+        setPending({ kind: "removeEpoch", label, preview, impact: preview.impact });
+      }
+    } catch (cause) {
+      if (request === previewRequestRef.current) setError(String(cause));
+    } finally {
+      if (request === previewRequestRef.current) setBusy(false);
+    }
+  }
+
+  async function savePhase(
+    value: TripPhaseFormValue,
+    range?: { startPosition: number; endPosition: number },
+  ) {
+    if (!phaseDraft || !overview) return;
+    const startIndex = range?.startPosition ?? phaseDraft.startIndex;
+    const endIndex = range?.endPosition ?? phaseDraft.endIndex;
+    const start = overview.assets[startIndex];
+    const end = overview.assets[endIndex];
+    if (!start || !end || startIndex > endIndex) return;
+    setPhaseBusy(true);
+    setPhaseError("");
+    try {
+      await chronologyApi.setTripPhase(projectId, {
+        ...phaseDraft.phase,
+        label: value.label,
+        kind: value.kind,
+        startAnchorAssetId: start.assetId,
+        endAnchorAssetId: end.assetId,
+        startTripTime: start.tripTime ?? phaseDraft.phase.startTripTime,
+        endTripTime: end.tripTime ?? phaseDraft.phase.endTripTime,
+        timezone: value.timezone,
+        originTimezone: value.originTimezone,
+        destinationTimezone: value.destinationTimezone,
+        displayMode: value.kind === "location" ? "local" : value.displayMode,
+      });
+      setPhaseDraft(null);
+      setNotice(`Adjusted ${value.label} to ${endIndex - startIndex + 1} clips`);
+      await refreshAfterMutation();
+    } catch (cause) {
+      setPhaseError(String(cause));
+    } finally {
+      setPhaseBusy(false);
+    }
+  }
+
+  async function acknowledge(diagnostic: Diagnostic) {
+    await chronologyApi.acknowledgeDiagnostic(projectId, diagnostic.id);
+    await refresh();
+  }
+
+  async function locate(diagnostic: Diagnostic) {
+    const context = diagnostic.context as { volumeHint?: string } | null;
+    const folder = await api.chooseRelinkFolder(context?.volumeHint || "these clips");
+    if (!folder) return;
+    setBusy(true);
+    try {
+      const report = await api.relinkFolder(projectId, folder);
+      setNotice(`Reconnected ${report.repaired} clips`);
+      await refreshAfterMutation();
     } catch (cause) {
       setError(String(cause));
     } finally {
       setBusy(false);
     }
-  }, [currentAssetId, onQueueResumed, pending, projectId, refreshAfterMutation]);
-
-  const clearEpoch = useCallback(
-    async (epochId: string) => {
-      setBusy(true);
-      try {
-        await chronologyApi.clearClockEpoch(projectId, epochId);
-        await refreshAfterMutation();
-      } catch (cause) {
-        setError(String(cause));
-      } finally {
-        setBusy(false);
-      }
-    },
-    [projectId, refreshAfterMutation],
-  );
-
-  const applySplit = useCallback(
-    async (sequenceId: string, atCounter: number) => {
-      setBusy(true);
-      try {
-        await chronologyApi.splitCaptureSequence(
-          projectId,
-          sequenceId,
-          atCounter,
-          `Card from ${atCounter}`,
-        );
-        await refreshAfterMutation();
-      } catch (cause) {
-        setError(String(cause));
-      } finally {
-        setBusy(false);
-      }
-    },
-    [projectId, refreshAfterMutation],
-  );
-
-  const acknowledge = useCallback(
-    async (diagnostic: Diagnostic) => {
-      await chronologyApi.acknowledgeDiagnostic(projectId, diagnostic.id);
-      await refresh();
-    },
-    [projectId, refresh],
-  );
-
-  // Originals move: a card remounts elsewhere, or the user relocates footage
-  // from the laptop to an external drive to the NAS. The app cannot follow that
-  // on its own, so the repair is to ask where it went and match by content.
-  const [relinkResult, setRelinkResult] = useState<string | null>(null);
-  const locateOriginals = useCallback(
-    async (diagnostic: Diagnostic) => {
-      const volumeHint = String(
-        (diagnostic.context as { volumeHint?: string } | null)?.volumeHint ?? "these clips",
-      );
-      const folder = await api.chooseRelinkFolder(volumeHint);
-      if (!folder) return;
-      setBusy(true);
-      setRelinkResult(null);
-      setError(null);
-      try {
-        const report = await api.relinkFolder(projectId, folder);
-        setRelinkResult(
-          report.repaired > 0
-            ? `Reconnected ${report.repaired} clip(s)` +
-                (report.stillMissing > 0 ? `; ${report.stillMissing} still missing` : "")
-            : `No clips from ${volumeHint} were found there` +
-                (report.unrecognized > 0
-                  ? ` (${report.unrecognized} file(s) there belong to another project)`
-                  : ""),
-        );
-        await refreshAfterMutation();
-      } catch (cause) {
-        setError(String(cause));
-      } finally {
-        setBusy(false);
-      }
-    },
-    [projectId, refreshAfterMutation],
-  );
-
-  const hardContradictions = useMemo(
-    () => overview?.contradictions.filter((found) => found.strength === "hard") ?? [],
-    [overview],
-  );
+  }
 
   if (!overview) {
     return (
-      <section className="calibration-panel" aria-busy="true">
-        <p>{error ?? "Loading chronology…"}</p>
+      <section className="chronology-workspace-loading" aria-label="Chronology calibration" aria-busy="true">
+        <span className="chronology-loader" aria-hidden="true" />
+        <h2>{overviewError ? "Chronology could not be loaded" : "Building the chronology desk…"}</h2>
+        {overviewError && <p role="alert">{overviewError}</p>}
+        {(error || overviewError) && <button className="button" onClick={() => void onChronologyChanged?.()}>Try again</button>}
       </section>
     );
   }
 
+  const focusedAsset = assetsById.get(focusedId) ?? assets[0];
+  const focusedIndex = overview.assets.findIndex((asset) => asset.assetId === focusedId);
+  const currentSequence = focusedChronology?.orderKey.captureSequenceId ?? "";
+  const focusedPhase = overview.phases.find(
+    (phase) => phase.id === focusedChronology?.displayTime?.phaseId,
+  );
+
   return (
-    <section className="calibration-panel" aria-label="Chronology calibration">
-      {error && (
-        <p className="calibration-error" role="alert">
-          {error}
-        </p>
-      )}
+    <section className="chronology-workspace" aria-label="Chronology calibration">
+      <header className="chronology-toolbar">
+        <button type="button" className="chronology-back" onClick={onBackToReview}>
+          <span aria-hidden="true">←</span>
+          Back to {currentAssetId ? assetsById.get(currentAssetId)?.filename ?? "review clip" : "Review"}
+        </button>
+        <div className="chronology-title">
+          <span>Chronology desk</span>
+          <strong>{actionableProblems.length ? `${actionableProblems.length} ${actionableProblems.length === 1 ? "problem" : "problems"}` : "Order looks trustworthy"}</strong>
+        </div>
+        <div className="chronology-trust-summary" aria-label="Chronology summary">
+          {actionableProblems.length > 0 && (
+            <div className="chronology-problem-nav" aria-label="Problem navigation">
+              <button type="button" disabled={Boolean(pending)} aria-label="Previous chronology problem" onClick={() => visitProblem(-1)}>←</button>
+              <span>{focusedProblemIndex >= 0 ? focusedProblemIndex + 1 : 1}/{actionableProblems.length}</span>
+              <button type="button" disabled={Boolean(pending)} aria-label="Next chronology problem" onClick={() => visitProblem(1)}>→</button>
+            </div>
+          )}
+          <span>{overview.assets.length} clips</span>
+          <span>{overview.sequences.length} cards</span>
+          <span>{overview.phases.length} phases</span>
+          {overview.unplacedAssets > 0 && <strong>{overview.unplacedAssets} unplaced</strong>}
+        </div>
+      </header>
 
-      {/* Hard contradictions block apply and name the conflicting evidence. */}
-      {hardContradictions.length > 0 && (
-        <div className="calibration-contradictions" role="alert">
-          <h3>{hardContradictions.length} contradiction(s) block changes</h3>
-          <ul>
-            {hardContradictions.map((found) => (
-              <li key={`${found.kind}:${found.assetIds.join(",")}`}>
-                {found.message}
-                <span className="calibration-evidence">
-                  {found.evidence.map((item) => item.detail).join("; ")}
-                </span>
-              </li>
-            ))}
-          </ul>
+      {(error || notice) && (
+        <div className={`chronology-toast ${error ? "is-error" : ""}`} role={error ? "alert" : "status"}>
+          <span>{error || notice}</span>
+          <button type="button" aria-label="Dismiss message" onClick={() => { setError(""); setNotice(""); }}>×</button>
         </div>
       )}
 
-      {/* One surface for every condition the user must know about. */}
-      {diagnostics.diagnostics.length > 0 && (
-        <div className="calibration-diagnostics">
-          <h3>
-            Needs attention — {diagnostics.counts.errors} error(s),{" "}
-            {diagnostics.counts.warnings} warning(s), {diagnostics.counts.infos} note(s)
-          </h3>
-          <ul>
-            {diagnostics.diagnostics.map((found) => (
-              <li key={found.id} data-severity={found.severity} data-kind={found.kind}>
-                <span>{found.message}</span>
-                {found.occurrenceCount > 1 && <em> ({found.occurrenceCount} times)</em>}
-                {/* Offline media has a repair, not just an acknowledgement. */}
-                {found.kind === "media.volume_offline" && (
-                  <button
-                    type="button"
-                    disabled={busy}
-                    onClick={() => void locateOriginals(found)}
-                  >
-                    Locate…
-                  </button>
-                )}
-                <button type="button" onClick={() => void acknowledge(found)}>
-                  Acknowledge
-                </button>
-              </li>
-            ))}
-          </ul>
-          {relinkResult && <p className="calibration-relink-result">{relinkResult}</p>}
+      <aside className="chronology-problem-rail" aria-label="Chronology problems">
+        <div className="chronology-rail-heading">
+          <span className="eyebrow">Worklist</span>
+          <h2>{actionableProblems.length ? "Needs a look" : "All in order"}</h2>
         </div>
-      )}
-
-      <div className="calibration-summary">
-        <span>{overview.assets.length} clips</span>
-        <span>{overview.sequences.length} capture sequences</span>
-        <span>{overview.epochs.length} clock corrections</span>
-        <span>{overview.phases.length} trip phases</span>
-        {overview.unplacedAssets > 0 && (
-          <span className="calibration-unplaced">
-            {overview.unplacedAssets} clip(s) have no time
-          </span>
-        )}
-      </div>
-
-      <h3>Capture sequences</h3>
-      <ul className="calibration-sequences">
-        {overview.sequences.map((sequence) => (
-          <li key={sequence.id}>
-            <strong>{sequence.label || sequence.cameraKey}</strong>
-            {sequence.volumeHint && <span> — {sequence.volumeHint}</span>}
-          </li>
-        ))}
-      </ul>
-
-      {/* Proposals, never applied automatically. */}
-      {overview.proposedSplits.length > 0 && (
-        <div className="calibration-proposals">
-          <h3>Suggested card splits</h3>
-          <ul>
-            {overview.proposedSplits.map((proposal) => (
-              <li key={`${proposal.captureSequenceId}:${proposal.atCounter}`}>
-                <span>{proposal.reason}</span>
-                <em> — {proposal.affectedAssetIds.length} clips would move</em>
+        {actionableProblems.length === 0 ? (
+          <div className="chronology-clean-state">
+            <span aria-hidden="true">✓</span>
+            <strong>No known ordering conflicts</strong>
+            <p>You can still inspect any clip or make an explicit correction.</p>
+          </div>
+        ) : (
+          <ol className="chronology-problem-list">
+            {actionableProblems.map((problem, index) => (
+              <li key={problem.id} data-severity={problem.severity}>
                 <button
                   type="button"
-                  disabled={busy}
-                  onClick={() =>
-                    void applySplit(proposal.captureSequenceId, proposal.atCounter)
-                  }
+                  disabled={Boolean(pending)}
+                  aria-label={`Problem ${index + 1}: ${problem.message}, ${problem.assetIds.length ? `${problem.assetIds.length} clips` : "project"}`}
+                  title={problem.message}
+                  onClick={() => {
+                    setActiveProblemIndex(index);
+                    activeProblemIdRef.current = problem.id;
+                    const assetId = problem.assetIds[0];
+                    if (assetId) {
+                      setFocusedId(assetId);
+                      setSelectedIds([assetId]);
+                    }
+                  }}
                 >
-                  Split here
+                  <span>{String(index + 1).padStart(2, "0")}</span>
+                  <strong>{problem.message}</strong>
+                  <em>{problem.assetIds.length ? `${problem.assetIds.length} clips` : "Project"}</em>
                 </button>
               </li>
             ))}
-          </ul>
-        </div>
-      )}
+          </ol>
+        )}
+        {diagnostics.diagnostics.length > 0 && (
+          <details className="chronology-media-problems">
+            <summary>Media and catalog notes · {diagnostics.diagnostics.length}</summary>
+            {diagnostics.diagnostics.map((diagnostic) => (
+              <div key={diagnostic.id}>
+                <p>{diagnostic.message}</p>
+                {diagnostic.kind === "media.volume_offline" && <button onClick={() => void locate(diagnostic)}>Locate originals…</button>}
+                <button onClick={() => void acknowledge(diagnostic)}>Acknowledge</button>
+              </div>
+            ))}
+          </details>
+        )}
+      </aside>
 
-      <h3>Clock corrections</h3>
-      <ul className="calibration-epochs">
-        {overview.epochs.map((epoch) => (
-          <li key={epoch.id}>
-            <span>
-              {epoch.label || "Correction"} — {formatOffset(epoch.offsetSeconds)} over clips{" "}
-              {formatRange(epoch)}
-            </span>
-            <button type="button" disabled={busy} onClick={() => void clearEpoch(epoch.id)}>
-              Remove
+      <main className="chronology-canvas-panel">
+        <div className="chronology-canvas-heading">
+          <div>
+            <span className="eyebrow">Solver order · one lane per card</span>
+            <h2>{selectedIds.length > 1 ? `${selectedIds.length} clips selected` : focusedAsset?.filename ?? "Select a clip"}</h2>
+          </div>
+          <p>Shift-click clips on one card, then choose a cyan gap to place the run.</p>
+        </div>
+        <ChronologyCanvas
+          overview={overview}
+          assetsById={assetsById}
+          focusedAssetId={focusedId}
+          selectedIds={selectedIds}
+          impact={pending?.impact ?? null}
+          columnWidth={reviewZoom}
+          initialScrollLeft={reviewScrollLeft}
+          disabled={busy || Boolean(pending)}
+          onFocusAsset={setFocusedId}
+          onSelectRange={setSelectedIds}
+          onPlaceSelection={(target, side) => void previewVisualPlacement(target, side)}
+          onAdjustPhase={setPhaseDraft}
+        />
+      </main>
+
+      <aside className="chronology-inspector" aria-label="Chronology inspector">
+        <div className="chronology-inspector-tabs" aria-label="Correction tools">
+          {(["why", "clock", "sequence"] as const).map((tool) => (
+            <button key={tool} disabled={Boolean(pending)} aria-pressed={activeTool === tool} onClick={() => setActiveTool(tool)}>
+              {tool === "why" ? "Why here" : tool === "clock" ? "Clock" : "Card"}
             </button>
-          </li>
-        ))}
-        {overview.epochs.length === 0 && <li>No clock corrections yet.</li>}
-      </ul>
-
-      <form
-        className="calibration-editor"
-        onSubmit={(event) => {
-          event.preventDefault();
-          void previewChange();
-        }}
-      >
-        <h3>Correct a camera clock</h3>
-        <label>
-          Capture sequence
-          <select
-            value={draft.sequenceId}
-            onChange={(event) => setDraft({ ...draft, sequenceId: event.target.value })}
-            required
-          >
-            <option value="">Choose…</option>
-            {overview.sequences.map((sequence) => (
-              <option key={sequence.id} value={sequence.id}>
-                {sequence.label || sequence.cameraKey}
-              </option>
-            ))}
-          </select>
-        </label>
-        <label>
-          From clip number
-          <input
-            type="number"
-            min={0}
-            value={draft.startCounter}
-            onChange={(event) => setDraft({ ...draft, startCounter: event.target.value })}
-          />
-        </label>
-        <label>
-          To clip number (blank for all later clips)
-          <input
-            type="number"
-            min={0}
-            value={draft.endCounter}
-            onChange={(event) => setDraft({ ...draft, endCounter: event.target.value })}
-          />
-        </label>
-        <label>
-          Shift by (minutes)
-          <input
-            type="number"
-            value={draft.offsetMinutes}
-            onChange={(event) => setDraft({ ...draft, offsetMinutes: event.target.value })}
-          />
-        </label>
-        <label>
-          Why
-          <input
-            type="text"
-            value={draft.label}
-            onChange={(event) => setDraft({ ...draft, label: event.target.value })}
-            placeholder="Camera clock never left home time"
-          />
-        </label>
-        <button type="submit" disabled={busy || !draft.sequenceId}>
-          Preview impact
-        </button>
-      </form>
-
-      {/* The confirmation step. The user sees the consequence, then decides. */}
-      {pending && (
-        <div className="calibration-confirm" role="dialog" aria-label="Confirm chronology change">
-          <h3>Apply this correction?</h3>
-          <p>
-            {formatOffset(pending.epoch.offsetSeconds)} over clips {formatRange(pending.epoch)}.
-          </p>
-          {pending.impact.length > 0 ? (
-            <div className="calibration-impact" role="alert">
-              <p>This would create {pending.impact.length} contradiction(s):</p>
-              <ul>
-                {pending.impact.map((found) => (
-                  <li key={`${found.kind}:${found.assetIds.join(",")}`}>{found.message}</li>
-                ))}
-              </ul>
-            </div>
-          ) : (
-            <p className="calibration-impact">No contradictions.</p>
-          )}
-          <button
-            type="button"
-            disabled={busy || pending.impact.some((found) => found.strength === "hard")}
-            onClick={() => void applyChange()}
-          >
-            Apply
-          </button>
-          <button type="button" disabled={busy} onClick={() => setPending(null)}>
-            Cancel
-          </button>
+          ))}
         </div>
+
+        {activeTool === "why" && (
+          <div className="chronology-inspector-body">
+            <span className="eyebrow">Clip {focusedIndex >= 0 ? focusedIndex + 1 : "—"}</span>
+            <h2>{focusedAsset?.filename ?? "Choose a clip"}</h2>
+            {focusedChronology && (
+              <>
+                <dl className="chronology-time-pair">
+                  <div><dt>Camera said</dt><dd>{formatChronologyTime(focusedChronology.rawTime)}</dd></div>
+                  <div><dt>Placed at</dt><dd>{formatChronologyTime(focusedChronology.displayTime?.primary ?? focusedChronology.tripTime, focusedChronology.displayTime?.timezone)}</dd></div>
+                  {focusedChronology.displayTime?.secondary && (
+                    <div><dt>Destination</dt><dd>{formatChronologyTime(focusedChronology.displayTime.secondary, focusedPhase?.destinationTimezone)}</dd></div>
+                  )}
+                </dl>
+                <div className="chronology-confidence">
+                  <span><i style={{ width: `${Math.round(focusedChronology.confidence * 100)}%` }} /></span>
+                  <strong>{Math.round(focusedChronology.confidence * 100)}% confidence</strong>
+                  <em>{focusedChronology.uncertaintySeconds === 0 ? "Exact" : `± ${focusedChronology.uncertaintySeconds}s`}</em>
+                </div>
+              </>
+            )}
+            {explanation && (
+              <div className="chronology-evidence-list">
+                <h3>Evidence and corrections</h3>
+                {explanation.appliedCorrections.length === 0 ? <p>No explicit corrections.</p> : (
+                  <ol>{explanation.appliedCorrections.map((correction, index) => (
+                    <li key={`${correction.type}-${index}`}>
+                      <span>{index + 1}</span>
+                      <p>
+                        {correction.type === "captureSequence" && `Grouped with ${correction.label}`}
+                        {correction.type === "clockEpoch" && `Clock shifted ${formatOffset(correction.offsetSeconds)}${correction.label ? ` · ${correction.label}` : ""}`}
+                        {correction.type === "clipException" && `Pinned at ${formatChronologyTime(correction.tripTime)} · ${correction.reason}`}
+                        {correction.type === "tripPhase" && `Displayed in ${correction.timezone} · ${correction.label}`}
+                        {correction.type === "eventOrder" && `${correction.strength === "hard" ? "Must" : "Should"} stay relative to another clip`}
+                      </p>
+                    </li>
+                  ))}</ol>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+
+        {activeTool === "clock" && (
+          <form className="chronology-tool-form" onSubmit={(event) => { event.preventDefault(); void previewClock(); }}>
+            <h2>Correct a camera clock</h2>
+            <p>Use this when a camera stayed on home time or changed mid-card.</p>
+            <label>Card / capture sequence<select required value={clockDraft.sequenceId} onChange={(event) => setClockDraft({ ...clockDraft, sequenceId: event.target.value })}><option value="">Choose a card…</option>{overview.sequences.map((sequence) => <option key={sequence.id} value={sequence.id}>{sequence.label || sequence.cameraKey}</option>)}</select></label>
+            <div className="chronology-form-pair">
+              <label>From clip number<input type="number" min={0} value={clockDraft.start} onChange={(event) => setClockDraft({ ...clockDraft, start: event.target.value })} /></label>
+              <label>Through (optional)<input type="number" min={0} value={clockDraft.end} onChange={(event) => setClockDraft({ ...clockDraft, end: event.target.value })} /></label>
+            </div>
+            <label>Shift by minutes<input type="number" value={clockDraft.minutes} onChange={(event) => setClockDraft({ ...clockDraft, minutes: event.target.value })} /></label>
+            <label>Reason<input value={clockDraft.label} onChange={(event) => setClockDraft({ ...clockDraft, label: event.target.value })} placeholder="Camera never left home time" /></label>
+            <button className="button primary" disabled={busy || Boolean(pending) || !clockDraft.sequenceId}>Preview correction</button>
+            {overview.epochs.length > 0 && <div className="chronology-existing-facts"><h3>Existing corrections</h3>{overview.epochs.map((epoch) => <button type="button" disabled={Boolean(pending)} key={epoch.id} onClick={() => void previewRemoveEpoch(epoch)}><span>{epoch.label || "Clock correction"}</span><em>{formatOffset(epoch.offsetSeconds)} · remove…</em></button>)}</div>}
+          </form>
+        )}
+
+        {activeTool === "sequence" && (
+          <div className="chronology-tool-form">
+            <h2>Fix card grouping</h2>
+            <p>Move one clip or the following filename run to the card it belongs to.</p>
+            <fieldset className="chronology-scope-picker">
+              <legend>Move scope</legend>
+              <label><input type="radio" name="sequence-scope" checked={sequenceScope === "single"} onChange={() => setSequenceScope("single")} /> This clip only</label>
+              <label><input type="radio" name="sequence-scope" checked={sequenceScope === "following"} onChange={() => setSequenceScope("following")} /> This clip and following</label>
+            </fieldset>
+            <label>Destination card<select value={sequenceTarget} onChange={(event) => setSequenceTarget(event.target.value)}><option value="">Choose a card…</option>{overview.sequences.filter((sequence) => sequence.id !== currentSequence).map((sequence) => <option key={sequence.id} value={sequence.id}>{sequence.label || sequence.cameraKey}</option>)}</select></label>
+            <button type="button" className="button primary" disabled={busy || Boolean(pending) || !focusedId || !sequenceTarget} onClick={() => void previewReassignment()}>Preview card move</button>
+            <label>Merge this whole card into<select value={mergeTarget} onChange={(event) => setMergeTarget(event.target.value)}><option value="">Choose a card…</option>{overview.sequences.filter((sequence) => sequence.id !== currentSequence).map((sequence) => <option key={sequence.id} value={sequence.id}>{sequence.label || sequence.cameraKey}</option>)}</select></label>
+            <button type="button" className="button" disabled={busy || Boolean(pending) || !currentSequence || !mergeTarget} onClick={() => void previewMerge()}>Preview whole-card merge</button>
+            {overview.proposedSplits.length > 0 && <div className="chronology-existing-facts"><h3>Suggested card boundaries</h3>{overview.proposedSplits.map((proposal) => <button type="button" disabled={Boolean(pending)} key={`${proposal.captureSequenceId}-${proposal.atCounter}`} onClick={() => void previewSplit(proposal)}><span>Counter restarts at {proposal.atCounter}</span><em>{proposal.affectedAssetIds.length} clips · preview split</em></button>)}</div>}
+          </div>
+        )}
+      </aside>
+
+      {pending && (
+        <section ref={impactDockRef} className="chronology-impact-dock" aria-label="Chronology impact preview" role="dialog" aria-modal="false">
+          <div className="chronology-impact-summary">
+            <span className="eyebrow">Nothing has changed yet</span>
+            <h2>{pending.label}</h2>
+            <p><strong>{pending.impact.changes.length}</strong> {pending.impact.changes.length === 1 ? "clip moves" : "clips move"}</p>
+          </div>
+          <div className="chronology-impact-rows">
+            {pending.impact.changes.length === 0 ? <p>No clip placement changes.</p> : pending.impact.changes.slice(0, 6).map((change) => (
+              <button type="button" key={change.assetId} onClick={() => setFocusedId(change.assetId)}>
+                <strong>{assetsById.get(change.assetId)?.filename ?? change.assetId}</strong>
+                <span>#{change.beforePosition + 1} → #{change.afterPosition + 1}</span>
+                <em>{formatChronologyTime(change.before)} → {formatChronologyTime(change.after)}</em>
+              </button>
+            ))}
+            {pending.impact.changes.length > 6 && <p>+ {pending.impact.changes.length - 6} more affected clips</p>}
+          </div>
+          <div className="chronology-impact-verdict">
+            {pending.impact.contradictions.length > 0 ? pending.impact.contradictions.map((item, index) => <p key={index} data-strength={item.strength}>{item.message}</p>) : <p className="is-clean">No contradictions introduced.</p>}
+          </div>
+          <div className="chronology-impact-actions">
+            <button type="button" className="button" disabled={busy} onClick={cancelPending}>Cancel</button>
+            <button type="button" className="button primary" disabled={busy || pending.impact.blocked || hard(pending.impact.contradictions)} onClick={() => void applyPending()}>{busy ? "Applying…" : "Apply change"}</button>
+          </div>
+        </section>
       )}
 
-      {/* Why is this clip here? Named by identity, so the user can act on it. */}
-      {explanation && (
-        <div className="calibration-explanation">
-          <h3>Why this clip is here</h3>
-          <p>
-            Camera said {explanation.rawTime ?? "nothing"}; placed at{" "}
-            {explanation.tripTime ?? "no time"}
-            {explanation.displayTime &&
-              ` (${explanation.displayTime.primary} ${explanation.displayTime.timezone})`}
-            .
-          </p>
-          <p>Confidence {Math.round(explanation.confidence * 100)}%.</p>
-          <ul>
-            {explanation.appliedCorrections.map((correction, index) => (
-              <li key={`${correction.type}:${index}`}>
-                {correction.type === "captureSequence" && `Grouped with ${correction.label}`}
-                {correction.type === "clockEpoch" &&
-                  `Clock shifted ${formatOffset(correction.offsetSeconds)}${
-                    correction.label ? ` — ${correction.label}` : ""
-                  }`}
-                {correction.type === "clipException" &&
-                  `Placed by hand at ${correction.tripTime}${
-                    correction.reason ? ` — ${correction.reason}` : ""
-                  }`}
-                {correction.type === "tripPhase" &&
-                  `Shown in ${correction.timezone} from ${correction.label}`}
-                {correction.type === "eventOrder" &&
-                  `${correction.strength === "hard" ? "Must" : "Should"} keep its place relative to another clip`}
-              </li>
-            ))}
-          </ul>
-        </div>
+      {phaseDraft && overview.assets[phaseDraft.startIndex] && overview.assets[phaseDraft.endIndex] && assetsById.get(overview.assets[phaseDraft.startIndex].assetId) && assetsById.get(overview.assets[phaseDraft.endIndex].assetId) && (
+        <TripPhaseDialog
+          phase={phaseDraft.phase}
+          start={assetsById.get(overview.assets[phaseDraft.startIndex].assetId)!}
+          end={assetsById.get(overview.assets[phaseDraft.endIndex].assetId)!}
+          startPosition={phaseDraft.startIndex}
+          endPosition={phaseDraft.endIndex}
+          assets={overview.assets.map((item) => assetsById.get(item.assetId)).filter((item): item is Asset => Boolean(item))}
+          busy={phaseBusy}
+          error={phaseError}
+          onCancel={() => setPhaseDraft(null)}
+          onSave={(value, range) => void savePhase(value, range)}
+        />
       )}
     </section>
   );

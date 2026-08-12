@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import type { CSSProperties, RefObject } from "react";
 import type { Asset } from "../types";
@@ -10,6 +10,7 @@ import {
   ribbonLaneRows,
 } from "../review/layout";
 import { formatDate } from "../review/format";
+import { ordinalWindow } from "../chronology/geometry";
 
 /** A contiguous run of clips sharing the same trip context. */
 export interface ContextRun {
@@ -46,6 +47,8 @@ export interface StoryRibbonProps {
   contextRuns: ContextRun[];
   selected: Asset | null;
   selectedId: string;
+  /** Phase-aware solver display time for the selected clip. */
+  selectedTimeLabel?: string | null;
   zoom: number;
   /** Collapsed to a 28px strip. */
   collapsed: boolean;
@@ -60,6 +63,10 @@ export interface StoryRibbonProps {
   onToggleCollapsed(): void;
   onRequestContext(assetId: string, direction: ContextDirection, source: ContextRun | null): void;
   onEditContext(phaseId: string, start: number, end: number): void;
+  /** Normally absent. Opens the first actionable chronology problem. */
+  chronologyProblemCount?: number;
+  onOpenChronologyProblems?(): void;
+  onOpenExpanded?(): void;
   /** Corrects the camera identification for every clip in a lane. */
   onRenameCamera(from: string, to: string): void;
 }
@@ -77,6 +84,7 @@ export function StoryRibbon({
   contextRuns,
   selected,
   selectedId,
+  selectedTimeLabel,
   zoom,
   collapsed,
   merged,
@@ -88,6 +96,9 @@ export function StoryRibbon({
   onToggleCollapsed,
   onRequestContext,
   onEditContext,
+  chronologyProblemCount = 0,
+  onOpenChronologyProblems,
+  onOpenExpanded,
   onRenameCamera,
 }: StoryRibbonProps) {
   // The lane whose name is being corrected, and the draft. Only one at a time:
@@ -97,6 +108,39 @@ export function StoryRibbon({
   const [hoveredContextIndex, setHoveredContextIndex] = useState<number | null>(null);
   const [contextAnchor, setContextAnchor] = useState<ContextAnchor | null>(null);
   const contextPopoverRef = useRef<HTMLDivElement>(null);
+  const [viewport, setViewport] = useState({ scrollLeft: 0, width: 0 });
+
+  const indexByAssetId = useMemo(
+    () => new Map(assets.map((asset, index) => [asset.id, index])),
+    [assets],
+  );
+  const visible = useMemo(
+    () => ordinalWindow(
+      assets.length,
+      zoom,
+      viewport.scrollLeft,
+      viewport.width || (typeof window === "undefined" ? assets.length * zoom : window.innerWidth),
+    ),
+    [assets.length, viewport, zoom],
+  );
+  const visibleAssetIds = useMemo(
+    () => new Set(assets.slice(visible.start, visible.end).map((asset) => asset.id)),
+    [assets, visible],
+  );
+  const visibleContextRuns = useMemo(
+    () => contextRuns.filter((run) => run.end >= visible.start && run.start < visible.end),
+    [contextRuns, visible.end, visible.start],
+  );
+
+  useEffect(() => {
+    const scroll = scrollRef.current;
+    if (!scroll || typeof ResizeObserver === "undefined") return;
+    const measure = () => setViewport({ scrollLeft: scroll.scrollLeft, width: scroll.clientWidth });
+    const observer = new ResizeObserver(measure);
+    observer.observe(scroll);
+    measure();
+    return () => observer.disconnect();
+  }, [scrollRef]);
 
   // Enter and blur both commit, so a rename survives clicking away. An empty or
   // unchanged draft closes the field without a write.
@@ -166,9 +210,20 @@ export function StoryRibbon({
           {collapsed ? "▸" : "▾"} Story ribbon <kbd>T</kbd>
         </button>
         <div className="chronology-actions">
+          {chronologyProblemCount > 0 && onOpenChronologyProblems && (
+            <button
+              type="button"
+              className="chronology-problem-chip"
+              onClick={onOpenChronologyProblems}
+            >
+              <span aria-hidden="true">⚠</span>
+              {chronologyProblemCount} chronology {chronologyProblemCount === 1 ? "problem" : "problems"}
+              <strong>Fix</strong>
+            </button>
+          )}
           <span className="chronology-position">
             {selected && !selected.removed
-              ? `#${assets.findIndex((asset) => asset.id === selected.id) + 1} · ${formatDate(selected.bestTime)}`
+              ? `#${assets.findIndex((asset) => asset.id === selected.id) + 1} · ${selectedTimeLabel ?? formatDate(selected.bestTime)}`
               : "No active clip selected"}
           </span>
           <div className="zoom-control" aria-label="Story ribbon zoom">
@@ -197,6 +252,11 @@ export function StoryRibbon({
           <button className="center-story-button" onClick={onCenter} aria-keyshortcuts="C">
             Center <kbd>C</kbd>
           </button>
+          {onOpenExpanded && (
+            <button className="center-story-button" onClick={onOpenExpanded} aria-keyshortcuts="Shift+T">
+              Expand <kbd>⇧T</kbd>
+            </button>
+          )}
         </div>
       </div>
       {collapsed ? null : laneRows.length > 0 ? (
@@ -239,6 +299,10 @@ export function StoryRibbon({
           <div
             className="story-scroll"
             ref={scrollRef}
+            onScroll={(event) => setViewport({
+              scrollLeft: event.currentTarget.scrollLeft,
+              width: event.currentTarget.clientWidth,
+            })}
             onWheel={(event) => {
               if (Math.abs(event.deltaY) <= Math.abs(event.deltaX) || event.ctrlKey) return;
               event.preventDefault();
@@ -264,7 +328,7 @@ export function StoryRibbon({
                   if (contextAnchor === null) setHoveredContextIndex(null);
                 }}
               >
-                {contextRuns.map((run) => {
+                {visibleContextRuns.map((run) => {
                   const primary = run.asset.phase || run.asset.location || "Context not tagged";
                   const detail = [
                     run.asset.location && run.asset.location !== primary ? run.asset.location : null,
@@ -315,16 +379,19 @@ export function StoryRibbon({
                 )}
               </div>
               <div className="order-track" aria-hidden="true">
-                {assets.map((asset, index) => (
+                {assets.slice(visible.start, visible.end).map((asset, visibleIndex) => {
+                  const index = visible.start + visibleIndex;
+                  return (
                   <span className={asset.id === selectedId ? "active" : ""} style={{ left: index * zoom }} key={asset.id}>
                     {String(index + 1).padStart(3, "0")}
                   </span>
-                ))}
+                  );
+                })}
               </div>
               {laneRows.map(([camera, cameraAssets]) => (
                 <div className="lane-track" key={camera || "merged"}>
-                  {cameraAssets.map((asset) => {
-                    const index = assets.findIndex((candidate) => candidate.id === asset.id);
+                  {cameraAssets.filter((asset) => visibleAssetIds.has(asset.id)).map((asset) => {
+                    const index = indexByAssetId.get(asset.id) ?? -1;
                     return (
                       <button
                         key={asset.id}

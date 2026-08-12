@@ -246,6 +246,22 @@ impl Catalog {
         transaction.execute("INSERT INTO projects(id, name, created_at, origin_node_id, paired_server_node_id, paired_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)", params![snapshot.project_id, snapshot.name, snapshot.created_at, snapshot.origin_node_id, snapshot.paired_server_node_id, snapshot.paired_at])?;
         for asset in &snapshot.assets {
             transaction.execute("INSERT INTO assets(id, project_id, fingerprint, path, filename, size_bytes, duration_seconds, frame_rate, width, height, codec, camera, captured_at_raw, best_time, offset_seconds, metadata_rotation_degrees, default_rotation_degrees, rotation_degrees, orientation_probed, notes, labels_json, removed, media_object_id, media_verification_state, created_at) VALUES (?1, ?2, ?3, '', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)", params![asset.id, snapshot.project_id, asset.fingerprint, asset.filename, asset.size_bytes as i64, asset.duration_seconds, asset.frame_rate, asset.width, asset.height, asset.codec, asset.camera, asset.captured_at_raw, asset.best_time, asset.offset_seconds, asset.metadata_rotation_degrees, asset.default_rotation_degrees, asset.baseline_rotation_degrees, asset.orientation_probed, asset.baseline_notes, serde_json::to_string(&asset.baseline_labels)?, asset.baseline_removed, asset.media_object_id, asset.media_verification_state.as_str(), asset.created_at])?;
+            let capture_sequence_id = crate::chronology::ensure_capture_sequence_for_camera(
+                &transaction,
+                &snapshot.project_id,
+                &asset.camera,
+                &asset.created_at,
+            )?;
+            transaction.execute(
+                "INSERT INTO asset_capture_sequence(asset_id, project_id, capture_sequence_id, filename_counter) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    asset.id,
+                    snapshot.project_id,
+                    capture_sequence_id,
+                    crate::chronology::parse_filename_counter(&asset.filename)
+                        .map(|counter| counter as i64),
+                ],
+            )?;
             crate::operations::reconcile_asset_baseline(
                 &transaction,
                 &snapshot.project_id,
