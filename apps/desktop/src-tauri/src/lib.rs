@@ -2301,8 +2301,12 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
+            // A dev convenience never gets to stop the app from launching:
+            // report the failure the way the media origin does and carry on.
             #[cfg(debug_assertions)]
-            eval_bridge::start_if_enabled(app)?;
+            if let Err(error) = eval_bridge::start_if_enabled(app) {
+                eprintln!("[eval-bridge] could not start: {error:#}");
+            }
 
             let app_data = app.path().app_data_dir()?;
             let settings_path = app_data.join("settings.json");
@@ -2437,6 +2441,10 @@ pub fn run() {
             // token goes with it.
             if matches!(event, tauri::RunEvent::Exit) {
                 app.state::<AppState>().stop_media_origin();
+                // Retract the advertised bridge address with it, so the next
+                // client reads "not running" rather than a reassigned port.
+                #[cfg(debug_assertions)]
+                eval_bridge::stop();
             }
         });
 }

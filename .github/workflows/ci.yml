@@ -112,6 +112,12 @@ jobs:
         if: ${{ !cancelled() }}
         run: pnpm check:docs
 
+      # The repository's own tooling — the docs checker and the eval-bridge
+      # address resolution that the desktop harness and `pnpm eval` share.
+      - name: pnpm test:scripts
+        if: ${{ !cancelled() }}
+        run: pnpm test:scripts
+
       - name: pnpm check:deployment
         if: ${{ !cancelled() }}
         run: pnpm check:deployment

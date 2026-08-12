@@ -4,10 +4,12 @@
 //! enabled. Keep the marker below in the listener log: the release-binary test
 //! uses it to prove that this code was not linked into a shipped binary.
 
+use anyhow::Context;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
 use std::ffi::OsStr;
-use std::net::{Ipv4Addr, SocketAddrV4, TcpListener as StdTcpListener};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener as StdTcpListener};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tauri::{Manager, Runtime};
@@ -17,8 +19,15 @@ use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
 use tokio_tungstenite::tungstenite::http::{StatusCode, header::ORIGIN};
 use tokio_tungstenite::tungstenite::protocol::Message;
 
-pub(crate) const LISTEN_PORT: u16 = 47_961;
 pub(crate) const COMPILED_MARKER: &str = "RCDVLOG_EVAL_BRIDGE_COMPILED";
+/// Pins the listener to one port instead of letting the kernel choose. For
+/// tooling that cannot read the app's stdout and cannot read the address file.
+const PORT_ENV: &str = "RCDVLOG_EVAL_BRIDGE_PORT";
+/// Redirects the published address file. A concurrent harness sets this to a
+/// path inside its own run directory so two runs never read each other's port.
+const ADDRESS_FILE_ENV: &str = "RCDVLOG_EVAL_BRIDGE_ADDRESS_FILE";
+/// Default address-file name, resolved inside the platform temp directory.
+const DEFAULT_ADDRESS_FILE: &str = "rcdvlog-eval-bridge.json";
 const RESULT_TIMEOUT: Duration = Duration::from_secs(30);
 
 type EvalCallback = Box<dyn Fn(String) + Send>;
@@ -39,20 +48,42 @@ impl<R: Runtime> ScriptEvaluator for WebviewEvaluator<R> {
     }
 }
 
+/// Bind the loopback bridge, publish where it landed, and start serving.
+///
+/// The port is ephemeral unless [`PORT_ENV`] pins it, so a leaked previous
+/// instance cannot take the address this one needs. Failure is returned rather
+/// than acted on here; the caller logs and keeps launching, because a dev
+/// convenience must never be able to stop the app from starting.
 pub(crate) fn start_if_enabled<R: Runtime>(app: &tauri::App<R>) -> anyhow::Result<()> {
     if !enabled(std::env::var_os("RCDVLOG_EVAL_BRIDGE").as_deref()) {
         return Ok(());
     }
 
-    let address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, LISTEN_PORT);
-    let listener = StdTcpListener::bind(address)?;
+    let requested = requested_port(std::env::var_os(PORT_ENV).as_deref())?;
+    let listener = StdTcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, requested))
+        .with_context(|| format!("bind the eval bridge on 127.0.0.1:{requested}"))?;
     listener.set_nonblocking(true)?;
+    let address = listener
+        .local_addr()
+        .context("read the eval bridge port back")?;
     let window = app
         .get_webview_window("main")
         .ok_or_else(|| anyhow::anyhow!("main webview is unavailable"))?;
     let evaluator = Arc::new(WebviewEvaluator { window });
 
-    println!("[{COMPILED_MARKER}] listening on ws://{address}");
+    // Two channels, because the two consumers differ: a harness that spawned
+    // the app reads this line off stdout, and a shell client that did not
+    // reads the file below. Both carry the same address; neither guesses.
+    println!("{}", marker_line(&address));
+    let path = address_file_path();
+    if let Err(error) = publish_address(&path, &address) {
+        eprintln!(
+            "[eval-bridge] could not publish {}: {error:#} — pass --port {} to the client",
+            path.display(),
+            address.port()
+        );
+    }
+
     tauri::async_runtime::spawn(async move {
         let listener = match TcpListener::from_std(listener) {
             Ok(listener) => listener,
@@ -66,8 +97,84 @@ pub(crate) fn start_if_enabled<R: Runtime>(app: &tauri::App<R>) -> anyhow::Resul
     Ok(())
 }
 
+/// Remove this process's address file on the way out, so the next client sees
+/// "not running" rather than a port that now belongs to something else.
+pub(crate) fn stop() {
+    let path = address_file_path();
+    match std::fs::read_to_string(&path) {
+        // Only ever retract our own advertisement.
+        Ok(contents) if published_pid(&contents) != Some(std::process::id()) => {}
+        Ok(_) => {
+            if let Err(error) = std::fs::remove_file(&path) {
+                eprintln!("[eval-bridge] could not remove {}: {error}", path.display());
+            }
+        }
+        Err(_) => {}
+    }
+}
+
 fn enabled(value: Option<&OsStr>) -> bool {
     value == Some(OsStr::new("1"))
+}
+
+/// `0` — an ephemeral port — unless the override names one. A malformed
+/// override is an error rather than a silent fall back to `0`: a listener that
+/// comes up somewhere its consumer is not looking is the failure this module
+/// is being changed to avoid.
+fn requested_port(value: Option<&OsStr>) -> anyhow::Result<u16> {
+    let Some(value) = value else {
+        return Ok(0);
+    };
+    let text = value
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("{PORT_ENV} is not valid UTF-8"))?;
+    text.parse::<u16>()
+        .with_context(|| format!("{PORT_ENV} must be a port number, got {text:?}"))
+}
+
+/// The one line a spawning harness parses. Keep the shape stable: the release
+/// binary test greps for the marker, and the harness greps for this whole line.
+fn marker_line(address: &SocketAddr) -> String {
+    format!("[{COMPILED_MARKER}] listening on ws://{address}")
+}
+
+fn address_file_path() -> PathBuf {
+    match std::env::var_os(ADDRESS_FILE_ENV) {
+        Some(path) => PathBuf::from(path),
+        None => std::env::temp_dir().join(DEFAULT_ADDRESS_FILE),
+    }
+}
+
+/// The client checks `pid` for liveness before trusting `address`, which is
+/// what makes a file left behind by a killed app legible as stale.
+fn address_document(address: &SocketAddr, pid: u32) -> String {
+    json!({
+        "address": format!("ws://{address}"),
+        "port": address.port(),
+        "pid": pid,
+    })
+    .to_string()
+}
+
+fn publish_address(path: &Path, address: &SocketAddr) -> anyhow::Result<()> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    std::fs::write(path, address_document(address, std::process::id()))
+        .with_context(|| format!("write {}", path.display()))?;
+    Ok(())
+}
+
+fn published_pid(contents: &str) -> Option<u32> {
+    serde_json::from_str::<serde_json::Value>(contents)
+        .ok()?
+        .get("pid")?
+        .as_u64()?
+        .try_into()
+        .ok()
 }
 
 async fn serve<E: ScriptEvaluator>(listener: TcpListener, evaluator: Arc<E>) {
@@ -217,6 +324,72 @@ mod tests {
         assert!(!enabled(None));
         assert!(!enabled(Some(OsStr::new("true"))));
         assert!(enabled(Some(OsStr::new("1"))));
+    }
+
+    #[test]
+    fn port_is_ephemeral_unless_the_override_names_one() {
+        assert_eq!(requested_port(None).unwrap(), 0);
+        assert_eq!(requested_port(Some(OsStr::new("47961"))).unwrap(), 47_961);
+
+        // A typo must not quietly become "wherever the kernel put it".
+        for bad in ["", "0x1", "70000", "47961 "] {
+            let error = requested_port(Some(OsStr::new(bad)))
+                .expect_err(&format!("{bad:?} is not a port"))
+                .to_string();
+            assert!(error.contains(PORT_ENV), "{error}");
+        }
+    }
+
+    #[test]
+    fn marker_line_is_parseable_by_a_spawning_harness() {
+        let address: SocketAddr = "127.0.0.1:53125".parse().unwrap();
+        let line = marker_line(&address);
+        assert_eq!(
+            line,
+            "[RCDVLOG_EVAL_BRIDGE_COMPILED] listening on ws://127.0.0.1:53125"
+        );
+
+        // The harness contract, applied to the line the app actually prints.
+        let parsed = line
+            .split_once(&format!("[{COMPILED_MARKER}] listening on "))
+            .map(|(_, address)| address)
+            .unwrap();
+        assert_eq!(parsed, "ws://127.0.0.1:53125");
+    }
+
+    #[test]
+    fn published_address_names_the_port_and_the_owning_process() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("nested").join("bridge.json");
+        let address: SocketAddr = "127.0.0.1:53125".parse().unwrap();
+
+        publish_address(&path, &address).unwrap();
+        let published: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(published["address"], "ws://127.0.0.1:53125");
+        assert_eq!(published["port"], 53_125);
+        assert_eq!(published["pid"], std::process::id());
+        assert_eq!(published_pid(&address_document(&address, 4242)), Some(4242));
+        assert_eq!(published_pid("not json"), None);
+    }
+
+    #[tokio::test]
+    async fn ephemeral_bind_survives_a_held_port() {
+        // The collision that used to abort the app at launch: something else
+        // already owns the port a previous run used.
+        let squatter = StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let held = squatter.local_addr().unwrap().port();
+
+        assert!(
+            StdTcpListener::bind((Ipv4Addr::LOCALHOST, held)).is_err(),
+            "the fixed-port path still fails, which is why it is no longer the default"
+        );
+        let listener = StdTcpListener::bind(SocketAddrV4::new(
+            Ipv4Addr::LOCALHOST,
+            requested_port(None).unwrap(),
+        ))
+        .expect("an ephemeral bind cannot collide");
+        assert_ne!(listener.local_addr().unwrap().port(), held);
     }
 
     #[test]

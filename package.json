@@ -20,6 +20,7 @@
     "test:desktop": "pnpm --dir apps/desktop test",
     "test:desktop:cuj": "pnpm --dir apps/desktop test:cuj",
     "test:desktop:browser": "pnpm --dir apps/desktop test:browser",
+    "test:scripts": "node --test \"scripts/*.test.mjs\"",
     "test:core": "cargo test -p rcdvlog-core",
     "test:integration": "cargo test -p rcdvlog-cli --test cli_workflow",
     "test:server": "cargo test -p rcdvlog-server-core && cargo test -p rcdvlog-server"

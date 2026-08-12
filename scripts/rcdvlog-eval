@@ -1,14 +1,33 @@
 #!/usr/bin/env node
 
 import { readFile } from "node:fs/promises";
+import { resolveAddress } from "./lib/eval-bridge.mjs";
 
-const address = "ws://127.0.0.1:47961";
 const forwardedArgs = process.argv.slice(2);
 const args = forwardedArgs[0] === "--" ? forwardedArgs.slice(1) : forwardedArgs;
 
 function usage() {
-  console.error("Usage: rcdvlog-eval '<javascript>' | rcdvlog-eval --file <path>");
+  console.error(
+    "Usage: rcdvlog-eval [--port <port>] [--wait <seconds>] '<javascript>'\n" +
+      "       rcdvlog-eval [--port <port>] [--wait <seconds>] --file <path>",
+  );
   process.exit(2);
+}
+
+// Connection options come first so the script itself can be any shape.
+let port;
+let waitMs = 0;
+while (args[0] === "--port" || args[0] === "--wait") {
+  const [flag, value] = args.splice(0, 2);
+  if (value === undefined) usage();
+  const parsed = Number(value);
+  if (flag === "--port") {
+    if (!Number.isInteger(parsed) || parsed < 1 || parsed > 65_535) usage();
+    port = parsed;
+  } else {
+    if (!Number.isFinite(parsed) || parsed < 0) usage();
+    waitMs = parsed * 1000;
+  }
 }
 
 let script;
@@ -23,6 +42,14 @@ if (args[0] === "--file") {
 } else {
   if (args.length !== 1) usage();
   script = args[0];
+}
+
+let address;
+try {
+  ({ address } = await resolveAddress({ port, waitMs }));
+} catch (error) {
+  console.error(error.message);
+  process.exit(1);
 }
 
 const socket = new WebSocket(address);

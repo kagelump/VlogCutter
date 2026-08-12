@@ -302,15 +302,33 @@ RCDVLOG_CATALOG=/absolute/path/to/catalog.sqlite3 pnpm dev
 For defects that only reproduce inside the live native webview, the desktop has
 a dev-only eval bridge. It is a remote-code-execution surface and must remain
 compiled out under `#[cfg(debug_assertions)]`, disabled unless the exact opt-in
-is present, bound to fixed loopback port `127.0.0.1:47961`, and closed to every
-WebSocket handshake carrying an `Origin` header. Never turn it into a release
-diagnostic, runtime setting, or non-loopback listener.
+is present, bound to loopback only, and closed to every WebSocket handshake
+carrying an `Origin` header. Never turn it into a release diagnostic, runtime
+setting, or non-loopback listener.
 
 ```bash
 RCDVLOG_EVAL_BRIDGE=1 pnpm dev
 pnpm eval -- 'document.readyState'
 pnpm eval -- --file /absolute/path/to/probe.js
 ```
+
+The bridge binds an ephemeral port and publishes it two ways: the marker line
+`[RCDVLOG_EVAL_BRIDGE_COMPILED] listening on ws://127.0.0.1:<port>` on the app's
+stdout, for a harness that spawned the app, and a JSON address file for a client
+that did not. `pnpm eval` finds the file on its own; `--port` and `--wait` are
+there for tooling. Set `RCDVLOG_EVAL_BRIDGE_ADDRESS_FILE` to give a concurrent
+run its own address file, and `RCDVLOG_EVAL_BRIDGE_PORT` to pin the listener for
+a tool that can read neither. A bridge that cannot bind logs and the app starts
+anyway: no dev convenience may keep the app from launching.
+
+**Fixed ports are contracts; ephemeral ports are implementation.** A listener
+whose address is discovered at runtime binds `127.0.0.1:0`, reads the assigned
+port back, and publishes it through a channel its consumer already reads — the
+media origin (`media_server.rs`) and the eval bridge both do exactly this. A
+config-pinned port gets a preflight that names the process holding it. Test
+fixtures always allocate dynamically. Never add a retry loop or a fallback
+range: a listener that comes up somewhere its consumers are not looking is a
+silent failure, which is worse than a named bind error.
 
 The loopback media origin has a second, narrower dev-only seam under the same
 rules, for the case where a clip will not play and the app is the only thing
@@ -738,6 +756,7 @@ Run the narrowest useful tests while iterating, then the full gate before handof
 | Server core/API | `pnpm test:server` | two-node process test plus target-topology check when external behavior changed |
 | Chrome web | `pnpm test:web` | `pnpm test:web:e2e` plus real HTTPS visual/interaction check |
 | OpenAPI/deployment/docs | `pnpm check:openapi` | `pnpm check:deployment`, `pnpm check:docs`, and Compose render when available |
+| Repository scripts in `scripts/` | `pnpm test:scripts` | `pnpm check:docs` |
 | Formatting/lints | `cargo fmt --all -- --check` | `cargo clippy --workspace --all-targets -- -D warnings` |
 | Full repository | — | `pnpm check` |
 

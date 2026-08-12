@@ -31,7 +31,10 @@ JSON. An agent or a developer drives it from a shell:
 rcdvlog-eval 'document.querySelectorAll("video[data-asset-id]").length'
 ```
 
-- Bind `127.0.0.1` on a **fixed dev port**, so tooling needs no discovery step.
+- Bind `127.0.0.1:0` and **publish the assigned address**, so a leaked previous
+  instance or a second dev app cannot take the port this one needs. Discovery is
+  one line of stdout for a harness that spawned the app, and an address file for
+  a client that did not.
 - Evaluate through Tauri's existing webview eval, resolving the completion
   value; serialise with `JSON.stringify` and return errors as
   `{error: {name, message, stack}}` rather than closing the socket.
@@ -66,9 +69,43 @@ pnpm eval -- --file /absolute/path/to/probe.js
 
 The client prints one JSON value. JavaScript failures print
 `{"error":{"name":...,"message":...,"stack":...}}` and exit non-zero. The
-listener stays available after an evaluation error. The bridge uses the fixed
-address `ws://127.0.0.1:47961` and refuses every WebSocket handshake that has an
-`Origin` header; the repository client deliberately sends none.
+listener stays available after an evaluation error. The bridge refuses every
+WebSocket handshake that has an `Origin` header; the repository client
+deliberately sends none.
+
+## Finding the listener
+
+The bridge binds `127.0.0.1:0`, so nothing may assume an address. It advertises
+the one it got twice, because its two clients differ:
+
+1. **Stdout**, for a harness that spawned the app:
+   `[RCDVLOG_EVAL_BRIDGE_COMPILED] listening on ws://127.0.0.1:<port>`. Parse
+   this line under a startup timeout — a bridge that never comes up must fail in
+   the harness, where it can be reported, not hang there.
+   `scripts/lib/eval-bridge.mjs` exports `parseMarkerLine` and
+   `readMarkerAddress` so the runner and the shell client cannot drift apart.
+2. **An address file**, for a client started in another shell, holding
+   `{"address","port","pid"}`. It defaults to `rcdvlog-eval-bridge.json` in the
+   platform temp directory. `pnpm eval` reads it with no arguments, checks the
+   recorded pid, and says the address is *stale* rather than connecting to a
+   port that has since been handed to something else. The app removes its own
+   file on exit.
+
+| Variable | Effect |
+| --- | --- |
+| `RCDVLOG_EVAL_BRIDGE_PORT` | Pins the listener to one port, for a tool that can read neither channel. A value that is not a port is an error, not a fall back to ephemeral. |
+| `RCDVLOG_EVAL_BRIDGE_ADDRESS_FILE` | Moves the address file, so concurrent runs never read each other's port. |
+
+The client takes `--port <port>` to skip discovery, and `--wait <seconds>` to
+poll for the address file when it is started alongside the app:
+
+```bash
+pnpm eval -- --wait 20 'document.readyState'
+```
+
+A bind failure never stops the app: `lib.rs` logs it and continues launching,
+the way the media origin's does. With an ephemeral port the residual failure
+mode is resource exhaustion, which is worth a line on stderr and nothing more.
 
 ## Gating — this is the part that matters
 
@@ -97,6 +134,8 @@ only because it cannot exist in a shipped binary.
   a structured error for a throwing one, without killing the connection.
 - [x] A request with a foreign `Origin` is refused.
 - [x] Every evaluated script appears in the dev server's stdout.
+- [x] A held port cannot abort the app's launch, and a client with no arguments
+  still finds the listener.
 
 The transport, opt-in parser, persistent connection, and origin refusal have
 Rust tests. `release_eval_bridge_absent` scans the built desktop executable for
