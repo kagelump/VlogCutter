@@ -79,6 +79,7 @@ function renderPanel(overrides: Partial<JudgmentPanelProps> = {}) {
     index: 118,
     observation: null as AssetAnalysisView | null,
     labelDraft: "",
+    labelVocabulary: [],
     saveState: "idle" as const,
     onLabelDraftChange: vi.fn(),
     onAddLabel: vi.fn(),

@@ -34,7 +34,7 @@ function twoProjects() {
 
 /** Open the other project through the topbar's switcher, as the user would. */
 async function openProject(app: Awaited<ReturnType<typeof renderApp>>, projectId: string) {
-  await app.user.selectOptions(screen.getByRole("combobox"), projectId);
+  await app.user.selectOptions(screen.getByRole("combobox", { name: "Project" }), projectId);
 }
 
 describe("switching projects while a read is in flight", () => {
@@ -54,7 +54,7 @@ describe("switching projects while a read is in flight", () => {
 
     await waitFor(() => expect(harness.calls("list_assets").length).toBeGreaterThan(1));
     expect(queueFilenames()).toEqual(["DJI_001.MP4", "DJI_002.MP4"]);
-    expect(screen.getByRole("combobox")).toHaveValue(B);
+    expect(screen.getByRole("combobox", { name: "Project" })).toHaveValue(B);
   });
 
   it("does not let the first project's failure become the second's error", async () => {

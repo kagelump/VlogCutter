@@ -1,6 +1,8 @@
+import { useEffect, useState } from "react";
 import type { KeyboardEvent as ReactKeyboardEvent } from "react";
 import type { Asset, AssetAnalysisView } from "../types";
 import type { SaveState } from "../session/assetMutations";
+import { suggestLabels, type LabelUse } from "../review/labelVocabulary";
 
 export type { SaveState };
 
@@ -11,6 +13,8 @@ export interface JudgmentPanelProps {
   /** Read only for the two permitted exceptions: AI labels and the ⚠ chip. */
   observation: AssetAnalysisView | null;
   labelDraft: string;
+  /** Labels this project already uses, most-used first — the typeahead's source. */
+  labelVocabulary: readonly LabelUse[];
   saveState: SaveState;
   /** Why the last save was refused, shown as the unsaved state's reason. */
   saveError?: string;
@@ -62,6 +66,7 @@ export function JudgmentPanel({
   index,
   observation,
   labelDraft,
+  labelVocabulary,
   saveState,
   saveError = "",
   onRetrySave,
@@ -83,6 +88,70 @@ export function JudgmentPanel({
   const suggestions = (observation?.aiLabels ?? []).filter(
     (label) => !taken.has(label.toLocaleLowerCase()),
   );
+
+  // The typeahead is opened by typing, never by focus: `L` → type → Enter is
+  // the review loop this field exists for, and a list that appears on focus
+  // would put a highlighted suggestion in front of the very first keystroke.
+  const [vocabularyOpen, setVocabularyOpen] = useState(false);
+  const [activeSuggestion, setActiveSuggestion] = useState(-1);
+  const matches = vocabularyOpen
+    ? suggestLabels(labelVocabulary, labelDraft, { exclude: asset.labels })
+    : [];
+  const active = activeSuggestion >= 0 && activeSuggestion < matches.length
+    ? matches[activeSuggestion]
+    : null;
+
+  // Moving to another clip must not leave a list open over the new one's rail.
+  useEffect(() => {
+    setVocabularyOpen(false);
+    setActiveSuggestion(-1);
+  }, [asset.id]);
+
+  function commitLabel(value: string) {
+    setVocabularyOpen(false);
+    setActiveSuggestion(-1);
+    onAddLabel(value);
+  }
+
+  function onLabelKeyDown(event: ReactKeyboardEvent<HTMLInputElement>) {
+    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+      const list = vocabularyOpen
+        ? matches
+        : suggestLabels(labelVocabulary, labelDraft, { exclude: asset.labels });
+      if (!list.length) return;
+      event.preventDefault();
+      setVocabularyOpen(true);
+      const step = event.key === "ArrowDown" ? 1 : -1;
+      // Wraps through -1, which is "nothing highlighted": the way back to
+      // committing exactly what was typed has to be reachable from the keys.
+      setActiveSuggestion((current) => {
+        const next = current + step;
+        if (next >= list.length) return -1;
+        if (next < -1) return list.length - 1;
+        return next;
+      });
+      return;
+    }
+    if (event.key === "Escape" && vocabularyOpen) {
+      // The shell owns Escape (issue #52); this one is genuinely the field's,
+      // so it is consumed here rather than closing the list *and* leaving Focus.
+      event.preventDefault();
+      event.stopPropagation();
+      setVocabularyOpen(false);
+      setActiveSuggestion(-1);
+      return;
+    }
+    if (event.key === "Enter" || event.key === ",") {
+      event.preventDefault();
+      // A highlighted suggestion is one the user deliberately arrowed to.
+      // Otherwise Enter still commits exactly what was typed.
+      commitLabel(active?.label ?? labelDraft);
+      return;
+    }
+    if (event.key === "Backspace" && !labelDraft && asset.labels.length > 0) {
+      onRemoveLabel(asset.labels.at(-1) ?? "");
+    }
+  }
 
   return (
     <aside className="judgment-panel">
@@ -149,23 +218,47 @@ export function JudgmentPanel({
       />
 
       <div className="micro-header"><span>Labels</span></div>
-      <input
-        id="label-input"
-        className="label-field"
-        value={labelDraft}
-        placeholder="+ add label"
-        aria-label="Add label"
-        aria-keyshortcuts="L"
-        onChange={(event) => onLabelDraftChange(event.currentTarget.value)}
-        onKeyDown={(event) => {
-          if (event.key === "Enter" || event.key === ",") {
-            event.preventDefault();
-            onAddLabel(labelDraft);
-          } else if (event.key === "Backspace" && !labelDraft && asset.labels.length > 0) {
-            onRemoveLabel(asset.labels.at(-1) ?? "");
-          }
-        }}
-      />
+      <div className="label-combobox">
+        <input
+          id="label-input"
+          className="label-field"
+          value={labelDraft}
+          placeholder="+ add label"
+          aria-label="Add label"
+          aria-keyshortcuts="L"
+          role="combobox"
+          aria-expanded={matches.length > 0}
+          aria-controls="label-vocabulary"
+          aria-autocomplete="list"
+          aria-activedescendant={active ? `label-vocabulary-${activeSuggestion}` : undefined}
+          onChange={(event) => {
+            onLabelDraftChange(event.currentTarget.value);
+            setVocabularyOpen(true);
+            setActiveSuggestion(-1);
+          }}
+          onKeyDown={onLabelKeyDown}
+          onBlur={() => setVocabularyOpen(false)}
+        />
+        {matches.length > 0 && (
+          <ul className="label-vocabulary" id="label-vocabulary" role="listbox" aria-label="Labels already in this project">
+            {matches.map((use, position) => (
+              <li
+                key={use.label}
+                id={`label-vocabulary-${position}`}
+                role="option"
+                aria-selected={position === activeSuggestion}
+                className={position === activeSuggestion ? "active" : ""}
+                // Commit before the input's blur can close the list underneath
+                // the click.
+                onMouseDown={(event) => { event.preventDefault(); commitLabel(use.label); }}
+              >
+                <span>{use.label}</span>
+                <em>{use.count}</em>
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
       <div className="chip-well" aria-label="Clip labels">
         {asset.labels.map((label) => (
           <button key={label} onClick={() => onRemoveLabel(label)} aria-label={`Remove ${label}`}>

@@ -227,7 +227,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
    surface in Focus that can carry it. Labels and the suggestion strip are the
    optional part, off until D. */
 .app-shell.is-focus .judgment-panel .micro-header ~ .micro-header,
-.app-shell.is-focus .label-field,
+.app-shell.is-focus .label-combobox,
 .app-shell.is-focus .chip-well,
 .app-shell.is-focus .ai-strip { display: none; }
 .app-shell.is-focus .header-action { display: none; }
@@ -242,7 +242,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .app-shell.is-focus.show-right-stack .judgment-panel .micro-header ~ .micro-header,
 .app-shell.is-focus.show-right-stack .chip-well,
 .app-shell.is-focus.show-right-stack .ai-strip { display: flex; }
-.app-shell.is-focus.show-right-stack .label-field { display: block; }
+.app-shell.is-focus.show-right-stack .label-combobox { display: block; }
 .app-shell.is-focus.show-right-stack .chip-well { height: 90px; }
 
 /* Ribbon overlay: one merged lane, because the question here is "where am I
@@ -362,6 +362,40 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 
 .label-field { width: 100%; height: 28px; padding: 0 8px; color: var(--ink); background: var(--graphite); border: 1px solid var(--line); border-radius: 3px; font-size: 13px; }
 .label-field::placeholder { color: #566168; }
+
+/* The project's existing vocabulary, over the chips rather than pushing them
+   down: rule 3 says nothing may move the notes field, and a list that grew the
+   rail would move everything below it. */
+.label-combobox { position: relative; }
+.label-vocabulary {
+  position: absolute;
+  z-index: 4;
+  top: 100%;
+  left: 0;
+  right: 0;
+  max-height: 148px;
+  margin: 2px 0 0;
+  padding: 2px;
+  overflow-y: auto;
+  list-style: none;
+  background: var(--graphite);
+  border: 1px solid var(--line-strong);
+  border-radius: 3px;
+  box-shadow: 0 8px 20px rgba(0,0,0,.45);
+}
+.label-vocabulary li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 3px 6px;
+  border-radius: 2px;
+  cursor: pointer;
+  font-size: 12px;
+}
+.label-vocabulary li span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.label-vocabulary li em { flex: none; color: var(--quiet); font-style: normal; font-size: 10px; }
+.label-vocabulary li.active, .label-vocabulary li:hover { color: #fff0d6; background: #332719; }
 .label-field:focus { outline: none; border-color: var(--amber); }
 
 /* Fixed and scrolling: a growing well would eat the notes field above it. */

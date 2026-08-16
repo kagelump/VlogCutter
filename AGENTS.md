@@ -157,6 +157,11 @@ Important gaps; do not accidentally describe these as complete:
   card/volume acceptance gate.
 - Desktop/CLI full-patch writes still have no transport-level optimistic revision token; cross-node operation sync does not make competing local full patches safe.
 - Search is currently simple filename/camera/label/note filtering, not SQLite FTS.
+- The label field offers the project's existing vocabulary as a keyboard-first
+  typeahead, and a commit that differs from an existing label only by case
+  joins that label rather than opening a second one. Nothing is renamed,
+  merged, or deleted: `apps/desktop/src/review/labelVocabulary.ts` is a
+  read-only view over the labels already written.
 - No key moments, chapters, events, or scripts. Edit-plan revisions, validation,
   preview rendering, and OTIO writing exist, but the desktop edit-plan workflow
   still lacks reordering, trimming, removal, preview playback, export history,

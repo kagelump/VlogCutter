@@ -35,8 +35,8 @@ function cardInSlot() {
 function priorImport(): ImportSessionDetail {
   return {
     id: "import_1", projectId: PROJECT, sourcePath: "/Volumes/DJI_SD",
-    destinationMode: "reference_in_place", destinationRootId: null, destinationName: null,
-    destinationPath: null, imported: 2, relinked: 0, skipped: 0, copied: 0, bytesCopied: 0,
+    destinationMode: "reference", destinationRootId: "", destinationName: "",
+    destinationPath: "", imported: 2, relinked: 0, skipped: 0, copied: 0, bytesCopied: 0,
     cancelled: false, failures: [], rolledBackAt: null, rolledBackAssetCount: 0,
     createdAt: "2026-08-08T12:00:00.000Z", files: [],
   };

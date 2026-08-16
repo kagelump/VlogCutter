@@ -41,6 +41,7 @@ import { SettingsModal } from "./components/SettingsModal";
 import { CardBanner } from "./components/CardBanner";
 import { analysisStageLabels, formatCost } from "./review/format";
 import { sourceVolumeHint } from "./review/summaries";
+import { canonicalLabel, projectLabelVocabulary } from "./review/labelVocabulary";
 import { rotationAfter } from "./review/rotation";
 import { buildMediaBuffer } from "./review/mediaBuffer";
 
@@ -252,6 +253,13 @@ function App() {
     () => mutationLifecycle.withDrafts(session.assets),
     [mutationLifecycle, mutations.drafts, session.assets],
   );
+
+  // Built from the session's assets rather than `assets`: label writes land
+  // there optimistically, while the draft overlay changes on every keystroke
+  // in the notes field — and rebuilding a few thousand clips' vocabulary per
+  // character typed would be work for nothing. Removed clips count: their
+  // labels are still part of what this project calls things.
+  const labelVocabulary = useMemo(() => projectLabelVocabulary(session.assets), [session.assets]);
 
   const selected = assets.find((asset) => asset.id === selectedId) ?? null;
   const project = projects.find((item) => item.id === projectId) ?? null;
@@ -647,12 +655,16 @@ function App() {
   );
 
   const addLabel = useCallback((asset: Asset, value: string) => {
-    const label = value.trim();
+    // The project's own spelling wins over a new casing of it (issue #11):
+    // typing "Market" where "market" exists joins that label rather than
+    // opening a second one beside it. A word the project has not seen is
+    // written exactly as typed.
+    const label = canonicalLabel(labelVocabulary, value);
     if (!label) return;
     setLabelDraft("");
     if (asset.labels.some((current) => current.toLocaleLowerCase() === label.toLocaleLowerCase())) return;
     void persistAsset(asset, { labels: [...asset.labels, label] });
-  }, [persistAsset]);
+  }, [labelVocabulary, persistAsset]);
 
   const removeLabel = useCallback((asset: Asset, label: string) => {
     void persistAsset(asset, {
@@ -2073,6 +2085,7 @@ function App() {
             index={filteredAssets.findIndex((candidate) => candidate.id === selected.id) + 1}
             observation={observation}
             labelDraft={labelDraft}
+            labelVocabulary={labelVocabulary}
             saveState={mutations.saveStateFor(selected.id)}
             saveError={mutations.drafts[selected.id]?.error ?? ""}
             onRetrySave={() => { void mutations.retryDraft(selected); }}

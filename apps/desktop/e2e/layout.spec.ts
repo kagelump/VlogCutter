@@ -100,3 +100,26 @@ test.describe("the queue's offline mark", () => {
     expect(rows.clipped).toBe(false);
   });
 });
+
+test.describe("the label typeahead", () => {
+  test.use({ viewport: SIZES.small });
+
+  test("floats over the rail instead of moving the notes field", async ({ page }) => {
+    // Browser property: real box positions. Rule 3 says nothing may move the
+    // notes field, and a suggestion list laid out in flow would push
+    // everything below it down. jsdom reports every rectangle as zero, so it
+    // cannot tell an overlay from a block that grew the rail.
+    await boot(page);
+    const before = await page.locator("#notes").boundingBox();
+
+    await page.locator("#label-input").fill("a");
+    const list = page.locator(".label-vocabulary");
+    await expect(list).toBeVisible();
+
+    expect(await page.locator("#notes").boundingBox()).toEqual(before);
+    const listBox = (await list.boundingBox())!;
+    const fieldBox = (await page.locator("#label-input").boundingBox())!;
+    expect(listBox.y).toBeGreaterThanOrEqual(fieldBox.y + fieldBox.height - 1);
+    expect(listBox.width).toBeLessThanOrEqual(fieldBox.width + 1);
+  });
+});

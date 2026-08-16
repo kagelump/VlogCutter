@@ -146,7 +146,7 @@ export function TopBar({
       </div>
       <label className="project-switcher">
         <span className="sr-only">Current project</span>
-        <select value={projectId} onChange={(event) => onProjectChange(event.target.value)}>
+        <select aria-label="Project" value={projectId} onChange={(event) => onProjectChange(event.target.value)}>
           {projects.map((item) => (
             <option value={item.id} key={item.id}>{item.name}</option>
           ))}
