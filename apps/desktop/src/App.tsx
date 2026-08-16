@@ -2081,6 +2081,7 @@ function App() {
             onToggleMute={toggleMute}
             onStep={moveSelection}
             onRotate={(addition) => void persistAsset(selected, { rotationDegrees: rotationAfter(selected.rotationDegrees, addition) })}
+            onSetRotation={(degrees) => void persistAsset(selected, { rotationDegrees: degrees })}
             onResetRotation={() => void persistAsset(selected, { rotationDegrees: selected.defaultRotationDegrees })}
             onEnterFocus={() => void toggleViewerFullscreen()}
           />

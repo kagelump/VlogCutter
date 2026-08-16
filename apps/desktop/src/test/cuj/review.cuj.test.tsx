@@ -83,7 +83,7 @@ describe("CUJ 5 — rotation survives leaving the clip", () => {
     const app = await renderApp(harness);
 
     await app.user.click(screen.getByLabelText("Frame orientation"));
-    await app.user.click(await screen.findByRole("menuitem", { name: "Rotate 90° clockwise" }));
+    await app.user.click(await screen.findByRole("menuitemradio", { name: "90°" }));
     await waitFor(() => expect(harness.state.assets.asset_sony_a7c_ii_001.rotationDegrees).toBe(90));
 
     await app.user.keyboard("jk");
@@ -124,7 +124,7 @@ describe("CUJ 12 — the renderer restarts", () => {
     await waitFor(() => expect(harness.state.assets.asset_sony_a7c_ii_001.labels).toEqual(["arrival"]));
 
     await app.user.click(screen.getByLabelText("Frame orientation"));
-    await app.user.click(await screen.findByRole("menuitem", { name: "Rotate 90° clockwise" }));
+    await app.user.click(await screen.findByRole("menuitemradio", { name: "90°" }));
     await waitFor(() => expect(harness.state.assets.asset_sony_a7c_ii_001.rotationDegrees).toBe(90));
 
     app = await app.remount();

@@ -19,9 +19,14 @@ export interface TransportBarProps {
   onToggleMute(): void;
   onStep(delta: number): void;
   onRotate(addition: 90 | 180): void;
+  /** An absolute orientation, chosen rather than cycled to. */
+  onSetRotation(degrees: number): void;
   onResetRotation(): void;
   onEnterFocus(): void;
 }
+
+/** The four cardinal orientations, as absolute choices. */
+const ORIENTATIONS = [0, 90, 180, 270] as const;
 
 /**
  * The single transport (spec §3.5).
@@ -49,6 +54,7 @@ export function TransportBar({
   onToggleMute,
   onStep,
   onRotate,
+  onSetRotation,
   onResetRotation,
   onEnterFocus,
 }: TransportBarProps) {
@@ -140,8 +146,8 @@ export function TransportBar({
         aria-haspopup="menu"
         aria-expanded={orientationOpen}
         title={rotationOverridden
-          ? `Rotation overridden — ${asset.rotationDegrees}° · O rotates · ⇧O flips`
-          : "Automatic orientation · O rotates · ⇧O flips"}
+          ? `Orientation set to ${asset.rotationDegrees}°, overriding automatic ${asset.defaultRotationDegrees}° · O rotates · ⇧O flips`
+          : `Automatic orientation (${asset.defaultRotationDegrees}°) · O rotates · ⇧O flips`}
       >⟳</button>
       {orientationOpen && typeof document !== "undefined" && createPortal(
         <div
@@ -156,35 +162,39 @@ export function TransportBar({
         >
           <div className="orientation-menu-heading">
             <strong>Frame orientation</strong>
-            <span>{rotationOverridden ? `Current: ${asset.rotationDegrees}° override` : `Automatic: ${asset.defaultRotationDegrees}°`}</span>
+            <span>{rotationOverridden ? `Overriding automatic ${asset.defaultRotationDegrees}°` : "Following camera metadata"}</span>
           </div>
+          {/* Absolute choices, not another way to cycle. Someone correcting a
+              wrong guess knows which way up the clip is; making them count
+              clicks to get there is the thing this replaces. */}
           <button
             type="button"
             role="menuitemradio"
             aria-checked={!rotationOverridden}
             onClick={() => chooseRotation(onResetRotation)}
           >
-            <span>Automatic</span>
+            <span>Auto ({asset.defaultRotationDegrees}°)</span>
             <small>Use camera metadata</small>
           </button>
-          <button
-            type="button"
-            role="menuitem"
-            aria-keyshortcuts="O"
-            onClick={() => chooseRotation(() => onRotate(90))}
-          >
-            <span>Rotate 90° clockwise</span>
-            <kbd aria-hidden="true">O</kbd>
-          </button>
-          <button
-            type="button"
-            role="menuitem"
-            aria-keyshortcuts="Shift+O"
-            onClick={() => chooseRotation(() => onRotate(180))}
-          >
-            <span>Flip 180°</span>
-            <kbd aria-hidden="true">⇧O</kbd>
-          </button>
+          {ORIENTATIONS.map((degrees) => (
+            <button
+              key={degrees}
+              type="button"
+              role="menuitemradio"
+              // An explicit angle that equals the automatic one is
+              // indistinguishable from Auto, because that is exactly what the
+              // catalog stores: an override *is* a rotation differing from the
+              // probed default.
+              aria-checked={rotationOverridden && asset.rotationDegrees === degrees}
+              onClick={() => chooseRotation(() => onSetRotation(degrees))}
+            >
+              <span>{degrees}°</span>
+              {degrees === asset.defaultRotationDegrees && <small>same as automatic</small>}
+            </button>
+          ))}
+          <p className="orientation-menu-keys">
+            <kbd>O</kbd> rotates 90° · <kbd>⇧O</kbd> flips 180°
+          </p>
         </div>,
         document.body,
       )}

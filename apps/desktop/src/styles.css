@@ -295,6 +295,12 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .orientation-menu > button:hover small, .orientation-menu > button:focus-visible small { color: #4d3a24; }
 .orientation-menu > button kbd { min-width: 17px; grid-column: 2; grid-row: 1 / span 2; padding: 1px 3px; color: var(--quiet); background: #20272b; border: 1px solid #3a454b; border-radius: 3px; text-align: center; }
 .orientation-menu > button:hover kbd, .orientation-menu > button:focus-visible kbd { color: #161b1d; background: rgba(255,255,255,.22); border-color: rgba(22,27,29,.28); }
+/* The keyboard rotations are advertised, not offered as choices: a relative
+   nudge is not an orientation, and mixing the two is what made the old control
+   ask you to count clicks. */
+.orientation-menu-keys { margin: 4px 0 0; padding: 5px 7px 0; border-top: 1px solid var(--line); color: var(--quiet); font-size: 10px; }
+.orientation-menu-keys kbd { padding: 1px 3px; background: #20272b; border: 1px solid #3a454b; border-radius: 3px; }
+
 .source-badge { flex: none; padding: 0 6px; color: var(--quiet); font: 10px/12px ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: .06em; }
 /* Amber when you are hitting the source drive rather than a proxy. */
 .source-badge.original { color: var(--amber); }
