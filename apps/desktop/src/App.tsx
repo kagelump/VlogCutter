@@ -110,7 +110,6 @@ function App() {
   const [playbackSeconds, setPlaybackSeconds] = useState(0);
   const [mediaDuration, setMediaDuration] = useState(0);
   const [isBuffering, setIsBuffering] = useState(false);
-  const [isViewerFullscreen, setIsViewerFullscreen] = useState(false);
   const [offsetMinutes, setOffsetMinutes] = useState(0);
   const [offsetLabel, setOffsetLabel] = useState("Camera time change");
   const [chronologyZoom, setChronologyZoom] = useState(RIBBON_ZOOM_DEFAULT);
@@ -1755,14 +1754,6 @@ function App() {
     else video.pause();
   }, [mediaUrl, selected?.durationSeconds, selectedId, shouldAutoplay]);
 
-  useEffect(() => {
-    const handleFullscreenChange = () => {
-      setIsViewerFullscreen(document.fullscreenElement === viewerStageRef.current);
-    };
-    document.addEventListener("fullscreenchange", handleFullscreenChange);
-    return () => document.removeEventListener("fullscreenchange", handleFullscreenChange);
-  }, []);
-
   function togglePlayback() {
     const video = videoRef.current;
     if (!video) return;
@@ -1778,13 +1769,16 @@ function App() {
     setPlaybackSeconds(video.currentTime);
   }
 
-  async function toggleViewerFullscreen() {
-    try {
-      if (document.fullscreenElement) await document.exitFullscreen();
-      else await viewerStageRef.current?.requestFullscreen();
-    } catch (reason) {
-      setError(`Fullscreen unavailable: ${String(reason)}`);
-    }
+  /**
+   * The transport's ⤢: Focus with nothing over the frame (issue #7).
+   *
+   * There is one fullscreen concept, and it is Focus. Native fullscreen was a
+   * second one with its own state, its own exit, and no relationship to the
+   * `F` the same button advertised.
+   */
+  function toggleFrameOnly() {
+    if (view.presentation === "focus" && !view.overlays) dispatchView({ kind: "exitFocus" });
+    else dispatchView({ kind: "enterFocus", overlays: false });
   }
 
   function toggleMute() {
@@ -2083,7 +2077,8 @@ function App() {
             onRotate={(addition) => void persistAsset(selected, { rotationDegrees: rotationAfter(selected.rotationDegrees, addition) })}
             onSetRotation={(degrees) => void persistAsset(selected, { rotationDegrees: degrees })}
             onResetRotation={() => void persistAsset(selected, { rotationDegrees: selected.defaultRotationDegrees })}
-            onEnterFocus={() => void toggleViewerFullscreen()}
+            frameOnly={view.presentation === "focus" && !view.overlays}
+            onToggleFrameOnly={toggleFrameOnly}
           />
           )}
 

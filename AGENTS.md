@@ -97,7 +97,9 @@ Implemented now:
   suggestion strip and the unusable chip), and the notes field has fixed
   geometry that nothing else may move. Machine output lives in a tabbed
   evidence shelf beneath the player, collapsed by default. Chronology and edit
-  planning are full-window modes on Cmd+1/2/3. A Focus presentation (F) fills
+  planning are full-window modes on Cmd+1/2/3. Focus is the only fullscreen
+  concept — the transport's ⤢ enters it with the overlays down and leaves it
+  again, and native/DOM fullscreen is gone. A Focus presentation (F) fills
   the window with the frame and floats the notes card, preserving the caret and
   the playback position because it restyles the mounted tree rather than
   replacing it. See `docs/superpowers/specs/2026-08-04-desktop-review-layout-design.md`.

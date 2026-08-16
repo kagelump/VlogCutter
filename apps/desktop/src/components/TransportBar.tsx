@@ -22,7 +22,9 @@ export interface TransportBarProps {
   /** An absolute orientation, chosen rather than cycled to. */
   onSetRotation(degrees: number): void;
   onResetRotation(): void;
-  onEnterFocus(): void;
+  /** Focus is on, with nothing over the frame. */
+  frameOnly: boolean;
+  onToggleFrameOnly(): void;
 }
 
 /** The four cardinal orientations, as absolute choices. */
@@ -48,6 +50,7 @@ export function TransportBar({
   bestMomentMs,
   segmentStartsMs,
   rotationOverridden,
+  frameOnly,
   onTogglePlay,
   onSeek,
   onSeekBy,
@@ -56,7 +59,7 @@ export function TransportBar({
   onRotate,
   onSetRotation,
   onResetRotation,
-  onEnterFocus,
+  onToggleFrameOnly,
 }: TransportBarProps) {
   const [orientationOpen, setOrientationOpen] = useState(false);
   const orientationButtonRef = useRef<HTMLButtonElement>(null);
@@ -201,7 +204,15 @@ export function TransportBar({
       <span className={`source-badge ${asset.proxyAvailable ? "" : "original"}`}>
         {asset.proxyAvailable ? "PROXY" : "ORIGINAL"}
       </span>
-      <button className="transport-toggle" onClick={onEnterFocus} aria-label="Fullscreen" aria-keyshortcuts="F">⤢</button>
+      {/* One fullscreen concept, and it is Focus. This is Focus with the
+          writing overlays down; `F` enters it with them up. */}
+      <button
+        className={`transport-toggle ${frameOnly ? "on" : ""}`}
+        onClick={onToggleFrameOnly}
+        aria-label="Frame only"
+        aria-pressed={frameOnly}
+        title="Focus, with nothing over the frame · F enters Focus · H shows the overlays"
+      >⤢</button>
     </div>
   );
 }

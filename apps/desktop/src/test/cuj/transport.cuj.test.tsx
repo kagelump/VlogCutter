@@ -1,5 +1,5 @@
 /**
- * The transport's own controls: skip, scrub, best-moment, mute, fullscreen.
+ * The transport's own controls: skip, scrub, best-moment, mute, frame-only.
  *
  * `playback.cuj.test.tsx` covers what the app does when the *element* reports
  * something. This covers the other direction — what the app does to the element
@@ -18,9 +18,9 @@
  * acceptance criterion.
  */
 
-import { fireEvent, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
-import { desktopScenario, renderApp } from "../harness";
+import { desktopScenario, renderApp, selectedRow } from "../harness";
 
 const first = "asset_sony_a7c_ii_001";
 
@@ -139,16 +139,67 @@ describe("muting", () => {
   });
 });
 
-describe("fullscreen", () => {
-  it("says so rather than failing silently when the platform refuses", async () => {
+describe("the frame-only control", () => {
+  it("enters Focus with nothing over the frame, rather than a second fullscreen", async () => {
     const harness = session();
     const app = await renderApp(harness);
     await harness.media(first).loaded({ duration: 24 });
 
-    await app.user.click(screen.getByLabelText("Fullscreen"));
+    await app.user.click(screen.getByLabelText("Frame only"));
 
-    // jsdom implements no Fullscreen API, which is exactly the shape of a
-    // platform that refuses: the user gets told, and the app stays usable.
-    expect(await screen.findByRole("alert")).toHaveTextContent(/Fullscreen unavailable/);
+    // One fullscreen concept, and it is Focus. Native fullscreen was a second
+    // one with its own state, its own exit, and no relation to the `F` this
+    // same button used to advertise.
+    await waitFor(() => expect(document.querySelector(".app-shell")).toHaveClass("is-focus"));
+    expect(document.querySelector(".app-shell")).not.toHaveClass("show-overlays");
+    expect(screen.getByLabelText("Frame only")).toHaveAttribute("aria-pressed", "true");
+  });
+
+  it("returns to Review when pressed again", async () => {
+    const harness = session();
+    const app = await renderApp(harness);
+    await harness.media(first).loaded({ duration: 24 });
+    await app.user.click(screen.getByLabelText("Frame only"));
+    await waitFor(() => expect(document.querySelector(".app-shell")).toHaveClass("is-focus"));
+
+    await app.user.click(screen.getByLabelText("Frame only"));
+
+    await waitFor(() => expect(document.querySelector(".app-shell")).not.toHaveClass("is-focus"));
+  });
+
+  it("takes the overlays down when Focus was entered with F", async () => {
+    const harness = session();
+    const app = await renderApp(harness);
+    await harness.media(first).loaded({ duration: 24 });
+    await act(async () => { screen.getByLabelText("Notes").blur(); });
+    await app.user.keyboard("f");
+    await waitFor(() => expect(document.querySelector(".app-shell")).toHaveClass("is-focus"));
+    expect(screen.getByLabelText("Frame only")).toHaveAttribute("aria-pressed", "false");
+
+    await app.user.click(screen.getByLabelText("Frame only"));
+
+    // Not an exit: the button means "just the frame", and from Focus-with-notes
+    // the thing between the user and just the frame is the notes card.
+    expect(document.querySelector(".app-shell")).toHaveClass("is-focus");
+    expect(screen.getByLabelText("Frame only")).toHaveAttribute("aria-pressed", "true");
+  });
+
+  it("keeps the clip, the playhead and the notes across the round trip", async () => {
+    const harness = session();
+    const app = await renderApp(harness);
+    const clip = harness.media(first);
+    await clip.loaded({ duration: 24 });
+    await app.user.type(screen.getByLabelText("Notes"), "the light changes here");
+    await act(async () => { screen.getByLabelText("Notes").blur(); });
+    await clip.advanceTo(12);
+
+    await app.user.click(screen.getByLabelText("Frame only"));
+    await waitFor(() => expect(document.querySelector(".app-shell")).toHaveClass("is-focus"));
+    await app.user.click(screen.getByLabelText("Frame only"));
+
+    await waitFor(() => expect(document.querySelector(".app-shell")).not.toHaveClass("is-focus"));
+    expect(selectedRow()?.textContent).toContain("SONY_001.MP4");
+    expect(screen.getByLabelText("Notes")).toHaveValue("the light changes here");
+    expect(clip.element().currentTime).toBe(12);
   });
 });

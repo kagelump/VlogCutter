@@ -565,8 +565,6 @@ kbd { padding: 2px 4px; color: #a8b1b6; background: #262d32; border: 1px solid #
 .viewer-buffering span { width: 5px; height: 5px; background: var(--amber); border-radius: 50%; animation: pulse 900ms ease-in-out infinite; }
 /* WKWebView matches only the prefixed selector, and a selector list is dropped
    whole when one of its parts does not parse — so these stay separate rules. */
-.viewer-stage:fullscreen { width: 100vw; height: 100vh; background: #050607; }
-.viewer-stage:fullscreen .viewer-controls { right: 18px; bottom: 16px; left: 18px; }
 .viewer-stage:-webkit-full-screen { width: 100vw; height: 100vh; background: #050607; }
 .viewer-stage:-webkit-full-screen .viewer-controls { right: 18px; bottom: 16px; left: 18px; }
 

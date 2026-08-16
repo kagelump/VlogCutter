@@ -36,7 +36,8 @@ function renderBar(overrides: Partial<TransportBarProps> = {}) {
     onRotate: vi.fn(),
     onSetRotation: vi.fn(),
     onResetRotation: vi.fn(),
-    onEnterFocus: vi.fn(),
+    frameOnly: false,
+    onToggleFrameOnly: vi.fn(),
     ...overrides,
   };
   return { props, ...render(<TransportBar {...props} />) };
