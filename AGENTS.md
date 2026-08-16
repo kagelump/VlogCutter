@@ -416,7 +416,10 @@ The Vite-only browser preview is useful for fast layout and interaction work:
 pnpm --dir apps/desktop dev --host 127.0.0.1
 ```
 
-It runs at `http://127.0.0.1:1420/`. Outside Tauri, `main.tsx` installs the CUJ harness (`apps/desktop/src/preview/`) as the backend, so the preview exercises the real adapters against the same fake backend the CUJ suite drives. `api.ts` and `chronologyApi.ts` have no environment branches left, and a behaviour change in `apps/desktop/src/test/harness/commands/` shows up in both the preview and the CUJ suite. Progress and cancellation are driven on real timers by `src/preview/liveJobs.ts`, which only the preview loads.
+It runs at `http://127.0.0.1:1420/`. Append `?clips=3000` to seed a project at
+the scale section 1 sets instead of the fourteen-clip demo; that is what
+`e2e/scale.spec.ts` boots to measure what the queue and the ribbon cost to
+mount. Outside Tauri, `main.tsx` installs the CUJ harness (`apps/desktop/src/preview/`) as the backend, so the preview exercises the real adapters against the same fake backend the CUJ suite drives. `api.ts` and `chronologyApi.ts` have no environment branches left, and a behaviour change in `apps/desktop/src/test/harness/commands/` shows up in both the preview and the CUJ suite. Progress and cancellation are driven on real timers by `src/preview/liveJobs.ts`, which only the preview loads.
 
 It still cannot validate native dialogs, Tauri commands reaching Rust, the loopback media origin, FFmpeg child processes, persistence, or filesystem permissions. The preview has no media origin, so no clip plays. Never treat a browser-only pass as an end-to-end media test.
 
@@ -807,7 +810,7 @@ Run the narrowest useful tests while iterating, then the full gate before handof
 | React/TypeScript/CSS | `pnpm --dir apps/desktop check` | `pnpm --dir apps/desktop build` plus interaction/visual check |
 | Desktop user journeys | `pnpm test:desktop:cuj` | `pnpm test:desktop` plus interaction/visual check |
 | Desktop coverage floor | `pnpm test:desktop:coverage` | thresholds in `apps/desktop/vitest.config.ts`; raise them, never lower them to go green |
-| Desktop layout/scroll/focus | `pnpm test:desktop:browser` | headless-Chromium tier; real-engine layout, scrolling, focus, pointer, and a11y only — never native evidence |
+| Desktop layout/scroll/focus | `pnpm test:desktop:browser` | headless-Chromium tier; real-engine layout, scrolling, focus, pointer, a11y, and the render-cost budgets in `e2e/scale.spec.ts` — never native evidence |
 | Rust core | `cargo test -p rcdvlog-core` | `cargo test --workspace` |
 | ETA library | `cargo test -p batch-estimator` | `cargo test --workspace` |
 | CLI parsing/JSON | `cargo test -p rcdvlog-cli` | `pnpm test:integration` |

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { Asset } from "../types";
-import { indexOfAsset, moveSelection, nextSelection, orderAssets } from "./order";
+import { indexOfAsset, moveSelection, nextSelection, orderAssets, replaceAsset } from "./order";
 
 function asset(overrides: Partial<Asset> & { id: string }): Asset {
   return {
@@ -163,5 +163,33 @@ describe("nextSelection", () => {
 
   it("returns null when nothing survives and there was no previous selection", () => {
     expect(nextSelection([], null)).toBeNull();
+  });
+});
+
+describe("replaceAsset", () => {
+  const list = [asset({ id: "a" }), asset({ id: "b" }), asset({ id: "c" })];
+
+  it("replaces the matching clip and leaves the rest in place", () => {
+    const updated = asset({ id: "b", notes: "now with a note" });
+    const next = replaceAsset(list, updated);
+    expect(next.map((entry) => entry.id)).toEqual(["a", "b", "c"]);
+    expect(next[1]).toBe(updated);
+    expect(next[0]).toBe(list[0]);
+  });
+
+  it("returns the same array when the clip is not in it", () => {
+    // Identity is the point: a new array is a re-render of the whole shell,
+    // and this runs once per progress event through a batch.
+    expect(replaceAsset(list, asset({ id: "elsewhere" }))).toBe(list);
+  });
+
+  it("returns the same array when the clip is already that value", () => {
+    expect(replaceAsset(list, list[1])).toBe(list);
+  });
+
+  it("does not mutate the list it was given", () => {
+    const before = [...list];
+    replaceAsset(list, asset({ id: "b", notes: "changed" }));
+    expect(list).toEqual(before);
   });
 });

@@ -63,3 +63,22 @@ export function nextSelection(
   if (index !== -1) return previousId;
   return ordered[0].id;
 }
+
+/**
+ * Replace one asset in a list, or return the list untouched.
+ *
+ * Called once per progress event during a batch — thousands of times over a
+ * proxy run on a project of the target size. `assets.map(...)` allocates a new
+ * array of every clip on each of those events even when the clip it is looking
+ * for is not in the list at all, and a new array identity is a re-render of
+ * the whole shell. This copies only when there is something to change, and the
+ * copy is one slot rather than a closure per element.
+ */
+export function replaceAsset(assets: Asset[], updated: Asset): Asset[] {
+  const index = assets.findIndex((candidate) => candidate.id === updated.id);
+  if (index === -1) return assets;
+  if (assets[index] === updated) return assets;
+  const next = assets.slice();
+  next[index] = updated;
+  return next;
+}

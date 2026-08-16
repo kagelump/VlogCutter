@@ -3,7 +3,7 @@ import { api } from "./api";
 import type { ArchiveRoot, Asset, AssetPatch, AutoplayMode, BaselineImportResult, BaselinePreviewResult, CardCandidate, DesktopSettings, ImportHistoryEntry, ImportPreflight, ImportProgress, ImportRollbackPreview, ImportRunReport, ImportSessionDetail, ModelInstallProgress, ModelStatus, PathAnalysis, Project, ProjectLibrary, ProjectLocation, ProjectPairingStatus, RootMappingEntry, ServerConnectionStatus, ServerVersionInfo, SyncStatus, TranscriptStatus } from "./types";
 import { useProjectSession } from "./session/projectSession";
 import { useAssetMutations } from "./session/assetMutations";
-import { orderAssets, moveSelection as moveSelectionInOrder } from "./review/order";
+import { orderAssets, replaceAsset as replaceAssetInList, moveSelection as moveSelectionInOrder } from "./review/order";
 import { resolveEscape, type EscapeLayer } from "./review/escape";
 import { resolveAction } from "./review/keymap";
 import { CalibrationPanel } from "./CalibrationPanel";
@@ -453,7 +453,7 @@ function App() {
       orientationActiveRef.current.add(assetId);
       void api.refreshAssetOrientation(assetId)
         .then((updated) => {
-          patchAssets((current) => current.map((candidate) => candidate.id === updated.id ? updated : candidate));
+          patchAssets((current) => replaceAssetInList(current, updated));
         })
         .catch((reason) => {
           if (selectedIdRef.current === assetId) setError(String(reason));
@@ -484,7 +484,7 @@ function App() {
       const listeners = await Promise.all([
         api.onProxyProgress((progress) => {
           if (progress.asset) {
-            patchAssets((current) => current.map((asset) => asset.id === progress.asset?.id ? progress.asset : asset));
+            patchAssets((current) => progress.asset ? replaceAssetInList(current, progress.asset) : current);
           }
           if (activeOperationRef.current === "proxy") {
             setOperationProgress({
@@ -500,7 +500,7 @@ function App() {
         }),
         api.onThumbnailProgress((progress) => {
           if (progress.asset) {
-            patchAssets((current) => current.map((asset) => asset.id === progress.asset?.id ? progress.asset : asset));
+            patchAssets((current) => progress.asset ? replaceAssetInList(current, progress.asset) : current);
           }
           if (activeOperationRef.current === "thumbnail") {
             setOperationProgress({
@@ -518,7 +518,7 @@ function App() {
           // Replacing the asset as each clip lands is what makes a generated
           // title appear during the run rather than after it.
           if (progress.asset) {
-            patchAssets((current) => current.map((asset) => asset.id === progress.asset?.id ? progress.asset : asset));
+            patchAssets((current) => progress.asset ? replaceAssetInList(current, progress.asset) : current);
           }
           if (activeOperationRef.current === "analysis") {
             setOperationProgress({

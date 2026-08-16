@@ -280,3 +280,38 @@ export function previewScenario(): ScenarioBuilder {
     .dialogAnswers(CARD_MOUNT, ARCHIVE_MOUNT, CARD_MOUNT)
     .selectedClip(SONY[0]);
 }
+
+/**
+ * A project at the scale the product is designed for.
+ *
+ * AGENTS.md §1 sets it: thousands of mostly 4K/60 clips across about five
+ * cameras. Nothing here is staged for legibility — there is no card in the
+ * slot, no chronology problem, no edit plan — because the only question this
+ * scenario exists to answer is what the two review surfaces cost to mount when
+ * a project is that big. Reached with `?clips=3000` in the preview.
+ */
+export function scaleScenario(clips: number): ScenarioBuilder {
+  const cameras = ["Sony A7C II", "DJI Pocket 3", "Apple iPhone 17 Pro", "Insta360 X5", "Sony FX3"];
+  const share = Math.floor(clips / cameras.length);
+  const scenario = desktopScenario({ now: "2026-08-09T12:00:00.000Z" })
+    .project(`${PROJECT} (${clips} clips)`, { id: PROJECT_ID, createdAt: "2026-08-01T09:00:00.000Z" });
+
+  cameras.forEach((camera, index) => {
+    // The remainder rides on the last camera, so the total is exactly `clips`.
+    const count = index === cameras.length - 1 ? clips - share * (cameras.length - 1) : share;
+    if (count <= 0) return;
+    scenario.camera(camera, {
+      clips: count,
+      // Interleaved rather than blocked, which is what a real trip looks like
+      // and what makes the ribbon's lanes worth windowing.
+      startAt: new Date(Date.parse("2026-02-08T00:00:00.000Z") + index * 120_000).toISOString(),
+      spacingSeconds: 600,
+      durationSeconds: 18.4,
+      withProxy: true,
+    });
+  });
+
+  return scenario.tap((state) => {
+    state.mediaOrigin = null;
+  });
+}

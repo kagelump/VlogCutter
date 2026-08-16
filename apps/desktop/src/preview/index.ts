@@ -17,7 +17,7 @@
  */
 
 import { DesktopHarness } from "../test/harness/DesktopHarness";
-import { previewScenario } from "./demoScenario";
+import { previewScenario, scaleScenario } from "./demoScenario";
 import { previewConvertFileSrc } from "./previewFrames";
 import { startPreviewJobs } from "./liveJobs";
 
@@ -28,12 +28,33 @@ declare global {
   }
 }
 
+/**
+ * How many clips the preview should seed, from `?clips=` in the URL.
+ *
+ * The demo project is fourteen clips, chosen to make every surface legible.
+ * Nothing in it can answer "what does this cost at the scale AGENTS.md §1
+ * sets" — thousands of clips — and that is a real-engine question: mounting
+ * three thousand rows is a reconciliation and layout cost jsdom does not have.
+ * So the preview takes a size, and the browser tier asks the question.
+ */
+function requestedClipCount(search: string): number | null {
+  const value = new URLSearchParams(search).get("clips");
+  if (value === null) return null;
+  const clips = Number(value);
+  return Number.isInteger(clips) && clips > 0 && clips <= 20_000 ? clips : null;
+}
+
 export function installPreviewBackend(): DesktopHarness {
-  const harness = previewScenario().build({ convertFileSrc: previewConvertFileSrc });
+  const clips = typeof window === "undefined" ? null : requestedClipCount(window.location.search);
+  const scenario = clips === null ? previewScenario() : scaleScenario(clips);
+  const harness = scenario.build({ convertFileSrc: previewConvertFileSrc });
   harness.install();
-  startPreviewJobs(harness);
+  // The demo's live jobs are staged against the demo's clips; a scale run is
+  // about mounting cost and would only be measuring the job timer.
+  if (clips === null) startPreviewJobs(harness);
   window.__RCDVLOG_PREVIEW__ = harness;
   return harness;
 }
 
-export { previewScenario } from "./demoScenario";
+export { previewScenario, scaleScenario } from "./demoScenario";
+export { requestedClipCount };
