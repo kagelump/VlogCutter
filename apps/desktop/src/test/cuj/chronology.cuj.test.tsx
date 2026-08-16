@@ -197,6 +197,30 @@ describe("Review entry and stable return", () => {
     expect(within(inspector).getByRole("heading", { name: "DJI_001.MP4" })).toBeVisible();
   });
 
+  it("clears the Review chip once the problem is fixed, without a relaunch", async () => {
+    // The last thing the chip has to get right: it is derived from the
+    // solver's current answer, so a correction that removes the contradiction
+    // removes the chip, in the same session, on the way back to Review.
+    const harness = chronologyWithProblem()
+      .whenClockEpochApplied("sequence_sony")
+      .thenChronology({ order: [dji[0], sony[0], sony[1]], sequences })
+      .build();
+    const app = await renderApp(harness);
+    await app.user.click(screen.getByText("SONY_002.MP4"));
+    await app.user.click(await screen.findByRole("button", { name: /1 chronology problem.*Fix/i }));
+    const panel = await screen.findByRole("region", { name: "Chronology calibration" });
+
+    const impact = await previewClockCorrection(app, panel);
+    await app.user.click(within(impact).getByRole("button", { name: "Apply change" }));
+    await waitFor(() => expect(harness.calls("set_clock_epoch")).toHaveLength(1));
+    await app.user.click(within(panel).getByRole("button", { name: /Back to SONY_002\.MP4/ }));
+
+    await waitFor(() => expect(screen.queryByRole("region", { name: "Chronology calibration" })).toBeNull());
+    expect(screen.queryByRole("button", { name: /chronology problem/i })).toBeNull();
+    // And the clip the user left Review on is the clip they come back to.
+    expect(selectedRow()?.textContent).toContain("SONY_002.MP4");
+  });
+
   it("opens with Shift+T and restores selection, ribbon zoom/scroll, and queue scroll", async () => {
     const app = await renderApp(chronologyTrip().build());
     await app.user.click(screen.getByText("SONY_002.MP4"));
