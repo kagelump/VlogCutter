@@ -4,6 +4,7 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
+    "predev": "node ../../scripts/preflight-dev-port.mjs --port 1421 --purpose \"the web dev server\"",
     "dev": "vite",
     "build": "tsc -b && vite build",
     "check": "tsc -b --pretty false && vitest run",

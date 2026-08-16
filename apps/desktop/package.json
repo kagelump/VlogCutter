@@ -4,6 +4,7 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
+    "predev": "node ../../scripts/preflight-dev-port.mjs --port 1420 --purpose \"the desktop dev server (pinned by tauri.conf.json devUrl and the media origin's allowed origins)\"",
     "dev": "vite",
     "build": "tsc -b && vite build",
     "check": "tsc -b --pretty false",

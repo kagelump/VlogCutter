@@ -367,9 +367,18 @@ whose address is discovered at runtime binds `127.0.0.1:0`, reads the assigned
 port back, and publishes it through a channel its consumer already reads — the
 media origin (`media_server.rs`) and the eval bridge both do exactly this. A
 config-pinned port gets a preflight that names the process holding it. Test
-fixtures always allocate dynamically. Never add a retry loop or a fallback
-range: a listener that comes up somewhere its consumers are not looking is a
-silent failure, which is worse than a named bind error.
+fixtures always allocate dynamically (`scripts/lib/loopback-port.mjs`). Never
+add a retry loop or a fallback range: a listener that comes up somewhere its
+consumers are not looking is a silent failure, which is worse than a named bind
+error.
+
+The desktop's 1420 and the web app's 1421 are contracts — `devUrl`, the
+Playwright base URL, and the media origin's allowed origins all name 1420, and
+an origin mismatch fails *silently*. Their `predev` preflight
+(`scripts/preflight-dev-port.mjs`) turns a raw `EADDRINUSE` into the holder's
+command and pid, and offers a `kill` line only for a Vite whose working
+directory is inside this checkout. It never kills anything itself, and it never
+claims a process it cannot positively identify.
 
 The loopback media origin has a second, narrower dev-only seam under the same
 rules, for the case where a clip will not play and the app is the only thing
