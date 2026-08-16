@@ -6,6 +6,9 @@ import {
   clockSummary,
   descriptionSummary,
   fileSummary,
+  mediaAvailability,
+  mediaAvailabilityDescription,
+  sourceVolumeHint,
   transcriptBadge,
   transcriptSummary,
 } from "./summaries";
@@ -224,5 +227,43 @@ describe("clockSummary", () => {
   it("keeps a sub-minute offset visible instead of rounding it to nothing", () => {
     expect(clockSummary(asset({ id: "a", offsetSeconds: 30 }))).toBe("+30 sec");
     expect(clockSummary(asset({ id: "a", offsetSeconds: -5 }))).toBe("−5 sec");
+  });
+});
+
+describe("mediaAvailability", () => {
+  it("is available when the original is mounted, whatever the proxy is doing", () => {
+    expect(mediaAvailability(asset({ id: "a", originalAvailable: true, proxyAvailable: false }))).toBe("available");
+    expect(mediaAvailability(asset({ id: "a", originalAvailable: true, proxyAvailable: true }))).toBe("available");
+  });
+
+  it("is proxy-only when the original is offline and a proxy stands in", () => {
+    expect(mediaAvailability(asset({ id: "a", originalAvailable: false, proxyAvailable: true }))).toBe("proxy_only");
+  });
+
+  it("is blocked when nothing can be played", () => {
+    expect(mediaAvailability(asset({ id: "a", originalAvailable: false, proxyAvailable: false }))).toBe("blocked");
+  });
+
+  it("says which of the two offline states this is", () => {
+    const withProxy = asset({ id: "a", originalAvailable: false, proxyAvailable: true });
+    const without = asset({ id: "a", originalAvailable: false, proxyAvailable: false });
+    expect(mediaAvailabilityDescription(withProxy)).toMatch(/720p proxy/);
+    expect(mediaAvailabilityDescription(without)).toMatch(/cannot be played/);
+    expect(mediaAvailabilityDescription(withProxy)).not.toBe(mediaAvailabilityDescription(without));
+  });
+});
+
+describe("sourceVolumeHint", () => {
+  it("names the volume, which is what actually went offline", () => {
+    expect(sourceVolumeHint(asset({ id: "a", path: "/Volumes/HOKKAIDO_SSD/DCIM/100/C0001.MP4" })))
+      .toBe("HOKKAIDO_SSD");
+  });
+
+  it("falls back to the containing folder off a volume", () => {
+    expect(sourceVolumeHint(asset({ id: "a", path: "/Users/kage/Movies/trip/C0001.MP4" }))).toBe("trip");
+  });
+
+  it("falls back to the filename when there is no folder to name", () => {
+    expect(sourceVolumeHint(asset({ id: "a", path: "C0001.MP4", filename: "C0001.MP4" }))).toBe("C0001.MP4");
   });
 });

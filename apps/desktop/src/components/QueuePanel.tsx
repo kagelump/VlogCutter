@@ -3,6 +3,7 @@ import type { CSSProperties, RefObject, UIEvent } from "react";
 import { api } from "../api";
 import type { Asset, AssetAnalysisIndexEntry } from "../types";
 import { clipTitle, formatDuration } from "../review/format";
+import { mediaAvailability, mediaAvailabilityDescription } from "../review/summaries";
 import { isRawOrientationThumbnail, renderedRotation } from "../review/rotation";
 import { QUEUE_ROW_HEIGHT, queueWindow, scrollTopForQueueIndex } from "./queueWindow";
 
@@ -135,6 +136,7 @@ export function QueuePanel({
     const thumbnailUrl = api.thumbnailUrl(asset);
     const rotation = renderedRotation(asset, isRawOrientationThumbnail(asset));
     const verdict = analysisIndex[asset.id];
+    const availability = mediaAvailability(asset);
     return (
       <button
         className={`queue-item ${asset.id === selectedId ? "selected" : ""}`}
@@ -165,6 +167,21 @@ export function QueuePanel({
               this line, inside the flexible column, so a long reason
               truncates instead of widening the row. */}
           <span className="queue-meta">
+            {/* Whether the source media is reachable is worth knowing while
+                scanning, before an operation that needs it fails. It is a
+                fact, not an alarm: an offline original with a proxy is the
+                mode this application was built for. */}
+            {availability !== "available" && (
+              <span
+                className={`offline-pip ${availability === "blocked" ? "blocked" : ""}`}
+                title={mediaAvailabilityDescription(asset)}
+              >
+                <span aria-hidden="true">{availability === "blocked" ? "no media" : "offline"}</span>
+                {/* The row is read by its text, so the mark says what it means
+                    rather than making a screen-reader user find the tooltip. */}
+                <span className="sr-only">{mediaAvailabilityDescription(asset)}</span>
+              </span>
+            )}
             {verdict?.usable === false && (
               <span className="unusable-pip" title={`Analysis flagged this clip: ${verdict.unusableReason || "unusable"}`}>
                 {verdict.unusableReason || "unusable"}

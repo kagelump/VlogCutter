@@ -68,3 +68,35 @@ for (const [name, size] of Object.entries(SIZES)) {
     });
   });
 }
+
+test.describe("the queue's offline mark", () => {
+  test.use({ viewport: SIZES.small });
+
+  test("does not change a row's height or push its content out of the row", async ({ page }) => {
+    // Browser property: real box measurement. The queue is virtualized against
+    // a fixed 52px row and read by position at speed, so a mark that grew a row
+    // would both misplace every row below it and cost the recognizability the
+    // fixed geometry buys. jsdom reports every height as zero.
+    await boot(page);
+    const rows = await page.evaluate(() => {
+      const marked: number[] = [];
+      const plain: number[] = [];
+      let clipped = false;
+      for (const row of document.querySelectorAll<HTMLElement>('.queue-list [role="option"]')) {
+        (row.querySelector(".offline-pip") ? marked : plain).push(row.getBoundingClientRect().height);
+        const pip = row.querySelector<HTMLElement>(".offline-pip");
+        if (pip) {
+          const rowBox = row.getBoundingClientRect();
+          const pipBox = pip.getBoundingClientRect();
+          if (pipBox.right > rowBox.right + 0.5 || pipBox.bottom > rowBox.bottom + 0.5) clipped = true;
+        }
+      }
+      return { marked, plain, clipped };
+    });
+
+    expect(rows.marked.length).toBeGreaterThan(0);
+    expect(rows.plain.length).toBeGreaterThan(0);
+    expect(new Set([...rows.marked, ...rows.plain].map(Math.round))).toEqual(new Set([52]));
+    expect(rows.clipped).toBe(false);
+  });
+});

@@ -1344,6 +1344,28 @@ kbd { padding: 2px 4px; color: #a8b1b6; background: #262d32; border: 1px solid #
 /* Queue: the verdict shares the secondary line and never widens the row. */
 .queue-meta { display: flex; min-width: 0; align-items: center; gap: 4px; }
 .queue-meta > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* The offline mark is deliberately quieter than the unusable one: an original
+   that is not mounted is the expected state of a NAS project reviewed on a
+   laptop, and only the no-proxy case is a problem. */
+.offline-pip {
+  flex: none;
+  padding: 1px 5px;
+  color: var(--quiet);
+  background: rgba(255,255,255,.05);
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  font-size: 10px;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.offline-pip.blocked {
+  color: var(--red);
+  background: rgba(230,120,104,.12);
+  border-color: rgba(230,120,104,.32);
+}
+
 .unusable-pip {
   flex: none;
   max-width: 90px;

@@ -2,6 +2,8 @@ import type { Asset, AssetAnalysisView, ClipTranscript } from "../types";
 import {
   analysisNeedsAttention,
   formatBytes,
+  mediaAvailability,
+  mediaAvailabilityDescription,
   transcriptBadge,
   transcriptStatusLabels,
 } from "../review/summaries";
@@ -20,6 +22,10 @@ export interface EvidenceShelfProps {
   onSeek(seconds: number): void;
   onChangeAsset(next: Asset): void;
   onCommitAsset(): void;
+  /** Reconnect this clip's originals: the relink workflow, from the clip that needs it. */
+  onLocateOriginals(): void;
+  /** An operation already has the project; the relink dialog must not stack on it. */
+  busy: boolean;
 }
 
 /**
@@ -45,6 +51,8 @@ export function EvidenceShelf({
   onSeek,
   onChangeAsset,
   onCommitAsset,
+  onLocateOriginals,
+  busy,
 }: EvidenceShelfProps) {
   const segments = transcript?.segments ?? [];
   const badge = transcriptBadge(transcript);
@@ -159,6 +167,20 @@ export function EvidenceShelf({
               <div><dt>Corrected</dt><dd className="mono">{formatDate(asset.bestTime)}</dd></div>
               <div><dt>Original</dt><dd>{asset.originalAvailable ? "mounted" : "offline"}</dd></div>
               <div><dt>Proxy</dt><dd>{asset.proxyAvailable ? "720p present" : "none"}</dd></div>
+              {/* Repair belongs where the problem is visible. Reaching relink
+                  only through the chronology desk's diagnostics made it
+                  something you had to already know about. */}
+              {mediaAvailability(asset) !== "available" && (
+                <div className="fact-wide">
+                  <dt>Offline</dt>
+                  <dd>
+                    {mediaAvailabilityDescription(asset)}
+                    <button className="button ghost" disabled={busy} onClick={onLocateOriginals}>
+                      Locate originals…
+                    </button>
+                  </dd>
+                </div>
+              )}
             </dl>
           )}
         </div>

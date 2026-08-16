@@ -148,7 +148,11 @@ Important gaps; do not accidentally describe these as complete:
   Relink now
   exists: media locations carry a verification state, ingest repairs an asset
   whose original it rediscovers, and an offline-volume diagnostic offers
-  `Locate…` (CLI: `relink`). Removable-card detection and archive-root rebinding
+  `Locate…` (CLI: `relink`). Queue rows carry a compact offline mark that
+  separates *original offline, reviewable from its proxy* from *nothing to
+  play*, and the selected clip's File shelf reaches the same project-wide
+  relink, so repair no longer requires knowing the chronology desk's
+  diagnostics exist. Removable-card detection and archive-root rebinding
   are implemented; see `docs/tasks/import/EPIC.md` for the remaining physical
   card/volume acceptance gate.
 - Desktop/CLI full-patch writes still have no transport-level optimistic revision token; cross-node operation sync does not make competing local full patches safe.

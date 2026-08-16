@@ -39,6 +39,7 @@ import { BaselineWizardModal } from "./components/BaselineWizardModal";
 import { SettingsModal } from "./components/SettingsModal";
 import { CardBanner } from "./components/CardBanner";
 import { analysisStageLabels, formatCost } from "./review/format";
+import { sourceVolumeHint } from "./review/summaries";
 import { rotationAfter } from "./review/rotation";
 import { buildMediaBuffer } from "./review/mediaBuffer";
 
@@ -1344,6 +1345,34 @@ function App() {
     }
   }
 
+  /**
+   * Reconnect this clip's originals, from the clip that is missing them.
+   *
+   * The same project-wide relink the chronology desk's offline-volume
+   * diagnostic runs: a folder search repairs every asset it recognises, not
+   * only the selected one, because a volume comes back all at once.
+   */
+  async function locateOriginals(asset: Asset) {
+    if (!projectId || busy) return;
+    const folder = await api.chooseRelinkFolder(sourceVolumeHint(asset));
+    if (!folder) return;
+    setBusy(true);
+    setError("");
+    try {
+      const report = await api.relinkFolder(projectId, folder);
+      // The queue's offline marks come from the assets, so re-reading them is
+      // what clears the state without a relaunch.
+      await reloadSessionAssets();
+      setMessage(report.repaired
+        ? `Reconnected ${report.repaired} clip${report.repaired === 1 ? "" : "s"}`
+        : "Nothing in that folder matched this project's offline clips");
+    } catch (reason) {
+      setError(String(reason));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function makeProxy() {
     if (!selected || busy) return;
     setBusy(true);
@@ -1961,6 +1990,8 @@ function App() {
               onSeek={seekTo}
               onChangeAsset={replaceAsset}
               onCommitAsset={() => void saveClipSummary(selected)}
+              onLocateOriginals={() => void locateOriginals(selected)}
+              busy={busy}
             />
           )}
         </section>

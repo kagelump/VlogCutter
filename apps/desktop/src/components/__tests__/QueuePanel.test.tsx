@@ -236,3 +236,38 @@ describe("search", () => {
     expect(props.onQueryChange).toHaveBeenCalledWith("r");
   });
 });
+
+describe("offline originals", () => {
+  it("marks a clip whose original is offline but whose proxy is present", () => {
+    const { container } = renderPanel({
+      assets: [asset({ id: "a", originalAvailable: false, proxyAvailable: true })],
+    });
+    const pip = container.querySelector(".offline-pip");
+    expect(pip?.textContent).toContain("offline");
+    // Quiet, not an alarm: reviewing from a proxy is what proxies are for.
+    expect(pip?.classList.contains("blocked")).toBe(false);
+    expect(pip?.getAttribute("title")).toMatch(/reviewing from the 720p proxy/i);
+  });
+
+  it("distinguishes a clip with neither original nor proxy", () => {
+    const { container } = renderPanel({
+      assets: [asset({ id: "a", originalAvailable: false, proxyAvailable: false })],
+    });
+    const pip = container.querySelector(".offline-pip");
+    expect(pip?.classList.contains("blocked")).toBe(true);
+    expect(pip?.getAttribute("title")).toMatch(/cannot be played/i);
+  });
+
+  it("marks nothing when the original is mounted", () => {
+    const { container } = renderPanel({
+      assets: [asset({ id: "a", originalAvailable: true, proxyAvailable: true })],
+    });
+    expect(container.querySelector(".offline-pip")).toBeNull();
+  });
+
+  it("explains the state in the row's text, not only in a tooltip", () => {
+    renderPanel({ assets: [asset({ id: "a", originalAvailable: false, proxyAvailable: true })] });
+    const row = screen.getByRole("option");
+    expect(row.textContent).toContain("Original is offline — reviewing from the 720p proxy");
+  });
+});

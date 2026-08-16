@@ -88,6 +88,8 @@ function renderShelf(overrides: Partial<EvidenceShelfProps> = {}) {
     onSeek: vi.fn(),
     onChangeAsset: vi.fn(),
     onCommitAsset: vi.fn(),
+    onLocateOriginals: vi.fn(),
+    busy: false,
     ...overrides,
   };
   return { props, ...render(<EvidenceShelf {...props} />) };

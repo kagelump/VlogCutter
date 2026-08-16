@@ -67,6 +67,47 @@ export function analysisNeedsAttention(observation: AssetAnalysisView | null): b
   return !observation.analysis.usable || !observation.current;
 }
 
+/**
+ * Whether a clip's source media is reachable right now.
+ *
+ * Three states rather than two, because "the original is offline" is only a
+ * problem in one of them. Reviewing a NAS project from a laptop on a train is
+ * the *designed* mode — proxies exist for it — so an offline original with a
+ * proxy is a fact to state quietly, while an offline original with no proxy is
+ * a clip that cannot be played at all.
+ */
+export type MediaAvailability = "available" | "proxy_only" | "blocked";
+
+export function mediaAvailability(asset: Asset): MediaAvailability {
+  if (asset.originalAvailable) return "available";
+  return asset.proxyAvailable ? "proxy_only" : "blocked";
+}
+
+/** What the offline mark means, for a tooltip and for the accessible name. */
+export function mediaAvailabilityDescription(asset: Asset): string {
+  switch (mediaAvailability(asset)) {
+    case "proxy_only":
+      return "Original is offline — reviewing from the 720p proxy";
+    case "blocked":
+      return "Original is offline and there is no proxy — this clip cannot be played";
+    default:
+      return "Original is mounted";
+  }
+}
+
+/**
+ * What to call the place this clip's original came from, when asking where it
+ * went. The volume when the path names one, otherwise the containing folder:
+ * "Where is the footage from HOKKAIDO_SSD now?" is answerable, and "where is
+ * the footage from these clips now?" is not.
+ */
+export function sourceVolumeHint(asset: Asset): string {
+  const segments = asset.path.split("/").filter(Boolean);
+  if (segments[0] === "Volumes" && segments[1]) return segments[1];
+  const parent = segments.at(-2);
+  return parent ?? asset.filename;
+}
+
 export function fileSummary(asset: Asset): string {
   return `${asset.camera} · ${asset.codec.toUpperCase()} · ${formatBytes(asset.sizeBytes)}`;
 }
