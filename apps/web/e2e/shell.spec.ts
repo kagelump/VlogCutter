@@ -1,11 +1,15 @@
 import { expect, test } from "@playwright/test";
 import { readFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+
+import { bootstrapCodePath } from "../../../scripts/lib/web-e2e-fixture.mjs";
 
 function bootstrapCode(index: number): string {
   const configured = process.env.RCDVLOG_E2E_BOOTSTRAP_CODES?.split(",")[index - 1]?.trim();
-  return configured || readFileSync(join(tmpdir(), `rcdvlog-web-e2e-bootstrap-${index}.secret`), "utf8").trim();
+  if (configured) return configured;
+  // Keyed to this run's port, which the config exported after allocating it.
+  const baseURL = process.env.RCDVLOG_WEB_E2E_BASE_URL;
+  if (!baseURL) throw new Error("web e2e: no RCDVLOG_WEB_E2E_BASE_URL and no RCDVLOG_E2E_BOOTSTRAP_CODES");
+  return readFileSync(bootstrapCodePath(baseURL, index), "utf8").trim();
 }
 
 test("Chrome reaches the real unauthenticated server session flow", async ({ page }) => {

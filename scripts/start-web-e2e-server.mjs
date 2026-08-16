@@ -1,9 +1,22 @@
+// The real server the Chrome e2e suite runs against, on a fixture catalog.
+//
+// Nothing outside this run may reach it and nothing from a previous run may be
+// mistaken for it, so the port is allocated rather than pinned and every
+// artefact — catalog, derived files, bootstrap codes — is keyed to that port.
+// Playwright normally allocates it and passes it in through
+// `RCDVLOG_LISTEN_ADDR` because it needs the health-check URL before it can
+// spawn anything; a standalone run allocates its own and prints it.
+
 import { spawn, spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
+import { allocateLoopbackAddress } from "./lib/loopback-port.mjs";
+import { bootstrapCodePath } from "./lib/web-e2e-fixture.mjs";
+
 const repository = resolve(import.meta.dirname, "..");
+const listenAddress = process.env.RCDVLOG_LISTEN_ADDR || (await allocateLoopbackAddress());
 const fixture = mkdtempSync(join(tmpdir(), "rcdvlog-web-e2e-"));
 const state = join(fixture, "state");
 const temp = join(state, "tmp");
@@ -17,7 +30,7 @@ const runtimeEnvironment = {
   RCDVLOG_TEMP_DIR: temp,
   RCDVLOG_DERIVED_DIR: derived,
   RCDVLOG_BACKUP_DIR: backup,
-  RCDVLOG_LISTEN_ADDR: "127.0.0.1:8090",
+  RCDVLOG_LISTEN_ADDR: listenAddress,
   RCDVLOG_WEB_DIR: join(repository, "apps/web/dist"),
   RCDVLOG_FFMPEG: "/usr/bin/true",
   RCDVLOG_FFPROBE: "/usr/bin/true",
@@ -34,7 +47,7 @@ if (seed.status !== 0) {
   throw new Error(`seed real web project fixture: ${seed.stderr}`);
 }
 
-const bootstrapFiles = [1, 2, 3].map((index) => join(tmpdir(), `rcdvlog-web-e2e-bootstrap-${index}.secret`));
+const bootstrapFiles = [1, 2, 3].map((index) => bootstrapCodePath(listenAddress, index));
 for (const bootstrapFile of bootstrapFiles) {
   rmSync(bootstrapFile, { force: true });
   const bootstrap = spawnSync(
@@ -46,6 +59,10 @@ for (const bootstrapFile of bootstrapFiles) {
     throw new Error(`create local bootstrap fixture: ${bootstrap.stderr}`);
   }
 }
+
+// Printed for the standalone case, where the caller allocated nothing and has
+// no other way to learn where the fixture came up.
+console.log(`[rcdvlog-web-e2e] serving http://${listenAddress}`);
 
 const server = spawn("cargo", ["run", "--quiet", "-p", "rcdvlog-server"], {
   cwd: repository,
