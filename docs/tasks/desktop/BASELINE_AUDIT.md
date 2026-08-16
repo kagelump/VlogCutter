@@ -53,20 +53,20 @@ No tracked files modified. Untracked `__pycache__` artifacts are harmless.
 - **Output:**
 
 ```text
-> rcd-vlogcutter@ check:docs /Users/ryantseng/Documents/VlogCutter
+> rcd-vlogcutter@ check:docs <repo>
 > node scripts/check-docs.mjs
 
-/Users/ryantseng/Documents/VlogCutter/.claude/skills/executing-bounded-task-cycle/SKILL.md:
+<repo>/.claude/skills/executing-bounded-task-cycle/SKILL.md:
   broken relative link: ../../../planning/ORCHESTRATION.md#9-definition-of-complete
-/Users/ryantseng/Documents/VlogCutter/.claude/skills/executing-bounded-task-cycle/references/epic-schema.md:
+<repo>/.claude/skills/executing-bounded-task-cycle/references/epic-schema.md:
   broken relative link: tasks/E01-T001-decoder-seam.md
-/Users/ryantseng/Documents/VlogCutter/.claude/skills/executing-bounded-task-cycle/references/epic-schema.md:
+<repo>/.claude/skills/executing-bounded-task-cycle/references/epic-schema.md:
   broken relative link: tasks/E01-T002-thumbnail-cache.md
-/Users/ryantseng/Documents/VlogCutter/.claude/skills/writing-bounded-task-packets/assets/EPIC.template.md:
+<repo>/.claude/skills/writing-bounded-task-packets/assets/EPIC.template.md:
   broken relative link: tasks/{{TASK_ID}}-{{TASK_SLUG}}.md
-/Users/ryantseng/Documents/VlogCutter/.claude/skills/writing-bounded-task-packets/references/epic-schema.md:
+<repo>/.claude/skills/writing-bounded-task-packets/references/epic-schema.md:
   broken relative link: tasks/E01-T001-decoder-seam.md
-/Users/ryantseng/Documents/VlogCutter/.claude/skills/writing-bounded-task-packets/references/epic-schema.md:
+<repo>/.claude/skills/writing-bounded-task-packets/references/epic-schema.md:
   broken relative link: tasks/E01-T002-thumbnail-cache.md
  ELIFECYCLE  Command failed with exit code 1.
 ```

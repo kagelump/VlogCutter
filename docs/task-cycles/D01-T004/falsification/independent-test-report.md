@@ -142,7 +142,7 @@ Both runners install FFmpeg before the verification steps.
 
 ## Charter item 6: Verify the README
 
-**File:** `/Users/ryantseng/Documents/VlogCutter/.github/workflows/README.md`
+**File:** `<repo>/.github/workflows/README.md`
 
 **Result: PASS**
 

@@ -48,7 +48,7 @@ Local desktop commands use `invalid_arguments`, `invalid_input`, `not_found`, `m
 Long ingest commands emit JSON progress objects to stderr every 25 assets and on completion:
 
 ```json
-{"event":"ingest.progress","completed":25,"total":273,"path":"/Volumes/data/clip.mp4"}
+{"event":"ingest.progress","completed":25,"total":273,"path":"/Volumes/Card/clip.mp4"}
 ```
 
 ## Commands

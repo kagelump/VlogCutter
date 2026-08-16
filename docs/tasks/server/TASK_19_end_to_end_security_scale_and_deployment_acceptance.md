@@ -106,7 +106,7 @@ Run on the actual Ubuntu i7-8550U/16 GB laptop and Mac:
 16. Create a backup and restore it to a disposable alternate data root.
 17. Prove original-root contents and metadata were not changed by comparing the captured tree/evidence.
 
-The known `/Volumes/data/VideoProjects/2025-08 Expo` fixture is optional scale acceptance. Enumerate it read-only first, begin with a small subset, never create outputs in it, and report exact counts.
+The large real corpus at `$RCDVLOG_ACCEPTANCE_MEDIA_ROOT` is optional scale acceptance. Enumerate it read-only first, begin with a small subset, never create outputs in it, and report exact counts.
 
 ## Resource expectations
 

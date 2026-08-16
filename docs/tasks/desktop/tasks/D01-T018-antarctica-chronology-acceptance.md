@@ -88,7 +88,7 @@ Go, and a Sony A7C, in per-camera folders. It is the same corpus D01-T005's smok
 run drew from, and the same one whose filename shapes D01-T028's pattern table
 was built against.
 
-Do not substitute the Expo fixture at `/Volumes/data/VideoProjects/2025-08 Expo`
+Do not substitute the large real corpus at `$RCDVLOG_ACCEPTANCE_MEDIA_ROOT`
 for this gate. That fixture is valuable for scale acceptance, but the product owner
 named the Antarctica pattern specifically because of its multi-timezone and
 date-line structure, and a single-region shoot cannot exercise trip phases,

@@ -34,8 +34,8 @@ macOS-specific.
 ## 2026-08-03 M3 benchmark
 
 The benchmark used an 8-core Apple M3 MacBook Air and read immutable originals
-from `/Volumes/data/VideoProjects/2025-08 Expo`. The corpus contained 273 files
-(98 GB); inspected files were 3840x2160, 59.94 fps, 10-bit HEVC with AAC audio.
+from a large real corpus (`$RCDVLOG_ACCEPTANCE_MEDIA_ROOT`), not from fixtures.
+The corpus contained 273 files (98 GB); inspected files were 3840x2160, 59.94 fps, 10-bit HEVC with AAC audio.
 Outputs were H.264 High, 1280x720, 59.94 fps, `yuv420p`, AAC, and zero display
 rotation. Temporary outputs lived outside the source tree.
 

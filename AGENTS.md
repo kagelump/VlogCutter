@@ -856,11 +856,17 @@ For frontend interaction changes, use the Vite browser preview for focus, keyboa
 
 ## 13. Real-project acceptance fixture
 
-The known large source fixture is:
+Scale acceptance runs against a large real corpus that is **not** named in this
+repository. Point the tooling at it through local configuration:
 
-```text
-/Volumes/data/VideoProjects/2025-08 Expo
+```bash
+export RCDVLOG_ACCEPTANCE_MEDIA_ROOT="/absolute/path/to/your/large/corpus"
 ```
+
+Everything below assumes that variable. Never hard-code the path in Git, in an
+issue, or in a commit message: it names somebody's private footage, and the
+technical value of an acceptance run is in the counts and the behaviour, not in
+where the files live.
 
 It is source media, not a disposable test directory. Before accessing it:
 

@@ -98,4 +98,4 @@ Residual security limitations:
 
 ## Release limitations and next action
 
-Task 19 is complete as an implementation and local automated-acceptance task, but this report is not approval to deploy the companion server as release-ready. Before release, run the 17-row matrix on the actual Ubuntu/Mac/NAS/LAN/Tailscale topology, attach exact counts and resource observations to a follow-up acceptance record, and resolve any target-only defect. The known `/Volumes/data/VideoProjects/2025-08 Expo` source was deliberately left untouched.
+Task 19 is complete as an implementation and local automated-acceptance task, but this report is not approval to deploy the companion server as release-ready. Before release, run the 17-row matrix on the actual Ubuntu/Mac/NAS/LAN/Tailscale topology, attach exact counts and resource observations to a follow-up acceptance record, and resolve any target-only defect. The large real corpus at `$RCDVLOG_ACCEPTANCE_MEDIA_ROOT` was deliberately left untouched.
