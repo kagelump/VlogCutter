@@ -243,6 +243,7 @@ function App() {
   // save state, and the double-submit guard.
   const mutations = useAssetMutations({
     update: useCallback((assetId: string, patch: AssetPatch) => api.updateAsset(assetId, patch), []),
+    reread: useCallback((assetId: string) => api.getAsset(assetId), []),
     applyAsset: applyAssetToQueue,
     onError: setError,
   });

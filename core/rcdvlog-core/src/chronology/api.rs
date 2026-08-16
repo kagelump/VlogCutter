@@ -21,8 +21,8 @@ use crate::Catalog;
 use crate::operations::{
     CAPTURE_SEQUENCE_DECLARED, CAPTURE_SEQUENCE_MERGED, CAPTURE_SEQUENCE_REASSIGNED,
     CAPTURE_SEQUENCE_SPLIT, CAPTURE_SEQUENCE_SPLIT_DECLINED, CAPTURE_SEQUENCE_SPLIT_EXACT,
-    CAPTURE_SEQUENCE_SPLIT_RESTORED, CLIP_TIME_EXCEPTION_CLEARED,
-    CLIP_TIME_EXCEPTION_SET, CLOCK_EPOCH_CLEARED, CLOCK_EPOCH_SET, CaptureSequenceDeclaredPayload,
+    CAPTURE_SEQUENCE_SPLIT_RESTORED, CLIP_TIME_EXCEPTION_CLEARED, CLIP_TIME_EXCEPTION_SET,
+    CLOCK_EPOCH_CLEARED, CLOCK_EPOCH_SET, CaptureSequenceDeclaredPayload,
     CaptureSequenceMergedPayload, CaptureSequenceReassignedPayload,
     CaptureSequenceSplitDeclinedPayload, CaptureSequenceSplitExactPayload,
     CaptureSequenceSplitPayload, CaptureSequenceSplitRestoredPayload, ClipTimeExceptionSetPayload,
@@ -1067,8 +1067,7 @@ impl Catalog {
             let Some(boundary_index) = timeline
                 .windows(2)
                 .position(|pair| {
-                    pair[1].1 < pair[0].1
-                        && !declined.contains(&(sequence.id.clone(), pair[1].1))
+                    pair[1].1 < pair[0].1 && !declined.contains(&(sequence.id.clone(), pair[1].1))
                 })
                 .map(|index| index + 1)
             else {
@@ -1120,10 +1119,7 @@ impl Catalog {
     }
 
     /// Every "same card" answer in the project, newest boundary last.
-    pub fn declined_capture_sequence_splits(
-        &self,
-        project_id: &str,
-    ) -> Result<Vec<DeclinedSplit>> {
+    pub fn declined_capture_sequence_splits(&self, project_id: &str) -> Result<Vec<DeclinedSplit>> {
         self.require_project(project_id)?;
         let connection = self.connection()?;
         let mut statement = connection.prepare(

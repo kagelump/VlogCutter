@@ -30,7 +30,7 @@ function asset(id: string, filename: string, overrides: Partial<Asset> = {}): As
     width: 1920, height: 1080, defaultRotationDegrees: 0, rotationDegrees: 0,
     metadataRotationDegrees: 0, orientationProbed: true, codec: "h264", camera: "Sony",
     capturedAtRaw: null, bestTime: null, offsetSeconds: 0, labels: [], notes: "",
-    removed: false, available: true, originalAvailable: true, proxyAvailable: true,
+    removed: false, available: true, revision: 0, originalAvailable: true, proxyAvailable: true,
     proxyPath: `/proxies/${id}.v3.mp4`, proxyRepresentation: "raw_v3",
     thumbnailPath: `/thumbs/${id}.v2.jpg`, thumbnailQuality: 1,
     mediaObjectId: null, mediaVerificationState: "verified", phase: "",
@@ -159,6 +159,7 @@ describe("CompareDeck", () => {
     assetsById.set("sony-2", asset("sony-2", "C0902.MP4", {
       proxyAvailable: false, proxyPath: null, proxyRepresentation: null, originalAvailable: false,
       available: false,
+      revision: 0,
     }));
     render(
       <CompareDeck

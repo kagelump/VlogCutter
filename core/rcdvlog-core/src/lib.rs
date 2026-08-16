@@ -124,8 +124,9 @@ pub use operations::{
     LABEL_REMOVED, MAX_REMOTE_HLC_FUTURE_SKEW_MILLIS, NOTE_REVISION_CREATED,
     NoteRevisionProjection, OperationBatchResult, OperationDiagnostics, PROJECT_ASSET_ADDED,
     PROJECT_ASSET_MEDIA_LINKED, ProjectAssetAddedPayload, ProjectAssetItem, ProjectAssetPage,
-    ProjectOperation, REMOVED_SET, ROTATION_SET, SequenceRecoveryProjection, SequenceRecoveryState,
-    TRIP_PHASE_REMOVED, TRIP_PHASE_SET, operation_affects_chronology_projection,
+    ProjectOperation, REMOVED_SET, ROTATION_SET, STALE_ASSET_REVISION, SequenceRecoveryProjection,
+    SequenceRecoveryState, TRIP_PHASE_REMOVED, TRIP_PHASE_SET,
+    operation_affects_chronology_projection,
 };
 
 pub use baseline::{PortableAssetBaseline, PortableRootMapping, ProjectBaselineSnapshot};
@@ -285,6 +286,13 @@ pub struct Asset {
     pub media_object_id: Option<String>,
     pub media_verification_state: MediaVerificationState,
     pub available: bool,
+    /// The operation revision this view was materialized from.
+    ///
+    /// A writer sends it back as `AssetPatch::expected_revision` so a patch
+    /// built from a stale read is refused rather than applied over whatever
+    /// happened in between.
+    #[serde(default)]
+    pub revision: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -294,6 +302,13 @@ pub struct AssetPatch {
     pub labels: Vec<String>,
     pub removed: bool,
     pub rotation_degrees: u16,
+    /// The `Asset::revision` this patch was built from, when the caller has one.
+    ///
+    /// `None` keeps the pre-existing last-write-wins behaviour, which the
+    /// scripted CLI paths and the ingest-time writers rely on. A caller that
+    /// read the asset and let a human edit it should always send one.
+    #[serde(default)]
+    pub expected_revision: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1355,6 +1370,7 @@ impl Catalog {
         };
         let (location_state, location_size, location_mtime, location_join) =
             location_columns(&connection)?;
+        let (revision, revision_join) = revision_columns(&connection)?;
         let sql = format!(
             r#"
             SELECT a.id, a.project_id, a.path, a.filename, a.fingerprint, a.size_bytes,
@@ -1364,10 +1380,12 @@ impl Catalog {
                    {orientation_probed}, {thumbnail_path}, {thumbnail_quality},
                    a.notes, {labels}, {removed}, {media_object_id},
                    {media_verification_state}, {title}, {description},
-                   {location_state}, {location_size}, {location_mtime}
+                   {location_state}, {location_size}, {location_mtime},
+                   {revision}
             FROM assets a
             {thumbnail_join}
             {location_join}
+            {revision_join}
             WHERE a.project_id = ?1 AND COALESCE(a.membership_removed, 0) = 0
             ORDER BY a.best_time IS NULL, a.best_time, a.filename, a.id
             "#
@@ -1440,6 +1458,7 @@ impl Catalog {
         };
         let (location_state, location_size, location_mtime, location_join) =
             location_columns(&connection)?;
+        let (revision, revision_join) = revision_columns(&connection)?;
         let sql = format!(
             r#"
             SELECT a.id, a.project_id, a.path, a.filename, a.fingerprint, a.size_bytes,
@@ -1449,10 +1468,12 @@ impl Catalog {
                    {orientation_probed}, {thumbnail_path}, {thumbnail_quality},
                    a.notes, {labels}, {removed}, {media_object_id},
                    {media_verification_state}, {title}, {description},
-                   {location_state}, {location_size}, {location_mtime}
+                   {location_state}, {location_size}, {location_mtime},
+                   {revision}
             FROM assets a
             {thumbnail_join}
             {location_join}
+            {revision_join}
             WHERE a.id = ?1
             "#
         );
@@ -3510,6 +3531,25 @@ fn row_to_asset(row: &rusqlite::Row<'_>) -> rusqlite::Result<Asset> {
         media_object_id: row.get(25)?,
         media_verification_state,
         available,
+        revision: row.get::<_, i64>(32)? as u64,
+    })
+}
+
+/// The asset's operation revision, and the join that supplies it.
+///
+/// One `LEFT JOIN` on a primary key rather than a query per asset: `list_assets`
+/// runs this for every clip in a project, and the target is thousands.
+/// A catalog predating the operations log has no such table and reports 0,
+/// which is the same revision `reconcile_asset_baseline` gives an asset that
+/// has never been written through an operation.
+fn revision_columns(connection: &rusqlite::Connection) -> Result<(&'static str, &'static str)> {
+    Ok(if table_exists(connection, "materialized_revisions")? {
+        (
+            "COALESCE(r.revision, 0)",
+            "LEFT JOIN materialized_revisions r ON r.project_id = a.project_id AND r.aggregate_type = 'projectAsset' AND r.aggregate_id = a.id",
+        )
+    } else {
+        ("0", "")
     })
 }
 
@@ -4932,6 +4972,7 @@ mod tests {
                     labels: vec!["arrival".to_string()],
                     removed: true,
                     rotation_degrees: current.rotation_degrees,
+                    expected_revision: None,
                 },
             )
             .unwrap();
@@ -5188,6 +5229,7 @@ mod tests {
                 labels: vec!["x".repeat(65)],
                 removed: false,
                 rotation_degrees: current.rotation_degrees,
+                expected_revision: None,
             },
         );
         assert!(result.is_err());
@@ -5216,6 +5258,7 @@ mod tests {
                     labels: asset.labels.clone(),
                     removed: asset.removed,
                     rotation_degrees: 180,
+                    expected_revision: None,
                 },
             )
             .unwrap();
@@ -5231,6 +5274,7 @@ mod tests {
                         labels: asset.labels,
                         removed: asset.removed,
                         rotation_degrees: 45,
+                        expected_revision: None,
                     },
                 )
                 .is_err()
@@ -5264,6 +5308,7 @@ mod tests {
                     labels: vec!["arrival".to_string()],
                     removed: false,
                     rotation_degrees: tie.rotation_degrees,
+                    expected_revision: None,
                 },
             )
             .unwrap();
@@ -5915,6 +5960,7 @@ mod tests {
                     labels: vec!["station".to_string(), "opening".to_string()],
                     removed: false,
                     rotation_degrees: asset.rotation_degrees,
+                    expected_revision: None,
                 },
             )
             .unwrap();

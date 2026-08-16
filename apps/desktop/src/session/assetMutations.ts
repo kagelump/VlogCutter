@@ -50,6 +50,8 @@ export interface MutationSnapshot {
 export interface AssetMutationEffects {
   /** The IPC write. Given the whole patch, as the `update_asset` contract requires. */
   update(assetId: string, patch: AssetPatch): Promise<Asset>;
+  /** Read one clip again, after the backend refused a write as stale. */
+  reread(assetId: string): Promise<Asset>;
   /** Put an asset into the queue — optimistic value, backend value, or rollback. */
   applyAsset(asset: Asset): void;
   /** Where a rejection is reported to the user. */
@@ -64,7 +66,15 @@ export function patchFor(asset: Asset): AssetPatch {
     labels: asset.labels,
     removed: asset.removed,
     rotationDegrees: asset.rotationDegrees,
+    expectedRevision: asset.revision,
   };
+}
+
+/** The backend's stable marker for a write built on a stale read (issue #49). */
+export const STALE_ASSET_REVISION = "stale asset revision";
+
+export function isStaleRevisionError(message: string): boolean {
+  return message.includes(STALE_ASSET_REVISION);
 }
 
 const EMPTY_SNAPSHOT: MutationSnapshot = { saveState: "idle", activeAssetId: null, drafts: {} };
@@ -183,7 +193,7 @@ export class AssetMutationLifecycle {
     this.update({ saveState: "saving", activeAssetId: assetId });
 
     try {
-      const updated = await this.effects.update(assetId, { ...patchFor(base), ...changes });
+      const updated = await this.writeThroughStaleness(assetId, base, changes);
       this.apply(updated);
       // A write carrying the retained draft is the draft being saved, whatever
       // else prompted it: the backend now holds that text, so the unsaved mark
@@ -212,6 +222,39 @@ export class AssetMutationLifecycle {
       }
       this.effects.onError(message);
       return "failed";
+    }
+  }
+
+  /**
+   * Send the patch, and recover once from a stale-revision refusal.
+   *
+   * The refusal means somebody else wrote between this clip being read and
+   * this edit being decided. The damage a stale whole patch does is to the
+   * fields the user was *not* editing — it carries their old values and so
+   * reverses the other writer rather than merely missing them — so the
+   * recovery is to rebuild the patch on the current value and put only the
+   * user's own change back on top. Everything the other writer did survives,
+   * and the field the user explicitly edited goes to what they typed, which is
+   * the one thing they unambiguously asked for.
+   *
+   * Exactly one recovery attempt. A second refusal means a third write landed
+   * while this one was recovering, and looping here would be a busy-wait
+   * against a writer that is winning; the user gets the failure and their
+   * text back, unsaved and retryable.
+   */
+  private async writeThroughStaleness(
+    assetId: string,
+    base: Asset,
+    changes: Partial<AssetPatch>,
+  ): Promise<Asset> {
+    try {
+      return await this.effects.update(assetId, { ...patchFor(base), ...changes });
+    } catch (reason) {
+      if (!isStaleRevisionError(String(reason))) throw reason;
+      const fresh = await this.effects.reread(assetId);
+      // Publish the other writer's work even if this write cannot proceed.
+      this.apply(fresh);
+      return await this.effects.update(assetId, { ...patchFor(fresh), ...changes });
     }
   }
 
@@ -310,6 +353,7 @@ export function useAssetMutations(
     () =>
       new AssetMutationLifecycle({
         update: (assetId, patch) => effectsRef.current.update(assetId, patch),
+        reread: (assetId) => effectsRef.current.reread(assetId),
         applyAsset: (asset) => effectsRef.current.applyAsset(asset),
         onError: (message) => effectsRef.current.onError(message),
         onChange: setSnapshot,

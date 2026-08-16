@@ -47,6 +47,7 @@ function buildClip(fields: Partial<Asset> & { id: string }): Asset {
     mediaObjectId: null,
     mediaVerificationState: "unlinked",
     available: true,
+    revision: 0,
     ...fields,
   };
 }

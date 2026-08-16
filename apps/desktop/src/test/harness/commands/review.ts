@@ -23,9 +23,21 @@ function assetPatch(value: unknown): AssetPatch {
 export const reviewCommands: CommandTable = {
   list_assets: (args, { state }): Asset[] => projectAssets(state, requireString(args, "projectId")),
 
+  get_asset: (args, { state }) => requireAsset(state, requireString(args, "assetId")),
+
   update_asset: (args, { state }) => {
     const assetId = requireString(args, "assetId");
     const patch = assetPatch(args.patch);
+    // The catalog's optimistic check (issue #49): a whole patch built from a
+    // stale read reverses the other writer rather than merely missing them.
+    if (typeof patch.expectedRevision === "number") {
+      const current = requireAsset(state, assetId);
+      if (current.revision !== patch.expectedRevision) {
+        throw new Error(
+          `stale asset revision: expected revision ${patch.expectedRevision}, catalog is at ${current.revision}`,
+        );
+      }
+    }
     return patchAsset(state, assetId, {
       notes: patch.notes,
       labels: [...patch.labels],

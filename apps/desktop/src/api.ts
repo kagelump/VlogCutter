@@ -212,11 +212,20 @@ export const api = {
    * write through here. They were removed rather than routed through: the
    * mutation lifecycle in `session/assetMutations.ts` owns this path, and one
    * write path is the property that made its failure policy stateable. The Rust
-   * commands remain registered for the CLI and for a future revision-aware
-   * frontend; `src/test/cuj/contract.test.ts` keeps that gap visible.
+   * commands remain registered for the CLI; `src/test/cuj/contract.test.ts`
+   * keeps that gap visible.
+   *
+   * The patch carries `expectedRevision` (#49), so a write built from a read
+   * the catalog has since moved past is refused rather than applied over
+   * whatever happened in between.
    */
   async updateAsset(assetId: string, patch: AssetPatch): Promise<Asset> {
     return invoke("update_asset", { assetId, patch });
+  },
+
+  /** One clip, read again — the recovery path for a write refused as stale. */
+  async getAsset(assetId: string): Promise<Asset> {
+    return invoke("get_asset", { assetId });
   },
 
   async applyClockEvent(

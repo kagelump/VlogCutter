@@ -150,13 +150,21 @@ fn a_declined_counter_restart_stops_being_proposed() {
         ("C0001.MP4", "DJIPocket3", "2026-01-02T09:00:00Z"),
         ("C0002.MP4", "DJIPocket3", "2026-01-02T10:00:00Z"),
     ]);
-    let sequence_id = fixture.catalog.capture_sequences(&fixture.project_id).unwrap()[0]
+    let sequence_id = fixture
+        .catalog
+        .capture_sequences(&fixture.project_id)
+        .unwrap()[0]
         .id
         .clone();
 
     fixture
         .catalog
-        .decline_capture_sequence_split(&fixture.project_id, &sequence_id, 1, "one card, counter rolled over")
+        .decline_capture_sequence_split(
+            &fixture.project_id,
+            &sequence_id,
+            1,
+            "one card, counter rolled over",
+        )
         .unwrap();
 
     assert!(
@@ -187,7 +195,10 @@ fn a_declined_counter_restart_can_be_restored() {
         ("C0002.MP4", "DJIPocket3", "2026-01-01T10:00:00Z"),
         ("C0001.MP4", "DJIPocket3", "2026-01-02T09:00:00Z"),
     ]);
-    let sequence_id = fixture.catalog.capture_sequences(&fixture.project_id).unwrap()[0]
+    let sequence_id = fixture
+        .catalog
+        .capture_sequences(&fixture.project_id)
+        .unwrap()[0]
         .id
         .clone();
 
@@ -229,7 +240,10 @@ fn declining_one_boundary_reveals_the_next_restart() {
         // Card three restarts again, at a different counter.
         ("C0003.MP4", "DJIPocket3", "2026-01-03T09:00:00Z"),
     ]);
-    let sequence_id = fixture.catalog.capture_sequences(&fixture.project_id).unwrap()[0]
+    let sequence_id = fixture
+        .catalog
+        .capture_sequences(&fixture.project_id)
+        .unwrap()[0]
         .id
         .clone();
 
@@ -251,7 +265,11 @@ fn declining_one_boundary_reveals_the_next_restart() {
         .catalog
         .propose_capture_sequence_splits(&fixture.project_id)
         .unwrap();
-    assert_eq!(next.len(), 1, "the later restart is now the open question: {next:?}");
+    assert_eq!(
+        next.len(),
+        1,
+        "the later restart is now the open question: {next:?}"
+    );
     assert_eq!(next[0].at_counter, 3);
     assert_eq!(next[0].affected_asset_ids, ["asset_C0003_4".to_string()]);
 }
@@ -264,7 +282,10 @@ fn declining_the_same_boundary_twice_is_idempotent() {
         ("C0001.MP4", "DJIPocket3", "2026-01-01T09:00:00Z"),
         ("C0001.MP4", "DJIPocket3", "2026-01-02T09:00:00Z"),
     ]);
-    let sequence_id = fixture.catalog.capture_sequences(&fixture.project_id).unwrap()[0]
+    let sequence_id = fixture
+        .catalog
+        .capture_sequences(&fixture.project_id)
+        .unwrap()[0]
         .id
         .clone();
 

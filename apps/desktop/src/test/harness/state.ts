@@ -333,11 +333,26 @@ export function putAsset(state: DesktopHarnessState, asset: Asset): Asset {
   return stored;
 }
 
+/**
+ * Write a judgment and advance the clip's revision, the way the catalog does.
+ *
+ * The revision is what makes a stale write detectable, so a harness that left
+ * it alone would answer "accepted" to a patch the real backend refuses — and
+ * the CUJ tier's whole point is that it answers like the real one.
+ */
 export function patchAsset(
   state: DesktopHarnessState,
   assetId: string,
   patch: Partial<Asset>,
 ): Asset {
   const current = requireAsset(state, assetId);
-  return putAsset(state, { ...current, ...patch });
+  const judgment: Array<keyof Asset> = ["notes", "labels", "removed", "rotationDegrees"];
+  const changed = judgment.some(
+    (field) => field in patch && JSON.stringify(patch[field]) !== JSON.stringify(current[field]),
+  );
+  return putAsset(state, {
+    ...current,
+    ...patch,
+    revision: changed ? current.revision + 1 : current.revision,
+  });
 }

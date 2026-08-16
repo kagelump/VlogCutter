@@ -188,6 +188,84 @@ fn read_commands_remain_available_during_an_uncommitted_writer() {
     transaction.rollback().unwrap();
 }
 
+/// An agent's whole-clip write is refused when the clip moved under it.
+///
+/// This is the concurrent-writer case the CLI exists to serve: an agent
+/// annotating the queue while a human reviews. A whole patch carries every
+/// judgment field, so applying one built from a stale read does not merely
+/// miss the other writer's change — it reverses it.
+#[test]
+fn a_stale_clip_update_is_refused_with_a_code_the_agent_can_act_on() {
+    let directory = tempdir().unwrap();
+    let catalog = directory.path().join("catalog.sqlite3");
+    let project_id = create_project(&catalog, "Concurrent writers");
+    Connection::open(&catalog)
+        .unwrap()
+        .execute(
+            "INSERT INTO assets(id, project_id, fingerprint, path, filename, size_bytes, duration_seconds, frame_rate, width, height, codec, camera, captured_at_raw, best_time, notes, labels_json, removed, rotation_degrees, created_at) \
+             VALUES ('asset_one', ?1, 'fingerprint', '/offline/clip.mp4', 'clip.mp4', 100, 10, 30, 1920, 1080, 'h264', 'DJI', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00.000Z', '', '[]', 0, 0, '2026-01-01T00:00:00Z')",
+            params![project_id],
+        )
+        .unwrap();
+
+    let read = success(&catalog, ["clips", "get", "--asset", "asset_one"]);
+    let seen = read.json["data"]["revision"].as_u64().unwrap();
+
+    // Somebody else writes first.
+    success(
+        &catalog,
+        [
+            "clips",
+            "update",
+            "--asset",
+            "asset_one",
+            "--add-label",
+            "market",
+        ],
+    );
+
+    let refused = failure(
+        &catalog,
+        [
+            "clips",
+            "update",
+            "--asset",
+            "asset_one",
+            "--notes",
+            "decided before the label landed",
+            "--expected-revision",
+            &seen.to_string(),
+        ],
+    );
+    assert_eq!(refused["error"]["code"], "stale_revision");
+
+    let after = success(&catalog, ["clips", "get", "--asset", "asset_one"]);
+    assert_eq!(after.json["data"]["labels"][0], "market");
+    assert_eq!(after.json["data"]["notes"], "");
+
+    // Re-read, keep the edit, retry: both writers' work survives.
+    let current = after.json["data"]["revision"].as_u64().unwrap();
+    assert_ne!(current, seen);
+    let settled = success(
+        &catalog,
+        [
+            "clips",
+            "update",
+            "--asset",
+            "asset_one",
+            "--notes",
+            "decided before the label landed",
+            "--expected-revision",
+            &current.to_string(),
+        ],
+    );
+    assert_eq!(
+        settled.json["data"]["notes"],
+        "decided before the label landed"
+    );
+    assert_eq!(settled.json["data"]["labels"][0], "market");
+}
+
 #[test]
 fn media_workflow_runs_end_to_end_through_the_agent_cli() {
     let directory = tempdir().unwrap();

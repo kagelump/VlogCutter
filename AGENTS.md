@@ -157,7 +157,15 @@ Important gaps; do not accidentally describe these as complete:
   diagnostics exist. Removable-card detection and archive-root rebinding
   are implemented; see `docs/tasks/import/EPIC.md` for the remaining physical
   card/volume acceptance gate.
-- Desktop/CLI full-patch writes still have no transport-level optimistic revision token; cross-node operation sync does not make competing local full patches safe.
+- Full-patch writes carry an optimistic `expectedRevision`. `Asset.revision` is
+  the materialized operation revision; `update_asset` refuses a patch built
+  from a stale read, and the desktop recovers by re-reading and re-applying the
+  user's own change on top of what the catalog now holds. The CLI takes
+  `--expected-revision` and reports `stale_revision`. What this does *not* do:
+  tell whose value won when both writers edited the same field — the client
+  cannot distinguish its own optimistic value from the other writer's, so an
+  explicit edit wins that field and the other writer's other fields survive.
+  Cross-node operation sync is unchanged.
 - Search is currently simple filename/camera/label/note/transcript filtering,
   not SQLite FTS. Result rows say *why* each clip matched — the field and a
   marked snippet — and Enter in the search box cycles the selected clip's

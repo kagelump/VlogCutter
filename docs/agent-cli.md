@@ -43,7 +43,7 @@ Failure is one JSON value on stderr with a nonzero exit code:
 }
 ```
 
-Local desktop commands use `invalid_arguments`, `invalid_input`, `not_found`, `media_offline`, `media_tool_failed`, and `internal_error`. Server commands preserve the server's shared stable registry, including authentication, protocol, mount, job, backup, and security codes. The registry is [`core/rcdvlog-server/src/error_codes.rs`](../core/rcdvlog-server/src/error_codes.rs); clients must branch on `error.code`, not prose. Remote failures also return the server `requestId` when available.
+Local desktop commands use `invalid_arguments`, `invalid_input`, `not_found`, `media_offline`, `media_tool_failed`, `stale_revision`, and `internal_error`. `stale_revision` is the only one whose correct handling is to retry: re-read the clip, re-apply the edit, send it again with the new revision. Server commands preserve the server's shared stable registry, including authentication, protocol, mount, job, backup, and security codes. The registry is [`core/rcdvlog-server/src/error_codes.rs`](../core/rcdvlog-server/src/error_codes.rs); clients must branch on `error.code`, not prose. Remote failures also return the server `requestId` when available.
 
 Long ingest commands emit JSON progress objects to stderr every 25 assets and on completion:
 
@@ -141,10 +141,13 @@ rcdvlog --catalog /absolute/project/catalog.sqlite3 clips update \
   --add-label establishing \
   --remove-label unusable \
   --removed false \
-  --rotation-degrees 180
+  --rotation-degrees 180 \
+  --expected-revision 7
 ```
 
 `clips update` is a patch operation: omitted fields retain their current values. The merged patch is converted to typed note/label/removal/rotation operations and committed atomically; unchanged fields emit nothing. Repeat `--add-label` or `--remove-label` to change multiple free-form labels. Label matching for removal is case-insensitive; the core trims, deduplicates, and validates labels. `--removed true` hides a clip from the default labeling queue without deleting its catalog row or source media. `clips list` excludes removed clips unless `--include-removed` is passed. `--rotation-degrees` controls the review-only orientation and accepts `0`, `90`, `180`, or `270`; it never changes the source file.
+
+`--expected-revision` is the optimistic check, and an agent writing to a project a human may also have open should always send it. Pass the `revision` from the `clips get` (or `clips list`) the edit was decided from; the write is refused with `stale_revision` if the clip changed in between. This matters because the merged patch is a *whole* judgment: a patch built from a stale read carries the old label list and the old note, so applying it does not merely miss the other writer's change, it reverses it. The recovery is idempotent and cheap — read the clip again, re-apply the same edit to what it now says, and send it with the new revision. Omitting the flag keeps the previous last-write-wins behaviour for scripted writes with no basis to be stale against.
 
 `clips refresh-orientation` is the explicit mutating counterpart to diagnosis. It probes the immutable original, marks orientation as known even when the answer is 0°, preserves a user override, and updates only catalog metadata.
 

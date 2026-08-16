@@ -429,6 +429,7 @@ mod tests {
                     labels: vec!["hero shot".to_string()],
                     removed: false,
                     rotation_degrees: 0,
+                    expected_revision: None,
                 },
             )
             .unwrap();

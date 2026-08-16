@@ -1299,6 +1299,16 @@ async fn refresh_asset_orientation(
         .map_err(error_message)
 }
 
+/// One clip, read again.
+///
+/// The recovery path for a write the catalog refused as stale (issue #49):
+/// the client needs the current value and the current revision before it can
+/// decide what its edit still meant.
+#[tauri::command]
+fn get_asset(asset_id: String, state: State<'_, AppState>) -> Result<Asset, String> {
+    state.catalog()?.get_asset(&asset_id).map_err(error_message)
+}
+
 #[tauri::command]
 fn update_asset(
     asset_id: String,
@@ -2406,6 +2416,7 @@ pub fn run() {
             relink_folder,
             list_assets,
             refresh_asset_orientation,
+            get_asset,
             update_asset,
             create_note_revision,
             add_label,

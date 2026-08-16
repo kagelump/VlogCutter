@@ -25,6 +25,7 @@ function asset(overrides: Partial<Asset> = {}): Asset {
     removed: false,
     rotationDegrees: 0,
     defaultRotationDegrees: 0,
+    revision: 0,
     ...overrides,
   } as unknown as Asset;
 }
@@ -35,22 +36,36 @@ interface Harness {
   errors: string[];
   snapshots: MutationSnapshot[];
   update: ReturnType<typeof vi.fn>;
+  reread: ReturnType<typeof vi.fn>;
   /** What the last snapshot says. */
   state(): MutationSnapshot;
 }
 
-function lifecycleFor(update: (assetId: string, patch: AssetPatch) => Promise<Asset>): Harness {
+function lifecycleFor(
+  update: (assetId: string, patch: AssetPatch) => Promise<Asset>,
+  reread: (assetId: string) => Promise<Asset> = async (assetId) => asset({ id: assetId }),
+): Harness {
   const applied: Asset[] = [];
   const errors: string[] = [];
   const snapshots: MutationSnapshot[] = [];
   const spy = vi.fn(update);
+  const rereadSpy = vi.fn(reread);
   const lifecycle = new AssetMutationLifecycle({
     update: spy,
+    reread: rereadSpy,
     applyAsset: (next) => applied.push(next),
     onError: (message) => errors.push(message),
     onChange: (snapshot) => snapshots.push(snapshot),
   });
-  return { lifecycle, applied, errors, snapshots, update: spy, state: () => lifecycle.snapshot() };
+  return {
+    lifecycle,
+    applied,
+    errors,
+    snapshots,
+    update: spy,
+    reread: rereadSpy,
+    state: () => lifecycle.snapshot(),
+  };
 }
 
 /** The backend accepting the write and answering with what it stored. */
@@ -85,6 +100,8 @@ describe("a write the backend accepts", () => {
       labels: ["arrival"],
       removed: false,
       rotationDegrees: 90,
+      // The revision the edit was decided from travels with it (issue #49).
+      expectedRevision: 0,
     });
   });
 });
@@ -147,6 +164,7 @@ describe("retrying a retained draft", () => {
       labels: [],
       removed: false,
       rotationDegrees: 0,
+      expectedRevision: 0,
     });
     expect(harness.lifecycle.draftFor("asset_1")).toBeNull();
     expect(harness.lifecycle.saveStateFor("asset_1")).toBe("saved");
@@ -333,6 +351,9 @@ describe("two submits at once", () => {
       labels: ["arrival"],
       removed: false,
       rotationDegrees: 180,
+      // Built from the first write's answer, so it also carries that write's
+      // revision — which is exactly what stops it being refused as stale.
+      expectedRevision: 0,
     });
     expect(harness.applied.at(-1)?.labels).toEqual(["arrival"]);
     expect(harness.applied.at(-1)?.rotationDegrees).toBe(180);
@@ -379,5 +400,114 @@ describe("two submits at once", () => {
     // The rejection rolled the first back; the write behind it is not stranded.
     expect(await second).toBe("saved");
     expect(harness.applied.at(-1)?.rotationDegrees).toBe(180);
+  });
+});
+
+
+describe("a write the backend refuses as stale", () => {
+  /** Somebody else writes once, between the read and the write. */
+  function withAnotherWriter(other: Partial<Asset>, revision = 4) {
+    const fresh = asset({ ...other, revision });
+    let refusals = 0;
+    const harness = lifecycleFor(
+      async (assetId, patch) => {
+        if (patch.expectedRevision !== fresh.revision) {
+          refusals += 1;
+          throw new Error(
+            `stale asset revision: expected revision ${patch.expectedRevision}, catalog is at ${fresh.revision}`,
+          );
+        }
+        return asset({ id: assetId, ...patch, revision: fresh.revision + 1 });
+      },
+      async () => fresh,
+    );
+    return { harness, fresh, refusals: () => refusals };
+  }
+
+  it("re-reads, re-sends the same edit, and saves it", async () => {
+    const { harness } = withAnotherWriter({ labels: ["market"] });
+
+    const result = await harness.lifecycle.saveNotes(asset({ notes: "the station clock" }));
+
+    expect(result).toBe("saved");
+    expect(harness.reread).toHaveBeenCalledWith("asset_1");
+    // The retry carries the other writer's label and the new revision, so it
+    // adds to their work instead of reversing it.
+    expect(harness.update).toHaveBeenLastCalledWith("asset_1", {
+      notes: "the station clock",
+      labels: ["market"],
+      removed: false,
+      rotationDegrees: 0,
+      expectedRevision: 4,
+    });
+  });
+
+  it("keeps every field the user was not editing at the other writer's value", async () => {
+    // The defect this whole change exists for: a stale whole patch carries the
+    // old label list, so applying it would have *removed* the label rather
+    // than merely missing it.
+    const { harness } = withAnotherWriter({ labels: ["market"], rotationDegrees: 90 });
+
+    await harness.lifecycle.saveNotes(asset({ notes: "the station clock" }));
+
+    const sent = harness.update.mock.calls.at(-1)?.[1];
+    expect(sent.labels).toEqual(["market"]);
+    expect(sent.rotationDegrees).toBe(90);
+  });
+
+  it("publishes the other writer's value on the way through", async () => {
+    const { harness } = withAnotherWriter({ labels: ["market"] });
+
+    await harness.lifecycle.saveNotes(asset({ notes: "the station clock" }));
+
+    // The queue shows what the catalog holds, before the retry lands as well
+    // as after: the user finds out the label appeared.
+    expect(harness.applied.some((applied) => applied.labels.includes("market"))).toBe(true);
+  });
+
+  it("keeps the draft when even the recovery fails", async () => {
+    let revision = 4;
+    const harness = lifecycleFor(
+      async (_assetId, patch) => {
+        revision += 1;
+        throw new Error(`stale asset revision: expected ${patch.expectedRevision}, catalog is at ${revision}`);
+      },
+      async () => asset({ revision }),
+    );
+
+    const result = await harness.lifecycle.saveNotes(asset({ notes: "mine" }));
+
+    expect(result).toBe("failed");
+    // Human prose is not thrown away because two writers collided.
+    expect(harness.lifecycle.draftFor("asset_1")?.notes).toBe("mine");
+    expect(harness.lifecycle.saveStateFor("asset_1")).toBe("unsaved");
+  });
+
+  it("recovers once and no more, rather than busy-waiting against a third writer", async () => {
+    let revision = 4;
+    const harness = lifecycleFor(
+      async (_assetId, patch) => {
+        // Every read is immediately out of date: another writer is winning.
+        revision += 1;
+        throw new Error(`stale asset revision: expected ${patch.expectedRevision}, catalog is at ${revision}`);
+      },
+      async () => asset({ revision }),
+    );
+
+    await harness.lifecycle.saveNotes(asset({ notes: "mine" }));
+
+    expect(harness.update).toHaveBeenCalledTimes(2);
+    expect(harness.reread).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not re-read for an ordinary failure", async () => {
+    const harness = lifecycleFor(async () => {
+      throw new Error("database is locked");
+    });
+
+    await harness.lifecycle.saveNotes(asset({ notes: "mine" }));
+
+    expect(harness.reread).not.toHaveBeenCalled();
+    expect(harness.errors.at(-1)).toBe("Error: database is locked");
   });
 });

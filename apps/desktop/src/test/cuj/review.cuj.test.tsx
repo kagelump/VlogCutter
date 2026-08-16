@@ -104,7 +104,8 @@ describe("CUJ 5 — rotation survives leaving the clip", () => {
 
     expect(harness.calls("update_asset").at(-1)).toEqual({
       assetId: "asset_sony_a7c_ii_001",
-      patch: { notes: "", labels: [], removed: false, rotationDegrees: 90 },
+      // The whole patch, and the revision it was decided from (issue #49).
+      patch: { notes: "", labels: [], removed: false, rotationDegrees: 90, expectedRevision: 0 },
     });
   });
 });

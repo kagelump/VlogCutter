@@ -146,6 +146,7 @@ export function buildCameraAssets({ projectId, camera, spec }: BuildAssetsOption
       location: null,
       timezone: null,
       storyBeat: null,
+      revision: 0,
     } satisfies Asset;
   });
 }

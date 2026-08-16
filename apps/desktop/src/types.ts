@@ -105,6 +105,8 @@ export interface Asset {
   mediaObjectId: string | null;
   mediaVerificationState: "unlinked" | "provisional" | "verified" | "mismatch";
   available: boolean;
+  /** The operation revision this view was materialized from. */
+  revision: number;
   phase?: string | null;
   location?: string | null;
   timezone?: string | null;
@@ -266,6 +268,13 @@ export interface AssetPatch {
   labels: string[];
   removed: boolean;
   rotationDegrees: number;
+  /**
+   * The `Asset.revision` this patch was decided from. The backend refuses the
+   * write when the clip has moved since, because a whole patch carries every
+   * judgment field and applying a stale one reverses the other writer rather
+   * than merely missing it.
+   */
+  expectedRevision?: number | null;
 }
 
 export interface IngestReport {

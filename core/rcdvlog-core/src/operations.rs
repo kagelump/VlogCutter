@@ -43,6 +43,13 @@ pub const MAX_REMOTE_HLC_FUTURE_SKEW_MILLIS: i64 = 5 * 60 * 1000;
 /// on writable catalog open is scoped to exactly these: for the legacy
 /// vocabulary a persisted row is never a signal that materialization is
 /// missing, so replaying them would rewrite the legacy log.
+/// The stable prefix of the error a stale whole-patch write is refused with.
+///
+/// Every adapter matches on this rather than on prose, because a client's only
+/// correct response — re-read, re-decide, retry — depends on telling this
+/// refusal apart from a genuine failure.
+pub const STALE_ASSET_REVISION: &str = "stale asset revision";
+
 pub(crate) const CHRONOLOGY_OPERATION_TYPES: &[&str] = &[
     CAPTURE_SEQUENCE_DECLARED,
     CAPTURE_SEQUENCE_SPLIT,
@@ -712,6 +719,20 @@ impl Catalog {
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         reconcile_asset_baseline(&transaction, &current.project_id, asset_id)?;
+        // A whole-patch write carries every judgment field, so a patch built
+        // from a stale read does not merely fail to include another writer's
+        // change — it actively reverses it, as a removal of the label or a
+        // restoration of the old note. Refusing is the only safe answer; the
+        // caller re-reads and decides what it still meant.
+        if let Some(expected) = patch.expected_revision {
+            let actual =
+                current_revision(&transaction, &current.project_id, "projectAsset", asset_id)?;
+            if actual != expected {
+                bail!(
+                    "{STALE_ASSET_REVISION}: expected revision {expected}, catalog is at {actual}"
+                );
+            }
+        }
         let mut operations = Vec::new();
         if current.notes != patch.notes {
             operations.push(NewOperation {
@@ -3245,6 +3266,155 @@ mod tests {
         }
     }
 
+    /// The judgment fields as they stand, for a patch that changes one of them.
+    fn patch_from(asset: &Asset) -> AssetPatch {
+        AssetPatch {
+            notes: asset.notes.clone(),
+            labels: asset.labels.clone(),
+            removed: asset.removed,
+            rotation_degrees: asset.rotation_degrees,
+            expected_revision: Some(asset.revision),
+        }
+    }
+
+    #[test]
+    fn asset_revision_starts_at_zero_and_advances_with_each_write() {
+        let (_directory, catalog) = fixture();
+        assert_eq!(catalog.get_asset("asset_test").unwrap().revision, 0);
+
+        let mut patch = patch_from(&catalog.get_asset("asset_test").unwrap());
+        patch.notes = "first".to_string();
+        let after = catalog.update_asset("asset_test", &patch).unwrap();
+
+        assert!(after.revision > 0, "a write must advance the revision");
+        assert_eq!(
+            catalog.list_assets("project_test").unwrap()[0].revision,
+            after.revision
+        );
+    }
+
+    #[test]
+    fn a_patch_built_from_the_current_revision_is_applied() {
+        let (_directory, catalog) = fixture();
+        let mut patch = patch_from(&catalog.get_asset("asset_test").unwrap());
+        patch.notes = "the station clock is legible".to_string();
+
+        let updated = catalog.update_asset("asset_test", &patch).unwrap();
+
+        assert_eq!(updated.notes, "the station clock is legible");
+    }
+
+    #[test]
+    fn a_patch_built_from_a_stale_read_is_refused_rather_than_applied() {
+        let (_directory, catalog) = fixture();
+        // The desktop reads, and a second writer — an agent annotating the
+        // queue — commits before the human finishes typing.
+        let stale = catalog.get_asset("asset_test").unwrap();
+        let mut agent = patch_from(&stale);
+        agent.labels = vec!["arrival".to_string(), "market".to_string()];
+        catalog.update_asset("asset_test", &agent).unwrap();
+
+        let mut human = patch_from(&stale);
+        human.notes = "typed while the agent was writing".to_string();
+        let refused = catalog.update_asset("asset_test", &human).unwrap_err();
+
+        assert!(
+            refused.to_string().starts_with(STALE_ASSET_REVISION),
+            "expected a stale-revision refusal, got: {refused}"
+        );
+        // A whole patch carries every field, so applying this one would not
+        // merely have missed the label — it would have removed it.
+        let current = catalog.get_asset("asset_test").unwrap();
+        assert_eq!(
+            current.labels,
+            vec!["arrival".to_string(), "market".to_string()]
+        );
+        assert_eq!(current.notes, "baseline");
+    }
+
+    #[test]
+    fn the_refused_write_leaves_no_operation_behind() {
+        let (_directory, catalog) = fixture();
+        let stale = catalog.get_asset("asset_test").unwrap();
+        let mut agent = patch_from(&stale);
+        agent.removed = true;
+        catalog.update_asset("asset_test", &agent).unwrap();
+        let before = catalog
+            .operation_diagnostics("project_test")
+            .unwrap()
+            .operation_count;
+
+        let mut human = patch_from(&stale);
+        human.notes = "lost".to_string();
+        assert!(catalog.update_asset("asset_test", &human).is_err());
+
+        assert_eq!(
+            catalog
+                .operation_diagnostics("project_test")
+                .unwrap()
+                .operation_count,
+            before,
+        );
+    }
+
+    #[test]
+    fn re_reading_after_a_refusal_lets_the_same_edit_through() {
+        let (_directory, catalog) = fixture();
+        let stale = catalog.get_asset("asset_test").unwrap();
+        let mut agent = patch_from(&stale);
+        agent.labels = vec!["arrival".to_string(), "market".to_string()];
+        catalog.update_asset("asset_test", &agent).unwrap();
+        let mut human = patch_from(&stale);
+        human.notes = "typed while the agent was writing".to_string();
+        assert!(catalog.update_asset("asset_test", &human).is_err());
+
+        // The prescribed recovery: read again, keep the human's delta, retry.
+        let mut retry = patch_from(&catalog.get_asset("asset_test").unwrap());
+        retry.notes = human.notes.clone();
+        let settled = catalog.update_asset("asset_test", &retry).unwrap();
+
+        assert_eq!(settled.notes, "typed while the agent was writing");
+        assert_eq!(
+            settled.labels,
+            vec!["arrival".to_string(), "market".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_patch_with_no_expectation_keeps_the_previous_last_write_wins_behaviour() {
+        let (_directory, catalog) = fixture();
+        let stale = catalog.get_asset("asset_test").unwrap();
+        let mut agent = patch_from(&stale);
+        agent.labels = vec!["arrival".to_string(), "market".to_string()];
+        catalog.update_asset("asset_test", &agent).unwrap();
+
+        // Ingest-time and scripted writers have no revision to send, and must
+        // keep working exactly as they did.
+        let blind = AssetPatch {
+            expected_revision: None,
+            ..patch_from(&stale)
+        };
+        assert!(catalog.update_asset("asset_test", &blind).is_ok());
+    }
+
+    #[test]
+    fn an_unchanged_patch_at_the_current_revision_is_still_a_no_op() {
+        let (_directory, catalog) = fixture();
+        let asset = catalog.get_asset("asset_test").unwrap();
+
+        catalog
+            .update_asset("asset_test", &patch_from(&asset))
+            .unwrap();
+
+        assert_eq!(
+            catalog
+                .operation_diagnostics("project_test")
+                .unwrap()
+                .operation_count,
+            0
+        );
+    }
+
     #[test]
     fn unchanged_patches_allocate_no_identity_sequence_or_operation() {
         let (_directory, catalog) = fixture();
@@ -3257,6 +3427,7 @@ mod tests {
                     labels: asset.labels,
                     removed: asset.removed,
                     rotation_degrees: asset.rotation_degrees,
+                    expected_revision: None,
                 },
             )
             .unwrap();
@@ -3281,6 +3452,7 @@ mod tests {
                     labels: vec!["market".to_string()],
                     removed: true,
                     rotation_degrees: 90,
+                    expected_revision: None,
                 },
             )
             .unwrap();
@@ -3304,6 +3476,7 @@ mod tests {
                     labels: vec!["x".repeat(65)],
                     removed: false,
                     rotation_degrees: 180,
+                    expected_revision: None,
                 },
             )
             .unwrap_err();

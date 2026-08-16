@@ -251,6 +251,12 @@ enum ClipsCommand {
         /// Clockwise display rotation: 0, 90, 180, or 270 degrees.
         #[arg(long)]
         rotation_degrees: Option<u16>,
+        /// The `revision` this edit was decided from. The write is refused
+        /// with `stale_revision` when the clip has changed since, which is how
+        /// an agent avoids reversing a change it never saw. Omit only for a
+        /// write that genuinely has no basis to be stale against.
+        #[arg(long)]
+        expected_revision: Option<u64>,
     },
 }
 
@@ -559,6 +565,7 @@ fn execute(cli: &Cli) -> Result<Value> {
                 remove_labels,
                 removed,
                 rotation_degrees,
+                expected_revision,
             } => {
                 let current = catalog.get_asset(asset)?;
                 let mut labels = current.labels;
@@ -573,6 +580,7 @@ fn execute(cli: &Cli) -> Result<Value> {
                     labels,
                     removed: removed.unwrap_or(current.removed),
                     rotation_degrees: rotation_degrees.unwrap_or(current.rotation_degrees),
+                    expected_revision: *expected_revision,
                 };
                 Ok(serde_json::to_value(catalog.update_asset(asset, &patch)?)?)
             }
@@ -992,6 +1000,10 @@ fn error_code(message: &str) -> &'static str {
     let message = message.to_lowercase();
     if message.contains("catalog schema") || message.contains("migration history") {
         "schema_incompatible"
+    } else if message.contains(rcdvlog_core::STALE_ASSET_REVISION) {
+        // Distinct from every other failure because the caller's correct
+        // response is distinct: re-read, re-decide, retry.
+        "stale_revision"
     } else if message.contains("not found") {
         "not_found"
     } else if message.contains("offline") {
@@ -1404,6 +1416,12 @@ mod tests {
     #[test]
     fn reports_stable_error_codes_and_requires_explicit_project_arguments() {
         assert_eq!(error_code("asset not found"), "not_found");
+        // An agent's response to a stale write is to re-read and retry, which
+        // no other failure calls for; the code has to say which one this is.
+        assert_eq!(
+            error_code("stale asset revision: expected revision 3, catalog is at 5"),
+            "stale_revision",
+        );
         assert_eq!(error_code("original is offline"), "media_offline");
         assert_eq!(error_code("invalid source range"), "invalid_input");
         assert_eq!(error_code("ffmpeg failed"), "media_tool_failed");

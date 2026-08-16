@@ -15,7 +15,7 @@ function asset(id: string, filename: string): Asset {
     rotationDegrees: 0, orientationProbed: true, originalAvailable: true,
     proxyAvailable: false, thumbnailPath: null, thumbnailQuality: 0, notes: "",
     title: "", description: "", labels: [], removed: false, mediaObjectId: null,
-    mediaVerificationState: "unlinked", available: true,
+    mediaVerificationState: "unlinked", available: true, revision: 0,
   };
 }
 
