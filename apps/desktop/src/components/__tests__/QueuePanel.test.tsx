@@ -35,6 +35,7 @@ function renderPanel(overrides: Partial<QueuePanelProps> = {}) {
     loadError: "",
     onReload: vi.fn(),
     onQueryChange: vi.fn(),
+    onSearchSubmit: vi.fn(),
     onSelect: vi.fn(),
     onToggleRemovedView: vi.fn(),
     onToggleUnusableView: vi.fn(),
@@ -265,9 +266,11 @@ describe("offline originals", () => {
     expect(container.querySelector(".offline-pip")).toBeNull();
   });
 
-  it("explains the state in the row's text, not only in a tooltip", () => {
+  it("explains the state in the row's accessible name, not only in a tooltip", () => {
     renderPanel({ assets: [asset({ id: "a", originalAvailable: false, proxyAvailable: true })] });
-    const row = screen.getByRole("option");
-    expect(row.textContent).toContain("Original is offline — reviewing from the 720p proxy");
+    // The visible mark is two words because the row is fixed-height and read by
+    // position; the name it is announced by carries the whole sentence.
+    expect(screen.getByRole("option").getAttribute("aria-label"))
+      .toContain("Original is offline — reviewing from the 720p proxy");
   });
 });

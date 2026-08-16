@@ -155,11 +155,14 @@ export interface TranscriptSpec {
   language?: string;
   text?: string;
   speechSeconds?: number;
+  /** Several spoken lines, for anything that has to cycle through them. */
+  segments?: Array<{ startMs: number; text: string }>;
 }
 
 export function buildTranscript(assetId: string, spec: TranscriptSpec = {}): ClipTranscript {
-  const status = spec.status ?? (spec.text ? "speech" : "no_speech");
-  const text = spec.text ?? "";
+  const spoken = spec.segments ?? [];
+  const text = spec.text ?? spoken.map((segment) => segment.text).join(" ");
+  const status = spec.status ?? (text ? "speech" : "no_speech");
   return {
     assetId,
     recipeKey: "stt.whisper-large-v3-turbo-q5_0.vad-silero-v5.win30.v1",
@@ -169,17 +172,25 @@ export function buildTranscript(assetId: string, spec: TranscriptSpec = {}): Cli
     primaryLanguage: spec.language ?? (text ? "en" : ""),
     speechSeconds: spec.speechSeconds ?? (text ? 6.5 : 0),
     windowCount: text ? 1 : 0,
-    segments: text
-      ? [
-          {
-            startMs: 1_200,
-            endMs: 6_400,
-            language: spec.language ?? "en",
-            text,
-            meanTokenProbability: 0.82,
-          },
-        ]
-      : [],
+    segments: spoken.length
+      ? spoken.map((segment) => ({
+          startMs: segment.startMs,
+          endMs: segment.startMs + 5_200,
+          language: spec.language ?? "en",
+          text: segment.text,
+          meanTokenProbability: 0.82,
+        }))
+      : text
+        ? [
+            {
+              startMs: 1_200,
+              endMs: 6_400,
+              language: spec.language ?? "en",
+              text,
+              meanTokenProbability: 0.82,
+            },
+          ]
+        : [],
   };
 }
 

@@ -156,7 +156,13 @@ Important gaps; do not accidentally describe these as complete:
   are implemented; see `docs/tasks/import/EPIC.md` for the remaining physical
   card/volume acceptance gate.
 - Desktop/CLI full-patch writes still have no transport-level optimistic revision token; cross-node operation sync does not make competing local full patches safe.
-- Search is currently simple filename/camera/label/note filtering, not SQLite FTS.
+- Search is currently simple filename/camera/label/note/transcript filtering,
+  not SQLite FTS. Result rows say *why* each clip matched — the field and a
+  marked snippet — and Enter in the search box cycles the selected clip's
+  playhead through the places the phrase was spoken, marking them in the
+  transcript. Only the flattened transcript text is indexed per clip, so the
+  per-row snippet has no timestamp; the timings come from the open clip's own
+  transcript.
 - The label field offers the project's existing vocabulary as a keyboard-first
   typeahead, and a commit that differs from an existing label only by case
   joins that label rather than opening a second one. Nothing is renamed,

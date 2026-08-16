@@ -42,14 +42,14 @@ describe("scanning a queue whose originals are offline", () => {
     expect(rowFor("DJI_001.MP4")?.querySelector(".offline-pip")).toBeNull();
   });
 
-  it("says which offline state it is, in text the row actually carries", async () => {
+  it("says which offline state it is, in the name the row is read by", async () => {
     const harness = unmountedVolume().build();
     // The second clip's proxy is taken away, so the two states appear together.
     harness.state.assets[sony[1]].proxyAvailable = false;
     await renderApp(harness);
 
-    expect(rowFor("SONY_001.MP4")?.textContent).toContain("reviewing from the 720p proxy");
-    expect(rowFor("SONY_002.MP4")?.textContent).toContain("cannot be played");
+    expect(rowFor("SONY_001.MP4")?.getAttribute("aria-label")).toContain("reviewing from the 720p proxy");
+    expect(rowFor("SONY_002.MP4")?.getAttribute("aria-label")).toContain("cannot be played");
     expect(rowFor("SONY_002.MP4")?.querySelector(".offline-pip.blocked")).not.toBeNull();
   });
 });

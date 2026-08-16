@@ -14,6 +14,7 @@ import {
   transcriptStatusLabels,
 } from "../review/summaries";
 import { formatDate, formatTimecode } from "../review/format";
+import { transcriptMatches } from "../review/searchMatch";
 
 export type ShelfTab = "transcript" | "description" | "analysis" | "file";
 
@@ -27,6 +28,8 @@ export interface EvidenceShelfProps {
   onToggleOpen(): void;
   /** Where playback is, so the transcript can show what is being said now. */
   positionSeconds: number;
+  /** The queue's search, so a spoken match is visible in the transcript too. */
+  query: string;
   onSeek(seconds: number): void;
   onChangeAsset(next: Asset): void;
   onCommitAsset(): void;
@@ -55,6 +58,7 @@ export function EvidenceShelf({
   open,
   tab,
   positionSeconds,
+  query,
   onTabChange,
   onToggleOpen,
   onSeek,
@@ -67,6 +71,9 @@ export function EvidenceShelf({
   const badge = transcriptBadge(transcript);
   const attention = analysisNeedsAttention(observation);
   const activeSegment = activeSegmentIndex(segments, positionSeconds);
+  // A clip reached through search should show where the phrase was said, not
+  // make the reader scan the transcript that already found it.
+  const matched = new Set(transcriptMatches(segments, query));
 
   // Auto-follow, and the rule for getting out of its way (issue #13).
   const listRef = useRef<HTMLOListElement>(null);
@@ -170,7 +177,10 @@ export function EvidenceShelf({
                 )}
                 <ol className="segment-list" ref={listRef} onScroll={onSegmentListScroll}>
                   {segments.map((segment, position) => (
-                    <li key={`${segment.startMs}-${segment.endMs}`} className={position === activeSegment ? "active" : ""}>
+                    <li
+                      key={`${segment.startMs}-${segment.endMs}`}
+                      className={`${position === activeSegment ? "active" : ""} ${matched.has(position) ? "matched" : ""}`.trim()}
+                    >
                       <button
                         className="segment"
                         aria-current={position === activeSegment ? "true" : undefined}

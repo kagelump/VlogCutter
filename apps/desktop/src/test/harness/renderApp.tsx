@@ -98,20 +98,15 @@ export function queueRows(): HTMLElement[] {
 }
 
 /**
- * The filename shown on each queue row, in order.
+ * The filename of each queue row, in order.
  *
- * A row leads with the clip's title once analysis or the user has named it, and
- * demotes the filename to the meta line as `filename · camera`; an unnamed clip
- * leads with the filename and shows only the camera below. Both cases are read
- * here so a CUJ can talk about clips by filename regardless of naming.
+ * Read from the row's composed accessible name (`Clip 3, SONY_001.MP4, …`)
+ * rather than from what is currently on the secondary line: that line shows a
+ * filename, a camera, or a search-match snippet depending on what is being
+ * asked, and a CUJ talks about clips by filename throughout.
  */
 export function queueFilenames(): string[] {
-  return queueRows().map((row) => {
-    const meta = row.querySelector(".queue-meta")?.textContent ?? "";
-    const separated = meta.split(" · ");
-    if (separated.length > 1) return separated[0].trim();
-    return row.querySelector(".queue-main strong")?.textContent?.trim() ?? "";
-  });
+  return queueRows().map((row) => (row.getAttribute("aria-label") ?? "").split(", ")[1] ?? "");
 }
 
 /** The headline each queue row leads with: the clip's title, or its filename. */

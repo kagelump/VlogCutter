@@ -4,6 +4,7 @@ import { api } from "../api";
 import type { Asset, AssetAnalysisIndexEntry } from "../types";
 import { clipTitle, formatDuration } from "../review/format";
 import { mediaAvailability, mediaAvailabilityDescription } from "../review/summaries";
+import { searchMatch } from "../review/searchMatch";
 import { isRawOrientationThumbnail, renderedRotation } from "../review/rotation";
 import { QUEUE_ROW_HEIGHT, queueWindow, scrollTopForQueueIndex } from "./queueWindow";
 
@@ -34,6 +35,8 @@ export interface QueuePanelProps {
   /** Read the project again — the only way back from a failed load. */
   onReload(): void;
   onQueryChange(value: string): void;
+  /** Enter in the search box: jump the selected clip to its next spoken match. */
+  onSearchSubmit(): void;
   onSelect(id: string): void;
   onToggleRemovedView(): void;
   onToggleUnusableView(): void;
@@ -62,6 +65,7 @@ export function QueuePanel({
   loadError,
   onReload,
   onQueryChange,
+  onSearchSubmit,
   onSelect,
   onToggleRemovedView,
   onToggleUnusableView,
@@ -137,12 +141,28 @@ export function QueuePanel({
     const rotation = renderedRotation(asset, isRawOrientationThumbnail(asset));
     const verdict = analysisIndex[asset.id];
     const availability = mediaAvailability(asset);
+    // Only while filtering: an unfiltered queue has no match to explain, and
+    // the row's four facts are what make it readable by position at speed.
+    const match = query.trim() ? searchMatch(asset, verdict, query) : null;
+    // The row's accessible name is composed rather than left to the sum of its
+    // parts: the visible secondary line is a filename, a camera, or a match
+    // snippet depending on what is being asked, and the clip's identity must
+    // not depend on which.
+    const rowName = [
+      `Clip ${index + 1}`,
+      asset.filename,
+      asset.camera,
+      asset.title.trim(),
+      availability === "available" ? "" : mediaAvailabilityDescription(asset),
+      verdict?.usable === false ? `flagged ${verdict.unusableReason || "unusable"}` : "",
+    ].filter(Boolean).join(", ");
     return (
       <button
         className={`queue-item ${asset.id === selectedId ? "selected" : ""}`}
         key={asset.id}
         onClick={() => onSelect(asset.id)}
         role="option"
+        aria-label={rowName}
         aria-selected={asset.id === selectedId}
         aria-posinset={index + 1}
         aria-setsize={assets.length}
@@ -176,10 +196,7 @@ export function QueuePanel({
                 className={`offline-pip ${availability === "blocked" ? "blocked" : ""}`}
                 title={mediaAvailabilityDescription(asset)}
               >
-                <span aria-hidden="true">{availability === "blocked" ? "no media" : "offline"}</span>
-                {/* The row is read by its text, so the mark says what it means
-                    rather than making a screen-reader user find the tooltip. */}
-                <span className="sr-only">{mediaAvailabilityDescription(asset)}</span>
+                {availability === "blocked" ? "no media" : "offline"}
               </span>
             )}
             {verdict?.usable === false && (
@@ -187,7 +204,16 @@ export function QueuePanel({
                 {verdict.unusableReason || "unusable"}
               </span>
             )}
-            <span>{asset.title.trim() ? `${asset.filename} · ${asset.camera}` : asset.camera}</span>
+            {match ? (
+              <span className="match-snippet">
+                <em>{match.field}</em>
+                {match.text.slice(0, match.offset)}
+                <mark>{match.text.slice(match.offset, match.offset + match.length)}</mark>
+                {match.text.slice(match.offset + match.length)}
+              </span>
+            ) : (
+              <span>{asset.title.trim() ? `${asset.filename} · ${asset.camera}` : asset.camera}</span>
+            )}
           </span>
         </span>
         <span className="queue-tail">
@@ -242,6 +268,11 @@ export function QueuePanel({
           id="queue-search"
           value={query}
           onChange={(event) => onQueryChange(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key !== "Enter") return;
+            event.preventDefault();
+            onSearchSubmit();
+          }}
           placeholder="Filter titles, labels, notes, speech…"
         />
         <kbd>/</kbd>

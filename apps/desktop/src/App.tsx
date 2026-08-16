@@ -42,6 +42,7 @@ import { CardBanner } from "./components/CardBanner";
 import { analysisStageLabels, formatCost } from "./review/format";
 import { sourceVolumeHint } from "./review/summaries";
 import { canonicalLabel, projectLabelVocabulary } from "./review/labelVocabulary";
+import { nextMatch, transcriptMatches } from "./review/searchMatch";
 import { rotationAfter } from "./review/rotation";
 import { buildMediaBuffer } from "./review/mediaBuffer";
 
@@ -78,6 +79,8 @@ function App() {
   const [projectId, setProjectId] = useState("");
   const [selectedId, setSelectedId] = useState("");
   const [query, setQuery] = useState("");
+  // Where the last spoken-match jump landed, so the next press moves on.
+  const spokenMatchRef = useRef(-1);
   const [showRemoved, setShowRemoved] = useState(false);
   const [labelDraft, setLabelDraft] = useState("");
   const [busy, setBusy] = useState(false);
@@ -268,6 +271,9 @@ function App() {
     assetsRef.current = assets;
     selectedIdRef.current = selectedId;
   }, [assets, selectedId]);
+
+  // Another clip or another phrase starts the cycle again.
+  useEffect(() => { spokenMatchRef.current = -1; }, [query, selectedId]);
 
   const activeAssets = useMemo(() => orderAssets(assets, { removedVisible: false }), [assets]);
   const filteredAssets = useMemo(() => {
@@ -1447,6 +1453,33 @@ function App() {
     }
   }
 
+  /**
+   * Enter in the search box: put the playhead on the next place the phrase was
+   * said in the selected clip (issue #12).
+   *
+   * Repeated presses cycle, because "say that again" is why anyone presses it
+   * twice and a control that goes dead on the last match makes the reader work
+   * out which one they are on.
+   */
+  function jumpToSpokenMatch() {
+    if (!selected || !query.trim()) return;
+    const segments = transcript?.segments ?? [];
+    const matches = transcriptMatches(segments, query);
+    if (!matches.length) {
+      // The clip is in the results, so it matched something; saying which is
+      // more use than saying nothing.
+      setMessage("Nothing spoken here matches — this clip matched elsewhere");
+      return;
+    }
+    const target = nextMatch(matches, spokenMatchRef.current);
+    if (target === null) return;
+    spokenMatchRef.current = target;
+    setShelfTab("transcript");
+    if (!view.shelf) dispatchView({ kind: "toggleShelf" });
+    seekTo(segments[target].startMs / 1000);
+    setMessage(`Spoken match ${matches.indexOf(target) + 1} of ${matches.length}`);
+  }
+
   async function makeProxy() {
     if (!selected || busy) return;
     setBusy(true);
@@ -1998,6 +2031,7 @@ function App() {
           loadError={session.loadError}
           onReload={() => { void reloadSession(); }}
           onQueryChange={setQuery}
+          onSearchSubmit={jumpToSpokenMatch}
           onSelect={setSelectedId}
           onToggleRemovedView={() => setShowRemoved((current) => !current)}
           onToggleUnusableView={() => setShowUnusableOnly((current) => !current)}
@@ -2060,6 +2094,7 @@ function App() {
               open={view.shelf}
               tab={shelfTab}
               positionSeconds={playbackSeconds}
+              query={query}
               onTabChange={setShelfTab}
               onToggleOpen={() => dispatchView({ kind: "toggleShelf" })}
               onSeek={seekTo}

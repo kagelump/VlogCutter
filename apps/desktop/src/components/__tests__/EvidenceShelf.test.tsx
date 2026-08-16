@@ -84,6 +84,7 @@ function renderShelf(overrides: Partial<EvidenceShelfProps> = {}) {
     open: true,
     tab: "transcript" as const,
     positionSeconds: 0,
+    query: "",
     onTabChange: vi.fn(),
     onToggleOpen: vi.fn(),
     onSeek: vi.fn(),
