@@ -2059,6 +2059,7 @@ function App() {
               observation={observation}
               open={view.shelf}
               tab={shelfTab}
+              positionSeconds={playbackSeconds}
               onTabChange={setShelfTab}
               onToggleOpen={() => dispatchView({ kind: "toggleShelf" })}
               onSeek={seekTo}

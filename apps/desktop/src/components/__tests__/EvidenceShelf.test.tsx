@@ -1,6 +1,6 @@
-import { render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Asset, AssetAnalysisView, ClipAnalysis, ClipTranscript } from "../../types";
 import { EvidenceShelf, type EvidenceShelfProps } from "../EvidenceShelf";
 
@@ -83,6 +83,7 @@ function renderShelf(overrides: Partial<EvidenceShelfProps> = {}) {
     observation: view(),
     open: true,
     tab: "transcript" as const,
+    positionSeconds: 0,
     onTabChange: vi.fn(),
     onToggleOpen: vi.fn(),
     onSeek: vi.fn(),
@@ -202,5 +203,119 @@ describe("tab behaviour", () => {
     await userEvent.click(screen.getByRole("tab", { name: /analysis/i }));
     expect(props.onTabChange).toHaveBeenCalledWith("analysis");
     expect(props.onToggleOpen).toHaveBeenCalled();
+  });
+});
+
+describe("following playback through the transcript", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("marks the segment under the playhead as current", () => {
+    const { container } = renderShelf({ positionSeconds: 10 });
+    const current = container.querySelectorAll(".segment-list li.active");
+    expect(current).toHaveLength(1);
+    expect(current[0].textContent).toContain("it's like six seats total");
+    expect(screen.getByText("it's like six seats total").closest("button"))
+      .toHaveAttribute("aria-current", "true");
+  });
+
+  it("marks nothing before the first word is spoken", () => {
+    const { container } = renderShelf({ positionSeconds: 0 });
+    expect(container.querySelector(".segment-list li.active")).toBeNull();
+  });
+
+  it("moves the mark when the playhead is seeked, not only when it plays", () => {
+    const { container, rerender, props } = renderShelf({ positionSeconds: 5 });
+    expect(container.querySelector(".segment-list li.active")?.textContent)
+      .toContain("we finally found the place");
+
+    rerender(<EvidenceShelf {...props} positionSeconds={10} />);
+
+    expect(container.querySelector(".segment-list li.active")?.textContent)
+      .toContain("it's like six seats total");
+  });
+
+  it("stands aside when the reader scrolls, and offers the way back", () => {
+    const { container } = renderShelf({ positionSeconds: 10 });
+    expect(screen.queryByRole("button", { name: "Follow playback" })).toBeNull();
+
+    fireEvent.scroll(container.querySelector(".segment-list")!);
+
+    // Fighting a reader for the scroll position is how this feature gets
+    // switched off; it gives way and says how to get it back.
+    expect(screen.getByRole("button", { name: "Follow playback" })).toBeVisible();
+  });
+
+  it("resumes on its own after the bounded suspension", () => {
+    vi.useFakeTimers();
+    const { container } = renderShelf({ positionSeconds: 10 });
+    fireEvent.scroll(container.querySelector(".segment-list")!);
+    expect(screen.getByRole("button", { name: "Follow playback" })).toBeVisible();
+
+    act(() => { vi.advanceTimersByTime(5000); });
+
+    expect(screen.queryByRole("button", { name: "Follow playback" })).toBeNull();
+  });
+
+  it("restarts the clock on each scroll, so a long read is not interrupted", () => {
+    vi.useFakeTimers();
+    const { container } = renderShelf({ positionSeconds: 10 });
+    const list = container.querySelector(".segment-list")!;
+    fireEvent.scroll(list);
+
+    act(() => { vi.advanceTimersByTime(4000); });
+    fireEvent.scroll(list);
+    act(() => { vi.advanceTimersByTime(4000); });
+
+    expect(screen.getByRole("button", { name: "Follow playback" })).toBeVisible();
+  });
+
+  it("resumes immediately when the reader asks it to", async () => {
+    const { container } = renderShelf({ positionSeconds: 10 });
+    fireEvent.scroll(container.querySelector(".segment-list")!);
+
+    await userEvent.click(screen.getByRole("button", { name: "Follow playback" }));
+
+    expect(screen.queryByRole("button", { name: "Follow playback" })).toBeNull();
+  });
+
+  it("re-establishes following when a segment is clicked", async () => {
+    const { container, props } = renderShelf({ positionSeconds: 10 });
+    fireEvent.scroll(container.querySelector(".segment-list")!);
+
+    await userEvent.click(screen.getByText("we finally found the place"));
+
+    expect(props.onSeek).toHaveBeenCalledWith(4);
+    expect(screen.queryByRole("button", { name: "Follow playback" })).toBeNull();
+  });
+
+  it("scrolls a segment that has gone off the bottom back into view", () => {
+    // jsdom has no layout, so the geometry is stated rather than measured; what
+    // this covers is the wiring — that the shelf reads the row's real position
+    // and applies what `followScrollTop` returns to the list it owns.
+    const { container, rerender, props } = renderShelf({ positionSeconds: 5 });
+    const list = container.querySelector(".segment-list") as HTMLElement;
+    const rows = [...list.children] as HTMLElement[];
+    Object.defineProperty(list, "offsetTop", { value: 0, configurable: true });
+    Object.defineProperty(list, "clientHeight", { value: 22, configurable: true });
+    rows.forEach((row, index) => {
+      Object.defineProperty(row, "offsetTop", { value: index * 22, configurable: true });
+      Object.defineProperty(row, "offsetHeight", { value: 22, configurable: true });
+    });
+    list.scrollTop = 0;
+
+    rerender(<EvidenceShelf {...props} positionSeconds={10} />);
+
+    expect(list.scrollTop).toBe(22);
+  });
+
+  it("offers nothing to follow on a clip with no speech", () => {
+    const { container } = renderShelf({
+      positionSeconds: 10,
+      transcript: transcript({ status: "no_speech", segments: [] }),
+    });
+    expect(container.querySelector(".segment-list")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Follow playback" })).toBeNull();
   });
 });

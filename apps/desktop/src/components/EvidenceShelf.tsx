@@ -1,4 +1,10 @@
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { Asset, AssetAnalysisView, ClipTranscript } from "../types";
+import {
+  activeSegmentIndex,
+  followScrollTop,
+  FOLLOW_SUSPENSION_MS,
+} from "../review/transcriptFollow";
 import {
   analysisNeedsAttention,
   formatBytes,
@@ -19,6 +25,8 @@ export interface EvidenceShelfProps {
   tab: ShelfTab;
   onTabChange(tab: ShelfTab): void;
   onToggleOpen(): void;
+  /** Where playback is, so the transcript can show what is being said now. */
+  positionSeconds: number;
   onSeek(seconds: number): void;
   onChangeAsset(next: Asset): void;
   onCommitAsset(): void;
@@ -46,6 +54,7 @@ export function EvidenceShelf({
   observation,
   open,
   tab,
+  positionSeconds,
   onTabChange,
   onToggleOpen,
   onSeek,
@@ -57,6 +66,61 @@ export function EvidenceShelf({
   const segments = transcript?.segments ?? [];
   const badge = transcriptBadge(transcript);
   const attention = analysisNeedsAttention(observation);
+  const activeSegment = activeSegmentIndex(segments, positionSeconds);
+
+  // Auto-follow, and the rule for getting out of its way (issue #13).
+  const listRef = useRef<HTMLOListElement>(null);
+  const [followSuspended, setFollowSuspended] = useState(false);
+  const suspensionTimer = useRef(0);
+  // A scroll this component performed is not the reader scrolling away from
+  // the playhead, and must not suspend following.
+  const selfScrolling = useRef(false);
+
+  const resumeFollowing = useCallback(() => {
+    window.clearTimeout(suspensionTimer.current);
+    suspensionTimer.current = 0;
+    setFollowSuspended(false);
+  }, []);
+
+  // Another clip is another transcript; nothing carries over.
+  useEffect(resumeFollowing, [asset.id, resumeFollowing]);
+
+  useEffect(() => {
+    if (!open || tab !== "transcript" || followSuspended || activeSegment < 0) return;
+    const list = listRef.current;
+    const row = list?.children[activeSegment];
+    if (!list || !(row instanceof HTMLElement)) return;
+    const next = followScrollTop({
+      itemTop: row.offsetTop - list.offsetTop,
+      itemHeight: row.offsetHeight,
+      scrollTop: list.scrollTop,
+      viewportHeight: list.clientHeight,
+    });
+    if (next === null) return;
+    selfScrolling.current = true;
+    list.scrollTop = next;
+  }, [activeSegment, followSuspended, open, tab]);
+
+  // Nothing may be left ticking against an unmounted shelf.
+  useEffect(() => () => window.clearTimeout(suspensionTimer.current), []);
+
+  function onSegmentListScroll() {
+    if (selfScrolling.current) {
+      selfScrolling.current = false;
+      return;
+    }
+    // Reading elsewhere is a legitimate thing to be doing; following gives way
+    // for a bounded time rather than fighting for the scroll position. Each
+    // further scroll restarts the clock, so a long read is not interrupted.
+    window.clearTimeout(suspensionTimer.current);
+    suspensionTimer.current = window.setTimeout(resumeFollowing, FOLLOW_SUSPENSION_MS);
+    setFollowSuspended(true);
+  }
+
+  function seekToSegment(startMs: number) {
+    resumeFollowing();
+    onSeek(startMs / 1000);
+  }
 
   const tabs: Array<{ id: ShelfTab; label: string; badge?: string; attention?: boolean }> = [
     { id: "transcript", label: "Transcript", badge: badge === null ? undefined : String(badge) },
@@ -98,16 +162,28 @@ export function EvidenceShelf({
                   : "This clip has not been transcribed."}
               </p>
             ) : (
-              <ol className="segment-list">
-                {segments.map((segment) => (
-                  <li key={`${segment.startMs}-${segment.endMs}`}>
-                    <button className="segment" onClick={() => onSeek(segment.startMs / 1000)} title="Jump to this moment">
-                      <time>{formatTimecode(segment.startMs)}</time>
-                      <span>{segment.text}</span>
-                    </button>
-                  </li>
-                ))}
-              </ol>
+              <>
+                {followSuspended && (
+                  <button className="segment-follow" onClick={resumeFollowing}>
+                    Follow playback
+                  </button>
+                )}
+                <ol className="segment-list" ref={listRef} onScroll={onSegmentListScroll}>
+                  {segments.map((segment, position) => (
+                    <li key={`${segment.startMs}-${segment.endMs}`} className={position === activeSegment ? "active" : ""}>
+                      <button
+                        className="segment"
+                        aria-current={position === activeSegment ? "true" : undefined}
+                        onClick={() => seekToSegment(segment.startMs)}
+                        title="Jump to this moment"
+                      >
+                        <time>{formatTimecode(segment.startMs)}</time>
+                        <span>{segment.text}</span>
+                      </button>
+                    </li>
+                  ))}
+                </ol>
+              </>
             )
           )}
 

@@ -189,6 +189,12 @@ Important gaps; do not accidentally describe these as complete:
   trip crossing zones makes the displayed wall clock run backwards.
 - Web has automated Vitest and Chrome Playwright coverage. Desktop React now has Vitest + jsdom + Testing Library component tests under `apps/desktop/src/components/__tests__/`, but there is still no automated native Tauri UI suite.
 - No macOS signing/notarization or clean-machine packaging acceptance.
+- The transcript shelf follows playback: the segment under the playhead is
+  marked, the list scrolls only when that segment has left the viewport, and a
+  manual scroll suspends following for five seconds or until *Follow playback*.
+  Real scroll geometry is covered by `review/transcriptFollow.ts`'s unit tests
+  rather than by a browser tier — the Vite preview has no media origin, so no
+  playhead there can actually move.
 - Analysis suggestions are shown and editable in the desktop, but there is no
   per-suggestion accept/reject workflow: an AI title or description is simply an
   editable field, and a forced re-run overwrites it.

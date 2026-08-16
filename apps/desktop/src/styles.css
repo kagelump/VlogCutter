@@ -430,6 +430,25 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .segment-list { margin: 0; padding: 0; list-style: none; }
 .segment { display: grid; grid-template-columns: 44px minmax(0, 1fr); align-items: baseline; gap: 8px; width: 100%; height: 22px; padding: 0; color: var(--ink); background: transparent; border: 0; cursor: pointer; text-align: left; font-size: 13px; }
 .segment:hover { color: var(--amber); }
+
+/* The segment under the playhead. A left rule rather than a filled row: the
+   list is read while the frame is being watched, and a block of colour moving
+   down it every few seconds pulls the eye off the video. */
+.segment-list li.active { border-left: 2px solid var(--amber); margin-left: -2px; }
+.segment-list li.active .segment { color: var(--amber); }
+.segment-follow {
+  display: block;
+  margin: 0 0 4px;
+  padding: 1px 6px;
+  color: var(--amber);
+  background: transparent;
+  border: 1px solid var(--line-strong);
+  border-radius: 3px;
+  cursor: pointer;
+  font-size: 10px;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+}
 .segment span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .segment time { color: var(--quiet); font: 11px/14px ui-monospace, SFMono-Regular, Menlo, monospace; }
 .shelf-pane .description-field { width: 100%; height: 222px; resize: none; padding: 8px; color: var(--ink); background: var(--graphite); border: 1px solid var(--line); border-radius: 3px; font: 13px/18px inherit; }
