@@ -76,7 +76,13 @@ test("two Chrome tabs converge concurrent notes when one WebSocket is unavailabl
     const response = await fetch(`/api/v1/projects/${encodeURIComponent(id)}/assets/asset_web_e2e/review`);
     return response.json();
   }, { id: projectId }), { timeout: 12_000 }).toMatchObject({
-    noteRevisionCount: 2,
+    // Three, not two: `reconcile_asset_baseline` writes a baseline note
+    // revision the first time an asset is touched by an operation, so a clip
+    // that has been saved twice carries that plus one per save. The server's
+    // own assertions use `>= 2` for the same reason. Exact here because this
+    // suite controls both writers, which makes a fourth revision a real
+    // double-write in the polling-recovery path rather than noise.
+    noteRevisionCount: 3,
     activeNote: expect.stringMatching(/Concurrent note from tab (one|two)/),
   });
 
