@@ -233,6 +233,81 @@ describe("removing an import from the project", () => {
   });
 });
 
+describe("when the backend refuses", () => {
+  it("says so on the main banner when the history itself cannot be read", async () => {
+    const harness = withPriorImport();
+    const app = await renderApp(harness);
+    harness.next("list_import_sessions").reject("catalog is locked by another process");
+
+    await app.user.click(screen.getByRole("button", { name: "More media generation actions" }));
+    await app.user.click(await screen.findByRole("button", { name: /Review last import/ }));
+
+    // No dialog opened, so the failure has nowhere else to go. A click that
+    // silently does nothing is the defect being prevented here.
+    expect(await screen.findByText(/catalog is locked by another process/)).toBeVisible();
+    expect(screen.queryByRole("dialog", { name: "Imports" })).toBeNull();
+  });
+
+  it("reports a ledger that will not open, inside the dialog that stayed up", async () => {
+    const harness = withPriorImport();
+    const app = await renderApp(harness);
+    const dialog = await openHistory(app);
+    harness.next("import_session").reject("session record is unreadable");
+
+    await app.user.click(within(dialog).getByRole("button", { name: /DJI_SD/ }));
+
+    expect(await within(dialog).findByRole("alert")).toHaveTextContent(/session record is unreadable/);
+  });
+
+  it("reports a preview that failed rather than showing no confirmation", async () => {
+    const harness = withPriorImport();
+    const app = await renderApp(harness);
+    const dialog = await openHistory(app);
+    await openSession(app, dialog);
+    harness.next("import_rollback_preview").reject("project was closed");
+
+    await app.user.click(within(dialog).getByRole("button", { name: /Remove from project…/ }));
+
+    expect(await within(dialog).findByRole("alert")).toHaveTextContent(/project was closed/);
+    expect(within(dialog).queryByText(/Remove 2 clip memberships\?/)).toBeNull();
+  });
+
+  it("never lets a failed rollback read as a completed one", async () => {
+    const harness = withPriorImport();
+    const app = await renderApp(harness);
+    const dialog = await openHistory(app);
+    await openSession(app, dialog);
+    await app.user.click(within(dialog).getByRole("button", { name: /Remove from project…/ }));
+    harness.next("rollback_import_membership").reject("membership write rejected");
+
+    await app.user.click(within(dialog).getByRole("button", { name: /Confirm remove from project/ }));
+
+    // The one operation where silence is least acceptable: the user has to be
+    // able to tell "it failed" from "it removed nothing visible".
+    expect(await within(dialog).findByRole("alert")).toHaveTextContent(/membership write rejected/);
+    expect(screen.queryByText(/original media was left untouched/i)).toBeNull();
+    expect(queueFilenames()).toHaveLength(3);
+  });
+
+  it("lets the same rollback be retried once the backend recovers", async () => {
+    const harness = withPriorImport();
+    const app = await renderApp(harness);
+    const dialog = await openHistory(app);
+    await openSession(app, dialog);
+    await app.user.click(within(dialog).getByRole("button", { name: /Remove from project…/ }));
+    harness.next("rollback_import_membership").reject("membership write rejected");
+    await app.user.click(within(dialog).getByRole("button", { name: /Confirm remove from project/ }));
+    await within(dialog).findByRole("alert");
+
+    // The fault was one-shot: the confirmation is still armed, and pressing it
+    // again runs the real write.
+    await app.user.click(within(dialog).getByRole("button", { name: /Confirm remove from project/ }));
+
+    await waitFor(() => expect(queueFilenames()).toEqual(["SONY_001.MP4"]));
+    expect(within(dialog).queryByRole("alert")).toBeNull();
+  });
+});
+
 describe("the detected-card banner", () => {
   it("stays dismissed for that card rather than reappearing on the next poll", async () => {
     const harness = desktopScenario({ now: "2026-08-14T09:00:00.000Z" })

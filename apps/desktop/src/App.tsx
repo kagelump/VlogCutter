@@ -128,6 +128,7 @@ function App() {
   const [importSessionDetail, setImportSessionDetail] = useState<ImportSessionDetail | null>(null);
   const [importRollback, setImportRollback] = useState<ImportRollbackPreview | null>(null);
   const [importError, setImportError] = useState("");
+  const [importHistoryError, setImportHistoryError] = useState("");
   const [verifyImportCopies, setVerifyImportCopies] = useState(true);
   const [makeImportProxies, setMakeImportProxies] = useState(true);
   const [mountedCard, setMountedCard] = useState<CardCandidate | null>(null);
@@ -1291,28 +1292,56 @@ function App() {
     setShowMediaMenu(false);
     setImportSessionDetail(null);
     setImportRollback(null);
-    setImportSessions(await api.listImportSessions(projectId));
+    setImportHistoryError("");
+    try {
+      setImportSessions(await api.listImportSessions(projectId));
+    } catch (reason) {
+      // The dialog never opens, so this one belongs on the main banner: the
+      // alternative is a click that visibly does nothing.
+      setError(String(reason));
+      return;
+    }
     setShowImportHistory(true);
   }
 
   async function openImportSession(sessionId: string) {
     if (!projectId) return;
     setImportRollback(null);
-    setImportSessionDetail(await api.importSession(projectId, sessionId));
+    setImportHistoryError("");
+    try {
+      setImportSessionDetail(await api.importSession(projectId, sessionId));
+    } catch (reason) {
+      setImportHistoryError(String(reason));
+    }
   }
 
   async function previewImportRollback(sessionId: string) {
     if (!projectId) return;
-    setImportRollback(await api.importRollbackPreview(projectId, sessionId));
+    setImportHistoryError("");
+    try {
+      setImportRollback(await api.importRollbackPreview(projectId, sessionId));
+    } catch (reason) {
+      setImportHistoryError(String(reason));
+    }
   }
 
   async function rollbackImportSession(sessionId: string) {
-    if (!projectId) return;
-    await api.rollbackImportMembership(projectId, sessionId);
-    await Promise.all([reloadSessionAssets(), api.listImportSessions(projectId).then(setImportSessions)]);
-    setImportRollback(null);
-    setImportSessionDetail(await api.importSession(projectId, sessionId));
-    setMessage("Import membership removed; original media was left untouched");
+    if (!projectId || busy) return;
+    setBusy(true);
+    setImportHistoryError("");
+    try {
+      await api.rollbackImportMembership(projectId, sessionId);
+      await Promise.all([reloadSessionAssets(), api.listImportSessions(projectId).then(setImportSessions)]);
+      setImportRollback(null);
+      setImportSessionDetail(await api.importSession(projectId, sessionId));
+      setMessage("Import membership removed; original media was left untouched");
+    } catch (reason) {
+      // The confirmation stays armed: a rollback that failed is one the user
+      // still means to make, and silence here reads as "it worked".
+      setImportHistoryError(String(reason));
+    } finally {
+      setBusy(false);
+    }
   }
 
   async function makeProxy() {
@@ -2173,10 +2202,12 @@ function App() {
           sessions={importSessions}
           detail={importSessionDetail}
           preview={importRollback}
+          error={importHistoryError}
+          busy={busy}
           onOpen={(id) => void openImportSession(id)}
           onPreview={(id) => void previewImportRollback(id)}
           onUndo={(id) => void rollbackImportSession(id)}
-          onClose={() => setShowImportHistory(false)}
+          onClose={() => (setShowImportHistory(false), setImportHistoryError(""))}
         />
       )}
 
