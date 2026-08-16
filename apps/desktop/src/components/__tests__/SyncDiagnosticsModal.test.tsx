@@ -34,13 +34,6 @@ describe("SyncDiagnosticsModal", () => {
     expect(onClose).toHaveBeenCalledTimes(1);
   });
 
-  it("closes on Escape from the backdrop", () => {
-    const onClose = vi.fn();
-    render(<SyncDiagnosticsModal status={status()} onSyncNow={vi.fn()} onClose={onClose} />);
-    fireEvent.keyDown(screen.getByRole("dialog"), { key: "Escape" });
-    expect(onClose).toHaveBeenCalledTimes(1);
-  });
-
   it("surfaces unresolved conflicts with both sides", () => {
     render(
       <SyncDiagnosticsModal

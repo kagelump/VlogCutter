@@ -39,7 +39,7 @@ export function BaselineWizardModal({
   onCancel(): void;
 }) {
   return (
-    <div className="modal-backdrop pairing-backdrop" role="presentation" onKeyDown={(event) => { if (event.key === "Escape") onCancel(); }}>
+    <div className="modal-backdrop pairing-backdrop" role="presentation">
       <section className="modal baseline-modal" role="dialog" aria-modal="true" aria-labelledby="baseline-title">
         <span className="eyebrow">Pair project with server</span>
         <div className="settings-modal-heading">

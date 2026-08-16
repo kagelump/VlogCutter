@@ -60,10 +60,6 @@ export function TripPhaseDialog({
   const [rangeStart, setRangeStart] = useState(startPosition);
   const [rangeEnd, setRangeEnd] = useState(endPosition);
   const dialogRef = useRef<HTMLElement>(null);
-  const cancelRef = useRef(onCancel);
-  const busyRef = useRef(busy);
-  cancelRef.current = onCancel;
-  busyRef.current = busy;
   const rangeStartAsset = assets?.[rangeStart] ?? start;
   const rangeEndAsset = assets?.[rangeEnd] ?? end;
   const clipCount = rangeEnd - rangeStart + 1;
@@ -73,12 +69,9 @@ export function TripPhaseDialog({
       'button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [tabindex]:not([tabindex="-1"])',
     ) ?? [])].filter((element) => element.offsetParent !== null || element === document.activeElement);
     function containFocus(event: KeyboardEvent) {
-      if (event.key === "Escape" && !busyRef.current) {
-        event.preventDefault();
-        event.stopPropagation();
-        cancelRef.current();
-        return;
-      }
+      // Escape is resolved by the shell's one escape stack (issue #52), which
+      // knows this dialog and knows what is underneath it. This listener keeps
+      // only the focus containment, which is genuinely the dialog's own.
       if (event.key !== "Tab") return;
       const items = focusable();
       if (!items.length) return;

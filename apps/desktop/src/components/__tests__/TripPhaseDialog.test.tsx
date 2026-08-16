@@ -191,7 +191,7 @@ describe("TripPhaseDialog", () => {
     expect(onSave).not.toHaveBeenCalled();
   });
 
-  it("keeps the scrolling fields separate from the fixed actions and closes on Escape", async () => {
+  it("keeps the scrolling fields separate from the fixed actions", () => {
     const onCancel = vi.fn();
     const { container } = render(
       <TripPhaseDialog
@@ -209,8 +209,8 @@ describe("TripPhaseDialog", () => {
 
     expect(container.querySelector(".context-modal-body")?.contains(screen.getByLabelText("Selected clip range"))).toBe(true);
     expect(container.querySelector(".context-modal-actions")?.contains(screen.getByRole("button", { name: "Cancel" }))).toBe(true);
-    await userEvent.keyboard("{Escape}");
-    expect(onCancel).toHaveBeenCalledOnce();
+    // Escape is the shell's to resolve now; see the escape-stack CUJ.
+    expect(onCancel).not.toHaveBeenCalled();
   });
 
   it("returns focus to the boundary control that opened it", async () => {

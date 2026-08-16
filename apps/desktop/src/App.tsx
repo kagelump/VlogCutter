@@ -4,6 +4,7 @@ import type { ArchiveRoot, Asset, AssetPatch, AutoplayMode, BaselineImportResult
 import { useProjectSession } from "./session/projectSession";
 import { useAssetMutations } from "./session/assetMutations";
 import { orderAssets, moveSelection as moveSelectionInOrder } from "./review/order";
+import { resolveEscape, type EscapeLayer } from "./review/escape";
 import { resolveAction } from "./review/keymap";
 import { CalibrationPanel } from "./CalibrationPanel";
 import { chronologyApi } from "./chronologyApi";
@@ -888,6 +889,69 @@ function App() {
     void persistNotes(selected);
   };
 
+  function closePairingWizard() {
+    setShowPairingWizard(false);
+    setPairingWizardStep("endpoint");
+    setPairingCode("");
+    setServerIdentity(null);
+  }
+
+  /**
+   * Every surface Escape can close, top of the stack first (issue #52).
+   *
+   * Only settings→pairing is a stack the user can really build, but the order
+   * is written out anyway: two surfaces on screen at once must have a defined
+   * winner, and "whichever branch of an if-chain ran first" is not one.
+   *
+   * The chronology desk's pending-preview dock resolves its own Escape on
+   * `document` and stops propagation, so it wins over this list without being
+   * in it — a transient inside a mode, not a surface over the shell.
+   */
+  const escapeLayers: EscapeLayer[] = [
+    { id: "tripPhase", open: Boolean(phaseDialog), locked: phaseDialogBusy },
+    // The dialog takes itself off screen when the run starts, so this lock
+    // mirrors `closeImportDialog`'s own guard rather than covering a state the
+    // interface can currently reach. A preflight still in progress is *not*
+    // locked: closing it cancels the preflight, which is free.
+    { id: "import", open: showImportDialog, locked: importRunning },
+    { id: "importHistory", open: showImportHistory },
+    { id: "baseline", open: showBaselineWizard, locked: baselineStep === "confirming" },
+    { id: "pairing", open: showPairingWizard, locked: busy },
+    { id: "sync", open: showSyncDiagnostics },
+    { id: "analysis", open: showAnalysisDialog },
+    { id: "shortcuts", open: showShortcuts },
+    { id: "settings", open: showSettings },
+    // With no project open there is nothing behind this modal to go back to.
+    { id: "create", open: showCreate, locked: projects.length === 0 },
+    { id: "mediaMenu", open: showMediaMenu },
+    { id: "focus", open: view.presentation === "focus" },
+    { id: "mode", open: view.mode !== "review" },
+  ];
+
+  function closeEscapeLayer(id: string) {
+    switch (id) {
+      case "tripPhase": return setPhaseDialog(null);
+      case "import": return closeImportDialog();
+      case "importHistory": return (setShowImportHistory(false), setImportHistoryError(""));
+      case "baseline": return handleCancelBaselineWizard();
+      case "pairing": return closePairingWizard();
+      case "sync": return setShowSyncDiagnostics(false);
+      case "analysis": return setShowAnalysisDialog(false);
+      case "shortcuts": return setShowShortcuts(false);
+      case "settings": return setShowSettings(false);
+      case "create": return setShowCreate(false);
+      case "mediaMenu": return setShowMediaMenu(false);
+      case "focus": return dispatchView({ kind: "exitFocus" });
+      case "mode": return returnToReview();
+    }
+  }
+
+  // Read through a ref so the key handler always resolves against this render's
+  // layers. The handler's effect deps do not list every modal flag, and a
+  // stale layer list is exactly the class of bug this change removes.
+  const escapeRef = useRef({ layers: escapeLayers, close: closeEscapeLayer });
+  escapeRef.current = { layers: escapeLayers, close: closeEscapeLayer };
+
   useEffect(() => {
     const handleKey = (event: KeyboardEvent) => {
       const key = event.key.toLocaleLowerCase();
@@ -907,15 +971,13 @@ function App() {
         return;
       }
       if (event.key === "Escape") {
-        // Modals first, then Focus: Escape should close what is on top.
-        const hadModal = showMediaMenu || showShortcuts || showSettings || showAnalysisDialog;
-        setShowMediaMenu(false);
-        setShowShortcuts(false);
-        setShowSettings(false);
-        setShowAnalysisDialog(false);
-        if (projects.length > 0) setShowCreate(false);
-        if (!hadModal && view.presentation === "focus") dispatchView({ kind: "exitFocus" });
-        else if (!hadModal && view.mode === "chronology") returnToReview();
+        // One owner for "what is on top" (issue #52). Every surface that can
+        // be on screen is in `escapeLayers`, in stack order, and exactly one
+        // of them answers.
+        const { layers, close } = escapeRef.current;
+        const resolution = resolveEscape(layers);
+        if (resolution.kind !== "none") event.preventDefault();
+        if (resolution.kind === "close") close(resolution.id);
         return;
       }
       const tag = (event.target as HTMLElement)?.tagName;
@@ -2157,7 +2219,7 @@ function App() {
           onDeviceLabelChange={setDeviceLabel}
           onPair={() => void handlePairWithServer()}
           onBack={() => setPairingWizardStep("endpoint")}
-          onCancel={() => { setShowPairingWizard(false); setPairingWizardStep("endpoint"); setPairingCode(""); setServerIdentity(null); }}
+          onCancel={closePairingWizard}
         />
       )}
 

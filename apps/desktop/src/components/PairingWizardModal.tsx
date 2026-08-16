@@ -41,7 +41,7 @@ export function PairingWizardModal({
   onCancel(): void;
 }) {
   return (
-    <div className="modal-backdrop pairing-backdrop" role="presentation" onKeyDown={(event) => { if (event.key === "Escape") onCancel(); }}>
+    <div className="modal-backdrop pairing-backdrop" role="presentation">
       <section className="modal pairing-modal" role="dialog" aria-modal="true" aria-labelledby="pairing-title">
         <span className="eyebrow">Connect to server</span>
         <div className="settings-modal-heading">

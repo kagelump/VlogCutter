@@ -18,7 +18,7 @@ export function SyncDiagnosticsModal({
   onClose(): void;
 }) {
   return (
-    <div className="modal-backdrop" role="presentation" onKeyDown={(event) => { if (event.key === "Escape") onClose(); }}>
+    <div className="modal-backdrop" role="presentation">
       <section className="modal sync-diagnostics-modal" role="dialog" aria-modal="true" aria-labelledby="sync-diag-title">
         <span className="eyebrow">Sync status</span>
         <div className="settings-modal-heading">

@@ -44,15 +44,12 @@ describe("PairingWizardModal", () => {
     expect(props.onBack).toHaveBeenCalledTimes(1);
   });
 
-  it("resets through onCancel from the button and from backdrop Escape", async () => {
+  it("resets through onCancel from its own button", () => {
+    // Escape reaches the same reset through the shell's escape stack, which is
+    // where that case is now asserted (issue #52).
     const { props } = renderWizard();
-    await userEvent.click(screen.getByRole("button", { name: /cancel/i }));
+    fireEvent.click(screen.getByRole("button", { name: /cancel/i }));
     expect(props.onCancel).toHaveBeenCalledTimes(1);
-
-    // Escape on the backdrop is wired to the same reset; the keydown bubbles
-    // from the dialog to the backdrop handler.
-    fireEvent.keyDown(screen.getByRole("dialog"), { key: "Escape" });
-    expect(props.onCancel).toHaveBeenCalledTimes(2);
   });
 
   it("gates the pairing action on a non-empty code", () => {

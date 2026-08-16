@@ -27,22 +27,22 @@ component in `src/components/` with its own test file:
 | `BaselineWizardModal` | five-step, receives its step |
 | `AnalysisDialog` | gated on `readiness` |
 | `KeyboardShortcutsModal` | presentational |
-| `SyncDiagnosticsModal` | own backdrop Escape |
+| `SyncDiagnosticsModal` | presentational; Escape now belongs to the shell |
 
 ### Decisions settled in #20 (applied to all seven)
 
 1. **Wizards receive their step state; they do not own it.** `pairingWizardStep`,
    `pairingCode`, `serverIdentity`, and the baseline equivalents stay in `App`
    and arrive as flat props. This kept the shell as the single owner of the
-   reset each wizard needs, so Cancel and backdrop Escape both resolve to one
+   reset each wizard needs, so Cancel and Escape both resolve to one
    `onCancel` callback rather than to state scattered across a component and its
    parent.
-2. **Backdrop Escape was left as-is, deliberately.** The four modals that handled
-   Escape inline on their backdrop still do — the handler moved into the
-   component unchanged (now calling the injected `onCancel`/`onClose`). The
-   global keymap's modal-list Escape resolution was **not** unified into it;
-   that is a separate change with its own risk, and folding it into a
-   markup-only extraction would have coupled two unrelated refactors.
+2. **Backdrop Escape was left as-is, deliberately** — and has since been
+   unified, which is what that deferral was waiting for. Issue #52 moved every
+   surface into one ordered stack in `apps/desktop/src/review/escape.ts`; the
+   four modals that watched for Escape themselves no longer do, and
+   `TripPhaseDialog` keeps only its focus containment. See that module for the
+   order and the lock semantics.
 
 Conventions followed: flat props (no grouped objects); a component owns the type
 of the data it renders (`SettingsModal` carries `autoplayOptions`,
