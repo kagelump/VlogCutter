@@ -118,7 +118,11 @@ function rememberCameraMapping(
     .replace(/[^a-z0-9]+/g, "_");
   state.imports.cameraMappings[projectId] = [
     ...mappings,
-    { id, folderHint: evidence.folderHint, filenamePrefix: evidence.filenamePrefix, camera: trimmed, createdAt: nowIso, updatedAt: nowIso },
+    // The harness never models EXIF, so `exifHint` stays empty here — every
+    // harness-recorded mapping lives on the brand-level tier
+    // `cameras::mapping`'s doc comment describes; the exif-narrowing half of
+    // that asymmetry is core-only and not exercised at the CUJ tier.
+    { id, folderHint: evidence.folderHint, filenamePrefix: evidence.filenamePrefix, exifHint: "", camera: trimmed, createdAt: nowIso, updatedAt: nowIso },
   ];
 }
 
@@ -444,12 +448,13 @@ export const importCommands: CommandTable = {
       pending: additions.filter((asset) => !context.state.assets[asset.id]),
       bytesCopied: 0,
     };
-    // A completed import is the project's best current statement of what this
-    // card's evidence means — same "record it whenever it was strong enough"
-    // rule as `run_import` in `preflight.rs`, so a reformatted or reinserted
-    // matching card defaults to it next time without the user repeating a
-    // correction.
-    if (tally.pending.length > 0 && plan.cameraIdentity) {
+    // A completed import driven by a real user decision is the project's
+    // best current statement of what this card's evidence means — same
+    // `UserSelected`-only gate as `run_import` in `preflight.rs`. A plain
+    // `detected` guess is never recorded: it can differ from what a real,
+    // EXIF-aware ingest would assign, and recording it would let a later
+    // `remembered` reinsertion force that guess over the truth.
+    if (tally.pending.length > 0 && plan.cameraIdentity?.source === "userSelected") {
       const evidence = cameraEvidenceFor(
         plan.card,
         plan.items.filter((item) => item.classification === "new").map((item) => item.filename),

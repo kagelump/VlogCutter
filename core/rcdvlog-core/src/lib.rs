@@ -4144,7 +4144,13 @@ fn orientation_name(width: u32, height: u32) -> &'static str {
 }
 
 /// Extracts camera make/model via ExifTool. Returns None on failure.
-fn exif_camera(path: &Path) -> Option<String> {
+///
+/// `pub(crate)` so `preflight.rs`'s `run_import` can independently observe a
+/// newly-ingested batch's *raw* EXIF, separately from whatever
+/// `probe_media`'s own resolved `camera` ends up being (which may already be
+/// a user override by the time ingest returns) — see
+/// `cameras::mapping::CameraEvidence::exif_hint`.
+pub(crate) fn exif_camera(path: &Path) -> Option<String> {
     let output = tool_command("exiftool")
         .args(["-json", "-Make", "-Model"])
         .arg(path)

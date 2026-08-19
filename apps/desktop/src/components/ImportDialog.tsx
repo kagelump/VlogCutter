@@ -47,6 +47,16 @@ export interface ImportDialogProps {
 }
 
 const NEW_CAMERA_OPTION = "__new_camera__";
+const CLEAR_CAMERA_OPTION = "__clear_camera__";
+
+/** Evidence text for one stored mapping. Includes the EXIF hint when
+ * present, since two rows can otherwise share the same folder/prefix text
+ * and look like duplicates (see `CameraMapping.exifHint`'s doc comment). */
+function mappingEvidenceLabel(mapping: CameraMapping): string {
+  return mapping.exifHint
+    ? `${mapping.folderHint} · ${mapping.filenamePrefix} · ${mapping.exifHint}`
+    : `${mapping.folderHint} · ${mapping.filenamePrefix}`;
+}
 
 /** What the camera control says beneath the resolved name — the "make
  * uncertainty visible" half of #71, not just the ready-to-import case. */
@@ -56,7 +66,12 @@ function cameraIdentityNote(identity: ImportPreflight["cameraIdentity"]): string
     case "userSelected":
       return "You chose this camera for this import.";
     case "remembered":
-      return "Remembered from a previous import of this camera.";
+      // Deliberately says "matching evidence", not "this camera": the match
+      // is on card layout and filename prefix, which is brand-level, not a
+      // verified device match (see `cameras::mapping`'s doc comment). Naming
+      // the exact camera here would overclaim a certainty this evidence
+      // does not have.
+      return "Remembered from a previous import with matching card and filename evidence.";
     case "detected":
       return identity.evidenceStrong
         ? "Detected from this card."
@@ -235,7 +250,12 @@ export function ImportDialog({
       setEditingCamera(true);
       return;
     }
-    onSelectCamera(value || null);
+    if (value === CLEAR_CAMERA_OPTION) {
+      onSelectCamera(null);
+      return;
+    }
+    if (!value) return; // The "Change camera…" placeholder is not itself a choice.
+    onSelectCamera(value);
   }
 
   const canImport = Boolean(
@@ -291,6 +311,9 @@ export function ImportDialog({
                       <span className="sr-only">Change camera</span>
                       <select value="" onChange={(event) => handleCameraSelect(event.target.value)}>
                         <option value="">Change camera…</option>
+                        {(plan.cameraIdentity.source === "userSelected" || plan.cameraIdentity.source === "remembered") && (
+                          <option value={CLEAR_CAMERA_OPTION}>Use the detected camera</option>
+                        )}
                         {knownCameras.map((cameraName) => (
                           <option key={cameraName} value={cameraName}>{cameraName}</option>
                         ))}
@@ -460,9 +483,9 @@ export function ImportDialog({
                 <ul>
                   {mappings.map((mapping) => (
                     <li key={mapping.id}>
-                      <span className="import-mapping-evidence">{mapping.folderHint} · {mapping.filenamePrefix}</span>
+                      <span className="import-mapping-evidence">{mappingEvidenceLabel(mapping)}</span>
                       <input
-                        aria-label={`Camera for ${mapping.folderHint} · ${mapping.filenamePrefix}`}
+                        aria-label={`Camera for ${mappingEvidenceLabel(mapping)}`}
                         value={mappingDrafts[mapping.id] ?? mapping.camera}
                         onChange={(event) => setMappingDrafts((current) => ({ ...current, [mapping.id]: event.target.value }))}
                       />
@@ -477,7 +500,7 @@ export function ImportDialog({
                       <button
                         type="button"
                         className="text-button"
-                        aria-label={`Clear the remembered camera for ${mapping.folderHint} · ${mapping.filenamePrefix}`}
+                        aria-label={`Clear the remembered camera for ${mappingEvidenceLabel(mapping)}`}
                         onClick={() => onClearMapping(mapping.id)}
                       >
                         Clear

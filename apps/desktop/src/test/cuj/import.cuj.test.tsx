@@ -278,6 +278,31 @@ describe("importing from a card", () => {
 
 describe("choosing and remembering a camera identity (#71)", () => {
   /**
+   * The regression this issue's review caught: an ordinary import the user
+   * never corrects (a plain "detected" identity) must record nothing,
+   * because that guess can differ from what a real, EXIF-aware ingest would
+   * assign — recording it would let a later reinsertion silently force the
+   * wrong name onto every asset. Mirrors
+   * `core/rcdvlog-core/src/preflight.rs`'s
+   * `a_detected_identity_is_never_recorded_but_a_user_choice_is_and_wins_over_real_exif`.
+   */
+  it("never records a mapping for a plain, uncorrected import", async () => {
+    const scenario = desktopScenario({ now: "2026-08-09T12:00:00.000Z" })
+      .project("Hokkaido field test", { id: "project_hokkaido" })
+      .archiveRoot("NAS Video", { availableBytes: 1_200_000_000_000 })
+      .cardInserted("SONY_SD", { clips: 1, newClips: 1, camera: "Sony (C-series)", cameraHint: "Sony" });
+    const harness = scenario.build();
+    const app = await renderApp(harness);
+    const dialog = await openCardImport(app);
+
+    expect(within(dialog).getByText("Sony (C-series)", { selector: "strong" })).toBeVisible();
+    await app.user.click(within(dialog).getByRole("button", { name: /Import 1 clip/ }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+
+    expect(harness.state.imports.cameraMappings.project_hokkaido ?? []).toHaveLength(0);
+  });
+
+  /**
    * The issue's named CUJ, end to end through the real ImportDialog and the
    * real command names: wrong auto-detection, a deliberate correction,
    * import, then a reformatted-and-reinserted card — at a different mount
@@ -336,7 +361,7 @@ describe("choosing and remembering a camera identity (#71)", () => {
 
     dialog = await openCardImport(app);
     expect(within(dialog).getByText("Sony A7C II", { selector: "strong" })).toBeVisible();
-    expect(within(dialog).getByText("Remembered from a previous import of this camera.")).toBeVisible();
+    expect(within(dialog).getByText("Remembered from a previous import with matching card and filename evidence.")).toBeVisible();
 
     await app.user.click(within(dialog).getByRole("button", { name: /Import 1 clip/ }));
     await waitFor(() => expect(Object.keys(harness.state.assets)).toHaveLength(4));

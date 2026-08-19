@@ -539,6 +539,42 @@ describe("choosing and remembering a camera identity (#71)", () => {
     expect(onSelectCamera).not.toHaveBeenCalled();
   });
 
+  it("does not offer to clear back to auto-detection when nothing has been chosen yet", () => {
+    // The default fixture's camera source is "detected" — nothing to undo.
+    renderDialog();
+    expect(screen.queryByRole("option", { name: "Use the detected camera" })).toBeNull();
+  });
+
+  it("lets the user clear an explicit choice back to auto-detection", async () => {
+    const user = userEvent.setup();
+    const onSelectCamera = vi.fn();
+    renderDialog({
+      plan: plan({
+        cameraIdentity: { camera: "Sony A7C II (backup body)", source: "userSelected", evidenceStrong: true },
+      }),
+      onSelectCamera,
+    });
+
+    await user.selectOptions(screen.getByLabelText("Change camera"), "Use the detected camera");
+
+    expect(onSelectCamera).toHaveBeenCalledWith(null);
+  });
+
+  it("lets the user clear a remembered mapping back to auto-detection", async () => {
+    const user = userEvent.setup();
+    const onSelectCamera = vi.fn();
+    renderDialog({
+      plan: plan({
+        cameraIdentity: { camera: "Sony A7C II", source: "remembered", evidenceStrong: true },
+      }),
+      onSelectCamera,
+    });
+
+    await user.selectOptions(screen.getByLabelText("Change camera"), "Use the detected camera");
+
+    expect(onSelectCamera).toHaveBeenCalledWith(null);
+  });
+
   it("shows that a choice was remembered from a previous import", () => {
     renderDialog({
       plan: plan({
@@ -547,7 +583,7 @@ describe("choosing and remembering a camera identity (#71)", () => {
     });
 
     expect(screen.getByText("Sony A7C II", { selector: "strong" })).toBeVisible();
-    expect(screen.getByText("Remembered from a previous import of this camera.")).toBeVisible();
+    expect(screen.getByText("Remembered from a previous import with matching card and filename evidence.")).toBeVisible();
   });
 
   it("makes ambiguous evidence visible rather than presenting a guess as settled", () => {
@@ -600,6 +636,7 @@ describe("choosing and remembering a camera identity (#71)", () => {
           id: "cammap_1",
           folderHint: "Sony",
           filenamePrefix: "C",
+          exifHint: "",
           camera: "Sony A7C II",
           createdAt: "2026-08-01T00:00:00Z",
           updatedAt: "2026-08-01T00:00:00Z",
@@ -634,6 +671,7 @@ describe("choosing and remembering a camera identity (#71)", () => {
           id: "cammap_1",
           folderHint: "Sony",
           filenamePrefix: "C",
+          exifHint: "",
           camera: "Sony A7C II",
           createdAt: "2026-08-01T00:00:00Z",
           updatedAt: "2026-08-01T00:00:00Z",
@@ -643,5 +681,35 @@ describe("choosing and remembering a camera identity (#71)", () => {
 
     await user.click(screen.getByText("Remembered cameras (1)"));
     expect(screen.getByRole("button", { name: "Save" })).toBeDisabled();
+  });
+
+  it("distinguishes two mappings that share folder and prefix but differ by EXIF hint", async () => {
+    const user = userEvent.setup();
+    renderDialog({
+      mappings: [
+        {
+          id: "cammap_1",
+          folderHint: "Sony",
+          filenamePrefix: "C",
+          exifHint: "",
+          camera: "Sony A7C II",
+          createdAt: "2026-08-01T00:00:00Z",
+          updatedAt: "2026-08-01T00:00:00Z",
+        },
+        {
+          id: "cammap_2",
+          folderHint: "Sony",
+          filenamePrefix: "C",
+          exifHint: "SONY ILME-FX3",
+          camera: "Sony FX3",
+          createdAt: "2026-08-01T00:00:00Z",
+          updatedAt: "2026-08-01T00:00:00Z",
+        },
+      ],
+    });
+
+    await user.click(screen.getByText("Remembered cameras (2)"));
+    expect(screen.getByText("Sony · C")).toBeVisible();
+    expect(screen.getByText("Sony · C · SONY ILME-FX3")).toBeVisible();
   });
 });

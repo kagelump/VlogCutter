@@ -468,6 +468,13 @@ export interface CameraMapping {
   id: string;
   folderHint: string;
   filenamePrefix: string;
+  /**
+   * Raw EXIF make/model this row was recorded with, or empty when it was
+   * recorded from files with no readable EXIF (the brand-level fallback
+   * tier). Not user-editable; shown so otherwise-identical
+   * folderHint/filenamePrefix rows can be told apart when inspecting.
+   */
+  exifHint: string;
   camera: string;
   createdAt: string;
   updatedAt: string;

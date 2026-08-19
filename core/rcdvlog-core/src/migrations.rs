@@ -1277,10 +1277,18 @@ fn add_camera_identity_mappings(transaction: &Transaction<'_>) -> Result<()> {
             project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
             folder_hint TEXT NOT NULL CHECK(length(folder_hint) > 0),
             filename_prefix TEXT NOT NULL CHECK(length(filename_prefix) > 0),
+            -- Raw EXIF make/model observed when the row was written, or ''
+            -- when none of that write's new files had readable EXIF. Part
+            -- of the unique key deliberately: a row recorded with a real
+            -- EXIF hint is a more specific match than the ''-tier row for
+            -- the same folder_hint/filename_prefix, and an ordinary
+            -- preflight lookup (which never has EXIF) can only ever query
+            -- the ''-tier. See cameras::mapping's doc comment.
+            exif_hint TEXT NOT NULL DEFAULT '',
             camera TEXT NOT NULL CHECK(length(camera) > 0),
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
-            UNIQUE(project_id, folder_hint, filename_prefix)
+            UNIQUE(project_id, folder_hint, filename_prefix, exif_hint)
         );
         CREATE INDEX IF NOT EXISTS camera_identity_mappings_project
             ON camera_identity_mappings(project_id);
@@ -1692,6 +1700,7 @@ mod tests {
             "project_id",
             "folder_hint",
             "filename_prefix",
+            "exif_hint",
             "camera",
             "created_at",
             "updated_at",
@@ -1709,8 +1718,8 @@ mod tests {
         connection
             .execute(
                 "INSERT INTO camera_identity_mappings
-                 (id, project_id, folder_hint, filename_prefix, camera, created_at, updated_at)
-                 VALUES ('m1', 'p1', 'Sony', 'C', 'Sony A7C II', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+                 (id, project_id, folder_hint, filename_prefix, exif_hint, camera, created_at, updated_at)
+                 VALUES ('m1', 'p1', 'Sony', 'C', '', 'Sony A7C II', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
                 [],
             )
             .unwrap();
@@ -1720,24 +1729,35 @@ mod tests {
             connection
                 .execute(
                     "INSERT INTO camera_identity_mappings
-                     (id, project_id, folder_hint, filename_prefix, camera, created_at, updated_at)
-                     VALUES ('m2', 'p1', '', 'C', 'Sony A7C II', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+                     (id, project_id, folder_hint, filename_prefix, exif_hint, camera, created_at, updated_at)
+                     VALUES ('m2', 'p1', '', 'C', '', 'Sony A7C II', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
                     [],
                 )
                 .is_err()
         );
-        // The same evidence signature cannot be recorded twice for one
-        // project.
+        // The same evidence signature (including exif_hint) cannot be
+        // recorded twice for one project...
         assert!(
             connection
                 .execute(
                     "INSERT INTO camera_identity_mappings
-                     (id, project_id, folder_hint, filename_prefix, camera, created_at, updated_at)
-                     VALUES ('m3', 'p1', 'Sony', 'C', 'Something else', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+                     (id, project_id, folder_hint, filename_prefix, exif_hint, camera, created_at, updated_at)
+                     VALUES ('m3', 'p1', 'Sony', 'C', '', 'Something else', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
                     [],
                 )
                 .is_err()
         );
+        // ...but a distinct exif_hint is a distinct row, even with the same
+        // folder_hint/filename_prefix — the narrowing `cameras::mapping`
+        // documents.
+        connection
+            .execute(
+                "INSERT INTO camera_identity_mappings
+                 (id, project_id, folder_hint, filename_prefix, exif_hint, camera, created_at, updated_at)
+                 VALUES ('m4', 'p1', 'Sony', 'C', 'SONY ILME-FX3', 'Sony FX3', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+                [],
+            )
+            .unwrap();
     }
 
     #[test]
