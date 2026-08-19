@@ -102,8 +102,11 @@ function chronologyBase(order: string[]) {
     spacingSeconds: CHRONOLOGY_SPACING,
     timezone: "Asia/Tokyo",
     sequences: [
-      { id: "sequence_sony_a", cameraKey: "Sony A7C II", label: "Sony A7C II · card A", volumeHint: "Travel/A001", filenamePrefix: "SONY", assetIds: SONY.slice(0, 2) },
-      { id: "sequence_sony_b", cameraKey: "Sony A7C II", label: "Sony A7C II · card B", volumeHint: "Travel/A002", filenamePrefix: "SONY", assetIds: SONY.slice(2) },
+      // Deliberately interleaved in solved order. The browser tier uses this to
+      // prove the two card identities become separate, non-overlapping runs
+      // inside one Sony lane instead of first-to-last bands covering each other.
+      { id: "sequence_sony_a", cameraKey: "Sony A7C II", label: "Sony A7C II · card A", volumeHint: "Travel/A001", filenamePrefix: "SONY", assetIds: [SONY[0], SONY[2]] },
+      { id: "sequence_sony_b", cameraKey: "Sony A7C II", label: "Sony A7C II · card B", volumeHint: "Travel/A002", filenamePrefix: "SONY", assetIds: [SONY[1], SONY[3]] },
       { id: "sequence_iphone", cameraKey: "Apple iPhone 17 Pro", label: "iPhone 17 Pro", volumeHint: "Travel", filenamePrefix: "APPLE", assetIds: IPHONE },
       { id: "sequence_insta", cameraKey: "Insta360 X5", label: "Insta360 X5", volumeHint: "Travel", filenamePrefix: "INSTA360", assetIds: INSTA },
       { id: "sequence_dji", cameraKey: "DJI Pocket 3", label: "DJI Pocket 3", volumeHint: "DJI_SD", filenamePrefix: "DJI", assetIds: DJI },

@@ -1291,7 +1291,7 @@ kbd { padding: 2px 4px; color: #a8b1b6; background: #262d32; border: 1px solid #
 /* Tile geometry is derived from the column so the frame keeps a roughly 16:9
    shape across the whole 44–116px zoom range, with a floor that keeps the
    smallest tiles legible rather than letterbox-thin. */
-.chronology-canvas { position: relative; min-height: 100%; --chronology-column: 92px; --chronology-gutter: 160px; --chronology-tile-width: calc(var(--chronology-column) - 10px); --chronology-tile-bar: 14px; --chronology-frame-height: max(30px, calc(var(--chronology-tile-width) * 0.5625)); --chronology-tile-height: calc(var(--chronology-frame-height) + var(--chronology-tile-bar)); --chronology-lane-height: calc(var(--chronology-tile-height) + 15px); background: repeating-linear-gradient(90deg, transparent 0, transparent calc(var(--chronology-column) - 1px), rgba(114,131,139,.12) calc(var(--chronology-column) - 1px), rgba(114,131,139,.12) var(--chronology-column)); background-position-x: var(--chronology-gutter); }
+.chronology-canvas { position: relative; min-height: 100%; --chronology-column: 92px; --chronology-gutter: 160px; --chronology-tile-width: calc(var(--chronology-column) - 10px); --chronology-tile-bar: 14px; --chronology-frame-height: max(30px, calc(var(--chronology-tile-width) * 0.5625)); --chronology-tile-height: calc(var(--chronology-frame-height) + var(--chronology-tile-bar)); --chronology-card-run-height: 18px; --chronology-lane-height: calc(var(--chronology-card-run-height) + var(--chronology-tile-height) + 22px); background: repeating-linear-gradient(90deg, transparent 0, transparent calc(var(--chronology-column) - 1px), rgba(114,131,139,.12) calc(var(--chronology-column) - 1px), rgba(114,131,139,.12) var(--chronology-column)); background-position-x: var(--chronology-gutter); }
 .chronology-sticky-label { position: sticky; z-index: 6; left: 0; width: var(--chronology-gutter); height: 100%; display: flex; align-items: center; padding: 0 12px; color: #68767d; border-right: 1px solid var(--line-strong); background: #111619; font: 10px/1 ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: .1em; text-transform: uppercase; }
 .chronology-phase-band { position: relative; height: 38px; border-bottom: 1px solid var(--line-strong); background: #101518; }
 .chronology-phase-band > .chronology-sticky-label, .chronology-ruler > .chronology-sticky-label { position: sticky; top: 0; }
@@ -1312,13 +1312,21 @@ kbd { padding: 2px 4px; color: #a8b1b6; background: #262d32; border: 1px solid #
 .chronology-ruler > span.is-day { color: #b8c6cb; border-left-color: #46545b; }
 .chronology-ruler > span.is-zone { color: #e8dcc4; border-left-color: var(--amber); }
 .chronology-ruler > span.is-zone b { margin-right: 6px; padding: 1px 4px; color: #2a1e0d; background: var(--amber); border-radius: 2px; font-weight: 600; }
-.chronology-sequence-lane { height: var(--chronology-lane-height); display: grid; grid-template-columns: var(--chronology-gutter) minmax(0, 1fr); border-bottom: 1px solid #242c30; }
+.chronology-camera-lane { height: var(--chronology-lane-height); display: grid; grid-template-columns: var(--chronology-gutter) minmax(0, 1fr); border-bottom: 1px solid #242c30; }
 .chronology-lane-label { position: sticky; z-index: 5; left: 0; min-width: 0; display: flex; flex-direction: column; justify-content: center; gap: 4px; overflow: hidden; padding: 0 12px; border-right: 1px solid var(--line-strong); background: #111619; }
 .chronology-lane-label strong, .chronology-lane-label span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .chronology-lane-label strong { color: #aeb9bd; font-size: 10px; }
 .chronology-lane-label span { color: #58656c; font: 10px/1 ui-monospace, SFMono-Regular, Menlo, monospace; }
 .chronology-lane-track { position: relative; min-width: 0; background: rgba(19,25,28,.5); }
-.chronology-block, .chronology-ghost-block { position: absolute; top: 7px; width: var(--chronology-tile-width); height: var(--chronology-tile-height); }
+.chronology-card-runs { position: absolute; z-index: 1; top: 5px; right: 0; left: 0; height: var(--chronology-card-run-height); }
+.chronology-card-run { position: absolute; height: var(--chronology-card-run-height); display: flex; align-items: center; justify-content: space-between; gap: 6px; overflow: hidden; padding: 0 5px 0 7px; color: #77868d; border: 0; border-left: 2px solid #50636b; border-radius: 2px; background: linear-gradient(90deg, rgba(76,97,106,.28), rgba(30,39,43,.18)); cursor: pointer; font: 10px/1 ui-monospace, SFMono-Regular, Menlo, monospace; text-align: left; }
+.chronology-card-run::after { position: absolute; right: 0; bottom: 0; left: 0; height: 1px; content: ""; background: repeating-linear-gradient(90deg, #50636b 0 5px, transparent 5px 9px); opacity: .65; }
+.chronology-card-run span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chronology-card-run em { flex: none; color: #64737a; font-style: normal; }
+.chronology-card-run:hover, .chronology-card-run:focus-visible { color: #b8c8cd; border-left-color: var(--cyan); outline: 1px solid rgba(91,197,212,.55); outline-offset: 1px; }
+.chronology-card-run.is-active { color: #e5c896; border-left-color: var(--amber); background: linear-gradient(90deg, rgba(141,103,51,.3), rgba(45,37,27,.16)); }
+.chronology-card-run.is-active::after { background: repeating-linear-gradient(90deg, var(--amber) 0 5px, transparent 5px 9px); }
+.chronology-block, .chronology-ghost-block { position: absolute; top: calc(var(--chronology-card-run-height) + 11px); width: var(--chronology-tile-width); height: var(--chronology-tile-height); }
 .chronology-block { z-index: 2; display: block; overflow: hidden; padding: 0; color: #aeb8bc; border: 1px solid #465259; border-radius: 4px; background: #1a2124; cursor: pointer; text-align: left; transition: left 140ms ease, border-color 100ms ease, background 100ms ease; }
 .chronology-block:hover { border-color: #6d7b82; }
 .chronology-block.is-selected { border-color: var(--amber); box-shadow: inset 0 0 0 1px rgba(232,168,79,.35); }
@@ -1371,6 +1379,10 @@ kbd { padding: 2px 4px; color: #a8b1b6; background: #262d32; border: 1px solid #
 .chronology-evidence-list li > span { width: 18px; height: 18px; display: grid; place-items: center; color: #0d1618; border-radius: 50%; background: var(--cyan); font: 10px/1 ui-monospace, SFMono-Regular, Menlo, monospace; }
 .chronology-evidence-list p { margin: 0; color: #aeb8bc; font-size: 10px; line-height: 1.45; }
 .chronology-tool-form > p { margin: -7px 0 16px; color: var(--quiet); font-size: 10px; line-height: 1.4; }
+.chronology-current-card { display: grid; gap: 4px; margin: 0 0 14px; padding: 8px 9px; border: 1px solid var(--line); border-left: 2px solid var(--amber); border-radius: 4px; background: #111619; }
+.chronology-current-card span { color: var(--quiet); font: 10px/1 ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: .08em; text-transform: uppercase; }
+.chronology-current-card strong { overflow: hidden; color: #c9d2d5; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.chronology-current-card em { overflow: hidden; color: #68767d; font: normal 10px/1.2 ui-monospace, SFMono-Regular, Menlo, monospace; text-overflow: ellipsis; white-space: nowrap; }
 .chronology-tool-form label { display: grid; gap: 4px; margin-bottom: 11px; color: #8d999f; font-size: 10px; }
 .chronology-tool-form input, .chronology-tool-form select { width: 100%; min-width: 0; padding: 7px 8px; color: var(--ink); border: 1px solid var(--line-strong); border-radius: 4px; background: #0e1315; }
 .chronology-scope-picker { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; margin: 0 0 12px; padding: 0; border: 0; }

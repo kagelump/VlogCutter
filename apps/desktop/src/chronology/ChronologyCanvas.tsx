@@ -94,11 +94,41 @@ export function ChronologyCanvas({
     [overview.assets, visibleWindow.end, visibleWindow.start],
   );
   const selected = new Set(selectedIds);
+  const focusedSequenceId = focusedAssetId
+    ? overview.assets[indexById.get(focusedAssetId) ?? -1]?.orderKey.captureSequenceId
+    : undefined;
+  const selectedSequenceId = selectedIds[0]
+    ? overview.assets[indexById.get(selectedIds[0]) ?? -1]?.orderKey.captureSequenceId
+    : undefined;
   const impactExtent = changedOrdinalExtent(impact);
   const timeTicks = useMemo(
     () => chronologyTimeTicks(overview.assets, columnWidth, visibleWindow),
     [columnWidth, overview.assets, visibleWindow.end, visibleWindow.start],
   );
+  const visibleCardRunsByCamera = useMemo(() => new Map(lanes.map((lane) => [
+    lane.cameraKey,
+    lane.sequences
+      .flatMap((segment, segmentIndex) => segment.runs.map((run, runIndex) => ({
+        segment,
+        segmentIndex,
+        run,
+        runIndex,
+      })))
+      // Keyboard/DOM order must follow the visual timeline, not the sequence
+      // declaration groups that happened to produce these runs.
+      .sort((left, right) => (
+        left.run.startIndex - right.run.startIndex
+        || left.segmentIndex - right.segmentIndex
+        || left.runIndex - right.runIndex
+      ))
+      // Card controls share the clip virtual window. An alternating A/B/A/B
+      // camera can have thousands of runs; mounting them all would defeat the
+      // canvas's bounded-DOM contract even though the clips are windowed.
+      .filter((item) => (
+        item.run.endIndex >= visibleWindow.start
+        && item.run.startIndex < visibleWindow.end
+      )),
+  ])), [lanes, visibleWindow.end, visibleWindow.start]);
 
   useEffect(() => {
     // The desk opens with the focused problem/Review clip preselected. Make it
@@ -348,12 +378,40 @@ export function ChronologyCanvas({
         </div>
 
         {lanes.map((lane) => (
-          <div className="chronology-sequence-lane" key={lane.sequence.id}>
+          <div className="chronology-camera-lane" key={lane.cameraKey}>
             <div className="chronology-lane-label">
-              <strong>{lane.sequence.label || lane.sequence.cameraKey}</strong>
-              <span>{lane.sequence.volumeHint || lane.sequence.cameraKey}</span>
+              <strong>{lane.cameraKey}</strong>
+              <span>{lane.sequences.length} {lane.sequences.length === 1 ? "card" : "cards"}</span>
             </div>
             <div className="chronology-lane-track">
+              <div className="chronology-card-runs" aria-label={`${lane.cameraKey} card runs`}>
+                {(visibleCardRunsByCamera.get(lane.cameraKey) ?? [])
+                  .map(({ segment, segmentIndex, run, runIndex }) => {
+                    const active = segment.sequence.id === focusedSequenceId;
+                    const runPosition = segment.runs.length > 1
+                      ? `, run ${runIndex + 1} of ${segment.runs.length}`
+                      : "";
+                    return (
+                      <button
+                        type="button"
+                        key={`${segment.sequence.id}-${runIndex}`}
+                        className={`chronology-card-run ${active ? "is-active" : ""}`}
+                        style={{
+                          left: run.startIndex * columnWidth + 5,
+                          width: Math.max(28, (run.endIndex - run.startIndex + 1) * columnWidth - 10),
+                        }}
+                        disabled={disabled}
+                        aria-pressed={active}
+                        aria-label={`Inspect card ${segmentIndex + 1} of ${lane.sequences.length}${runPosition}: ${segment.sequence.label || segment.sequence.id}, ${run.assets.length} ${run.assets.length === 1 ? "clip" : "clips"}`}
+                        title={`${segment.sequence.label || segment.sequence.id} · ${segment.sequence.volumeHint || segment.sequence.filenamePrefix || lane.cameraKey}`}
+                        onClick={() => choose(run.assets[0].assetId, false)}
+                      >
+                        <span>{segment.sequence.label || "Card"}</span>
+                        <em>{run.assets.length}</em>
+                      </button>
+                    );
+                  })}
+              </div>
               {lane.assets.filter((asset) => visibleIds.has(asset.assetId)).map((asset) => {
                 const index = indexById.get(asset.assetId) ?? 0;
                 const file = assetsById.get(asset.assetId);
@@ -414,9 +472,11 @@ export function ChronologyCanvas({
                   </div>
                 );
               })}
-              {selectedIds.length > 0 && lane.assets.some((asset) => selected.has(asset.assetId)) && (
+              {selectedIds.length > 0 && selectedSequenceId
+                && lane.assets.some((asset) => selected.has(asset.assetId)) && (
                 <div className="chronology-placement-targets" aria-label="Place selected run">
-                  {overview.assets.slice(visibleWindow.start, visibleWindow.end).filter((asset) => !selected.has(asset.assetId)).map((asset) => {
+                  {overview.assets.slice(visibleWindow.start, visibleWindow.end)
+                    .filter((asset) => !selected.has(asset.assetId)).map((asset) => {
                     const index = indexById.get(asset.assetId) ?? 0;
                     return (
                       <span key={asset.assetId} style={{ left: index * columnWidth }}>

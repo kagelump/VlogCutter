@@ -31,7 +31,7 @@ import {
   type PhaseBoundaryDraft,
 } from "./chronology/ChronologyCanvas";
 import { CompareDeck } from "./chronology/CompareDeck";
-import { formatChronologyTime } from "./chronology/geometry";
+import { chronologyLanes, formatChronologyTime, type ChronologyLane } from "./chronology/geometry";
 import { TripPhaseDialog, type TripPhaseFormValue } from "./components/TripPhaseDialog";
 
 interface Props {
@@ -75,6 +75,28 @@ function formatOffset(seconds: number): string {
   const minutes = Math.floor((total % 3600) / 60);
   if (hours) return `${sign}${hours}h ${minutes}m`;
   return `${sign}${minutes}m`;
+}
+
+function sequenceSummary(
+  overview: ChronologyOverview,
+  lanes: ChronologyLane[],
+  sequenceId: string,
+) {
+  const sequence = overview.sequences.find((item) => item.id === sequenceId);
+  if (!sequence) return { label: "No card selected", detail: "Choose a clip on the canvas" };
+  // Use the exact solver-first card order drawn on the canvas. The core's
+  // declaration list is ID-sorted, so numbering from it can call the same card
+  // "Card 1" in the inspector and "Card 2" in the lane.
+  const cameraSequences = lanes
+    .find((lane) => lane.cameraKey === sequence.cameraKey)
+    ?.sequences.map((segment) => segment.sequence)
+    ?? overview.sequences.filter((item) => item.cameraKey === sequence.cameraKey);
+  const ordinal = cameraSequences.findIndex((item) => item.id === sequence.id) + 1;
+  const hint = sequence.volumeHint || sequence.filenamePrefix || "No card hint";
+  return {
+    label: `Card ${ordinal} of ${cameraSequences.length} · ${sequence.label || sequence.cameraKey}`,
+    detail: `${sequence.cameraKey} · ${hint}`,
+  };
 }
 
 export function CalibrationPanel({
@@ -122,7 +144,13 @@ export function CalibrationPanel({
   const previewOriginRef = useRef<HTMLElement | null>(null);
 
   const assetsById = useMemo(() => new Map(assets.map((asset) => [asset.id, asset])), [assets]);
+  // Lane construction is linear in the project's clips. Keep the toolbar
+  // count tied to the exact rows the canvas draws without repeating that work
+  // on every focus, inspector, or draft-state change.
+  const cameraLanes = useMemo(() => overview ? chronologyLanes(overview) : [], [overview]);
+  const cameraCount = cameraLanes.length;
   const focusedChronology = overview?.assets.find((asset) => asset.assetId === focusedId) ?? null;
+  const currentSequence = focusedChronology?.orderKey.captureSequenceId ?? "";
   const actionableProblems = useMemo(() => [
     ...(overview?.contradictions ?? []).map((item, index) => ({
       id: `contradiction-${index}`,
@@ -165,6 +193,14 @@ export function CalibrationPanel({
     activeProblemIdRef.current = null;
     setActiveProblemIndex(-1);
   }, [actionableProblems]);
+
+  useEffect(() => {
+    // A target chosen for card A becomes ambiguous or self-referential after
+    // the user focuses card B. Require a fresh, visible choice for the new
+    // source instead of retaining stale hidden intent.
+    setSequenceTarget("");
+    setMergeTarget("");
+  }, [currentSequence]);
 
   function visitProblem(delta: number) {
     if (!actionableProblems.length) return;
@@ -571,7 +607,7 @@ export function CalibrationPanel({
   const focusedAsset = assetsById.get(focusedId) ?? assets[0];
   const zoom = reviewZoom ?? RIBBON_ZOOM_DEFAULT;
   const focusedIndex = overview.assets.findIndex((asset) => asset.assetId === focusedId);
-  const currentSequence = focusedChronology?.orderKey.captureSequenceId ?? "";
+  const currentCard = sequenceSummary(overview, cameraLanes, currentSequence);
   const focusedPhase = overview.phases.find(
     (phase) => phase.id === focusedChronology?.displayTime?.phaseId,
   );
@@ -600,6 +636,7 @@ export function CalibrationPanel({
             </div>
           )}
           <span>{overview.assets.length} clips</span>
+          <span>{cameraCount} {cameraCount === 1 ? "camera" : "cameras"}</span>
           <span>{overview.sequences.length} cards</span>
           <span>{overview.phases.length} phases</span>
           {overview.unplacedAssets > 0 && <strong>{overview.unplacedAssets} unplaced</strong>}
@@ -708,7 +745,7 @@ export function CalibrationPanel({
       <main className="chronology-canvas-panel">
         <div className="chronology-canvas-heading">
           <div>
-            <span className="eyebrow">Solver order · one lane per card</span>
+            <span className="eyebrow">Solver order · one lane per camera</span>
             <h2>{selectedIds.length > 1 ? `${selectedIds.length} clips selected` : focusedAsset?.filename ?? "Select a clip"}</h2>
           </div>
           <p>Shift-click clips on one card, then choose a cyan gap to place the run.</p>
@@ -819,7 +856,7 @@ export function CalibrationPanel({
           <form className="chronology-tool-form" onSubmit={(event) => { event.preventDefault(); void previewClock(); }}>
             <h2>Correct a camera clock</h2>
             <p>Use this when a camera stayed on home time or changed mid-card.</p>
-            <label>Card / capture sequence<select required value={clockDraft.sequenceId} onChange={(event) => setClockDraft({ ...clockDraft, sequenceId: event.target.value })}><option value="">Choose a card…</option>{overview.sequences.map((sequence) => <option key={sequence.id} value={sequence.id}>{sequence.label || sequence.cameraKey}</option>)}</select></label>
+            <label>Card / capture sequence<select required value={clockDraft.sequenceId} onChange={(event) => setClockDraft({ ...clockDraft, sequenceId: event.target.value })}><option value="">Choose a card…</option>{overview.sequences.map((sequence) => <option key={sequence.id} value={sequence.id}>{sequenceSummary(overview, cameraLanes, sequence.id).label}</option>)}</select></label>
             <div className="chronology-form-pair">
               <label>From clip number<input type="number" min={0} value={clockDraft.start} onChange={(event) => setClockDraft({ ...clockDraft, start: event.target.value })} /></label>
               <label>Through (optional)<input type="number" min={0} value={clockDraft.end} onChange={(event) => setClockDraft({ ...clockDraft, end: event.target.value })} /></label>
@@ -835,14 +872,23 @@ export function CalibrationPanel({
           <div className="chronology-tool-form">
             <h2>Fix card grouping</h2>
             <p>Move one clip or the following filename run to the card it belongs to.</p>
+            <div
+              className="chronology-current-card"
+              role="group"
+              aria-label={`Source card: ${currentCard.label}, ${currentCard.detail}`}
+            >
+              <span>Source card</span>
+              <strong>{currentCard.label}</strong>
+              <em>{currentCard.detail}</em>
+            </div>
             <fieldset className="chronology-scope-picker">
               <legend>Move scope</legend>
               <label><input type="radio" name="sequence-scope" checked={sequenceScope === "single"} onChange={() => setSequenceScope("single")} /> This clip only</label>
               <label><input type="radio" name="sequence-scope" checked={sequenceScope === "following"} onChange={() => setSequenceScope("following")} /> This clip and following</label>
             </fieldset>
-            <label>Destination card<select value={sequenceTarget} onChange={(event) => setSequenceTarget(event.target.value)}><option value="">Choose a card…</option>{overview.sequences.filter((sequence) => sequence.id !== currentSequence).map((sequence) => <option key={sequence.id} value={sequence.id}>{sequence.label || sequence.cameraKey}</option>)}</select></label>
+            <label>Destination card<select value={sequenceTarget} onChange={(event) => setSequenceTarget(event.target.value)}><option value="">Choose a card…</option>{overview.sequences.filter((sequence) => sequence.id !== currentSequence).map((sequence) => <option key={sequence.id} value={sequence.id}>{sequenceSummary(overview, cameraLanes, sequence.id).label}</option>)}</select></label>
             <button type="button" className="button primary" disabled={busy || Boolean(pending) || !focusedId || !sequenceTarget} onClick={() => void previewReassignment()}>Preview card move</button>
-            <label>Merge this whole card into<select value={mergeTarget} onChange={(event) => setMergeTarget(event.target.value)}><option value="">Choose a card…</option>{overview.sequences.filter((sequence) => sequence.id !== currentSequence).map((sequence) => <option key={sequence.id} value={sequence.id}>{sequence.label || sequence.cameraKey}</option>)}</select></label>
+            <label>Merge this whole card into<select value={mergeTarget} onChange={(event) => setMergeTarget(event.target.value)}><option value="">Choose a card…</option>{overview.sequences.filter((sequence) => sequence.id !== currentSequence).map((sequence) => <option key={sequence.id} value={sequence.id}>{sequenceSummary(overview, cameraLanes, sequence.id).label}</option>)}</select></label>
             <button type="button" className="button" disabled={busy || Boolean(pending) || !currentSequence || !mergeTarget} onClick={() => void previewMerge()}>Preview whole-card merge</button>
             {overview.declinedSplits.length > 0 && (
               <div className="chronology-existing-facts">

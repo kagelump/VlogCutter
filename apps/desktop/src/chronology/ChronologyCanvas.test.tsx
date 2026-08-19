@@ -87,6 +87,38 @@ describe("ChronologyCanvas virtual window", () => {
 
     expect(screen.getByRole("button", { name: /A025\.MP4/ })).toBeInTheDocument();
   });
+
+  it("bounds alternating card-run controls to the visible window at scale", () => {
+    restoreLayout = stubLayout(920);
+    const order = Array.from({ length: 3_000 }, (_, index) => `clip-${index}`);
+    const overview = buildChronologyOverview({
+      order,
+      sequences: [
+        { id: "card-a", cameraKey: "Sony", label: "Card A", assetIds: order.filter((_, index) => index % 2 === 0) },
+        { id: "card-b", cameraKey: "Sony", label: "Card B", assetIds: order.filter((_, index) => index % 2 === 1) },
+      ],
+    });
+    const assets = order.map((id, index) => asset(id, `A${String(index).padStart(4, "0")}.MP4`));
+
+    render(
+      <ChronologyCanvas
+        overview={overview}
+        assetsById={new Map(assets.map((item) => [item.id, item]))}
+        focusedAssetId="clip-0"
+        selectedIds={["clip-0"]}
+        impact={null}
+        onFocusAsset={vi.fn()}
+        onSelectRange={vi.fn()}
+        onPlaceSelection={vi.fn()}
+        onAdjustPhase={vi.fn()}
+      />,
+    );
+
+    const mountedRuns = screen.getAllByRole("button", { name: /Inspect card/ });
+    expect(mountedRuns.length).toBeGreaterThan(0);
+    expect(mountedRuns.length).toBeLessThan(30);
+    expect(mountedRuns).toHaveLength(document.querySelectorAll(".chronology-block").length);
+  });
 });
 
 describe("ChronologyCanvas tiles", () => {
@@ -193,6 +225,50 @@ describe("ChronologyCanvas tiles", () => {
     expect(ticks[0]).toBe("TokyoFeb 8");
     expect(ticks.slice(1).every((label) => /^\d{2}:\d{2}$/.test(label ?? ""))).toBe(true);
     expect(ticks).not.toContain("001");
+  });
+
+  it("splits interleaved cards into non-overlapping selectable runs", () => {
+    const assets = [asset("a", "A.MP4"), asset("b", "B.MP4"), asset("c", "C.MP4")];
+    const overview = buildChronologyOverview({
+      order: ["a", "b", "c"],
+      sequences: [
+        { id: "card-a", cameraKey: "Sony", label: "Travel card", assetIds: ["a", "c"] },
+        { id: "card-b", cameraKey: "Sony", label: "Travel card", assetIds: ["b"] },
+      ],
+    });
+    const onFocusAsset = vi.fn();
+    render(
+      <ChronologyCanvas
+        overview={overview}
+        assetsById={new Map(assets.map((item) => [item.id, item]))}
+        focusedAssetId="a"
+        selectedIds={["a"]}
+        impact={null}
+        onFocusAsset={onFocusAsset}
+        onSelectRange={vi.fn()}
+        onPlaceSelection={vi.fn()}
+        onAdjustPhase={vi.fn()}
+      />,
+    );
+
+    const firstRun = screen.getByRole("button", {
+      name: /Inspect card 1 of 2, run 1 of 2: Travel card/,
+    });
+    const middleRun = screen.getByRole("button", {
+      name: /Inspect card 2 of 2: Travel card/,
+    });
+    const lastRun = screen.getByRole("button", {
+      name: /Inspect card 1 of 2, run 2 of 2: Travel card/,
+    });
+    expect([firstRun.style.left, middleRun.style.left, lastRun.style.left])
+      .toEqual(["5px", "97px", "189px"]);
+    expect([firstRun.style.width, middleRun.style.width, lastRun.style.width])
+      .toEqual(["82px", "82px", "82px"]);
+    expect(screen.getAllByRole("button", { name: /Inspect card/ }).map((button) => button.style.left))
+      .toEqual(["5px", "97px", "189px"]);
+
+    fireEvent.click(lastRun);
+    expect(onFocusAsset).toHaveBeenCalledWith("c");
   });
 });
 

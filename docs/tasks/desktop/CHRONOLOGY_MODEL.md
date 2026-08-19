@@ -359,6 +359,19 @@ must never write them.
   through one camera therefore surfaces its second boundary once the first is
   settled, instead of going silent after one answer.
 
+### Desktop camera and card hierarchy
+
+- Review and the Chronology desk use the same visual meaning: a lane is one
+  physical/logical `camera_key`; a capture sequence is a selectable card/run
+  inside that lane.
+- Selecting a card/run focuses one of its exact assets. Clock epochs,
+  reassignment, and merge actions continue to use that asset's
+  `capture_sequence_id`; grouping the display never broadens an operation to
+  the whole camera.
+- Shift-selection cannot cross a capture-sequence boundary, even when two cards
+  share a camera lane. Once selected, that exact run can be placed beside any
+  clip in solved order, including a clip from another card or camera.
+
 ### Clock epochs
 
 - A range is `[start_counter, end_counter]` inclusive; a NULL `end_counter`

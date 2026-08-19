@@ -55,8 +55,23 @@ function overview(): ChronologyOverview {
 }
 
 describe("chronology geometry", () => {
-  it("keeps two cards from one camera in distinct lanes", () => {
-    expect(chronologyLanes(overview()).map((lane) => lane.sequence.id)).toEqual(["card-a", "card-b"]);
+  it("keeps two cards from one camera as distinct segments in one lane", () => {
+    const lanes = chronologyLanes(overview());
+    expect(lanes.map((lane) => lane.cameraKey)).toEqual(["Sony"]);
+    expect(lanes[0].sequences.map((segment) => segment.sequence.id)).toEqual(["card-a", "card-b"]);
+    expect(lanes[0].sequences.map((segment) => segment.runs.map(({ startIndex, endIndex }) => [startIndex, endIndex])))
+      .toEqual([[[0, 1]], [[2, 2]]]);
+  });
+
+  it("keeps a camera lane's assets in solver order when its cards interleave", () => {
+    const interleaved = overview();
+    interleaved.assets[1].orderKey.captureSequenceId = "card-b";
+    interleaved.assets[2].orderKey.captureSequenceId = "card-a";
+    expect(chronologyLanes(interleaved)[0].assets.map((asset) => asset.assetId))
+      .toEqual(["a", "b", "c"]);
+    expect(chronologyLanes(interleaved)[0].sequences.map((segment) => (
+      segment.runs.map(({ startIndex, endIndex }) => [startIndex, endIndex])
+    ))).toEqual([[[0, 0], [2, 2]], [[1, 1]]]);
   });
 
   it("windows thousands of ordinal columns with overscan", () => {
@@ -98,8 +113,8 @@ describe("chronology geometry", () => {
     const withStray = overview();
     withStray.assets[2].orderKey.captureSequenceId = "card-vanished";
     const lanes = chronologyLanes(withStray);
-    expect(lanes.map((lane) => lane.sequence.id)).toEqual(["card-a", "card-vanished"]);
-    expect(lanes[1].sequence.label).toBe("Unassigned clips");
+    expect(lanes.map((lane) => lane.cameraKey)).toEqual(["Sony", "Unknown camera"]);
+    expect(lanes[1].sequences[0].sequence.label).toBe("Unassigned clips");
     expect(lanes[1].assets.map((asset) => asset.assetId)).toEqual(["c"]);
   });
 

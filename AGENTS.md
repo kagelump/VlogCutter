@@ -127,7 +127,8 @@ Implemented now:
   decision is recorded in `apps/desktop/src/test/harness/contract.ts`.
 - Relative-order “story ribbon” with camera lanes sized from the project's
   actual camera count, horizontal scrolling, zoom, and a merged single-lane
-  variant for Focus.
+  variant for Focus. The expanded Chronology desk uses the same camera-first
+  hierarchy, with selectable capture-sequence/card runs inside each lane.
 - A non-interactive JSON CLI for catalog, clip annotation, chronology, and media operations.
 - Immutable typed project operations for asset membership, notes, labels, removal, rotation, and fixed clock events, with deterministic materialized views and conflict diagnostics.
 - Read-only catalog/project/clip/proxy diagnostics, including the desktop's persisted last-selected catalog, project, and asset breadcrumb.
@@ -190,8 +191,8 @@ Important gaps; do not accidentally describe these as complete:
   add a location/transit phase forward or backward from a hovered clip, edit an
   existing phase, and atomically cut a new phase from either side of a filled
   segment. The Chronology desk adds identity-snapped pointer and keyboard
-  boundary adjustment for both phase kinds, plus a full sequence-lane/trip-band
-  view. Story beats remain display-only browser-mock fields and are not
+  boundary adjustment for both phase kinds, plus a full camera-lane/card-run
+  and trip-band view. Story beats remain display-only browser-mock fields and are not
   persisted.
 - The Chronology desk surfaces conflicts, explanations, diagnostics, clock
   epochs, phase boundaries, split/merge, single/following reassignment, and

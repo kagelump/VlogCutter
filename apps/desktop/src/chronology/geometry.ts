@@ -7,7 +7,17 @@ import type {
 } from "../chronologyTypes";
 
 export interface ChronologyLane {
-  sequence: CaptureSequence;
+  cameraKey: string;
+  sequences: Array<{
+    sequence: CaptureSequence;
+    assets: AssetChronology[];
+    /** Contiguous runs in this camera lane; other cameras do not break a run. */
+    runs: Array<{
+      assets: AssetChronology[];
+      startIndex: number;
+      endIndex: number;
+    }>;
+  }>;
   assets: AssetChronology[];
 }
 
@@ -16,9 +26,18 @@ export interface OrdinalWindow {
   end: number;
 }
 
-/** Groups the solver response without changing its order. */
+/**
+ * Groups the solver response into physical-camera lanes and card segments.
+ *
+ * A capture sequence protects one card's filename counters and clock facts;
+ * it is not another camera. The lane order and each card's left-to-right order
+ * follow the solver's first placed clip, matching Review's camera-first ribbon.
+ */
 export function chronologyLanes(overview: ChronologyOverview): ChronologyLane[] {
   const bySequence = new Map<string, AssetChronology[]>();
+  const indexByAssetId = new Map(
+    overview.assets.map((asset, index) => [asset.assetId, index]),
+  );
   for (const asset of overview.assets) {
     const id = asset.orderKey.captureSequenceId;
     // Append in place. Rebuilding the lane array per clip is quadratic, and an
@@ -27,24 +46,71 @@ export function chronologyLanes(overview: ChronologyOverview): ChronologyLane[] 
     if (lane) lane.push(asset);
     else bySequence.set(id, [asset]);
   }
-  const declared = overview.sequences.map((sequence) => ({
-    sequence,
-    assets: bySequence.get(sequence.id) ?? [],
-  }));
   const declaredIds = new Set(overview.sequences.map((sequence) => sequence.id));
-  const unknown = [...bySequence.entries()]
+  const unknownSequences: CaptureSequence[] = [...bySequence.entries()]
     .filter(([id]) => !declaredIds.has(id))
-    .map(([id, assets]) => ({
-      sequence: {
-        id,
-        cameraKey: "Unknown camera",
-        label: "Unassigned clips",
-        volumeHint: "",
-        filenamePrefix: "",
-      },
-      assets,
+    .map(([id]) => ({
+      id,
+      cameraKey: "Unknown camera",
+      label: "Unassigned clips",
+      volumeHint: "",
+      filenamePrefix: "",
     }));
-  return [...declared, ...unknown].filter((lane) => lane.assets.length > 0);
+
+  const segments = [...overview.sequences, ...unknownSequences]
+    .map((sequence) => {
+      const assets = bySequence.get(sequence.id) ?? [];
+      return {
+        sequence,
+        assets,
+        runs: [] as ChronologyLane["sequences"][number]["runs"],
+      };
+    })
+    .filter((segment) => segment.assets.length > 0)
+    .sort((left, right) => (
+      (indexByAssetId.get(left.assets[0].assetId) ?? 0)
+      - (indexByAssetId.get(right.assets[0].assetId) ?? 0)
+    ));
+
+  const byCamera = new Map<string, ChronologyLane>();
+  for (const segment of segments) {
+    const cameraKey = segment.sequence.cameraKey.trim() || "Unknown camera";
+    const lane = byCamera.get(cameraKey);
+    if (lane) {
+      lane.sequences.push(segment);
+      lane.assets.push(...segment.assets);
+    } else {
+      byCamera.set(cameraKey, {
+        cameraKey,
+        sequences: [segment],
+        assets: [...segment.assets],
+      });
+    }
+  }
+  for (const lane of byCamera.values()) {
+    lane.assets.sort(
+      (left, right) => (indexByAssetId.get(left.assetId) ?? 0) - (indexByAssetId.get(right.assetId) ?? 0),
+    );
+    const segmentById = new Map(lane.sequences.map((segment) => [segment.sequence.id, segment]));
+    let previousSequenceId: string | null = null;
+    for (const asset of lane.assets) {
+      const sequenceId = asset.orderKey.captureSequenceId;
+      const segment = segmentById.get(sequenceId);
+      if (!segment) continue;
+      const index = indexByAssetId.get(asset.assetId) ?? 0;
+      const activeRun = sequenceId === previousSequenceId
+        ? segment.runs[segment.runs.length - 1]
+        : null;
+      if (activeRun) {
+        activeRun.assets.push(asset);
+        activeRun.endIndex = index;
+      } else {
+        segment.runs.push({ assets: [asset], startIndex: index, endIndex: index });
+      }
+      previousSequenceId = sequenceId;
+    }
+  }
+  return [...byCamera.values()];
 }
 
 export function ordinalWindow(

@@ -24,6 +24,7 @@ import {
 } from "../harness";
 
 const sony = ["asset_sony_a7c_ii_001", "asset_sony_a7c_ii_002"];
+const threeSony = [...sony, "asset_sony_a7c_ii_003"];
 const dji = ["asset_dji_pocket_3_001"];
 
 const clockImpact: ChronologyImpact = {
@@ -85,6 +86,26 @@ const visualPlacementPreview: VisualPlacementPreview = {
   impact: clockImpact,
 };
 
+const cardTwoClockEpoch: ClockEpoch = {
+  ...clockEpoch,
+  id: "epoch_preview_sony_card_two",
+  captureSequenceId: "sequence_sony_card_two",
+  offsetSeconds: 1_800,
+  label: "Second card clock correction",
+};
+
+const cardTwoClockImpact: ChronologyImpact = {
+  changes: [{
+    assetId: threeSony[2],
+    before: "2026-02-08T00:25:00.000Z",
+    after: "2026-02-08T00:55:00.000Z",
+    beforePosition: 3,
+    afterPosition: 3,
+  }],
+  contradictions: [],
+  blocked: false,
+};
+
 const singleReassignment: CaptureSequenceReassignmentPreview = {
   fromSequenceId: "sequence_sony",
   intoSequenceId: "sequence_dji",
@@ -124,6 +145,74 @@ function chronologyWithProblem() {
       }),
     ],
   });
+}
+
+function chronologyWithTwoSonyCards() {
+  const cameraSequences = [
+    {
+      id: "sequence_sony_card_one",
+      cameraKey: "Sony A7C II",
+      label: "Sony travel card",
+      volumeHint: "/Volumes/Travel/A001",
+      assetIds: threeSony.slice(0, 2),
+    },
+    {
+      id: "sequence_sony_card_two",
+      cameraKey: "Sony A7C II",
+      label: "Sony travel card",
+      volumeHint: "/Volumes/Travel/A002",
+      assetIds: threeSony.slice(2),
+    },
+    sequences[1],
+  ];
+  return desktopScenario({ now: "2026-08-09T12:00:00.000Z" })
+    .project("Hokkaido field test", { id: "project_hokkaido" })
+    .camera("Sony A7C II", { clips: 3, withProxy: true, startAt: "2026-02-08T00:10:00.000Z" })
+    .camera("DJI Pocket 3", { clips: 1, withProxy: true, startAt: "2026-02-08T00:20:00.000Z" })
+    .chronology({ order: [threeSony[0], threeSony[1], dji[0], threeSony[2]], sequences: cameraSequences })
+    .impactOnClockPreview("sequence_sony_card_two", {
+      epoch: cardTwoClockEpoch,
+      factsToken: "facts-clock-sony-card-two",
+      impact: cardTwoClockImpact,
+    })
+    .whenClockEpochApplied("sequence_sony_card_two")
+    .thenChronology({ order: [threeSony[0], threeSony[1], dji[0], threeSony[2]], sequences: cameraSequences });
+}
+
+function chronologyWithSplittableSonyCard() {
+  const createdSequence = {
+    id: "sequence_sony_card_two",
+    cameraKey: "Sony A7C II",
+    label: "Sony travel card · new card",
+    volumeHint: "",
+    filenamePrefix: "SONY",
+  };
+  const proposal = {
+    captureSequenceId: "sequence_sony",
+    atCounter: 2,
+    reason: "the filename counter restarts at 2 partway through this sequence",
+    affectedAssetIds: [sony[1]],
+  };
+  return chronologyTrip()
+    .chronology({ order: [sony[0], sony[1], dji[0]], sequences, proposedSplits: [proposal] })
+    .captureSequenceSplit(
+      {
+        sourceSequenceId: "sequence_sony",
+        atCounter: 2,
+        createdSequence,
+        assetIds: [sony[1]],
+        factsToken: "facts-split-sony",
+        impact: { changes: [], contradictions: [], blocked: false },
+      },
+      {
+        order: [sony[0], sony[1], dji[0]],
+        sequences: [
+          { ...sequences[0], assetIds: [sony[0]] },
+          { ...createdSequence, assetIds: [sony[1]] },
+          sequences[1],
+        ],
+      },
+    );
 }
 
 /**
@@ -251,17 +340,87 @@ describe("Review entry and stable return", () => {
 });
 
 describe("Chronology desk", () => {
-  it("presents the problem rail and one visual lane per declared capture sequence", async () => {
+  it("presents the problem rail and one visual lane per camera", async () => {
     const app = await renderApp(chronologyWithProblem().build());
     const panel = await enterChronology(app);
 
     expect(within(panel).getByRole("heading", { name: "Needs a look" })).toBeVisible();
-    const lanes = panel.querySelectorAll(".chronology-sequence-lane");
+    const lanes = panel.querySelectorAll(".chronology-camera-lane");
     expect(lanes).toHaveLength(2);
-    expect(within(lanes[0] as HTMLElement).getByText("Sony travel card")).toBeVisible();
+    expect(within(lanes[0] as HTMLElement).getByText("Sony A7C II")).toBeVisible();
+    expect(within(lanes[0] as HTMLElement).getByText("1 card")).toBeVisible();
     expect(within(lanes[0] as HTMLElement).getAllByRole("button", { name: /SONY_/ })).toHaveLength(2);
-    expect(within(lanes[1] as HTMLElement).getByText("DJI day card")).toBeVisible();
+    expect(within(lanes[1] as HTMLElement).getByText("DJI Pocket 3")).toBeVisible();
     expect(within(lanes[1] as HTMLElement).getByRole("button", { name: /DJI_001/ })).toBeVisible();
+  });
+
+  it("shows two selectable cards inside one Sony lane and keeps actions scoped to the chosen card", async () => {
+    const app = await renderApp(chronologyWithTwoSonyCards().build());
+    const panel = await enterChronology(app);
+    const lanes = panel.querySelectorAll<HTMLElement>(".chronology-camera-lane");
+
+    expect(lanes).toHaveLength(2);
+    const sonyLane = lanes[0];
+    expect(within(sonyLane).getByText("2 cards")).toBeVisible();
+    expect(within(sonyLane).getByRole("button", { name: /Inspect card 1 of 2: Sony travel card, 2 clips/ })).toBeVisible();
+    const secondCard = within(sonyLane).getByRole("button", {
+      name: /Inspect card 2 of 2: Sony travel card, 1 clip/,
+    });
+    expect(within(lanes[1]).getByText("DJI Pocket 3")).toBeVisible();
+
+    // The selected run stays card-scoped, while the possible destinations span
+    // the solved order — including another card and another camera.
+    await app.user.click(within(sonyLane).getByRole("button", { name: /SONY_001\.MP4, clip 1/ }));
+    expect(within(sonyLane).getByRole("button", { name: /Place selected run before asset_sony_a7c_ii_002/ })).toBeVisible();
+    expect(within(sonyLane).getByRole("button", { name: /Place selected run before asset_sony_a7c_ii_003/ })).toBeVisible();
+    expect(within(sonyLane).getByRole("button", { name: /Place selected run before asset_dji_pocket_3_001/ })).toBeVisible();
+
+    const inspector = within(panel).getByRole("complementary", { name: "Chronology inspector" });
+    await app.user.click(within(inspector).getByRole("button", { name: "Card" }));
+    const destination = within(inspector).getByLabelText("Destination card");
+    const merge = within(inspector).getByLabelText("Merge this whole card into");
+    await app.user.selectOptions(destination, "sequence_sony_card_two");
+    await app.user.selectOptions(merge, "sequence_dji");
+
+    // The card strip itself changes the exact operation source. Any targets
+    // chosen for the previous source are cleared rather than silently reused.
+    await app.user.click(secondCard);
+    expect(destination).toHaveValue("");
+    expect(merge).toHaveValue("");
+    expect(within(inspector).getByRole("group", {
+      name: /Source card: Card 2 of 2 · Sony travel card, Sony A7C II/,
+    })).toBeVisible();
+    expect(within(destination).queryByRole("option", { name: /Card 2 of 2 · Sony travel card/ })).toBeNull();
+    expect(within(destination).getByRole("option", { name: /Card 1 of 2 · Sony travel card/ })).toBeVisible();
+  });
+
+  it("applies a clock correction to card 2 without broadening it to the Sony camera", async () => {
+    const harness = chronologyWithTwoSonyCards().build();
+    const app = await renderApp(harness);
+    const panel = await enterChronology(app);
+    const secondCard = within(panel).getByRole("button", {
+      name: /Inspect card 2 of 2: Sony travel card/,
+    });
+    await app.user.click(secondCard);
+    await app.user.click(within(panel).getByRole("button", { name: "Clock" }));
+    await app.user.selectOptions(
+      within(panel).getByLabelText(/Card \/ capture sequence/),
+      "sequence_sony_card_two",
+    );
+    await app.user.clear(within(panel).getByLabelText("Shift by minutes"));
+    await app.user.type(within(panel).getByLabelText("Shift by minutes"), "30");
+    await app.user.type(within(panel).getByLabelText("Reason"), "Second card clock correction");
+    await app.user.click(within(panel).getByRole("button", { name: "Preview correction" }));
+
+    const dock = await screen.findByRole("dialog", { name: "Chronology impact preview" });
+    expect(harness.calls("preview_clock_epoch_impact").at(-1)).toMatchObject({
+      epoch: { captureSequenceId: "sequence_sony_card_two" },
+    });
+    await app.user.click(within(dock).getByRole("button", { name: "Apply change" }));
+    await waitFor(() => expect(harness.calls("set_clock_epoch")).toHaveLength(1));
+    expect(harness.calls("set_clock_epoch")[0]).toMatchObject({
+      preview: { epoch: { captureSequenceId: "sequence_sony_card_two" } },
+    });
   });
 
   it("puts the focused clip and its solved-order neighbours on the compare deck", async () => {
@@ -408,6 +567,25 @@ describe("Chronology desk", () => {
     // Previewed, not written: the desk never mutates before an explicit confirm.
     expect(harness.commandNames()).toContain("preview_capture_sequence_split");
     expect(harness.commandNames()).not.toContain("apply_capture_sequence_split");
+  });
+
+  it("accepts a new-card split without adding a camera lane", async () => {
+    const harness = chronologyWithSplittableSonyCard().build();
+    const app = await renderApp(harness);
+    const panel = await enterChronology(app);
+    expect(panel.querySelectorAll(".chronology-camera-lane")).toHaveLength(2);
+
+    await app.user.click(within(panel).getByRole("button", { name: /yes.*new card/i }));
+    const dock = await screen.findByRole("dialog", { name: "Chronology impact preview" });
+    await app.user.click(within(dock).getByRole("button", { name: "Apply change" }));
+
+    await waitFor(() => expect(harness.calls("apply_capture_sequence_split")).toHaveLength(1));
+    await waitFor(() => expect(panel.querySelectorAll(".chronology-camera-lane")).toHaveLength(2));
+    const sonyLane = [...panel.querySelectorAll<HTMLElement>(".chronology-camera-lane")]
+      .find((lane) => lane.textContent?.includes("Sony A7C II"))!;
+    expect(within(sonyLane).getByText("2 cards")).toBeVisible();
+    expect(within(sonyLane).getAllByRole("button", { name: /Inspect card \d of 2: Sony travel card/ }))
+      .toHaveLength(2);
   });
 
   it("shows exact impact, cancels without a write, then applies once and restores the queue", async () => {
