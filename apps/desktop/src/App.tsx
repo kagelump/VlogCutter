@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import { api } from "./api";
-import type { ArchiveRoot, Asset, AssetPatch, AutoplayMode, BaselineImportResult, BaselinePreviewResult, CameraMapping, CardCandidate, DesktopSettings, ImportHistoryEntry, ImportPreflight, ImportProgress, ImportRollbackPreview, ImportRunReport, ImportSessionDetail, ModelInstallProgress, ModelStatus, PathAnalysis, Project, ProjectLibrary, ProjectLocation, ProjectPairingStatus, RootMappingEntry, ServerConnectionStatus, ServerVersionInfo, SyncStatus, TranscriptStatus } from "./types";
+import type { ArchiveRoot, Asset, AssetPatch, AutoplayMode, BaselineImportResult, BaselinePreviewResult, CameraMapping, CameraMergePreview, CardCandidate, DesktopSettings, ImportHistoryEntry, ImportPreflight, ImportProgress, ImportRollbackPreview, ImportRunReport, ImportSessionDetail, ModelInstallProgress, ModelStatus, PathAnalysis, Project, ProjectLibrary, ProjectLocation, ProjectPairingStatus, RootMappingEntry, ServerConnectionStatus, ServerVersionInfo, SyncStatus, TranscriptStatus } from "./types";
 import { useProjectSession } from "./session/projectSession";
 import { useAssetMutations } from "./session/assetMutations";
 import { orderAssets, replaceAsset as replaceAssetInList, moveSelection as moveSelectionInOrder } from "./review/order";
@@ -39,6 +39,7 @@ import { PairingWizardModal } from "./components/PairingWizardModal";
 import { BaselineWizardModal } from "./components/BaselineWizardModal";
 import { SettingsModal } from "./components/SettingsModal";
 import { CardBanner } from "./components/CardBanner";
+import { CameraMergeDialog } from "./components/CameraMergeDialog";
 import { analysisStageLabels, formatCost } from "./review/format";
 import { sourceVolumeHint } from "./review/summaries";
 import { canonicalLabel, projectLabelVocabulary } from "./review/labelVocabulary";
@@ -117,6 +118,11 @@ function App() {
   const [phaseDialog, setPhaseDialog] = useState<PhaseDialogState | null>(null);
   const [phaseDialogBusy, setPhaseDialogBusy] = useState(false);
   const [phaseDialogError, setPhaseDialogError] = useState("");
+  const [cameraMergeSource, setCameraMergeSource] = useState("");
+  const [cameraMergeDestination, setCameraMergeDestination] = useState("");
+  const [cameraMergePreview, setCameraMergePreview] = useState<CameraMergePreview | null>(null);
+  const [cameraMergeBusy, setCameraMergeBusy] = useState(false);
+  const [cameraMergeError, setCameraMergeError] = useState("");
   const [showImportDialog, setShowImportDialog] = useState(false);
   const [importProjectName, setImportProjectName] = useState("");
   const [importSource, setImportSource] = useState("");
@@ -215,6 +221,15 @@ function App() {
   const restoreAssetIdRef = useRef("");
   const orientationQueueRef = useRef<string[]>([]);
   const orientationActiveRef = useRef(new Set<string>());
+  const cameraMergeRequestRef = useRef(0);
+
+  useEffect(() => {
+    cameraMergeRequestRef.current += 1;
+    setCameraMergeSource("");
+    setCameraMergeDestination("");
+    setCameraMergePreview(null);
+    setCameraMergeError("");
+  }, [projectId]);
 
   // One owner for the open project's reads, and the only thing that may write
   // them: a response from a project the user has since left is dropped rather
@@ -311,6 +326,15 @@ function App() {
     });
     return [...grouped.entries()];
   }, [activeAssets]);
+
+  // Merge actions stay attached to visible Review lanes, but a valid
+  // destination may currently be represented only by removed footage or an
+  // empty chronology card. Keep those identities reachable and deterministic.
+  const projectCameraIdentities = useMemo(() => {
+    const identities = new Set(assets.map((asset) => asset.camera));
+    chronologyOverview?.sequences.forEach((sequence) => identities.add(sequence.cameraKey));
+    return [...identities].sort((left, right) => left.localeCompare(right));
+  }, [assets, chronologyOverview]);
 
   const chronologyAssetsById = useMemo(
     () => new Map((chronologyOverview?.assets ?? []).map((asset) => [asset.assetId, asset])),
@@ -932,6 +956,7 @@ function App() {
    * in it — a transient inside a mode, not a surface over the shell.
    */
   const escapeLayers: EscapeLayer[] = [
+    { id: "cameraMerge", open: Boolean(cameraMergeSource), locked: cameraMergeBusy },
     { id: "tripPhase", open: Boolean(phaseDialog), locked: phaseDialogBusy },
     // The dialog takes itself off screen when the run starts, so this lock
     // mirrors `closeImportDialog`'s own guard rather than covering a state the
@@ -954,6 +979,7 @@ function App() {
 
   function closeEscapeLayer(id: string) {
     switch (id) {
+      case "cameraMerge": return closeCameraMerge();
       case "tripPhase": return setPhaseDialog(null);
       case "import": return closeImportDialog();
       case "importHistory": return (setShowImportHistory(false), setImportHistoryError(""));
@@ -1677,12 +1703,85 @@ function App() {
     setError("");
     try {
       const moved = await api.renameCamera(projectId, from, to);
-      await reloadSessionAssets();
+      await Promise.all([reloadSessionAssets(), session.reloadChronology()]);
       setMessage(`Renamed ${from} to ${to} on ${moved} ${moved === 1 ? "clip" : "clips"}`);
     } catch (reason) {
       setError(String(reason));
     } finally {
       setBusy(false);
+    }
+  }
+
+  function openCameraMerge(sourceCamera: string) {
+    cameraMergeRequestRef.current += 1;
+    setCameraMergeSource(sourceCamera);
+    setCameraMergeDestination("");
+    setCameraMergePreview(null);
+    setCameraMergeError("");
+  }
+
+  function restoreCameraMergeFocus(sourceCamera: string) {
+    queueMicrotask(() => {
+      const trigger = [...document.querySelectorAll<HTMLButtonElement>(".lane-action-button")]
+        .find((button) => button.getAttribute("aria-label") === `Camera actions for ${sourceCamera}`);
+      trigger?.focus();
+    });
+  }
+
+  function closeCameraMerge() {
+    if (cameraMergeBusy) return;
+    const sourceCamera = cameraMergeSource;
+    cameraMergeRequestRef.current += 1;
+    setCameraMergeSource("");
+    setCameraMergeDestination("");
+    setCameraMergePreview(null);
+    setCameraMergeError("");
+    restoreCameraMergeFocus(sourceCamera);
+  }
+
+  async function selectCameraMergeDestination(destinationCamera: string) {
+    setCameraMergeDestination(destinationCamera);
+    setCameraMergePreview(null);
+    setCameraMergeError("");
+    const request = ++cameraMergeRequestRef.current;
+    if (!projectId || !cameraMergeSource || !destinationCamera) return;
+    try {
+      const preview = await api.previewCameraMerge(projectId, cameraMergeSource, destinationCamera);
+      if (request === cameraMergeRequestRef.current && preview.projectId === projectId) setCameraMergePreview(preview);
+    } catch (reason) {
+      if (request === cameraMergeRequestRef.current) setCameraMergeError(String(reason));
+    }
+  }
+
+  async function confirmCameraMerge() {
+    if (!projectId || !cameraMergePreview || cameraMergePreview.projectId !== projectId || cameraMergeBusy) return;
+    const request = cameraMergeRequestRef.current;
+    const mergeProjectId = projectId;
+    const preview = cameraMergePreview;
+    setCameraMergeBusy(true);
+    setCameraMergeError("");
+    try {
+      const report = await api.mergeCamera(
+        mergeProjectId,
+        preview.sourceCamera,
+        preview.destinationCamera,
+      );
+      if (request !== cameraMergeRequestRef.current) return;
+      cameraMergeRequestRef.current += 1;
+      setCameraMergeSource("");
+      setCameraMergeDestination("");
+      setCameraMergePreview(null);
+      const completion = `Merged ${report.sourceCamera} into ${report.destinationCamera}: ${report.movedClipCount} clips and ${report.movedCaptureSequenceCount} cards moved`;
+      setMessage(completion);
+      try {
+        await Promise.all([reloadSessionAssets(), session.reloadChronology()]);
+      } catch (reason) {
+        setError(`Camera merge completed, but the refreshed view failed: ${String(reason)}`);
+      }
+    } catch (reason) {
+      setCameraMergeError(String(reason));
+    } finally {
+      setCameraMergeBusy(false);
     }
   }
 
@@ -2243,6 +2342,7 @@ function App() {
           onOpenChronologyProblems={() => openChronology(firstChronologyProblemAssetId, false)}
           onOpenExpanded={() => openChronology(selectedId, true)}
           onRenameCamera={(from, to) => { void renameCamera(from, to); }}
+          onRequestCameraMerge={openCameraMerge}
         />
       </footer>
       )}
@@ -2351,6 +2451,20 @@ function App() {
           onOpenSettings={() => { setShowAnalysisDialog(false); setShowSettings(true); }}
           onCancel={() => setShowAnalysisDialog(false)}
           onStart={runAnalysis}
+        />
+      )}
+
+      {cameraMergeSource && (
+        <CameraMergeDialog
+          sourceCamera={cameraMergeSource}
+          destinationCameras={projectCameraIdentities.filter((camera) => camera !== cameraMergeSource)}
+          destinationCamera={cameraMergeDestination}
+          preview={cameraMergePreview}
+          busy={cameraMergeBusy}
+          error={cameraMergeError}
+          onDestinationChange={(camera) => void selectCameraMergeDestination(camera)}
+          onConfirm={() => void confirmCameraMerge()}
+          onCancel={closeCameraMerge}
         />
       )}
 

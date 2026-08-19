@@ -488,6 +488,25 @@ export interface CameraMapping {
   updatedAt: string;
 }
 
+export interface CameraMergePreview {
+  projectId: string;
+  sourceCamera: string;
+  destinationCamera: string;
+  affectedClipCount: number;
+  affectedCaptureSequenceCount: number;
+  affectedMappingCount: number;
+  destinationCaptureSequenceCount: number;
+}
+
+export interface CameraMergeReport {
+  projectId: string;
+  sourceCamera: string;
+  destinationCamera: string;
+  movedClipCount: number;
+  movedCaptureSequenceCount: number;
+  movedMappingCount: number;
+}
+
 export type ImportStage = "scanning" | "copying" | "reading" | "proxies" | "complete";
 
 export interface ImportProgress {

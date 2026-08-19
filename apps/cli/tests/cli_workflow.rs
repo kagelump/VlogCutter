@@ -313,6 +313,92 @@ fn camera_mapping_commands_list_rename_and_clear_project_scoped_state() {
     assert_eq!(cleared_again.json["data"]["cleared"], true);
 }
 
+#[test]
+fn camera_merge_commands_preview_and_preserve_separate_cards() {
+    let directory = tempdir().unwrap();
+    let catalog = directory.path().join("catalog.sqlite3");
+    let project_id = create_project(&catalog, "Camera merge");
+    let connection = Connection::open(&catalog).unwrap();
+    for (id, camera) in [("clip_wrong", "Sony wrong"), ("clip_right", "Sony")] {
+        connection.execute(
+            "INSERT INTO assets (id, project_id, fingerprint, path, filename, size_bytes, duration_seconds, frame_rate, width, height, codec, camera, captured_at_raw, best_time, created_at) VALUES (?1, ?2, ?3, '', ?4, 1, 1, 30, 1920, 1080, 'h264', ?5, NULL, NULL, '2026-08-19T00:00:00Z')",
+            params![id, project_id, format!("fp-{id}"), format!("{id}.MP4"), camera],
+        ).unwrap();
+    }
+    for (id, camera) in [
+        ("card_wrong", "Sony wrong"),
+        ("card_right_a", "Sony"),
+        ("card_right_b", "Sony"),
+    ] {
+        connection.execute(
+            "INSERT INTO capture_sequences (id, project_id, camera_key, label, volume_hint, filename_prefix, created_at) VALUES (?1, ?2, ?3, ?1, '', '', '2026-08-19T00:00:00Z')",
+            params![id, project_id, camera],
+        ).unwrap();
+    }
+    connection.execute(
+        "INSERT INTO asset_capture_sequence (asset_id, project_id, capture_sequence_id, filename_counter) VALUES ('clip_wrong', ?1, 'card_wrong', 1)",
+        [&project_id],
+    ).unwrap();
+    connection.execute(
+        "INSERT INTO clock_epochs (id, project_id, capture_sequence_id, start_counter, end_counter, offset_seconds, confidence, evidence_json, label, created_at) VALUES ('epoch_wrong', ?1, 'card_wrong', 0, NULL, 60, 1, '[]', 'kept', '2026-08-19T00:00:00Z')",
+        [&project_id],
+    ).unwrap();
+    drop(connection);
+
+    let preview = success(
+        &catalog,
+        [
+            "cameras",
+            "merge-preview",
+            "--project",
+            &project_id,
+            "--from",
+            "Sony wrong",
+            "--into",
+            "Sony",
+        ],
+    );
+    assert_eq!(preview.json["command"], "cameras.merge-preview");
+    assert_eq!(preview.json["data"]["affectedClipCount"], 1);
+    assert_eq!(preview.json["data"]["affectedCaptureSequenceCount"], 1);
+    assert_eq!(preview.json["data"]["destinationCaptureSequenceCount"], 2);
+
+    let merged = success(
+        &catalog,
+        [
+            "cameras",
+            "merge",
+            "--project",
+            &project_id,
+            "--from",
+            "Sony wrong",
+            "--into",
+            "Sony",
+        ],
+    );
+    assert_eq!(merged.json["command"], "cameras.merge");
+    assert_eq!(merged.json["data"]["movedClipCount"], 1);
+    assert_eq!(merged.json["data"]["movedCaptureSequenceCount"], 1);
+
+    let connection = Connection::open(&catalog).unwrap();
+    let cards: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM capture_sequences WHERE project_id=?1 AND camera_key='Sony'",
+            [&project_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let epoch_sequence: String = connection
+        .query_row(
+            "SELECT capture_sequence_id FROM clock_epochs WHERE id='epoch_wrong'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(cards, 3);
+    assert_eq!(epoch_sequence, "card_wrong");
+}
+
 /// An agent's whole-clip write is refused when the clip moved under it.
 ///
 /// This is the concurrent-writer case the CLI exists to serve: an agent

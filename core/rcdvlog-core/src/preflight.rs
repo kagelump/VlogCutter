@@ -20,7 +20,7 @@ use anyhow::Result;
 use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 use walkdir::WalkDir;
@@ -659,13 +659,15 @@ impl Catalog {
             new_items.iter().map(|item| item.filename.as_str()),
             representative_exif,
         );
-        let camera_identity = self.resolve_import_camera(
+        let mut camera_identity = self.resolve_import_camera(
             project_id,
             card.as_ref(),
             &camera_evidence,
             &new_items,
             camera_override,
         )?;
+        camera_identity.camera =
+            self.canonical_camera_identity(project_id, &camera_identity.camera)?;
         // Only an active selection or a remembered mapping forces every
         // candidate to one identity. Plain detection leaves each file's own
         // per-file guess in place, unchanged from before this identity was
@@ -673,12 +675,28 @@ impl Catalog {
         // groups by each file's own camera rather than being homogenized by
         // a guess nobody confirmed.
         let uniform_camera = camera_identity.uniform_camera();
+        let mut canonical_cameras: BTreeMap<String, String> = BTreeMap::new();
         let sequence_candidates = new_items
             .iter()
             .map(|item| {
-                sequence_candidate(source, Path::new(&item.path), card.as_ref(), uniform_camera)
+                let mut candidate = sequence_candidate(
+                    source,
+                    Path::new(&item.path),
+                    card.as_ref(),
+                    uniform_camera,
+                );
+                candidate.camera_key =
+                    if let Some(camera) = canonical_cameras.get(&candidate.camera_key) {
+                        camera.clone()
+                    } else {
+                        let camera =
+                            self.canonical_camera_identity(project_id, &candidate.camera_key)?;
+                        canonical_cameras.insert(candidate.camera_key.clone(), camera.clone());
+                        camera
+                    };
+                Ok(candidate)
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
         let sequence_preview = self.import_sequence_preview(project_id, sequence_candidates)?;
 
         Ok(ImportPreflight {
@@ -1204,7 +1222,12 @@ impl Catalog {
         // file's own probe. Plain detection leaves `ingest_file`'s ordinary
         // EXIF-then-pattern guess in place, unchanged from before this
         // field existed. See `ResolvedImportCamera::uniform_camera`.
-        let camera_override = plan.camera_identity.uniform_camera();
+        let canonical_override = plan
+            .camera_identity
+            .uniform_camera()
+            .map(|camera| self.canonical_camera_identity(project_id, camera))
+            .transpose()?;
+        let camera_override = canonical_override.as_deref();
 
         let actionable: Vec<&PreflightItem> = plan
             .items
@@ -1330,7 +1353,9 @@ impl Catalog {
             && let Err(error) = self.remember_camera_mapping(
                 project_id,
                 &plan.camera_evidence,
-                &plan.camera_identity.camera,
+                canonical_override
+                    .as_deref()
+                    .unwrap_or(&plan.camera_identity.camera),
             )
         {
             outcome.camera_mapping_warning = Some(format!(
@@ -2917,6 +2942,61 @@ mod tests {
         let sequences = catalog.capture_sequences(&project.id).unwrap();
         assert_eq!(sequences.len(), 1);
         assert_eq!(sequences[0].camera_key, "Sony A7C II");
+    }
+
+    #[test]
+    fn merged_plain_detection_is_canonical_in_preflight_sequence_preview_and_import() {
+        if skip_without_ffprobe() || skip_without_exiftool() {
+            return;
+        }
+        let directory = tempdir().unwrap();
+        let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).unwrap();
+        let project = catalog.create_project("Merged camera import").unwrap();
+        let connection = catalog.connection().unwrap();
+        for (id, camera) in [("old", "DJI Pocket 3"), ("right", "Pocket")] {
+            connection.execute(
+                "INSERT INTO assets (id, project_id, fingerprint, path, filename, size_bytes, duration_seconds, frame_rate, width, height, codec, camera, captured_at_raw, best_time, created_at) VALUES (?1, ?2, ?3, '', ?4, 1, 1, 5, 64, 64, 'mpeg4', ?5, NULL, NULL, ?6)",
+                params![id, project.id, format!("fp-{id}"), format!("{id}.MP4"), camera, crate::now()],
+            ).unwrap();
+            connection.execute(
+                "INSERT INTO capture_sequences (id, project_id, camera_key, label, volume_hint, filename_prefix, created_at) VALUES (?1, ?2, ?3, ?3, '', '', ?4)",
+                params![format!("card-{id}"), project.id, camera, crate::now()],
+            ).unwrap();
+        }
+        drop(connection);
+        catalog
+            .merge_camera(&project.id, "DJI Pocket 3", "Pocket")
+            .unwrap();
+
+        let mount = labeled_card_fixture_media(
+            directory.path(),
+            "CARD",
+            "DCIM/DJI_001",
+            &[("DJI_20251221092058_0001_D.MP4", "maroon")],
+        );
+        let plan = catalog
+            .preflight_import(&project.id, &mount, None, None, |_, _, _| true)
+            .unwrap();
+        assert_eq!(plan.camera_identity.source, ImportCameraSource::Detected);
+        assert_eq!(plan.camera_identity.camera, "Pocket");
+        assert!(
+            plan.sequence_preview
+                .runs
+                .iter()
+                .all(|run| run.camera_key == "Pocket")
+        );
+
+        let outcome = catalog
+            .run_import(&project.id, &plan, true, |_| true)
+            .unwrap();
+        assert_eq!(outcome.imported, 1);
+        let imported = catalog
+            .list_assets(&project.id)
+            .unwrap()
+            .into_iter()
+            .find(|asset| asset.filename == "DJI_20251221092058_0001_D.MP4")
+            .unwrap();
+        assert_eq!(imported.camera, "Pocket");
     }
 
     #[test]

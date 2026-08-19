@@ -58,6 +58,11 @@ enum Commands {
         #[command(subcommand)]
         command: CameraMappingsCommand,
     },
+    /// Preview or apply a project camera-identity merge.
+    Cameras {
+        #[command(subcommand)]
+        command: CamerasCommand,
+    },
     /// Reference all supported media in a folder.
     Ingest {
         #[arg(long)]
@@ -222,6 +227,28 @@ enum CameraMappingsCommand {
         project: String,
         #[arg(long)]
         mapping: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum CamerasCommand {
+    /// Count the clips and cards that would move. Does not mutate the catalog.
+    MergePreview {
+        #[arg(long)]
+        project: String,
+        #[arg(long)]
+        from: String,
+        #[arg(long)]
+        into: String,
+    },
+    /// Merge one accidental identity into another existing project camera.
+    Merge {
+        #[arg(long)]
+        project: String,
+        #[arg(long)]
+        from: String,
+        #[arg(long)]
+        into: String,
     },
 }
 
@@ -407,6 +434,10 @@ fn command_name(command: &Commands) -> &'static str {
             CameraMappingsCommand::Rename { .. } => "camera-mappings.rename",
             CameraMappingsCommand::Clear { .. } => "camera-mappings.clear",
         },
+        Commands::Cameras { command } => match command {
+            CamerasCommand::MergePreview { .. } => "cameras.merge-preview",
+            CamerasCommand::Merge { .. } => "cameras.merge",
+        },
         Commands::Ingest { .. } => "ingest",
         Commands::Relink { .. } => "relink",
         Commands::Clips { command } => match command {
@@ -499,6 +530,8 @@ fn execute(cli: &Cli) -> Result<Value> {
             command: LabelsCommand::Vocabulary { .. }
         } | Commands::CameraMappings {
             command: CameraMappingsCommand::List { .. }
+        } | Commands::Cameras {
+            command: CamerasCommand::MergePreview { .. }
         }
     ) || match &cli.command {
         // The chronology surface never writes; diagnostics only writes to
@@ -548,6 +581,22 @@ fn execute(cli: &Cli) -> Result<Value> {
                     "cleared": true,
                 }))
             }
+        },
+        Commands::Cameras { command } => match command {
+            CamerasCommand::MergePreview {
+                project,
+                from,
+                into,
+            } => Ok(serde_json::to_value(
+                catalog.preview_camera_merge(project, from, into)?,
+            )?),
+            CamerasCommand::Merge {
+                project,
+                from,
+                into,
+            } => Ok(serde_json::to_value(
+                catalog.merge_camera(project, from, into)?,
+            )?),
         },
         Commands::Ingest { project, folder } => Ok(serde_json::to_value(
             catalog.ingest_folder_with_progress(project, folder, |completed, total, path| {

@@ -5,8 +5,8 @@
  * the queue, ribbon, and evidence shelf that read from it — observe the write.
  */
 
-import type { Asset, AssetPatch } from "../../../types";
-import { patchAsset, projectAssets, requireAsset } from "../state";
+import type { Asset, AssetPatch, CameraMergePreview, CameraMergeReport } from "../../../types";
+import { patchAsset, projectAssets, requireAsset, type DesktopHarnessState } from "../state";
 import type { CommandTable } from "../registry";
 import { requireBoolean, requireNumber, requireString } from "../registry";
 
@@ -18,6 +18,50 @@ function assetPatch(value: unknown): AssetPatch {
   if (typeof patch.removed !== "boolean") throw new Error("patch.removed must be a boolean");
   if (typeof patch.rotationDegrees !== "number") throw new Error("patch.rotationDegrees must be a number");
   return patch as AssetPatch;
+}
+
+function cameraMergePreview(state: DesktopHarnessState, projectId: string, source: string, destination: string, requireDestination = true): CameraMergePreview {
+  if (!source || !destination || source === destination) throw new Error("source and destination cameras must be different");
+  const assets = projectAssets(state, projectId);
+  const sourceExists = assets.some((asset) => asset.camera === source)
+    || state.chronology.overview.sequences.some((sequence) => sequence.cameraKey === source);
+  const destinationExists = assets.some((asset) => asset.camera === destination)
+    || state.chronology.overview.sequences.some((sequence) => sequence.cameraKey === destination);
+  if (!sourceExists) throw new Error(`camera not found in project: ${source}`);
+  if (requireDestination && !destinationExists) throw new Error(`destination camera not found in project: ${destination}`);
+  return {
+    projectId,
+    sourceCamera: source,
+    destinationCamera: destination,
+    affectedClipCount: assets.filter((asset) => asset.camera === source).length,
+    affectedCaptureSequenceCount: state.chronology.overview.sequences.filter((sequence) => sequence.cameraKey === source).length,
+    affectedMappingCount: (state.imports.cameraMappings[projectId] ?? []).filter((mapping) => mapping.camera === source).length,
+    destinationCaptureSequenceCount: state.chronology.overview.sequences.filter((sequence) => sequence.cameraKey === destination).length,
+  };
+}
+
+function applyCameraIdentity(state: DesktopHarnessState, projectId: string, source: string, destination: string, requireDestination = true): CameraMergeReport {
+  const preview = cameraMergePreview(state, projectId, source, destination, requireDestination);
+  for (const asset of projectAssets(state, projectId)) {
+    if (asset.camera === source) patchAsset(state, asset.id, { camera: destination });
+  }
+  state.chronology.overview = {
+    ...state.chronology.overview,
+    sequences: state.chronology.overview.sequences.map((sequence) =>
+      sequence.cameraKey === source ? { ...sequence, cameraKey: destination } : sequence,
+    ),
+  };
+  for (const mapping of state.imports.cameraMappings[projectId] ?? []) {
+    if (mapping.camera === source) mapping.camera = destination;
+  }
+  return {
+    projectId,
+    sourceCamera: source,
+    destinationCamera: destination,
+    movedClipCount: preview.affectedClipCount,
+    movedCaptureSequenceCount: preview.affectedCaptureSequenceCount,
+    movedMappingCount: preview.affectedMappingCount,
+  };
 }
 
 export const reviewCommands: CommandTable = {
@@ -96,14 +140,22 @@ export const reviewCommands: CommandTable = {
     const from = requireString(args, "from");
     const to = requireString(args, "to").trim();
     if (!to) throw new Error("A camera name cannot be empty");
-    let changed = 0;
-    for (const asset of projectAssets(state, projectId)) {
-      if (asset.camera !== from) continue;
-      patchAsset(state, asset.id, { camera: to });
-      changed += 1;
-    }
-    return changed;
+    return applyCameraIdentity(state, projectId, from, to, false).movedClipCount;
   },
+
+  preview_camera_merge: (args, { state }) => cameraMergePreview(
+    state,
+    requireString(args, "projectId"),
+    requireString(args, "sourceCamera").trim(),
+    requireString(args, "destinationCamera").trim(),
+  ),
+
+  merge_camera: (args, { state }) => applyCameraIdentity(
+    state,
+    requireString(args, "projectId"),
+    requireString(args, "sourceCamera").trim(),
+    requireString(args, "destinationCamera").trim(),
+  ),
 
   /**
    * A clock event shifts every later clip from one camera. The real command

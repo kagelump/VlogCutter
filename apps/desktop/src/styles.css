@@ -610,16 +610,21 @@ kbd { padding: 2px 4px; color: #a8b1b6; background: #262d32; border: 1px solid #
 /* Scrolls vertically as one unit, so the camera-name gutter and the lane
    tracks stay aligned when the ribbon is shorter than its lane stack. */
 .story-map { min-height: 0; flex: 1; display: grid; grid-template-columns: 96px minmax(0, 1fr); overflow-x: hidden; overflow-y: auto; background: #0c1012; }
-.story-labels { position: relative; z-index: 2; display: grid; overflow: hidden; background: #111619; border-right: 1px solid var(--line-strong); }
-.story-labels > span { min-width: 0; display: flex; align-items: center; overflow: hidden; padding: 0 8px; border-bottom: 1px solid #20272b; text-overflow: ellipsis; white-space: nowrap; }
+.story-labels { position: relative; z-index: 4; display: grid; overflow: visible; background: #111619; border-right: 1px solid var(--line-strong); }
+.story-labels > span, .story-labels > .lane-name { min-width: 0; display: flex; align-items: center; overflow: hidden; padding: 0 8px; border-bottom: 1px solid #20272b; text-overflow: ellipsis; white-space: nowrap; }
 .context-label, .order-label { color: #748087; font: 10px/12px ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: .1em; text-transform: uppercase; }
 /* The camera is a guess made from the filename and whatever EXIF survived the
    card, so the gutter that displays it is also where it gets corrected: click
    the name to edit it, Enter or blur to commit, Escape to abandon. */
-.story-labels .lane-name { padding: 0; color: var(--muted); font: 11px/14px ui-monospace, SFMono-Regular, Menlo, monospace; }
+.story-labels .lane-name { position: relative; overflow: visible; padding: 0; color: var(--muted); font: 11px/14px ui-monospace, SFMono-Regular, Menlo, monospace; }
 .lane-name-button, .lane-name-field { width: 100%; min-width: 0; height: 100%; padding: 0 8px; font: inherit; }
 .lane-name-button { overflow: hidden; color: inherit; background: transparent; border: 0; border-bottom: 1px solid transparent; cursor: text; text-align: left; text-overflow: ellipsis; white-space: nowrap; }
 .lane-name-button:hover { color: var(--ink); border-bottom-color: var(--line-strong); }
+.lane-action-button { flex: none; width: 26px; height: 100%; padding: 0; color: #8d9ca2; background: transparent; border: 0; border-left: 1px solid #20272b; cursor: pointer; font: 10px/1 ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: -1px; }
+.lane-action-button:hover, .lane-action-button:focus-visible, .lane-action-button[aria-expanded="true"] { color: var(--amber); background: #20272b; outline: none; }
+.lane-action-menu { position: absolute; z-index: 8; top: 2px; left: calc(100% - 2px); display: grid; width: 132px; padding: 4px; background: #1a2024; border: 1px solid var(--line-strong); border-radius: 4px; box-shadow: 0 9px 26px rgba(0,0,0,.5); }
+.lane-action-menu button { padding: 7px 9px; color: var(--ink); background: transparent; border: 0; border-radius: 2px; cursor: pointer; font: 11px/1.2 ui-monospace, SFMono-Regular, Menlo, monospace; text-align: left; }
+.lane-action-menu button:hover, .lane-action-menu button:focus-visible { color: var(--amber); background: #252d31; outline: none; }
 .lane-name-field { color: var(--ink); background: var(--graphite); border: 1px solid var(--amber); border-radius: 3px; }
 .lane-name-field:focus { outline: none; }
 .story-scroll { min-width: 0; overflow-x: auto; overflow-y: hidden; overscroll-behavior-x: contain; scrollbar-color: #48535a #111619; scrollbar-width: thin; }
@@ -672,6 +677,19 @@ kbd { padding: 2px 4px; color: #a8b1b6; background: #262d32; border: 1px solid #
 .modal p { margin: 0 0 18px; color: var(--muted); font-size: 12px; line-height: 1.5; }
 .modal input { padding: 10px; font-family: inherit; }
 .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; }
+.camera-merge-modal { width: min(500px, calc(100vw - 40px)); }
+.camera-merge-eyebrow { margin: 0 0 5px; color: var(--amber); font: 700 10px/1.2 ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: .13em; text-transform: uppercase; }
+.camera-merge-modal h2 { margin: 0 0 5px; }
+.camera-merge-route { display: grid; grid-template-columns: minmax(0, 1fr) 24px minmax(0, 1fr); align-items: center; gap: 8px; margin: 20px 0; }
+.camera-merge-route span { overflow: hidden; padding: 10px 12px; color: var(--ink); background: #111619; border: 1px solid var(--line-strong); border-radius: 4px; font: 600 12px/1.25 ui-monospace, SFMono-Regular, Menlo, monospace; text-overflow: ellipsis; white-space: nowrap; }
+.camera-merge-route span:last-child { border-color: #8a6b28; box-shadow: inset 3px 0 0 var(--amber); }
+.camera-merge-route b { color: var(--amber); text-align: center; }
+.camera-merge-preview { margin-top: 18px; padding: 14px; background: #141a1d; border: 1px solid var(--line); border-radius: 5px; }
+.camera-merge-preview dl { display: grid; grid-template-columns: repeat(3, 1fr); gap: 2px; margin: 0 0 12px; background: var(--line); }
+.camera-merge-preview dl > div { padding: 9px; background: #1a2024; }
+.camera-merge-preview dt { color: var(--muted); font-size: 10px; text-transform: uppercase; }
+.camera-merge-preview dd { margin: 4px 0 0; color: var(--ink); font: 700 13px/1 ui-monospace, SFMono-Regular, Menlo, monospace; }
+.camera-merge-preview p { margin: 7px 0 0; color: var(--muted); font-size: 12px; line-height: 1.45; }
 .context-modal-backdrop { padding: 20px; }
 .context-modal { width: min(580px, calc(100vw - 40px)); max-height: calc(100vh - 40px); display: flex; flex-direction: column; overflow: hidden; padding: 0; }
 .context-modal-header { flex: none; display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; padding: 22px 24px 17px; border-bottom: 1px solid var(--line); }

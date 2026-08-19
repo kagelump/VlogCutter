@@ -43,12 +43,29 @@ function renderRibbon(overrides: Partial<StoryRibbonProps> = {}) {
     onRequestContext: vi.fn(),
     onEditContext: vi.fn(),
     onRenameCamera: vi.fn(),
+    onRequestCameraMerge: vi.fn(),
     ...overrides,
   };
   return { props, ...render(<StoryRibbon {...props} />) };
 }
 
 describe("adaptive lanes", () => {
+  it("exposes an explicit merge action from each camera lane", async () => {
+    const { props } = renderRibbon();
+    await userEvent.click(screen.getByRole("button", { name: "Camera actions for Sony" }));
+    await userEvent.click(screen.getByRole("button", { name: "Merge with…" }));
+    expect(props.onRequestCameraMerge).toHaveBeenCalledWith("Sony");
+  });
+
+  it("dismisses the lane actions menu with Escape", async () => {
+    await userEvent.click(renderRibbon().getByRole("button", { name: "Camera actions for Sony" }));
+    const rename = screen.getByRole("button", { name: "Rename" });
+    expect(document.activeElement).toBe(rename);
+    await userEvent.keyboard("{Escape}");
+    expect(screen.queryByRole("button", { name: "Merge with…" })).toBeNull();
+    expect(document.activeElement).toBe(screen.getByRole("button", { name: "Camera actions for Sony" }));
+  });
+
   it("emits one lane track per camera rather than a hardcoded five", () => {
     const { container } = renderRibbon();
     expect(container.querySelectorAll(".lane-track")).toHaveLength(2);

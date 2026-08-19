@@ -13,9 +13,11 @@
 //! correction at all.
 
 pub mod mapping;
+pub mod merge;
 pub mod patterns;
 
 pub use mapping::{CameraEvidence, CameraMapping};
+pub use merge::{CameraMergePreview, CameraMergeReport};
 pub use patterns::{CAMERA_PATTERNS, CameraPattern, PatternConfidence};
 
 use regex::Regex;

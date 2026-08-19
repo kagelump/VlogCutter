@@ -75,6 +75,8 @@ export interface StoryRibbonProps {
   onOpenExpanded?(): void;
   /** Corrects the camera identification for every clip in a lane. */
   onRenameCamera(from: string, to: string): void;
+  /** Opens the explicit camera-identity merge preview for this lane. */
+  onRequestCameraMerge(camera: string): void;
 }
 
 /**
@@ -107,14 +109,18 @@ export function StoryRibbon({
   onOpenChronologyProblems,
   onOpenExpanded,
   onRenameCamera,
+  onRequestCameraMerge,
 }: StoryRibbonProps) {
   // The lane whose name is being corrected, and the draft. Only one at a time:
   // the gutter is 96px, so a second open field would have nowhere to go.
   const [editingLane, setEditingLane] = useState<string | null>(null);
+  const [actionLane, setActionLane] = useState<string | null>(null);
   const [laneDraft, setLaneDraft] = useState("");
   const [hoveredContextIndex, setHoveredContextIndex] = useState<number | null>(null);
   const [contextAnchor, setContextAnchor] = useState<ContextAnchor | null>(null);
   const contextPopoverRef = useRef<HTMLDivElement>(null);
+  const laneActionRef = useRef<HTMLDivElement>(null);
+  const laneActionTriggerRef = useRef<HTMLButtonElement>(null);
   const [viewport, setViewport] = useState({ scrollLeft: 0, width: 0 });
 
   const indexByAssetId = useMemo(
@@ -156,6 +162,16 @@ export function StoryRibbon({
     setEditingLane(null);
     if (next && next !== camera) onRenameCamera(camera, next);
   }
+
+  useEffect(() => {
+    if (!actionLane) return;
+    laneActionRef.current?.querySelector<HTMLButtonElement>("button")?.focus();
+    function dismiss(event: PointerEvent) {
+      if (!laneActionRef.current?.contains(event.target as Node)) setActionLane(null);
+    }
+    window.addEventListener("pointerdown", dismiss);
+    return () => window.removeEventListener("pointerdown", dismiss);
+  }, [actionLane]);
   // Merged draws one lane holding every clip; otherwise one lane per camera.
   const laneRows: Array<[string, Asset[]]> = merged ? [["", assets]] : lanes;
   // A dragged height wins over the content height, and the lane stack scrolls
@@ -285,7 +301,7 @@ export function StoryRibbon({
             {/* The gutter is interactive, so it cannot be aria-hidden wholesale
                 the way the tracks are. */}
             {merged ? null : lanes.map(([camera]) => (
-              <span className="lane-name" key={camera}>
+              <div className="lane-name" key={camera}>
                 {editingLane === camera ? (
                   <input
                     className="lane-name-field"
@@ -302,16 +318,52 @@ export function StoryRibbon({
                     }}
                   />
                 ) : (
-                  <button
-                    className="lane-name-button"
-                    title={`${camera} — click to rename`}
-                    onClick={() => {
-                      setLaneDraft(camera);
-                      setEditingLane(camera);
-                    }}
-                  >{camera}</button>
+                  <>
+                    <button
+                      className="lane-name-button"
+                      title={`${camera} — click to rename`}
+                      onClick={() => {
+                        setLaneDraft(camera);
+                        setEditingLane(camera);
+                      }}
+                    >{camera}</button>
+                    <button
+                      className="lane-action-button"
+                      aria-label={`Camera actions for ${camera}`}
+                      aria-expanded={actionLane === camera}
+                      onClick={(event) => {
+                        laneActionTriggerRef.current = event.currentTarget;
+                        setActionLane((current) => current === camera ? null : camera);
+                      }}
+                    >•••</button>
+                    {actionLane === camera && (
+                      <div
+                        className="lane-action-menu"
+                        role="group"
+                        aria-label={`Actions for ${camera}`}
+                        ref={laneActionRef}
+                        onKeyDown={(event) => {
+                          if (event.key === "Escape") {
+                            setActionLane(null);
+                            queueMicrotask(() => laneActionTriggerRef.current?.focus());
+                            event.preventDefault();
+                          }
+                        }}
+                      >
+                        <button onClick={() => {
+                          setActionLane(null);
+                          setLaneDraft(camera);
+                          setEditingLane(camera);
+                        }}>Rename</button>
+                        <button onClick={() => {
+                          setActionLane(null);
+                          onRequestCameraMerge(camera);
+                        }}>Merge with…</button>
+                      </div>
+                    )}
+                  </>
                 )}
-              </span>
+              </div>
             ))}
           </div>
           <div

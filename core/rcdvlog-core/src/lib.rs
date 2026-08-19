@@ -94,7 +94,8 @@ pub use analysis::vlm_store::StoredAnalysis as ClipAnalysis;
 pub use analysis::{FRAMEPACK_RECIPE_KEY, STT_RECIPE_KEY, STT_TASK_KEY, VLM_PROMPT_VERSION};
 pub use cameras::{
     CAMERA_PATTERNS, CameraEvidence, CameraIdentity, CameraIdentitySource, CameraMapping,
-    CameraPattern, PatternConfidence, UNKNOWN_CAMERA, identify_camera, pattern_counter,
+    CameraMergePreview, CameraMergeReport, CameraPattern, PatternConfidence, UNKNOWN_CAMERA,
+    identify_camera, pattern_counter,
 };
 pub use chronology::{
     AppliedCorrection, AssetChronology, AssetTimeHypothesis, CaptureSequence,
@@ -1780,27 +1781,21 @@ impl Catalog {
         self.get_asset(asset_id)
     }
 
-    /// Renames a camera across every clip in a project.
+    /// Renames a camera identity across every clip and capture sequence in a project.
     ///
     /// The camera on an asset is a guess: `identify_camera` reads a filename
     /// pattern and whatever EXIF survived the card, and `UNKNOWN_CAMERA` is a
     /// routine outcome. The ribbon's lane gutter is where that guess becomes
     /// visible, so it is also where it gets corrected.
     ///
-    /// Written directly rather than as a typed operation, for the same reason
-    /// as `set_clip_summary`: a human edit of a derived field, not synchronized
-    /// between nodes today. Returns the number of clips moved to the new lane.
+    /// Written as the same typed identity operation as an explicit merge so
+    /// replay and synchronization keep clips, card lanes, and future ingest
+    /// aliases coherent. Sequence and epoch identities remain intact. Returns
+    /// the number of clips moved to the new lane.
     pub fn rename_camera(&self, project_id: &str, from: &str, to: &str) -> Result<usize> {
-        let to = to.trim();
-        if to.is_empty() {
-            bail!("a camera name cannot be empty");
-        }
-        let connection = self.connection()?;
-        let changed = connection.execute(
-            "UPDATE assets SET camera=?3 WHERE project_id=?1 AND camera=?2",
-            params![project_id, from, to],
-        )?;
-        Ok(changed)
+        Ok(self
+            .rename_camera_identity(project_id, from, to)?
+            .moved_clip_count)
     }
 
     /// Per-clip analysis facts the queue needs for every clip at once.

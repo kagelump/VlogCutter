@@ -19,6 +19,7 @@ pub const PROJECT_ASSET_ADDED: &str = "projectAssetAdded";
 pub const PROJECT_ASSET_MEMBERSHIP_SET: &str = "projectAssetMembershipSet";
 pub const PROJECT_ASSET_MEDIA_LINKED: &str = "projectAssetMediaLinked";
 pub const CLOCK_EVENT_CREATED: &str = "clockEventCreated";
+pub const CAMERA_IDENTITY_MERGED: &str = "cameraIdentityMerged";
 pub const CAPTURE_SEQUENCE_DECLARED: &str = "captureSequenceDeclared";
 pub const CAPTURE_SEQUENCE_SPLIT: &str = "captureSequenceSplit";
 pub const CAPTURE_SEQUENCE_SPLIT_EXACT: &str = "captureSequenceSplitExact";
@@ -51,6 +52,7 @@ pub const MAX_REMOTE_HLC_FUTURE_SKEW_MILLIS: i64 = 5 * 60 * 1000;
 pub const STALE_ASSET_REVISION: &str = "stale asset revision";
 
 pub(crate) const CHRONOLOGY_OPERATION_TYPES: &[&str] = &[
+    CAMERA_IDENTITY_MERGED,
     CAPTURE_SEQUENCE_DECLARED,
     CAPTURE_SEQUENCE_SPLIT,
     CAPTURE_SEQUENCE_SPLIT_EXACT,
@@ -83,6 +85,7 @@ pub(crate) const KNOWN_OPERATION_TYPES: &[&str] = &[
     PROJECT_ASSET_MEMBERSHIP_SET,
     PROJECT_ASSET_MEDIA_LINKED,
     CLOCK_EVENT_CREATED,
+    CAMERA_IDENTITY_MERGED,
     CAPTURE_SEQUENCE_DECLARED,
     CAPTURE_SEQUENCE_SPLIT,
     CAPTURE_SEQUENCE_SPLIT_EXACT,
@@ -305,6 +308,23 @@ struct ClockPayload {
     start_filename: String,
     offset_seconds: i64,
     label: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct CameraIdentityMergedPayload {
+    pub(crate) source_camera: String,
+    pub(crate) destination_camera: String,
+    pub(crate) asset_ids: Vec<String>,
+    pub(crate) capture_sequence_ids: Vec<String>,
+    pub(crate) assignments: Vec<CameraSequenceAssignmentPayload>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct CameraSequenceAssignmentPayload {
+    pub(crate) asset_id: String,
+    pub(crate) capture_sequence_id: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1796,6 +1816,9 @@ pub(crate) fn materialize_operation(
         PROJECT_ASSET_ADDED => materialize_asset_add(transaction, operation)?,
         PROJECT_ASSET_MEDIA_LINKED => materialize_media_link(transaction, operation)?,
         CLOCK_EVENT_CREATED => return materialize_clock(transaction, operation),
+        CAMERA_IDENTITY_MERGED => {
+            return materialize_camera_identity_merged(transaction, operation);
+        }
         CAPTURE_SEQUENCE_DECLARED => {
             return materialize_capture_sequence_declared(transaction, operation);
         }
@@ -1978,6 +2001,181 @@ fn materialize_register(
     Ok(true)
 }
 
+pub(crate) fn resolve_camera_alias(
+    transaction: &Transaction<'_>,
+    project_id: &str,
+    camera: &str,
+) -> Result<String> {
+    let mut current = camera.to_string();
+    let mut seen = BTreeSet::new();
+    while seen.insert(current.clone()) {
+        let next = transaction
+            .query_row(
+                "SELECT destination_camera FROM camera_identity_aliases WHERE project_id=?1 AND source_camera=?2",
+                params![project_id, current],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        match next {
+            Some(next) => current = next,
+            None => return Ok(current),
+        }
+    }
+    bail!("camera identity aliases contain a cycle for {camera}")
+}
+
+fn materialize_camera_identity_merged(
+    transaction: &Transaction<'_>,
+    operation: &ProjectOperation,
+) -> Result<ApplyOperationResult> {
+    let payload: CameraIdentityMergedPayload = payload(operation)?;
+    if operation.aggregate_type != "cameraIdentity"
+        || operation.aggregate_id != payload.source_camera
+    {
+        bail!("cameraIdentityMerged aggregate must be the source camera");
+    }
+    if payload.source_camera.trim().is_empty()
+        || payload.destination_camera.trim().is_empty()
+        || payload.source_camera == payload.destination_camera
+    {
+        bail!("cameraIdentityMerged requires two distinct non-empty camera identities");
+    }
+    let asset_ids = payload.asset_ids.iter().collect::<BTreeSet<_>>();
+    let capture_sequence_ids = payload.capture_sequence_ids.iter().collect::<BTreeSet<_>>();
+    if asset_ids.len() != payload.asset_ids.len()
+        || capture_sequence_ids.len() != payload.capture_sequence_ids.len()
+    {
+        bail!("cameraIdentityMerged requires unique asset and capture-sequence identities");
+    }
+    if payload
+        .assignments
+        .iter()
+        .map(|item| &item.asset_id)
+        .collect::<BTreeSet<_>>()
+        .len()
+        != payload.assignments.len()
+        || payload.assignments.iter().any(|item| {
+            !asset_ids.contains(&item.asset_id)
+                || !capture_sequence_ids.contains(&item.capture_sequence_id)
+        })
+    {
+        bail!(
+            "cameraIdentityMerged assignments must uniquely reference confirmed assets and sequences"
+        );
+    }
+    transaction.execute(
+        "INSERT OR IGNORE INTO camera_identity_merge_facts(operation_id, project_id, source_camera, destination_camera, hlc_wall_millis, hlc_counter, origin_node_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![operation.operation_id, operation.project_id, payload.source_camera, payload.destination_camera,
+            operation.logical_time.wall_millis, operation.logical_time.counter as i64, operation.origin_node_id],
+    )?;
+    recompute_camera_identity_component(
+        transaction,
+        &operation.project_id,
+        &payload.source_camera,
+        &payload.destination_camera,
+    )?;
+    for assignment in &payload.assignments {
+        let sequence_exists: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM capture_sequences WHERE id=?1 AND project_id=?2)",
+            params![assignment.capture_sequence_id, operation.project_id],
+            |row| row.get(0),
+        )?;
+        if !sequence_exists {
+            bail!(
+                "cameraIdentityMerged capture sequence not found during replay: {}",
+                assignment.capture_sequence_id
+            );
+        }
+        transaction.execute(
+            "UPDATE asset_capture_sequence SET capture_sequence_id=?1 WHERE asset_id=?2 AND project_id=?3",
+            params![assignment.capture_sequence_id, assignment.asset_id, operation.project_id],
+        )?;
+    }
+    advance_revision(transaction, operation)?;
+    Ok(ApplyOperationResult::Applied)
+}
+
+/// Rebuilds the entire undirected merge component from durable facts. The
+/// destination of the fact with the greatest operation key is canonical, so
+/// chained and even opposing concurrent merges converge regardless of delivery
+/// order. Aliases are flattened and every camera-bearing projection follows.
+fn recompute_camera_identity_component(
+    transaction: &Transaction<'_>,
+    project_id: &str,
+    source: &str,
+    destination: &str,
+) -> Result<String> {
+    type MergeFact = (String, String, (i64, i64, String, String));
+    let mut statement = transaction.prepare(
+        "SELECT source_camera, destination_camera, hlc_wall_millis, hlc_counter, origin_node_id, operation_id FROM camera_identity_merge_facts WHERE project_id=?1",
+    )?;
+    let facts = statement
+        .query_map([project_id], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                (row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?),
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<MergeFact>>>()?;
+    drop(statement);
+
+    let mut component = BTreeSet::from([source.to_string(), destination.to_string()]);
+    loop {
+        let before = component.len();
+        for (left, right, _) in &facts {
+            if component.contains(left) || component.contains(right) {
+                component.insert(left.clone());
+                component.insert(right.clone());
+            }
+        }
+        if component.len() == before {
+            break;
+        }
+    }
+    let (_, canonical, winning_key) = facts
+        .iter()
+        .filter(|(left, right, _)| component.contains(left) && component.contains(right))
+        .max_by_key(|(_, _, key)| key)
+        .cloned()
+        .ok_or_else(|| anyhow!("camera identity merge fact was not persisted"))?;
+
+    for member in &component {
+        transaction.execute(
+            "DELETE FROM camera_identity_aliases WHERE project_id=?1 AND source_camera=?2",
+            params![project_id, member],
+        )?;
+    }
+    for member in component.iter().filter(|member| *member != &canonical) {
+        transaction.execute(
+            "INSERT INTO camera_identity_aliases(project_id, source_camera, destination_camera, operation_id, hlc_wall_millis, hlc_counter, origin_node_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![project_id, member, canonical, winning_key.3, winning_key.0, winning_key.1, winning_key.2],
+        )?;
+    }
+    for member in &component {
+        transaction.execute(
+            "UPDATE assets SET camera=?1 WHERE project_id=?2 AND camera=?3",
+            params![canonical, project_id, member],
+        )?;
+        transaction.execute(
+            "UPDATE capture_sequences SET camera_key=?1 WHERE project_id=?2 AND camera_key=?3",
+            params![canonical, project_id, member],
+        )?;
+        transaction.execute(
+            "UPDATE clock_events SET camera=?1 WHERE project_id=?2 AND camera=?3",
+            params![canonical, project_id, member],
+        )?;
+        if crate::table_exists(transaction, "camera_identity_mappings")? {
+            transaction.execute(
+                "UPDATE camera_identity_mappings SET camera=?1, updated_at=?2 WHERE project_id=?3 AND camera=?4",
+                params![canonical, now(), project_id, member],
+            )?;
+        }
+    }
+    recalculate_clock(transaction, project_id, &canonical)?;
+    Ok(canonical)
+}
+
 fn materialize_asset_add(
     transaction: &Transaction<'_>,
     operation: &ProjectOperation,
@@ -1997,10 +2195,11 @@ fn materialize_asset_add(
     if existing {
         return Ok(true);
     }
+    let camera = resolve_camera_alias(transaction, &operation.project_id, &payload.camera)?;
     transaction.execute(
         "INSERT INTO assets(id, project_id, fingerprint, path, filename, size_bytes, duration_seconds, frame_rate, width, height, codec, camera, captured_at_raw, best_time, metadata_rotation_degrees, default_rotation_degrees, rotation_degrees, orientation_probed, created_at) VALUES (?1, ?2, ?3, '', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?15, 1, ?16)",
         params![payload.id, operation.project_id, payload.fingerprint, payload.filename, payload.size_bytes as i64,
-            payload.duration_seconds, payload.frame_rate, payload.width, payload.height, payload.codec, payload.camera,
+            payload.duration_seconds, payload.frame_rate, payload.width, payload.height, payload.codec, camera,
             payload.captured_at_raw, payload.best_time, payload.metadata_rotation_degrees, payload.default_rotation_degrees, payload.created_at],
     )?;
     // Every asset belongs to exactly one capture sequence. A new asset joins
@@ -2010,7 +2209,7 @@ fn materialize_asset_add(
     crate::chronology::ensure_capture_sequence_for_camera(
         transaction,
         &operation.project_id,
-        &payload.camera,
+        &camera,
         &payload.created_at,
     )?;
     transaction.execute(
@@ -2018,7 +2217,7 @@ fn materialize_asset_add(
         params![
             operation.aggregate_id,
             operation.project_id,
-            crate::chronology::capture_sequence_id_for(&operation.project_id, &payload.camera),
+            crate::chronology::capture_sequence_id_for(&operation.project_id, &camera),
             crate::chronology::parse_filename_counter(&payload.filename).map(|value| value as i64),
         ],
     )?;
@@ -2090,23 +2289,28 @@ fn materialize_clock(
                 active, operation.base_revision.map(|v| v as i64), actual as i64, now()])?;
         return Ok(ApplyOperationResult::Conflict);
     }
+    // The immutable operation and its revision remain on the raw camera
+    // aggregate named by the writer. Only materialized camera projections are
+    // canonicalized. This makes revision checks deterministic while a late
+    // pre-merge operation still follows the durable identity equivalence.
+    let camera = resolve_camera_alias(transaction, &operation.project_id, &payload.camera)?;
     let created_at = now();
     transaction.execute("INSERT INTO clock_events(id, project_id, camera, start_filename, offset_seconds, label, created_at, operation_id, hlc_wall_millis, hlc_counter, origin_node_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-        params![payload.event_id, operation.project_id, payload.camera, payload.start_filename, payload.offset_seconds, payload.label, created_at, operation.operation_id,
+        params![payload.event_id, operation.project_id, camera, payload.start_filename, payload.offset_seconds, payload.label, created_at, operation.operation_id,
             operation.logical_time.wall_millis, operation.logical_time.counter as i64, operation.origin_node_id])?;
     crate::chronology::materialize_legacy_clock_epoch(
         transaction,
         &operation.project_id,
         &crate::chronology::LegacyClockEpoch {
             event_id: &payload.event_id,
-            camera: &payload.camera,
+            camera: &camera,
             start_filename: &payload.start_filename,
             offset_seconds: payload.offset_seconds,
             label: &payload.label,
             created_at: &created_at,
         },
     )?;
-    recalculate_clock(transaction, &operation.project_id, &operation.aggregate_id)?;
+    recalculate_clock(transaction, &operation.project_id, &camera)?;
     advance_revision(transaction, operation)?;
     Ok(ApplyOperationResult::Applied)
 }
@@ -2201,12 +2405,13 @@ fn materialize_capture_sequence_declared(
     if !revision_guard_passes(transaction, operation)? {
         return Ok(ApplyOperationResult::Conflict);
     }
+    let camera_key = resolve_camera_alias(transaction, &operation.project_id, &payload.camera_key)?;
     transaction.execute(
         "INSERT INTO capture_sequences(id, project_id, camera_key, label, volume_hint, filename_prefix, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) ON CONFLICT(id) DO UPDATE SET camera_key=excluded.camera_key, label=excluded.label, volume_hint=excluded.volume_hint, filename_prefix=excluded.filename_prefix",
         params![
             payload.sequence_id,
             operation.project_id,
-            payload.camera_key,
+            camera_key,
             payload.label,
             payload.volume_hint,
             payload.filename_prefix,
@@ -2254,12 +2459,13 @@ fn materialize_capture_sequence_split(
             operation.aggregate_id
         );
     }
+    let camera_key = resolve_camera_alias(transaction, &operation.project_id, &payload.camera_key)?;
     transaction.execute(
         "INSERT OR IGNORE INTO capture_sequences(id, project_id, camera_key, label, volume_hint, filename_prefix, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![
             payload.new_sequence_id,
             operation.project_id,
-            payload.camera_key,
+            camera_key,
             payload.label,
             payload.volume_hint,
             payload.filename_prefix,
@@ -2392,9 +2598,10 @@ fn materialize_capture_sequence_split_exact(
                 operation.aggregate_id
             )
         })?;
+    let camera_key = resolve_camera_alias(transaction, &operation.project_id, &payload.camera_key)?;
     if source_details
         != (
-            payload.camera_key.clone(),
+            camera_key.clone(),
             payload.volume_hint.clone(),
             payload.filename_prefix.clone(),
         )
@@ -2431,7 +2638,7 @@ fn materialize_capture_sequence_split_exact(
         params![
             payload.new_sequence_id,
             operation.project_id,
-            payload.camera_key,
+            camera_key,
             payload.label,
             payload.volume_hint,
             payload.filename_prefix,

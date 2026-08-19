@@ -371,6 +371,20 @@ must never write them.
 - Shift-selection cannot cross a capture-sequence boundary, even when two cards
   share a camera lane. Once selected, that exact run can be placed beside any
   clip in solved order, including a clip from another card or camera.
+- Camera identity merge is distinct from capture-sequence merge. It changes the
+  lane identity on the exact confirmed assets and sequences, while retaining
+  every sequence ID, membership assignment, and clock-epoch ID. Its preview
+  names both lanes and counts the affected clips, sequences, Smart ingest
+  mappings, and already-present destination sequences.
+- `cameraIdentityMerged` also materializes a project-local source-to-destination
+  alias from durable merge facts. The full undirected fact component is rebuilt
+  after every delivery; the destination of the greatest operation key is the
+  canonical identity, so chained and opposing concurrent merges converge
+  without an alias cycle. Later asset/sequence/legacy-clock operations,
+  preflight detection, and baseline replay resolve that alias, so stale EXIF or
+  ingest evidence cannot recreate the split lane. The payload's exact
+  asset-to-sequence assignments restore card boundaries when a portable baseline
+  initially derives one sequence per asset camera.
 
 ### Clock epochs
 
@@ -422,6 +436,7 @@ must never write them.
 | `captureSequenceSplitExact` | `newSequenceId`, `cameraKey`, `label`, `volumeHint`, `filenamePrefix`, `atCounter`, `assetIds` |
 | `captureSequenceMerged` | `fromSequenceId`, `intoSequenceId`, `assetIds?`, `epochIds?` |
 | `captureSequenceReassigned` | `fromSequenceId`, `intoSequenceId`, `assetIds` |
+| `cameraIdentityMerged` | `sourceCamera`, `destinationCamera`, `assetIds`, `captureSequenceIds`, `assignments` (`assetId`, `captureSequenceId`) |
 | `clockEpochSet` | `epochId`, `captureSequenceId`, `startCounter`, `endCounter?`, `offsetSeconds`, `label`, `confidence?`, `evidence?` |
 | `clockEpochCleared` | `epochId` |
 | `clipTimeExceptionSet` | `tripTime`, `reason` |

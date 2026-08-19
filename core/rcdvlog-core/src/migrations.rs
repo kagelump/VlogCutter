@@ -7,7 +7,7 @@ use thiserror::Error;
 
 use crate::chronology::forward_migrate_project_chronology;
 
-pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 22;
+pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 23;
 
 const MIGRATION_TABLE_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -215,6 +215,12 @@ pub const PROJECT_CATALOG_MIGRATIONS: &[SqliteMigration] = &[
         name: "camera_identity_mapping_exif_evidence",
         source_identity: "project-catalog/0022-camera-identity-mapping-exif-evidence/20260819",
         apply: add_camera_identity_mapping_exif_evidence,
+    },
+    SqliteMigration {
+        id: 23,
+        name: "camera_identity_aliases",
+        source_identity: "project-catalog/0023-camera-identity-aliases/20260819",
+        apply: add_camera_identity_aliases,
     },
 ];
 
@@ -1350,6 +1356,40 @@ fn add_camera_identity_mapping_exif_evidence(transaction: &Transaction<'_>) -> R
     Ok(())
 }
 
+fn add_camera_identity_aliases(transaction: &Transaction<'_>) -> Result<()> {
+    transaction.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS camera_identity_aliases (
+            project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            source_camera TEXT NOT NULL,
+            destination_camera TEXT NOT NULL,
+            operation_id TEXT NOT NULL,
+            hlc_wall_millis INTEGER NOT NULL,
+            hlc_counter INTEGER NOT NULL,
+            origin_node_id TEXT NOT NULL,
+            PRIMARY KEY(project_id, source_camera)
+        );
+
+        CREATE INDEX IF NOT EXISTS camera_identity_aliases_destination
+            ON camera_identity_aliases(project_id, destination_camera);
+
+        CREATE TABLE IF NOT EXISTS camera_identity_merge_facts (
+            operation_id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            source_camera TEXT NOT NULL,
+            destination_camera TEXT NOT NULL,
+            hlc_wall_millis INTEGER NOT NULL,
+            hlc_counter INTEGER NOT NULL,
+            origin_node_id TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS camera_identity_merge_facts_project
+            ON camera_identity_merge_facts(project_id);
+        "#,
+    )?;
+    Ok(())
+}
+
 /// Gives a node-local media location a verification state, so "the original is
 /// available" can stop meaning "some file exists at that pathname".
 ///
@@ -1871,7 +1911,66 @@ mod tests {
             inspect_project_catalog_migrations(&connection)
                 .unwrap()
                 .current_version,
-            22
+            23
+        );
+    }
+
+    #[test]
+    fn migration_23_upgrades_v22_catalogs_with_durable_camera_aliases() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        run_sqlite_migrations(&mut connection, &PROJECT_CATALOG_MIGRATIONS[..22]).unwrap();
+        assert!(!table_exists(&connection, "camera_identity_aliases").unwrap());
+        assert!(!table_exists(&connection, "camera_identity_merge_facts").unwrap());
+
+        migrate_project_catalog(&mut connection).unwrap();
+
+        assert!(table_exists(&connection, "camera_identity_aliases").unwrap());
+        assert!(table_exists(&connection, "camera_identity_merge_facts").unwrap());
+        let columns = connection
+            .prepare("SELECT name FROM pragma_table_info('camera_identity_aliases') ORDER BY cid")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            columns,
+            [
+                "project_id",
+                "source_camera",
+                "destination_camera",
+                "operation_id",
+                "hlc_wall_millis",
+                "hlc_counter",
+                "origin_node_id",
+            ]
+        );
+        let fact_columns = connection
+            .prepare(
+                "SELECT name FROM pragma_table_info('camera_identity_merge_facts') ORDER BY cid",
+            )
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            fact_columns,
+            [
+                "operation_id",
+                "project_id",
+                "source_camera",
+                "destination_camera",
+                "hlc_wall_millis",
+                "hlc_counter",
+                "origin_node_id",
+            ]
+        );
+        assert_eq!(
+            inspect_project_catalog_migrations(&connection)
+                .unwrap()
+                .current_version,
+            23,
         );
     }
 

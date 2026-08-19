@@ -3,12 +3,12 @@ use chrono::{SecondsFormat, Utc};
 use rcdvlog_core::{
     AnalysisReadiness, AnalysisRunOptions, AnalysisRunOutcome, AnalysisRunRecord, AnalyzeReport,
     ArchiveRoot, Asset, AssetAnalysisIndexEntry, AssetAnalysisView, AssetPatch,
-    BatchProgressEstimate, CameraMapping, CardCandidate, Catalog, ClipTranscript, ClockEvent,
-    ImportHistoryEntry, ImportOutcome, ImportPreflight, ImportPreviewItem, ImportPreviewRequest,
-    ImportProgress as CoreImportProgress, ImportRollbackPreview, ImportSessionDetail,
-    ImportStage as CoreImportStage, IngestReport, ModelStatus, MountedVolumes, Project,
-    ProxyReport, RelinkReport, ThumbnailReport, ToolStatus, TranscribeReport, detect_cards,
-    inspect_card,
+    BatchProgressEstimate, CameraMapping, CameraMergePreview, CameraMergeReport, CardCandidate,
+    Catalog, ClipTranscript, ClockEvent, ImportHistoryEntry, ImportOutcome, ImportPreflight,
+    ImportPreviewItem, ImportPreviewRequest, ImportProgress as CoreImportProgress,
+    ImportRollbackPreview, ImportSessionDetail, ImportStage as CoreImportStage, IngestReport,
+    ModelStatus, MountedVolumes, Project, ProxyReport, RelinkReport, ThumbnailReport, ToolStatus,
+    TranscribeReport, detect_cards, inspect_card,
 };
 use rcdvlog_sync::BaselineEnvelope;
 use serde::{Deserialize, Serialize};
@@ -1712,6 +1712,32 @@ fn rename_camera(
 }
 
 #[tauri::command]
+fn preview_camera_merge(
+    project_id: String,
+    source_camera: String,
+    destination_camera: String,
+    state: State<'_, AppState>,
+) -> Result<CameraMergePreview, String> {
+    state
+        .catalog()?
+        .preview_camera_merge(&project_id, &source_camera, &destination_camera)
+        .map_err(error_message)
+}
+
+#[tauri::command]
+fn merge_camera(
+    project_id: String,
+    source_camera: String,
+    destination_camera: String,
+    state: State<'_, AppState>,
+) -> Result<CameraMergeReport, String> {
+    state
+        .catalog()?
+        .merge_camera(&project_id, &source_camera, &destination_camera)
+        .map_err(error_message)
+}
+
+#[tauri::command]
 fn project_analysis_index(
     project_id: String,
     state: State<'_, AppState>,
@@ -2516,6 +2542,8 @@ pub fn run() {
             project_analysis_index,
             set_clip_summary,
             rename_camera,
+            preview_camera_merge,
+            merge_camera,
             asset_transcript,
             asset_analysis,
             model_status,

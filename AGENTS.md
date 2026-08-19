@@ -129,6 +129,12 @@ Implemented now:
   actual camera count, horizontal scrolling, zoom, and a merged single-lane
   variant for Focus. The expanded Chronology desk uses the same camera-first
   hierarchy, with selectable capture-sequence/card runs inside each lane.
+- An explicit camera-lane identity merge previews affected clips and card runs,
+  then moves the source identity into an existing lane without combining its
+  capture sequences or changing clock-epoch IDs. The typed operation is
+  replay/baseline safe, updates Smart ingest mappings, and derives flattened
+  aliases deterministically from all merge facts so later operations carrying
+  an old identity and concurrent chained merges converge.
 - A non-interactive JSON CLI for catalog, clip annotation, chronology, and media operations.
 - Immutable typed project operations for asset membership, notes, labels, removal, rotation, and fixed clock events, with deterministic materialized views and conflict diagnostics.
 - Read-only catalog/project/clip/proxy diagnostics, including the desktop's persisted last-selected catalog, project, and asset breadcrumb.
@@ -467,7 +473,7 @@ Always pass `--catalog` in agent automation, tests, and temporary workflows. A d
 
 SQLite connections enable foreign keys, WAL journal mode, and a five-second busy timeout. Read operations can continue during an uncommitted writer. Project mutations append typed operations with materialized revisions. Adopted projects synchronize bounded operation pages between independent local catalogs; live SQLite/WAL files are never copied or placed on NAS.
 
-Project catalogs use an explicit `schema_migrations` history and are currently at version 22. The server control catalog is version 10; backup format is version 1. Migration definitions have immutable names/source identities and each migration commits atomically. Migration 18 includes a one-time compatibility reconciliation for catalogs created on the import feature branch before its migration IDs were merged with main. When changing the schema:
+Project catalogs use an explicit `schema_migrations` history and are currently at version 23. The server control catalog is version 10; backup format is version 1. Migration definitions have immutable names/source identities and each migration commits atomically. Migration 18 includes a one-time compatibility reconciliation for catalogs created on the import feature branch before its migration IDs were merged with main. When changing the schema:
 
 - Preserve existing catalogs; never solve migration issues by deleting the database.
 - Add a forward migration and an upgrade test using an older schema fixture.

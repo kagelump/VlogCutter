@@ -127,6 +127,24 @@ archives, or cache files; it is idempotent so retrying an already-completed clea
 is safe. Both mutations require the project ID as well as the stable mapping ID,
 so a mapping from another project cannot be renamed accidentally.
 
+### Camera identity merge
+
+```bash
+rcdvlog --catalog /absolute/project/catalog.sqlite3 cameras merge-preview \
+  --project <project-id> --from "Sony wrong" --into "Sony A7C II"
+rcdvlog --catalog /absolute/project/catalog.sqlite3 cameras merge \
+  --project <project-id> --from "Sony wrong" --into "Sony A7C II"
+```
+
+`merge-preview` is strictly read-only. It confirms both cameras exist and
+reports the source clip, capture-sequence, and Smart ingest mapping counts plus
+the destination's existing capture-sequence count. `merge` changes camera
+identity only: every source card keeps its capture-sequence ID, membership, and
+clock epochs while joining the destination lane. Smart ingest mappings follow
+the destination, and later replay or ingest that still names the old camera is
+resolved through the durable project-local alias. Neither command changes
+original, archive, or cache files.
+
 ### Relink
 
 ```bash

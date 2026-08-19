@@ -1,7 +1,7 @@
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
-import type { AnalysisProgress, AnalysisReadiness, AnalysisRunRecord, AnalysisRunReport, AnalysisRunRequest, AnalysisStage, ArchiveRoot, Asset, AssetAnalysisIndexEntry, AssetAnalysisView, AssetPatch, AutoplayMode, BaselineImportResult, BaselinePreviewResult, CameraMapping, CardCandidate, ClipTranscript, DesktopSettings, GenerationProgress, ImportHistoryEntry, ImportPreflight, ImportPreviewItem, ImportPreviewRequest, ImportProgress, ImportRollbackPreview, ImportRunReport, ImportSessionDetail, LoadedCatalog, MediaOrigin, ModelInstallProgress, ModelStatus, PathAnalysis, Project, ProjectLibrary, ProjectPairingStatus, RelinkReport, RootMappingEntry, ServerConnectionStatus, ServerPairingResult, ServerVersionInfo, SyncStatus, ThumbnailReport } from "./types";
+import type { AnalysisProgress, AnalysisReadiness, AnalysisRunRecord, AnalysisRunReport, AnalysisRunRequest, AnalysisStage, ArchiveRoot, Asset, AssetAnalysisIndexEntry, AssetAnalysisView, AssetPatch, AutoplayMode, BaselineImportResult, BaselinePreviewResult, CameraMapping, CameraMergePreview, CameraMergeReport, CardCandidate, ClipTranscript, DesktopSettings, GenerationProgress, ImportHistoryEntry, ImportPreflight, ImportPreviewItem, ImportPreviewRequest, ImportProgress, ImportRollbackPreview, ImportRunReport, ImportSessionDetail, LoadedCatalog, MediaOrigin, ModelInstallProgress, ModelStatus, PathAnalysis, Project, ProjectLibrary, ProjectPairingStatus, RelinkReport, RootMappingEntry, ServerConnectionStatus, ServerPairingResult, ServerVersionInfo, SyncStatus, ThumbnailReport } from "./types";
 
 /**
  * Whether a backend is answering behind `@tauri-apps/api`.
@@ -325,6 +325,14 @@ export const api = {
     const next = to.trim();
     if (!next) throw new Error("A camera name cannot be empty");
     return invoke("rename_camera", { projectId, from, to: next });
+  },
+
+  async previewCameraMerge(projectId: string, sourceCamera: string, destinationCamera: string): Promise<CameraMergePreview> {
+    return invoke("preview_camera_merge", { projectId, sourceCamera, destinationCamera });
+  },
+
+  async mergeCamera(projectId: string, sourceCamera: string, destinationCamera: string): Promise<CameraMergeReport> {
+    return invoke("merge_camera", { projectId, sourceCamera, destinationCamera });
   },
 
   async projectAnalysisIndex(projectId: string): Promise<AssetAnalysisIndexEntry[]> {
