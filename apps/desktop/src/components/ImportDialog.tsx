@@ -64,14 +64,11 @@ function cameraIdentityNote(identity: ImportPreflight["cameraIdentity"]): string
   if (!identity) return "";
   switch (identity.source) {
     case "userSelected":
-      return "You chose this camera for this import.";
+      return identity.evidenceStrong
+        ? "You chose this camera for this import. Its camera metadata can be remembered for matching cards."
+        : "You chose this camera for this import. Camera metadata is unavailable, so it will not be remembered automatically.";
     case "remembered":
-      // Deliberately says "matching evidence", not "this camera": the match
-      // is on card layout and filename prefix, which is brand-level, not a
-      // verified device match (see `cameras::mapping`'s doc comment). Naming
-      // the exact camera here would overclaim a certainty this evidence
-      // does not have.
-      return "Remembered from a previous import with matching card and filename evidence.";
+      return "Remembered from a previous import with matching camera, card, and filename evidence.";
     case "detected":
       return identity.evidenceStrong
         ? "Detected from this card."
@@ -131,6 +128,12 @@ export function ImportDialog({
   const [ledgerFocusPath, setLedgerFocusPath] = useState<string | null>(null);
   const ledgerListRef = useRef<HTMLUListElement>(null);
   const selectedRoot = roots.find((root) => root.id === selectedRootId) ?? null;
+  const activeRememberedMapping = plan?.cameraIdentity?.source === "remembered"
+    ? mappings.find((mapping) =>
+      mapping.folderHint === plan.cameraEvidence?.folderHint
+      && mapping.filenamePrefix === plan.cameraEvidence?.filenamePrefix
+      && mapping.exifHint === plan.cameraEvidence?.exifHint)
+    : undefined;
 
   // #65: posters/duration/capture time for the rows the ledger is actually
   // showing, fetched lazily as they scroll into view (`FileLedger`'s
@@ -251,7 +254,8 @@ export function ImportDialog({
       return;
     }
     if (value === CLEAR_CAMERA_OPTION) {
-      onSelectCamera(null);
+      if (activeRememberedMapping) onClearMapping(activeRememberedMapping.id);
+      else onSelectCamera(null);
       return;
     }
     if (!value) return; // The "Change camera…" placeholder is not itself a choice.
@@ -311,8 +315,10 @@ export function ImportDialog({
                       <span className="sr-only">Change camera</span>
                       <select value="" onChange={(event) => handleCameraSelect(event.target.value)}>
                         <option value="">Change camera…</option>
-                        {(plan.cameraIdentity.source === "userSelected" || plan.cameraIdentity.source === "remembered") && (
-                          <option value={CLEAR_CAMERA_OPTION}>Use the detected camera</option>
+                        {(plan.cameraIdentity.source === "userSelected" || activeRememberedMapping) && (
+                          <option value={CLEAR_CAMERA_OPTION}>
+                            {plan.cameraIdentity.source === "remembered" ? "Forget this remembered camera" : "Use the detected camera"}
+                          </option>
                         )}
                         {knownCameras.map((cameraName) => (
                           <option key={cameraName} value={cameraName}>{cameraName}</option>
@@ -337,6 +343,9 @@ export function ImportDialog({
               <p>
                 {noun(report.outcome.copied, "original")} copied · {noun(report.outcome.relinked, "original")} reconnected · {noun(report.outcome.skipped, "known clip")} left alone
               </p>
+              {report.outcome.cameraMappingWarning && (
+                <p className="context-modal-error" role="alert">{report.outcome.cameraMappingWarning}</p>
+              )}
               {report.proxies && <p>{noun(report.proxies.generated, "proxy", "proxies")} made for laptop review.</p>}
             </div>
             <details className="import-file-ledger">
@@ -492,6 +501,7 @@ export function ImportDialog({
                       <button
                         type="button"
                         className="text-button"
+                        aria-label={`Save the remembered camera for ${mappingEvidenceLabel(mapping)}`}
                         disabled={!(mappingDrafts[mapping.id] ?? mapping.camera).trim() || (mappingDrafts[mapping.id] ?? mapping.camera) === mapping.camera}
                         onClick={() => onRenameMapping(mapping.id, (mappingDrafts[mapping.id] ?? mapping.camera).trim())}
                       >

@@ -15,6 +15,7 @@ import type {
   ArchiveRoot,
   Asset,
   CameraMapping,
+  CameraEvidence,
   CardCandidate,
   ImportPreflight,
   ImportPreviewItem,
@@ -36,18 +37,13 @@ import { requireBoolean, requireString } from "../registry";
 // Mirrors `core/rcdvlog-core/src/cameras/mapping.rs` and
 // `preflight.rs::resolve_import_camera` closely enough that the same scenario
 // sequence exercises the same decisions, without re-implementing the Rust
-// solver: evidence is the card's folder-layout hint plus the dominant
-// filename prefix among the incoming new clips, and it is looked up or
-// recorded only when both are present. See that module's doc comment for why
-// the mount path and the volume label are deliberately excluded.
-
-interface CameraEvidence {
-  folderHint: string;
-  filenamePrefix: string;
-}
+// solver: evidence is the card's folder-layout hint, the dominant filename
+// prefix among the incoming new clips, and representative EXIF make/model.
+// It is looked up or recorded only when all three are present. See that
+// module's doc comment for why mount path and volume label are excluded.
 
 function evidenceIsStrong(evidence: CameraEvidence): boolean {
-  return evidence.folderHint !== "" && evidence.filenamePrefix !== "";
+  return evidence.folderHint !== "" && evidence.filenamePrefix !== "" && evidence.exifHint !== "";
 }
 
 /** The stem up to its first digit run, trimmed and upper-cased — the same
@@ -76,10 +72,11 @@ function mode(values: string[]): string {
   return best ?? "";
 }
 
-function cameraEvidenceFor(card: CardCandidate | null, newFilenames: string[]): CameraEvidence {
+function cameraEvidenceFor(card: CardCandidate | null, newFilenames: string[], exifHint: string): CameraEvidence {
   return {
     folderHint: card?.cameraHint.trim() ?? "",
     filenamePrefix: mode(newFilenames.map(derivePrefixFromFilename)),
+    exifHint,
   };
 }
 
@@ -87,7 +84,9 @@ function remembered(state: DesktopHarnessState, projectId: string, evidence: Cam
   if (!evidenceIsStrong(evidence)) return null;
   const mappings = state.imports.cameraMappings[projectId] ?? [];
   const match = mappings.find(
-    (mapping) => mapping.folderHint === evidence.folderHint && mapping.filenamePrefix === evidence.filenamePrefix,
+    (mapping) => mapping.folderHint === evidence.folderHint
+      && mapping.filenamePrefix === evidence.filenamePrefix
+      && mapping.exifHint === evidence.exifHint,
   );
   return match?.camera ?? null;
 }
@@ -106,7 +105,9 @@ function rememberCameraMapping(
   if (!evidenceIsStrong(evidence) || trimmed === "" || trimmed === "Unknown camera") return;
   const mappings = state.imports.cameraMappings[projectId] ?? [];
   const existing = mappings.find(
-    (mapping) => mapping.folderHint === evidence.folderHint && mapping.filenamePrefix === evidence.filenamePrefix,
+    (mapping) => mapping.folderHint === evidence.folderHint
+      && mapping.filenamePrefix === evidence.filenamePrefix
+      && mapping.exifHint === evidence.exifHint,
   );
   if (existing) {
     existing.camera = trimmed;
@@ -118,11 +119,7 @@ function rememberCameraMapping(
     .replace(/[^a-z0-9]+/g, "_");
   state.imports.cameraMappings[projectId] = [
     ...mappings,
-    // The harness never models EXIF, so `exifHint` stays empty here — every
-    // harness-recorded mapping lives on the brand-level tier
-    // `cameras::mapping`'s doc comment describes; the exif-narrowing half of
-    // that asymmetry is core-only and not exercised at the CUJ tier.
-    { id, folderHint: evidence.folderHint, filenamePrefix: evidence.filenamePrefix, exifHint: "", camera: trimmed, createdAt: nowIso, updatedAt: nowIso },
+    { id, folderHint: evidence.folderHint, filenamePrefix: evidence.filenamePrefix, exifHint: evidence.exifHint, camera: trimmed, createdAt: nowIso, updatedAt: nowIso },
   ];
 }
 
@@ -179,7 +176,11 @@ function preflight(
   const bytesToCopy = newClips.reduce((total, asset) => total + asset.sizeBytes, 0);
   const availableBytes = archiveRoot?.availableBytes ?? null;
   const roomless = availableBytes !== null && availableBytes < bytesToCopy;
-  const evidence = cameraEvidenceFor(card, newClips.map((asset) => asset.filename));
+  const evidence = cameraEvidenceFor(
+    card,
+    newClips.map((asset) => asset.filename),
+    state.imports.cameraExifHints[sourcePath] ?? "",
+  );
   const cameraIdentity = resolveCameraIdentity(state, projectId, card, newClips, evidence, cameraOverride);
   const newCamera = cameraIdentity.camera;
   const existingCameras = new Set(known.map((asset) => asset.camera));
@@ -207,6 +208,7 @@ function preflight(
     sourcePath,
     card,
     cameraIdentity,
+    cameraEvidence: evidence,
     destination: {
       copies: card !== null,
       archiveRoot,
@@ -321,6 +323,7 @@ function runReport(state: DesktopHarnessState, tally: RunTally, plan: ImportPref
       bytesCopied: tally.bytesCopied,
       cancelled,
       failures: [],
+      cameraMappingWarning: null,
     },
     proxies: makeProxies
       ? { generated: tally.imported.length, skipped: 0, cancelled, failures: [] }
@@ -455,9 +458,10 @@ export const importCommands: CommandTable = {
     // EXIF-aware ingest would assign, and recording it would let a later
     // `remembered` reinsertion force that guess over the truth.
     if (tally.pending.length > 0 && plan.cameraIdentity?.source === "userSelected") {
-      const evidence = cameraEvidenceFor(
+      const evidence = plan.cameraEvidence ?? cameraEvidenceFor(
         plan.card,
         plan.items.filter((item) => item.classification === "new").map((item) => item.filename),
+        context.state.imports.cameraExifHints[plan.sourcePath] ?? "",
       );
       rememberCameraMapping(context.state, projectId, evidence, plan.cameraIdentity.camera, context.clock.iso());
     }

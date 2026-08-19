@@ -188,6 +188,131 @@ fn read_commands_remain_available_during_an_uncommitted_writer() {
     transaction.rollback().unwrap();
 }
 
+#[test]
+fn camera_mapping_commands_list_rename_and_clear_project_scoped_state() {
+    let directory = tempdir().unwrap();
+    let catalog = directory.path().join("catalog.sqlite3");
+    let project_id = create_project(&catalog, "Camera mappings");
+    let other_project_id = create_project(&catalog, "Other project");
+    Connection::open(&catalog)
+        .unwrap()
+        .execute(
+            "INSERT INTO camera_identity_mappings
+             (id, project_id, folder_hint, filename_prefix, exif_hint, camera, created_at, updated_at)
+             VALUES ('cammap_sony', ?1, 'Sony', 'C', 'SONY ILCE-7CM2', 'Sony A7C II',
+                     '2026-08-19T00:00:00Z', '2026-08-19T00:00:00Z')",
+            params![project_id],
+        )
+        .unwrap();
+
+    let listed = success(
+        &catalog,
+        ["camera-mappings", "list", "--project", &project_id],
+    );
+    assert_eq!(listed.json["command"], "camera-mappings.list");
+    assert_eq!(listed.json["data"].as_array().unwrap().len(), 1);
+    assert_eq!(listed.json["data"][0]["id"], "cammap_sony");
+    assert_eq!(listed.json["data"][0]["folderHint"], "Sony");
+    assert_eq!(listed.json["data"][0]["filenamePrefix"], "C");
+    assert_eq!(listed.json["data"][0]["exifHint"], "SONY ILCE-7CM2");
+    assert_eq!(listed.json["data"][0]["camera"], "Sony A7C II");
+
+    // Listing is a diagnostic read: it stays available and excludes
+    // uncommitted rows while another connection owns the writer slot.
+    let mut writer = Connection::open(&catalog).unwrap();
+    let transaction = writer.transaction().unwrap();
+    transaction
+        .execute(
+            "INSERT INTO camera_identity_mappings
+             (id, project_id, folder_hint, filename_prefix, exif_hint, camera, created_at, updated_at)
+             VALUES ('cammap_uncommitted', ?1, 'DJI', 'DJI', 'DJI FC8282', 'DJI Pocket 3',
+                     '2026-08-19T00:00:00Z', '2026-08-19T00:00:00Z')",
+            params![project_id],
+        )
+        .unwrap();
+    let concurrent_list = success(
+        &catalog,
+        ["camera-mappings", "list", "--project", &project_id],
+    );
+    assert_eq!(concurrent_list.json["data"].as_array().unwrap().len(), 1);
+    transaction.rollback().unwrap();
+
+    let wrong_project = failure(
+        &catalog,
+        [
+            "camera-mappings",
+            "rename",
+            "--project",
+            &other_project_id,
+            "--mapping",
+            "cammap_sony",
+            "--camera",
+            "Sony A7C II backup",
+        ],
+    );
+    assert_eq!(wrong_project["command"], "camera-mappings.rename");
+    assert_eq!(wrong_project["error"]["code"], "not_found");
+
+    let renamed = success(
+        &catalog,
+        [
+            "camera-mappings",
+            "rename",
+            "--project",
+            &project_id,
+            "--mapping",
+            "cammap_sony",
+            "--camera",
+            "Sony A7C II backup",
+        ],
+    );
+    assert_eq!(renamed.json["command"], "camera-mappings.rename");
+    assert_eq!(renamed.json["data"]["id"], "cammap_sony");
+    assert_eq!(renamed.json["data"]["camera"], "Sony A7C II backup");
+
+    let persisted = success(
+        &catalog,
+        ["camera-mappings", "list", "--project", &project_id],
+    );
+    assert_eq!(persisted.json["data"][0]["camera"], "Sony A7C II backup");
+
+    let cleared = success(
+        &catalog,
+        [
+            "camera-mappings",
+            "clear",
+            "--project",
+            &project_id,
+            "--mapping",
+            "cammap_sony",
+        ],
+    );
+    assert_eq!(cleared.json["command"], "camera-mappings.clear");
+    assert_eq!(cleared.json["data"]["projectId"], project_id);
+    assert_eq!(cleared.json["data"]["mappingId"], "cammap_sony");
+    assert_eq!(cleared.json["data"]["cleared"], true);
+
+    let empty = success(
+        &catalog,
+        ["camera-mappings", "list", "--project", &project_id],
+    );
+    assert!(empty.json["data"].as_array().unwrap().is_empty());
+
+    // Clear is deliberately idempotent for retries and races with the UI.
+    let cleared_again = success(
+        &catalog,
+        [
+            "camera-mappings",
+            "clear",
+            "--project",
+            &project_id,
+            "--mapping",
+            "cammap_sony",
+        ],
+    );
+    assert_eq!(cleared_again.json["data"]["cleared"], true);
+}
+
 /// An agent's whole-clip write is refused when the clip moved under it.
 ///
 /// This is the concurrent-writer case the CLI exists to serve: an agent

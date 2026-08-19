@@ -12,8 +12,9 @@
 //!
 //! Cost discipline: identity comes from the sampled fingerprint (size plus the
 //! first and last 1 MiB), so a card of a few hundred 4K clips classifies in
-//! seconds. ffprobe and ExifTool are not run here at all; they are import's
-//! problem, and only for files that turn out to be new.
+//! seconds. Preflight makes one bounded ExifTool read from the first sorted new
+//! card item to distinguish physical camera models for sticky camera mappings;
+//! it does not probe every file. Full media probing remains import's problem.
 
 use anyhow::Result;
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -228,15 +229,14 @@ pub enum ImportCameraSource {
     /// This project's durable evidence-to-camera store (`cameras::mapping`)
     /// recognized this card's folder layout and filename prefix.
     Remembered,
-    /// Ordinary per-file inference from the filename-pattern table, then the
-    /// card's folder-layout hint. This is deliberately **not** the same
-    /// guess ingest will make: this module never probes EXIF (see its own
-    /// cost-discipline doc comment above), while `probe_media` tries EXIF
-    /// first and only falls back to the pattern table when EXIF is absent.
+    /// Bounded preflight inference: representative EXIF first, then the
+    /// filename-pattern table, then the card's folder-layout hint. This is not
+    /// durable unless the user explicitly selects it.
     /// A `Detected` value is therefore never durable — never written to the
     /// mapping store, never forced onto ingest via `run_import`'s
     /// `camera_override` — precisely because it can be wrong in a way
-    /// ingest's own EXIF-aware probe would not be. See `ResolvedImportCamera::uniform_camera`.
+    /// a heuristic should never become a sticky correction merely because no
+    /// one changed it. See `ResolvedImportCamera::uniform_camera`.
     Detected,
     /// Nothing identified the camera at all.
     Unknown,
@@ -298,6 +298,11 @@ pub struct ImportPreflight {
     /// The camera identity this plan resolved to. See `ResolvedImportCamera`.
     #[serde(default)]
     pub camera_identity: ResolvedImportCamera,
+    /// The exact evidence key consulted for `camera_identity`, carried into
+    /// `run_import` so a successful explicit choice is recorded under the same
+    /// key rather than recomputed from potentially changed source state.
+    #[serde(default)]
+    pub camera_evidence: CameraEvidence,
     pub destination: ImportDestination,
     pub scanned: usize,
     pub new_clips: usize,
@@ -368,15 +373,6 @@ fn camera_evidence_for<'a>(
         filename_prefix: mode(new_filenames.map(filename_prefix)).unwrap_or_default(),
         exif_hint,
     }
-}
-
-/// The dominant raw EXIF make/model among a set of newly-ingested files, or
-/// `""` when none had readable EXIF. Only ever called from `run_import`,
-/// after those files have actually been probed — preflight itself never
-/// probes EXIF (see this module's doc comment), so the evidence it builds
-/// always passes `String::new()` here instead of calling this at all.
-fn observed_exif_hint<'a>(paths: impl Iterator<Item = &'a str>) -> String {
-    mode(paths.filter_map(|path| crate::exif_camera(Path::new(path)))).unwrap_or_default()
 }
 
 /// Today's ordinary per-file camera guess: the filename-pattern table first,
@@ -648,8 +644,28 @@ impl Catalog {
             .iter()
             .filter(|item| item.classification == Classification::New)
             .collect();
-        let camera_identity =
-            self.resolve_import_camera(project_id, card.as_ref(), &new_items, camera_override)?;
+        // Candidates are sorted before classification, so the first new item
+        // is a deterministic representative. One EXIF read is the bounded
+        // cost needed to avoid treating every same-brand filename convention
+        // as the same physical camera. Ordinary folder imports cannot create
+        // sticky card mappings, so they do not pay even this one read.
+        let representative_exif = card
+            .as_ref()
+            .and_then(|_| new_items.first())
+            .and_then(|item| crate::exif_camera(Path::new(&item.path)))
+            .unwrap_or_default();
+        let camera_evidence = camera_evidence_for(
+            card.as_ref(),
+            new_items.iter().map(|item| item.filename.as_str()),
+            representative_exif,
+        );
+        let camera_identity = self.resolve_import_camera(
+            project_id,
+            card.as_ref(),
+            &camera_evidence,
+            &new_items,
+            camera_override,
+        )?;
         // Only an active selection or a remembered mapping forces every
         // candidate to one identity. Plain detection leaves each file's own
         // per-file guess in place, unchanged from before this identity was
@@ -669,6 +685,7 @@ impl Catalog {
             source_path: source.to_string_lossy().into_owned(),
             card,
             camera_identity,
+            camera_evidence,
             scanned: total,
             new_clips: count(&items, Classification::New),
             known_clips: count(&items, Classification::KnownVerified),
@@ -692,17 +709,10 @@ impl Catalog {
         &self,
         project_id: &str,
         card: Option<&CardCandidate>,
+        evidence: &CameraEvidence,
         new_items: &[&PreflightItem],
         camera_override: Option<&str>,
     ) -> Result<ResolvedImportCamera> {
-        // Preflight never probes EXIF — this evidence always looks up the
-        // blank tier. See `camera_evidence_for` and `cameras::mapping`'s doc
-        // comment.
-        let evidence = camera_evidence_for(
-            card,
-            new_items.iter().map(|item| item.filename.as_str()),
-            String::new(),
-        );
         let evidence_strong = evidence.is_strong_enough();
 
         if let Some(explicit) = camera_override
@@ -717,7 +727,7 @@ impl Catalog {
         }
 
         if evidence_strong
-            && let Some(remembered) = self.remembered_camera_for_evidence(project_id, &evidence)?
+            && let Some(remembered) = self.remembered_camera_for_evidence(project_id, evidence)?
         {
             return Ok(ResolvedImportCamera {
                 camera: remembered,
@@ -726,12 +736,16 @@ impl Catalog {
             });
         }
 
-        let detected = mode(
-            new_items
-                .iter()
-                .map(|item| detected_camera_key(&item.filename, card)),
-        )
-        .unwrap_or_else(|| UNKNOWN_CAMERA.to_string());
+        let detected = if evidence.exif_hint.is_empty() {
+            mode(
+                new_items
+                    .iter()
+                    .map(|item| detected_camera_key(&item.filename, card)),
+            )
+            .unwrap_or_else(|| UNKNOWN_CAMERA.to_string())
+        } else {
+            evidence.exif_hint.clone()
+        };
         Ok(ResolvedImportCamera {
             source: if detected == UNKNOWN_CAMERA {
                 ImportCameraSource::Unknown
@@ -1117,6 +1131,12 @@ pub struct ImportOutcome {
     pub bytes_copied: u64,
     pub cancelled: bool,
     pub failures: Vec<crate::IngestFailure>,
+    /// A non-fatal failure to persist the user's sticky camera choice after
+    /// the imported assets were already committed. The import remains valid;
+    /// callers should surface this warning and let the user retry on a later
+    /// matching import.
+    #[serde(default)]
+    pub camera_mapping_warning: Option<String>,
 }
 
 /// Where an import has got to, for a dialog that replaces its body with progress.
@@ -1303,25 +1323,19 @@ impl Catalog {
         // already copied and committed by this point (this loop's own doc
         // comment — "each commits atomically"), so a failure here (a busy
         // database, say) must not turn a completed import into a reported
-        // one. Swallowed, not propagated — the next successful `UserSelected`
-        // import for this evidence will simply try again.
-        if outcome.imported > 0 && plan.camera_identity.source == ImportCameraSource::UserSelected {
-            let new_paths = plan
-                .items
-                .iter()
-                .filter(|item| item.classification == Classification::New)
-                .map(|item| item.path.as_str());
-            let exif_hint = observed_exif_hint(new_paths);
-            let evidence = camera_evidence_for(
-                plan.card.as_ref(),
-                plan.items
-                    .iter()
-                    .filter(|item| item.classification == Classification::New)
-                    .map(|item| item.filename.as_str()),
-                exif_hint,
-            );
-            let _ =
-                self.remember_camera_mapping(project_id, &evidence, &plan.camera_identity.camera);
+        // one. Report it as a warning rather than propagating an error that
+        // would falsely imply the already-committed assets were rolled back.
+        if outcome.imported > 0
+            && plan.camera_identity.source == ImportCameraSource::UserSelected
+            && let Err(error) = self.remember_camera_mapping(
+                project_id,
+                &plan.camera_evidence,
+                &plan.camera_identity.camera,
+            )
+        {
+            outcome.camera_mapping_warning = Some(format!(
+                "The clips were imported, but VlogCutter could not remember this camera choice: {error:#}"
+            ));
         }
         Ok(outcome)
     }
@@ -2842,7 +2856,7 @@ mod tests {
     /// asset ingest creates and the capture sequence it joins.
     #[test]
     fn a_camera_override_is_the_one_identity_the_sequence_preview_and_ingest_both_use() {
-        if skip_without_ffprobe() {
+        if skip_without_ffprobe() || skip_without_exiftool() {
             return;
         }
         let directory = tempdir().unwrap();
@@ -2857,11 +2871,18 @@ mod tests {
             "DCIM/100MSDCF",
             &[("C0001.MP4", "navy"), ("C0002.MP4", "maroon")],
         );
+        stamp_exif(
+            &mount,
+            "DCIM/100MSDCF",
+            &["C0001.MP4", "C0002.MP4"],
+            "SONY",
+            "ILCE-7C",
+        );
 
         let auto = catalog
             .preflight_import(&project.id, &mount, None, None, |_, _, _| true)
             .unwrap();
-        assert_eq!(auto.camera_identity.camera, "Sony (C-series)");
+        assert_eq!(auto.camera_identity.camera, "SONY ILCE-7C");
         assert_eq!(auto.camera_identity.source, ImportCameraSource::Detected);
 
         let plan = catalog
@@ -2898,6 +2919,45 @@ mod tests {
         assert_eq!(sequences[0].camera_key, "Sony A7C II");
     }
 
+    #[test]
+    fn a_mapping_persistence_failure_warns_without_rolling_back_imported_assets() {
+        if skip_without_ffprobe() || skip_without_exiftool() {
+            return;
+        }
+        let directory = tempdir().unwrap();
+        let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).unwrap();
+        let project = catalog.create_project("Spain 2026").unwrap();
+        let mount = labeled_card_fixture_media(
+            directory.path(),
+            "UNTITLED",
+            "DCIM/100MSDCF",
+            &[("C0001.MP4", "navy")],
+        );
+        stamp_exif(&mount, "DCIM/100MSDCF", &["C0001.MP4"], "SONY", "ILCE-7C");
+        let plan = catalog
+            .preflight_import(&project.id, &mount, None, Some("Sony A7C II"), |_, _, _| {
+                true
+            })
+            .unwrap();
+        catalog
+            .connection()
+            .unwrap()
+            .execute_batch("DROP TABLE camera_identity_mappings")
+            .unwrap();
+
+        let outcome = catalog
+            .run_import(&project.id, &plan, true, |_| true)
+            .unwrap();
+        assert_eq!(outcome.imported, 1);
+        assert_eq!(catalog.list_assets(&project.id).unwrap().len(), 1);
+        assert!(
+            outcome
+                .camera_mapping_warning
+                .as_deref()
+                .is_some_and(|warning| warning.contains("could not remember this camera choice"))
+        );
+    }
+
     /// The issue's named CUJ: wrong auto-detection, an explicit correction,
     /// import, then a *reformatted card at a different mount path* comes
     /// back and defaults to the corrected identity without the user
@@ -2906,7 +2966,7 @@ mod tests {
     /// in-memory state this process happens to be holding.
     #[test]
     fn a_remembered_mapping_survives_a_reformatted_card_a_new_mount_path_and_a_restart() {
-        if skip_without_ffprobe() {
+        if skip_without_ffprobe() || skip_without_exiftool() {
             return;
         }
         let directory = tempdir().unwrap();
@@ -2919,6 +2979,13 @@ mod tests {
             "UNTITLED",
             "DCIM/100MSDCF",
             &[("C0001.MP4", "navy")],
+        );
+        stamp_exif(
+            &first_mount,
+            "DCIM/100MSDCF",
+            &["C0001.MP4"],
+            "SONY",
+            "ILCE-7C",
         );
         let first_plan = catalog
             .preflight_import(
@@ -2949,6 +3016,13 @@ mod tests {
             "DCIM/100MSDCF",
             &[("C0001.MP4", "olive")],
         );
+        stamp_exif(
+            &second_mount,
+            "DCIM/100MSDCF",
+            &["C0001.MP4"],
+            "SONY",
+            "ILCE-7C",
+        );
         assert_ne!(
             first_mount, second_mount,
             "the mount path must actually differ"
@@ -2976,12 +3050,12 @@ mod tests {
         }
     }
 
-    /// A generic `DCIM`-only card (no vendor layout recognized) is exactly
-    /// the "ambiguous evidence" case: nothing here should be recorded, and
+    /// A recognizable vendor card whose representative clip has no EXIF is
+    /// still ambiguous: nothing here should be recorded, and
     /// nothing should ever be silently offered back as a remembered
     /// mapping — the dialog must keep showing this as a guess, not a fact.
     #[test]
-    fn ambiguous_generic_dcim_evidence_is_never_recorded_or_applied() {
+    fn ambiguous_no_exif_evidence_is_never_recorded_or_applied() {
         if skip_without_ffprobe() {
             return;
         }
@@ -2991,8 +3065,8 @@ mod tests {
         let mount = labeled_card_fixture_media(
             directory.path(),
             "UNTITLED",
-            "DCIM",
-            &[("VID_0001.MP4", "navy")],
+            "DCIM/100MSDCF",
+            &[("C0001.MP4", "navy")],
         );
 
         let plan = catalog
@@ -3033,7 +3107,7 @@ mod tests {
     /// Sony card used stays its own thing.
     #[test]
     fn a_different_camera_under_the_same_generic_label_does_not_inherit() {
-        if skip_without_ffprobe() {
+        if skip_without_ffprobe() || skip_without_exiftool() {
             return;
         }
         let directory = tempdir().unwrap();
@@ -3045,6 +3119,13 @@ mod tests {
             "CARD",
             "DCIM/100MSDCF",
             &[("C0001.MP4", "navy")],
+        );
+        stamp_exif(
+            &sony_mount,
+            "DCIM/100MSDCF",
+            &["C0001.MP4"],
+            "SONY",
+            "ILCE-7C",
         );
         let sony_plan = catalog
             .preflight_import(
@@ -3065,6 +3146,13 @@ mod tests {
             "CARD",
             "DCIM/DJI_001",
             &[("DJI_20251221092058_0001_D.MP4", "maroon")],
+        );
+        stamp_exif(
+            &dji_mount,
+            "DCIM/DJI_001",
+            &["DJI_20251221092058_0001_D.MP4"],
+            "DJI",
+            "Pocket 3",
         );
         assert_eq!(
             Path::new(&sony_mount).file_name(),
@@ -3095,11 +3183,7 @@ mod tests {
         false
     }
 
-    /// Writes real EXIF Make/Model onto every clip a fixture just produced,
-    /// so a test can exercise the actual gap between preflight's own
-    /// EXIF-blind guess and what `probe_media` (EXIF-first) assigns at
-    /// ingest — the gap the whole test suite was otherwise blind to before
-    /// this test existed.
+    /// Writes real EXIF Make/Model onto every clip a fixture just produced.
     fn stamp_exif(mount: &Path, layout: &str, clips: &[&str], make: &str, model: &str) {
         for clip in clips {
             let status = crate::tool_command("exiftool")
@@ -3113,19 +3197,9 @@ mod tests {
         }
     }
 
-    /// The regression pinned to the review that caught it: a `Detected`
-    /// identity is preflight's own EXIF-blind guess (`detected_camera_key`)
-    /// and can differ from what ingest's EXIF-first `probe_media` actually
-    /// assigns — proven here with *real* EXIF, not a synthetic seam. Before
-    /// the fix, `run_import` recorded that guess into the mapping store
-    /// whenever anything imported, and a later `Remembered` reinsertion then
-    /// forced every asset to the wrong, EXIF-blind name — silently
-    /// overriding real EXIF and splitting exactly the camera lane #71 exists
-    /// to keep whole. This proves both halves of the fix: a plain `Detected`
-    /// import records nothing, and a real `UserSelected` choice is recorded
-    /// and does win at ingest — deliberately, because a human decision is
-    /// not a pattern guess (see `ImportCameraSource::Detected`'s doc
-    /// comment).
+    /// A detected EXIF identity is accurate but still not a user-authored
+    /// sticky correction. A later explicit choice is persisted under the same
+    /// representative EXIF evidence and wins on a matching new card.
     #[test]
     fn a_detected_identity_is_never_recorded_but_a_user_choice_is_and_wins_over_real_exif() {
         if skip_without_ffprobe() || skip_without_exiftool() {
@@ -3158,7 +3232,7 @@ mod tests {
             first_plan.camera_identity.source,
             ImportCameraSource::Detected
         );
-        assert_eq!(first_plan.camera_identity.camera, "Sony (C-series)");
+        assert_eq!(first_plan.camera_identity.camera, "SONY ILCE-7C");
 
         let first_outcome = catalog
             .run_import(&project.id, &first_plan, true, |_| true)
@@ -3167,7 +3241,7 @@ mod tests {
         let assets = catalog.list_assets(&project.id).unwrap();
         assert_eq!(
             assets[0].camera, "SONY ILCE-7C",
-            "ingest is EXIF-first and must not match preflight's EXIF-blind guess here"
+            "preflight and ingest should agree on representative EXIF"
         );
         assert!(
             catalog
@@ -3185,6 +3259,13 @@ mod tests {
             "UNTITLED",
             "DCIM/100MSDCF",
             &[("C0002.MP4", "maroon")],
+        );
+        stamp_exif(
+            &second_mount,
+            "DCIM/100MSDCF",
+            &["C0002.MP4"],
+            "SONY",
+            "ILCE-7C",
         );
         let second_plan = catalog
             .preflight_import(&project.id, &second_mount, None, None, |_, _, _| true)

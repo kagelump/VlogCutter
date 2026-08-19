@@ -63,3 +63,20 @@ test("Tab traverses real focusable controls rather than dropping focus to the bo
   // Focus never fell through to the body; every stop is a real control.
   expect(landed).not.toContain("BODY");
 });
+
+test("smart ingest exposes the camera override and focuses a new camera name", async ({ page }) => {
+  // Browser property: the real select/input focus handoff and the dialog's
+  // accessible control names, which jsdom cannot validate end to end.
+  await boot(page, "large");
+  await page.getByRole("button", { name: "Review import" }).click();
+
+  const dialog = page.getByRole("dialog");
+  const camera = dialog.getByRole("combobox", { name: "Change camera" });
+  await expect(camera).toBeVisible();
+  await camera.selectOption({ label: "New camera name…" });
+
+  const name = dialog.getByRole("textbox", { name: "New camera name" });
+  await expect(name).toBeFocused();
+  await name.fill("Sony A7C II");
+  await expect(dialog.getByRole("button", { name: "Use this name" })).toBeEnabled();
+});

@@ -460,6 +460,7 @@ mod tests {
             source_path: "/Volumes/CARD".to_string(),
             card: None,
             camera_identity: Default::default(),
+            camera_evidence: Default::default(),
             destination: ImportDestination {
                 copies: false,
                 archive_root: None,

@@ -57,6 +57,10 @@ Implemented now:
   cards atomically with optional full-file verification, remembers the proxy
   preference, supports cancellation/resume, and keeps a file ledger available
   after the dialog closes.
+- Smart ingest shows the resolved camera before import, lets the user choose an
+  existing or new project camera, uses that choice for both asset ingest and
+  sequence preview, and remembers it only when card layout, filename prefix,
+  and representative EXIF make/model form an unambiguous project-local key.
 - Low-frequency macOS removable-card detection with a review/dismiss banner;
   it lists and counts only until the user asks to review the import.
 - Sampled fingerprint deduplication within a project, with rediscovered content
@@ -462,7 +466,7 @@ Always pass `--catalog` in agent automation, tests, and temporary workflows. A d
 
 SQLite connections enable foreign keys, WAL journal mode, and a five-second busy timeout. Read operations can continue during an uncommitted writer. Project mutations append typed operations with materialized revisions. Adopted projects synchronize bounded operation pages between independent local catalogs; live SQLite/WAL files are never copied or placed on NAS.
 
-Project catalogs use an explicit `schema_migrations` history and are currently at version 18. The server control catalog is version 10; backup format is version 1. Migration definitions have immutable names/source identities and each migration commits atomically. Migration 18 includes a one-time compatibility reconciliation for catalogs created on the import feature branch before its migration IDs were merged with main. When changing the schema:
+Project catalogs use an explicit `schema_migrations` history and are currently at version 22. The server control catalog is version 10; backup format is version 1. Migration definitions have immutable names/source identities and each migration commits atomically. Migration 18 includes a one-time compatibility reconciliation for catalogs created on the import feature branch before its migration IDs were merged with main. When changing the schema:
 
 - Preserve existing catalogs; never solve migration issues by deleting the database.
 - Add a forward migration and an upgrade test using an older schema fixture.

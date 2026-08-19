@@ -1288,6 +1288,9 @@ function App() {
     try {
       setImportPlan(await api.preflightImport(projectId, importSource, rootId || null, cameraOverride));
     } catch (reason) {
+      // Never leave the previous camera plan actionable after a failed replan.
+      // It may carry an override or remembered mapping the user just changed.
+      setImportPlan(null);
       if (!String(reason).includes("preflight cancelled")) setImportError(String(reason));
     } finally {
       setImportLoading(false);

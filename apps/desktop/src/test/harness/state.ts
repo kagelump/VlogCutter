@@ -120,6 +120,8 @@ export interface ImportScenarioState {
    * restart within one CUJ test.
    */
   cameraMappings: Record<string, CameraMapping[]>;
+  /** Synthetic raw EXIF make/model by source path for #71 CUJs. */
+  cameraExifHints: Record<string, string>;
 }
 
 export interface DesktopHarnessState {
@@ -256,7 +258,7 @@ export function createInitialState(clock: HarnessClock): DesktopHarnessState {
 
     archiveRoots: [],
     cards: [],
-    imports: { preflights: {}, additions: {}, lastRunSourcePath: null, sessions: {}, cameraMappings: {} },
+    imports: { preflights: {}, additions: {}, lastRunSourcePath: null, sessions: {}, cameraMappings: {}, cameraExifHints: {} },
     relinkable: {},
 
     pairing: {

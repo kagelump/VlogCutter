@@ -53,6 +53,11 @@ enum Commands {
         #[command(subcommand)]
         command: ProjectCommand,
     },
+    /// Inspect or change Smart ingest's project-scoped camera mappings.
+    CameraMappings {
+        #[command(subcommand)]
+        command: CameraMappingsCommand,
+    },
     /// Reference all supported media in a folder.
     Ingest {
         #[arg(long)]
@@ -192,6 +197,31 @@ enum ProjectCommand {
     Diagnose {
         #[arg(long)]
         project: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum CameraMappingsCommand {
+    /// List the durable evidence-to-camera mappings for one project.
+    List {
+        #[arg(long)]
+        project: String,
+    },
+    /// Point one stored mapping at a different camera identity.
+    Rename {
+        #[arg(long)]
+        project: String,
+        #[arg(long)]
+        mapping: String,
+        #[arg(long)]
+        camera: String,
+    },
+    /// Forget one stored mapping. Clearing an already-absent mapping is safe.
+    Clear {
+        #[arg(long)]
+        project: String,
+        #[arg(long)]
+        mapping: String,
     },
 }
 
@@ -372,6 +402,11 @@ fn command_name(command: &Commands) -> &'static str {
             ProjectCommand::Status { .. } => "project.status",
             ProjectCommand::Diagnose { .. } => "project.diagnose",
         },
+        Commands::CameraMappings { command } => match command {
+            CameraMappingsCommand::List { .. } => "camera-mappings.list",
+            CameraMappingsCommand::Rename { .. } => "camera-mappings.rename",
+            CameraMappingsCommand::Clear { .. } => "camera-mappings.clear",
+        },
         Commands::Ingest { .. } => "ingest",
         Commands::Relink { .. } => "relink",
         Commands::Clips { command } => match command {
@@ -462,6 +497,8 @@ fn execute(cli: &Cli) -> Result<Value> {
             command: AnalyzeCommand::Status { .. }
         } | Commands::Labels {
             command: LabelsCommand::Vocabulary { .. }
+        } | Commands::CameraMappings {
+            command: CameraMappingsCommand::List { .. }
         }
     ) || match &cli.command {
         // The chronology surface never writes; diagnostics only writes to
@@ -491,6 +528,26 @@ fn execute(cli: &Cli) -> Result<Value> {
             ProjectCommand::List => Ok(serde_json::to_value(catalog.list_projects()?)?),
             ProjectCommand::Status { project } => project_status(&catalog, project),
             ProjectCommand::Diagnose { project } => project_diagnosis(&catalog, project),
+        },
+        Commands::CameraMappings { command } => match command {
+            CameraMappingsCommand::List { project } => Ok(serde_json::to_value(
+                catalog.list_camera_mappings(project)?,
+            )?),
+            CameraMappingsCommand::Rename {
+                project,
+                mapping,
+                camera,
+            } => Ok(serde_json::to_value(
+                catalog.rename_camera_mapping(project, mapping, camera)?,
+            )?),
+            CameraMappingsCommand::Clear { project, mapping } => {
+                catalog.clear_camera_mapping(project, mapping)?;
+                Ok(json!({
+                    "projectId": project,
+                    "mappingId": mapping,
+                    "cleared": true,
+                }))
+            }
         },
         Commands::Ingest { project, folder } => Ok(serde_json::to_value(
             catalog.ingest_folder_with_progress(project, folder, |completed, total, path| {
@@ -1175,6 +1232,7 @@ mod tests {
         for command in [
             "doctor",
             "project",
+            "camera-mappings",
             "ingest",
             "clips",
             "clock",
@@ -1432,6 +1490,7 @@ mod tests {
         assert_eq!(error_code("database locked"), "internal_error");
         assert!(Cli::try_parse_from(["rcdvlog", "clips", "list"]).is_err());
         assert!(Cli::try_parse_from(["rcdvlog", "project", "status"]).is_err());
+        assert!(Cli::try_parse_from(["rcdvlog", "camera-mappings", "list"]).is_err());
     }
 
     #[test]

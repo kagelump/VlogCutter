@@ -2,11 +2,10 @@
 //! probed duration, and probed capture time — for the preflight rows a
 //! dialog is actually showing.
 //!
-//! `preflight.rs`'s module doc is explicit that ffprobe and ExifTool never
-//! run during preflight itself; it calls that "import's problem, and only
-//! for files that turn out to be new." This module is exactly that deferred
-//! work, invoked separately from preflight and only for the caller's chosen
-//! batch (e.g. the rows currently visible in the dialog), never for a whole
+//! Full media probing never runs during classification. Preflight performs at
+//! most one representative ExifTool read for sticky camera identity; this
+//! module owns the separately deferred ffprobe/poster work for the caller's
+//! chosen batch (e.g. rows currently visible in the dialog), never for a whole
 //! several-hundred-clip card at once.
 //!
 //! Nothing here touches the catalog or the project: there is no asset yet

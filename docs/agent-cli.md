@@ -105,6 +105,28 @@ location, and repairs the asset when its recorded original had gone offline — 
 re-running ingest against a card that remounted elsewhere reconnects it. The
 report separates `imported`, `duplicates`, and `relinked`.
 
+### Smart ingest camera mappings
+
+```bash
+rcdvlog --catalog /absolute/project/catalog.sqlite3 camera-mappings list \
+  --project <project-id>
+rcdvlog --catalog /absolute/project/catalog.sqlite3 camera-mappings rename \
+  --project <project-id> --mapping <mapping-id> --camera "Sony A7C II"
+rcdvlog --catalog /absolute/project/catalog.sqlite3 camera-mappings clear \
+  --project <project-id> --mapping <mapping-id>
+```
+
+`camera-mappings list` is strictly read-only and returns the stable mapping ID,
+folder hint, filename prefix, representative EXIF make/model, resolved camera,
+and creation/update timestamps. The evidence is project-scoped and excludes an
+ephemeral mount path, which is why a matching reformatted card can reuse it.
+
+`rename` changes only the camera identity one stored evidence key resolves to.
+`clear` forgets that key without touching clips, capture sequences, originals,
+archives, or cache files; it is idempotent so retrying an already-completed clear
+is safe. Both mutations require the project ID as well as the stable mapping ID,
+so a mapping from another project cannot be renamed accidentally.
+
 ### Relink
 
 ```bash

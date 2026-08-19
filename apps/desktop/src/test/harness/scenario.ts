@@ -390,6 +390,7 @@ export class ScenarioBuilder {
     const projectId = this.requireProject();
     const card = buildCard(label, { clipCount: spec.clips, ...spec });
     this.state.cards.push(card);
+    this.state.imports.cameraExifHints[card.mountPath] = spec.exifHint ?? "";
 
     const total = spec.clips ?? 0;
     if (total === 0) return this;

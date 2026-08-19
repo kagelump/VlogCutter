@@ -263,6 +263,8 @@ export interface CardSpec {
   cameraHint?: string;
   clipCount?: number;
   totalBytes?: number;
+  /** Synthetic raw EXIF make/model used only by the CUJ harness. */
+  exifHint?: string;
 }
 
 export function buildCard(label: string, spec: CardSpec = {}): CardCandidate {

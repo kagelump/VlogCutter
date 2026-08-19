@@ -19,16 +19,15 @@
 //!
 //! ## The evidence signature
 //!
-//! [`CameraEvidence`] is the cheap, preflight-time signal this module keys on
+//! [`CameraEvidence`] is the bounded preflight-time signal this module keys on
 //! instead: the camera family recognized from the card's folder layout
-//! (`cards::card_camera_hint` — "Sony", "DJI", "GoPro", ...) plus the
-//! dominant filename prefix among the incoming clips ("C", "DJI_", "VID_",
-//! ...). Both come from work preflight already does; neither requires EXIF or
-//! probing a single byte of media.
+//! (`cards::card_camera_hint` — "Sony", "DJI", "GoPro", ...), the dominant
+//! filename prefix among the incoming clips ("C", "DJI_", "VID_", ...), and
+//! the EXIF make/model from one deterministic representative new clip.
 //!
 //! [`CameraEvidence::is_strong_enough`] is the line between "safe to apply or
 //! record automatically" and "ambiguous — the dialog must ask instead of
-//! guessing". Evidence is strong only when *both* signals are present. A card
+//! guessing". Evidence is strong only when all three signals are present. A card
 //! preflight could only recognize as a generic `DCIM` folder (no vendor
 //! layout — `folder_hint` empty) is common to nearly every camera ever made,
 //! so a filename-prefix match alone would be a coincidence, not evidence.
@@ -43,41 +42,16 @@
 //! device-level, and cannot on its own tell two different real cameras of
 //! the same brand apart.
 //!
-//! ## Narrowing with EXIF, asymmetrically
+//! EXIF closes the brand-level ambiguity: two Sony bodies can share both the
+//! same folder layout and `C####` convention. When the representative clip has
+//! no readable EXIF, the evidence remains visible in preflight but is never
+//! automatically looked up or recorded. The user can still choose a camera for
+//! that run; the choice simply does not become a potentially unsafe sticky
+//! default.
 //!
-//! [`CameraEvidence`] carries a third field, `exif_hint`, precisely to claw
-//! back some of that precision — but only on the *write* side. Preflight
-//! never probes EXIF (see this module's cost-discipline note above and
-//! `preflight.rs`'s own), so every lookup this module ever performs passes
-//! `exif_hint: String::new()` — preflight has nothing else to offer.
-//! `run_import`, by contrast, has already run `probe_media`/`exiftool` on
-//! every newly ingested file by the time it calls `remember_camera_mapping`,
-//! so *that* call can pass the real observed EXIF make/model (or `""` when
-//! none of the new files had readable EXIF — plenty of action cameras and
-//! some tools genuinely don't). `exif_hint` is part of the table's unique
-//! key, so a row recorded with a real EXIF hint is a *more specific* row
-//! than the brand-level one, and — because lookup can only ever ask for
-//! `exif_hint = ""` — it is invisible to ordinary preflight matching. Net
-//! effect: once any import under one brand+prefix combination has real EXIF,
-//! that combination stops offering its (still-present, still-inspectable)
-//! history to a sibling camera model at preflight time, because the row
-//! preflight could match against no longer holds anything — the specific
-//! row took its place at the specific key, and the generic key was never
-//! written to begin with by that import (see `remember_camera_mapping`'s
-//! doc comment for exactly which imports are allowed to write at all). A
-//! camera whose files carry no readable EXIF continues to rely on the
-//! brand-level fallback, same as before, because there is no stronger
-//! signal available for it either — that residual collision (two bodies of
-//! the same brand+prefix, *both* without readable EXIF) is the one case
-//! this module still cannot distinguish, and the dialog's "Remembered..."
-//! copy says so rather than claiming certainty it does not have.
-//!
-//! This is a heuristic, not a certificate of physical identity, and the
-//! remaining collision above is the accepted trade the issue describes
-//! ("normally inherit... when the evidence is strong enough") — the user
-//! can always override, and can inspect, change, or clear any stored
-//! mapping (`list_camera_mappings`, `rename_camera_mapping`,
-//! `clear_camera_mapping`).
+//! These mappings are project-scoped local ingest preferences. They influence
+//! a future import on this catalog; they are not human clip annotations and are
+//! intentionally not replicated through the project-operation protocol.
 //!
 //! ## Relationship to #74
 //!
@@ -101,7 +75,7 @@ use crate::Catalog;
 /// The cheap, preflight-time evidence used to recognize "the same camera"
 /// across remounts, reformats, and card swaps. Deliberately excludes the
 /// mount path and the volume label — see this module's doc comment.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CameraEvidence {
     /// The camera family recognized from the card's folder layout
@@ -112,23 +86,21 @@ pub struct CameraEvidence {
     /// The dominant filename prefix among this import's new clips, e.g. "C",
     /// "DJI_", "VID_". Empty when there is nothing new to derive it from.
     pub filename_prefix: String,
-    /// The dominant raw EXIF make/model observed among this import's newly
-    /// ingested files, when any had readable EXIF. Always empty for the
-    /// evidence a *lookup* uses — preflight never probes EXIF, so it always
-    /// asks with this field blank. Only ever non-empty for the evidence a
-    /// *write* uses, computed from files `run_import` has already probed.
-    /// See this module's doc comment for the resulting read/write asymmetry.
+    /// Raw EXIF make/model from the deterministic representative new clip.
+    /// The exact same value is carried by the preflight plan into lookup and
+    /// post-import persistence. Empty means the evidence is ambiguous.
     pub exif_hint: String,
 }
 
 impl CameraEvidence {
     /// Evidence is strong enough to safely look up or record a durable
-    /// mapping only when both signals are present. See this module's doc
-    /// comment for why a generic `DCIM`-only card, or a run with no ordinary
-    /// filename prefix, must not participate: either alone is shared by too
-    /// many unrelated cameras to mean anything.
+    /// mapping only when all three signals are present. See this module's doc
+    /// comment for why a generic `DCIM`-only card, a run with no ordinary
+    /// filename prefix, or a clip with no readable EXIF must not participate.
     pub fn is_strong_enough(&self) -> bool {
-        !self.folder_hint.is_empty() && !self.filename_prefix.is_empty()
+        !self.folder_hint.is_empty()
+            && !self.filename_prefix.is_empty()
+            && !self.exif_hint.is_empty()
     }
 }
 
@@ -172,7 +144,7 @@ impl Catalog {
     /// The remembered camera for this import's evidence, or `None` when the
     /// evidence is too weak to trust or nothing has been recorded for it yet.
     /// Never returns a mapping recorded under different evidence — an exact
-    /// match on both signals is required.
+    /// match on all three signals is required.
     pub(crate) fn remembered_camera_for_evidence(
         &self,
         project_id: &str,
@@ -185,10 +157,6 @@ impl Catalog {
         if !crate::table_exists(&connection, "camera_identity_mappings")? {
             return Ok(None);
         }
-        // `evidence.exif_hint` is always `""` for a lookup — preflight never
-        // probes EXIF — so this can only ever match the brand-level tier a
-        // write recorded with no EXIF of its own. See this module's doc
-        // comment.
         Ok(connection
             .query_row(
                 "SELECT camera FROM camera_identity_mappings
@@ -377,7 +345,7 @@ mod tests {
     }
 
     fn strong(folder_hint: &str, filename_prefix: &str) -> CameraEvidence {
-        strong_with_exif(folder_hint, filename_prefix, "")
+        strong_with_exif(folder_hint, filename_prefix, "SONY ILCE-7C")
     }
 
     fn strong_with_exif(
@@ -396,7 +364,7 @@ mod tests {
     fn weak_evidence_is_never_strong_enough() {
         assert!(!strong("", "C").is_strong_enough());
         assert!(!strong("Sony", "").is_strong_enough());
-        assert!(!strong("", "").is_strong_enough());
+        assert!(!strong_with_exif("Sony", "C", "").is_strong_enough());
         assert!(strong("Sony", "C").is_strong_enough());
     }
 
@@ -599,65 +567,56 @@ mod tests {
         );
     }
 
-    /// The read/write asymmetry this module's doc comment describes: a row
-    /// recorded with a real EXIF hint is a *more specific* row than the
-    /// brand-level one, and a lookup — which always asks with `exif_hint`
-    /// blank, because preflight never has it — cannot see it.
+    /// The exact evidence gathered by preflight must round-trip through the
+    /// store; a different EXIF model under the same brand/prefix must not.
     #[test]
-    fn a_mapping_recorded_with_an_exif_hint_is_invisible_to_a_blank_lookup() {
+    fn exif_is_part_of_the_exact_mapping_key() {
         let (_directory, catalog, project_id) = open_project();
         let with_exif = strong_with_exif("Sony", "C", "SONY ILCE-7C");
         catalog
             .remember_camera_mapping(&project_id, &with_exif, "Sony A7C II")
             .unwrap();
 
-        // Preflight never has EXIF, so it always looks up the blank tier.
-        let blank = strong("Sony", "C");
-        assert_eq!(
-            catalog
-                .remembered_camera_for_evidence(&project_id, &blank)
-                .unwrap(),
-            None,
-            "an EXIF-specific row must not answer a blank (preflight) lookup"
-        );
-
-        // The exact same EXIF hint, however, does round-trip.
         assert_eq!(
             catalog
                 .remembered_camera_for_evidence(&project_id, &with_exif)
                 .unwrap(),
             Some("Sony A7C II".to_string())
         );
+
+        let other_model = strong_with_exif("Sony", "C", "SONY ILME-FX3");
+        assert_eq!(
+            catalog
+                .remembered_camera_for_evidence(&project_id, &other_model)
+                .unwrap(),
+            None
+        );
     }
 
-    /// The residual, accepted collision: two real cameras sharing brand and
-    /// filename prefix, *neither* of which has readable EXIF, still share
-    /// the one blank-tier row — exactly the case the module doc says is not
-    /// solved. A blank write from the second camera silently overwrites the
-    /// first's mapping, and this test pins that as the documented trade
-    /// rather than an unexamined accident.
+    /// Same-brand/same-prefix footage without EXIF is ambiguous and must never
+    /// create or consume an automatic mapping.
     #[test]
-    fn two_same_brand_same_prefix_cameras_without_exif_still_collide_on_the_blank_tier() {
+    fn no_exif_evidence_is_never_recorded_or_applied() {
         let (_directory, catalog, project_id) = open_project();
-        let blank = strong("Sony", "C");
-        catalog
-            .remember_camera_mapping(&project_id, &blank, "Sony A7C II")
-            .unwrap();
-        catalog
-            .remember_camera_mapping(&project_id, &blank, "Sony FX3")
-            .unwrap();
+        let ambiguous = strong_with_exif("Sony", "C", "");
 
         assert_eq!(
             catalog
-                .remembered_camera_for_evidence(&project_id, &blank)
+                .remember_camera_mapping(&project_id, &ambiguous, "Sony A7C II")
                 .unwrap(),
-            Some("Sony FX3".to_string()),
-            "last write wins on the blank tier — the documented residual collision"
+            None
         );
-        assert_eq!(
-            catalog.list_camera_mappings(&project_id).unwrap().len(),
-            1,
-            "still one row: the blank tier is one key, not narrowed by brand alone"
+        assert!(
+            catalog
+                .remembered_camera_for_evidence(&project_id, &ambiguous)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            catalog
+                .list_camera_mappings(&project_id)
+                .unwrap()
+                .is_empty()
         );
     }
 

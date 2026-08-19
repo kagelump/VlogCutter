@@ -240,9 +240,12 @@ one-click operation.
 
 ### 5.1 Detecting the camera
 
-Camera identification for the *banner* comes from folder structure, not file contents:
-`DCIM/100MSDCF` (Sony), `DJI_*` (DJI), `100GOPRO` (GoPro). This costs no I/O beyond a directory
-listing and is available before anything is hashed.
+Camera identification for the initial *banner* comes from folder structure:
+`DCIM/100MSDCF` (Sony), `DJI_*` (DJI), `100GOPRO` (GoPro). Smart ingest then performs one bounded
+ExifTool read from the first sorted new clip so a user-corrected camera identity can be remembered
+by project across remounts without conflating two bodies that share a brand and filename pattern.
+If that representative clip has no readable make/model, the dialog keeps the choice explicit for
+this run and does not create an ambiguous sticky mapping.
 
 The existing filename-pattern table (`docs/tasks/desktop/CAMERA_PATTERNS.md`) is unchanged and
 still authoritative for per-asset camera identity, behind EXIF. Folder structure is a card-level
@@ -267,8 +270,8 @@ automation.
 skipped" and "found your missing footage."
 
 Preflight reports progress (`scanned / total`, current file) and is cancellable. On a card of a few
-hundred 4K clips the sampled fingerprint keeps this to seconds, because ffprobe and ExifTool run
-only for files that classify as `New`.
+hundred 4K clips the sampled fingerprint keeps classification to seconds. ffprobe remains deferred;
+the only metadata process in the initial plan is the single representative ExifTool read above.
 
 ## 7. The import modal
 

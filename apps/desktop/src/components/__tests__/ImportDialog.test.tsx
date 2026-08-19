@@ -44,6 +44,7 @@ function plan(overrides: Partial<ImportPreflight> = {}): ImportPreflight {
     collisions: 0,
     unreadable: 0,
     cameraIdentity: { camera: "DJI Pocket 3", source: "detected", evidenceStrong: true },
+    cameraEvidence: { folderHint: "DJI", filenamePrefix: "DJI", exifHint: "DJI FC8282" },
     items: [],
     ...overrides,
   };
@@ -563,16 +564,29 @@ describe("choosing and remembering a camera identity (#71)", () => {
   it("lets the user clear a remembered mapping back to auto-detection", async () => {
     const user = userEvent.setup();
     const onSelectCamera = vi.fn();
+    const onClearMapping = vi.fn();
     renderDialog({
       plan: plan({
         cameraIdentity: { camera: "Sony A7C II", source: "remembered", evidenceStrong: true },
+        cameraEvidence: { folderHint: "Sony", filenamePrefix: "C", exifHint: "SONY ILCE-7CM2" },
       }),
+      mappings: [{
+        id: "cammap_sony",
+        folderHint: "Sony",
+        filenamePrefix: "C",
+        exifHint: "SONY ILCE-7CM2",
+        camera: "Sony A7C II",
+        createdAt: "2026-08-01T00:00:00Z",
+        updatedAt: "2026-08-01T00:00:00Z",
+      }],
       onSelectCamera,
+      onClearMapping,
     });
 
-    await user.selectOptions(screen.getByLabelText("Change camera"), "Use the detected camera");
+    await user.selectOptions(screen.getByLabelText("Change camera"), "Forget this remembered camera");
 
-    expect(onSelectCamera).toHaveBeenCalledWith(null);
+    expect(onClearMapping).toHaveBeenCalledWith("cammap_sony");
+    expect(onSelectCamera).not.toHaveBeenCalled();
   });
 
   it("shows that a choice was remembered from a previous import", () => {
@@ -583,7 +597,7 @@ describe("choosing and remembering a camera identity (#71)", () => {
     });
 
     expect(screen.getByText("Sony A7C II", { selector: "strong" })).toBeVisible();
-    expect(screen.getByText("Remembered from a previous import with matching card and filename evidence.")).toBeVisible();
+    expect(screen.getByText("Remembered from a previous import with matching camera, card, and filename evidence.")).toBeVisible();
   });
 
   it("makes ambiguous evidence visible rather than presenting a guess as settled", () => {
@@ -603,6 +617,7 @@ describe("choosing and remembering a camera identity (#71)", () => {
         outcome: {
           imported: 18, importedAssetIds: [], relinked: 0, relinkedAssetIds: [],
           skipped: 212, copied: 18, bytesCopied: 62_400_000_000, cancelled: false, failures: [],
+          cameraMappingWarning: "The clips were imported, but VlogCutter could not remember this camera choice.",
         },
         proxies: null,
         files: [],
@@ -618,6 +633,7 @@ describe("choosing and remembering a camera identity (#71)", () => {
     });
 
     expect(screen.getByText("DJI Pocket 3")).toBeVisible();
+    expect(screen.getByRole("alert")).toHaveTextContent(/could not remember this camera choice/);
     expect(screen.queryByLabelText("Change camera")).toBeNull();
   });
 
@@ -655,7 +671,7 @@ describe("choosing and remembering a camera identity (#71)", () => {
     // Change.
     await user.clear(input);
     await user.type(input, "Sony A7C II mk2");
-    await user.click(screen.getByRole("button", { name: "Save" }));
+    await user.click(screen.getByRole("button", { name: "Save the remembered camera for Sony · C" }));
     expect(onRenameMapping).toHaveBeenCalledWith("cammap_1", "Sony A7C II mk2");
 
     // Clear.
@@ -680,7 +696,7 @@ describe("choosing and remembering a camera identity (#71)", () => {
     });
 
     await user.click(screen.getByText("Remembered cameras (1)"));
-    expect(screen.getByRole("button", { name: "Save" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Save the remembered camera for Sony · C" })).toBeDisabled();
   });
 
   it("distinguishes two mappings that share folder and prefix but differ by EXIF hint", async () => {

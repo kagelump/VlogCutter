@@ -7,7 +7,7 @@ use thiserror::Error;
 
 use crate::chronology::forward_migrate_project_chronology;
 
-pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 21;
+pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 22;
 
 const MIGRATION_TABLE_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -209,6 +209,12 @@ pub const PROJECT_CATALOG_MIGRATIONS: &[SqliteMigration] = &[
         name: "camera_identity_mappings",
         source_identity: "project-catalog/0021-camera-identity-mappings/20260819",
         apply: add_camera_identity_mappings,
+    },
+    SqliteMigration {
+        id: 22,
+        name: "camera_identity_mapping_exif_evidence",
+        source_identity: "project-catalog/0022-camera-identity-mapping-exif-evidence/20260819",
+        apply: add_camera_identity_mapping_exif_evidence,
     },
 ];
 
@@ -1277,20 +1283,67 @@ fn add_camera_identity_mappings(transaction: &Transaction<'_>) -> Result<()> {
             project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
             folder_hint TEXT NOT NULL CHECK(length(folder_hint) > 0),
             filename_prefix TEXT NOT NULL CHECK(length(filename_prefix) > 0),
-            -- Raw EXIF make/model observed when the row was written, or ''
-            -- when none of that write's new files had readable EXIF. Part
-            -- of the unique key deliberately: a row recorded with a real
-            -- EXIF hint is a more specific match than the ''-tier row for
-            -- the same folder_hint/filename_prefix, and an ordinary
-            -- preflight lookup (which never has EXIF) can only ever query
-            -- the ''-tier. See cameras::mapping's doc comment.
+            camera TEXT NOT NULL CHECK(length(camera) > 0),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(project_id, folder_hint, filename_prefix)
+        );
+        CREATE INDEX IF NOT EXISTS camera_identity_mappings_project
+            ON camera_identity_mappings(project_id);
+        "#,
+    )?;
+    Ok(())
+}
+
+/// Adds the representative EXIF make/model to the sticky camera evidence key.
+///
+/// Migration 21 is intentionally kept byte-for-byte compatible with the first
+/// committed #71 schema. A short-lived development revision nevertheless
+/// created the four-column schema while still recording migration 21. Rebuild
+/// from either shape here so both honest v21 catalogs and those development
+/// catalogs advance safely to the same v22 schema without losing mappings.
+fn add_camera_identity_mapping_exif_evidence(transaction: &Transaction<'_>) -> Result<()> {
+    let already_has_exif = column_exists(transaction, "camera_identity_mappings", "exif_hint")?;
+    transaction.execute_batch(
+        r#"
+        DROP TABLE IF EXISTS camera_identity_mappings_v22;
+        CREATE TABLE camera_identity_mappings_v22 (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            folder_hint TEXT NOT NULL CHECK(length(folder_hint) > 0),
+            filename_prefix TEXT NOT NULL CHECK(length(filename_prefix) > 0),
             exif_hint TEXT NOT NULL DEFAULT '',
             camera TEXT NOT NULL CHECK(length(camera) > 0),
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             UNIQUE(project_id, folder_hint, filename_prefix, exif_hint)
         );
-        CREATE INDEX IF NOT EXISTS camera_identity_mappings_project
+        "#,
+    )?;
+    if already_has_exif {
+        transaction.execute_batch(
+            r#"
+            INSERT INTO camera_identity_mappings_v22
+                (id, project_id, folder_hint, filename_prefix, exif_hint, camera, created_at, updated_at)
+            SELECT id, project_id, folder_hint, filename_prefix, exif_hint, camera, created_at, updated_at
+            FROM camera_identity_mappings;
+            "#,
+        )?;
+    } else {
+        transaction.execute_batch(
+            r#"
+            INSERT INTO camera_identity_mappings_v22
+                (id, project_id, folder_hint, filename_prefix, exif_hint, camera, created_at, updated_at)
+            SELECT id, project_id, folder_hint, filename_prefix, '', camera, created_at, updated_at
+            FROM camera_identity_mappings;
+            "#,
+        )?;
+    }
+    transaction.execute_batch(
+        r#"
+        DROP TABLE camera_identity_mappings;
+        ALTER TABLE camera_identity_mappings_v22 RENAME TO camera_identity_mappings;
+        CREATE INDEX camera_identity_mappings_project
             ON camera_identity_mappings(project_id);
         "#,
     )?;
@@ -1685,8 +1738,26 @@ mod tests {
     }
 
     #[test]
-    fn migration_21_creates_camera_identity_mappings() {
+    fn migration_21_fixture_upgrades_forward_to_exif_evidence() {
         let mut connection = Connection::open_in_memory().unwrap();
+        run_sqlite_migrations(&mut connection, &PROJECT_CATALOG_MIGRATIONS[..21]).unwrap();
+        assert!(!column_exists(&connection, "camera_identity_mappings", "exif_hint").unwrap());
+        connection
+            .execute(
+                "INSERT INTO projects (id, name, created_at)
+                 VALUES ('p1', 'p', '2026-01-01T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO camera_identity_mappings
+                 (id, project_id, folder_hint, filename_prefix, camera, created_at, updated_at)
+                 VALUES ('m1', 'p1', 'Sony', 'C', 'Sony A7C II', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+
         migrate_project_catalog(&mut connection).unwrap();
         let columns: Vec<String> = connection
             .prepare("SELECT name FROM pragma_table_info('camera_identity_mappings')")
@@ -1708,21 +1779,14 @@ mod tests {
             assert!(columns.contains(&column.to_string()), "missing {column}");
         }
 
-        connection
-            .execute(
-                "INSERT INTO projects (id, name, created_at)
-                 VALUES ('p1', 'p', '2026-01-01T00:00:00Z')",
+        let preserved: (String, String) = connection
+            .query_row(
+                "SELECT camera, exif_hint FROM camera_identity_mappings WHERE id='m1'",
                 [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        connection
-            .execute(
-                "INSERT INTO camera_identity_mappings
-                 (id, project_id, folder_hint, filename_prefix, exif_hint, camera, created_at, updated_at)
-                 VALUES ('m1', 'p1', 'Sony', 'C', '', 'Sony A7C II', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
-                [],
-            )
-            .unwrap();
+        assert_eq!(preserved, ("Sony A7C II".to_string(), String::new()));
         // Weak evidence must be rejected at the schema level too, not only in
         // the Rust layer above it.
         assert!(
@@ -1758,6 +1822,57 @@ mod tests {
                 [],
             )
             .unwrap();
+    }
+
+    #[test]
+    fn migration_22_accepts_the_short_lived_buggy_v21_shape() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        run_sqlite_migrations(&mut connection, &PROJECT_CATALOG_MIGRATIONS[..20]).unwrap();
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE camera_identity_mappings (
+                    id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                    folder_hint TEXT NOT NULL CHECK(length(folder_hint) > 0),
+                    filename_prefix TEXT NOT NULL CHECK(length(filename_prefix) > 0),
+                    exif_hint TEXT NOT NULL DEFAULT '',
+                    camera TEXT NOT NULL CHECK(length(camera) > 0),
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(project_id, folder_hint, filename_prefix, exif_hint)
+                );
+                CREATE INDEX camera_identity_mappings_project
+                    ON camera_identity_mappings(project_id);
+                INSERT INTO projects (id, name, created_at)
+                    VALUES ('p_buggy', 'p', '2026-01-01T00:00:00Z');
+                INSERT INTO camera_identity_mappings
+                    (id, project_id, folder_hint, filename_prefix, exif_hint, camera, created_at, updated_at)
+                    VALUES ('m_buggy', 'p_buggy', 'Sony', 'C', 'SONY ILCE-7C', 'Sony A7C II', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+                INSERT INTO schema_migrations (migration_id, name, source_identity, applied_at)
+                    VALUES (21, 'camera_identity_mappings', 'project-catalog/0021-camera-identity-mappings/20260819', '2026-08-19T00:00:00Z');
+                "#,
+            )
+            .unwrap();
+
+        migrate_project_catalog(&mut connection).unwrap();
+        let preserved: (String, String) = connection
+            .query_row(
+                "SELECT camera, exif_hint FROM camera_identity_mappings WHERE id='m_buggy'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            preserved,
+            ("Sony A7C II".to_string(), "SONY ILCE-7C".to_string())
+        );
+        assert_eq!(
+            inspect_project_catalog_migrations(&connection)
+                .unwrap()
+                .current_version,
+            22
+        );
     }
 
     #[test]

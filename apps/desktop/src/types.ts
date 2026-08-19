@@ -437,12 +437,19 @@ export interface ResolvedImportCamera {
   camera: string;
   source: ImportCameraSource;
   /**
-   * Whether this import's own card evidence (folder layout plus filename
-   * prefix) was strong enough to safely consult or update the durable
-   * mapping store. When false, `source` is never `"remembered"` — present
-   * `camera` as a guess to confirm, not a settled fact.
+   * Whether this import's folder layout, filename prefix, and representative
+   * EXIF make/model were all present, making the evidence safe to remember.
+   * When false, `source` is never `"remembered"` — present `camera` as a
+   * choice for this run, not a settled future default.
    */
   evidenceStrong: boolean;
+}
+
+/** The durable evidence used to recall a user-selected camera on a later card. */
+export interface CameraEvidence {
+  folderHint: string;
+  filenamePrefix: string;
+  exifHint: string;
 }
 
 export interface ImportPreflight {
@@ -450,6 +457,8 @@ export interface ImportPreflight {
   card: CardCandidate | null;
   /** Optional only for compatibility with older CUJ fixtures. Production preflight always sends it. */
   cameraIdentity?: ResolvedImportCamera;
+  /** Optional only for compatibility with older CUJ fixtures. Production preflight always sends it. */
+  cameraEvidence?: CameraEvidence;
   destination: ImportDestination;
   scanned: number;
   newClips: number;
@@ -469,10 +478,9 @@ export interface CameraMapping {
   folderHint: string;
   filenamePrefix: string;
   /**
-   * Raw EXIF make/model this row was recorded with, or empty when it was
-   * recorded from files with no readable EXIF (the brand-level fallback
-   * tier). Not user-editable; shown so otherwise-identical
-   * folderHint/filenamePrefix rows can be told apart when inspecting.
+   * Raw EXIF make/model this row was recorded with. Empty only on a legacy
+   * migration-21 row, which is retained for inspection but is too ambiguous
+   * to apply automatically. Not user-editable.
    */
   exifHint: string;
   camera: string;
@@ -501,6 +509,8 @@ export interface ImportOutcome {
   bytesCopied: number;
   cancelled: boolean;
   failures: Array<{ path: string; error: string }>;
+  /** Import succeeded, but its explicit camera choice could not be remembered. */
+  cameraMappingWarning?: string | null;
 }
 
 export interface ProxyReport {

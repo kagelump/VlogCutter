@@ -290,7 +290,7 @@ describe("choosing and remembering a camera identity (#71)", () => {
     const scenario = desktopScenario({ now: "2026-08-09T12:00:00.000Z" })
       .project("Hokkaido field test", { id: "project_hokkaido" })
       .archiveRoot("NAS Video", { availableBytes: 1_200_000_000_000 })
-      .cardInserted("SONY_SD", { clips: 1, newClips: 1, camera: "Sony (C-series)", cameraHint: "Sony" });
+      .cardInserted("SONY_SD", { clips: 1, newClips: 1, camera: "Sony (C-series)", cameraHint: "Sony", exifHint: "SONY ILCE-7CM2" });
     const harness = scenario.build();
     const app = await renderApp(harness);
     const dialog = await openCardImport(app);
@@ -320,9 +320,11 @@ describe("choosing and remembering a camera identity (#71)", () => {
     // example of a wrong auto-detection.
     const scenario = desktopScenario({ now: "2026-08-09T12:00:00.000Z" })
       .project("Hokkaido field test", { id: "project_hokkaido" })
+      .camera("Sony A7C II", { clips: 1, withProxy: true })
       .archiveRoot("NAS Video", { availableBytes: 1_200_000_000_000 })
-      .cardInserted("SONY_SD", { clips: 3, newClips: 3, camera: "Sony (C-series)", cameraHint: "Sony" });
+      .cardInserted("SONY_SD", { clips: 3, newClips: 3, camera: "Sony (C-series)", cameraHint: "Sony", exifHint: "SONY ILCE-7CM2" });
     const harness = scenario.build();
+    const preexistingAssetIds = new Set(Object.keys(harness.state.assets));
 
     let app = await renderApp(harness);
     let dialog = await openCardImport(app);
@@ -330,19 +332,17 @@ describe("choosing and remembering a camera identity (#71)", () => {
     expect(within(dialog).getByText("Sony (C-series)", { selector: "strong" })).toBeVisible();
     expect(within(dialog).getByText("Detected from this card.")).toBeVisible();
 
-    // Choose: no "Sony A7C II" exists in the project yet, so this is a
-    // deliberate new camera name, not a pick from the existing list.
-    await app.user.selectOptions(within(dialog).getByLabelText("Change camera"), "New camera name…");
-    await app.user.type(within(dialog).getByLabelText("New camera name"), "Sony A7C II");
-    await app.user.click(within(dialog).getByRole("button", { name: "Use this name" }));
+    // Choose the existing physical-camera identity rather than creating a
+    // second lane for this card's weak filename guess.
+    await app.user.selectOptions(within(dialog).getByLabelText("Change camera"), "Sony A7C II");
     await waitFor(() => expect(within(dialog).getByText("Sony A7C II", { selector: "strong" })).toBeVisible());
-    expect(within(dialog).getByText("You chose this camera for this import.")).toBeVisible();
+    expect(within(dialog).getByText(/Its camera metadata can be remembered/)).toBeVisible();
 
     // Import: every new asset lands under the chosen camera, not the weak
     // pattern guess — the sequence preview and asset ingest cannot disagree.
     await app.user.click(within(dialog).getByRole("button", { name: /Import 3 clips/ }));
     await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
-    const firstBatch = Object.values(harness.state.assets);
+    const firstBatch = Object.values(harness.state.assets).filter((asset) => !preexistingAssetIds.has(asset.id));
     expect(firstBatch).toHaveLength(3);
     for (const asset of firstBatch) expect(asset.camera).toBe("Sony A7C II");
 
@@ -354,20 +354,19 @@ describe("choosing and remembering a camera identity (#71)", () => {
     // fingerprints ("asset_<slug>_<counter>") don't collide with the first
     // batch's; the filename prefix ("SONY") is what matters for evidence,
     // and it still comes from the same first word.
-    scenario.cardInserted("SONY_SD_2", { clips: 1, newClips: 1, camera: "Sony (C-series) reformatted", cameraHint: "Sony" });
+    scenario.cardInserted("SONY_SD_2", { clips: 1, newClips: 1, camera: "Sony (C-series) reformatted", cameraHint: "Sony", exifHint: "SONY ILCE-7CM2" });
     const secondMountPath = harness.state.cards[0]?.mountPath;
+    const secondAssetId = harness.state.imports.additions[secondMountPath!]?.[0]?.id;
     expect(secondMountPath).not.toBe(firstMountPath);
     app = await app.remount();
 
     dialog = await openCardImport(app);
     expect(within(dialog).getByText("Sony A7C II", { selector: "strong" })).toBeVisible();
-    expect(within(dialog).getByText("Remembered from a previous import with matching card and filename evidence.")).toBeVisible();
+    expect(within(dialog).getByText("Remembered from a previous import with matching camera, card, and filename evidence.")).toBeVisible();
 
     await app.user.click(within(dialog).getByRole("button", { name: /Import 1 clip/ }));
-    await waitFor(() => expect(Object.keys(harness.state.assets)).toHaveLength(4));
-    const secondAsset = Object.values(harness.state.assets).find(
-      (asset) => !firstBatch.some((first) => first.id === asset.id),
-    );
+    await waitFor(() => expect(Object.keys(harness.state.assets)).toHaveLength(5));
+    const secondAsset = secondAssetId ? harness.state.assets[secondAssetId] : undefined;
     expect(secondAsset?.camera).toBe("Sony A7C II");
   });
 
@@ -376,7 +375,7 @@ describe("choosing and remembering a camera identity (#71)", () => {
       .project("Hokkaido field test", { id: "project_hokkaido" })
       .camera("Sony A7C II", { clips: 1, withProxy: true })
       .archiveRoot("NAS Video", { availableBytes: 1_200_000_000_000 })
-      .cardInserted("SONY_SD", { clips: 2, newClips: 2, camera: "Sony (C-series)", cameraHint: "Sony" });
+      .cardInserted("SONY_SD", { clips: 2, newClips: 2, camera: "Sony (C-series)", cameraHint: "Sony", exifHint: "SONY ILCE-7CM2" });
     const harness = scenario.build();
     const app = await renderApp(harness);
     const dialog = await openCardImport(app);
@@ -389,6 +388,30 @@ describe("choosing and remembering a camera identity (#71)", () => {
     for (const asset of Object.values(harness.state.assets)) {
       if (asset.filename.startsWith("SONY_")) expect(asset.camera).toBe("Sony A7C II");
     }
+  });
+
+  it("cannot import a stale camera plan when replanning the choice fails", async () => {
+    const harness = desktopScenario({ now: "2026-08-09T12:00:00.000Z" })
+      .project("Hokkaido field test", { id: "project_hokkaido" })
+      .camera("Sony A7C II", { clips: 1, withProxy: true })
+      .archiveRoot("NAS Video", { availableBytes: 1_200_000_000_000 })
+      .cardInserted("SONY_SD", {
+        clips: 1,
+        newClips: 1,
+        camera: "Sony (C-series)",
+        cameraHint: "Sony",
+        exifHint: "SONY ILCE-7CM2",
+      })
+      .build();
+    const app = await renderApp(harness);
+    const dialog = await openCardImport(app);
+
+    harness.next("preflight_import").reject("the source card disconnected");
+    await app.user.selectOptions(within(dialog).getByLabelText("Change camera"), "Sony A7C II");
+
+    expect(await within(dialog).findByRole("alert")).toHaveTextContent("the source card disconnected");
+    expect(within(dialog).queryByRole("button", { name: /Import 1 clip/ })).toBeNull();
+    expect(harness.calls("run_smart_import")).toHaveLength(0);
   });
 
   it("does not let a different camera under a generic label inherit a remembered mapping", async () => {
@@ -412,7 +435,7 @@ describe("choosing and remembering a camera identity (#71)", () => {
     const scenario = desktopScenario({ now: "2026-08-09T12:00:00.000Z" })
       .project("Hokkaido field test", { id: "project_hokkaido" })
       .archiveRoot("NAS Video", { availableBytes: 1_200_000_000_000 })
-      .cardInserted("SONY_SD", { clips: 1, newClips: 1, camera: "Sony (C-series)", cameraHint: "Sony" });
+      .cardInserted("SONY_SD", { clips: 1, newClips: 1, camera: "Sony (C-series)", cameraHint: "Sony", exifHint: "SONY ILCE-7CM2" });
     const harness = scenario.build();
     let app = await renderApp(harness);
     let dialog = await openCardImport(app);
@@ -437,14 +460,14 @@ describe("choosing and remembering a camera identity (#71)", () => {
     dialog = await screen.findByRole("dialog");
 
     await app.user.click(within(dialog).getByText("Remembered cameras (1)"));
-    expect(within(dialog).getByText("Sony · SONY")).toBeVisible();
-    const input = within(dialog).getByLabelText("Camera for Sony · SONY");
+    expect(within(dialog).getByText("Sony · SONY · SONY ILCE-7CM2")).toBeVisible();
+    const input = within(dialog).getByLabelText("Camera for Sony · SONY · SONY ILCE-7CM2");
     expect(input).toHaveValue("Sony A7C II");
 
     // Change.
     await app.user.clear(input);
     await app.user.type(input, "Sony A7C II mk2");
-    await app.user.click(within(dialog).getByRole("button", { name: "Save" }));
+    await app.user.click(within(dialog).getByRole("button", { name: "Save the remembered camera for Sony · SONY · SONY ILCE-7CM2" }));
     await waitFor(() =>
       expect(harness.state.imports.cameraMappings.project_hokkaido[0]?.camera).toBe("Sony A7C II mk2"),
     );
@@ -452,7 +475,7 @@ describe("choosing and remembering a camera identity (#71)", () => {
 
     // Clear.
     await app.user.click(
-      within(dialog).getByRole("button", { name: "Clear the remembered camera for Sony · SONY" }),
+      within(dialog).getByRole("button", { name: "Clear the remembered camera for Sony · SONY · SONY ILCE-7CM2" }),
     );
     await waitFor(() => expect(harness.state.imports.cameraMappings.project_hokkaido).toHaveLength(0));
     expect(within(dialog).queryByText(/Remembered cameras/)).toBeNull();
