@@ -1,7 +1,15 @@
-import { useEffect, useMemo, useState } from "react";
-import type { ArchiveRoot, CardCandidate, ImportPreflight, ImportProgress, ImportRunReport, ImportSequenceBoundaryEvidence } from "../types";
+import { useEffect, useMemo, useRef, useState } from "react";
+import type {
+  ArchiveRoot,
+  CardCandidate,
+  ImportPreflight,
+  ImportProgress,
+  ImportRunReport,
+  ImportSequenceBoundaryEvidence,
+  ImportSequenceRunPreview,
+} from "../types";
 import { formatBytes } from "../review/summaries";
-import { formatDuration } from "../review/format";
+import { FileLedger } from "./ImportFileLedger";
 
 export interface ImportDialogProps {
   projectName: string;
@@ -64,10 +72,65 @@ export function ImportDialog({
 }: ImportDialogProps) {
   const [newRootName, setNewRootName] = useState("");
   const [showNewRoot, setShowNewRoot] = useState(false);
+  const [ledgerOpen, setLedgerOpen] = useState(false);
+  const [ledgerFocusPath, setLedgerFocusPath] = useState<string | null>(null);
+  const ledgerListRef = useRef<HTMLUListElement>(null);
   const selectedRoot = roots.find((root) => root.id === selectedRootId) ?? null;
-  const title = card ? `${card.label} detected` : "Add media folder";
-  const subtitle = card?.cameraHint || (card ? "Camera card" : "Reference originals in place");
-  const actionable = (plan?.newClips ?? 0) + (plan?.relinkable ?? 0);
+
+  // A card's `label` is just the mount directory's own name, which is often a
+  // generic default like "Untitled" — not an identity worth leading with. The
+  // camera family, when known, is the more legible headline; the volume name
+  // stays visible as the secondary line rather than disappearing.
+  const cameraLabel = card?.cameraHint.trim() || "";
+  const title = card ? (cameraLabel ? `${cameraLabel} — Volume ${card.label}` : card.label) : "Add media folder";
+  const identityLine = card ? noun(card.clipCount, "clip") : "Reference originals in place";
+
+  const newClips = plan?.newClips ?? 0;
+  const relinkable = plan?.relinkable ?? 0;
+  const missingProxies = plan?.missingProxies ?? 0;
+  const alreadyKnown = (plan?.knownClips ?? 0) + missingProxies - newClips;
+  const collisions = plan?.collisions ?? 0;
+  const unreadable = plan?.unreadable ?? 0;
+  const attentionFileCount = collisions + unreadable;
+  const blockedReason = plan?.destination.blockedReason ?? "";
+  const needsAttention = attentionFileCount > 0 || Boolean(blockedReason);
+  const actionable = newClips + relinkable;
+  const summaryState: "attention" | "ready" | "uptodate" = needsAttention
+    ? "attention"
+    : actionable > 0
+      ? "ready"
+      : "uptodate";
+  const summaryHeadline = needsAttention ? "Needs attention" : actionable > 0 ? "Ready to import" : "Nothing new to import";
+
+  // Only the numbers that change what the user should do lead the summary;
+  // bookkeeping totals (scanned, already known) live behind the details
+  // disclosure below instead of crowding four counters up front.
+  const leadStats: string[] = [];
+  if (newClips > 0) leadStats.push(noun(newClips, "new clip"));
+  if (relinkable > 0) leadStats.push(`${noun(relinkable, "clip")} to reconnect`);
+  if (missingProxies > 0 && actionable > 0 && makeProxies) leadStats.push(`${noun(missingProxies, "proxy", "proxies")} will be made`);
+  const staleProxyNote =
+    summaryState === "uptodate" && missingProxies > 0
+      ? `${noun(missingProxies, "clip")} already imported still need proxies`
+      : "";
+
+  function reviewAttentionFiles() {
+    const target = plan?.items.find(
+      (item) => item.classification === "pathCollision" || item.classification === "unreadable",
+    );
+    setLedgerFocusPath(target?.path ?? null);
+    setLedgerOpen(true);
+  }
+
+  useEffect(() => {
+    if (!ledgerOpen || !ledgerFocusPath || !ledgerListRef.current) return;
+    const row = Array.from(ledgerListRef.current.querySelectorAll<HTMLLIElement>("li")).find(
+      (item) => item.dataset.path === ledgerFocusPath,
+    );
+    row?.scrollIntoView({ block: "center" });
+    row?.focus();
+  }, [ledgerOpen, ledgerFocusPath]);
+
   const workPercent = useMemo(() => {
     if (!progress) return 0;
     if (progress.totalBytes > 0) return Math.min(100, (progress.completedBytes / progress.totalBytes) * 100);
@@ -93,7 +156,7 @@ export function ImportDialog({
           <div>
             <p className="eyebrow">Smart ingest</p>
             <h2 id="import-title">{title}</h2>
-            <p>{subtitle}{card ? ` · ${noun(card.clipCount, "clip")}` : ""}</p>
+            <p>{identityLine}</p>
           </div>
           <button className="context-modal-close" aria-label="Close import dialog" disabled={running} onClick={onClose}>×</button>
         </header>
@@ -129,12 +192,33 @@ export function ImportDialog({
           </div>
         ) : (
           <div className="import-body">
-            <div className="import-delta" aria-label="Import summary">
-              <strong>{plan?.scanned ?? card?.clipCount ?? 0}</strong><span>clips scanned</span>
-              <strong>{plan?.newClips ?? 0}</strong><span>new to {projectName}</span>
-              <strong>{(plan?.knownClips ?? 0) + (plan?.missingProxies ?? 0) - (plan?.newClips ?? 0)}</strong><span>already known</span>
-              <strong>{plan?.missingProxies ?? 0}</strong><span>need proxies</span>
-            </div>
+            {plan && (
+              <div className="import-summary" data-state={summaryState} aria-label="Import summary">
+                <p className="import-summary-headline">{summaryHeadline}</p>
+                {leadStats.length > 0 && <p className="import-summary-stats">{leadStats.join(" · ")}</p>}
+                {staleProxyNote && <p className="import-summary-stats">{staleProxyNote}</p>}
+                {attentionFileCount > 0 && (
+                  <p className="import-warning">
+                    {[collisions > 0 ? noun(collisions, "path collision") : "", unreadable > 0 ? noun(unreadable, "unreadable file") : ""]
+                      .filter(Boolean)
+                      .join(" · ")}
+                    . These stay untouched.{" "}
+                    <button type="button" className="text-button" onClick={reviewAttentionFiles}>
+                      Review {noun(attentionFileCount, "file")}
+                    </button>
+                  </p>
+                )}
+                <details className="import-summary-bookkeeping">
+                  <summary>All counts</summary>
+                  <div className="import-delta">
+                    <strong>{plan.scanned}</strong><span>clips scanned</span>
+                    <strong>{newClips}</strong><span>new to {projectName}</span>
+                    <strong>{alreadyKnown}</strong><span>already known</span>
+                    <strong>{missingProxies}</strong><span>need proxies</span>
+                  </div>
+                </details>
+              </div>
+            )}
 
             <div className="import-route" aria-label="Media destinations">
               <div className="import-route-node source">
@@ -203,10 +287,7 @@ export function ImportDialog({
             )}
 
             {loading && <p className="import-loading" role="status">Scanning without changing the project…</p>}
-            {plan?.destination.blockedReason && <p className="context-modal-error" role="alert">{plan.destination.blockedReason}</p>}
-            {plan && (plan.collisions > 0 || plan.unreadable > 0) && (
-              <p className="import-warning">{noun(plan.collisions, "path collision")} · {noun(plan.unreadable, "unreadable file")}. These stay untouched and appear in the file ledger.</p>
-            )}
+            {blockedReason && <p className="context-modal-error" role="alert">{blockedReason}</p>}
             {error && <p className="context-modal-error" role="alert">{error}</p>}
 
             <div className="import-options">
@@ -214,7 +295,16 @@ export function ImportDialog({
               <label><input type="checkbox" checked={makeProxies} onChange={(event) => onMakeProxies(event.target.checked)} /> Make missing proxies after import</label>
             </div>
 
-            {plan && <details className="import-file-ledger"><summary>Preview every file</summary><FileLedger plan={plan} /></details>}
+            {plan && (
+              <details
+                className="import-file-ledger"
+                open={ledgerOpen}
+                onToggle={(event) => setLedgerOpen((event.target as HTMLDetailsElement).open)}
+              >
+                <summary>Preview every file</summary>
+                <FileLedger plan={plan} listRef={ledgerListRef} />
+              </details>
+            )}
           </div>
         )}
 
@@ -263,94 +353,93 @@ function evidenceDescription(evidence: ImportSequenceBoundaryEvidence) {
   }
 }
 
-function SequencePreview({ preview }: { preview: NonNullable<ImportPreflight["sequencePreview"]> }) {
-  const matched = preview.matchedExistingSequenceCount > 0 && preview.suggestedNewSequenceCount === 0;
+/**
+ * A `proposeNew` run compared against a specific existing sequence is the one
+ * case the algorithm itself flags as ambiguous — it found a candidate match
+ * and rejected it. That is worth a look before the user confirms it in
+ * Chronology. A run with nothing to compare against (first-ever footage) or a
+ * clean extension of a known sequence is routine and does not need to block
+ * the reader on capture-sequence machinery before importing.
+ */
+function sequenceRunKind(run: ImportSequenceRunPreview): "extend" | "attention" | "new" {
+  if (run.decision === "extendExisting") return "extend";
+  return run.comparedExistingSequenceId ? "attention" : "new";
+}
+
+function SequenceRunList({ runs }: { runs: ImportSequenceRunPreview[] }) {
   return (
-    <section className="import-sequence-preview" aria-label="Capture sequence preview">
-      <div className="import-sequence-heading">
-        <div>
-          <span className="import-route-kicker">Chronology preflight</span>
-          <strong>{noun(preview.proposedSequenceCount, "incoming card run")}</strong>
-        </div>
-        <span className={preview.suggestedNewSequenceCount > 0 ? "is-new" : "is-matched"}>
-          {matched ? "Fits the project" : noun(preview.suggestedNewSequenceCount, "new sequence")}
-        </span>
+    <ol className="import-sequence-runs">
+      {runs.map((run) => {
+        const kind = sequenceRunKind(run);
+        const first = run.firstRelativePath.split("/").at(-1);
+        const last = run.lastRelativePath.split("/").at(-1);
+        return (
+          <li
+            key={`${run.firstRelativePath}:${run.lastRelativePath}`}
+            data-decision={run.decision}
+            data-attention={kind === "attention" ? "true" : undefined}
+          >
+            <div className="import-sequence-evidence">
+              {run.evidence.map((evidence, index) => (
+                <span key={`${evidence.kind}:${index}`} title={evidenceDescription(evidence)}>{evidenceLabel(evidence)}</span>
+              ))}
+            </div>
+            <div className="import-sequence-run-copy">
+              <strong>
+                {kind === "extend"
+                  ? <>Extends “{run.matchedExistingSequenceLabel}” by {noun(run.clipCount, "clip")}</>
+                  : <>Proposes a new sequence for {noun(run.clipCount, "clip")}</>}
+              </strong>
+              <small>{run.cameraKey} · {first}{first === last ? "" : ` → ${last}`}</small>
+              <p>{run.reason}</p>
+            </div>
+            <em>{kind === "extend" ? "Existing sequence" : kind === "attention" ? "Review before confirming" : "New sequence"}</em>
+          </li>
+        );
+      })}
+    </ol>
+  );
+}
+
+function SequencePreview({ preview }: { preview: NonNullable<ImportPreflight["sequencePreview"]> }) {
+  const attentionRuns = preview.runs.filter((run) => sequenceRunKind(run) === "attention");
+
+  const heading = (
+    <div className="import-sequence-heading">
+      <div>
+        <span className="import-route-kicker">Chronology preflight</span>
+        <strong>{noun(preview.proposedSequenceCount, "incoming card run")}</strong>
       </div>
-      <p>
-        {matched
-          ? `${noun(preview.newClipCount, "new clip")} fit the named capture sequences below.`
-          : `${noun(preview.newClipCount, "new clip")} are grouped below from card, folder, filename, and timestamp evidence.`}
+      {attentionRuns.length > 0 && <span className="is-attention">Needs a look</span>}
+    </div>
+  );
+  const footer = <footer>Suggestions only — importing never changes chronology until you confirm it in Chronology.</footer>;
+
+  if (attentionRuns.length === 0) {
+    // Nothing here needs a decision before import — collapse it to one line
+    // so routine chronology bookkeeping never has to be read before copying.
+    return (
+      <section className="import-sequence-preview is-routine" aria-label="Capture sequence preview">
+        <details>
+          <summary>Chronology suggestions ready for later review</summary>
+          {heading}
+          <SequenceRunList runs={preview.runs} />
+          {footer}
+        </details>
+      </section>
+    );
+  }
+
+  return (
+    <section className="import-sequence-preview is-attention" aria-label="Capture sequence preview">
+      {heading}
+      <p className="import-sequence-attention-note">
+        {noun(attentionRuns.length, "sequence proposal")} {attentionRuns.length === 1 ? "differs" : "differ"} from an
+        existing named sequence and {attentionRuns.length === 1 ? "is" : "are"} worth a look before you confirm{" "}
+        {attentionRuns.length === 1 ? "it" : "them"} in Chronology — the rest can wait until after import.
       </p>
-      <ol className="import-sequence-runs">
-        {preview.runs.map((run) => {
-          const first = run.firstRelativePath.split("/").at(-1);
-          const last = run.lastRelativePath.split("/").at(-1);
-          const extendsExisting = run.decision === "extendExisting";
-          return (
-            <li key={`${run.firstRelativePath}:${run.lastRelativePath}`} data-decision={run.decision}>
-              <div className="import-sequence-evidence">
-                {run.evidence.map((evidence, index) => (
-                  <span key={`${evidence.kind}:${index}`} title={evidenceDescription(evidence)}>{evidenceLabel(evidence)}</span>
-                ))}
-              </div>
-              <div className="import-sequence-run-copy">
-                <strong>
-                  {extendsExisting
-                    ? <>Extends “{run.matchedExistingSequenceLabel}” by {noun(run.clipCount, "clip")}</>
-                    : <>Proposes a new sequence for {noun(run.clipCount, "clip")}</>}
-                </strong>
-                <small>{run.cameraKey} · {first}{first === last ? "" : ` → ${last}`}</small>
-                <p>{run.reason}</p>
-              </div>
-              <em>{extendsExisting ? "Existing sequence" : "Review in Chronology"}</em>
-            </li>
-          );
-        })}
-      </ol>
-      <footer>Suggestions only — importing never changes chronology until you confirm it in Chronology.</footer>
+      <SequenceRunList runs={preview.runs} />
+      {footer}
     </section>
   );
-}
-
-function FileLedger({ plan, report }: { plan: ImportPreflight | null; report?: ImportRunReport }) {
-  if (!plan) return <p>No file plan is available.</p>;
-  const failed = new Map(report?.outcome.failures.map((failure) => [failure.path, failure.error]));
-  const metadata = new Map(report?.files.map((file) => [file.path, file]));
-  return (
-    <ul>
-      {plan.items.map((item) => (
-        <li key={item.path}>
-          <span className="import-file-name">{item.filename}</span>
-          {report && (
-            <>
-              <time dateTime={metadata.get(item.path)?.timestamp ?? undefined}>
-                {formatImportTimestamp(metadata.get(item.path)?.timestamp ?? null)}
-              </time>
-              <span className="import-file-duration">
-                {metadata.get(item.path)?.durationSeconds != null
-                  ? formatDuration(metadata.get(item.path)!.durationSeconds!)
-                  : "—"}
-              </span>
-            </>
-          )}
-          <span className="import-file-status">{failed.has(item.path) ? "failed" : item.classification.replace(/([A-Z])/g, " $1").toLowerCase()}</span>
-          {(failed.get(item.path) || item.error) && <small>{failed.get(item.path) || item.error}</small>}
-        </li>
-      ))}
-    </ul>
-  );
-}
-
-function formatImportTimestamp(value: string | null) {
-  if (!value) return "—";
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return value;
-  return date.toLocaleString(undefined, {
-    year: "numeric",
-    month: "short",
-    day: "numeric",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-  });
 }

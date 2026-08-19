@@ -784,6 +784,20 @@ kbd { padding: 2px 4px; color: #a8b1b6; background: #262d32; border: 1px solid #
 .import-delta strong { color: var(--ink); font: 600 21px/25px ui-monospace, SFMono-Regular, Menlo, monospace; }
 .import-delta span { color: var(--quiet); font-size: 10px; }
 
+/* The decision the user actually needs: is this card safe to import right
+   now? Everything else — scan totals, already-known counts — is bookkeeping
+   that stays behind the details disclosure below it. */
+.import-summary { margin-bottom: 16px; padding: 14px 16px; background: #12191b; border: 1px solid var(--line); border-radius: 7px; }
+.import-summary-headline { margin: 0; color: var(--cyan); font-size: 13px; font-weight: 600; letter-spacing: -.01em; }
+.import-summary[data-state="attention"] .import-summary-headline { color: var(--amber); }
+.import-summary[data-state="uptodate"] .import-summary-headline { color: var(--muted); }
+.import-summary-stats { margin: 5px 0 0; color: var(--quiet); font: 11px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
+.import-summary .import-warning { margin-top: 9px; }
+.import-summary .import-warning .text-button { margin-left: 2px; color: var(--amber); text-decoration: underline; }
+.import-summary-bookkeeping { margin-top: 12px; padding-top: 11px; border-top: 1px solid var(--line); }
+.import-summary-bookkeeping summary { color: var(--quiet); cursor: pointer; font-size: 10px; }
+.import-summary-bookkeeping .import-delta { margin: 9px 0 0; }
+
 /* The route is the dialog's one visual flourish, and carries actual meaning:
    card bytes become durable originals, then lightweight review media. */
 .import-route { display: grid; grid-template-columns: minmax(0, .82fr) 22px minmax(0, 1.35fr) 22px minmax(0, .9fr); align-items: stretch; padding: 5px; background: #111719; border: 1px solid var(--line); border-radius: 7px; }
@@ -800,17 +814,23 @@ kbd { padding: 2px 4px; color: #a8b1b6; background: #262d32; border: 1px solid #
 .import-sequence-heading strong { color: var(--ink); font-size: 12px; }
 .import-sequence-heading > span { padding: 4px 8px; color: var(--amber); background: rgba(216,161,87,.09); border: 1px solid rgba(216,161,87,.25); border-radius: 999px; font: 10px/1 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: nowrap; }
 .import-sequence-heading > span.is-matched { color: var(--cyan); background: rgba(87,195,205,.07); border-color: rgba(87,195,205,.24); }
+.import-sequence-heading > span.is-attention { color: var(--red); background: rgba(230,120,104,.1); border-color: rgba(230,120,104,.32); }
 .import-sequence-preview > p { margin: 9px 0 0; color: var(--quiet); font-size: 10px; }
+.import-sequence-preview.is-attention { background: linear-gradient(135deg, rgba(230,120,104,.09), rgba(18,24,26,.72)); border-color: rgba(230,120,104,.3); }
+.import-sequence-attention-note { margin: 9px 0 0; color: var(--red); font-size: 10px; line-height: 1.5; }
 .import-sequence-preview details { margin-top: 10px; }
+.import-sequence-preview.is-routine > details { margin-top: 0; }
 .import-sequence-preview summary { color: var(--amber); cursor: pointer; font-size: 10px; }
 .import-sequence-preview ol { display: grid; gap: 4px; max-height: 126px; margin: 8px 0 0; padding: 0; overflow-y: auto; list-style: none; }
 .import-sequence-preview li { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 8px; align-items: center; padding: 8px; background: rgba(7,11,12,.32); border-left: 2px solid rgba(216,161,87,.52); }
 .import-sequence-preview li[data-decision="extendExisting"] { border-left-color: rgba(87,195,205,.62); }
+.import-sequence-preview li[data-attention="true"] { border-left-color: var(--red); }
 .import-sequence-run-copy { min-width: 0; display: grid; gap: 2px; }
 .import-sequence-preview li strong { color: var(--ink); font: 10px/1.25 ui-monospace, SFMono-Regular, Menlo, monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .import-sequence-preview li small { color: var(--quiet); overflow: hidden; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
 .import-sequence-preview li p { margin: 2px 0 0; color: var(--muted); font-size: 10px; }
 .import-sequence-preview li em { color: var(--amber); font: normal 10px/1 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: nowrap; }
+.import-sequence-preview li[data-attention="true"] em { color: var(--red); }
 .import-sequence-evidence { display: flex; gap: 4px; }
 .import-sequence-evidence span { padding: 2px 4px; color: var(--amber); background: rgba(216,161,87,.08); border: 1px solid rgba(216,161,87,.2); border-radius: 4px; font: 10px/1 ui-monospace, SFMono-Regular, Menlo, monospace; text-transform: uppercase; }
 .import-sequence-preview footer { margin-top: 8px; padding-top: 8px; color: var(--quiet); border-top: 1px solid rgba(216,161,87,.15); font-size: 10px; }
@@ -829,7 +849,9 @@ kbd { padding: 2px 4px; color: #a8b1b6; background: #262d32; border: 1px solid #
 .import-file-ledger { margin-top: 14px; color: var(--quiet); font-size: 10px; }
 .import-file-ledger summary { cursor: pointer; color: var(--cyan); }
 .import-file-ledger ul { display: grid; max-height: 180px; margin: 9px 0 0; padding: 0; overflow-y: auto; list-style: none; border-top: 1px solid var(--line); }
-.import-file-ledger li { display: grid; grid-template-columns: minmax(0, 1fr) auto auto auto; gap: 2px 16px; align-items: baseline; padding: 7px 4px; border-bottom: 1px solid var(--line); }
+.import-file-ledger li { display: grid; grid-template-columns: minmax(0, 1fr) auto auto auto; gap: 2px 16px; align-items: baseline; padding: 7px 4px; border-bottom: 1px solid var(--line); border-left: 2px solid transparent; }
+.import-file-ledger li[data-attention="true"] { border-left-color: var(--amber); }
+.import-file-ledger li:focus { outline: 2px solid var(--cyan); outline-offset: -2px; }
 .import-file-ledger .import-file-name { color: var(--ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .import-file-ledger time, .import-file-ledger .import-file-duration { color: var(--quiet); font-variant-numeric: tabular-nums; white-space: nowrap; }
 .import-file-ledger .import-file-status { white-space: nowrap; }
