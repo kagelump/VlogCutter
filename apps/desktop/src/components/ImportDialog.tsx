@@ -1,8 +1,10 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { api } from "../api";
 import type {
   ArchiveRoot,
   CardCandidate,
   ImportPreflight,
+  ImportPreviewItem,
   ImportProgress,
   ImportRunReport,
   ImportSequenceBoundaryEvidence,
@@ -76,6 +78,40 @@ export function ImportDialog({
   const [ledgerFocusPath, setLedgerFocusPath] = useState<string | null>(null);
   const ledgerListRef = useRef<HTMLUListElement>(null);
   const selectedRoot = roots.find((root) => root.id === selectedRootId) ?? null;
+
+  // #65: posters/duration/capture time for the rows the ledger is actually
+  // showing, fetched lazily as they scroll into view (`FileLedger`'s
+  // `onVisible`). Kept here rather than in the ledger itself so it survives
+  // the preflight ledger unmounting and the completed-run ledger mounting in
+  // its place — both read from and write to the same cache.
+  const [previews, setPreviews] = useState<Map<string, ImportPreviewItem>>(new Map());
+  const previewsInFlight = useRef<Set<string>>(new Set());
+  const requestPreviews = useCallback(
+    (paths: string[]) => {
+      const fresh = paths.filter((path) => !previewsInFlight.current.has(path));
+      if (fresh.length === 0) return;
+      for (const path of fresh) previewsInFlight.current.add(path);
+      const requests = fresh.map((path) => ({
+        path,
+        fingerprint: plan?.items.find((item) => item.path === path)?.fingerprint ?? null,
+      }));
+      api
+        .generateImportPreview(requests)
+        .then((results) => {
+          setPreviews((current) => {
+            const next = new Map(current);
+            for (const result of results) next.set(result.path, result);
+            return next;
+          });
+        })
+        .catch(() => {
+          // A batch failure degrades these rows to their placeholder/
+          // best-available data only; it must never block Import, and a
+          // stuck row is simply never retried within this dialog session.
+        });
+    },
+    [plan],
+  );
 
   // A card's `label` is just the mount directory's own name, which is often a
   // generic default like "Untitled" — not an identity worth leading with. The
@@ -174,7 +210,7 @@ export function ImportDialog({
             </div>
             <details className="import-file-ledger">
               <summary>Review every file</summary>
-              <FileLedger plan={plan} report={report} />
+              <FileLedger plan={plan} report={report} previews={previews} onVisible={requestPreviews} />
             </details>
           </div>
         ) : running || (loading && progress) ? (
@@ -302,7 +338,7 @@ export function ImportDialog({
                 onToggle={(event) => setLedgerOpen((event.target as HTMLDetailsElement).open)}
               >
                 <summary>Preview every file</summary>
-                <FileLedger plan={plan} listRef={ledgerListRef} />
+                <FileLedger plan={plan} listRef={ledgerListRef} previews={previews} onVisible={requestPreviews} />
               </details>
             )}
           </div>

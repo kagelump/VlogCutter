@@ -486,6 +486,8 @@ mod tests {
                     classification: Classification::New,
                     asset_id: None,
                     error: String::new(),
+                    fingerprint: None,
+                    filesystem_modified_at: None,
                 },
                 PreflightItem {
                     path: "/Volumes/CARD/relinked.MP4".to_string(),
@@ -495,6 +497,8 @@ mod tests {
                     classification: Classification::KnownRelinkable,
                     asset_id: Some("asset_relinked".to_string()),
                     error: String::new(),
+                    fingerprint: None,
+                    filesystem_modified_at: None,
                 },
                 PreflightItem {
                     path: "/Volumes/CARD/existing.MP4".to_string(),
@@ -504,6 +508,8 @@ mod tests {
                     classification: Classification::KnownVerified,
                     asset_id: Some("asset_existing".to_string()),
                     error: String::new(),
+                    fingerprint: None,
+                    filesystem_modified_at: None,
                 },
             ],
         };

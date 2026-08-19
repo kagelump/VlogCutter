@@ -16,6 +16,7 @@
 //! problem, and only for files that turn out to be new.
 
 use anyhow::Result;
+use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -172,6 +173,22 @@ pub struct PreflightItem {
     pub asset_id: Option<String>,
     /// Why a file could not be classified. Empty unless `Unreadable`.
     pub error: String,
+    /// The sampled content fingerprint already computed to answer "is this
+    /// known" (see this module's cost-discipline note above). Reused as the
+    /// cache key for import-preview posters so identical bytes at a
+    /// different path do not re-decode. Absent when the file could not be
+    /// read well enough to classify (`Unreadable`).
+    #[serde(default)]
+    pub fingerprint: Option<String>,
+    /// The file's own filesystem modification time, RFC 3339 UTC, read from
+    /// the same `stat` preflight already pays for every candidate. This is a
+    /// best-available stand-in for a probed capture time, not a claim about
+    /// when the footage was actually shot — ffprobe never runs during
+    /// preflight (see this module's doc comment). Import-preview's probed
+    /// capture time, and after import the asset's own probed `bestTime`,
+    /// both supersede it.
+    #[serde(default)]
+    pub filesystem_modified_at: Option<String>,
 }
 
 /// Where an import would put originals, stated plainly enough to show a user.
@@ -637,12 +654,15 @@ impl Catalog {
             classification: Classification::Unreadable,
             asset_id: None,
             error: String::new(),
+            fingerprint: None,
+            filesystem_modified_at: filesystem_modified_at(path),
         };
         match self.classify_inner(project_id, path, &relative_path, archive_root_id, card) {
-            Ok((classification, asset_id, size_bytes)) => {
+            Ok((classification, asset_id, size_bytes, fingerprint)) => {
                 item.classification = classification;
                 item.asset_id = asset_id;
                 item.size_bytes = size_bytes;
+                item.fingerprint = Some(fingerprint);
             }
             Err(error) => item.error = format!("{error:#}"),
         }
@@ -656,7 +676,7 @@ impl Catalog {
         relative_path: &str,
         archive_root_id: Option<&str>,
         card: Option<&CardCandidate>,
-    ) -> Result<(Classification, Option<String>, u64)> {
+    ) -> Result<(Classification, Option<String>, u64, String)> {
         let size_bytes = std::fs::metadata(path)?.len();
         let fingerprint = sampled_media_fingerprint(path, size_bytes)?;
         let connection = self.connection()?;
@@ -676,10 +696,10 @@ impl Catalog {
                 if target.is_file() {
                     // Same name, different content. Overwriting an archived
                     // original is never the answer.
-                    return Ok((Classification::PathCollision, None, size_bytes));
+                    return Ok((Classification::PathCollision, None, size_bytes, fingerprint));
                 }
             }
-            return Ok((Classification::New, None, size_bytes));
+            return Ok((Classification::New, None, size_bytes, fingerprint));
         };
 
         if membership_removed {
@@ -694,12 +714,12 @@ impl Catalog {
                 if target.is_file() {
                     let target_size = std::fs::metadata(&target)?.len();
                     if sampled_media_fingerprint(&target, target_size)? == fingerprint {
-                        return Ok((Classification::New, Some(asset_id), size_bytes));
+                        return Ok((Classification::New, Some(asset_id), size_bytes, fingerprint));
                     }
-                    return Ok((Classification::PathCollision, None, size_bytes));
+                    return Ok((Classification::PathCollision, None, size_bytes, fingerprint));
                 }
             }
-            return Ok((Classification::New, Some(asset_id), size_bytes));
+            return Ok((Classification::New, Some(asset_id), size_bytes, fingerprint));
         }
 
         // Known content. Can the asset actually reach an original right now?
@@ -710,17 +730,28 @@ impl Catalog {
             recorded.and_then(|found| found.guard),
         );
         if !reachable {
-            return Ok((Classification::KnownRelinkable, Some(asset_id), size_bytes));
+            return Ok((
+                Classification::KnownRelinkable,
+                Some(asset_id),
+                size_bytes,
+                fingerprint,
+            ));
         }
         drop(connection);
         let asset = self.get_asset(&asset_id)?;
         if has_current_proxy(&asset) {
-            Ok((Classification::KnownVerified, Some(asset_id), size_bytes))
+            Ok((
+                Classification::KnownVerified,
+                Some(asset_id),
+                size_bytes,
+                fingerprint,
+            ))
         } else {
             Ok((
                 Classification::KnownMissingProxy,
                 Some(asset_id),
                 size_bytes,
+                fingerprint,
             ))
         }
     }
@@ -1130,6 +1161,14 @@ impl Catalog {
             )
             .optional()?)
     }
+}
+
+/// The file's own filesystem modification time, RFC 3339 UTC. One `stat`,
+/// same cost as the one every candidate already pays for size and the
+/// sequence-boundary evidence above — never a probed capture time.
+fn filesystem_modified_at(path: &Path) -> Option<String> {
+    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
+    Some(DateTime::<Utc>::from(modified).to_rfc3339_opts(SecondsFormat::Millis, true))
 }
 
 fn count(items: &[PreflightItem], classification: Classification) -> usize {
@@ -1655,6 +1694,59 @@ mod tests {
             .unwrap();
         assert_eq!(relinkable.asset_id.as_deref(), Some("asset_lost"));
         assert_eq!(relinkable.relative_path, "DCIM/100MSDCF/C0002.MP4");
+
+        // #65: every readable candidate carries the fingerprint already spent
+        // to classify it (the import-preview cache key) and a cheap
+        // filesystem timestamp, without preflight running ffprobe.
+        for item in &preflight.items {
+            assert!(
+                item.fingerprint.is_some(),
+                "{} should carry the fingerprint classification already computed",
+                item.filename
+            );
+            assert!(
+                item.filesystem_modified_at.is_some(),
+                "{} should carry a best-available filesystem timestamp",
+                item.filename
+            );
+        }
+    }
+
+    /// A file preflight cannot read still classifies (as `Unreadable`) rather
+    /// than aborting the whole scan, and it still keeps the one field that
+    /// costs only a `stat`: a failed fingerprint read must not also lose the
+    /// cheap filesystem timestamp a caller could still show for the row.
+    #[test]
+    #[cfg(unix)]
+    fn an_unreadable_file_still_keeps_its_cheap_filesystem_timestamp() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempdir().unwrap();
+        let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).unwrap();
+        let project = catalog.create_project("Spain 2026").unwrap();
+        let mount = card_fixture(directory.path(), &[("C0001.MP4", b"will be locked")]);
+        let clip = mount.join("DCIM/100MSDCF/C0001.MP4");
+        fs::set_permissions(&clip, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let preflight = catalog
+            .preflight_import(&project.id, &mount, None, |_, _, _| true)
+            .unwrap();
+
+        assert_eq!(preflight.unreadable, 1);
+        let item = &preflight.items[0];
+        assert_eq!(item.classification, Classification::Unreadable);
+        assert!(!item.error.is_empty());
+        assert!(
+            item.fingerprint.is_none(),
+            "a file that could not be opened has no fingerprint to reuse"
+        );
+        assert!(
+            item.filesystem_modified_at.is_some(),
+            "a stat does not require read permission, so the timestamp still degrades gracefully rather than disappearing"
+        );
+
+        // Restore permissions so the temp directory can clean itself up.
+        fs::set_permissions(&clip, fs::Permissions::from_mode(0o644)).unwrap();
     }
 
     /// A preview that half-imports is not a preview.

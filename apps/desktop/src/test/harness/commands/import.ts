@@ -16,6 +16,7 @@ import type {
   Asset,
   CardCandidate,
   ImportPreflight,
+  ImportPreviewItem,
   ImportProgress,
   ImportRollbackPreview,
   ImportRunReport,
@@ -64,6 +65,11 @@ function preflight(
     classification: state.assets[asset.id] ? "knownVerified" : "new",
     assetId: state.assets[asset.id] ? asset.id : null,
     error: "",
+    // A cheap stand-in for what real preflight computes from one `stat`: the
+    // harness has no filesystem, so it reuses the scenario's own capture time
+    // rather than modelling a distinct mtime.
+    fingerprint: asset.fingerprint,
+    filesystemModifiedAt: asset.bestTime ?? asset.capturedAtRaw ?? null,
   }));
 
   return {
@@ -273,6 +279,35 @@ export const importCommands: CommandTable = {
       result: (outcome) => runReport(context.state, tally, plan, Boolean(outcome?.cancelled) || controller.isCancelled, makeProxies),
     };
     return controller.bind(binding);
+  },
+
+  /**
+   * The harness has no ffmpeg/ffprobe and no filesystem, so it stands in
+   * with whatever the scenario already knows about a same-filename addition
+   * — good enough to exercise the frontend's fetch-and-cache wiring without
+   * claiming to be real media evidence (see `docs/integration-testing.md`).
+   * A request naming a file no scenario declared degrades to `error`, the
+   * same shape a real unreadable/missing-tool file would produce.
+   */
+  generate_import_preview: (args, { state }): ImportPreviewItem[] => {
+    const requests = args.requests;
+    if (!Array.isArray(requests)) throw new Error("generate_import_preview requires requests");
+    const known = Object.values(state.imports.additions).flat();
+    return requests.map((request) => {
+      const path = typeof request?.path === "string" ? request.path : "";
+      const filename = path.split("/").pop() ?? path;
+      const asset = known.find((candidate) => candidate.filename === filename);
+      if (!asset) {
+        return { path, thumbnailPath: null, durationSeconds: null, capturedAt: null, error: "no preview available in the harness for this file" };
+      }
+      return {
+        path,
+        thumbnailPath: `/fake/import-preview/${request.fingerprint ?? filename}.jpg`,
+        durationSeconds: asset.durationSeconds,
+        capturedAt: asset.bestTime ?? asset.capturedAtRaw ?? null,
+        error: null,
+      };
+    });
   },
 
   cancel_import: (_args, { jobs }) => {

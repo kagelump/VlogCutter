@@ -30,6 +30,7 @@ mod diagnostics;
 mod editplan;
 mod identifiers;
 mod import_history;
+mod import_preview;
 mod locations;
 mod migrations;
 mod operations;
@@ -73,6 +74,7 @@ pub use import_history::{
     ImportHistoryEntry, ImportRollbackModifiedClip, ImportRollbackPreview, ImportSessionDetail,
     ImportSessionFile,
 };
+pub use import_preview::{ImportPreviewItem, ImportPreviewRequest};
 pub use preflight::{
     Classification, ImportDestination, ImportOutcome, ImportPreflight, ImportProgress,
     ImportSequenceBoundary, ImportSequenceBoundaryEvidence, ImportSequencePreview,

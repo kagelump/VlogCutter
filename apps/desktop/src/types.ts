@@ -320,6 +320,42 @@ export interface PreflightItem {
   classification: ImportClassification;
   assetId: string | null;
   error: string;
+  /**
+   * The sampled content fingerprint already spent to classify this file.
+   * Reused as the import-preview poster cache key. Absent when the file
+   * could not be read well enough to classify (`unreadable`).
+   */
+  fingerprint?: string | null;
+  /**
+   * The file's own filesystem modification time (RFC 3339), read from the
+   * same `stat` preflight already pays for every candidate. This is a
+   * best-available stand-in for a probed capture time, not a claim about
+   * when the footage was actually shot — preflight never runs ffprobe.
+   * `ImportPreviewItem.capturedAt`, and after import the file's own real
+   * `timestamp` in `ImportRunReport.files`, both supersede it.
+   */
+  filesystemModifiedAt?: string | null;
+}
+
+/** One file `generateImportPreview` was asked for. */
+export interface ImportPreviewRequest {
+  path: string;
+  fingerprint?: string | null;
+}
+
+/**
+ * What import-preview could determine for one file, without mutating
+ * anything. Any field being absent degrades only that field on its row;
+ * `error` explains why, but a row missing its poster or capture time is
+ * still an otherwise-importable file.
+ */
+export interface ImportPreviewItem {
+  path: string;
+  thumbnailPath: string | null;
+  durationSeconds: number | null;
+  /** The camera's own probed capture time, distinct from the filesystem mtime. */
+  capturedAt: string | null;
+  error: string | null;
 }
 
 export interface ImportDestination {

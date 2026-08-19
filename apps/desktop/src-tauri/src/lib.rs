@@ -4,10 +4,11 @@ use rcdvlog_core::{
     AnalysisReadiness, AnalysisRunOptions, AnalysisRunOutcome, AnalysisRunRecord, AnalyzeReport,
     ArchiveRoot, Asset, AssetAnalysisIndexEntry, AssetAnalysisView, AssetPatch,
     BatchProgressEstimate, CardCandidate, Catalog, ClipTranscript, ClockEvent, ImportHistoryEntry,
-    ImportOutcome, ImportPreflight, ImportProgress as CoreImportProgress, ImportRollbackPreview,
-    ImportSessionDetail, ImportStage as CoreImportStage, IngestReport, ModelStatus, MountedVolumes,
-    Project, ProxyReport, RelinkReport, ThumbnailReport, ToolStatus, TranscribeReport,
-    detect_cards, inspect_card,
+    ImportOutcome, ImportPreflight, ImportPreviewItem, ImportPreviewRequest,
+    ImportProgress as CoreImportProgress, ImportRollbackPreview, ImportSessionDetail,
+    ImportStage as CoreImportStage, IngestReport, ModelStatus, MountedVolumes, Project,
+    ProxyReport, RelinkReport, ThumbnailReport, ToolStatus, TranscribeReport, detect_cards,
+    inspect_card,
 };
 use rcdvlog_sync::BaselineEnvelope;
 use serde::{Deserialize, Serialize};
@@ -1123,6 +1124,23 @@ async fn run_smart_import(
         app,
     );
     Ok(report)
+}
+
+/// Posters/duration/probed capture time for a bounded batch of preflight
+/// rows — the dialog asks only for the rows it is currently showing, never
+/// for a whole card at once. See `rcdvlog_core::import_preview` for why this
+/// is a separate operation from `preflight_import` rather than folded into
+/// it: preflight itself must never run ffprobe/ffmpeg.
+#[tauri::command]
+async fn generate_import_preview(
+    requests: Vec<ImportPreviewRequest>,
+    state: State<'_, AppState>,
+) -> Result<Vec<ImportPreviewItem>, String> {
+    let catalog = state.catalog()?;
+    tauri::async_runtime::spawn_blocking(move || catalog.generate_import_preview(&requests))
+        .await
+        .map_err(error_message)?
+        .map_err(error_message)
 }
 
 #[tauri::command]
@@ -2407,6 +2425,7 @@ pub fn run() {
             set_import_preferences,
             preflight_import,
             run_smart_import,
+            generate_import_preview,
             cancel_import,
             list_import_sessions,
             import_session,
