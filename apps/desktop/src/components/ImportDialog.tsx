@@ -10,6 +10,7 @@ import type {
   ImportRunReport,
   ImportSequenceBoundaryEvidence,
   ImportSequenceRunPreview,
+  PreflightItem,
 } from "../types";
 import {
   interruptedFailureNote,
@@ -63,6 +64,9 @@ export interface ImportDialogProps {
   onResume(): void;
   onChooseSource(): void;
   onCancelInterrupted(): void;
+  /** Set this project's durable "start here" boundary for this card (#66). */
+  onSetCutoff(item: PreflightItem): void;
+  onClearCutoff(): void;
 }
 
 const NEW_CAMERA_OPTION = "__new_camera__";
@@ -139,6 +143,8 @@ export function ImportDialog({
   onResume,
   onChooseSource,
   onCancelInterrupted,
+  onSetCutoff,
+  onClearCutoff,
   interrupted,
   reconnected,
 }: ImportDialogProps) {
@@ -217,6 +223,8 @@ export function ImportDialog({
   const relinkable = plan?.relinkable ?? 0;
   const missingProxies = plan?.missingProxies ?? 0;
   const alreadyKnown = (plan?.knownClips ?? 0) + missingProxies - newClips;
+  const excludedByCutoff = plan?.excludedByCutoff ?? 0;
+  const cutoff = plan?.cutoff ?? null;
   const collisions = plan?.collisions ?? 0;
   const unreadable = plan?.unreadable ?? 0;
   const attentionFileCount = collisions + unreadable;
@@ -237,10 +245,26 @@ export function ImportDialog({
   if (newClips > 0) leadStats.push(noun(newClips, "new clip"));
   if (relinkable > 0) leadStats.push(`${noun(relinkable, "clip")} to reconnect`);
   if (missingProxies > 0 && actionable > 0 && makeProxies) leadStats.push(`${noun(missingProxies, "proxy", "proxies")} will be made`);
+  // Deliberately a lead stat rather than a bookkeeping total: a persistent
+  // filter is the one number a user must never have to go looking for.
+  if (excludedByCutoff > 0) leadStats.push(`${noun(excludedByCutoff, "earlier clip")} excluded`);
   const staleProxyNote =
     summaryState === "uptodate" && missingProxies > 0
       ? `${noun(missingProxies, "clip")} already imported still need proxies`
       : "";
+
+  /**
+   * A stored cutoff is a filter the user set once and will meet again months
+   * later. One click from the summary opens the ledger *at the boundary row*,
+   * so inspecting, moving, and clearing it never require remembering where it
+   * lives (#66).
+   */
+  function reviewCutoff() {
+    setLedgerFocusPath(
+      plan?.items.find((item) => item.relativePath === cutoff?.relativePath)?.path ?? null,
+    );
+    setLedgerOpen(true);
+  }
 
   function reviewAttentionFiles() {
     const target = plan?.items.find(
@@ -444,6 +468,14 @@ export function ImportDialog({
                 <p className="import-summary-headline">{summaryHeadline}</p>
                 {leadStats.length > 0 && <p className="import-summary-stats">{leadStats.join(" · ")}</p>}
                 {staleProxyNote && <p className="import-summary-stats">{staleProxyNote}</p>}
+                {cutoff && (
+                  <p className="import-summary-cutoff">
+                    Starting at <strong>{cutoff.filename}</strong> — remembered for this card.{" "}
+                    <button type="button" className="text-button" onClick={reviewCutoff}>
+                      Review the cutoff
+                    </button>
+                  </p>
+                )}
                 {attentionFileCount > 0 && (
                   <p className="import-warning">
                     {[collisions > 0 ? noun(collisions, "path collision") : "", unreadable > 0 ? noun(unreadable, "unreadable file") : ""]
@@ -461,6 +493,11 @@ export function ImportDialog({
                     <strong>{plan.scanned}</strong><span>clips scanned</span>
                     <strong>{newClips}</strong><span>new to {projectName}</span>
                     <strong>{alreadyKnown}</strong><span>already known</span>
+                    {excludedByCutoff > 0 && (
+                      <>
+                        <strong>{excludedByCutoff}</strong><span>excluded by your cutoff</span>
+                      </>
+                    )}
                     <strong>{missingProxies}</strong><span>need proxies</span>
                   </div>
                 </details>
@@ -549,7 +586,14 @@ export function ImportDialog({
                 onToggle={(event) => setLedgerOpen((event.target as HTMLDetailsElement).open)}
               >
                 <summary>Preview every file</summary>
-                <FileLedger plan={plan} listRef={ledgerListRef} previews={previews} onVisible={requestPreviews} />
+                <FileLedger
+                  plan={plan}
+                  listRef={ledgerListRef}
+                  previews={previews}
+                  onVisible={requestPreviews}
+                  onSetCutoff={card ? onSetCutoff : undefined}
+                  onClearCutoff={cutoff ? onClearCutoff : undefined}
+                />
               </details>
             )}
 

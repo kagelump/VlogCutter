@@ -22,6 +22,7 @@ import type {
   CardCandidate,
   ClipTranscript,
   DesktopSettings,
+  ImportCutoff,
   ImportPreflight,
   ImportSessionDetail,
   MediaOrigin,
@@ -122,6 +123,13 @@ export interface ImportScenarioState {
   cameraMappings: Record<string, CameraMapping[]>;
   /** Synthetic raw EXIF make/model by source path for #71 CUJs. */
   cameraExifHints: Record<string, string>;
+  /**
+   * Durable per-project "start here" boundaries (#66), keyed by project id.
+   * The harness's stand-in for the real `import_cutoffs` SQLite table: it
+   * lives on `harness.state` rather than in any component, so it survives an
+   * `app.remount()` the way the real table survives an app restart.
+   */
+  cutoffs: Record<string, ImportCutoff[]>;
 }
 
 export interface DesktopHarnessState {
@@ -258,7 +266,7 @@ export function createInitialState(clock: HarnessClock): DesktopHarnessState {
 
     archiveRoots: [],
     cards: [],
-    imports: { preflights: {}, additions: {}, lastRunSourcePath: null, sessions: {}, cameraMappings: {}, cameraExifHints: {} },
+    imports: { preflights: {}, additions: {}, lastRunSourcePath: null, sessions: {}, cameraMappings: {}, cameraExifHints: {}, cutoffs: {} },
     relinkable: {},
 
     pairing: {

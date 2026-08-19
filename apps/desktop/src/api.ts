@@ -1,7 +1,7 @@
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
-import type { AnalysisProgress, AnalysisReadiness, AnalysisRunRecord, AnalysisRunReport, AnalysisRunRequest, AnalysisStage, ArchiveRoot, Asset, AssetAnalysisIndexEntry, AssetAnalysisView, AssetPatch, AutoplayMode, BaselineImportResult, BaselinePreviewResult, CameraMapping, CameraMergePreview, CameraMergeReport, CardCandidate, ClipTranscript, DesktopSettings, GenerationProgress, ImportHistoryEntry, ImportPreflight, ImportPreviewItem, ImportPreviewRequest, ImportProgress, ImportRollbackPreview, ImportRunReport, ImportSessionDetail, LoadedCatalog, MediaOrigin, ModelInstallProgress, ModelStatus, PathAnalysis, Project, ProjectLibrary, ProjectPairingStatus, RelinkReport, RootMappingEntry, ServerConnectionStatus, ServerPairingResult, ServerVersionInfo, SyncStatus, ThumbnailReport } from "./types";
+import type { AnalysisProgress, AnalysisReadiness, AnalysisRunRecord, AnalysisRunReport, AnalysisRunRequest, AnalysisStage, ArchiveRoot, Asset, AssetAnalysisIndexEntry, AssetAnalysisView, AssetPatch, AutoplayMode, BaselineImportResult, BaselinePreviewResult, CameraMapping, CameraMergePreview, CameraMergeReport, CardCandidate, ClipTranscript, DesktopSettings, GenerationProgress, ImportCutoff, ImportHistoryEntry, ImportPreflight, ImportPreviewItem, ImportPreviewRequest, ImportProgress, ImportRollbackPreview, ImportRunReport, ImportSessionDetail, LoadedCatalog, MediaOrigin, ModelInstallProgress, ModelStatus, PathAnalysis, Project, ProjectLibrary, ProjectPairingStatus, RelinkReport, RootMappingEntry, ServerConnectionStatus, ServerPairingResult, ServerVersionInfo, SyncStatus, ThumbnailReport } from "./types";
 
 /**
  * Whether a backend is answering behind `@tauri-apps/api`.
@@ -165,6 +165,29 @@ export const api = {
 
   async clearCameraMapping(projectId: string, mappingId: string): Promise<void> {
     return invoke("clear_camera_mapping", { projectId, mappingId });
+  },
+
+  /**
+   * Records or moves this project's "start here" boundary for one card (#66).
+   * Setting and moving are the same call: there is one boundary per card.
+   */
+  async setImportCutoff(
+    projectId: string,
+    cardSessionId: string,
+    cardLabel: string,
+    relativePath: string,
+    filename: string,
+    capturedAt: string | null,
+  ): Promise<ImportCutoff> {
+    return invoke("set_import_cutoff", { projectId, cardSessionId, cardLabel, relativePath, filename, capturedAt });
+  },
+
+  async clearImportCutoff(projectId: string, cardSessionId: string): Promise<void> {
+    return invoke("clear_import_cutoff", { projectId, cardSessionId });
+  },
+
+  async listImportCutoffs(projectId: string): Promise<ImportCutoff[]> {
+    return invoke("list_import_cutoffs", { projectId });
   },
 
   async setImportPreferences(makeProxies: boolean, archiveRootId: string | null, cardSessionId: string | null): Promise<DesktopSettings> {

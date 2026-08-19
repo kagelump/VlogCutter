@@ -83,6 +83,8 @@ function renderDialog(overrides: Partial<ImportDialogProps> = {}) {
     onResume: vi.fn(),
     onChooseSource: vi.fn(),
     onCancelInterrupted: vi.fn(),
+    onSetCutoff: vi.fn(),
+    onClearCutoff: vi.fn(),
     ...overrides,
   };
   return { props, ...render(<ImportDialog {...props} />) };

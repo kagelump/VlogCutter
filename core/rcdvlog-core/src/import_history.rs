@@ -478,6 +478,9 @@ mod tests {
             missing_proxies: 0,
             collisions: 0,
             unreadable: 0,
+            cutoff: None,
+            excluded_by_cutoff: 0,
+            relinkable_before_cutoff: 0,
             sequence_preview: Default::default(),
             items: vec![
                 PreflightItem {

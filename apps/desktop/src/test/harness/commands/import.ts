@@ -17,6 +17,7 @@ import type {
   CameraMapping,
   CameraEvidence,
   CardCandidate,
+  ImportCutoff,
   ImportPreflight,
   ImportPreviewItem,
   ImportProgress,
@@ -171,7 +172,24 @@ function preflight(
   const card = state.cards.find((candidate) => candidate.mountPath === sourcePath) ?? null;
   const additions = state.imports.additions[sourcePath] ?? [];
   const known = projectAssets(state, projectId);
-  const newClips = additions.filter((asset) => !state.assets[asset.id]);
+  // The stored boundary is resolved before anything is derived from the
+  // candidates, exactly where `preflight_import` resolves it (#66): an
+  // excluded clip must not reach the byte cost, the camera evidence, or a
+  // capture-sequence proposal. Keyed on the card session, so a folder source
+  // and a different card are both unfiltered.
+  const cutoff = card
+    ? (state.imports.cutoffs[projectId] ?? []).find((stored) => stored.cardSessionId === card.sessionId) ?? null
+    : null;
+  const excludedFilenames = new Set(
+    cutoff
+      ? additions
+        .filter((asset) => !state.assets[asset.id] && asset.filename < cutoff.relativePath)
+        .map((asset) => asset.filename)
+      : [],
+  );
+  const newClips = additions.filter(
+    (asset) => !state.assets[asset.id] && !excludedFilenames.has(asset.filename),
+  );
   const archiveRoot = state.archiveRoots.find((root) => root.id === archiveRootId) ?? null;
   const bytesToCopy = newClips.reduce((total, asset) => total + asset.sizeBytes, 0);
   const availableBytes = archiveRoot?.availableBytes ?? null;
@@ -194,7 +212,11 @@ function preflight(
     relativePath: asset.filename,
     filename: asset.filename,
     sizeBytes: asset.sizeBytes,
-    classification: state.assets[asset.id] ? "knownVerified" : "new",
+    classification: state.assets[asset.id]
+      ? "knownVerified"
+      : excludedFilenames.has(asset.filename)
+        ? "excludedByCutoff"
+        : "new",
     assetId: state.assets[asset.id] ? asset.id : null,
     error: "",
     // A cheap stand-in for what real preflight computes from one `stat`: the
@@ -227,11 +249,14 @@ function preflight(
     },
     scanned: additions.length,
     newClips: newClips.length,
-    knownClips: additions.length - newClips.length,
+    knownClips: additions.length - newClips.length - excludedFilenames.size,
     relinkable: 0,
     missingProxies: known.filter((asset) => !asset.proxyAvailable).length,
     collisions: 0,
     unreadable: 0,
+    cutoff,
+    excludedByCutoff: excludedFilenames.size,
+    relinkableBeforeCutoff: 0,
     sequencePreview: {
       newClipCount: newClips.length,
       existingSequenceCount: existingCameras.size,
@@ -468,6 +493,52 @@ export const importCommands: CommandTable = {
     return null;
   },
 
+  /**
+   * The durable "start here" boundary for one card session (#66). Setting and
+   * moving are one call, as they are in `set_import_cutoff`: there is exactly
+   * one boundary per card.
+   */
+  set_import_cutoff: (args, { state, clock }): ImportCutoff => {
+    const projectId = requireString(args, "projectId");
+    const cardSessionId = requireString(args, "cardSessionId");
+    const relativePath = requireString(args, "relativePath");
+    const stored = state.imports.cutoffs[projectId] ?? [];
+    const existing = stored.find((cutoff) => cutoff.cardSessionId === cardSessionId);
+    const cutoff: ImportCutoff = {
+      id: existing?.id ?? `cutoff_${cardSessionId}`,
+      cardSessionId,
+      cardLabel: typeof args.cardLabel === "string" ? args.cardLabel : "",
+      relativePath,
+      filename: typeof args.filename === "string" ? args.filename : relativePath,
+      capturedAt: typeof args.capturedAt === "string" ? args.capturedAt : null,
+      createdAt: existing?.createdAt ?? clock.iso(),
+      updatedAt: clock.iso(),
+    };
+    state.imports.cutoffs[projectId] = [
+      ...stored.filter((entry) => entry.cardSessionId !== cardSessionId),
+      cutoff,
+    ];
+    return cutoff;
+  },
+
+  clear_import_cutoff: (args, { state }): null => {
+    const projectId = requireString(args, "projectId");
+    const cardSessionId = requireString(args, "cardSessionId");
+    state.imports.cutoffs[projectId] = (state.imports.cutoffs[projectId] ?? []).filter(
+      (cutoff) => cutoff.cardSessionId !== cardSessionId,
+    );
+    return null;
+  },
+
+  list_import_cutoffs: (args, { state }): ImportCutoff[] => {
+    const projectId = requireString(args, "projectId");
+    return [...(state.imports.cutoffs[projectId] ?? [])].sort((left, right) =>
+      left.cardLabel === right.cardLabel
+        ? left.id.localeCompare(right.id)
+        : left.cardLabel.localeCompare(right.cardLabel),
+    );
+  },
+
   run_smart_import: (args, context: HarnessContext): ImportRunReport | Promise<unknown> => {
     const projectId = requireString(args, "projectId");
     const plan = args.plan as ImportPreflight | undefined;
@@ -478,11 +549,20 @@ export const importCommands: CommandTable = {
 
     context.state.imports.lastRunSourcePath = plan.sourcePath;
     const additions = context.state.imports.additions[plan.sourcePath] ?? [];
+    // `run_import` walks the plan, not the source, and only its actionable
+    // items — so a clip the plan excluded is never opened (#66). Filtering the
+    // additions by what the plan actually classified is how the harness keeps
+    // that property instead of quietly importing the whole card.
+    const excludedByCutoff = new Set(
+      plan.items.filter((item) => item.classification === "excludedByCutoff").map((item) => item.filename),
+    );
     const tally: RunTally = {
       projectId,
       imported: [],
       // Exactly the clips the plan classified as new, and no others.
-      pending: additions.filter((asset) => !context.state.assets[asset.id]),
+      pending: additions.filter(
+        (asset) => !context.state.assets[asset.id] && !excludedByCutoff.has(asset.filename),
+      ),
       bytesCopied: 0,
     };
     // A completed import driven by a real user decision is the project's

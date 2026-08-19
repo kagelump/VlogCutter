@@ -29,6 +29,7 @@ mod copy;
 mod diagnostics;
 mod editplan;
 mod identifiers;
+mod import_cutoff;
 mod import_history;
 mod import_preview;
 mod locations;
@@ -70,11 +71,13 @@ pub use batch_estimator::BatchEstimate as BatchProgressEstimate;
 pub use cards::{
     CardCandidate, MountedVolumes, VolumeSource, card_session_slug, detect_cards, inspect_card,
 };
+pub use import_cutoff::ImportCutoff;
 pub use import_history::{
     ImportHistoryEntry, ImportRollbackModifiedClip, ImportRollbackPreview, ImportSessionDetail,
     ImportSessionFile,
 };
 pub use import_preview::{ImportPreviewItem, ImportPreviewRequest};
+
 pub use preflight::{
     Classification, ImportDestination, ImportOutcome, ImportPreflight, ImportProgress,
     ImportSequenceBoundary, ImportSequenceBoundaryEvidence, ImportSequencePreview,

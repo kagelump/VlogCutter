@@ -4,8 +4,8 @@ use rcdvlog_core::{
     AnalysisReadiness, AnalysisRunOptions, AnalysisRunOutcome, AnalysisRunRecord, AnalyzeReport,
     ArchiveRoot, Asset, AssetAnalysisIndexEntry, AssetAnalysisView, AssetPatch,
     BatchProgressEstimate, CameraMapping, CameraMergePreview, CameraMergeReport, CardCandidate,
-    Catalog, ClipTranscript, ClockEvent, ImportHistoryEntry, ImportOutcome, ImportPreflight,
-    ImportPreviewItem, ImportPreviewRequest, ImportProgress as CoreImportProgress,
+    Catalog, ClipTranscript, ClockEvent, ImportCutoff, ImportHistoryEntry, ImportOutcome,
+    ImportPreflight, ImportPreviewItem, ImportPreviewRequest, ImportProgress as CoreImportProgress,
     ImportRollbackPreview, ImportSessionDetail, ImportStage as CoreImportStage, IngestReport,
     ModelStatus, MountedVolumes, Project, ProxyReport, RelinkReport, ThumbnailReport, ToolStatus,
     TranscribeReport, detect_cards, inspect_card,
@@ -960,6 +960,58 @@ fn clear_camera_mapping(
     state
         .catalog()?
         .clear_camera_mapping(&project_id, &mapping_id)
+        .map_err(error_message)
+}
+
+/// The durable "start here" boundary for one card session (#66). Setting and
+/// moving are the same call: there is one boundary per card, and pointing at
+/// another clip replaces it.
+#[tauri::command]
+fn set_import_cutoff(
+    project_id: String,
+    card_session_id: String,
+    card_label: String,
+    relative_path: String,
+    filename: String,
+    captured_at: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<ImportCutoff, String> {
+    state
+        .catalog()?
+        .set_import_cutoff(
+            &project_id,
+            &card_session_id,
+            &card_label,
+            &relative_path,
+            &filename,
+            captured_at.as_deref(),
+        )
+        .map_err(error_message)
+}
+
+/// Forgets a boundary, so the whole card is offered again.
+#[tauri::command]
+fn clear_import_cutoff(
+    project_id: String,
+    card_session_id: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    state
+        .catalog()?
+        .clear_import_cutoff(&project_id, &card_session_id)
+        .map_err(error_message)
+}
+
+/// Every boundary this project holds, so a stored rule stays inspectable even
+/// when its card is not in the slot.
+#[tauri::command]
+fn list_import_cutoffs(
+    project_id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<ImportCutoff>, String> {
+    state
+        .catalog()?
+        .list_import_cutoffs(&project_id)
         .map_err(error_message)
 }
 
@@ -2528,6 +2580,9 @@ pub fn run() {
             list_camera_mappings,
             rename_camera_mapping,
             clear_camera_mapping,
+            set_import_cutoff,
+            clear_import_cutoff,
+            list_import_cutoffs,
             set_import_preferences,
             preflight_import,
             run_smart_import,

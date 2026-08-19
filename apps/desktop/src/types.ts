@@ -304,13 +304,37 @@ export interface ArchiveRoot {
   createdAt: string;
 }
 
+/**
+ * One project's durable "everything before this clip is old" boundary for one
+ * card session (#66). Keyed on the card session rather than a mount path or a
+ * camera, so it survives remounts, resets on reformat, and never arrives
+ * pre-applied to a brand-new card.
+ */
+export interface ImportCutoff {
+  id: string;
+  cardSessionId: string;
+  cardLabel: string;
+  /** The boundary: card-relative path of the clip the user pointed at. */
+  relativePath: string;
+  filename: string;
+  capturedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export type ImportClassification =
   | "new"
   | "knownVerified"
   | "knownRelinkable"
   | "knownMissingProxy"
   | "pathCollision"
-  | "unreadable";
+  | "unreadable"
+  /**
+   * Older than this project's stored "start here" boundary for this card
+   * (#66). Not copied, not ingested, not proxied, and deliberately not a
+   * failure — the user said this footage predates the project.
+   */
+  | "excludedByCutoff";
 
 export interface PreflightItem {
   path: string;
@@ -467,6 +491,17 @@ export interface ImportPreflight {
   missingProxies: number;
   collisions: number;
   unreadable: number;
+  /** This project's stored "start here" boundary for this card, if it has one (#66). */
+  cutoff?: ImportCutoff | null;
+  /** Candidates the cutoff excluded — deliberately never folded into `knownClips`. */
+  excludedByCutoff?: number;
+  /**
+   * Clips before the cutoff whose original this project has lost and which
+   * this source could repair. The cutoff never suppresses a relink, and this
+   * count is how the dialog says so rather than leaving a surprise in a
+   * filtered list.
+   */
+  relinkableBeforeCutoff?: number;
   /** Optional only for compatibility with older CUJ fixtures. Production preflight always sends it. */
   sequencePreview?: ImportSequencePreview;
   items: PreflightItem[];

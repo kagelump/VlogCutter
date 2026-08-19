@@ -272,6 +272,34 @@ The existing filename-pattern table (`docs/tasks/desktop/CAMERA_PATTERNS.md`) is
 still authoritative for per-asset camera identity, behind EXIF. Folder structure is a card-level
 hint for the banner and the archive path; it never overrides EXIF on an asset.
 
+### 5.2 "Everything before this clip is old"
+
+A card that has lived in a camera for months carries footage that predates the project, and
+re-presenting it on every reinsertion is noise. The project stores one boundary per card session
+(`import_cutoff`), and preflight applies it between classification and every number derived from
+classification — so an excluded clip never reaches the byte cost, the camera evidence, or a
+capture-sequence proposal.
+
+The rule is keyed on the **card session**, deliberately not on a mount path (transient) and not on
+camera evidence (shared by every card that camera ever wrote, so a brand-new card would arrive
+already filtered — a silent filter over unseen footage). The boundary itself is the clip's
+card-relative path, which is stable wherever the volume mounts and is exactly the order the file
+ledger displays, so "everything above this row" is a rule the user reads rather than infers.
+
+Three properties are load-bearing:
+
+- **Excluded is not known, and not failed.** `excluded_by_cutoff` is reported separately from
+  `known_clips`, because "you already have these" and "you told me to ignore these" lead to
+  different actions. `PathCollision` and `Unreadable` before the boundary are absorbed too: both
+  are only problems because the file was going to be imported.
+- **A cutoff never suppresses a relink.** A clip before the boundary whose original this project
+  has lost stays `KnownRelinkable`, is counted in `relinkable_before_cutoff`, and is marked as such
+  in the ledger. A relink copies nothing, so there is no cost to weigh against leaving the
+  project broken.
+- **It is never invisible.** The boundary row is marked in the ledger, the banner above the list
+  names the clip and the number of exclusions, and the dialog summary carries both a lead stat and
+  a one-click route back to the boundary row.
+
 ## 6. Preflight
 
 Preflight walks a source and returns a classification per candidate file **without mutating the
@@ -377,6 +405,10 @@ trait-shaped so other platforms can be added without touching the classifier.
   `apps/desktop/src/test/cuj/importRecovery.cuj.test.tsx` carries the same journey through the UI.
 - **Card identity.** Same card resumes; reformatted card gets a new session and a new directory;
   added footage preserves identity.
+- **Import cutoff.** A boundary excludes only what precedes it, survives a remount at another
+  path, does not reach a different card from the same camera, still finds footage shot after it,
+  and never hides a lost original. `apps/desktop/src/test/cuj/importCutoff.cuj.test.tsx` carries
+  set → close → restart → remembered → move → clear through the UI.
 - **Preflight purity.** Preflight over a card leaves the catalog byte-identical.
 - **Modal.** Destination, byte cost, and free space are asserted present; insufficient space blocks
   import. Desktop component tests under `apps/desktop/src/components/__tests__/`.

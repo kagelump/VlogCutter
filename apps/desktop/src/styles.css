@@ -889,8 +889,39 @@ kbd { padding: 2px 4px; color: #a8b1b6; background: #262d32; border: 1px solid #
 .import-file-ledger .import-file-thumb-placeholder { font-size: 10px; letter-spacing: 0.03em; color: var(--quiet); }
 .import-file-ledger .import-file-name { color: var(--ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .import-file-ledger time, .import-file-ledger .import-file-duration { color: var(--quiet); font-variant-numeric: tabular-nums; white-space: nowrap; }
-.import-file-ledger .import-file-status { white-space: nowrap; }
+/* Each row is its own grid, so the trailing columns only line up down the
+   list if they are given a width to hold. A ledger read for a *boundary* is
+   read down a column, and a ragged one cannot be. */
+.import-file-ledger .import-file-status { min-width: 96px; white-space: nowrap; }
+.import-file-ledger .import-file-duration { min-width: 36px; text-align: right; }
 .import-file-ledger li small { grid-column: 1 / -1; color: var(--red); }
+
+/* The durable "start here" boundary (#66). The boundary row is the one thing
+   in this list a user will come back to months later, so it is marked on the
+   row itself rather than only in a summary, and everything before it is dimmed
+   into the background it was asked to become. */
+.import-file-ledger li { grid-template-columns: auto minmax(0, 1fr) auto auto auto auto; }
+.import-file-ledger li[data-cutoff="boundary"] { border-left-color: var(--cyan); background: #16202299; }
+.import-file-ledger li[data-cutoff="excluded"] { opacity: .48; }
+.import-file-ledger li[data-cutoff="relinkBeforeCutoff"] { border-left-color: var(--amber); }
+.import-file-ledger .import-file-cutoff { min-width: 108px; text-align: right; white-space: nowrap; }
+.import-cutoff-hint { margin: 9px 0 0; padding: 8px; color: var(--quiet); background: var(--panel-raised); border-radius: 4px; }
+.import-cutoff-hint strong { color: var(--ink); }
+.import-file-ledger .import-file-cutoff.is-boundary { color: var(--cyan); font-weight: 600; }
+/* Revealed on hover or keyboard focus: a per-row action on every row of a
+   several-hundred-clip list would otherwise shout louder than the list. */
+.import-file-ledger button.import-file-cutoff { opacity: 0; }
+.import-file-ledger li:hover button.import-file-cutoff,
+.import-file-ledger li:focus-within button.import-file-cutoff,
+.import-file-ledger button.import-file-cutoff:focus-visible { opacity: 1; }
+.import-file-ledger .import-file-cutoff-note { grid-column: 1 / -1; color: var(--amber); }
+.import-cutoff-banner { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 12px; align-items: start; margin: 9px 0 0; padding: 9px 8px; background: #16202299; border: 1px solid var(--line-strong); border-radius: 4px; }
+.import-cutoff-banner .import-cutoff-mark { width: 3px; align-self: stretch; background: var(--cyan); border-radius: 2px; }
+.import-cutoff-banner strong { color: var(--ink); }
+.import-cutoff-banner small { display: block; margin-top: 3px; color: var(--quiet); }
+.import-cutoff-banner .import-cutoff-relink { color: var(--amber); }
+.import-summary-cutoff { margin: 4px 0 0; color: var(--quiet); font-size: 11px; }
+.import-summary-cutoff strong { color: var(--ink); }
 
 /* Inspect/change/clear the durable evidence-to-camera store (#71). Reuses
    `.import-file-ledger`'s disclosure/list chrome; only the row contents differ. */

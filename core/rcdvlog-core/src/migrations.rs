@@ -7,7 +7,7 @@ use thiserror::Error;
 
 use crate::chronology::forward_migrate_project_chronology;
 
-pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 23;
+pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 24;
 
 const MIGRATION_TABLE_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -221,6 +221,12 @@ pub const PROJECT_CATALOG_MIGRATIONS: &[SqliteMigration] = &[
         name: "camera_identity_aliases",
         source_identity: "project-catalog/0023-camera-identity-aliases/20260819",
         apply: add_camera_identity_aliases,
+    },
+    SqliteMigration {
+        id: 24,
+        name: "import_cutoffs",
+        source_identity: "project-catalog/0024-import-cutoffs/20260820",
+        apply: add_import_cutoffs,
     },
 ];
 
@@ -1301,6 +1307,43 @@ fn add_camera_identity_mappings(transaction: &Transaction<'_>) -> Result<()> {
     Ok(())
 }
 
+/// A reused card carries footage from before the project started, and the
+/// user needs to say so once rather than on every reinsertion (#66).
+///
+/// Keyed on the *card session* (`cards::card_session_slug`'s identity), not on
+/// a mount path and not on camera evidence. A mount path is transient. Camera
+/// evidence is shared by every card that camera ever wrote, so keying on it
+/// would silently hide the start of a brand-new card — the opposite of what
+/// the user asked for. A card session survives remounts and reinsertion,
+/// changes on reformat (so a reformatted card correctly starts clean), and is
+/// preserved when more footage is shot onto a partly imported card.
+///
+/// The boundary itself is the card-relative path of the clip the user pointed
+/// at, which is stable wherever the volume mounts, plus the filename and
+/// best-available time so the rule can always name the clip that set it. A
+/// persistent filter must never be invisible.
+fn add_import_cutoffs(transaction: &Transaction<'_>) -> Result<()> {
+    transaction.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS import_cutoffs (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            card_session_id TEXT NOT NULL CHECK(length(card_session_id) > 0),
+            card_label TEXT NOT NULL,
+            relative_path TEXT NOT NULL CHECK(length(relative_path) > 0),
+            filename TEXT NOT NULL,
+            captured_at TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(project_id, card_session_id)
+        );
+        CREATE INDEX IF NOT EXISTS import_cutoffs_project
+            ON import_cutoffs(project_id);
+        "#,
+    )?;
+    Ok(())
+}
+
 /// Adds the representative EXIF make/model to the sticky camera evidence key.
 ///
 /// Migration 21 is intentionally kept byte-for-byte compatible with the first
@@ -1911,7 +1954,7 @@ mod tests {
             inspect_project_catalog_migrations(&connection)
                 .unwrap()
                 .current_version,
-            23
+            PROJECT_CATALOG_SCHEMA_VERSION
         );
     }
 
@@ -1970,7 +2013,7 @@ mod tests {
             inspect_project_catalog_migrations(&connection)
                 .unwrap()
                 .current_version,
-            23,
+            PROJECT_CATALOG_SCHEMA_VERSION,
         );
     }
 

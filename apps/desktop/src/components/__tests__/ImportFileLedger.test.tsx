@@ -1,6 +1,7 @@
-import { render, screen } from "@testing-library/react";
+import { render, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { ImportPreflight, ImportPreviewItem, ImportRunReport, PreflightItem } from "../../types";
+import userEvent from "@testing-library/user-event";
+import type { ImportCutoff, ImportPreflight, ImportPreviewItem, ImportRunReport, PreflightItem } from "../../types";
 import { FileLedger } from "../ImportFileLedger";
 
 vi.mock("@tauri-apps/api/core", () => ({
@@ -20,6 +21,20 @@ function item(overrides: Partial<PreflightItem> = {}): PreflightItem {
     classification: "new",
     assetId: null,
     error: "",
+    ...overrides,
+  };
+}
+
+function cutoff(overrides: Partial<ImportCutoff> = {}): ImportCutoff {
+  return {
+    id: "cutoff_1",
+    cardSessionId: "card_dji",
+    cardLabel: "DJI_SD",
+    relativePath: "DCIM/DJI_0925.MP4",
+    filename: "DJI_0925.MP4",
+    capturedAt: "2026-08-08T10:17:21Z",
+    createdAt: "2026-08-20T09:00:00Z",
+    updatedAt: "2026-08-20T09:00:00Z",
     ...overrides,
   };
 }
@@ -171,5 +186,99 @@ describe("FileLedger lazy/bounded preview requests", () => {
     const onVisible = vi.fn();
     render(<FileLedger plan={plan([item()])} onVisible={onVisible} />);
     expect(onVisible).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * The durable "start here" boundary (#66). The invariant under test is that a
+ * persistent filter is never invisible: the boundary names itself, says how
+ * much it is hiding, and can be moved or cleared from the same list it filters.
+ */
+describe("FileLedger cutoff presentation", () => {
+  const items = [
+    item({ path: "/a/DCIM/DJI_0923.MP4", relativePath: "DCIM/DJI_0923.MP4", filename: "DJI_0923.MP4", classification: "excludedByCutoff" }),
+    item({ path: "/a/DCIM/DJI_0924.MP4", relativePath: "DCIM/DJI_0924.MP4", filename: "DJI_0924.MP4", classification: "excludedByCutoff" }),
+    item({ path: "/a/DCIM/DJI_0925.MP4", relativePath: "DCIM/DJI_0925.MP4", filename: "DJI_0925.MP4" }),
+    item({ path: "/a/DCIM/DJI_0926.MP4", relativePath: "DCIM/DJI_0926.MP4", filename: "DJI_0926.MP4" }),
+  ];
+
+  function withCutoff(overrides: Partial<ImportPreflight> = {}): ImportPreflight {
+    return { ...plan(items), cutoff: cutoff(), excludedByCutoff: 2, newClips: 2, ...overrides };
+  }
+
+  it("names the boundary and says how many earlier clips it is hiding", () => {
+    render(<FileLedger plan={withCutoff()} onSetCutoff={vi.fn()} onClearCutoff={vi.fn()} />);
+
+    const banner = screen.getByTestId("import-cutoff-banner");
+    expect(within(banner).getByText("Importing from DJI_0925.MP4")).toBeVisible();
+    expect(within(banner).getByText(/2 earlier clips are excluded\./)).toBeVisible();
+    expect(within(banner).getByText(/Remembered for this card, DJI_SD, until you clear it\./)).toBeVisible();
+  });
+
+  it("marks the boundary row and dims what it excluded, without dropping any of it", () => {
+    const { container } = render(<FileLedger plan={withCutoff()} onSetCutoff={vi.fn()} />);
+
+    // Every candidate is still listed: a filter you cannot see through is not
+    // inspectable, and moving the boundary earlier needs those rows.
+    expect(container.querySelectorAll("li")).toHaveLength(4);
+    expect(container.querySelector('li[data-cutoff="boundary"]')?.getAttribute("data-path")).toBe("/a/DCIM/DJI_0925.MP4");
+    expect(container.querySelectorAll('li[data-cutoff="excluded"]')).toHaveLength(2);
+    expect(screen.getByText("Import starts here")).toBeVisible();
+    expect(screen.getAllByText("excluded by cutoff")).toHaveLength(2);
+  });
+
+  it("moves the boundary from any row, including one it currently excludes", async () => {
+    const user = userEvent.setup();
+    const onSetCutoff = vi.fn();
+    render(<FileLedger plan={withCutoff()} onSetCutoff={onSetCutoff} />);
+
+    await user.click(screen.getByRole("button", { name: /Import from DJI_0923.MP4 onward/ }));
+    expect(onSetCutoff).toHaveBeenCalledWith(expect.objectContaining({ filename: "DJI_0923.MP4" }));
+
+    // The boundary row offers no "from here": it already is here.
+    expect(screen.queryByRole("button", { name: /Import from DJI_0925.MP4 onward/ })).toBeNull();
+  });
+
+  it("clears the boundary from the same list it filters", async () => {
+    const user = userEvent.setup();
+    const onClearCutoff = vi.fn();
+    render(<FileLedger plan={withCutoff()} onSetCutoff={vi.fn()} onClearCutoff={onClearCutoff} />);
+
+    await user.click(screen.getByRole("button", { name: "Clear cutoff" }));
+    expect(onClearCutoff).toHaveBeenCalledTimes(1);
+  });
+
+  it("says out loud that a lost original before the boundary is still reconnected", () => {
+    const withRelink = withCutoff({
+      items: [
+        item({ path: "/a/DCIM/DJI_0923.MP4", relativePath: "DCIM/DJI_0923.MP4", filename: "DJI_0923.MP4", classification: "knownRelinkable", assetId: "asset_lost" }),
+        ...items.slice(1),
+      ],
+      excludedByCutoff: 1,
+      relinkableBeforeCutoff: 1,
+    });
+    const { container } = render(<FileLedger plan={withRelink} onSetCutoff={vi.fn()} />);
+
+    expect(container.querySelector('li[data-cutoff="relinkBeforeCutoff"]')).not.toBeNull();
+    expect(screen.getByText("Before the cutoff · original still needed")).toBeVisible();
+    expect(screen.getByText(/the cutoff never hides an original this project has lost/)).toBeVisible();
+  });
+
+  it("offers no boundary controls in the completed-run report: that is a record, not a decision", () => {
+    const report: ImportRunReport = {
+      outcome: { imported: 2, importedAssetIds: [], relinked: 0, relinkedAssetIds: [], skipped: 0, copied: 2, bytesCopied: 1, cancelled: false, failures: [] },
+      proxies: null,
+      files: [],
+    };
+    render(<FileLedger plan={withCutoff()} report={report} onSetCutoff={vi.fn()} onClearCutoff={vi.fn()} />);
+
+    expect(screen.queryByTestId("import-cutoff-banner")).toBeNull();
+    expect(screen.queryByRole("button", { name: /Import from/ })).toBeNull();
+  });
+
+  it("leaves a plan with no boundary exactly as it was", () => {
+    const { container } = render(<FileLedger plan={plan(items.slice(2))} onSetCutoff={vi.fn()} />);
+    expect(screen.queryByTestId("import-cutoff-banner")).toBeNull();
+    expect(container.querySelectorAll("li[data-cutoff]")).toHaveLength(0);
   });
 });

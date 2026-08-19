@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import { api } from "./api";
-import type { ArchiveRoot, Asset, AssetPatch, AutoplayMode, BaselineImportResult, BaselinePreviewResult, CameraMapping, CameraMergePreview, CardCandidate, DesktopSettings, ImportHistoryEntry, ImportPreflight, ImportProgress, ImportRollbackPreview, ImportRunReport, ImportSessionDetail, ModelInstallProgress, ModelStatus, PathAnalysis, Project, ProjectLibrary, ProjectLocation, ProjectPairingStatus, RootMappingEntry, ServerConnectionStatus, ServerVersionInfo, SyncStatus, TranscriptStatus } from "./types";
+import type { ArchiveRoot, Asset, AssetPatch, AutoplayMode, BaselineImportResult, BaselinePreviewResult, CameraMapping, CameraMergePreview, CardCandidate, DesktopSettings, ImportHistoryEntry, ImportPreflight, ImportProgress, ImportRollbackPreview, ImportRunReport, ImportSessionDetail, PreflightItem, ModelInstallProgress, ModelStatus, PathAnalysis, Project, ProjectLibrary, ProjectLocation, ProjectPairingStatus, RootMappingEntry, ServerConnectionStatus, ServerVersionInfo, SyncStatus, TranscriptStatus } from "./types";
 import {
   detectsSourceAutomatically,
   interruptedMenuNote,
@@ -1856,6 +1856,47 @@ function App() {
     await openImportForPath(path, card ?? undefined);
   }
 
+  /**
+   * "Everything before this clip is old" (#66). Stored against the card
+   * session, so it survives this dialog, this app run, and this mount point.
+   *
+   * Re-runs preflight rather than filtering the plan on screen: the boundary
+   * changes the byte cost, the camera evidence, and the sequence proposals, and
+   * a dialog whose summary disagreed with what import would actually do would
+   * be worse than no cutoff at all.
+   */
+  async function setImportCutoff(item: PreflightItem) {
+    if (!projectId || !importCard) return;
+    setImportError("");
+    try {
+      await api.setImportCutoff(
+        projectId,
+        importCard.sessionId,
+        importCard.label,
+        item.relativePath,
+        item.filename,
+        item.filesystemModifiedAt ?? null,
+      );
+    } catch (reason) {
+      setImportError(String(reason));
+      return;
+    }
+    await refreshImportPlan(selectedArchiveRootId);
+  }
+
+  /** Forget the boundary, offering the whole card again. */
+  async function clearImportCutoff() {
+    if (!projectId || !importCard) return;
+    setImportError("");
+    try {
+      await api.clearImportCutoff(projectId, importCard.sessionId);
+    } catch (reason) {
+      setImportError(String(reason));
+      return;
+    }
+    await refreshImportPlan(selectedArchiveRootId);
+  }
+
   /** Give up on the interrupted session. Safe and idempotent from any state. */
   function cancelInterruptedImport() {
     // Back to before the import: the card is offerable again, because the
@@ -2961,6 +3002,8 @@ function App() {
           onResume={() => void resumeInterruptedImport(resumableCard)}
           onChooseSource={() => void chooseInterruptedImportSource()}
           onCancelInterrupted={cancelInterruptedImport}
+          onSetCutoff={(item) => void setImportCutoff(item)}
+          onClearCutoff={() => void clearImportCutoff()}
         />
       )}
       {showImportHistory && (

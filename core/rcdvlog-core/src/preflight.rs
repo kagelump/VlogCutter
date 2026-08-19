@@ -159,6 +159,12 @@ pub enum Classification {
     PathCollision,
     /// Could not be read well enough to classify.
     Unreadable,
+    /// Older than this project's stored "start here" boundary for this card
+    /// (#66). Not copied, not ingested, not proxied, and deliberately not a
+    /// failure: the user said this footage predates the project. Kept in the
+    /// item list rather than dropped, so a persistent filter is always
+    /// inspectable — see `import_cutoff`.
+    ExcludedByCutoff,
 }
 
 /// One classified file.
@@ -314,6 +320,21 @@ pub struct ImportPreflight {
     pub missing_proxies: usize,
     pub collisions: usize,
     pub unreadable: usize,
+    /// The project's stored "start here" boundary for this card, when it has
+    /// one and this source is that card. See `import_cutoff`.
+    #[serde(default)]
+    pub cutoff: Option<crate::ImportCutoff>,
+    /// Candidates the cutoff excluded. Reported separately from
+    /// `known_clips` on purpose: "you already have these" and "you told me to
+    /// ignore these" are different facts and lead to different actions.
+    #[serde(default)]
+    pub excluded_by_cutoff: usize,
+    /// Clips before the cutoff whose original this project has lost and which
+    /// this source could repair. The cutoff never suppresses these — see
+    /// `apply_import_cutoff` — and the count exists so the dialog can say so
+    /// rather than leaving a surprise inside a filtered list.
+    #[serde(default)]
+    pub relinkable_before_cutoff: usize,
     /// Suggested card runs and their evidence. Preflight never applies them.
     #[serde(default)]
     pub sequence_preview: ImportSequencePreview,
@@ -627,6 +648,19 @@ impl Catalog {
             }
         }
 
+        // The boundary is applied here, between classification and every
+        // number derived from it, so an excluded clip cannot reach the byte
+        // cost, the camera evidence, or a capture-sequence proposal. Footage
+        // the user told the project to ignore must not go on shaping it.
+        let cutoff = match card.as_ref() {
+            Some(card) => self.import_cutoff(project_id, &card.session_id)?,
+            None => None,
+        };
+        let (excluded_by_cutoff, relinkable_before_cutoff) = match cutoff.as_ref() {
+            Some(cutoff) => apply_import_cutoff(&mut items, &cutoff.relative_path),
+            None => (0, 0),
+        };
+
         let bytes_to_copy = items
             .iter()
             .filter(|item| item.classification == Classification::New)
@@ -712,6 +746,9 @@ impl Catalog {
                 + count(&items, Classification::New),
             collisions: count(&items, Classification::PathCollision),
             unreadable: count(&items, Classification::Unreadable),
+            cutoff,
+            excluded_by_cutoff,
+            relinkable_before_cutoff,
             sequence_preview,
             destination,
             items,
@@ -1195,6 +1232,55 @@ pub struct ImportProgress {
     /// verifying, or failed item is deliberately never exposed as an asset.
     #[serde(default)]
     pub asset: Option<Asset>,
+}
+
+/// Applies a stored "start here" boundary to a freshly classified list (#66).
+///
+/// Returns `(excluded, relinkable_before_cutoff)`.
+///
+/// Comparison is by `Path`, not by string, so the boundary means exactly what
+/// the ledger shows: preflight sorts its candidate paths before classifying
+/// them, and `Path`'s component-wise ordering is the ordering that sort used.
+/// A raw string comparison disagrees with it (`a/b` versus `a.txt`), and a
+/// filter whose rule does not match the list it is drawn on is a filter nobody
+/// can reason about.
+///
+/// What the cutoff does *not* touch is as important as what it does:
+///
+/// - `KnownRelinkable` survives untouched. That is a clip this project already
+///   owns whose original it has lost, and this source is where the original
+///   is. Hiding it behind "that footage is old" would quietly leave the
+///   project broken; a relink copies nothing, so there is no cost to weigh
+///   against it. The count comes back so the dialog can say this out loud.
+/// - `KnownVerified` and `KnownMissingProxy` stay as they are. They describe
+///   clips the project already has, which is a fact about the project rather
+///   than about this import, and conflating the two is exactly what the
+///   separate `excluded_by_cutoff` count exists to avoid.
+///
+/// What it does absorb is `New`, and also `PathCollision` and `Unreadable`:
+/// both of those are only problems *because* the file was going to be
+/// imported, and excluded files must not be reported as failures.
+fn apply_import_cutoff(items: &mut [PreflightItem], boundary: &str) -> (usize, usize) {
+    let boundary = Path::new(boundary);
+    let mut excluded = 0;
+    let mut relinkable = 0;
+    for item in items.iter_mut() {
+        if Path::new(&item.relative_path) >= boundary {
+            continue;
+        }
+        match item.classification {
+            Classification::New | Classification::PathCollision | Classification::Unreadable => {
+                item.classification = Classification::ExcludedByCutoff;
+                item.error.clear();
+                excluded += 1;
+            }
+            Classification::KnownRelinkable => relinkable += 1,
+            Classification::KnownVerified
+            | Classification::KnownMissingProxy
+            | Classification::ExcludedByCutoff => {}
+        }
+    }
+    (excluded, relinkable)
 }
 
 /// Whether a plan's source is still present *and still the same source*.
@@ -2796,6 +2882,274 @@ mod tests {
             .unwrap();
         assert_eq!(resumed.imported, 1);
         assert_eq!(catalog.list_assets(&project.id).unwrap().len(), 3);
+    }
+
+    /// #66: the boundary is a rule about *this import*, and everything before
+    /// it stops being work without becoming a problem.
+    #[test]
+    fn a_cutoff_excludes_earlier_clips_without_calling_any_of_them_a_failure() {
+        let directory = tempdir().unwrap();
+        let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).unwrap();
+        let project = catalog.create_project("Spain 2026").unwrap();
+        let mount = card_fixture(
+            directory.path(),
+            &[
+                ("C0001.MP4", b"last spring"),
+                ("C0002.MP4", b"last summer"),
+                ("C0003.MP4", b"the trip"),
+                ("C0004.MP4", b"the trip, later"),
+            ],
+        );
+
+        let before = catalog
+            .preflight_import(&project.id, &mount, None, None, |_, _, _| true)
+            .unwrap();
+        assert_eq!(before.new_clips, 4);
+        assert_eq!(before.excluded_by_cutoff, 0);
+        assert!(before.cutoff.is_none());
+
+        let card = before.card.clone().unwrap();
+        catalog
+            .set_import_cutoff(
+                &project.id,
+                &card.session_id,
+                &card.label,
+                "DCIM/100MSDCF/C0003.MP4",
+                "C0003.MP4",
+                None,
+            )
+            .unwrap();
+
+        let plan = catalog
+            .preflight_import(&project.id, &mount, None, None, |_, _, _| true)
+            .unwrap();
+        assert_eq!(plan.scanned, 4, "the card still holds four clips");
+        assert_eq!(plan.new_clips, 2);
+        assert_eq!(plan.excluded_by_cutoff, 2);
+        assert_eq!(plan.unreadable, 0);
+        assert_eq!(plan.collisions, 0);
+        assert_eq!(
+            plan.cutoff.as_ref().map(|cutoff| cutoff.filename.as_str()),
+            Some("C0003.MP4"),
+            "a persistent filter has to be able to name itself"
+        );
+        // The clip the user pointed at is on the *inside* of the boundary.
+        let excluded: Vec<&str> = plan
+            .items
+            .iter()
+            .filter(|item| item.classification == Classification::ExcludedByCutoff)
+            .map(|item| item.filename.as_str())
+            .collect();
+        assert_eq!(excluded, ["C0001.MP4", "C0002.MP4"]);
+        assert_eq!(
+            plan.destination.bytes_to_copy, 0,
+            "nothing is copied in place"
+        );
+    }
+
+    /// The other half of the criterion: excluded clips are not copied, not
+    /// ingested, and produce no failure. Needs real media, because this one
+    /// actually runs the import rather than only classifying it.
+    #[test]
+    fn an_excluded_clip_is_never_copied_ingested_or_reported() {
+        if crate::tool_command("ffprobe")
+            .arg("-version")
+            .output()
+            .is_err()
+        {
+            eprintln!("ffprobe is unavailable; skipping media integration test");
+            return;
+        }
+
+        let directory = tempdir().unwrap();
+        let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).unwrap();
+        let project = catalog.create_project("Spain 2026").unwrap();
+        let mount = card_fixture_media(
+            directory.path(),
+            &[
+                ("C0001.MP4", "navy"),
+                ("C0002.MP4", "maroon"),
+                ("C0003.MP4", "green"),
+            ],
+        );
+        let archive = directory.path().join("nas");
+        fs::create_dir_all(&archive).unwrap();
+        let root = catalog.create_archive_root("NAS Video", &archive).unwrap();
+        let card = inspect_card(&mount).unwrap().unwrap();
+        catalog
+            .set_import_cutoff(
+                &project.id,
+                &card.session_id,
+                &card.label,
+                "DCIM/100MSDCF/C0002.MP4",
+                "C0002.MP4",
+                None,
+            )
+            .unwrap();
+
+        let plan = catalog
+            .preflight_import(&project.id, &mount, Some(&root.id), None, |_, _, _| true)
+            .unwrap();
+        assert_eq!(plan.excluded_by_cutoff, 1);
+
+        let outcome = catalog
+            .run_import(&project.id, &plan, true, |_| true)
+            .unwrap();
+        assert_eq!(outcome.imported, 2);
+        assert_eq!(outcome.copied, 2);
+        assert!(outcome.failures.is_empty());
+        assert!(outcome.warnings.is_empty());
+
+        let filenames: Vec<String> = catalog
+            .list_assets(&project.id)
+            .unwrap()
+            .into_iter()
+            .map(|asset| asset.filename)
+            .collect();
+        assert_eq!(filenames, ["C0002.MP4", "C0003.MP4"]);
+        // Nothing landed in the archive for the clip the cutoff excluded.
+        let archived: Vec<String> = WalkDir::new(&archive)
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_file())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(!archived.contains(&"C0001.MP4".to_string()), "{archived:?}");
+    }
+
+    /// A cutoff answers "what should I import", never "what may this project
+    /// repair". An original the project has lost stays reachable through it.
+    #[test]
+    fn a_cutoff_never_hides_an_original_this_project_has_lost() {
+        let directory = tempdir().unwrap();
+        let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).unwrap();
+        let project = catalog.create_project("Spain 2026").unwrap();
+        let mount = card_fixture(
+            directory.path(),
+            &[
+                ("C0001.MP4", b"the lost clip"),
+                ("C0002.MP4", b"the new clip"),
+            ],
+        );
+
+        // C0001 belongs to the project already, and its original is offline.
+        let gone = directory.path().join("old-drive/C0001.MP4");
+        fs::create_dir_all(gone.parent().unwrap()).unwrap();
+        fs::copy(mount.join("DCIM/100MSDCF/C0001.MP4"), &gone).unwrap();
+        insert_asset_at(&catalog, &project.id, "asset_lost", &gone);
+        fs::remove_file(&gone).unwrap();
+
+        let card = inspect_card(&mount).unwrap().unwrap();
+        catalog
+            .set_import_cutoff(
+                &project.id,
+                &card.session_id,
+                &card.label,
+                "DCIM/100MSDCF/C0002.MP4",
+                "C0002.MP4",
+                None,
+            )
+            .unwrap();
+
+        let plan = catalog
+            .preflight_import(&project.id, &mount, None, None, |_, _, _| true)
+            .unwrap();
+        assert_eq!(plan.relinkable, 1, "the cutoff must not swallow a repair");
+        assert_eq!(
+            plan.relinkable_before_cutoff, 1,
+            "and it must say so out loud"
+        );
+        assert_eq!(plan.excluded_by_cutoff, 0);
+        assert_eq!(
+            plan.items[0].classification,
+            Classification::KnownRelinkable
+        );
+    }
+
+    /// The rule follows the card, not the mount point, and not the camera.
+    #[test]
+    fn a_cutoff_survives_a_remount_and_does_not_reach_a_different_card() {
+        let directory = tempdir().unwrap();
+        let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).unwrap();
+        let project = catalog.create_project("Spain 2026").unwrap();
+        let first_slot = directory.path().join("slot-a");
+        fs::create_dir_all(&first_slot).unwrap();
+        let mount = card_fixture(
+            &first_slot,
+            &[("C0001.MP4", b"last spring"), ("C0002.MP4", b"the trip")],
+        );
+
+        let card = inspect_card(&mount).unwrap().unwrap();
+        catalog
+            .set_import_cutoff(
+                &project.id,
+                &card.session_id,
+                &card.label,
+                "DCIM/100MSDCF/C0002.MP4",
+                "C0002.MP4",
+                None,
+            )
+            .unwrap();
+
+        // The same volume, mounted somewhere else entirely.
+        let second_slot = directory.path().join("slot-b");
+        fs::create_dir_all(&second_slot).unwrap();
+        let moved = second_slot.join("DJI_SD");
+        fs::rename(&mount, &moved).unwrap();
+        let plan = catalog
+            .preflight_import(&project.id, &moved, None, None, |_, _, _| true)
+            .unwrap();
+        assert_eq!(plan.excluded_by_cutoff, 1);
+        assert_eq!(plan.new_clips, 1);
+
+        // A different card from the same camera arrives unfiltered: its own
+        // first clip is not old footage just because another card's was.
+        let other = card_fixture(
+            &directory.path().join("other-camera-bag"),
+            &[("C0001.MP4", b"a fresh card"), ("C0002.MP4", b"also fresh")],
+        );
+        let other_plan = catalog
+            .preflight_import(&project.id, &other, None, None, |_, _, _| true)
+            .unwrap();
+        assert!(other_plan.cutoff.is_none());
+        assert_eq!(other_plan.excluded_by_cutoff, 0);
+        assert_eq!(other_plan.new_clips, 2);
+    }
+
+    /// Shooting more onto a partly imported card keeps its identity, so the
+    /// boundary keeps applying and the new footage is still found.
+    #[test]
+    fn newer_footage_on_the_same_card_is_still_discovered_past_the_cutoff() {
+        let directory = tempdir().unwrap();
+        let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).unwrap();
+        let project = catalog.create_project("Spain 2026").unwrap();
+        let mount = card_fixture(
+            directory.path(),
+            &[("C0001.MP4", b"last spring"), ("C0002.MP4", b"the trip")],
+        );
+        let card = inspect_card(&mount).unwrap().unwrap();
+        catalog
+            .set_import_cutoff(
+                &project.id,
+                &card.session_id,
+                &card.label,
+                "DCIM/100MSDCF/C0002.MP4",
+                "C0002.MP4",
+                None,
+            )
+            .unwrap();
+
+        fs::write(mount.join("DCIM/100MSDCF/C0003.MP4"), b"shot today").unwrap();
+        let plan = catalog
+            .preflight_import(&project.id, &mount, None, None, |_, _, _| true)
+            .unwrap();
+        assert_eq!(
+            plan.card.as_ref().map(|found| found.session_id.as_str()),
+            Some(card.session_id.as_str()),
+            "adding footage must not change which card this is"
+        );
+        assert_eq!(plan.excluded_by_cutoff, 1);
+        assert_eq!(plan.new_clips, 2);
     }
 
     /// #67: presence is a question about identity, not about a pathname. A
