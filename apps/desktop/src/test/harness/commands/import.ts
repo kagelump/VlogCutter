@@ -111,6 +111,10 @@ function preflight(
         matchedExistingSequenceLabel: matchesExistingSequence ? sequenceLabel : null,
         comparedExistingSequenceId: null,
         comparedExistingSequenceLabel: null,
+        // The harness never models a comparison against an existing
+        // sequence, so this run is always routine either way (it matches or
+        // it's brand new — never a disagreement worth reviewing).
+        needsReview: false,
         reason: matchesExistingSequence
           ? `This run matches the camera, card, and filename evidence for “${sequenceLabel}”.`
           : `No existing capture sequence is available for ${newCamera}.`,

@@ -361,6 +361,18 @@ export interface ImportSequenceRunPreview {
   matchedExistingSequenceLabel: string | null;
   comparedExistingSequenceId: string | null;
   comparedExistingSequenceLabel: string | null;
+  /**
+   * True only when this run's own evidence actively disagrees with
+   * `comparedExistingSequenceId` (card/filename evidence differs). A
+   * `proposeNew` run can also carry a `comparedExistingSequenceId` because
+   * another incoming run already claimed that sequence, or because a
+   * boundary split it off deliberately — both are routine, expected
+   * outcomes of the sequencing algorithm, not something the user needs to
+   * look at before import. Use this field to tell "genuinely ambiguous"
+   * apart from "routine new sequence" — never pattern-match `reason`, which
+   * is prose for humans and can be reworded without notice.
+   */
+  needsReview: boolean;
   reason: string;
   evidence: ImportSequenceBoundaryEvidence[];
 }

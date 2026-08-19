@@ -85,6 +85,17 @@ pub struct ImportSequenceRunPreview {
     /// The same-camera sequence used to explain a mismatch, if there was one.
     pub compared_existing_sequence_id: Option<String>,
     pub compared_existing_sequence_label: Option<String>,
+    /// True only when this run's own evidence actively disagrees with
+    /// `compared_existing_sequence_id` (card/filename evidence differs). A
+    /// `proposeNew` run can also carry a `compared_existing_sequence_id`
+    /// because another incoming run already claimed that sequence, or
+    /// because a boundary split it off deliberately — both are routine,
+    /// expected outcomes of the sequencing algorithm, not something the
+    /// user needs to look at before import. This is the one field a reader
+    /// should use to distinguish "genuinely ambiguous" from "routine new
+    /// sequence"; `reason` is prose for humans and must not be pattern
+    /// matched to recover this distinction.
+    pub needs_review: bool,
     pub reason: String,
     pub evidence: Vec<ImportSequenceBoundaryEvidence>,
 }
@@ -511,6 +522,7 @@ impl Catalog {
                     matched_existing_sequence_label: Some(sequence.label.clone()),
                     compared_existing_sequence_id: None,
                     compared_existing_sequence_label: None,
+                    needs_review: false,
                     reason: format!(
                         "This run matches the camera, card, and filename evidence for \"{}\".",
                         sequence.label
@@ -579,6 +591,7 @@ impl Catalog {
                 compared_existing_sequence_id: compared.map(|(_, sequence)| sequence.id.clone()),
                 compared_existing_sequence_label: compared
                     .map(|(_, sequence)| sequence.label.clone()),
+                needs_review: has_mismatch,
                 reason,
                 evidence,
             });
@@ -1403,6 +1416,8 @@ mod tests {
         assert_eq!(run.clip_count, 2);
         assert_eq!(run.camera_key, "Sony (C-series)");
         assert!(run.reason.contains("Sony SD-A"));
+        // A clean extension is routine: nothing here needs a second look.
+        assert!(!run.needs_review);
         assert_eq!(
             catalog.list_operations(&project.id).unwrap().len(),
             operations_before
@@ -1468,12 +1483,79 @@ mod tests {
                 if from == &compared.filename_prefix && to == "C"
         )));
         assert!(run.reason.contains(&compared.label));
+        // Card/filename evidence actually disagrees with the compared
+        // sequence — this is the one case that genuinely needs a look.
+        assert!(run.needs_review);
         assert_eq!(plan.sequence_preview.matched_existing_sequence_count, 0);
         assert_eq!(plan.sequence_preview.suggested_new_sequence_count, 1);
         assert_eq!(
             catalog.list_operations(&project.id).unwrap().len(),
             operations_before
         );
+        assert!(catalog.list_assets(&project.id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn import_preflight_does_not_flag_a_second_run_that_only_lost_the_slot() {
+        // Two runs of the same camera on one card, split by a folder/counter
+        // reset — the same fixture shape as
+        // `import_preflight_surfaces_folder_and_counter_boundary_evidence`,
+        // but with a matching existing sequence declared first. Both runs
+        // agree with it (empty volume/prefix hints match anything), so the
+        // first one extends it and the second — which agrees just as much,
+        // but lost the slot to the first — must not be flagged as a
+        // condition needing review. It is a routine multi-run outcome, not a
+        // disagreement with the sequence's evidence.
+        let directory = tempdir().unwrap();
+        let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).unwrap();
+        let project = catalog.create_project("Spain 2026").unwrap();
+        let existing = catalog
+            .declare_capture_sequence(&project.id, "Sony (C-series)", "Sony SD-A", "", "")
+            .unwrap();
+        let mount = directory.path().join("SONY_SD");
+        let first_folder = mount.join("DCIM/100MSDCF");
+        let second_folder = mount.join("DCIM/101MSDCF");
+        fs::create_dir_all(&first_folder).unwrap();
+        fs::create_dir_all(&second_folder).unwrap();
+        let first = first_folder.join("C0241.MP4");
+        let second = second_folder.join("C0001.MP4");
+        fs::write(&first, b"first card run").unwrap();
+        fs::write(&second, b"second card run").unwrap();
+        let base = UNIX_EPOCH + std::time::Duration::from_secs(100);
+        fs::File::open(&first)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(base))
+            .unwrap();
+        fs::File::open(&second)
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new().set_modified(base + std::time::Duration::from_secs(1)),
+            )
+            .unwrap();
+
+        let plan = catalog
+            .preflight_import(&project.id, &mount, None, |_, _, _| true)
+            .unwrap();
+
+        assert_eq!(plan.sequence_preview.runs.len(), 2);
+        let extended = &plan.sequence_preview.runs[0];
+        assert_eq!(extended.decision, ImportSequenceRunDecision::ExtendExisting);
+        assert_eq!(
+            extended.matched_existing_sequence_id.as_deref(),
+            Some(existing.id.as_str())
+        );
+        assert!(!extended.needs_review);
+
+        let displaced = &plan.sequence_preview.runs[1];
+        assert_eq!(displaced.decision, ImportSequenceRunDecision::ProposeNew);
+        assert_eq!(
+            displaced.compared_existing_sequence_id.as_deref(),
+            Some(existing.id.as_str())
+        );
+        assert!(displaced.reason.contains("already extends"));
+        // The core message: agreeing with a sequence that another run in the
+        // same batch already claimed is routine, not a disagreement.
+        assert!(!displaced.needs_review);
         assert!(catalog.list_assets(&project.id).unwrap().is_empty());
     }
 

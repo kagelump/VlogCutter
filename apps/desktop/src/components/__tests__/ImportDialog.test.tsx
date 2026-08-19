@@ -304,6 +304,7 @@ describe("chronology preflight, collapsed by default", () => {
             matchedExistingSequenceLabel: null,
             comparedExistingSequenceId: null,
             comparedExistingSequenceLabel: null,
+            needsReview: false,
             reason: "First footage seen from this camera.",
             evidence: [],
           }],
@@ -348,6 +349,7 @@ describe("chronology preflight, collapsed by default", () => {
             matchedExistingSequenceLabel: "Sony SD-A",
             comparedExistingSequenceId: null,
             comparedExistingSequenceLabel: null,
+            needsReview: false,
             reason: "This run matches the camera, card, and filename evidence for “Sony SD-A”.",
             evidence: [],
           }, {
@@ -362,6 +364,7 @@ describe("chronology preflight, collapsed by default", () => {
             matchedExistingSequenceLabel: null,
             comparedExistingSequenceId: "sequence_sony_a",
             comparedExistingSequenceLabel: "Sony SD-A",
+            needsReview: true,
             reason: "This run differs from “Sony SD-A” on card or filename evidence.",
             evidence: [
               { kind: "folderReset", from: "DCIM/100MSDCF", to: "DCIM/101MSDCF" },
@@ -388,5 +391,101 @@ describe("chronology preflight, collapsed by default", () => {
     expect(screen.getByText("Counter").getAttribute("title")).toContain("241 → 1");
     expect(screen.getByText("Volume").getAttribute("title")).toContain("card_old → card_new");
     expect(screen.getByText(/importing never changes chronology/)).toBeTruthy();
+  });
+
+  // A `proposeNew` run can name a `comparedExistingSequenceId` for entirely
+  // routine reasons — core's own `needsReview` flag, not the mere presence
+  // of that id, is what separates "genuinely disagrees" from "routine, but
+  // happened to be compared against something." These two pin the routine
+  // reason branches core can emit alongside a non-null compared id.
+  it("stays routine when a run only lost its slot to another incoming run", () => {
+    renderDialog({
+      plan: plan({
+        sequencePreview: {
+          newClipCount: 4,
+          existingSequenceCount: 1,
+          proposedSequenceCount: 2,
+          matchedExistingSequenceCount: 1,
+          suggestedNewSequenceCount: 1,
+          boundaries: [],
+          runs: [{
+            firstRelativePath: "DCIM/100MSDCF/C0001.MP4",
+            lastRelativePath: "DCIM/100MSDCF/C0002.MP4",
+            clipCount: 2,
+            cameraKey: "Sony (C-series)",
+            volumeHint: "card_new",
+            filenamePrefix: "C",
+            decision: "extendExisting",
+            matchedExistingSequenceId: "sequence_sony_a",
+            matchedExistingSequenceLabel: "Sony SD-A",
+            comparedExistingSequenceId: null,
+            comparedExistingSequenceLabel: null,
+            needsReview: false,
+            reason: "This run matches the camera, card, and filename evidence for “Sony SD-A”.",
+            evidence: [],
+          }, {
+            firstRelativePath: "DCIM/101MSDCF/C0001.MP4",
+            lastRelativePath: "DCIM/101MSDCF/C0002.MP4",
+            clipCount: 2,
+            cameraKey: "Sony (C-series)",
+            volumeHint: "card_new",
+            filenamePrefix: "C",
+            decision: "proposeNew",
+            matchedExistingSequenceId: null,
+            matchedExistingSequenceLabel: null,
+            comparedExistingSequenceId: "sequence_sony_a",
+            comparedExistingSequenceLabel: "Sony SD-A",
+            needsReview: false,
+            reason: "Another incoming run already extends “Sony SD-A”; this distinct run stays separate.",
+            evidence: [],
+          }],
+        },
+      }),
+    });
+
+    // Nothing here needs a decision: the whole section collapses, and
+    // neither run carries the attention marker.
+    expect(screen.getByText("Chronology suggestions ready for later review")).toBeVisible();
+    expect(screen.queryByText("Needs a look")).toBeNull();
+    const displacedRow = screen.getByText(/already extends/).closest("li")!;
+    expect(displacedRow.dataset.attention).toBeUndefined();
+  });
+
+  it("stays routine when boundary evidence, not a disagreement, kept a run separate", () => {
+    renderDialog({
+      plan: plan({
+        sequencePreview: {
+          newClipCount: 2,
+          existingSequenceCount: 1,
+          proposedSequenceCount: 1,
+          matchedExistingSequenceCount: 0,
+          suggestedNewSequenceCount: 1,
+          boundaries: [],
+          runs: [{
+            firstRelativePath: "DCIM/101MSDCF/C0001.MP4",
+            lastRelativePath: "DCIM/101MSDCF/C0002.MP4",
+            clipCount: 2,
+            cameraKey: "Sony (C-series)",
+            volumeHint: "card_new",
+            filenamePrefix: "C",
+            decision: "proposeNew",
+            matchedExistingSequenceId: null,
+            matchedExistingSequenceLabel: null,
+            comparedExistingSequenceId: "sequence_sony_a",
+            comparedExistingSequenceLabel: "Sony SD-A",
+            needsReview: false,
+            reason: "Boundary evidence keeps this run separate from “Sony SD-A”.",
+            evidence: [
+              { kind: "folderReset", from: "DCIM/100MSDCF", to: "DCIM/101MSDCF" },
+            ],
+          }],
+        },
+      }),
+    });
+
+    expect(screen.getByText("Chronology suggestions ready for later review")).toBeVisible();
+    expect(screen.queryByText("Needs a look")).toBeNull();
+    const separatedRow = screen.getByText(/Boundary evidence keeps this run separate/).closest("li")!;
+    expect(separatedRow.dataset.attention).toBeUndefined();
   });
 });

@@ -354,16 +354,19 @@ function evidenceDescription(evidence: ImportSequenceBoundaryEvidence) {
 }
 
 /**
- * A `proposeNew` run compared against a specific existing sequence is the one
- * case the algorithm itself flags as ambiguous — it found a candidate match
- * and rejected it. That is worth a look before the user confirms it in
- * Chronology. A run with nothing to compare against (first-ever footage) or a
- * clean extension of a known sequence is routine and does not need to block
- * the reader on capture-sequence machinery before importing.
+ * `run.needsReview` is core's own verdict on whether this run's evidence
+ * actively disagrees with the sequence it was compared against — the one
+ * condition worth a look before the user confirms it in Chronology. A
+ * `proposeNew` run can carry a `comparedExistingSequenceId` for entirely
+ * routine reasons too (another incoming run already claimed that sequence,
+ * or a boundary split this run off deliberately), so `comparedExistingSequenceId`
+ * alone is not the signal — `needsReview` is. This must stay a read of that
+ * field, not a re-derivation from `reason`, which is prose for humans and
+ * can be reworded without notice.
  */
 function sequenceRunKind(run: ImportSequenceRunPreview): "extend" | "attention" | "new" {
   if (run.decision === "extendExisting") return "extend";
-  return run.comparedExistingSequenceId ? "attention" : "new";
+  return run.needsReview ? "attention" : "new";
 }
 
 function SequenceRunList({ runs }: { runs: ImportSequenceRunPreview[] }) {
