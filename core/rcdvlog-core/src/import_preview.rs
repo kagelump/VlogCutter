@@ -25,7 +25,8 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -206,7 +207,15 @@ fn extract_poster(
     if output.is_file() {
         return Ok(output.to_string_lossy().into_owned());
     }
-    let temporary = cache_dir.join(format!("{safe_key}.tmp.jpg"));
+    // Two concurrent requests can legitimately share a cache key: duplicate
+    // footage (same fingerprint, different card path) both scrolling into
+    // view lands two workers here for the same `safe_key` at once. The
+    // shared `output` path is fine as an atomic-rename target, but each
+    // invocation must stage its own ffmpeg output — a temp name derived from
+    // `safe_key` alone would let two `ffmpeg` processes write the same file
+    // concurrently (a torn/corrupted JPEG) and would fail one of the two
+    // `rename`s with "no such file" once the other had already moved it.
+    let temporary = unique_temp_path(cache_dir, &safe_key);
     let seek = (duration_seconds.max(0.0) * 0.2).to_string();
     let status = std::process::Command::new(ffmpeg_program)
         .args([
@@ -237,6 +246,24 @@ fn extract_poster(
     }
     std::fs::rename(&temporary, &output)?;
     Ok(output.to_string_lossy().into_owned())
+}
+
+/// Monotonic, process-wide: combined with the pid, guarantees a staging
+/// filename that no two invocations — even two threads racing on the same
+/// cache key in the same batch, or two overlapping `generate_import_preview`
+/// calls — can ever collide on, without needing a crate dependency for it.
+static POSTER_STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// A staging path for one poster-extraction attempt. Never reused, so it is
+/// always safe for `extract_poster` to write, `rename`, or clean up on its
+/// own without another concurrent attempt (for the same `safe_key`) touching
+/// it — only the final, shared `<safe_key>.jpg` output name is contended.
+fn unique_temp_path(cache_dir: &Path, safe_key: &str) -> PathBuf {
+    let sequence = POSTER_STAGING_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    cache_dir.join(format!(
+        "{safe_key}.{}-{sequence}.tmp.jpg",
+        std::process::id()
+    ))
 }
 
 /// Cache filenames stay path-safe regardless of what a fingerprint or
@@ -342,6 +369,103 @@ mod tests {
                 .unwrap(),
             first_modified,
             "an identical fingerprint must reuse the cached poster, not regenerate it"
+        );
+    }
+
+    /// A deterministic pin on the staging-path fix itself: no real ffmpeg
+    /// needed. Two concurrent stagings for the same cache key must never
+    /// collide, and a leftover staging file (from a killed or failed
+    /// attempt) must never be mistaken for the finished, atomically-renamed
+    /// output — they are different filenames, not the same file observed at
+    /// different times.
+    #[test]
+    fn staging_paths_for_the_same_cache_key_never_collide_or_look_like_the_output() {
+        let directory = tempdir().unwrap();
+        let cache_dir = directory.path().join("cache/import-preview");
+        let safe_key = "fingerprint_shared";
+
+        let first = unique_temp_path(&cache_dir, safe_key);
+        let second = unique_temp_path(&cache_dir, safe_key);
+        assert_ne!(
+            first, second,
+            "two concurrent stagings for the same cache key must never share a path"
+        );
+
+        let output = cache_dir.join(format!("{safe_key}.jpg"));
+        assert_ne!(
+            first, output,
+            "a staging path must never equal the shared output path"
+        );
+        assert_ne!(
+            second, output,
+            "a staging path must never equal the shared output path"
+        );
+        assert!(first.to_string_lossy().ends_with(".tmp.jpg"));
+        assert!(second.to_string_lossy().ends_with(".tmp.jpg"));
+    }
+
+    /// The regression this exists to pin: two different source files with
+    /// identical content (the realistic case — duplicate footage on a card,
+    /// not the same path twice) sharing a fingerprint, dispatched into the
+    /// same batch. `worker_count` clamps to `requests.len()` (2), so the pool
+    /// genuinely runs both on separate threads racing on the same cache key
+    /// — before the unique-staging-path fix, this produced a real
+    /// torn/corrupted poster and a spurious "no such file" error on whichever
+    /// `rename` lost the race.
+    #[test]
+    fn two_requests_sharing_a_fingerprint_in_one_batch_both_succeed() {
+        if !ffmpeg_available() {
+            eprintln!("ffmpeg/ffprobe unavailable; skipping import preview test");
+            return;
+        }
+        let directory = tempdir().unwrap();
+        let clip_a = directory.path().join("A.MP4");
+        write_test_clip(&clip_a);
+        let clip_b = directory.path().join("B.MP4");
+        std::fs::copy(&clip_a, &clip_b).unwrap();
+        let cache_dir = directory.path().join("cache/import-preview");
+        let ffprobe = resolve_tool_path("ffprobe");
+        let ffmpeg = resolve_tool_path("ffmpeg");
+
+        let requests = vec![
+            ImportPreviewRequest {
+                path: clip_a.to_string_lossy().into_owned(),
+                fingerprint: Some("fingerprint_duplicate_footage".to_string()),
+            },
+            ImportPreviewRequest {
+                path: clip_b.to_string_lossy().into_owned(),
+                fingerprint: Some("fingerprint_duplicate_footage".to_string()),
+            },
+        ];
+        let results =
+            generate_import_preview_with_tools(&requests, &cache_dir, &ffprobe, &ffmpeg).unwrap();
+        assert_eq!(results.len(), 2);
+        for (index, item) in results.iter().enumerate() {
+            assert!(
+                item.error.is_none(),
+                "request {index} must not fail from racing on a shared cache key: {:?}",
+                item.error
+            );
+            let poster = PathBuf::from(item.thumbnail_path.as_deref().unwrap());
+            assert!(poster.is_file(), "request {index}'s poster must exist");
+            assert!(
+                poster.metadata().unwrap().len() > 0,
+                "request {index}'s poster must not be a torn/empty file"
+            );
+        }
+        // Both requests share the same cache key, so both resolve to the
+        // same output path.
+        assert_eq!(results[0].thumbnail_path, results[1].thumbnail_path);
+        // No staging leftovers: every temp file was renamed away or cleaned
+        // up, regardless of which side of the race it was on.
+        let leftover_staging_files = std::fs::read_dir(&cache_dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp."))
+            .count();
+        assert_eq!(
+            leftover_staging_files, 0,
+            "no staging file should survive a completed batch"
         );
     }
 
