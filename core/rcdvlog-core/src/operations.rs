@@ -2212,13 +2212,16 @@ fn materialize_asset_add(
         &camera,
         &payload.created_at,
     )?;
+    let capture_sequence_id =
+        crate::chronology::capture_sequence_id_for(&operation.project_id, &camera);
+    let filename_counter = crate::chronology::parse_filename_counter(&payload.filename);
     transaction.execute(
         "INSERT OR IGNORE INTO asset_capture_sequence(asset_id, project_id, capture_sequence_id, filename_counter) VALUES (?1, ?2, ?3, ?4)",
         params![
             operation.aggregate_id,
             operation.project_id,
-            crate::chronology::capture_sequence_id_for(&operation.project_id, &camera),
-            crate::chronology::parse_filename_counter(&payload.filename).map(|value| value as i64),
+            capture_sequence_id,
+            filename_counter.map(|value| value as i64),
         ],
     )?;
     transaction.execute(
@@ -2236,6 +2239,20 @@ fn materialize_asset_add(
         transaction.execute("INSERT INTO lww_registers(project_id, aggregate_type, aggregate_id, field_name, value_json, operation_id, hlc_wall_millis, hlc_counter, origin_node_id) VALUES (?1, 'projectAsset', ?2, ?3, ?4, NULL, 0, 0, 'baseline')",
             params![operation.project_id, operation.aggregate_id, field, value])?;
     }
+    // A clock epoch or exception may have been committed before this clip was
+    // ingested. Re-running a whole project on every item would make a large
+    // card quadratic, so project the solver's governing fact onto this row
+    // only. A clock-event write still recalculates its camera because it
+    // intentionally changes every existing row.
+    project_chronology_for_asset(
+        transaction,
+        &operation.project_id,
+        &operation.aggregate_id,
+        &capture_sequence_id,
+        filename_counter,
+        &payload.filename,
+        payload.captured_at_raw.as_deref(),
+    )?;
     Ok(true)
 }
 
@@ -3240,6 +3257,29 @@ fn recalculate_clock(transaction: &Transaction<'_>, project_id: &str, camera: &s
     Ok(())
 }
 
+/// Routes one newly materialized asset through the solver-owned bounded
+/// projection. It loads only that card's epochs and this asset's exception,
+/// rather than replaying every project asset after each imported file.
+fn project_chronology_for_asset(
+    transaction: &Transaction<'_>,
+    project_id: &str,
+    asset_id: &str,
+    capture_sequence_id: &str,
+    filename_counter: Option<u64>,
+    filename: &str,
+    captured_at_raw: Option<&str>,
+) -> Result<()> {
+    Catalog::project_new_asset_chronology_on_connection(
+        transaction,
+        project_id,
+        asset_id,
+        capture_sequence_id,
+        filename_counter,
+        filename,
+        captured_at_raw,
+    )
+}
+
 fn refresh_labels(transaction: &Transaction<'_>, asset_id: &str) -> Result<()> {
     let mut statement = transaction.prepare(
         "SELECT normalized_label, display_label FROM label_tags t WHERE asset_id=?1 AND NOT EXISTS(SELECT 1 FROM label_tag_removals r WHERE r.add_tag=t.add_tag AND r.normalized_label=t.normalized_label) ORDER BY hlc_wall_millis, hlc_counter, origin_node_id, add_tag",
@@ -3497,6 +3537,138 @@ mod tests {
         assert_eq!(
             catalog.list_assets("project_test").unwrap()[0].revision,
             after.revision
+        );
+    }
+
+    #[test]
+    fn a_new_asset_projects_an_existing_camera_clock_without_replaying_the_camera() {
+        let (_directory, catalog) = fixture();
+        catalog
+            .create_clock_event_operation(
+                "project_test",
+                "DJI",
+                "clip.mp4",
+                3_600,
+                "camera was one hour slow",
+            )
+            .unwrap();
+        let corrected_existing = catalog.get_asset("asset_test").unwrap();
+
+        let added = catalog
+            .add_portable_project_asset(
+                "project_test",
+                ProjectAssetAddedPayload {
+                    id: "asset_later".to_string(),
+                    fingerprint: "later-fingerprint".to_string(),
+                    filename: "later.mp4".to_string(),
+                    size_bytes: 100,
+                    duration_seconds: 10.0,
+                    frame_rate: 30.0,
+                    width: 1920,
+                    height: 1080,
+                    codec: "h264".to_string(),
+                    camera: "DJI".to_string(),
+                    captured_at_raw: Some("2026-01-01T00:00:00Z".to_string()),
+                    // This is what a probe would have supplied before an
+                    // existing correction is projected at import commit.
+                    best_time: Some("2026-01-01T00:00:00.000Z".to_string()),
+                    metadata_rotation_degrees: 0,
+                    default_rotation_degrees: 0,
+                    created_at: "2026-01-01T00:00:00Z".to_string(),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(added.offset_seconds, 3_600);
+        assert_eq!(added.best_time, corrected_existing.best_time);
+        assert_eq!(
+            catalog.get_asset("asset_later").unwrap().best_time,
+            corrected_existing.best_time
+        );
+    }
+
+    #[test]
+    fn a_new_asset_uses_the_solver_governing_epoch_for_its_capture_sequence() {
+        let (_directory, catalog) = fixture();
+        let payload = |id: &str, filename: &str| ProjectAssetAddedPayload {
+            id: id.to_string(),
+            fingerprint: format!("fingerprint-{id}"),
+            filename: filename.to_string(),
+            size_bytes: 100,
+            duration_seconds: 10.0,
+            frame_rate: 30.0,
+            width: 1920,
+            height: 1080,
+            codec: "h264".to_string(),
+            camera: "DJI".to_string(),
+            captured_at_raw: Some("2026-01-01T00:00:00Z".to_string()),
+            best_time: Some("2026-01-01T00:00:00.000Z".to_string()),
+            metadata_rotation_degrees: 0,
+            default_rotation_degrees: 0,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+        catalog
+            .add_portable_project_asset(
+                "project_test",
+                payload("asset_epoch_first", "DJI_0001.MP4"),
+            )
+            .unwrap();
+        let sequence_id = crate::chronology::capture_sequence_id_for("project_test", "DJI");
+        catalog
+            .set_clock_epoch(
+                "project_test",
+                &crate::chronology::ClockEpoch {
+                    id: "epoch_dji_after_2".to_string(),
+                    capture_sequence_id: sequence_id,
+                    start_counter: 2,
+                    end_counter: None,
+                    offset_seconds: 7_200,
+                    confidence: 1.0,
+                    evidence: vec!["manual clock calibration".to_string()],
+                    label: "DJI two hours slow".to_string(),
+                },
+            )
+            .unwrap();
+
+        let added = catalog
+            .add_portable_project_asset(
+                "project_test",
+                payload("asset_epoch_later", "DJI_0002.MP4"),
+            )
+            .unwrap();
+
+        assert_eq!(added.offset_seconds, 7_200);
+        assert_eq!(added.best_time.as_deref(), Some("2026-01-01T02:00:00.000Z"));
+
+        // An exception is user authority over the epoch. Re-run the same
+        // bounded projector for this existing/reconnected-row shape and prove
+        // its stored offset is the actual raw→exception shift, not the stale
+        // epoch's offset.
+        catalog
+            .set_clip_time_exception(
+                "asset_epoch_later",
+                "2026-01-01T05:00:00Z",
+                "the camera was reset after lunch",
+            )
+            .unwrap();
+        let mut connection = catalog.connection().unwrap();
+        let transaction = connection.transaction().unwrap();
+        Catalog::project_new_asset_chronology_on_connection(
+            &transaction,
+            "project_test",
+            "asset_epoch_later",
+            &crate::chronology::capture_sequence_id_for("project_test", "DJI"),
+            Some(2),
+            "DJI_0002.MP4",
+            Some("2026-01-01T00:00:00Z"),
+        )
+        .unwrap();
+        transaction.commit().unwrap();
+        let exceptional = catalog.get_asset("asset_epoch_later").unwrap();
+        assert_eq!(exceptional.offset_seconds, 18_000);
+        assert_eq!(
+            exceptional.best_time.as_deref(),
+            Some("2026-01-01T05:00:00.000Z")
         );
     }
 

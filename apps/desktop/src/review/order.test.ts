@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { Asset } from "../types";
-import { indexOfAsset, moveSelection, nextSelection, orderAssets, replaceAsset } from "./order";
+import { compareAssets, indexOfAsset, moveSelection, nextSelection, orderAssets, replaceAsset, sortAssets, upsertAsset } from "./order";
 
 function asset(overrides: Partial<Asset> & { id: string }): Asset {
   return {
@@ -191,5 +191,53 @@ describe("replaceAsset", () => {
     const before = [...list];
     replaceAsset(list, asset({ id: "b", notes: "changed" }));
     expect(list).toEqual(before);
+  });
+});
+
+describe("upsertAsset", () => {
+  it("inserts a committed import clip in the catalog's deterministic review order", () => {
+    const existing = [
+      asset({ id: "later", filename: "B.MP4", bestTime: "2026-08-09T12:00:00Z" }),
+      asset({ id: "unknown", filename: "Z.MP4", bestTime: null }),
+    ];
+    const inserted = upsertAsset(existing, asset({ id: "first", filename: "A.MP4", bestTime: "2026-08-09T11:00:00Z" }));
+    expect(inserted.map((entry) => entry.id)).toEqual(["first", "later", "unknown"]);
+    expect(existing.map((entry) => entry.id)).toEqual(["later", "unknown"]);
+  });
+
+  it("replaces an already-visible import clip without moving it", () => {
+    const existing = [asset({ id: "a" }), asset({ id: "b" })];
+    const enriched = asset({ id: "b", thumbnailPath: "/tmp/b.jpg", thumbnailQuality: 1 });
+    expect(upsertAsset(existing, enriched)).toEqual([existing[0], enriched]);
+  });
+});
+
+describe("canonical catalog ordering", () => {
+  it("uses SQLite-style binary filename and id ties, never locale collation", () => {
+    const sameTime = "2026-08-09T12:00:00.000Z";
+    const ordered = sortAssets([
+      asset({ id: "z", filename: "á.MP4", bestTime: sameTime }),
+      asset({ id: "z", filename: "a.MP4", bestTime: sameTime }),
+      asset({ id: "b", filename: "Z.MP4", bestTime: sameTime }),
+      asset({ id: "a", filename: "Z.MP4", bestTime: sameTime }),
+    ]);
+    expect(ordered.map((entry) => `${entry.filename}:${entry.id}`)).toEqual([
+      "Z.MP4:a",
+      "Z.MP4:b",
+      "a.MP4:z",
+      "á.MP4:z",
+    ]);
+    expect(compareAssets(ordered[0], ordered[1])).toBeLessThan(0);
+  });
+
+  it("compares astral and high-BMP filenames as SQLite UTF-8 BINARY bytes", () => {
+    // U+E000 is EE 80 80; 😀 is F0 9F 98 80. SQLite therefore places the
+    // high-BMP filename first, unlike JavaScript's UTF-16 `<` comparison.
+    const sameTime = "2026-08-09T12:00:00.000Z";
+    const ordered = sortAssets([
+      asset({ id: "emoji", filename: "😀.MP4", bestTime: sameTime }),
+      asset({ id: "bmp", filename: "\uE000.MP4", bestTime: sameTime }),
+    ]);
+    expect(ordered.map((entry) => entry.id)).toEqual(["bmp", "emoji"]);
   });
 });

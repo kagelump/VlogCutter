@@ -350,6 +350,18 @@ fn solve_asset(
     }
 }
 
+/// The solver-owned projection for one asset when only its own chronology
+/// facts need refreshing. Import materialization uses this rather than
+/// reimplementing epoch/exception precedence or solving every project asset.
+pub(crate) fn solve_one_asset(
+    asset: &AssetTimeHypothesis,
+    epochs: &[ClockEpoch],
+    exceptions: &[ClipTimeException],
+) -> AssetChronology {
+    let exception_index = sorted_index(exceptions, |exception| exception.asset_id.as_str());
+    solve_asset(asset, epochs, exceptions, &exception_index, &[])
+}
+
 fn apply_phase_context(asset: &mut AssetChronology, phases: &[TripPhase]) {
     asset.evidence.retain(|entry| entry.kind != "trip_phase");
     if let Some(placed) = asset.trip_time.as_deref() {

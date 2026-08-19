@@ -3214,10 +3214,12 @@ impl Catalog {
     /// Writes the solution's derived times back into the `assets` projection
     /// columns.
     ///
-    /// This is the *only* writer of `assets.best_time` and
-    /// `assets.offset_seconds` (`CHRONOLOGY_MODEL.md`, "Evidence only"). No
-    /// migration and no operation materializer may write them; they exist for
-    /// query performance and are always reproducible by re-solving.
+    /// This is the whole-project route through the solver-owned writer of
+    /// `assets.best_time` and `assets.offset_seconds` (`CHRONOLOGY_MODEL.md`,
+    /// "Evidence only"). Asset-add materialization uses that same writer's
+    /// bounded single-asset route; no adapter or parallel chronology rule may
+    /// write them. They exist for query performance and are reproducible by
+    /// re-solving.
     pub fn project_chronology_solution(
         &self,
         project_id: &str,
@@ -3239,23 +3241,60 @@ impl Catalog {
     ) -> Result<usize> {
         let mut written = 0usize;
         for asset in &solution.assets {
-            // The offset is the derived shift from the camera's own claim, so
-            // a projection round-trip cannot invent one where none was applied.
-            let offset_seconds = match (asset.raw_time.as_deref(), asset.trip_time.as_deref()) {
-                (Some(raw), Some(trip)) => {
-                    match (chronology::parse_utc(raw), chronology::parse_utc(trip)) {
-                        (Some(from), Some(to)) => (to - from).num_seconds(),
-                        _ => 0,
-                    }
-                }
-                _ => 0,
-            };
-            written += connection.execute(
-                "UPDATE assets SET best_time = ?1, offset_seconds = ?2 WHERE id = ?3 AND project_id = ?4",
-                params![asset.trip_time, offset_seconds, asset.asset_id, project_id],
-            )?;
+            written += Self::project_solved_asset_on_connection(connection, project_id, asset)?;
         }
         Ok(written)
+    }
+
+    /// The one writer for the derived `assets.best_time`/`offset_seconds`
+    /// projection. Both a whole chronology solve and a just-committed import
+    /// route through this helper so epoch and exception semantics cannot fork.
+    fn project_solved_asset_on_connection(
+        connection: &Connection,
+        project_id: &str,
+        asset: &chronology::AssetChronology,
+    ) -> Result<usize> {
+        // The offset is the derived shift from the camera's own claim, so an
+        // exception correctly replaces an epoch instead of merely displaying
+        // over it.
+        let offset_seconds = match (asset.raw_time.as_deref(), asset.trip_time.as_deref()) {
+            (Some(raw), Some(trip)) => {
+                match (chronology::parse_utc(raw), chronology::parse_utc(trip)) {
+                    (Some(from), Some(to)) => (to - from).num_seconds(),
+                    _ => 0,
+                }
+            }
+            _ => 0,
+        };
+        Ok(connection.execute(
+            "UPDATE assets SET best_time = ?1, offset_seconds = ?2 WHERE id = ?3 AND project_id = ?4",
+            params![asset.trip_time, offset_seconds, asset.asset_id, project_id],
+        )?)
+    }
+
+    /// Projects the solver's exact local result for one newly materialized
+    /// asset. This is bounded to its sequence epochs and own exception rather
+    /// than re-solving every row of a large import.
+    pub(crate) fn project_new_asset_chronology_on_connection(
+        connection: &Connection,
+        project_id: &str,
+        asset_id: &str,
+        capture_sequence_id: &str,
+        filename_counter: Option<u64>,
+        filename: &str,
+        captured_at_raw: Option<&str>,
+    ) -> Result<()> {
+        let solved = chronology::projected_asset_solution(
+            connection,
+            project_id,
+            asset_id,
+            capture_sequence_id,
+            filename_counter,
+            filename,
+            captured_at_raw,
+        )?;
+        Self::project_solved_asset_on_connection(connection, project_id, &solved)?;
+        Ok(())
     }
 
     pub(crate) fn project_current_chronology_in_transaction(

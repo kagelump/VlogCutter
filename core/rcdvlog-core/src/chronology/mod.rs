@@ -36,7 +36,9 @@ use crate::operations::{
     operation_from_row, revision_guard_passes_without_recording,
 };
 use anyhow::Result;
-use rusqlite::{Connection, Transaction, TransactionBehavior, params, params_from_iter};
+use rusqlite::{
+    Connection, OptionalExtension, Transaction, TransactionBehavior, params, params_from_iter,
+};
 use serde::{Deserialize, Serialize};
 
 /// An operation this build retained but could not materialize, because its
@@ -52,6 +54,67 @@ pub struct QuarantinedOperation {
     pub aggregate_id: String,
     pub payload_version: u32,
     pub received_at: String,
+}
+
+/// Projects the solver's own local time rule for one newly materialized asset.
+///
+/// It intentionally loads only that asset's exception and capture sequence's
+/// epochs. `solver::governing_epoch_for` remains the single definition of
+/// range/tie-breaking behavior; importing a large card therefore costs O(E)
+/// per item (E = epochs for its card), never a whole-project solve.
+pub(crate) fn projected_asset_solution(
+    connection: &Connection,
+    project_id: &str,
+    asset_id: &str,
+    capture_sequence_id: &str,
+    filename_counter: Option<u64>,
+    filename: &str,
+    captured_at_raw: Option<&str>,
+) -> Result<solver::AssetChronology> {
+    let exception: Option<ClipTimeException> = connection
+        .query_row(
+            "SELECT asset_id, trip_time, reason FROM clip_time_exceptions WHERE project_id=?1 AND asset_id=?2",
+            params![project_id, asset_id],
+            |row| {
+                Ok(ClipTimeException {
+                    asset_id: row.get(0)?,
+                    trip_time: row.get(1)?,
+                    reason: row.get(2)?,
+                })
+            },
+        )
+        .optional()?;
+    let mut statement = connection.prepare(
+        "SELECT id, capture_sequence_id, start_counter, end_counter, offset_seconds, confidence, evidence_json, label FROM clock_epochs WHERE project_id=?1 AND capture_sequence_id=?2 ORDER BY id",
+    )?;
+    let epochs = statement
+        .query_map(params![project_id, capture_sequence_id], |row| {
+            let evidence_json: String = row.get(6)?;
+            Ok(ClockEpoch {
+                id: row.get(0)?,
+                capture_sequence_id: row.get(1)?,
+                start_counter: row.get::<_, i64>(2)? as u64,
+                end_counter: row.get::<_, Option<i64>>(3)?.map(|value| value as u64),
+                offset_seconds: row.get(4)?,
+                confidence: row.get(5)?,
+                evidence: serde_json::from_str(&evidence_json).unwrap_or_default(),
+                label: row.get(7)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let hypothesis = AssetTimeHypothesis {
+        asset_id: asset_id.to_string(),
+        filename: filename.to_string(),
+        captured_at_raw: captured_at_raw.map(ToOwned::to_owned),
+        duration_seconds: 0.0,
+        capture_sequence_id: Some(capture_sequence_id.to_string()),
+        filename_counter,
+    };
+    Ok(solver::solve_one_asset(
+        &hypothesis,
+        &epochs,
+        &exception.into_iter().collect::<Vec<_>>(),
+    ))
 }
 
 /// Deterministic capture-sequence id for one project camera. Both migration 9

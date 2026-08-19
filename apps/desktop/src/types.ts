@@ -510,12 +510,16 @@ export interface CameraMergeReport {
 export type ImportStage = "scanning" | "copying" | "reading" | "proxies" | "complete";
 
 export interface ImportProgress {
+  /** The project that owns this progress stream; stale-project events are ignored. */
+  projectId: string;
   stage: ImportStage;
   completed: number;
   total: number;
   currentFile: string;
   completedBytes: number;
   totalBytes: number;
+  /** Present only once this file's catalog membership is safely committed. */
+  asset?: Asset | null;
 }
 
 export interface ImportOutcome {
@@ -528,6 +532,8 @@ export interface ImportOutcome {
   bytesCopied: number;
   cancelled: boolean;
   failures: Array<{ path: string; error: string }>;
+  /** A committed clip needs optional bookkeeping attention; it is not a failed import. */
+  warnings?: Array<{ path: string; error: string }>;
   /** Import succeeded, but its explicit camera choice could not be remembered. */
   cameraMappingWarning?: string | null;
 }

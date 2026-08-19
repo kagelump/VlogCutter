@@ -836,12 +836,15 @@ enum DesktopImportStage {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DesktopImportProgress {
+    project_id: String,
     stage: DesktopImportStage,
     completed: usize,
     total: usize,
     current_file: String,
     completed_bytes: u64,
     total_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    asset: Option<Asset>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1015,6 +1018,7 @@ async fn preflight_import(
                 let _ = app.emit(
                     "import-progress",
                     DesktopImportProgress {
+                        project_id: project_id.clone(),
                         stage: DesktopImportStage::Scanning,
                         completed,
                         total,
@@ -1024,6 +1028,7 @@ async fn preflight_import(
                             .unwrap_or_default(),
                         completed_bytes: 0,
                         total_bytes: 0,
+                        asset: None,
                     },
                 );
                 !cancel.load(Ordering::SeqCst)
@@ -1063,12 +1068,14 @@ async fn run_smart_import(
                     let _ = import_app.emit(
                         "import-progress",
                         DesktopImportProgress {
+                            project_id: pid.clone(),
                             stage,
                             completed: progress.completed_items,
                             total: progress.total_items,
                             current_file: progress.current_file,
                             completed_bytes: progress.completed_bytes,
                             total_bytes: progress.total_bytes,
+                            asset: progress.asset,
                         },
                     );
                     !cancel.load(Ordering::SeqCst)
@@ -1081,6 +1088,7 @@ async fn run_smart_import(
                         let _ = import_app.emit(
                             "import-progress",
                             DesktopImportProgress {
+                                project_id: pid.clone(),
                                 stage: DesktopImportStage::Proxies,
                                 completed: progress.estimate.completed_items,
                                 total: progress.estimate.total_items,
@@ -1091,6 +1099,11 @@ async fn run_smart_import(
                                     .unwrap_or_default(),
                                 completed_bytes: progress.estimate.completed_work_units,
                                 total_bytes: progress.estimate.total_work_units,
+                                // The proxy generator commits an updated
+                                // materialized asset one file at a time. Keep
+                                // it on the same import event stream so a row
+                                // shown during ingest is enriched immediately.
+                                asset: progress.asset,
                             },
                         );
                         if cancel.load(Ordering::SeqCst) {
@@ -1106,12 +1119,14 @@ async fn run_smart_import(
             let _ = import_app.emit(
                 "import-progress",
                 DesktopImportProgress {
+                    project_id: pid.clone(),
                     stage: DesktopImportStage::Complete,
                     completed: plan.scanned,
                     total: plan.scanned,
                     current_file: String::new(),
                     completed_bytes: outcome.bytes_copied,
                     total_bytes: outcome.bytes_copied,
+                    asset: None,
                 },
             );
             let session = catalog.record_import_session(&pid, &plan, &outcome)?;

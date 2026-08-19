@@ -12,7 +12,7 @@
 
 import { screen, waitFor, within } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
-import { desktopScenario, queueFilenames, renderApp } from "../harness";
+import { desktopScenario, queueFilenames, renderApp, selectedRow } from "../harness";
 
 /**
  * Two Sony clips already reviewed, and a card of five DJI clips — two of which
@@ -24,6 +24,17 @@ function cardInSlot() {
     .camera("Sony A7C II", { clips: 2, withProxy: true, startAt: "2026-02-08T00:10:00.000Z" })
     .archiveRoot("NAS Video", { availableBytes: 1_200_000_000_000 })
     .cardInserted("DJI_SD", { clips: 5, newClips: 3, camera: "DJI Pocket 3", cameraHint: "DJI Pocket 3" })
+    .build();
+}
+
+function importThenSwitchProjects() {
+  return desktopScenario({ now: "2026-08-09T12:00:00.000Z" })
+    .project("Hokkaido field test", { id: "project_hokkaido" })
+    .camera("Sony A7C II", { clips: 1, withProxy: true })
+    .archiveRoot("NAS Video", { availableBytes: 1_200_000_000_000 })
+    .cardInserted("DJI_SD", { clips: 2, newClips: 2, camera: "DJI Pocket 3", cameraHint: "DJI Pocket 3" })
+    .project("Okinawa reef", { id: "project_okinawa" })
+    .camera("Insta360 X4", { clips: 2, withProxy: true, startAt: "2026-03-02T00:10:00.000Z" })
     .build();
 }
 
@@ -238,7 +249,45 @@ describe("importing from a card", () => {
     await app.user.click(within(dialog).getByRole("button", { name: /Import 3 clips/ }));
     await run.started();
     await run.progress();
+
+    // The first file is already committed, so it reaches both Review and the
+    // ribbon while the second file has not even started. The existing review
+    // selection must not jump just because a new chronological row arrives.
+    await waitFor(() => expect(queueFilenames()).toEqual([
+      "SONY_001.MP4",
+      "SONY_002.MP4",
+      "DJI_001.MP4",
+      "DJI_002.MP4",
+      "DJI_003.MP4",
+    ]));
+    expect(selectedRow()?.getAttribute("aria-label")).toContain("SONY_001.MP4");
+    expect(screen.getByRole("button", { name: "Clip 5, DJI_003.MP4, DJI Pocket 3" })).toBeVisible();
+
+    // A later representation event enriches the just-inserted row in place;
+    // it must not append a second copy while the import is still active.
+    const committed = Object.values(harness.state.assets).find((asset) => asset.filename === "DJI_003.MP4");
+    expect(committed).toBeDefined();
+    await harness.emit("thumbnail-progress", {
+      asset: {
+        ...committed!,
+        thumbnailPath: `/tmp/rcdvlog-demo/thumbnails/${committed!.id}/q1.v2.jpg`,
+        thumbnailQuality: 1,
+      },
+      estimate: {
+        completedItems: 1,
+        totalItems: 3,
+        completedWorkUnits: committed!.sizeBytes,
+        totalWorkUnits: committed!.sizeBytes * 3,
+        workerCount: 1,
+        estimatedRemainingSeconds: 1,
+      },
+    });
+    const committedRow = screen.getByRole("option", { name: /DJI_003\.MP4/ });
+    await waitFor(() => expect(committedRow.querySelector("img")).toBeVisible());
+    expect(queueFilenames().filter((filename) => filename === "DJI_003.MP4")).toHaveLength(1);
+
     await run.progress();
+    await waitFor(() => expect(queueFilenames()).toContain("DJI_004.MP4"));
 
     expect(screen.queryByRole("dialog")).toBeNull();
     expect(screen.getByText("Copying and verifying originals")).toBeVisible();
@@ -251,6 +300,166 @@ describe("importing from a card", () => {
     // The two it finished are in the project; the third is not.
     expect(Object.keys(harness.state.assets)).toHaveLength(6);
     expect(harness.state.assets.asset_dji_pocket_3_005).toBeUndefined();
+    expect(queueFilenames()).not.toContain("DJI_005.MP4");
+  });
+
+  it("does not let an import from a project left behind alter the current project", async () => {
+    const harness = importThenSwitchProjects();
+    const app = await renderApp(harness);
+    const dialog = await openImport(app);
+    const run = harness.job<void, { cancelled?: boolean }>("run_smart_import");
+
+    await app.user.click(within(dialog).getByRole("button", { name: /Import 2 clips/ }));
+    await run.started();
+    await app.user.selectOptions(screen.getByRole("combobox", { name: "Project" }), "project_okinawa");
+    await waitFor(() => expect(queueFilenames()).toEqual(["INSTA360_001.MP4", "INSTA360_002.MP4"]));
+
+    // The native worker commits a Hokkaido clip after the switch. Its event
+    // and eventual completion are both stale UI work, not Okinawa updates.
+    await run.progress();
+    expect(queueFilenames()).toEqual(["INSTA360_001.MP4", "INSTA360_002.MP4"]);
+    await run.complete();
+    await waitFor(() => expect(screen.getByRole("combobox", { name: "Project" })).toHaveValue("project_okinawa"));
+    expect(queueFilenames()).toEqual(["INSTA360_001.MP4", "INSTA360_002.MP4"]);
+    expect(screen.queryByRole("button", { name: /Review last import/ })).toBeNull();
+  });
+
+  it("keeps a committed row visible when the next file fails and gives the user an actionable error", async () => {
+    const harness = cardInSlot();
+    const app = await renderApp(harness);
+    const dialog = await openImport(app);
+    const run = harness.job<void, { cancelled?: boolean }>("run_smart_import");
+
+    await app.user.click(within(dialog).getByRole("button", { name: /Import 3 clips/ }));
+    await run.started();
+    await run.progress();
+    await waitFor(() => expect(queueFilenames()).toContain("DJI_003.MP4"));
+
+    await run.fail("DJI_004.MP4 could not be verified. Reconnect the card and review the import again.");
+
+    expect(queueFilenames()).toContain("DJI_003.MP4");
+    expect(queueFilenames()).not.toContain("DJI_004.MP4");
+    expect(queueFilenames()).not.toContain("DJI_005.MP4");
+    expect(await screen.findByText(/DJI_004\.MP4 could not be verified/)).toBeVisible();
+    expect(screen.getByText(/Reconnect the card and review the import again/)).toBeVisible();
+  });
+
+  it("coalesces a rapid committed-import burst into non-overlapping chronology refreshes", async () => {
+    const harness = cardInSlot();
+    const app = await renderApp(harness);
+    const dialog = await openImport(app);
+    const run = harness.job<void, { cancelled?: boolean }>("run_smart_import");
+
+    await app.user.click(within(dialog).getByRole("button", { name: /Import 3 clips/ }));
+    await run.started();
+    const priorSolves = harness.calls("chronology_overview").filter((call) => call.projectId === "project_hokkaido").length;
+    harness.command("chronology_overview", (args) => args.projectId === "project_hokkaido").delayUntilReleased();
+    // Two commits land inside the debounce window: only one full solve starts.
+    await run.progress();
+    await run.progress();
+    await waitFor(() => expect(
+      harness.calls("chronology_overview").filter((call) => call.projectId === "project_hokkaido").length,
+    ).toBe(priorSolves + 1));
+
+    // The third commit arrives while that solve is held. Its trailing timer
+    // marks the work dirty but cannot launch an overlapping solve.
+    await run.progress();
+    await new Promise<void>((resolve) => window.setTimeout(resolve, 150));
+    expect(harness.calls("chronology_overview").filter((call) => call.projectId === "project_hokkaido")).toHaveLength(priorSolves + 1);
+
+    harness.command("chronology_overview").clear();
+    await waitFor(() => expect(
+      harness.calls("chronology_overview").filter((call) => call.projectId === "project_hokkaido").length,
+    ).toBe(priorSolves + 2));
+    await run.cancel();
+  });
+
+  it("waits for a held progressive chronology solve before final reconciliation starts another", async () => {
+    const harness = cardInSlot();
+    const app = await renderApp(harness);
+    const dialog = await openImport(app);
+    const run = harness.job<void, { cancelled?: boolean }>("run_smart_import");
+
+    await app.user.click(within(dialog).getByRole("button", { name: /Import 3 clips/ }));
+    await run.started();
+    const priorSolves = harness.calls("chronology_overview").filter((call) => call.projectId === "project_hokkaido").length;
+    harness.command("chronology_overview", (args) => args.projectId === "project_hokkaido").delayUntilReleased();
+    await run.progress();
+    await waitFor(() => expect(
+      harness.calls("chronology_overview").filter((call) => call.projectId === "project_hokkaido").length,
+    ).toBe(priorSolves + 1));
+
+    // The import completes while the progressive query is still held. Final
+    // reconciliation must wait for it instead of issuing a concurrent solve.
+    await run.complete();
+    await new Promise<void>((resolve) => window.setTimeout(resolve, 150));
+    expect(harness.calls("chronology_overview").filter((call) => call.projectId === "project_hokkaido")).toHaveLength(priorSolves + 1);
+
+    harness.command("chronology_overview").clear();
+    await waitFor(() => expect(
+      harness.calls("chronology_overview").filter((call) => call.projectId === "project_hokkaido").length,
+    ).toBe(priorSolves + 2));
+  });
+
+  it("does not show a late import failure in the project opened afterward", async () => {
+    const harness = importThenSwitchProjects();
+    const app = await renderApp(harness);
+    const dialog = await openImport(app);
+    const run = harness.job<void, { cancelled?: boolean }>("run_smart_import");
+
+    await app.user.click(within(dialog).getByRole("button", { name: /Import 2 clips/ }));
+    await run.started();
+    await app.user.selectOptions(screen.getByRole("combobox", { name: "Project" }), "project_okinawa");
+    await waitFor(() => expect(queueFilenames()).toEqual(["INSTA360_001.MP4", "INSTA360_002.MP4"]));
+    await run.fail("the card disappeared");
+
+    await waitFor(() => expect(screen.getByRole("combobox", { name: "Project" })).toHaveValue("project_okinawa"));
+    expect(queueFilenames()).toEqual(["INSTA360_001.MP4", "INSTA360_002.MP4"]);
+    expect(screen.queryByText("the card disappeared")).toBeNull();
+  });
+
+  it("does not publish a completed import if the project changes during final reconciliation", async () => {
+    const harness = importThenSwitchProjects();
+    const app = await renderApp(harness);
+    const dialog = await openImport(app);
+    const run = harness.job<void, { cancelled?: boolean }>("run_smart_import");
+
+    await app.user.click(within(dialog).getByRole("button", { name: /Import 2 clips/ }));
+    await run.started();
+    // Hold only the old project's reconciliation queue read. The project
+    // switch still loads Okinawa normally, reproducing a real user leaving
+    // while an import is doing its last bounded refresh.
+    const oldProjectReads = harness.calls("list_assets").filter((call) => call.projectId === "project_hokkaido").length;
+    harness.command("list_assets", (args) => args.projectId === "project_hokkaido").delayUntilReleased();
+    await run.complete();
+    await waitFor(() => expect(
+      harness.calls("list_assets").filter((call) => call.projectId === "project_hokkaido").length,
+    ).toBeGreaterThan(oldProjectReads));
+
+    await app.user.selectOptions(screen.getByRole("combobox", { name: "Project" }), "project_okinawa");
+    await waitFor(() => expect(queueFilenames()).toEqual(["INSTA360_001.MP4", "INSTA360_002.MP4"]));
+    harness.release("list_assets");
+
+    await waitFor(() => expect(screen.getByRole("combobox", { name: "Project" })).toHaveValue("project_okinawa"));
+    expect(queueFilenames()).toEqual(["INSTA360_001.MP4", "INSTA360_002.MP4"]);
+    expect(screen.queryByRole("button", { name: /Review last import/ })).toBeNull();
+  });
+
+  it("reports a proxy-tail cancellation as stopped even after all imports committed", async () => {
+    const harness = cardInSlot();
+    const app = await renderApp(harness);
+    const dialog = await openImport(app);
+    const run = harness.job<void, { proxyCancelled?: boolean }>("run_smart_import");
+
+    await app.user.click(within(dialog).getByRole("button", { name: /Import 3 clips/ }));
+    await run.started();
+    await run.progress();
+    await run.progress();
+    await run.progress();
+    await run.complete({ proxyCancelled: true });
+
+    expect(await screen.findByText("Import stopped cleanly; finished files were kept")).toBeVisible();
+    expect(Object.keys(harness.state.assets)).toHaveLength(7);
   });
 
   it("takes a new archive destination the user chooses", async () => {

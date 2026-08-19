@@ -25,6 +25,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "../api";
 import { chronologyApi } from "../chronologyApi";
+import { sortAssets as sortAssetsInOrder, upsertAsset as upsertAssetInOrder } from "../review/order";
 import type { ChronologyOverview } from "../chronologyTypes";
 import type {
   AnalysisReadiness,
@@ -70,6 +71,8 @@ export interface ProjectSession {
   reloadEvidence(): Promise<void>;
   /** Replace one asset in place, keeping the queue's order. Optimistic writes and progress events. */
   applyAsset(asset: Asset): void;
+  /** Add a durably committed import asset in canonical queue order. */
+  upsertAsset(asset: Asset): void;
   /** Rewrite the queue from the current one, for the batch listeners that touch many rows. */
   patchAssets(update: (current: Asset[]) => Asset[]): void;
 }
@@ -84,12 +87,6 @@ interface ReadToken {
 
 function indexAnalyses(entries: AssetAnalysisIndexEntry[]): Record<string, AssetAnalysisIndexEntry> {
   return Object.fromEntries(entries.map((entry) => [entry.assetId, entry]));
-}
-
-function sortAssets(assets: Asset[]): Asset[] {
-  return [...assets].sort((a, b) =>
-    (a.bestTime ?? `z${a.filename}`).localeCompare(b.bestTime ?? `z${b.filename}`),
-  );
 }
 
 export function useProjectSession({
@@ -178,7 +175,7 @@ export function useProjectSession({
       if (!isCurrent(token)) return;
       // The backend's order is the queue's order; only a per-asset replacement
       // re-sorts, and it does so the way `App` always has.
-      setAssets(result);
+      setAssets(sortAssetsInOrder(result));
       setLoadError("");
       onAssetsReadRef.current?.(result);
     } catch (reason) {
@@ -349,7 +346,14 @@ export function useProjectSession({
   }, [begin, loadEvidence]);
 
   const applyAsset = useCallback((updated: Asset) => {
-    setAssets((current) => sortAssets(current.map((asset) => (asset.id === updated.id ? updated : asset))));
+    setAssets((current) => sortAssetsInOrder(current.map((asset) => (asset.id === updated.id ? updated : asset))));
+  }, []);
+
+  const upsertAsset = useCallback((updated: Asset) => {
+    // Event subscriptions are application-wide. A response from an import the
+    // user started before opening another project must not enter this session.
+    if (updated.projectId !== projectIdRef.current) return;
+    setAssets((current) => upsertAssetInOrder(current, updated));
   }, []);
 
   const patchAssets = useCallback((update: (current: Asset[]) => Asset[]) => {
@@ -372,6 +376,7 @@ export function useProjectSession({
     reloadReadiness,
     reloadEvidence,
     applyAsset,
+    upsertAsset,
     patchAssets,
   };
 }

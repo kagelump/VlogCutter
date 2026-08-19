@@ -59,6 +59,17 @@ interface PhaseDialogState {
   };
 }
 
+interface ImportChronologyRefresh {
+  key: string;
+  projectId: string;
+  generation: number;
+  timer: number | null;
+  inFlight: Promise<void> | null;
+  dirty: boolean;
+  finalizing: boolean;
+  closed: boolean;
+}
+
 function initialProgress(kind: OperationProgress["kind"], total: number): OperationProgress {
   return {
     kind,
@@ -213,7 +224,10 @@ function App() {
   const viewerStageRef = useRef<HTMLDivElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const assetsRef = useRef<Asset[]>([]);
+  const projectIdRef = useRef("");
   const selectedIdRef = useRef("");
+  const importChronologyGenerationRef = useRef({ projectId: "", generation: 0 });
+  const importChronologyRefreshesRef = useRef(new Map<string, ImportChronologyRefresh>());
   // The clip to land on when a queue arrives with no live selection yet — the
   // review position recorded on last exit. Held in a ref so the assets read can
   // consult it without a dependency, and left in place: once the selection is
@@ -222,6 +236,15 @@ function App() {
   const orientationQueueRef = useRef<string[]>([]);
   const orientationActiveRef = useRef(new Set<string>());
   const cameraMergeRequestRef = useRef(0);
+  // Event listeners are registered once and can fire between renders and
+  // effects; keep the project guard current synchronously with the render.
+  projectIdRef.current = projectId;
+  if (importChronologyGenerationRef.current.projectId !== projectId) {
+    importChronologyGenerationRef.current = {
+      projectId,
+      generation: importChronologyGenerationRef.current.generation + 1,
+    };
+  }
 
   useEffect(() => {
     cameraMergeRequestRef.current += 1;
@@ -229,6 +252,23 @@ function App() {
     setCameraMergeDestination("");
     setCameraMergePreview(null);
     setCameraMergeError("");
+  }, [projectId]);
+
+  // Close only this project's generation on a switch. A held old-project
+  // solve therefore cannot reset or schedule the new project's work.
+  useEffect(() => {
+    const { projectId: effectProjectId, generation } = importChronologyGenerationRef.current;
+    const key = `${effectProjectId}:${generation}`;
+    return () => {
+      const refresh = importChronologyRefreshesRef.current.get(key);
+      if (!refresh) return;
+      refresh.closed = true;
+      refresh.dirty = false;
+      if (refresh.timer !== null) {
+        window.clearTimeout(refresh.timer);
+        refresh.timer = null;
+      }
+    };
   }, [projectId]);
 
   // One owner for the open project's reads, and the only thing that may write
@@ -256,9 +296,118 @@ function App() {
   });
   const { analysisIndex, readiness, transcript, observation, patchAssets } = session;
   const applyAssetToQueue = session.applyAsset;
+  const upsertSessionAsset = session.upsertAsset;
   const chronologyOverview = session.chronology;
   const reloadSession = session.reload;
   const reloadSessionAssets = session.reloadAssets;
+  const reloadSessionChronology = session.reloadChronology;
+
+  const scheduleImportChronologyRefresh = useCallback((importedProjectId: string) => {
+    const current = importChronologyGenerationRef.current;
+    if (current.projectId !== importedProjectId) return;
+    const key = `${importedProjectId}:${current.generation}`;
+    let refresh = importChronologyRefreshesRef.current.get(key);
+    if (!refresh || refresh.closed) {
+      refresh = {
+        key,
+        projectId: importedProjectId,
+        generation: current.generation,
+        timer: null,
+        inFlight: null,
+        dirty: false,
+        finalizing: false,
+        closed: false,
+      };
+      importChronologyRefreshesRef.current.set(key, refresh);
+    }
+    if (refresh.finalizing) {
+      // The final authoritative refresh is already serialized behind any
+      // progressive work; let it absorb this late event rather than overlap.
+      refresh.dirty = true;
+      return;
+    }
+    if (refresh.timer !== null) window.clearTimeout(refresh.timer);
+    refresh.timer = window.setTimeout(() => {
+      refresh!.timer = null;
+      const active = importChronologyGenerationRef.current;
+      if (
+        refresh!.closed
+        || active.projectId !== refresh!.projectId
+        || active.generation !== refresh!.generation
+      ) return;
+      if (refresh!.inFlight) {
+        refresh!.dirty = true;
+        return;
+      }
+      const flight = reloadSessionChronology();
+      refresh!.inFlight = flight;
+      void flight.finally(() => {
+        if (refresh!.inFlight !== flight) return;
+        refresh!.inFlight = null;
+        const latest = importChronologyGenerationRef.current;
+        if (
+          refresh!.closed
+          || latest.projectId !== refresh!.projectId
+          || latest.generation !== refresh!.generation
+        ) {
+          refresh!.dirty = false;
+          return;
+        }
+        if (refresh!.finalizing) return;
+        if (refresh!.dirty) {
+          refresh!.dirty = false;
+          scheduleImportChronologyRefresh(refresh!.projectId);
+        }
+      });
+    }, 100);
+  }, [reloadSessionChronology]);
+
+  const reconcileImportChronology = useCallback(async (importingProjectId: string) => {
+    const current = importChronologyGenerationRef.current;
+    if (current.projectId !== importingProjectId) return;
+    const key = `${importingProjectId}:${current.generation}`;
+    let refresh = importChronologyRefreshesRef.current.get(key);
+    if (!refresh || refresh.closed) {
+      refresh = {
+        key,
+        projectId: importingProjectId,
+        generation: current.generation,
+        timer: null,
+        inFlight: null,
+        dirty: false,
+        finalizing: false,
+        closed: false,
+      };
+      importChronologyRefreshesRef.current.set(key, refresh);
+    }
+    refresh.finalizing = true;
+    refresh.dirty = false;
+    if (refresh.timer !== null) {
+      window.clearTimeout(refresh.timer);
+      refresh.timer = null;
+    }
+    try {
+      await refresh.inFlight;
+      const latest = importChronologyGenerationRef.current;
+      if (
+        refresh.closed
+        || latest.projectId !== importingProjectId
+        || latest.generation !== refresh.generation
+      ) return;
+      // Do not race the final authoritative query with the progressive read
+      // it supersedes. This direct read is deliberately awaited by the caller.
+      await reloadSessionChronology();
+    } finally {
+      refresh.finalizing = false;
+      const latest = importChronologyGenerationRef.current;
+      const needsFollowUp = refresh.dirty
+        && !refresh.closed
+        && latest.projectId === refresh.projectId
+        && latest.generation === refresh.generation;
+      refresh.dirty = false;
+      if (needsFollowUp) scheduleImportChronologyRefresh(refresh.projectId);
+    }
+  }, [reloadSessionChronology, scheduleImportChronologyRefresh]);
 
   // One owner for the write path: optimistic apply, the stated failure policy,
   // save state, and the double-submit guard.
@@ -435,7 +584,18 @@ function App() {
   }, [refreshLibrary, refreshProjects]);
 
   useEffect(() => {
-    api.listImportSessions(projectId).then(setImportSessions).catch(() => setImportSessions([]));
+    // Import sessions are project-scoped state, just like the queue. An older
+    // catalog read must not replace the history after a project switch.
+    let active = true;
+    const requestedProjectId = projectId;
+    api.listImportSessions(requestedProjectId)
+      .then((sessions) => {
+        if (active && projectIdRef.current === requestedProjectId) setImportSessions(sessions);
+      })
+      .catch(() => {
+        if (active && projectIdRef.current === requestedProjectId) setImportSessions([]);
+      });
+    return () => { active = false; };
   }, [projectId]);
 
   useEffect(() => {
@@ -568,7 +728,23 @@ function App() {
         }),
         api.onModelInstallProgress((progress) => setModelInstall(progress)),
         api.onImportProgress((progress) => {
+          // Import progress is emitted from a long-lived native worker. A
+          // user may have switched projects since it started, in which case
+          // neither its progress UI nor a committed asset belongs here.
+          if (progress.projectId !== projectIdRef.current) return;
           setImportProgress(progress);
+          // A Smart-import item is safe to show only when the Rust-owned
+          // import loop has committed it and supplied the materialized asset.
+          // Insert it into the cache in canonical review order instead of
+          // waiting for the end-of-run reconciliation. The project guard is a
+          // ref because event listeners outlive the render that attached them.
+          if (progress.asset) {
+            upsertSessionAsset(progress.asset);
+            // The ribbon can render the committed asset immediately from the
+            // queue cache. Solver-derived context follows in one coalesced,
+            // single-flight refresh rather than once per copied clip.
+            scheduleImportChronologyRefresh(progress.asset.projectId);
+          }
           if (activeOperationRef.current === "import" && progress.stage !== "complete") {
             setOperationProgress({
               kind: "import",
@@ -591,8 +767,16 @@ function App() {
     return () => {
       disposed = true;
       unlisten.forEach((dispose) => dispose());
+      for (const refresh of importChronologyRefreshesRef.current.values()) {
+        refresh.closed = true;
+        refresh.dirty = false;
+        if (refresh.timer !== null) {
+          window.clearTimeout(refresh.timer);
+          refresh.timer = null;
+        }
+      }
     };
-  }, [patchAssets]);
+  }, [patchAssets, scheduleImportChronologyRefresh, upsertSessionAsset]);
 
   // Mount detection is deliberately low-frequency and listing-only. It offers
   // a review action; hashing and probing begin only after that click.
@@ -1390,6 +1574,7 @@ function App() {
 
   async function runSmartImport() {
     if (!projectId || !importPlan || importRunning || busy) return;
+    const importingProjectId = projectId;
     setImportRunning(true);
     setBusy(true);
     setImportProgress(null);
@@ -1404,22 +1589,43 @@ function App() {
         importCard?.sessionId ?? null,
       );
       setSettings(nextSettings);
-      const report = await api.runSmartImport(projectId, importPlan, verifyImportCopies, makeImportProxies);
+      const report = await api.runSmartImport(importingProjectId, importPlan, verifyImportCopies, makeImportProxies);
+      // The worker may finish after the user has opened another project. Its
+      // durable work remains valid, but its ledger, message, and reloads must
+      // not overwrite the project now on screen.
+      if (projectIdRef.current !== importingProjectId) return;
+      // The incremental events already made committed rows visible. This final
+      // pass reconciles anything an event could not carry, including all
+      // solver-derived chronology after the last card run landed.
+      await Promise.all([
+        reloadSessionAssets(),
+        reconcileImportChronology(importingProjectId),
+        refreshProjects(),
+        session.reloadReadiness(),
+      ]);
+      // Reconciliation itself is asynchronous. The user can leave while it is
+      // running, so publish the ledger and completion message only after the
+      // same project guard has held across that final await too.
+      if (projectIdRef.current !== importingProjectId) return;
       setImportReport(report);
       setImportSessions((current) => report.session ? [report.session, ...current.filter((entry) => entry.id !== report.session!.id)] : current);
-      await Promise.all([reloadSessionAssets(), refreshProjects(), session.reloadReadiness()]);
       const failures = report.outcome.failures.length + (report.proxies?.failures.length ?? 0);
+      const warnings = report.outcome.warnings?.length ?? 0;
       if (failures) {
         const failureMessage = `${failures} file${failures === 1 ? "" : "s"} need attention in the import ledger.`;
         setImportError(failureMessage);
         setError(failureMessage);
-      } else if (report.outcome.cancelled) {
+      } else if (report.outcome.cancelled || report.proxies?.cancelled) {
         setMessage("Import stopped cleanly; finished files were kept");
+      } else if (warnings) {
+        setMessage(
+          `Import complete · ${report.outcome.imported} clip${report.outcome.imported === 1 ? "" : "s"} added · ${warnings} warning${warnings === 1 ? "" : "s"} to review`,
+        );
       } else {
         setMessage(`Import complete · ${report.outcome.imported} clip${report.outcome.imported === 1 ? "" : "s"} added`);
       }
     } catch (reason) {
-      setError(String(reason));
+      if (projectIdRef.current === importingProjectId) setError(String(reason));
     } finally {
       activeOperationRef.current = null;
       setOperationProgress(null);

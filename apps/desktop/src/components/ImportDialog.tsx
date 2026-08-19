@@ -346,6 +346,11 @@ export function ImportDialog({
               {report.outcome.cameraMappingWarning && (
                 <p className="context-modal-error" role="alert">{report.outcome.cameraMappingWarning}</p>
               )}
+              {report.outcome.warnings?.map((warning) => (
+                <p className="context-modal-error" role="alert" key={`${warning.path}:${warning.error}`}>
+                  {warning.error}
+                </p>
+              ))}
               {report.proxies && <p>{noun(report.proxies.generated, "proxy", "proxies")} made for laptop review.</p>}
             </div>
             <details className="import-file-ledger">

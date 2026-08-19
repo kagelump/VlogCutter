@@ -4,6 +4,38 @@ export interface OrderOptions {
   removedVisible: boolean;
 }
 
+const utf8 = new TextEncoder();
+
+/** SQLite's default BINARY collation compares UTF-8 bytes, not UTF-16 code units. */
+function compareSqliteBinary(left: string, right: string): number {
+  if (left === right) return 0;
+  const leftBytes = utf8.encode(left);
+  const rightBytes = utf8.encode(right);
+  const length = Math.min(leftBytes.length, rightBytes.length);
+  for (let index = 0; index < length; index += 1) {
+    const difference = leftBytes[index] - rightBytes[index];
+    if (difference !== 0) return difference;
+  }
+  return leftBytes.length - rightBytes.length;
+}
+
+/** The catalog's canonical review ordering: known timestamps first, then filename and stable id. */
+export function compareAssets(left: Asset, right: Asset): number {
+  if (left.bestTime === null && right.bestTime !== null) return 1;
+  if (left.bestTime !== null && right.bestTime === null) return -1;
+  // These strings are persisted order keys, so locale and JavaScript UTF-16
+  // ordering could make an incremental insertion disagree with SQLite.
+  const time = compareSqliteBinary(left.bestTime ?? "", right.bestTime ?? "");
+  if (time !== 0) return time;
+  const filename = compareSqliteBinary(left.filename, right.filename);
+  return filename !== 0 ? filename : compareSqliteBinary(left.id, right.id);
+}
+
+/** A non-mutating canonical-order copy for a queue refresh or imported row. */
+export function sortAssets(assets: Asset[]): Asset[] {
+  return [...assets].sort(compareAssets);
+}
+
 /**
  * Returns the review queue in display order. Pure, total, and stable: it only
  * filters by removed status, so the relative order of `assets` is preserved
@@ -81,4 +113,26 @@ export function replaceAsset(assets: Asset[], updated: Asset): Asset[] {
   const next = assets.slice();
   next[index] = updated;
   return next;
+}
+
+/**
+ * Merge a just-committed asset into the review cache in the same deterministic
+ * order as `Catalog::list_assets`: solved timestamp, filename, then stable id.
+ *
+ * Import is the one progress stream that can introduce a new asset. Other
+ * batch streams only enrich an existing row and should keep using
+ * `replaceAsset`, which avoids needless whole-list work for unrelated events.
+ */
+export function upsertAsset(assets: Asset[], updated: Asset): Asset[] {
+  const existing = assets.findIndex((candidate) => candidate.id === updated.id);
+  if (existing !== -1) return replaceAsset(assets, updated);
+
+  let low = 0;
+  let high = assets.length;
+  while (low < high) {
+    const middle = Math.floor((low + high) / 2);
+    if (compareAssets(assets[middle], updated) <= 0) low = middle + 1;
+    else high = middle;
+  }
+  return [...assets.slice(0, low), updated, ...assets.slice(low)];
 }

@@ -28,7 +28,7 @@ use walkdir::WalkDir;
 use crate::cameras::mapping::CameraEvidence;
 use crate::cards::{CardCandidate, card_session_slug, inspect_card};
 use crate::{
-    ArchiveRoot, Catalog, UNKNOWN_CAMERA, has_current_proxy, is_media, locations,
+    ArchiveRoot, Asset, Catalog, UNKNOWN_CAMERA, has_current_proxy, is_media, locations,
     sampled_media_fingerprint,
 };
 
@@ -1149,6 +1149,12 @@ pub struct ImportOutcome {
     pub bytes_copied: u64,
     pub cancelled: bool,
     pub failures: Vec<crate::IngestFailure>,
+    /// Non-fatal bookkeeping problems after a clip's membership and bytes are
+    /// already durable. These are deliberately separate from `failures`: the
+    /// clip must stay visible and resumable, while the user still gets a clear
+    /// path to repair the optional archive-location metadata.
+    #[serde(default)]
+    pub warnings: Vec<crate::IngestFailure>,
     /// A non-fatal failure to persist the user's sticky camera choice after
     /// the imported assets were already committed. The import remains valid;
     /// callers should surface this warning and let the user retry on a later
@@ -1176,6 +1182,10 @@ pub struct ImportProgress {
     pub current_file: String,
     pub completed_bytes: u64,
     pub total_bytes: u64,
+    /// Present only after the item has been durably committed. A copying,
+    /// verifying, or failed item is deliberately never exposed as an asset.
+    #[serde(default)]
+    pub asset: Option<Asset>,
 }
 
 /// The per-plan context every item in a `run_import` loop shares, bundled so
@@ -1188,6 +1198,15 @@ struct ImportOneContext<'a> {
     /// is either a user selection or a remembered mapping. See
     /// `ResolvedImportCamera` and `run_import`'s doc comment.
     camera_override: Option<&'a str>,
+}
+
+/// The durable result of one import item. `warnings` are emitted only after
+/// the asset has committed; callers must never reinterpret them as a failed
+/// item that should disappear from Review.
+struct ImportedItem {
+    bytes: u64,
+    asset_id: String,
+    warnings: Vec<crate::IngestFailure>,
 }
 
 impl Catalog {
@@ -1265,11 +1284,13 @@ impl Catalog {
                 current_file: item.filename.clone(),
                 completed_bytes,
                 total_bytes,
+                asset: None,
             }) {
                 outcome.cancelled = true;
                 break;
             }
             let completed_before_file = completed_bytes;
+            let mut committed_asset = None;
             match self.import_one(
                 project_id,
                 item,
@@ -1287,10 +1308,18 @@ impl Catalog {
                         current_file: item.filename.clone(),
                         completed_bytes: completed_before_file.saturating_add(file_bytes),
                         total_bytes,
+                        asset: None,
                     })
                 },
             ) {
-                Ok(Some((bytes, asset_id))) => {
+                Ok(Some(item_result)) => {
+                    let ImportedItem {
+                        bytes,
+                        asset_id,
+                        warnings,
+                    } = item_result;
+                    let emitted_asset_id = asset_id.clone();
+                    outcome.warnings.extend(warnings);
                     if item.classification == Classification::New {
                         outcome.imported += 1;
                         outcome.imported_asset_ids.push(asset_id);
@@ -1305,6 +1334,13 @@ impl Catalog {
                         outcome.relinked += 1;
                         outcome.relinked_asset_ids.push(asset_id);
                     }
+                    // Read the materialized row only after all of
+                    // `import_one`'s bookkeeping (including an archive
+                    // location) has committed. Failure to produce this
+                    // optional live update must not turn a safe import into a
+                    // failed one; the end-of-run reconciliation remains the
+                    // authority.
+                    committed_asset = self.get_asset(&emitted_asset_id).ok();
                 }
                 // Cancelled mid-copy.
                 Ok(None) => {
@@ -1323,6 +1359,7 @@ impl Catalog {
                 current_file: item.filename.clone(),
                 completed_bytes,
                 total_bytes,
+                asset: committed_asset,
             }) {
                 outcome.cancelled = index + 1 < total;
                 break;
@@ -1365,7 +1402,7 @@ impl Catalog {
         Ok(outcome)
     }
 
-    /// Returns the bytes copied and stable asset id, or `None` when the copy was cancelled.
+    /// Returns the durable item result, or `None` when the copy was cancelled.
     fn import_one<F>(
         &self,
         project_id: &str,
@@ -1373,7 +1410,7 @@ impl Catalog {
         context: &ImportOneContext<'_>,
         verify_copies: bool,
         mut on_copy_bytes: F,
-    ) -> Result<Option<(u64, String)>>
+    ) -> Result<Option<ImportedItem>>
     where
         F: FnMut(u64) -> bool,
     {
@@ -1395,7 +1432,11 @@ impl Catalog {
             let asset_id = self.asset_id_at_path(project_id, &source)?.ok_or_else(|| {
                 anyhow::anyhow!("relinked asset was not found at {}", source.display())
             })?;
-            return Ok(Some((0, asset_id)));
+            return Ok(Some(ImportedItem {
+                bytes: 0,
+                asset_id,
+                warnings: Vec::new(),
+            }));
         }
 
         // New content. Copy it off the card first when there is somewhere to put
@@ -1430,7 +1471,11 @@ impl Catalog {
                                 source.display()
                             )
                         })?;
-                    return Ok(Some((0, asset_id)));
+                    return Ok(Some(ImportedItem {
+                        bytes: 0,
+                        asset_id,
+                        warnings: Vec::new(),
+                    }));
                 }
                 match crate::copy::commit_into_archive(
                     &source,
@@ -1458,15 +1503,33 @@ impl Catalog {
 
         // Bind the new asset to the archive root, so relocating the archive later
         // is one rebind rather than a per-asset repair.
+        let mut warnings = Vec::new();
         if let (Some(root_id), Some(card)) = (archive_root_id, card)
             && bytes > 0
         {
             let relative = self.archive_relative_path(project_id, card, &item.relative_path)?;
             let relative = crate::RootRelativePath::parse(relative)
                 .map_err(|error| anyhow::anyhow!("unusable archive path: {error}"))?;
-            self.record_archive_location(&asset_id, root_id, &relative, &path_to_register)?;
+            // Asset membership and its verified local location committed in
+            // `ingest_file_with_camera` above. The archive-root binding makes
+            // a future root rebind convenient, but cannot retroactively make
+            // this completed clip a failure or hide it from progressive Review.
+            if let Err(error) =
+                self.record_archive_location(&asset_id, root_id, &relative, &path_to_register)
+            {
+                warnings.push(crate::IngestFailure {
+                    path: path_to_register.to_string_lossy().into_owned(),
+                    error: format!(
+                        "Clip imported, but its archive location was not recorded: {error:#}. Keep this archive mounted and review the import warning before relocating it."
+                    ),
+                });
+            }
         }
-        Ok(Some((bytes, asset_id)))
+        Ok(Some(ImportedItem {
+            bytes,
+            asset_id,
+            warnings,
+        }))
     }
 
     fn asset_id_at_path(&self, project_id: &str, path: &Path) -> Result<Option<String>> {
@@ -2455,8 +2518,26 @@ mod tests {
             .unwrap();
         assert_eq!(plan.new_clips, 2);
 
+        let mut committed_progress_assets = Vec::new();
+        let mut committed_progress_count = 0;
         let outcome = catalog
-            .run_import(&project.id, &plan, true, |_| true)
+            .run_import(&project.id, &plan, true, |progress| {
+                if let Some(asset) = progress.asset {
+                    // The live object is emitted only after the asset itself
+                    // is materialized, so a frontend may put it on screen
+                    // before the next file starts copying.
+                    assert_eq!(asset.project_id, project.id);
+                    assert!(asset.original_available);
+                    assert_eq!(progress.completed_items, committed_progress_count + 1);
+                    committed_progress_count += 1;
+                    committed_progress_assets.push(asset.id);
+                } else {
+                    // Copy/read progress may advance bytes, but it cannot
+                    // announce a catalog row before the post-commit callback.
+                    assert_eq!(progress.completed_items, committed_progress_count);
+                }
+                true
+            })
             .unwrap();
         assert_eq!(outcome.imported, 2);
         assert_eq!(outcome.imported_asset_ids.len(), 2);
@@ -2464,6 +2545,7 @@ mod tests {
         assert_eq!(outcome.copied, 2);
         assert!(outcome.bytes_copied > 0);
         assert!(outcome.failures.is_empty(), "{:?}", outcome.failures);
+        assert_eq!(committed_progress_assets, outcome.imported_asset_ids);
 
         // Originals landed under the archive root, keeping the camera's own
         // folder structure, and the card still has them.
@@ -2509,6 +2591,77 @@ mod tests {
         assert_eq!(second.imported_asset_ids.len(), 1);
         assert_eq!(second.copied, 1, "already-archived clips are not re-copied");
         assert_eq!(catalog.list_assets(&project.id).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn archive_location_bookkeeping_failure_keeps_the_committed_clip_visible_with_a_warning() {
+        if crate::tool_command("ffprobe")
+            .arg("-version")
+            .output()
+            .is_err()
+        {
+            eprintln!("ffprobe is unavailable; skipping media integration test");
+            return;
+        }
+
+        let directory = tempdir().unwrap();
+        let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).unwrap();
+        let project = catalog.create_project("Spain 2026").unwrap();
+        let mount = card_fixture_media(directory.path(), &[("C0001.MP4", "navy")]);
+        let archive = directory.path().join("nas");
+        fs::create_dir_all(&archive).unwrap();
+        let root = catalog.create_archive_root("NAS Video", &archive).unwrap();
+        let plan = catalog
+            .preflight_import(&project.id, &mount, Some(&root.id), None, |_, _, _| true)
+            .unwrap();
+
+        // Force only the post-ingest archive-location UPDATE to fail. The
+        // operation-backed asset membership and its verified local location
+        // have already committed by then, which is the boundary this
+        // regression protects.
+        catalog
+            .connection()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER fail_archive_location \
+                 BEFORE UPDATE OF archive_root_id ON project_asset_local_locations \
+                 WHEN NEW.archive_root_id IS NOT NULL \
+                 BEGIN SELECT RAISE(FAIL, 'forced archive-location failure'); END;",
+            )
+            .unwrap();
+
+        let mut emitted = Vec::new();
+        let outcome = catalog
+            .run_import(&project.id, &plan, true, |progress| {
+                if let Some(asset) = progress.asset {
+                    emitted.push(asset);
+                }
+                true
+            })
+            .unwrap();
+
+        assert!(
+            outcome.failures.is_empty(),
+            "a durable clip is never reported as failed"
+        );
+        assert_eq!(outcome.imported_asset_ids.len(), 1);
+        assert_eq!(
+            emitted.iter().map(|asset| &asset.id).collect::<Vec<_>>(),
+            outcome.imported_asset_ids.iter().collect::<Vec<_>>()
+        );
+        assert_eq!(outcome.warnings.len(), 1);
+        assert!(
+            outcome.warnings[0]
+                .error
+                .contains("archive location was not recorded")
+        );
+        let assets = catalog.list_assets(&project.id).unwrap();
+        assert_eq!(assets.len(), 1);
+        assert_eq!(assets[0].id, outcome.imported_asset_ids[0]);
+        assert!(
+            assets[0].original_available,
+            "the verified archive copy remains usable"
+        );
     }
 
     /// Importing must not start a copy it cannot finish.
@@ -2572,13 +2725,18 @@ mod tests {
         let plan = catalog
             .preflight_import(&project.id, &mount, Some(&root.id), None, |_, _, _| true)
             .unwrap();
+        let mut cancelled_progress_assets = Vec::new();
         let outcome = catalog
             .run_import(&project.id, &plan, true, |progress| {
+                if let Some(asset) = progress.asset {
+                    cancelled_progress_assets.push(asset.id);
+                }
                 progress.completed_items < 2
             })
             .unwrap();
         assert!(outcome.cancelled);
         assert_eq!(outcome.imported, 2);
+        assert_eq!(cancelled_progress_assets, outcome.imported_asset_ids);
 
         // Re-planning sees only what is left.
         let resumed_plan = catalog
@@ -2731,8 +2889,12 @@ mod tests {
             .unwrap();
         let archive_path = PathBuf::from(&asset.path);
         let mut target_replaced = false;
+        let mut failure_progress_assets = Vec::new();
         let changed_after_preflight = catalog
-            .run_import(&project.id, &matching_plan, true, |_| {
+            .run_import(&project.id, &matching_plan, true, |progress| {
+                if let Some(asset) = progress.asset {
+                    failure_progress_assets.push(asset.id);
+                }
                 if !target_replaced {
                     fs::write(&archive_path, b"replaced footage").unwrap();
                     target_replaced = true;
@@ -2746,6 +2908,7 @@ mod tests {
                 .error
                 .contains("archive target already exists with different content")
         );
+        assert!(failure_progress_assets.is_empty());
         assert!(catalog.list_assets(&project.id).unwrap().is_empty());
         fs::write(&archive_path, b"returned footage").unwrap();
 

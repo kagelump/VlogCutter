@@ -266,9 +266,15 @@ function preflight(
 }
 
 interface RunTally {
+  projectId: string;
   imported: string[];
   pending: Asset[];
   bytesCopied: number;
+}
+
+interface RunOutcome {
+  cancelled?: boolean;
+  proxyCancelled?: boolean;
 }
 
 /** Only a user selection or a remembered mapping forces every new asset's
@@ -285,23 +291,33 @@ function stepProgress(state: DesktopHarnessState, tally: RunTally, plan: ImportP
   const next = tally.pending.shift();
   if (!next) throw new Error("The import has no pending clips left to report");
   const camera = uniformCameraFor(plan);
-  putAsset(state, camera ? { ...next, camera } : next);
+  const committed = camera ? { ...next, camera } : next;
+  putAsset(state, committed);
   tally.imported.push(next.id);
   tally.bytesCopied += next.sizeBytes;
   return {
+    projectId: tally.projectId,
     stage: "copying",
     completed: tally.imported.length,
     total: plan.newClips,
     currentFile: next.filename,
     completedBytes: tally.bytesCopied,
     totalBytes: plan.destination.bytesToCopy,
+    asset: committed,
   };
 }
 
-function runReport(state: DesktopHarnessState, tally: RunTally, plan: ImportPreflight, cancelled: boolean, makeProxies: boolean): ImportRunReport {
+function runReport(
+  state: DesktopHarnessState,
+  tally: RunTally,
+  plan: ImportPreflight,
+  cancelled: boolean,
+  makeProxies: boolean,
+  proxyCancelled = false,
+): ImportRunReport {
   const sessionId = `import_${Object.keys(state.imports.sessions).length + 1}`;
   const session: ImportSessionDetail = {
-    id: sessionId, projectId: "project_hokkaido", sourcePath: plan.sourcePath,
+    id: sessionId, projectId: tally.projectId, sourcePath: plan.sourcePath,
     destinationMode: plan.destination.copies ? "archive_copy" : "reference",
     destinationRootId: plan.destination.archiveRoot?.id ?? null,
     destinationName: plan.destination.archiveRoot?.displayName ?? "Originals stay in place",
@@ -323,10 +339,11 @@ function runReport(state: DesktopHarnessState, tally: RunTally, plan: ImportPref
       bytesCopied: tally.bytesCopied,
       cancelled,
       failures: [],
+      warnings: [],
       cameraMappingWarning: null,
     },
     proxies: makeProxies
-      ? { generated: tally.imported.length, skipped: 0, cancelled, failures: [] }
+      ? { generated: tally.imported.length, skipped: 0, cancelled: cancelled || proxyCancelled, failures: [] }
       : null,
     files: plan.items.map((item) => {
       const asset = (item.assetId ? state.assets[item.assetId] : undefined)
@@ -446,6 +463,7 @@ export const importCommands: CommandTable = {
     context.state.imports.lastRunSourcePath = plan.sourcePath;
     const additions = context.state.imports.additions[plan.sourcePath] ?? [];
     const tally: RunTally = {
+      projectId,
       imported: [],
       // Exactly the clips the plan classified as new, and no others.
       pending: additions.filter((asset) => !context.state.assets[asset.id]),
@@ -472,12 +490,19 @@ export const importCommands: CommandTable = {
       return runReport(context.state, tally, plan, false, makeProxies);
     }
 
-    const binding: JobBinding<void, { cancelled?: boolean }, ImportRunReport> = {
+    const binding: JobBinding<void, RunOutcome, ImportRunReport> = {
       command: "run_smart_import",
       args: { sourcePath: plan.sourcePath },
       event: "import-progress",
       progress: () => stepProgress(context.state, tally, plan),
-      result: (outcome) => runReport(context.state, tally, plan, Boolean(outcome?.cancelled) || controller.isCancelled, makeProxies),
+      result: (outcome) => runReport(
+        context.state,
+        tally,
+        plan,
+        Boolean(outcome?.cancelled) || controller.isCancelled,
+        makeProxies,
+        Boolean(outcome?.proxyCancelled),
+      ),
     };
     return controller.bind(binding);
   },
@@ -517,8 +542,10 @@ export const importCommands: CommandTable = {
   },
 
   list_import_sessions: (args, { state }) => {
-    requireString(args, "projectId");
-    return Object.values(state.imports.sessions).map(({ files: _files, ...entry }) => entry);
+    const projectId = requireString(args, "projectId");
+    return Object.values(state.imports.sessions)
+      .filter((entry) => entry.projectId === projectId)
+      .map(({ files: _files, ...entry }) => entry);
   },
 
   import_session: (args, { state }): ImportSessionDetail => {
