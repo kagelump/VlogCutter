@@ -1598,6 +1598,211 @@ mod tests {
         assert!(catalog.list_assets(&project.id).unwrap().is_empty());
     }
 
+    // The tests above prove each detector fires on a synthetic layout built to
+    // trigger it. The ones below are the other half of the same acceptance
+    // question (#56): that an ordinary card, and a gap just under the
+    // threshold, do *not* produce a spurious boundary or evidence entry, and
+    // that the two evidence kinds not yet exercised through the real
+    // `preflight_import` entry point (`PrefixChange`, `LargeDiscontinuity`) are
+    // covered there too, not only at the low-level candidate-list layer.
+
+    #[test]
+    fn sequence_detector_does_not_flag_a_gap_under_the_discontinuity_threshold() {
+        let (_ordered, runs, boundaries) = propose_import_runs(vec![
+            sequence_hint("A/C0001.MP4", "Sony", "card", "A", "C", Some(1), Some(1)),
+            sequence_hint(
+                "A/C0002.MP4",
+                "Sony",
+                "card",
+                "A",
+                "C",
+                Some(2),
+                Some(LARGE_CAPTURE_SEQUENCE_GAP_SECONDS), // one second under the gap.
+            ),
+        ]);
+        assert!(boundaries.is_empty());
+        assert_eq!(runs.len(), 1);
+        assert!(runs[0].boundary_evidence.is_empty());
+    }
+
+    #[test]
+    fn import_preflight_flags_no_boundary_for_ordinary_continuous_footage() {
+        // One card, one folder, one filename prefix, an ascending counter, and
+        // clips shot minutes apart: nothing here should ever look like a card
+        // swap. This is the negative twin of the five positive fixtures above
+        // and below — a detector that fired here would corrupt chronology on
+        // every ordinary import.
+        let directory = tempdir().unwrap();
+        let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).unwrap();
+        let project = catalog.create_project("Spain 2026").unwrap();
+        let mount = directory.path().join("SONY_SD");
+        let folder = mount.join("DCIM/100MSDCF");
+        fs::create_dir_all(&folder).unwrap();
+        let base = UNIX_EPOCH + std::time::Duration::from_secs(1_000);
+        for (index, counter) in (1..=5u64).enumerate() {
+            let path = folder.join(format!("C{counter:04}.MP4"));
+            fs::write(&path, format!("clip {counter}").into_bytes()).unwrap();
+            let shot_at = base + std::time::Duration::from_secs(index as u64 * 60);
+            fs::File::open(&path)
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(shot_at))
+                .unwrap();
+        }
+
+        let plan = catalog
+            .preflight_import(&project.id, &mount, None, |_, _, _| true)
+            .unwrap();
+
+        assert!(plan.sequence_preview.boundaries.is_empty());
+        assert_eq!(plan.sequence_preview.runs.len(), 1);
+        let run = &plan.sequence_preview.runs[0];
+        assert_eq!(run.clip_count, 5);
+        assert!(run.evidence.is_empty());
+        assert!(!run.needs_review);
+    }
+
+    #[test]
+    fn import_preflight_surfaces_prefix_change_boundary_evidence() {
+        // Same card, same folder, tight timing, and neither filename matches a
+        // known camera pattern — so both resolve to the card's own camera
+        // hint and only the filename prefix itself changes. `PrefixChange`
+        // should be the only evidence, exercised here through the real scan
+        // rather than a hand-built candidate list.
+        let directory = tempdir().unwrap();
+        let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).unwrap();
+        let project = catalog.create_project("Spain 2026").unwrap();
+        let mount = directory.path().join("SONY_SD");
+        let folder = mount.join("DCIM/100MSDCF");
+        fs::create_dir_all(&folder).unwrap();
+        let first = folder.join("AAA0001.MP4");
+        let second = folder.join("BBB0002.MP4");
+        fs::write(&first, b"first pattern").unwrap();
+        fs::write(&second, b"second pattern").unwrap();
+        let base = UNIX_EPOCH + std::time::Duration::from_secs(200);
+        fs::File::open(&first)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(base))
+            .unwrap();
+        fs::File::open(&second)
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new().set_modified(base + std::time::Duration::from_secs(1)),
+            )
+            .unwrap();
+
+        let plan = catalog
+            .preflight_import(&project.id, &mount, None, |_, _, _| true)
+            .unwrap();
+
+        assert_eq!(plan.sequence_preview.boundaries.len(), 1);
+        let boundary = &plan.sequence_preview.boundaries[0];
+        assert_eq!(boundary.after_relative_path, "DCIM/100MSDCF/BBB0002.MP4");
+        assert!(matches!(
+            boundary.evidence.as_slice(),
+            [ImportSequenceBoundaryEvidence::PrefixChange { from, to }]
+                if from == "AAA" && to == "BBB"
+        ));
+    }
+
+    #[test]
+    fn import_preflight_surfaces_large_discontinuity_boundary_evidence() {
+        // Same card, same folder, same filename prefix, a normally ascending
+        // counter — only the clock jumps by more than
+        // `LARGE_CAPTURE_SEQUENCE_GAP_SECONDS`, so `LargeDiscontinuity` should
+        // be the only evidence, exercised here through the real scan.
+        let directory = tempdir().unwrap();
+        let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).unwrap();
+        let project = catalog.create_project("Spain 2026").unwrap();
+        let mount = directory.path().join("SONY_SD");
+        let folder = mount.join("DCIM/100MSDCF");
+        fs::create_dir_all(&folder).unwrap();
+        let first = folder.join("C0001.MP4");
+        let second = folder.join("C0002.MP4");
+        fs::write(&first, b"before the gap").unwrap();
+        fs::write(&second, b"after the gap").unwrap();
+        let base = UNIX_EPOCH + std::time::Duration::from_secs(300);
+        fs::File::open(&first)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(base))
+            .unwrap();
+        fs::File::open(&second)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(
+                base + std::time::Duration::from_secs(LARGE_CAPTURE_SEQUENCE_GAP_SECONDS),
+            ))
+            .unwrap();
+
+        let plan = catalog
+            .preflight_import(&project.id, &mount, None, |_, _, _| true)
+            .unwrap();
+
+        assert_eq!(plan.sequence_preview.boundaries.len(), 1);
+        let boundary = &plan.sequence_preview.boundaries[0];
+        assert_eq!(boundary.after_relative_path, "DCIM/100MSDCF/C0002.MP4");
+        assert!(matches!(
+            boundary.evidence.as_slice(),
+            [ImportSequenceBoundaryEvidence::LargeDiscontinuity { gap_seconds }]
+                if *gap_seconds == LARGE_CAPTURE_SEQUENCE_GAP_SECONDS
+        ));
+    }
+
+    #[test]
+    fn import_preflight_recognizes_a_reformatted_card_reusing_a_path_as_a_volume_change() {
+        // The issue's named "reformat-reuse" scenario: a card is imported, then
+        // physically reformatted and reused for an unrelated shoot before the
+        // next import. `cards.rs` already proves a reformat changes
+        // `session_id` even when paths and filenames repeat
+        // (`card_identity_survives_new_footage_but_not_a_reformat`); this test
+        // proves that identity change actually reaches the preview as
+        // `VolumeChange` evidence against the sequence the first session
+        // declared, isolated from any prefix or folder change.
+        let directory = tempdir().unwrap();
+        let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).unwrap();
+        let project = catalog.create_project("Spain 2026").unwrap();
+        let mount = card_fixture(
+            directory.path(),
+            &[("C0101.MP4", b"day one"), ("C0102.MP4", b"day one more")],
+        );
+        let original_card = inspect_card(&mount).unwrap().unwrap();
+        let original_sequence = catalog
+            .declare_capture_sequence(
+                &project.id,
+                "Sony (C-series)",
+                "Sony SD - Day 1",
+                &original_card.session_id,
+                "C",
+            )
+            .unwrap();
+
+        // Reformat: the DCIM tree is wiped and rewritten with unrelated
+        // footage that happens to reuse the same relative path and filename
+        // prefix.
+        fs::remove_dir_all(mount.join("DCIM")).unwrap();
+        fs::create_dir_all(mount.join("DCIM/100MSDCF")).unwrap();
+        fs::write(mount.join("DCIM/100MSDCF/C0101.MP4"), b"reshot entirely").unwrap();
+        let reformatted_card = inspect_card(&mount).unwrap().unwrap();
+        assert_ne!(reformatted_card.session_id, original_card.session_id);
+
+        let plan = catalog
+            .preflight_import(&project.id, &mount, None, |_, _, _| true)
+            .unwrap();
+
+        assert_eq!(plan.sequence_preview.runs.len(), 1);
+        let run = &plan.sequence_preview.runs[0];
+        assert_eq!(run.decision, ImportSequenceRunDecision::ProposeNew);
+        assert_eq!(
+            run.compared_existing_sequence_id.as_deref(),
+            Some(original_sequence.id.as_str())
+        );
+        assert!(run.reason.contains(&original_sequence.label));
+        assert!(run.needs_review);
+        assert!(matches!(
+            run.evidence.as_slice(),
+            [ImportSequenceBoundaryEvidence::VolumeChange { from, to }]
+                if from == &original_card.session_id && to == &reformatted_card.session_id
+        ));
+    }
+
     /// A card holding real, probeable media. Import creates assets, which runs
     /// ffprobe, so byte blobs will not do here.
     fn card_fixture_media(root: &Path, clips: &[(&str, &str)]) -> PathBuf {
