@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../api";
 import type {
   ArchiveRoot,
+  CameraMapping,
   CardCandidate,
   ImportPreflight,
   ImportPreviewItem,
@@ -27,14 +28,42 @@ export interface ImportDialogProps {
   error: string;
   verifyCopies: boolean;
   makeProxies: boolean;
+  /** Existing project camera identities, for "choose an existing project camera" (#71). */
+  knownCameras: string[];
+  /** Every stored evidence-to-camera mapping for this project, for "inspect/change/clear" (#71). */
+  mappings: CameraMapping[];
   onSelectRoot(id: string): void;
   onCreateRoot(name: string): void;
   onLocateRoot(root: ArchiveRoot): void;
   onVerifyCopies(value: boolean): void;
   onMakeProxies(value: boolean): void;
+  /** `null` clears back to auto-detection; any other string is a deliberate choice. */
+  onSelectCamera(camera: string | null): void;
+  onRenameMapping(mappingId: string, camera: string): void;
+  onClearMapping(mappingId: string): void;
   onImport(): void;
   onCancel(): void;
   onClose(): void;
+}
+
+const NEW_CAMERA_OPTION = "__new_camera__";
+
+/** What the camera control says beneath the resolved name — the "make
+ * uncertainty visible" half of #71, not just the ready-to-import case. */
+function cameraIdentityNote(identity: ImportPreflight["cameraIdentity"]): string {
+  if (!identity) return "";
+  switch (identity.source) {
+    case "userSelected":
+      return "You chose this camera for this import.";
+    case "remembered":
+      return "Remembered from a previous import of this camera.";
+    case "detected":
+      return identity.evidenceStrong
+        ? "Detected from this card."
+        : "Detected from the filenames — not much to go on, so double-check it.";
+    case "unknown":
+      return "Not detected — choose the camera this footage came from.";
+  }
 }
 
 const stageLabels: Record<ImportProgress["stage"], string> = {
@@ -63,17 +92,26 @@ export function ImportDialog({
   error,
   verifyCopies,
   makeProxies,
+  knownCameras,
+  mappings,
   onSelectRoot,
   onCreateRoot,
   onLocateRoot,
   onVerifyCopies,
   onMakeProxies,
+  onSelectCamera,
+  onRenameMapping,
+  onClearMapping,
   onImport,
   onCancel,
   onClose,
 }: ImportDialogProps) {
   const [newRootName, setNewRootName] = useState("");
   const [showNewRoot, setShowNewRoot] = useState(false);
+  const [editingCamera, setEditingCamera] = useState(false);
+  const [cameraDraft, setCameraDraft] = useState("");
+  const [mappingsOpen, setMappingsOpen] = useState(false);
+  const [mappingDrafts, setMappingDrafts] = useState<Record<string, string>>({});
   const [ledgerOpen, setLedgerOpen] = useState(false);
   const [ledgerFocusPath, setLedgerFocusPath] = useState<string | null>(null);
   const ledgerListRef = useRef<HTMLUListElement>(null);
@@ -177,6 +215,29 @@ export function ImportDialog({
     if (roots.length === 0 && card) setShowNewRoot(true);
   }, [card, roots.length]);
 
+  // A fresh dialog session (a new source path) starts with the picker
+  // closed, even if the previous card left it open.
+  useEffect(() => {
+    setEditingCamera(false);
+    setCameraDraft("");
+  }, [sourcePath]);
+
+  function confirmNewCamera() {
+    const camera = cameraDraft.trim();
+    if (!camera) return;
+    onSelectCamera(camera);
+    setEditingCamera(false);
+    setCameraDraft("");
+  }
+
+  function handleCameraSelect(value: string) {
+    if (value === NEW_CAMERA_OPTION) {
+      setEditingCamera(true);
+      return;
+    }
+    onSelectCamera(value || null);
+  }
+
   const canImport = Boolean(
     plan
     && plan.destination.ready
@@ -193,6 +254,53 @@ export function ImportDialog({
             <p className="eyebrow">Smart ingest</p>
             <h2 id="import-title">{title}</h2>
             <p>{identityLine}</p>
+            {plan?.cameraIdentity && (
+              <div
+                className="import-camera"
+                data-source={plan.cameraIdentity.source}
+                data-evidence-strong={plan.cameraIdentity.evidenceStrong ? "true" : "false"}
+              >
+                <span className="import-route-kicker">Camera</span>
+                <strong>{plan.cameraIdentity.camera}</strong>
+                <small>{cameraIdentityNote(plan.cameraIdentity)}</small>
+                {!report && !running && !loading && (
+                  editingCamera ? (
+                    <form
+                      className="import-camera-new"
+                      onSubmit={(event) => { event.preventDefault(); confirmNewCamera(); }}
+                    >
+                      <label htmlFor="import-camera-name">New camera name</label>
+                      <input
+                        id="import-camera-name"
+                        value={cameraDraft}
+                        onChange={(event) => setCameraDraft(event.target.value)}
+                        placeholder="e.g. Sony A7C II"
+                        autoFocus
+                      />
+                      <button type="submit" className="button secondary" disabled={!cameraDraft.trim()}>Use this name</button>
+                      <button
+                        type="button"
+                        className="text-button"
+                        onClick={() => { setEditingCamera(false); setCameraDraft(""); }}
+                      >
+                        Cancel
+                      </button>
+                    </form>
+                  ) : (
+                    <label className="import-camera-picker">
+                      <span className="sr-only">Change camera</span>
+                      <select value="" onChange={(event) => handleCameraSelect(event.target.value)}>
+                        <option value="">Change camera…</option>
+                        {knownCameras.map((cameraName) => (
+                          <option key={cameraName} value={cameraName}>{cameraName}</option>
+                        ))}
+                        <option value={NEW_CAMERA_OPTION}>New camera name…</option>
+                      </select>
+                    </label>
+                  )
+                )}
+              </div>
+            )}
           </div>
           <button className="context-modal-close" aria-label="Close import dialog" disabled={running} onClick={onClose}>×</button>
         </header>
@@ -339,6 +447,44 @@ export function ImportDialog({
               >
                 <summary>Preview every file</summary>
                 <FileLedger plan={plan} listRef={ledgerListRef} previews={previews} onVisible={requestPreviews} />
+              </details>
+            )}
+
+            {mappings.length > 0 && (
+              <details
+                className="import-file-ledger import-camera-mappings"
+                open={mappingsOpen}
+                onToggle={(event) => setMappingsOpen((event.target as HTMLDetailsElement).open)}
+              >
+                <summary>Remembered cameras ({mappings.length})</summary>
+                <ul>
+                  {mappings.map((mapping) => (
+                    <li key={mapping.id}>
+                      <span className="import-mapping-evidence">{mapping.folderHint} · {mapping.filenamePrefix}</span>
+                      <input
+                        aria-label={`Camera for ${mapping.folderHint} · ${mapping.filenamePrefix}`}
+                        value={mappingDrafts[mapping.id] ?? mapping.camera}
+                        onChange={(event) => setMappingDrafts((current) => ({ ...current, [mapping.id]: event.target.value }))}
+                      />
+                      <button
+                        type="button"
+                        className="text-button"
+                        disabled={!(mappingDrafts[mapping.id] ?? mapping.camera).trim() || (mappingDrafts[mapping.id] ?? mapping.camera) === mapping.camera}
+                        onClick={() => onRenameMapping(mapping.id, (mappingDrafts[mapping.id] ?? mapping.camera).trim())}
+                      >
+                        Save
+                      </button>
+                      <button
+                        type="button"
+                        className="text-button"
+                        aria-label={`Clear the remembered camera for ${mapping.folderHint} · ${mapping.filenamePrefix}`}
+                        onClick={() => onClearMapping(mapping.id)}
+                      >
+                        Clear
+                      </button>
+                    </li>
+                  ))}
+                </ul>
               </details>
             )}
           </div>

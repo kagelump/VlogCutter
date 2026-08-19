@@ -1,7 +1,7 @@
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
-import type { AnalysisProgress, AnalysisReadiness, AnalysisRunRecord, AnalysisRunReport, AnalysisRunRequest, AnalysisStage, ArchiveRoot, Asset, AssetAnalysisIndexEntry, AssetAnalysisView, AssetPatch, AutoplayMode, BaselineImportResult, BaselinePreviewResult, CardCandidate, ClipTranscript, DesktopSettings, GenerationProgress, ImportHistoryEntry, ImportPreflight, ImportPreviewItem, ImportPreviewRequest, ImportProgress, ImportRollbackPreview, ImportRunReport, ImportSessionDetail, LoadedCatalog, MediaOrigin, ModelInstallProgress, ModelStatus, PathAnalysis, Project, ProjectLibrary, ProjectPairingStatus, RelinkReport, RootMappingEntry, ServerConnectionStatus, ServerPairingResult, ServerVersionInfo, SyncStatus, ThumbnailReport } from "./types";
+import type { AnalysisProgress, AnalysisReadiness, AnalysisRunRecord, AnalysisRunReport, AnalysisRunRequest, AnalysisStage, ArchiveRoot, Asset, AssetAnalysisIndexEntry, AssetAnalysisView, AssetPatch, AutoplayMode, BaselineImportResult, BaselinePreviewResult, CameraMapping, CardCandidate, ClipTranscript, DesktopSettings, GenerationProgress, ImportHistoryEntry, ImportPreflight, ImportPreviewItem, ImportPreviewRequest, ImportProgress, ImportRollbackPreview, ImportRunReport, ImportSessionDetail, LoadedCatalog, MediaOrigin, ModelInstallProgress, ModelStatus, PathAnalysis, Project, ProjectLibrary, ProjectPairingStatus, RelinkReport, RootMappingEntry, ServerConnectionStatus, ServerPairingResult, ServerVersionInfo, SyncStatus, ThumbnailReport } from "./types";
 
 /**
  * Whether a backend is answering behind `@tauri-apps/api`.
@@ -149,14 +149,37 @@ export const api = {
     return invoke("bind_archive_root", { archiveRootId, path });
   },
 
+  /** The camera identities this project already has footage under (#71). */
+  async knownProjectCameras(projectId: string): Promise<string[]> {
+    return invoke("known_project_cameras", { projectId });
+  },
+
+  /** Every stored evidence-to-camera mapping, for inspecting/managing them. */
+  async listCameraMappings(projectId: string): Promise<CameraMapping[]> {
+    return invoke("list_camera_mappings", { projectId });
+  },
+
+  async renameCameraMapping(projectId: string, mappingId: string, camera: string): Promise<CameraMapping> {
+    return invoke("rename_camera_mapping", { projectId, mappingId, camera });
+  },
+
+  async clearCameraMapping(projectId: string, mappingId: string): Promise<void> {
+    return invoke("clear_camera_mapping", { projectId, mappingId });
+  },
+
   async setImportPreferences(makeProxies: boolean, archiveRootId: string | null, cardSessionId: string | null): Promise<DesktopSettings> {
     return rememberMediaOrigin(
       await invoke<DesktopSettings>("set_import_preferences", { makeProxies, archiveRootId, cardSessionId }),
     );
   },
 
-  async preflightImport(projectId: string, sourcePath: string, archiveRootId: string | null): Promise<ImportPreflight> {
-    return invoke("preflight_import", { projectId, sourcePath, archiveRootId });
+  async preflightImport(
+    projectId: string,
+    sourcePath: string,
+    archiveRootId: string | null,
+    cameraOverride: string | null = null,
+  ): Promise<ImportPreflight> {
+    return invoke("preflight_import", { projectId, sourcePath, archiveRootId, cameraOverride });
   },
 
   async runSmartImport(projectId: string, plan: ImportPreflight, verifyCopies: boolean, makeProxies: boolean): Promise<ImportRunReport> {

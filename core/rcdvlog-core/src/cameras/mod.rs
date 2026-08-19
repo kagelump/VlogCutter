@@ -12,8 +12,10 @@
 //! its counter was NULL and it could not be targeted by any counter-ranged
 //! correction at all.
 
+pub mod mapping;
 pub mod patterns;
 
+pub use mapping::{CameraEvidence, CameraMapping};
 pub use patterns::{CAMERA_PATTERNS, CameraPattern, PatternConfidence};
 
 use regex::Regex;

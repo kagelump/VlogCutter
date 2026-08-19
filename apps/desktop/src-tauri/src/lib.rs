@@ -3,8 +3,8 @@ use chrono::{SecondsFormat, Utc};
 use rcdvlog_core::{
     AnalysisReadiness, AnalysisRunOptions, AnalysisRunOutcome, AnalysisRunRecord, AnalyzeReport,
     ArchiveRoot, Asset, AssetAnalysisIndexEntry, AssetAnalysisView, AssetPatch,
-    BatchProgressEstimate, CardCandidate, Catalog, ClipTranscript, ClockEvent, ImportHistoryEntry,
-    ImportOutcome, ImportPreflight, ImportPreviewItem, ImportPreviewRequest,
+    BatchProgressEstimate, CameraMapping, CardCandidate, Catalog, ClipTranscript, ClockEvent,
+    ImportHistoryEntry, ImportOutcome, ImportPreflight, ImportPreviewItem, ImportPreviewRequest,
     ImportProgress as CoreImportProgress, ImportRollbackPreview, ImportSessionDetail,
     ImportStage as CoreImportStage, IngestReport, ModelStatus, MountedVolumes, Project,
     ProxyReport, RelinkReport, ThumbnailReport, ToolStatus, TranscribeReport, detect_cards,
@@ -905,6 +905,61 @@ fn bind_archive_root(
         .map_err(error_message)
 }
 
+/// Every camera identity this project already has footage under — the pick
+/// list for "choose an existing project camera" in the import dialog's
+/// camera control.
+#[tauri::command]
+fn known_project_cameras(
+    project_id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<String>, String> {
+    state
+        .catalog()?
+        .known_project_cameras(&project_id)
+        .map_err(error_message)
+}
+
+/// The durable per-project camera-identity mappings (#71), for the inspect
+/// half of "inspect/change/clear stored camera mappings".
+#[tauri::command]
+fn list_camera_mappings(
+    project_id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<CameraMapping>, String> {
+    state
+        .catalog()?
+        .list_camera_mappings(&project_id)
+        .map_err(error_message)
+}
+
+/// The "change" half: repoints a stored mapping at a different camera.
+#[tauri::command]
+fn rename_camera_mapping(
+    project_id: String,
+    mapping_id: String,
+    camera: String,
+    state: State<'_, AppState>,
+) -> Result<CameraMapping, String> {
+    state
+        .catalog()?
+        .rename_camera_mapping(&project_id, &mapping_id, &camera)
+        .map_err(error_message)
+}
+
+/// The "clear" half: forgets a stored mapping. A future matching card goes
+/// back to plain detection until a new choice is made.
+#[tauri::command]
+fn clear_camera_mapping(
+    project_id: String,
+    mapping_id: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    state
+        .catalog()?
+        .clear_camera_mapping(&project_id, &mapping_id)
+        .map_err(error_message)
+}
+
 #[tauri::command]
 fn set_import_preferences(
     make_proxies: bool,
@@ -939,6 +994,7 @@ async fn preflight_import(
     project_id: String,
     source_path: String,
     archive_root_id: Option<String>,
+    camera_override: Option<String>,
     state: State<'_, AppState>,
     app: tauri::AppHandle,
 ) -> Result<ImportPreflight, String> {
@@ -954,6 +1010,7 @@ async fn preflight_import(
             &project_id,
             &source_path,
             archive_root_id.as_deref(),
+            camera_override.as_deref(),
             |completed, total, path| {
                 let _ = app.emit(
                     "import-progress",
@@ -2422,6 +2479,10 @@ pub fn run() {
             list_archive_roots,
             create_archive_root,
             bind_archive_root,
+            known_project_cameras,
+            list_camera_mappings,
+            rename_camera_mapping,
+            clear_camera_mapping,
             set_import_preferences,
             preflight_import,
             run_smart_import,
@@ -2547,7 +2608,7 @@ mod tests {
         fs::copy(&source, &backup).unwrap();
 
         let plan = catalog
-            .preflight_import(&project.id, &source_dir, None, |_, _, _| true)
+            .preflight_import(&project.id, &source_dir, None, None, |_, _, _| true)
             .unwrap();
         let outcome = catalog
             .run_import(&project.id, &plan, true, |_| true)

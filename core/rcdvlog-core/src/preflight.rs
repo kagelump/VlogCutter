@@ -24,9 +24,11 @@ use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 use walkdir::WalkDir;
 
+use crate::cameras::mapping::CameraEvidence;
 use crate::cards::{CardCandidate, card_session_slug, inspect_card};
 use crate::{
-    ArchiveRoot, Catalog, has_current_proxy, is_media, locations, sampled_media_fingerprint,
+    ArchiveRoot, Catalog, UNKNOWN_CAMERA, has_current_proxy, is_media, locations,
+    sampled_media_fingerprint,
 };
 
 /// Twelve hours is long enough to separate shooting sessions without treating
@@ -214,6 +216,52 @@ pub struct ImportDestination {
     pub blocked_reason: String,
 }
 
+/// Where a plan's camera identity came from — the answer the import dialog
+/// needs to decide how much confidence to show, and whether to make
+/// uncertainty visible rather than presenting a guess as settled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ImportCameraSource {
+    /// The user chose this camera for this import (an existing project
+    /// camera, or a deliberately typed new one).
+    UserSelected,
+    /// This project's durable evidence-to-camera store (`cameras::mapping`)
+    /// recognized this card's folder layout and filename prefix.
+    Remembered,
+    /// Ordinary per-file inference — the filename-pattern table, then the
+    /// card's folder-layout hint — the same guess ingest would make on its
+    /// own with no user or stored mapping involved.
+    Detected,
+    /// Nothing identified the camera at all.
+    Unknown,
+}
+
+/// The one camera identity a plan resolves to, so it can flow unchanged into
+/// both the sequence preview below and every new asset `run_import` creates —
+/// see this module's and `cameras::mapping`'s doc comments for why the two
+/// must never be free to disagree.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolvedImportCamera {
+    pub camera: String,
+    pub source: ImportCameraSource,
+    /// Whether this import's own card evidence (folder layout plus filename
+    /// prefix) was strong enough to safely consult or update the durable
+    /// mapping store. When false, `source` is never `Remembered`: the
+    /// dialog should present `camera` as a guess to confirm, not a fact.
+    pub evidence_strong: bool,
+}
+
+impl Default for ResolvedImportCamera {
+    fn default() -> Self {
+        Self {
+            camera: UNKNOWN_CAMERA.to_string(),
+            source: ImportCameraSource::Unknown,
+            evidence_strong: false,
+        }
+    }
+}
+
 /// The whole answer the import dialog renders.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -221,6 +269,9 @@ pub struct ImportPreflight {
     pub source_path: String,
     /// Set when the source is a recognizable camera card.
     pub card: Option<CardCandidate>,
+    /// The camera identity this plan resolved to. See `ResolvedImportCamera`.
+    #[serde(default)]
+    pub camera_identity: ResolvedImportCamera,
     pub destination: ImportDestination,
     pub scanned: usize,
     pub new_clips: usize,
@@ -254,10 +305,73 @@ fn filename_prefix(filename: &str) -> String {
     }
 }
 
+/// The most common value, ties broken lexicographically so the result is
+/// deterministic regardless of scan order. `None` for an empty input.
+fn mode(values: impl IntoIterator<Item = String>) -> Option<String> {
+    let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for value in values {
+        *counts.entry(value).or_insert(0) += 1;
+    }
+    // Iteration ascends by key; keep the current leader unless a later
+    // (lexicographically larger) key strictly beats its count, so the first
+    // (smallest) key among an exact tie wins.
+    counts
+        .into_iter()
+        .fold(None::<(String, usize)>, |best, (value, count)| match best {
+            Some((best_value, best_count)) if best_count >= count => Some((best_value, best_count)),
+            _ => Some((value, count)),
+        })
+        .map(|(value, _)| value)
+}
+
+/// The card evidence one set of new clips presents, in the exact shape
+/// `cameras::mapping` keys a durable mapping on. Used both to *resolve* a
+/// plan's camera identity in `preflight_import` and, after a successful
+/// import, to *record* it in `run_import` — sharing this function is what
+/// keeps those two computations from silently drifting apart into different
+/// keys for what should be the same evidence.
+fn camera_evidence_for<'a>(
+    card: Option<&CardCandidate>,
+    new_filenames: impl Iterator<Item = &'a str>,
+) -> CameraEvidence {
+    CameraEvidence {
+        folder_hint: card
+            .map(|candidate| candidate.camera_hint.trim().to_string())
+            .unwrap_or_default(),
+        filename_prefix: mode(new_filenames.map(filename_prefix)).unwrap_or_default(),
+    }
+}
+
+/// Today's ordinary per-file camera guess: the filename-pattern table first,
+/// then the card's folder-layout hint, then `UNKNOWN_CAMERA`. This is exactly
+/// what asset ingest's own EXIF-blind fallback would produce (`probe_media`
+/// tries EXIF first; preflight never has it — see this module's doc
+/// comment), which is why it stays the default whenever nothing more
+/// specific — a user selection or a remembered mapping — overrides it.
+fn detected_camera_key(filename: &str, card: Option<&CardCandidate>) -> String {
+    let inferred = crate::identify_camera(None, filename).camera;
+    if inferred == UNKNOWN_CAMERA {
+        card.map(|candidate| candidate.camera_hint.trim())
+            .filter(|hint| !hint.is_empty())
+            .unwrap_or(inferred.as_str())
+            .to_string()
+    } else {
+        inferred
+    }
+}
+
+/// One incoming file's contribution to the sequence preview. `camera_override`
+/// forces every candidate in a plan to the one identity that resolved for it
+/// (a user selection or a remembered mapping — see `ResolvedImportCamera`),
+/// which is what makes the preview and asset ingest structurally unable to
+/// disagree. `None` preserves today's independent per-file detection, so a
+/// heterogeneous "Add media folder" import (no single card, no override in
+/// play) still groups by each file's own camera as before.
 fn sequence_candidate(
     source: &Path,
     path: &Path,
     card: Option<&CardCandidate>,
+    camera_override: Option<&str>,
 ) -> ImportSequenceCandidate {
     let relative_path = path
         .strip_prefix(source)
@@ -268,15 +382,9 @@ fn sequence_candidate(
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let inferred = crate::identify_camera(None, &filename).camera;
-    let camera_key = if inferred == crate::UNKNOWN_CAMERA {
-        card.map(|candidate| candidate.camera_hint.trim())
-            .filter(|hint| !hint.is_empty())
-            .unwrap_or(inferred.as_str())
-            .to_string()
-    } else {
-        inferred
-    };
+    let camera_key = camera_override
+        .map(str::to_string)
+        .unwrap_or_else(|| detected_camera_key(&filename, card));
     let folder = Path::new(&relative_path)
         .parent()
         .map(|parent| parent.to_string_lossy().replace('\\', "/"))
@@ -438,11 +546,23 @@ impl Catalog {
     ///
     /// `archive_root_id` names where originals would be copied. Passing `None`
     /// means reference-in-place, which is what a non-removable source gets.
+    ///
+    /// `camera_override` is the camera the dialog's user has explicitly
+    /// chosen for this import, if any — an existing project camera or a
+    /// deliberately typed new one. Passing `None` lets the plan resolve its
+    /// own identity: a durable per-project mapping when this card's evidence
+    /// is strong enough (`cameras::mapping`), otherwise today's ordinary
+    /// per-file detection. Whatever wins becomes `ImportPreflight.camera_identity`
+    /// and is the *only* camera identity threaded into both the sequence
+    /// preview below and `run_import`'s asset ingest — see
+    /// `ResolvedImportCamera`'s doc comment for why that must be one value,
+    /// not two independently-recomputed guesses.
     pub fn preflight_import<F>(
         &self,
         project_id: &str,
         source: impl AsRef<Path>,
         archive_root_id: Option<&str>,
+        camera_override: Option<&str>,
         mut on_progress: F,
     ) -> Result<ImportPreflight>
     where
@@ -486,16 +606,36 @@ impl Catalog {
             card.as_ref(),
             bytes_to_copy,
         )?;
-        let sequence_candidates = items
+
+        let new_items: Vec<&PreflightItem> = items
             .iter()
             .filter(|item| item.classification == Classification::New)
-            .map(|item| sequence_candidate(source, Path::new(&item.path), card.as_ref()))
+            .collect();
+        let camera_identity =
+            self.resolve_import_camera(project_id, card.as_ref(), &new_items, camera_override)?;
+        // Only an active selection or a remembered mapping forces every
+        // candidate to one identity. Plain detection leaves each file's own
+        // per-file guess in place, unchanged from before this identity was
+        // introduced, so a heterogeneous "Add media folder" import still
+        // groups by each file's own camera rather than being homogenized by
+        // a guess nobody confirmed.
+        let uniform_camera = matches!(
+            camera_identity.source,
+            ImportCameraSource::UserSelected | ImportCameraSource::Remembered
+        )
+        .then_some(camera_identity.camera.as_str());
+        let sequence_candidates = new_items
+            .iter()
+            .map(|item| {
+                sequence_candidate(source, Path::new(&item.path), card.as_ref(), uniform_camera)
+            })
             .collect();
         let sequence_preview = self.import_sequence_preview(project_id, sequence_candidates)?;
 
         Ok(ImportPreflight {
             source_path: source.to_string_lossy().into_owned(),
             card,
+            camera_identity,
             scanned: total,
             new_clips: count(&items, Classification::New),
             known_clips: count(&items, Classification::KnownVerified),
@@ -507,6 +647,60 @@ impl Catalog {
             sequence_preview,
             destination,
             items,
+        })
+    }
+
+    /// Resolves the one camera identity a plan will use. See
+    /// `preflight_import`'s doc comment for the precedence
+    /// (override, then remembered mapping, then plain detection) and
+    /// `cameras::mapping::CameraEvidence` for the evidence-strength rule
+    /// that gates the remembered-mapping lookup.
+    fn resolve_import_camera(
+        &self,
+        project_id: &str,
+        card: Option<&CardCandidate>,
+        new_items: &[&PreflightItem],
+        camera_override: Option<&str>,
+    ) -> Result<ResolvedImportCamera> {
+        let evidence =
+            camera_evidence_for(card, new_items.iter().map(|item| item.filename.as_str()));
+        let evidence_strong = evidence.is_strong_enough();
+
+        if let Some(explicit) = camera_override
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return Ok(ResolvedImportCamera {
+                camera: explicit.to_string(),
+                source: ImportCameraSource::UserSelected,
+                evidence_strong,
+            });
+        }
+
+        if evidence_strong
+            && let Some(remembered) = self.remembered_camera_for_evidence(project_id, &evidence)?
+        {
+            return Ok(ResolvedImportCamera {
+                camera: remembered,
+                source: ImportCameraSource::Remembered,
+                evidence_strong,
+            });
+        }
+
+        let detected = mode(
+            new_items
+                .iter()
+                .map(|item| detected_camera_key(&item.filename, card)),
+        )
+        .unwrap_or_else(|| UNKNOWN_CAMERA.to_string());
+        Ok(ResolvedImportCamera {
+            source: if detected == UNKNOWN_CAMERA {
+                ImportCameraSource::Unknown
+            } else {
+                ImportCameraSource::Detected
+            },
+            camera: detected,
+            evidence_strong,
         })
     }
 
@@ -907,6 +1101,18 @@ pub struct ImportProgress {
     pub total_bytes: u64,
 }
 
+/// The per-plan context every item in a `run_import` loop shares, bundled so
+/// `import_one` takes one reference instead of growing an argument for each.
+#[derive(Debug, Clone, Copy)]
+struct ImportOneContext<'a> {
+    archive_root_id: Option<&'a str>,
+    card: Option<&'a CardCandidate>,
+    /// The one camera identity `run_import` resolved for this plan, when it
+    /// is either a user selection or a remembered mapping. See
+    /// `ResolvedImportCamera` and `run_import`'s doc comment.
+    camera_override: Option<&'a str>,
+}
+
 impl Catalog {
     /// Executes a preflight plan: copy what is new, register it, reconnect what
     /// was lost, and leave alone what needs nothing.
@@ -933,6 +1139,18 @@ impl Catalog {
         if plan.destination.copies && !plan.destination.ready {
             anyhow::bail!("{}", plan.destination.blocked_reason);
         }
+
+        // Only when the plan actively resolved to one identity — a user
+        // selection or a remembered mapping — does ingest override each
+        // file's own probe. Plain detection leaves `ingest_file`'s ordinary
+        // EXIF-then-pattern guess in place, unchanged from before this
+        // field existed. See `ResolvedImportCamera` and
+        // `preflight_import`'s doc comment.
+        let camera_override = matches!(
+            plan.camera_identity.source,
+            ImportCameraSource::UserSelected | ImportCameraSource::Remembered
+        )
+        .then_some(plan.camera_identity.camera.as_str());
 
         let actionable: Vec<&PreflightItem> = plan
             .items
@@ -978,8 +1196,11 @@ impl Catalog {
             match self.import_one(
                 project_id,
                 item,
-                archive_root_id.as_deref(),
-                plan.card.as_ref(),
+                &ImportOneContext {
+                    archive_root_id: archive_root_id.as_deref(),
+                    card: plan.card.as_ref(),
+                    camera_override,
+                },
                 verify_copies,
                 |file_bytes| {
                     on_progress(ImportProgress {
@@ -1030,6 +1251,24 @@ impl Catalog {
                 break;
             }
         }
+
+        // A completed import is the project's best current statement of what
+        // this card's evidence means, whether that statement came from a
+        // user correction or from plain detection agreeing with itself. This
+        // is what makes "reinsert a matching new card" work without the user
+        // repeating a correction: idempotent when nothing changed, and it
+        // silently declines when the evidence was never strong enough to
+        // trust (`remember_camera_mapping`'s own gate).
+        if outcome.imported > 0 {
+            let evidence = camera_evidence_for(
+                plan.card.as_ref(),
+                plan.items
+                    .iter()
+                    .filter(|item| item.classification == Classification::New)
+                    .map(|item| item.filename.as_str()),
+            );
+            self.remember_camera_mapping(project_id, &evidence, &plan.camera_identity.camera)?;
+        }
         Ok(outcome)
     }
 
@@ -1038,22 +1277,28 @@ impl Catalog {
         &self,
         project_id: &str,
         item: &PreflightItem,
-        archive_root_id: Option<&str>,
-        card: Option<&CardCandidate>,
+        context: &ImportOneContext<'_>,
         verify_copies: bool,
         mut on_copy_bytes: F,
     ) -> Result<Option<(u64, String)>>
     where
         F: FnMut(u64) -> bool,
     {
+        let ImportOneContext {
+            archive_root_id,
+            card,
+            camera_override,
+        } = *context;
         let source = PathBuf::from(&item.path);
         if item.classification == Classification::KnownRelinkable {
             // Already-known content: registering where it is found is the whole
-            // job, and it costs no copy.
+            // job, and it costs no copy. A relink never re-probes an
+            // already-known asset's camera, so the override is passed
+            // through for consistency only — it has no effect here.
             // Go through ingest rather than the Locate-only relink flow: this
             // smart-import path is allowed to reactivate a membership that was
             // rolled back, after first recording the freshly verified source.
-            self.ingest_file(project_id, &source)?;
+            self.ingest_file_with_camera(project_id, &source, camera_override)?;
             let asset_id = self.asset_id_at_path(project_id, &source)?.ok_or_else(|| {
                 anyhow::anyhow!("relinked asset was not found at {}", source.display())
             })?;
@@ -1084,7 +1329,7 @@ impl Catalog {
                     // Smart import, unlike Locate, intentionally restores
                     // membership. Ingest the freshly verified source so it is
                     // registered before that restoration happens.
-                    self.ingest_file(project_id, &source)?;
+                    self.ingest_file_with_camera(project_id, &source, camera_override)?;
                     let asset_id =
                         self.asset_id_at_path(project_id, &source)?.ok_or_else(|| {
                             anyhow::anyhow!(
@@ -1108,7 +1353,7 @@ impl Catalog {
             _ => (source, 0),
         };
 
-        self.ingest_file(project_id, &path_to_register)?;
+        self.ingest_file_with_camera(project_id, &path_to_register, camera_override)?;
         let asset_id = self
             .asset_id_at_path(project_id, &path_to_register)?
             .ok_or_else(|| {
@@ -1367,7 +1612,7 @@ mod tests {
             .unwrap();
 
         let plan = catalog
-            .preflight_import(&project.id, &mount, None, |_, _, _| true)
+            .preflight_import(&project.id, &mount, None, None, |_, _, _| true)
             .unwrap();
 
         assert_eq!(plan.sequence_preview.new_clip_count, 2);
@@ -1435,7 +1680,7 @@ mod tests {
         let operations_before = catalog.list_operations(&project.id).unwrap().len();
 
         let plan = catalog
-            .preflight_import(&project.id, &mount, None, |_, _, _| true)
+            .preflight_import(&project.id, &mount, None, None, |_, _, _| true)
             .unwrap();
 
         assert_eq!(plan.sequence_preview.runs.len(), 1);
@@ -1497,7 +1742,7 @@ mod tests {
         let operations_before = catalog.list_operations(&project.id).unwrap().len();
 
         let plan = catalog
-            .preflight_import(&project.id, &mount, None, |_, _, _| true)
+            .preflight_import(&project.id, &mount, None, None, |_, _, _| true)
             .unwrap();
 
         let run = &plan.sequence_preview.runs[0];
@@ -1573,7 +1818,7 @@ mod tests {
             .unwrap();
 
         let plan = catalog
-            .preflight_import(&project.id, &mount, None, |_, _, _| true)
+            .preflight_import(&project.id, &mount, None, None, |_, _, _| true)
             .unwrap();
 
         assert_eq!(plan.sequence_preview.runs.len(), 2);
@@ -1650,7 +1895,7 @@ mod tests {
         }
 
         let plan = catalog
-            .preflight_import(&project.id, &mount, None, |_, _, _| true)
+            .preflight_import(&project.id, &mount, None, None, |_, _, _| true)
             .unwrap();
 
         assert!(plan.sequence_preview.boundaries.is_empty());
@@ -1691,7 +1936,7 @@ mod tests {
             .unwrap();
 
         let plan = catalog
-            .preflight_import(&project.id, &mount, None, |_, _, _| true)
+            .preflight_import(&project.id, &mount, None, None, |_, _, _| true)
             .unwrap();
 
         assert_eq!(plan.sequence_preview.boundaries.len(), 1);
@@ -1733,7 +1978,7 @@ mod tests {
             .unwrap();
 
         let plan = catalog
-            .preflight_import(&project.id, &mount, None, |_, _, _| true)
+            .preflight_import(&project.id, &mount, None, None, |_, _, _| true)
             .unwrap();
 
         assert_eq!(plan.sequence_preview.boundaries.len(), 1);
@@ -1784,7 +2029,7 @@ mod tests {
         assert_ne!(reformatted_card.session_id, original_card.session_id);
 
         let plan = catalog
-            .preflight_import(&project.id, &mount, None, |_, _, _| true)
+            .preflight_import(&project.id, &mount, None, None, |_, _, _| true)
             .unwrap();
 
         assert_eq!(plan.sequence_preview.runs.len(), 1);
@@ -1872,7 +2117,7 @@ mod tests {
         fs::remove_file(&lost).unwrap();
 
         let preflight = catalog
-            .preflight_import(&project.id, &mount, None, |_, _, _| true)
+            .preflight_import(&project.id, &mount, None, None, |_, _, _| true)
             .unwrap();
 
         assert_eq!(preflight.scanned, 3);
@@ -1934,7 +2179,7 @@ mod tests {
         fs::set_permissions(&clip, fs::Permissions::from_mode(0o000)).unwrap();
 
         let preflight = catalog
-            .preflight_import(&project.id, &mount, None, |_, _, _| true)
+            .preflight_import(&project.id, &mount, None, None, |_, _, _| true)
             .unwrap();
 
         assert_eq!(preflight.unreadable, 1);
@@ -1966,7 +2211,7 @@ mod tests {
         let operations_before = catalog.list_operations(&project.id).unwrap().len();
 
         catalog
-            .preflight_import(&project.id, &mount, None, |_, _, _| true)
+            .preflight_import(&project.id, &mount, None, None, |_, _, _| true)
             .unwrap();
 
         assert_eq!(catalog.list_assets(&project.id).unwrap().len(), before);
@@ -1989,7 +2234,7 @@ mod tests {
         let root = catalog.create_archive_root("NAS Video", &archive).unwrap();
 
         let preflight = catalog
-            .preflight_import(&project.id, &mount, Some(&root.id), |_, _, _| true)
+            .preflight_import(&project.id, &mount, Some(&root.id), None, |_, _, _| true)
             .unwrap();
 
         let destination = &preflight.destination;
@@ -2015,7 +2260,7 @@ mod tests {
         fs::write(folder.join("C0001.MP4"), b"nas footage").unwrap();
 
         let preflight = catalog
-            .preflight_import(&project.id, &folder, None, |_, _, _| true)
+            .preflight_import(&project.id, &folder, None, None, |_, _, _| true)
             .unwrap();
 
         assert!(!preflight.destination.copies);
@@ -2047,7 +2292,7 @@ mod tests {
 
         fs::remove_dir_all(&archive).unwrap();
         let preflight = catalog
-            .preflight_import(&project.id, &mount, Some(&root.id), |_, _, _| true)
+            .preflight_import(&project.id, &mount, Some(&root.id), None, |_, _, _| true)
             .unwrap();
         assert!(!preflight.destination.ready);
         assert!(
@@ -2080,7 +2325,7 @@ mod tests {
         fs::write(&target, b"different bytes entirely").unwrap();
 
         let preflight = catalog
-            .preflight_import(&project.id, &mount, Some(&root.id), |_, _, _| true)
+            .preflight_import(&project.id, &mount, Some(&root.id), None, |_, _, _| true)
             .unwrap();
         assert_eq!(preflight.collisions, 1);
         assert_eq!(preflight.new_clips, 0);
@@ -2113,7 +2358,7 @@ mod tests {
         let root = catalog.create_archive_root("NAS Video", &archive).unwrap();
 
         let plan = catalog
-            .preflight_import(&project.id, &mount, Some(&root.id), |_, _, _| true)
+            .preflight_import(&project.id, &mount, Some(&root.id), None, |_, _, _| true)
             .unwrap();
         assert_eq!(plan.new_clips, 2);
 
@@ -2155,7 +2400,7 @@ mod tests {
         )
         .unwrap();
         let second_plan = catalog
-            .preflight_import(&project.id, &mount, Some(&root.id), |_, _, _| true)
+            .preflight_import(&project.id, &mount, Some(&root.id), None, |_, _, _| true)
             .unwrap();
         assert_eq!(second_plan.scanned, 3);
         assert_eq!(second_plan.new_clips, 1, "only the new clip is new");
@@ -2187,11 +2432,11 @@ mod tests {
             .unwrap();
 
         let plan = catalog
-            .preflight_import(&project.id, &mount, Some(&root.id), |_, _, _| true)
+            .preflight_import(&project.id, &mount, Some(&root.id), None, |_, _, _| true)
             .unwrap();
         fs::remove_dir_all(&archive).unwrap();
         let replanned = catalog
-            .preflight_import(&project.id, &mount, Some(&root.id), |_, _, _| true)
+            .preflight_import(&project.id, &mount, Some(&root.id), None, |_, _, _| true)
             .unwrap();
 
         assert!(
@@ -2232,7 +2477,7 @@ mod tests {
         let root = catalog.create_archive_root("NAS Video", &archive).unwrap();
 
         let plan = catalog
-            .preflight_import(&project.id, &mount, Some(&root.id), |_, _, _| true)
+            .preflight_import(&project.id, &mount, Some(&root.id), None, |_, _, _| true)
             .unwrap();
         let outcome = catalog
             .run_import(&project.id, &plan, true, |progress| {
@@ -2244,7 +2489,7 @@ mod tests {
 
         // Re-planning sees only what is left.
         let resumed_plan = catalog
-            .preflight_import(&project.id, &mount, Some(&root.id), |_, _, _| true)
+            .preflight_import(&project.id, &mount, Some(&root.id), None, |_, _, _| true)
             .unwrap();
         assert_eq!(resumed_plan.new_clips, 1);
         let resumed = catalog
@@ -2270,7 +2515,7 @@ mod tests {
         fs::remove_file(&gone).unwrap();
 
         let plan = catalog
-            .preflight_import(&project.id, &mount, None, |_, _, _| true)
+            .preflight_import(&project.id, &mount, None, None, |_, _, _| true)
             .unwrap();
         assert_eq!(plan.relinkable, 1);
         assert_eq!(plan.new_clips, 0);
@@ -2303,7 +2548,7 @@ mod tests {
         fs::remove_file(&old).unwrap();
 
         let plan = catalog
-            .preflight_import(&project.id, &mount, None, |_, _, _| true)
+            .preflight_import(&project.id, &mount, None, None, |_, _, _| true)
             .unwrap();
         assert_eq!(plan.new_clips, 1);
         assert_eq!(plan.items[0].asset_id.as_deref(), Some("asset_rolled_back"));
@@ -2358,7 +2603,7 @@ mod tests {
         fs::create_dir_all(&archive).unwrap();
         let root = catalog.create_archive_root("Archive", &archive).unwrap();
         let plan = catalog
-            .preflight_import(&project.id, &mount, Some(&root.id), |_, _, _| true)
+            .preflight_import(&project.id, &mount, Some(&root.id), None, |_, _, _| true)
             .unwrap();
         assert_eq!(plan.new_clips, 1, "an absent archive copy must be created");
 
@@ -2389,7 +2634,7 @@ mod tests {
             .remove_project_asset_membership(&project.id, &["asset_rolled_back".to_string()])
             .unwrap();
         let matching_plan = catalog
-            .preflight_import(&project.id, &mount, Some(&root.id), |_, _, _| true)
+            .preflight_import(&project.id, &mount, Some(&root.id), None, |_, _, _| true)
             .unwrap();
         let archive_path = PathBuf::from(&asset.path);
         let mut target_replaced = false;
@@ -2421,7 +2666,7 @@ mod tests {
             .set_times(std::fs::FileTimes::new().set_modified(original_mtime))
             .unwrap();
         let collision = catalog
-            .preflight_import(&project.id, &mount, Some(&root.id), |_, _, _| true)
+            .preflight_import(&project.id, &mount, Some(&root.id), None, |_, _, _| true)
             .unwrap();
         assert_eq!(collision.collisions, 1);
         assert_eq!(collision.new_clips, 0);
@@ -2437,7 +2682,7 @@ mod tests {
             .set_times(std::fs::FileTimes::new().set_modified(original_mtime))
             .unwrap();
         let continued = catalog
-            .preflight_import(&project.id, &mount, Some(&root.id), |_, _, _| true)
+            .preflight_import(&project.id, &mount, Some(&root.id), None, |_, _, _| true)
             .unwrap();
         assert_eq!(continued.new_clips, 1);
         assert_eq!(continued.relinkable, 0);
@@ -2488,5 +2733,299 @@ mod tests {
         assert_eq!(human_bytes(999), "999 B");
         assert_eq!(human_bytes(62_400_000_000), "62.4 GB");
         assert_eq!(human_bytes(1_200_000_000_000), "1.2 TB");
+    }
+
+    // --- #71: choosing and remembering a camera identity at import time ---
+
+    /// Same shape as `card_fixture_media`, but with a caller-chosen mount
+    /// name and folder layout so these tests can build cards from different
+    /// manufacturers and, deliberately, cards that share a mount name.
+    fn labeled_card_fixture_media(
+        root: &Path,
+        mount_name: &str,
+        layout: &str,
+        clips: &[(&str, &str)],
+    ) -> PathBuf {
+        let mount = root.join(mount_name);
+        let folder = mount.join(layout);
+        fs::create_dir_all(&folder).unwrap();
+        for (name, color) in clips {
+            let status = crate::tool_command("ffmpeg")
+                .args([
+                    "-y",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &format!("color=c={color}:s=64x64:r=5:d=1"),
+                    "-c:v",
+                    "mpeg4",
+                ])
+                .arg(folder.join(name))
+                .status()
+                .unwrap();
+            assert!(status.success(), "failed to build fixture {name}");
+        }
+        mount
+    }
+
+    fn skip_without_ffprobe() -> bool {
+        if crate::tool_command("ffprobe")
+            .arg("-version")
+            .output()
+            .is_err()
+        {
+            eprintln!("ffprobe is unavailable; skipping media integration test");
+            return true;
+        }
+        false
+    }
+
+    /// The core of "the two cannot disagree": a user override must land, as
+    /// the exact same string, on the sequence preview's run *and* on every
+    /// asset ingest creates and the capture sequence it joins.
+    #[test]
+    fn a_camera_override_is_the_one_identity_the_sequence_preview_and_ingest_both_use() {
+        if skip_without_ffprobe() {
+            return;
+        }
+        let directory = tempdir().unwrap();
+        let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).unwrap();
+        let project = catalog.create_project("Spain 2026").unwrap();
+        // C####.MP4 only weakly pattern-matches "Sony (C-series)" — a
+        // manufacturer family, not the body the user actually owns. This is
+        // the issue's own example of a wrong auto-detection.
+        let mount = labeled_card_fixture_media(
+            directory.path(),
+            "UNTITLED",
+            "DCIM/100MSDCF",
+            &[("C0001.MP4", "navy"), ("C0002.MP4", "maroon")],
+        );
+
+        let auto = catalog
+            .preflight_import(&project.id, &mount, None, None, |_, _, _| true)
+            .unwrap();
+        assert_eq!(auto.camera_identity.camera, "Sony (C-series)");
+        assert_eq!(auto.camera_identity.source, ImportCameraSource::Detected);
+
+        let plan = catalog
+            .preflight_import(&project.id, &mount, None, Some("Sony A7C II"), |_, _, _| {
+                true
+            })
+            .unwrap();
+        assert_eq!(
+            plan.camera_identity,
+            ResolvedImportCamera {
+                camera: "Sony A7C II".to_string(),
+                source: ImportCameraSource::UserSelected,
+                evidence_strong: true,
+            }
+        );
+        assert!(
+            plan.sequence_preview
+                .runs
+                .iter()
+                .all(|run| run.camera_key == "Sony A7C II"),
+            "the sequence preview must use the chosen identity, not the weak pattern guess"
+        );
+
+        let outcome = catalog
+            .run_import(&project.id, &plan, true, |_| true)
+            .unwrap();
+        assert_eq!(outcome.imported, 2);
+
+        for asset in catalog.list_assets(&project.id).unwrap() {
+            assert_eq!(asset.camera, "Sony A7C II");
+        }
+        let sequences = catalog.capture_sequences(&project.id).unwrap();
+        assert_eq!(sequences.len(), 1);
+        assert_eq!(sequences[0].camera_key, "Sony A7C II");
+    }
+
+    /// The issue's named CUJ: wrong auto-detection, an explicit correction,
+    /// import, then a *reformatted card at a different mount path* comes
+    /// back and defaults to the corrected identity without the user
+    /// repeating themselves. Reopening the catalog between the two imports
+    /// stands in for an app restart: the mapping lives in SQLite, not in any
+    /// in-memory state this process happens to be holding.
+    #[test]
+    fn a_remembered_mapping_survives_a_reformatted_card_a_new_mount_path_and_a_restart() {
+        if skip_without_ffprobe() {
+            return;
+        }
+        let directory = tempdir().unwrap();
+        let catalog_path = directory.path().join("catalog.sqlite3");
+        let catalog = Catalog::open(&catalog_path).unwrap();
+        let project = catalog.create_project("Spain 2026").unwrap();
+
+        let first_mount = labeled_card_fixture_media(
+            &directory.path().join("first-insert"),
+            "UNTITLED",
+            "DCIM/100MSDCF",
+            &[("C0001.MP4", "navy")],
+        );
+        let first_plan = catalog
+            .preflight_import(
+                &project.id,
+                &first_mount,
+                None,
+                Some("Sony A7C II"),
+                |_, _, _| true,
+            )
+            .unwrap();
+        let first_outcome = catalog
+            .run_import(&project.id, &first_plan, true, |_| true)
+            .unwrap();
+        assert_eq!(first_outcome.imported, 1);
+
+        // "Restart the app": drop this handle and open a fresh one against
+        // the same file, so nothing survives except what is actually
+        // durable.
+        drop(catalog);
+        let catalog = Catalog::open(&catalog_path).unwrap();
+
+        // A reformatted card, reinserted at a different mount path than the
+        // first one and with fresh filenames, still carries the same folder
+        // layout and filename prefix.
+        let second_mount = labeled_card_fixture_media(
+            &directory.path().join("second-insert-after-reformat"),
+            "UNTITLED",
+            "DCIM/100MSDCF",
+            &[("C0001.MP4", "olive")],
+        );
+        assert_ne!(
+            first_mount, second_mount,
+            "the mount path must actually differ"
+        );
+
+        let second_plan = catalog
+            .preflight_import(&project.id, &second_mount, None, None, |_, _, _| true)
+            .unwrap();
+        assert_eq!(
+            second_plan.camera_identity,
+            ResolvedImportCamera {
+                camera: "Sony A7C II".to_string(),
+                source: ImportCameraSource::Remembered,
+                evidence_strong: true,
+            },
+            "a reformatted card at a new mount path must default to the remembered identity"
+        );
+
+        let second_outcome = catalog
+            .run_import(&project.id, &second_plan, true, |_| true)
+            .unwrap();
+        assert_eq!(second_outcome.imported, 1);
+        for asset in catalog.list_assets(&project.id).unwrap() {
+            assert_eq!(asset.camera, "Sony A7C II");
+        }
+    }
+
+    /// A generic `DCIM`-only card (no vendor layout recognized) is exactly
+    /// the "ambiguous evidence" case: nothing here should be recorded, and
+    /// nothing should ever be silently offered back as a remembered
+    /// mapping — the dialog must keep showing this as a guess, not a fact.
+    #[test]
+    fn ambiguous_generic_dcim_evidence_is_never_recorded_or_applied() {
+        if skip_without_ffprobe() {
+            return;
+        }
+        let directory = tempdir().unwrap();
+        let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).unwrap();
+        let project = catalog.create_project("Spain 2026").unwrap();
+        let mount = labeled_card_fixture_media(
+            directory.path(),
+            "UNTITLED",
+            "DCIM",
+            &[("VID_0001.MP4", "navy")],
+        );
+
+        let plan = catalog
+            .preflight_import(&project.id, &mount, None, Some("Some Camera"), |_, _, _| {
+                true
+            })
+            .unwrap();
+        assert!(!plan.camera_identity.evidence_strong);
+
+        catalog
+            .run_import(&project.id, &plan, true, |_| true)
+            .unwrap();
+        assert!(
+            catalog
+                .list_camera_mappings(&project.id)
+                .unwrap()
+                .is_empty(),
+            "weak evidence must never be recorded, even for an explicit user choice"
+        );
+
+        // Reinserting the very same card must not spuriously resolve to
+        // "Some Camera" either — there was never strong enough evidence to
+        // remember it by.
+        let replan = catalog
+            .preflight_import(&project.id, &mount, None, None, |_, _, _| true)
+            .unwrap();
+        assert_ne!(
+            replan.camera_identity.source,
+            ImportCameraSource::Remembered
+        );
+    }
+
+    /// The issue's explicit negative case: a different camera that happens
+    /// to be mounted under the same generic volume label as a
+    /// previously-corrected one must not inherit that correction. The
+    /// mapping store never sees the volume label — only folder layout and
+    /// filename prefix — so a DJI card under the exact same "CARD" label a
+    /// Sony card used stays its own thing.
+    #[test]
+    fn a_different_camera_under_the_same_generic_label_does_not_inherit() {
+        if skip_without_ffprobe() {
+            return;
+        }
+        let directory = tempdir().unwrap();
+        let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).unwrap();
+        let project = catalog.create_project("Spain 2026").unwrap();
+
+        let sony_mount = labeled_card_fixture_media(
+            &directory.path().join("sony"),
+            "CARD",
+            "DCIM/100MSDCF",
+            &[("C0001.MP4", "navy")],
+        );
+        let sony_plan = catalog
+            .preflight_import(
+                &project.id,
+                &sony_mount,
+                None,
+                Some("Sony A7C II"),
+                |_, _, _| true,
+            )
+            .unwrap();
+        catalog
+            .run_import(&project.id, &sony_plan, true, |_| true)
+            .unwrap();
+
+        // A DJI Pocket 3, mounted under the identical "CARD" label.
+        let dji_mount = labeled_card_fixture_media(
+            &directory.path().join("dji"),
+            "CARD",
+            "DCIM/DJI_001",
+            &[("DJI_20251221092058_0001_D.MP4", "maroon")],
+        );
+        assert_eq!(
+            Path::new(&sony_mount).file_name(),
+            Path::new(&dji_mount).file_name(),
+            "both cards must share the same generic mount label for this test to prove anything"
+        );
+
+        let dji_plan = catalog
+            .preflight_import(&project.id, &dji_mount, None, None, |_, _, _| true)
+            .unwrap();
+        assert_ne!(
+            dji_plan.camera_identity.source,
+            ImportCameraSource::Remembered,
+            "a different camera must never inherit a mapping via a shared volume label"
+        );
+        assert_eq!(dji_plan.camera_identity.camera, "DJI Pocket 3");
     }
 }

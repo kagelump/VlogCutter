@@ -59,6 +59,7 @@ describe("adding a folder of existing media", () => {
       projectId: PROJECT,
       sourcePath: FOLDER,
       archiveRootId: null,
+      cameraOverride: null,
     });
     expect(within(dialog).getByText(/Originals stay where they are/)).toBeVisible();
   });

@@ -93,8 +93,8 @@ pub use analysis::vlm::AnalysisOutcome;
 pub use analysis::vlm_store::StoredAnalysis as ClipAnalysis;
 pub use analysis::{FRAMEPACK_RECIPE_KEY, STT_RECIPE_KEY, STT_TASK_KEY, VLM_PROMPT_VERSION};
 pub use cameras::{
-    CAMERA_PATTERNS, CameraIdentity, CameraIdentitySource, CameraPattern, PatternConfidence,
-    UNKNOWN_CAMERA, identify_camera, pattern_counter,
+    CAMERA_PATTERNS, CameraEvidence, CameraIdentity, CameraIdentitySource, CameraMapping,
+    CameraPattern, PatternConfidence, UNKNOWN_CAMERA, identify_camera, pattern_counter,
 };
 pub use chronology::{
     AppliedCorrection, AssetChronology, AssetTimeHypothesis, CaptureSequence,
@@ -1213,6 +1213,26 @@ impl Catalog {
     }
 
     pub(crate) fn ingest_file(&self, project_id: &str, path: &Path) -> Result<IngestOutcome> {
+        self.ingest_file_with_camera(project_id, path, None)
+    }
+
+    /// Same as `ingest_file`, except a genuinely new asset's camera is
+    /// `camera_override` when given, instead of `probe_media`'s own
+    /// EXIF-then-filename-pattern guess. This is the other half of #71's
+    /// "the selected identity is used by both asset ingest and
+    /// capture-sequence preflight" requirement: `preflight_import` resolves
+    /// one identity into `ImportPreflight.camera_identity`, and `run_import`
+    /// passes that same string here so the asset this creates and the
+    /// capture sequence `materialize_asset_add` files it under (keyed on
+    /// `payload.camera`, see `operations.rs`) can never disagree with what
+    /// the dialog showed. Has no effect on already-known content: a relink
+    /// never re-probes or re-assigns a camera.
+    pub(crate) fn ingest_file_with_camera(
+        &self,
+        project_id: &str,
+        path: &Path,
+        camera_override: Option<&str>,
+    ) -> Result<IngestOutcome> {
         let metadata =
             fs::metadata(path).with_context(|| format!("read metadata for {}", path.display()))?;
         let fingerprint = sampled_fingerprint(path, metadata.len())?;
@@ -1241,7 +1261,13 @@ impl Catalog {
             return self.relink_known_asset(&asset_id, &recorded_path, path, &fingerprint);
         }
 
-        let probe = probe_media(path)?;
+        let mut probe = probe_media(path)?;
+        if let Some(camera) = camera_override
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            probe.camera = camera.to_string();
+        }
         self.record_camera_identity_diagnostics(project_id, path, &probe.camera);
         let id = format!("asset_{}", Uuid::new_v4().simple());
         let filename = path

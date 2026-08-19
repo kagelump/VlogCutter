@@ -18,6 +18,7 @@ import type {
   ArchiveRoot,
   Asset,
   AssetAnalysisView,
+  CameraMapping,
   CardCandidate,
   ClipTranscript,
   DesktopSettings,
@@ -111,6 +112,14 @@ export interface ImportScenarioState {
   lastRunSourcePath: string | null;
   /** Durable import history, keyed by its deterministic harness id. */
   sessions: Record<string, ImportSessionDetail>;
+  /**
+   * Durable per-project camera-identity mappings (#71), keyed by project id.
+   * This is the harness's stand-in for the real `camera_identity_mappings`
+   * SQLite table — it lives on `harness.state`, not in any component, so it
+   * survives an `app.remount()` the same way the real table survives an app
+   * restart within one CUJ test.
+   */
+  cameraMappings: Record<string, CameraMapping[]>;
 }
 
 export interface DesktopHarnessState {
@@ -247,7 +256,7 @@ export function createInitialState(clock: HarnessClock): DesktopHarnessState {
 
     archiveRoots: [],
     cards: [],
-    imports: { preflights: {}, additions: {}, lastRunSourcePath: null, sessions: {} },
+    imports: { preflights: {}, additions: {}, lastRunSourcePath: null, sessions: {}, cameraMappings: {} },
     relinkable: {},
 
     pairing: {

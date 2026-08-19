@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import { api } from "./api";
-import type { ArchiveRoot, Asset, AssetPatch, AutoplayMode, BaselineImportResult, BaselinePreviewResult, CardCandidate, DesktopSettings, ImportHistoryEntry, ImportPreflight, ImportProgress, ImportRollbackPreview, ImportRunReport, ImportSessionDetail, ModelInstallProgress, ModelStatus, PathAnalysis, Project, ProjectLibrary, ProjectLocation, ProjectPairingStatus, RootMappingEntry, ServerConnectionStatus, ServerVersionInfo, SyncStatus, TranscriptStatus } from "./types";
+import type { ArchiveRoot, Asset, AssetPatch, AutoplayMode, BaselineImportResult, BaselinePreviewResult, CameraMapping, CardCandidate, DesktopSettings, ImportHistoryEntry, ImportPreflight, ImportProgress, ImportRollbackPreview, ImportRunReport, ImportSessionDetail, ModelInstallProgress, ModelStatus, PathAnalysis, Project, ProjectLibrary, ProjectLocation, ProjectPairingStatus, RootMappingEntry, ServerConnectionStatus, ServerVersionInfo, SyncStatus, TranscriptStatus } from "./types";
 import { useProjectSession } from "./session/projectSession";
 import { useAssetMutations } from "./session/assetMutations";
 import { orderAssets, replaceAsset as replaceAssetInList, moveSelection as moveSelectionInOrder } from "./review/order";
@@ -124,6 +124,12 @@ function App() {
   const [archiveRoots, setArchiveRoots] = useState<ArchiveRoot[]>([]);
   const [selectedArchiveRootId, setSelectedArchiveRootId] = useState("");
   const [importPlan, setImportPlan] = useState<ImportPreflight | null>(null);
+  /** Existing project camera identities, for the import dialog's camera control (#71). */
+  const [importKnownCameras, setImportKnownCameras] = useState<string[]>([]);
+  /** The camera the user explicitly chose for the current import dialog session, if any. */
+  const [importCameraOverride, setImportCameraOverride] = useState<string | null>(null);
+  /** Every stored evidence-to-camera mapping for this project (#71). */
+  const [importCameraMappings, setImportCameraMappings] = useState<CameraMapping[]>([]);
   const [importProgress, setImportProgress] = useState<ImportProgress | null>(null);
   const [importReport, setImportReport] = useState<ImportRunReport | null>(null);
   const [importLoading, setImportLoading] = useState(false);
@@ -1237,14 +1243,21 @@ function App() {
     setImportProgress(null);
     setImportReport(null);
     setImportError("");
+    setImportCameraOverride(null);
+    setImportKnownCameras([]);
+    setImportCameraMappings([]);
     setImportLoading(true);
     try {
-      const [card, roots] = await Promise.all([
+      const [card, roots, knownCameras, mappings] = await Promise.all([
         knownCard ? Promise.resolve(knownCard) : api.inspectImportSource(path),
         api.listArchiveRoots(),
+        projectId ? api.knownProjectCameras(projectId) : Promise.resolve([]),
+        projectId ? api.listCameraMappings(projectId) : Promise.resolve([]),
       ]);
       setImportCard(card);
       setArchiveRoots(roots);
+      setImportKnownCameras(knownCameras);
+      setImportCameraMappings(mappings);
       const mappedRootId = card
         ? settings.importArchiveRootIdsByCardSession[card.sessionId]
         : null;
@@ -1254,7 +1267,7 @@ function App() {
       const rootId = selectedRoot?.id ?? "";
       setSelectedArchiveRootId(rootId);
       if (!card || rootId) {
-        setImportPlan(await api.preflightImport(projectId, path, rootId || null));
+        setImportPlan(await api.preflightImport(projectId, path, rootId || null, null));
       }
     } catch (reason) {
       if (!String(reason).includes("preflight cancelled")) setImportError(String(reason));
@@ -1263,7 +1276,7 @@ function App() {
     }
   }
 
-  async function refreshImportPlan(rootId: string) {
+  async function refreshImportPlan(rootId: string, cameraOverride: string | null = importCameraOverride) {
     if (!projectId || !importSource || (importCard && !rootId)) {
       setImportPlan(null);
       return;
@@ -1273,11 +1286,48 @@ function App() {
     setImportError("");
     setImportProgress(null);
     try {
-      setImportPlan(await api.preflightImport(projectId, importSource, rootId || null));
+      setImportPlan(await api.preflightImport(projectId, importSource, rootId || null, cameraOverride));
     } catch (reason) {
       if (!String(reason).includes("preflight cancelled")) setImportError(String(reason));
     } finally {
       setImportLoading(false);
+    }
+  }
+
+  /**
+   * The user picked an existing project camera, typed a deliberate new name,
+   * or cleared back to auto-detection (#71). Re-runs preflight with the
+   * override so the sequence preview reflects it before Import is pressed —
+   * the same identity `run_import` will then use for every new asset, so the
+   * two can never disagree (see `preflight.rs`'s `ResolvedImportCamera` doc).
+   */
+  async function selectImportCamera(camera: string | null) {
+    setImportCameraOverride(camera);
+    await refreshImportPlan(selectedArchiveRootId, camera);
+  }
+
+  /** The "change" half of inspect/change/clear (#71). Re-plans afterward: a
+   * rename can change what the currently mounted card resolves to. */
+  async function renameImportCameraMapping(mappingId: string, camera: string) {
+    if (!projectId) return;
+    try {
+      const updated = await api.renameCameraMapping(projectId, mappingId, camera);
+      setImportCameraMappings((current) => current.map((mapping) => (mapping.id === updated.id ? updated : mapping)));
+      await refreshImportPlan(selectedArchiveRootId);
+    } catch (reason) {
+      setImportError(String(reason));
+    }
+  }
+
+  /** The "clear" half of inspect/change/clear (#71). */
+  async function clearImportCameraMapping(mappingId: string) {
+    if (!projectId) return;
+    try {
+      await api.clearCameraMapping(projectId, mappingId);
+      setImportCameraMappings((current) => current.filter((mapping) => mapping.id !== mappingId));
+      await refreshImportPlan(selectedArchiveRootId);
+    } catch (reason) {
+      setImportError(String(reason));
     }
   }
 
@@ -2326,11 +2376,16 @@ function App() {
           error={importError}
           verifyCopies={verifyImportCopies}
           makeProxies={makeImportProxies}
+          knownCameras={importKnownCameras}
+          mappings={importCameraMappings}
           onSelectRoot={(id) => void refreshImportPlan(id)}
           onCreateRoot={(name) => void createImportArchive(name)}
           onLocateRoot={(root) => void locateImportArchive(root)}
           onVerifyCopies={setVerifyImportCopies}
           onMakeProxies={setMakeImportProxies}
+          onSelectCamera={(camera) => void selectImportCamera(camera)}
+          onRenameMapping={(id, camera) => void renameImportCameraMapping(id, camera)}
+          onClearMapping={(id) => void clearImportCameraMapping(id)}
           onImport={() => void runSmartImport()}
           onCancel={() => void api.cancelImport()}
           onClose={closeImportDialog}

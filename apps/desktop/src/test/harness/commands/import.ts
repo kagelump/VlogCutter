@@ -14,6 +14,7 @@
 import type {
   ArchiveRoot,
   Asset,
+  CameraMapping,
   CardCandidate,
   ImportPreflight,
   ImportPreviewItem,
@@ -22,12 +23,135 @@ import type {
   ImportRunReport,
   ImportSessionDetail,
   PreflightItem,
+  ResolvedImportCamera,
 } from "../../../types";
 import { buildArchiveRoot } from "../builders";
 import type { JobBinding } from "../jobs";
 import { projectAssets, putAsset, type DesktopHarnessState } from "../state";
 import type { CommandTable, HarnessContext } from "../registry";
 import { requireBoolean, requireString } from "../registry";
+
+// --- #71: resolving and remembering a camera identity ---
+//
+// Mirrors `core/rcdvlog-core/src/cameras/mapping.rs` and
+// `preflight.rs::resolve_import_camera` closely enough that the same scenario
+// sequence exercises the same decisions, without re-implementing the Rust
+// solver: evidence is the card's folder-layout hint plus the dominant
+// filename prefix among the incoming new clips, and it is looked up or
+// recorded only when both are present. See that module's doc comment for why
+// the mount path and the volume label are deliberately excluded.
+
+interface CameraEvidence {
+  folderHint: string;
+  filenamePrefix: string;
+}
+
+function evidenceIsStrong(evidence: CameraEvidence): boolean {
+  return evidence.folderHint !== "" && evidence.filenamePrefix !== "";
+}
+
+/** The stem up to its first digit run, trimmed and upper-cased — the same
+ * rule `preflight.rs::filename_prefix` applies. */
+function derivePrefixFromFilename(filename: string): string {
+  const stem = filename.includes(".") ? filename.slice(0, filename.lastIndexOf(".")) : filename;
+  const digitIndex = Array.from(stem).findIndex((character) => character >= "0" && character <= "9");
+  const rawPrefix = digitIndex === -1 ? stem : stem.slice(0, digitIndex);
+  const trimmed = rawPrefix.replace(/^[-_. ]+|[-_. ]+$/g, "");
+  return (trimmed || stem).toUpperCase();
+}
+
+/** The most common value, ties broken by whichever sorts first — deterministic
+ * regardless of iteration order, same as `preflight.rs::mode`. */
+function mode(values: string[]): string {
+  const counts = new Map<string, number>();
+  for (const value of values) counts.set(value, (counts.get(value) ?? 0) + 1);
+  let best: string | null = null;
+  let bestCount = 0;
+  for (const [value, count] of [...counts.entries()].sort(([left], [right]) => left.localeCompare(right))) {
+    if (count > bestCount) {
+      best = value;
+      bestCount = count;
+    }
+  }
+  return best ?? "";
+}
+
+function cameraEvidenceFor(card: CardCandidate | null, newFilenames: string[]): CameraEvidence {
+  return {
+    folderHint: card?.cameraHint.trim() ?? "",
+    filenamePrefix: mode(newFilenames.map(derivePrefixFromFilename)),
+  };
+}
+
+function remembered(state: DesktopHarnessState, projectId: string, evidence: CameraEvidence): string | null {
+  if (!evidenceIsStrong(evidence)) return null;
+  const mappings = state.imports.cameraMappings[projectId] ?? [];
+  const match = mappings.find(
+    (mapping) => mapping.folderHint === evidence.folderHint && mapping.filenamePrefix === evidence.filenamePrefix,
+  );
+  return match?.camera ?? null;
+}
+
+/** Records (or updates) the camera one evidence signature should default to.
+ * A no-op for weak evidence or an unusable camera name, same as the core
+ * store's own gate. */
+function rememberCameraMapping(
+  state: DesktopHarnessState,
+  projectId: string,
+  evidence: CameraEvidence,
+  camera: string,
+  nowIso: string,
+): void {
+  const trimmed = camera.trim();
+  if (!evidenceIsStrong(evidence) || trimmed === "" || trimmed === "Unknown camera") return;
+  const mappings = state.imports.cameraMappings[projectId] ?? [];
+  const existing = mappings.find(
+    (mapping) => mapping.folderHint === evidence.folderHint && mapping.filenamePrefix === evidence.filenamePrefix,
+  );
+  if (existing) {
+    existing.camera = trimmed;
+    existing.updatedAt = nowIso;
+    return;
+  }
+  const id = `cammap_${projectId}_${evidence.folderHint}_${evidence.filenamePrefix}`
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_");
+  state.imports.cameraMappings[projectId] = [
+    ...mappings,
+    { id, folderHint: evidence.folderHint, filenamePrefix: evidence.filenamePrefix, camera: trimmed, createdAt: nowIso, updatedAt: nowIso },
+  ];
+}
+
+/** Resolves the one camera identity a plan uses — user override, then a
+ * remembered mapping, then plain per-card detection — the same precedence
+ * `preflight.rs::resolve_import_camera` documents. */
+function resolveCameraIdentity(
+  state: DesktopHarnessState,
+  projectId: string,
+  card: CardCandidate | null,
+  newClips: Asset[],
+  evidence: CameraEvidence,
+  cameraOverride: string | null,
+): ResolvedImportCamera {
+  const evidenceStrong = evidenceIsStrong(evidence);
+
+  const trimmedOverride = cameraOverride?.trim();
+  if (trimmedOverride) {
+    return { camera: trimmedOverride, source: "userSelected", evidenceStrong };
+  }
+
+  const rememberedCamera = remembered(state, projectId, evidence);
+  if (rememberedCamera) {
+    return { camera: rememberedCamera, source: "remembered", evidenceStrong };
+  }
+
+  const detected = newClips[0]?.camera ?? card?.cameraHint ?? "";
+  return {
+    camera: detected || "Unknown camera",
+    source: detected && detected !== "Unknown camera" ? "detected" : "unknown",
+    evidenceStrong,
+  };
+}
 
 /**
  * Build the plan for a source, from what the scenario said is on the card and
@@ -38,6 +162,7 @@ function preflight(
   projectId: string,
   sourcePath: string,
   archiveRootId: string | null,
+  cameraOverride: string | null,
 ): ImportPreflight {
   const declared = state.imports.preflights[sourcePath];
   if (declared) return declared;
@@ -50,7 +175,9 @@ function preflight(
   const bytesToCopy = newClips.reduce((total, asset) => total + asset.sizeBytes, 0);
   const availableBytes = archiveRoot?.availableBytes ?? null;
   const roomless = availableBytes !== null && availableBytes < bytesToCopy;
-  const newCamera = newClips[0]?.camera ?? card?.cameraHint ?? "Unknown camera";
+  const evidence = cameraEvidenceFor(card, newClips.map((asset) => asset.filename));
+  const cameraIdentity = resolveCameraIdentity(state, projectId, card, newClips, evidence, cameraOverride);
+  const newCamera = cameraIdentity.camera;
   const existingCameras = new Set(known.map((asset) => asset.camera));
   const matchesExistingSequence = newClips.length > 0 && existingCameras.has(newCamera);
   const sequenceLabel = `${newCamera} card`;
@@ -75,6 +202,7 @@ function preflight(
   return {
     sourcePath,
     card,
+    cameraIdentity,
     destination: {
       copies: card !== null,
       archiveRoot,
@@ -111,7 +239,7 @@ function preflight(
         clipCount: newClips.length,
         cameraKey: newCamera,
         volumeHint: card?.sessionId ?? sourcePath,
-        filenamePrefix: newCamera.split(" ")[0].toUpperCase(),
+        filenamePrefix: evidence.filenamePrefix,
         decision: matchesExistingSequence ? "extendExisting" : "proposeNew",
         matchedExistingSequenceId: matchesExistingSequence ? `sequence_${newCamera.toLowerCase().replaceAll(" ", "_")}` : null,
         matchedExistingSequenceLabel: matchesExistingSequence ? sequenceLabel : null,
@@ -137,10 +265,21 @@ interface RunTally {
   bytesCopied: number;
 }
 
+/** Only a user selection or a remembered mapping forces every new asset's
+ * camera, mirroring `run_import`'s own `camera_override` gate in
+ * `preflight.rs` — plain detection leaves each clip's own declared camera
+ * alone. */
+function uniformCameraFor(plan: ImportPreflight): string | null {
+  const identity = plan.cameraIdentity;
+  if (!identity) return null;
+  return identity.source === "userSelected" || identity.source === "remembered" ? identity.camera : null;
+}
+
 function stepProgress(state: DesktopHarnessState, tally: RunTally, plan: ImportPreflight): ImportProgress {
   const next = tally.pending.shift();
   if (!next) throw new Error("The import has no pending clips left to report");
-  putAsset(state, next);
+  const camera = uniformCameraFor(plan);
+  putAsset(state, camera ? { ...next, camera } : next);
   tally.imported.push(next.id);
   tally.bytesCopied += next.sizeBytes;
   return {
@@ -245,11 +384,52 @@ export const importCommands: CommandTable = {
     const projectId = requireString(args, "projectId");
     const sourcePath = requireString(args, "sourcePath");
     const archiveRootId = typeof args.archiveRootId === "string" ? args.archiveRootId : null;
-    return preflight(state, projectId, sourcePath, archiveRootId);
+    const cameraOverride = typeof args.cameraOverride === "string" ? args.cameraOverride : null;
+    return preflight(state, projectId, sourcePath, archiveRootId, cameraOverride);
+  },
+
+  /** Every camera identity this project already has footage under (#71). */
+  known_project_cameras: (args, { state }): string[] => {
+    const projectId = requireString(args, "projectId");
+    const cameras = new Set(
+      projectAssets(state, projectId)
+        .map((asset) => asset.camera)
+        .filter((camera) => camera && camera !== "Unknown camera"),
+    );
+    return [...cameras].sort();
+  },
+
+  list_camera_mappings: (args, { state }): CameraMapping[] => {
+    const projectId = requireString(args, "projectId");
+    return [...(state.imports.cameraMappings[projectId] ?? [])].sort((left, right) =>
+      left.camera === right.camera ? left.id.localeCompare(right.id) : left.camera.localeCompare(right.camera),
+    );
+  },
+
+  rename_camera_mapping: (args, { state, clock }): CameraMapping => {
+    const projectId = requireString(args, "projectId");
+    const mappingId = requireString(args, "mappingId");
+    const camera = requireString(args, "camera").trim();
+    if (!camera) throw new Error("a camera mapping needs a name");
+    const mappings = state.imports.cameraMappings[projectId] ?? [];
+    const mapping = mappings.find((candidate) => candidate.id === mappingId);
+    if (!mapping) throw new Error(`camera mapping not found: ${mappingId}`);
+    mapping.camera = camera;
+    mapping.updatedAt = clock.iso();
+    return mapping;
+  },
+
+  clear_camera_mapping: (args, { state }): null => {
+    const projectId = requireString(args, "projectId");
+    const mappingId = requireString(args, "mappingId");
+    state.imports.cameraMappings[projectId] = (state.imports.cameraMappings[projectId] ?? []).filter(
+      (mapping) => mapping.id !== mappingId,
+    );
+    return null;
   },
 
   run_smart_import: (args, context: HarnessContext): ImportRunReport | Promise<unknown> => {
-    requireString(args, "projectId");
+    const projectId = requireString(args, "projectId");
     const plan = args.plan as ImportPreflight | undefined;
     if (!plan?.sourcePath) throw new Error("run_smart_import requires the plan it previewed");
     requireBoolean(args, "verifyCopies");
@@ -264,6 +444,18 @@ export const importCommands: CommandTable = {
       pending: additions.filter((asset) => !context.state.assets[asset.id]),
       bytesCopied: 0,
     };
+    // A completed import is the project's best current statement of what this
+    // card's evidence means — same "record it whenever it was strong enough"
+    // rule as `run_import` in `preflight.rs`, so a reformatted or reinserted
+    // matching card defaults to it next time without the user repeating a
+    // correction.
+    if (tally.pending.length > 0 && plan.cameraIdentity) {
+      const evidence = cameraEvidenceFor(
+        plan.card,
+        plan.items.filter((item) => item.classification === "new").map((item) => item.filename),
+      );
+      rememberCameraMapping(context.state, projectId, evidence, plan.cameraIdentity.camera, context.clock.iso());
+    }
 
     const controller = context.jobs.claimed("run_smart_import");
     if (!controller) {

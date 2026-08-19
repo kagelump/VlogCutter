@@ -7,7 +7,7 @@ use thiserror::Error;
 
 use crate::chronology::forward_migrate_project_chronology;
 
-pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 20;
+pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 21;
 
 const MIGRATION_TABLE_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -203,6 +203,12 @@ pub const PROJECT_CATALOG_MIGRATIONS: &[SqliteMigration] = &[
         name: "declined_capture_sequence_splits",
         source_identity: "project-catalog/0020-declined-capture-sequence-splits/20260812",
         apply: add_declined_capture_sequence_splits,
+    },
+    SqliteMigration {
+        id: 21,
+        name: "camera_identity_mappings",
+        source_identity: "project-catalog/0021-camera-identity-mappings/20260819",
+        apply: add_camera_identity_mappings,
     },
 ];
 
@@ -1257,6 +1263,32 @@ fn add_import_history(transaction: &Transaction<'_>) -> Result<()> {
     Ok(())
 }
 
+/// Durable per-project camera-identity evidence (#71): a corrected camera
+/// name, keyed on a card's folder layout plus its filename prefix rather than
+/// its mount path or volume label, so a reformatted or swapped card from the
+/// same physical camera can default to the identity the user already chose.
+/// See `cameras::mapping` for the evidence-strength rule and how import
+/// preflight and asset ingest both consume it so the two cannot disagree.
+fn add_camera_identity_mappings(transaction: &Transaction<'_>) -> Result<()> {
+    transaction.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS camera_identity_mappings (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            folder_hint TEXT NOT NULL CHECK(length(folder_hint) > 0),
+            filename_prefix TEXT NOT NULL CHECK(length(filename_prefix) > 0),
+            camera TEXT NOT NULL CHECK(length(camera) > 0),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(project_id, folder_hint, filename_prefix)
+        );
+        CREATE INDEX IF NOT EXISTS camera_identity_mappings_project
+            ON camera_identity_mappings(project_id);
+        "#,
+    )?;
+    Ok(())
+}
+
 /// Gives a node-local media location a verification state, so "the original is
 /// available" can stop meaning "some file exists at that pathname".
 ///
@@ -1642,6 +1674,70 @@ mod tests {
         for column in ["status", "stage_reached", "cost_usd", "budget_exhausted"] {
             assert!(columns.contains(&column.to_string()), "missing {column}");
         }
+    }
+
+    #[test]
+    fn migration_21_creates_camera_identity_mappings() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        migrate_project_catalog(&mut connection).unwrap();
+        let columns: Vec<String> = connection
+            .prepare("SELECT name FROM pragma_table_info('camera_identity_mappings')")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<String>>>()
+            .unwrap();
+        for column in [
+            "id",
+            "project_id",
+            "folder_hint",
+            "filename_prefix",
+            "camera",
+            "created_at",
+            "updated_at",
+        ] {
+            assert!(columns.contains(&column.to_string()), "missing {column}");
+        }
+
+        connection
+            .execute(
+                "INSERT INTO projects (id, name, created_at)
+                 VALUES ('p1', 'p', '2026-01-01T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO camera_identity_mappings
+                 (id, project_id, folder_hint, filename_prefix, camera, created_at, updated_at)
+                 VALUES ('m1', 'p1', 'Sony', 'C', 'Sony A7C II', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+        // Weak evidence must be rejected at the schema level too, not only in
+        // the Rust layer above it.
+        assert!(
+            connection
+                .execute(
+                    "INSERT INTO camera_identity_mappings
+                     (id, project_id, folder_hint, filename_prefix, camera, created_at, updated_at)
+                     VALUES ('m2', 'p1', '', 'C', 'Sony A7C II', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+                    [],
+                )
+                .is_err()
+        );
+        // The same evidence signature cannot be recorded twice for one
+        // project.
+        assert!(
+            connection
+                .execute(
+                    "INSERT INTO camera_identity_mappings
+                     (id, project_id, folder_hint, filename_prefix, camera, created_at, updated_at)
+                     VALUES ('m3', 'p1', 'Sony', 'C', 'Something else', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+                    [],
+                )
+                .is_err()
+        );
     }
 
     #[test]

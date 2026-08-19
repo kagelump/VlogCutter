@@ -778,7 +778,21 @@ kbd { padding: 2px 4px; color: #a8b1b6; background: #262d32; border: 1px solid #
 .import-modal { display: flex; width: min(820px, calc(100vw - 40px)); max-height: calc(100vh - 40px); padding: 0; overflow: hidden; flex-direction: column; }
 .import-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 24px; padding: 21px 24px 18px; border-bottom: 1px solid var(--line); }
 .import-header h2 { margin: 2px 0 4px; font-size: 21px; letter-spacing: -.02em; }
-.import-header p:last-child { margin: 0; color: var(--quiet); }
+.import-header p:last-of-type { margin: 0; color: var(--quiet); }
+
+/* The camera control (#71): the resolved identity, why the dialog is showing
+   it, and — while the plan is still editable — the picker to correct it. */
+.import-camera { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 8px; margin-top: 9px; }
+.import-camera .import-route-kicker { margin-bottom: 0; }
+.import-camera strong { color: var(--ink); font-size: 12px; }
+.import-camera small { color: var(--quiet); font-size: 10px; }
+.import-camera[data-source="unknown"] small,
+.import-camera[data-evidence-strong="false"] small { color: var(--amber); }
+.import-camera-picker { display: inline-flex; }
+.import-camera-picker select { min-height: 24px; padding: 0 6px; color: var(--quiet); background: #111719; border: 1px solid var(--line-strong); border-radius: 4px; font-size: 10px; }
+.import-camera-new { display: flex; align-items: center; gap: 8px; }
+.import-camera-new label { color: var(--quiet); font-size: 10px; }
+.import-camera-new input { min-height: 26px; padding: 0 8px; color: var(--ink); background: #111719; border: 1px solid var(--line-strong); border-radius: 4px; font-size: 11px; }
 .import-body { min-height: 0; padding: 18px 24px 20px; overflow-y: auto; }
 .import-delta { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 4px 12px; margin-bottom: 17px; }
 .import-delta strong { color: var(--ink); font: 600 21px/25px ui-monospace, SFMono-Regular, Menlo, monospace; }
@@ -859,6 +873,13 @@ kbd { padding: 2px 4px; color: #a8b1b6; background: #262d32; border: 1px solid #
 .import-file-ledger time, .import-file-ledger .import-file-duration { color: var(--quiet); font-variant-numeric: tabular-nums; white-space: nowrap; }
 .import-file-ledger .import-file-status { white-space: nowrap; }
 .import-file-ledger li small { grid-column: 1 / -1; color: var(--red); }
+
+/* Inspect/change/clear the durable evidence-to-camera store (#71). Reuses
+   `.import-file-ledger`'s disclosure/list chrome; only the row contents differ. */
+.import-camera-mappings li { grid-template-columns: auto minmax(0, 1fr) auto auto; }
+.import-mapping-evidence { color: var(--quiet); font: 10px/1 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: nowrap; }
+.import-camera-mappings input { min-height: 24px; padding: 0 6px; color: var(--ink); background: #111719; border: 1px solid var(--line-strong); border-radius: 4px; font-size: 10px; }
+
 .import-actions { gap: 16px; }
 .import-actions > span { min-width: 0; color: var(--quiet); font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .import-actions > div { display: flex; flex: none; gap: 8px; }

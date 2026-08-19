@@ -423,9 +423,33 @@ export interface ImportSequencePreview {
   runs: ImportSequenceRunPreview[];
 }
 
+/** Where a plan's camera identity came from (#71). */
+export type ImportCameraSource = "userSelected" | "remembered" | "detected" | "unknown";
+
+/**
+ * The one camera identity a plan resolved to. This flows unchanged into both
+ * the sequence preview below and every new asset the import creates, so the
+ * two can never disagree about which camera this footage belongs to. See
+ * `ImportDialog`'s camera control for how `source` drives what the dialog
+ * shows the user.
+ */
+export interface ResolvedImportCamera {
+  camera: string;
+  source: ImportCameraSource;
+  /**
+   * Whether this import's own card evidence (folder layout plus filename
+   * prefix) was strong enough to safely consult or update the durable
+   * mapping store. When false, `source` is never `"remembered"` — present
+   * `camera` as a guess to confirm, not a settled fact.
+   */
+  evidenceStrong: boolean;
+}
+
 export interface ImportPreflight {
   sourcePath: string;
   card: CardCandidate | null;
+  /** Optional only for compatibility with older CUJ fixtures. Production preflight always sends it. */
+  cameraIdentity?: ResolvedImportCamera;
   destination: ImportDestination;
   scanned: number;
   newClips: number;
@@ -437,6 +461,16 @@ export interface ImportPreflight {
   /** Optional only for compatibility with older CUJ fixtures. Production preflight always sends it. */
   sequencePreview?: ImportSequencePreview;
   items: PreflightItem[];
+}
+
+/** One stored evidence-to-camera correction, inspectable and editable per project. */
+export interface CameraMapping {
+  id: string;
+  folderHint: string;
+  filenamePrefix: string;
+  camera: string;
+  createdAt: string;
+  updatedAt: string;
 }
 
 export type ImportStage = "scanning" | "copying" | "reading" | "proxies" | "complete";

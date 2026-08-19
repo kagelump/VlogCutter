@@ -43,6 +43,7 @@ function plan(overrides: Partial<ImportPreflight> = {}): ImportPreflight {
     missingProxies: 31,
     collisions: 0,
     unreadable: 0,
+    cameraIdentity: { camera: "DJI Pocket 3", source: "detected", evidenceStrong: true },
     items: [],
     ...overrides,
   };
@@ -63,11 +64,16 @@ function renderDialog(overrides: Partial<ImportDialogProps> = {}) {
     error: "",
     verifyCopies: true,
     makeProxies: true,
+    knownCameras: ["DJI Pocket 3", "Sony A7C II"],
+    mappings: [],
     onSelectRoot: vi.fn(),
     onCreateRoot: vi.fn(),
     onLocateRoot: vi.fn(),
     onVerifyCopies: vi.fn(),
     onMakeProxies: vi.fn(),
+    onSelectCamera: vi.fn(),
+    onRenameMapping: vi.fn(),
+    onClearMapping: vi.fn(),
     onImport: vi.fn(),
     onCancel: vi.fn(),
     onClose: vi.fn(),
@@ -487,5 +493,155 @@ describe("chronology preflight, collapsed by default", () => {
     expect(screen.queryByText("Needs a look")).toBeNull();
     const separatedRow = screen.getByText(/Boundary evidence keeps this run separate/).closest("li")!;
     expect(separatedRow.dataset.attention).toBeUndefined();
+  });
+});
+
+describe("choosing and remembering a camera identity (#71)", () => {
+  it("shows the detected camera near the source identity", () => {
+    renderDialog();
+    expect(screen.getByText("Camera")).toBeVisible();
+    expect(screen.getByText("DJI Pocket 3", { selector: "strong" })).toBeVisible();
+    expect(screen.getByText("Detected from this card.")).toBeVisible();
+  });
+
+  it("lets the user pick an existing project camera", async () => {
+    const user = userEvent.setup();
+    const onSelectCamera = vi.fn();
+    renderDialog({ onSelectCamera });
+
+    await user.selectOptions(screen.getByLabelText("Change camera"), "Sony A7C II");
+
+    expect(onSelectCamera).toHaveBeenCalledWith("Sony A7C II");
+  });
+
+  it("lets the user type a deliberate new camera name", async () => {
+    const user = userEvent.setup();
+    const onSelectCamera = vi.fn();
+    renderDialog({ onSelectCamera });
+
+    await user.selectOptions(screen.getByLabelText("Change camera"), "New camera name…");
+    const input = screen.getByLabelText("New camera name");
+    await user.type(input, "Sony A7C II");
+    await user.click(screen.getByRole("button", { name: "Use this name" }));
+
+    expect(onSelectCamera).toHaveBeenCalledWith("Sony A7C II");
+    // The picker closes back to the read-only view once confirmed.
+    expect(screen.queryByLabelText("New camera name")).toBeNull();
+  });
+
+  it("does not offer an empty new-camera name", async () => {
+    const user = userEvent.setup();
+    const onSelectCamera = vi.fn();
+    renderDialog({ onSelectCamera });
+
+    await user.selectOptions(screen.getByLabelText("Change camera"), "New camera name…");
+    expect(screen.getByRole("button", { name: "Use this name" })).toBeDisabled();
+    expect(onSelectCamera).not.toHaveBeenCalled();
+  });
+
+  it("shows that a choice was remembered from a previous import", () => {
+    renderDialog({
+      plan: plan({
+        cameraIdentity: { camera: "Sony A7C II", source: "remembered", evidenceStrong: true },
+      }),
+    });
+
+    expect(screen.getByText("Sony A7C II", { selector: "strong" })).toBeVisible();
+    expect(screen.getByText("Remembered from a previous import of this camera.")).toBeVisible();
+  });
+
+  it("makes ambiguous evidence visible rather than presenting a guess as settled", () => {
+    renderDialog({
+      plan: plan({
+        cameraIdentity: { camera: "Unknown camera", source: "unknown", evidenceStrong: false },
+      }),
+    });
+
+    expect(screen.getByText("Unknown camera")).toBeVisible();
+    expect(screen.getByText("Not detected — choose the camera this footage came from.")).toBeVisible();
+  });
+
+  it("does not offer the camera picker once import has completed", () => {
+    renderDialog({
+      report: {
+        outcome: {
+          imported: 18, importedAssetIds: [], relinked: 0, relinkedAssetIds: [],
+          skipped: 212, copied: 18, bytesCopied: 62_400_000_000, cancelled: false, failures: [],
+        },
+        proxies: null,
+        files: [],
+        session: {
+          id: "import_1", projectId: "project_spain", sourcePath: card.mountPath,
+          destinationMode: "archive_copy", destinationRootId: root.id, destinationName: root.displayName,
+          destinationPath: "/Volumes/nas/VideoArchive/spain-2026/DJI_SD-4f2a0000",
+          imported: 18, relinked: 0, skipped: 212, copied: 18, bytesCopied: 62_400_000_000,
+          cancelled: false, failures: [], rolledBackAt: null, rolledBackAssetCount: 0,
+          createdAt: "2026-08-09T00:00:00Z", files: [],
+        },
+      } satisfies ImportRunReport,
+    });
+
+    expect(screen.getByText("DJI Pocket 3")).toBeVisible();
+    expect(screen.queryByLabelText("Change camera")).toBeNull();
+  });
+
+  it("hides the remembered-cameras disclosure when the project has none stored", () => {
+    renderDialog({ mappings: [] });
+    expect(screen.queryByText(/Remembered cameras/)).toBeNull();
+  });
+
+  it("lets the user inspect, change, and clear a stored mapping", async () => {
+    const user = userEvent.setup();
+    const onRenameMapping = vi.fn();
+    const onClearMapping = vi.fn();
+    renderDialog({
+      mappings: [
+        {
+          id: "cammap_1",
+          folderHint: "Sony",
+          filenamePrefix: "C",
+          camera: "Sony A7C II",
+          createdAt: "2026-08-01T00:00:00Z",
+          updatedAt: "2026-08-01T00:00:00Z",
+        },
+      ],
+      onRenameMapping,
+      onClearMapping,
+    });
+
+    // Inspect: the evidence and the camera it resolves to are both visible.
+    await user.click(screen.getByText("Remembered cameras (1)"));
+    expect(screen.getByText("Sony · C")).toBeVisible();
+    const input = screen.getByLabelText("Camera for Sony · C");
+    expect(input).toHaveValue("Sony A7C II");
+
+    // Change.
+    await user.clear(input);
+    await user.type(input, "Sony A7C II mk2");
+    await user.click(screen.getByRole("button", { name: "Save" }));
+    expect(onRenameMapping).toHaveBeenCalledWith("cammap_1", "Sony A7C II mk2");
+
+    // Clear.
+    await user.click(screen.getByRole("button", { name: "Clear the remembered camera for Sony · C" }));
+    expect(onClearMapping).toHaveBeenCalledWith("cammap_1");
+  });
+
+  it("does not offer to save a mapping back to its own unchanged name", async () => {
+    const user = userEvent.setup();
+    renderDialog({
+      mappings: [
+        {
+          id: "cammap_1",
+          folderHint: "Sony",
+          filenamePrefix: "C",
+          camera: "Sony A7C II",
+          createdAt: "2026-08-01T00:00:00Z",
+          updatedAt: "2026-08-01T00:00:00Z",
+        },
+      ],
+    });
+
+    await user.click(screen.getByText("Remembered cameras (1)"));
+    expect(screen.getByRole("button", { name: "Save" })).toBeDisabled();
   });
 });

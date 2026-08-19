@@ -459,6 +459,7 @@ mod tests {
         let plan = ImportPreflight {
             source_path: "/Volumes/CARD".to_string(),
             card: None,
+            camera_identity: Default::default(),
             destination: ImportDestination {
                 copies: false,
                 archive_root: None,
