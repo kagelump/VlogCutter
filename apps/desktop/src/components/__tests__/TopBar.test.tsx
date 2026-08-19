@@ -38,6 +38,7 @@ function renderBar(overrides: Partial<TopBarProps> = {}) {
     missingAnalysisCount: 0,
     mediaMenuOpen: false,
     hasLastImport: false,
+    interruptedImportLabel: "",
     labeledCount: 0,
     activeCount: 0,
     onProjectChange: vi.fn(),
@@ -57,6 +58,7 @@ function renderBar(overrides: Partial<TopBarProps> = {}) {
     onOpenAnalysis: vi.fn(),
     onImportFolder: vi.fn(),
     onReviewLastImport: vi.fn(),
+    onResumeInterruptedImport: vi.fn(),
     ...overrides,
   };
   return { props, ...render(<TopBar {...props} />) };
@@ -176,6 +178,28 @@ describe("media generation", () => {
     renderBar({ mediaMenuOpen: true, missingThumbnailCount: 0, missingAnalysisCount: 0 });
     expect(screen.getByText("Thumbnails ready").closest("button")!.hasAttribute("disabled")).toBe(true);
     expect(screen.getByText("Analysis up to date").closest("button")!.hasAttribute("disabled")).toBe(false);
+  });
+
+  it("offers no way back into an import when none was interrupted", () => {
+    renderBar({ mediaMenuOpen: true, hasLastImport: true });
+    expect(screen.queryByText("Resume interrupted import")).toBeNull();
+  });
+
+  it("leads with an interrupted import, above the history entry (#67)", async () => {
+    const { props } = renderBar({
+      mediaMenuOpen: true,
+      hasLastImport: true,
+      interruptedImportLabel: "Sony — Volume Untitled · waiting to reconnect",
+    });
+
+    const entry = screen.getByText("Resume interrupted import").closest("button")!;
+    expect(within(entry).getByText("Sony — Volume Untitled · waiting to reconnect")).toBeTruthy();
+    // Live work above history: "Review last import" is not a way back in.
+    const history = screen.getByText("Review last import").closest("button")!;
+    expect(entry.compareDocumentPosition(history) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+
+    await userEvent.click(entry);
+    expect(props.onResumeInterruptedImport).toHaveBeenCalledTimes(1);
   });
 
   it("hints ⇧G for thumbnails, since T belongs to the ribbon", () => {

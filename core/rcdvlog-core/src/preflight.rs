@@ -1148,6 +1148,15 @@ pub struct ImportOutcome {
     pub copied: usize,
     pub bytes_copied: u64,
     pub cancelled: bool,
+    /// The run stopped because the source volume went away underneath it.
+    ///
+    /// Distinct from `cancelled`, which is the user's own decision, and from
+    /// `failures`, which are per-file problems the user has to look at. A
+    /// disconnected source leaves no failed file: the interrupted item copied
+    /// nothing and is simply work still to do. Everything already committed
+    /// stays committed, so resuming re-plans and copies only the remainder.
+    #[serde(default)]
+    pub source_disconnected: bool,
     pub failures: Vec<crate::IngestFailure>,
     /// Non-fatal bookkeeping problems after a clip's membership and bytes are
     /// already durable. These are deliberately separate from `failures`: the
@@ -1186,6 +1195,33 @@ pub struct ImportProgress {
     /// verifying, or failed item is deliberately never exposed as an asset.
     #[serde(default)]
     pub asset: Option<Asset>,
+}
+
+/// Whether a plan's source is still present *and still the same source*.
+///
+/// Identity, never pathname. A bus-powered enclosure can drop a volume and
+/// remount a different card at the same `/Volumes/Untitled` within seconds,
+/// and treating that as "the source came back" would copy the wrong footage
+/// into the interrupted session's archive directory. A card therefore has to
+/// present the same session identity it presented at preflight; only a
+/// referenced-in-place folder, which has no card identity to check, is
+/// satisfied by its directory still being there.
+///
+/// Costs one directory walk with nothing read or hashed, so it is affordable
+/// on the error path of an import — where it is asked at most once, because
+/// the answer `false` stops the run.
+pub fn import_source_present(plan: &ImportPreflight) -> bool {
+    let source = Path::new(&plan.source_path);
+    if !source.is_dir() {
+        return false;
+    }
+    let Some(expected) = plan.card.as_ref() else {
+        return true;
+    };
+    matches!(
+        inspect_card(source),
+        Ok(Some(found)) if found.session_id == expected.session_id,
+    )
 }
 
 /// The per-plan context every item in a `run_import` loop shares, bundled so
@@ -1347,10 +1383,22 @@ impl Catalog {
                     outcome.cancelled = true;
                     break;
                 }
-                Err(error) => outcome.failures.push(crate::IngestFailure {
-                    path: item.path.clone(),
-                    error: format!("{error:#}"),
-                }),
+                Err(error) => {
+                    // A removable source disappearing mid-copy is a normal
+                    // field failure, not one corrupt file per remaining item.
+                    // Stop the run and report the interruption, so the caller
+                    // can offer a reconnect instead of burning through the
+                    // whole card with the same I/O error and presenting the
+                    // result as hundreds of files needing attention.
+                    if !import_source_present(plan) {
+                        outcome.source_disconnected = true;
+                        break;
+                    }
+                    outcome.failures.push(crate::IngestFailure {
+                        path: item.path.clone(),
+                        error: format!("{error:#}"),
+                    });
+                }
             }
             if !on_progress(ImportProgress {
                 stage,
@@ -2747,6 +2795,136 @@ mod tests {
             .run_import(&project.id, &resumed_plan, true, |_| true)
             .unwrap();
         assert_eq!(resumed.imported, 1);
+        assert_eq!(catalog.list_assets(&project.id).unwrap().len(), 3);
+    }
+
+    /// #67: presence is a question about identity, not about a pathname. A
+    /// different card mounted where the interrupted one was must never be
+    /// mistaken for the source coming back.
+    #[test]
+    fn source_presence_tracks_card_identity_rather_than_the_mount_path() {
+        let directory = tempdir().unwrap();
+        let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).unwrap();
+        let project = catalog.create_project("Spain 2026").unwrap();
+        let mount = card_fixture(
+            directory.path(),
+            &[("C0001.MP4", b"first"), ("C0002.MP4", b"second")],
+        );
+
+        let plan = catalog
+            .preflight_import(&project.id, &mount, None, None, |_, _, _| true)
+            .unwrap();
+        assert!(import_source_present(&plan));
+
+        // Unmounted: the whole volume is gone.
+        let stash = directory.path().join("ejected");
+        fs::rename(&mount, &stash).unwrap();
+        assert!(!import_source_present(&plan));
+
+        // A *different* card mounted at the same path is not this source.
+        let intruder = card_fixture(&directory.path().join("other"), &[("C0009.MP4", b"other")]);
+        fs::rename(&intruder, &mount).unwrap();
+        assert!(!import_source_present(&plan));
+
+        // The original card back in the slot is.
+        fs::remove_dir_all(&mount).unwrap();
+        fs::rename(&stash, &mount).unwrap();
+        assert!(import_source_present(&plan));
+    }
+
+    /// A folder the user picked has no card identity to verify; its directory
+    /// still existing is the whole test.
+    #[test]
+    fn source_presence_for_a_plain_folder_is_just_its_directory() {
+        let directory = tempdir().unwrap();
+        let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).unwrap();
+        let project = catalog.create_project("Spain 2026").unwrap();
+        let folder = directory.path().join("nas-footage");
+        fs::create_dir_all(&folder).unwrap();
+        fs::write(folder.join("C0001.MP4"), b"in place").unwrap();
+
+        let plan = catalog
+            .preflight_import(&project.id, &folder, None, None, |_, _, _| true)
+            .unwrap();
+        assert!(plan.card.is_none());
+        assert!(import_source_present(&plan));
+
+        fs::remove_dir_all(&folder).unwrap();
+        assert!(!import_source_present(&plan));
+    }
+
+    /// #67: pulling the card mid-copy stops the run as an interruption. It is
+    /// not a cancellation, it produces no failed files, and everything already
+    /// committed survives so the remount can resume the remainder.
+    #[test]
+    fn a_source_lost_mid_import_stops_the_run_and_resumes_after_remount() {
+        if crate::tool_command("ffprobe")
+            .arg("-version")
+            .output()
+            .is_err()
+        {
+            eprintln!("ffprobe is unavailable; skipping media integration test");
+            return;
+        }
+
+        let directory = tempdir().unwrap();
+        let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).unwrap();
+        let project = catalog.create_project("Spain 2026").unwrap();
+        let mount = card_fixture_media(
+            directory.path(),
+            &[
+                ("C0001.MP4", "navy"),
+                ("C0002.MP4", "maroon"),
+                ("C0003.MP4", "green"),
+            ],
+        );
+        let archive = directory.path().join("nas");
+        fs::create_dir_all(&archive).unwrap();
+        let root = catalog.create_archive_root("NAS Video", &archive).unwrap();
+
+        let plan = catalog
+            .preflight_import(&project.id, &mount, Some(&root.id), None, |_, _, _| true)
+            .unwrap();
+
+        // Rename rather than delete, so the identical bytes can be remounted
+        // and the card keeps the session identity resume has to match on.
+        let stash = directory.path().join("ejected");
+        let mut ejected = false;
+        let outcome = catalog
+            .run_import(&project.id, &plan, true, |progress| {
+                if progress.asset.is_some() && !ejected {
+                    fs::rename(&mount, &stash).unwrap();
+                    ejected = true;
+                }
+                true
+            })
+            .unwrap();
+
+        assert!(outcome.source_disconnected);
+        assert!(
+            !outcome.cancelled,
+            "a pulled card is not the user cancelling"
+        );
+        assert!(
+            outcome.failures.is_empty(),
+            "the uncopied remainder is work still to do, not files needing attention: {:?}",
+            outcome.failures
+        );
+        assert_eq!(outcome.imported, 1);
+        assert_eq!(catalog.list_assets(&project.id).unwrap().len(), 1);
+
+        // Remounted: re-planning classifies the committed clip as known and
+        // copies only what is left.
+        fs::rename(&stash, &mount).unwrap();
+        let resumed_plan = catalog
+            .preflight_import(&project.id, &mount, Some(&root.id), None, |_, _, _| true)
+            .unwrap();
+        assert_eq!(resumed_plan.new_clips, 2);
+        let resumed = catalog
+            .run_import(&project.id, &resumed_plan, true, |_| true)
+            .unwrap();
+        assert!(!resumed.source_disconnected);
+        assert_eq!(resumed.imported, 2);
         assert_eq!(catalog.list_assets(&project.id).unwrap().len(), 3);
     }
 

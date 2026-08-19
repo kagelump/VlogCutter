@@ -63,6 +63,8 @@ function renderDialog(overrides: Partial<ImportDialogProps> = {}) {
     progress: null,
     report: null,
     error: "",
+    interrupted: null,
+    reconnected: false,
     verifyCopies: true,
     makeProxies: true,
     knownCameras: ["DJI Pocket 3", "Sony A7C II"],
@@ -78,6 +80,9 @@ function renderDialog(overrides: Partial<ImportDialogProps> = {}) {
     onImport: vi.fn(),
     onCancel: vi.fn(),
     onClose: vi.fn(),
+    onResume: vi.fn(),
+    onChooseSource: vi.fn(),
+    onCancelInterrupted: vi.fn(),
     ...overrides,
   };
   return { props, ...render(<ImportDialog {...props} />) };
@@ -728,4 +733,79 @@ describe("choosing and remembering a camera identity (#71)", () => {
     expect(screen.getByText("Sony · C")).toBeVisible();
     expect(screen.getByText("Sony · C · SONY ILME-FX3")).toBeVisible();
   });
+
+describe("a source that went away mid-import (#67)", () => {
+  const interrupted = {
+    projectId: "project_1",
+    sourcePath: card.mountPath,
+    card,
+    archiveRootId: root.id,
+    cameraOverride: "DJI Pocket 3",
+    verifyCopies: true,
+    makeProxies: true,
+    committed: 12,
+    failed: 0,
+    interruptedAt: 1_700_000_000_000,
+  };
+
+  it("replaces the plan with a waiting state instead of a dead-end error", () => {
+    renderDialog({ interrupted, reconnected: false });
+
+    expect(screen.getByRole("heading", { level: 3 })).toHaveTextContent(
+      /Source disconnected — waiting for/,
+    );
+    expect(screen.getByText(/12 clips committed/)).toBeVisible();
+    // The plan on screen described a card that is no longer in the slot.
+    expect(screen.queryByText("Ready to import")).toBeNull();
+  });
+
+  it("offers no resume until the card is verified back, and never blocks the way out", () => {
+    renderDialog({ interrupted, reconnected: false });
+
+    expect(screen.getByRole("button", { name: "Reconnect source" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Choose source…" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Cancel import" })).toBeEnabled();
+  });
+
+  it("enables Resume once the same card is back", async () => {
+    const user = userEvent.setup();
+    const onResume = vi.fn();
+    renderDialog({ interrupted, reconnected: true, onResume });
+
+    expect(screen.getByText("Source reconnected")).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "Resume import" }));
+    expect(onResume).toHaveBeenCalledTimes(1);
+  });
+
+  it("says a plain folder cannot be watched for, and offers a retry rather than a wait", () => {
+    renderDialog({ interrupted: { ...interrupted, card: null, sourcePath: "/Volumes/NAS/Trip" }, reconnected: false });
+
+    expect(screen.getByText("Source unavailable")).toBeVisible();
+    expect(screen.getByRole("button", { name: "Retry source" })).toBeEnabled();
+  });
+
+  it("cancels and chooses another source without touching the interrupted run", async () => {
+    const user = userEvent.setup();
+    const onCancelInterrupted = vi.fn();
+    const onChooseSource = vi.fn();
+    renderDialog({ interrupted, reconnected: false, onCancelInterrupted, onChooseSource });
+
+    await user.click(screen.getByRole("button", { name: "Choose source…" }));
+    await user.click(screen.getByRole("button", { name: "Cancel import" }));
+    expect(onChooseSource).toHaveBeenCalledTimes(1);
+    expect(onCancelInterrupted).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the running progress screen when a run is still in flight", () => {
+    renderDialog({
+      interrupted,
+      reconnected: false,
+      running: true,
+      progress: { projectId: "project_1", stage: "copying", completed: 3, total: 18, currentFile: "C0004.MP4", completedBytes: 1, totalBytes: 2 },
+    });
+
+    expect(screen.getByText("Copying and verifying originals")).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Reconnect source" })).toBeNull();
+  });
+});
 });

@@ -1082,7 +1082,11 @@ async fn run_smart_import(
                 },
             )?;
 
-            let proxies = if make_proxies && !outcome.cancelled {
+            // A pulled card stops the run. Proxying the handful of clips
+            // that did land would bury the reconnect prompt behind minutes of
+            // unrelated work, and any referenced-in-place original is on the
+            // volume that just went away. Resume makes them on the next pass.
+            let proxies = if make_proxies && !outcome.cancelled && !outcome.source_disconnected {
                 Some(
                     catalog.generate_missing_proxies_with_progress(&pid, |progress| {
                         let _ = import_app.emit(

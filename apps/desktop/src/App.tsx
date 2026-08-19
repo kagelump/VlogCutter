@@ -1,6 +1,19 @@
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import { api } from "./api";
 import type { ArchiveRoot, Asset, AssetPatch, AutoplayMode, BaselineImportResult, BaselinePreviewResult, CameraMapping, CameraMergePreview, CardCandidate, DesktopSettings, ImportHistoryEntry, ImportPreflight, ImportProgress, ImportRollbackPreview, ImportRunReport, ImportSessionDetail, ModelInstallProgress, ModelStatus, PathAnalysis, Project, ProjectLibrary, ProjectLocation, ProjectPairingStatus, RootMappingEntry, ServerConnectionStatus, ServerVersionInfo, SyncStatus, TranscriptStatus } from "./types";
+import {
+  detectsSourceAutomatically,
+  interruptedMenuNote,
+  interruptedProgressNote,
+  interruptedSourceHeadline,
+  interruptionFromReport,
+  isSameCardSession,
+  isSameInterruptedSession,
+  matchesInterruptedSource,
+  selectMountedCards,
+  type InterruptedImport,
+  type InterruptedImportOptions,
+} from "./import/interruptedImport";
 import { useProjectSession } from "./session/projectSession";
 import { useAssetMutations } from "./session/assetMutations";
 import { orderAssets, replaceAsset as replaceAssetInList, moveSelection as moveSelectionInOrder } from "./review/order";
@@ -161,6 +174,16 @@ function App() {
   const [makeImportProxies, setMakeImportProxies] = useState(true);
   const [mountedCard, setMountedCard] = useState<CardCandidate | null>(null);
   const dismissedCardSessionsRef = useRef(new Set<string>());
+  /**
+   * The Smart ingest session whose source disappeared mid-import (#67). It
+   * outlives the dialog: the media menu reopens it, and mount polling watches
+   * for its card by session identity so a remount is recognized on its own.
+   */
+  const [interruptedImport, setInterruptedImport] = useState<InterruptedImport | null>(null);
+  /** That session's own card, back in the slot. Identity-matched, never by path. */
+  const [resumableCard, setResumableCard] = useState<CardCandidate | null>(null);
+  /** Whether the import dialog is currently showing the waiting-for-source state. */
+  const [importDisconnected, setImportDisconnected] = useState(false);
   // The active shelf tab is a mode, not per-clip state: it persists as you
   // move through the queue (spec §3.6).
   const [shelfTab, setShelfTab] = useState<ShelfTab>("transcript");
@@ -584,6 +607,16 @@ function App() {
   }, [refreshLibrary, refreshProjects]);
 
   useEffect(() => {
+    // An interrupted import belongs to the project that started it (#67). It
+    // survives a project switch — its clips are still half-copied and its card
+    // is still missing — but its waiting screen must not stay on top of a
+    // different project's review.
+    if (interruptedImport && interruptedImport.projectId !== projectId) {
+      setImportDisconnected(false);
+    }
+  }, [interruptedImport, projectId]);
+
+  useEffect(() => {
     // Import sessions are project-scoped state, just like the queue. An older
     // catalog read must not replace the history after a project switch.
     let active = true;
@@ -780,28 +813,51 @@ function App() {
 
   // Mount detection is deliberately low-frequency and listing-only. It offers
   // a review action; hashing and probing begin only after that click.
+  //
+  // The one poll answers two questions (`selectMountedCards`): what the banner
+  // should offer, and whether an interrupted import's own card is back. The
+  // second answer is why the poll keeps running while the import dialog is
+  // open and why it ignores the dismissed set for that one session — a card
+  // enters the dismissed set the moment the user chooses to review it, which
+  // is exactly the card a subsequent disconnect needs to notice returning.
   useEffect(() => {
     if (!api.isDesktop() || !projectId) {
       setMountedCard(null);
+      setResumableCard(null);
       return;
     }
     let disposed = false;
+    const waitingForSource = detectsSourceAutomatically(interruptedImport);
     const poll = async () => {
       try {
         const cards = await api.detectMountedCards();
-        if (disposed || showImportDialog) return;
-        setMountedCard(cards.find((card) => !dismissedCardSessionsRef.current.has(card.sessionId)) ?? null);
+        if (disposed) return;
+        const { banner, resumable } = selectMountedCards(
+          cards,
+          dismissedCardSessionsRef.current,
+          interruptedImport,
+        );
+        setResumableCard(resumable);
+        // The banner is a background offer; it stays put while a modal owns
+        // the screen rather than changing behind it.
+        if (!showImportDialog) setMountedCard(banner);
       } catch {
-        if (!disposed) setMountedCard(null);
+        if (!disposed) {
+          setMountedCard(null);
+          setResumableCard(null);
+        }
       }
     };
     void poll();
-    const timer = window.setInterval(() => void poll(), 15_000);
+    // Someone standing at the machine reseating a cable should not wait out a
+    // 15-second cycle, so the wait for a known-missing source is tightened —
+    // still listing-only, and still bounded to the interruption.
+    const timer = window.setInterval(() => void poll(), waitingForSource ? 4_000 : 15_000);
     return () => {
       disposed = true;
       window.clearInterval(timer);
     };
-  }, [projectId, showImportDialog]);
+  }, [interruptedImport, projectId, showImportDialog]);
 
   useEffect(() => {
     if (selected) {
@@ -1445,18 +1501,33 @@ function App() {
     await openImportForPath(path);
   }
 
-  async function openImportForPath(path: string, knownCard?: CardCandidate) {
+  /**
+   * `resume` carries an interrupted session's own choices back in (#67), so
+   * reconnecting a card does not silently re-derive a destination or drop a
+   * camera the user already chose. Everything else about the reopened dialog
+   * is a fresh classification of whatever is actually there now.
+   */
+  async function openImportForPath(
+    path: string,
+    knownCard?: CardCandidate,
+    resume?: { archiveRootId: string; cameraOverride: string | null },
+  ) {
     setShowImportDialog(true);
+    setImportDisconnected(false);
     setImportProjectName(project?.name ?? "this project");
     setImportSource(path);
     setImportPlan(null);
     setImportProgress(null);
     setImportReport(null);
     setImportError("");
-    setImportCameraOverride(null);
+    setImportCameraOverride(resume?.cameraOverride ?? null);
     setImportKnownCameras([]);
     setImportCameraMappings([]);
     setImportLoading(true);
+    // Held outside the try so a preflight that dies on a vanished card can
+    // still record which destination the run would have used.
+    let resolvedCard: CardCandidate | null = knownCard ?? null;
+    let resolvedRootId = resume?.archiveRootId ?? "";
     try {
       const [card, roots, knownCameras, mappings] = await Promise.all([
         knownCard ? Promise.resolve(knownCard) : api.inspectImportSource(path),
@@ -1464,6 +1535,7 @@ function App() {
         projectId ? api.knownProjectCameras(projectId) : Promise.resolve([]),
         projectId ? api.listCameraMappings(projectId) : Promise.resolve([]),
       ]);
+      resolvedCard = card;
       setImportCard(card);
       setArchiveRoots(roots);
       setImportKnownCameras(knownCameras);
@@ -1471,16 +1543,40 @@ function App() {
       const mappedRootId = card
         ? settings.importArchiveRootIdsByCardSession[card.sessionId]
         : null;
-      const remembered = roots.find((root) => root.id === mappedRootId)
+      const resumedRoot = resume ? roots.find((root) => root.id === resume.archiveRootId) : undefined;
+      const remembered = resumedRoot
+        ?? roots.find((root) => root.id === mappedRootId)
         ?? roots.find((root) => root.id === settings.lastImportArchiveRootId);
       const selectedRoot = card ? (remembered ?? roots.find((root) => root.available) ?? roots[0] ?? null) : null;
       const rootId = selectedRoot?.id ?? "";
+      resolvedRootId = rootId;
       setSelectedArchiveRootId(rootId);
       if (!card || rootId) {
-        setImportPlan(await api.preflightImport(projectId, path, rootId || null, null));
+        setImportPlan(
+          await api.preflightImport(projectId, path, rootId || null, resume?.cameraOverride ?? null),
+        );
       }
     } catch (reason) {
-      if (!String(reason).includes("preflight cancelled")) setImportError(String(reason));
+      if (String(reason).includes("preflight cancelled")) return;
+      // Classifying a card is the first thing that touches it, so it is also
+      // the first thing a loose cable breaks. Reviewing a card dismisses its
+      // banner, so without this the card could come back and have nothing
+      // left to offer the user — the recovery trap #67 names.
+      const session: InterruptedImportOptions = {
+        projectId,
+        sourcePath: path,
+        card: resolvedCard,
+        archiveRootId: resolvedRootId,
+        cameraOverride: resume?.cameraOverride ?? null,
+        verifyCopies: verifyImportCopies,
+        makeProxies: makeImportProxies,
+      };
+      if (await sourceWentAway(session)) {
+        setInterruptedImport({ ...session, committed: 0, failed: 0, interruptedAt: Date.now() });
+        setImportDisconnected(true);
+        return;
+      }
+      setImportError(String(reason));
     } finally {
       setImportLoading(false);
     }
@@ -1575,6 +1671,18 @@ function App() {
   async function runSmartImport() {
     if (!projectId || !importPlan || importRunning || busy) return;
     const importingProjectId = projectId;
+    // Snapshot the choices now, while the dialog still holds them: a source
+    // that disappears mid-run has to be resumable with the same destination,
+    // camera, and verification the user agreed to (#67).
+    const sessionOptions: InterruptedImportOptions = {
+      projectId: importingProjectId,
+      sourcePath: importSource,
+      card: importCard,
+      archiveRootId: selectedArchiveRootId,
+      cameraOverride: importCameraOverride,
+      verifyCopies: verifyImportCopies,
+      makeProxies: makeImportProxies,
+    };
     setImportRunning(true);
     setBusy(true);
     setImportProgress(null);
@@ -1582,6 +1690,7 @@ function App() {
     activeOperationRef.current = "import";
     setOperationProgress(initialProgress("import", importPlan.newClips + importPlan.relinkable));
     setShowImportDialog(false);
+    setImportDisconnected(false);
     try {
       const nextSettings = await api.setImportPreferences(
         makeImportProxies,
@@ -1607,8 +1716,24 @@ function App() {
       // running, so publish the ledger and completion message only after the
       // same project guard has held across that final await too.
       if (projectIdRef.current !== importingProjectId) return;
-      setImportReport(report);
       setImportSessions((current) => report.session ? [report.session, ...current.filter((entry) => entry.id !== report.session!.id)] : current);
+      // A source that went away is a recoverable state, not a result. Record
+      // the session, reopen the dialog on its waiting screen, and leave the
+      // completed-run report unset — there is no completed run to report.
+      const interruption = interruptionFromReport(sessionOptions, report);
+      setInterruptedImport((current) => {
+        if (interruption) return interruption;
+        // A run that finished on its own terms clears only its own session's
+        // recovery state; an unrelated card still waiting stays waiting.
+        return current && isSameInterruptedSession(current, sessionOptions) ? null : current;
+      });
+      if (interruption) {
+        setImportDisconnected(true);
+        setShowImportDialog(true);
+        setMessage(interruptedSourceHeadline(interruption));
+        return;
+      }
+      setImportReport(report);
       const failures = report.outcome.failures.length + (report.proxies?.failures.length ?? 0);
       const warnings = report.outcome.warnings?.length ?? 0;
       if (failures) {
@@ -1625,13 +1750,123 @@ function App() {
         setMessage(`Import complete · ${report.outcome.imported} clip${report.outcome.imported === 1 ? "" : "s"} added`);
       }
     } catch (reason) {
-      if (projectIdRef.current === importingProjectId) setError(String(reason));
+      if (projectIdRef.current !== importingProjectId) return;
+      // The run can also fail outright — a destination that bails, an error
+      // raised before the per-item loop could classify anything. Ask the
+      // hardware directly before settling for a generic error: if the card
+      // this run was reading is no longer the card in the slot, the honest
+      // reading is an interruption with a way back, not a dead end (#67).
+      if (await sourceWentAway(sessionOptions)) {
+        const interruption: InterruptedImport = {
+          ...sessionOptions,
+          committed: 0,
+          failed: 0,
+          interruptedAt: Date.now(),
+        };
+        setInterruptedImport(interruption);
+        setImportDisconnected(true);
+        setShowImportDialog(true);
+        setMessage(interruptedSourceHeadline(interruption));
+        return;
+      }
+      setError(String(reason));
     } finally {
       activeOperationRef.current = null;
       setOperationProgress(null);
       setImportRunning(false);
       setBusy(false);
     }
+  }
+
+  /**
+   * Whether the card this run was reading has left. Answered by identity, so
+   * a different card already remounted at the same path counts as gone.
+   * Only card sources can be answered this way; a plain folder has no identity
+   * to compare and keeps the ordinary error path.
+   */
+  async function sourceWentAway(session: InterruptedImportOptions): Promise<boolean> {
+    if (!session.card) return false;
+    try {
+      return !isSameCardSession(session.card, await api.inspectImportSource(session.sourcePath));
+    } catch {
+      return true;
+    }
+  }
+
+  /**
+   * Reopen the interrupted session's dialog (#67). Called from the media menu,
+   * because a modal the user closed — or one that was never reopened — must
+   * not be the only way back to an import that is still waiting on hardware.
+   */
+  function reopenInterruptedImport() {
+    if (!interruptedImport) return;
+    setShowMediaMenu(false);
+    if (resumableCard) {
+      void resumeInterruptedImport(resumableCard);
+      return;
+    }
+    setImportProjectName(project?.name ?? "this project");
+    setImportSource(interruptedImport.sourcePath);
+    setImportCard(interruptedImport.card);
+    // The plan described a card that is no longer in the slot; a resume
+    // re-classifies from scratch rather than reusing it.
+    setImportPlan(null);
+    setImportError("");
+    setImportProgress(null);
+    setImportReport(null);
+    setImportDisconnected(true);
+    setShowImportDialog(true);
+  }
+
+  /**
+   * Resume into a source that has been verified as this session's own. The
+   * identity check is repeated here rather than trusted from the poll: the
+   * only thing standing between "the card came back" and "a different card is
+   * at that path" is this comparison.
+   */
+  async function resumeInterruptedImport(card: CardCandidate | null) {
+    const session = interruptedImport;
+    if (!session || !projectId || session.projectId !== projectId) return;
+    if (session.card && !matchesInterruptedSource(session, card)) return;
+    setVerifyImportCopies(session.verifyCopies);
+    setMakeImportProxies(session.makeProxies);
+    setShowMediaMenu(false);
+    await openImportForPath(card?.mountPath ?? session.sourcePath, card ?? undefined, {
+      archiveRootId: session.archiveRootId,
+      cameraOverride: session.cameraOverride,
+    });
+  }
+
+  /**
+   * "Choose source…" from the waiting state. A source the user points at by
+   * hand is an explicit decision, not an inference from a pathname — but it
+   * only *resumes* the interrupted session when it is that session's card.
+   * Anything else opens as the ordinary new import it is, and leaves the
+   * interrupted session still waiting in the media menu.
+   */
+  async function chooseInterruptedImportSource() {
+    const path = await api.chooseFolder();
+    if (!path) return;
+    const card = await api.inspectImportSource(path).catch(() => null);
+    if (interruptedImport && matchesInterruptedSource(interruptedImport, card)) {
+      await resumeInterruptedImport(card);
+      return;
+    }
+    setImportDisconnected(false);
+    await openImportForPath(path, card ?? undefined);
+  }
+
+  /** Give up on the interrupted session. Safe and idempotent from any state. */
+  function cancelInterruptedImport() {
+    // Back to before the import: the card is offerable again, because the
+    // dismissal that suppressed its banner was part of the run being abandoned.
+    if (interruptedImport?.card) dismissedCardSessionsRef.current.delete(interruptedImport.card.sessionId);
+    setInterruptedImport(null);
+    setResumableCard(null);
+    setImportDisconnected(false);
+    setShowImportDialog(false);
+    setImportError("");
+    setMessage("Interrupted import cancelled; every committed clip was kept");
   }
 
   function reviewMountedCard() {
@@ -1650,6 +1885,9 @@ function App() {
   function closeImportDialog() {
     if (importRunning) return;
     if (importLoading) void api.cancelImport();
+    // Closing the waiting screen puts the interrupted session away; it does
+    // not abandon it. The media menu is how it comes back (#67).
+    setImportDisconnected(false);
     setShowImportDialog(false);
   }
 
@@ -2305,6 +2543,11 @@ function App() {
         missingAnalysisCount={readiness?.missingAnalyses ?? 0}
         mediaMenuOpen={showMediaMenu}
         hasLastImport={Boolean(importReport) || importSessions.length > 0}
+        interruptedImportLabel={
+          interruptedImport && interruptedImport.projectId === projectId
+            ? interruptedMenuNote(interruptedImport, Boolean(resumableCard))
+            : ""
+        }
         labeledCount={labeledCount}
         activeCount={activeAssets.length}
         onProjectChange={setProjectId}
@@ -2328,6 +2571,7 @@ function App() {
         onOpenAnalysis={openAnalysisDialog}
         onImportFolder={importFolder}
         onReviewLastImport={() => importReport ? (setShowMediaMenu(false), setShowImportDialog(true)) : void openImportHistory()}
+        onResumeInterruptedImport={reopenInterruptedImport}
       />
 
       {view.mode !== "review" && projectId ? (
@@ -2697,6 +2941,8 @@ function App() {
           progress={importProgress}
           report={importReport}
           error={importError}
+          interrupted={importDisconnected ? interruptedImport : null}
+          reconnected={Boolean(resumableCard)}
           verifyCopies={verifyImportCopies}
           makeProxies={makeImportProxies}
           knownCameras={importKnownCameras}
@@ -2712,6 +2958,9 @@ function App() {
           onImport={() => void runSmartImport()}
           onCancel={() => void api.cancelImport()}
           onClose={closeImportDialog}
+          onResume={() => void resumeInterruptedImport(resumableCard)}
+          onChooseSource={() => void chooseInterruptedImportSource()}
+          onCancelInterrupted={cancelInterruptedImport}
         />
       )}
       {showImportHistory && (

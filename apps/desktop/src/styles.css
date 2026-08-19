@@ -913,6 +913,15 @@ kbd { padding: 2px 4px; color: #a8b1b6; background: #262d32; border: 1px solid #
 .import-result h3 { margin: 5px 0 9px; color: var(--ink); font-size: 21px; }
 .import-result p { margin: 5px 0; color: var(--quiet); }
 
+/* Waiting for a source that went away mid-import (#67). Amber, not red: no
+   footage was lost and nothing here is a failure — the import is paused. */
+.import-disconnected { min-height: 340px; padding: 48px 70px 36px; overflow-y: auto; border-left: 3px solid var(--amber); }
+.import-disconnected[data-state="reconnected"] { border-left-color: var(--cyan); }
+.import-disconnected h3 { margin: 5px 0 9px; color: var(--ink); font-size: 21px; }
+.import-disconnected p { margin: 5px 0; color: var(--quiet); }
+.import-disconnected .import-disconnected-note { max-width: 520px; margin-top: 18px; font-size: 10px; }
+.media-menu button.media-menu-interrupted { color: var(--amber); }
+
 @media (max-width: 760px) {
   .import-delta { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .import-route { grid-template-columns: 1fr; gap: 4px; }
@@ -920,7 +929,7 @@ kbd { padding: 2px 4px; color: #a8b1b6; background: #262d32; border: 1px solid #
   .import-destination-controls, .import-options { align-items: stretch; flex-direction: column; }
   .import-sequence-preview li { grid-template-columns: minmax(0, 1fr) auto; }
   .import-sequence-evidence { grid-column: 1 / -1; }
-  .import-running, .import-result { padding: 38px 24px; }
+  .import-running, .import-result, .import-disconnected { padding: 38px 24px; }
 }
 .wizard-step { display: flex; flex-direction: column; gap: 16px; }
 .wizard-step p { margin: 0; font-size: 13px; color: var(--muted); line-height: 1.5; }

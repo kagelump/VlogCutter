@@ -11,6 +11,13 @@ import type {
   ImportSequenceBoundaryEvidence,
   ImportSequenceRunPreview,
 } from "../types";
+import {
+  interruptedFailureNote,
+  interruptedProgressNote,
+  interruptedSourceHeadline,
+  interruptedSourceLabel,
+  type InterruptedImport,
+} from "../import/interruptedImport";
 import { formatBytes } from "../review/summaries";
 import { FileLedger } from "./ImportFileLedger";
 
@@ -26,6 +33,15 @@ export interface ImportDialogProps {
   progress: ImportProgress | null;
   report: ImportRunReport | null;
   error: string;
+  /**
+   * Set while this dialog is the waiting screen for a session whose source
+   * went away (#67). It replaces the body: there is nothing to decide until
+   * the hardware is back, and the plan on screen describes a card that is no
+   * longer in the slot.
+   */
+  interrupted: InterruptedImport | null;
+  /** That session's own card is back, verified by identity. */
+  reconnected: boolean;
   verifyCopies: boolean;
   makeProxies: boolean;
   /** Existing project camera identities, for "choose an existing project camera" (#71). */
@@ -44,6 +60,9 @@ export interface ImportDialogProps {
   onImport(): void;
   onCancel(): void;
   onClose(): void;
+  onResume(): void;
+  onChooseSource(): void;
+  onCancelInterrupted(): void;
 }
 
 const NEW_CAMERA_OPTION = "__new_camera__";
@@ -117,6 +136,11 @@ export function ImportDialog({
   onImport,
   onCancel,
   onClose,
+  onResume,
+  onChooseSource,
+  onCancelInterrupted,
+  interrupted,
+  reconnected,
 }: ImportDialogProps) {
   const [newRootName, setNewRootName] = useState("");
   const [showNewRoot, setShowNewRoot] = useState(false);
@@ -174,8 +198,20 @@ export function ImportDialog({
   // camera family, when known, is the more legible headline; the volume name
   // stays visible as the secondary line rather than disappearing.
   const cameraLabel = card?.cameraHint.trim() || "";
-  const title = card ? (cameraLabel ? `${cameraLabel} — Volume ${card.label}` : card.label) : "Add media folder";
-  const identityLine = card ? noun(card.clipCount, "clip") : "Reference originals in place";
+  const title = interrupted
+    ? interruptedSourceLabel(interrupted)
+    : card ? (cameraLabel ? `${cameraLabel} — Volume ${card.label}` : card.label) : "Add media folder";
+  const identityLine = interrupted
+    ? "Import interrupted"
+    : card ? noun(card.clipCount, "clip") : "Reference originals in place";
+  // "Watching" is the only state with no action to offer yet, and it is only
+  // reachable for a card: mount detection has a session identity to match on.
+  // A plain folder has none, so its way back is the user pointing at it again.
+  const disconnectedState: "reconnected" | "watching" | "unwatchable" = reconnected
+    ? "reconnected"
+    : interrupted?.card
+      ? "watching"
+      : "unwatchable";
 
   const newClips = plan?.newClips ?? 0;
   const relinkable = plan?.relinkable ?? 0;
@@ -287,7 +323,10 @@ export function ImportDialog({
                 <span className="import-route-kicker">Camera</span>
                 <strong>{plan.cameraIdentity.camera}</strong>
                 <small>{cameraIdentityNote(plan.cameraIdentity)}</small>
-                {!report && !running && !loading && (
+                {/* The camera control acts on the plan, and while the source
+                    is missing there is nothing to re-plan against — pressing it
+                    would only fire a preflight that fails (#67). */}
+                {!report && !running && !loading && !interrupted && (
                   editingCamera ? (
                     <form
                       className="import-camera-new"
@@ -334,7 +373,34 @@ export function ImportDialog({
           <button className="context-modal-close" aria-label="Close import dialog" disabled={running} onClick={onClose}>×</button>
         </header>
 
-        {report ? (
+        {interrupted && !running ? (
+          <div className="import-disconnected" aria-live="polite" data-state={disconnectedState}>
+            <p className="eyebrow">
+              {disconnectedState === "reconnected"
+                ? "Source reconnected"
+                : disconnectedState === "watching"
+                  ? "Waiting for the source"
+                  : "Source unavailable"}
+            </p>
+            <h3>
+              {disconnectedState === "reconnected"
+                ? `${interruptedSourceLabel(interrupted)} is back`
+                : interruptedSourceHeadline(interrupted)}
+            </h3>
+            <p>{interruptedProgressNote(interrupted)}</p>
+            {interruptedFailureNote(interrupted) && (
+              <p className="import-warning">{interruptedFailureNote(interrupted)}</p>
+            )}
+            <p className="import-disconnected-note">
+              {disconnectedState === "reconnected"
+                ? "Resuming re-classifies this card against the project before copying anything, so nothing already imported is copied twice."
+                : disconnectedState === "watching"
+                  ? "Reconnect the card or drive. VlogCutter is watching for this exact card and recognizes it on its own — a different card in the same slot is not this source."
+                  : "This source is a folder, not a card, so there is no card identity to watch for. Point at it again once it is back."}
+            </p>
+            {error && <p className="context-modal-error" role="alert">{error}</p>}
+          </div>
+        ) : report ? (
           <div className="import-result">
             <div className="import-result-mark" aria-hidden="true">✓</div>
             <div>
@@ -529,9 +595,29 @@ export function ImportDialog({
         )}
 
         <footer className="modal-actions import-actions">
-          <span>{plan?.destination.summary ?? (card ? "Choose where originals will be copied." : "Originals remain in the selected folder.")}</span>
+          <span>
+            {interrupted && !running
+              ? "Committed clips are already in the project. Only the remainder is left to copy."
+              : plan?.destination.summary ?? (card ? "Choose where originals will be copied." : "Originals remain in the selected folder.")}
+          </span>
           <div>
-            {report ? (
+            {interrupted && !running ? (
+              <>
+                <button className="button secondary" onClick={onCancelInterrupted}>Cancel import</button>
+                <button className="button secondary" onClick={onChooseSource}>Choose source…</button>
+                <button
+                  className="button primary"
+                  disabled={disconnectedState === "watching"}
+                  onClick={onResume}
+                >
+                  {disconnectedState === "reconnected"
+                    ? "Resume import"
+                    : disconnectedState === "watching"
+                      ? "Reconnect source"
+                      : "Retry source"}
+                </button>
+              </>
+            ) : report ? (
               <button className="button primary" onClick={onClose}>Done</button>
             ) : running ? (
               <button className="button secondary" onClick={onCancel}>Stop import</button>

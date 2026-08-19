@@ -43,6 +43,8 @@ export interface TopBarProps {
   missingAnalysisCount: number;
   mediaMenuOpen: boolean;
   hasLastImport: boolean;
+  /** Copy for the interrupted-import entry, or empty when nothing is waiting (#67). */
+  interruptedImportLabel: string;
 
   /** The completion hairline. */
   labeledCount: number;
@@ -65,6 +67,7 @@ export interface TopBarProps {
   onOpenAnalysis(): void;
   onImportFolder(): void;
   onReviewLastImport(): void;
+  onResumeInterruptedImport(): void;
 }
 
 const modes: Array<[Mode, string, string]> = [
@@ -97,6 +100,7 @@ export function TopBar({
   missingAnalysisCount,
   mediaMenuOpen,
   hasLastImport,
+  interruptedImportLabel,
   labeledCount,
   activeCount,
   onProjectChange,
@@ -116,6 +120,7 @@ export function TopBar({
   onOpenAnalysis,
   onImportFolder,
   onReviewLastImport,
+  onResumeInterruptedImport,
 }: TopBarProps) {
   const [projectMenuOpen, setProjectMenuOpen] = useState(false);
   const projectMenuRef = useRef<HTMLDivElement>(null);
@@ -271,6 +276,15 @@ export function TopBar({
         >▾</button>
         {mediaMenuOpen && (
           <div className="media-menu">
+            {/* An import still waiting on its source is live work, and it
+                leads the menu. "Review last import" below is history, and is
+                no substitute for getting back into a session (#67). */}
+            {interruptedImportLabel && (
+              <button className="media-menu-interrupted" onClick={onResumeInterruptedImport}>
+                <span>Resume interrupted import</span>
+                <small>{interruptedImportLabel}</small>
+              </button>
+            )}
             {hasLastImport && (
               <button onClick={onReviewLastImport}>
                 <span>Review last import</span>

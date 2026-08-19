@@ -277,6 +277,17 @@ interface RunOutcome {
   proxyCancelled?: boolean;
 }
 
+/**
+ * Whether the plan's own source is still in the slot, matched on session
+ * identity rather than mount path — the harness's stand-in for
+ * `import_source_present` in `preflight.rs`. A test that ejects a card can
+ * therefore never receive a clean report, which is the invariant #67 rests on.
+ */
+function sourcePresent(state: DesktopHarnessState, plan: ImportPreflight): boolean {
+  if (!plan.card) return true;
+  return state.cards.some((card) => card.sessionId === plan.card!.sessionId);
+}
+
 /** Only a user selection or a remembered mapping forces every new asset's
  * camera, mirroring `run_import`'s own `camera_override` gate in
  * `preflight.rs` — plain detection leaves each clip's own declared camera
@@ -315,6 +326,10 @@ function runReport(
   makeProxies: boolean,
   proxyCancelled = false,
 ): ImportRunReport {
+  // A source that left stops the run; it does not cancel it and it produces no
+  // failed files. Proxies are skipped for the same reason the desktop command
+  // skips them: the reconnect prompt is the thing the user needs next.
+  const sourceDisconnected = !sourcePresent(state, plan);
   const sessionId = `import_${Object.keys(state.imports.sessions).length + 1}`;
   const session: ImportSessionDetail = {
     id: sessionId, projectId: tally.projectId, sourcePath: plan.sourcePath,
@@ -338,11 +353,12 @@ function runReport(
       copied: tally.imported.length,
       bytesCopied: tally.bytesCopied,
       cancelled,
+      sourceDisconnected,
       failures: [],
       warnings: [],
       cameraMappingWarning: null,
     },
-    proxies: makeProxies
+    proxies: makeProxies && !sourceDisconnected
       ? { generated: tally.imported.length, skipped: 0, cancelled: cancelled || proxyCancelled, failures: [] }
       : null,
     files: plan.items.map((item) => {

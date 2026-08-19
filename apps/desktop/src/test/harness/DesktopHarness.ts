@@ -23,7 +23,7 @@ import { importCommands } from "./commands/import";
 import { mediaCommands } from "./commands/media";
 import { editPlanCommands } from "./commands/editPlan";
 import { MediaController } from "./media";
-import type { Asset } from "../../types";
+import type { Asset, CardCandidate } from "../../types";
 
 export interface CommandLogEntry {
   command: string;
@@ -304,6 +304,54 @@ export class DesktopHarness {
    */
   media(assetId: string): MediaController {
     return new MediaController(assetId, (action) => this.inAct(action));
+  }
+
+  /**
+   * The removable volume that goes away and comes back (#67).
+   *
+   * `eject` is an unmount: a brownout, a nudged cable, a card pulled a second
+   * early. `remount` puts the *same* card back — same session identity, which
+   * is the only thing resume is allowed to match on — optionally at a
+   * different mount path, because that is what actually happens when a volume
+   * reappears while its old name is still taken.
+   */
+  card(mountPath: string) {
+    const harness = this;
+    return {
+      eject(): CardCandidate {
+        const index = harness.state.cards.findIndex((card) => card.mountPath === mountPath);
+        if (index < 0) throw new Error(`No card is mounted at ${mountPath}`);
+        return harness.state.cards.splice(index, 1)[0];
+      },
+      remount(card: CardCandidate, at: string = mountPath): CardCandidate {
+        const moved = { ...card, mountPath: at };
+        if (at !== card.mountPath) {
+          // Everything the harness keys by mount path travels with the volume.
+          // The session identity is the part that does not move.
+          harness.state.imports.additions[at] = harness.state.imports.additions[card.mountPath] ?? [];
+          delete harness.state.imports.additions[card.mountPath];
+          harness.state.imports.cameraExifHints[at] = harness.state.imports.cameraExifHints[card.mountPath] ?? "";
+          delete harness.state.imports.cameraExifHints[card.mountPath];
+        }
+        harness.state.cards.push(moved);
+        return moved;
+      },
+      /** A *different* card in the same slot. Same path, new identity. */
+      swapForDifferentCard(sessionId: string): CardCandidate {
+        const index = harness.state.cards.findIndex((card) => card.mountPath === mountPath);
+        const previous = index < 0 ? null : harness.state.cards.splice(index, 1)[0];
+        const intruder: CardCandidate = {
+          sessionId,
+          label: previous?.label ?? "Untitled",
+          mountPath,
+          cameraHint: previous?.cameraHint ?? "",
+          clipCount: 1,
+          totalBytes: 1_000_000,
+        };
+        harness.state.cards.push(intruder);
+        return intruder;
+      },
+    };
   }
 
   /** Direct state edits that read like the condition they represent. */

@@ -79,7 +79,7 @@ pub use preflight::{
     Classification, ImportDestination, ImportOutcome, ImportPreflight, ImportProgress,
     ImportSequenceBoundary, ImportSequenceBoundaryEvidence, ImportSequencePreview,
     ImportSequenceRunDecision, ImportSequenceRunPreview, ImportStage,
-    LARGE_CAPTURE_SEQUENCE_GAP_SECONDS, PreflightItem, human_bytes,
+    LARGE_CAPTURE_SEQUENCE_GAP_SECONDS, PreflightItem, human_bytes, import_source_present,
 };
 
 pub use analysis::quality::DecodedSegment;

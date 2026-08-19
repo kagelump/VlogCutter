@@ -220,6 +220,27 @@ Verification roughly doubles read cost on the destination. It stays on by defaul
 unverified copy of footage that is about to be the only copy is not worth having, and it is
 overridable per import for a user who knows what they are trading away.
 
+#### The source going away is one of those interruptions
+
+A bus-powered enclosure browning out mid-import is a normal field failure, not an exceptional one,
+and the per-file commit discipline above already makes it survivable. What it needs beyond that is
+a way back, so `run_import` treats it as a distinct ending rather than as N unreadable files:
+
+- `import_source_present` re-asks the source's identity — the §5 session id, never the pathname —
+  on the first per-item error. If the source is gone, the run stops with
+  `ImportOutcome.source_disconnected` and records no failure for the interrupted file: it copied
+  nothing, so it is remaining work rather than a file needing attention. Proxies are skipped for
+  the same reason, so the reconnect is not buried behind minutes of unrelated work.
+- The desktop keeps the session — destination, camera choice, verification and proxy preferences,
+  and the card identity — and offers it from the media menu as well as from the dialog, because a
+  modal the user closed must not be the only way back into live work.
+- Mount detection (§8) recognizes that one card by session identity even when its banner was
+  dismissed, which happens the moment the user chooses to review it. Dismissal is a statement about
+  a banner, not about a session already under way.
+- Resume is an ordinary re-run: preflight re-classifies, already-committed files come back as
+  known, and only the remainder copies. A *different* card at the same mount path is never the
+  interrupted source; nothing is inferred from a pathname.
+
 ## 5. Card identity
 
 A card session is identified by the volume UUID or label combined with a digest of the first N
@@ -350,6 +371,10 @@ trait-shaped so other platforms can be added without touching the classifier.
   never overwrites an existing file; a failed commit leaves no file under the final name.
 - **Interrupted import.** Kill mid-copy, re-run, assert no partial file committed and only the
   missing files transfer.
+- **Source loss and resume.** Pull the source mid-copy: the run stops as an interruption rather
+  than a cancellation, reports no failed files, keeps everything already committed, and a remount
+  of the *same* card resumes only the remainder. A different card at that path does not.
+  `apps/desktop/src/test/cuj/importRecovery.cuj.test.tsx` carries the same journey through the UI.
 - **Card identity.** Same card resumes; reformatted card gets a new session and a new directory;
   added footage preserves identity.
 - **Preflight purity.** Preflight over a card leaves the catalog byte-identical.

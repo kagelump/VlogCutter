@@ -531,6 +531,12 @@ export interface ImportOutcome {
   copied: number;
   bytesCopied: number;
   cancelled: boolean;
+  /**
+   * The run stopped because the source volume went away underneath it (#67).
+   * Not a cancellation and not a per-file failure: committed clips stayed
+   * committed, and resuming copies only the remainder.
+   */
+  sourceDisconnected?: boolean;
   failures: Array<{ path: string; error: string }>;
   /** A committed clip needs optional bookkeeping attention; it is not a failed import. */
   warnings?: Array<{ path: string; error: string }>;
