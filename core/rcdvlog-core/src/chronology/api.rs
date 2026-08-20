@@ -335,6 +335,89 @@ impl Catalog {
         Ok(sequence)
     }
 
+    /// Records the card a capture sequence's footage actually came from (#74).
+    ///
+    /// Import creates a sequence per camera with empty `volume_hint` and
+    /// `filename_prefix`, and an empty hint means "matches any run" — so until
+    /// something writes real evidence, every later import from that camera
+    /// extends the same sequence and the reformatted-card detectors can never
+    /// fire. This is the write that closes that loop, and it is deliberately
+    /// narrow:
+    ///
+    /// - **Observed, not inferred.** It records where bytes came from, which is
+    ///   a fact this machine witnessed with the card in the slot. It changes no
+    ///   ordering, no time, and no membership, so it is not a chronology
+    ///   correction and needs no confirmation gate — the only thing it can
+    ///   cause is the app asking *more* questions of a later import, never
+    ///   fewer.
+    /// - **First write wins.** A sequence that already names a card keeps it.
+    ///   Overwriting would erase precisely the evidence that lets the next
+    ///   reformatted card be recognised as a different one.
+    /// - **Card sources only.** A folder import has no durable identity to
+    ///   record; a mount path is not a name.
+    ///
+    /// It goes through `captureSequenceDeclared` rather than a direct UPDATE so
+    /// it is an operation like every other project mutation: logged, guarded by
+    /// the aggregate's revision, and carried to peers.
+    ///
+    /// Returns the sequence when it recorded something, and `None` when there
+    /// was nothing to annotate or the sequence already named a card.
+    pub fn record_capture_sequence_card(
+        &self,
+        project_id: &str,
+        camera_key: &str,
+        volume_hint: &str,
+        filename_prefix: &str,
+    ) -> Result<Option<CaptureSequence>> {
+        self.require_project(project_id)?;
+        let volume_hint = volume_hint.trim();
+        if volume_hint.is_empty() {
+            return Ok(None);
+        }
+        let camera_key = self.canonical_camera_identity(project_id, camera_key)?;
+        let sequence_id = super::capture_sequence_id_for(project_id, &camera_key);
+        let Some(existing) = self
+            .capture_sequences(project_id)?
+            .into_iter()
+            .find(|sequence| sequence.id == sequence_id)
+        else {
+            // Nothing to annotate. The sequence is created by ingest, and this
+            // runs after it, so absence means this camera imported nothing.
+            return Ok(None);
+        };
+        if !existing.volume_hint.is_empty() {
+            return Ok(None);
+        }
+
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let revision = current_revision(&transaction, project_id, "captureSequence", &sequence_id)?;
+        let recorded = CaptureSequence {
+            volume_hint: volume_hint.to_string(),
+            filename_prefix: filename_prefix.trim().to_string(),
+            ..existing
+        };
+        commit_local_in_transaction(
+            &transaction,
+            project_id,
+            vec![NewOperation {
+                aggregate_type: "captureSequence",
+                aggregate_id: sequence_id.clone(),
+                operation_type: CAPTURE_SEQUENCE_DECLARED,
+                base_revision: Some(revision),
+                payload: serde_json::to_value(CaptureSequenceDeclaredPayload {
+                    sequence_id,
+                    camera_key: recorded.camera_key.clone(),
+                    label: recorded.label.clone(),
+                    volume_hint: recorded.volume_hint.clone(),
+                    filename_prefix: recorded.filename_prefix.clone(),
+                })?,
+            }],
+        )?;
+        transaction.commit()?;
+        Ok(Some(recorded))
+    }
+
     fn capture_sequence_split_preview_from_facts(
         facts: super::model::ChronologyFacts,
         source_sequence_id: &str,

@@ -259,7 +259,34 @@ This gives the three properties the workflow needs:
 Card sessions are persisted per project so the second insertion of a known card is genuinely a
 one-click operation.
 
-### 5.1 Detecting the camera
+### 5.1 Recording which card a sequence came from
+
+Ingest creates one capture sequence per camera, and until #74 it created them
+with empty `volume_hint`/`filename_prefix`. An empty hint means "matches any
+run", so every later import from the same camera model extended the same
+sequence and the reformatted-card detectors — the ones §9 asks for — could
+never fire outside their own tests.
+
+A completed import now records the card it read, once, on the sequences its new
+clips joined. Four properties make that safe:
+
+- **Observed, not inferred.** It records where bytes came from, witnessed with
+  the card in the slot. It changes no ordering, no time, and no membership, so
+  it is not a chronology correction and import gains no confirmation gate. The
+  only thing it can cause is the app asking *more* of a later import.
+- **First write wins.** A sequence that already names a card keeps it.
+  Overwriting would erase the very evidence that recognizes the next reformat.
+- **Cards only.** A folder import has no durable identity to record; a mount
+  path is not a name, and an empty hint keeps matching anything.
+- **An operation, not an UPDATE.** It goes through `captureSequenceDeclared`,
+  so it is logged, revision-guarded, and carried to peers like every other
+  project mutation.
+
+A camera whose clips in one run used two filename prefixes records no prefix,
+only the card: picking one of two would manufacture a mismatch on the next
+import out of this run's own ambiguity.
+
+### 5.2 Detecting the camera
 
 Camera identification for the initial *banner* comes from folder structure:
 `DCIM/100MSDCF` (Sony), `DJI_*` (DJI), `100GOPRO` (GoPro). Smart ingest then performs one bounded
@@ -272,7 +299,7 @@ The existing filename-pattern table (`docs/tasks/desktop/CAMERA_PATTERNS.md`) is
 still authoritative for per-asset camera identity, behind EXIF. Folder structure is a card-level
 hint for the banner and the archive path; it never overrides EXIF on an asset.
 
-### 5.2 "Everything before this clip is old"
+### 5.3 "Everything before this clip is old"
 
 A card that has lived in a camera for months carries footage that predates the project, and
 re-presenting it on every reinsertion is noise. The project stores one boundary per card session
@@ -405,6 +432,10 @@ trait-shaped so other platforms can be added without touching the classifier.
   `apps/desktop/src/test/cuj/importRecovery.cuj.test.tsx` carries the same journey through the UI.
 - **Card identity.** Same card resumes; reformatted card gets a new session and a new directory;
   added footage preserves identity.
+- **Card provenance reaches the detectors.** A real import — no `declare_capture_sequence` in the
+  setup — leaves its card on the sequence it created, so re-importing a reformatted card that
+  reuses the same mount path produces `volumeChange` evidence and a run that needs review. The
+  same card with more footage on it stays routine, and a folder import records nothing.
 - **Import cutoff.** A boundary excludes only what precedes it, survives a remount at another
   path, does not reach a different card from the same camera, still finds footage shot after it,
   and never hides a lost original. `apps/desktop/src/test/cuj/importCutoff.cuj.test.tsx` carries

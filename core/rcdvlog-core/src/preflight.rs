@@ -1533,7 +1533,76 @@ impl Catalog {
                 "The clips were imported, but VlogCutter could not remember this camera choice: {error:#}"
             ));
         }
+
+        // Record which card these clips actually came off (#74).
+        //
+        // Ingest creates one capture sequence per camera with empty hints, and
+        // an empty hint matches any run — so without this, every later import
+        // from the same camera model extends the same sequence and the
+        // reformatted-card detectors can never fire against a real user. This
+        // is the only production write of that evidence.
+        //
+        // It runs after the loop, on facts the import observed: the card that
+        // was in the slot, and the filename prefix the clips it just committed
+        // actually used. It is first-write-wins and card-only — see
+        // `record_capture_sequence_card`. Like the camera mapping above, a
+        // failure here is bookkeeping about already-durable clips, so it is
+        // reported as a warning rather than raised.
+        if let Some(card) = plan.card.as_ref()
+            && !outcome.imported_asset_ids.is_empty()
+        {
+            for (camera, prefix) in self.imported_camera_prefixes(&outcome.imported_asset_ids)? {
+                if let Err(error) = self.record_capture_sequence_card(
+                    project_id,
+                    &camera,
+                    &card.session_id,
+                    &prefix,
+                ) {
+                    outcome.warnings.push(crate::IngestFailure {
+                        path: plan.source_path.clone(),
+                        error: format!(
+                            "The clips were imported, but VlogCutter could not record which card “{camera}” came from: {error:#}"
+                        ),
+                    });
+                }
+            }
+        }
         Ok(outcome)
+    }
+
+    /// The filename prefix each camera's freshly imported clips actually used.
+    ///
+    /// A camera whose clips in this run used more than one prefix yields an
+    /// empty prefix rather than an arbitrary winner: recording one of two would
+    /// make the other look like a mismatch on the next import, which is a false
+    /// alarm invented out of this run's own ambiguity. The volume hint is still
+    /// recorded in that case — the card is unambiguous even when the prefix is
+    /// not.
+    fn imported_camera_prefixes(
+        &self,
+        imported_asset_ids: &[String],
+    ) -> Result<BTreeMap<String, String>> {
+        let mut prefixes: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for asset_id in imported_asset_ids {
+            let Ok(asset) = self.get_asset(asset_id) else {
+                continue;
+            };
+            prefixes
+                .entry(asset.camera)
+                .or_default()
+                .insert(filename_prefix(&asset.filename));
+        }
+        Ok(prefixes
+            .into_iter()
+            .map(|(camera, found)| {
+                let prefix = if found.len() == 1 {
+                    found.into_iter().next().unwrap_or_default()
+                } else {
+                    String::new()
+                };
+                (camera, prefix)
+            })
+            .collect())
     }
 
     /// Returns the durable item result, or `None` when the copy was cancelled.
@@ -2882,6 +2951,189 @@ mod tests {
             .unwrap();
         assert_eq!(resumed.imported, 1);
         assert_eq!(catalog.list_assets(&project.id).unwrap().len(), 3);
+    }
+
+    /// #74: the end-to-end version of the reformat-reuse scenario, driven
+    /// entirely through the production path.
+    ///
+    /// The sibling test above sets its sequence up with `declare_capture_
+    /// sequence`, a call no real import performs — which was the whole
+    /// complaint: the detectors were correct and unreachable. Here the first
+    /// import *is* the setup, and the evidence it leaves behind is what the
+    /// second import is measured against.
+    #[test]
+    fn a_real_import_records_its_card_so_a_reformat_is_caught_next_time() {
+        if crate::tool_command("ffprobe")
+            .arg("-version")
+            .output()
+            .is_err()
+        {
+            eprintln!("ffprobe is unavailable; skipping media integration test");
+            return;
+        }
+
+        let directory = tempdir().unwrap();
+        let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).unwrap();
+        let project = catalog.create_project("Spain 2026").unwrap();
+        let mount = card_fixture_media(
+            directory.path(),
+            &[("C0101.MP4", "navy"), ("C0102.MP4", "maroon")],
+        );
+        let original_card = inspect_card(&mount).unwrap().unwrap();
+
+        // An ordinary one-click import. No chronology gate, no declaration.
+        let plan = catalog
+            .preflight_import(&project.id, &mount, None, None, |_, _, _| true)
+            .unwrap();
+        let outcome = catalog
+            .run_import(&project.id, &plan, false, |_| true)
+            .unwrap();
+        assert_eq!(outcome.imported, 2);
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+
+        // The sequence it created now names the card the bytes came off.
+        let sequences = catalog.capture_sequences(&project.id).unwrap();
+        assert_eq!(sequences.len(), 1);
+        let declared = &sequences[0];
+        assert_eq!(declared.volume_hint, original_card.session_id);
+        assert_eq!(declared.filename_prefix, "C");
+
+        // Reformat: same mount path, same filename prefix, unrelated footage.
+        fs::remove_dir_all(mount.join("DCIM")).unwrap();
+        let reformatted = card_fixture_media(directory.path(), &[("C0101.MP4", "green")]);
+        assert_eq!(reformatted, mount);
+        let reformatted_card = inspect_card(&mount).unwrap().unwrap();
+        assert_ne!(reformatted_card.session_id, original_card.session_id);
+
+        let second = catalog
+            .preflight_import(&project.id, &mount, None, None, |_, _, _| true)
+            .unwrap();
+        assert_eq!(second.sequence_preview.runs.len(), 1);
+        let run = &second.sequence_preview.runs[0];
+        assert_eq!(run.decision, ImportSequenceRunDecision::ProposeNew);
+        assert!(run.needs_review, "a reused card has to be worth a look");
+        assert_eq!(
+            run.compared_existing_sequence_id.as_deref(),
+            Some(declared.id.as_str())
+        );
+        assert!(
+            run.evidence.iter().any(|found| matches!(
+                found,
+                ImportSequenceBoundaryEvidence::VolumeChange { from, to }
+                    if from == &original_card.session_id && to == &reformatted_card.session_id
+            )),
+            "{:?}",
+            run.evidence
+        );
+    }
+
+    /// The same card again — more footage, nothing reformatted — must stay
+    /// routine. A detector that fired here would make every ordinary second
+    /// import a question.
+    #[test]
+    fn re_importing_the_same_card_after_shooting_more_stays_routine() {
+        if crate::tool_command("ffprobe")
+            .arg("-version")
+            .output()
+            .is_err()
+        {
+            eprintln!("ffprobe is unavailable; skipping media integration test");
+            return;
+        }
+
+        let directory = tempdir().unwrap();
+        let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).unwrap();
+        let project = catalog.create_project("Spain 2026").unwrap();
+        let mount = card_fixture_media(directory.path(), &[("C0101.MP4", "navy")]);
+
+        let plan = catalog
+            .preflight_import(&project.id, &mount, None, None, |_, _, _| true)
+            .unwrap();
+        catalog
+            .run_import(&project.id, &plan, false, |_| true)
+            .unwrap();
+        let recorded = catalog.capture_sequences(&project.id).unwrap()[0].clone();
+        assert!(!recorded.volume_hint.is_empty());
+
+        // More footage on the same card preserves its identity (`cards.rs`).
+        card_fixture_media(directory.path(), &[("C0102.MP4", "maroon")]);
+        let second = catalog
+            .preflight_import(&project.id, &mount, None, None, |_, _, _| true)
+            .unwrap();
+        let run = &second.sequence_preview.runs[0];
+        assert_eq!(run.decision, ImportSequenceRunDecision::ExtendExisting);
+        assert!(!run.needs_review);
+        assert_eq!(
+            run.matched_existing_sequence_id.as_deref(),
+            Some(recorded.id.as_str())
+        );
+
+        // And the second import does not overwrite what the first recorded.
+        catalog
+            .run_import(&project.id, &second, false, |_| true)
+            .unwrap();
+        let after = catalog.capture_sequences(&project.id).unwrap();
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].volume_hint, recorded.volume_hint);
+    }
+
+    /// A project whose sequences predate this evidence keeps working: an empty
+    /// hint stays "matches anything" until a real import writes one, and a
+    /// folder import — which has no durable identity — never writes one.
+    #[test]
+    fn an_empty_hint_still_matches_anything_and_a_folder_import_writes_none() {
+        if crate::tool_command("ffprobe")
+            .arg("-version")
+            .output()
+            .is_err()
+        {
+            eprintln!("ffprobe is unavailable; skipping media integration test");
+            return;
+        }
+
+        let directory = tempdir().unwrap();
+        let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).unwrap();
+        let project = catalog.create_project("Spain 2026").unwrap();
+
+        // A plain folder, not a card: nothing here is a durable identity.
+        let folder = directory.path().join("nas-footage");
+        fs::create_dir_all(&folder).unwrap();
+        let staged = card_fixture_media(
+            directory.path(),
+            &[("C0101.MP4", "navy"), ("C0102.MP4", "maroon")],
+        );
+        fs::copy(
+            staged.join("DCIM/100MSDCF/C0101.MP4"),
+            folder.join("C0101.MP4"),
+        )
+        .unwrap();
+
+        let plan = catalog
+            .preflight_import(&project.id, &folder, None, None, |_, _, _| true)
+            .unwrap();
+        assert!(plan.card.is_none());
+        catalog
+            .run_import(&project.id, &plan, false, |_| true)
+            .unwrap();
+
+        let sequences = catalog.capture_sequences(&project.id).unwrap();
+        assert_eq!(sequences.len(), 1);
+        assert_eq!(sequences[0].volume_hint, "", "a mount path is not a name");
+
+        // A later import against that empty-hinted sequence still extends it.
+        // Genuinely different footage, or preflight would rightly call it known.
+        fs::copy(
+            staged.join("DCIM/100MSDCF/C0102.MP4"),
+            folder.join("C0102.MP4"),
+        )
+        .unwrap();
+        let second = catalog
+            .preflight_import(&project.id, &folder, None, None, |_, _, _| true)
+            .unwrap();
+        assert_eq!(
+            second.sequence_preview.runs[0].decision,
+            ImportSequenceRunDecision::ExtendExisting
+        );
     }
 
     /// #66: the boundary is a rule about *this import*, and everything before
