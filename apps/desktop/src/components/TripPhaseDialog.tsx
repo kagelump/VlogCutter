@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import type { Asset } from "../types";
 import type { DisplayMode, PhaseKind, TripPhase } from "../chronologyTypes";
+import { describeTimezoneSuggestion, type TimezoneSuggestion } from "../chronology/displayTimezone";
 
 export interface TripPhaseFormValue {
   label: string;
@@ -20,6 +21,12 @@ interface Props {
   assets?: Asset[];
   busy: boolean;
   error: string;
+  /**
+   * A timezone the project's own evidence points at, for a clip nothing
+   * covers yet (#72). Offered, never filled in: the difference between a
+   * proposal and a silent commit is that the user has to press it.
+   */
+  suggestedTimezone?: TimezoneSuggestion | null;
   onCancel(): void;
   onSave(value: TripPhaseFormValue, range?: { startPosition: number; endPosition: number }): void;
   onRemove?(): void;
@@ -39,6 +46,7 @@ export function TripPhaseDialog({
   assets,
   busy,
   error,
+  suggestedTimezone,
   onCancel,
   onSave,
   onRemove,
@@ -207,7 +215,22 @@ export function TripPhaseDialog({
               <label className="context-form-field">
                 Timezone
                 <input value={timezone} onChange={(event) => setTimezone(event.target.value)} placeholder="Asia/Tokyo" />
-                <small>Use an IANA timezone. Leave blank if you only want a named place.</small>
+                <small>
+                  Use an IANA timezone, so daylight saving resolves by rule rather than by a frozen
+                  offset. Leave blank for UTC, or if you only want a named place.
+                </small>
+                {suggestedTimezone && !timezone.trim() && (
+                  <p className="context-timezone-suggestion">
+                    <button
+                      type="button"
+                      className="text-button"
+                      onClick={() => setTimezone(suggestedTimezone.timezone)}
+                    >
+                      Use {suggestedTimezone.timezone}
+                    </button>
+                    <small>{describeTimezoneSuggestion(suggestedTimezone)}</small>
+                  </p>
+                )}
               </label>
             ) : (
               <div className="context-transit-fields">

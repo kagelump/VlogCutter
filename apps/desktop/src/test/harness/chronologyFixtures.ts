@@ -59,6 +59,64 @@ export function buildSequence(spec: SequenceSpec): CaptureSequence {
   };
 }
 
+/**
+ * `phases::covering_phase`'s rule, in the harness: inclusive at both ends, the
+ * later `startTripTime` wins an overlap, and an exact tie goes to the greater
+ * id.
+ */
+function coveringPhase(phases: TripPhase[], at: number): TripPhase | null {
+  let best: TripPhase | null = null;
+  for (const phase of phases) {
+    const from = Date.parse(phase.startTripTime);
+    const to = Date.parse(phase.endTripTime);
+    if (Number.isNaN(from) || Number.isNaN(to) || at < from || at > to) continue;
+    if (!best) { best = phase; continue; }
+    const bestFrom = Date.parse(best.startTripTime);
+    if (from > bestFrom || (from === bestFrom && phase.id > best.id)) best = phase;
+  }
+  return best;
+}
+
+/** The zone a phase displays in. Transit shows its origin first, as Rust does. */
+function phaseTimezone(phase: TripPhase | null): string | null {
+  if (!phase) return null;
+  const zone = phase.kind === "transit"
+    ? phase.originTimezone ?? phase.timezone
+    : phase.timezone;
+  return zone?.trim() || null;
+}
+
+/**
+ * Re-derive every clip's display time from the phases now in the overview.
+ *
+ * The real backend recomputes this on any phase write, because display
+ * timezone is a *function* of phase coverage rather than a field stored per
+ * clip. Without this the harness would let a saved timezone appear in the
+ * phase list while the readout beside it still said UTC — a disagreement the
+ * production code cannot produce and a CUJ must not be able to pass through.
+ */
+export function withPhaseDisplayTimes(overview: ChronologyOverview): ChronologyOverview {
+  return {
+    ...overview,
+    assets: overview.assets.map((asset) => {
+      const at = Date.parse(asset.tripTime ?? "");
+      const primary = asset.displayTime?.primary ?? asset.tripTime;
+      // A clip with no placeable time has nothing for a phase to cover.
+      if (Number.isNaN(at) || primary === null) return asset;
+      const covering = coveringPhase(overview.phases, at);
+      return {
+        ...asset,
+        displayTime: {
+          primary,
+          secondary: asset.displayTime?.secondary ?? null,
+          timezone: phaseTimezone(covering) ?? "UTC",
+          phaseId: covering?.id ?? null,
+        },
+      };
+    }),
+  };
+}
+
 export function buildChronologyOverview(spec: ChronologySpec): ChronologyOverview {
   const sequences = (spec.sequences ?? []).map(buildSequence);
   const sequenceByAssetId = new Map<string, string>();
@@ -69,15 +127,26 @@ export function buildChronologyOverview(spec: ChronologySpec): ChronologyOvervie
   }
   const start = Date.parse(spec.startAt ?? "2026-02-08T00:10:00.000Z");
   const spacing = (spec.spacingSeconds ?? 300) * 1000;
-  const timezone = spec.timezone ?? "Asia/Tokyo";
+  const phases = spec.phases ?? [];
 
   const assets: AssetChronology[] = spec.order.map((assetId, index) => {
-    const tripTime = new Date(start + index * spacing).toISOString();
+    const placedAt = start + index * spacing;
+    const tripTime = new Date(placedAt).toISOString();
+    // Local display time comes from the covering phase or it does not exist —
+    // the same coupling `phases::display_time` enforces. A fixture that handed
+    // out a named zone with no phase behind it made an uncovered clip look
+    // answered, which is exactly the state #72's readout has to distinguish.
+    const covering = coveringPhase(phases, placedAt);
     return {
       assetId,
       rawTime: tripTime,
       tripTime,
-      displayTime: { primary: tripTime, secondary: null, timezone, phaseId: null },
+      displayTime: {
+        primary: tripTime,
+        secondary: null,
+        timezone: phaseTimezone(covering) ?? spec.timezone ?? "UTC",
+        phaseId: covering?.id ?? null,
+      },
       confidence: 0.9,
       evidence: [{ kind: "camera_clock", detail: "camera clock", weight: 1 }],
       uncertaintySeconds: 0,
@@ -95,7 +164,7 @@ export function buildChronologyOverview(spec: ChronologySpec): ChronologyOvervie
     ...EMPTY_CHRONOLOGY_OVERVIEW,
     sequences,
     epochs: spec.epochs ?? [],
-    phases: spec.phases ?? [],
+    phases,
     contradictions: spec.contradictions ?? [],
     proposedSplits: spec.proposedSplits ?? [],
     declinedSplits: spec.declinedSplits ?? [],

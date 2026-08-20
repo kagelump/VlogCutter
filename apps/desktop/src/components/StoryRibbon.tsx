@@ -48,7 +48,12 @@ export interface StoryRibbonProps {
   selected: Asset | null;
   selectedId: string;
   /** Phase-aware solver display time for the selected clip. */
-  selectedTimeLabel?: string | null;
+  /**
+   * The selected clip's resolved reading, split so the zone can be laid out
+   * independently of the wall clock (#72). A truncated zone is worse than no
+   * zone: `Aug 8, 09:21:23 · U…` cannot answer which clock it is.
+   */
+  selectedTime?: { date: string; clock: string; zone: string; authoritative: boolean } | null;
   zoom: number;
   /** Collapsed to a 28px strip. */
   collapsed: boolean;
@@ -62,6 +67,12 @@ export interface StoryRibbonProps {
   onSelect(id: string): void;
   onToggleCollapsed(): void;
   onRequestContext(assetId: string, direction: ContextDirection, source: ContextRun | null): void;
+  /**
+   * Change the timezone the selected clip's time is *displayed* in. Scoped to
+   * a trip phase, never to camera clock evidence: display and correction are
+   * different facts and this control must not be able to reach the latter.
+   */
+  onEditDisplayTimezone?: () => void;
   onEditContext(phaseId: string, start: number, end: number): void;
   /** Normally absent. Opens the first actionable chronology problem. */
   chronologyProblemCount?: number;
@@ -92,7 +103,8 @@ export function StoryRibbon({
   contextRuns,
   selected,
   selectedId,
-  selectedTimeLabel,
+  selectedTime,
+  onEditDisplayTimezone,
   zoom,
   collapsed,
   merged,
@@ -255,10 +267,43 @@ export function StoryRibbon({
               <strong>Review</strong>
             </button>
           )}
+          {/* Three parts, laid out by priority rather than clipped as one
+              string: the ordinal yields first, the wall clock next, and the
+              zone never truncates. See `.chronology-position` (#72). */}
           <span className="chronology-position">
-            {selected && !selected.removed
-              ? `#${assets.findIndex((asset) => asset.id === selected.id) + 1} · ${selectedTimeLabel ?? formatDate(selected.bestTime)}`
-              : "No active clip selected"}
+            {selected && !selected.removed ? (
+              <>
+                <span className="position-ordinal">
+                  #{assets.findIndex((asset) => asset.id === selected.id) + 1}
+                </span>
+                {selectedTime?.date && <span className="position-date">{selectedTime.date}</span>}
+                <span className="position-clock">
+                  {selectedTime?.clock ?? formatDate(selected.bestTime)}
+                </span>
+                {selectedTime?.zone && (
+                  onEditDisplayTimezone ? (
+                    <button
+                      type="button"
+                      className="position-zone"
+                      data-authoritative={selectedTime.authoritative ? "true" : "false"}
+                      title={
+                        selectedTime.authoritative
+                          ? `Shown in ${selectedTime.zone}, from this clip's trip context. Click to change it.`
+                          : `No trip context covers this clip, so its time is shown in ${selectedTime.zone}. Click to set the timezone you were actually in.`
+                      }
+                      onClick={onEditDisplayTimezone}
+                    >
+                      {selectedTime.zone}
+                      {!selectedTime.authoritative && <span className="position-zone-hint">set zone</span>}
+                    </button>
+                  ) : (
+                    <span className="position-zone">{selectedTime.zone}</span>
+                  )
+                )}
+              </>
+            ) : (
+              "No active clip selected"
+            )}
           </span>
           <div className="zoom-control" aria-label="Story ribbon zoom">
             <button

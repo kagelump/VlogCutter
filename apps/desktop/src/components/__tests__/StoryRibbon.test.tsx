@@ -336,3 +336,64 @@ describe("trip context anchoring", () => {
     expect(props.onEditContext).toHaveBeenCalledWith("phase_osaka", 0, 0);
   });
 });
+
+/**
+ * The selected-position readout (#72). The bug it replaces clipped a normal
+ * full timestamp at 180px and ate the timezone, leaving `Aug 8, 09:21:23 · U…`
+ * — a wall clock nobody could interpret. The invariant now is that the zone is
+ * a whole, reachable thing.
+ */
+describe("StoryRibbon selected position readout", () => {
+  const selected = asset("a0", "Sony");
+  const time = { date: "Aug 8", clock: "09:21:23", zone: "Europe/Madrid", authoritative: true };
+
+  it("shows ordinal, full wall clock, and an unabbreviated timezone", () => {
+    const { container } = renderRibbon({ selected, selectedId: "a0", selectedTime: time });
+
+    const readout = container.querySelector(".chronology-position")!;
+    expect(readout.textContent).toContain("#1");
+    expect(readout.querySelector(".position-date")!.textContent).toBe("Aug 8");
+    expect(readout.querySelector(".position-clock")!.textContent).toBe("09:21:23");
+    expect(readout.querySelector(".position-zone")!.textContent).toContain("Europe/Madrid");
+    // Three boxes, so the readout can drop the date without ever taking the
+    // clock or the zone with it.
+    expect(readout.querySelectorAll(".position-date, .position-clock, .position-zone")).toHaveLength(3);
+  });
+
+  it("makes the zone a real control, reachable by keyboard", async () => {
+    const onEditDisplayTimezone = vi.fn();
+    renderRibbon({ selected, selectedId: "a0", selectedTime: time, onEditDisplayTimezone });
+
+    const zone = screen.getByRole("button", { name: /Europe\/Madrid/ });
+    zone.focus();
+    expect(document.activeElement).toBe(zone);
+    await userEvent.keyboard("{Enter}");
+    expect(onEditDisplayTimezone).toHaveBeenCalledTimes(1);
+    expect(zone.getAttribute("title")).toContain("from this clip's trip context");
+  });
+
+  it("marks a UTC fallback as an open question and offers the way to answer it", () => {
+    renderRibbon({
+      selected,
+      selectedId: "a0",
+      selectedTime: { date: "Aug 8", clock: "09:21:23", zone: "UTC", authoritative: false },
+      onEditDisplayTimezone: vi.fn(),
+    });
+
+    const zone = screen.getByRole("button", { name: /UTC/ });
+    expect(zone.getAttribute("data-authoritative")).toBe("false");
+    expect(zone.textContent).toContain("set zone");
+    expect(zone.getAttribute("title")).toContain("set the timezone you were actually in");
+  });
+
+  it("renders the zone as plain text when no handler is wired, rather than a dead button", () => {
+    const { container } = renderRibbon({ selected, selectedId: "a0", selectedTime: time });
+    expect(container.querySelector("button.position-zone")).toBeNull();
+    expect(container.querySelector("span.position-zone")!.textContent).toBe("Europe/Madrid");
+  });
+
+  it("says so plainly when nothing is selected", () => {
+    const { container } = renderRibbon({ selected: null, selectedId: "" });
+    expect(container.querySelector(".chronology-position")!.textContent).toBe("No active clip selected");
+  });
+});

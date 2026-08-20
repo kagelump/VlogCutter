@@ -221,21 +221,51 @@ function formatWallClockDate(clock: WallClock): string {
  * Rust remains the only owner of timezone resolution and daylight-saving rules.
  */
 export function formatChronologyTime(value: string | null, timezone?: string | null): string {
-  if (!value) return "No camera time";
-  const clock = parseWallClock(value);
-  if (clock) {
-    const zone = timezone?.trim() || (clock.offset === "Z" ? "UTC" : `UTC${clock.offset}`);
-    return `${formatWallClockDate(clock)}, ${clock.hour}:${clock.minute}:${clock.second} · ${zone}`;
+  const { date, clock, zone } = describeChronologyTime(value, timezone);
+  const time = date ? `${date}, ${clock}` : clock;
+  return zone ? `${time} · ${zone}` : time;
+}
+
+/**
+ * The same reading, split into the three parts a narrow readout has to be able
+ * to drop independently (#72).
+ *
+ * The order they may be given up in is the order they answer questions the
+ * reader can get elsewhere. The **date** goes first: the ribbon's own ruler is
+ * dated. The **clock** and the **zone** never go, because they are only
+ * meaningful together — `Aug 8, 09:21:23 · U…` was the original bug, and a
+ * clipped `Feb 8, 01…` beside a whole zone is the same defect wearing the
+ * other half.
+ *
+ * `date` is empty when the value did not parse as a serialized wall clock;
+ * `zone` is empty when there is no time to qualify.
+ */
+export function describeChronologyTime(
+  value: string | null,
+  timezone?: string | null,
+): { date: string; clock: string; zone: string } {
+  if (!value) return { date: "", clock: "No camera time", zone: "" };
+  const wall = parseWallClock(value);
+  if (wall) {
+    return {
+      date: formatWallClockDate(wall),
+      clock: `${wall.hour}:${wall.minute}:${wall.second}`,
+      zone: timezone?.trim() || (wall.offset === "Z" ? "UTC" : `UTC${wall.offset}`),
+    };
   }
   const parsed = new Date(value);
-  if (Number.isNaN(parsed.valueOf())) return value;
-  return new Intl.DateTimeFormat(undefined, {
-    month: "short",
-    day: "numeric",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-  }).format(parsed);
+  if (Number.isNaN(parsed.valueOf())) return { date: "", clock: value, zone: "" };
+  return {
+    date: "",
+    clock: new Intl.DateTimeFormat(undefined, {
+      month: "short",
+      day: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+    }).format(parsed),
+    zone: "",
+  };
 }
 
 /** Shorter form for the ruler: no seconds, no zone, no date. */

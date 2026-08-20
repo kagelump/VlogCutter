@@ -143,6 +143,22 @@ describe("ChronologyCanvas tiles", () => {
       sequences: [{ id: "card-a", cameraKey: "Sony", label: "Sony card", assetIds: order }],
       startAt: "2026-02-08T00:10:00.000Z",
       spacingSeconds: 600,
+      // A named place on the ruler comes from a trip phase or it does not
+      // exist — the same coupling `phases::display_time` enforces, so the
+      // fixture declares the phase rather than being handed a bare timezone.
+      phases: [{
+        id: "phase_tokyo",
+        label: "Tokyo",
+        kind: "location",
+        startAnchorAssetId: null,
+        endAnchorAssetId: null,
+        startTripTime: "2026-02-08T00:00:00.000Z",
+        endTripTime: "2026-02-09T00:00:00.000Z",
+        timezone: "Asia/Tokyo",
+        originTimezone: null,
+        destinationTimezone: null,
+        displayMode: "local",
+      }],
     });
     return render(
       <ChronologyCanvas

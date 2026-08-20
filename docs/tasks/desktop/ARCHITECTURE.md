@@ -90,6 +90,25 @@ Camera metadata timezone is evidence about the camera, not about where the user
 was, and is never the display authority. Transit phases carry origin and
 destination timezones and a dual display mode (`PRD.md` §10.2).
 
+An asset no phase covers displays in UTC. That is deliberate: the host's
+timezone says where the editor is sitting today, which is not evidence about
+where the footage was shot, and a confident wrong local clock is worse than an
+honest UTC one. What the UI owes that state is a way out, not a guess (#72):
+
+- The Story Ribbon's selected-position readout renders ordinal, wall clock, and
+  zone as three independently laid-out parts. The clock and the zone are only
+  meaningful together, so neither ever truncates; the ordinal yields first, then
+  the date, and the ribbon's zoom slider yields before any of them.
+- The zone is a control. A covered clip opens its phase; an uncovered one opens
+  the range flow, so the scope of the answer is named before it is given.
+- The project's own phases may *propose* a zone for an uncovered range, labelled
+  with the phase it came from. A proposal is offered, never prefilled, and
+  nothing is stored until the user saves a phase.
+
+Display timezone and camera clock correction stay separate concepts. Changing
+the former edits a phase and cannot reorder clips or alter `tripTime`; only a
+clock epoch does that.
+
 ### 3.5 Contradictions
 
 Hard contradictions block apply and name every conflicting piece of evidence.

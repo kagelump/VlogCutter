@@ -36,6 +36,7 @@ import {
   sequenceMergeRequestKey,
   sequenceSplitRequestKey,
   visualPlacementRequestKey,
+  withPhaseDisplayTimes,
 } from "../chronologyFixtures";
 
 function overviewOf(state: DesktopHarnessState): ChronologyOverview {
@@ -355,10 +356,12 @@ export const chronologyCommands: CommandTable = {
     const phase = args.phase as ChronologyOverview["phases"][number];
     if (!phase || typeof phase !== "object") throw new Error("A trip phase object is required");
     const stored = { ...phase, id: phase.id || `phase_${state.chronology.overview.phases.length + 1}` };
-    state.chronology.overview = {
+    // Display timezone is derived from phase coverage, never stored per clip,
+    // so a phase write recomputes it exactly as the backend does (#72).
+    state.chronology.overview = withPhaseDisplayTimes({
       ...state.chronology.overview,
       phases: [...state.chronology.overview.phases.filter((found) => found.id !== stored.id), stored],
-    };
+    });
     return stored;
   },
 
@@ -396,24 +399,24 @@ export const chronologyCommands: CommandTable = {
       : boundary > first
         ? { ...existing, startAnchorAssetId: orderedIds[first], endAnchorAssetId: orderedIds[boundary - 1] }
         : null;
-    state.chronology.overview = {
+    state.chronology.overview = withPhaseDisplayTimes({
       ...state.chronology.overview,
       phases: [
         ...state.chronology.overview.phases.filter((found) => found.id !== existingPhaseId),
         ...(existingRemainder ? [existingRemainder] : []),
         authored,
       ],
-    };
+    });
     return authored;
   },
 
   remove_trip_phase: (args, { state }) => {
     requireString(args, "projectId");
     const phaseId = requireString(args, "phaseId");
-    state.chronology.overview = {
+    state.chronology.overview = withPhaseDisplayTimes({
       ...state.chronology.overview,
       phases: state.chronology.overview.phases.filter((phase) => phase.id !== phaseId),
-    };
+    });
     return null;
   },
 

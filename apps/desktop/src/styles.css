@@ -584,7 +584,28 @@ kbd { padding: 2px 4px; color: #a8b1b6; background: #262d32; border: 1px solid #
 .chronology-problem-chip { height: 24px; display: inline-flex; align-items: center; gap: 6px; padding: 0 8px; color: #f0c787; border: 1px solid #75532c; border-radius: 4px; background: #271e14; cursor: pointer; font: 10px/1 ui-monospace, SFMono-Regular, Menlo, monospace; }
 .chronology-problem-chip strong { color: #15100a; padding: 3px 5px; border-radius: 3px; background: var(--amber); font-weight: 750; }
 .chronology-problem-chip:hover, .chronology-problem-chip:focus-visible { border-color: var(--amber); background: #342619; }
-.chronology-position { max-width: 180px; overflow: hidden; color: var(--muted); font: 11px/14px ui-monospace, SFMono-Regular, Menlo, monospace; text-overflow: ellipsis; white-space: nowrap; }
+/* The selected position, laid out by priority instead of clipped as one
+   string (#72). The old `max-width: 180px` truncated a normal full timestamp
+   even with room to spare, and the part it ate was the timezone — leaving a
+   wall clock nobody could interpret. Now the ordinal yields first, the wall
+   clock next, and the zone is `flex: none` so it is never the thing that
+   goes. Narrower windows drop less important controls first; see the ribbon's
+   media queries below. */
+.chronology-position { display: flex; min-width: 0; align-items: baseline; gap: 6px; color: var(--muted); font: 11px/14px ui-monospace, SFMono-Regular, Menlo, monospace; white-space: nowrap; }
+.chronology-position .position-ordinal { flex: 0 1 auto; overflow: hidden; text-overflow: ellipsis; }
+.chronology-position .position-date { flex: 0 1 auto; overflow: hidden; text-overflow: ellipsis; }
+/* The clock and the zone are only meaningful together, so neither is ever the
+   thing that yields. Everything around them gives way first. */
+.chronology-position .position-clock { flex: none; }
+.chronology-position .position-zone { flex: none; padding: 0; color: var(--muted); background: transparent; border: 0; font: inherit; }
+.chronology-position button.position-zone { cursor: pointer; text-decoration: underline dotted; text-underline-offset: 3px; }
+.chronology-position button.position-zone:hover, .chronology-position button.position-zone:focus-visible { color: var(--ink); }
+/* Not an error — an unanswered question. A clip no trip context covers reads
+   in UTC, and the prompt is the way to say where you actually were. */
+.chronology-position button.position-zone[data-authoritative="false"] { color: var(--amber); }
+.context-timezone-suggestion { margin: 6px 0 0; padding: 6px 8px; background: var(--panel-raised); border-radius: 4px; }
+.context-timezone-suggestion small { display: block; margin-top: 2px; color: var(--quiet); }
+.chronology-position .position-zone-hint { margin-left: 6px; padding: 1px 4px; border: 1px solid #75532c; border-radius: 3px; font-size: 10px; }
 .context-anchor-popover { position: fixed; z-index: 30; width: 300px; padding: 8px; color: var(--muted); border: 1px solid #536168; border-radius: 6px; background: #151b1e; box-shadow: 0 10px 32px rgba(0,0,0,.55); transform: translate(-50%, -100%); }
 .context-anchor-popover.has-context { width: 420px; }
 .context-anchor-popover::after { position: absolute; bottom: -6px; left: calc(50% - 5px); width: 10px; height: 10px; background: #151b1e; border-right: 1px solid #536168; border-bottom: 1px solid #536168; content: ""; transform: rotate(45deg); }
@@ -605,6 +626,21 @@ kbd { padding: 2px 4px; color: #a8b1b6; background: #262d32; border: 1px solid #
 .zoom-control button:disabled { opacity: .35; cursor: default; }
 .zoom-control input { width: 64px; accent-color: var(--amber); }
 .zoom-control kbd, .center-story-button kbd { padding: 1px 3px; font-size: 10px; }
+/* The ribbon toolbar's compression order (#72). Least useful first: the zoom
+   slider goes before the readout gives up anything, because the ± buttons
+   still do its whole job; the ordinal goes next, because the queue already
+   shows the position. The zone never goes at any width. */
+@media (max-width: 1120px) {
+  .zoom-control input { display: none; }
+}
+@media (max-width: 920px) {
+  .chronology-position .position-ordinal { display: none; }
+}
+@media (max-width: 860px) {
+  /* The ribbon's own ruler is dated; the readout's copy of it is the next
+     thing that can go without taking meaning with it. */
+  .chronology-position .position-date { display: none; }
+}
 .center-story-button { height: 25px; padding: 0 7px; border: 1px solid var(--line); border-radius: 4px; background: #171d20; }
 .zoom-control button:hover:not(:disabled), .center-story-button:hover { color: var(--ink); background: #242b2f; }
 /* Scrolls vertically as one unit, so the camera-name gutter and the lane

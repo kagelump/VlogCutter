@@ -21,7 +21,8 @@ import { resolveEscape, type EscapeLayer } from "./review/escape";
 import { resolveAction } from "./review/keymap";
 import { CalibrationPanel } from "./CalibrationPanel";
 import { chronologyApi } from "./chronologyApi";
-import { formatChronologyTime } from "./chronology/geometry";
+import { describeChronologyTime } from "./chronology/geometry";
+import { suggestTimezoneFromPhases } from "./chronology/displayTimezone";
 import type { ChronologyOverview, TripPhase } from "./chronologyTypes";
 import { EditPlanPanel } from "./EditPlanPanel";
 import { RIBBON_ZOOM_DEFAULT, RIBBON_ZOOM_MAX, RIBBON_ZOOM_MIN, RIBBON_ZOOM_STEP, ribbonHeight } from "./review/layout";
@@ -1055,6 +1056,44 @@ function App() {
     setPhaseDialog({ phase, startIndex, endIndex });
     setPhaseDialogError("");
   }, [phasesById]);
+
+  /**
+   * "Show this in the timezone I was actually in" (#72).
+   *
+   * Routed through trip phases on purpose. A phase is where display timezone
+   * already lives, it has an explicit range the user confirms, and it cannot
+   * reach camera clock evidence — so changing Madrid ↔ UTC can never shift
+   * chronology or rewrite a capture time. A clip a phase already covers edits
+   * that phase; a clip nothing covers opens the range flow, which is what
+   * makes the scope of the answer visible before it is given.
+   */
+  const editSelectedDisplayTimezone = useCallback(() => {
+    if (!selected) return;
+    const phaseId = chronologyAssetsById.get(selected.id)?.displayTime?.phaseId;
+    if (phaseId) {
+      const run = contextRuns.find((candidate) => candidate.phaseId === phaseId);
+      const index = activeAssets.findIndex((asset) => asset.id === selected.id);
+      openExistingContext(phaseId, run?.start ?? index, run?.end ?? index);
+      return;
+    }
+    // No covering phase: offer a range ending at this clip, the same flow the
+    // ribbon's own "add context" uses, so the user names the span the answer
+    // applies to rather than having one inferred for them.
+    openContextRange(selected.id, "through", null);
+  }, [activeAssets, chronologyAssetsById, contextRuns, openContextRange, openExistingContext, selected]);
+
+  /**
+   * What the project's own phases suggest for the range this dialog is about
+   * to define (#72). Only for a *new* phase: an existing one already carries
+   * the user's answer, and proposing over it would be second-guessing them.
+   */
+  const phaseDialogTimezoneSuggestion = useMemo(() => {
+    if (!phaseDialog || phaseDialog.phase) return null;
+    const anchor = activeAssets[phaseDialog.endIndex];
+    if (!anchor) return null;
+    const tripTime = chronologyAssetsById.get(anchor.id)?.tripTime ?? anchor.bestTime;
+    return suggestTimezoneFromPhases(chronologyOverview?.phases ?? [], tripTime ?? null);
+  }, [activeAssets, chronologyAssetsById, chronologyOverview, phaseDialog]);
 
   async function saveTripPhase(
     value: TripPhaseFormValue,
@@ -2811,12 +2850,19 @@ function App() {
           contextRuns={contextRuns}
           selected={selected}
           selectedId={selectedId}
-          selectedTimeLabel={selected
-            ? formatChronologyTime(
-                chronologyAssetsById.get(selected.id)?.displayTime?.primary ?? selected.bestTime,
-                chronologyAssetsById.get(selected.id)?.displayTime?.timezone,
-              )
+          selectedTime={selected
+            ? {
+                ...describeChronologyTime(
+                  chronologyAssetsById.get(selected.id)?.displayTime?.primary ?? selected.bestTime,
+                  chronologyAssetsById.get(selected.id)?.displayTime?.timezone,
+                ),
+                // Authoritative means a trip phase actually covers this clip.
+                // Without one the core falls back to UTC, which is honest but
+                // is a question rather than an answer (#72).
+                authoritative: Boolean(chronologyAssetsById.get(selected.id)?.displayTime?.phaseId),
+              }
             : null}
+          onEditDisplayTimezone={editSelectedDisplayTimezone}
           zoom={chronologyZoom}
           scrollRef={chronologyScrollRef}
           collapsed={!view.ribbon}
@@ -2849,6 +2895,7 @@ function App() {
           endPosition={phaseDialog.endIndex}
           busy={phaseDialogBusy}
           error={phaseDialogError}
+          suggestedTimezone={phaseDialogTimezoneSuggestion}
           onCancel={() => setPhaseDialog(null)}
           onSave={(value, range) => { void saveTripPhase(value, range); }}
           onRemove={phaseDialog.phase ? () => { void removeTripPhase(); } : undefined}
