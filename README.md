@@ -28,6 +28,8 @@ RCDVLOG_CATALOG=/absolute/project/catalog.sqlite3 pnpm dev
 
 New projects default to `~/Movies/VideoProjects/<project-name>/`, with one local SQLite catalog and project-local cache. The projects parent and autoplay behavior are configurable in desktop Settings.
 
+`pnpm dev` writes a full session log to `./logs/dev-<timestamp>.log` (gitignored, folder capped ~100 MB, oldest pruned first). Backend `tracing` events — including per-file import and proxy-worker timing — flow into that file; set `RCDVLOG_LOG=trace` to raise verbosity.
+
 ## Companion server fast start
 
 The raw backend is loopback-only. Originals are mounted read-only; server state stays on local SSD; derived media and backups have separate writable roots.
