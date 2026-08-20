@@ -2566,7 +2566,27 @@ fn sync_all_status(state: State<'_, AppState>) -> Result<Vec<sync_manager::SyncS
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
+/// Install a stderr tracing subscriber for local development. The dev-with-logs
+/// wrapper tees stderr to `./logs`, so these events land in the session file
+/// alongside cargo/vite output. Never active in release unless `RCDVLOG_LOG`
+/// is set; `try_init` keeps a second call (tests, re-entry) from panicking.
+fn init_dev_logging() {
+    let enabled = cfg!(debug_assertions) || std::env::var_os("RCDVLOG_LOG").is_some();
+    if !enabled {
+        return;
+    }
+    use tracing_subscriber::{EnvFilter, fmt, prelude::*};
+    let filter = EnvFilter::try_from_env("RCDVLOG_LOG").unwrap_or_else(|_| {
+        EnvFilter::new("info,rcdvlog_core=debug,rcdvlog_desktop_lib=debug")
+    });
+    let _ = tracing_subscriber::registry()
+        .with(filter)
+        .with(fmt::layer().with_target(true).with_writer(std::io::stderr))
+        .try_init();
+}
+
 pub fn run() {
+    init_dev_logging();
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
