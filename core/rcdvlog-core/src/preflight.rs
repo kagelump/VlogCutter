@@ -996,9 +996,18 @@ impl Catalog {
             if let (Some(root_id), Some(card)) = (archive_root_id, card) {
                 let target = self.archive_target(project_id, root_id, card, relative_path)?;
                 if target.is_file() {
-                    // Same name, different content. Overwriting an archived
+                    // Something occupies the pathname, which on its own says
+                    // nothing: an interruption between `commit_into_archive`
+                    // and asset registration leaves *our own* verified bytes
+                    // here, with no asset to find them by fingerprint. Ask
+                    // what the content is. Same content is a copy we already
+                    // committed and can adopt; only genuinely different
+                    // content is a collision, and overwriting an archived
                     // original is never the answer.
-                    return Ok((Classification::PathCollision, None, size_bytes, fingerprint));
+                    let target_size = std::fs::metadata(&target)?.len();
+                    if sampled_media_fingerprint(&target, target_size)? != fingerprint {
+                        return Ok((Classification::PathCollision, None, size_bytes, fingerprint));
+                    }
                 }
             }
             return Ok((Classification::New, None, size_bytes, fingerprint));
@@ -1703,14 +1712,34 @@ impl Catalog {
                         warnings: Vec::new(),
                     }));
                 }
-                match crate::copy::commit_into_archive(
-                    &source,
-                    &target,
-                    verify_copies,
-                    &mut on_copy_bytes,
-                )? {
-                    Some(committed) => (committed.path, committed.size_bytes),
-                    None => return Ok(None),
+                if target.is_file() {
+                    // Reaching here with a target already in place means an
+                    // earlier run committed these bytes but was interrupted
+                    // before registering them. Adopt the committed copy
+                    // instead of copying it a second time. Preflight already
+                    // rejects a target whose content differs, but the archive
+                    // is create-only and that guarantee is not preflight's to
+                    // make, so confirm the content here too.
+                    let source_size = std::fs::metadata(&source)?.len();
+                    let source_fingerprint = sampled_media_fingerprint(&source, source_size)?;
+                    let target_size = std::fs::metadata(&target)?.len();
+                    if sampled_media_fingerprint(&target, target_size)? != source_fingerprint {
+                        anyhow::bail!(
+                            "archive target already exists with different content: {}",
+                            target.display()
+                        );
+                    }
+                    (target, 0)
+                } else {
+                    match crate::copy::commit_into_archive(
+                        &source,
+                        &target,
+                        verify_copies,
+                        &mut on_copy_bytes,
+                    )? {
+                        Some(committed) => (committed.path, committed.size_bytes),
+                        None => return Ok(None),
+                    }
                 }
             }
             // Referenced in place: the original stays exactly where it is.
@@ -3787,6 +3816,73 @@ mod tests {
         assert!(
             catalog.list_assets(&project.id).unwrap().is_empty(),
             "the reactivated membership belongs to this new import session"
+        );
+    }
+
+    /// #77: an interruption between `commit_into_archive` and asset
+    /// registration leaves verified bytes in the archive that the catalog has
+    /// never heard of. Resume must recognize its own committed copy by
+    /// content rather than refuse it because something occupies the pathname.
+    #[test]
+    fn an_archive_copy_committed_before_registration_is_adopted_not_called_a_collision() {
+        if skip_without_ffprobe() {
+            return;
+        }
+        let directory = tempdir().unwrap();
+        let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).unwrap();
+        let project = catalog.create_project("Spain 2026").unwrap();
+        let mount = card_fixture_media(directory.path(), &[("C0001.MP4", "red")]);
+        let archive = directory.path().join("archive");
+        fs::create_dir_all(&archive).unwrap();
+        let root = catalog.create_archive_root("Archive", &archive).unwrap();
+
+        let plan = catalog
+            .preflight_import(&project.id, &mount, Some(&root.id), None, |_, _, _| true)
+            .unwrap();
+        let first = catalog
+            .run_import(&project.id, &plan, true, |_| true)
+            .unwrap();
+        assert_eq!(first.copied, 1);
+        let asset = catalog.list_assets(&project.id).unwrap().remove(0);
+        let archive_path = PathBuf::from(&asset.path);
+        let committed_bytes = fs::read(&archive_path).unwrap();
+
+        // Exactly the state a stall, crash, or kill between commit and
+        // registration leaves behind: the archive holds a verified copy that
+        // the catalog has no asset for.
+        catalog
+            .connection()
+            .unwrap()
+            .execute(
+                "DELETE FROM assets WHERE id = ?1",
+                rusqlite::params![asset.id],
+            )
+            .unwrap();
+        assert!(catalog.list_assets(&project.id).unwrap().is_empty());
+        assert!(archive_path.is_file(), "the committed copy stays on disk");
+
+        let resumed_plan = catalog
+            .preflight_import(&project.id, &mount, Some(&root.id), None, |_, _, _| true)
+            .unwrap();
+        assert_eq!(
+            resumed_plan.collisions, 0,
+            "our own verified copy is not a collision"
+        );
+        assert_eq!(resumed_plan.new_clips, 1);
+
+        let resumed = catalog
+            .run_import(&project.id, &resumed_plan, true, |_| true)
+            .unwrap();
+        assert_eq!(resumed.imported, 1);
+        assert_eq!(
+            resumed.copied, 0,
+            "the committed copy is adopted, never recopied"
+        );
+        assert_eq!(catalog.list_assets(&project.id).unwrap().len(), 1);
+        assert_eq!(
+            fs::read(&archive_path).unwrap(),
+            committed_bytes,
+            "adoption must not rewrite the archived original"
         );
     }
 

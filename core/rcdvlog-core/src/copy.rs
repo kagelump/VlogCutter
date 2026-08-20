@@ -24,6 +24,13 @@
 //! Resume needs no ledger. Because commit is atomic per file, a file either
 //! committed or did not, and re-running an import re-classifies and copies only
 //! what is missing.
+//!
+//! Committing is not the same as *registering*, though, and the gap between
+//! them is real: the caller registers the asset after this module returns, so
+//! an interruption in between leaves verified bytes under the final name that
+//! the catalog cannot find by fingerprint. That is why resume compares content
+//! at an occupied target instead of reading mere pathname occupancy as a
+//! collision — a copy this code already committed is adopted, not refused.
 
 use anyhow::{Context, Result, bail};
 use blake3::Hasher;
