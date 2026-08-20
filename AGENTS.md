@@ -782,6 +782,19 @@ The ribbon already accepts optional TypeScript fields `phase`, `location`, `time
 
 The app has a minimum 980×680 window and a three-column workbench. Review queue and inspector scroll independently; the player and story ribbon occupy the center. Preserve visible focus styles, semantic labels, `aria-keyshortcuts`, and reduced-clutter dark editing-bench aesthetic. Test at the configured 1440×900 default and the 980×680 minimum.
 
+The top bar is one row that degrades rather than clips (#75). Its ladder is in
+`styles.css` under "The degradation ladder": stage 1 drops the wordmark word,
+the full progress form, and the lifecycle labels (into `•••`); stage 2 drops
+the mode switcher's words to glyphs and the `?` button into the same menu. The
+`N/N` count, Stop/Cancel, Add media, and the project switcher never give way
+and are asserted whole and clickable in `e2e/topbar-degradation.spec.ts`. Each
+stage is a container query on the bar with a wider twin for
+`[data-operation="active"]`, because a running operation claims ~400px of the
+same row. Two rules keep it working: anything added to the bar must be bounded
+in width — the operation slot's compact form relocates its variable text to a
+tooltip for exactly that reason — and the bar clips across but not down
+(`overflow-x: clip`), because its own dropdown menus open below it.
+
 Review video is **not** served over the Tauri asset protocol. `WKWebView` never
 produces a video frame for media delivered through a custom scheme, so an
 un-played clip has no first frame; the app binds its own loopback HTTP origin at

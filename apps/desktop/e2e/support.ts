@@ -31,3 +31,48 @@ export async function gridRows(page: Page): Promise<number[]> {
       .map((value) => Math.round(parseFloat(value)));
   });
 }
+
+/**
+ * Start a Smart ingest run from the mount banner and leave it running.
+ *
+ * The preview releases one item at a time on a real timer, so the operation
+ * slot is genuinely live rather than a styled fixture.
+ */
+export async function startImport(page: Page) {
+  await page.getByRole("button", { name: "Review import" }).click();
+  const dialog = page.getByRole("dialog");
+  const start = dialog.getByRole("button", { name: /^Import \d+ clips?$/ });
+  await expect(start).toBeEnabled();
+  await start.click();
+  await expect(page.locator(".operation-slot")).toContainText(/Copying|Importing|Reading|proxies|\d+\/\d+/);
+}
+
+/**
+ * One import stage, pushed through the real event transport rather than by
+ * styling a fixture — including, where a caller asks for it, a filename far
+ * longer than any card would produce.
+ */
+export async function showImportStage(
+  page: Page,
+  stage: string,
+  currentFile: string,
+  counts: { completed: number; total: number } = { completed: 7, total: 243 },
+) {
+  await page.evaluate(async ([importStage, file, completed, total]) => {
+    const harness = (window as unknown as { __RCDVLOG_PREVIEW__: {
+      state: { settings: { lastProjectId?: string }; projects: Array<{ id: string }> };
+      emit(event: string, payload: unknown): Promise<number>;
+    } }).__RCDVLOG_PREVIEW__;
+    const projectId = harness.state.settings.lastProjectId ?? harness.state.projects[0].id;
+    await harness.emit("import-progress", {
+      projectId,
+      stage: importStage,
+      completed,
+      total,
+      currentFile: file,
+      completedBytes: 7_000_000_000,
+      totalBytes: 243_000_000_000,
+      asset: null,
+    });
+  }, [stage, currentFile, counts.completed, counts.total] as const);
+}

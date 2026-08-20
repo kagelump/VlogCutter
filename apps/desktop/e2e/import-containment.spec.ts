@@ -1,5 +1,5 @@
 import { expect, test, type Page } from "@playwright/test";
-import { boot, SIZES } from "./support";
+import { boot, showImportStage, SIZES, startImport } from "./support";
 
 /**
  * The shell stays inside the window while an import runs (#68).
@@ -43,42 +43,6 @@ function expectContained(found: Containment) {
   expect(found.ribbonRight, "the ribbon must not extend past the window").toBeLessThanOrEqual(found.viewport);
 }
 
-/** Start a Smart ingest run from the mount banner and leave it running. */
-async function startImport(page: Page) {
-  await page.getByRole("button", { name: "Review import" }).click();
-  const dialog = page.getByRole("dialog");
-  const start = dialog.getByRole("button", { name: /^Import \d+ clips?$/ });
-  await expect(start).toBeEnabled();
-  await start.click();
-  // The preview animates one item at a time, so the slot is genuinely live.
-  await expect(page.locator(".operation-slot")).toContainText(/Copying|Importing|Reading|proxies/);
-}
-
-/**
- * Every stage the top bar can display, driven through the real event
- * transport rather than by styling a fixture — including a filename far
- * longer than any card would produce.
- */
-async function showStage(page: Page, stage: string, currentFile: string) {
-  await page.evaluate(async ([importStage, file]) => {
-    const harness = (window as unknown as { __RCDVLOG_PREVIEW__: {
-      state: { settings: { lastProjectId?: string }; projects: Array<{ id: string }> };
-      emit(event: string, payload: unknown): Promise<number>;
-    } }).__RCDVLOG_PREVIEW__;
-    const projectId = harness.state.settings.lastProjectId ?? harness.state.projects[0].id;
-    await harness.emit("import-progress", {
-      projectId,
-      stage: importStage,
-      completed: 7,
-      total: 243,
-      currentFile: file,
-      completedBytes: 7_000_000_000,
-      totalBytes: 243_000_000_000,
-      asset: null,
-    });
-  }, [stage, currentFile]);
-}
-
 for (const [, size] of Object.entries(SIZES)) {
   test.describe(`import containment at ${size.width}×${size.height}`, () => {
     test.use({ viewport: size });
@@ -101,7 +65,7 @@ for (const [, size] of Object.entries(SIZES)) {
 
       const longFilename = `${"A".repeat(180)}_C0001.MP4`;
       for (const stage of ["scanning", "copying", "reading", "proxies"]) {
-        await showStage(page, stage, longFilename);
+        await showImportStage(page, stage, longFilename);
         expectContained(await containment(page));
       }
 

@@ -84,6 +84,18 @@ describe("the mode switcher", () => {
     expect(screen.getByRole("button", { name: "Edit plan" }).hasAttribute("disabled")).toBe(true);
   });
 
+  it("carries a glyph for the collapsed switcher without losing its name (#75)", () => {
+    const nav = renderBar().container.querySelector(".mode-switcher")!;
+    const buttons = [...nav.querySelectorAll("button")];
+    // The glyph is drawn by CSS from this attribute, so the button's text and
+    // its accessible name are still the mode itself once the words are hidden.
+    expect(buttons.map((node) => node.getAttribute("data-glyph")).every(Boolean)).toBe(true);
+    expect(buttons.map((node) => node.getAttribute("aria-label")))
+      .toEqual(["Review", "Chronology", "Edit plan"]);
+    expect(buttons.map((node) => node.querySelector(".mode-label")!.textContent))
+      .toEqual(["Review", "Chronology", "Edit plan"]);
+  });
+
   it("reports the mode that was chosen", async () => {
     const { props } = renderBar();
     await userEvent.click(screen.getByRole("button", { name: "Edit plan" }));
@@ -141,6 +153,53 @@ describe("the operation slot", () => {
     const withoutUnits = renderBar({ operationProgress: progress({ completed: 4, total: 10 }) });
     expect(withoutUnits.getByRole("progressbar").getAttribute("aria-valuenow")).toBe("4");
     expect(withoutUnits.getByRole("progressbar").getAttribute("aria-valuemax")).toBe("10");
+  });
+
+  it("tells the bar it is busy, which is what moves the collapse thresholds (#75)", () => {
+    const { container } = renderBar({ operationProgress: progress() });
+    expect(container.querySelector(".topbar")!.getAttribute("data-operation")).toBe("active");
+
+    document.body.innerHTML = "";
+    const idle = renderBar().container.querySelector(".topbar")!;
+    expect(idle.getAttribute("data-operation")).toBe("idle");
+  });
+
+  it("keeps everything the compact form drops in one tooltip (#75)", () => {
+    renderBar({
+      operationProgress: progress({
+        kind: "analysis", stage: "transcripts", stageIndex: 1, stageCount: 3, costUsd: 0.42,
+        completed: 97, total: 1953, currentFile: "C0097.MP4",
+      }),
+    });
+    const tooltip = document.querySelector(".operation-progress")!.getAttribute("title")!;
+    // The label, the count, the file, the ETA, the workers, and the money:
+    // under pressure only the count stays on screen, so all of it lives here.
+    expect(tooltip).toContain("Transcribing · step 2 of 3");
+    expect(tooltip).toContain("97/1953");
+    expect(tooltip).toContain("C0097.MP4");
+    expect(tooltip).toContain("45s remaining");
+    expect(tooltip).toContain("2 workers");
+    expect(tooltip).toContain("$0.42 spent");
+  });
+
+  it("keeps one progressbar across both forms, with the count beside it", () => {
+    // The compact form restyles these two elements rather than swapping them
+    // out, so the run never loses its progressbar role on the way down.
+    renderBar({ operationProgress: progress({ completed: 2, total: 10 }) });
+    const readout = document.querySelector(".progress-readout")!;
+    expect(document.querySelectorAll('[role="progressbar"]').length).toBe(1);
+    expect(readout.querySelector('[role="progressbar"]')).toBeTruthy();
+    expect(readout.querySelector("output")!.textContent).toBe("2/10");
+  });
+
+  it("keeps Stop in the slot itself, never in an overflow menu", async () => {
+    const { props } = renderBar({ operationProgress: progress({ kind: "import", importStage: "proxies" }) });
+    const slot = screen.getByTestId("operation-slot");
+    const stop = within(slot).getByRole("button", { name: "Stop" });
+    expect(stop.closest(".topbar-overflow")).toBeNull();
+    expect(stop.closest(".media-menu")).toBeNull();
+    await userEvent.click(stop);
+    expect(props.onCancelImport).toHaveBeenCalled();
   });
 
   it("gives an error the alert role and a way out", async () => {
@@ -220,6 +279,21 @@ describe("desktop-only affordances", () => {
   it("offers pairing on desktop once the server says it can be paired", () => {
     renderBar({ isDesktop: true, canPairWithServer: true });
     expect(screen.getByRole("button", { name: "Pair with server" })).toBeTruthy();
+  });
+});
+
+describe("the overflow menu", () => {
+  it("holds every action the ladder can collapse, including the ? button (#75)", async () => {
+    const { props } = renderBar({ isDesktop: true, canPairWithServer: true });
+    await userEvent.click(screen.getByRole("button", { name: "Project actions" }));
+    const menu = document.querySelector(".topbar-overflow > div")!;
+    expect([...menu.querySelectorAll("button")].map((node) => node.textContent)).toEqual([
+      "Open catalog", "Settings", "New project", "Pair with server", "Keyboard shortcuts",
+    ]);
+
+    await userEvent.click(within(menu as HTMLElement).getByRole("button", { name: "Keyboard shortcuts" }));
+    expect(props.onOpenShortcuts).toHaveBeenCalled();
+    expect(document.querySelector(".topbar-overflow > div")).toBeNull();
   });
 });
 

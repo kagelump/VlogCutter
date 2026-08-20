@@ -70,11 +70,49 @@ export interface TopBarProps {
   onResumeInterruptedImport(): void;
 }
 
-const modes: Array<[Mode, string, string]> = [
-  ["review", "Review", "Meta+1"],
-  ["chronology", "Chronology", "Meta+2"],
-  ["editPlan", "Edit plan", "Meta+3"],
+/**
+ * Mode, label, shortcut, and the glyph the switcher shows once the bar is too
+ * narrow to spell the modes out (#75). The glyph is decorative — the button
+ * keeps its label as its accessible name — so it is drawn from `data-glyph`
+ * by CSS rather than added to the button's text.
+ */
+const modes: Array<[Mode, string, string, string]> = [
+  ["review", "Review", "Meta+1", "▤"],
+  ["chronology", "Chronology", "Meta+2", "◷"],
+  ["editPlan", "Edit plan", "Meta+3", "✎"],
 ];
+
+/** What the operation slot calls the running job. */
+function operationLabel(operation: OperationProgress): string {
+  if (operation.kind === "analysis" && operation.stage) {
+    return `${analysisStageLabels[operation.stage]} · step ${(operation.stageIndex ?? 0) + 1} of ${operation.stageCount ?? 3}`;
+  }
+  if (operation.kind === "import") {
+    if (operation.importStage === "copying") return "Copying and verifying originals";
+    if (operation.importStage === "reading") return "Reading clip metadata";
+    if (operation.importStage === "proxies") return "Making import proxies";
+    return "Importing media";
+  }
+  if (operation.kind === "thumbnail") return "Generating thumbnails";
+  return "Generating proxies";
+}
+
+/**
+ * Everything the compact bar stops showing, in one tooltip.
+ *
+ * The compact form keeps the count, the rule, and the Stop button — the parts
+ * that are a control or a number — and relocates the variable-length text
+ * here. That is what bounds its inline width, which is what lets the ladder
+ * below run on discrete thresholds instead of a measure loop.
+ */
+function operationSummary(operation: OperationProgress): string {
+  const parts = [operationLabel(operation), `${operation.completed}/${operation.total}`];
+  if (operation.currentFile) parts.push(operation.currentFile);
+  parts.push(formatEta(operation.estimatedRemainingSeconds));
+  parts.push(`${operation.workerCount} worker${operation.workerCount === 1 ? "" : "s"}`);
+  if (operation.kind === "analysis") parts.push(`${formatCost(operation.costUsd ?? 0)} spent`);
+  return parts.join(" · ");
+}
 
 /**
  * The topbar (spec §3.2).
@@ -144,7 +182,7 @@ export function TopBar({
     };
   }, [projectMenuOpen]);
   return (
-    <header className="topbar">
+    <header className="topbar" data-operation={operationProgress ? "active" : "idle"}>
       <div className="wordmark" aria-label="RCD VlogCutter">
         <span className="wordmark-mark">RCD</span>
         <span>VlogCutter</span>
@@ -160,15 +198,18 @@ export function TopBar({
       {/* Visible rather than tucked into a menu: three modes is few enough
           to show, and hiding them makes them read as settings. */}
       <nav className="mode-switcher" aria-label="View mode">
-        {modes.map(([value, label, shortcut]) => (
+        {modes.map(([value, label, shortcut, glyph]) => (
           <button
             key={value}
             className={mode === value ? "active" : ""}
             aria-pressed={mode === value}
             aria-keyshortcuts={shortcut}
+            aria-label={label}
+            title={label}
+            data-glyph={glyph}
             disabled={!projectId && value !== "review"}
             onClick={() => onModeChange(value)}
-          >{label}</button>
+          ><span className="mode-label">{label}</span></button>
         ))}
       </nav>
       {isDesktop && <button className="text-button desktop-lifecycle-action" disabled={busy} onClick={onOpenCatalog} aria-keyshortcuts="Meta+O">Open catalog</button>}
@@ -187,6 +228,7 @@ export function TopBar({
             <button onClick={() => runProjectAction(onOpenSettings)}>Settings</button>
             <button onClick={() => runProjectAction(onOpenCreateProject)}>New project</button>
             {isDesktop && canPairWithServer && <button disabled={busy} onClick={() => runProjectAction(onPairWithServer)}>Pair with server</button>}
+            <button onClick={() => runProjectAction(onOpenShortcuts)}>Keyboard shortcuts</button>
           </div>
         )}
       </div>
@@ -206,47 +248,43 @@ export function TopBar({
           anything to say. */}
       <div className="operation-slot" data-testid="operation-slot" aria-live="polite">
         {operationProgress ? (
-          <>
-            <span>
-              {operationProgress.kind === "analysis" && operationProgress.stage
-                ? `${analysisStageLabels[operationProgress.stage]} · step ${(operationProgress.stageIndex ?? 0) + 1} of ${operationProgress.stageCount ?? 3}`
-                : operationProgress.kind === "import"
-                  ? operationProgress.importStage === "copying"
-                    ? "Copying and verifying originals"
-                    : operationProgress.importStage === "reading"
-                      ? "Reading clip metadata"
-                      : operationProgress.importStage === "proxies"
-                        ? "Making import proxies"
-                        : "Importing media"
-                : operationProgress.kind === "thumbnail"
-                  ? "Generating thumbnails"
-                  : "Generating proxies"}
-            </span>
-            <div
-              className="progress-track"
-              role="progressbar"
-              aria-valuemin={0}
-              aria-valuemax={operationProgress.totalWorkUnits || operationProgress.total}
-              aria-valuenow={operationProgress.totalWorkUnits ? operationProgress.completedWorkUnits : operationProgress.completed}
-            >
-              <span style={{ width: `${operationProgress.totalWorkUnits
-                ? (operationProgress.completedWorkUnits / operationProgress.totalWorkUnits) * 100
-                : operationProgress.total
-                  ? (operationProgress.completed / operationProgress.total) * 100
-                  : 0}%` }} />
+          /* One tooltip for the whole readout: under pressure the label and
+             the detail line are the parts that go, and this is where they go
+             to (#75). The count, the rule, and Stop stay on screen. */
+          <div className="operation-progress" title={operationSummary(operationProgress)}>
+            <span className="operation-label">{operationLabel(operationProgress)}</span>
+            {/* Track and count together, because the compact form is the same
+                two elements stacked: the count with its rule underneath. */}
+            <div className="progress-readout">
+              <div
+                className="progress-track"
+                role="progressbar"
+                aria-valuemin={0}
+                aria-valuemax={operationProgress.totalWorkUnits || operationProgress.total}
+                aria-valuenow={operationProgress.totalWorkUnits ? operationProgress.completedWorkUnits : operationProgress.completed}
+              >
+                <span style={{ width: `${operationProgress.totalWorkUnits
+                  ? (operationProgress.completedWorkUnits / operationProgress.totalWorkUnits) * 100
+                  : operationProgress.total
+                    ? (operationProgress.completed / operationProgress.total) * 100
+                    : 0}%` }} />
+              </div>
+              <output>{operationProgress.completed}/{operationProgress.total}</output>
             </div>
-            <output title={operationProgress.currentFile}>{operationProgress.completed}/{operationProgress.total}</output>
-            <span>
+            <span className="operation-detail">
               {formatEta(operationProgress.estimatedRemainingSeconds)} · {operationProgress.workerCount} worker{operationProgress.workerCount === 1 ? "" : "s"}
               {operationProgress.kind === "analysis" ? ` · ${formatCost(operationProgress.costUsd ?? 0)} spent` : ""}
             </span>
+            {/* Never routed into an overflow menu, and never allowed to
+                shrink: cancelling the run is the one thing a busy bar must
+                always let the user do. */}
             {operationProgress.kind === "analysis" && (
               <button className="button ghost progress-cancel" onClick={onCancelAnalysis}>Cancel</button>
             )}
             {operationProgress.kind === "import" && (
               <button className="button ghost progress-cancel" onClick={onCancelImport}>Stop</button>
             )}
-          </>
+          </div>
         ) : error ? (
           <span className="error-banner" role="alert">
             {error}

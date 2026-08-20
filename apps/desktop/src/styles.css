@@ -62,14 +62,28 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 
 .topbar {
   position: relative;
+  /* Above the workbench. `container-type` below gives the row layout
+     containment, which makes it a stacking context — its dropdowns can no
+     longer outrank the rows beneath it on their own z-index, so the row has to
+     outrank them for it. Below every modal backdrop (20 and up). */
+  z-index: 18;
   display: flex;
   align-items: center;
   gap: 12px;
   padding: 0 14px;
   min-width: 0;
-  /* The row is contained by the shell above; this keeps its own children from
-     painting over the window edge once they have compressed as far as they go. */
-  overflow: hidden;
+  /* Clipped across, open downwards. The row is contained by the shell above,
+     and this keeps its own children from painting over the window edge once
+     they have compressed as far as they go — but `overflow: hidden` (#68)
+     clipped the row's own dropdown menus too, which open below it and were
+     invisible from the moment they were opened. `clip` on one axis is the
+     combination that does not force the other axis to scroll, and clipped
+     overflow still never reaches the shell's scrollable overflow. */
+  overflow-x: clip;
+  overflow-y: visible;
+  /* The row measures itself for the degradation ladder further down (#75). */
+  container-type: inline-size;
+  container-name: topbar;
   background: #151a1e;
   border-bottom: 1px solid var(--line);
   -webkit-app-region: drag;
@@ -83,7 +97,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .topbar > .mode-switcher,
 .topbar > .desktop-lifecycle-action,
 .topbar > .topbar-overflow,
-.topbar > .sync-chip,
+.topbar > .sync-indicator,
 .topbar > .media-split,
 .topbar > .button,
 .topbar > .shortcut-help-button { flex: none; }
@@ -94,7 +108,11 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .wordmark-mark { color: var(--amber); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; letter-spacing: 0.08em; }
 
 .project-switcher select {
+  /* Bounded in both directions: a `select` sizes itself to its widest option,
+     so a long project name used to widen the row and squeeze the controls
+     beside it. */
   min-width: 190px;
+  max-width: 190px;
   color: var(--ink);
   background: var(--panel-raised);
   border: 1px solid var(--line-strong);
@@ -155,10 +173,19 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
    min-content, which is what let a long stage label push the shell wider than
    the window. These are the only parts allowed to lose characters. */
 .operation-slot > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
-.operation-slot > output, .operation-slot > .progress-cancel { flex: none; }
 .error-banner { min-width: 0; }
 .error-banner > :first-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.banner-dismiss { flex: none; }
 .operation-slot output { color: #b9c2c6; font: inherit; }
+
+/* The full progress form: label, 160px track, count, ETA, and the cancel
+   button. Only the two text spans may lose characters; the ladder below
+   swaps the whole thing for the compact form before the rest is under
+   pressure, because the rest cannot give anything up without being clipped. */
+.operation-progress { min-width: 0; display: flex; align-items: center; gap: 8px; }
+.operation-label, .operation-detail { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.progress-readout { flex: none; display: flex; align-items: center; gap: 8px; }
+.progress-readout > output, .progress-cancel { flex: none; }
 .progress-track { width: 160px; height: 3px; flex: none; overflow: hidden; background: #283036; border-radius: 3px; }
 .progress-track > span { display: block; height: 100%; background: var(--amber); border-radius: inherit; transition: width 180ms ease-out; }
 .error-banner { display: inline-flex; align-items: center; gap: 8px; padding: 2px 8px; color: var(--red); background: rgba(230,120,104,.1); border-radius: 3px; }
@@ -181,13 +208,84 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .topbar-overflow > div button { padding: 8px 9px; color: var(--muted); border: 0; border-radius: 3px; background: transparent; cursor: pointer; text-align: left; }
 .topbar-overflow > div button:hover, .topbar-overflow > div button:focus-visible { color: var(--ink); background: #222a2f; }
 
-@media (max-width: 1100px) {
-  .topbar { gap: 6px; padding: 0 8px; }
+/* The mode glyph, drawn only once the switcher has no room to spell the modes
+   out. Generated content, because it is decoration: the button's accessible
+   name is its `aria-label`, and its text stays "Review" for anything reading
+   the DOM. */
+.mode-switcher button::after { content: attr(data-glyph); display: none; font-size: 13px; }
+
+/* ── The degradation ladder (#75) ───────────────────────────────────────────
+   #68 contained the shell by clipping this row. A busy row then clipped its
+   own Stop button: every child of the operation slot is `flex: none`, so once
+   the label and the ETA had ellipsized away the slot kept shrinking and the
+   trailing control — the one that cancels the import — was cut in half.
+
+   The row now gives ground in a defined order, cheapest to the user first,
+   rather than clipping whatever happens to be last:
+
+     stage 1  the wordmark drops to the RCD mark, the progress form drops to
+              its compact shape, and the lifecycle actions move into •••
+              — nothing is lost; the compact form is feature-complete
+     stage 2  the mode switcher drops to glyphs and ? moves into •••
+              — both are one hover or one shortcut away (⌘1/2/3, ?)
+     never    the N/N count, Stop/Cancel, Add media, the project switcher
+
+   Each stage is a container query on the row plus a wider twin for
+   `[data-operation="active"]`, because the full progress form claims some
+   500px of this same row: available space, not window width, is what decides
+   when the row is out of room. Thresholds are the row's content box, so they
+   read ~28px under the window width they correspond to.
+
+   Discrete thresholds are enough — no ResizeObserver, no measure loop —
+   because the compact form moves the only variable-length text it has (the
+   label, the ETA, the filename) into its tooltip, which bounds the inline
+   width of every stage. */
+
+/* The row's own box cannot be styled from a query on itself, so its gaps stay
+   on a window media query; the row spans the window, so the two agree. */
+@media (max-width: 1100px) { .topbar { gap: 6px; padding: 0 8px; } }
+@media (max-width: 1400px) { .topbar[data-operation="active"] { gap: 6px; padding: 0 8px; } }
+
+/* Stage 1 — lossless. */
+@container topbar (max-width: 1080px) {
   .wordmark { margin-right: 0; }
   .wordmark > span:not(.wordmark-mark), .topbar > .desktop-lifecycle-action { display: none; }
   .project-switcher select { min-width: 160px; max-width: 160px; }
   .mode-switcher button { padding-right: 8px; padding-left: 8px; }
   .topbar-overflow { display: block; }
+}
+@container topbar (max-width: 1640px) {
+  .topbar[data-operation="active"] .wordmark { margin-right: 0; }
+  .topbar[data-operation="active"] .wordmark > span:not(.wordmark-mark),
+  .topbar[data-operation="active"] > .desktop-lifecycle-action { display: none; }
+  .topbar[data-operation="active"] .project-switcher select { min-width: 160px; max-width: 160px; }
+  .topbar[data-operation="active"] .mode-switcher button { padding-right: 8px; padding-left: 8px; }
+  .topbar[data-operation="active"] .topbar-overflow { display: block; }
+}
+
+/* Stage 1, the progress form: the count with a rule beneath it, and Stop.
+   The slot stops shrinking here — its remaining content is a number and a
+   button, and neither can lose anything without being clipped. */
+@container topbar (max-width: 1380px) {
+  .topbar[data-operation="active"] .operation-slot { flex: none; }
+  .topbar[data-operation="active"] .operation-label,
+  .topbar[data-operation="active"] .operation-detail { display: none; }
+  .topbar[data-operation="active"] .progress-readout { flex-direction: column-reverse; align-items: stretch; gap: 2px; }
+  .topbar[data-operation="active"] .progress-track { width: auto; height: 2px; }
+}
+
+/* Stage 2 — the switcher keeps its three targets, in glyph form. */
+@container topbar (max-width: 920px) {
+  .mode-switcher button { padding-right: 7px; padding-left: 7px; }
+  .mode-switcher .mode-label { display: none; }
+  .mode-switcher button::after { display: block; }
+  .topbar > .shortcut-help-button { display: none; }
+}
+@container topbar (max-width: 1100px) {
+  .topbar[data-operation="active"] .mode-switcher button { padding-right: 7px; padding-left: 7px; }
+  .topbar[data-operation="active"] .mode-switcher .mode-label { display: none; }
+  .topbar[data-operation="active"] .mode-switcher button::after { display: block; }
+  .topbar[data-operation="active"] > .shortcut-help-button { display: none; }
 }
 
 /* Chronology and edit planning are global, sit-down operations: they get the
