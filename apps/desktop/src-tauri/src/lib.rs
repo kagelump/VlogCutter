@@ -1239,7 +1239,11 @@ async fn run_smart_import(
             // that did land would bury the reconnect prompt behind minutes of
             // unrelated work, and any referenced-in-place original is on the
             // volume that just went away. Resume makes them on the next pass.
-            let proxies = if make_proxies && !outcome.cancelled && !outcome.source_disconnected {
+            let proxies = if make_proxies
+                && !outcome.cancelled
+                && !outcome.source_disconnected
+                && !outcome.destination_disconnected
+            {
                 Some(
                     catalog.generate_missing_proxies_with_progress(&pid, |progress| {
                         let _ = import_app.emit(
@@ -2598,9 +2602,8 @@ fn init_dev_logging() {
         return;
     }
     use tracing_subscriber::{EnvFilter, fmt, prelude::*};
-    let filter = EnvFilter::try_from_env("RCDVLOG_LOG").unwrap_or_else(|_| {
-        EnvFilter::new("info,rcdvlog_core=debug,rcdvlog_desktop_lib=debug")
-    });
+    let filter = EnvFilter::try_from_env("RCDVLOG_LOG")
+        .unwrap_or_else(|_| EnvFilter::new("info,rcdvlog_core=debug,rcdvlog_desktop_lib=debug"));
     let _ = tracing_subscriber::registry()
         .with(filter)
         .with(fmt::layer().with_target(true).with_writer(std::io::stderr))

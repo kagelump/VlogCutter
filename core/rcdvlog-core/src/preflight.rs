@@ -1203,6 +1203,14 @@ pub struct ImportOutcome {
     /// stays committed, so resuming re-plans and copies only the remainder.
     #[serde(default)]
     pub source_disconnected: bool,
+    /// The run stopped because the archive destination went away underneath it.
+    ///
+    /// The mirror image of `source_disconnected`, and stopping matters more
+    /// here: with the destination gone, every remaining item would fail the
+    /// same way, and each one first pays a full stall timeout waiting on a
+    /// volume that is not coming back inside this run.
+    #[serde(default)]
+    pub destination_disconnected: bool,
     pub failures: Vec<crate::IngestFailure>,
     /// Non-fatal bookkeeping problems after a clip's membership and bytes are
     /// already durable. These are deliberately separate from `failures`: the
@@ -1317,6 +1325,22 @@ pub fn import_source_present(plan: &ImportPreflight) -> bool {
         inspect_card(source),
         Ok(Some(found)) if found.session_id == expected.session_id,
     )
+}
+
+impl Catalog {
+    /// Whether this plan's archive destination is still mounted.
+    ///
+    /// Asked only on the error path, where the answer decides whether the run
+    /// has anything left worth attempting. A plan that references originals in
+    /// place has no destination to lose, so it is always present.
+    fn archive_destination_present(&self, plan: &ImportPreflight) -> bool {
+        let Some(root) = plan.destination.archive_root.as_ref() else {
+            return true;
+        };
+        self.archive_root(&root.id)
+            .map(|current| current.available)
+            .unwrap_or(false)
+    }
 }
 
 /// The per-plan context every item in a `run_import` loop shares, bundled so
@@ -1503,6 +1527,14 @@ impl Catalog {
                     // result as hundreds of files needing attention.
                     if !import_source_present(plan) {
                         outcome.source_disconnected = true;
+                        break;
+                    }
+                    // The same reasoning for the far end of the copy. It
+                    // matters more here: with the destination gone, every
+                    // remaining item fails identically, and each one first
+                    // spends a full stall timeout finding that out.
+                    if !self.archive_destination_present(plan) {
+                        outcome.destination_disconnected = true;
                         break;
                     }
                     outcome.failures.push(crate::IngestFailure {
@@ -1745,6 +1777,16 @@ impl Catalog {
             // Referenced in place: the original stays exactly where it is.
             _ => (source, 0),
         };
+
+        // The bytes are committed but nothing is registered yet, and the
+        // ingest below can run for minutes on a large clip — fingerprinting
+        // it, then probing it twice. Poll here so Cancel is answered inside
+        // that window rather than only between copy chunks. Stopping now
+        // needs no undo: the committed copy is adopted by a later run rather
+        // than recopied.
+        if !on_copy_bytes(bytes.saturating_mul(if verify_copies { 2 } else { 1 })) {
+            return Ok(None);
+        }
 
         self.ingest_file_with_camera(project_id, &path_to_register, camera_override)?;
         let asset_id = self
@@ -3509,6 +3551,126 @@ mod tests {
 
         fs::remove_dir_all(&folder).unwrap();
         assert!(!import_source_present(&plan));
+    }
+
+    /// #76: the cancel flag is polled between copy chunks and again at the end
+    /// of an item, but not in between — and "in between" is where the whole
+    /// post-copy ingest lives. On a large clip that window is minutes long,
+    /// during which Cancel cannot be honoured.
+    #[test]
+    fn cancelling_after_the_bytes_land_registers_nothing() {
+        if skip_without_ffprobe() {
+            return;
+        }
+        let directory = tempdir().unwrap();
+        let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).unwrap();
+        let project = catalog.create_project("Spain 2026").unwrap();
+        let mount = card_fixture_media(directory.path(), &[("C0001.MP4", "navy")]);
+        let archive = directory.path().join("nas");
+        fs::create_dir_all(&archive).unwrap();
+        let root = catalog.create_archive_root("NAS Video", &archive).unwrap();
+
+        let plan = catalog
+            .preflight_import(&project.id, &mount, Some(&root.id), None, |_, _, _| true)
+            .unwrap();
+
+        // A clip visible under its final name means the copy has committed, so
+        // the run is inside the post-copy window this test is about.
+        let committed = archive.clone();
+        let outcome = catalog
+            .run_import(&project.id, &plan, true, move |_progress| {
+                !walkdir::WalkDir::new(&committed)
+                    .into_iter()
+                    .filter_map(Result::ok)
+                    .any(|entry| {
+                        entry
+                            .path()
+                            .extension()
+                            .is_some_and(|extension| extension.eq_ignore_ascii_case("MP4"))
+                    })
+            })
+            .unwrap();
+
+        assert!(
+            outcome.cancelled,
+            "cancelling during the post-copy ingest must stop the run"
+        );
+        assert!(
+            catalog.list_assets(&project.id).unwrap().is_empty(),
+            "a cancelled item must not leave a registered asset behind"
+        );
+    }
+
+    /// #76: losing the *destination* mid-import is as normal as losing the
+    /// card, and stopping matters more: every remaining item would fail the
+    /// same way, each after a full stall timeout spent waiting on a volume
+    /// that is not coming back inside this run.
+    #[cfg(unix)]
+    #[test]
+    fn a_destination_lost_mid_import_stops_the_run_rather_than_failing_every_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if skip_without_ffprobe() {
+            return;
+        }
+        let directory = tempdir().unwrap();
+        let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).unwrap();
+        let project = catalog.create_project("Spain 2026").unwrap();
+        let mount = card_fixture_media(
+            directory.path(),
+            &[
+                ("C0001.MP4", "navy"),
+                ("C0002.MP4", "maroon"),
+                ("C0003.MP4", "green"),
+            ],
+        );
+        let mount_parent = directory.path().join("mnt");
+        fs::create_dir_all(&mount_parent).unwrap();
+        let archive = mount_parent.join("nas");
+        fs::create_dir_all(&archive).unwrap();
+        let root = catalog.create_archive_root("NAS Video", &archive).unwrap();
+
+        let plan = catalog
+            .preflight_import(&project.id, &mount, Some(&root.id), None, |_, _, _| true)
+            .unwrap();
+
+        let mut unplugged = false;
+        let outcome = catalog
+            .run_import(&project.id, &plan, true, |progress| {
+                if progress.asset.is_some() && !unplugged {
+                    // Unmounting takes the directory away and leaves a parent
+                    // the app cannot recreate it in, the way /Volumes is
+                    // root-owned. Without that, the next `create_dir_all`
+                    // would quietly rebuild the mount point on the internal
+                    // disk and copy into it.
+                    fs::remove_dir_all(&archive).unwrap();
+                    let mut permissions = fs::metadata(&mount_parent).unwrap().permissions();
+                    permissions.set_mode(0o555);
+                    fs::set_permissions(&mount_parent, permissions).unwrap();
+                    unplugged = true;
+                }
+                true
+            })
+            .unwrap();
+
+        let mut permissions = fs::metadata(&mount_parent).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&mount_parent, permissions).unwrap();
+
+        assert!(
+            outcome.destination_disconnected,
+            "losing the archive root must stop the run"
+        );
+        assert!(!outcome.source_disconnected, "the card never went anywhere");
+        assert!(
+            outcome.failures.is_empty(),
+            "a disconnected destination leaves work to redo, not files to triage: {:?}",
+            outcome.failures
+        );
+        assert!(
+            outcome.imported >= 1,
+            "whatever committed before the unplug still counts"
+        );
     }
 
     /// #67: pulling the card mid-copy stops the run as an interruption. It is

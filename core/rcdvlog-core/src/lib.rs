@@ -37,6 +37,7 @@ mod locations;
 mod migrations;
 mod operations;
 mod preflight;
+mod stall;
 mod storage;
 
 use analysis::audio::{AudioExtractor, FfmpegAudioExtractor};
@@ -1243,9 +1244,24 @@ impl Catalog {
         path: &Path,
         camera_override: Option<&str>,
     ) -> Result<IngestOutcome> {
-        let metadata =
-            fs::metadata(path).with_context(|| format!("read metadata for {}", path.display()))?;
-        let fingerprint = sampled_fingerprint(path, metadata.len())?;
+        // Both of these touch the volume the file lives on, and a removable
+        // volume that has gone away parks a read rather than failing it. Bound
+        // them: the import's disconnect handling only runs on an `Err`, so a
+        // call that never returns disables every recovery path we have.
+        let stat_target = path.to_path_buf();
+        let metadata = crate::stall::with_stall_timeout(
+            &format!("reading metadata for {}", path.display()),
+            crate::stall::io_stall_timeout(),
+            move || fs::metadata(stat_target),
+        )?
+        .with_context(|| format!("read metadata for {}", path.display()))?;
+        let fingerprint_target = path.to_path_buf();
+        let size = metadata.len();
+        let fingerprint = crate::stall::with_stall_timeout(
+            &format!("fingerprinting {}", path.display()),
+            crate::stall::io_stall_timeout(),
+            move || sampled_fingerprint(&fingerprint_target, size),
+        )??;
         let connection = self.connection()?;
         let known: Option<(String, String, bool)> = connection
             .query_row(
@@ -4049,7 +4065,8 @@ pub fn probe_media_normalized(
 
 /// Returns the raw ffprobe JSON document using a specific ffprobe executable.
 fn probe_media_document_with(path: &Path, ffprobe_program: &Path) -> Result<Value> {
-    let output = Command::new(ffprobe_program)
+    let mut command = Command::new(ffprobe_program);
+    command
         .args([
             "-v",
             "error",
@@ -4060,9 +4077,12 @@ fn probe_media_document_with(path: &Path, ffprobe_program: &Path) -> Result<Valu
             "-of",
             "json",
         ])
-        .arg(path)
-        .output()
-        .context("start ffprobe")?;
+        .arg(path);
+    let output = crate::stall::output_with_timeout(
+        &mut command,
+        &format!("ffprobe on {}", path.display()),
+        crate::stall::io_stall_timeout(),
+    )?;
     if !output.status.success() {
         bail!(
             "ffprobe failed: {}",
@@ -4074,11 +4094,14 @@ fn probe_media_document_with(path: &Path, ffprobe_program: &Path) -> Result<Valu
 
 /// Extracts camera make/model via a specific ExifTool executable.
 fn exif_camera_with(path: &Path, exiftool_program: &Path) -> Option<(String, String)> {
-    let output = Command::new(exiftool_program)
-        .args(["-json", "-Make", "-Model"])
-        .arg(path)
-        .output()
-        .ok()?;
+    let mut command = Command::new(exiftool_program);
+    command.args(["-json", "-Make", "-Model"]).arg(path);
+    let output = crate::stall::output_with_timeout(
+        &mut command,
+        &format!("exiftool on {}", path.display()),
+        crate::stall::io_stall_timeout(),
+    )
+    .ok()?;
     if !output.status.success() {
         return None;
     }
@@ -4166,7 +4189,8 @@ fn modified_nanos(_metadata: &std::fs::Metadata) -> Option<i128> {
 
 /// Returns the raw ffprobe JSON document for a media file.
 fn probe_media_document(path: &Path) -> Result<Value> {
-    let output = tool_command("ffprobe")
+    let mut command = tool_command("ffprobe");
+    command
         .args([
             "-v",
             "error",
@@ -4177,9 +4201,12 @@ fn probe_media_document(path: &Path) -> Result<Value> {
             "-of",
             "json",
         ])
-        .arg(path)
-        .output()
-        .context("start ffprobe")?;
+        .arg(path);
+    let output = crate::stall::output_with_timeout(
+        &mut command,
+        &format!("ffprobe on {}", path.display()),
+        crate::stall::io_stall_timeout(),
+    )?;
     if !output.status.success() {
         bail!(
             "ffprobe failed: {}",
@@ -4221,11 +4248,14 @@ fn orientation_name(width: u32, height: u32) -> &'static str {
 /// and carry the raw evidence unchanged through sticky-camera lookup and
 /// persistence — see `cameras::mapping::CameraEvidence::exif_hint`.
 pub(crate) fn exif_camera(path: &Path) -> Option<String> {
-    let output = tool_command("exiftool")
-        .args(["-json", "-Make", "-Model"])
-        .arg(path)
-        .output()
-        .ok()?;
+    let mut command = tool_command("exiftool");
+    command.args(["-json", "-Make", "-Model"]).arg(path);
+    let output = crate::stall::output_with_timeout(
+        &mut command,
+        &format!("exiftool on {}", path.display()),
+        crate::stall::io_stall_timeout(),
+    )
+    .ok()?;
     if !output.status.success() {
         return None;
     }
@@ -4640,6 +4670,45 @@ mod tests {
         let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).unwrap();
         let project = catalog.create_project("Test project").unwrap();
         (directory, catalog, project)
+    }
+
+    /// #76: a volume that stops answering leaves a read parked forever rather
+    /// than failing. The ingest has to give up on its own, because the
+    /// import's disconnect handling only runs on an `Err` — a call that never
+    /// returns bypasses every recovery path the import has.
+    #[cfg(unix)]
+    #[test]
+    fn an_ingest_whose_read_never_returns_gives_up_instead_of_hanging() {
+        let (directory, catalog, project) = catalog_fixture();
+        let unresponsive = directory.path().join("unresponsive.MP4");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&unresponsive)
+                .status()
+                .unwrap()
+                .success(),
+            "could not create the FIFO this test needs"
+        );
+
+        // Run the ingest on its own thread so a regression fails this test in
+        // seconds instead of hanging the suite the way it hung the app.
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let outcome =
+                crate::stall::with_io_stall_timeout(std::time::Duration::from_millis(300), || {
+                    catalog.ingest_file_with_camera(&project.id, &unresponsive, None)
+                });
+            let _ = sender.send(outcome.err().map(|error| format!("{error:#}")));
+        });
+
+        match receiver.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(Some(error)) => assert!(
+                error.contains("stopped answering"),
+                "the failure must name the stall, got: {error}"
+            ),
+            Ok(None) => panic!("ingesting an unresponsive path unexpectedly succeeded"),
+            Err(_) => panic!("the ingest never returned — this is the hang #76 is about"),
+        }
     }
 
     #[test]

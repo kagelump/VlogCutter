@@ -631,6 +631,12 @@ export interface ImportOutcome {
    * committed, and resuming copies only the remainder.
    */
   sourceDisconnected?: boolean;
+  /**
+   * The run stopped because the archive destination went away underneath it
+   * (#76). The mirror of `sourceDisconnected`: committed clips stayed
+   * committed, and resuming copies only the remainder.
+   */
+  destinationDisconnected?: boolean;
   failures: Array<{ path: string; error: string }>;
   /** A committed clip needs optional bookkeeping attention; it is not a failed import. */
   warnings?: Array<{ path: string; error: string }>;
