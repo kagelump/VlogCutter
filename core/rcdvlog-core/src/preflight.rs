@@ -1393,6 +1393,14 @@ impl Catalog {
             ..Default::default()
         };
 
+        tracing::info!(
+            target: "rcdvlog_core::import",
+            total,
+            total_bytes,
+            verify_copies,
+            "run_import: begin copy loop"
+        );
+
         for (index, item) in actionable.iter().enumerate() {
             let stage = if item.classification == Classification::New && plan.destination.copies {
                 ImportStage::Copying
@@ -1413,6 +1421,14 @@ impl Catalog {
             }
             let completed_before_file = completed_bytes;
             let mut committed_asset = None;
+            let file_started = std::time::Instant::now();
+            tracing::debug!(
+                target: "rcdvlog_core::import",
+                index,
+                total,
+                file = %item.filename,
+                "import_one: begin"
+            );
             match self.import_one(
                 project_id,
                 item,
@@ -1486,6 +1502,13 @@ impl Catalog {
                     });
                 }
             }
+            tracing::debug!(
+                target: "rcdvlog_core::import",
+                index,
+                file = %item.filename,
+                elapsed_ms = file_started.elapsed().as_millis() as u64,
+                "import_one: end"
+            );
             if !on_progress(ImportProgress {
                 stage,
                 completed_items: index + 1,

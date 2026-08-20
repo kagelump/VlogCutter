@@ -1143,6 +1143,12 @@ async fn preflight_import(
     let catalog = state.catalog()?;
     let cancel = state.import_cancel.clone();
     cancel.store(false, Ordering::SeqCst);
+    tracing::info!(
+        target: "rcdvlog_desktop_lib::import",
+        project_id = %project_id,
+        source_path = %source_path,
+        "preflight_import: begin"
+    );
     tauri::async_runtime::spawn_blocking(move || {
         // A caller may offer the remembered archive root before it knows what
         // kind of source was picked. Non-card folders always remain in place.
@@ -1191,6 +1197,14 @@ async fn run_smart_import(
     let catalog = state.catalog()?;
     let cancel = state.import_cancel.clone();
     cancel.store(false, Ordering::SeqCst);
+    tracing::info!(
+        target: "rcdvlog_desktop_lib::import",
+        project_id = %project_id,
+        items = plan.items.len(),
+        verify_copies,
+        make_proxies,
+        "run_smart_import: begin"
+    );
     let pid = project_id.clone();
     let import_app = app.clone();
     let report =
@@ -1337,6 +1351,14 @@ async fn run_smart_import(
         state.thumbnail_coordinator.clone(),
         touched_asset_ids,
         app,
+    );
+    tracing::info!(
+        target: "rcdvlog_desktop_lib::import",
+        imported = report.outcome.imported,
+        relinked = report.outcome.relinked,
+        failures = report.outcome.failures.len(),
+        cancelled = report.outcome.cancelled,
+        "run_smart_import: end"
     );
     Ok(report)
 }

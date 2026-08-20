@@ -2880,6 +2880,12 @@ impl Catalog {
         };
         let task_work: Vec<u64> = pending.iter().map(|asset| asset.size_bytes).collect();
         let worker_count = pending.len().clamp(1, PROXY_WORKERS);
+        tracing::info!(
+            target: "rcdvlog_core::proxy",
+            worker_count,
+            pending = task_work.len(),
+            "generate_missing_proxies: begin"
+        );
         let task_kind = proxy_task_kind(worker_count);
         let mut estimator = BatchEstimator::new(
             &task_work,
@@ -2920,6 +2926,13 @@ impl Catalog {
                         else {
                             break;
                         };
+                        let asset_id = asset.id.clone();
+                        tracing::debug!(
+                            target: "rcdvlog_core::proxy",
+                            index,
+                            asset = %asset_id,
+                            "proxy worker: spawn ffmpeg"
+                        );
                         let started = Instant::now();
                         let result =
                             catalog.generate_proxy_untracked_with_progress(&asset.id, |fraction| {
@@ -2931,6 +2944,22 @@ impl Catalog {
                                     ),
                                 });
                             });
+                        match &result {
+                            Ok(_) => tracing::debug!(
+                                target: "rcdvlog_core::proxy",
+                                index,
+                                asset = %asset_id,
+                                elapsed_ms = started.elapsed().as_millis() as u64,
+                                "proxy worker: ffmpeg done"
+                            ),
+                            Err(error) => tracing::warn!(
+                                target: "rcdvlog_core::proxy",
+                                index,
+                                asset = %asset_id,
+                                error = %format!("{error:#}"),
+                                "proxy worker: ffmpeg failed"
+                            ),
+                        }
                         if outcome_sender
                             .send(ProxyWorkerMessage::Finished(Box::new(
                                 ProxyWorkerFinished {
