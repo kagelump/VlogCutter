@@ -38,6 +38,12 @@ epic.
   (`PRD.md` §21.4).
 - The Vite browser mock is never evidence that persistence, media processing, or
   native behavior works.
+- **The shell fits the window; content never sizes it.** `.app-shell` is a grid
+  with a `minmax(0, 1fr)` column and `min-width: 0` rows, so no row's content
+  can widen the shell, and the top bar clips rather than pushing. The only
+  element allowed a scrollable overflow wider than the viewport is
+  `story-scroll`, which owns the chronology canvas. Status regions yield before
+  controls do (#68).
 
 ## 3. Chronology architecture
 

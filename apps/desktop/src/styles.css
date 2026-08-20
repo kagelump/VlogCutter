@@ -49,7 +49,16 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 /* Exactly three children: topbar, workbench, ribbon. A fourth would land in
    an implicit auto row and silently take height from the workbench, which is
    what the chronology drawer used to do. */
-.app-shell { height: 100vh; display: grid; grid-template-rows: 44px minmax(0, 1fr) auto; }
+/* One column, pinned to the window (#68).
+   Without an explicit track the grid gets an implicit `auto` column, and grid
+   items default to `min-width: auto` — so the widest row's *min-content* sized
+   every row. An active import put ~500px of progress text in the top bar, the
+   column grew to 1633px at a 1280px window, and the Story Ribbon inherited that
+   width and hung 353px outside the screen. `minmax(0, 1fr)` plus `min-width: 0`
+   on the rows makes that impossible: no top-bar state can widen the shell, and
+   `story-scroll` stays the only horizontal scroller in the app. */
+.app-shell { height: 100vh; width: 100%; display: grid; grid-template-columns: minmax(0, 1fr); grid-template-rows: 44px minmax(0, 1fr) auto; overflow: hidden; }
+.app-shell > * { min-width: 0; }
 
 .topbar {
   position: relative;
@@ -57,10 +66,27 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   align-items: center;
   gap: 12px;
   padding: 0 14px;
+  min-width: 0;
+  /* The row is contained by the shell above; this keeps its own children from
+     painting over the window edge once they have compressed as far as they go. */
+  overflow: hidden;
   background: #151a1e;
   border-bottom: 1px solid var(--line);
   -webkit-app-region: drag;
 }
+
+/* What yields, and in what order (#68). Everything that is a control keeps its
+   size; the status region is the only thing that gives, because it is the only
+   thing that can lose a few characters and still do its job. */
+.topbar > .wordmark,
+.topbar > .project-switcher,
+.topbar > .mode-switcher,
+.topbar > .desktop-lifecycle-action,
+.topbar > .topbar-overflow,
+.topbar > .sync-chip,
+.topbar > .media-split,
+.topbar > .button,
+.topbar > .shortcut-help-button { flex: none; }
 
 .topbar button, .topbar select, .media-split { -webkit-app-region: no-drag; }
 
@@ -112,6 +138,8 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
    entire replacement for the 28px status line, which was reserved whether or
    not it had anything to say. */
 .operation-slot {
+  /* Shrinks to nothing before any control does. */
+  flex: 0 1 auto;
   min-width: 0;
   display: flex;
   align-items: center;
@@ -123,7 +151,13 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   -webkit-app-region: no-drag;
 }
 .operation-slot:empty { display: none; }
-.operation-slot > span { overflow: hidden; text-overflow: ellipsis; }
+/* A flex item's default `min-width: auto` refuses to shrink below its own
+   min-content, which is what let a long stage label push the shell wider than
+   the window. These are the only parts allowed to lose characters. */
+.operation-slot > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.operation-slot > output, .operation-slot > .progress-cancel { flex: none; }
+.error-banner { min-width: 0; }
+.error-banner > :first-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .operation-slot output { color: #b9c2c6; font: inherit; }
 .progress-track { width: 160px; height: 3px; flex: none; overflow: hidden; background: #283036; border-radius: 3px; }
 .progress-track > span { display: block; height: 100%; background: var(--amber); border-radius: inherit; transition: width 180ms ease-out; }
