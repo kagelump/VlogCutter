@@ -628,6 +628,12 @@ impl Catalog {
             anyhow::bail!("import source is not a directory: {}", source.display());
         }
         let card = inspect_card(source)?;
+        if let Some(found) = card.as_ref() {
+            // Tie this card session to the hardware it was read from (#78).
+            // Best-effort: a volume that cannot identify itself must not stop
+            // an import from being planned.
+            let _ = self.observe_card_volume(source, &found.session_id);
+        }
 
         let mut candidates: Vec<PathBuf> = WalkDir::new(source)
             .follow_links(false)

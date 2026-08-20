@@ -7,7 +7,7 @@ use thiserror::Error;
 
 use crate::chronology::forward_migrate_project_chronology;
 
-pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 24;
+pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 25;
 
 const MIGRATION_TABLE_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -227,6 +227,12 @@ pub const PROJECT_CATALOG_MIGRATIONS: &[SqliteMigration] = &[
         name: "import_cutoffs",
         source_identity: "project-catalog/0024-import-cutoffs/20260820",
         apply: add_import_cutoffs,
+    },
+    SqliteMigration {
+        id: 25,
+        name: "volume_identity",
+        source_identity: "project-catalog/0025-volume-identity/20260820",
+        apply: add_volume_identity,
     },
 ];
 
@@ -1340,6 +1346,44 @@ fn add_import_cutoffs(transaction: &Transaction<'_>) -> Result<()> {
         CREATE INDEX IF NOT EXISTS import_cutoffs_project
             ON import_cutoffs(project_id);
         "#,
+    )?;
+    Ok(())
+}
+
+/// Gives volumes an identity of their own, so a remembered root path stops
+/// meaning "whatever is mounted here right now".
+///
+/// The unique indexes carry the honesty rule. A volume that reports a UUID is
+/// unique *by that UUID*, so it is the same volume wherever it mounts. A volume
+/// that reports none is keyed by its path instead — enough to stay one row
+/// rather than growing without bound, and deliberately not enough to prove
+/// identity, which is why `volume_identity_is_verifiable` gates on the UUID
+/// rather than on the row existing.
+fn add_volume_identity(transaction: &Transaction<'_>) -> Result<()> {
+    transaction.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS volumes (
+            volume_id TEXT PRIMARY KEY,
+            volume_uuid TEXT,
+            label TEXT NOT NULL DEFAULT '',
+            last_mount_path TEXT NOT NULL DEFAULT '',
+            removable INTEGER NOT NULL DEFAULT 0,
+            last_card_session_id TEXT,
+            first_seen_at TEXT NOT NULL,
+            last_seen_at TEXT NOT NULL
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS volumes_by_uuid
+            ON volumes(volume_uuid) WHERE volume_uuid IS NOT NULL;
+        CREATE UNIQUE INDEX IF NOT EXISTS volumes_unidentified_by_path
+            ON volumes(last_mount_path) WHERE volume_uuid IS NULL;
+        "#,
+    )?;
+    add_column_if_missing(transaction, "archive_root_bindings", "volume_id", "TEXT")?;
+    add_column_if_missing(
+        transaction,
+        "project_asset_local_locations",
+        "volume_id",
+        "TEXT",
     )?;
     Ok(())
 }

@@ -178,19 +178,24 @@ pub(crate) fn record_verification(
         guard,
         at: now,
     } = verification;
+    // Which drive this landed on, for naming it while it is disconnected
+    // (#78). A resolved-from-known-volumes hint, never an identity claim, and
+    // never a subprocess: this runs once per verified asset.
+    let volume_id = crate::volumes::volume_id_for_path(connection, path)?;
     connection.execute(
         r#"
         INSERT INTO project_asset_local_locations(
             asset_id, node_id, local_path, created_at,
             verification_state, verified_fingerprint,
-            verified_size_bytes, verified_mtime_millis, verified_at
-        ) VALUES (?1, ?2, ?3, ?8, ?4, ?5, ?6, ?7, ?8)
+            verified_size_bytes, verified_mtime_millis, verified_at, volume_id
+        ) VALUES (?1, ?2, ?3, ?8, ?4, ?5, ?6, ?7, ?8, ?9)
         ON CONFLICT(asset_id, node_id, local_path) DO UPDATE SET
             verification_state = excluded.verification_state,
             verified_fingerprint = excluded.verified_fingerprint,
             verified_size_bytes = excluded.verified_size_bytes,
             verified_mtime_millis = excluded.verified_mtime_millis,
-            verified_at = excluded.verified_at
+            verified_at = excluded.verified_at,
+            volume_id = COALESCE(excluded.volume_id, project_asset_local_locations.volume_id)
         "#,
         params![
             asset_id,
@@ -201,6 +206,7 @@ pub(crate) fn record_verification(
             guard.map(|guard| guard.size_bytes),
             guard.and_then(|guard| guard.mtime_millis),
             now,
+            volume_id,
         ],
     )?;
     Ok(())

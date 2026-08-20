@@ -38,6 +38,11 @@ pub struct ArchiveRoot {
     /// Free bytes at the mount point, when it is reachable. The import dialog
     /// refuses to start a copy that will not fit.
     pub available_bytes: Option<u64>,
+    /// The volume this root was bound to on this node (#78). `None` for a
+    /// binding made before volumes had identity, or on a platform that cannot
+    /// describe one; such a root still resolves by path, it just cannot prove
+    /// the drive that answered is the drive it was bound to.
+    pub volume_id: Option<String>,
     pub created_at: String,
 }
 
@@ -78,6 +83,7 @@ impl Catalog {
         )?;
         transaction.commit()?;
         drop(connection);
+        self.record_binding_volume(&id, mount_path)?;
         self.archive_root(&id)
     }
 
@@ -120,6 +126,9 @@ impl Catalog {
             "#,
             params![archive_root_id, node_id, mount_text, now()],
         )?;
+        drop(connection);
+        self.record_binding_volume(archive_root_id, mount_path)?;
+        let connection = self.connection()?;
 
         // Re-resolve every location stored under this root. `local_path` is a
         // derived cache; the root-relative path is what was true all along.
@@ -161,6 +170,47 @@ impl Catalog {
             .with_context(|| format!("archive root not found: {archive_root_id}"))
     }
 
+    /// Records which volume a root's binding landed on (#78).
+    ///
+    /// Best-effort by design: a platform or a volume that cannot describe
+    /// itself leaves the binding without identity rather than failing the
+    /// bind. Such a root still resolves by path — it simply cannot later prove
+    /// the drive that answered is the drive it was bound to, which is exactly
+    /// what `archive_root_volume_matches` reports.
+    fn record_binding_volume(&self, archive_root_id: &str, mount_path: &Path) -> Result<()> {
+        let Some(facts) = crate::cards::inspect_volume(mount_path) else {
+            return Ok(());
+        };
+        let volume_id = self.observe_volume(mount_path, &facts)?;
+        let node_id = self.node_id()?;
+        self.connection()?.execute(
+            "UPDATE archive_root_bindings SET volume_id = ?3
+             WHERE archive_root_id = ?1 AND node_id = ?2",
+            params![archive_root_id, node_id, volume_id],
+        )?;
+        Ok(())
+    }
+
+    /// Whether the volume now mounted at this root's path is the one it was
+    /// bound to.
+    ///
+    /// The gate for continuing work against a destination that went away and
+    /// came back. `false` covers three different situations on purpose —
+    /// a different volume answered, the binding predates volume identity, or
+    /// nothing there can identify itself — because none of them is proof, and
+    /// the caller's response to all three is the same: do not continue
+    /// automatically.
+    pub fn archive_root_volume_matches(&self, archive_root_id: &str) -> Result<bool> {
+        let root = self.archive_root(archive_root_id)?;
+        let (Some(volume_id), Some(mount)) = (root.volume_id, root.local_mount_path) else {
+            return Ok(false);
+        };
+        let Some(facts) = crate::cards::inspect_volume(Path::new(&mount)) else {
+            return Ok(false);
+        };
+        self.volume_identity_is_verifiable(&volume_id, &facts)
+    }
+
     /// Every named destination, newest first, each resolved against this machine.
     pub fn list_archive_roots(&self) -> Result<Vec<ArchiveRoot>> {
         let connection = self.connection()?;
@@ -171,7 +221,8 @@ impl Catalog {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
             r#"
-            SELECT r.archive_root_id, r.display_name, r.created_at, b.local_mount_path
+            SELECT r.archive_root_id, r.display_name, r.created_at, b.local_mount_path,
+                   b.volume_id
             FROM archive_roots r
             LEFT JOIN archive_root_bindings b
                 ON b.archive_root_id = r.archive_root_id AND b.node_id = ?1
@@ -184,11 +235,12 @@ impl Catalog {
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
                 row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
             ))
         })?;
         let mut roots = Vec::new();
         for row in rows {
-            let (id, display_name, created_at, local_mount_path) = row?;
+            let (id, display_name, created_at, local_mount_path, volume_id) = row?;
             let available = local_mount_path
                 .as_deref()
                 .is_some_and(|path| Path::new(path).is_dir());
@@ -204,6 +256,7 @@ impl Catalog {
                     .flatten(),
                 local_mount_path,
                 available,
+                volume_id,
                 created_at,
             });
         }
@@ -292,6 +345,34 @@ impl Catalog {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    /// #78: a root is bound to a *volume*, not merely to a pathname, so that
+    /// "is my archive back?" is a question about hardware rather than about
+    /// whether something now occupies the folder it used to live in.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn binding_a_root_remembers_which_volume_it_was_bound_to() {
+        let directory = tempdir().unwrap();
+        let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).unwrap();
+        let mount = directory.path().join("Volumes/Shuttle");
+        std::fs::create_dir_all(&mount).unwrap();
+
+        let root = catalog.create_archive_root("Shuttle SSD", &mount).unwrap();
+
+        let volume_id = root
+            .volume_id
+            .as_deref()
+            .expect("a root bound on macOS records the volume it landed on");
+        let volume = catalog.known_volume(volume_id).unwrap().unwrap();
+        assert!(
+            volume.identity_is_verifiable(),
+            "the host volume reports a UUID, so the binding can be proven later"
+        );
+        assert!(
+            catalog.archive_root_volume_matches(&root.id).unwrap(),
+            "the volume has not moved, so the root still matches it"
+        );
+    }
 
     /// The promise the whole model exists for: the archive drive moves, the user
     /// says where it went once, and every clip under it resolves again — no

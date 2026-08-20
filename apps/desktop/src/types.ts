@@ -360,6 +360,13 @@ export interface ArchiveRoot {
   localMountPath: string | null;
   available: boolean;
   availableBytes: number | null;
+  /**
+   * The volume this root was bound to on this machine (#78). Null for a
+   * binding made before volumes had identity, or for a volume that cannot
+   * describe itself — such a root still resolves by path, it just cannot prove
+   * the drive that answered is the drive it was bound to.
+   */
+  volumeId: string | null;
   createdAt: string;
 }
 

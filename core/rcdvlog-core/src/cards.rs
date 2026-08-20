@@ -133,24 +133,99 @@ impl VolumeSource for MountedVolumes {
     }
 }
 
-/// `diskutil` is the macOS source of truth for whether a mounted volume is
-/// removable/ejectable. Folder shape alone identifies a camera layout, not the
-/// physical lifecycle: a NAS share can also contain a DCIM directory.
+/// What `diskutil` says about the volume mounted at `path`.
+///
+/// `diskutil` is the macOS source of truth both for whether a volume is
+/// removable/ejectable and for the identity that survives a remount. Folder
+/// shape alone identifies a camera layout, not the physical lifecycle: a NAS
+/// share can also contain a DCIM directory.
+///
+/// One plist answers both questions, so removability and identity are never
+/// two separate shell-outs. Returns `None` when the volume cannot be described
+/// at all, which is distinct from a volume that describes itself as having no
+/// UUID — the latter is a fact worth recording, the former is not a fact.
+///
+/// The path is resolved to its device first. `diskutil info` only accepts a
+/// mount point or a device, and the paths we care about mostly are not mount
+/// points: an archive root is routinely a folder well inside a volume, like
+/// `~/Movies/VideoProjects`. Asking which device backs the path is what makes
+/// "the volume this lives on" answerable for an arbitrary directory.
+pub fn inspect_volume(path: &Path) -> Option<VolumeFacts> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    let device = crate::stall::output_with_timeout(
+        std::process::Command::new("/usr/bin/stat")
+            .arg("-f")
+            .arg("%Sd")
+            .arg(path),
+        &format!("stat on {}", path.display()),
+        crate::stall::io_stall_timeout(),
+    )
+    .ok()
+    .filter(|output| output.status.success())?;
+    let device = String::from_utf8_lossy(&device.stdout).trim().to_string();
+    if device.is_empty() || device == "???" {
+        return None;
+    }
+
+    let output = crate::stall::output_with_timeout(
+        std::process::Command::new("/usr/sbin/diskutil")
+            .arg("info")
+            .arg("-plist")
+            .arg(&device),
+        &format!("diskutil on {device}"),
+        crate::stall::io_stall_timeout(),
+    )
+    .ok()?;
+    output
+        .status
+        .success()
+        .then(|| parse_volume_facts(&output.stdout))
+}
+
 fn macos_volume_is_removable(path: &Path) -> bool {
     if !cfg!(target_os = "macos") {
         return true;
     }
-    let Ok(output) = std::process::Command::new("/usr/sbin/diskutil")
-        .arg("info")
-        .arg("-plist")
-        .arg(path)
-        .output()
-    else {
-        return false;
-    };
-    output.status.success()
-        && (plist_boolean(&output.stdout, "RemovableMedia") == Some(true)
-            || plist_boolean(&output.stdout, "Ejectable") == Some(true))
+    inspect_volume(path).is_some_and(|facts| facts.removable)
+}
+
+/// What a mounted volume says about itself.
+///
+/// The identity is the anchor and the mount path is a hint: a path change is
+/// routine, but a different identity at a remembered path means a different
+/// volume, which is the one case that must never be adopted silently.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VolumeFacts {
+    /// Hardware identity, absent when the volume exposes none. Never
+    /// synthesised from the path: a made-up identity would compare equal to
+    /// whatever mounts there next, which is exactly the confusion to avoid.
+    pub volume_uuid: Option<String>,
+    /// What the volume calls itself, for naming it while it is disconnected.
+    pub label: String,
+    /// Whether this is the kind of volume that goes away.
+    pub removable: bool,
+}
+
+fn parse_volume_facts(plist: &[u8]) -> VolumeFacts {
+    VolumeFacts {
+        volume_uuid: plist_string(plist, "VolumeUUID").filter(|value| !value.trim().is_empty()),
+        label: plist_string(plist, "VolumeName").unwrap_or_default(),
+        removable: plist_boolean(plist, "RemovableMedia") == Some(true)
+            || plist_boolean(plist, "Ejectable") == Some(true),
+    }
+}
+
+fn plist_string(bytes: &[u8], key: &str) -> Option<String> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let tail = text
+        .split_once(&format!("<key>{key}</key>"))?
+        .1
+        .trim_start();
+    let inner = tail.strip_prefix("<string>")?;
+    let (value, _) = inner.split_once("</string>")?;
+    Some(value.to_string())
 }
 
 fn plist_boolean(bytes: &[u8], key: &str) -> Option<bool> {
@@ -327,6 +402,46 @@ mod tests {
         assert_eq!(plist_boolean(plist, "RemovableMedia"), Some(true));
         assert_eq!(plist_boolean(plist, "Internal"), Some(false));
         assert_eq!(plist_boolean(plist, "Missing"), None);
+    }
+
+    /// #78: one `diskutil` call answers both questions. The identity is what
+    /// survives a remount at a different path, so it is read from the same
+    /// plist rather than shelling out a second time.
+    #[test]
+    fn one_plist_read_yields_both_identity_and_removability() {
+        let plist = br#"<?xml version="1.0"?><plist><dict>
+          <key>Ejectable</key><true/>
+          <key>RemovableMedia</key><true/>
+          <key>VolumeName</key><string>SD_Card</string>
+          <key>VolumeUUID</key><string>BA088C5E-2334-48A0-8292-34F4E42FD97E</string>
+        </dict></plist>"#;
+
+        let facts = parse_volume_facts(plist);
+
+        assert_eq!(
+            facts.volume_uuid.as_deref(),
+            Some("BA088C5E-2334-48A0-8292-34F4E42FD97E")
+        );
+        assert_eq!(facts.label, "SD_Card");
+        assert!(facts.removable);
+    }
+
+    /// A volume that exposes no UUID is a known-unknown. Recording absence is
+    /// the whole point: a synthesised identity would silently compare equal to
+    /// the next volume mounted at the same path.
+    #[test]
+    fn a_volume_without_a_uuid_reports_absence_rather_than_a_guess() {
+        let plist = br#"<?xml version="1.0"?><plist><dict>
+          <key>Ejectable</key><false/>
+          <key>RemovableMedia</key><false/>
+          <key>VolumeName</key><string>media</string>
+        </dict></plist>"#;
+
+        let facts = parse_volume_facts(plist);
+
+        assert_eq!(facts.volume_uuid, None);
+        assert_eq!(facts.label, "media");
+        assert!(!facts.removable);
     }
 
     #[test]

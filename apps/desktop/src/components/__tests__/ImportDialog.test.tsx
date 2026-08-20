@@ -19,6 +19,7 @@ const root: ArchiveRoot = {
   localMountPath: "/Volumes/nas/VideoArchive",
   available: true,
   availableBytes: 1_200_000_000_000,
+  volumeId: "vol_nas",
   createdAt: "2026-08-09T00:00:00Z",
 };
 

@@ -39,6 +39,7 @@ mod operations;
 mod preflight;
 mod stall;
 mod storage;
+mod volumes;
 
 use analysis::audio::{AudioExtractor, FfmpegAudioExtractor};
 use analysis::consolidate::{

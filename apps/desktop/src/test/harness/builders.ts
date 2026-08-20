@@ -243,6 +243,7 @@ export interface ArchiveRootSpec {
   localMountPath?: string;
   available?: boolean;
   availableBytes?: number | null;
+  volumeId?: string | null;
   createdAt?: string;
 }
 
@@ -253,6 +254,7 @@ export function buildArchiveRoot(displayName: string, spec: ArchiveRootSpec = {}
     localMountPath: spec.localMountPath ?? `/Volumes/${displayName.replace(/\s+/g, "")}`,
     available: spec.available ?? true,
     availableBytes: spec.availableBytes ?? 1_200_000_000_000,
+    volumeId: spec.volumeId ?? `vol_${slugify(displayName)}`,
     createdAt: spec.createdAt ?? "2026-08-01T09:00:00.000Z",
   };
 }
