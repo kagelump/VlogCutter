@@ -21,3 +21,6 @@ __pycache__/
 
 # Coverage reports from `pnpm test:desktop:coverage`.
 coverage/
+
+# Dev session logs (see scripts/dev-with-logs.mjs).
+logs/
