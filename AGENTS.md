@@ -2,6 +2,8 @@
 
 This file is the operational handoff for agents working on RCD VlogCutter. It applies to the entire repository. Read it before changing code, then read the task-relevant source and the linked documentation. Do not treat the aspirational portions of `PRD.md` as already implemented.
 
+This repository-root `AGENTS.md` describes the *software repository*. It is not the same artifact as the generated `AGENTS.md` that will one day live inside each user's video project root (PRD §6.3, issue #48). That one describes a footage project to a coding agent; this one describes source code to a contributor. Do not conflate them.
+
 ## 1. Product in one paragraph
 
 RCD VlogCutter is a local-first, single-user footage labeling system. The macOS desktop references immutable originals in place, except that its explicit card-import workflow may copy from a read-only removable card into a named create-only archive root, and keeps one laptop-local SQLite catalog per project. The optional private Ubuntu companion server keeps its own local-SSD control catalog and project replicas, indexes read-only NAS roots, runs durable media jobs, serves Chrome review/admin, synchronizes immutable project operations, and creates verified backups. The Mac remains useful offline and neither node shares live SQLite files.
@@ -26,6 +28,13 @@ Never violate these invariants without explicit user approval:
   media, and never overwrites an archived original. See
   `docs/tasks/import/ARCHITECTURE.md` §2.1.
 - SQLite is canonical. Portable project catalogs own project operations; the server's local-SSD control catalog owns server jobs/library/auth and its local replicas. Do not introduce a competing JSON store, share SQLite/WAL across nodes, or add a permanent Python service.
+- The accepted agent architecture (PRD §25.1 item 18) is a project-local
+  workspace layered over the revision-safe CLI. Workspace files are the agent
+  discovery and context layer; the CLI is the safe machine-control layer; SQLite
+  stays canonical. When the workspace lands, do not let a generated projection
+  become a second write path: hand-editing `PROJECT.md` or `edit-plan.json` must
+  not mutate catalog state. A custom embedded AI harness and an MCP server are
+  both out of scope for the MVP.
 - The owning Rust crate controls domain behavior. Desktop, web, HTTP, Tauri, and CLI adapters must not implement competing ingest, sync, job, storage, chronology, or representation logic.
 - Generated outputs live in project-local caches or the configured server derived root, never beside originals.
 - Review, notes, search, and chronology should remain useful when originals are offline and proxies are available.
@@ -193,6 +202,14 @@ Important gaps; do not accidentally describe these as complete:
   preview rendering, and OTIO writing exist, but the desktop edit-plan workflow
   still lacks reordering, trimming, removal, preview playback, export history,
   and overwrite confirmation; there is no edit-plan CLI yet.
+- No project-local agent workspace. A created project folder contains
+  `catalog.sqlite3`, `cache/`, and `exports/` and nothing else. Materializing
+  `AGENTS.md`, `PROJECT.md`, `script.md`, `project.json`, and `edit-plan.json`
+  into the video project root — so a cold Claude Code or Codex session opened
+  there can learn the project and safely create an edit-plan revision without
+  the user bootstrapping the integration — is a planned capability tracked by
+  issue #48 and PRD Milestone 5. Script revisions do not exist either. Do not
+  document or describe any of this as shipped.
 - Trip phases and timezone display are persisted and solved, and the ribbon can
   add a location/transit phase forward or backward from a hovered clip, edit an
   existing phase, and atomically cut a new phase from either side of a filled

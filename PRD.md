@@ -16,8 +16,8 @@ thumbnails/proxies, operation-backed chronology facts and deterministic solving,
 durable diagnostics, versioned edit plans, preview generation, deterministic
 OTIO writing, and JSON chronology diagnostics. The expanded calibration and
 edit-plan desktop workflows remain partial, and there is still no ingest
-preview, complete capture-sequence editor, edit-plan CLI, Resolve import
-acceptance, relink/cleanup, or AI feature set.
+preview, complete capture-sequence editor, edit-plan CLI, project-local agent
+workspace, Resolve import acceptance, relink/cleanup, or AI feature set.
 
 The optional private Ubuntu companion server is implemented at application `0.1.0`, sync protocol `1.0`, baseline format `1`, project schema `8`, control schema `10`, and backup format `1`. It adds read-only NAS scanning and verified global identity, durable jobs, shared representations, independent server project replicas synchronized by operations, Chrome review/admin, revocable authentication, and verified database backups. It never shares live SQLite files or uploads originals. See [`docs/server/README.md`](docs/server/README.md).
 
@@ -271,17 +271,56 @@ Tracks project-specific facts:
 
 ## 6.3 Project workspace
 
-Human- and agent-readable files:
+The project root is a first-class workspace for general-purpose coding agents
+such as Claude Code and Codex. A user should be able to open the video project
+root directly in such an agent and have the agent learn what the project is and
+how to work on it safely, without bespoke per-session setup. Materializing this
+workspace is planned, not implemented; it is tracked by issue #48 and Milestone
+5. Only `catalog.sqlite3`, `cache/`, and `exports/` exist today.
+
+Intended project-root layout:
 
 ```text
 ~/Movies/VideoProjects/TripName/
-├── catalog.sqlite3
-├── cache/
+├── AGENTS.md          # generated  — how an agent should work on this project
+├── PROJECT.md         # generated  — compact, readable project state
+├── script.md          # authored   — human/agent creative intent
+├── project.json       # generated  — machine-readable project identity/config
+├── edit-plan.json     # projection — transactional, revision-guarded
+├── catalog.sqlite3    # canonical  — do not edit directly
+├── cache/             # generated  — disposable, do not edit directly
 │   └── proxies/
-└── exports/
+└── exports/           # generated  — export outputs and history
 ```
 
-These files are not the only canonical state, but they expose stable working artifacts to external agents.
+SQLite remains the single canonical store for catalog, project, chronology,
+annotation, job, and revision state. Workspace files are a discovery and
+interchange layer over it, never a competing source of truth.
+
+Three artifact classes, with different authority:
+
+**1. Human- and agent-authored artifacts** — `script.md`, and future creative
+notes or story intent. These may be edited directly by the human or by an
+agent. They are versioned inputs to VlogCutter, not projections of it.
+
+**2. Generated read-only projections** — `AGENTS.md`, `PROJECT.md`, and
+`project.json`. `PROJECT.md` carries compact agent-readable state such as clip
+counts, chronology span, analysis status, unresolved issues, and the current
+script and edit-plan revisions. VlogCutter owns these values and regenerates
+the projection; re-projecting unchanged state produces no file diff. Editing the
+Markdown must not become an alternate way of mutating canonical state.
+
+**3. Structured transactional projections** — `edit-plan.json`. Canonical
+edit-plan state stays in SQLite. The JSON file is an agent-readable projection
+and interchange artifact; arbitrary edits to it do not silently mutate the
+catalog. Mutation goes through revision-safe CLI operations, or through a future
+explicit apply/import operation that validates the plan and rejects a write
+based on a stale revision.
+
+Originals, `cache/`, and `catalog.sqlite3` are never edited directly by an
+agent. The generated `AGENTS.md` inside a video project is distinct from this
+repository's root `AGENTS.md`, which is an engineering handoff for people and
+agents working on VlogCutter's source code.
 
 ---
 
@@ -644,6 +683,18 @@ It should not be the primary chronology-correction interaction.
 
 # 15. CLI and Agent API
 
+The agent surface has two complementary halves. The project workspace of
+Section 6.3 is the *discovery, context, and bootstrap* layer: it is how an
+arbitrary coding agent, opened cold at a project root, learns that this is a
+VlogCutter video project, what it contains, which files it may edit, and that
+this CLI exists. The CLI is the *query, mutation, and control* layer: it is the
+authoritative transactional interface to canonical SQLite state, with stable
+JSON envelopes, explicit project selection, and revision checks.
+
+Neither replaces the other. The workspace is not optional, and it is not an
+alternative to the CLI. An MCP server is not required for the MVP; see
+Section 25.1.
+
 Implemented MVP commands:
 
 ```bash
@@ -682,6 +733,12 @@ CLI requirements:
 * No silent source-media mutation
 
 Transcript, keyframe, script-revision, semantic-search, and preview-render CLI commands are deferred with their underlying post-MVP features.
+
+Edit-plan commands and workspace projection do not exist yet. Both are tracked
+by issue #48 and specified in Milestone 5. When they land, workspace
+projections remain projections: writing to `PROJECT.md` or `edit-plan.json` by
+hand is not equivalent to a CLI mutation, and importing a changed projection is
+an explicit, validated, revision-guarded operation.
 
 ---
 
@@ -850,7 +907,7 @@ The MVP is successful when one real trip project can be completed through that l
 * Manual clock epochs, explicit clip exceptions, and contradiction reporting
 * Explainable best-time calculation with confidence and evidence
 * Text search over metadata available in the project
-* Versioned project workspace artifacts
+* Versioned project workspace artifacts that make the project root self-describing to a general-purpose coding agent (Section 6.3)
 * Non-interactive JSON CLI for project, clip, chronology, script, and edit-plan operations
 * Edit-plan validation
 * Preview rendering
@@ -923,6 +980,8 @@ This keeps domain behavior identical across the desktop and CLI while minimizing
     │   └── proxies/
     └── exports/
 ```
+
+This is the layout that exists today. The agent-facing workspace artifacts of Section 6.3 — `AGENTS.md`, `PROJECT.md`, `script.md`, `project.json`, and `edit-plan.json` — are planned and not yet materialized.
 
 The parent project folder defaults to `~/Movies/VideoProjects` and is configurable in global desktop settings. Project directories use a filesystem-safe form of the project name with numeric suffixes for collisions. The first-run screen scans immediate child folders for valid catalogs. Global playback settings offer autoplay modes of never, only when a proxy is available, or always; proxy-only autoplay is the default and existing settings files migrate to it.
 
@@ -1041,9 +1100,13 @@ Exit criteria:
 
 ## Milestone 5 — Agent workspace, CLI, and revision safety
 
+Tracked by issue #48, "Agent workspace + edit-plan CLI: make projects
+self-describing to Codex/Claude".
+
 Build:
 
-* Materialize `AGENTS.md`, `PROJECT.md`, `script.md`, `project.json`, and `edit-plan.json` from a versioned workspace template.
+* Materialize `AGENTS.md`, `PROJECT.md`, `script.md`, `project.json`, and `edit-plan.json` from a versioned workspace template, respecting the Section 6.3 authority classes.
+* Generate a project-local `AGENTS.md` that teaches a coding agent, with no prior VlogCutter knowledge, that this is a video project rather than a source tree; what the project contains; which files are generated, authored, or transactional; how to inspect clips, chronology, transcripts, VLM observations, representative media, and edit-plan state; how to use the CLI; how revisions and stale-write protection work; and that originals, caches, and `catalog.sqlite3` must never be edited directly.
 * Implement the Section 15 CLI surface with explicit project selection, stable JSON envelopes, and machine-readable error codes.
 * Add chronology explain and project status responses suitable for external agents.
 * Implement script and edit-plan revision creation, validation, activation, and stale-dependency reporting.
@@ -1051,12 +1114,20 @@ Build:
 * Make workspace projection writes atomic.
 * Document example Claude and Codex workflows using only the CLI and workspace files.
 
+Agents should reason from VlogCutter's derived knowledge — project status,
+chronology, labels, notes, transcripts, analysis summaries — plus targeted
+access to representative media such as thumbnails, keyframes, or a specific
+proxy range. Ingesting all original video into an agent's context is not the
+intended design and must not be required to complete the cold-start journey.
+
 Exit criteria:
 
+* Cold-start CUJ: a fresh Claude Code or Codex session opened at a project root, with no user-supplied setup instructions beyond the natural-language task, can discover from the project-local `AGENTS.md` how to inspect the project, find the relevant clips for a request such as "make a 3-minute sequence covering our arrival in Madrid", and create a new edit-plan revision through the CLI without touching originals, caches, or the catalog file directly.
 * Every documented CLI command has a JSON contract test and exits nonzero with a stable error code on failure.
 * Two edits based on the same script revision cannot silently replace one another.
 * An edit plan derived from an older script is visibly stale in the UI and CLI.
 * Re-projecting unchanged workspace state produces no file diff.
+* Hand-editing a generated projection does not change canonical state; importing a changed transactional projection is rejected when its base revision is stale.
 
 ## Milestone 6 — Edit plan, preview, and finishing handoff
 
@@ -1226,18 +1297,32 @@ The following decisions were accepted for the MVP on 2026-07-18.
     logical-root rebind. The app never formats, deletes, or claims a card is
     safe to erase. See `docs/tasks/import/ARCHITECTURE.md`.
 
+18. **Agent architecture (accepted 2026-08-20):** the MVP agent architecture is
+    a project-local workspace layered over the revision-safe `rcdvlog` CLI, with
+    SQLite remaining canonical. The video project root is a first-class
+    workspace: a generated project-local `AGENTS.md` and `PROJECT.md` make the
+    project self-describing to a general-purpose coding agent such as Claude
+    Code or Codex, and the CLI is the authoritative transactional interface for
+    reading and mutating canonical state. These are complementary layers, not
+    alternatives, and the workspace is not optional. A custom embedded AI
+    harness is not required. An MCP server is not required for the MVP; revisit
+    it only if a specific capability cannot be served cleanly through the
+    workspace-plus-CLI model. Reads and version-creating writes are allowed
+    without ceremony; activation and destructive changes require explicit
+    revision checks. Workspace authority classes are defined in Section 6.3.
+    Implementation is tracked by issue #48 and Milestone 5; none of it ships
+    today.
+
 ## 25.2 Remaining reversible workflow questions
 
-1. **Is CLI plus workspace access sufficient for Claude and Codex?** Or is an MCP server required later? Proposed MVP behavior: CLI and files only; reads and version-creating writes are allowed, while activation and destructive changes require explicit revision checks.
+1. **Is lexical search sufficient for the MVP?** Proposed MVP behavior: filename and notes filtering first; SQLite FTS can follow after the review loop is validated.
 
-2. **Is lexical search sufficient for the MVP?** Proposed MVP behavior: filename and notes filtering first; SQLite FTS can follow after the review loop is validated.
-
-3. **Resolved 2026-08-09 — same physical media at multiple paths:** retain
+2. **Resolved 2026-08-09 — same physical media at multiple paths:** retain
    multiple verified node-local locations, prefer a verified reachable
    location, and repair an offline asset when its sampled fingerprint is found
    elsewhere. Paths remain node-local and are never synchronized as project
    operations.
 
-4. **How are events and chapters created?** Proposed MVP behavior: defer both. Notes and chronological order are sufficient for the first workflow validation.
+3. **How are events and chapters created?** Proposed MVP behavior: defer both. Notes and chronological order are sufficient for the first workflow validation.
 
-5. **How should project deletion and cache cleanup work?** Proposed MVP behavior: no destructive project deletion in the UI; proxy cleanup is an explicit project action added after the main loop is validated.
+4. **How should project deletion and cache cleanup work?** Proposed MVP behavior: no destructive project deletion in the UI; proxy cleanup is an explicit project action added after the main loop is validated.

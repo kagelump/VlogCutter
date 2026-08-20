@@ -2,6 +2,33 @@
 
 `rcdvlog` is the non-interactive JSON control surface for desktop catalogs and the authenticated companion server. Local commands call the same Rust core as Tauri; remote commands use bounded documented HTTP operations rather than opening server databases.
 
+## The CLI and the project-local agent workspace
+
+This document describes the CLI as implemented today.
+
+The accepted product architecture (PRD §6.3, §15, §25.1 item 18) pairs this CLI
+with a project-local *agent workspace*. Issue #48 will make a VlogCutter video
+project root self-describing to a general-purpose coding agent: a generated
+`AGENTS.md` and `PROJECT.md` inside the project folder will tell an agent what
+the project is and how to use this CLI, so a cold Claude Code or Codex session
+opened at the project root needs no bespoke setup from the user.
+
+The two layers have different jobs:
+
+- **Workspace files** are the discovery, context, and bootstrap layer.
+- **This CLI** is the authoritative transactional interface for reading and
+  mutating canonical catalog and project state, with revision safety.
+
+Workspace projections do not replace SQLite, which stays canonical. Directly
+modifying a generated projection such as `PROJECT.md` or `edit-plan.json` is not
+equivalent to changing VlogCutter state; changes flow back only through a
+revision-safe CLI command or a future explicit, validated apply/import
+operation. Human- and agent-authored files are different: the planned
+`script.md` is a versioned input that may be edited directly.
+
+None of the workspace materialization, script revisions, or edit-plan commands
+exist yet. Everything below is implemented; anything marked planned is not.
+
 ## Build and catalog selection
 
 ```bash
@@ -254,7 +281,11 @@ failure. `labels consolidate` makes one text-only request and remaps only labels
 Rough-cut selection and source ranges remain separate from the labeling phase.
 The core and desktop now have an initial edit-plan/preview/OTIO path, but the
 CLI does not yet expose edit-plan revision, validation, preview, export, or
-history commands. That missing machine-readable surface is tracked by D01-T030.
+history commands. That missing machine-readable surface is tracked by D01-T030
+and by issue #48, which pairs it with the project-local agent workspace. When
+those commands land they are the supported way for an agent to create or
+activate an edit-plan revision; editing a projected `edit-plan.json` by hand is
+not.
 
 ## Companion-server commands
 
