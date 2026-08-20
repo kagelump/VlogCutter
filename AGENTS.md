@@ -166,8 +166,16 @@ Important gaps; do not accidentally describe these as complete:
   problem, because swapping cards through one camera is ordinary practice. The
   "same card" answer is an operation (`captureSequenceSplitDeclined`) and is
   reversible from the desk's Card tab.
-- No general mounted-volume inventory, project deletion, or cache cleanup UI.
-  Relink now
+- Project deletion and cache cleanup now ship (#16). Deletion runs from the
+  opening project library behind a removability audit — refusing a folder that
+  holds an archive root, a referenced original, another project's rows, or any
+  file the app did not create — and a typed project-name confirmation;
+  `delete_project` removes trip phases before assets because their clip anchors
+  are `ON DELETE RESTRICT`. Cache cleanup is a Settings storage panel that lists
+  the seven cache categories with their weight, replacement cost, and what stops
+  working until rebuilt; there is no single clear-cache button, and cleanup
+  reads nothing about the media so it works with every drive unplugged. There is
+  no general mounted-volume inventory UI. Relink now
   exists: media locations carry a verification state, ingest repairs an asset
   whose original it rediscovers, and an offline-volume diagnostic offers
   `Locate…` (CLI: `relink`). Queue rows carry a compact offline mark that

@@ -7,17 +7,20 @@
 
 ---
 
-## Current implementation checkpoint — 2026-07-28
+## Current implementation checkpoint — 2026-08-20
 
 The macOS desktop implements the local-first labeling vertical slice plus the
 domain foundation for chronology and edit handoff: project catalogs,
-reference-in-place ingest, metadata, notes/labels/reversible removal,
-thumbnails/proxies, operation-backed chronology facts and deterministic solving,
-durable diagnostics, versioned edit plans, preview generation, deterministic
-OTIO writing, and JSON chronology diagnostics. The expanded calibration and
-edit-plan desktop workflows remain partial, and there is still no ingest
-preview, complete capture-sequence editor, edit-plan CLI, project-local agent
-workspace, Resolve import acceptance, relink/cleanup, or AI feature set.
+reference-in-place ingest and removable-card import, metadata,
+notes/labels/reversible removal, thumbnails/proxies, local transcription and
+bounded cloud clip analysis, operation-backed chronology facts and deterministic
+solving, durable diagnostics, missing-volume relink, project deletion and cache
+cleanup, versioned edit plans, preview generation, deterministic OTIO writing,
+and JSON chronology diagnostics. The expanded calibration and edit-plan desktop
+workflows remain partial, and there is still no ingest preview, complete
+capture-sequence editor, edit-plan CLI, project-local agent workspace, or
+Resolve import acceptance. Local VLM inference, embeddings, and semantic search
+remain out of scope.
 
 The optional private Ubuntu companion server is implemented at application `0.1.0`, sync protocol `1.0`, baseline format `1`, project schema `8`, control schema `10`, and backup format `1`. It adds read-only NAS scanning and verified global identity, durable jobs, shared representations, independent server project replicas synchronized by operations, Chrome review/admin, revocable authentication, and verified database backups. It never shares live SQLite files or uploads originals. See [`docs/server/README.md`](docs/server/README.md).
 
@@ -918,12 +921,15 @@ The MVP is successful when one real trip project can be completed through that l
 
 These capabilities are intentionally excluded from the MVP so implementation can validate the ingest, reorder, review, notes, and export loop:
 
-* Automatic transcription
-* VLM summaries
 * Automatic visual clock detection
+* Local VLM inference
 * Embedding or semantic search
 * Automatic scene detection
 * Background full-file hashing after the fast fingerprint is available
+
+Local transcription and bounded cloud VLM clip analysis were subsequently
+brought into scope and now ship (see `AGENTS.md` §9); they are no longer
+post-MVP enrichments.
 
 The core review and chronology flows must remain useful without them. No permanent Python service or model-provider dependency should be introduced in anticipation of this later work.
 
@@ -1149,6 +1155,12 @@ Exit criteria:
 
 ## Milestone 7 — Optional analysis adapters
 
+The transcription adapter and the bounded cloud VLM clip-analysis adapter,
+including transcript/summary indexing and cost accounting, have already shipped
+ahead of this milestone (see `AGENTS.md` §9). The remaining items below —
+embeddings and semantic search, visual clock-anchor proposals, and scene
+detection — are still planned.
+
 Build only the enrichments selected for the MVP:
 
 * Transcription adapter and transcript indexing
@@ -1275,7 +1287,7 @@ The following decisions were accepted for the MVP on 2026-07-18.
 
 9. **Persistence:** use one portable SQLite catalog per project. New projects default to `~/Movies/VideoProjects/<project name>/`, with the parent folder configurable and laptop-local proxies stored beside the catalog.
 
-10. **AI analysis:** transcription, VLM summaries, semantic search, and automatic clock detection are excluded from the MVP. The purpose is to validate importing NAS clips into a project, ordering them, reviewing proxies, adding notes, and exporting a rough sequence.
+10. **AI analysis:** transcription, VLM summaries, semantic search, and automatic clock detection are excluded from the MVP. The purpose is to validate importing NAS clips into a project, ordering them, reviewing proxies, adding notes, and exporting a rough sequence. **Superseded (2026-08, see `AGENTS.md` §9):** local transcription and bounded cloud VLM clip analysis were later brought into MVP scope and now ship as an opt-in suggestion layer that never overwrites human notes or labels; semantic search, embeddings, local VLM inference, and automatic clock detection remain excluded.
 
 11. **Implementation:** React/TypeScript UI with a canonical Rust desktop and core. FFmpeg, ffprobe, and ExifTool are managed children. Python is allowed only for small exploratory analysis scripts or a short-lived OTIO exporter if direct JSON is insufficient.
 
@@ -1325,4 +1337,10 @@ The following decisions were accepted for the MVP on 2026-07-18.
 
 3. **How are events and chapters created?** Proposed MVP behavior: defer both. Notes and chronological order are sufficient for the first workflow validation.
 
-4. **How should project deletion and cache cleanup work?** Proposed MVP behavior: no destructive project deletion in the UI; proxy cleanup is an explicit project action added after the main loop is validated.
+4. **Resolved 2026-08-20 — project deletion and cache cleanup (#16):**
+   deletion runs from the project library behind a removability audit — refusing
+   a folder that holds an archive root, a referenced original, another project's
+   rows, or any file the app did not create — and a typed project-name
+   confirmation. Cache cleanup is an explicit per-category action in Settings
+   with no automatic eviction and no single clear-cache button, because the seven
+   cache categories have very different replacement costs.
