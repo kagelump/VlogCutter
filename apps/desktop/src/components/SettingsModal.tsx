@@ -1,3 +1,4 @@
+import type { ReactNode } from "react";
 import type { AutoplayMode, DesktopSettings, ModelInstallProgress, ModelStatus, ServerConnectionStatus } from "../types";
 import { formatBytes } from "../review/summaries";
 
@@ -33,6 +34,7 @@ export function SettingsModal({
   onConnectServer,
   onDisconnectServer,
   onClose,
+  storage,
 }: {
   settings: DesktopSettings;
   libraryRootPath: string;
@@ -43,6 +45,12 @@ export function SettingsModal({
   keyInput: string;
   keyPresent: boolean;
   serverStatus: ServerConnectionStatus | null;
+  /**
+   * The open project's storage panel (#16). Passed as a node rather than as a
+   * dozen more flat props: it owns real state of its own, and Settings' job
+   * here is only to give it a home the user can find.
+   */
+  storage?: ReactNode;
   onAutoplayModeChange(mode: AutoplayMode): void;
   onChangeProjectsRoot(): void;
   onInstallModels(): void;
@@ -190,6 +198,8 @@ export function SettingsModal({
             )
           )}
         </div>
+
+        {storage}
       </section>
     </div>
   );

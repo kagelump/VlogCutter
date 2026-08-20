@@ -14,6 +14,7 @@ export function NewProjectModal({
   canCancel,
   onChangeRoot,
   onOpenProject,
+  onDeleteProject,
   onNewProjectNameChange,
   onOpenCatalog,
   onCancel,
@@ -26,6 +27,11 @@ export function NewProjectModal({
   canCancel: boolean;
   onChangeRoot(): void;
   onOpenProject(location: ProjectLocation): void;
+  /**
+   * Delete a project from the library (#16). Present only on desktop, where
+   * there is a folder to remove; the browser preview has nothing to delete.
+   */
+  onDeleteProject?(location: ProjectLocation): void;
   onNewProjectNameChange(value: string): void;
   onOpenCatalog(): void;
   onCancel(): void;
@@ -44,15 +50,36 @@ export function NewProjectModal({
         {library.projects.length > 0 ? (
           <div className="project-library-list">
             {library.projects.map((location) => (
-              <button
-                className="project-library-item"
-                disabled={busy}
-                key={`${location.catalogPath}:${location.project.id}`}
-                onClick={() => onOpenProject(location)}
-              >
-                <strong>{location.project.name}</strong>
-                <span>{location.project.assetCount} clips · {location.project.labeledCount} labeled</span>
-              </button>
+              /* A row, not a button: the row opens the project and carries a
+                 separate destructive action beside it. Abandoned and test
+                 projects accumulate exactly here, so this is where removing
+                 one belongs — not behind a hunt through Settings (#16). */
+              <div className="project-library-row" key={`${location.catalogPath}:${location.project.id}`}>
+                <button
+                  className="project-library-item"
+                  disabled={busy}
+                  /* Named explicitly so it pairs with the Delete beside it:
+                     two controls about the same project need two names that
+                     say which is which, not one that happens to read first. */
+                  aria-label={`Open ${location.project.name}`}
+                  onClick={() => onOpenProject(location)}
+                >
+                  <strong>{location.project.name}</strong>
+                  <span>{location.project.assetCount} clips · {location.project.labeledCount} labeled</span>
+                </button>
+                {onDeleteProject && (
+                  <button
+                    type="button"
+                    className="project-library-delete"
+                    disabled={busy}
+                    aria-label={`Delete ${location.project.name}`}
+                    title={`Delete ${location.project.name}`}
+                    onClick={() => onDeleteProject(location)}
+                  >
+                    Delete
+                  </button>
+                )}
+              </div>
             ))}
           </div>
         ) : (

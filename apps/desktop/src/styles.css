@@ -801,6 +801,60 @@ kbd { padding: 2px 4px; color: #a8b1b6; background: #262d32; border: 1px solid #
 .project-library-item:hover:not(:disabled) { background: #22292e; }
 .project-library-item strong { overflow: hidden; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
 .project-library-item span { flex: none; color: var(--muted); font: 11px/14px ui-monospace, SFMono-Regular, Menlo, monospace; }
+
+/* Project lifecycle (#16). The delete action shares a row with the project it
+   would remove, but never shares its hit area: it appears on hover or keyboard
+   focus and reads in red, because it is the one control here that cannot be
+   undone. */
+.project-library-row { display: flex; align-items: stretch; border-bottom: 1px solid var(--line); }
+.project-library-row:last-child { border-bottom: 0; }
+.project-library-row .project-library-item { flex: 1 1 auto; min-width: 0; border-bottom: 0; }
+.project-library-delete { flex: none; padding: 0 12px; color: var(--red); background: #12171a; border: 0; border-left: 1px solid var(--line); cursor: pointer; font-size: 11px; opacity: 0; }
+.project-library-row:hover .project-library-delete,
+.project-library-row:focus-within .project-library-delete { opacity: 1; }
+.project-library-delete:hover:not(:disabled) { color: #ffd9d1; background: #3b1515; }
+.project-library-delete:disabled { color: var(--quiet); cursor: not-allowed; }
+
+.button.danger { color: #ffe3dc; background: #8e3325; border-color: #a53d2c; }
+.button.danger:hover:not(:disabled) { background: #a53d2c; }
+.button.danger:disabled { color: #a9847c; background: #4a231c; border-color: #4a231c; }
+
+.delete-project-modal { max-width: 560px; }
+.delete-project-body { display: grid; gap: 12px; padding: 16px 20px; }
+.delete-project-boundary { margin: 0; padding: 12px; color: var(--muted); background: var(--panel-raised); border-left: 3px solid var(--cyan); border-radius: 4px; font-size: 12px; line-height: 1.5; }
+.delete-project-boundary strong { color: var(--ink); }
+.delete-project-section h3 { margin: 0 0 4px; color: var(--muted); font-size: 10px; font-weight: 650; letter-spacing: 0.08em; text-transform: uppercase; }
+.delete-project-section ul { margin: 0; padding-left: 16px; color: var(--muted); font-size: 12px; line-height: 1.5; }
+.delete-project-section strong { color: var(--ink); }
+.delete-project-folder { margin: 0; color: var(--quiet); font-size: 11px; line-height: 1.5; }
+.delete-project-folder code { color: var(--muted); font: 10px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; word-break: break-all; }
+.delete-project-folder.is-kept { padding: 8px; color: var(--amber); background: #271e14; border-radius: 4px; }
+.delete-project-folder.is-kept strong { color: var(--ink); }
+.delete-project-confirm input { min-height: 30px; padding: 0 8px; color: var(--ink); background: #111719; border: 1px solid var(--line-strong); border-radius: 4px; }
+
+/* The storage panel (#16). Every row carries what it costs *and* what living
+   without it means, because the second is the part that decides the click. */
+.storage-panel { padding: 16px 20px; border-top: 1px solid var(--line); }
+.storage-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
+.storage-total { margin: 4px 0 0; color: var(--muted); font: 11px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
+.storage-total strong { color: var(--ink); }
+.storage-list { display: grid; gap: 8px; margin: 12px 0 0; padding: 0; list-style: none; }
+.storage-list li { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 2px 12px; padding: 8px; background: var(--panel-raised); border-radius: 4px; }
+.storage-list li[data-empty="true"] { opacity: .5; }
+.storage-list label { display: flex; align-items: center; gap: 8px; min-width: 0; cursor: pointer; }
+/* The settings modal styles its inputs full-width for text fields; a checkbox
+   that inherited that grew to 245px and pushed its own label across the row. */
+.storage-list input[type="checkbox"] { flex: none; width: auto; min-width: 0; margin: 0; }
+.storage-kind { color: var(--ink); font-size: 12px; }
+.storage-size { color: var(--muted); font: 11px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: nowrap; }
+.storage-shared { grid-column: 1 / -1; color: var(--amber); font-size: 10px; }
+.storage-list small { grid-column: 1 / -1; color: var(--quiet); font-size: 10px; line-height: 1.5; }
+.storage-list .storage-unavailable { color: var(--muted); }
+.storage-keeps { margin: 12px 0 0; color: var(--quiet); font-size: 11px; line-height: 1.5; }
+.storage-warning { margin: 8px 0 0; padding: 8px; color: var(--amber); background: #271e14; border-radius: 4px; font-size: 11px; line-height: 1.5; }
+.storage-result { margin: 8px 0 0; color: var(--cyan); font-size: 11px; }
+.storage-empty { margin: 12px 0 0; color: var(--quiet); font-size: 11px; line-height: 1.5; }
+.storage-actions { display: flex; justify-content: flex-end; margin-top: 12px; }
 .project-library-empty { margin: 8px 0 0 !important; padding: 10px; border: 1px dashed var(--line); border-radius: 5px; }
 .modal-divider { display: flex; align-items: center; gap: 8px; margin: 18px 0 13px; color: var(--quiet); font: 11px/14px ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: .1em; text-transform: uppercase; }
 .modal-divider::before, .modal-divider::after { height: 1px; flex: 1; background: var(--line); content: ""; }

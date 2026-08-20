@@ -3,12 +3,13 @@ use chrono::{SecondsFormat, Utc};
 use rcdvlog_core::{
     AnalysisReadiness, AnalysisRunOptions, AnalysisRunOutcome, AnalysisRunRecord, AnalyzeReport,
     ArchiveRoot, Asset, AssetAnalysisIndexEntry, AssetAnalysisView, AssetPatch,
-    BatchProgressEstimate, CameraMapping, CameraMergePreview, CameraMergeReport, CardCandidate,
-    Catalog, ClipTranscript, ClockEvent, ImportCutoff, ImportHistoryEntry, ImportOutcome,
-    ImportPreflight, ImportPreviewItem, ImportPreviewRequest, ImportProgress as CoreImportProgress,
-    ImportRollbackPreview, ImportSessionDetail, ImportStage as CoreImportStage, IngestReport,
-    ModelStatus, MountedVolumes, Project, ProxyReport, RelinkReport, ThumbnailReport, ToolStatus,
-    TranscribeReport, detect_cards, inspect_card,
+    BatchProgressEstimate, CacheCleanupReport, CacheKind, CameraMapping, CameraMergePreview,
+    CameraMergeReport, CardCandidate, Catalog, ClipTranscript, ClockEvent, ImportCutoff,
+    ImportHistoryEntry, ImportOutcome, ImportPreflight, ImportPreviewItem, ImportPreviewRequest,
+    ImportProgress as CoreImportProgress, ImportRollbackPreview, ImportSessionDetail,
+    ImportStage as CoreImportStage, IngestReport, ModelStatus, MountedVolumes, Project,
+    ProjectRemovalAudit, ProjectStorageReport, ProxyReport, RelinkReport, ThumbnailReport,
+    ToolStatus, TranscribeReport, detect_cards, inspect_card,
 };
 use rcdvlog_sync::BaselineEnvelope;
 use serde::{Deserialize, Serialize};
@@ -808,6 +809,92 @@ async fn media_origin_healthy(origin: &media_server::MediaOrigin) -> bool {
         .send()
         .await
         .is_ok_and(|response| response.status().is_success())
+}
+
+/// What one project costs on this machine, category by category (#16).
+///
+/// Answered against whichever catalog holds it, not only the open one, so the
+/// project library can show usage for a project the user has not opened.
+#[tauri::command]
+fn project_storage_report(
+    catalog_path: String,
+    project_id: String,
+) -> Result<ProjectStorageReport, String> {
+    Catalog::open_existing(Path::new(&catalog_path))
+        .map_err(error_message)?
+        .project_storage_report(&project_id)
+        .map_err(error_message)
+}
+
+/// Deletes regenerable local data. Never opens the catalog for writing and
+/// never touches media — see `rcdvlog_core::lifecycle`.
+#[tauri::command]
+async fn clear_project_cache(
+    catalog_path: String,
+    project_id: String,
+    kinds: Vec<CacheKind>,
+) -> Result<CacheCleanupReport, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        Catalog::open_existing(Path::new(&catalog_path))?.clear_project_cache(
+            &project_id,
+            &kinds,
+            |_, _| true,
+        )
+    })
+    .await
+    .map_err(error_message)?
+    .map_err(error_message)
+}
+
+/// Everything the user needs to see before a project is deleted, including
+/// every reason its folder must survive.
+#[tauri::command]
+fn audit_project_removal(
+    catalog_path: String,
+    folder_path: String,
+    project_id: String,
+) -> Result<ProjectRemovalAudit, String> {
+    Catalog::open_existing(Path::new(&catalog_path))
+        .map_err(error_message)?
+        .audit_project_removal(&project_id, Path::new(&folder_path))
+        .map_err(error_message)
+}
+
+/// The destructive half: removes the project's own state and caches, and then
+/// the folder itself only when the audit — re-run here, against the state as
+/// it is now rather than as it was when the dialog opened — says it may go.
+///
+/// Originals and archive copies are never removed. The audit refuses a folder
+/// holding either, and this command refuses to act on an audit it did not
+/// just perform itself.
+#[tauri::command]
+async fn delete_project(
+    catalog_path: String,
+    folder_path: String,
+    project_id: String,
+) -> Result<ProjectRemovalAudit, String> {
+    let audit_path = catalog_path.clone();
+    let audit_folder = folder_path.clone();
+    let audit_project = project_id.clone();
+    let audit =
+        tauri::async_runtime::spawn_blocking(move || -> anyhow::Result<ProjectRemovalAudit> {
+            let catalog = Catalog::open_existing(Path::new(&audit_path))?;
+            let audit = catalog.audit_project_removal(&audit_project, Path::new(&audit_folder))?;
+            catalog.delete_project(&audit_project)?;
+            Ok(audit)
+        })
+        .await
+        .map_err(error_message)?
+        .map_err(error_message)?;
+
+    if audit.folder_removable {
+        // The catalog handle is dropped by now, so the file is closed before
+        // its directory goes. A failure here leaves an empty project folder,
+        // which is untidy and harmless — the project itself is already gone.
+        fs::remove_dir_all(Path::new(&folder_path)).map_err(error_message)?;
+    }
+
+    Ok(audit)
 }
 
 #[tauri::command]
@@ -2570,6 +2657,10 @@ pub fn run() {
             set_autoplay_mode,
             record_desktop_context,
             list_projects,
+            project_storage_report,
+            clear_project_cache,
+            audit_project_removal,
+            delete_project,
             create_project,
             inspect_import_source,
             detect_mounted_cards,

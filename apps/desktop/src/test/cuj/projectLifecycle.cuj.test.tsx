@@ -121,7 +121,8 @@ describe("opening a project from the library", () => {
     const modal = await openLibraryModal(app);
     harness.clearLog();
 
-    await app.user.click(within(modal).getByRole("button", { name: /Hokkaido field test/ }));
+    // The row carries two controls now: open, and delete (#16).
+    await app.user.click(within(modal).getByRole("button", { name: "Open Hokkaido field test" }));
 
     await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
     // Each project owns a catalog file; opening one by id alone would read the
@@ -139,7 +140,8 @@ describe("opening a project from the library", () => {
     const app = await renderApp(harness);
     const modal = await openLibraryModal(app);
 
-    await app.user.click(within(modal).getByRole("button", { name: /Hokkaido field test/ }));
+    // The row carries two controls now: open, and delete (#16).
+    await app.user.click(within(modal).getByRole("button", { name: "Open Hokkaido field test" }));
 
     // The failure reaches the user as an alert, which outranks the status
     // toast the handler also sets — so the alert is what has to carry it.

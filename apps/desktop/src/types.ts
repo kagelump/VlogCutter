@@ -21,6 +21,65 @@ export interface ProjectLocation {
   project: Project;
 }
 
+/**
+ * A kind of regenerable local data (#16). Every one of these can be made again;
+ * what differs is what it costs and what stops working until it is.
+ */
+export type CacheKind =
+  | "proxies"
+  | "thumbnails"
+  | "audio"
+  | "framePacks"
+  | "editPreviews"
+  | "importPreviews"
+  | "analysisModels";
+
+/** Whether a cache belongs to one project or to the catalog holding it. */
+export type CacheScope = "project" | "catalog";
+
+export interface CacheCategory {
+  kind: CacheKind;
+  scope: CacheScope;
+  bytes: number;
+  fileCount: number;
+}
+
+export interface ProjectStorageReport {
+  projectId: string;
+  catalogPath: string;
+  /** The user's own work: annotations, chronology, import history. */
+  catalogBytes: number;
+  categories: CacheCategory[];
+  cacheBytes: number;
+}
+
+export interface CacheCleanupReport {
+  removedBytes: number;
+  removedFiles: number;
+  failures: Array<{ path: string; error: string }>;
+}
+
+/**
+ * Whether a project's folder can be removed, and every reason it cannot.
+ * A folder holding an archive root, a referenced original, another project, or
+ * any file VlogCutter did not create is never removable.
+ */
+export interface ProjectRemovalAudit {
+  projectId: string;
+  projectName: string;
+  catalogPath: string;
+  folderPath: string;
+  catalogBytes: number;
+  cacheBytes: number;
+  /** Clips whose membership ends. Not one byte of their media is touched. */
+  assetCount: number;
+  otherProjectsInCatalog: string[];
+  archiveRootsInside: string[];
+  originalsInside: number;
+  unexpectedEntries: string[];
+  folderRemovable: boolean;
+}
+
 export interface ProjectLibrary {
   rootPath: string;
   projects: ProjectLocation[];

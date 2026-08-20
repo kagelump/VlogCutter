@@ -21,6 +21,7 @@ import type {
   CameraMapping,
   CardCandidate,
   ClipTranscript,
+  CacheKind,
   DesktopSettings,
   ImportCutoff,
   ImportPreflight,
@@ -132,12 +133,36 @@ export interface ImportScenarioState {
   cutoffs: Record<string, ImportCutoff[]>;
 }
 
+/** What one project is declared to cost on disk (#16). */
+export interface DeclaredCacheUsage {
+  bytes: number;
+  fileCount: number;
+}
+
+/** Why a project's folder cannot be removed. Absent means it can. */
+export interface DeclaredRemovalBlockers {
+  otherProjectsInCatalog?: string[];
+  archiveRootsInside?: string[];
+  originalsInside?: number;
+  unexpectedEntries?: string[];
+}
+
 export interface DesktopHarnessState {
   settings: DesktopSettings;
   prerequisites: Array<{ name: string; path: string; available: boolean }>;
   catalogPath: string;
 
   projects: Project[];
+  /**
+   * Declared cache usage per project, keyed by cache kind (#16). The harness
+   * has no filesystem; a scenario states what a project costs and the
+   * lifecycle commands account against that.
+   */
+  storage: Record<string, Partial<Record<CacheKind, DeclaredCacheUsage>>>;
+  /** Declared catalog size per project — the part that cannot be regenerated. */
+  catalogBytes: Record<string, number>;
+  /** Declared reasons a project's folder must survive its deletion. */
+  removalBlockers: Record<string, DeclaredRemovalBlockers>;
   /** Insertion order for `list_assets`; the app does its own ordering on top. */
   assetOrder: string[];
   assets: Record<string, Asset>;
@@ -211,6 +236,9 @@ export function createInitialState(clock: HarnessClock): DesktopHarnessState {
     catalogPath: "/Users/harness/Movies/VideoProjects/catalog.sqlite3",
 
     projects: [],
+    storage: {},
+    catalogBytes: {},
+    removalBlockers: {},
     assetOrder: [],
     assets: {},
 

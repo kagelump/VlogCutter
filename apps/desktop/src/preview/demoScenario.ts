@@ -156,6 +156,20 @@ function revisionCreatedAt(index: number): string {
 export function previewScenario(): ScenarioBuilder {
   const scenario = desktopScenario({ now: "2026-08-09T12:00:00.000Z" })
     .project(PROJECT, { id: PROJECT_ID, createdAt: "2026-08-01T09:00:00.000Z" })
+    // Plausible weights for a real trip, so the storage panel and the delete
+    // confirmation have something honest-looking to lay out (#16).
+    .storageUsage(
+      {
+        proxies: { bytes: 14_800_000_000, fileCount: 312 },
+        thumbnails: { bytes: 61_000_000, fileCount: 312 },
+        audio: { bytes: 940_000_000, fileCount: 312 },
+        framePacks: { bytes: 2_300_000_000, fileCount: 4_800 },
+        editPreviews: { bytes: 180_000_000, fileCount: 6 },
+        importPreviews: { bytes: 24_000_000, fileCount: 243 },
+        analysisModels: { bytes: 3_100_000_000, fileCount: 4 },
+      },
+      2_240_000,
+    )
     .camera("Sony A7C II", {
       clips: 4,
       startAt: "2026-02-08T00:14:08.000Z",

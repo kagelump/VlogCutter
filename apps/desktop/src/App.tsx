@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import { api } from "./api";
-import type { ArchiveRoot, Asset, AssetPatch, AutoplayMode, BaselineImportResult, BaselinePreviewResult, CameraMapping, CameraMergePreview, CardCandidate, DesktopSettings, ImportHistoryEntry, ImportPreflight, ImportProgress, ImportRollbackPreview, ImportRunReport, ImportSessionDetail, PreflightItem, ModelInstallProgress, ModelStatus, PathAnalysis, Project, ProjectLibrary, ProjectLocation, ProjectPairingStatus, RootMappingEntry, ServerConnectionStatus, ServerVersionInfo, SyncStatus, TranscriptStatus } from "./types";
+import type { ArchiveRoot, Asset, AssetPatch, AutoplayMode, BaselineImportResult, BaselinePreviewResult, CameraMapping, CameraMergePreview, CardCandidate, DesktopSettings, ImportHistoryEntry, ImportPreflight, ImportProgress, CacheCleanupReport, CacheKind, ImportRollbackPreview, ImportRunReport, ImportSessionDetail, PreflightItem, ProjectRemovalAudit, ProjectStorageReport, ModelInstallProgress, ModelStatus, PathAnalysis, Project, ProjectLibrary, ProjectLocation, ProjectPairingStatus, RootMappingEntry, ServerConnectionStatus, ServerVersionInfo, SyncStatus, TranscriptStatus } from "./types";
 import {
   detectsSourceAutomatically,
   interruptedMenuNote,
@@ -49,13 +49,15 @@ import { KeyboardShortcutsModal } from "./components/KeyboardShortcutsModal";
 import { AnalysisDialog } from "./components/AnalysisDialog";
 import { SyncDiagnosticsModal } from "./components/SyncDiagnosticsModal";
 import { NewProjectModal } from "./components/NewProjectModal";
+import { DeleteProjectDialog } from "./components/DeleteProjectDialog";
+import { StoragePanel } from "./components/StoragePanel";
 import { PairingWizardModal } from "./components/PairingWizardModal";
 import { BaselineWizardModal } from "./components/BaselineWizardModal";
 import { SettingsModal } from "./components/SettingsModal";
 import { CardBanner } from "./components/CardBanner";
 import { CameraMergeDialog } from "./components/CameraMergeDialog";
 import { analysisStageLabels, formatCost } from "./review/format";
-import { sourceVolumeHint } from "./review/summaries";
+import { formatBytes, sourceVolumeHint } from "./review/summaries";
 import { canonicalLabel, projectLabelVocabulary } from "./review/labelVocabulary";
 import { nextMatch, transcriptMatches } from "./review/searchMatch";
 import { rotationAfter } from "./review/rotation";
@@ -140,6 +142,15 @@ function App() {
   const [offsetLabel, setOffsetLabel] = useState("Camera time change");
   const [chronologyZoom, setChronologyZoom] = useState(RIBBON_ZOOM_DEFAULT);
   const [chronologyFocusAssetId, setChronologyFocusAssetId] = useState<string | null>(null);
+  /** Project and cache lifecycle state (#16). */
+  const [removalAudit, setRemovalAudit] = useState<ProjectRemovalAudit | null>(null);
+  const [removalTarget, setRemovalTarget] = useState<ProjectLocation | null>(null);
+  const [removalBusy, setRemovalBusy] = useState(false);
+  const [removalError, setRemovalError] = useState("");
+  const [storageReport, setStorageReport] = useState<ProjectStorageReport | null>(null);
+  const [storageBusy, setStorageBusy] = useState(false);
+  const [storageError, setStorageError] = useState("");
+  const [lastCleanup, setLastCleanup] = useState<CacheCleanupReport | null>(null);
   const [phaseDialog, setPhaseDialog] = useState<PhaseDialogState | null>(null);
   const [phaseDialogBusy, setPhaseDialogBusy] = useState(false);
   const [phaseDialogError, setPhaseDialogError] = useState("");
@@ -1474,6 +1485,127 @@ function App() {
       setMessage("Could not open project");
     } finally {
       setBusy(false);
+    }
+  }
+
+  /**
+   * Open the destructive confirmation for a project in the library (#16).
+   *
+   * The audit runs before the dialog does, so the confirmation can state what
+   * is actually at stake for *this* project — how many clips lose their
+   * annotations, how much of it is regenerable cache, and whether the folder
+   * survives. A dialog that had to guess at those would be asking the user to
+   * confirm something nobody has looked at.
+   */
+  async function beginProjectRemoval(location: ProjectLocation) {
+    setRemovalError("");
+    setRemovalTarget(location);
+    try {
+      setRemovalAudit(
+        await api.auditProjectRemoval(location.catalogPath, location.folderPath, location.project.id),
+      );
+    } catch (reason) {
+      setRemovalTarget(null);
+      setError(String(reason));
+    }
+  }
+
+  function cancelProjectRemoval() {
+    setRemovalAudit(null);
+    setRemovalTarget(null);
+    setRemovalError("");
+  }
+
+  /**
+   * Delete it. The command re-audits inside itself against state as it is now,
+   * so a folder that gained an archive root while this dialog was open is
+   * still refused a removal.
+   */
+  async function confirmProjectRemoval() {
+    const location = removalTarget;
+    if (!location) return;
+    setRemovalBusy(true);
+    setRemovalError("");
+    try {
+      const result = await api.deleteProject(
+        location.catalogPath,
+        location.folderPath,
+        location.project.id,
+      );
+      cancelProjectRemoval();
+      const remaining = await refreshLibrary();
+      // The deleted project must not stay open underneath the user. Anything
+      // still on screen belongs to a catalog that no longer describes it.
+      if (projectId === location.project.id) {
+        setProjectId("");
+        setSelectedId("");
+        setStorageReport(null);
+        setShowCreate(true);
+      }
+      setMessage(
+        result.folderRemovable
+          ? `Deleted ${result.projectName} and its folder · ${formatBytes(result.cacheBytes)} reclaimed`
+          : `Deleted ${result.projectName} · its folder was kept`,
+      );
+      if (remaining && remaining.projects.length === 0) setShowCreate(true);
+    } catch (reason) {
+      setRemovalError(String(reason));
+    } finally {
+      setRemovalBusy(false);
+    }
+  }
+
+  /**
+   * Where the open project's catalog actually is (#16). Read from the library
+   * rather than from `lastCatalogPath`, which is a persisted preference that
+   * describes the last catalog *opened* and can lag behind the project on
+   * screen. A storage report is about a specific project; it has to be asked
+   * of the catalog that holds it.
+   */
+  const openCatalogPath = useMemo(
+    () =>
+      library.projects.find((location) => location.project.id === projectId)?.catalogPath
+      ?? settings.lastCatalogPath
+      ?? "",
+    [library.projects, projectId, settings.lastCatalogPath],
+  );
+
+  /** Measure what the open project costs on this machine (#16). */
+  async function measureProjectStorage() {
+    if (!projectId || !openCatalogPath) return;
+    setStorageBusy(true);
+    setStorageError("");
+    setLastCleanup(null);
+    try {
+      setStorageReport(await api.projectStorageReport(openCatalogPath, projectId));
+    } catch (reason) {
+      setStorageError(String(reason));
+    } finally {
+      setStorageBusy(false);
+    }
+  }
+
+  /**
+   * Delete the chosen categories, then re-measure. Re-measuring rather than
+   * subtracting the report's own numbers: what is actually left on disk is the
+   * only honest answer, and a partial failure has to show up as space still
+   * used rather than as a total nobody checked.
+   */
+  async function clearProjectCaches(kinds: CacheKind[]) {
+    if (!projectId || !openCatalogPath || kinds.length === 0) return;
+    setStorageBusy(true);
+    setStorageError("");
+    try {
+      const report = await api.clearProjectCache(openCatalogPath, projectId, kinds);
+      setLastCleanup(report);
+      setStorageReport(await api.projectStorageReport(openCatalogPath, projectId));
+      // Availability is read from the filesystem, so the queue's idea of which
+      // clips have proxies is stale the moment those files go.
+      await reloadSessionAssets();
+    } catch (reason) {
+      setStorageError(String(reason));
+    } finally {
+      setStorageBusy(false);
     }
   }
 
@@ -2911,6 +3043,7 @@ function App() {
           canCancel={projects.length > 0}
           onChangeRoot={configureProjectsRoot}
           onOpenProject={openLibraryProject}
+          onDeleteProject={api.isDesktop() ? (location) => void beginProjectRemoval(location) : undefined}
           onNewProjectNameChange={setNewProjectName}
           onOpenCatalog={openCatalog}
           onCancel={() => setShowCreate(false)}
@@ -2938,6 +3071,26 @@ function App() {
           onConnectServer={() => setShowPairingWizard(true)}
           onDisconnectServer={() => void handleUnpairServer()}
           onClose={() => setShowSettings(false)}
+          storage={projectId ? (
+            <StoragePanel
+              report={storageReport}
+              busy={busy || storageBusy}
+              error={storageError}
+              lastCleanup={lastCleanup}
+              onRefresh={() => void measureProjectStorage()}
+              onClear={(kinds) => void clearProjectCaches(kinds)}
+            />
+          ) : undefined}
+        />
+      )}
+
+      {removalAudit && (
+        <DeleteProjectDialog
+          audit={removalAudit}
+          busy={removalBusy}
+          error={removalError}
+          onCancel={cancelProjectRemoval}
+          onConfirm={() => void confirmProjectRemoval()}
         />
       )}
 

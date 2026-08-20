@@ -22,7 +22,13 @@ import {
   type CardSpec,
   type TranscriptSpec,
 } from "./builders";
-import { createInitialState, putAsset, type DesktopHarnessState } from "./state";
+import {
+  createInitialState,
+  putAsset,
+  type DeclaredCacheUsage,
+  type DeclaredRemovalBlockers,
+  type DesktopHarnessState,
+} from "./state";
 import {
   buildChronologyOverview,
   reassignmentPreviewRequestKey,
@@ -46,7 +52,7 @@ import type {
   ValidationReport,
   VisualPlacementPreview,
 } from "../../chronologyTypes";
-import type { Asset, DesktopSettings, SyncStatus } from "../../types";
+import type { Asset, CacheKind, DesktopSettings, SyncStatus } from "../../types";
 
 export interface ScenarioOptions {
   /** The instant the scenario starts at. Every fake timestamp derives from it. */
@@ -421,6 +427,33 @@ export class ScenarioBuilder {
       spec: { clips: existing.length + clips, startAt: "2026-02-09T08:00:00.000Z", volume: mountPath },
     });
     this.state.imports.additions[mountPath] = grown;
+    return this;
+  }
+
+  /**
+   * "This project is costing this much on disk" (#16). The harness has no
+   * filesystem, so usage is declared rather than measured; what the CUJ tier
+   * then proves is what the UI does with it.
+   */
+  storageUsage(usage: Partial<Record<CacheKind, DeclaredCacheUsage>>, catalogBytes?: number): this {
+    const projectId = this.requireProject();
+    this.state.storage[projectId] = { ...(this.state.storage[projectId] ?? {}), ...usage };
+    if (catalogBytes !== undefined) this.state.catalogBytes[projectId] = catalogBytes;
+    return this;
+  }
+
+  /**
+   * "…and its folder must survive being deleted, because of this." Each of
+   * these is a real reason the production audit refuses a folder: an archive
+   * root inside it, an original inside it, another project in the same
+   * catalog, or a file VlogCutter did not put there.
+   */
+  removalBlockedBy(blockers: DeclaredRemovalBlockers): this {
+    const projectId = this.requireProject();
+    this.state.removalBlockers[projectId] = {
+      ...(this.state.removalBlockers[projectId] ?? {}),
+      ...blockers,
+    };
     return this;
   }
 

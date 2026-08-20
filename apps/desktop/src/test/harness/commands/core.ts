@@ -3,7 +3,17 @@
  * desktop settings, and the native dialog seam.
  */
 
-import type { DesktopSettings, LoadedCatalog, MediaOrigin, Project, ProjectLibrary } from "../../../types";
+import type {
+  CacheCleanupReport,
+  CacheKind,
+  DesktopSettings,
+  LoadedCatalog,
+  MediaOrigin,
+  Project,
+  ProjectLibrary,
+  ProjectRemovalAudit,
+  ProjectStorageReport,
+} from "../../../types";
 import { buildProject } from "../builders";
 import { projectSummary, type DesktopHarnessState } from "../state";
 import type { CommandTable } from "../registry";
@@ -27,6 +37,77 @@ function library(state: DesktopHarnessState): ProjectLibrary {
   };
 }
 
+function requireProject(state: DesktopHarnessState, projectId: string): Project {
+  const project = state.projects.find((found) => found.id === projectId);
+  if (!project) throw new Error(`Unknown project: ${projectId}`);
+  return project;
+}
+
+const CACHE_KINDS: CacheKind[] = [
+  "proxies",
+  "thumbnails",
+  "audio",
+  "framePacks",
+  "editPreviews",
+  "importPreviews",
+  "analysisModels",
+];
+
+function storageReport(
+  state: DesktopHarnessState,
+  projectId: string,
+  catalogPath: string,
+): ProjectStorageReport {
+  const stored = state.storage[projectId] ?? {};
+  const categories = CACHE_KINDS.map((kind) => ({
+    kind,
+    scope: (kind === "importPreviews" || kind === "analysisModels" ? "catalog" : "project") as
+      "catalog" | "project",
+    bytes: stored[kind]?.bytes ?? 0,
+    fileCount: stored[kind]?.fileCount ?? 0,
+  }));
+  return {
+    projectId,
+    catalogPath,
+    catalogBytes: state.catalogBytes[projectId] ?? 2_048,
+    categories,
+    cacheBytes: categories.reduce((total, category) => total + category.bytes, 0),
+  };
+}
+
+function removalAudit(
+  state: DesktopHarnessState,
+  projectId: string,
+  catalogPath: string,
+  folderPath: string,
+): ProjectRemovalAudit {
+  const project = requireProject(state, projectId);
+  const report = storageReport(state, projectId, catalogPath);
+  const blockers = state.removalBlockers[projectId] ?? {};
+  const otherProjectsInCatalog = blockers.otherProjectsInCatalog ?? [];
+  const archiveRootsInside = blockers.archiveRootsInside ?? [];
+  const originalsInside = blockers.originalsInside ?? 0;
+  const unexpectedEntries = blockers.unexpectedEntries ?? [];
+  return {
+    projectId,
+    projectName: project.name,
+    catalogPath,
+    folderPath,
+    catalogBytes: report.catalogBytes,
+    cacheBytes: report.cacheBytes,
+    assetCount: Object.values(state.assets).filter((asset) => asset.projectId === projectId).length,
+    otherProjectsInCatalog,
+    archiveRootsInside,
+    originalsInside,
+    unexpectedEntries,
+    folderRemovable:
+      otherProjectsInCatalog.length === 0
+      && archiveRootsInside.length === 0
+      && originalsInside === 0
+      && unexpectedEntries.length === 0,
+  };
+}
+
 /** Settings always carry the media origin, so `api.mediaUrl` builds real URLs. */
 function settingsView(state: DesktopHarnessState): DesktopSettings {
   return { ...state.settings, mediaOrigin: state.mediaOrigin };
@@ -43,6 +124,68 @@ export const coreCommands: CommandTable = {
     const path = requireString(args, "path");
     state.catalogPath = path;
     return { path, projects: state.projects.map((project) => projectSummary(state, project)) };
+  },
+
+  /**
+   * Project and cache lifecycle (#16).
+   *
+   * The harness has no filesystem, so a scenario declares what a project costs
+   * (`state.storage`) and these commands account against that declaration. What
+   * is modelled faithfully is the part the UI has to get right: categories are
+   * separate, a cleared category goes to zero while the others do not move, the
+   * catalog is never touched, and the folder-removal verdict comes from the
+   * same four blockers the real audit checks.
+   */
+  project_storage_report: (args, { state }): ProjectStorageReport => {
+    const projectId = requireString(args, "projectId");
+    requireProject(state, projectId);
+    return storageReport(state, projectId, requireString(args, "catalogPath"));
+  },
+
+  clear_project_cache: (args, { state }): CacheCleanupReport => {
+    const projectId = requireString(args, "projectId");
+    requireProject(state, projectId);
+    const kinds = Array.isArray(args.kinds) ? (args.kinds as CacheKind[]) : [];
+    if (kinds.length === 0) throw new Error("clear_project_cache needs the kinds to clear");
+    const stored = state.storage[projectId] ?? {};
+    let removedBytes = 0;
+    let removedFiles = 0;
+    for (const kind of new Set(kinds)) {
+      const entry = stored[kind];
+      if (!entry) continue;
+      removedBytes += entry.bytes;
+      removedFiles += entry.fileCount;
+      stored[kind] = { bytes: 0, fileCount: 0 };
+    }
+    state.storage[projectId] = stored;
+    return { removedBytes, removedFiles, failures: [] };
+  },
+
+  audit_project_removal: (args, { state }): ProjectRemovalAudit =>
+    removalAudit(
+      state,
+      requireString(args, "projectId"),
+      requireString(args, "catalogPath"),
+      requireString(args, "folderPath"),
+    ),
+
+  delete_project: (args, { state }): ProjectRemovalAudit => {
+    const projectId = requireString(args, "projectId");
+    const audit = removalAudit(
+      state,
+      projectId,
+      requireString(args, "catalogPath"),
+      requireString(args, "folderPath"),
+    );
+    // Rows go; media never does. The harness has no originals to delete and
+    // the assertion that matters is that nothing tried.
+    state.projects = state.projects.filter((project) => project.id !== projectId);
+    for (const assetId of Object.keys(state.assets)) {
+      if (state.assets[assetId].projectId === projectId) delete state.assets[assetId];
+    }
+    state.assetOrder = state.assetOrder.filter((assetId) => state.assets[assetId]);
+    delete state.storage[projectId];
+    return audit;
   },
 
   set_projects_root: (args, { state }): ProjectLibrary => {

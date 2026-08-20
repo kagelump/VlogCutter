@@ -137,6 +137,37 @@ a newer desktop's operations. `D01-T007` owns this decision and must implement a
 quarantine-and-report policy: an unknown operation is retained and surfaced, not
 silently dropped, and not allowed to fail an entire sync batch.
 
+## 3.8 Storage lifecycle
+
+Local storage divides into exactly two things, and every lifecycle action has
+to say which one it is touching (#16):
+
+- **The catalog** — labels, notes, chronology corrections, import history. The
+  user's own work, and the only thing here that cannot be regenerated. Cache
+  cleanup never opens it for writing.
+- **The cache** — `<catalog dir>/cache`, in seven categories with very different
+  replacement costs. Remaking proxies needs the source media reconnected;
+  replacing downloaded analysis models means gigabytes over the network. The UI
+  therefore never offers one "clear cache" button: the user chooses per
+  category, and each row states what it costs and what stops working.
+
+Two properties make cleanup safe by construction. Availability is derived at
+read time from whether the file exists, so a deleted proxy is correctly
+reported missing with no row to update and no window of disagreement. And
+cleanup reads nothing about the media, so it works with every drive unplugged —
+which is exactly when a user wants to reclaim space.
+
+Project removal is guarded by `audit_project_removal`, which refuses to declare
+a folder removable when it holds an archive root, a referenced original,
+another project's catalog rows, or any file the application did not create. The
+narrow removal — this project's rows and its own caches, folder left standing —
+is always available and is what runs when the audit refuses. `delete_project`
+removes trip phases before the project, because their clip anchors are
+`ON DELETE RESTRICT` and a cascade reaching the assets first aborts the delete.
+
+Nothing in this path deletes, moves, renames, or rewrites an original or an
+archive copy, and the confirmation says so before it says anything else.
+
 ## 4. Editing-handoff architecture
 
 ### 4.1 Accepted scope, exhaustively

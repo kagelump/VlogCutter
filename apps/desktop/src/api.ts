@@ -1,7 +1,7 @@
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
-import type { AnalysisProgress, AnalysisReadiness, AnalysisRunRecord, AnalysisRunReport, AnalysisRunRequest, AnalysisStage, ArchiveRoot, Asset, AssetAnalysisIndexEntry, AssetAnalysisView, AssetPatch, AutoplayMode, BaselineImportResult, BaselinePreviewResult, CameraMapping, CameraMergePreview, CameraMergeReport, CardCandidate, ClipTranscript, DesktopSettings, GenerationProgress, ImportCutoff, ImportHistoryEntry, ImportPreflight, ImportPreviewItem, ImportPreviewRequest, ImportProgress, ImportRollbackPreview, ImportRunReport, ImportSessionDetail, LoadedCatalog, MediaOrigin, ModelInstallProgress, ModelStatus, PathAnalysis, Project, ProjectLibrary, ProjectPairingStatus, RelinkReport, RootMappingEntry, ServerConnectionStatus, ServerPairingResult, ServerVersionInfo, SyncStatus, ThumbnailReport } from "./types";
+import type { AnalysisProgress, AnalysisReadiness, AnalysisRunRecord, AnalysisRunReport, AnalysisRunRequest, AnalysisStage, ArchiveRoot, Asset, AssetAnalysisIndexEntry, AssetAnalysisView, AssetPatch, AutoplayMode, BaselineImportResult, BaselinePreviewResult, CacheCleanupReport, CacheKind, CameraMapping, CameraMergePreview, CameraMergeReport, CardCandidate, ClipTranscript, DesktopSettings, GenerationProgress, ImportCutoff, ImportHistoryEntry, ImportPreflight, ImportPreviewItem, ImportPreviewRequest, ImportProgress, ImportRollbackPreview, ImportRunReport, ImportSessionDetail, LoadedCatalog, MediaOrigin, ModelInstallProgress, ModelStatus, PathAnalysis, Project, ProjectLibrary, ProjectRemovalAudit, ProjectStorageReport, ProjectPairingStatus, RelinkReport, RootMappingEntry, ServerConnectionStatus, ServerPairingResult, ServerVersionInfo, SyncStatus, ThumbnailReport } from "./types";
 
 /**
  * Whether a backend is answering behind `@tauri-apps/api`.
@@ -127,6 +127,30 @@ export const api = {
   async chooseArchiveFolder(title = "Choose an archive destination"): Promise<string | null> {
     const path = await open({ directory: true, multiple: false, title });
     return typeof path === "string" ? path : null;
+  },
+
+  /** What one project costs on this machine, by category (#16). */
+  async projectStorageReport(catalogPath: string, projectId: string): Promise<ProjectStorageReport> {
+    return invoke("project_storage_report", { catalogPath, projectId });
+  },
+
+  /** Deletes regenerable local data. Never touches the catalog or any media. */
+  async clearProjectCache(catalogPath: string, projectId: string, kinds: CacheKind[]): Promise<CacheCleanupReport> {
+    return invoke("clear_project_cache", { catalogPath, projectId, kinds });
+  },
+
+  /** What deleting this project would take, and every reason its folder stays. */
+  async auditProjectRemoval(catalogPath: string, folderPath: string, projectId: string): Promise<ProjectRemovalAudit> {
+    return invoke("audit_project_removal", { catalogPath, folderPath, projectId });
+  },
+
+  /**
+   * Deletes the project. Re-audits inside the command against state as it is
+   * now, so a folder that gained an archive root while the dialog was open is
+   * still refused.
+   */
+  async deleteProject(catalogPath: string, folderPath: string, projectId: string): Promise<ProjectRemovalAudit> {
+    return invoke("delete_project", { catalogPath, folderPath, projectId });
   },
 
   async inspectImportSource(path: string): Promise<CardCandidate | null> {
