@@ -6,10 +6,11 @@
 
 import { describe, expect, it } from "vitest";
 import {
+  correctiveFor,
   pauseFromReport,
-  pausedDetail,
   pausedHeadline,
   resumeDecision,
+  unmetConditionDetail,
   type PausedImport,
   type PausedImportOptions,
 } from "./pausedImport";
@@ -115,25 +116,28 @@ describe("resumeDecision", () => {
     });
   });
 
-  it("keeps waiting while nothing is there", () => {
+  it("names presence as the unmet condition while nothing is there", () => {
     expect(resumeDecision(paused(), { present: false, identityVerified: false })).toEqual({
-      action: "keep-waiting",
+      action: "blocked",
+      unmet: ["endpoint-present"],
     });
   });
 
   /// The case that would otherwise write onto the wrong disk: something is
   /// there, and it cannot prove it is ours.
-  it("asks rather than guessing when what returned cannot prove itself", () => {
+  it("names identity as the unmet condition when what returned cannot prove itself", () => {
     expect(resumeDecision(paused(), { present: true, identityVerified: false })).toEqual({
-      action: "escalate",
-      corrective: "locate-archive",
+      action: "blocked",
+      unmet: ["identity-proven"],
     });
   });
 
-  it("escalates a source to choosing a source, not locating an archive", () => {
-    expect(
-      resumeDecision(paused({ endpoint: "source" }), { present: true, identityVerified: false }),
-    ).toEqual({ action: "escalate", corrective: "choose-source" });
+  /// Identity is not evaluable for something that is not there, so reporting it
+  /// as unmet alongside presence would be noise rather than information.
+  it("does not report identity as unmet when the endpoint is simply absent", () => {
+    const decision = resumeDecision(paused(), { present: false, identityVerified: false });
+
+    expect(decision).toEqual({ action: "blocked", unmet: ["endpoint-present"] });
   });
 
   /// Identity is never inferred from presence, whichever end it is.
@@ -144,22 +148,49 @@ describe("resumeDecision", () => {
       ).not.toBe("continue");
     }
   });
+
+  /// A pause is a set of conditions, not a stopwatch. Four hours of lid-shut is
+  /// not a reason to stop, and a clock is not a safety property.
+  it("decides the same way however long the pause has lasted", () => {
+    const brief = paused({ pausedAt: 1_000 });
+    const overnight = paused({ pausedAt: 1_000 - 8 * 60 * 60 * 1_000 });
+    const probe = { present: true, identityVerified: true };
+
+    expect(resumeDecision(overnight, probe)).toEqual(resumeDecision(brief, probe));
+  });
 });
 
 describe("paused copy", () => {
-  it("keeps the headline constant so the detail line carries the news", () => {
+  it("keeps the headline constant so the condition lines carry the news", () => {
     expect(pausedHeadline()).toBe("Import paused");
   });
 
   it("says a stalled volume is not responding, not that it is missing", () => {
-    expect(pausedDetail(paused({ reachability: "not-responding" }))).toBe(
-      "Acasis isn't responding",
-    );
+    expect(
+      unmetConditionDetail(paused({ reachability: "not-responding" }), "endpoint-present"),
+    ).toBe("Acasis isn't responding");
   });
 
   it("says a vanished volume is not connected", () => {
-    expect(pausedDetail(paused({ reachability: "not-connected" }))).toBe(
+    expect(unmetConditionDetail(paused({ reachability: "not-connected" }), "endpoint-present")).toBe(
       "Acasis isn't connected",
     );
+  });
+
+  it("says plainly when the drive that came back is a different one", () => {
+    expect(unmetConditionDetail(paused(), "identity-proven")).toBe(
+      "The drive connected as Acasis isn't the one this import was using",
+    );
+  });
+
+  it("offers no corrective for a volume that is merely absent", () => {
+    expect(correctiveFor(paused(), "endpoint-present")).toBeNull();
+  });
+
+  it("offers the smallest corrective for each endpoint that cannot prove itself", () => {
+    expect(correctiveFor(paused({ endpoint: "destination" }), "identity-proven")).toBe(
+      "locate-archive",
+    );
+    expect(correctiveFor(paused({ endpoint: "source" }), "identity-proven")).toBe("choose-source");
   });
 });

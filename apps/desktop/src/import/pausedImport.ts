@@ -12,13 +12,18 @@
  * What follows from those two is this module's whole premise: for the common
  * case — lid shut, lid opened, same drives — the user did nothing wrong and
  * nothing needs confirming. So the pause is a state to sit in, not a workflow
- * to drive. It shows what is blocking progress, offers exactly two routine
- * actions, and continues on its own the moment the endpoint can *prove* it is
- * the one we were using.
+ * to drive. Its one routine action is Cancel; detection is automatic, with
+ * nothing to press to hurry it along. It continues on its own the moment the
+ * endpoint can *prove* it is the one we were using.
  *
  * That proof is the whole safety story, and it is why `resumeDecision` treats
- * "cannot identify" as an escalation rather than a match. A destination that
- * cannot prove itself is not a destination we may resume writing 138 GB onto.
+ * "cannot identify" as unmet rather than as a match. A destination that cannot
+ * prove itself is not a destination we may resume writing 138 GB onto.
+ *
+ * Continuing is a question about conditions, never about elapsed time. A pause
+ * of four hours is judged exactly like a pause of four seconds — a clock is not
+ * a safety property, and a threshold is a number nobody can pick correctly. So
+ * the surface always answers the same question: what is still missing?
  */
 
 import type { ImportRunReport } from "../types";
@@ -65,11 +70,23 @@ export interface EndpointProbe {
   identityVerified: boolean;
 }
 
+/**
+ * Something that has to hold before the import goes on by itself.
+ *
+ * Deliberately not a stopwatch. Elapsed time is not one of these, because a
+ * clock is not a safety property: a pause of four hours and a pause of four
+ * seconds are the same question, and the answer is whichever of these is still
+ * missing.
+ */
+export type ResumeCondition = "endpoint-present" | "identity-proven";
+
+/** The smallest thing to offer a user whose endpoint cannot prove itself. */
+export type Corrective = "locate-archive" | "choose-source";
+
 /** What to do about a paused import, given the latest probe. */
 export type ResumeDecision =
   | { action: "continue" }
-  | { action: "keep-waiting" }
-  | { action: "escalate"; corrective: "locate-archive" | "choose-source" };
+  | { action: "blocked"; unmet: ResumeCondition[] };
 
 /** The naming and options a paused run has to restore when it continues. */
 export interface PausedImportOptions {
@@ -121,25 +138,45 @@ export function pauseFromReport(
  * The escalation case is deliberately narrow: something is there, and it
  * cannot prove it is ours.
  */
-export function resumeDecision(paused: PausedImport, probe: EndpointProbe): ResumeDecision {
-  if (!probe.present) return { action: "keep-waiting" };
-  if (probe.identityVerified) return { action: "continue" };
-  // Present but unproven. Presence is not identity, and the cost of being
-  // wrong here is writing onto someone else's disk, so this is the one place
-  // the pause turns into a question.
-  return {
-    action: "escalate",
-    corrective: paused.endpoint === "destination" ? "locate-archive" : "choose-source",
-  };
+export function resumeDecision(_paused: PausedImport, probe: EndpointProbe): ResumeDecision {
+  // Nothing is there. Identity is not evaluable for a volume that has not come
+  // back, so reporting it as unmet too would be noise rather than information.
+  if (!probe.present) return { action: "blocked", unmet: ["endpoint-present"] };
+  // Present but unproven. Presence is not identity, and the cost of being wrong
+  // here is writing onto someone else's disk.
+  if (!probe.identityVerified) return { action: "blocked", unmet: ["identity-proven"] };
+  return { action: "continue" };
 }
 
-/** The unchanging headline. What varies goes in the detail line. */
+/** The unchanging headline. What varies goes in the condition lines. */
 export function pausedHeadline(): string {
   return "Import paused";
 }
 
-/** One line naming the volume and what is wrong with it. */
-export function pausedDetail(paused: PausedImport): string {
-  const state = paused.reachability === "not-responding" ? "isn't responding" : "isn't connected";
-  return `${paused.volumeLabel} ${state}`;
+/** One line saying what this unmet condition means for this volume. */
+export function unmetConditionDetail(
+  paused: PausedImport,
+  condition: ResumeCondition,
+): string {
+  if (condition === "endpoint-present") {
+    const state = paused.reachability === "not-responding" ? "isn't responding" : "isn't connected";
+    return `${paused.volumeLabel} ${state}`;
+  }
+  return `The drive connected as ${paused.volumeLabel} isn't the one this import was using`;
+}
+
+/**
+ * The smallest corrective action for an unmet condition, or null when there is
+ * nothing useful to offer.
+ *
+ * A volume that is merely absent needs no dialog — it needs plugging in, and
+ * detection is automatic once it is. Only an endpoint that came back unable to
+ * prove itself is a question a user can actually answer.
+ */
+export function correctiveFor(
+  paused: PausedImport,
+  condition: ResumeCondition,
+): Corrective | null {
+  if (condition !== "identity-proven") return null;
+  return paused.endpoint === "destination" ? "locate-archive" : "choose-source";
 }
