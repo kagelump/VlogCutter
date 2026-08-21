@@ -201,10 +201,19 @@ Following travel §4.2, which was designed for this exact problem:
 The archive root is writable only along the create-new-file path. No code in this epic renames,
 overwrites, truncates, or deletes anything beneath it.
 
-Commit is temp-file-in-the-same-directory, `fsync`, then atomic rename. A partial file is never
-visible under its final name, and a failed copy leaves only a temp path the application owns and
-cleans up. An existing file at the target name is never overwritten — it is a classification input
-(§6), not a collision to resolve by clobbering.
+Commit is temp-file-in-the-same-directory, `fsync`, then create-only publication. A partial file is
+never visible under its final name, and a failed copy leaves only a temp path the application owns
+and cleans up. An existing file at the target name is never overwritten — it is a classification
+input (§6), not a collision to resolve by clobbering.
+
+Create-only is enforced by the operation that publishes the file, not by an `exists()` check taken
+before the copy: copying a clip takes minutes, and a plain rename would replace a file that appeared
+during them. Publication uses the platform's no-replace rename
+(`renameat2(RENAME_NOREPLACE)`, `renamex_np(RENAME_EXCL)`), falling back to a hard link plus temp
+unlink, and finally to an exclusive create that reserves the name — each of them refuses an occupied
+destination rather than replacing it. A clip that loses that race fails as one item with its temp
+file cleaned up, its card untouched, and the file that won left byte-for-byte intact; re-running the
+import reclassifies the pathname and either adopts identical content or reports a collision.
 
 ### 4.4 Verification and resume
 

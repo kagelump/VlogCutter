@@ -14,6 +14,7 @@ dirs.workspace = true
 chrono-tz.workspace = true
 fs2.workspace = true
 hound = "3.5"
+libc.workspace = true
 regex.workspace = true
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 rusqlite.workspace = true

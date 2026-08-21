@@ -3235,6 +3235,7 @@ dependencies = [
  "dirs",
  "fs2",
  "hound",
+ "libc",
  "proptest",
  "regex",
  "reqwest 0.12.28",
