@@ -14,6 +14,17 @@ import {
   type InterruptedImport,
   type InterruptedImportOptions,
 } from "./import/interruptedImport";
+import {
+  findPausedSource,
+  pauseFromReport,
+  probeOnce,
+  resumeDecision,
+  sourceProbe,
+  type Corrective,
+  type EndpointProbe,
+  type PausedImport,
+} from "./import/pausedImport";
+import { PausedImportPanel } from "./components/PausedImportPanel";
 import { useProjectSession } from "./session/projectSession";
 import { useAssetMutations } from "./session/assetMutations";
 import { orderAssets, replaceAsset as replaceAssetInList, moveSelection as moveSelectionInOrder } from "./review/order";
@@ -194,6 +205,14 @@ function App() {
   const [interruptedImport, setInterruptedImport] = useState<InterruptedImport | null>(null);
   /** That session's own card, back in the slot. Identity-matched, never by path. */
   const [resumableCard, setResumableCard] = useState<CardCandidate | null>(null);
+  /**
+   * An import waiting on a volume that stopped answering (#79). Unlike the
+   * interrupted session above, this one is not a workflow: it watches for its
+   * own endpoint and continues by itself once identity checks out.
+   */
+  const [pausedImport, setPausedImport] = useState<PausedImport | null>(null);
+  /** The last completed probe of that endpoint. Null until the first lands. */
+  const [pausedProbe, setPausedProbe] = useState<EndpointProbe | null>(null);
   /** Whether the import dialog is currently showing the waiting-for-source state. */
   const [importDisconnected, setImportDisconnected] = useState(false);
   // The active shelf tab is a mode, not per-clip state: it persists as you
@@ -870,6 +889,44 @@ function App() {
       window.clearInterval(timer);
     };
   }, [interruptedImport, projectId, showImportDialog]);
+
+  // ── Paused import: watch for the endpoint, continue when it proves itself ──
+  // The whole recovery model of #79 lives here. There is nothing for the user
+  // to press: this asks, on a timer, whether the endpoint is back and whether
+  // it can prove it is the same one, and continues the moment both hold.
+  //
+  // Elapsed time is not consulted. A pause of four hours asks exactly what a
+  // pause of four seconds asks, because identity is the safety property and a
+  // clock is not.
+  useEffect(() => {
+    if (!api.isDesktop() || !pausedImport) return;
+    let disposed = false;
+    // One probe at a time, for the whole life of this pause. Probing a volume
+    // that has stopped answering can park for as long as the copy did, so a
+    // tick landing on top of an outstanding probe is skipped rather than queued
+    // (#79) — otherwise the recovery UI reproduces the hang it recovers from.
+    const gate = probeOnce<{ probe: EndpointProbe; sourcePath: string }>();
+    const look = async () => {
+      let looked: { probe: EndpointProbe; sourcePath: string } | null = null;
+      try {
+        looked = await gate(() => probePausedEndpoint(pausedImport));
+      } catch {
+        looked = { probe: { present: false, identityVerified: false }, sourcePath: pausedImport.session.sourcePath };
+      }
+      // A skipped tick is not an answer; the last real probe stands.
+      if (disposed || looked === null) return;
+      setPausedProbe(looked.probe);
+      if (resumeDecision(pausedImport, looked.probe).action === "continue") {
+        void continuePausedImport(pausedImport, looked.sourcePath);
+      }
+    };
+    void look();
+    const timer = window.setInterval(() => void look(), 4_000);
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+    };
+  }, [pausedImport]);
 
   useEffect(() => {
     if (selected) {
@@ -1891,7 +1948,20 @@ function App() {
       // A source that went away is a recoverable state, not a result. Record
       // the session, reopen the dialog on its waiting screen, and leave the
       // completed-run report unset — there is no completed run to report.
+      // #79 takes the disconnected cases first: both ends are now recoverable
+      // without a Resume step. #67's interrupted session is still recorded
+      // underneath it, because that workflow is what "Choose source…" escalates
+      // into when an endpoint comes back unable to prove itself.
+      const paused = pauseFromReport(pausedOptionsFor(sessionOptions), report);
       const interruption = interruptionFromReport(sessionOptions, report);
+      if (paused) {
+        setPausedImport(paused);
+        setPausedProbe(null);
+        setInterruptedImport(interruption);
+        setShowImportDialog(false);
+        setImportDisconnected(false);
+        return;
+      }
       setInterruptedImport((current) => {
         if (interruption) return interruption;
         // A run that finished on its own terms clears only its own session's
@@ -1947,6 +2017,159 @@ function App() {
       setImportRunning(false);
       setBusy(false);
     }
+  }
+
+  /**
+   * The labels the paused surface says out loud (#79), resolved while the run's
+   * choices are still in hand.
+   */
+  function pausedOptionsFor(session: InterruptedImportOptions) {
+    const root = archiveRoots.find((entry) => entry.id === session.archiveRootId);
+    return {
+      ...session,
+      sourceLabel: session.card?.label ?? session.sourcePath,
+      destinationLabel: root?.displayName ?? "the archive",
+    };
+  }
+
+  /**
+   * What the last look at a paused import's endpoint found (#79).
+   *
+   * A destination is a catalog question, bounded in the core. A source is read
+   * from the card listing the mount poll already maintains, so watching for it
+   * costs nothing beyond what #67 was already doing.
+   */
+  async function probePausedEndpoint(
+    state: PausedImport,
+  ): Promise<{ probe: EndpointProbe; sourcePath: string }> {
+    const sourcePath = state.session.sourcePath;
+    if (state.endpoint === "destination") {
+      return { probe: await api.probeArchiveRoot(state.session.archiveRootId), sourcePath };
+    }
+    const mounted = await api.detectMountedCards().catch(() => []);
+    // Identity first, wherever it now sits: a card that came back while its old
+    // name was still taken is mounted somewhere else entirely (#67).
+    const match = findPausedSource(state.session.card, mounted);
+    if (match) {
+      return { probe: sourceProbe(state.session.card, match), sourcePath: match.mountPath };
+    }
+    // Nothing of ours. Something occupying the remembered path is still worth
+    // reporting as present, because "a card is in the slot and it is not yours"
+    // is the one source condition a user can actually settle.
+    const atPath = mounted.find((candidate) => candidate.mountPath === sourcePath) ?? null;
+    return { probe: sourceProbe(state.session.card, atPath), sourcePath };
+  }
+
+  /**
+   * Continue a paused run now that its endpoint has proven itself (#79).
+   *
+   * Deliberately re-runs preflight rather than reusing the plan the run started
+   * with: clips committed before the pause are already in the project, and a
+   * stale plan would offer to copy them a second time. Re-planning is what makes
+   * continuing safe without asking the user to confirm anything.
+   */
+  async function continuePausedImport(state: PausedImport, sourcePath = state.session.sourcePath) {
+    const run = { ...state.session, sourcePath };
+    if (projectIdRef.current !== run.projectId || importRunning || busy) return;
+    setPausedImport(null);
+    setPausedProbe(null);
+    setImportRunning(true);
+    setBusy(true);
+    setImportError("");
+    activeOperationRef.current = "import";
+    try {
+      const plan = await api.preflightImport(
+        run.projectId,
+        run.sourcePath,
+        run.archiveRootId || null,
+        run.cameraOverride,
+      );
+      setOperationProgress(initialProgress("import", plan.newClips + plan.relinkable));
+      const report = await api.runSmartImport(
+        run.projectId,
+        plan,
+        run.verifyCopies,
+        run.makeProxies,
+      );
+      if (projectIdRef.current !== run.projectId) return;
+      await Promise.all([
+        reloadSessionAssets(),
+        reconcileImportChronology(run.projectId),
+        refreshProjects(),
+        session.reloadReadiness(),
+      ]);
+      if (projectIdRef.current !== run.projectId) return;
+      setImportSessions((current) => report.session ? [report.session, ...current.filter((entry) => entry.id !== report.session!.id)] : current);
+      // The volume can go away again mid-continuation. That is another pause,
+      // not a failure: the same conditions are evaluated afresh.
+      const paused = pauseFromReport(pausedOptionsFor(run), report);
+      if (paused) {
+        setPausedImport(paused);
+        setPausedProbe(null);
+        return;
+      }
+      setInterruptedImport((current) =>
+        current && isSameInterruptedSession(current, run) ? null : current,
+      );
+      setMessage(`Import complete · ${report.outcome.imported} clip${report.outcome.imported === 1 ? "" : "s"} added`);
+    } catch (reason) {
+      if (projectIdRef.current !== run.projectId) return;
+      // Continuing failed outright. Park the run back in the paused state it
+      // came from rather than dropping it: the endpoint that just proved itself
+      // may already be gone again, and the committed work is still committed.
+      setPausedImport(state);
+      setPausedProbe(null);
+      setImportError(String(reason));
+    } finally {
+      activeOperationRef.current = null;
+      setOperationProgress(null);
+      setImportRunning(false);
+      setBusy(false);
+    }
+  }
+
+  /** Stop waiting and let the run go (#79). Committed clips stay committed. */
+  function cancelPausedImport() {
+    if (!pausedImport) return;
+    const run = pausedImport.session;
+    setPausedImport(null);
+    setPausedProbe(null);
+    setInterruptedImport((current) =>
+      current && isSameInterruptedSession(current, run) ? null : current,
+    );
+    setMessage("Import stopped; finished files were kept");
+  }
+
+  /**
+   * The escalation of last resort (#79 §5), and the answer to what becomes of
+   * #67's Resume entry point: it is not dead code, it is this. An endpoint that
+   * came back unable to prove itself is the one case a user can actually settle,
+   * and settling it by hand is exactly the workflow #67 already built.
+   */
+  async function correctPausedImport(corrective: Corrective) {
+    const state = pausedImport;
+    if (!state) return;
+    if (corrective === "locate-archive") {
+      const root = archiveRoots.find((entry) => entry.id === state.session.archiveRootId);
+      if (!root) return;
+      const path = await api.chooseArchiveFolder(`Where is “${root.displayName}” mounted now?`);
+      if (!path) return;
+      try {
+        const rebound = await api.bindArchiveRoot(root.id, path);
+        setArchiveRoots((current) => current.map((item) => item.id === rebound.id ? rebound : item));
+        // Deliberately does not continue the import here. Rebinding records the
+        // volume the root now lives on (#78); the next probe reads that back and
+        // continues only if it proves out. The user's answer is an input to the
+        // identity check, never a way around it.
+      } catch (reason) {
+        setImportError(String(reason));
+      }
+      return;
+    }
+    setPausedImport(null);
+    setPausedProbe(null);
+    setInterruptedImport({ ...state.session, committed: state.committed, failed: state.failed, interruptedAt: state.pausedAt });
+    await chooseInterruptedImportSource();
   }
 
   /**
@@ -3167,6 +3390,19 @@ function App() {
           onSyncNow={() => { api.syncNow(syncStatus.projectId).catch(() => {}); }}
           onClose={() => setShowSyncDiagnostics(false)}
         />
+      )}
+
+      {pausedImport && pausedImport.session.projectId === projectId && (
+        <div className="context-modal-backdrop" role="dialog" aria-modal="true" aria-label="Import paused">
+          <div className="context-modal import-paused-modal">
+            <PausedImportPanel
+              paused={pausedImport}
+              probe={pausedProbe}
+              onCancel={cancelPausedImport}
+              onCorrective={(corrective) => void correctPausedImport(corrective)}
+            />
+          </div>
+        </div>
       )}
 
       {showImportDialog && (

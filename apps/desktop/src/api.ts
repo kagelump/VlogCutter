@@ -1,6 +1,7 @@
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
+import type { EndpointProbe } from "./import/pausedImport";
 import type { AnalysisProgress, AnalysisReadiness, AnalysisRunRecord, AnalysisRunReport, AnalysisRunRequest, AnalysisStage, ArchiveRoot, Asset, AssetAnalysisIndexEntry, AssetAnalysisView, AssetPatch, AutoplayMode, BaselineImportResult, BaselinePreviewResult, CacheCleanupReport, CacheKind, CameraMapping, CameraMergePreview, CameraMergeReport, CardCandidate, ClipTranscript, DesktopSettings, GenerationProgress, ImportCutoff, ImportHistoryEntry, ImportPreflight, ImportPreviewItem, ImportPreviewRequest, ImportProgress, ImportRollbackPreview, ImportRunReport, ImportSessionDetail, LoadedCatalog, MediaOrigin, ModelInstallProgress, ModelStatus, PathAnalysis, Project, ProjectLibrary, ProjectRemovalAudit, ProjectStorageReport, ProjectPairingStatus, RelinkReport, RootMappingEntry, ServerConnectionStatus, ServerPairingResult, ServerVersionInfo, SyncStatus, ThumbnailReport } from "./types";
 
 /**
@@ -155,6 +156,16 @@ export const api = {
 
   async inspectImportSource(path: string): Promise<CardCandidate | null> {
     return invoke("inspect_import_source", { path });
+  },
+
+  /**
+   * What a look at a paused import's destination finds right now (#79).
+   *
+   * Bounded in the core, so a volume that is mounted and refusing to answer
+   * returns "not present" instead of parking the poll that asked.
+   */
+  async probeArchiveRoot(archiveRootId: string): Promise<EndpointProbe> {
+    return invoke("probe_archive_root", { archiveRootId });
   },
 
   async detectMountedCards(): Promise<CardCandidate[]> {

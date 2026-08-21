@@ -46,6 +46,36 @@ pub struct ArchiveRoot {
     pub created_at: String,
 }
 
+/// How long a probe waits on a mount point before calling it unresponsive.
+///
+/// Deliberately far below the import path's stall limit. That limit is sized so
+/// a cold spin-up is never mistaken for a dead disk during a copy; this one is
+/// asked repeatedly by a waiting import, where a slow answer is itself the
+/// answer — nothing that takes seconds to stat is ready to receive a copy.
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// What a look at a paused import's endpoint found (#79).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EndpointProbe {
+    /// Something is reachable at the endpoint and answered in time.
+    pub present: bool,
+    /// That something proved it is the volume the import was using — a UUID
+    /// match, not a pathname match. Never inferred from `present`.
+    pub identity_verified: bool,
+}
+
+impl EndpointProbe {
+    /// Nothing there. Identity is not evaluable for a volume that has not come
+    /// back, so it is reported unproven rather than guessed at.
+    fn absent() -> Self {
+        Self {
+            present: false,
+            identity_verified: false,
+        }
+    }
+}
+
 impl Catalog {
     /// Names a new destination and binds it to where it is mounted now.
     ///
@@ -189,6 +219,38 @@ impl Catalog {
             params![archive_root_id, node_id, volume_id],
         )?;
         Ok(())
+    }
+
+    /// What a look at this root's endpoint finds right now (#79).
+    ///
+    /// The question a paused import asks on repeat while it waits, so it is
+    /// bounded far more tightly than a copy would be: a mounted-but-mute
+    /// volume must not park the answer for a minute every time it is asked.
+    /// Failing that bound reads as "not answering", which is the honest state
+    /// — an endpoint that cannot be stat'd cannot be written to either.
+    ///
+    /// `identity_verified` is never inferred from `present`. A path that
+    /// answers proves only that something is there; continuing a 138 GB copy
+    /// needs the UUID gate to agree it is the same drive.
+    pub fn probe_archive_root(&self, archive_root_id: &str) -> Result<EndpointProbe> {
+        let root = self.archive_root(archive_root_id)?;
+        let Some(mount) = root.local_mount_path else {
+            return Ok(EndpointProbe::absent());
+        };
+        let probed = PathBuf::from(&mount);
+        let present = crate::stall::with_stall_timeout(
+            "probing the archive volume",
+            PROBE_TIMEOUT,
+            move || probed.is_dir(),
+        )
+        .unwrap_or(false);
+        if !present {
+            return Ok(EndpointProbe::absent());
+        }
+        Ok(EndpointProbe {
+            present: true,
+            identity_verified: self.archive_root_volume_matches(archive_root_id)?,
+        })
     }
 
     /// Whether the volume now mounted at this root's path is the one it was
@@ -372,6 +434,79 @@ mod tests {
             catalog.archive_root_volume_matches(&root.id).unwrap(),
             "the volume has not moved, so the root still matches it"
         );
+    }
+
+    /// #79: a paused import asks this over and over while it waits. An endpoint
+    /// that is simply unplugged has to come back "absent", not as an error.
+    #[test]
+    fn probing_a_root_whose_drive_is_unplugged_finds_it_absent() {
+        let directory = tempdir().unwrap();
+        let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).unwrap();
+        let mount = directory.path().join("Volumes/Shuttle");
+        std::fs::create_dir_all(&mount).unwrap();
+        let root = catalog.create_archive_root("Shuttle SSD", &mount).unwrap();
+
+        std::fs::remove_dir_all(&mount).unwrap();
+
+        let probe = catalog.probe_archive_root(&root.id).unwrap();
+        assert!(!probe.present, "nothing is mounted there any more");
+        assert!(
+            !probe.identity_verified,
+            "identity is never claimed for something that is not there"
+        );
+    }
+
+    /// The escalation case #79 exists to keep safe: something is at the path,
+    /// and it cannot prove it is the drive the import was writing to. Presence
+    /// must never be reported as identity.
+    #[test]
+    fn probing_a_root_that_cannot_prove_itself_is_present_but_unverified() {
+        let directory = tempdir().unwrap();
+        let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).unwrap();
+        let mount = directory.path().join("Volumes/Shuttle");
+        std::fs::create_dir_all(&mount).unwrap();
+        let root = catalog.create_archive_root("Shuttle SSD", &mount).unwrap();
+        // Strip whatever identity the bind recorded, so the root is one that
+        // cannot prove itself on any platform — the state a binding made before
+        // #78, or on a volume that cannot describe itself, is permanently in.
+        catalog
+            .connection()
+            .unwrap()
+            .execute(
+                "UPDATE archive_root_bindings SET volume_id = NULL WHERE archive_root_id = ?1",
+                params![root.id],
+            )
+            .unwrap();
+
+        let probe = catalog.probe_archive_root(&root.id).unwrap();
+        assert!(probe.present, "the directory is right there and answers");
+        assert!(
+            !probe.identity_verified,
+            "a path that answers proves only that something is there"
+        );
+    }
+
+    /// A root that was never bound on this node has no path to probe — the
+    /// binding row simply is not there. That is a state, not a failure.
+    #[test]
+    fn probing_an_unbound_root_finds_it_absent() {
+        let directory = tempdir().unwrap();
+        let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).unwrap();
+        let mount = directory.path().join("Volumes/Shuttle");
+        std::fs::create_dir_all(&mount).unwrap();
+        let root = catalog.create_archive_root("Shuttle SSD", &mount).unwrap();
+        catalog
+            .connection()
+            .unwrap()
+            .execute(
+                "DELETE FROM archive_root_bindings WHERE archive_root_id = ?1",
+                params![root.id],
+            )
+            .unwrap();
+
+        let probe = catalog.probe_archive_root(&root.id).unwrap();
+        assert!(!probe.present);
+        assert!(!probe.identity_verified);
     }
 
     /// The promise the whole model exists for: the archive drive moves, the user

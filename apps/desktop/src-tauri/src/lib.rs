@@ -4,11 +4,11 @@ use rcdvlog_core::{
     AnalysisReadiness, AnalysisRunOptions, AnalysisRunOutcome, AnalysisRunRecord, AnalyzeReport,
     ArchiveRoot, Asset, AssetAnalysisIndexEntry, AssetAnalysisView, AssetPatch,
     BatchProgressEstimate, CacheCleanupReport, CacheKind, CameraMapping, CameraMergePreview,
-    CameraMergeReport, CardCandidate, Catalog, ClipTranscript, ClockEvent, ImportCutoff,
-    ImportHistoryEntry, ImportOutcome, ImportPreflight, ImportPreviewItem, ImportPreviewRequest,
-    ImportProgress as CoreImportProgress, ImportRollbackPreview, ImportSessionDetail,
-    ImportStage as CoreImportStage, IngestReport, ModelStatus, MountedVolumes, Project,
-    ProjectRemovalAudit, ProjectStorageReport, ProxyReport, RelinkReport, ThumbnailReport,
+    CameraMergeReport, CardCandidate, Catalog, ClipTranscript, ClockEvent, EndpointProbe,
+    ImportCutoff, ImportHistoryEntry, ImportOutcome, ImportPreflight, ImportPreviewItem,
+    ImportPreviewRequest, ImportProgress as CoreImportProgress, ImportRollbackPreview,
+    ImportSessionDetail, ImportStage as CoreImportStage, IngestReport, ModelStatus, MountedVolumes,
+    Project, ProjectRemovalAudit, ProjectStorageReport, ProxyReport, RelinkReport, ThumbnailReport,
     ToolStatus, TranscribeReport, detect_cards, inspect_card,
 };
 use rcdvlog_sync::BaselineEnvelope;
@@ -969,6 +969,23 @@ async fn detect_mounted_cards() -> Result<Vec<CardCandidate>, String> {
 #[tauri::command]
 fn list_archive_roots(state: State<'_, AppState>) -> Result<Vec<ArchiveRoot>, String> {
     state.catalog()?.list_archive_roots().map_err(error_message)
+}
+
+/// What a look at a paused import's destination finds right now (#79).
+///
+/// Deliberately cheap and deliberately repeatable: a paused import asks this on
+/// a timer while it waits, and the answer must arrive whether the volume is
+/// back, gone, or mounted and refusing to answer.
+#[tauri::command]
+async fn probe_archive_root(
+    archive_root_id: String,
+    state: State<'_, AppState>,
+) -> Result<EndpointProbe, String> {
+    let catalog = state.catalog()?;
+    tauri::async_runtime::spawn_blocking(move || catalog.probe_archive_root(&archive_root_id))
+        .await
+        .map_err(error_message)?
+        .map_err(error_message)
 }
 
 #[tauri::command]
@@ -2708,6 +2725,7 @@ pub fn run() {
             delete_project,
             create_project,
             inspect_import_source,
+            probe_archive_root,
             detect_mounted_cards,
             list_archive_roots,
             create_archive_root,

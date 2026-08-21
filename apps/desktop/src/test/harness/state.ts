@@ -182,6 +182,12 @@ export interface DesktopHarnessState {
   editPlans: EditPlanScenarioState;
 
   archiveRoots: ArchiveRoot[];
+  /**
+   * The volume actually mounted at a given path right now, keyed by path (#78).
+   * Absent means "whatever the root was bound to is still there"; setting it is
+   * how a scenario stages a different drive answering at a remembered path.
+   */
+  mountedVolumeIds: Record<string, string>;
   cards: CardCandidate[];
   imports: ImportScenarioState;
   /** Asset ids a relink at a given folder would actually find. */
@@ -293,6 +299,7 @@ export function createInitialState(clock: HarnessClock): DesktopHarnessState {
     },
 
     archiveRoots: [],
+    mountedVolumeIds: {},
     cards: [],
     imports: { preflights: {}, additions: {}, lastRunSourcePath: null, sessions: {}, cameraMappings: {}, cameraExifHints: {}, cutoffs: {} },
     relinkable: {},

@@ -23,7 +23,7 @@ import { importCommands } from "./commands/import";
 import { mediaCommands } from "./commands/media";
 import { editPlanCommands } from "./commands/editPlan";
 import { MediaController } from "./media";
-import type { Asset, CardCandidate } from "../../types";
+import type { ArchiveRoot, Asset, CardCandidate } from "../../types";
 
 export interface CommandLogEntry {
   command: string;
@@ -350,6 +350,46 @@ export class DesktopHarness {
         };
         harness.state.cards.push(intruder);
         return intruder;
+      },
+    };
+  }
+
+  /**
+   * The archive destination that goes away and comes back (#79).
+   *
+   * The mirror of `card`, for the other end of the copy. `disconnect` is the
+   * enclosure dropping off the bus mid-write; `reconnect` brings back the same
+   * volume, and `swapForDifferentVolume` stages the case #78 exists to catch —
+   * a drive answering at the remembered path that is not the drive the import
+   * was writing to.
+   */
+  archive(archiveRootId: string) {
+    const harness = this;
+    const find = () => {
+      const root = harness.state.archiveRoots.find((entry) => entry.id === archiveRootId);
+      if (!root) throw new Error(`No archive root ${archiveRootId}`);
+      return root;
+    };
+    const update = (patch: Partial<ArchiveRoot>) => {
+      harness.state.archiveRoots = harness.state.archiveRoots.map((entry) =>
+        entry.id === archiveRootId ? { ...entry, ...patch } : entry,
+      );
+    };
+    return {
+      disconnect() {
+        find();
+        update({ available: false });
+      },
+      reconnect() {
+        const root = find();
+        if (root.localMountPath) delete harness.state.mountedVolumeIds[root.localMountPath];
+        update({ available: true });
+      },
+      /** Same path, different hardware. Identity must refuse this one. */
+      swapForDifferentVolume(volumeId: string) {
+        const root = find();
+        if (root.localMountPath) harness.state.mountedVolumeIds[root.localMountPath] = volumeId;
+        update({ available: true });
       },
     };
   }

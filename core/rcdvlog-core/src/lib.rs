@@ -69,7 +69,7 @@ pub use analysis::provider::{
     ChainOutcome, DEFAULT_MODEL, FALLBACK_MODEL, MODELS, ModelSpec, ProviderChain, VlmProvider,
     VlmRequest, VlmResponse, model_spec,
 };
-pub use archive::ArchiveRoot;
+pub use archive::{ArchiveRoot, EndpointProbe};
 pub use batch_estimator::BatchEstimate as BatchProgressEstimate;
 pub use cards::{
     CardCandidate, MountedVolumes, VolumeSource, card_session_slug, detect_cards, inspect_card,

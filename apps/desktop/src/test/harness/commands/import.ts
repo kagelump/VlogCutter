@@ -313,6 +313,13 @@ function sourcePresent(state: DesktopHarnessState, plan: ImportPreflight): boole
   return state.cards.some((card) => card.sessionId === plan.card!.sessionId);
 }
 
+/** Whether the archive root this run copies into is still answering (#79). */
+function destinationPresent(state: DesktopHarnessState, plan: ImportPreflight): boolean {
+  const root = plan.destination.archiveRoot;
+  if (!root) return true;
+  return state.archiveRoots.some((entry) => entry.id === root.id && entry.available);
+}
+
 /** Only a user selection or a remembered mapping forces every new asset's
  * camera, mirroring `run_import`'s own `camera_override` gate in
  * `preflight.rs` — plain detection leaves each clip's own declared camera
@@ -355,6 +362,10 @@ function runReport(
   // failed files. Proxies are skipped for the same reason the desktop command
   // skips them: the reconnect prompt is the thing the user needs next.
   const sourceDisconnected = !sourcePresent(state, plan);
+  // The other end of the copy (#79). A destination that dropped off the bus
+  // stops the run the same way a vanished source does: committed clips stay
+  // committed, and what is left is work to continue, not work that failed.
+  const destinationDisconnected = !sourceDisconnected && !destinationPresent(state, plan);
   const sessionId = `import_${Object.keys(state.imports.sessions).length + 1}`;
   const session: ImportSessionDetail = {
     id: sessionId, projectId: tally.projectId, sourcePath: plan.sourcePath,
@@ -379,11 +390,12 @@ function runReport(
       bytesCopied: tally.bytesCopied,
       cancelled,
       sourceDisconnected,
+      destinationDisconnected,
       failures: [],
       warnings: [],
       cameraMappingWarning: null,
     },
-    proxies: makeProxies && !sourceDisconnected
+    proxies: makeProxies && !sourceDisconnected && !destinationDisconnected
       ? { generated: tally.imported.length, skipped: 0, cancelled: cancelled || proxyCancelled, failures: [] }
       : null,
     files: plan.items.map((item) => {
@@ -408,6 +420,26 @@ export const importCommands: CommandTable = {
   },
 
   list_archive_roots: (_args, { state }) => state.archiveRoots,
+
+  /**
+   * What a paused import's destination looks like right now (#79).
+   *
+   * Presence and identity are answered separately on purpose, because the case
+   * that matters is the one where they disagree: a drive is mounted at the
+   * remembered path and is not the drive the import was writing to.
+   */
+  probe_archive_root: (args, { state }) => {
+    const archiveRootId = requireString(args, "archiveRootId");
+    const root = state.archiveRoots.find((existing) => existing.id === archiveRootId);
+    if (!root || !root.available || !root.localMountPath) {
+      return { present: false, identityVerified: false };
+    }
+    const mounted = state.mountedVolumeIds[root.localMountPath] ?? root.volumeId;
+    return {
+      present: true,
+      identityVerified: root.volumeId !== null && mounted === root.volumeId,
+    };
+  },
 
   create_archive_root: (args, { state, clock }): ArchiveRoot => {
     const displayName = requireString(args, "displayName");

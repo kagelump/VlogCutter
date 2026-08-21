@@ -1175,6 +1175,23 @@ kbd { padding: 2px 4px; color: #a8b1b6; background: #262d32; border: 1px solid #
 .import-disconnected .import-disconnected-note { max-width: 520px; margin-top: 18px; font-size: 10px; }
 .media-menu button.media-menu-interrupted { color: var(--amber); }
 
+/* The paused import surface (#79). Deliberately quieter than an error: a pause
+   is a state to sit in, and the amber rule is the whole of its alarm. */
+.import-paused-modal { max-width: 560px; }
+.import-paused { padding: 40px 48px 32px; border-left: 3px solid var(--amber); }
+.import-paused h3 { margin: 5px 0 9px; color: var(--ink); font-size: 21px; }
+.import-paused p { margin: 5px 0; color: var(--quiet); }
+.import-paused-conditions { margin: 18px 0 0; padding: 0; list-style: none; }
+.import-paused-conditions li {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 10px 0; border-top: 1px solid var(--line-soft); color: var(--ink);
+}
+.import-paused-note { max-width: 520px; margin-top: 18px; font-size: 10px; }
+.import-paused-details { margin-top: 18px; font-size: 11px; color: var(--quiet); }
+.import-paused-details summary { cursor: pointer; }
+.import-paused-details ul { margin: 8px 0 0; padding-left: 18px; }
+.import-paused-actions { display: flex; justify-content: flex-end; margin-top: 24px; }
+
 @media (max-width: 760px) {
   .import-delta { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .import-route { grid-template-columns: 1fr; gap: 4px; }

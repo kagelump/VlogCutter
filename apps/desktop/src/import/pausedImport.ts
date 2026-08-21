@@ -26,7 +26,8 @@
  * the surface always answers the same question: what is still missing?
  */
 
-import type { ImportRunReport } from "../types";
+import type { CardCandidate, ImportRunReport } from "../types";
+import { isSameCardSession, type InterruptedImportOptions } from "./interruptedImport";
 
 /** Which end of the copy stopped answering. */
 export type PausedEndpoint = "source" | "destination";
@@ -43,6 +44,13 @@ export type PausedReachability = "not-responding" | "not-connected";
 
 /** An import waiting for a volume, holding everything needed to go on. */
 export interface PausedImport {
+  /**
+   * The choices the run was started with. Continuing means continuing *this*
+   * run — same destination, same camera, same verification the user agreed to
+   * — so the pause keeps the whole snapshot rather than re-deriving it from a
+   * dialog that is no longer open.
+   */
+  session: InterruptedImportOptions;
   endpoint: PausedEndpoint;
   /** What to call the volume while it is unavailable. */
   volumeLabel: string;
@@ -88,9 +96,14 @@ export type ResumeDecision =
   | { action: "continue" }
   | { action: "blocked"; unmet: ResumeCondition[] };
 
-/** The naming and options a paused run has to restore when it continues. */
-export interface PausedImportOptions {
-  projectId: string;
+/**
+ * The naming and options a paused run has to restore when it continues.
+ *
+ * Extends #67's session snapshot rather than duplicating it: an import that
+ * paused on its destination needs exactly what an import that lost its source
+ * needed, plus the two labels the waiting surface says out loud.
+ */
+export interface PausedImportOptions extends InterruptedImportOptions {
   sourceLabel: string;
   destinationLabel: string;
 }
@@ -123,6 +136,15 @@ export function pauseFromReport(
   const stalled = outcome.failures.some((failure) => failure.error.includes(STALL_MARKER));
 
   return {
+    session: {
+      projectId: options.projectId,
+      sourcePath: options.sourcePath,
+      card: options.card,
+      archiveRootId: options.archiveRootId,
+      cameraOverride: options.cameraOverride,
+      verifyCopies: options.verifyCopies,
+      makeProxies: options.makeProxies,
+    },
     endpoint,
     volumeLabel: endpoint === "destination" ? options.destinationLabel : options.sourceLabel,
     reachability: stalled ? "not-responding" : "not-connected",
@@ -146,6 +168,72 @@ export function resumeDecision(_paused: PausedImport, probe: EndpointProbe): Res
   // here is writing onto someone else's disk.
   if (!probe.identityVerified) return { action: "blocked", unmet: ["identity-proven"] };
   return { action: "continue" };
+}
+
+/**
+ * What the mount poll's answer means for a paused *source*.
+ *
+ * The destination's probe is a catalog question answered in the core, where
+ * the archive root's recorded volume lives. A source is answered from the same
+ * card listing the app already polls, so it costs nothing extra to ask.
+ *
+ * A run whose source was a plain folder has no identity to compare, so it can
+ * never be proven — which is the honest answer, not a shortcoming. Presence is
+ * not identity here either.
+ */
+export function sourceProbe(
+  expected: CardCandidate | null,
+  found: CardCandidate | null,
+): EndpointProbe {
+  return {
+    present: found !== null,
+    identityVerified: isSameCardSession(expected, found),
+  };
+}
+
+/**
+ * The card a paused source is waiting for, found wherever it is now mounted.
+ *
+ * By identity and only by identity. A volume that returns while its old name is
+ * still taken comes back at a different path, so searching the remembered path
+ * would miss the very case this exists for — and matching on that path would
+ * accept a different card in the same slot, which is worse.
+ */
+export function findPausedSource(
+  expected: CardCandidate | null,
+  mounted: CardCandidate[],
+): CardCandidate | null {
+  if (!expected) return null;
+  return mounted.find((candidate) => isSameCardSession(expected, candidate)) ?? null;
+}
+
+/**
+ * A gate that lets one probe run at a time, skipping ticks that arrive while
+ * one is still outstanding.
+ *
+ * #79 requires this for the same reason #76 exists: probing a volume that has
+ * stopped answering can park for as long as the original copy did. A poll that
+ * fired regardless would accumulate one stuck probe per tick against precisely
+ * the volume least able to answer them — the failure mode being recovered from,
+ * reproduced inside the recovery UI.
+ *
+ * A skipped tick returns null, which is not an answer and must not be read as
+ * one: the last real probe stands until a new one lands.
+ */
+export function probeOnce<T = EndpointProbe>(): (probe: () => Promise<T>) => Promise<T | null> {
+  let inFlight = false;
+  return async (probe: () => Promise<T>) => {
+    if (inFlight) return null;
+    inFlight = true;
+    try {
+      return await probe();
+    } finally {
+      // Released on failure too. A volume that errors rather than hangs is
+      // still a volume that may come back, and a gate left shut would mean the
+      // pause could never end.
+      inFlight = false;
+    }
+  };
 }
 
 /** The unchanging headline. What varies goes in the condition lines. */
