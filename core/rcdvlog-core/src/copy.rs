@@ -11,11 +11,14 @@
 //!
 //! - **Create-only.** An occupied target is a classification result
 //!   (`PathCollision`), never a collision to resolve by clobbering. Archived
-//!   originals are immutable once written.
-//! - **Atomic.** Temp file in the destination directory, fsync, rename. A
-//!   partial file is never visible under its final name, so an interrupted
-//!   import leaves a card half-copied but never a truncated clip masquerading as
-//!   a whole one.
+//!   originals are immutable once written. This is enforced by the operation
+//!   that publishes the file, not merely by an `exists()` check taken minutes
+//!   earlier: copying a clip takes real time, and a target that appears during
+//!   that window must survive too (#80).
+//! - **Atomic.** Temp file in the destination directory, fsync, no-replace
+//!   publication. A partial file is never visible under its final name, so an
+//!   interrupted import leaves a card half-copied but never a truncated clip
+//!   masquerading as a whole one.
 //! - **Verified.** The full-file BLAKE3 is computed while writing and again from
 //!   the committed file. The sampled fingerprint used for identity reads only
 //!   the first and last 1 MiB and would not notice a corrupted middle, so it is
@@ -35,7 +38,7 @@
 use anyhow::{Context, Result, bail};
 use blake3::Hasher;
 use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 
 /// Bytes moved per read/write cycle. Large enough to keep a spinning NAS
@@ -68,6 +71,11 @@ where
         // Never overwrite. Preflight classifies this as a collision; reaching
         // here means the archive changed under us, which is still not licence to
         // destroy what is already there.
+        //
+        // This is an early exit, not the guarantee: it saves copying a clip
+        // that already has nowhere to land. The guarantee is `publish`, which
+        // is create-only at the moment of publication and so also covers a
+        // target that appears after this check (#80).
         bail!(
             "{} already exists; archived originals are never overwritten",
             target.display()
@@ -143,8 +151,23 @@ where
         }
     }
 
-    fs::rename(temp, target)
-        .with_context(|| format!("commit archive file {}", target.display()))?;
+    match publish(temp, target)
+        .with_context(|| format!("commit archive file {}", target.display()))?
+    {
+        Publication::Committed => {}
+        Publication::TargetAppeared => {
+            // Someone occupied the pathname while this clip was being copied.
+            // Whatever is there now is not ours to judge, let alone replace;
+            // the temp file is discarded by the caller and the card is
+            // untouched, so a later run reclassifies the pathname and either
+            // adopts identical content or reports a collision.
+            bail!(
+                "{} appeared while it was being copied; archived originals are never overwritten. \
+                 Nothing was imported for this clip — re-run the import to reconcile it",
+                target.display()
+            );
+        }
+    }
     // fsync the directory so the new name itself survives a crash.
     if let Some(parent) = target.parent()
         && let Ok(directory) = File::open(parent)
@@ -156,6 +179,167 @@ where
         path: target.to_path_buf(),
         size_bytes,
     }))
+}
+
+/// What happened at the moment a finished temp file was given its final name.
+#[derive(Debug, PartialEq, Eq)]
+enum Publication {
+    /// The final name did not exist and now names the copied bytes.
+    Committed,
+    /// The final name was occupied by the time we tried to publish. Whatever
+    /// is there was left exactly as it was found.
+    TargetAppeared,
+}
+
+/// Publishes a verified temp file under its final name, create-only.
+///
+/// A plain `rename` is not create-only: it replaces an existing destination.
+/// The `exists()` check `commit_into_archive` starts with is minutes stale by
+/// the time a large clip finishes copying, so publication has to carry the
+/// invariant itself. Three tiers, best first, each of them no-clobber:
+///
+/// 1. The platform's no-replace rename (`renameat2(RENAME_NOREPLACE)`,
+///    `renamex_np(RENAME_EXCL)`). One atomic operation that fails rather than
+///    replace.
+/// 2. A hard link, then unlinking the temp name. `link(2)` and
+///    `CreateHardLinkW` refuse an existing destination, so the final name
+///    still appears atomically and complete. A crash between the link and the
+///    unlink leaves the correct bytes under the final name plus a temp file to
+///    sweep up — never a wrong or partial target.
+/// 3. Reserving the name with an exclusive create, then renaming the temp file
+///    over the placeholder we now own. Last resort for filesystems with
+///    neither of the above (FAT/exFAT external drives), where the alternative
+///    would be to give up no-clobber entirely.
+fn publish(temp: &Path, target: &Path) -> Result<Publication> {
+    if let Some(result) = native_no_replace_rename(temp, target) {
+        return match result {
+            Ok(()) => Ok(Publication::Committed),
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+                Ok(Publication::TargetAppeared)
+            }
+            Err(error) => Err(error.into()),
+        };
+    }
+    if let Some(publication) = publish_by_link(temp, target)? {
+        return Ok(publication);
+    }
+    publish_by_reservation(temp, target)
+}
+
+/// Tier 2. `None` when this filesystem has no hard links to offer, which is
+/// not a failure of the copy — the caller falls through to the next tier.
+fn publish_by_link(temp: &Path, target: &Path) -> Result<Option<Publication>> {
+    match fs::hard_link(temp, target) {
+        Ok(()) => {
+            // The final name is published. The temp name is now a second link
+            // to the same bytes and is ours alone to remove.
+            let _ = fs::remove_file(temp);
+            Ok(Some(Publication::Committed))
+        }
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+            Ok(Some(Publication::TargetAppeared))
+        }
+        Err(_) => Ok(None),
+    }
+}
+
+/// Tier 3. An exclusive create is the one create-only primitive every
+/// filesystem has. It reserves the pathname against any concurrent copy taking
+/// this same route, and the rename that follows replaces only the empty
+/// placeholder we just created.
+fn publish_by_reservation(temp: &Path, target: &Path) -> Result<Publication> {
+    match File::create_new(target) {
+        // Dropped immediately: Windows will not rename over an open file.
+        Ok(_) => {}
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+            return Ok(Publication::TargetAppeared);
+        }
+        Err(error) => return Err(error.into()),
+    }
+    if let Err(error) = fs::rename(temp, target) {
+        // Leave no zero-byte file wearing a real clip's name.
+        let _ = fs::remove_file(target);
+        return Err(error.into());
+    }
+    Ok(Publication::Committed)
+}
+
+/// The platform's create-only rename, or `None` where there is not one to use.
+///
+/// `None` means "ask the next tier": either this target has no such call, or
+/// the kernel or filesystem under this particular path does not implement it.
+/// An occupied destination comes back as `Some(Err(AlreadyExists))`, which is
+/// a race outcome rather than a fault.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn native_no_replace_rename(temp: &Path, target: &Path) -> Option<std::io::Result<()>> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    // From `uapi/linux/fs.h`. Spelled out rather than imported so the build
+    // does not depend on which libc version exposes the constant, and invoked
+    // through `syscall` for the same reason.
+    const RENAME_NOREPLACE: libc::c_uint = 1;
+
+    let (Ok(from), Ok(to)) = (
+        CString::new(temp.as_os_str().as_bytes()),
+        CString::new(target.as_os_str().as_bytes()),
+    ) else {
+        // An interior NUL cannot name a file we just wrote; let the portable
+        // tiers produce the ordinary error.
+        return None;
+    };
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            from.as_ptr(),
+            libc::AT_FDCWD,
+            to.as_ptr(),
+            RENAME_NOREPLACE,
+        )
+    };
+    if result == 0 {
+        return Some(Ok(()));
+    }
+    let error = std::io::Error::last_os_error();
+    match error.raw_os_error() {
+        // Old kernel, or a filesystem whose rename ignores flags. Not this
+        // copy's failure.
+        Some(libc::ENOSYS) | Some(libc::EINVAL) | Some(libc::EOPNOTSUPP) => None,
+        _ => Some(Err(error)),
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn native_no_replace_rename(temp: &Path, target: &Path) -> Option<std::io::Result<()>> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let (Ok(from), Ok(to)) = (
+        CString::new(temp.as_os_str().as_bytes()),
+        CString::new(target.as_os_str().as_bytes()),
+    ) else {
+        return None;
+    };
+    if unsafe { libc::renamex_np(from.as_ptr(), to.as_ptr(), libc::RENAME_EXCL) } == 0 {
+        return Some(Ok(()));
+    }
+    let error = std::io::Error::last_os_error();
+    match error.raw_os_error() {
+        // Not every volume type implements it — an exFAT card reader will not.
+        Some(libc::ENOTSUP) | Some(libc::EINVAL) | Some(libc::ENOSYS) => None,
+        _ => Some(Err(error)),
+    }
+}
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios"
+)))]
+fn native_no_replace_rename(_temp: &Path, _target: &Path) -> Option<std::io::Result<()>> {
+    None
 }
 
 /// Full-file BLAKE3. Distinct from the sampled fingerprint used for identity,
@@ -256,6 +440,92 @@ mod tests {
             .filter_map(Result::ok)
             .collect();
         assert!(debris.is_empty(), "the temp file must be cleaned up");
+    }
+
+    /// #80. The `exists()` check at the top of a copy is stale by the time a
+    /// real clip finishes: a target that appears in between must survive.
+    ///
+    /// The race is injected deterministically rather than raced for. Progress
+    /// reports cumulative bytes across both passes, so a report of exactly
+    /// twice the file size is the last verification chunk — after the temp
+    /// file is written and hashed, before it is published.
+    #[test]
+    fn a_target_that_appears_during_the_copy_is_not_overwritten() {
+        let directory = tempdir().unwrap();
+        let source = directory.path().join("C0001.MP4");
+        fs::write(&source, b"new footage").unwrap();
+        let target = directory.path().join("archive/C0001.MP4");
+
+        let mut raced = false;
+        let error = commit_into_archive(&source, &target, true, |bytes| {
+            if bytes == 22 && !raced {
+                // Another import commits this pathname while we were copying.
+                fs::create_dir_all(target.parent().unwrap()).unwrap();
+                fs::write(&target, b"someone else's footage").unwrap();
+                raced = true;
+            }
+            true
+        })
+        .unwrap_err();
+
+        assert!(raced, "the race was never injected");
+        assert!(format!("{error:#}").contains("never overwritten"));
+        assert_eq!(
+            fs::read(&target).unwrap(),
+            b"someone else's footage",
+            "the file that won the race must keep its own bytes"
+        );
+        assert_eq!(
+            fs::read(&source).unwrap(),
+            b"new footage",
+            "the card must be left untouched"
+        );
+        let debris: Vec<_> = fs::read_dir(target.parent().unwrap())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name())
+            .filter(|name| name != "C0001.MP4")
+            .collect();
+        assert!(
+            debris.is_empty(),
+            "the temp file must be cleaned up when the commit loses the race: {debris:?}"
+        );
+    }
+
+    /// Each publication tier is create-only on its own, because which one runs
+    /// depends on the filesystem the archive happens to live on.
+    #[test]
+    fn every_publication_tier_refuses_an_occupied_name() {
+        for publish_one in [
+            &publish as &dyn Fn(&Path, &Path) -> Result<Publication>,
+            &|temp, target| publish_by_link(temp, target).map(Option::unwrap),
+            &publish_by_reservation,
+        ] {
+            let directory = tempdir().unwrap();
+            let temp = directory.path().join(".rcdvlog-incoming-1");
+            let target = directory.path().join("C0001.MP4");
+
+            fs::write(&temp, b"copied bytes").unwrap();
+            assert_eq!(publish_one(&temp, &target).unwrap(), Publication::Committed);
+            assert_eq!(fs::read(&target).unwrap(), b"copied bytes");
+            assert!(!temp.exists(), "the temp name must not linger");
+
+            fs::write(&temp, b"later bytes").unwrap();
+            assert_eq!(
+                publish_one(&temp, &target).unwrap(),
+                Publication::TargetAppeared
+            );
+            assert_eq!(
+                fs::read(&target).unwrap(),
+                b"copied bytes",
+                "the occupant must survive publication"
+            );
+            assert_eq!(
+                fs::read(&temp).unwrap(),
+                b"later bytes",
+                "a lost race must not consume the temp file it declined to publish"
+            );
+        }
     }
 
     #[test]
