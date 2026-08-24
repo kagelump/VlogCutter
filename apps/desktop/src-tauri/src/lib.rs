@@ -19,7 +19,7 @@ use std::io::ErrorKind;
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 use tauri::{Emitter, Manager, State};
 
 mod chronology_commands;
@@ -108,11 +108,11 @@ pub(crate) struct AppState {
     baseline_attempt: Arc<RwLock<Option<BaselineAttempt>>>,
     sync_manager: sync_manager::SyncManager,
     sync_status: Arc<RwLock<HashMap<String, sync_manager::SyncStatus>>>,
-    /// Set by `cancel_analysis` and observed by the running batch. Cleared when
-    /// a run starts so a cancel from a previous run cannot stop the next one.
-    analysis_cancel: Arc<AtomicBool>,
-    /// Shared by preflight, copy/verification, and the optional proxy tail.
-    import_cancel: Arc<AtomicBool>,
+    /// Live cancel tokens for in-flight imports, analyses, and model
+    /// downloads. Every run mints its own token, so a cancel reaches exactly
+    /// the runs that were in flight when it was requested — never a later run,
+    /// and never a run of another kind.
+    operation_cancels: Arc<OperationCancels>,
     /// Session-local ownership for thumbnail output paths. Import-triggered
     /// work and explicit repair batches share it so they cannot write the same
     /// temporary/output file concurrently.
@@ -167,6 +167,100 @@ impl Drop for ThumbnailClaims {
             for asset_id in &self.asset_ids {
                 in_flight.remove(asset_id);
             }
+        }
+    }
+}
+
+/// The family of long-running work a cancel token belongs to. A cancel is
+/// aimed at one kind and must never observe or disturb another kind's runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum OperationKind {
+    /// Preflight, copy/verification, and the optional proxy tail.
+    Import,
+    /// The proxies → transcripts → cloud-analysis chain.
+    Analysis,
+    /// The speech-model download.
+    ModelInstall,
+}
+
+/// Cancel tokens for the operations currently in flight, keyed by kind.
+///
+/// Every run registers a token of its own instead of sharing an app-global
+/// flag, which gives two invariants for free: a cancel arriving between runs
+/// cannot stop the next one before it starts (the next run's token did not
+/// exist when the cancel fired), and starting a run cannot erase a cancel
+/// aimed at one already in flight (no run ever writes to another's token).
+#[derive(Default)]
+struct OperationCancels {
+    registered: Mutex<HashMap<OperationKind, Vec<Weak<AtomicBool>>>>,
+}
+
+impl OperationCancels {
+    /// Mints a fresh token for one run. It stays registered until the returned
+    /// guard drops, so an early return or error unregisters it too.
+    fn register(self: &Arc<Self>, kind: OperationKind) -> OperationCancelGuard {
+        let token = Arc::new(AtomicBool::new(false));
+        let mut registered = self
+            .registered
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        registered
+            .entry(kind)
+            .or_default()
+            .push(Arc::downgrade(&token));
+        drop(registered);
+        OperationCancelGuard {
+            registry: self.clone(),
+            kind,
+            token,
+        }
+    }
+
+    /// Sets every token currently registered under `kind`. A token registered
+    /// after this call belongs to a run the cancel could not have been aimed
+    /// at, so it is left untouched.
+    fn cancel(&self, kind: OperationKind) {
+        let mut registered = self
+            .registered
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(tokens) = registered.get_mut(&kind) {
+            // The weak entries double as liveness: a guard that already
+            // dropped leaves nothing to upgrade, and its slot is reclaimed
+            // here rather than accumulating for the session.
+            tokens.retain(|token| match token.upgrade() {
+                Some(token) => {
+                    token.store(true, Ordering::SeqCst);
+                    true
+                }
+                None => false,
+            });
+        }
+    }
+}
+
+/// Keeps one run's token registered for exactly the run's lifetime.
+struct OperationCancelGuard {
+    registry: Arc<OperationCancels>,
+    kind: OperationKind,
+    token: Arc<AtomicBool>,
+}
+
+impl OperationCancelGuard {
+    /// The token a run's progress callbacks observe. Set only by a cancel
+    /// aimed at this kind while the run is in flight.
+    fn token(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.token)
+    }
+}
+
+impl Drop for OperationCancelGuard {
+    fn drop(&mut self) {
+        if let Ok(mut registered) = self.registry.registered.lock()
+            && let Some(tokens) = registered.get_mut(&self.kind)
+        {
+            let ptr = Arc::as_ptr(&self.token);
+            tokens.retain(|token| token.as_ptr() != ptr);
         }
     }
 }
@@ -358,8 +452,7 @@ impl AppState {
             baseline_attempt: Arc::new(RwLock::new(None)),
             sync_manager,
             sync_status,
-            analysis_cancel: Arc::new(AtomicBool::new(false)),
-            import_cancel: Arc::new(AtomicBool::new(false)),
+            operation_cancels: Arc::new(OperationCancels::default()),
             thumbnail_coordinator: Arc::new(ThumbnailCoordinator::default()),
             media_catalog,
             media_server: Arc::new(RwLock::new(None)),
@@ -389,8 +482,7 @@ impl AppState {
             baseline_attempt: Arc::new(RwLock::new(None)),
             sync_manager: sync_manager::SyncManager::spawn_test(),
             sync_status: Arc::new(RwLock::new(HashMap::new())),
-            analysis_cancel: Arc::new(AtomicBool::new(false)),
-            import_cancel: Arc::new(AtomicBool::new(false)),
+            operation_cancels: Arc::new(OperationCancels::default()),
             thumbnail_coordinator: Arc::new(ThumbnailCoordinator::default()),
             media_catalog: Arc::new(CatalogMedia {
                 catalog,
@@ -1158,8 +1250,11 @@ async fn preflight_import(
     app: tauri::AppHandle,
 ) -> Result<ImportPreflight, String> {
     let catalog = state.catalog()?;
-    let cancel = state.import_cancel.clone();
-    cancel.store(false, Ordering::SeqCst);
+    // A token of this run's own, not a shared flag: a cancel arriving between
+    // runs cannot stop this one, and this run starting cannot erase a cancel
+    // aimed at an import already in flight.
+    let cancel_guard = state.operation_cancels.register(OperationKind::Import);
+    let cancel = cancel_guard.token();
     tracing::info!(
         target: "rcdvlog_desktop_lib::import",
         project_id = %project_id,
@@ -1212,8 +1307,10 @@ async fn run_smart_import(
     app: tauri::AppHandle,
 ) -> Result<ImportRunReport, String> {
     let catalog = state.catalog()?;
-    let cancel = state.import_cancel.clone();
-    cancel.store(false, Ordering::SeqCst);
+    // One token covers copy/verification and the optional proxy tail; it is
+    // this run's alone, so a cancel between runs cannot stop the next one.
+    let cancel_guard = state.operation_cancels.register(OperationKind::Import);
+    let cancel = cancel_guard.token();
     tracing::info!(
         target: "rcdvlog_desktop_lib::import",
         project_id = %project_id,
@@ -1513,9 +1610,12 @@ where
     catalog.generate_thumbnails_for_assets_with_progress(asset_ids, 1, on_progress)
 }
 
+/// Stops every import-family run currently in flight — preflight as well as
+/// copy/proxy work — at its next progress callback. Runs of other kinds and
+/// runs that start after this call are out of reach by construction.
 #[tauri::command]
 fn cancel_import(state: State<'_, AppState>) {
-    state.import_cancel.store(true, Ordering::SeqCst);
+    state.operation_cancels.cancel(OperationKind::Import);
 }
 
 #[tauri::command]
@@ -1992,8 +2092,15 @@ async fn install_analysis_models(
     app: tauri::AppHandle,
 ) -> Result<Vec<ModelStatus>, String> {
     let catalog = state.catalog()?;
-    let cancel = Arc::clone(&state.analysis_cancel);
-    cancel.store(false, Ordering::Relaxed);
+    // Registered under its own kind so cancelling an analysis run cannot
+    // abort a download, nor a download's start un-cancel a pending analysis
+    // cancel. Nothing sets this token today — the settings screen offers no
+    // way to stop a download — but the observation point stays, so a stop
+    // affordance needs no plumbing here.
+    let cancel_guard = state
+        .operation_cancels
+        .register(OperationKind::ModelInstall);
+    let cancel = cancel_guard.token();
     tauri::async_runtime::spawn_blocking(move || {
         catalog.install_models_with_progress(|progress| {
             let _ = app.emit("model-install-progress", progress);
@@ -2009,10 +2116,13 @@ async fn install_analysis_models(
     .map_err(error_message)
 }
 
-/// Stops the running analysis chain or model download at the next safe point.
+/// Stops the running analysis chain at the next safe point. Only the chain:
+/// the model download is its own operation, and the one place the frontend
+/// calls this — the busy bar's Cancel during an analysis run — means the
+/// chain.
 #[tauri::command]
 fn cancel_analysis(state: State<'_, AppState>) {
-    state.analysis_cancel.store(true, Ordering::Relaxed);
+    state.operation_cancels.cancel(OperationKind::Analysis);
 }
 
 /// Runs proxies, then transcription, then cloud analysis, as one cancellable
@@ -2030,10 +2140,10 @@ async fn analyze_project(
     app: tauri::AppHandle,
 ) -> Result<AnalysisRunReport, String> {
     let catalog = state.catalog()?;
-    let cancel = Arc::clone(&state.analysis_cancel);
-    // Cleared here rather than in `cancel_analysis` so a cancel arriving
-    // between runs cannot stop the next one before it starts.
-    cancel.store(false, Ordering::Relaxed);
+    // A fresh token per run, so a cancel arriving between runs cannot stop
+    // the next one before it starts.
+    let cancel_guard = state.operation_cancels.register(OperationKind::Analysis);
+    let cancel = cancel_guard.token();
     let api_key = keychain::get_openrouter_key().map_err(error_message)?;
 
     tauri::async_runtime::spawn_blocking(move || {
@@ -2986,13 +3096,49 @@ mod tests {
         )
         .unwrap();
 
-        assert!(!state.analysis_cancel.load(Ordering::Relaxed));
-        state.analysis_cancel.store(true, Ordering::Relaxed);
+        // A cancel with nothing in flight has no token to reach; the run that
+        // starts afterwards mints its own token, which the earlier cancel
+        // never saw.
+        state.operation_cancels.cancel(OperationKind::Analysis);
+        let run = state.operation_cancels.register(OperationKind::Analysis);
+        assert!(!run.token().load(Ordering::SeqCst));
+    }
 
-        // `analyze_project` clears the flag as it starts rather than when a
-        // cancel is handled; this models that entry point.
-        state.analysis_cancel.store(false, Ordering::Relaxed);
-        assert!(!state.analysis_cancel.load(Ordering::Relaxed));
+    #[test]
+    fn a_cancel_still_reaches_its_run_when_a_newer_run_starts() {
+        // The lost-cancel race under the old shared flag: run B's start
+        // cleared a cancel that run A had not yet observed. With registered
+        // tokens, the cancel lands on A immediately and B stays untouched.
+        let registry = Arc::new(OperationCancels::default());
+        let run_a = registry.register(OperationKind::Import);
+        registry.cancel(OperationKind::Import);
+        let run_b = registry.register(OperationKind::Import);
+        assert!(run_a.token().load(Ordering::SeqCst));
+        assert!(!run_b.token().load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn cancelling_one_kind_leaves_the_other_kinds_running() {
+        let registry = Arc::new(OperationCancels::default());
+        let import = registry.register(OperationKind::Import);
+        let analysis = registry.register(OperationKind::Analysis);
+        let install = registry.register(OperationKind::ModelInstall);
+        registry.cancel(OperationKind::Import);
+        assert!(import.token().load(Ordering::SeqCst));
+        assert!(!analysis.token().load(Ordering::SeqCst));
+        assert!(!install.token().load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn a_finished_run_is_out_of_reach_of_a_later_cancel() {
+        // The guard is what unregisters, so every exit path — success, error,
+        // early return — takes the token out of the registry with it.
+        let registry = Arc::new(OperationCancels::default());
+        let run = registry.register(OperationKind::Analysis);
+        let token = run.token();
+        drop(run);
+        registry.cancel(OperationKind::Analysis);
+        assert!(!token.load(Ordering::SeqCst));
     }
 
     #[test]
