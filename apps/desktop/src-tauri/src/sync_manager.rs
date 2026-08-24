@@ -194,6 +194,8 @@ impl SyncManager {
         catalog: Arc<RwLock<Catalog>>,
         settings: Arc<RwLock<crate::DesktopSettings>>,
         status: Arc<RwLock<HashMap<String, SyncStatus>>>,
+        representations: Arc<crate::RepresentationCoordinator>,
+        project_work: Arc<crate::ProjectWorkRegistry>,
     ) -> Self {
         let (wake_tx, wake_rx) = tokio::sync::mpsc::unbounded_channel();
         let handle = SyncLoopHandle {
@@ -206,6 +208,8 @@ impl SyncManager {
             wake_tx: wake_tx.clone(),
             media_task_slot: Arc::new(tokio::sync::Semaphore::new(1)),
             shutdown: Arc::new(AtomicBool::new(false)),
+            representations,
+            project_work,
         };
         // `spawn` is called from Tauri's setup hook, which runs on the main
         // thread outside any Tokio runtime context — `tokio::spawn` would panic
@@ -266,6 +270,13 @@ struct SyncLoopHandle {
     /// Set when the loop exits, so a detached media task stops between items
     /// instead of outliving the app's sync machinery.
     shutdown: Arc<AtomicBool>,
+    /// Per-asset ownership of proxy/thumbnail output paths, shared with the
+    /// user-facing commands so a sync writer and a batch on the same asset
+    /// never address the same temp/output file.
+    representations: Arc<crate::RepresentationCoordinator>,
+    /// Where the detached media task reports the project it works on, so
+    /// `delete_project` refuses while it runs.
+    project_work: Arc<crate::ProjectWorkRegistry>,
 }
 
 /// The WS hint task together with the settings it was started with, so a
@@ -758,14 +769,22 @@ impl SyncLoopHandle {
                     let media_project_id = project_id.to_string();
                     let jobs = resp.node_targeted_jobs.clone();
                     let shutdown = self.shutdown.clone();
+                    let representations = self.representations.clone();
+                    // Registered before the task detaches, so `delete_project`
+                    // sees this project as busy for the task's whole life.
+                    let work = self
+                        .project_work
+                        .register(&media_project_id, "sync media transfer");
                     tauri::async_runtime::spawn(async move {
                         let _permit = permit;
+                        let _work = work;
                         run_media_tasks(
                             app_handle,
                             client,
                             media_catalog,
                             media_project_id,
                             jobs,
+                            representations,
                             shutdown,
                         )
                         .await;
@@ -954,9 +973,18 @@ async fn run_media_tasks(
     catalog: Catalog,
     project_id: String,
     jobs: Vec<rcdvlog_sync::NodeTargetedJob>,
+    representations: Arc<crate::RepresentationCoordinator>,
     shutdown: Arc<AtomicBool>,
 ) {
-    download_missing_proxies(&app_handle, &client, &catalog, &project_id, &shutdown).await;
+    download_missing_proxies(
+        &app_handle,
+        &client,
+        &catalog,
+        &project_id,
+        &representations,
+        &shutdown,
+    )
+    .await;
     if !jobs.is_empty() && !shutdown.load(Ordering::Relaxed) {
         handle_node_targeted_jobs(
             &app_handle,
@@ -964,6 +992,7 @@ async fn run_media_tasks(
             &catalog,
             &project_id,
             &jobs,
+            &representations,
             &shutdown,
         )
         .await;
@@ -977,6 +1006,7 @@ async fn download_missing_proxies(
     client: &ServerClient,
     catalog: &Catalog,
     project_id: &str,
+    representations: &Arc<crate::RepresentationCoordinator>,
     shutdown: &AtomicBool,
 ) {
     // Collect media_object_ids for assets missing local proxies
@@ -999,7 +1029,7 @@ async fn download_missing_proxies(
         .filter_map(|a| a.media_object_id.clone())
         .collect();
 
-    let representations = match client.query_representations(&media_ids).await {
+    let available = match client.query_representations(&media_ids).await {
         Ok(r) => r,
         Err(_) => return,
     };
@@ -1018,12 +1048,24 @@ async fn download_missing_proxies(
         let Some(ref media_id) = asset.media_object_id else {
             continue;
         };
-        let Some(rep) = representations
+        let Some(rep) = available
             .iter()
             .find(|r| r.media_object_id == *media_id && r.kind == "proxy")
         else {
             continue;
         };
+
+        // Own the asset's proxy slot for the whole download+validate+rename+
+        // register span. A busy slot means a local writer is already producing
+        // this very file; skip it — the asset is re-checked on the next cycle
+        // if a proxy is still missing then.
+        let claim = representations.claim(
+            crate::RepresentationKind::Proxy,
+            std::iter::once(asset.id.clone()),
+        );
+        if claim.asset_ids.is_empty() {
+            continue;
+        }
 
         if let Err(e) =
             download_and_register_proxy(client, catalog, &asset.id, rep, &proxy_dir).await
@@ -1052,6 +1094,7 @@ async fn handle_node_targeted_jobs(
     catalog: &Catalog,
     project_id: &str,
     jobs: &[rcdvlog_sync::NodeTargetedJob],
+    representations: &Arc<crate::RepresentationCoordinator>,
     shutdown: &AtomicBool,
 ) {
     let assets = match catalog.list_assets(project_id) {
@@ -1080,6 +1123,16 @@ async fn handle_node_targeted_jobs(
 
         let result = match job.kind.as_str() {
             "proxy" => {
+                // A busy slot means a local writer already owns this asset's
+                // proxy paths; skip without reporting, and the still-queued
+                // job is offered again on the next reconcile.
+                let _claim = representations.claim(
+                    crate::RepresentationKind::Proxy,
+                    std::iter::once(asset.id.clone()),
+                );
+                if _claim.asset_ids.is_empty() {
+                    continue;
+                }
                 let generated = {
                     let catalog = catalog.clone();
                     let asset_id = asset.id.clone();
@@ -1106,11 +1159,24 @@ async fn handle_node_targeted_jobs(
                 }
             }
             "thumbnail" => {
+                let _claim = representations.claim(
+                    crate::RepresentationKind::Thumbnail,
+                    std::iter::once(asset.id.clone()),
+                );
+                if _claim.asset_ids.is_empty() {
+                    continue;
+                }
                 let generated = {
                     let catalog = catalog.clone();
                     let asset_id = asset.id.clone();
-                    tokio::task::spawn_blocking(move || catalog.generate_thumbnail(&asset_id, 1))
-                        .await
+                    let coordinator = representations.clone();
+                    tokio::task::spawn_blocking(move || {
+                        // Thumbnails keep their measured one-worker policy
+                        // even when the writer is a server-directed job.
+                        let _execution = coordinator.lock_thumbnail_execution();
+                        catalog.generate_thumbnail(&asset_id, 1)
+                    })
+                    .await
                 };
                 match generated {
                     Ok(Ok(updated)) => {
@@ -1388,22 +1454,18 @@ async fn download_and_register_proxy(
     // Atomically commit
     std::fs::rename(&temporary, &output).map_err(|e| format!("commit proxy: {e}"))?;
 
-    // Update the catalog
-    let output_str = output.to_string_lossy().to_string();
+    // Register through the core so the write carries the catalog's standard
+    // pragmas and busy timeout — a bare connection would fail the moment
+    // another writer holds the database lock.
+    let register_catalog = catalog.clone();
     let asset_id_owned = asset_id.to_string();
-    let db_path = catalog.database_path().to_path_buf();
-    tokio::task::spawn_blocking(move || -> Result<(), String> {
-        let conn =
-            rusqlite::Connection::open(&db_path).map_err(|e| format!("open catalog: {e}"))?;
-        conn.execute(
-            "UPDATE assets SET proxy_path = ?2 WHERE id = ?1",
-            rusqlite::params![asset_id_owned, output_str],
-        )
-        .map_err(|e| format!("update proxy_path: {e}"))?;
-        Ok(())
+    let output_path = output.clone();
+    tokio::task::spawn_blocking(move || {
+        register_catalog.register_proxy_file(&asset_id_owned, &output_path)
     })
     .await
-    .map_err(|e| format!("catalog update panicked: {e}"))??;
+    .map_err(|e| format!("catalog update panicked: {e}"))?
+    .map_err(|e| format!("update proxy_path: {e:#}"))?;
 
     Ok(())
 }

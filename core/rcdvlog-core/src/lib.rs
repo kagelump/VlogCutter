@@ -1756,6 +1756,19 @@ impl Catalog {
         result
     }
 
+    /// Records a proxy produced outside this catalog's own generator — a
+    /// server representation the sync layer downloaded and validated — for one
+    /// asset. Writing through `connection()` keeps the update under the same
+    /// pragmas and busy timeout as every other catalog write, instead of a
+    /// bare connection that fails the moment another writer holds the lock.
+    pub fn register_proxy_file(&self, asset_id: &str, proxy_path: &Path) -> Result<Asset> {
+        self.connection()?.execute(
+            "UPDATE assets SET proxy_path = ?2 WHERE id = ?1",
+            params![asset_id, proxy_path.to_string_lossy()],
+        )?;
+        self.get_asset(asset_id)
+    }
+
     /// Fingerprint of the proxy a transcript would be derived from.
     ///
     /// Transcripts are pinned to the proxy file, so regenerating a proxy must
@@ -2872,28 +2885,73 @@ impl Catalog {
         self.generate_missing_proxies_with_progress(project_id, |_| ControlFlow::Continue(()))
     }
 
-    /// Generates every missing or stale proxy.
+    /// Generates every missing or stale proxy in the project. Implemented on
+    /// the per-asset batch so callers that own concrete asset ids and the
+    /// project-wide entry share one pipeline.
+    pub fn generate_missing_proxies_with_progress<F>(
+        &self,
+        project_id: &str,
+        on_progress: F,
+    ) -> Result<ProxyReport>
+    where
+        F: FnMut(AssetBatchProgress) -> ControlFlow<()>,
+    {
+        let asset_ids = self
+            .list_assets(project_id)?
+            .into_iter()
+            .map(|asset| asset.id)
+            .collect::<Vec<_>>();
+        self.generate_proxies_for_assets_with_progress(&asset_ids, on_progress)
+    }
+
+    pub fn generate_proxies_for_assets(&self, asset_ids: &[String]) -> Result<ProxyReport> {
+        self.generate_proxies_for_assets_with_progress(asset_ids, |_| ControlFlow::Continue(()))
+    }
+
+    /// Generates missing or stale proxies for exactly the supplied assets,
+    /// mirroring the thumbnail batch: duplicate ids are coalesced, a current
+    /// proxy — or a proxy-only clip whose original is offline — is left
+    /// untouched, and an unknown id becomes a per-item failure rather than an
+    /// abort.
     ///
     /// `on_progress` returning `ControlFlow::Break` stops the batch; workers
     /// finish the clip in flight and then stop claiming new work, so a
     /// cancelled run still commits whatever it completed.
-    pub fn generate_missing_proxies_with_progress<F>(
+    pub fn generate_proxies_for_assets_with_progress<F>(
         &self,
-        project_id: &str,
+        asset_ids: &[String],
         mut on_progress: F,
     ) -> Result<ProxyReport>
     where
         F: FnMut(AssetBatchProgress) -> ControlFlow<()>,
     {
-        let assets = self.list_assets(project_id)?;
-        let (ready, pending): (Vec<_>, Vec<_>) = assets.into_iter().partition(|asset| {
-            has_current_proxy(asset) || (!asset.original_available && asset.proxy_available)
-        });
+        let mut seen = HashSet::new();
+        let mut pending = Vec::new();
+        let mut skipped = 0;
+        let mut failures = Vec::new();
+        for asset_id in asset_ids {
+            if !seen.insert(asset_id.clone()) {
+                continue;
+            }
+            match self.get_asset(asset_id) {
+                Ok(asset)
+                    if has_current_proxy(&asset)
+                        || (!asset.original_available && asset.proxy_available) =>
+                {
+                    skipped += 1;
+                }
+                Ok(asset) => pending.push(asset),
+                Err(error) => failures.push(IngestFailure {
+                    path: asset_id.clone(),
+                    error: format!("{error:#}"),
+                }),
+            }
+        }
         let mut report = ProxyReport {
             generated: 0,
-            skipped: ready.len(),
+            skipped,
             cancelled: false,
-            failures: Vec::new(),
+            failures,
         };
         let task_work: Vec<u64> = pending.iter().map(|asset| asset.size_bytes).collect();
         let worker_count = pending.len().clamp(1, PROXY_WORKERS);
@@ -5622,6 +5680,72 @@ mod tests {
         let report = catalog.generate_missing_proxies(&project.id).unwrap();
         assert_eq!(report.skipped, 1);
         assert!(report.failures.is_empty());
+    }
+
+    #[test]
+    fn a_proxy_batch_for_named_assets_coalesces_skips_and_reports_unknown_ids() {
+        let (directory, catalog, project) = catalog_fixture();
+        insert_asset(
+            &catalog,
+            &project.id,
+            "asset_offline",
+            "OFFLINE.MP4",
+            "Camera A",
+            "2026-07-18T00:00:00Z",
+            directory.path().join("missing.mp4").as_path(),
+        );
+        // Proxy-only clip whose original is offline: left untouched, exactly
+        // as the project-wide batch treats it.
+        let proxy = directory.path().join("offline-proxy.mp4");
+        fs::write(&proxy, b"proxy sentinel").unwrap();
+        catalog
+            .connection()
+            .unwrap()
+            .execute(
+                "UPDATE assets SET proxy_path = ?2 WHERE id = ?1",
+                params!["asset_offline", proxy.to_string_lossy()],
+            )
+            .unwrap();
+
+        let report = catalog
+            .generate_proxies_for_assets(&[
+                "asset_offline".to_string(),
+                "asset_offline".to_string(),
+                "asset_unknown".to_string(),
+            ])
+            .unwrap();
+        assert_eq!(report.generated, 0);
+        assert_eq!(report.skipped, 1, "duplicate ids coalesce to one skip");
+        assert_eq!(report.failures.len(), 1);
+        assert!(report.failures[0].path.contains("asset_unknown"));
+        assert!(!report.cancelled);
+    }
+
+    #[test]
+    fn registers_an_externally_produced_proxy_through_the_catalog() {
+        let (directory, catalog, project) = catalog_fixture();
+        insert_asset(
+            &catalog,
+            &project.id,
+            "a1",
+            "DJI_0001.MP4",
+            "DJI Pocket 3",
+            "2026-04-01T09:00:00Z",
+            Path::new("/volumes/nas/DJI_0001.MP4"),
+        );
+        let downloaded = directory.path().join("a1.v3.mp4");
+        fs::write(&downloaded, b"downloaded proxy").unwrap();
+
+        let updated = catalog.register_proxy_file("a1", &downloaded).unwrap();
+        assert_eq!(
+            updated.proxy_path.as_deref(),
+            Some(downloaded.to_string_lossy().as_ref())
+        );
+
+        let error = catalog
+            .register_proxy_file("a_missing", &downloaded)
+            .unwrap_err();
+        assert!(error.to_string().contains("a_missing"), "{error}");
     }
 
     #[test]

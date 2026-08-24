@@ -18,7 +18,7 @@ use std::fs;
 use std::io::ErrorKind;
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use tauri::{Emitter, Manager, State};
 
@@ -113,10 +113,15 @@ pub(crate) struct AppState {
     /// the runs that were in flight when it was requested — never a later run,
     /// and never a run of another kind.
     operation_cancels: Arc<OperationCancels>,
-    /// Session-local ownership for thumbnail output paths. Import-triggered
-    /// work and explicit repair batches share it so they cannot write the same
-    /// temporary/output file concurrently.
-    thumbnail_coordinator: Arc<ThumbnailCoordinator>,
+    /// Session-local ownership for derived-media output paths — proxies and
+    /// thumbnails both. Import-triggered work, explicit repair batches, and
+    /// the sync manager's downloads and server-directed jobs share it so no
+    /// two writers ever address the same temporary/output file concurrently.
+    representations: Arc<RepresentationCoordinator>,
+    /// The background work currently touching each project's files, so
+    /// `delete_project` can refuse to remove a folder a writer is still
+    /// working inside.
+    project_work: Arc<ProjectWorkRegistry>,
     /// Resolves asset ids to on-disk media for the loopback origin. Held here so
     /// a restarted origin reads the same live catalog and settings.
     media_catalog: Arc<CatalogMedia>,
@@ -128,47 +133,165 @@ pub(crate) struct AppState {
     media_restarted: Arc<AtomicBool>,
 }
 
-#[derive(Default)]
-struct ThumbnailCoordinator {
-    in_flight: Mutex<HashSet<String>>,
-    /// Serializes batches as well as per-asset ownership, preserving the
-    /// measured one-worker policy across overlapping command invocations.
-    execution: Mutex<()>,
+/// Which derived-media slot of an asset a writer owns while it runs. Proxies
+/// and thumbnails each live at one fixed per-asset cache path (temporary and
+/// final), so each slot admits exactly one writer at a time — but the two
+/// slots of the same asset are different files and never conflict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum RepresentationKind {
+    Proxy,
+    Thumbnail,
 }
 
-impl ThumbnailCoordinator {
-    fn claim(self: &Arc<Self>, asset_ids: impl IntoIterator<Item = String>) -> ThumbnailClaims {
+/// Session-local ownership of representation output paths, keyed by
+/// (kind, asset id).
+///
+/// A slot already claimed is skipped, never queued: the holder is producing
+/// the very file the second writer wanted, and a sync job that skips is
+/// simply re-offered by the server on its next cycle.
+#[derive(Default)]
+struct RepresentationCoordinator {
+    in_flight: Mutex<HashSet<(RepresentationKind, String)>>,
+    /// Serializes thumbnail batches as well as per-asset ownership, preserving
+    /// the measured one-worker policy across overlapping command invocations.
+    /// Proxy batches stay outside it: they bring their own bounded worker
+    /// pool, and per-asset claims already keep their output paths disjoint.
+    thumbnail_execution: Mutex<()>,
+}
+
+impl RepresentationCoordinator {
+    fn claim(
+        self: &Arc<Self>,
+        kind: RepresentationKind,
+        asset_ids: impl IntoIterator<Item = String>,
+    ) -> RepresentationClaims {
         let mut in_flight = self
             .in_flight
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut claimed = Vec::new();
         for asset_id in asset_ids {
-            if in_flight.insert(asset_id.clone()) {
+            if in_flight.insert((kind, asset_id.clone())) {
                 claimed.push(asset_id);
             }
         }
         drop(in_flight);
-        ThumbnailClaims {
+        RepresentationClaims {
             coordinator: self.clone(),
+            kind,
             asset_ids: claimed,
         }
     }
+
+    /// The one-worker execution gate every thumbnail writer takes.
+    fn lock_thumbnail_execution(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.thumbnail_execution
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 }
 
-struct ThumbnailClaims {
-    coordinator: Arc<ThumbnailCoordinator>,
+struct RepresentationClaims {
+    coordinator: Arc<RepresentationCoordinator>,
+    kind: RepresentationKind,
     asset_ids: Vec<String>,
 }
 
-impl Drop for ThumbnailClaims {
+impl Drop for RepresentationClaims {
     fn drop(&mut self) {
         if let Ok(mut in_flight) = self.coordinator.in_flight.lock() {
             for asset_id in &self.asset_ids {
-                in_flight.remove(asset_id);
+                in_flight.remove(&(self.kind, asset_id.clone()));
             }
         }
     }
+}
+
+/// The background work currently touching one project's files, one labelled
+/// entry per running writer.
+///
+/// `delete_project` cannot see in-flight work by looking at the folder — the
+/// audit inspects contents, not writers — while the writers hold `Catalog`
+/// clones whose `create_dir_all` calls resurrect cache directories in the
+/// middle of a `remove_dir_all`. Keyed by project id because deletion may
+/// target a catalog that is not the open one; the id is the one name every
+/// writer already knows.
+#[derive(Default)]
+struct ProjectWorkRegistry {
+    active: Mutex<HashMap<String, Vec<(u64, &'static str)>>>,
+    next_entry: AtomicU64,
+}
+
+impl ProjectWorkRegistry {
+    /// Marks `label` work as running for `project_id` until the guard drops,
+    /// so an early return or error in the writer releases it too.
+    fn register(self: &Arc<Self>, project_id: &str, label: &'static str) -> ProjectWorkGuard {
+        let entry = self.next_entry.fetch_add(1, Ordering::Relaxed);
+        let mut active = self
+            .active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        active
+            .entry(project_id.to_string())
+            .or_default()
+            .push((entry, label));
+        drop(active);
+        ProjectWorkGuard {
+            registry: self.clone(),
+            project_id: project_id.to_string(),
+            entry,
+        }
+    }
+
+    /// The labels of work still running for `project_id`, deduplicated in
+    /// registration order — exactly what a refusal message shows.
+    fn active_labels(&self, project_id: &str) -> Vec<&'static str> {
+        let active = self
+            .active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut labels = Vec::new();
+        for (_, label) in active.get(project_id).into_iter().flatten() {
+            if !labels.contains(label) {
+                labels.push(*label);
+            }
+        }
+        labels
+    }
+}
+
+/// Keeps one writer's work entry registered for exactly the writer's lifetime.
+struct ProjectWorkGuard {
+    registry: Arc<ProjectWorkRegistry>,
+    project_id: String,
+    entry: u64,
+}
+
+impl Drop for ProjectWorkGuard {
+    fn drop(&mut self) {
+        if let Ok(mut active) = self.registry.active.lock()
+            && let Some(entries) = active.get_mut(&self.project_id)
+        {
+            entries.retain(|(entry, _)| *entry != self.entry);
+            if entries.is_empty() {
+                active.remove(&self.project_id);
+            }
+        }
+    }
+}
+
+/// The integrity-conflict refusal (#53 rule 6) for deleting a project whose
+/// background work is still running: name what is running so the user can let
+/// it finish or cancel it, instead of racing `remove_dir_all` against a live
+/// writer.
+fn active_work_refusal(labels: &[&str]) -> Option<String> {
+    if labels.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "project has work in progress: {} — let it finish or cancel it first",
+        labels.join(", ")
+    ))
 }
 
 /// The family of long-running work a cancel token belongs to. A cancel is
@@ -434,11 +557,15 @@ impl AppState {
         let catalog = Arc::new(RwLock::new(catalog));
         let settings = Arc::new(RwLock::new(settings));
         let sync_status = Arc::new(RwLock::new(HashMap::new()));
+        let representations = Arc::new(RepresentationCoordinator::default());
+        let project_work = Arc::new(ProjectWorkRegistry::default());
         let sync_manager = sync_manager::SyncManager::spawn(
             app_handle,
             catalog.clone(),
             settings.clone(),
             sync_status.clone(),
+            representations.clone(),
+            project_work.clone(),
         );
         let media_catalog = Arc::new(CatalogMedia {
             catalog: catalog.clone(),
@@ -453,7 +580,8 @@ impl AppState {
             sync_manager,
             sync_status,
             operation_cancels: Arc::new(OperationCancels::default()),
-            thumbnail_coordinator: Arc::new(ThumbnailCoordinator::default()),
+            representations,
+            project_work,
             media_catalog,
             media_server: Arc::new(RwLock::new(None)),
             media_restarted: Arc::new(AtomicBool::new(false)),
@@ -483,7 +611,8 @@ impl AppState {
             sync_manager: sync_manager::SyncManager::spawn_test(),
             sync_status: Arc::new(RwLock::new(HashMap::new())),
             operation_cancels: Arc::new(OperationCancels::default()),
-            thumbnail_coordinator: Arc::new(ThumbnailCoordinator::default()),
+            representations: Arc::new(RepresentationCoordinator::default()),
+            project_work: Arc::new(ProjectWorkRegistry::default()),
             media_catalog: Arc::new(CatalogMedia {
                 catalog,
                 settings,
@@ -964,28 +1093,45 @@ async fn delete_project(
     catalog_path: String,
     folder_path: String,
     project_id: String,
+    state: State<'_, AppState>,
 ) -> Result<ProjectRemovalAudit, String> {
-    let audit_path = catalog_path.clone();
-    let audit_folder = folder_path.clone();
-    let audit_project = project_id.clone();
-    let audit =
-        tauri::async_runtime::spawn_blocking(move || -> anyhow::Result<ProjectRemovalAudit> {
-            let catalog = Catalog::open_existing(Path::new(&audit_path))?;
-            let audit = catalog.audit_project_removal(&audit_project, Path::new(&audit_folder))?;
-            catalog.delete_project(&audit_project)?;
-            Ok(audit)
-        })
-        .await
-        .map_err(error_message)?
-        .map_err(error_message)?;
-
-    if audit.folder_removable {
-        // The catalog handle is dropped by now, so the file is closed before
-        // its directory goes. A failure here leaves an empty project folder,
-        // which is untidy and harmless — the project itself is already gone.
-        fs::remove_dir_all(Path::new(&folder_path)).map_err(error_message)?;
+    // Checked before anything is removed. The audit inspects the folder's
+    // contents, not running work, and a live writer's `create_dir_all` would
+    // resurrect cache directories in the middle of `remove_dir_all` — so
+    // running work is refused here, out of the registry every writer reports
+    // to, with the labels the user needs to know what to wait for or cancel.
+    if let Some(refusal) = active_work_refusal(&state.project_work.active_labels(&project_id)) {
+        return Err(refusal);
     }
+    tauri::async_runtime::spawn_blocking(move || {
+        perform_project_delete(
+            Path::new(&catalog_path),
+            Path::new(&folder_path),
+            &project_id,
+        )
+    })
+    .await
+    .map_err(error_message)?
+    .map_err(error_message)
+}
 
+/// The blocking half of `delete_project`: re-audit, remove the project's
+/// catalog state, and remove the folder only when the fresh audit allows it.
+fn perform_project_delete(
+    catalog_path: &Path,
+    folder_path: &Path,
+    project_id: &str,
+) -> anyhow::Result<ProjectRemovalAudit> {
+    let catalog = Catalog::open_existing(catalog_path)?;
+    let audit = catalog.audit_project_removal(project_id, folder_path)?;
+    catalog.delete_project(project_id)?;
+    // The catalog handle is dropped before the folder goes, so the file is
+    // closed first. A failure below leaves an empty project folder, which is
+    // untidy and harmless — the project itself is already gone.
+    drop(catalog);
+    if audit.folder_removable {
+        fs::remove_dir_all(folder_path)?;
+    }
     Ok(audit)
 }
 
@@ -1311,6 +1457,7 @@ async fn run_smart_import(
     // this run's alone, so a cancel between runs cannot stop the next one.
     let cancel_guard = state.operation_cancels.register(OperationKind::Import);
     let cancel = cancel_guard.token();
+    let _work = state.project_work.register(&project_id, "import");
     tracing::info!(
         target: "rcdvlog_desktop_lib::import",
         project_id = %project_id,
@@ -1321,6 +1468,7 @@ async fn run_smart_import(
     );
     let pid = project_id.clone();
     let import_app = app.clone();
+    let representations = state.representations.clone();
     let report =
         tauri::async_runtime::spawn_blocking(move || -> anyhow::Result<ImportRunReport> {
             let outcome = catalog.run_import(
@@ -1358,8 +1506,21 @@ async fn run_smart_import(
                 && !outcome.source_disconnected
                 && !outcome.destination_disconnected
             {
-                Some(
-                    catalog.generate_missing_proxies_with_progress(&pid, |progress| {
+                // The tail claims the concrete assets it will write, so a
+                // sync writer already producing one of these proxies keeps
+                // sole ownership of its paths and the tail counts that clip
+                // as skipped instead of racing it.
+                let proxy_ids = catalog
+                    .list_assets(&pid)?
+                    .into_iter()
+                    .map(|asset| asset.id)
+                    .collect::<Vec<_>>();
+                let total = proxy_ids.len();
+                let claims = representations.claim(RepresentationKind::Proxy, proxy_ids);
+                let already_in_flight = total.saturating_sub(claims.asset_ids.len());
+                let mut tail = catalog.generate_proxies_for_assets_with_progress(
+                    &claims.asset_ids,
+                    |progress| {
                         let _ = import_app.emit(
                             "import-progress",
                             DesktopImportProgress {
@@ -1386,8 +1547,10 @@ async fn run_smart_import(
                         } else {
                             ControlFlow::Continue(())
                         }
-                    })?,
-                )
+                    },
+                )?;
+                tail.skipped += already_in_flight;
+                Some(tail)
             } else {
                 None
             };
@@ -1466,7 +1629,10 @@ async fn run_smart_import(
         .collect();
     schedule_background_thumbnails(
         state.catalog()?,
-        state.thumbnail_coordinator.clone(),
+        state.representations.clone(),
+        state
+            .project_work
+            .register(&project_id, "thumbnail generation"),
         touched_asset_ids,
         app,
     );
@@ -1549,13 +1715,15 @@ fn rollback_import_membership(
 
 fn schedule_background_thumbnails(
     catalog: Catalog,
-    coordinator: Arc<ThumbnailCoordinator>,
+    coordinator: Arc<RepresentationCoordinator>,
+    work: ProjectWorkGuard,
     asset_ids: Vec<String>,
     app: tauri::AppHandle,
 ) {
     schedule_background_thumbnails_with(
         catalog,
         coordinator,
+        work,
         asset_ids,
         move |progress| {
             let _ = app.emit("thumbnail-progress", progress);
@@ -1572,7 +1740,8 @@ fn schedule_background_thumbnails(
 /// injectable so this production path can be tested without a native app.
 fn schedule_background_thumbnails_with<F, S>(
     catalog: Catalog,
-    coordinator: Arc<ThumbnailCoordinator>,
+    coordinator: Arc<RepresentationCoordinator>,
+    work: ProjectWorkGuard,
     asset_ids: Vec<String>,
     mut on_progress: F,
     start: S,
@@ -1580,17 +1749,16 @@ fn schedule_background_thumbnails_with<F, S>(
     F: FnMut(rcdvlog_core::AssetBatchProgress) + Send + 'static,
     S: FnOnce(Box<dyn FnOnce() -> anyhow::Result<ThumbnailReport> + Send>),
 {
-    let claims = coordinator.claim(asset_ids);
+    let claims = coordinator.claim(RepresentationKind::Thumbnail, asset_ids);
     if claims.asset_ids.is_empty() {
         return;
     }
     start(Box::new(move || {
+        // The work registration travels with the claims: the project reads as
+        // busy for exactly as long as this detached task can touch its files.
+        let _work = work;
         let _claims = claims;
-        let _execution = _claims
-            .coordinator
-            .execution
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _execution = _claims.coordinator.lock_thumbnail_execution();
         // Import success is already final. Individual failures stay in this
         // quiet report and the explicit backfill action remains the recovery path.
         generate_detached_q1_thumbnails(&catalog, &_claims.asset_ids, &mut on_progress)
@@ -1793,7 +1961,20 @@ async fn generate_proxy(
     app: tauri::AppHandle,
 ) -> Result<Asset, String> {
     let catalog = state.catalog()?;
+    let asset = catalog.get_asset(&asset_id).map_err(error_message)?;
+    let _work = state
+        .project_work
+        .register(&asset.project_id, "proxy generation");
+    let claims = state
+        .representations
+        .claim(RepresentationKind::Proxy, std::iter::once(asset_id.clone()));
+    if claims.asset_ids.is_empty() {
+        // Another writer owns this proxy slot right now; hand back the
+        // current row rather than queueing a duplicate transcode behind it.
+        return Ok(asset);
+    }
     tauri::async_runtime::spawn_blocking(move || {
+        let _claims = claims;
         catalog.generate_proxy_with_progress(&asset_id, |progress| {
             let _ = app.emit("proxy-progress", progress);
         })
@@ -1810,11 +1991,27 @@ async fn generate_missing_proxies(
     app: tauri::AppHandle,
 ) -> Result<ProxyReport, String> {
     let catalog = state.catalog()?;
-    tauri::async_runtime::spawn_blocking(move || {
-        catalog.generate_missing_proxies_with_progress(&project_id, |progress| {
-            let _ = app.emit("proxy-progress", progress);
-            ControlFlow::Continue(())
-        })
+    let _work = state.project_work.register(&project_id, "proxy generation");
+    let asset_ids = catalog
+        .list_assets(&project_id)
+        .map_err(error_message)?
+        .into_iter()
+        .map(|asset| asset.id)
+        .collect::<Vec<_>>();
+    let total = asset_ids.len();
+    let claims = state
+        .representations
+        .claim(RepresentationKind::Proxy, asset_ids);
+    let already_in_flight = total.saturating_sub(claims.asset_ids.len());
+    tauri::async_runtime::spawn_blocking(move || -> anyhow::Result<ProxyReport> {
+        let _claims = claims;
+        let mut report =
+            catalog.generate_proxies_for_assets_with_progress(&_claims.asset_ids, |progress| {
+                let _ = app.emit("proxy-progress", progress);
+                ControlFlow::Continue(())
+            })?;
+        report.skipped += already_in_flight;
+        Ok(report)
     })
     .await
     .map_err(error_message)?
@@ -1828,19 +2025,20 @@ async fn generate_thumbnail(
     state: State<'_, AppState>,
 ) -> Result<Asset, String> {
     let catalog = state.catalog()?;
-    let claims = state
-        .thumbnail_coordinator
-        .claim(std::iter::once(asset_id.clone()));
+    let asset = catalog.get_asset(&asset_id).map_err(error_message)?;
+    let _work = state
+        .project_work
+        .register(&asset.project_id, "thumbnail generation");
+    let claims = state.representations.claim(
+        RepresentationKind::Thumbnail,
+        std::iter::once(asset_id.clone()),
+    );
     if claims.asset_ids.is_empty() {
-        return catalog.get_asset(&asset_id).map_err(error_message);
+        return Ok(asset);
     }
     tauri::async_runtime::spawn_blocking(move || {
         let _claims = claims;
-        let _execution = _claims
-            .coordinator
-            .execution
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _execution = _claims.coordinator.lock_thumbnail_execution();
         catalog.generate_thumbnail(&asset_id, quality)
     })
     .await
@@ -1856,6 +2054,9 @@ async fn generate_missing_thumbnails(
     app: tauri::AppHandle,
 ) -> Result<ThumbnailReport, String> {
     let catalog = state.catalog()?;
+    let _work = state
+        .project_work
+        .register(&project_id, "thumbnail generation");
     let asset_ids = catalog
         .list_assets(&project_id)
         .map_err(error_message)?
@@ -1863,15 +2064,13 @@ async fn generate_missing_thumbnails(
         .map(|asset| asset.id)
         .collect::<Vec<_>>();
     let total = asset_ids.len();
-    let claims = state.thumbnail_coordinator.claim(asset_ids);
+    let claims = state
+        .representations
+        .claim(RepresentationKind::Thumbnail, asset_ids);
     let already_in_flight = total.saturating_sub(claims.asset_ids.len());
     tauri::async_runtime::spawn_blocking(move || -> anyhow::Result<ThumbnailReport> {
         let _claims = claims;
-        let _execution = _claims
-            .coordinator
-            .execution
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _execution = _claims.coordinator.lock_thumbnail_execution();
         let mut report = catalog.generate_thumbnails_for_assets_with_progress(
             &_claims.asset_ids,
             quality,
@@ -2144,6 +2343,8 @@ async fn analyze_project(
     // the next one before it starts.
     let cancel_guard = state.operation_cancels.register(OperationKind::Analysis);
     let cancel = cancel_guard.token();
+    let _work = state.project_work.register(&project_id, "clip analysis");
+    let representations = state.representations.clone();
     let api_key = keychain::get_openrouter_key().map_err(error_message)?;
 
     tauri::async_runtime::spawn_blocking(move || {
@@ -2171,16 +2372,34 @@ async fn analyze_project(
             }
         };
 
-        let proxies = catalog.generate_missing_proxies_with_progress(&project_id, |progress| {
-            emit(
-                AnalysisStage::Proxies,
-                0,
-                progress.asset,
-                progress.estimate,
-                0.0,
-            );
-            flow(stop_requested())
-        })?;
+        // The stage claims the concrete assets it will write; a clip whose
+        // proxy is being produced elsewhere is counted as skipped here, and
+        // the later stages fail it per clip if that proxy has not landed yet.
+        let proxies = {
+            let proxy_ids = catalog
+                .list_assets(&project_id)?
+                .into_iter()
+                .map(|asset| asset.id)
+                .collect::<Vec<_>>();
+            let total = proxy_ids.len();
+            let claims = representations.claim(RepresentationKind::Proxy, proxy_ids);
+            let already_in_flight = total.saturating_sub(claims.asset_ids.len());
+            let mut report = catalog.generate_proxies_for_assets_with_progress(
+                &claims.asset_ids,
+                |progress| {
+                    emit(
+                        AnalysisStage::Proxies,
+                        0,
+                        progress.asset,
+                        progress.estimate,
+                        0.0,
+                    );
+                    flow(stop_requested())
+                },
+            )?;
+            report.skipped += already_in_flight;
+            report
+        };
 
         let mut stage_reached = AnalysisStage::Proxies;
         let mut transcripts = TranscribeReport {
@@ -2925,17 +3144,105 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn thumbnail_coordinator_deduplicates_overlapping_batches_until_release() {
-        let coordinator = Arc::new(ThumbnailCoordinator::default());
-        let first = coordinator.claim(["asset_a".to_string(), "asset_b".to_string()]);
+    fn representation_coordinator_deduplicates_overlapping_batches_until_release() {
+        let coordinator = Arc::new(RepresentationCoordinator::default());
+        let first = coordinator.claim(
+            RepresentationKind::Thumbnail,
+            ["asset_a".to_string(), "asset_b".to_string()],
+        );
         assert_eq!(first.asset_ids, ["asset_a", "asset_b"]);
 
-        let overlap = coordinator.claim(["asset_b".to_string(), "asset_c".to_string()]);
+        let overlap = coordinator.claim(
+            RepresentationKind::Thumbnail,
+            ["asset_b".to_string(), "asset_c".to_string()],
+        );
         assert_eq!(overlap.asset_ids, ["asset_c"]);
+
+        // The same asset's proxy slot is a different file: owning the
+        // thumbnail must not block a proxy writer, and vice versa.
+        let other_kind = coordinator.claim(
+            RepresentationKind::Proxy,
+            ["asset_a".to_string(), "asset_b".to_string()],
+        );
+        assert_eq!(other_kind.asset_ids, ["asset_a", "asset_b"]);
         drop(first);
 
-        let resumed = coordinator.claim(["asset_a".to_string(), "asset_b".to_string()]);
+        let resumed = coordinator.claim(
+            RepresentationKind::Thumbnail,
+            ["asset_a".to_string(), "asset_b".to_string()],
+        );
         assert_eq!(resumed.asset_ids, ["asset_a", "asset_b"]);
+        drop(other_kind);
+        let proxy_resumed = coordinator.claim(RepresentationKind::Proxy, ["asset_a".to_string()]);
+        assert_eq!(proxy_resumed.asset_ids, ["asset_a"]);
+    }
+
+    #[test]
+    fn project_work_shows_active_labels_until_every_guard_releases() {
+        let registry = Arc::new(ProjectWorkRegistry::default());
+        assert!(registry.active_labels("p1").is_empty());
+
+        let import = registry.register("p1", "import");
+        let thumbs = registry.register("p1", "thumbnail generation");
+        let duplicate = registry.register("p1", "import");
+        let elsewhere = registry.register("p2", "proxy generation");
+        assert_eq!(
+            registry.active_labels("p1"),
+            ["import", "thumbnail generation"],
+            "labels deduplicate in registration order"
+        );
+        assert_eq!(registry.active_labels("p2"), ["proxy generation"]);
+
+        drop(import);
+        assert_eq!(
+            registry.active_labels("p1"),
+            ["thumbnail generation", "import"],
+            "a second registration keeps its label alive"
+        );
+        drop(duplicate);
+        assert_eq!(registry.active_labels("p1"), ["thumbnail generation"]);
+        drop(thumbs);
+        assert!(registry.active_labels("p1").is_empty());
+        drop(elsewhere);
+        assert!(registry.active_labels("p2").is_empty());
+    }
+
+    #[test]
+    fn a_delete_refusal_names_the_running_work() {
+        assert_eq!(active_work_refusal(&[]), None);
+        assert_eq!(
+            active_work_refusal(&["proxy generation", "sync media transfer"]).as_deref(),
+            Some(
+                "project has work in progress: proxy generation, sync media transfer — let it finish or cancel it first"
+            )
+        );
+    }
+
+    #[test]
+    fn delete_refuses_while_work_is_registered_and_succeeds_after_release() {
+        let directory = tempdir().unwrap();
+        let folder = directory.path().join("Trip");
+        fs::create_dir_all(&folder).unwrap();
+        let catalog_path = folder.join("catalog.sqlite3");
+        let catalog = Catalog::open(&catalog_path).unwrap();
+        let project = catalog.create_project("Trip").unwrap();
+        drop(catalog);
+
+        let registry = Arc::new(ProjectWorkRegistry::default());
+        let work = registry.register(&project.id, "proxy generation");
+        let refusal = active_work_refusal(&registry.active_labels(&project.id))
+            .expect("registered work must block deletion");
+        assert!(refusal.contains("proxy generation"), "{refusal}");
+        assert!(folder.exists(), "a refusal removes nothing");
+
+        drop(work);
+        assert_eq!(
+            active_work_refusal(&registry.active_labels(&project.id)),
+            None
+        );
+        let audit = perform_project_delete(&catalog_path, &folder, &project.id).unwrap();
+        assert!(audit.folder_removable);
+        assert!(!folder.exists());
     }
 
     #[test]
@@ -2990,12 +3297,18 @@ mod tests {
         // sees the original disappear and records a recoverable failure.
         fs::remove_file(&source).unwrap();
         let mut automatic_report = None;
+        let registry = Arc::new(ProjectWorkRegistry::default());
         schedule_background_thumbnails_with(
             catalog.clone(),
-            Arc::new(ThumbnailCoordinator::default()),
+            Arc::new(RepresentationCoordinator::default()),
+            registry.register(&project.id, "thumbnail generation"),
             imported_ids.clone(),
             |_| {},
             |task| automatic_report = Some(task().unwrap()),
+        );
+        assert!(
+            registry.active_labels(&project.id).is_empty(),
+            "the finished task releases its project-work entry"
         );
         let failed = automatic_report.unwrap();
         assert_eq!(failed.generated, 0);
