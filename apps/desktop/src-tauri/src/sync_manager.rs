@@ -8,8 +8,10 @@ use rcdvlog_sync::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::{AppHandle, Emitter};
 use tokio::io::AsyncWriteExt;
 use tokio_tungstenite::connect_async;
@@ -193,10 +195,6 @@ impl SyncManager {
         settings: Arc<RwLock<crate::DesktopSettings>>,
         status: Arc<RwLock<HashMap<String, SyncStatus>>>,
     ) -> Self {
-        let catalog_path = catalog
-            .read()
-            .ok()
-            .map(|catalog| catalog.database_path().to_path_buf());
         let (wake_tx, wake_rx) = tokio::sync::mpsc::unbounded_channel();
         let handle = SyncLoopHandle {
             app_handle,
@@ -206,26 +204,18 @@ impl SyncManager {
             backoffs: HashMap::new(),
             active_projects: HashSet::new(),
             wake_tx: wake_tx.clone(),
+            media_task_slot: Arc::new(tokio::sync::Semaphore::new(1)),
+            shutdown: Arc::new(AtomicBool::new(false)),
         };
         // `spawn` is called from Tauri's setup hook, which runs on the main
         // thread outside any Tokio runtime context — `tokio::spawn` would panic
         // there. `tauri::async_runtime::spawn` targets Tauri's global runtime.
+        //
+        // The loop starts immediately rather than waiting for a process guard:
+        // the user can swap catalogs at any time, so the guard has to follow
+        // the currently open catalog. `run` (re)acquires it per cycle.
         tauri::async_runtime::spawn(async move {
-            let Some(catalog_path) = catalog_path else {
-                return;
-            };
-            loop {
-                match rcdvlog_sync::SyncProcessGuard::try_acquire(&catalog_path) {
-                    Ok(Some(guard)) => {
-                        let _guard = guard;
-                        handle.run(wake_rx).await;
-                        return;
-                    }
-                    Ok(None) | Err(_) => {
-                        tokio::time::sleep(std::time::Duration::from_secs(1)).await
-                    }
-                }
-            }
+            handle.run(wake_rx).await;
         });
         Self { wake_tx }
     }
@@ -269,13 +259,35 @@ struct SyncLoopHandle {
     backoffs: HashMap<String, Backoff>,
     active_projects: HashSet<String>,
     wake_tx: tokio::sync::mpsc::UnboundedSender<WakeEvent>,
+    /// Single slot for the detached media task (proxy downloads + ffmpeg
+    /// jobs). One permit means at most one ffmpeg writer at a time; a busy
+    /// slot just means the work is re-offered on the next reconcile.
+    media_task_slot: Arc<tokio::sync::Semaphore>,
+    /// Set when the loop exits, so a detached media task stops between items
+    /// instead of outliving the app's sync machinery.
+    shutdown: Arc<AtomicBool>,
+}
+
+/// The WS hint task together with the settings it was started with, so a
+/// settings change (unpair, re-pair to another server, token rotation) is
+/// detectable and the stale task can be aborted instead of hammering a dead
+/// endpoint forever.
+struct WsClientTask {
+    settings: WsSettings,
+    handle: tokio::task::JoinHandle<()>,
 }
 
 impl SyncLoopHandle {
     const PERIODIC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
     async fn run(mut self, mut wake_rx: tokio::sync::mpsc::UnboundedReceiver<WakeEvent>) {
-        let mut ws_task: Option<tokio::task::JoinHandle<()>> = None;
+        let mut ws_task: Option<WsClientTask> = None;
+        // The cross-process sync guard, tagged with the catalog path it was
+        // acquired for. The user can swap catalogs at any time, so the guard
+        // is re-checked every cycle rather than held for the app's lifetime —
+        // holding the old catalog's lock would both let another sync actor
+        // race us on the new catalog and block legitimate actors on the old.
+        let mut guard: Option<(PathBuf, rcdvlog_sync::SyncProcessGuard)> = None;
         loop {
             let event = tokio::time::timeout(Self::PERIODIC_INTERVAL, wake_rx.recv()).await;
 
@@ -323,30 +335,66 @@ impl SyncLoopHandle {
                 }
             }
 
+            // ── Process-guard upkeep ────────────────────────────────
+            // Resolve the currently open catalog and make sure the guard we
+            // hold is for it. Dropping first matters: the flock lives in the
+            // catalog's own cache directory, so a stale guard must be released
+            // before another actor (CLI, second instance) can take it over.
+            let catalog_path = self
+                .catalog
+                .read()
+                .ok()
+                .map(|catalog| catalog.database_path().to_path_buf());
+            if guard_needs_reacquire(
+                guard.as_ref().map(|(path, _)| path.as_path()),
+                catalog_path.as_deref(),
+            ) {
+                guard = None;
+                // A failed acquisition (held by another sync actor, or a
+                // transient IO error) just skips reconciling this cycle and
+                // retries on the next wake or periodic tick — never a
+                // busy-loop on the lock.
+                if let Some(path) = &catalog_path
+                    && let Ok(Some(acquired)) = rcdvlog_sync::SyncProcessGuard::try_acquire(path)
+                {
+                    guard = Some((path.clone(), acquired));
+                }
+            }
+
             let paired_projects = self.list_paired_projects();
             if paired_projects.is_empty() {
                 // Still ensure WS is cleaned up if no paired projects
-                ws_task = None;
+                if let Some(task) = ws_task.take() {
+                    task.handle.abort();
+                }
                 continue;
             }
 
-            if let Some(ref project_id) = targeted_project {
-                if paired_projects.contains(project_id) {
-                    self.reconcile_project(project_id).await;
-                }
-            } else {
-                for project_id in &paired_projects {
-                    if self.should_attempt(project_id) {
+            // Reconcile only while we hold this catalog's guard; wake events
+            // keep draining above either way, so nothing queues up unbounded.
+            if guard.is_some() {
+                if let Some(ref project_id) = targeted_project {
+                    if paired_projects.contains(project_id) {
                         self.reconcile_project(project_id).await;
+                    }
+                } else {
+                    for project_id in &paired_projects {
+                        if self.should_attempt(project_id) {
+                            self.reconcile_project(project_id).await;
+                        }
                     }
                 }
             }
 
-            // Ensure WebSocket hint listener is running
+            // Ensure WebSocket hint listener is running and matches settings
             self.ensure_ws_client(&mut ws_task);
         }
-        // Shutdown: drop ws_task, which aborts the spawned task
-        drop(ws_task);
+        // Shutdown: signal any detached media task to stop between items, and
+        // abort the WS task — dropping a JoinHandle only detaches it.
+        self.shutdown.store(true, Ordering::Relaxed);
+        if let Some(task) = ws_task.take() {
+            task.handle.abort();
+        }
     }
 
     fn should_attempt(&self, project_id: &str) -> bool {
@@ -372,16 +420,33 @@ impl SyncLoopHandle {
 
     // ── WebSocket hint client ───────────────────────────────────────
 
-    fn ensure_ws_client(&self, ws_task: &mut Option<tokio::task::JoinHandle<()>>) {
-        let needs_start = ws_task.as_ref().is_none_or(|t| t.is_finished());
-        if !needs_start {
+    fn ensure_ws_client(&self, ws_task: &mut Option<WsClientTask>) {
+        // `ws_client_loop` runs forever, so a running task never finishes on
+        // its own — the only way it tracks unpairing or re-pairing is this
+        // per-cycle comparison against the desired settings. Reading them
+        // costs a keychain lookup per tick, the same one `read_ws_settings`
+        // already pays on every start.
+        let desired = self.read_ws_settings();
+        let running_finished = ws_task.as_ref().is_some_and(|t| t.handle.is_finished());
+        if !ws_client_needs_restart(
+            ws_task.as_ref().map(|t| &t.settings),
+            running_finished,
+            desired.as_ref(),
+        ) {
             return;
         }
-        if let Some(settings) = self.read_ws_settings() {
+        if let Some(task) = ws_task.take() {
+            // Dropping a JoinHandle merely detaches the task; abort() is what
+            // actually stops the old loop from hammering a stale endpoint.
+            task.handle.abort();
+        }
+        if let Some(settings) = desired {
             let wake_tx = self.wake_tx.clone();
-            *ws_task = Some(tokio::spawn(async move {
-                ws_client_loop(wake_tx, &settings.endpoint, &settings.token).await;
-            }));
+            let task_settings = settings.clone();
+            let handle = tokio::spawn(async move {
+                ws_client_loop(wake_tx, &task_settings.endpoint, &task_settings.token).await;
+            });
+            *ws_task = Some(WsClientTask { settings, handle });
         }
     }
 
@@ -402,6 +467,11 @@ impl SyncLoopHandle {
         ));
 
         // ── Read current state (brief lock) ─────────────────────────
+        // The catalog clone taken here is pinned for the whole cycle: request
+        // building, applying the response, acknowledgements, conflict
+        // enrichment, and the deferred media work all use it. Re-reading
+        // `self.catalog` mid-cycle would let a catalog swap during the HTTP
+        // round trip misdirect catalog A's results into catalog B.
         let (settings, catalog) = {
             let s = match self.settings.read() {
                 Ok(s) => s.clone(),
@@ -512,9 +582,10 @@ impl SyncLoopHandle {
 
         let pending_local_count = request.operations.len() as u64;
 
-        // Drop locks before HTTP call
+        // The settings snapshot is done; the pinned catalog clone stays live
+        // for the rest of the cycle (it holds no lock — every operation opens
+        // a fresh connection).
         drop(settings);
-        drop(catalog);
 
         // ── Endpoint selection ──────────────────────────────────────
         let endpoints = self.get_endpoints();
@@ -602,14 +673,28 @@ impl SyncLoopHandle {
         // ── Apply response ──────────────────────────────────────────
         match (response, used_endpoint.as_ref()) {
             (Some(resp), Some(endpoint)) => {
-                // Re-acquire catalog lock to apply server operations
-                let catalog = match self.catalog.read() {
-                    Ok(c) => c.clone(),
-                    Err(_) => {
-                        self.active_projects.remove(project_id);
-                        return;
-                    }
-                };
+                // Acknowledgement bookkeeping is catalog-global, keyed by node
+                // ids that every catalog shares, and MAX()-only — a write into
+                // the wrong catalog permanently marks its unsent operations as
+                // acknowledged. If the user swapped catalogs during the HTTP
+                // wait, this cycle's results belong to a catalog that is no
+                // longer open: drop them on the floor. The server still holds
+                // everything, and the next reconcile redoes the work against
+                // whichever catalog is actually open.
+                let open_path = self
+                    .catalog
+                    .read()
+                    .ok()
+                    .map(|c| c.database_path().to_path_buf());
+                if catalog_swapped_mid_cycle(catalog.database_path(), open_path.as_deref()) {
+                    tracing::warn!(
+                        project_id,
+                        pinned_catalog = %catalog.database_path().display(),
+                        "catalog changed during reconcile — discarding this cycle's results"
+                    );
+                    self.active_projects.remove(project_id);
+                    return;
+                }
 
                 if !resp.operations.is_empty()
                     && let Err(e) = apply_reconcile_operations(&catalog, &resp.operations)
@@ -657,22 +742,34 @@ impl SyncLoopHandle {
 
                 self.set_status(status);
 
-                // ── Auto-download server proxies for assets missing local ones ──
-                if let Some(client) = self.build_client(endpoint, &server_node_id) {
-                    self.download_missing_proxies(&client, &catalog, project_id)
+                // ── Defer media work to a detached background task ──
+                // Proxy downloads and node-targeted jobs can run ffmpeg for
+                // minutes; awaiting them here would stall wake events and
+                // every other project's sync for the whole encode. The single
+                // semaphore permit keeps at most one media task alive so two
+                // ffmpeg writers never race the same asset paths — a busy
+                // slot just skips scheduling, because the server re-offers
+                // unfinished jobs on the next reconcile.
+                if let Ok(permit) = self.media_task_slot.clone().try_acquire_owned()
+                    && let Some(client) = self.build_client(endpoint, &server_node_id)
+                {
+                    let app_handle = self.app_handle.clone();
+                    let media_catalog = catalog.clone();
+                    let media_project_id = project_id.to_string();
+                    let jobs = resp.node_targeted_jobs.clone();
+                    let shutdown = self.shutdown.clone();
+                    tauri::async_runtime::spawn(async move {
+                        let _permit = permit;
+                        run_media_tasks(
+                            app_handle,
+                            client,
+                            media_catalog,
+                            media_project_id,
+                            jobs,
+                            shutdown,
+                        )
                         .await;
-                }
-
-                // ── Process Mac-targeted jobs from the server ──
-                if !resp.node_targeted_jobs.is_empty() {
-                    self.handle_node_targeted_jobs(
-                        endpoint,
-                        &server_node_id,
-                        &catalog,
-                        project_id,
-                        &resp.node_targeted_jobs,
-                    )
-                    .await;
+                    });
                 }
 
                 // If there are more operations to fetch, loop immediately
@@ -811,114 +908,185 @@ impl SyncLoopHandle {
     fn build_client(&self, endpoint: &str, server_node_id: &str) -> Option<ServerClient> {
         ServerClient::new(endpoint.to_string(), server_node_id.to_string()).ok()
     }
+}
 
-    /// After reconciliation, check for assets that have a media_object_id
-    /// but no local proxy, and download compatible server representations.
-    async fn download_missing_proxies(
-        &self,
-        client: &ServerClient,
-        catalog: &Catalog,
-        project_id: &str,
-    ) {
-        // Collect media_object_ids for assets missing local proxies
-        let assets = match catalog.list_assets(project_id) {
-            Ok(a) => a,
-            Err(_) => return,
-        };
+// ── Pure decision helpers ───────────────────────────────────────────
 
-        let missing: Vec<_> = assets
-            .iter()
-            .filter(|a| a.media_object_id.is_some() && !a.proxy_available && a.original_available)
-            .collect();
+/// True when the held sync-process guard (if any) is not for the currently
+/// open catalog and must be dropped — and, when a catalog is open, re-acquired
+/// for its path. `None` on either side means "no guard held" / "no catalog".
+fn guard_needs_reacquire(held_for: Option<&Path>, current: Option<&Path>) -> bool {
+    held_for != current
+}
 
-        if missing.is_empty() {
+/// True when the catalog pinned at the start of a reconcile cycle is no longer
+/// the open one, so the cycle's results must be discarded rather than applied
+/// to whichever catalog happens to be open now.
+fn catalog_swapped_mid_cycle(pinned: &Path, open: Option<&Path>) -> bool {
+    open != Some(pinned)
+}
+
+/// Decide whether the WS hint task needs tearing down and restarting, given
+/// the settings the running task was started with (`None` when no task runs),
+/// whether that task has finished, and the currently desired settings (`None`
+/// when unpaired or the token is gone).
+fn ws_client_needs_restart(
+    running: Option<&WsSettings>,
+    running_finished: bool,
+    desired: Option<&WsSettings>,
+) -> bool {
+    match (running, desired) {
+        (None, None) => false,
+        (None, Some(_)) | (Some(_), None) => true,
+        (Some(running), Some(desired)) => running_finished || running != desired,
+    }
+}
+
+// ── Deferred media work (runs on a detached task) ───────────────────
+
+/// Run the media work deferred from one reconcile cycle: proxy downloads
+/// first, then node-targeted jobs. Uses the same catalog clone the cycle
+/// pinned, so a catalog swap while an encode runs can't misdirect results.
+/// Checks the shutdown flag between items — never mid-ffmpeg.
+async fn run_media_tasks(
+    app_handle: AppHandle,
+    client: ServerClient,
+    catalog: Catalog,
+    project_id: String,
+    jobs: Vec<rcdvlog_sync::NodeTargetedJob>,
+    shutdown: Arc<AtomicBool>,
+) {
+    download_missing_proxies(&app_handle, &client, &catalog, &project_id, &shutdown).await;
+    if !jobs.is_empty() && !shutdown.load(Ordering::Relaxed) {
+        handle_node_targeted_jobs(
+            &app_handle,
+            &client,
+            &catalog,
+            &project_id,
+            &jobs,
+            &shutdown,
+        )
+        .await;
+    }
+}
+
+/// After reconciliation, check for assets that have a media_object_id
+/// but no local proxy, and download compatible server representations.
+async fn download_missing_proxies(
+    app_handle: &AppHandle,
+    client: &ServerClient,
+    catalog: &Catalog,
+    project_id: &str,
+    shutdown: &AtomicBool,
+) {
+    // Collect media_object_ids for assets missing local proxies
+    let assets = match catalog.list_assets(project_id) {
+        Ok(a) => a,
+        Err(_) => return,
+    };
+
+    let missing: Vec<_> = assets
+        .iter()
+        .filter(|a| a.media_object_id.is_some() && !a.proxy_available && a.original_available)
+        .collect();
+
+    if missing.is_empty() {
+        return;
+    }
+
+    let media_ids: Vec<String> = missing
+        .iter()
+        .filter_map(|a| a.media_object_id.clone())
+        .collect();
+
+    let representations = match client.query_representations(&media_ids).await {
+        Ok(r) => r,
+        Err(_) => return,
+    };
+
+    // Build a map from media_object_id -> representation
+    // Pick the first available proxy for each media object
+    let proxy_dir = match catalog.database_path().parent() {
+        Some(p) => p.join("cache").join("proxies").join(project_id),
+        None => return,
+    };
+
+    for asset in &missing {
+        if shutdown.load(Ordering::Relaxed) {
             return;
         }
-
-        let media_ids: Vec<String> = missing
+        let Some(ref media_id) = asset.media_object_id else {
+            continue;
+        };
+        let Some(rep) = representations
             .iter()
-            .filter_map(|a| a.media_object_id.clone())
-            .collect();
-
-        let representations = match client.query_representations(&media_ids).await {
-            Ok(r) => r,
-            Err(_) => return,
+            .find(|r| r.media_object_id == *media_id && r.kind == "proxy")
+        else {
+            continue;
         };
 
-        // Build a map from media_object_id -> representation
-        // Pick the first available proxy for each media object
-        let proxy_dir = match catalog.database_path().parent() {
-            Some(p) => p.join("cache").join("proxies").join(project_id),
-            None => return,
-        };
-
-        for asset in &missing {
-            let Some(ref media_id) = asset.media_object_id else {
-                continue;
-            };
-            let Some(rep) = representations
-                .iter()
-                .find(|r| r.media_object_id == *media_id && r.kind == "proxy")
-            else {
-                continue;
-            };
-
-            if let Err(e) =
-                download_and_register_proxy(client, catalog, &asset.id, rep, &proxy_dir).await
-            {
-                // Log but continue — one failed download shouldn't block others
-                eprintln!(
-                    "failed to download proxy for asset {} (rep {}): {e}",
-                    asset.id, rep.id
-                );
-            } else {
-                // Emit updated asset to refresh UI
-                if let Ok(updated) = catalog.get_asset(&asset.id) {
-                    let _ = self.app_handle.emit("asset-updated", updated);
-                }
+        if let Err(e) =
+            download_and_register_proxy(client, catalog, &asset.id, rep, &proxy_dir).await
+        {
+            // Log but continue — one failed download shouldn't block others
+            eprintln!(
+                "failed to download proxy for asset {} (rep {}): {e}",
+                asset.id, rep.id
+            );
+        } else {
+            // Emit updated asset to refresh UI
+            if let Ok(updated) = catalog.get_asset(&asset.id) {
+                let _ = app_handle.emit("asset-updated", updated);
             }
         }
     }
+}
 
-    /// Handle node-targeted jobs received from the server during reconciliation.
-    /// For each job, check original availability, execute locally, and report
-    /// the result back to the server.
-    async fn handle_node_targeted_jobs(
-        &self,
-        endpoint: &str,
-        server_node_id: &str,
-        catalog: &Catalog,
-        project_id: &str,
-        jobs: &[rcdvlog_sync::NodeTargetedJob],
-    ) {
-        let Some(client) = self.build_client(endpoint, server_node_id) else {
+/// Handle node-targeted jobs received from the server during reconciliation.
+/// For each job, check original availability, execute locally, and report
+/// the result back to the server. The ffmpeg-backed core calls block for
+/// minutes, so they run on the blocking pool — never on a runtime worker.
+async fn handle_node_targeted_jobs(
+    app_handle: &AppHandle,
+    client: &ServerClient,
+    catalog: &Catalog,
+    project_id: &str,
+    jobs: &[rcdvlog_sync::NodeTargetedJob],
+    shutdown: &AtomicBool,
+) {
+    let assets = match catalog.list_assets(project_id) {
+        Ok(a) => a,
+        Err(_) => return,
+    };
+
+    for job in jobs {
+        if shutdown.load(Ordering::Relaxed) {
             return;
+        }
+        // Find the local asset with matching media_object_id
+        let Some(asset) = assets
+            .iter()
+            .find(|a| a.media_object_id.as_deref() == Some(&job.media_object_id))
+        else {
+            continue;
         };
 
-        let assets = match catalog.list_assets(project_id) {
-            Ok(a) => a,
-            Err(_) => return,
-        };
+        // Check original availability
+        let original_path = std::path::Path::new(&asset.path);
+        if !original_path.exists() {
+            // Original is offline — skip, job stays queued on server
+            continue;
+        }
 
-        for job in jobs {
-            // Find the local asset with matching media_object_id
-            let Some(asset) = assets
-                .iter()
-                .find(|a| a.media_object_id.as_deref() == Some(&job.media_object_id))
-            else {
-                continue;
-            };
-
-            // Check original availability
-            let original_path = std::path::Path::new(&asset.path);
-            if !original_path.exists() {
-                // Original is offline — skip, job stays queued on server
-                continue;
-            }
-
-            let result = match job.kind.as_str() {
-                "proxy" => match catalog.generate_proxy(&asset.id) {
-                    Ok(updated) => {
+        let result = match job.kind.as_str() {
+            "proxy" => {
+                let generated = {
+                    let catalog = catalog.clone();
+                    let asset_id = asset.id.clone();
+                    tokio::task::spawn_blocking(move || catalog.generate_proxy(&asset_id)).await
+                };
+                match generated {
+                    Ok(Ok(updated)) => {
                         let output_path = updated.proxy_path.as_deref().unwrap_or("");
                         let output = std::path::Path::new(output_path);
                         let byte_len = std::fs::metadata(output).ok().map(|m| m.len());
@@ -928,12 +1096,24 @@ impl SyncLoopHandle {
                             output_path,
                         )
                     }
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         CompleteNodeJobResult::failure("proxy_generation_failed", &format!("{e:#}"))
                     }
-                },
-                "thumbnail" => match catalog.generate_thumbnail(&asset.id, 1) {
-                    Ok(updated) => {
+                    Err(e) => CompleteNodeJobResult::failure(
+                        "proxy_generation_failed",
+                        &format!("generation task panicked: {e}"),
+                    ),
+                }
+            }
+            "thumbnail" => {
+                let generated = {
+                    let catalog = catalog.clone();
+                    let asset_id = asset.id.clone();
+                    tokio::task::spawn_blocking(move || catalog.generate_thumbnail(&asset_id, 1))
+                        .await
+                };
+                match generated {
+                    Ok(Ok(updated)) => {
                         let thumb_path = updated.thumbnail_path.as_deref().unwrap_or("");
                         let output = std::path::Path::new(thumb_path);
                         let byte_len = std::fs::metadata(output).ok().map(|m| m.len());
@@ -943,23 +1123,27 @@ impl SyncLoopHandle {
                             thumb_path,
                         )
                     }
-                    Err(e) => CompleteNodeJobResult::failure(
+                    Ok(Err(e)) => CompleteNodeJobResult::failure(
                         "thumbnail_generation_failed",
                         &format!("{e:#}"),
                     ),
-                },
-                _ => continue,
-            };
-
-            // Report result back to server
-            let request = result.to_complete_request();
-            if let Err(e) = client.complete_node_job(&job.job_id, &request).await {
-                eprintln!("failed to report job {} result to server: {e}", job.job_id);
-            } else {
-                // Emit updated asset to refresh UI
-                if let Ok(updated) = catalog.get_asset(&asset.id) {
-                    let _ = self.app_handle.emit("asset-updated", updated);
+                    Err(e) => CompleteNodeJobResult::failure(
+                        "thumbnail_generation_failed",
+                        &format!("generation task panicked: {e}"),
+                    ),
                 }
+            }
+            _ => continue,
+        };
+
+        // Report result back to server
+        let request = result.to_complete_request();
+        if let Err(e) = client.complete_node_job(&job.job_id, &request).await {
+            eprintln!("failed to report job {} result to server: {e}", job.job_id);
+        } else {
+            // Emit updated asset to refresh UI
+            if let Ok(updated) = catalog.get_asset(&asset.id) {
+                let _ = app_handle.emit("asset-updated", updated);
             }
         }
     }
@@ -1013,6 +1197,7 @@ impl CompleteNodeJobResult {
 
 // ── WebSocket client loop (runs as a spawned task) ──────────────────
 
+#[derive(Clone, PartialEq, Eq)]
 struct WsSettings {
     endpoint: String,
     token: String,
@@ -1258,4 +1443,140 @@ fn operation_summary_for(
         offset_seconds,
         label,
     })
+}
+
+// ── Tests ────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ws(endpoint: &str, token: &str) -> WsSettings {
+        WsSettings {
+            endpoint: endpoint.to_string(),
+            token: token.to_string(),
+        }
+    }
+
+    // ── guard_needs_reacquire ───────────────────────────────────────
+
+    #[test]
+    fn guard_kept_while_catalog_unchanged() {
+        let path = Path::new("/library/catalog.db");
+        assert!(!guard_needs_reacquire(Some(path), Some(path)));
+    }
+
+    #[test]
+    fn guard_reacquired_after_catalog_swap() {
+        assert!(guard_needs_reacquire(
+            Some(Path::new("/library-a/catalog.db")),
+            Some(Path::new("/library-b/catalog.db")),
+        ));
+    }
+
+    #[test]
+    fn guard_acquired_when_none_held() {
+        assert!(guard_needs_reacquire(
+            None,
+            Some(Path::new("/library/catalog.db"))
+        ));
+    }
+
+    #[test]
+    fn guard_dropped_when_catalog_unresolvable() {
+        assert!(guard_needs_reacquire(
+            Some(Path::new("/library/catalog.db")),
+            None
+        ));
+    }
+
+    #[test]
+    fn no_guard_and_no_catalog_is_stable() {
+        assert!(!guard_needs_reacquire(None, None));
+    }
+
+    // ── catalog_swapped_mid_cycle ───────────────────────────────────
+
+    #[test]
+    fn results_apply_when_catalog_still_open() {
+        let pinned = Path::new("/library/catalog.db");
+        assert!(!catalog_swapped_mid_cycle(pinned, Some(pinned)));
+    }
+
+    #[test]
+    fn results_dropped_after_catalog_swap() {
+        assert!(catalog_swapped_mid_cycle(
+            Path::new("/library-a/catalog.db"),
+            Some(Path::new("/library-b/catalog.db")),
+        ));
+    }
+
+    #[test]
+    fn results_dropped_when_open_catalog_unresolvable() {
+        assert!(catalog_swapped_mid_cycle(
+            Path::new("/library/catalog.db"),
+            None
+        ));
+    }
+
+    // ── ws_client_needs_restart ─────────────────────────────────────
+
+    #[test]
+    fn ws_idle_stays_idle_while_unpaired() {
+        assert!(!ws_client_needs_restart(None, false, None));
+    }
+
+    #[test]
+    fn ws_starts_when_pairing_appears() {
+        let desired = ws("https://server.local", "tok");
+        assert!(ws_client_needs_restart(None, false, Some(&desired)));
+    }
+
+    #[test]
+    fn ws_stops_after_unpairing() {
+        let running = ws("https://server.local", "tok");
+        assert!(ws_client_needs_restart(Some(&running), false, None));
+    }
+
+    #[test]
+    fn ws_restarts_on_endpoint_change() {
+        let running = ws("https://old.local", "tok");
+        let desired = ws("https://new.local", "tok");
+        assert!(ws_client_needs_restart(
+            Some(&running),
+            false,
+            Some(&desired)
+        ));
+    }
+
+    #[test]
+    fn ws_restarts_on_token_rotation() {
+        let running = ws("https://server.local", "old-token");
+        let desired = ws("https://server.local", "new-token");
+        assert!(ws_client_needs_restart(
+            Some(&running),
+            false,
+            Some(&desired)
+        ));
+    }
+
+    #[test]
+    fn ws_restarts_when_task_finished() {
+        let settings = ws("https://server.local", "tok");
+        assert!(ws_client_needs_restart(
+            Some(&settings),
+            true,
+            Some(&settings)
+        ));
+    }
+
+    #[test]
+    fn ws_left_alone_while_settings_match() {
+        let settings = ws("https://server.local", "tok");
+        assert!(!ws_client_needs_restart(
+            Some(&settings),
+            false,
+            Some(&settings)
+        ));
+    }
 }
