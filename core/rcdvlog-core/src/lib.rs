@@ -1653,7 +1653,8 @@ impl Catalog {
             let _ = fs::remove_file(&temporary);
             bail!(
                 "ffmpeg proxy generation failed with {}{}",
-                result.status, result.diagnostic
+                result.status,
+                result.diagnostic
             );
         }
         let proxy_probe = probe_media_stream(&temporary);
@@ -3079,7 +3080,8 @@ impl Catalog {
         let output = thumbnail_dir.join(format!("q{quality}.{THUMBNAIL_CACHE_VERSION}.jpg"));
         let temporary = thumbnail_dir.join(format!("q{quality}.{THUMBNAIL_CACHE_VERSION}.tmp.jpg"));
         let seek = (asset.duration_seconds.max(0.0) * 0.2).to_string();
-        let status = tool_command("ffmpeg")
+        let mut command = tool_command("ffmpeg");
+        command
             .args([
                 "-y",
                 "-hide_banner",
@@ -3099,12 +3101,14 @@ impl Catalog {
                 "-q:v",
                 "3",
             ])
-            .arg(&temporary)
-            .status()
+            .arg(&temporary);
+        let (status, diagnostic) = run_captured_media_command(&mut command, &input, &temporary)
             .context("start ffmpeg thumbnail process")?;
         if !status.success() {
             let _ = fs::remove_file(&temporary);
-            bail!("ffmpeg thumbnail generation failed with {status}");
+            bail!(
+                "ffmpeg thumbnail generation failed with {status}{diagnostic}"
+            );
         }
         fs::rename(&temporary, &output)?;
         self.connection()?.execute(
@@ -3819,21 +3823,7 @@ where
         .stderr
         .take()
         .ok_or_else(|| anyhow!("ffmpeg stderr pipe was not available"))?;
-    let stderr_reader = thread::spawn(move || {
-        let mut reader = stderr;
-        let mut kept = Vec::new();
-        let mut buffer = [0u8; 4096];
-        loop {
-            let count = match reader.read(&mut buffer) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => n,
-            };
-            if kept.len() < 4096 {
-                kept.extend_from_slice(&buffer[..count.min(4096 - kept.len())]);
-            }
-        }
-        kept
-    });
+    let stderr_reader = drain_child_stderr(stderr);
     for line in BufReader::new(stdout)
         .lines()
         .map_while(std::result::Result::ok)
@@ -3843,18 +3833,65 @@ where
         }
     }
     let status = child.wait().context("wait for ffmpeg proxy process")?;
-    let stderr = String::from_utf8_lossy(&stderr_reader.join().unwrap_or_default()).trim().to_string();
-    let diagnostic = if stderr.is_empty() {
+    let stderr = String::from_utf8_lossy(&stderr_reader.join().unwrap_or_default());
+    let diagnostic = redact_media_diagnostic(&stderr, source, output);
+    Ok(ProxyProcessResult { status, diagnostic })
+}
+
+fn drain_child_stderr(mut stderr: impl Read + Send + 'static) -> thread::JoinHandle<Vec<u8>> {
+    thread::spawn(move || {
+        let mut kept = Vec::new();
+        let mut buffer = [0u8; 4096];
+        loop {
+            let count = match stderr.read(&mut buffer) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            if kept.len() < 4096 {
+                kept.extend_from_slice(&buffer[..count.min(4096 - kept.len())]);
+            }
+        }
+        kept
+    })
+}
+
+pub(crate) fn run_captured_media_command(
+    command: &mut Command,
+    input: &Path,
+    output: &Path,
+) -> Result<(std::process::ExitStatus, String)> {
+    command.stdout(Stdio::null()).stderr(Stdio::piped());
+    let mut child = command.spawn().context("spawn media tool process")?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow!("media tool stderr pipe was not available"))?;
+    let stderr_reader = drain_child_stderr(stderr);
+    let status = child.wait().context("wait for media tool process")?;
+    let stderr = String::from_utf8_lossy(&stderr_reader.join().unwrap_or_default()).into_owned();
+    let diagnostic = redact_media_diagnostic(&stderr, input, output);
+    Ok((status, diagnostic))
+}
+
+fn redact_media_diagnostic(stderr: &str, source: &Path, output: &Path) -> String {
+    let exact_redacted = stderr
+        .replace(&source.to_string_lossy().to_string(), "<source>")
+        .replace(&output.to_string_lossy().to_string(), "<output>");
+    let absolute_paths = regex::Regex::new(
+        r#"'(?:[A-Za-z]:\\|/)[^']*'|"(?:[A-Za-z]:\\|/)[^"]*"|(?:[A-Za-z]:\\|/)[^\s:'"<>]+"#,
+    )
+    .expect("constant media path pattern");
+    let redacted = absolute_paths.replace_all(&exact_redacted, "<path>");
+    let trimmed = redacted.trim();
+    let mut end = trimmed.len().min(4094);
+    while !trimmed.is_char_boundary(end) {
+        end -= 1;
+    }
+    if end == 0 {
         String::new()
     } else {
-        format!(
-            ": {}",
-            stderr
-                .replace(&source.to_string_lossy().to_string(), "<source>")
-                .replace(&output.to_string_lossy().to_string(), "<output>")
-        )
-    };
-    Ok(ProxyProcessResult { status, diagnostic })
+        format!(": {}", &trimmed[..end])
+    }
 }
 
 fn ffmpeg_progress_fraction(line: &str, duration_seconds: f64) -> Option<f64> {
@@ -5699,6 +5736,27 @@ mod tests {
             residual_work_units(&[1_000, 500], &[false, true], &[250, 0]),
             vec![750]
         );
+    }
+
+    #[test]
+    fn media_diagnostics_redact_paths_and_bound_the_redacted_text() {
+        let stderr = "failure ".to_owned() + &"/a ".repeat(2_000);
+        let diagnostic = redact_media_diagnostic(
+            &stderr,
+            Path::new("/a"),
+            Path::new("/output"),
+        );
+        assert!(diagnostic.len() <= 4096);
+        assert!(!diagnostic.contains("/a"));
+        assert!(diagnostic.contains("<source>"));
+
+        let quoted = redact_media_diagnostic(
+            "could not read '/private area/clip.mp4': invalid data",
+            Path::new("/source"),
+            Path::new("/output"),
+        );
+        assert!(!quoted.contains("/private area/clip.mp4"));
+        assert!(quoted.contains("invalid data"));
     }
 
     #[cfg(target_os = "macos")]

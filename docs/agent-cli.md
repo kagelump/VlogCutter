@@ -72,7 +72,7 @@ Failure is one JSON value on stderr with a nonzero exit code:
 
 Local desktop commands use `invalid_arguments`, `invalid_input`, `not_found`, `media_offline`, `media_tool_failed`, `stale_revision`, and `internal_error`. `stale_revision` is the only one whose correct handling is to retry: re-read the clip, re-apply the edit, send it again with the new revision. Server commands preserve the server's shared stable registry, including authentication, protocol, mount, job, backup, and security codes. The registry is [`core/rcdvlog-server/src/error_codes.rs`](../core/rcdvlog-server/src/error_codes.rs); clients must branch on `error.code`, not prose. Remote failures also return the server `requestId` when available.
 
-Proxy generation captures FFmpeg stderr while draining its progress stream. A failed transcode keeps the stable `media_tool_failed` code and includes at most 4 KiB of child diagnostics in the JSON `error.message`; the source and output file names are replaced with `<source>` and `<output>`. This is part of the error envelope, so failures never prepend raw tool output to stderr.
+Proxy and thumbnail generation capture FFmpeg diagnostics and keep failures inside the JSON `error.message` with the stable `media_tool_failed` code. Proxy stderr is drained concurrently with its progress stream; thumbnail stderr is drained concurrently with the child process. Diagnostics redact absolute paths and are bounded to 4 KiB after redaction, so failures never prepend raw tool output to stderr.
 
 Long ingest commands emit JSON progress objects to stderr every 25 assets and on completion:
 

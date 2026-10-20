@@ -1,6 +1,7 @@
 use rcdvlog_core::PROJECT_CATALOG_SCHEMA_VERSION;
 use rusqlite::{Connection, params};
 use serde_json::Value;
+use std::env;
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -23,6 +24,20 @@ where
         .args(arguments)
         .output()
         .expect("run rcdvlog CLI")
+}
+
+fn invoke_with_path<I, S>(catalog: &Path, arguments: I, path: &OsStr) -> Output
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    Command::new(env!("CARGO_BIN_EXE_rcdvlog"))
+        .arg("--catalog")
+        .arg(catalog)
+        .args(arguments)
+        .env("PATH", path)
+        .output()
+        .expect("run rcdvlog CLI with synthetic tool")
 }
 
 fn success<I, S>(catalog: &Path, arguments: I) -> Invocation
@@ -131,6 +146,82 @@ fn process_contract_persists_across_invocations_and_routes_errors() {
     let missing = failure(&catalog, ["clips", "get", "--asset", "asset_missing"]);
     assert_eq!(missing["command"], "clips.get");
     assert_eq!(missing["error"]["code"], "not_found");
+}
+
+#[cfg(unix)]
+#[test]
+fn media_tool_failures_keep_cli_stderr_as_one_redacted_json_value() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = tempdir().unwrap();
+    let catalog = directory.path().join("catalog.sqlite3");
+    let media = directory.path().join("synthetic.mp4");
+    let doctor = success(&catalog, ["doctor"]);
+    let Some(ffmpeg) = available_tool(&doctor.json, "ffmpeg") else {
+        return;
+    };
+    if available_tool(&doctor.json, "ffprobe").is_none() {
+        return;
+    }
+    create_media_fixture(&ffmpeg, &media);
+    let project_id = create_project(&catalog, "Synthetic media failure");
+    success(
+        &catalog,
+        [
+            "ingest",
+            "--project",
+            &project_id,
+            "--folder",
+            directory.path().to_str().unwrap(),
+        ],
+    );
+    let asset_id = success(&catalog, ["clips", "list", "--project", &project_id]).json
+        ["data"]["items"][0]["id"]
+        .as_str()
+        .expect("ingested synthetic asset")
+        .to_owned();
+
+    let shim_dir = directory.path().join("tool-shim");
+    fs::create_dir_all(&shim_dir).unwrap();
+    let shim = shim_dir.join("ffmpeg");
+    fs::write(
+        &shim,
+        "#!/bin/sh\nprintf 'out_time_us=0\\nprogress=continue\\n'\nfor arg do case \"$arg\" in /*) printf 'synthetic decoder detail for %s\\n' \"$arg\" >&2;; esac; done\nprintf 'synthetic decoder failure\\n' >&2\nexit 1\n",
+    )
+    .unwrap();
+    fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).unwrap();
+    let current_path = env::var_os("PATH").unwrap_or_default();
+    let mut paths = vec![shim_dir];
+    paths.extend(env::split_paths(&current_path));
+    let path = env::join_paths(paths).unwrap();
+
+    for args in [
+        vec!["proxy", "generate", "--asset", asset_id.as_str()],
+        vec![
+            "thumbnails",
+            "generate",
+            "--asset",
+            asset_id.as_str(),
+            "--quality",
+            "1",
+        ],
+    ] {
+        let output = invoke_with_path(&catalog, args, &path);
+        assert!(!output.status.success(), "tool failure must exit nonzero");
+        assert!(
+            output.stdout.is_empty(),
+            "tool failures must keep stdout empty"
+        );
+        let stderr = String::from_utf8(output.stderr).expect("CLI stderr is UTF-8");
+        let error: Value =
+            serde_json::from_str(&stderr).expect("stderr is exactly one JSON value");
+        assert_eq!(error["ok"], false);
+        assert_eq!(error["error"]["code"], "media_tool_failed");
+        let message = error["error"]["message"].as_str().unwrap();
+        assert!(message.contains("synthetic decoder failure"));
+        assert!(!message.contains(directory.path().to_str().unwrap()));
+        assert!(message.len() < 4600, "diagnostic should remain bounded");
+    }
 }
 
 #[test]
