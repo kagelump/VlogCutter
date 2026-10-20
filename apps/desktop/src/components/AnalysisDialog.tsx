@@ -12,8 +12,14 @@ export function AnalysisDialog({
   readiness,
   budget,
   forceReanalyze,
+  primaryModel,
+  allowFallback,
+  allowedModels,
   onBudgetChange,
   onForceReanalyzeChange,
+  onPrimaryModelChange,
+  onAllowFallbackChange,
+  onAllowedModelsChange,
   onOpenSettings,
   onCancel,
   onStart,
@@ -22,8 +28,14 @@ export function AnalysisDialog({
   readiness: AnalysisReadiness;
   budget: string;
   forceReanalyze: boolean;
+  primaryModel: string;
+  allowFallback: boolean;
+  allowedModels: string[];
   onBudgetChange(value: string): void;
   onForceReanalyzeChange(value: boolean): void;
+  onPrimaryModelChange(value: string): void;
+  onAllowFallbackChange(value: boolean): void;
+  onAllowedModelsChange(value: string[]): void;
   onOpenSettings(): void;
   onCancel(): void;
   onStart(): void;
@@ -86,6 +98,29 @@ export function AnalysisDialog({
         <p id="budget-note" className="section-note">
           US dollars. The run stops once returned provider usage reaches this, keeping whatever it finished.
         </p>
+
+        <label className="field-label">Primary vision model
+          <select value={primaryModel} onChange={(event) => onPrimaryModelChange(event.target.value)}>
+            <option value="qwen/qwen3.7-flash">Qwen 3.7 Flash</option>
+            <option value="google/gemini-2.5-flash-lite">Gemini 2.5 Flash Lite</option>
+          </select>
+        </label>
+        <fieldset className="field-label">
+          <legend>Models allowed for this run</legend>
+          {[["qwen/qwen3.7-flash", "Qwen 3.7 Flash"], ["google/gemini-2.5-flash-lite", "Gemini 2.5 Flash Lite"]].map(([id, label]) => (
+            <label className="checkbox-row" key={id}>
+              <input type="checkbox" checked={allowedModels.includes(id)} disabled={primaryModel === id} onChange={(event) => {
+                const next = event.target.checked ? [...allowedModels, id] : allowedModels.filter((model) => model !== id);
+                onAllowedModelsChange(next);
+              }} />
+              <span>{label}</span>
+            </label>
+          ))}
+        </fieldset>
+        <label className="checkbox-row">
+          <input type="checkbox" checked={allowFallback} onChange={(event) => onAllowFallbackChange(event.target.checked)} />
+          <span>Allow one retry using the other permitted model</span>
+        </label>
 
         <label className="checkbox-row">
           <input type="checkbox" checked={forceReanalyze} onChange={(event) => onForceReanalyzeChange(event.target.checked)} />

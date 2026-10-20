@@ -42,6 +42,7 @@ mod storage;
 mod volumes;
 
 use analysis::audio::{AudioExtractor, FfmpegAudioExtractor};
+use analysis::chronology_suggestions::request_suggestion;
 use analysis::consolidate::{
     apply_mapping as persist_label_mapping, assets_for_label, consolidation_prompt, mapping_schema,
     parse_mapping, proposals as label_proposals,
@@ -60,6 +61,11 @@ use analysis::vlm_store::{
 };
 use analysis::whisper_engine::{WhisperEngine, read_pcm};
 
+pub use analysis::chronology_suggestions::{
+    ChronologyEvidenceRequest, ChronologySuggestion, EvidenceFrame, PairMatch,
+    SuggestionProvenance, SuggestionResult, SuggestionReview, review_suggestion,
+    review_suggestion_against_facts,
+};
 pub use analysis::consolidate::{ConsolidationReport, LabelMapping, LabelProposal};
 pub use analysis::framepack::{FramePackManifest, build_frame_pack, encode_frames};
 pub use analysis::openrouter::{
@@ -679,6 +685,12 @@ pub struct AnalysisRunOptions {
     pub budget_usd: Option<f64>,
     /// Overrides `RCDVLOG_VLM_WORKERS` when set.
     pub worker_count: Option<usize>,
+    /// Model explicitly selected for this run. Defaults to the measured primary.
+    pub primary_model: Option<String>,
+    /// Complete set of models the run may call. Empty means the defaults.
+    pub allowed_models: Vec<String>,
+    /// Whether one retry using the configured alternate model is permitted.
+    pub allow_fallback: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2993,6 +3005,15 @@ impl Catalog {
     where
         F: FnMut(AnalyzeBatchProgress) -> ControlFlow<()>,
     {
+        let primary = options.primary_model.as_deref().unwrap_or(DEFAULT_MODEL);
+        let allowed = if options.allowed_models.is_empty() {
+            vec![DEFAULT_MODEL.to_string(), FALLBACK_MODEL.to_string()]
+        } else {
+            options.allowed_models.clone()
+        };
+        let allow_fallback = options.allow_fallback.unwrap_or(true);
+        // Validate before resolving credentials or constructing a network provider.
+        ProviderChain::with_policy(primary, &allowed, allow_fallback)?;
         let api_key = match options.api_key.clone() {
             Some(key) => key,
             None => resolve_api_key()?,
@@ -3113,7 +3134,17 @@ impl Catalog {
                 .collect::<VecDeque<_>>(),
         ));
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let chain = ProviderChain::new();
+        let default_allowed = vec![DEFAULT_MODEL.to_string(), FALLBACK_MODEL.to_string()];
+        let allowed_models = if options.allowed_models.is_empty() {
+            &default_allowed
+        } else {
+            &options.allowed_models
+        };
+        let chain = ProviderChain::with_policy(
+            options.primary_model.as_deref().unwrap_or(DEFAULT_MODEL),
+            allowed_models,
+            options.allow_fallback.unwrap_or(true),
+        )?;
         let (sender, receiver) = mpsc::channel();
         let mut completed = vec![false; task_work.len()];
         thread::scope(|scope| -> Result<()> {
@@ -3729,6 +3760,104 @@ impl Catalog {
             offset,
             limit,
         )
+    }
+
+    /// Makes one read-only, proxy-only cross-clip evidence request. Results are
+    /// suggestions and provenance; this method has no path to chronology writes.
+    pub fn suggest_chronology_with_provider(
+        &self,
+        project_id: &str,
+        asset_ids: &[String],
+        provider: &dyn VlmProvider,
+        chain: &ProviderChain,
+    ) -> Result<SuggestionResult> {
+        anyhow::ensure!(
+            !asset_ids.is_empty() && asset_ids.len() <= 8,
+            "select 1..=8 clips"
+        );
+        anyhow::ensure!(
+            asset_ids.iter().collect::<HashSet<_>>().len() == asset_ids.len(),
+            "each clip may be selected only once"
+        );
+        let facts = self.chronology_facts(project_id)?;
+        let facts_revision = blake3::hash(&serde_json::to_vec(&facts)?)
+            .to_hex()
+            .to_string();
+        let mut frames = Vec::new();
+        for asset_id in asset_ids {
+            let asset = self.get_asset(asset_id)?;
+            anyhow::ensure!(
+                asset.project_id == project_id && !asset.removed,
+                "clip is not an active member of this project"
+            );
+            let proxy = Self::require_proxy(&asset)?;
+            let manifest = self.analysis_frame_pack(&asset)?;
+            let parent = self
+                .database_path
+                .parent()
+                .ok_or_else(|| anyhow!("catalog has no parent directory"))?;
+            let directory = parent
+                .join("cache")
+                .join("framepacks")
+                .join(project_id)
+                .join(asset_id)
+                .join(&manifest.source_fingerprint);
+            let paths = encode_frames(&proxy, &manifest, &directory)?;
+            anyhow::ensure!(
+                !paths.is_empty() && paths.len() == manifest.timestamps_ms.len(),
+                "proxy frame pack is empty or incomplete for {asset_id}"
+            );
+            // Two deterministic samples per selected clip keep cross-clip requests small.
+            let indexes = if paths.len() <= 2 {
+                vec![0, paths.len().saturating_sub(1)]
+            } else {
+                vec![0, paths.len() - 1]
+            };
+            for index in indexes {
+                let timestamp_ms = manifest.timestamps_ms[index];
+                let bytes = fs::read(&paths[index])
+                    .with_context(|| format!("read proxy frame {}", paths[index].display()))?;
+                frames.push(EvidenceFrame {
+                    id: format!("{asset_id}@{timestamp_ms}"),
+                    asset_id: asset_id.clone(),
+                    timestamp_ms,
+                    proxy_data_uri: frame_data_uri(&bytes),
+                });
+            }
+        }
+        let required_frame_ids = frames.iter().map(|frame| frame.id.clone()).collect();
+        let request = ChronologyEvidenceRequest {
+            facts_revision,
+            frames,
+            required_frame_ids,
+        };
+        let request_key = blake3::hash(&serde_json::to_vec(&(
+            &request,
+            chain.current_default(),
+            chain.fallback_model(),
+        ))?)
+        .to_hex()
+        .to_string();
+        let connection = self.connection()?;
+        if let Some(result) =
+            analysis::chronology_suggestions::load_cached(&connection, &request_key)?
+        {
+            return Ok(result);
+        }
+        anyhow::ensure!(
+            analysis::chronology_suggestions::reserve_request(
+                &connection,
+                &request_key,
+                project_id,
+                &request.facts_revision
+            )?,
+            "an identical chronology suggestion request is already running or was interrupted; refusing a duplicate provider charge"
+        );
+        drop(connection);
+        let mut result = request_suggestion(provider, chain, &request)?;
+        result.review = review_suggestion_against_facts(&request, &result.suggestion, &facts);
+        analysis::chronology_suggestions::store_result(&self.connection()?, &request_key, &result)?;
+        Ok(result)
     }
 
     /// Writes the solution's derived times back into the `assets` projection

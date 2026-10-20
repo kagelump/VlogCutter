@@ -326,6 +326,24 @@ export interface AnalysisRunReport {
 export interface AnalysisRunRequest {
   force?: boolean;
   budgetUsd?: number | null;
+  primaryModel?: string | null;
+  allowedModels?: string[];
+  allowFallback?: boolean | null;
+}
+
+export interface ChronologySuggestionRequest {
+  projectId: string;
+  assetIds: string[];
+  primaryModel: string;
+  allowedModels: string[];
+  allowFallback: boolean;
+}
+
+export interface ChronologySuggestionResult {
+  suggestion: { frameIds: string[]; matches: Array<{ earlierAssetId: string; laterAssetId: string; supportingFrameIds: string[] }> };
+  review: { missingFrameIds: string[]; duplicateFrameIds: string[]; unknownFrameIds: string[]; semanticInconsistencies: string[] };
+  provenance: { model: string; attempts: number; costUsd: number; promptTokens: number; completionTokens: number; latencyMs: number };
+  cached: boolean;
 }
 
 export interface AssetPatch {

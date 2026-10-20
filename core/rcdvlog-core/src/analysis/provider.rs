@@ -98,11 +98,51 @@ pub struct ChainOutcome {
 #[derive(Debug, Clone, Default)]
 pub struct ProviderChain {
     default_failures: Arc<AtomicU32>,
+    primary_model: &'static str,
+    allowed_models: Vec<&'static str>,
+    allow_fallback: bool,
 }
 
 impl ProviderChain {
     pub fn new() -> Self {
-        Self::default()
+        Self::with_policy(
+            DEFAULT_MODEL,
+            &[DEFAULT_MODEL.to_string(), FALLBACK_MODEL.to_string()],
+            true,
+        )
+        .expect("built-in provider policy is valid")
+    }
+
+    /// Creates a run-scoped chain after validating all model choices locally.
+    pub fn with_policy(primary: &str, allowed: &[String], allow_fallback: bool) -> Result<Self> {
+        let primary =
+            model_spec(primary).ok_or_else(|| anyhow::anyhow!("unsupported model: {primary}"))?;
+        let allowed = allowed
+            .iter()
+            .map(|id| {
+                model_spec(id).ok_or_else(|| anyhow::anyhow!("unsupported allowed model: {id}"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if !allowed.iter().any(|model| model.id == primary.id) {
+            bail!(
+                "primary model {} is not in the allowed model list",
+                primary.id
+            );
+        }
+        let fallback = if primary.id == DEFAULT_MODEL {
+            FALLBACK_MODEL
+        } else {
+            DEFAULT_MODEL
+        };
+        if allow_fallback && !allowed.iter().any(|model| model.id == fallback) {
+            bail!("fallback model {fallback} is not in the allowed model list");
+        }
+        Ok(Self {
+            default_failures: Arc::new(AtomicU32::new(0)),
+            primary_model: primary.id,
+            allowed_models: allowed.iter().map(|model| model.id).collect(),
+            allow_fallback,
+        })
     }
 
     /// Once tripped the default model is not attempted again in this process.
@@ -116,10 +156,10 @@ impl ProviderChain {
 
     /// The model this chain would try first right now.
     pub fn current_default(&self) -> &'static str {
-        if self.breaker_tripped() {
+        if self.breaker_tripped() && self.allow_fallback {
             FALLBACK_MODEL
         } else {
-            DEFAULT_MODEL
+            self.primary_model
         }
     }
 
@@ -141,20 +181,22 @@ impl ProviderChain {
                 fell_back: false,
             }),
             Err(first_error) => {
-                if first == FALLBACK_MODEL {
+                let fallback = self.fallback_model();
+                if !self.allow_fallback || fallback == Some(first) {
                     // The breaker already routed here; there is nowhere else to go.
                     return Err(first_error);
                 }
                 self.default_failures.fetch_add(1, Ordering::Relaxed);
-                match provider.analyze(FALLBACK_MODEL, request) {
+                let fallback = fallback.expect("fallback policy checked");
+                match provider.analyze(fallback, request) {
                     Ok(response) => Ok(ChainOutcome {
                         response,
                         attempts: 2,
                         fell_back: true,
                     }),
                     Err(fallback_error) => bail!(
-                        "both models failed: {DEFAULT_MODEL}: {first_error:#}; \
-                         {FALLBACK_MODEL}: {fallback_error:#}"
+                        "both models failed: {first}: {first_error:#}; \
+                         {fallback}: {fallback_error:#}"
                     ),
                 }
             }
@@ -165,6 +207,20 @@ impl ProviderChain {
     /// from the transport — a domain-invalid response, for instance.
     pub fn record_default_failure(&self) {
         self.default_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn fallback_model(&self) -> Option<&'static str> {
+        if !self.allow_fallback {
+            return None;
+        }
+        let candidate = if self.primary_model == DEFAULT_MODEL {
+            FALLBACK_MODEL
+        } else {
+            DEFAULT_MODEL
+        };
+        self.allowed_models
+            .contains(&candidate)
+            .then_some(candidate)
     }
 }
 
@@ -235,6 +291,42 @@ mod tests {
             .to_string();
         assert!(error.contains(DEFAULT_MODEL), "{error}");
         assert!(error.contains(FALLBACK_MODEL), "{error}");
+    }
+
+    #[test]
+    fn explicit_policy_refuses_models_before_calling_the_provider() {
+        let provider = ScriptedProvider::new(vec![]);
+        assert!(ProviderChain::with_policy("unknown/model", &[], false).is_err());
+        assert!(provider.calls.lock().unwrap().is_empty());
+        assert!(
+            ProviderChain::with_policy(DEFAULT_MODEL, &[FALLBACK_MODEL.to_string()], true).is_err()
+        );
+    }
+
+    #[test]
+    fn disabled_fallback_makes_only_the_primary_request() {
+        let provider = ScriptedProvider::new(vec![DEFAULT_MODEL]);
+        let chain =
+            ProviderChain::with_policy(DEFAULT_MODEL, &[DEFAULT_MODEL.to_string()], false).unwrap();
+        assert!(chain.analyze(&provider, &VlmRequest::default()).is_err());
+        assert_eq!(*provider.calls.lock().unwrap(), vec![DEFAULT_MODEL]);
+    }
+
+    #[test]
+    fn an_explicit_alternate_primary_falls_back_to_the_other_allowed_model() {
+        let scripted = ScriptedProvider::new(vec![FALLBACK_MODEL]);
+        let chain = ProviderChain::with_policy(
+            FALLBACK_MODEL,
+            &[FALLBACK_MODEL.to_string(), DEFAULT_MODEL.to_string()],
+            true,
+        )
+        .unwrap();
+        let outcome = chain.analyze(&scripted, &VlmRequest::default()).unwrap();
+        assert_eq!(outcome.response.model, DEFAULT_MODEL);
+        assert_eq!(
+            *scripted.calls.lock().unwrap(),
+            vec![FALLBACK_MODEL, DEFAULT_MODEL]
+        );
     }
 
     #[test]

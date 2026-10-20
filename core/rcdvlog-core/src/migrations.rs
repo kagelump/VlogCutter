@@ -7,7 +7,7 @@ use thiserror::Error;
 
 use crate::chronology::forward_migrate_project_chronology;
 
-pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 28;
+pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 29;
 
 const MIGRATION_TABLE_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -252,7 +252,36 @@ pub const PROJECT_CATALOG_MIGRATIONS: &[SqliteMigration] = &[
         source_identity: "project-catalog/0028-camera-proxy-sidecars/20261021",
         apply: add_camera_proxy_sidecars,
     },
+    SqliteMigration {
+        id: 29,
+        name: "chronology_suggestions",
+        source_identity: "project-catalog/0029-chronology-suggestions/20261021",
+        apply: add_chronology_suggestions,
+    },
 ];
+
+fn add_chronology_suggestions(transaction: &Transaction<'_>) -> Result<()> {
+    transaction.execute_batch(
+        r#"CREATE TABLE IF NOT EXISTS analysis_chronology_suggestions (
+            request_key TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            facts_revision TEXT NOT NULL,
+            status TEXT NOT NULL CHECK(status IN ('running','completed')),
+            result_json TEXT NOT NULL DEFAULT '',
+            model TEXT NOT NULL DEFAULT '',
+            attempts INTEGER NOT NULL DEFAULT 0,
+            cost_usd REAL NOT NULL DEFAULT 0,
+            prompt_tokens INTEGER NOT NULL DEFAULT 0,
+            completion_tokens INTEGER NOT NULL DEFAULT 0,
+            latency_ms INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS analysis_chronology_suggestions_project
+            ON analysis_chronology_suggestions(project_id, created_at DESC);"#,
+    )?;
+    Ok(())
+}
 
 fn add_camera_proxy_sidecars(transaction: &Transaction<'_>) -> Result<()> {
     transaction.execute_batch(

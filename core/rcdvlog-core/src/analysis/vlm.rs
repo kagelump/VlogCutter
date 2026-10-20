@@ -7,9 +7,7 @@
 use anyhow::Result;
 use serde::Serialize;
 
-use crate::analysis::provider::{
-    DEFAULT_MODEL, FALLBACK_MODEL, ProviderChain, VlmProvider, VlmRequest, VlmResponse,
-};
+use crate::analysis::provider::{ProviderChain, VlmProvider, VlmRequest, VlmResponse};
 use crate::analysis::schema::{ClipObservation, output_schema, validate};
 use crate::analysis::store::TranscriptStatus;
 
@@ -136,9 +134,15 @@ pub fn analyze_clip(
             cost_usd: first.response.cost_usd,
             latency_ms: first.response.latency_ms,
         }),
-        Err(error) if first.response.model == DEFAULT_MODEL => {
+        Err(error)
+            if chain.fallback_model().is_some()
+                && chain.fallback_model() != Some(first.response.model.as_str()) =>
+        {
             chain.record_default_failure();
-            let fallback = provider.analyze(FALLBACK_MODEL, &request)?;
+            let fallback_model = chain
+                .fallback_model()
+                .expect("guard checked fallback policy");
+            let fallback = provider.analyze(fallback_model, &request)?;
             let aggregate = |fallback: &VlmResponse| {
                 (
                     first
@@ -207,6 +211,7 @@ pub fn analyze_clip(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analysis::provider::FALLBACK_MODEL;
     use anyhow::bail;
     use std::sync::Mutex;
 
