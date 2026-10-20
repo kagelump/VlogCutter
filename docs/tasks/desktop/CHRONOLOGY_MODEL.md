@@ -288,6 +288,47 @@ writes both columns; D01-T008 replaces that path. After D01-T008, the solver's
 projection helper is the sole writer of both columns. D01-T009 through D01-T017
 must never write them.
 
+### Human clock-block questions
+
+Clock calibration may present a bounded `ClockBlockQuestion` when evidence
+supports several distinct offsets, including alternatives separated by whole
+days. The proposal names one capture sequence and inclusive counter range,
+lists each offset and its evidence, references proxy excerpts by project asset
+and clip-relative range, and includes one human anchor: an event at a UTC date
+and time, or a relative-order relation to another clip. Excerpts are explicitly
+`selected_proxy` clips inside the block or `independent_reference` clips in the
+project. Bundles are bounded to eight alternatives, twenty excerpts, 64
+context items, and 5,000 clips in a finite counter range. A reviewer answer
+applies to the whole proposed block. Alternatives remain a discrete list and
+must not be collapsed into solver uncertainty seconds.
+
+Questions and decisions are typed project operations on the `clockQuestion`
+aggregate. Revising a proposal or answering it carries the current aggregate
+revision. An accepted answer writes its selected ordinary `ClockEpochSet`
+operation and decision in one transaction; rejection records only the human
+decision. Both refresh the derived open-question snapshot. The raw source
+timestamps stay immutable. An open question disappears from that snapshot
+after accept or reject, while its proposal and answer remain in operation
+history. Same-operator, activity-overlap, or similar assumptions are only
+human-entered contextual evidence; they do not create hard event-order
+constraints. A solver-consistent placement is not externally anchored or
+owner-accepted unless the question records that human decision.
+
+The machine-readable CLI exposes the workflow as
+`chronology preview --project ID --input FILE` with `kind: "questionPropose"`
+and the complete `question` object. Review the returned evidence bundle and
+each alternative's solver impact before sending it unchanged as
+`chronology apply` with the same kind and returned `preview`. `chronology
+questions --project ID` lists unresolved bundles and durable human decisions,
+distinguishing solver-consistent placement from externally anchored and
+owner-accepted chronology. For a decision, preview with
+`kind: "questionDecision"` and a decision containing `questionId`, `kind`
+(`accepted` or `rejected`), `alternativeId` for acceptance, and `note`; apply
+the returned preview unchanged. Excerpts are project asset ids and
+clip-relative ranges, so a UI or media client can open the selected proxies and
+independent reference clips without embedding media bytes in chronology
+operations.
+
 ### Capture sequences
 
 - Filename identity is scoped to the capture sequence (`PRD.md` §8.2): two
@@ -439,6 +480,8 @@ must never write them.
 | `cameraIdentityMerged` | `sourceCamera`, `destinationCamera`, `assetIds`, `captureSequenceIds`, `assignments` (`assetId`, `captureSequenceId`) |
 | `clockEpochSet` | `epochId`, `captureSequenceId`, `startCounter`, `endCounter?`, `offsetSeconds`, `label`, `confidence?`, `evidence?` |
 | `clockEpochCleared` | `epochId` |
+| `clockQuestionProposed` | Complete validated `ClockBlockQuestion` proposal, including bounded scope, alternatives, proxy excerpt references, human anchor, and contextual evidence |
+| `clockQuestionDecisionRecorded` | `questionId`, `accepted`, `alternativeId?`, `note` |
 | `clipTimeExceptionSet` | `tripTime`, `reason` |
 | `clipTimeExceptionCleared` | *(empty payload)* |
 | `tripPhaseSet` | `phaseId`, `label`, `phaseKind`, `startTripTime`, `endTripTime`, `timezone?`, `originTimezone?`, `destinationTimezone?`, `displayMode` |

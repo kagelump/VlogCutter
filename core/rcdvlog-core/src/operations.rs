@@ -30,6 +30,8 @@ pub const CAPTURE_SEQUENCE_SPLIT_DECLINED: &str = "captureSequenceSplitDeclined"
 pub const CAPTURE_SEQUENCE_SPLIT_RESTORED: &str = "captureSequenceSplitRestored";
 pub const CLOCK_EPOCH_SET: &str = "clockEpochSet";
 pub const CLOCK_EPOCH_CLEARED: &str = "clockEpochCleared";
+pub const CLOCK_QUESTION_DECISION_RECORDED: &str = "clockQuestionDecisionRecorded";
+pub const CLOCK_QUESTION_PROPOSED: &str = "clockQuestionProposed";
 pub const CLIP_TIME_EXCEPTION_SET: &str = "clipTimeExceptionSet";
 pub const CLIP_TIME_EXCEPTION_CLEARED: &str = "clipTimeExceptionCleared";
 pub const TRIP_PHASE_SET: &str = "tripPhaseSet";
@@ -64,6 +66,8 @@ pub(crate) const CHRONOLOGY_OPERATION_TYPES: &[&str] = &[
     CAPTURE_SEQUENCE_SPLIT_RESTORED,
     CLOCK_EPOCH_SET,
     CLOCK_EPOCH_CLEARED,
+    CLOCK_QUESTION_DECISION_RECORDED,
+    CLOCK_QUESTION_PROPOSED,
     CLIP_TIME_EXCEPTION_SET,
     CLIP_TIME_EXCEPTION_CLEARED,
     TRIP_PHASE_SET,
@@ -98,6 +102,8 @@ pub(crate) const KNOWN_OPERATION_TYPES: &[&str] = &[
     CAPTURE_SEQUENCE_SPLIT_RESTORED,
     CLOCK_EPOCH_SET,
     CLOCK_EPOCH_CLEARED,
+    CLOCK_QUESTION_DECISION_RECORDED,
+    CLOCK_QUESTION_PROPOSED,
     CLIP_TIME_EXCEPTION_SET,
     CLIP_TIME_EXCEPTION_CLEARED,
     TRIP_PHASE_SET,
@@ -118,9 +124,11 @@ pub(crate) fn is_known_operation_type(value: &str) -> bool {
 /// after a successful remote page so queue reads immediately reflect the same
 /// chronology the solver does.
 pub fn operation_affects_chronology_projection(value: &str) -> bool {
-    value == PROJECT_ASSET_ADDED
-        || value == CLOCK_EVENT_CREATED
-        || CHRONOLOGY_OPERATION_TYPES.contains(&value)
+    value != CLOCK_QUESTION_DECISION_RECORDED
+        && value != CLOCK_QUESTION_PROPOSED
+        && (value == PROJECT_ASSET_ADDED
+            || value == CLOCK_EVENT_CREATED
+            || CHRONOLOGY_OPERATION_TYPES.contains(&value))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -522,6 +530,15 @@ pub(crate) struct EventOrderConstraintSetPayload {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct EventOrderConstraintClearedPayload {
     pub(crate) constraint_id: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct ClockQuestionDecisionPayload {
+    pub(crate) question_id: String,
+    pub(crate) accepted: bool,
+    pub(crate) alternative_id: Option<String>,
+    pub(crate) note: String,
 }
 
 pub(crate) struct NewOperation {
@@ -1876,6 +1893,12 @@ pub(crate) fn materialize_operation(
         }
         CLOCK_EPOCH_SET => return materialize_clock_epoch_set(transaction, operation),
         CLOCK_EPOCH_CLEARED => return materialize_clock_epoch_cleared(transaction, operation),
+        CLOCK_QUESTION_DECISION_RECORDED => {
+            return materialize_clock_question_decision(transaction, operation);
+        }
+        CLOCK_QUESTION_PROPOSED => {
+            return materialize_clock_question_proposed(transaction, operation);
+        }
         CLIP_TIME_EXCEPTION_SET => {
             return materialize_clip_time_exception_set(transaction, operation);
         }
@@ -3109,6 +3132,95 @@ fn materialize_clock_epoch_cleared(
         "DELETE FROM clock_epochs WHERE id=?1 AND project_id=?2",
         params![payload.epoch_id, operation.project_id],
     )?;
+    advance_revision(transaction, operation)?;
+    Ok(ApplyOperationResult::Applied)
+}
+
+fn materialize_clock_question_proposed(
+    transaction: &Transaction<'_>,
+    operation: &ProjectOperation,
+) -> Result<ApplyOperationResult> {
+    let question: crate::chronology::ClockBlockQuestion = payload(operation)?;
+    if operation.aggregate_type != "clockQuestion" || operation.aggregate_id != question.id {
+        bail!("clock question proposal aggregate must be the question id");
+    }
+    question
+        .validate()
+        .map_err(|error| anyhow!("invalid clock question: {error}"))?;
+    let facts = crate::chronology::load_chronology_facts(transaction, &operation.project_id)?;
+    crate::chronology::api::validate_question_scope(&question, &facts)
+        .map_err(|error| anyhow!("invalid clock question scope: {error}"))?;
+    if !revision_guard_passes(transaction, operation)? {
+        return Ok(ApplyOperationResult::Conflict);
+    }
+    advance_revision(transaction, operation)?;
+    Ok(ApplyOperationResult::Applied)
+}
+
+fn materialize_clock_question_decision(
+    transaction: &Transaction<'_>,
+    operation: &ProjectOperation,
+) -> Result<ApplyOperationResult> {
+    let decision: ClockQuestionDecisionPayload = payload(operation)?;
+    if operation.aggregate_type != "clockQuestion"
+        || operation.aggregate_id != decision.question_id
+        || decision.question_id.trim().is_empty()
+        || decision.accepted != decision.alternative_id.is_some()
+        || decision.note.chars().count() > 2_000
+    {
+        bail!("clock question decision has invalid aggregate or fields");
+    }
+    if !revision_guard_passes(transaction, operation)? {
+        return Ok(ApplyOperationResult::Conflict);
+    }
+    let current: Option<(String, String)> = transaction
+        .query_row(
+            "SELECT o.operation_type, o.payload_json FROM materialized_revisions r \
+             JOIN project_operations o ON o.operation_id=r.last_operation_id \
+             WHERE r.project_id=?1 AND r.aggregate_type='clockQuestion' AND r.aggregate_id=?2",
+            params![operation.project_id, decision.question_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((kind, proposal_json)) = current else {
+        bail!("clock question decision requires a current proposal");
+    };
+    if kind != CLOCK_QUESTION_PROPOSED {
+        bail!("clock question is already answered; revise it before answering again");
+    }
+    let question: crate::chronology::ClockBlockQuestion = serde_json::from_str(&proposal_json)?;
+    if decision.accepted {
+        let alternative = question
+            .alternatives
+            .iter()
+            .find(|alternative| Some(alternative.id.as_str()) == decision.alternative_id.as_deref())
+            .ok_or_else(|| anyhow!("accepted clock question alternative is not in the proposal"))?;
+        let epoch: Option<(i64, Option<i64>, i64)> = transaction
+            .query_row(
+                "SELECT start_counter, end_counter, offset_seconds FROM clock_epochs \
+                 WHERE project_id=?1 AND id=?2 AND capture_sequence_id=?3",
+                params![
+                    operation.project_id,
+                    alternative.epoch.id,
+                    alternative.epoch.capture_sequence_id
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        if epoch
+            != Some((
+                alternative.epoch.start_counter as i64,
+                alternative.epoch.end_counter.map(|value| value as i64),
+                alternative.epoch.offset_seconds,
+            ))
+        {
+            bail!("accepted clock question requires its selected clock epoch operation first");
+        }
+    } else {
+        if decision.alternative_id.is_some() {
+            bail!("rejected clock question cannot select an alternative");
+        }
+    }
     advance_revision(transaction, operation)?;
     Ok(ApplyOperationResult::Applied)
 }

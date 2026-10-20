@@ -1,4 +1,4 @@
-use rcdvlog_core::{Catalog, PROJECT_CATALOG_SCHEMA_VERSION};
+use rcdvlog_core::{Catalog, PROJECT_CATALOG_SCHEMA_VERSION, ProjectAssetAddedPayload};
 use rusqlite::{Connection, params};
 use serde_json::Value;
 use std::env;
@@ -501,6 +501,150 @@ fn chronology_preview_is_reusable_revision_guarded_and_process_safe() {
         ],
     );
     assert_eq!(retry["error"]["code"], "chronology.invalid_reference");
+}
+
+#[test]
+fn chronology_clock_question_cli_previews_applies_and_keeps_human_decision_visible() {
+    let directory = tempdir().expect("temporary catalog directory");
+    let catalog_path = directory.path().join("catalog.sqlite3");
+    let project = create_project(&catalog_path, "synthetic clock question");
+    let catalog = Catalog::open(&catalog_path).unwrap();
+    for (index, (filename, raw, camera)) in [
+        ("C0001.MP4", "2030-01-01T09:00:00Z", "Synthetic Camera"),
+        ("C0002.MP4", "2030-01-01T10:00:00Z", "Synthetic Camera"),
+        ("R0001.MP4", "2029-12-31T12:00:00Z", "Reference Camera"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        catalog
+            .add_portable_project_asset(
+                &project,
+                ProjectAssetAddedPayload {
+                    id: format!("synthetic-asset-{index}"),
+                    fingerprint: format!("synthetic-fingerprint-{index}"),
+                    filename: filename.into(),
+                    size_bytes: 1,
+                    duration_seconds: 2.0,
+                    frame_rate: 30.0,
+                    width: 1,
+                    height: 1,
+                    codec: "h264".into(),
+                    camera: camera.into(),
+                    captured_at_raw: Some(raw.into()),
+                    timestamp_candidates: None,
+                    best_time: Some(raw.into()),
+                    metadata_rotation_degrees: 0,
+                    default_rotation_degrees: 0,
+                    created_at: "2030-01-01T00:00:00Z".into(),
+                },
+            )
+            .unwrap();
+    }
+    let facts = catalog.chronology_facts(&project).unwrap();
+    let first = &facts.assets[0];
+    let sequence = first.capture_sequence_id.clone().unwrap();
+    let reference = facts
+        .assets
+        .iter()
+        .find(|asset| asset.capture_sequence_id.as_deref() != Some(sequence.as_str()))
+        .unwrap();
+    let counter = first.filename_counter.unwrap();
+    let question = serde_json::json!({
+        "id":"synthetic-question", "captureSequenceId":sequence,
+        "startCounter":counter, "endCounter":counter + 1,
+        "alternatives":[
+            {"id":"date-a","label":"Synthetic date A","epoch":{"id":"synthetic-epoch-a","captureSequenceId":sequence,"startCounter":counter,"endCounter":counter + 1,"offsetSeconds":0,"confidence":1.0,"evidence":["synthetic reference A"],"label":"Date A"},"evidence":["synthetic reference A"]},
+            {"id":"date-b","label":"Synthetic date B","epoch":{"id":"synthetic-epoch-b","captureSequenceId":sequence,"startCounter":counter,"endCounter":counter + 1,"offsetSeconds":86400,"confidence":1.0,"evidence":["synthetic reference B"],"label":"Date B"},"evidence":["synthetic reference B"]}
+        ],
+        "proxyExcerpts":[{"assetId":first.asset_id,"startSeconds":0.0,"endSeconds":1.0,"role":"selected_proxy"},{"assetId":reference.asset_id,"startSeconds":0.0,"endSeconds":1.0,"role":"independent_reference"}],
+        "anchor":{"kind":"event_at_utc","assetId":first.asset_id,"referenceAssetId":reference.asset_id,"eventLabel":"Synthetic event","utcTime":"2030-01-01T12:00:00Z"},
+        "contextualEvidence":["reviewer supplied overlap context"]
+    });
+    let preview_output = invoke_with_stdin(
+        &catalog_path,
+        [
+            "chronology",
+            "preview",
+            "--project",
+            &project,
+            "--input",
+            "-",
+        ],
+        &serde_json::json!({"kind":"questionPropose","question":question}).to_string(),
+    );
+    assert!(
+        preview_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&preview_output.stderr)
+    );
+    let preview: Value = serde_json::from_slice(&preview_output.stdout).unwrap();
+    assert_eq!(
+        preview["data"]["data"]["alternativeImpacts"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    let proposal_apply = invoke_with_stdin(
+        &catalog_path,
+        ["chronology", "apply", "--project", &project, "--input", "-"],
+        &serde_json::json!({"kind":"questionPropose","preview":preview["data"]["data"]})
+            .to_string(),
+    );
+    assert!(
+        proposal_apply.status.success(),
+        "{}",
+        String::from_utf8_lossy(&proposal_apply.stderr)
+    );
+    let listing = success(
+        &catalog_path,
+        ["chronology", "questions", "--project", &project],
+    )
+    .json;
+    assert_eq!(
+        listing["data"]["openQuestions"].as_array().unwrap().len(),
+        1
+    );
+
+    let decision_preview = invoke_with_stdin(
+        &catalog_path,
+        ["chronology", "preview", "--project", &project, "--input", "-"],
+        &serde_json::json!({"kind":"questionDecision","decision":{"questionId":"synthetic-question","kind":"accepted","alternativeId":"date-b","note":"synthetic owner anchor"}}).to_string(),
+    );
+    assert!(
+        decision_preview.status.success(),
+        "{}",
+        String::from_utf8_lossy(&decision_preview.stderr)
+    );
+    let decision_preview: Value = serde_json::from_slice(&decision_preview.stdout).unwrap();
+    let applied = invoke_with_stdin(
+        &catalog_path,
+        ["chronology", "apply", "--project", &project, "--input", "-"],
+        &serde_json::json!({"kind":"questionDecision","preview":decision_preview["data"]["data"]})
+            .to_string(),
+    );
+    assert!(
+        applied.status.success(),
+        "{}",
+        String::from_utf8_lossy(&applied.stderr)
+    );
+    let listing = success(
+        &catalog_path,
+        ["chronology", "questions", "--project", &project],
+    )
+    .json;
+    assert!(
+        listing["data"]["openQuestions"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        listing["data"]["humanDecisions"][0]["decision"]["kind"],
+        "accepted"
+    );
+    assert_eq!(listing["data"]["humanDecisions"][0]["proposalRevision"], 1);
 }
 
 #[test]
