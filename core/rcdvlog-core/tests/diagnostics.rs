@@ -291,7 +291,12 @@ fn diagnostics_are_not_operations() {
     let operations_before = catalog.list_operations(&project.id).unwrap().len();
 
     catalog
-        .record_unreadable_media(&project.id, "/card/DCIM", "._C0001.MP4", "synthetic unreadable sidecar")
+        .record_unreadable_media(
+            &project.id,
+            "/card/DCIM",
+            "._C0001.MP4",
+            "synthetic unreadable sidecar",
+        )
         .unwrap();
     catalog
         .record_quarantined_operation(&project.id, "operation_1", "futureThing")

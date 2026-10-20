@@ -2076,7 +2076,9 @@ impl Catalog {
             None
         };
         let (status, diagnostic, validated_at) = match stored {
-            Some((fingerprint, status, diagnostic, validated_at)) if fingerprint == asset.fingerprint => {
+            Some((fingerprint, status, diagnostic, validated_at))
+                if fingerprint == asset.fingerprint =>
+            {
                 let state = match status.as_str() {
                     "usable" => AssetVideoValidationStatus::Usable,
                     "quarantined" => AssetVideoValidationStatus::Quarantined,
@@ -2741,8 +2743,7 @@ impl Catalog {
             if asset.removed {
                 continue;
             }
-            if self.asset_video_validation(&asset.id)?.status
-                != AssetVideoValidationStatus::Usable
+            if self.asset_video_validation(&asset.id)?.status != AssetVideoValidationStatus::Usable
             {
                 skipped += 1;
                 continue;
@@ -4331,9 +4332,17 @@ pub fn probe_media_normalized(
         .filter(|rate| *rate > 0.0)
         .ok_or_else(|| anyhow!("video stream has no valid frame rate"))?;
     let metadata_rotation_degrees = stream_rotation(Some(stream));
-    let width = stream["width"].as_u64().ok_or_else(|| anyhow!("video stream has no usable width"))? as u32;
-    let height = stream["height"].as_u64().ok_or_else(|| anyhow!("video stream has no usable height"))? as u32;
-    let codec = stream["codec_name"].as_str().filter(|codec| !codec.is_empty()).ok_or_else(|| anyhow!("video stream has no codec name"))?.to_string();
+    let width = stream["width"]
+        .as_u64()
+        .ok_or_else(|| anyhow!("video stream has no usable width"))? as u32;
+    let height = stream["height"]
+        .as_u64()
+        .ok_or_else(|| anyhow!("video stream has no usable height"))? as u32;
+    let codec = stream["codec_name"]
+        .as_str()
+        .filter(|codec| !codec.is_empty())
+        .ok_or_else(|| anyhow!("video stream has no codec name"))?
+        .to_string();
     Ok(NormalizedMediaProbe {
         duration_seconds,
         frame_rate: rate,
@@ -5512,7 +5521,10 @@ mod tests {
         assert_eq!(asset.rotation_degrees, 90);
         assert_eq!(catalog.list_operations("project_v4").unwrap().len(), 0);
         let video_validation = catalog.asset_video_validation("asset_v4").unwrap();
-        assert_eq!(video_validation.status, AssetVideoValidationStatus::Unverified);
+        assert_eq!(
+            video_validation.status,
+            AssetVideoValidationStatus::Unverified
+        );
         assert!(!video_validation.bytes_reachable);
         let diagnostics = catalog.asset_revision_diagnostics("asset_v4").unwrap();
         assert_eq!(diagnostics.materialized_revision, 0);

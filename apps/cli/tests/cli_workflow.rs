@@ -154,7 +154,10 @@ fn create_zero_frame_fixture(ffmpeg: &Path, output: &Path) {
         .arg(output)
         .status()
         .expect("create zero-frame fixture");
-    assert!(status.success(), "ffmpeg failed to create zero-frame fixture");
+    assert!(
+        status.success(),
+        "ffmpeg failed to create zero-frame fixture"
+    );
 }
 
 #[test]
@@ -196,9 +199,21 @@ fn ingest_quarantines_reachable_files_without_video_and_preserves_originals() {
     let diagnostics = success(&catalog, ["diagnostics", "list", "--project", &project]);
     let items = diagnostics.json["data"]["diagnostics"].as_array().unwrap();
     assert_eq!(items.len(), 2);
-    assert!(items.iter().all(|diagnostic| diagnostic["kind"] == "ingest.no_video_stream"));
-    assert!(items.iter().all(|diagnostic| diagnostic["context"]["usableVideo"] == false));
-    assert!(items.iter().all(|diagnostic| diagnostic["context"]["reason"].as_str().is_some()));
+    assert!(
+        items
+            .iter()
+            .all(|diagnostic| diagnostic["kind"] == "ingest.no_video_stream")
+    );
+    assert!(
+        items
+            .iter()
+            .all(|diagnostic| diagnostic["context"]["usableVideo"] == false)
+    );
+    assert!(
+        items
+            .iter()
+            .all(|diagnostic| diagnostic["context"]["reason"].as_str().is_some())
+    );
 }
 
 #[test]
@@ -206,7 +221,9 @@ fn generic_unreadable_media_diagnostics_keep_each_filename_and_reason() {
     let directory = tempdir().unwrap();
     let catalog = directory.path().join("catalog.sqlite3");
     let doctor = success(&catalog, ["doctor"]);
-    if available_tool(&doctor.json, "ffprobe").is_none() { return; }
+    if available_tool(&doctor.json, "ffprobe").is_none() {
+        return;
+    }
     let source_dir = directory.path().join("synthetic");
     fs::create_dir_all(&source_dir).unwrap();
     let first = source_dir.join("broken-one.mp4");
@@ -215,15 +232,38 @@ fn generic_unreadable_media_diagnostics_keep_each_filename_and_reason() {
     fs::write(&second, b"synthetic invalid media two").unwrap();
     let project = create_project(&catalog, "Synthetic unreadable media");
 
-    let ingest = success(&catalog, ["ingest", "--project", &project, "--folder", source_dir.to_str().unwrap()]);
+    let ingest = success(
+        &catalog,
+        [
+            "ingest",
+            "--project",
+            &project,
+            "--folder",
+            source_dir.to_str().unwrap(),
+        ],
+    );
     assert_eq!(ingest.json["data"]["imported"], 0);
     let diagnostics = success(&catalog, ["diagnostics", "list", "--project", &project]);
     let items = diagnostics.json["data"]["diagnostics"].as_array().unwrap();
     assert_eq!(items.len(), 2);
-    let files = items.iter().map(|item| item["context"]["filename"].as_str().unwrap()).collect::<std::collections::HashSet<_>>();
-    assert_eq!(files, ["broken-one.mp4", "broken-two.mp4"].into_iter().collect());
-    assert!(items.iter().all(|item| item["kind"] == "ingest.unreadable_media"));
-    assert!(items.iter().all(|item| item["context"]["reason"].as_str().is_some_and(|reason| !reason.is_empty())));
+    let files = items
+        .iter()
+        .map(|item| item["context"]["filename"].as_str().unwrap())
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(
+        files,
+        ["broken-one.mp4", "broken-two.mp4"].into_iter().collect()
+    );
+    assert!(
+        items
+            .iter()
+            .all(|item| item["kind"] == "ingest.unreadable_media")
+    );
+    assert!(items.iter().all(|item| {
+        item["context"]["reason"]
+            .as_str()
+            .is_some_and(|reason| !reason.is_empty())
+    }));
 }
 
 #[cfg(unix)]
@@ -234,8 +274,12 @@ fn legacy_asset_with_incomplete_video_stream_is_not_reported_usable() {
     let directory = tempdir().unwrap();
     let catalog = directory.path().join("catalog.sqlite3");
     let doctor = success(&catalog, ["doctor"]);
-    let Some(ffmpeg) = available_tool(&doctor.json, "ffmpeg") else { return; };
-    if available_tool(&doctor.json, "ffprobe").is_none() { return; }
+    let Some(ffmpeg) = available_tool(&doctor.json, "ffmpeg") else {
+        return;
+    };
+    if available_tool(&doctor.json, "ffprobe").is_none() {
+        return;
+    }
     let media = directory.path().join("legacy.mp4");
     create_media_fixture(&ffmpeg, &media);
     let original_bytes = fs::read(&media).unwrap();
@@ -244,13 +288,25 @@ fn legacy_asset_with_incomplete_video_stream_is_not_reported_usable() {
     let source = source_dir.join("legacy.mp4");
     fs::copy(&media, &source).unwrap();
     let project = create_project(&catalog, "Synthetic legacy row");
-    let ingest = success(&catalog, ["ingest", "--project", &project, "--folder", source_dir.to_str().unwrap()]);
+    let ingest = success(
+        &catalog,
+        [
+            "ingest",
+            "--project",
+            &project,
+            "--folder",
+            source_dir.to_str().unwrap(),
+        ],
+    );
     let listed = success(&catalog, ["clips", "list", "--project", &project]);
     let asset_id = listed.json["data"]["items"][0]["id"].as_str().unwrap();
     assert_eq!(ingest.json["data"]["imported"], 1);
     Connection::open(&catalog)
         .unwrap()
-        .execute("DELETE FROM asset_video_validation WHERE asset_id = ?1", [asset_id])
+        .execute(
+            "DELETE FROM asset_video_validation WHERE asset_id = ?1",
+            [asset_id],
+        )
         .unwrap();
 
     let shim_dir = directory.path().join("shim");
@@ -260,47 +316,120 @@ fn legacy_asset_with_incomplete_video_stream_is_not_reported_usable() {
     let mut permissions = fs::metadata(&shim).unwrap().permissions();
     permissions.set_mode(0o755);
     fs::set_permissions(&shim, permissions).unwrap();
-    let output = invoke_with_path(&catalog, ["clips", "diagnose", "--asset", asset_id], shim_dir.as_os_str());
-    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let output = invoke_with_path(
+        &catalog,
+        ["clips", "diagnose", "--asset", asset_id],
+        shim_dir.as_os_str(),
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let diagnosis: Value = serde_json::from_slice(&output.stdout).unwrap();
     let data = &diagnosis["data"];
-    assert_eq!(data["representations"]["originalReadiness"]["bytesReachable"], true);
-    assert_eq!(data["representations"]["originalReadiness"]["usableVideo"], false);
-    assert_eq!(data["representations"]["originalReadiness"]["diagnosis"], "incomplete_video_stream");
-    assert_eq!(data["representations"]["catalogVideoValidation"]["status"], "unverified");
-    assert!(data["warnings"].as_array().unwrap().iter().any(|warning| warning.as_str().unwrap().contains("not usable video")));
-    assert!(data["recommendedActions"].as_array().unwrap().iter().any(|action| action.as_str().unwrap().contains("valid dimensions")));
+    assert_eq!(
+        data["representations"]["originalReadiness"]["bytesReachable"],
+        true
+    );
+    assert_eq!(
+        data["representations"]["originalReadiness"]["usableVideo"],
+        false
+    );
+    assert_eq!(
+        data["representations"]["originalReadiness"]["diagnosis"],
+        "incomplete_video_stream"
+    );
+    assert_eq!(
+        data["representations"]["catalogVideoValidation"]["status"],
+        "unverified"
+    );
+    assert!(
+        data["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|warning| warning.as_str().unwrap().contains("not usable video"))
+    );
+    assert!(
+        data["recommendedActions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|action| action.as_str().unwrap().contains("valid dimensions"))
+    );
 
     let unverified_status = success(&catalog, ["project", "status", "--project", &project]);
-    assert_eq!(unverified_status.json["data"]["analysisReadiness"]["totalClips"], 0);
-    assert_eq!(unverified_status.json["data"]["analysisReadiness"]["unverifiedVideoClips"], 1);
-    assert_eq!(unverified_status.json["data"]["analysisReadiness"]["reachableOriginals"], 1);
+    assert_eq!(
+        unverified_status.json["data"]["analysisReadiness"]["totalClips"],
+        0
+    );
+    assert_eq!(
+        unverified_status.json["data"]["analysisReadiness"]["unverifiedVideoClips"],
+        1
+    );
+    assert_eq!(
+        unverified_status.json["data"]["analysisReadiness"]["reachableOriginals"],
+        1
+    );
 
     let operations_before = Connection::open(&catalog)
         .unwrap()
-        .query_row("SELECT COUNT(*) FROM project_operations", [], |row| row.get::<_, i64>(0))
+        .query_row("SELECT COUNT(*) FROM project_operations", [], |row| {
+            row.get::<_, i64>(0)
+        })
         .unwrap();
-    let validation = invoke_with_path(&catalog, ["clips", "validate-video", "--asset", asset_id], shim_dir.as_os_str());
-    assert!(validation.status.success(), "{}", String::from_utf8_lossy(&validation.stderr));
+    let validation = invoke_with_path(
+        &catalog,
+        ["clips", "validate-video", "--asset", asset_id],
+        shim_dir.as_os_str(),
+    );
+    assert!(
+        validation.status.success(),
+        "{}",
+        String::from_utf8_lossy(&validation.stderr)
+    );
     let validation: Value = serde_json::from_slice(&validation.stdout).unwrap();
     assert_eq!(validation["data"]["status"], "quarantined");
     assert_eq!(validation["data"]["bytesReachable"], true);
-    assert!(validation["data"]["diagnostic"].as_str().unwrap().contains("frame rate"));
+    assert!(
+        validation["data"]["diagnostic"]
+            .as_str()
+            .unwrap()
+            .contains("frame rate")
+    );
     let operations_after = Connection::open(&catalog)
         .unwrap()
-        .query_row("SELECT COUNT(*) FROM project_operations", [], |row| row.get::<_, i64>(0))
+        .query_row("SELECT COUNT(*) FROM project_operations", [], |row| {
+            row.get::<_, i64>(0)
+        })
         .unwrap();
     assert_eq!(operations_after, operations_before);
 
     let status = success(&catalog, ["project", "status", "--project", &project]);
     assert_eq!(status.json["data"]["media"]["assets"], 1);
     assert_eq!(status.json["data"]["media"]["durationSeconds"], 0.0);
-    assert_eq!(status.json["data"]["media"]["videoValidation"]["usableVideo"], 0);
-    assert_eq!(status.json["data"]["media"]["videoValidation"]["quarantinedVideo"], 1);
-    assert_eq!(status.json["data"]["media"]["videoValidation"]["reachableOriginals"], 1);
+    assert_eq!(
+        status.json["data"]["media"]["videoValidation"]["usableVideo"],
+        0
+    );
+    assert_eq!(
+        status.json["data"]["media"]["videoValidation"]["quarantinedVideo"],
+        1
+    );
+    assert_eq!(
+        status.json["data"]["media"]["videoValidation"]["reachableOriginals"],
+        1
+    );
     assert_eq!(status.json["data"]["analysisReadiness"]["totalClips"], 0);
-    assert_eq!(status.json["data"]["analysisReadiness"]["quarantinedVideoClips"], 1);
-    assert_eq!(status.json["data"]["analysisReadiness"]["reachableOriginals"], 1);
+    assert_eq!(
+        status.json["data"]["analysisReadiness"]["quarantinedVideoClips"],
+        1
+    );
+    assert_eq!(
+        status.json["data"]["analysisReadiness"]["reachableOriginals"],
+        1
+    );
     assert_eq!(fs::read(&source).unwrap(), original_bytes);
 }
 
