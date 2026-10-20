@@ -213,8 +213,7 @@ fn media_tool_failures_keep_cli_stderr_as_one_redacted_json_value() {
             "tool failures must keep stdout empty"
         );
         let stderr = String::from_utf8(output.stderr).expect("CLI stderr is UTF-8");
-        let error: Value =
-            serde_json::from_str(&stderr).expect("stderr is exactly one JSON value");
+        let error: Value = serde_json::from_str(&stderr).expect("stderr is exactly one JSON value");
         assert_eq!(error["ok"], false);
         assert_eq!(error["error"]["code"], "media_tool_failed");
         let message = error["error"]["message"].as_str().unwrap();

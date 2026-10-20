@@ -184,8 +184,8 @@ impl Catalog {
                     .context("start ffmpeg preview segment process")?;
 
             if !status.success() {
-                let message = media_tool_failure("ffmpeg preview segment", status, diagnostic)
-                    .to_string();
+                let message =
+                    media_tool_failure("ffmpeg preview segment", status, diagnostic).to_string();
                 progress(PreviewProgress::ClipFailed {
                     position: operation.position,
                     message: message.clone(),

@@ -3835,7 +3835,8 @@ where
         }
     }
     let status = child.wait().context("wait for ffmpeg proxy process")?;
-    let stderr = String::from_utf8_lossy(&stderr_reader.join().unwrap_or_default());
+    let stderr = stderr_reader.join().unwrap_or_default();
+    let stderr = String::from_utf8_lossy(&stderr).into_owned();
     let diagnostic = redact_media_diagnostic(&stderr, source, output);
     Ok(ProxyProcessResult { status, diagnostic })
 }
@@ -3870,7 +3871,8 @@ pub(crate) fn run_captured_media_command(
         .ok_or_else(|| anyhow!("media tool stderr pipe was not available"))?;
     let stderr_reader = drain_child_stderr(stderr);
     let status = child.wait().context("wait for media tool process")?;
-    let stderr = String::from_utf8_lossy(&stderr_reader.join().unwrap_or_default()).into_owned();
+    let stderr = stderr_reader.join().unwrap_or_default();
+    let stderr = String::from_utf8_lossy(&stderr).into_owned();
     let diagnostic = redact_media_diagnostic(&stderr, input, output);
     Ok((status, diagnostic))
 }
@@ -4183,11 +4185,7 @@ fn probe_media_document_with(path: &Path, ffprobe_program: &Path) -> Result<Valu
         crate::stall::io_stall_timeout(),
     )?;
     if !output.status.success() {
-        let diagnostic = redact_media_diagnostic(
-            &String::from_utf8_lossy(&output.stderr),
-            path,
-            path,
-        );
+        let diagnostic = redact_media_diagnostic(&String::from_utf8_lossy(&output.stderr), path, path);
         return Err(media_tool_failure("ffprobe", output.status, diagnostic));
     }
     serde_json::from_slice(&output.stdout).context("parse ffprobe JSON")
@@ -4309,11 +4307,7 @@ fn probe_media_document(path: &Path) -> Result<Value> {
         crate::stall::io_stall_timeout(),
     )?;
     if !output.status.success() {
-        let diagnostic = redact_media_diagnostic(
-            &String::from_utf8_lossy(&output.stderr),
-            path,
-            path,
-        );
+        let diagnostic = redact_media_diagnostic(&String::from_utf8_lossy(&output.stderr), path, path);
         return Err(media_tool_failure("ffprobe", output.status, diagnostic));
     }
     serde_json::from_slice(&output.stdout).context("parse ffprobe JSON")
@@ -5770,11 +5764,7 @@ mod tests {
     #[test]
     fn media_diagnostics_redact_paths_and_bound_the_redacted_text() {
         let stderr = "failure ".to_owned() + &"/a ".repeat(2_000);
-        let diagnostic = redact_media_diagnostic(
-            &stderr,
-            Path::new("/a"),
-            Path::new("/output"),
-        );
+        let diagnostic = redact_media_diagnostic(&stderr, Path::new("/a"), Path::new("/output"));
         assert!(diagnostic.len() <= 4096);
         assert!(!diagnostic.contains("/a"));
         assert!(diagnostic.contains("<source>"));

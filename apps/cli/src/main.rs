@@ -1178,8 +1178,9 @@ fn main() -> ExitCode {
         Err(error) => {
             let message = format!("{error:#}");
             let remote = error.downcast_ref::<server_commands::RemoteCommandError>();
-            let media_tool_failure =
-                error.downcast_ref::<rcdvlog_core::MediaToolFailure>().is_some();
+            let media_tool_failure = error
+                .downcast_ref::<rcdvlog_core::MediaToolFailure>()
+                .is_some();
             let code = if let Some(remote) = remote {
                 remote.code.as_str()
             } else if media_tool_failure {

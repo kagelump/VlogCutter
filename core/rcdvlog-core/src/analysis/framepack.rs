@@ -15,7 +15,9 @@ use std::process::{Command, Stdio};
 
 use crate::analysis::FRAMEPACK_RECIPE_KEY;
 use crate::analysis::frames::{GrayFrame, score_frames, select_frames};
-use crate::{media_tool_failure, redact_media_diagnostic, run_captured_media_command, tool_command};
+use crate::{
+    media_tool_failure, redact_media_diagnostic, run_captured_media_command, tool_command,
+};
 
 const CANDIDATE_FPS: u32 = 2;
 const WORK_WIDTH: usize = 320;
@@ -148,12 +150,13 @@ pub fn build_frame_pack(proxy: &Path, fingerprint: &str) -> Result<FramePackMani
         .output()
         .context("spawn ffmpeg frame sampling")?;
     if !output.status.success() {
-        let diagnostic = redact_media_diagnostic(
-            &String::from_utf8_lossy(&output.stderr),
-            proxy,
-            proxy,
-        );
-        return Err(media_tool_failure("ffmpeg frame sampling", output.status, diagnostic));
+        let diagnostic =
+            redact_media_diagnostic(&String::from_utf8_lossy(&output.stderr), proxy, proxy);
+        return Err(media_tool_failure(
+            "ffmpeg frame sampling",
+            output.status,
+            diagnostic,
+        ));
     }
     let duration_output = tool_command("ffprobe")
         .args([
@@ -216,8 +219,9 @@ pub fn encode_frames(
     for timestamp in &manifest.timestamps_ms {
         let path = directory.join(format!("f{timestamp:08}.jpg"));
         let mut command = jpeg_command(proxy, *timestamp, &path);
-        let (status, diagnostic) = run_captured_media_command(&mut command, proxy, &path)
-            .context("spawn ffmpeg frame encode")?;
+        let (status, diagnostic) =
+            run_captured_media_command(&mut command, proxy, &path)
+                .context("spawn ffmpeg frame encode")?;
         if !status.success() {
             return Err(media_tool_failure("ffmpeg frame encode", status, diagnostic));
         }
