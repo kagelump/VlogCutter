@@ -161,6 +161,48 @@ fn ingest_quarantines_reachable_files_without_video_and_preserves_originals() {
     assert!(items.iter().all(|diagnostic| diagnostic["context"]["reason"].as_str().is_some()));
 }
 
+#[cfg(unix)]
+#[test]
+fn legacy_asset_with_incomplete_video_stream_is_not_reported_usable() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = tempdir().unwrap();
+    let catalog = directory.path().join("catalog.sqlite3");
+    let doctor = success(&catalog, ["doctor"]);
+    let Some(ffmpeg) = available_tool(&doctor.json, "ffmpeg") else { return; };
+    if available_tool(&doctor.json, "ffprobe").is_none() { return; }
+    let media = directory.path().join("legacy.mp4");
+    create_media_fixture(&ffmpeg, &media);
+    let original_bytes = fs::read(&media).unwrap();
+    let source_dir = directory.path().join("legacy-source");
+    fs::create_dir_all(&source_dir).unwrap();
+    let source = source_dir.join("legacy.mp4");
+    fs::copy(&media, &source).unwrap();
+    let project = create_project(&catalog, "Synthetic legacy row");
+    let ingest = success(&catalog, ["ingest", "--project", &project, "--folder", source_dir.to_str().unwrap()]);
+    let listed = success(&catalog, ["clips", "list", "--project", &project]);
+    let asset_id = listed.json["data"]["items"][0]["id"].as_str().unwrap();
+    assert_eq!(ingest.json["data"]["imported"], 1);
+
+    let shim_dir = directory.path().join("shim");
+    fs::create_dir_all(&shim_dir).unwrap();
+    let shim = shim_dir.join("ffprobe");
+    fs::write(&shim, "#!/bin/sh\nprintf '%s\\n' '{\"streams\":[{\"codec_type\":\"video\",\"width\":640,\"height\":360,\"codec_name\":\"mpeg4\"}],\"format\":{\"duration\":\"1.0\"}}'\n").unwrap();
+    let mut permissions = fs::metadata(&shim).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&shim, permissions).unwrap();
+    let output = invoke_with_path(&catalog, ["clips", "diagnose", "--asset", asset_id], shim_dir.as_os_str());
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let diagnosis: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let data = &diagnosis["data"];
+    assert_eq!(data["representations"]["originalReadiness"]["bytesReachable"], true);
+    assert_eq!(data["representations"]["originalReadiness"]["usableVideo"], false);
+    assert_eq!(data["representations"]["originalReadiness"]["diagnosis"], "incomplete_video_stream");
+    assert!(data["warnings"].as_array().unwrap().iter().any(|warning| warning.as_str().unwrap().contains("not usable video")));
+    assert!(data["recommendedActions"].as_array().unwrap().iter().any(|action| action.as_str().unwrap().contains("valid dimensions")));
+    assert_eq!(fs::read(&source).unwrap(), original_bytes);
+}
+
 #[test]
 fn process_contract_persists_across_invocations_and_routes_errors() {
     let directory = tempdir().unwrap();

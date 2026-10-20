@@ -228,6 +228,24 @@ impl Catalog {
         })
     }
 
+    /// Records per-file video streams that exist but lack usable technical metadata.
+    pub fn record_invalid_video_stream(
+        &self,
+        project_id: &str,
+        containing_folder: &str,
+        filename: &str,
+        reason: &str,
+    ) -> Result<Diagnostic> {
+        self.record_diagnostic(project_id, DiagnosticRecord {
+            dedupe_key: format!("ingest.invalid_video_stream:{containing_folder}:{filename}"),
+            severity: DiagnosticSeverity::Warning,
+            kind: "ingest.invalid_video_stream".to_string(),
+            subject: DiagnosticSubject::Project,
+            message: format!("{filename} contains a video stream with unusable technical metadata and was skipped. Repair or replace the source only after confirming what it contains."),
+            context: serde_json::json!({ "folder": containing_folder, "filename": filename, "reason": reason, "bytesReachable": true, "usableVideo": false }),
+        })
+    }
+
     /// Producer: an operation this build does not recognize and has retained.
     ///
     /// Supplements `quarantined_operations()` rather than replacing it: that

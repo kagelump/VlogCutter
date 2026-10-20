@@ -823,6 +823,10 @@ fn clip_diagnosis(catalog: &Catalog, asset_id: &str) -> Result<Value> {
     let no_video_stream = original["error"]
         .as_str()
         .is_some_and(|error| error.contains("no video stream"));
+    let original_bytes_reachable = Path::new(&asset.path).is_file();
+    let incomplete_video_stream = original_bytes_reachable
+        && original_probe.is_none()
+        && original["error"].as_str().is_some_and(|error| error.contains("video stream"));
     let proxy_version = proxy_version(&asset);
     let proxy_probe = asset
         .proxy_path
@@ -894,8 +898,9 @@ fn clip_diagnosis(catalog: &Catalog, asset_id: &str) -> Result<Value> {
     };
 
     let mut warnings = Vec::new();
-    if no_video_stream {
-        warnings.push("original file is reachable, but ffprobe found no video stream; this legacy catalog row is not usable video and should not be counted as ready".to_string());
+    if original_bytes_reachable && original_probe.is_none() {
+        let issue = if no_video_stream { "no video stream" } else { "unusable video stream or probe failure" };
+        warnings.push(format!("original file bytes are reachable, but ffprobe found {issue}; this legacy catalog row is not usable video and should not be counted as ready"));
     }
     if !asset.orientation_probed {
         warnings.push(
@@ -934,8 +939,8 @@ fn clip_diagnosis(catalog: &Catalog, asset_id: &str) -> Result<Value> {
     }
 
     let mut recommended_actions = Vec::new();
-    if no_video_stream {
-        recommended_actions.push("verify the referenced file is the intended video; if it is audio-only or has no video frames, keep it out of video review and chronology (re-import after replacing it with valid video only when that is the intended source)".to_string());
+    if original_bytes_reachable && original_probe.is_none() {
+        recommended_actions.push("verify the referenced file is the intended video and contains decodable video frames, valid dimensions, a frame rate, a codec, and a duration; keep it out of video review and chronology until those checks pass".to_string());
     }
     if !asset.orientation_probed {
         recommended_actions.push(format!(
@@ -974,9 +979,9 @@ fn clip_diagnosis(catalog: &Catalog, asset_id: &str) -> Result<Value> {
         "representations": {
             "original": original,
             "originalReadiness": {
-                "bytesReachable": Path::new(&asset.path).is_file(),
+                "bytesReachable": original_bytes_reachable,
                 "usableVideo": original_probe.is_some(),
-                "diagnosis": if no_video_stream { "no_video_stream" } else if original_probe.is_some() { "video_stream_available" } else { "probe_failed" },
+                "diagnosis": if no_video_stream { "no_video_stream" } else if incomplete_video_stream { "incomplete_video_stream" } else if original_probe.is_some() { "video_stream_available" } else { "probe_failed" },
             },
             "proxy": {
                 "path": asset.proxy_path,

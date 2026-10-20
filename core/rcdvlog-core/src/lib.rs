@@ -794,10 +794,10 @@ pub fn probe_media_stream(path: impl AsRef<Path>) -> Result<MediaStreamInfo> {
     let stream = require_video_stream(&probe)?;
     let width = stream["width"]
         .as_u64()
-        .unwrap_or(0) as u32;
+        .ok_or_else(|| anyhow!("video stream has no usable width"))? as u32;
     let height = stream["height"]
         .as_u64()
-        .unwrap_or(0) as u32;
+        .ok_or_else(|| anyhow!("video stream has no usable height"))? as u32;
     let metadata_rotation_degrees = stream_rotation(Some(stream));
     let sideways = matches!(metadata_rotation_degrees, 90 | 270);
     let (display_width, display_height) = if sideways {
@@ -812,7 +812,7 @@ pub fn probe_media_stream(path: impl AsRef<Path>) -> Result<MediaStreamInfo> {
         height,
         codec: stream["codec_name"]
             .as_str()
-            .unwrap_or("unknown")
+            .ok_or_else(|| anyhow!("video stream has no codec name"))?
             .to_string(),
         metadata_rotation_degrees,
         display_width,
@@ -1094,6 +1094,8 @@ impl Catalog {
                     let reason = format!("{error:#}");
                     let _ = if reason.contains("no video stream") {
                         self.record_no_video_stream(project_id, &folder, &filename, &reason)
+                    } else if reason.contains("video stream") {
+                        self.record_invalid_video_stream(project_id, &folder, &filename, &reason)
                     } else {
                         self.record_unreadable_media(project_id, &folder, &filename, &reason)
                     };
@@ -3997,28 +3999,31 @@ fn probe_media(path: &Path) -> Result<MediaProbe> {
         &path.file_name().unwrap_or_default().to_string_lossy(),
     )
     .camera;
-    let duration_seconds = document["format"]["duration"]
-        .as_str()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(0.0);
+    let duration_seconds = video_duration(&document, stream)
+        .ok_or_else(|| anyhow!("video stream has no valid duration"))?;
     let rate = stream["r_frame_rate"]
         .as_str()
-        .map(parse_rate)
+        .and_then(parse_rate)
         .filter(|rate| *rate > 0.0)
         .ok_or_else(|| anyhow!("video stream has no valid frame rate"))?;
     let metadata_rotation_degrees = stream_rotation(Some(stream));
-    let width = stream["width"].as_u64().unwrap_or(0) as u32;
-    let height = stream["height"].as_u64().unwrap_or(0) as u32;
-    if width == 0 || height == 0 {
-        bail!("video stream has no usable dimensions");
-    }
+    let width = stream["width"]
+        .as_u64()
+        .ok_or_else(|| anyhow!("video stream has no usable width"))? as u32;
+    let height = stream["height"]
+        .as_u64()
+        .ok_or_else(|| anyhow!("video stream has no usable height"))? as u32;
+    let codec = stream["codec_name"]
+        .as_str()
+        .filter(|codec| !codec.is_empty())
+        .ok_or_else(|| anyhow!("video stream has no codec name"))?
+        .to_string();
     Ok(MediaProbe {
         duration_seconds,
         frame_rate: rate,
         width,
         height,
-        codec: stream["codec_name"].as_str().filter(|codec| !codec.is_empty())
-            .ok_or_else(|| anyhow!("video stream has no codec name"))?.to_string(),
+        codec,
         camera,
         captured_at_raw: raw_time.clone(),
         best_time: raw_time
@@ -4053,10 +4058,40 @@ pub struct NormalizedMediaProbe {
 }
 
 fn require_video_stream(document: &Value) -> Result<&Value> {
-    document["streams"]
+    let stream = document["streams"]
         .as_array()
         .and_then(|streams| streams.iter().find(|stream| stream["codec_type"] == "video"))
-        .ok_or_else(|| anyhow!("ffprobe found no video stream; file bytes are reachable but contain no usable video"))
+        .ok_or_else(|| {
+            anyhow!("ffprobe found no video stream; file bytes are reachable but contain no usable video")
+        })?;
+    if stream["width"].as_u64().is_none_or(|value| value == 0) {
+        bail!("video stream has no usable width");
+    }
+    if stream["height"].as_u64().is_none_or(|value| value == 0) {
+        bail!("video stream has no usable height");
+    }
+    if stream["codec_name"].as_str().is_none_or(str::is_empty) {
+        bail!("video stream has no codec name");
+    }
+    if stream["r_frame_rate"]
+        .as_str()
+        .and_then(parse_rate)
+        .is_none_or(|rate| !rate.is_finite() || rate <= 0.0)
+    {
+        bail!("video stream has no valid frame rate");
+    }
+    if video_duration(document, stream).is_none() {
+        bail!("video stream has no valid duration");
+    }
+    Ok(stream)
+}
+
+fn video_duration(document: &Value, stream: &Value) -> Option<f64> {
+    document["format"]["duration"]
+        .as_str()
+        .or_else(|| stream["duration"].as_str())
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|duration| duration.is_finite() && *duration > 0.0)
 }
 
 /// A media executable exited unsuccessfully. Kept typed so CLI adapters can
@@ -4133,26 +4168,23 @@ pub fn probe_media_normalized(
         .or_else(|| document.pointer("/format/tags/creation_time"))
         .and_then(Value::as_str)
         .map(str::to_owned);
-    let duration_seconds = document["format"]["duration"]
-        .as_str()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(0.0);
+    let duration_seconds = video_duration(&document, stream)
+        .ok_or_else(|| anyhow!("video stream has no valid duration"))?;
     let rate = stream["r_frame_rate"]
         .as_str()
-        .map(parse_rate)
+        .and_then(parse_rate)
         .filter(|rate| *rate > 0.0)
         .ok_or_else(|| anyhow!("video stream has no valid frame rate"))?;
     let metadata_rotation_degrees = stream_rotation(Some(stream));
-    let width = stream["width"].as_u64().unwrap_or(0) as u32;
-    let height = stream["height"].as_u64().unwrap_or(0) as u32;
-    if width == 0 || height == 0 { bail!("video stream has no usable dimensions"); }
+    let width = stream["width"].as_u64().ok_or_else(|| anyhow!("video stream has no usable width"))? as u32;
+    let height = stream["height"].as_u64().ok_or_else(|| anyhow!("video stream has no usable height"))? as u32;
+    let codec = stream["codec_name"].as_str().filter(|codec| !codec.is_empty()).ok_or_else(|| anyhow!("video stream has no codec name"))?.to_string();
     Ok(NormalizedMediaProbe {
         duration_seconds,
         frame_rate: rate,
         encoded_width: width,
         encoded_height: height,
-        codec: stream["codec_name"].as_str().filter(|codec| !codec.is_empty())
-            .ok_or_else(|| anyhow!("video stream has no codec name"))?.to_string(),
+        codec,
         camera_make,
         camera_model,
         camera_string,
@@ -4176,7 +4208,7 @@ fn probe_media_document_with(path: &Path, ffprobe_program: &Path) -> Result<Valu
             "-select_streams",
             "v:0",
             "-show_entries",
-            "format=duration:format_tags=creation_time:stream=codec_type,width,height,codec_name,r_frame_rate:stream_tags=creation_time,rotate:stream_side_data=rotation",
+            "format=duration:format_tags=creation_time:stream=codec_type,width,height,codec_name,r_frame_rate,duration:stream_tags=creation_time,rotate:stream_side_data=rotation",
             "-of",
             "json",
         ])
@@ -4299,7 +4331,7 @@ fn probe_media_document(path: &Path) -> Result<Value> {
             "-select_streams",
             "v:0",
             "-show_entries",
-            "format=duration:format_tags=creation_time:stream=codec_type,width,height,codec_name,r_frame_rate:stream_tags=creation_time,rotate:stream_side_data=rotation",
+            "format=duration:format_tags=creation_time:stream=codec_type,width,height,codec_name,r_frame_rate,duration:stream_tags=creation_time,rotate:stream_side_data=rotation",
             "-of",
             "json",
         ])
@@ -4368,21 +4400,15 @@ pub(crate) fn exif_camera(path: &Path) -> Option<String> {
     (!combined.is_empty()).then_some(combined)
 }
 
-fn parse_rate(value: &str) -> f64 {
-    let mut parts = value.split('/');
-    let numerator = parts
-        .next()
-        .and_then(|part| part.parse::<f64>().ok())
-        .unwrap_or(30.0);
-    let denominator = parts
-        .next()
-        .and_then(|part| part.parse::<f64>().ok())
-        .unwrap_or(1.0);
+fn parse_rate(value: &str) -> Option<f64> {
+    let (numerator, denominator) = value.split_once('/').unwrap_or((value, "1"));
+    let numerator = numerator.parse::<f64>().ok()?;
+    let denominator = denominator.parse::<f64>().ok()?;
     if denominator == 0.0 {
-        30.0
-    } else {
-        numerator / denominator
+        return None;
     }
+    let rate = numerator / denominator;
+    (rate.is_finite() && rate > 0.0).then_some(rate)
 }
 
 fn normalize_datetime(value: &str, offset_seconds: i64) -> Option<String> {
@@ -5741,9 +5767,9 @@ mod tests {
             proxy_representation("asset.mp4"),
             ProxyRepresentation::MetadataBakedV1
         );
-        assert!((parse_rate("60000/1001") - 59.94005994).abs() < 0.0001);
-        assert_eq!(parse_rate("30/0"), 30.0);
-        assert_eq!(parse_rate("invalid"), 30.0);
+        assert!((parse_rate("60000/1001").unwrap() - 59.94005994).abs() < 0.0001);
+        assert_eq!(parse_rate("30/0"), None);
+        assert_eq!(parse_rate("invalid"), None);
     }
 
     #[test]
