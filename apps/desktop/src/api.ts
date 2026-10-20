@@ -357,7 +357,13 @@ export const api = {
   },
 
   async suggestChronology(request: ChronologySuggestionRequest): Promise<ChronologySuggestionResult> {
-    return invoke("analysis_suggest_chronology", request);
+    return invoke("analysis_suggest_chronology", {
+      projectId: request.projectId,
+      assetIds: request.assetIds,
+      primaryModel: request.primaryModel,
+      allowedModels: request.allowedModels,
+      allowFallback: request.allowFallback,
+    });
   },
 
   async analyzeProject(projectId: string, request: AnalysisRunRequest = {}): Promise<AnalysisRunReport> {

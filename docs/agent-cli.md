@@ -344,7 +344,7 @@ Transcription is offline and reads proxies only. Vision analysis reads proxy-der
 `analyze status` and `labels vocabulary` are strictly read-only. Analysis progress is emitted as JSON on stderr.
 
 `analyze suggest-chronology` makes one bounded, read-only visual evidence request
-for 1–8 selected clips, using at most two selected proxy frames per clip. It
+for 2–8 selected clips, using at most two selected proxy frames per clip. It
 returns coverage diagnostics and checkable conflicts against the current solved
 chronology. The result is stored separately from chronology facts and keyed by
 the facts revision, proxy frames, and model policy; repeating a completed

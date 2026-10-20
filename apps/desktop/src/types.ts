@@ -345,7 +345,7 @@ export interface ChronologySuggestionRequest {
 export interface ChronologySuggestionResult {
   suggestion: { frameIds: string[]; matches: Array<{ earlierAssetId: string; laterAssetId: string; supportingFrameIds: string[] }> };
   review: { missingFrameIds: string[]; duplicateFrameIds: string[]; unknownFrameIds: string[]; semanticInconsistencies: string[] };
-  provenance: { model: string; attempts: number; costUsd: number; promptTokens: number; completionTokens: number; latencyMs: number };
+  provenance: { model: string; attempts: number; attemptedModels: string[]; usageComplete: boolean; costUsd: number; promptTokens: number; completionTokens: number; latencyMs: number };
   cached: boolean;
 }
 

@@ -94,6 +94,51 @@ describe("the harness's own guarantees", () => {
     }
   });
 
+  it("serves bounded chronology suggestions locally without mutating canonical chronology", async () => {
+    const harness = desktopScenario()
+      .project("Synthetic chronology test", { id: "project_test" })
+      .camera("Camera A", { clips: 2 })
+      .build()
+      .install();
+    try {
+      const before = JSON.stringify(harness.state.chronology.overview);
+      const result = (await window.__TAURI_INTERNALS__!.invoke(
+        "analysis_suggest_chronology",
+        {
+          projectId: "project_test",
+          assetIds: harness.state.assetOrder,
+          primaryModel: "local-test-model",
+          allowedModels: ["local-test-model"],
+          allowFallback: false,
+        },
+      )) as {
+        suggestion: { frameIds: string[]; matches: unknown[] };
+        provenance: { model: string; attempts: number; attemptedModels: string[]; usageComplete: boolean; costUsd: number };
+      };
+      expect(result.suggestion.frameIds).toHaveLength(4);
+      expect(result.suggestion.matches).toEqual([]);
+      expect(result.provenance).toMatchObject({
+        model: "local-test-model",
+        attempts: 1,
+        attemptedModels: ["local-test-model"],
+        usageComplete: true,
+        costUsd: 0,
+      });
+      expect(JSON.stringify(harness.state.chronology.overview)).toBe(before);
+      await expect(
+        window.__TAURI_INTERNALS__!.invoke("analysis_suggest_chronology", {
+          projectId: "project_test",
+          assetIds: [harness.state.assetOrder[0]],
+          primaryModel: "local-test-model",
+          allowedModels: ["local-test-model"],
+          allowFallback: false,
+        }),
+      ).rejects.toThrow(/2–8 distinct clips/);
+    } finally {
+      harness.uninstall();
+    }
+  });
+
   it("states a reason for every exemption", () => {
     for (const entry of contractExemptions) {
       expect(entry.command, "an exemption needs a command").toBeTruthy();
