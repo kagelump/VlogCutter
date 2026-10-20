@@ -4289,45 +4289,45 @@ fn collect_timestamp_candidates(
     }
     if let Some(streams) = document.get("streams").and_then(Value::as_array) {
         for (index, stream) in streams.iter().enumerate() {
-            if stream.get("codec_type").and_then(Value::as_str) == Some("video") {
-                if let Some(tags) = stream.pointer("/tags").and_then(Value::as_object) {
-                    for key in [
-                        "creation_time",
-                        "recording_start_time",
-                        "recording_end_time",
-                    ] {
-                        if let Some(value) = tags.get(key).and_then(Value::as_str) {
-                            add(
-                                format!("ffprobe.streams[{index}].tags.{key}"),
-                                value.into(),
-                                timestamp_tag_semantics(key, "stream_creation_time"),
-                            );
-                        }
+            if stream.get("codec_type").and_then(Value::as_str) == Some("video")
+                && let Some(tags) = stream.pointer("/tags").and_then(Value::as_object)
+            {
+                for key in [
+                    "creation_time",
+                    "recording_start_time",
+                    "recording_end_time",
+                ] {
+                    if let Some(value) = tags.get(key).and_then(Value::as_str) {
+                        add(
+                            format!("ffprobe.streams[{index}].tags.{key}"),
+                            value.into(),
+                            timestamp_tag_semantics(key, "stream_creation_time"),
+                        );
                     }
                 }
             }
         }
     }
-    if let Some(filename) = path.file_name().and_then(|value| value.to_str()) {
-        if let Some((start, len)) = find_compact_filename_timestamp(filename) {
-            let value = &filename[start..start + len];
-            let parsed = chrono::NaiveDateTime::parse_from_str(value, "%Y%m%d%H%M%S")
-                .ok()
-                .map(|date| date.format("%Y-%m-%dT%H:%M:%S").to_string());
-            let parse_status = if parsed.is_some() {
-                "parsed_without_timezone"
-            } else {
-                "unparseable"
-            };
-            candidates.push(chronology::TimestampCandidate {
-                origin: "filename.compact_timestamp".into(),
-                original_text: value.into(),
-                parsed_value: parsed,
-                timezone_claim: None,
-                parse_status: parse_status.into(),
-                semantics: None,
-            });
-        }
+    if let Some(filename) = path.file_name().and_then(|value| value.to_str())
+        && let Some((start, len)) = find_compact_filename_timestamp(filename)
+    {
+        let value = &filename[start..start + len];
+        let parsed = chrono::NaiveDateTime::parse_from_str(value, "%Y%m%d%H%M%S")
+            .ok()
+            .map(|date| date.format("%Y-%m-%dT%H:%M:%S").to_string());
+        let parse_status = if parsed.is_some() {
+            "parsed_without_timezone"
+        } else {
+            "unparseable"
+        };
+        candidates.push(chronology::TimestampCandidate {
+            origin: "filename.compact_timestamp".into(),
+            original_text: value.into(),
+            parsed_value: parsed,
+            timezone_claim: None,
+            parse_status: parse_status.into(),
+            semantics: None,
+        });
     }
     candidates
 }
