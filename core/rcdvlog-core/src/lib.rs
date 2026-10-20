@@ -4185,7 +4185,8 @@ fn probe_media_document_with(path: &Path, ffprobe_program: &Path) -> Result<Valu
         crate::stall::io_stall_timeout(),
     )?;
     if !output.status.success() {
-        let diagnostic = redact_media_diagnostic(&String::from_utf8_lossy(&output.stderr), path, path);
+        let diagnostic =
+            redact_media_diagnostic(&String::from_utf8_lossy(&output.stderr), path, path);
         return Err(media_tool_failure("ffprobe", output.status, diagnostic));
     }
     serde_json::from_slice(&output.stdout).context("parse ffprobe JSON")
@@ -4307,7 +4308,8 @@ fn probe_media_document(path: &Path) -> Result<Value> {
         crate::stall::io_stall_timeout(),
     )?;
     if !output.status.success() {
-        let diagnostic = redact_media_diagnostic(&String::from_utf8_lossy(&output.stderr), path, path);
+        let diagnostic =
+            redact_media_diagnostic(&String::from_utf8_lossy(&output.stderr), path, path);
         return Err(media_tool_failure("ffprobe", output.status, diagnostic));
     }
     serde_json::from_slice(&output.stdout).context("parse ffprobe JSON")

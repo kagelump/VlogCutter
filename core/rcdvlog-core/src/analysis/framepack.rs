@@ -219,11 +219,14 @@ pub fn encode_frames(
     for timestamp in &manifest.timestamps_ms {
         let path = directory.join(format!("f{timestamp:08}.jpg"));
         let mut command = jpeg_command(proxy, *timestamp, &path);
-        let (status, diagnostic) =
-            run_captured_media_command(&mut command, proxy, &path)
-                .context("spawn ffmpeg frame encode")?;
+        let (status, diagnostic) = run_captured_media_command(&mut command, proxy, &path)
+            .context("spawn ffmpeg frame encode")?;
         if !status.success() {
-            return Err(media_tool_failure("ffmpeg frame encode", status, diagnostic));
+            return Err(media_tool_failure(
+                "ffmpeg frame encode",
+                status,
+                diagnostic,
+            ));
         }
         written.push(path);
     }
