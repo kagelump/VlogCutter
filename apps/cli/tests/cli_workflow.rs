@@ -235,6 +235,120 @@ fn chronology_preview_is_reusable_revision_guarded_and_process_safe() {
         ],
     );
     assert_eq!(stale["error"]["code"], "chronology.stale_preview");
+
+    let epoch_id = preview["data"]["data"]["epoch"]["id"]
+        .as_str()
+        .expect("epoch identity");
+    let clear_request = serde_json::json!({"kind":"epochClear", "epochId":epoch_id});
+    let clear_preview_output = invoke_with_stdin(
+        &catalog,
+        [
+            "chronology",
+            "preview",
+            "--project",
+            &project,
+            "--input",
+            "-",
+        ],
+        &clear_request.to_string(),
+    );
+    assert!(
+        clear_preview_output.status.success(),
+        "clear preview failed: {}",
+        String::from_utf8_lossy(&clear_preview_output.stderr)
+    );
+    let clear_preview: Value =
+        serde_json::from_slice(&clear_preview_output.stdout).expect("epoch clear preview JSON");
+    assert_eq!(clear_preview["data"]["kind"], "epochClear");
+    assert_eq!(clear_preview["data"]["data"]["epochId"], epoch_id);
+    assert!(
+        clear_preview["data"]["data"]["factsToken"]
+            .as_str()
+            .is_some()
+    );
+    fs::write(
+        &request_path,
+        serde_json::json!({
+            "kind":"epochClear", "preview":clear_preview["data"]["data"]
+        })
+        .to_string(),
+    )
+    .expect("write epoch clear apply request");
+
+    // Another chronology change invalidates the saved clear preview. The
+    // adapter returns the same machine-readable stale code used by other kinds.
+    chronology_apply(
+        &catalog,
+        &project,
+        serde_json::json!({
+            "kind":"sequenceDeclare", "cameraKey":"Synthetic Camera",
+            "label":"Unrelated card", "volumeHint":"CARD-B", "filenamePrefix":"SYN_"
+        }),
+    );
+    let stale_clear = failure(
+        &catalog,
+        [
+            "chronology",
+            "apply",
+            "--project",
+            &project,
+            "--input",
+            request_path.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(stale_clear["error"]["code"], "chronology.stale_preview");
+
+    let refreshed_clear_preview = invoke_with_stdin(
+        &catalog,
+        [
+            "chronology",
+            "preview",
+            "--project",
+            &project,
+            "--input",
+            "-",
+        ],
+        &clear_request.to_string(),
+    );
+    assert!(
+        refreshed_clear_preview.status.success(),
+        "refreshed clear preview failed: {}",
+        String::from_utf8_lossy(&refreshed_clear_preview.stderr)
+    );
+    let refreshed_clear_preview: Value =
+        serde_json::from_slice(&refreshed_clear_preview.stdout).unwrap();
+    fs::write(
+        &request_path,
+        serde_json::json!({
+            "kind":"epochClear", "preview":refreshed_clear_preview["data"]["data"]
+        })
+        .to_string(),
+    )
+    .expect("write refreshed epoch clear apply request");
+    let cleared = success(
+        &catalog,
+        [
+            "chronology",
+            "apply",
+            "--project",
+            &project,
+            "--input",
+            request_path.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(cleared.json["data"]["data"]["applied"], true);
+    let retry = failure(
+        &catalog,
+        [
+            "chronology",
+            "apply",
+            "--project",
+            &project,
+            "--input",
+            request_path.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(retry["error"]["code"], "chronology.invalid_reference");
 }
 
 #[test]
