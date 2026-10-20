@@ -161,6 +161,31 @@ fn ingest_quarantines_reachable_files_without_video_and_preserves_originals() {
     assert!(items.iter().all(|diagnostic| diagnostic["context"]["reason"].as_str().is_some()));
 }
 
+#[test]
+fn generic_unreadable_media_diagnostics_keep_each_filename_and_reason() {
+    let directory = tempdir().unwrap();
+    let catalog = directory.path().join("catalog.sqlite3");
+    let doctor = success(&catalog, ["doctor"]);
+    if available_tool(&doctor.json, "ffprobe").is_none() { return; }
+    let source_dir = directory.path().join("synthetic");
+    fs::create_dir_all(&source_dir).unwrap();
+    let first = source_dir.join("broken-one.mp4");
+    let second = source_dir.join("broken-two.mp4");
+    fs::write(&first, b"synthetic invalid media one").unwrap();
+    fs::write(&second, b"synthetic invalid media two").unwrap();
+    let project = create_project(&catalog, "Synthetic unreadable media");
+
+    let ingest = success(&catalog, ["ingest", "--project", &project, "--folder", source_dir.to_str().unwrap()]);
+    assert_eq!(ingest.json["data"]["imported"], 0);
+    let diagnostics = success(&catalog, ["diagnostics", "list", "--project", &project]);
+    let items = diagnostics.json["data"]["diagnostics"].as_array().unwrap();
+    assert_eq!(items.len(), 2);
+    let files = items.iter().map(|item| item["context"]["filename"].as_str().unwrap()).collect::<std::collections::HashSet<_>>();
+    assert_eq!(files, ["broken-one.mp4", "broken-two.mp4"].into_iter().collect());
+    assert!(items.iter().all(|item| item["kind"] == "ingest.unreadable_media"));
+    assert!(items.iter().all(|item| item["context"]["reason"].as_str().is_some_and(|reason| !reason.is_empty())));
+}
+
 #[cfg(unix)]
 #[test]
 fn legacy_asset_with_incomplete_video_stream_is_not_reported_usable() {

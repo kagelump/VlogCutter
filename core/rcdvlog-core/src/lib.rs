@@ -1106,8 +1106,8 @@ impl Catalog {
                 Err(error) => {
                     // The transient report is not enough: a rejected file must
                     // still be discoverable after the run, and after relaunch
-                    // (D01-T027). Deduped by folder, so a card full of `._*`
-                    // sidecars is one diagnostic with a count, not 400 rows.
+                    // (D01-T027). Sidecars remain folder-deduped, but each
+                    // actual media candidate retains its own failure details.
                     let folder = path
                         .parent()
                         .map(|parent| parent.to_string_lossy().into_owned())
@@ -1122,8 +1122,10 @@ impl Catalog {
                         self.record_no_video_stream(project_id, &folder, &filename, &reason)
                     } else if reason.contains("video stream") {
                         self.record_invalid_video_stream(project_id, &folder, &filename, &reason)
-                    } else {
+                    } else if filename.starts_with("._") {
                         self.record_unreadable_media(project_id, &folder, &filename, &reason)
+                    } else {
+                        self.record_unreadable_media_file(project_id, &folder, &filename, &reason)
                     };
                     report.failures.push(IngestFailure {
                         path: path.to_string_lossy().into_owned(),

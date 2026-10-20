@@ -209,6 +209,34 @@ impl Catalog {
         )
     }
 
+    /// Records a rejected media candidate independently so every source keeps
+    /// its own filename and probe diagnosis. AppleDouble sidecars continue to
+    /// use the folder-aggregated recorder above.
+    pub fn record_unreadable_media_file(
+        &self,
+        project_id: &str,
+        containing_folder: &str,
+        filename: &str,
+        reason: &str,
+    ) -> Result<Diagnostic> {
+        self.record_diagnostic(project_id, DiagnosticRecord {
+            dedupe_key: format!("ingest.unreadable_media:{containing_folder}:{filename}"),
+            severity: DiagnosticSeverity::Warning,
+            kind: "ingest.unreadable_media".to_string(),
+            subject: DiagnosticSubject::Project,
+            message: format!("{filename} could not be read as usable video and was skipped: {reason}. Check that the file contains video frames and valid video metadata."),
+            context: serde_json::json!({
+                "folder": containing_folder,
+                "filename": filename,
+                "reason": reason,
+                "mostRecentFilename": filename,
+                "mostRecentReason": reason,
+                "bytesReachable": true,
+                "usableVideo": false,
+            }),
+        })
+    }
+
     /// Records a reachable media candidate that ffprobe cannot identify as video.
     /// These are per-file so each rejected asset remains diagnosable after ingest.
     pub fn record_no_video_stream(

@@ -164,11 +164,16 @@ D01-T015 and D01-T017 key display behaviour off it.
 
 | Kind | Severity | Subject | Dedupe key |
 | --- | --- | --- | --- |
-| `ingest.unreadable_media` | `warning` | `Project` | `ingest.unreadable_media:<containing folder>` |
+| `ingest.unreadable_media` | `warning` | `Project` | `ingest.unreadable_media:<containing folder>[:<filename>]` |
 | `sync.operation_quarantined` | `warning` | `Operation` | `sync.operation_quarantined:<operation_type>` |
 | `media.volume_offline` | `error` | `Volume` | `media.volume_offline:<volume_hint>` |
 
 Later packets add kinds; they never repurpose one.
+
+Unreadable media candidates use the filename-qualified key and include
+`filename` and `reason` in context so each rejected source remains diagnosable.
+The folder-only key remains supported for aggregated AppleDouble sidecars and
+for diagnostics already stored by older builds.
 
 ## Forward compatibility
 
