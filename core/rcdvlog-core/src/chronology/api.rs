@@ -468,16 +468,23 @@ pub(crate) fn validate_question_scope(
             )
             .into());
         }
-        if excerpt.role == "independent_reference"
-            && !facts
+        if excerpt.role == "independent_reference" {
+            let Some(asset) = facts
                 .assets
                 .iter()
-                .any(|asset| asset.asset_id == excerpt.asset_id)
-        {
-            return Err(ChronologyError::InvalidReference(
-                "independent reference excerpt clip is missing".into(),
-            )
-            .into());
+                .find(|asset| asset.asset_id == excerpt.asset_id)
+            else {
+                return Err(ChronologyError::InvalidReference(
+                    "independent reference excerpt clip is missing".into(),
+                )
+                .into());
+            };
+            if scoped.contains(asset.asset_id.as_str()) {
+                return Err(ChronologyError::InvalidReference(
+                    "independent reference excerpt must be outside the questioned block".into(),
+                )
+                .into());
+            }
         }
         if excerpt.role != "selected_proxy" && excerpt.role != "independent_reference" {
             return Err(ChronologyError::InvalidReference(

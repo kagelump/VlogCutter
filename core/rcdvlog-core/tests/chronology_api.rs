@@ -3230,10 +3230,16 @@ fn synthetic_clock_question(fixture: &Fixture) -> ClockBlockQuestion {
         .unwrap();
     let first = &facts.assets[0];
     let sequence = first.capture_sequence_id.clone().unwrap();
+    let end_counter = first.filename_counter.unwrap() + 1;
     let reference = facts
         .assets
         .iter()
-        .find(|asset| asset.capture_sequence_id.as_deref() != Some(sequence.as_str()))
+        .find(|asset| {
+            asset.capture_sequence_id.as_deref() == Some(sequence.as_str())
+                && asset
+                    .filename_counter
+                    .is_some_and(|counter| counter > end_counter)
+        })
         .unwrap();
     let counter = first.filename_counter.unwrap();
     let epoch = |id: &str, offset_seconds| ClockEpoch {
@@ -3295,6 +3301,7 @@ fn clock_question_accept_reject_revise_and_stale_preview_are_revision_safe() {
     let fixture = fixture(&[
         ("C0001.MP4", "SyntheticCamera", "2026-01-01T09:00:00Z"),
         ("C0002.MP4", "SyntheticCamera", "2026-01-01T10:00:00Z"),
+        ("C0003.MP4", "SyntheticCamera", "2026-01-01T11:00:00Z"),
         ("C0001.MP4", "IndependentReference", "2025-12-31T12:00:00Z"),
     ]);
     let original_raw: Vec<_> = fixture
@@ -3306,6 +3313,28 @@ fn clock_question_accept_reject_revise_and_stale_preview_are_revision_safe() {
         .map(|a| a.captured_at_raw.clone())
         .collect();
     let question = synthetic_clock_question(&fixture);
+    let mut invalid_reference = question.clone();
+    let selected_asset = invalid_reference
+        .proxy_excerpts
+        .iter()
+        .find(|excerpt| excerpt.role == "selected_proxy")
+        .unwrap()
+        .asset_id
+        .clone();
+    invalid_reference
+        .proxy_excerpts
+        .iter_mut()
+        .find(|excerpt| excerpt.role == "independent_reference")
+        .unwrap()
+        .asset_id = selected_asset;
+    assert!(
+        fixture
+            .catalog
+            .preview_clock_block_question(&fixture.project_id, &invalid_reference)
+            .unwrap_err()
+            .to_string()
+            .contains("must be outside the questioned block")
+    );
     let proposal_preview = fixture
         .catalog
         .preview_clock_block_question(&fixture.project_id, &question)
@@ -3390,7 +3419,7 @@ fn clock_question_accept_reject_revise_and_stale_preview_are_revision_safe() {
             .impact
             .changes
             .len()
-            <= 2
+            <= 3
     );
 
     // Change chronology after preview to prove the facts token protects confirmation.

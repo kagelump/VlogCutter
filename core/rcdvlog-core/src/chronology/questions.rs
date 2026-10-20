@@ -106,9 +106,9 @@ impl ClockBlockQuestion {
         if self.anchor.event_label.trim().is_empty() {
             return Err("human anchor requires an event label".into());
         }
-        let first = &self.alternatives[0].epoch;
         let mut ids = std::collections::BTreeSet::new();
         let mut epoch_ids = std::collections::BTreeSet::new();
+        let mut offsets = std::collections::BTreeSet::new();
         for alternative in &self.alternatives {
             if alternative.id.trim().is_empty() || !ids.insert(&alternative.id) {
                 return Err("alternative identities must be nonempty and unique".into());
@@ -117,20 +117,15 @@ impl ClockBlockQuestion {
             if epoch.id.trim().is_empty() || !epoch_ids.insert(&epoch.id) {
                 return Err("alternative epoch identities must be nonempty and unique".into());
             }
+            if !offsets.insert(epoch.offset_seconds) {
+                return Err("clock alternatives must represent distinct offsets".into());
+            }
             if epoch.capture_sequence_id != self.capture_sequence_id
                 || epoch.start_counter != self.start_counter
                 || epoch.end_counter != self.end_counter
             {
                 return Err("alternative epoch must match the exact question scope".into());
             }
-        }
-        if self
-            .alternatives
-            .iter()
-            .skip(1)
-            .any(|a| a.epoch.offset_seconds == first.offset_seconds)
-        {
-            return Err("clock alternatives must represent distinct offsets".into());
         }
         for excerpt in &self.proxy_excerpts {
             if excerpt.role != "selected_proxy" && excerpt.role != "independent_reference" {
@@ -262,5 +257,20 @@ mod tests {
         question = proposal();
         question.alternatives.truncate(1);
         assert!(question.validate().unwrap_err().contains("two and eight"));
+    }
+
+    #[test]
+    fn rejects_duplicate_offsets_after_the_first_alternative() {
+        let mut question = proposal();
+        let mut third = question.alternatives[1].clone();
+        third.id = "date-c".into();
+        third.epoch.id = "epoch-c".into();
+        question.alternatives.push(third);
+        assert!(
+            question
+                .validate()
+                .unwrap_err()
+                .contains("distinct offsets")
+        );
     }
 }
