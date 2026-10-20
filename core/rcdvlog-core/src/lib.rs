@@ -1643,15 +1643,18 @@ impl Catalog {
         fs::create_dir_all(&proxy_dir)?;
         let output = proxy_dir.join(format!("{}.{}.mp4", asset.id, PROXY_CACHE_VERSION));
         let temporary = proxy_dir.join(format!("{}.{}.tmp.mp4", asset.id, PROXY_CACHE_VERSION));
-        let status = run_proxy_ffmpeg(
+        let result = run_proxy_ffmpeg(
             Path::new(&asset.path),
             &temporary,
             asset.duration_seconds,
             &mut on_progress,
         )?;
-        if !status.success() {
+        if !result.status.success() {
             let _ = fs::remove_file(&temporary);
-            bail!("ffmpeg proxy generation failed with {status}");
+            bail!(
+                "ffmpeg proxy generation failed with {}{}",
+                result.status, result.diagnostic
+            );
         }
         let proxy_probe = probe_media_stream(&temporary);
         match proxy_probe {
@@ -3753,12 +3756,17 @@ fn proxy_ffmpeg_command(source: &Path, output: &Path, encoder: ProxyEncoder) -> 
     command
 }
 
+struct ProxyProcessResult {
+    status: std::process::ExitStatus,
+    diagnostic: String,
+}
+
 fn run_proxy_ffmpeg<F>(
     source: &Path,
     output: &Path,
     duration_seconds: f64,
     on_progress: &mut F,
-) -> Result<std::process::ExitStatus>
+) -> Result<ProxyProcessResult>
 where
     F: FnMut(f64),
 {
@@ -3772,7 +3780,7 @@ where
             on_progress,
         )
         .context("start VideoToolbox ffmpeg proxy process")?;
-        if hardware_status.success() {
+        if hardware_status.status.success() {
             return Ok(hardware_status);
         }
         let _ = fs::remove_file(output);
@@ -3795,21 +3803,37 @@ fn run_proxy_ffmpeg_encoder<F>(
     encoder: ProxyEncoder,
     duration_seconds: f64,
     on_progress: &mut F,
-) -> Result<std::process::ExitStatus>
+) -> Result<ProxyProcessResult>
 where
     F: FnMut(f64),
 {
     let mut command = proxy_ffmpeg_command(source, output, encoder);
     command.stdout(Stdio::piped());
-    #[cfg(target_os = "macos")]
-    if matches!(encoder, ProxyEncoder::VideoToolbox) {
-        command.stderr(Stdio::null());
-    }
+    command.stderr(Stdio::piped());
     let mut child = command.spawn().context("spawn ffmpeg proxy process")?;
     let stdout = child
         .stdout
         .take()
         .ok_or_else(|| anyhow!("ffmpeg progress pipe was not available"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow!("ffmpeg stderr pipe was not available"))?;
+    let stderr_reader = thread::spawn(move || {
+        let mut reader = stderr;
+        let mut kept = Vec::new();
+        let mut buffer = [0u8; 4096];
+        loop {
+            let count = match reader.read(&mut buffer) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            if kept.len() < 4096 {
+                kept.extend_from_slice(&buffer[..count.min(4096 - kept.len())]);
+            }
+        }
+        kept
+    });
     for line in BufReader::new(stdout)
         .lines()
         .map_while(std::result::Result::ok)
@@ -3818,7 +3842,19 @@ where
             on_progress(fraction);
         }
     }
-    child.wait().context("wait for ffmpeg proxy process")
+    let status = child.wait().context("wait for ffmpeg proxy process")?;
+    let stderr = String::from_utf8_lossy(&stderr_reader.join().unwrap_or_default()).trim().to_string();
+    let diagnostic = if stderr.is_empty() {
+        String::new()
+    } else {
+        format!(
+            ": {}",
+            stderr
+                .replace(&source.to_string_lossy().to_string(), "<source>")
+                .replace(&output.to_string_lossy().to_string(), "<output>")
+        )
+    };
+    Ok(ProxyProcessResult { status, diagnostic })
 }
 
 fn ffmpeg_progress_fraction(line: &str, duration_seconds: f64) -> Option<f64> {
