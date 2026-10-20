@@ -95,6 +95,9 @@ describe("api.mediaUrl", () => {
     const missingProxy = asset({ proxyPath: "/cache/proxies/asset_1.mp4", proxyAvailable: false });
     expect(new URL(api.mediaUrl(missingProxy) as string).searchParams.get("rep")).toBe("original");
 
+    const sidecarFallback = asset({ originalAvailable: false, cameraProxyAvailable: true, available: true });
+    expect(new URL(api.mediaUrl(sidecarFallback) as string).searchParams.get("rep")).toBe("camera_proxy");
+
     // Nothing available is still nothing: the stage shows its offline slate.
     expect(api.mediaUrl(asset({ originalAvailable: false, available: false }))).toBeNull();
   });

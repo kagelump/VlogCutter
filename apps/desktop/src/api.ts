@@ -513,7 +513,9 @@ export const api = {
       ? "proxy"
       : asset.originalAvailable
         ? "original"
-        : null;
+        : asset.cameraProxyAvailable
+          ? "camera_proxy"
+          : null;
     if (!representation || !mediaOrigin) return null;
     const query = new URLSearchParams({ rep: representation, t: mediaOrigin.token });
     return `${mediaOrigin.baseUrl}/media/${encodeURIComponent(asset.id)}?${query}`;

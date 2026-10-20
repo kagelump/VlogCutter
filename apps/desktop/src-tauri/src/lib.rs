@@ -270,9 +270,15 @@ impl media_server::MediaCatalog for CatalogMedia {
     fn locate(&self, asset_id: &str) -> Option<media_server::AssetMedia> {
         let catalog = self.catalog.read().ok()?.clone();
         let asset = catalog.get_asset(asset_id).ok()?;
+        let camera_proxy = catalog
+            .resolve_camera_proxy_for_review(asset_id)
+            .ok()
+            .flatten()
+            .map(|sidecar| PathBuf::from(sidecar.path));
         Some(media_server::AssetMedia {
             original: Some(PathBuf::from(asset.path)),
             proxy: asset.proxy_path.map(PathBuf::from),
+            camera_proxy,
         })
     }
 

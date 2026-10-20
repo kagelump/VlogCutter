@@ -72,13 +72,16 @@ pub(crate) struct MediaOrigin {
 /// Which representation of a clip the caller wants. The frontend resolves this
 /// exactly as it always has — proxy when one is available, otherwise the
 /// original — and names its choice here so the two sides cannot disagree about
-/// what is on screen. `Auto` applies the same rule server-side.
+/// what is on screen. Auto may use a verified camera sidecar only after both
+/// generated proxy and original are unavailable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum Representation {
     #[default]
     Auto,
     Proxy,
+    /// Camera supplied verified `.LRF` sidecar, independent of generated recipes.
+    CameraProxy,
     Original,
 }
 
@@ -89,6 +92,7 @@ impl Representation {
         match self {
             Self::Auto => "auto",
             Self::Proxy => "proxy",
+            Self::CameraProxy => "camera_proxy",
             Self::Original => "original",
         }
     }
@@ -100,6 +104,7 @@ impl Representation {
 pub(crate) struct AssetMedia {
     pub original: Option<PathBuf>,
     pub proxy: Option<PathBuf>,
+    pub camera_proxy: Option<PathBuf>,
 }
 
 /// The catalog behind the origin. Implemented over the open project catalog by
@@ -573,9 +578,14 @@ fn resolve_media_path(
     representation: Representation,
     roots: &[PathBuf],
 ) -> Result<PathBuf, ResolveFailure> {
-    let candidates: [Option<&PathBuf>; 2] = match representation {
-        Representation::Auto => [media.proxy.as_ref(), media.original.as_ref()],
+    let candidates: [Option<&PathBuf>; 3] = match representation {
+        Representation::Auto => [
+            media.proxy.as_ref(),
+            media.original.as_ref(),
+            media.camera_proxy.as_ref(),
+        ],
         Representation::Proxy => [media.proxy.as_ref(), None],
+        Representation::CameraProxy => [media.camera_proxy.as_ref(), None],
         Representation::Original => [media.original.as_ref(), None],
     };
     let mut failure = ResolveFailure::NoRepresentation;
@@ -914,6 +924,7 @@ mod tests {
                 AssetMedia {
                     original: Some(original),
                     proxy: Some(proxy),
+                    camera_proxy: None,
                 },
             )]),
             roots: vec![directory.path().to_path_buf()],
@@ -1007,10 +1018,12 @@ mod tests {
         let directory = TempDir::new().unwrap();
         let original = write_fixture(directory.path(), "original.mp4", b"original");
         let proxy = write_fixture(directory.path(), "proxy.mp4", b"proxy");
+        let camera_proxy = write_fixture(directory.path(), "camera.LRF", b"sidecar");
         let roots = vec![directory.path().to_path_buf()];
         let media = AssetMedia {
             original: Some(original.clone()),
             proxy: Some(proxy.clone()),
+            camera_proxy: Some(camera_proxy.clone()),
         };
 
         assert_eq!(
@@ -1021,12 +1034,36 @@ mod tests {
             resolve_media_path(&media, Representation::Original, &roots),
             Ok(original.canonicalize().unwrap())
         );
+        assert_eq!(
+            resolve_media_path(&media, Representation::CameraProxy, &roots),
+            Ok(camera_proxy.canonicalize().unwrap())
+        );
+        // Explicit sidecar playback never shadows normal generated/original selection.
+        assert_eq!(
+            resolve_media_path(&media, Representation::Auto, &roots),
+            Ok(proxy.canonicalize().unwrap())
+        );
+        let offline_original = AssetMedia {
+            original: Some(directory.path().join("offline.mp4")),
+            proxy: None,
+            camera_proxy: Some(camera_proxy.clone()),
+        };
+        assert_eq!(
+            resolve_media_path(&offline_original, Representation::CameraProxy, &roots),
+            Ok(camera_proxy.canonicalize().unwrap())
+        );
+        assert_eq!(
+            resolve_media_path(&offline_original, Representation::Auto, &roots),
+            Ok(camera_proxy.canonicalize().unwrap())
+        );
+        assert_eq!(Representation::CameraProxy.as_str(), "camera_proxy");
 
         // A recorded proxy that is no longer on disk is not silently swapped for
         // the original when the caller asked for the proxy...
         let missing_proxy = AssetMedia {
             original: Some(original.clone()),
             proxy: Some(directory.path().join("gone.mp4")),
+            camera_proxy: None,
         };
         assert_eq!(
             resolve_media_path(&missing_proxy, Representation::Proxy, &roots),
@@ -1057,7 +1094,8 @@ mod tests {
             resolve_media_path(
                 &AssetMedia {
                     original: Some(outside.clone()),
-                    proxy: None
+                    proxy: None,
+                    camera_proxy: None,
                 },
                 Representation::Original,
                 &roots,
@@ -1075,7 +1113,8 @@ mod tests {
             resolve_media_path(
                 &AssetMedia {
                     original: Some(traversal),
-                    proxy: None
+                    proxy: None,
+                    camera_proxy: None,
                 },
                 Representation::Original,
                 &roots,
@@ -1088,7 +1127,8 @@ mod tests {
             resolve_media_path(
                 &AssetMedia {
                     original: Some(allowed.path().to_path_buf()),
-                    proxy: None
+                    proxy: None,
+                    camera_proxy: None,
                 },
                 Representation::Original,
                 &roots,
@@ -1099,7 +1139,8 @@ mod tests {
             resolve_media_path(
                 &AssetMedia {
                     original: Some(outside),
-                    proxy: None
+                    proxy: None,
+                    camera_proxy: None,
                 },
                 Representation::Original,
                 &[],

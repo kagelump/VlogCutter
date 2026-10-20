@@ -7,7 +7,7 @@ use thiserror::Error;
 
 use crate::chronology::forward_migrate_project_chronology;
 
-pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 27;
+pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 28;
 
 const MIGRATION_TABLE_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -246,7 +246,33 @@ pub const PROJECT_CATALOG_MIGRATIONS: &[SqliteMigration] = &[
         source_identity: "project-catalog/0027-asset-timestamp-candidates/20261020",
         apply: add_asset_timestamp_candidates,
     },
+    SqliteMigration {
+        id: 28,
+        name: "camera_proxy_sidecars",
+        source_identity: "project-catalog/0028-camera-proxy-sidecars/20261021",
+        apply: add_camera_proxy_sidecars,
+    },
 ];
+
+fn add_camera_proxy_sidecars(transaction: &Transaction<'_>) -> Result<()> {
+    transaction.execute_batch(
+        "CREATE TABLE IF NOT EXISTS camera_proxy_sidecars (
+        asset_id TEXT PRIMARY KEY REFERENCES assets(id) ON DELETE CASCADE,
+        path TEXT NOT NULL,
+        card_root TEXT NOT NULL,
+        byte_length INTEGER NOT NULL,
+        fingerprint TEXT NOT NULL,
+        codec TEXT NOT NULL,
+        width INTEGER NOT NULL,
+        height INTEGER NOT NULL,
+        duration_seconds REAL NOT NULL,
+        verified_at TEXT NOT NULL,
+        verification TEXT NOT NULL CHECK(verification = 'verified')
+    );
+    CREATE INDEX IF NOT EXISTS camera_proxy_sidecars_card_root ON camera_proxy_sidecars(card_root);",
+    )?;
+    Ok(())
+}
 
 fn add_asset_timestamp_candidates(transaction: &Transaction<'_>) -> Result<()> {
     add_column_if_missing(transaction, "assets", "timestamp_candidates_json", "TEXT")?;

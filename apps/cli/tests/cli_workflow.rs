@@ -1,4 +1,4 @@
-use rcdvlog_core::PROJECT_CATALOG_SCHEMA_VERSION;
+use rcdvlog_core::{Catalog, PROJECT_CATALOG_SCHEMA_VERSION};
 use rusqlite::{Connection, params};
 use serde_json::Value;
 use std::env;
@@ -137,6 +137,158 @@ fn create_project(catalog: &Path, name: &str) -> String {
         .as_str()
         .expect("project id")
         .to_string()
+}
+
+#[test]
+fn camera_proxy_cli_commands_are_discoverable_and_have_clear_empty_missing_results() {
+    let directory = tempdir().unwrap();
+    let catalog = directory.path().join("catalog.sqlite3");
+    let project = create_project(&catalog, "Synthetic camera proxy CLI");
+    let card = directory.path().join("empty-card");
+    fs::create_dir(&card).unwrap();
+    let discovered = success(
+        &catalog,
+        [
+            "camera-proxy",
+            "discover",
+            "--project",
+            &project,
+            "--card",
+            card.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(discovered.json["data"], serde_json::json!([]));
+    let missing = failure(
+        &catalog,
+        ["camera-proxy", "status", "--asset", "missing_asset"],
+    );
+    assert_eq!(missing["error"]["code"], "not_found");
+    let registration = failure(
+        &catalog,
+        [
+            "camera-proxy",
+            "register",
+            "--asset",
+            "missing_asset",
+            "--card",
+            card.to_str().unwrap(),
+            "--sidecar",
+            card.join("MISSING.LRF").to_str().unwrap(),
+        ],
+    );
+    assert_eq!(registration["error"]["code"], "not_found");
+}
+
+#[test]
+fn camera_proxy_cli_round_trips_a_generated_lrf_without_changing_media() {
+    if Command::new("ffmpeg").arg("-version").output().is_err() {
+        eprintln!("skipping generated media CLI round trip: ffmpeg unavailable");
+        return;
+    }
+    let directory = tempdir().unwrap();
+    let catalog_path = directory.path().join("catalog.sqlite3");
+    let project = create_project(&catalog_path, "Synthetic LRF CLI round trip");
+    let card = directory.path().join("card-one");
+    let dcim = card.join("DCIM");
+    fs::create_dir_all(&dcim).unwrap();
+    let original = dcim.join("CLIP0001.MP4");
+    let sidecar = dcim.join("CLIP0001.LRF");
+    for (path, dimensions) in [(&original, "640x360"), (&sidecar, "320x180")] {
+        let output = Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                &format!("color=c=green:s={dimensions}:r=24:d=2"),
+                "-f",
+                "lavfi",
+                "-i",
+                "anullsrc=r=48000:cl=stereo",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                "-shortest",
+                "-f",
+                "mp4",
+            ])
+            .arg(path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "ffmpeg failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let original_bytes = fs::read(&original).unwrap();
+    let sidecar_bytes = fs::read(&sidecar).unwrap();
+    success(
+        &catalog_path,
+        [
+            "ingest",
+            "--project",
+            &project,
+            "--folder",
+            card.to_str().unwrap(),
+        ],
+    );
+    let catalog = Catalog::open_existing(&catalog_path).unwrap();
+    let asset_id = catalog.list_assets(&project).unwrap().remove(0).id;
+
+    let found = success(
+        &catalog_path,
+        [
+            "camera-proxy",
+            "discover",
+            "--project",
+            &project,
+            "--card",
+            card.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(found.json["data"][0]["status"], "candidate");
+    assert_eq!(found.json["data"][0]["assetId"], asset_id);
+    let registered = success(
+        &catalog_path,
+        [
+            "camera-proxy",
+            "register",
+            "--asset",
+            &asset_id,
+            "--card",
+            card.to_str().unwrap(),
+            "--sidecar",
+            sidecar.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(registered.json["data"]["status"], "registered");
+    assert!(
+        registered.json["data"]["fingerprint"]
+            .as_str()
+            .unwrap()
+            .len()
+            >= 64
+    );
+    let status = success(
+        &catalog_path,
+        ["camera-proxy", "status", "--asset", &asset_id],
+    );
+    assert_eq!(status.json["data"]["status"], "registered");
+    assert_eq!(
+        status.json["data"]["cardRoot"],
+        card.canonicalize().unwrap().to_string_lossy().as_ref()
+    );
+    let asset = catalog.get_asset(&asset_id).unwrap();
+    assert!(asset.proxy_path.is_none());
+    assert_eq!(fs::read(&original).unwrap(), original_bytes);
+    assert_eq!(fs::read(&sidecar).unwrap(), sidecar_bytes);
 }
 
 #[test]

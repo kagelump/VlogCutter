@@ -154,6 +154,8 @@ export interface Asset {
   orientationProbed: boolean;
   originalAvailable: boolean;
   proxyAvailable: boolean;
+  /** Verified camera supplied `.LRF` sidecar is available for review. */
+  cameraProxyAvailable?: boolean;
   thumbnailPath: string | null;
   thumbnailQuality: number;
   notes: string;
