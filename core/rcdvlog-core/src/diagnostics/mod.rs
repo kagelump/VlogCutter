@@ -188,6 +188,7 @@ impl Catalog {
         project_id: &str,
         containing_folder: &str,
         filename: &str,
+        reason: &str,
     ) -> Result<Diagnostic> {
         self.record_diagnostic(
             project_id,
@@ -197,14 +198,34 @@ impl Catalog {
                 kind: "ingest.unreadable_media".to_string(),
                 subject: DiagnosticSubject::Project,
                 message: format!(
-                    "Some files in {containing_folder} could not be read as media and were skipped, most recently {filename}."
+                    "Some files in {containing_folder} could not be read as usable video and were skipped, most recently {filename}: {reason}. Check that file contains a video stream and valid video metadata."
                 ),
                 context: serde_json::json!({
                     "folder": containing_folder,
                     "mostRecentFilename": filename,
+                    "mostRecentReason": reason,
                 }),
             },
         )
+    }
+
+    /// Records a reachable media candidate that ffprobe cannot identify as video.
+    /// These are per-file so each rejected asset remains diagnosable after ingest.
+    pub fn record_no_video_stream(
+        &self,
+        project_id: &str,
+        containing_folder: &str,
+        filename: &str,
+        reason: &str,
+    ) -> Result<Diagnostic> {
+        self.record_diagnostic(project_id, DiagnosticRecord {
+            dedupe_key: format!("ingest.no_video_stream:{containing_folder}:{filename}"),
+            severity: DiagnosticSeverity::Warning,
+            kind: "ingest.no_video_stream".to_string(),
+            subject: DiagnosticSubject::Project,
+            message: format!("{filename} is reachable but has no usable video stream and was skipped. Check that the intended source contains video frames and valid video metadata."),
+            context: serde_json::json!({ "folder": containing_folder, "filename": filename, "reason": reason, "bytesReachable": true, "usableVideo": false }),
+        })
     }
 
     /// Producer: an operation this build does not recognize and has retained.

@@ -820,6 +820,9 @@ fn clip_diagnosis(catalog: &Catalog, asset_id: &str) -> Result<Value> {
     let asset = catalog.get_asset(asset_id)?;
     let revision = catalog.asset_revision_diagnostics(asset_id)?;
     let (original_probe, original) = probe_value(&asset.path);
+    let no_video_stream = original["error"]
+        .as_str()
+        .is_some_and(|error| error.contains("no video stream"));
     let proxy_version = proxy_version(&asset);
     let proxy_probe = asset
         .proxy_path
@@ -891,6 +894,9 @@ fn clip_diagnosis(catalog: &Catalog, asset_id: &str) -> Result<Value> {
     };
 
     let mut warnings = Vec::new();
+    if no_video_stream {
+        warnings.push("original file is reachable, but ffprobe found no video stream; this legacy catalog row is not usable video and should not be counted as ready".to_string());
+    }
     if !asset.orientation_probed {
         warnings.push(
             "catalog orientation is unprobed; stored 0° means unknown, not confirmed".to_string(),
@@ -928,6 +934,9 @@ fn clip_diagnosis(catalog: &Catalog, asset_id: &str) -> Result<Value> {
     }
 
     let mut recommended_actions = Vec::new();
+    if no_video_stream {
+        recommended_actions.push("verify the referenced file is the intended video; if it is audio-only or has no video frames, keep it out of video review and chronology (re-import after replacing it with valid video only when that is the intended source)".to_string());
+    }
     if !asset.orientation_probed {
         recommended_actions.push(format!(
             "rcdvlog --catalog {} clips refresh-orientation --asset {}",
@@ -964,6 +973,11 @@ fn clip_diagnosis(catalog: &Catalog, asset_id: &str) -> Result<Value> {
         },
         "representations": {
             "original": original,
+            "originalReadiness": {
+                "bytesReachable": Path::new(&asset.path).is_file(),
+                "usableVideo": original_probe.is_some(),
+                "diagnosis": if no_video_stream { "no_video_stream" } else if original_probe.is_some() { "video_stream_available" } else { "probe_failed" },
+            },
             "proxy": {
                 "path": asset.proxy_path,
                 "version": proxy_version,

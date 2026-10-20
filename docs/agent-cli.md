@@ -134,6 +134,13 @@ location, and repairs the asset when its recorded original had gone offline — 
 re-running ingest against a card that remounted elsewhere reconnects it. The
 report separates `imported`, `duplicates`, and `relinked`.
 
+Ingest requires ffprobe to report a usable video stream. Reachable files with no
+video stream are skipped, preserved in place, and recorded as per-file
+`ingest.no_video_stream` diagnostics with byte reachability and failure
+evidence. They do not become assets or count as imported. For older catalogs,
+`clips diagnose --asset <id>` reports byte reachability separately from usable
+video and recommends keeping a no-video row out of review and chronology.
+
 ### Smart ingest camera mappings
 
 ```bash

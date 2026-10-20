@@ -114,6 +114,53 @@ fn create_media_fixture(ffmpeg: &Path, output: &Path) {
     assert!(status.success(), "ffmpeg failed to create media fixture");
 }
 
+fn create_audio_only_fixture(ffmpeg: &Path, output: &Path) {
+    let status = Command::new(ffmpeg)
+        .args(["-y", "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "sine=frequency=440:duration=1", "-vn", "-c:a", "aac"])
+        .arg(output)
+        .status().expect("create audio-only fixture");
+    assert!(status.success());
+}
+
+fn create_zero_frame_fixture(ffmpeg: &Path, output: &Path) {
+    let status = Command::new(ffmpeg)
+        .args(["-y", "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "color=c=black:s=64x64:r=1", "-frames:v", "0", "-c:v", "mpeg4"])
+        .arg(output)
+        .status().expect("create zero-frame fixture");
+    assert!(status.success(), "ffmpeg failed to create zero-frame fixture");
+}
+
+#[test]
+fn ingest_quarantines_reachable_files_without_video_and_preserves_originals() {
+    let directory = tempdir().unwrap();
+    let catalog = directory.path().join("catalog.sqlite3");
+    let doctor = success(&catalog, ["doctor"]);
+    let Some(ffmpeg) = available_tool(&doctor.json, "ffmpeg") else { return; };
+    if available_tool(&doctor.json, "ffprobe").is_none() { return; }
+    let source_dir = directory.path().join("synthetic");
+    fs::create_dir_all(&source_dir).unwrap();
+    let audio = source_dir.join("audio-only.mp4");
+    let zero = source_dir.join("zero-frame.mp4");
+    create_audio_only_fixture(&ffmpeg, &audio);
+    create_zero_frame_fixture(&ffmpeg, &zero);
+    let audio_bytes = fs::read(&audio).unwrap();
+    let zero_bytes = fs::read(&zero).unwrap();
+    let project = create_project(&catalog, "Synthetic ingest");
+    let ingest = success(&catalog, ["ingest", "--project", &project, "--folder", source_dir.to_str().unwrap()]);
+    assert_eq!(ingest.json["data"]["imported"], 0);
+    assert_eq!(ingest.json["data"]["failures"].as_array().unwrap().len(), 2);
+    assert_eq!(fs::read(&audio).unwrap(), audio_bytes);
+    assert_eq!(fs::read(&zero).unwrap(), zero_bytes);
+    let clips = success(&catalog, ["clips", "list", "--project", &project]);
+    assert_eq!(clips.json["data"]["total"], 0);
+    let diagnostics = success(&catalog, ["diagnostics", "list", "--project", &project]);
+    let items = diagnostics.json["data"]["diagnostics"].as_array().unwrap();
+    assert_eq!(items.len(), 2);
+    assert!(items.iter().all(|diagnostic| diagnostic["kind"] == "ingest.no_video_stream"));
+    assert!(items.iter().all(|diagnostic| diagnostic["context"]["usableVideo"] == false));
+    assert!(items.iter().all(|diagnostic| diagnostic["context"]["reason"].as_str().is_some()));
+}
+
 #[test]
 fn process_contract_persists_across_invocations_and_routes_errors() {
     let directory = tempdir().unwrap();
