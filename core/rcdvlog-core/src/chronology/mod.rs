@@ -8,6 +8,7 @@
 
 pub mod api;
 pub mod explain;
+pub mod export;
 pub mod model;
 pub mod phases;
 pub mod solver;
@@ -19,10 +20,11 @@ pub use api::{
     VisualPlacementSide,
 };
 pub use explain::{AppliedCorrection, ChronologyExplanation, QueuePosition};
+pub use export::{ChronologyEvidenceAsset, ChronologyEvidencePage, evidence_page};
 pub use model::{
     AssetTimeHypothesis, CaptureSequence, ChronologyFacts, ClipTimeException, ClockEpoch,
     ConstraintStrength, DisplayMode, EventOrderConstraint, PhaseKind, PhaseSplitDirection,
-    TripPhase,
+    TimestampCandidate, TripPhase,
 };
 pub(crate) use phases::parse_utc;
 pub use phases::{DisplayTime, covering_phase, display_time, is_valid_timezone};
@@ -109,6 +111,7 @@ pub(crate) fn projected_asset_solution(
         duration_seconds: 0.0,
         capture_sequence_id: Some(capture_sequence_id.to_string()),
         filename_counter,
+        timestamp_candidates: None,
     };
     Ok(solver::solve_one_asset(
         &hypothesis,
@@ -245,6 +248,7 @@ pub fn load_chronology_facts(connection: &Connection, project_id: &str) -> Resul
     let mut assets_statement = connection.prepare(
         r#"
         SELECT a.id, a.filename, a.captured_at_raw, a.duration_seconds,
+               a.timestamp_candidates_json,
                acs.capture_sequence_id, acs.filename_counter
         FROM assets a
         LEFT JOIN asset_capture_sequence acs ON acs.asset_id = a.id
@@ -259,8 +263,11 @@ pub fn load_chronology_facts(connection: &Connection, project_id: &str) -> Resul
                 filename: row.get(1)?,
                 captured_at_raw: row.get(2)?,
                 duration_seconds: row.get(3)?,
-                capture_sequence_id: row.get(4)?,
-                filename_counter: row.get::<_, Option<i64>>(5)?.map(|value| value as u64),
+                timestamp_candidates: row
+                    .get::<_, Option<String>>(4)?
+                    .and_then(|json| serde_json::from_str(&json).ok()),
+                capture_sequence_id: row.get(5)?,
+                filename_counter: row.get::<_, Option<i64>>(6)?.map(|value| value as u64),
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;

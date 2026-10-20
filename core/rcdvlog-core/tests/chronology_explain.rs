@@ -34,6 +34,7 @@ fn project(count: u64) -> Fixture {
                     codec: "h264".to_string(),
                     camera: "SonyA7C".to_string(),
                     captured_at_raw: Some(format!("2026-01-01T{:02}:00:00Z", index % 24)),
+                    timestamp_candidates: None,
                     best_time: None,
                     metadata_rotation_degrees: 0,
                     default_rotation_degrees: 0,

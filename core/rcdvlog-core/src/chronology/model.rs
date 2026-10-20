@@ -31,6 +31,22 @@ pub struct AssetTimeHypothesis {
     pub capture_sequence_id: Option<String>,
     pub filename_counter: Option<u64>,
     pub duration_seconds: f64,
+    /// Timestamp observations retained at ingest. `None` means legacy/unavailable;
+    /// an empty vector means a new probe found no candidate timestamps.
+    #[serde(default)]
+    pub timestamp_candidates: Option<Vec<TimestampCandidate>>,
+}
+
+/// Immutable timestamp observation and its source-provided semantics.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TimestampCandidate {
+    pub origin: String,
+    pub original_text: String,
+    pub parsed_value: Option<String>,
+    pub timezone_claim: Option<String>,
+    pub parse_status: String,
+    pub semantics: Option<String>,
 }
 
 /// One offset model over a contiguous counter range in one capture sequence.

@@ -239,6 +239,7 @@ fn two_node_process_reconciles_duplicate_pages_browser_edits_and_restart() {
             codec: "h264".into(),
             camera: "camera".into(),
             captured_at_raw: None,
+            timestamp_candidates: None,
             best_time: None,
             metadata_rotation_degrees: 0,
             default_rotation_degrees: 0,

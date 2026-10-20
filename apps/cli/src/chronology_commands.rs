@@ -60,6 +60,17 @@ pub enum ChronologyCommand {
         #[arg(long)]
         project: String,
     },
+    /// Export a bounded, revision-pinned page of full chronology evidence.
+    Evidence {
+        #[arg(long)]
+        project: String,
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        #[arg(long)]
+        facts_revision: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -95,6 +106,7 @@ pub fn chronology_command_name(command: &ChronologyCommand) -> &'static str {
         ChronologyCommand::Contradictions { .. } => "chronology.contradictions",
         ChronologyCommand::Explain { .. } => "chronology.explain",
         ChronologyCommand::Status { .. } => "chronology.status",
+        ChronologyCommand::Evidence { .. } => "chronology.evidence",
     }
 }
 
@@ -194,6 +206,17 @@ pub fn execute_chronology(catalog: &Catalog, command: &ChronologyCommand) -> Res
                     .collect::<Vec<_>>(),
             }))
         }
+        ChronologyCommand::Evidence {
+            project,
+            offset,
+            limit,
+            facts_revision,
+        } => Ok(serde_json::to_value(catalog.chronology_evidence_page(
+            project,
+            facts_revision.as_deref(),
+            *offset,
+            *limit,
+        )?)?),
     }
 }
 

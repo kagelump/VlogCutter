@@ -19,6 +19,8 @@ pub struct PortableAssetBaseline {
     pub codec: String,
     pub camera: String,
     pub captured_at_raw: Option<String>,
+    #[serde(default)]
+    pub timestamp_candidates: Option<Vec<crate::chronology::TimestampCandidate>>,
     pub best_time: Option<String>,
     pub offset_seconds: i64,
     pub metadata_rotation_degrees: u16,
@@ -96,7 +98,7 @@ impl Catalog {
             [project_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
         )?;
         let mut statement = connection.prepare(
-            "SELECT id, fingerprint, filename, size_bytes, duration_seconds, frame_rate, width, height, codec, camera, captured_at_raw, best_time, offset_seconds, metadata_rotation_degrees, default_rotation_degrees, orientation_probed, notes, labels_json, removed, rotation_degrees, media_object_id, media_verification_state, created_at FROM assets WHERE project_id=?1 AND COALESCE(membership_removed, 0) = 0 ORDER BY id",
+            "SELECT id, fingerprint, filename, size_bytes, duration_seconds, frame_rate, width, height, codec, camera, captured_at_raw, best_time, offset_seconds, metadata_rotation_degrees, default_rotation_degrees, orientation_probed, notes, labels_json, removed, rotation_degrees, media_object_id, media_verification_state, created_at, timestamp_candidates_json FROM assets WHERE project_id=?1 AND COALESCE(membership_removed, 0) = 0 ORDER BY id",
         )?;
         let rows = statement
             .query_map([project_id], |row| {
@@ -124,6 +126,7 @@ impl Catalog {
                     row.get::<_, Option<String>>(20)?,
                     row.get::<_, String>(21)?,
                     row.get::<_, String>(22)?,
+                    row.get::<_, Option<String>>(23)?,
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -157,6 +160,7 @@ impl Catalog {
                 codec: row.8,
                 camera: row.9,
                 captured_at_raw: row.10,
+                timestamp_candidates: row.23.and_then(|json| serde_json::from_str(&json).ok()),
                 best_time: row.11,
                 offset_seconds: row.12,
                 metadata_rotation_degrees: row.13 as u16,
@@ -245,7 +249,7 @@ impl Catalog {
         let transaction = connection.transaction()?;
         transaction.execute("INSERT INTO projects(id, name, created_at, origin_node_id, paired_server_node_id, paired_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)", params![snapshot.project_id, snapshot.name, snapshot.created_at, snapshot.origin_node_id, snapshot.paired_server_node_id, snapshot.paired_at])?;
         for asset in &snapshot.assets {
-            transaction.execute("INSERT INTO assets(id, project_id, fingerprint, path, filename, size_bytes, duration_seconds, frame_rate, width, height, codec, camera, captured_at_raw, best_time, offset_seconds, metadata_rotation_degrees, default_rotation_degrees, rotation_degrees, orientation_probed, notes, labels_json, removed, media_object_id, media_verification_state, created_at) VALUES (?1, ?2, ?3, '', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)", params![asset.id, snapshot.project_id, asset.fingerprint, asset.filename, asset.size_bytes as i64, asset.duration_seconds, asset.frame_rate, asset.width, asset.height, asset.codec, asset.camera, asset.captured_at_raw, asset.best_time, asset.offset_seconds, asset.metadata_rotation_degrees, asset.default_rotation_degrees, asset.baseline_rotation_degrees, asset.orientation_probed, asset.baseline_notes, serde_json::to_string(&asset.baseline_labels)?, asset.baseline_removed, asset.media_object_id, asset.media_verification_state.as_str(), asset.created_at])?;
+            transaction.execute("INSERT INTO assets(id, project_id, fingerprint, path, filename, size_bytes, duration_seconds, frame_rate, width, height, codec, camera, captured_at_raw, best_time, offset_seconds, metadata_rotation_degrees, default_rotation_degrees, rotation_degrees, orientation_probed, notes, labels_json, removed, media_object_id, media_verification_state, created_at, timestamp_candidates_json) VALUES (?1, ?2, ?3, '', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)", params![asset.id, snapshot.project_id, asset.fingerprint, asset.filename, asset.size_bytes as i64, asset.duration_seconds, asset.frame_rate, asset.width, asset.height, asset.codec, asset.camera, asset.captured_at_raw, asset.best_time, asset.offset_seconds, asset.metadata_rotation_degrees, asset.default_rotation_degrees, asset.baseline_rotation_degrees, asset.orientation_probed, asset.baseline_notes, serde_json::to_string(&asset.baseline_labels)?, asset.baseline_removed, asset.media_object_id, asset.media_verification_state.as_str(), asset.created_at, asset.timestamp_candidates.as_ref().map(serde_json::to_string).transpose()?])?;
             let capture_sequence_id = crate::chronology::ensure_capture_sequence_for_camera(
                 &transaction,
                 &snapshot.project_id,

@@ -7,7 +7,7 @@ use thiserror::Error;
 
 use crate::chronology::forward_migrate_project_chronology;
 
-pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 26;
+pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 27;
 
 const MIGRATION_TABLE_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -240,7 +240,18 @@ pub const PROJECT_CATALOG_MIGRATIONS: &[SqliteMigration] = &[
         source_identity: "project-catalog/0026-asset-video-validation/20261020",
         apply: add_asset_video_validation,
     },
+    SqliteMigration {
+        id: 27,
+        name: "asset_timestamp_candidates",
+        source_identity: "project-catalog/0027-asset-timestamp-candidates/20261020",
+        apply: add_asset_timestamp_candidates,
+    },
 ];
+
+fn add_asset_timestamp_candidates(transaction: &Transaction<'_>) -> Result<()> {
+    add_column_if_missing(transaction, "assets", "timestamp_candidates_json", "TEXT")?;
+    Ok(())
+}
 
 pub fn migrate_project_catalog(connection: &mut Connection) -> Result<()> {
     reconcile_divergent_import_migration_history(connection)?;
