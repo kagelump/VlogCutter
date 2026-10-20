@@ -134,6 +134,63 @@ pub struct CaptureSequenceMergePreview {
     pub impact: ChronologyImpact,
 }
 
+/// Direct chronology changes without a specialized preview API. This typed
+/// request lets adapters obtain a core-solved impact before confirmation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum ChronologyMutation {
+    SequenceDeclare {
+        sequence: CaptureSequence,
+    },
+    SameCard {
+        sequence_id: String,
+        at_counter: u64,
+        reason: String,
+    },
+    SameCardRestore {
+        sequence_id: String,
+        at_counter: u64,
+    },
+    ExceptionSet {
+        exception: ClipTimeException,
+    },
+    ExceptionClear {
+        asset_id: String,
+    },
+    PhaseSet {
+        phase: TripPhase,
+    },
+    PhaseRemove {
+        phase_id: String,
+    },
+    PhaseSplit {
+        existing_phase_id: String,
+        boundary_asset_id: String,
+        direction: PhaseSplitDirection,
+        phase: TripPhase,
+    },
+    ConstraintSet {
+        constraint: EventOrderConstraint,
+    },
+    ConstraintClear {
+        constraint_id: String,
+    },
+}
+
+/// Core-authored preview for a direct chronology mutation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChronologyMutationPreview {
+    pub mutation: ChronologyMutation,
+    pub affected_asset_ids: Vec<String>,
+    pub facts_token: String,
+    pub impact: ChronologyImpact,
+}
+
 /// One internally coherent read for the desktop calibration surface. Facts,
 /// solution, and proposals are all derived from the same loaded catalog state.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -295,6 +352,530 @@ pub struct DeclinedSplit {
 }
 
 impl Catalog {
+    fn trip_phase_split_candidate(
+        &self,
+        project_id: &str,
+        facts: &super::model::ChronologyFacts,
+        existing_phase_id: &str,
+        boundary_asset_id: &str,
+        direction: PhaseSplitDirection,
+        new_phase: &TripPhase,
+    ) -> Result<(TripPhase, Option<TripPhase>, Vec<String>)> {
+        let solution = solve(facts);
+        let covered: Vec<usize> = solution
+            .assets
+            .iter()
+            .enumerate()
+            .filter_map(|(index, asset)| {
+                (asset
+                    .display_time
+                    .as_ref()
+                    .and_then(|display| display.phase_id.as_deref())
+                    == Some(existing_phase_id))
+                .then_some(index)
+            })
+            .collect();
+        let Some(&first) = covered.first() else {
+            return Err(ChronologyError::InvalidReference(format!(
+                "trip phase {existing_phase_id} has no visible clips to split"
+            ))
+            .into());
+        };
+        let last = *covered.last().expect("nonempty phase has last clip");
+        if !covered.windows(2).all(|pair| pair[1] == pair[0] + 1) {
+            return Err(ChronologyError::InvalidInterval(format!(
+                "trip phase {existing_phase_id} is interrupted by overlapping context"
+            ))
+            .into());
+        }
+        let boundary = solution
+            .assets
+            .iter()
+            .position(|asset| asset.asset_id == boundary_asset_id)
+            .filter(|index| *index >= first && *index <= last)
+            .ok_or_else(|| {
+                ChronologyError::InvalidReference(format!(
+                    "clip {boundary_asset_id} is not inside trip phase {existing_phase_id}"
+                ))
+            })?;
+        let (mut phases, _) = resolve_anchored_phases(&facts.phases, &solution.assets);
+        let mut existing = phases
+            .drain(..)
+            .find(|phase| phase.id == existing_phase_id)
+            .ok_or_else(|| {
+                ChronologyError::InvalidReference(format!(
+                    "trip phase not found: {existing_phase_id}"
+                ))
+            })?;
+        let mut authored = new_phase.clone();
+        let asset_id_at = |index: usize| solution.assets[index].asset_id.clone();
+        let keeps_existing = match direction {
+            PhaseSplitDirection::Through => {
+                authored.start_anchor_asset_id = Some(asset_id_at(first));
+                authored.end_anchor_asset_id = Some(asset_id_at(boundary));
+                if boundary < last {
+                    existing.start_anchor_asset_id = Some(asset_id_at(boundary + 1));
+                    existing.end_anchor_asset_id = Some(asset_id_at(last));
+                    true
+                } else {
+                    false
+                }
+            }
+            PhaseSplitDirection::From => {
+                authored.start_anchor_asset_id = Some(asset_id_at(boundary));
+                authored.end_anchor_asset_id = Some(asset_id_at(last));
+                if boundary > first {
+                    existing.start_anchor_asset_id = Some(asset_id_at(first));
+                    existing.end_anchor_asset_id = Some(asset_id_at(boundary - 1));
+                    true
+                } else {
+                    false
+                }
+            }
+        };
+        let authored = self.prepare_trip_phase(project_id, &authored)?;
+        let existing = if keeps_existing {
+            Some(self.prepare_trip_phase(project_id, &existing)?)
+        } else {
+            None
+        };
+        let affected = covered
+            .into_iter()
+            .map(|index| solution.assets[index].asset_id.clone())
+            .collect();
+        Ok((authored, existing, affected))
+    }
+
+    /// Previews chronology writes that do not have a specialized exact preview
+    /// API. The candidate and solver impact are produced by the core so all
+    /// adapters confirm the same facts token and affected identities.
+    pub fn preview_chronology_mutation(
+        &self,
+        project_id: &str,
+        mutation: &ChronologyMutation,
+    ) -> Result<ChronologyMutationPreview> {
+        let mut facts = self.chronology_facts(project_id)?;
+        let facts_token = chronology_facts_token(&facts)?;
+        let before = solve(&facts);
+        let mut phase_split_assets = Vec::new();
+        let mutation = match mutation.clone() {
+            ChronologyMutation::SequenceDeclare { mut sequence } => {
+                sequence.camera_key = sequence.camera_key.trim().to_string();
+                sequence.label = sequence.label.trim().to_string();
+                sequence.volume_hint = sequence.volume_hint.trim().to_string();
+                sequence.filename_prefix = sequence.filename_prefix.trim().to_string();
+                if sequence.id.is_empty() {
+                    sequence.id = format!("sequence_{}", Uuid::new_v4().simple());
+                }
+                if facts.sequences.iter().any(|item| item.id == sequence.id) {
+                    return Err(ChronologyError::InvalidReference(format!(
+                        "capture sequence identity is already in use: {}",
+                        sequence.id
+                    ))
+                    .into());
+                }
+                facts.sequences.push(sequence.clone());
+                ChronologyMutation::SequenceDeclare { sequence }
+            }
+            ChronologyMutation::SameCard {
+                sequence_id,
+                at_counter,
+                reason,
+            } => {
+                if !facts.sequences.iter().any(|item| item.id == sequence_id) {
+                    return Err(ChronologyError::InvalidReference(format!(
+                        "capture sequence {sequence_id} is not in this project"
+                    ))
+                    .into());
+                }
+                ChronologyMutation::SameCard {
+                    sequence_id,
+                    at_counter,
+                    reason: reason.trim().to_string(),
+                }
+            }
+            ChronologyMutation::SameCardRestore {
+                sequence_id,
+                at_counter,
+            } => {
+                if !facts.sequences.iter().any(|item| item.id == sequence_id) {
+                    return Err(ChronologyError::InvalidReference(format!(
+                        "capture sequence {sequence_id} is not in this project"
+                    ))
+                    .into());
+                }
+                ChronologyMutation::SameCardRestore {
+                    sequence_id,
+                    at_counter,
+                }
+            }
+            ChronologyMutation::ExceptionSet { mut exception } => {
+                if !facts
+                    .assets
+                    .iter()
+                    .any(|asset| asset.asset_id == exception.asset_id)
+                {
+                    return Err(ChronologyError::InvalidReference(format!(
+                        "asset {} is not in this project",
+                        exception.asset_id
+                    ))
+                    .into());
+                }
+                if parse_utc(&exception.trip_time).is_none() {
+                    return Err(ChronologyError::InvalidInterval(format!(
+                        "{} is not an RFC 3339 timestamp",
+                        exception.trip_time
+                    ))
+                    .into());
+                }
+                exception.reason = exception.reason.trim().to_string();
+                facts
+                    .exceptions
+                    .retain(|item| item.asset_id != exception.asset_id);
+                facts.exceptions.push(exception.clone());
+                ChronologyMutation::ExceptionSet { exception }
+            }
+            ChronologyMutation::ExceptionClear { asset_id } => {
+                if !facts.assets.iter().any(|asset| asset.asset_id == asset_id) {
+                    return Err(ChronologyError::InvalidReference(format!(
+                        "asset {asset_id} is not in this project"
+                    ))
+                    .into());
+                }
+                facts.exceptions.retain(|item| item.asset_id != asset_id);
+                ChronologyMutation::ExceptionClear { asset_id }
+            }
+            ChronologyMutation::PhaseSet { phase } => {
+                let phase = self.prepare_trip_phase(project_id, &phase)?;
+                facts.phases.retain(|item| item.id != phase.id);
+                facts.phases.push(phase.clone());
+                ChronologyMutation::PhaseSet { phase }
+            }
+            ChronologyMutation::PhaseRemove { phase_id } => {
+                facts.phases.retain(|item| item.id != phase_id);
+                ChronologyMutation::PhaseRemove { phase_id }
+            }
+            ChronologyMutation::PhaseSplit {
+                existing_phase_id,
+                boundary_asset_id,
+                direction,
+                phase,
+            } => {
+                let (authored, existing, affected) = self.trip_phase_split_candidate(
+                    project_id,
+                    &facts,
+                    &existing_phase_id,
+                    &boundary_asset_id,
+                    direction,
+                    &phase,
+                )?;
+                phase_split_assets = affected;
+                facts.phases.retain(|item| item.id != existing_phase_id);
+                if let Some(existing) = existing {
+                    facts.phases.push(existing);
+                }
+                facts.phases.push(authored.clone());
+                ChronologyMutation::PhaseSplit {
+                    existing_phase_id,
+                    boundary_asset_id,
+                    direction,
+                    phase: authored,
+                }
+            }
+            ChronologyMutation::ConstraintSet { mut constraint } => {
+                if constraint.earlier_asset_id == constraint.later_asset_id {
+                    return Err(ChronologyError::InvalidReference(
+                        "a clip cannot be constrained to precede itself".into(),
+                    )
+                    .into());
+                }
+                for asset_id in [&constraint.earlier_asset_id, &constraint.later_asset_id] {
+                    if !facts.assets.iter().any(|asset| &asset.asset_id == asset_id) {
+                        return Err(ChronologyError::InvalidReference(format!(
+                            "asset {asset_id} is not in this project"
+                        ))
+                        .into());
+                    }
+                }
+                if constraint.id.is_empty() {
+                    constraint.id = format!("constraint_{}", Uuid::new_v4().simple());
+                }
+                constraint.source = constraint.source.trim().to_string();
+                facts.constraints.retain(|item| {
+                    !(item.earlier_asset_id == constraint.earlier_asset_id
+                        && item.later_asset_id == constraint.later_asset_id)
+                });
+                facts.constraints.push(constraint.clone());
+                if constraint.strength == ConstraintStrength::Hard
+                    && let Some(blocking) = solve(&facts)
+                        .contradictions
+                        .into_iter()
+                        .find(|found| found.kind == ContradictionKind::Cycle)
+                {
+                    return Err(ChronologyError::HardContradiction(blocking.message).into());
+                }
+                ChronologyMutation::ConstraintSet { constraint }
+            }
+            ChronologyMutation::ConstraintClear { constraint_id } => {
+                facts.constraints.retain(|item| item.id != constraint_id);
+                ChronologyMutation::ConstraintClear { constraint_id }
+            }
+        };
+        let mut affected_asset_ids = match &mutation {
+            ChronologyMutation::ExceptionSet { exception } => vec![exception.asset_id.clone()],
+            ChronologyMutation::ExceptionClear { asset_id } => vec![asset_id.clone()],
+            ChronologyMutation::ConstraintSet { constraint } => vec![
+                constraint.earlier_asset_id.clone(),
+                constraint.later_asset_id.clone(),
+            ],
+            ChronologyMutation::SequenceDeclare { .. }
+            | ChronologyMutation::SameCard { .. }
+            | ChronologyMutation::SameCardRestore { .. }
+            | ChronologyMutation::PhaseSet { .. }
+            | ChronologyMutation::PhaseRemove { .. }
+            | ChronologyMutation::PhaseSplit { .. }
+            | ChronologyMutation::ConstraintClear { .. } => Vec::new(),
+        };
+        affected_asset_ids.extend(phase_split_assets);
+        affected_asset_ids.extend(
+            chronology_impact(&before, solve(&facts))
+                .changes
+                .into_iter()
+                .map(|change| change.asset_id),
+        );
+        affected_asset_ids.sort();
+        affected_asset_ids.dedup();
+        let impact = chronology_impact(&before, solve(&facts));
+        Ok(ChronologyMutationPreview {
+            mutation,
+            affected_asset_ids,
+            facts_token,
+            impact,
+        })
+    }
+
+    /// Applies an unchanged direct-mutation preview in one immediate SQLite
+    /// transaction. A repeated request after a lost response is recognized by
+    /// its durable fact and succeeds without adding a duplicate operation.
+    pub fn apply_chronology_mutation_preview(
+        &self,
+        project_id: &str,
+        preview: &ChronologyMutationPreview,
+    ) -> Result<ChronologyMutation> {
+        self.require_project(project_id)?;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let facts = super::load_chronology_facts(&transaction, project_id)?;
+        let current_token = chronology_facts_token(&facts)?;
+        if current_token != preview.facts_token {
+            if Self::chronology_mutation_is_applied(&transaction, project_id, &preview.mutation)? {
+                transaction.commit()?;
+                return Ok(preview.mutation.clone());
+            }
+            return Err(ChronologyError::InvalidReference(
+                "chronology preview is stale; preview it again before applying".into(),
+            )
+            .into());
+        }
+        let expected_preview = self.preview_chronology_mutation(project_id, &preview.mutation)?;
+        if expected_preview != *preview {
+            return Err(ChronologyError::InvalidReference(
+                "chronology preview was altered; preview it again before applying".into(),
+            )
+            .into());
+        }
+        if Self::chronology_mutation_is_applied(&transaction, project_id, &preview.mutation)? {
+            transaction.commit()?;
+            return Ok(preview.mutation.clone());
+        }
+        if let ChronologyMutation::PhaseSplit {
+            existing_phase_id,
+            boundary_asset_id,
+            direction,
+            phase,
+        } = &preview.mutation
+        {
+            let (_, updated_existing, _) = self.trip_phase_split_candidate(
+                project_id,
+                &facts,
+                existing_phase_id,
+                boundary_asset_id,
+                *direction,
+                phase,
+            )?;
+            let existing_revision =
+                current_revision(&transaction, project_id, "tripPhase", existing_phase_id)?;
+            let mut operations = Vec::with_capacity(2);
+            if let Some(existing) = updated_existing {
+                operations.push(trip_phase_set_operation(&existing, existing_revision)?);
+            } else {
+                operations.push(NewOperation {
+                    aggregate_type: "tripPhase",
+                    aggregate_id: existing_phase_id.clone(),
+                    operation_type: TRIP_PHASE_REMOVED,
+                    base_revision: Some(existing_revision),
+                    payload: serde_json::to_value(TripPhaseRemovedPayload {
+                        phase_id: existing_phase_id.clone(),
+                    })?,
+                });
+            }
+            let authored_revision =
+                current_revision(&transaction, project_id, "tripPhase", &phase.id)?;
+            operations.push(trip_phase_set_operation(phase, authored_revision)?);
+            commit_local_in_transaction(&transaction, project_id, operations)?;
+            Self::project_current_chronology_in_transaction(&transaction, project_id)?;
+            transaction.commit()?;
+            return Ok(preview.mutation.clone());
+        }
+        let mutation = &preview.mutation;
+        let operation = match mutation {
+            ChronologyMutation::SequenceDeclare { sequence } => NewOperation {
+                aggregate_type: "captureSequence",
+                aggregate_id: sequence.id.clone(),
+                operation_type: CAPTURE_SEQUENCE_DECLARED,
+                base_revision: Some(0),
+                payload: serde_json::to_value(CaptureSequenceDeclaredPayload {
+                    sequence_id: sequence.id.clone(),
+                    camera_key: sequence.camera_key.clone(),
+                    label: sequence.label.clone(),
+                    volume_hint: sequence.volume_hint.clone(),
+                    filename_prefix: sequence.filename_prefix.clone(),
+                })?,
+            },
+            ChronologyMutation::SameCard {
+                sequence_id,
+                at_counter,
+                reason,
+            } => NewOperation {
+                aggregate_type: "captureSequence",
+                aggregate_id: sequence_id.clone(),
+                operation_type: CAPTURE_SEQUENCE_SPLIT_DECLINED,
+                base_revision: None,
+                payload: serde_json::to_value(CaptureSequenceSplitDeclinedPayload {
+                    at_counter: *at_counter,
+                    reason: reason.clone(),
+                })?,
+            },
+            ChronologyMutation::SameCardRestore {
+                sequence_id,
+                at_counter,
+            } => NewOperation {
+                aggregate_type: "captureSequence",
+                aggregate_id: sequence_id.clone(),
+                operation_type: CAPTURE_SEQUENCE_SPLIT_RESTORED,
+                base_revision: None,
+                payload: serde_json::to_value(CaptureSequenceSplitRestoredPayload {
+                    at_counter: *at_counter,
+                })?,
+            },
+            ChronologyMutation::ExceptionSet { exception } => NewOperation {
+                aggregate_type: "projectAsset",
+                aggregate_id: exception.asset_id.clone(),
+                operation_type: CLIP_TIME_EXCEPTION_SET,
+                base_revision: None,
+                payload: serde_json::to_value(ClipTimeExceptionSetPayload {
+                    trip_time: exception.trip_time.clone(),
+                    reason: exception.reason.clone(),
+                })?,
+            },
+            ChronologyMutation::ExceptionClear { asset_id } => NewOperation {
+                aggregate_type: "projectAsset",
+                aggregate_id: asset_id.clone(),
+                operation_type: CLIP_TIME_EXCEPTION_CLEARED,
+                base_revision: None,
+                payload: serde_json::to_value(serde_json::json!({}))?,
+            },
+            ChronologyMutation::PhaseSet { phase } => trip_phase_set_operation(
+                phase,
+                current_revision(&transaction, project_id, "tripPhase", &phase.id)?,
+            )?,
+            ChronologyMutation::PhaseRemove { phase_id } => NewOperation {
+                aggregate_type: "tripPhase",
+                aggregate_id: phase_id.clone(),
+                operation_type: TRIP_PHASE_REMOVED,
+                base_revision: Some(current_revision(
+                    &transaction,
+                    project_id,
+                    "tripPhase",
+                    phase_id,
+                )?),
+                payload: serde_json::to_value(TripPhaseRemovedPayload {
+                    phase_id: phase_id.clone(),
+                })?,
+            },
+            ChronologyMutation::PhaseSplit { .. } => unreachable!("phase split handled above"),
+            ChronologyMutation::ConstraintSet { constraint } => NewOperation {
+                aggregate_type: "eventOrderConstraint",
+                aggregate_id: constraint.id.clone(),
+                operation_type: EVENT_ORDER_CONSTRAINT_SET,
+                base_revision: Some(current_revision(
+                    &transaction,
+                    project_id,
+                    "eventOrderConstraint",
+                    &constraint.id,
+                )?),
+                payload: serde_json::to_value(EventOrderConstraintSetPayload {
+                    constraint_id: constraint.id.clone(),
+                    earlier_asset_id: constraint.earlier_asset_id.clone(),
+                    later_asset_id: constraint.later_asset_id.clone(),
+                    strength: strength_str(constraint.strength).to_string(),
+                    source: constraint.source.clone(),
+                })?,
+            },
+            ChronologyMutation::ConstraintClear { constraint_id } => NewOperation {
+                aggregate_type: "eventOrderConstraint",
+                aggregate_id: constraint_id.clone(),
+                operation_type: EVENT_ORDER_CONSTRAINT_CLEARED,
+                base_revision: Some(current_revision(
+                    &transaction,
+                    project_id,
+                    "eventOrderConstraint",
+                    constraint_id,
+                )?),
+                payload: serde_json::to_value(EventOrderConstraintClearedPayload {
+                    constraint_id: constraint_id.clone(),
+                })?,
+            },
+        };
+        commit_local_in_transaction(&transaction, project_id, vec![operation])?;
+        Self::project_current_chronology_in_transaction(&transaction, project_id)?;
+        transaction.commit()?;
+        Ok(preview.mutation.clone())
+    }
+
+    fn chronology_mutation_is_applied(
+        transaction: &rusqlite::Transaction<'_>,
+        project_id: &str,
+        mutation: &ChronologyMutation,
+    ) -> Result<bool> {
+        let facts = super::load_chronology_facts(transaction, project_id)?;
+        let counter = match mutation {
+            ChronologyMutation::SameCard { at_counter, .. }
+            | ChronologyMutation::SameCardRestore { at_counter, .. } => {
+                Some(i64::try_from(*at_counter)?)
+            }
+            _ => None,
+        };
+        Ok(match mutation {
+            ChronologyMutation::SequenceDeclare { sequence } => facts.sequences.contains(sequence),
+            ChronologyMutation::SameCard { sequence_id, .. } => transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM declined_capture_sequence_splits WHERE project_id=?1 AND capture_sequence_id=?2 AND at_counter=?3)",
+                rusqlite::params![project_id, sequence_id, counter], |row| row.get(0),
+            )?,
+            ChronologyMutation::SameCardRestore { sequence_id, .. } => transaction.query_row(
+                "SELECT NOT EXISTS(SELECT 1 FROM declined_capture_sequence_splits WHERE project_id=?1 AND capture_sequence_id=?2 AND at_counter=?3)",
+                rusqlite::params![project_id, sequence_id, counter], |row| row.get(0),
+            )?,
+            ChronologyMutation::ExceptionSet { exception } => facts.exceptions.contains(exception),
+            ChronologyMutation::ExceptionClear { asset_id } => !facts.exceptions.iter().any(|item| &item.asset_id == asset_id),
+            ChronologyMutation::PhaseSet { phase } => facts.phases.contains(phase),
+            ChronologyMutation::PhaseRemove { phase_id } => !facts.phases.iter().any(|item| &item.id == phase_id),
+            ChronologyMutation::PhaseSplit { phase, .. } => facts.phases.contains(phase),
+            ChronologyMutation::ConstraintSet { constraint } => facts.constraints.contains(constraint),
+            ChronologyMutation::ConstraintClear { constraint_id } => !facts.constraints.iter().any(|item| &item.id == constraint_id),
+        })
+    }
+
     // --- D01-T009: capture-sequence management -----------------------------
 
     /// Declares a new capture sequence for a camera, for example when a second
@@ -1501,94 +2082,22 @@ impl Catalog {
         new_phase: &TripPhase,
     ) -> Result<TripPhase> {
         self.require_project(project_id)?;
-        let solution = self.solve_chronology(project_id)?;
-        let covered_indices: Vec<usize> = solution
-            .assets
-            .iter()
-            .enumerate()
-            .filter_map(|(index, asset)| {
-                (asset
-                    .display_time
-                    .as_ref()
-                    .and_then(|display| display.phase_id.as_deref())
-                    == Some(existing_phase_id))
-                .then_some(index)
-            })
-            .collect();
-        let Some(&first_index) = covered_indices.first() else {
-            return Err(ChronologyError::InvalidReference(format!(
-                "trip phase {existing_phase_id} has no visible clips to split"
-            ))
-            .into());
-        };
-        let last_index = *covered_indices
-            .last()
-            .expect("a non-empty phase has a last clip");
-        if !covered_indices
-            .windows(2)
-            .all(|pair| pair[1] == pair[0] + 1)
-        {
-            return Err(ChronologyError::InvalidInterval(format!(
-                "trip phase {existing_phase_id} is interrupted by overlapping context"
-            ))
-            .into());
-        }
-        let boundary_index = solution
-            .assets
-            .iter()
-            .position(|asset| asset.asset_id == boundary_asset_id)
-            .filter(|index| *index >= first_index && *index <= last_index)
-            .ok_or_else(|| {
-                ChronologyError::InvalidReference(format!(
-                    "clip {boundary_asset_id} is not inside trip phase {existing_phase_id}"
-                ))
-            })?;
-
-        let mut existing = self
-            .trip_phases(project_id)?
-            .into_iter()
-            .find(|phase| phase.id == existing_phase_id)
-            .ok_or_else(|| {
-                ChronologyError::InvalidReference(format!(
-                    "trip phase not found: {existing_phase_id}"
-                ))
-            })?;
         let mut authored = new_phase.clone();
         authored.id.clear();
-
-        let asset_id_at = |index: usize| solution.assets[index].asset_id.clone();
-        let keeps_existing = match direction {
-            PhaseSplitDirection::Through => {
-                authored.start_anchor_asset_id = Some(asset_id_at(first_index));
-                authored.end_anchor_asset_id = Some(asset_id_at(boundary_index));
-                if boundary_index < last_index {
-                    existing.start_anchor_asset_id = Some(asset_id_at(boundary_index + 1));
-                    existing.end_anchor_asset_id = Some(asset_id_at(last_index));
-                    true
-                } else {
-                    false
-                }
-            }
-            PhaseSplitDirection::From => {
-                authored.start_anchor_asset_id = Some(asset_id_at(boundary_index));
-                authored.end_anchor_asset_id = Some(asset_id_at(last_index));
-                if boundary_index > first_index {
-                    existing.start_anchor_asset_id = Some(asset_id_at(first_index));
-                    existing.end_anchor_asset_id = Some(asset_id_at(boundary_index - 1));
-                    true
-                } else {
-                    false
-                }
-            }
-        };
-
-        let authored = self.prepare_trip_phase(project_id, &authored)?;
+        let facts = self.chronology_facts(project_id)?;
+        let (authored, existing, _) = self.trip_phase_split_candidate(
+            project_id,
+            &facts,
+            existing_phase_id,
+            boundary_asset_id,
+            direction,
+            &authored,
+        )?;
         let connection = self.connection()?;
         let existing_revision =
             current_revision(&connection, project_id, "tripPhase", existing_phase_id)?;
         let mut operations = Vec::with_capacity(2);
-        if keeps_existing {
-            let existing = self.prepare_trip_phase(project_id, &existing)?;
+        if let Some(existing) = existing {
             operations.push(trip_phase_set_operation(&existing, existing_revision)?);
         } else {
             operations.push(NewOperation {

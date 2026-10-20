@@ -15,9 +15,9 @@ pub mod solver;
 
 pub use api::{
     CaptureSequenceMergePreview, CaptureSequenceReassignmentPreview, CaptureSequenceSplitPreview,
-    ChronologyError, ChronologyImpact, ChronologyImpactChange, ChronologySnapshot,
-    ClockEpochClearPreview, ClockEpochImpactPreview, SplitProposal, VisualPlacementPreview,
-    VisualPlacementSide,
+    ChronologyError, ChronologyImpact, ChronologyImpactChange, ChronologyMutation,
+    ChronologyMutationPreview, ChronologySnapshot, ClockEpochClearPreview, ClockEpochImpactPreview,
+    SplitProposal, VisualPlacementPreview, VisualPlacementSide,
 };
 pub use explain::{AppliedCorrection, ChronologyExplanation, QueuePosition};
 pub use export::{ChronologyEvidenceAsset, ChronologyEvidencePage, evidence_page};

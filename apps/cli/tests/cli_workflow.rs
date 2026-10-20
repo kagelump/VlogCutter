@@ -4,8 +4,9 @@ use serde_json::Value;
 use std::env;
 use std::ffi::OsStr;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use tempfile::tempdir;
 
 struct Invocation {
@@ -24,6 +25,61 @@ where
         .args(arguments)
         .output()
         .expect("run rcdvlog CLI")
+}
+
+fn invoke_with_stdin<I, S>(catalog: &Path, arguments: I, input: &str) -> Output
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rcdvlog"))
+        .arg("--catalog")
+        .arg(catalog)
+        .args(arguments)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("run rcdvlog CLI with JSON stdin");
+    child
+        .stdin
+        .take()
+        .expect("stdin pipe")
+        .write_all(input.as_bytes())
+        .expect("write JSON stdin");
+    child.wait_with_output().expect("collect CLI output")
+}
+
+fn chronology_apply(catalog: &Path, project: &str, request: Value) -> Value {
+    let preview_output = invoke_with_stdin(
+        catalog,
+        [
+            "chronology",
+            "preview",
+            "--project",
+            project,
+            "--input",
+            "-",
+        ],
+        &request.to_string(),
+    );
+    assert!(
+        preview_output.status.success(),
+        "chronology preview failed: {}",
+        String::from_utf8_lossy(&preview_output.stderr)
+    );
+    let preview: Value = serde_json::from_slice(&preview_output.stdout).expect("preview JSON");
+    let output = invoke_with_stdin(
+        catalog,
+        ["chronology", "apply", "--project", project, "--input", "-"],
+        &serde_json::json!({"kind":request["kind"], "preview":preview["data"]["data"]}).to_string(),
+    );
+    assert!(
+        output.status.success(),
+        "chronology apply failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).expect("chronology JSON output")
 }
 
 fn invoke_with_path<I, S>(catalog: &Path, arguments: I, path: &OsStr) -> Output
@@ -81,6 +137,502 @@ fn create_project(catalog: &Path, name: &str) -> String {
         .as_str()
         .expect("project id")
         .to_string()
+}
+
+#[test]
+fn chronology_preview_is_reusable_revision_guarded_and_process_safe() {
+    let directory = tempdir().expect("temporary catalog directory");
+    let catalog = directory.path().join("catalog.sqlite3");
+    let project = create_project(&catalog, "synthetic chronology");
+    let request_path = directory.path().join("request.json");
+    let sequence_request = serde_json::json!({
+        "kind": "sequenceDeclare", "cameraKey": "Synthetic Camera", "label": "Card A",
+        "volumeHint": "CARD-A", "filenamePrefix": "SYN_"
+    });
+    let sequence = chronology_apply(&catalog, &project, sequence_request);
+    let sequence = sequence["data"]["data"]["sequence"]["id"]
+        .as_str()
+        .expect("sequence identity")
+        .to_owned();
+
+    let epoch_request = serde_json::json!({
+        "kind": "epochSet", "epoch": {"id":"", "captureSequenceId":sequence,
+        "startCounter":1,"endCounter":null,"offsetSeconds":3600,"confidence":0.9,
+        "evidence":["synthetic review"],"label":"Synthetic clock correction"}
+    });
+    let output = invoke_with_stdin(
+        &catalog,
+        [
+            "chronology",
+            "preview",
+            "--project",
+            &project,
+            "--input",
+            "-",
+        ],
+        &epoch_request.to_string(),
+    );
+    assert!(
+        output.status.success(),
+        "preview failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let preview: Value = serde_json::from_slice(&output.stdout).expect("preview JSON envelope");
+    assert_eq!(preview["data"]["kind"], "epochSet");
+    assert!(preview["data"]["data"]["factsToken"].as_str().is_some());
+    assert_eq!(
+        preview["data"]["data"]["epoch"]["captureSequenceId"],
+        sequence
+    );
+
+    fs::write(
+        &request_path,
+        serde_json::json!({
+            "kind":"merge", "fromSequenceId":"missing-sequence", "intoSequenceId":sequence
+        })
+        .to_string(),
+    )
+    .expect("write invalid reference request");
+    let invalid = failure(
+        &catalog,
+        [
+            "chronology",
+            "preview",
+            "--project",
+            &project,
+            "--input",
+            request_path.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(invalid["error"]["code"], "chronology.invalid_reference");
+
+    fs::write(
+        &request_path,
+        serde_json::json!({"kind":"epochSet", "preview":preview["data"]["data"]}).to_string(),
+    )
+    .expect("write apply request");
+    let applied = success(
+        &catalog,
+        [
+            "chronology",
+            "apply",
+            "--project",
+            &project,
+            "--input",
+            request_path.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(applied.json["data"]["data"]["offsetSeconds"], 3600);
+    let stale = failure(
+        &catalog,
+        [
+            "chronology",
+            "apply",
+            "--project",
+            &project,
+            "--input",
+            request_path.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(stale["error"]["code"], "chronology.stale_preview");
+}
+
+#[test]
+fn chronology_direct_preview_apply_can_be_retried_after_cli_restart() {
+    let directory = tempdir().unwrap();
+    let catalog = directory.path().join("catalog.sqlite3");
+    let project = create_project(&catalog, "synthetic retry");
+    let request_path = directory.path().join("sequence-request.json");
+    fs::write(
+        &request_path,
+        serde_json::json!({"kind":"sequenceDeclare", "cameraKey":"Synthetic", "label":"Card", "volumeHint":"CARD", "filenamePrefix":"SYN_"}).to_string(),
+    ).unwrap();
+    let preview = success(
+        &catalog,
+        [
+            "chronology",
+            "preview",
+            "--project",
+            &project,
+            "--input",
+            request_path.to_str().unwrap(),
+        ],
+    )
+    .json;
+    let apply_path = directory.path().join("sequence-apply.json");
+    fs::write(
+        &apply_path,
+        serde_json::json!({"kind":"sequenceDeclare", "preview":preview["data"]["data"]})
+            .to_string(),
+    )
+    .unwrap();
+    success(
+        &catalog,
+        [
+            "chronology",
+            "apply",
+            "--project",
+            &project,
+            "--input",
+            apply_path.to_str().unwrap(),
+        ],
+    );
+    // A second process receives the same candidate after the caller lost its
+    // response. The core recognizes the durable sequence and does not append a duplicate.
+    success(
+        &catalog,
+        [
+            "chronology",
+            "apply",
+            "--project",
+            &project,
+            "--input",
+            apply_path.to_str().unwrap(),
+        ],
+    );
+    let sequences = success(&catalog, ["chronology", "sequences", "--project", &project]);
+    assert_eq!(
+        sequences.json["data"]["sequences"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn chronology_exact_split_never_expands_after_a_later_import() {
+    let directory = tempdir().expect("temporary catalog directory");
+    let catalog = directory.path().join("catalog.sqlite3");
+    let project = create_project(&catalog, "synthetic exact split");
+    // Declare through the CLI so the sequence itself is an ordinary typed operation.
+    let sequence_request = serde_json::json!({
+        "kind":"sequenceDeclare", "cameraKey":"Synthetic Camera", "label":"Card",
+        "volumeHint":"CARD", "filenamePrefix":"SYN_"
+    });
+    let sequence = chronology_apply(&catalog, &project, sequence_request);
+    let sequence_id = sequence["data"]["data"]["sequence"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // These are synthetic rows in the temporary test catalog. The sequence is
+    // created by the domain API; rows stand in for three later imported clips.
+    let connection = Connection::open(&catalog).unwrap();
+    for (asset_id, counter, captured) in [
+        ("clip_one", 1_i64, "2026-01-01T00:00:00Z"),
+        ("clip_two", 2, "2026-01-01T00:01:00Z"),
+        ("clip_later", 2, "2026-01-01T00:02:00Z"),
+    ] {
+        connection.execute(
+            "INSERT INTO assets(id, project_id, fingerprint, path, filename, size_bytes, duration_seconds, frame_rate, width, height, codec, camera, captured_at_raw, best_time, notes, labels_json, removed, rotation_degrees, created_at) VALUES (?1, ?2, ?3, ?4, ?5, 100, 1, 30, 1920, 1080, 'h264', 'Synthetic Camera', ?6, NULL, '', '[]', 0, 0, '2026-01-01T00:00:00Z')",
+            rusqlite::params![asset_id, project, format!("fingerprint-{asset_id}"), format!("/synthetic/{asset_id}.mp4"), format!("{asset_id}.mp4"), captured],
+        ).unwrap();
+        connection.execute(
+            "INSERT INTO asset_capture_sequence(asset_id, project_id, capture_sequence_id, filename_counter) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![asset_id, project, sequence_id, counter],
+        ).unwrap();
+    }
+    drop(connection);
+
+    let preview_request = serde_json::json!({
+        "kind":"split", "sourceSequenceId":sequence_id, "atCounter":2,
+        "label":"Card B", "assetIds":["clip_two"]
+    });
+    let preview = invoke_with_stdin(
+        &catalog,
+        [
+            "chronology",
+            "preview",
+            "--project",
+            &project,
+            "--input",
+            "-",
+        ],
+        &preview_request.to_string(),
+    );
+    assert!(
+        preview.status.success(),
+        "{}",
+        String::from_utf8_lossy(&preview.stderr)
+    );
+    let preview: Value = serde_json::from_slice(&preview.stdout).unwrap();
+    assert_eq!(
+        preview["data"]["data"]["assetIds"],
+        serde_json::json!(["clip_two"])
+    );
+
+    let later_connection = Connection::open(&catalog).unwrap();
+    later_connection.execute(
+        "INSERT INTO assets(id, project_id, fingerprint, path, filename, size_bytes, duration_seconds, frame_rate, width, height, codec, camera, captured_at_raw, best_time, notes, labels_json, removed, rotation_degrees, created_at) VALUES ('clip_after_preview', ?1, 'fingerprint-later', '/synthetic/later.mp4', 'later.mp4', 100, 1, 30, 1920, 1080, 'h264', 'Synthetic Camera', NULL, NULL, '', '[]', 0, 0, '2026-01-01T00:00:00Z')",
+        [&project],
+    ).unwrap();
+    later_connection.execute(
+        "INSERT INTO asset_capture_sequence(asset_id, project_id, capture_sequence_id, filename_counter) VALUES ('clip_after_preview', ?1, ?2, 2)",
+        rusqlite::params![project, sequence_id],
+    ).unwrap();
+    drop(later_connection);
+
+    let stale_request = serde_json::json!({"kind":"split", "preview":preview["data"]["data"]});
+    let stale = invoke_with_stdin(
+        &catalog,
+        ["chronology", "apply", "--project", &project, "--input", "-"],
+        &stale_request.to_string(),
+    );
+    assert!(!stale.status.success());
+    let stale: Value = serde_json::from_slice(&stale.stderr).unwrap();
+    assert_eq!(stale["error"]["code"], "chronology.stale_preview");
+
+    let refreshed = invoke_with_stdin(
+        &catalog,
+        [
+            "chronology",
+            "preview",
+            "--project",
+            &project,
+            "--input",
+            "-",
+        ],
+        &preview_request.to_string(),
+    );
+    let refreshed: Value = serde_json::from_slice(&refreshed.stdout).unwrap();
+    assert_eq!(
+        refreshed["data"]["data"]["assetIds"],
+        serde_json::json!(["clip_two"])
+    );
+    let apply = invoke_with_stdin(
+        &catalog,
+        ["chronology", "apply", "--project", &project, "--input", "-"],
+        &serde_json::json!({"kind":"split", "preview":refreshed["data"]["data"]}).to_string(),
+    );
+    assert!(
+        apply.status.success(),
+        "{}",
+        String::from_utf8_lossy(&apply.stderr)
+    );
+    let assignments = Connection::open(&catalog).unwrap();
+    let moved: String = assignments
+        .query_row(
+            "SELECT capture_sequence_id FROM asset_capture_sequence WHERE asset_id='clip_two'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_ne!(moved, sequence_id);
+    for asset_id in ["clip_later", "clip_after_preview"] {
+        let retained: String = assignments
+            .query_row(
+                "SELECT capture_sequence_id FROM asset_capture_sequence WHERE asset_id=?1",
+                [asset_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(retained, sequence_id);
+    }
+
+    let base_phase = chronology_apply(
+        &catalog,
+        &project,
+        serde_json::json!({"kind":"phaseSet", "phase":{"id":"", "label":"Synthetic trip", "kind":"location", "startAnchorAssetId":null, "endAnchorAssetId":null, "startTripTime":"2026-01-01T00:00:00Z", "endTripTime":"2026-01-01T00:05:00Z", "timezone":"Etc/UTC", "originTimezone":null, "destinationTimezone":null, "displayMode":"local"}}),
+    );
+    let base_phase_id = base_phase["data"]["data"]["phase"]["id"].as_str().unwrap();
+    let phase_split_request = serde_json::json!({"kind":"phaseSplit", "existingPhaseId":base_phase_id, "boundaryAssetId":"clip_two", "direction":"through", "phase":{"id":"", "label":"Synthetic first leg", "kind":"transit", "startAnchorAssetId":null, "endAnchorAssetId":null, "startTripTime":"2026-01-01T00:00:00Z", "endTripTime":"2026-01-01T00:01:00Z", "timezone":"Etc/UTC", "originTimezone":null, "destinationTimezone":null, "displayMode":"local"}});
+    let phase_preview_output = invoke_with_stdin(
+        &catalog,
+        [
+            "chronology",
+            "preview",
+            "--project",
+            &project,
+            "--input",
+            "-",
+        ],
+        &phase_split_request.to_string(),
+    );
+    assert!(
+        phase_preview_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&phase_preview_output.stderr)
+    );
+    let phase_preview: Value = serde_json::from_slice(&phase_preview_output.stdout).unwrap();
+    assert_eq!(
+        phase_preview["data"]["data"]["affectedAssetIds"],
+        serde_json::json!(["clip_later", "clip_one", "clip_two"])
+    );
+    let phase_split_apply = invoke_with_stdin(
+        &catalog,
+        ["chronology", "apply", "--project", &project, "--input", "-"],
+        &serde_json::json!({"kind":"phaseSplit", "preview":phase_preview["data"]["data"]})
+            .to_string(),
+    );
+    assert!(
+        phase_split_apply.status.success(),
+        "{}",
+        String::from_utf8_lossy(&phase_split_apply.stderr)
+    );
+
+    chronology_apply(
+        &catalog,
+        &project,
+        serde_json::json!({"kind":"sameCard", "sequenceId":sequence_id, "atCounter":2, "reason":"synthetic confirmation"}),
+    );
+    chronology_apply(
+        &catalog,
+        &project,
+        serde_json::json!({"kind":"sameCardRestore", "sequenceId":sequence_id, "atCounter":2}),
+    );
+    chronology_apply(
+        &catalog,
+        &project,
+        serde_json::json!({"kind":"exceptionSet", "assetId":"clip_one", "tripTime":"2026-01-01T01:00:00Z", "reason":"synthetic correction"}),
+    );
+    chronology_apply(
+        &catalog,
+        &project,
+        serde_json::json!({"kind":"exceptionClear", "assetId":"clip_one"}),
+    );
+    let phase = chronology_apply(
+        &catalog,
+        &project,
+        serde_json::json!({
+            "kind":"phaseSet", "phase":{"id":"", "label":"Synthetic location", "kind":"location",
+            "startAnchorAssetId":null,"endAnchorAssetId":null,
+            "startTripTime":"2026-01-01T00:00:00Z","endTripTime":"2026-01-02T00:00:00Z",
+            "timezone":"Etc/UTC","originTimezone":null,"destinationTimezone":null,"displayMode":"local"}
+        }),
+    );
+    chronology_apply(
+        &catalog,
+        &project,
+        serde_json::json!({"kind":"phaseRemove", "phaseId":phase["data"]["data"]["phase"]["id"]}),
+    );
+    let constraint = chronology_apply(
+        &catalog,
+        &project,
+        serde_json::json!({"kind":"constraintSet", "earlierAssetId":"clip_one", "laterAssetId":"clip_two", "strength":"soft", "source":"synthetic test"}),
+    );
+    chronology_apply(
+        &catalog,
+        &project,
+        serde_json::json!({"kind":"constraintClear", "constraintId":constraint["data"]["data"]["constraint"]["id"]}),
+    );
+}
+
+#[test]
+fn chronology_reassignment_and_merge_use_reusable_exact_previews() {
+    let directory = tempdir().expect("temporary catalog directory");
+    let catalog = directory.path().join("catalog.sqlite3");
+    let project = create_project(&catalog, "synthetic sequence move");
+    let declare = |label: &str| {
+        chronology_apply(
+            &catalog,
+            &project,
+            serde_json::json!({
+                "kind":"sequenceDeclare", "cameraKey":"Synthetic Camera", "label":label,
+                "volumeHint":label, "filenamePrefix":"SYN_"
+            }),
+        )["data"]["data"]["sequence"]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let original = declare("Original card");
+    let destination = declare("Destination card");
+    let connection = Connection::open(&catalog).unwrap();
+    connection.execute(
+        "INSERT INTO assets(id, project_id, fingerprint, path, filename, size_bytes, duration_seconds, frame_rate, width, height, codec, camera, captured_at_raw, best_time, notes, labels_json, removed, rotation_degrees, created_at) VALUES ('clip_selected', ?1, 'fingerprint-selected', '/synthetic/selected.mp4', 'selected.mp4', 100, 1, 30, 1920, 1080, 'h264', 'Synthetic Camera', '2026-01-01T00:00:00Z', NULL, '', '[]', 0, 0, '2026-01-01T00:00:00Z')",
+        [&project],
+    ).unwrap();
+    connection.execute(
+        "INSERT INTO asset_capture_sequence(asset_id, project_id, capture_sequence_id, filename_counter) VALUES ('clip_selected', ?1, ?2, 1)",
+        rusqlite::params![project, original],
+    ).unwrap();
+    drop(connection);
+
+    let preview = invoke_with_stdin(
+        &catalog,
+        [
+            "chronology",
+            "preview",
+            "--project",
+            &project,
+            "--input",
+            "-",
+        ],
+        &serde_json::json!({
+            "kind":"reassign", "fromSequenceId":original,
+            "intoSequenceId":destination, "assetIds":["clip_selected"]
+        })
+        .to_string(),
+    );
+    assert!(
+        preview.status.success(),
+        "{}",
+        String::from_utf8_lossy(&preview.stderr)
+    );
+    let preview: Value = serde_json::from_slice(&preview.stdout).unwrap();
+    assert_eq!(
+        preview["data"]["data"]["assetIds"],
+        serde_json::json!(["clip_selected"])
+    );
+    assert!(preview["data"]["data"]["factsToken"].as_str().is_some());
+    let apply = invoke_with_stdin(
+        &catalog,
+        ["chronology", "apply", "--project", &project, "--input", "-"],
+        &serde_json::json!({"kind":"reassign", "preview":preview["data"]["data"]}).to_string(),
+    );
+    assert!(
+        apply.status.success(),
+        "{}",
+        String::from_utf8_lossy(&apply.stderr)
+    );
+
+    let merge_preview = invoke_with_stdin(
+        &catalog,
+        [
+            "chronology",
+            "preview",
+            "--project",
+            &project,
+            "--input",
+            "-",
+        ],
+        &serde_json::json!({
+            "kind":"merge", "fromSequenceId":destination,
+            "intoSequenceId":original
+        })
+        .to_string(),
+    );
+    assert!(
+        merge_preview.status.success(),
+        "{}",
+        String::from_utf8_lossy(&merge_preview.stderr)
+    );
+    let merge_preview: Value = serde_json::from_slice(&merge_preview.stdout).unwrap();
+    assert!(
+        merge_preview["data"]["data"]["factsToken"]
+            .as_str()
+            .is_some()
+    );
+    let merge = invoke_with_stdin(
+        &catalog,
+        ["chronology", "apply", "--project", &project, "--input", "-"],
+        &serde_json::json!({"kind":"merge", "preview":merge_preview["data"]["data"]}).to_string(),
+    );
+    assert!(
+        merge.status.success(),
+        "{}",
+        String::from_utf8_lossy(&merge.stderr)
+    );
+    let connection = Connection::open(&catalog).unwrap();
+    let assigned: String = connection
+        .query_row(
+            "SELECT capture_sequence_id FROM asset_capture_sequence WHERE asset_id='clip_selected'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(assigned, original);
 }
 
 fn available_tool(doctor: &Value, name: &str) -> Option<PathBuf> {

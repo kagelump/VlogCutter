@@ -267,6 +267,40 @@ rcdvlog --catalog /absolute/project/catalog.sqlite3 clock apply \
 
 The fixed offset applies from the filename boundary onward for that camera. It does not alter source metadata.
 
+### Revision-safe chronology changes
+
+Chronology facts can be changed through the typed core operations. Requests are
+JSON on stdin (`--input -`) or in a request file. `chronology preview` is
+read-only and returns a reusable `data` value for operations with core preview
+support; send that exact value back as `preview` to `chronology apply`. Those
+preview payloads include the core facts token, solver impact, and exact affected
+identities. If the catalog changed, apply returns `chronology.stale_preview`
+and writes nothing; preview again and review the new impact. Exact
+split/reassignment selections remain pinned to their returned asset IDs, so
+clips imported later are never added implicitly.
+
+```bash
+printf '%s\n' '{"kind":"split","sourceSequenceId":"<sequence>","atCounter":120,"label":"Second card","assetIds":["<clip-a>","<clip-b>"]}' |
+  rcdvlog --catalog /absolute/project/catalog.sqlite3 chronology preview --project <project> --input -
+rcdvlog --catalog /absolute/project/catalog.sqlite3 chronology preview --project <project> --input epoch-request.json
+rcdvlog --catalog /absolute/project/catalog.sqlite3 chronology apply --project <project> --input saved-apply-request.json
+```
+
+Preview kinds are `split`, `reassign`, `merge`, `epochSet`, `epochClear`,
+`sequenceDeclare`, `sameCard`, `sameCardRestore`, `exceptionSet`,
+`exceptionClear`, `phaseSet`, `phaseRemove`, `phaseSplit`, `constraintSet`, and
+`constraintClear`. Apply accepts each kind with its exact preview under
+`preview`. Clock epoch requests use an `epoch` object matching the chronology
+JSON fields. Phases use a `phase` object. A phase-split preview commits both
+resulting phase operations in one transaction. No command edits raw timestamps.
+
+Each CLI process commits an apply atomically. The direct-mutation preview API
+recognizes retry of the same saved candidate after a lost response and returns
+the applied mutation without appending another operation. Specialized sequence
+and epoch previews reject reuse after state changes; after a lost response,
+read the chronology facts before deciding whether to preview again. For a split
+or reassignment, the selected IDs are explicit and cannot grow during retry.
+
 ### Proxies
 
 ```bash

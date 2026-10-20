@@ -561,8 +561,9 @@ fn execute(cli: &Cli) -> Result<Value> {
             command: CamerasCommand::RepairPreview { .. }
         }
     ) || match &cli.command {
-        // The chronology surface never writes; diagnostics only writes to
-        // acknowledge, which changes no project fact (D01-T017).
+        // Chronology read and preview commands use a read-only catalog; apply
+        // opens the writable catalog. Diagnostics acknowledge is a separate
+        // write that changes no project fact (D01-T017).
         Commands::Chronology { command } => chronology_commands::chronology_is_read_only(command),
         Commands::Diagnostics { command } => chronology_commands::diagnostics_is_read_only(command),
         _ => false,
@@ -1283,7 +1284,20 @@ fn project_status(catalog: &Catalog, project_id: &str) -> Result<Value> {
 
 fn error_code(message: &str) -> &'static str {
     let message = message.to_lowercase();
-    if message.contains("catalog schema") || message.contains("migration history") {
+    if message.contains("chronology.invalid_reference")
+        && (message.contains("stale") || message.contains("changed"))
+        || message.contains("preview is stale")
+    {
+        "chronology.stale_preview"
+    } else if message.contains("chronology.invalid_reference") {
+        "chronology.invalid_reference"
+    } else if message.contains("chronology.hard_contradiction") {
+        "chronology.hard_contradiction"
+    } else if message.contains("chronology.invalid_timezone") {
+        "chronology.invalid_timezone"
+    } else if message.contains("chronology.invalid_interval") {
+        "chronology.invalid_interval"
+    } else if message.contains("catalog schema") || message.contains("migration history") {
         "schema_incompatible"
     } else if message.contains(rcdvlog_core::STALE_ASSET_REVISION) {
         // Distinct from every other failure because the caller's correct
