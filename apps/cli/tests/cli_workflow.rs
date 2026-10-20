@@ -186,7 +186,7 @@ fn media_tool_failures_keep_cli_stderr_as_one_redacted_json_value() {
     let shim = shim_dir.join("ffmpeg");
     fs::write(
         &shim,
-        "#!/bin/sh\nprintf 'out_time_us=0\\nprogress=continue\\n'\nfor arg do case \"$arg\" in /*) printf 'synthetic decoder detail for %s\\n' \"$arg\" >&2;; esac; done\nprintf 'synthetic decoder failure\\n' >&2\nexit 1\n",
+        "#!/bin/sh\nprintf 'out_time_us=0\\nprogress=continue\\n'\nfor arg do case \"$arg\" in /*) printf 'synthetic decoder detail for %s\\n' \"$arg\" >&2;; esac; done\nprintf 'Invalid data found while processing input\\n' >&2\nexit 1\n",
     )
     .unwrap();
     fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).unwrap();
@@ -218,7 +218,7 @@ fn media_tool_failures_keep_cli_stderr_as_one_redacted_json_value() {
         assert_eq!(error["ok"], false);
         assert_eq!(error["error"]["code"], "media_tool_failed");
         let message = error["error"]["message"].as_str().unwrap();
-        assert!(message.contains("synthetic decoder failure"));
+        assert!(message.contains("Invalid data found while processing input"));
         assert!(!message.contains(directory.path().to_str().unwrap()));
         assert!(message.len() < 4600, "diagnostic should remain bounded");
     }

@@ -9,7 +9,7 @@ use anyhow::{Context, Result, bail};
 use std::path::Path;
 use std::process::Command;
 
-use crate::{run_captured_media_command, tool_command};
+use crate::{media_tool_failure, run_captured_media_command, tool_command};
 
 /// Extracts 16 kHz mono PCM, the only input format whisper.cpp accepts.
 pub trait AudioExtractor {
@@ -49,7 +49,11 @@ impl AudioExtractor for FfmpegAudioExtractor {
         let (status, diagnostic) = run_captured_media_command(&mut command, source, destination)
             .context("spawn ffmpeg audio extraction process")?;
         if !status.success() {
-            bail!("ffmpeg audio extraction failed with {status}{diagnostic}");
+            return Err(media_tool_failure(
+                "ffmpeg audio extraction",
+                status,
+                diagnostic,
+            ));
         }
         Ok(())
     }

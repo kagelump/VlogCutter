@@ -12,7 +12,7 @@
 //! with a stream copy and the segments are concatenated, so there is no filter
 //! graph that could add one.
 
-use crate::{Catalog, run_captured_media_command, tool_command};
+use crate::{Catalog, media_tool_failure, run_captured_media_command, tool_command};
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -184,7 +184,8 @@ impl Catalog {
                     .context("start ffmpeg preview segment process")?;
 
             if !status.success() {
-                let message = format!("ffmpeg failed with {status}{diagnostic}");
+                let message = media_tool_failure("ffmpeg preview segment", status, diagnostic)
+                    .to_string();
                 progress(PreviewProgress::ClipFailed {
                     position: operation.position,
                     message: message.clone(),
@@ -252,7 +253,11 @@ impl Catalog {
             .context("start ffmpeg preview concat process")?;
         if !status.success() {
             let _ = fs::remove_file(&temporary);
-            bail!("ffmpeg preview concat failed with {status}{diagnostic}");
+            return Err(media_tool_failure(
+                "ffmpeg preview concat",
+                status,
+                diagnostic,
+            ));
         }
         // Renamed only once complete, so a crash mid-render never leaves a
         // truncated file sitting at the preview's path.

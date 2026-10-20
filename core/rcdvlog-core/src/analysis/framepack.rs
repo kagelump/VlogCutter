@@ -15,7 +15,7 @@ use std::process::{Command, Stdio};
 
 use crate::analysis::FRAMEPACK_RECIPE_KEY;
 use crate::analysis::frames::{GrayFrame, score_frames, select_frames};
-use crate::tool_command;
+use crate::{media_tool_failure, redact_media_diagnostic, run_captured_media_command, tool_command};
 
 const CANDIDATE_FPS: u32 = 2;
 const WORK_WIDTH: usize = 320;
@@ -148,7 +148,12 @@ pub fn build_frame_pack(proxy: &Path, fingerprint: &str) -> Result<FramePackMani
         .output()
         .context("spawn ffmpeg frame sampling")?;
     if !output.status.success() {
-        bail!("ffmpeg frame sampling failed with {}", output.status);
+        let diagnostic = redact_media_diagnostic(
+            &String::from_utf8_lossy(&output.stderr),
+            proxy,
+            proxy,
+        );
+        return Err(media_tool_failure("ffmpeg frame sampling", output.status, diagnostic));
     }
     let duration_output = tool_command("ffprobe")
         .args([
@@ -163,10 +168,16 @@ pub fn build_frame_pack(proxy: &Path, fingerprint: &str) -> Result<FramePackMani
         .output()
         .context("spawn ffprobe frame-pack duration")?;
     if !duration_output.status.success() {
-        bail!(
-            "ffprobe frame-pack duration failed with {}",
-            duration_output.status
+        let diagnostic = redact_media_diagnostic(
+            &String::from_utf8_lossy(&duration_output.stderr),
+            proxy,
+            proxy,
         );
+        return Err(media_tool_failure(
+            "ffprobe frame-pack duration",
+            duration_output.status,
+            diagnostic,
+        ));
     }
     let duration_ms = String::from_utf8_lossy(&duration_output.stdout)
         .trim()
@@ -204,11 +215,11 @@ pub fn encode_frames(
     let mut written = Vec::new();
     for timestamp in &manifest.timestamps_ms {
         let path = directory.join(format!("f{timestamp:08}.jpg"));
-        let status = jpeg_command(proxy, *timestamp, &path)
-            .status()
+        let mut command = jpeg_command(proxy, *timestamp, &path);
+        let (status, diagnostic) = run_captured_media_command(&mut command, proxy, &path)
             .context("spawn ffmpeg frame encode")?;
         if !status.success() {
-            bail!("ffmpeg frame encode failed with {status}");
+            return Err(media_tool_failure("ffmpeg frame encode", status, diagnostic));
         }
         written.push(path);
     }

@@ -1651,11 +1651,11 @@ impl Catalog {
         )?;
         if !result.status.success() {
             let _ = fs::remove_file(&temporary);
-            bail!(
-                "ffmpeg proxy generation failed with {}{}",
+            return Err(media_tool_failure(
+                "ffmpeg proxy generation",
                 result.status,
-                result.diagnostic
-            );
+                result.diagnostic,
+            ));
         }
         let proxy_probe = probe_media_stream(&temporary);
         match proxy_probe {
@@ -3106,9 +3106,11 @@ impl Catalog {
             .context("start ffmpeg thumbnail process")?;
         if !status.success() {
             let _ = fs::remove_file(&temporary);
-            bail!(
-                "ffmpeg thumbnail generation failed with {status}{diagnostic}"
-            );
+            return Err(media_tool_failure(
+                "ffmpeg thumbnail generation",
+                status,
+                diagnostic,
+            ));
         }
         fs::rename(&temporary, &output)?;
         self.connection()?.execute(
@@ -4047,6 +4049,29 @@ pub struct NormalizedMediaProbe {
     pub enrichment_warning: Option<String>,
 }
 
+/// A media executable exited unsuccessfully. Kept typed so CLI adapters can
+/// preserve the stable `media_tool_failed` code regardless of child wording.
+#[derive(Debug, thiserror::Error)]
+#[error("{tool} failed with {status}{diagnostic}")]
+pub struct MediaToolFailure {
+    tool: &'static str,
+    status: String,
+    diagnostic: String,
+}
+
+fn media_tool_failure(
+    tool: &'static str,
+    status: impl std::fmt::Display,
+    diagnostic: String,
+) -> anyhow::Error {
+    MediaToolFailure {
+        tool,
+        status: status.to_string(),
+        diagnostic,
+    }
+    .into()
+}
+
 /// Probes a media file with configured ffprobe and optional ExifTool,
 /// returning a normalized DTO suitable for cross-node persistence.
 pub fn probe_media_normalized(
@@ -4158,10 +4183,12 @@ fn probe_media_document_with(path: &Path, ffprobe_program: &Path) -> Result<Valu
         crate::stall::io_stall_timeout(),
     )?;
     if !output.status.success() {
-        bail!(
-            "ffprobe failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
+        let diagnostic = redact_media_diagnostic(
+            &String::from_utf8_lossy(&output.stderr),
+            path,
+            path,
         );
+        return Err(media_tool_failure("ffprobe", output.status, diagnostic));
     }
     serde_json::from_slice(&output.stdout).context("parse ffprobe JSON")
 }
@@ -4282,10 +4309,12 @@ fn probe_media_document(path: &Path) -> Result<Value> {
         crate::stall::io_stall_timeout(),
     )?;
     if !output.status.success() {
-        bail!(
-            "ffprobe failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
+        let diagnostic = redact_media_diagnostic(
+            &String::from_utf8_lossy(&output.stderr),
+            path,
+            path,
         );
+        return Err(media_tool_failure("ffprobe", output.status, diagnostic));
     }
     serde_json::from_slice(&output.stdout).context("parse ffprobe JSON")
 }

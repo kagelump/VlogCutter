@@ -1178,12 +1178,21 @@ fn main() -> ExitCode {
         Err(error) => {
             let message = format!("{error:#}");
             let remote = error.downcast_ref::<server_commands::RemoteCommandError>();
+            let media_tool_failure =
+                error.downcast_ref::<rcdvlog_core::MediaToolFailure>().is_some();
+            let code = if let Some(remote) = remote {
+                remote.code.as_str()
+            } else if media_tool_failure {
+                "media_tool_failed"
+            } else {
+                error_code(&message)
+            };
             write_json(
                 &json!({
                     "ok": false,
                     "command": name,
                     "error": {
-                        "code": remote.map(|error| error.code.as_str()).unwrap_or_else(|| error_code(&message)),
+                        "code": code,
                         "message": message,
                         "requestId": remote.and_then(|error| error.request_id.as_deref()),
                     }
