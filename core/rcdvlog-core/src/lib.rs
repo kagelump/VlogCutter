@@ -5070,6 +5070,13 @@ mod tests {
         proxy_path
     }
 
+    fn mark_asset_video_usable(catalog: &Catalog, asset_id: &str) {
+        let asset = catalog.get_asset(asset_id).unwrap();
+        catalog
+            .store_video_validation(asset_id, &asset.fingerprint, "usable", None)
+            .unwrap();
+    }
+
     #[test]
     fn proxy_fingerprint_changes_when_the_proxy_is_regenerated() {
         let (directory, catalog, project) = catalog_fixture();
@@ -5159,6 +5166,7 @@ mod tests {
             Path::new("/volumes/nas/DJI_0001.MP4"),
         );
         attach_stub_proxy(&catalog, "a1", directory.path(), b"proxy bytes");
+        mark_asset_video_usable(&catalog, "a1");
         let error = catalog.transcribe_missing(&project.id).unwrap_err();
         assert!(
             error.to_string().contains("is not installed"),
@@ -5887,6 +5895,7 @@ mod tests {
             "2026-07-18T00:00:00Z",
             directory.path().join("missing.mp4").as_path(),
         );
+        mark_asset_video_usable(&catalog, "asset_offline");
         assert!(!catalog.get_asset("asset_offline").unwrap().available);
         let report = catalog.generate_missing_proxies(&project.id).unwrap();
         assert_eq!(report.generated, 0);

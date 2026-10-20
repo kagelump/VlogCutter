@@ -36,7 +36,7 @@ export function AnalysisDialog({
 
         {(readiness.unverifiedVideoClips > 0 || readiness.quarantinedVideoClips > 0 || readiness.unavailableVideoClips > 0) && (
           <p className="blocking-note" role="status">
-            Analysis includes {readiness.totalClips} usable video clips. {readiness.reachableOriginals} original files are reachable; {readiness.unverifiedVideoClips} clips need validation, {readiness.quarantinedVideoClips} are quarantined, and {readiness.unavailableVideoClips} have neither source bytes nor a proxy available. Use <code>clips validate-video --asset &lt;id&gt;</code> after checking each source.
+            Analysis includes {readiness.totalClips} usable video clips. {readiness.reachableOriginals} original files are reachable; {readiness.unverifiedVideoClips} {readiness.unverifiedVideoClips === 1 ? "clip needs" : "clips need"} validation, {readiness.quarantinedVideoClips} {readiness.quarantinedVideoClips === 1 ? "clip is" : "clips are"} quarantined, and {readiness.unavailableVideoClips} {readiness.unavailableVideoClips === 1 ? "clip has" : "clips have"} neither source bytes nor a proxy available. Use <code>clips validate-video --asset &lt;id&gt;</code> after checking each source.
           </p>
         )}
 
