@@ -150,6 +150,24 @@ validated usable clips enter analysis totals. Run
 originals can be checked through an existing proxy. A prior usable validation
 remains useful while its proxy is available.
 
+### Camera identity repair
+
+```bash
+rcdvlog --catalog /absolute/project/catalog.sqlite3 ingest --project <project-id> \
+  --folder /absolute/media --camera "DJI Pocket 3"
+rcdvlog --catalog /absolute/project/catalog.sqlite3 cameras repair-preview \
+  --project <project-id> --camera "DJI Pocket 3" --asset <asset-id> --asset <asset-id>
+rcdvlog --catalog /absolute/project/catalog.sqlite3 cameras repair --preview /tmp/camera-repair.json
+```
+
+`ingest --camera` is an explicit per-run identity choice for newly imported
+clips. For an existing catalog, save the `repair-preview` JSON verbatim and
+pass that file to `cameras repair`; stale previews are refused. Repair updates
+only the selected assets and their filename counters. Partial card selections
+receive a separate capture sequence, preserving the other assets and card
+counter spaces. A NULL counter is filled only when the preserved filename
+matches a known camera pattern.
+
 ### Smart ingest camera mappings
 
 ```bash

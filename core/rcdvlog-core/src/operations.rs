@@ -20,6 +20,7 @@ pub const PROJECT_ASSET_MEMBERSHIP_SET: &str = "projectAssetMembershipSet";
 pub const PROJECT_ASSET_MEDIA_LINKED: &str = "projectAssetMediaLinked";
 pub const CLOCK_EVENT_CREATED: &str = "clockEventCreated";
 pub const CAMERA_IDENTITY_MERGED: &str = "cameraIdentityMerged";
+pub const CAMERA_ASSETS_REPAIRED: &str = "cameraAssetsRepaired";
 pub const CAPTURE_SEQUENCE_DECLARED: &str = "captureSequenceDeclared";
 pub const CAPTURE_SEQUENCE_SPLIT: &str = "captureSequenceSplit";
 pub const CAPTURE_SEQUENCE_SPLIT_EXACT: &str = "captureSequenceSplitExact";
@@ -53,6 +54,7 @@ pub const STALE_ASSET_REVISION: &str = "stale asset revision";
 
 pub(crate) const CHRONOLOGY_OPERATION_TYPES: &[&str] = &[
     CAMERA_IDENTITY_MERGED,
+    CAMERA_ASSETS_REPAIRED,
     CAPTURE_SEQUENCE_DECLARED,
     CAPTURE_SEQUENCE_SPLIT,
     CAPTURE_SEQUENCE_SPLIT_EXACT,
@@ -86,6 +88,7 @@ pub(crate) const KNOWN_OPERATION_TYPES: &[&str] = &[
     PROJECT_ASSET_MEDIA_LINKED,
     CLOCK_EVENT_CREATED,
     CAMERA_IDENTITY_MERGED,
+    CAMERA_ASSETS_REPAIRED,
     CAPTURE_SEQUENCE_DECLARED,
     CAPTURE_SEQUENCE_SPLIT,
     CAPTURE_SEQUENCE_SPLIT_EXACT,
@@ -325,6 +328,23 @@ pub(crate) struct CameraIdentityMergedPayload {
 pub(crate) struct CameraSequenceAssignmentPayload {
     pub(crate) asset_id: String,
     pub(crate) capture_sequence_id: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CameraAssetsRepairedPayload {
+    camera: String,
+    assignments: Vec<CameraAssetRepairAssignment>,
+    new_sequences: Vec<crate::chronology::CaptureSequence>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CameraAssetRepairAssignment {
+    asset_id: String,
+    source_capture_sequence_id: String,
+    capture_sequence_id: String,
+    filename_counter: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1819,6 +1839,7 @@ pub(crate) fn materialize_operation(
         CAMERA_IDENTITY_MERGED => {
             return materialize_camera_identity_merged(transaction, operation);
         }
+        CAMERA_ASSETS_REPAIRED => return materialize_camera_assets_repaired(transaction, operation),
         CAPTURE_SEQUENCE_DECLARED => {
             return materialize_capture_sequence_declared(transaction, operation);
         }
@@ -2090,6 +2111,91 @@ fn materialize_camera_identity_merged(
             "UPDATE asset_capture_sequence SET capture_sequence_id=?1 WHERE asset_id=?2 AND project_id=?3",
             params![assignment.capture_sequence_id, assignment.asset_id, operation.project_id],
         )?;
+    }
+    advance_revision(transaction, operation)?;
+    Ok(ApplyOperationResult::Applied)
+}
+
+fn materialize_camera_assets_repaired(
+    transaction: &Transaction<'_>,
+    operation: &ProjectOperation,
+) -> Result<ApplyOperationResult> {
+    let payload: CameraAssetsRepairedPayload = payload(operation)?;
+    if operation.aggregate_type != "cameraRepair" || operation.aggregate_id != "assets" {
+        bail!("cameraAssetsRepaired requires the cameraRepair/assets aggregate");
+    }
+    if payload.camera.trim().is_empty() || payload.assignments.is_empty() {
+        bail!("cameraAssetsRepaired requires a camera and at least one assignment");
+    }
+    if payload.assignments.iter().any(|assignment| assignment.filename_counter.is_some_and(|counter| i64::try_from(counter).is_err())) {
+        bail!("cameraAssetsRepaired filename counter exceeds SQLite integer range");
+    }
+    if !revision_guard_passes(transaction, operation)? {
+        return Ok(ApplyOperationResult::Conflict);
+    }
+    let mut ids = BTreeSet::new();
+    let mut sequences = BTreeSet::new();
+    for assignment in &payload.assignments {
+        if !ids.insert(&assignment.asset_id) || assignment.capture_sequence_id.trim().is_empty() {
+            bail!("cameraAssetsRepaired assignments must have unique assets and valid sequences");
+        }
+        sequences.insert(assignment.capture_sequence_id.as_str());
+    }
+    for sequence in &payload.new_sequences {
+        if sequence.id.trim().is_empty() || sequence.camera_key != payload.camera {
+            bail!("cameraAssetsRepaired new sequence has invalid identity");
+        }
+        let existing: Option<(String,String,String,String,String)> = transaction.query_row(
+            "SELECT project_id,camera_key,label,volume_hint,filename_prefix FROM capture_sequences WHERE id=?1",
+            [&sequence.id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
+        ).optional()?;
+        if let Some(existing)=existing {
+            if existing!=(operation.project_id.clone(),sequence.camera_key.clone(),sequence.label.clone(),sequence.volume_hint.clone(),sequence.filename_prefix.clone()) {
+                bail!("cameraAssetsRepaired destination sequence identity collision");
+            }
+        } else {
+            transaction.execute(
+                "INSERT INTO capture_sequences(id,project_id,camera_key,label,volume_hint,filename_prefix,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                params![sequence.id, operation.project_id, sequence.camera_key, sequence.label, sequence.volume_hint, sequence.filename_prefix, now()],
+            )?;
+        }
+    }
+    let new_sequence_ids = payload.new_sequences.iter().map(|s| s.id.as_str()).collect::<BTreeSet<_>>();
+    for sequence_id in sequences {
+        if new_sequence_ids.contains(sequence_id) { continue; }
+        let total: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM asset_capture_sequence WHERE project_id=?1 AND capture_sequence_id=?2",
+            params![operation.project_id, sequence_id], |row| row.get(0))?;
+        let selected = payload.assignments.iter().filter(|a| a.capture_sequence_id == sequence_id).count() as i64;
+        if total != selected {
+            bail!("cameraAssetsRepaired must select every asset in each affected capture sequence");
+        }
+        transaction.execute(
+            "UPDATE capture_sequences SET camera_key=?1 WHERE project_id=?2 AND id=?3",
+            params![payload.camera, operation.project_id, sequence_id],
+        )?;
+    }
+    for assignment in &payload.assignments {
+        let affected = transaction.execute(
+            "UPDATE assets SET camera=?1 WHERE id=?2 AND project_id=?3",
+            params![payload.camera, assignment.asset_id, operation.project_id],
+        )?;
+        if affected != 1 { bail!("cameraAssetsRepaired asset is missing during replay: {}", assignment.asset_id); }
+        let affected = transaction.execute(
+            "UPDATE asset_capture_sequence SET capture_sequence_id=?1, filename_counter=?2 WHERE asset_id=?3 AND project_id=?4 AND capture_sequence_id=?5",
+            params![assignment.capture_sequence_id, assignment.filename_counter.map(|value| value as i64), assignment.asset_id, operation.project_id, assignment.source_capture_sequence_id],
+        )?;
+        if affected != 1 { bail!("cameraAssetsRepaired sequence membership is missing: {}", assignment.asset_id); }
+        let mut affected_aggregates=vec![("projectAsset", assignment.asset_id.as_str()),("captureSequence", assignment.source_capture_sequence_id.as_str())];
+        if assignment.source_capture_sequence_id!=assignment.capture_sequence_id {
+            affected_aggregates.push(("captureSequence",assignment.capture_sequence_id.as_str()));
+        }
+        for (aggregate_type, aggregate_id) in affected_aggregates {
+            transaction.execute(
+                "INSERT INTO materialized_revisions(project_id,aggregate_type,aggregate_id,revision,last_operation_id) VALUES (?1,?2,?3,1,?4) ON CONFLICT(project_id,aggregate_type,aggregate_id) DO UPDATE SET revision=revision+1,last_operation_id=excluded.last_operation_id",
+                params![operation.project_id, aggregate_type, aggregate_id, operation.operation_id],
+            )?;
+        }
     }
     advance_revision(transaction, operation)?;
     Ok(ApplyOperationResult::Applied)

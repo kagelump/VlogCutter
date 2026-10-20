@@ -915,11 +915,23 @@ fn media_workflow_runs_end_to_end_through_the_agent_cli() {
             &project_id,
             "--folder",
             source_dir.to_str().unwrap(),
+            "--camera",
+            "Synthetic selected camera",
         ],
     );
     assert_eq!(ingest.json["data"]["scanned"], 1);
     assert_eq!(ingest.json["data"]["imported"], 1);
     assert_eq!(ingest.json["data"]["failures"].as_array().unwrap().len(), 0);
+    let imported=success(&catalog,["clips","list","--project",&project_id]);
+    let asset_id=imported.json["data"]["items"][0]["id"].as_str().unwrap();
+    let asset=success(&catalog,["clips","get","--asset",asset_id]);
+    assert_eq!(asset.json["data"]["camera"],"Synthetic selected camera");
+    let repair_preview=success(&catalog,["cameras","repair-preview","--project",&project_id,"--camera","Corrected Synthetic Camera","--asset",asset_id]);
+    let preview_path=directory.path().join("camera-repair-preview.json");
+    fs::write(&preview_path,serde_json::to_vec(&repair_preview.json).unwrap()).unwrap();
+    success(&catalog,["cameras","repair","--preview",preview_path.to_str().unwrap()]);
+    let repaired=success(&catalog,["clips","get","--asset",asset_id]);
+    assert_eq!(repaired.json["data"]["camera"],"Corrected Synthetic Camera");
     let progress: Value = serde_json::from_str(ingest.stderr.trim()).expect("JSON progress event");
     assert_eq!(progress["event"], "ingest.progress");
     assert_eq!(progress["completed"], 1);

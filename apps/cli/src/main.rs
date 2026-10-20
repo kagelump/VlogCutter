@@ -69,6 +69,9 @@ enum Commands {
         project: String,
         #[arg(long)]
         folder: PathBuf,
+        /// Explicitly assign every newly imported asset to this project camera.
+        #[arg(long)]
+        camera: Option<String>,
     },
     /// Find originals this project has lost track of. Never imports new media.
     Relink {
@@ -232,6 +235,16 @@ enum CameraMappingsCommand {
 
 #[derive(Debug, Subcommand)]
 enum CamerasCommand {
+    /// Preview exact selected asset identity and parsed counter repairs.
+    RepairPreview {
+        #[arg(long)] project: String,
+        #[arg(long)] camera: String,
+        #[arg(long="asset", required=true, num_args=1..)] assets: Vec<String>,
+    },
+    /// Apply an unchanged repair preview JSON file.
+    Repair {
+        #[arg(long)] preview: PathBuf,
+    },
     /// Count the clips and cards that would move. Does not mutate the catalog.
     MergePreview {
         #[arg(long)]
@@ -440,6 +453,8 @@ fn command_name(command: &Commands) -> &'static str {
             CameraMappingsCommand::Clear { .. } => "camera-mappings.clear",
         },
         Commands::Cameras { command } => match command {
+            CamerasCommand::RepairPreview { .. } => "cameras.repair-preview",
+            CamerasCommand::Repair { .. } => "cameras.repair",
             CamerasCommand::MergePreview { .. } => "cameras.merge-preview",
             CamerasCommand::Merge { .. } => "cameras.merge",
         },
@@ -538,6 +553,8 @@ fn execute(cli: &Cli) -> Result<Value> {
             command: CameraMappingsCommand::List { .. }
         } | Commands::Cameras {
             command: CamerasCommand::MergePreview { .. }
+        } | Commands::Cameras {
+            command: CamerasCommand::RepairPreview { .. }
         }
     ) || match &cli.command {
         // The chronology surface never writes; diagnostics only writes to
@@ -589,6 +606,16 @@ fn execute(cli: &Cli) -> Result<Value> {
             }
         },
         Commands::Cameras { command } => match command {
+            CamerasCommand::RepairPreview { project, camera, assets } => Ok(serde_json::to_value(
+                catalog.preview_camera_repair(project, camera, assets)?,
+            )?),
+            CamerasCommand::Repair { preview } => {
+                let value: Value = serde_json::from_slice(&std::fs::read(preview)?)?;
+                let preview: rcdvlog_core::CameraRepairPreview = serde_json::from_value(
+                    value.get("data").cloned().unwrap_or(value),
+                )?;
+                Ok(json!({"repaired":catalog.apply_camera_repair(&preview)?,"projectId":preview.project_id,"camera":preview.camera}))
+            }
             CamerasCommand::MergePreview {
                 project,
                 from,
@@ -604,8 +631,14 @@ fn execute(cli: &Cli) -> Result<Value> {
                 catalog.merge_camera(project, from, into)?,
             )?),
         },
-        Commands::Ingest { project, folder } => Ok(serde_json::to_value(
-            catalog.ingest_folder_with_progress(project, folder, |completed, total, path| {
+        Commands::Ingest { project, folder, camera } => Ok(serde_json::to_value(
+            match camera {
+                Some(camera) => catalog.ingest_folder_with_camera(project, folder, camera, |completed, total, path| {
+                    if completed == total || completed % 25 == 0 {
+                        eprintln!("{}", json!({"event":"ingest.progress", "completed":completed, "total":total, "path":path}));
+                    }
+                })?,
+                None => catalog.ingest_folder_with_progress(project, folder, |completed, total, path| {
                 if completed == total || completed % 25 == 0 {
                     eprintln!(
                         "{}",
@@ -617,7 +650,8 @@ fn execute(cli: &Cli) -> Result<Value> {
                         })
                     );
                 }
-            })?,
+                })?,
+            },
         )?),
         Commands::Relink { project, folder } => Ok(serde_json::to_value(catalog.relink_folder(
             project,
