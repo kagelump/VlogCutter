@@ -513,6 +513,27 @@ mod tests {
     }
 
     #[test]
+    fn exact_unknown_repair_keeps_an_unselected_card_and_its_counter_space() {
+        let (_directory,catalog,project_id)=fixture();
+        let connection=catalog.connection().unwrap();
+        connection.execute("UPDATE assets SET camera='Unknown camera' WHERE id IN ('a_wrong_1','a_wrong_2')",[]).unwrap();
+        connection.execute("UPDATE capture_sequences SET camera_key='Unknown camera' WHERE id IN ('card_wrong_a','card_wrong_b')",[]).unwrap();
+        connection.execute("UPDATE asset_capture_sequence SET filename_counter=42 WHERE asset_id='a_wrong_1'",[]).unwrap();
+        connection.execute("UPDATE asset_capture_sequence SET filename_counter=7 WHERE asset_id='a_wrong_2'",[]).unwrap();
+        drop(connection);
+
+        let preview=catalog.preview_camera_repair(&project_id,"DJI Pocket 3",&["a_wrong_1".into()]).unwrap();
+        assert_eq!(preview.capture_sequence_ids,vec!["card_wrong_a"]);
+        catalog.apply_camera_repair(&preview).unwrap();
+
+        let connection=catalog.connection().unwrap();
+        let selected:(String,String,i64)=connection.query_row("SELECT a.camera,acs.capture_sequence_id,acs.filename_counter FROM assets a JOIN asset_capture_sequence acs ON acs.asset_id=a.id WHERE a.id='a_wrong_1'",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+        let retained:(String,String,String,i64)=connection.query_row("SELECT a.camera,acs.capture_sequence_id,cs.camera_key,acs.filename_counter FROM assets a JOIN asset_capture_sequence acs ON acs.asset_id=a.id JOIN capture_sequences cs ON cs.id=acs.capture_sequence_id WHERE a.id='a_wrong_2'",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
+        assert_eq!(selected,("DJI Pocket 3".into(),"card_wrong_a".into(),42));
+        assert_eq!(retained,("Unknown camera".into(),"card_wrong_b".into(),"Unknown camera".into(),7));
+    }
+
+    #[test]
     fn partial_card_repair_creates_a_separate_sequence() {
         let (_directory,catalog,project_id)=fixture();
         catalog.connection().unwrap().execute("UPDATE asset_capture_sequence SET capture_sequence_id='card_wrong_a' WHERE asset_id='a_wrong_2'",[]).unwrap();
