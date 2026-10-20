@@ -371,11 +371,15 @@ their serving model; prior retry histories are not reconstructable, so those
 rows keep an empty attempted-model list and mark usage incomplete.
 
 `transcribe missing` and `analyze missing` reports include a `cancelled` flag,
-and the analysis report also includes `budgetExhausted`. Both are always `false`
-from the CLI, which never stops a batch early; they exist because the desktop
-shares these methods and can. A budget stop additionally appends a failure entry
-naming the ceiling, while a cancellation does not — stopping on request is not a
-failure. `labels consolidate` makes one text-only request and remaps only labels whose local authorship record says analysis created them; it never changes human-only labels.
+and the analysis report also includes `budgetExhausted`. `cancelled` is always
+`false` from the CLI, which does not expose cancellation. The CLI honors
+`analyze missing --budget-usd`; `budgetExhausted` is true when returned usage
+reaches the ceiling. The ceiling is checked after each completed request, so
+already in-flight requests can finish first. A budget stop additionally appends
+a failure entry naming the ceiling, while a cancellation does not — stopping on
+request is not a failure. `labels consolidate` makes one text-only request and
+remaps only labels whose local authorship record says analysis created them; it
+never changes human-only labels.
 
 Rough-cut selection and source ranges remain separate from the labeling phase.
 The core and desktop now have an initial edit-plan/preview/OTIO path, but the
