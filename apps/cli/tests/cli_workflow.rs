@@ -183,6 +183,10 @@ fn legacy_asset_with_incomplete_video_stream_is_not_reported_usable() {
     let listed = success(&catalog, ["clips", "list", "--project", &project]);
     let asset_id = listed.json["data"]["items"][0]["id"].as_str().unwrap();
     assert_eq!(ingest.json["data"]["imported"], 1);
+    Connection::open(&catalog)
+        .unwrap()
+        .execute("DELETE FROM asset_video_validation WHERE asset_id = ?1", [asset_id])
+        .unwrap();
 
     let shim_dir = directory.path().join("shim");
     fs::create_dir_all(&shim_dir).unwrap();
@@ -198,8 +202,40 @@ fn legacy_asset_with_incomplete_video_stream_is_not_reported_usable() {
     assert_eq!(data["representations"]["originalReadiness"]["bytesReachable"], true);
     assert_eq!(data["representations"]["originalReadiness"]["usableVideo"], false);
     assert_eq!(data["representations"]["originalReadiness"]["diagnosis"], "incomplete_video_stream");
+    assert_eq!(data["representations"]["catalogVideoValidation"]["status"], "unverified");
     assert!(data["warnings"].as_array().unwrap().iter().any(|warning| warning.as_str().unwrap().contains("not usable video")));
     assert!(data["recommendedActions"].as_array().unwrap().iter().any(|action| action.as_str().unwrap().contains("valid dimensions")));
+
+    let unverified_status = success(&catalog, ["project", "status", "--project", &project]);
+    assert_eq!(unverified_status.json["data"]["analysisReadiness"]["totalClips"], 0);
+    assert_eq!(unverified_status.json["data"]["analysisReadiness"]["unverifiedVideoClips"], 1);
+    assert_eq!(unverified_status.json["data"]["analysisReadiness"]["reachableOriginals"], 1);
+
+    let operations_before = Connection::open(&catalog)
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM project_operations", [], |row| row.get::<_, i64>(0))
+        .unwrap();
+    let validation = invoke_with_path(&catalog, ["clips", "validate-video", "--asset", asset_id], shim_dir.as_os_str());
+    assert!(validation.status.success(), "{}", String::from_utf8_lossy(&validation.stderr));
+    let validation: Value = serde_json::from_slice(&validation.stdout).unwrap();
+    assert_eq!(validation["data"]["status"], "quarantined");
+    assert_eq!(validation["data"]["bytesReachable"], true);
+    assert!(validation["data"]["diagnostic"].as_str().unwrap().contains("frame rate"));
+    let operations_after = Connection::open(&catalog)
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM project_operations", [], |row| row.get::<_, i64>(0))
+        .unwrap();
+    assert_eq!(operations_after, operations_before);
+
+    let status = success(&catalog, ["project", "status", "--project", &project]);
+    assert_eq!(status.json["data"]["media"]["assets"], 1);
+    assert_eq!(status.json["data"]["media"]["durationSeconds"], 0.0);
+    assert_eq!(status.json["data"]["media"]["videoValidation"]["usableVideo"], 0);
+    assert_eq!(status.json["data"]["media"]["videoValidation"]["quarantinedVideo"], 1);
+    assert_eq!(status.json["data"]["media"]["videoValidation"]["reachableOriginals"], 1);
+    assert_eq!(status.json["data"]["analysisReadiness"]["totalClips"], 0);
+    assert_eq!(status.json["data"]["analysisReadiness"]["quarantinedVideoClips"], 1);
+    assert_eq!(status.json["data"]["analysisReadiness"]["reachableOriginals"], 1);
     assert_eq!(fs::read(&source).unwrap(), original_bytes);
 }
 

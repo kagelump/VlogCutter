@@ -34,6 +34,12 @@ export function AnalysisDialog({
         <span className="eyebrow">Analyze project</span>
         <h2 id="analysis-title">{projectName}</h2>
 
+        {(readiness.unverifiedVideoClips > 0 || readiness.quarantinedVideoClips > 0 || readiness.unavailableVideoClips > 0) && (
+          <p className="blocking-note" role="status">
+            Analysis includes {readiness.totalClips} usable video clips. {readiness.reachableOriginals} original files are reachable; {readiness.unverifiedVideoClips} clips need validation, {readiness.quarantinedVideoClips} are quarantined, and {readiness.unavailableVideoClips} have neither source bytes nor a proxy available. Use <code>clips validate-video --asset &lt;id&gt;</code> after checking each source.
+          </p>
+        )}
+
         <ol className="stage-plan">
           <li>
             <strong>{readiness.missingProxies}</strong>

@@ -277,6 +277,10 @@ export interface AnalysisRunRecord {
 export interface AnalysisReadiness {
   projectId: string;
   totalClips: number;
+  reachableOriginals: number;
+  unverifiedVideoClips: number;
+  quarantinedVideoClips: number;
+  unavailableVideoClips: number;
   missingProxies: number;
   missingTranscripts: number;
   missingAnalyses: number;

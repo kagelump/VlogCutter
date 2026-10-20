@@ -7,7 +7,7 @@ use thiserror::Error;
 
 use crate::chronology::forward_migrate_project_chronology;
 
-pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 25;
+pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 26;
 
 const MIGRATION_TABLE_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -233,6 +233,12 @@ pub const PROJECT_CATALOG_MIGRATIONS: &[SqliteMigration] = &[
         name: "volume_identity",
         source_identity: "project-catalog/0025-volume-identity/20260820",
         apply: add_volume_identity,
+    },
+    SqliteMigration {
+        id: 26,
+        name: "asset_video_validation",
+        source_identity: "project-catalog/0026-asset-video-validation/20261020",
+        apply: add_asset_video_validation,
     },
 ];
 
@@ -1384,6 +1390,27 @@ fn add_volume_identity(transaction: &Transaction<'_>) -> Result<()> {
         "project_asset_local_locations",
         "volume_id",
         "TEXT",
+    )?;
+    Ok(())
+}
+
+/// Persist explicit video validation without rewriting asset facts or operation history.
+/// Existing rows intentionally begin unverified because migration cannot inspect media.
+fn add_asset_video_validation(transaction: &Transaction<'_>) -> Result<()> {
+    transaction.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS asset_video_validation (
+            asset_id TEXT PRIMARY KEY REFERENCES assets(id) ON DELETE CASCADE,
+            fingerprint TEXT NOT NULL,
+            status TEXT NOT NULL CHECK(status IN ('usable', 'quarantined')),
+            diagnostic TEXT,
+            validated_at TEXT NOT NULL,
+            CHECK((status = 'usable' AND diagnostic IS NULL) OR
+                  (status = 'quarantined' AND diagnostic IS NOT NULL))
+        );
+        CREATE INDEX IF NOT EXISTS asset_video_validation_status
+            ON asset_video_validation(status);
+        "#,
     )?;
     Ok(())
 }

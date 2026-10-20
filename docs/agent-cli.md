@@ -142,6 +142,13 @@ diagnostics; streams missing required fields receive per-file
 failure evidence, and neither kind creates an asset or counts as imported. For older catalogs,
 `clips diagnose --asset <id>` reports byte reachability separately from usable
 video and recommends keeping a no-video row out of review and chronology.
+Migration leaves preexisting rows `unverified` because it cannot inspect
+originals. `project status` and analysis readiness distinguish reachable source
+bytes from usable, unverified, quarantined, and unavailable video counts. Only
+validated usable clips enter analysis totals. Run
+`clips validate-video --asset <id>` to persist a live source check. Offline
+originals can be checked through an existing proxy. A prior usable validation
+remains useful while its proxy is available.
 
 ### Smart ingest camera mappings
 

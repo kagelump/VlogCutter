@@ -102,7 +102,7 @@ describe("reload paths", () => {
     await waitFor(() => expect(listAssets).toHaveBeenCalledTimes(1));
 
     listAssets.mockResolvedValue([{ id: "asset_1" }]);
-    analysisReadiness.mockResolvedValue({ projectId: "project_a", totalClips: 1 });
+    analysisReadiness.mockResolvedValue({ projectId: "project_a", totalClips: 1, reachableOriginals: 1, unverifiedVideoClips: 0, quarantinedVideoClips: 0, unavailableVideoClips: 0 });
 
     // Issued together, as the app does after an import: each has to land.
     await act(async () => {
@@ -110,7 +110,7 @@ describe("reload paths", () => {
     });
 
     expect(result.current.assets).toEqual([{ id: "asset_1" }]);
-    expect(result.current.readiness).toEqual({ projectId: "project_a", totalClips: 1 });
+    expect(result.current.readiness).toEqual({ projectId: "project_a", totalClips: 1, reachableOriginals: 1, unverifiedVideoClips: 0, quarantinedVideoClips: 0, unavailableVideoClips: 0 });
   });
 
   it("report a failed queue read as retryable, and clear it when the retry works", async () => {
@@ -149,10 +149,10 @@ describe("reload paths", () => {
       );
     });
 
-    analysisReadiness.mockResolvedValue({ projectId: "project_b", totalClips: 2 });
+    analysisReadiness.mockResolvedValue({ projectId: "project_b", totalClips: 2, reachableOriginals: 2, unverifiedVideoClips: 0, quarantinedVideoClips: 0, unavailableVideoClips: 0 });
     rerender({ project: "project_b" });
     await waitFor(() =>
-      expect(result.current.readiness).toEqual({ projectId: "project_b", totalClips: 2 }),
+      expect(result.current.readiness).toEqual({ projectId: "project_b", totalClips: 2, reachableOriginals: 2, unverifiedVideoClips: 0, quarantinedVideoClips: 0, unavailableVideoClips: 0 }),
     );
 
     await act(async () => {
@@ -161,7 +161,7 @@ describe("reload paths", () => {
     });
 
     expect(outcome).toBe("resolved");
-    expect(result.current.readiness).toEqual({ projectId: "project_b", totalClips: 2 });
+    expect(result.current.readiness).toEqual({ projectId: "project_b", totalClips: 2, reachableOriginals: 2, unverifiedVideoClips: 0, quarantinedVideoClips: 0, unavailableVideoClips: 0 });
     expect(onError).not.toHaveBeenCalled();
   });
 

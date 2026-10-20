@@ -474,9 +474,17 @@ pub struct AnalysisRunOutcome {
 #[serde(rename_all = "camelCase")]
 pub struct AnalysisReadiness {
     pub project_id: String,
-    /// Clips currently in the labeling queue; removed clips are excluded
-    /// because no stage touches them.
+    /// Validated usable clips currently eligible for analysis. Removed,
+    /// unverified, quarantined, and unavailable clips are excluded.
     pub total_clips: usize,
+    /// Nonremoved catalog rows whose sources can currently be statted.
+    pub reachable_originals: usize,
+    /// Nonremoved legacy rows awaiting explicit media validation.
+    pub unverified_video_clips: usize,
+    /// Nonremoved rows durably quarantined after failed video validation.
+    pub quarantined_video_clips: usize,
+    /// Previously usable media whose original and proxy are both unavailable.
+    pub unavailable_video_clips: usize,
     pub missing_proxies: usize,
     pub missing_transcripts: usize,
     pub missing_analyses: usize,
@@ -491,6 +499,24 @@ pub struct AnalysisReadiness {
     pub cost_basis: AnalysisCostBasis,
     pub observed_cost_per_clip_usd: f64,
     pub last_run: Option<AnalysisRunRecord>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssetVideoValidationStatus {
+    Unverified,
+    Usable,
+    Quarantined,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AssetVideoValidation {
+    pub asset_id: String,
+    pub status: AssetVideoValidationStatus,
+    pub bytes_reachable: bool,
+    pub diagnostic: Option<String>,
+    pub validated_at: Option<String>,
 }
 
 /// Whether a cost projection is grounded in this project or in the reference
@@ -1313,8 +1339,8 @@ impl Catalog {
             project_id,
             &path.to_string_lossy(),
             operations::ProjectAssetAddedPayload {
-                id,
-                fingerprint,
+                id: id.clone(),
+                fingerprint: fingerprint.clone(),
                 filename: filename.to_string(),
                 size_bytes: metadata.len(),
                 duration_seconds: probe.duration_seconds,
@@ -1330,6 +1356,7 @@ impl Catalog {
                 created_at: now(),
             },
         )?;
+        self.store_video_validation(&id, &fingerprint, "usable", None)?;
         Ok(IngestOutcome::Imported)
     }
 
@@ -1937,6 +1964,10 @@ impl Catalog {
         let mut readiness = AnalysisReadiness {
             project_id: project_id.to_string(),
             total_clips: 0,
+            reachable_originals: 0,
+            unverified_video_clips: 0,
+            quarantined_video_clips: 0,
+            unavailable_video_clips: 0,
             missing_proxies: 0,
             missing_transcripts: 0,
             missing_analyses: 0,
@@ -1953,6 +1984,26 @@ impl Catalog {
         for asset in self.list_assets(project_id)? {
             if asset.removed {
                 continue;
+            }
+            let validation = self.asset_video_validation_for(&asset)?;
+            if validation.bytes_reachable {
+                readiness.reachable_originals += 1;
+            }
+            match validation.status {
+                AssetVideoValidationStatus::Usable => {
+                    if !validation.bytes_reachable && !asset.proxy_available {
+                        readiness.unavailable_video_clips += 1;
+                        continue;
+                    }
+                }
+                AssetVideoValidationStatus::Unverified => {
+                    readiness.unverified_video_clips += 1;
+                    continue;
+                }
+                AssetVideoValidationStatus::Quarantined => {
+                    readiness.quarantined_video_clips += 1;
+                    continue;
+                }
             }
             readiness.total_clips += 1;
             // A clip whose original is offline but whose proxy is present is not
@@ -2001,6 +2052,85 @@ impl Catalog {
         readiness.observed_cost_per_clip_usd = per_clip;
         readiness.estimated_cost_usd = per_clip * readiness.missing_analyses as f64;
         Ok(readiness)
+    }
+
+    /// Returns durable video eligibility separately from current byte reachability.
+    /// Catalog rows created before explicit validation are unverified until checked.
+    pub fn asset_video_validation(&self, asset_id: &str) -> Result<AssetVideoValidation> {
+        let asset = self.get_asset(asset_id)?;
+        self.asset_video_validation_for(&asset)
+    }
+
+    fn asset_video_validation_for(&self, asset: &Asset) -> Result<AssetVideoValidation> {
+        let connection = self.connection()?;
+        let has_validation_table = table_exists(&connection, "asset_video_validation")?;
+        let stored: Option<(String, String, Option<String>, String)> = if has_validation_table {
+            connection.query_row(
+                "SELECT fingerprint, status, diagnostic, validated_at FROM asset_video_validation WHERE asset_id = ?1",
+                [&asset.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            ).optional()?
+        } else {
+            None
+        };
+        let (status, diagnostic, validated_at) = match stored {
+            Some((fingerprint, status, diagnostic, validated_at)) if fingerprint == asset.fingerprint => {
+                let state = match status.as_str() {
+                    "usable" => AssetVideoValidationStatus::Usable,
+                    "quarantined" => AssetVideoValidationStatus::Quarantined,
+                    _ => AssetVideoValidationStatus::Unverified,
+                };
+                (state, diagnostic, Some(validated_at))
+            }
+            _ => (AssetVideoValidationStatus::Unverified, None, None),
+        };
+        Ok(AssetVideoValidation {
+            asset_id: asset.id.clone(),
+            status,
+            bytes_reachable: Path::new(&asset.path).is_file(),
+            diagnostic,
+            validated_at,
+        })
+    }
+
+    /// Explicitly validates a legacy or new asset and durably records its video eligibility.
+    /// Offline originals may validate against an existing proxy; neither representation is changed.
+    pub fn validate_asset_video(&self, asset_id: &str) -> Result<AssetVideoValidation> {
+        let asset = self.get_asset(asset_id)?;
+        let validation_path = if Path::new(&asset.path).is_file() {
+            PathBuf::from(&asset.path)
+        } else if let Some(proxy_path) = asset
+            .proxy_path
+            .as_deref()
+            .filter(|proxy_path| Path::new(proxy_path).is_file())
+        {
+            PathBuf::from(proxy_path)
+        } else {
+            bail!("original bytes and proxy are not reachable; video validation was not recorded");
+        };
+        let (status, diagnostic) = match probe_media_stream(&validation_path) {
+            Ok(_) => ("usable", None),
+            Err(error) => ("quarantined", Some(format!("{error:#}"))),
+        };
+        self.store_video_validation(asset_id, &asset.fingerprint, status, diagnostic.as_deref())?;
+        self.asset_video_validation(asset_id)
+    }
+
+    fn store_video_validation(
+        &self,
+        asset_id: &str,
+        fingerprint: &str,
+        status: &str,
+        diagnostic: Option<&str>,
+    ) -> Result<()> {
+        self.connection()?.execute(
+            "INSERT INTO asset_video_validation(asset_id, fingerprint, status, diagnostic, validated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(asset_id) DO UPDATE SET fingerprint=excluded.fingerprint,
+                status=excluded.status, diagnostic=excluded.diagnostic, validated_at=excluded.validated_at",
+            params![asset_id, fingerprint, status, diagnostic, now()],
+        )?;
+        Ok(())
     }
 
     /// Opens a run record so spend is attributable even if the app exits.
@@ -2231,6 +2361,12 @@ impl Catalog {
             let connection = self.connection()?;
             for asset in assets {
                 if asset.removed {
+                    continue;
+                }
+                if self.asset_video_validation(&asset.id)?.status
+                    != AssetVideoValidationStatus::Usable
+                {
+                    skipped += 1;
                     continue;
                 }
                 match self.proxy_fingerprint(&asset.id) {
@@ -2603,6 +2739,12 @@ impl Catalog {
             if asset.removed {
                 continue;
             }
+            if self.asset_video_validation(&asset.id)?.status
+                != AssetVideoValidationStatus::Usable
+            {
+                skipped += 1;
+                continue;
+            }
             let current = self
                 .proxy_fingerprint(&asset.id)
                 .ok()
@@ -2897,9 +3039,20 @@ impl Catalog {
         F: FnMut(AssetBatchProgress) -> ControlFlow<()>,
     {
         let assets = self.list_assets(project_id)?;
-        let (ready, pending): (Vec<_>, Vec<_>) = assets.into_iter().partition(|asset| {
-            has_current_proxy(asset) || (!asset.original_available && asset.proxy_available)
-        });
+        let mut ready = Vec::new();
+        let mut pending = Vec::new();
+        for asset in assets {
+            if asset.removed
+                || self.asset_video_validation(&asset.id)?.status
+                    != AssetVideoValidationStatus::Usable
+                || has_current_proxy(&asset)
+                || (!asset.original_available && asset.proxy_available)
+            {
+                ready.push(asset);
+            } else {
+                pending.push(asset);
+            }
+        }
         let mut report = ProxyReport {
             generated: 0,
             skipped: ready.len(),
@@ -5348,6 +5501,9 @@ mod tests {
         assert!(asset.removed);
         assert_eq!(asset.rotation_degrees, 90);
         assert_eq!(catalog.list_operations("project_v4").unwrap().len(), 0);
+        let video_validation = catalog.asset_video_validation("asset_v4").unwrap();
+        assert_eq!(video_validation.status, AssetVideoValidationStatus::Unverified);
+        assert!(!video_validation.bytes_reachable);
         let diagnostics = catalog.asset_revision_diagnostics("asset_v4").unwrap();
         assert_eq!(diagnostics.materialized_revision, 0);
         assert_eq!(diagnostics.note_revisions.len(), 1);
