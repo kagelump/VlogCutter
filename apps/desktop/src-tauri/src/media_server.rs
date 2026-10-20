@@ -584,9 +584,9 @@ fn resolve_media_path(
             media.original.as_ref(),
             media.camera_proxy.as_ref(),
         ],
-        Representation::Proxy => [media.proxy.as_ref(), None],
-        Representation::CameraProxy => [media.camera_proxy.as_ref(), None],
-        Representation::Original => [media.original.as_ref(), None],
+        Representation::Proxy => [media.proxy.as_ref(), None, None],
+        Representation::CameraProxy => [media.camera_proxy.as_ref(), None, None],
+        Representation::Original => [media.original.as_ref(), None, None],
     };
     let mut failure = ResolveFailure::NoRepresentation;
     for candidate in candidates.into_iter().flatten() {
