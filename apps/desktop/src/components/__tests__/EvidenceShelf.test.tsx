@@ -67,6 +67,7 @@ function analysis(overrides: Partial<ClipAnalysis> = {}): ClipAnalysis {
     unusableReason: null, bestMomentStartMs: 4000, bestMomentEndMs: 6000,
     thumbnailTimestampMs: null, cameraMovement: "pan", ocrText: [], transcriptUsed: true,
     promptTokens: 1, completionTokens: 1, costUsd: 0.001, latencyMs: 1, attempts: 1,
+    attemptedModels: ["gemini-2.5-flash"], usageComplete: true,
     createdAt: "2026-06-03T10:00:00Z",
     ...overrides,
   };

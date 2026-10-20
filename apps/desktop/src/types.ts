@@ -226,6 +226,8 @@ export interface ClipAnalysis {
   costUsd: number;
   latencyMs: number;
   attempts: number;
+  attemptedModels: string[];
+  usageComplete: boolean;
   createdAt: string;
 }
 

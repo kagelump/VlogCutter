@@ -2890,7 +2890,11 @@ impl Catalog {
                 prompt_version: VLM_PROMPT_VERSION.to_string(),
                 provider: "openrouter".to_string(),
                 model: outcome.model.clone(),
-                status: AnalysisStatus::Rejected,
+                status: if outcome.model.is_empty() {
+                    AnalysisStatus::Failed
+                } else {
+                    AnalysisStatus::Rejected
+                },
                 reject_reason: outcome.reject_reason.clone(),
                 usable: false,
                 unusable_reason: None,
@@ -2905,6 +2909,8 @@ impl Catalog {
                 cost_usd: 0.0,
                 latency_ms: 0,
                 attempts: outcome.attempts,
+                attempted_models: outcome.attempted_models.clone(),
+                usage_complete: outcome.usage_complete,
                 created_at: now(),
             }
         };
@@ -2914,6 +2920,8 @@ impl Catalog {
         stored.cost_usd = outcome.cost_usd;
         stored.latency_ms = outcome.latency_ms;
         stored.attempts = outcome.attempts;
+        stored.attempted_models = outcome.attempted_models.clone();
+        stored.usage_complete = outcome.usage_complete;
 
         if let Some(observation) = &outcome.observation {
             // Remove only labels whose local authorship side-table says this

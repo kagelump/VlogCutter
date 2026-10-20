@@ -91,6 +91,8 @@ function analysis(overrides: Partial<ClipAnalysis> = {}): ClipAnalysis {
     costUsd: 0.002,
     latencyMs: 900,
     attempts: 1,
+    attemptedModels: ["gemini-2.5-flash"],
+    usageComplete: true,
     createdAt: "2026-06-03T10:00:00Z",
     ...overrides,
   };

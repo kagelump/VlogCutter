@@ -365,6 +365,10 @@ negative values are rejected before credentials or provider setup. The report
 records returned usage for successful and domain-rejected requests, including
 fallback attempts. A request with a failed provider attempt marks usage
 incomplete; known usage is retained and no cost is inferred for failed attempts.
+Per-clip analysis records persist `attemptedModels` and `usageComplete` with the
+model, attempt count, and returned usage. Existing single-attempt rows backfill
+their serving model; prior retry histories are not reconstructable, so those
+rows keep an empty attempted-model list and mark usage incomplete.
 
 `transcribe missing` and `analyze missing` reports include a `cancelled` flag,
 and the analysis report also includes `budgetExhausted`. Both are always `false`
