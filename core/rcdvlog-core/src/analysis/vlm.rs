@@ -7,7 +7,9 @@
 use anyhow::Result;
 use serde::Serialize;
 
-use crate::analysis::provider::{ProviderChain, VlmProvider, VlmRequest, VlmResponse};
+use crate::analysis::provider::{
+    ProviderChain, ProviderChainError, VlmProvider, VlmRequest, VlmResponse,
+};
 use crate::analysis::schema::{ClipObservation, output_schema, validate};
 use crate::analysis::store::TranscriptStatus;
 
@@ -83,6 +85,9 @@ pub struct AnalysisOutcome {
     pub completion_tokens: u32,
     pub cost_usd: f64,
     pub latency_ms: u64,
+    pub attempted_models: Vec<String>,
+    /// False when at least one attempted provider call returned no usage data.
+    pub usage_complete: bool,
 }
 
 fn rejected(
@@ -90,6 +95,8 @@ fn rejected(
     attempts: u32,
     fell_back: bool,
     reason: String,
+    attempted_models: Vec<String>,
+    usage_complete: bool,
 ) -> AnalysisOutcome {
     AnalysisOutcome {
         observation: None,
@@ -101,6 +108,8 @@ fn rejected(
         completion_tokens: response.completion_tokens,
         cost_usd: response.cost_usd,
         latency_ms: response.latency_ms,
+        attempted_models,
+        usage_complete,
     }
 }
 
@@ -117,7 +126,27 @@ pub fn analyze_clip(
         frames,
         schema: output_schema(&context.frame_timestamps_ms, context.clip_duration_ms),
     };
-    let first = chain.analyze(provider, &request)?;
+    let first = match chain.analyze(provider, &request) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            let Some(failure) = error.downcast_ref::<ProviderChainError>() else {
+                return Err(error);
+            };
+            return Ok(AnalysisOutcome {
+                observation: None,
+                reject_reason: failure.message.clone(),
+                model: String::new(),
+                attempts: failure.attempted_models.len() as u32,
+                fell_back: failure.attempted_models.len() > 1,
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                cost_usd: 0.0,
+                latency_ms: 0,
+                attempted_models: failure.attempted_models.clone(),
+                usage_complete: false,
+            });
+        }
+    };
     match validate(
         &first.response.body,
         &context.frame_timestamps_ms,
@@ -133,6 +162,8 @@ pub fn analyze_clip(
             completion_tokens: first.response.completion_tokens,
             cost_usd: first.response.cost_usd,
             latency_ms: first.response.latency_ms,
+            attempted_models: first.attempted_models,
+            usage_complete: first.usage_complete,
         }),
         Err(error)
             if chain.fallback_model().is_some()
@@ -142,7 +173,32 @@ pub fn analyze_clip(
             let fallback_model = chain
                 .fallback_model()
                 .expect("guard checked fallback policy");
-            let fallback = provider.analyze(fallback_model, &request)?;
+            let fallback = match provider.analyze(fallback_model, &request) {
+                Ok(response) => response,
+                Err(fallback_error) => {
+                    let mut outcome = rejected(
+                        &first.response,
+                        first.attempts + 1,
+                        true,
+                        format!(
+                            "{}; fallback {fallback_model} failed: {fallback_error:#}",
+                            error.as_reason()
+                        ),
+                        first
+                            .attempted_models
+                            .iter()
+                            .cloned()
+                            .chain([fallback_model.to_string()])
+                            .collect(),
+                        false,
+                    );
+                    outcome.prompt_tokens = first.response.prompt_tokens;
+                    outcome.completion_tokens = first.response.completion_tokens;
+                    outcome.cost_usd = first.response.cost_usd;
+                    outcome.latency_ms = first.response.latency_ms;
+                    return Ok(outcome);
+                }
+            };
             let aggregate = |fallback: &VlmResponse| {
                 (
                     first
@@ -177,6 +233,13 @@ pub fn analyze_clip(
                         completion_tokens: usage.1,
                         cost_usd: usage.2,
                         latency_ms: usage.3,
+                        attempted_models: first
+                            .attempted_models
+                            .iter()
+                            .cloned()
+                            .chain([fallback_model.to_string()])
+                            .collect(),
+                        usage_complete: first.usage_complete,
                     })
                 }
                 Err(fallback_error) => {
@@ -190,6 +253,13 @@ pub fn analyze_clip(
                             error.as_reason(),
                             fallback_error.as_reason()
                         ),
+                        first
+                            .attempted_models
+                            .iter()
+                            .cloned()
+                            .chain([fallback_model.to_string()])
+                            .collect(),
+                        first.usage_complete,
                     );
                     outcome.prompt_tokens = usage.0;
                     outcome.completion_tokens = usage.1;
@@ -204,6 +274,8 @@ pub fn analyze_clip(
             first.attempts,
             first.fell_back,
             error.as_reason(),
+            first.attempted_models,
+            first.usage_complete,
         )),
     }
 }
@@ -211,7 +283,7 @@ pub fn analyze_clip(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analysis::provider::FALLBACK_MODEL;
+    use crate::analysis::provider::{DEFAULT_MODEL, FALLBACK_MODEL};
     use anyhow::bail;
     use std::sync::Mutex;
 
@@ -244,6 +316,9 @@ mod tests {
                 bail!("no scripted response")
             }
             let response = body.remove(0);
+            if response == "__ERROR__" {
+                bail!("scripted provider failure")
+            }
             Ok(VlmResponse {
                 model: model.into(),
                 body: response,
@@ -294,6 +369,86 @@ mod tests {
         assert_eq!(outcome.model, FALLBACK_MODEL);
         assert_eq!(outcome.attempts, 2);
         assert_eq!(outcome.cost_usd, 0.002);
+        assert_eq!(
+            outcome.attempted_models,
+            vec![DEFAULT_MODEL, FALLBACK_MODEL]
+        );
+        assert!(outcome.usage_complete);
+    }
+
+    #[test]
+    fn primary_usage_is_kept_when_domain_rejection_fallback_transport_fails() {
+        let fake = Fake {
+            bodies: Mutex::new(vec!["{}".into()]),
+            calls: Mutex::default(),
+        };
+        let outcome = analyze_clip(
+            &fake,
+            &ProviderChain::new(),
+            &context(TranscriptStatus::NoSpeech),
+            vec![],
+        )
+        .unwrap();
+        assert!(outcome.observation.is_none());
+        assert_eq!(outcome.attempts, 2);
+        assert_eq!(
+            outcome.attempted_models,
+            vec![DEFAULT_MODEL, FALLBACK_MODEL]
+        );
+        assert_eq!(outcome.model, DEFAULT_MODEL);
+        assert_eq!(outcome.prompt_tokens, 10);
+        assert_eq!(outcome.completion_tokens, 2);
+        assert_eq!(outcome.cost_usd, 0.001);
+        assert_eq!(outcome.latency_ms, 5);
+        assert!(!outcome.usage_complete);
+        assert_eq!(
+            *fake.calls.lock().unwrap(),
+            vec![DEFAULT_MODEL, FALLBACK_MODEL]
+        );
+    }
+
+    #[test]
+    fn transport_failures_without_responses_are_explicitly_usage_incomplete() {
+        let fake = Fake {
+            bodies: Mutex::new(vec![]),
+            calls: Mutex::default(),
+        };
+        let outcome = analyze_clip(
+            &fake,
+            &ProviderChain::new(),
+            &context(TranscriptStatus::NoSpeech),
+            vec![],
+        )
+        .unwrap();
+        assert_eq!(outcome.attempts, 2);
+        assert_eq!(outcome.cost_usd, 0.0); // known returned usage only; failed attempts are unpriced, not free
+        assert!(!outcome.usage_complete);
+        assert_eq!(
+            outcome.attempted_models,
+            vec![DEFAULT_MODEL, FALLBACK_MODEL]
+        );
+    }
+
+    #[test]
+    fn fallback_success_keeps_cost_and_marks_primary_usage_incomplete() {
+        let fake = Fake {
+            bodies: Mutex::new(vec!["__ERROR__".into(), valid()]),
+            calls: Mutex::default(),
+        };
+        let outcome = analyze_clip(
+            &fake,
+            &ProviderChain::new(),
+            &context(TranscriptStatus::NoSpeech),
+            vec![],
+        )
+        .unwrap();
+        assert!(outcome.observation.is_some());
+        assert_eq!(
+            outcome.attempted_models,
+            vec![DEFAULT_MODEL, FALLBACK_MODEL]
+        );
+        assert_eq!(outcome.cost_usd, 0.001);
+        assert!(!outcome.usage_complete);
     }
 
     #[test]

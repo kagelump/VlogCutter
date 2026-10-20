@@ -2523,10 +2523,11 @@ function App() {
       // come from the same read.
       await reloadSession();
       const spent = formatCost(report.costUsd);
+      const usageNote = report.analysis.usageComplete ? "" : " (provider usage incomplete; failed attempts may add unpriced cost)";
       if (report.status === "cancelled") {
-        setMessage(`Analysis stopped during ${analysisStageLabels[report.stageReached].toLocaleLowerCase()}; ${report.analysis.analyzed} clips analyzed, ${spent} spent. Run it again to resume.`);
+        setMessage(`Analysis stopped during ${analysisStageLabels[report.stageReached].toLocaleLowerCase()}; ${report.analysis.analyzed} clips analyzed, ${spent} known cost${usageNote}. Run it again to resume.`);
       } else {
-        setMessage(`Analyzed ${report.analysis.analyzed} clips and transcribed ${report.transcripts.transcribed}; ${spent} spent`);
+        setMessage(`Analyzed ${report.analysis.analyzed} clips and transcribed ${report.transcripts.transcribed}; ${spent} known cost${usageNote}`);
       }
       if (report.analysis.budgetExhausted) {
         setError(`Stopped at the ${formatCost(budget)} budget for this run. Raise it and run again to continue.`);

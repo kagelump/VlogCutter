@@ -316,6 +316,7 @@ export interface AnalysisRunReport {
     rejected: number;
     fallbackServed: number;
     costUsd: number;
+    usageComplete: boolean;
     cancelled: boolean;
     budgetExhausted: boolean;
     failures: Array<{ path: string; error: string }>;

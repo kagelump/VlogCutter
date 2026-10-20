@@ -349,8 +349,9 @@ returns coverage diagnostics and checkable conflicts against the current solved
 chronology. The result is stored separately from chronology facts and keyed by
 the facts revision, proxy frames, and model policy; repeating a completed
 request returns the saved result without another provider call. A request left
-running by an interrupted process is refused on retry to avoid an accidental
-duplicate charge.
+`running` by an error or interrupted process is refused on retry to avoid an
+accidental duplicate charge. There is currently no automatic recovery or retry
+path for such reservations; they require manual catalog repair.
 
 `analyze missing` accepts `--primary-model`, repeatable `--allow-model`, and
 `--no-fallback`. The core validates this policy against its local model registry
@@ -359,8 +360,11 @@ run request uses the same fields. The run ceiling is checked after each
 completed request: workers already in flight are allowed to finish, so the
 final spend can exceed the ceiling by the sum of those outstanding requests;
 there is no fixed dollar bound because providers do not offer a reliable
-pre-request charge cap. The report records returned usage for successful and
-domain-rejected requests, including fallback attempts.
+pre-request charge cap. Budgets must be finite and greater than zero; zero and
+negative values are rejected before credentials or provider setup. The report
+records returned usage for successful and domain-rejected requests, including
+fallback attempts. A request with a failed provider attempt marks usage
+incomplete; known usage is retained and no cost is inferred for failed attempts.
 
 `transcribe missing` and `analyze missing` reports include a `cancelled` flag,
 and the analysis report also includes `budgetExhausted`. Both are always `false`

@@ -59,10 +59,18 @@ pub struct SuggestionReview {
 pub struct SuggestionProvenance {
     pub model: String,
     pub attempts: u32,
+    #[serde(default)]
+    pub attempted_models: Vec<String>,
+    #[serde(default = "usage_is_complete")]
+    pub usage_complete: bool,
     pub cost_usd: f64,
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub latency_ms: u64,
+}
+
+fn usage_is_complete() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -127,6 +135,8 @@ pub(crate) fn request_suggestion(
         provenance: SuggestionProvenance {
             model: chained.response.model,
             attempts: chained.attempts,
+            attempted_models: chained.attempted_models,
+            usage_complete: chained.usage_complete,
             cost_usd: chained.response.cost_usd,
             prompt_tokens: chained.response.prompt_tokens,
             completion_tokens: chained.response.completion_tokens,
@@ -190,6 +200,9 @@ impl ChronologyEvidenceRequest {
         }
         let assets: std::collections::HashSet<_> =
             self.frames.iter().map(|f| f.asset_id.as_str()).collect();
+        if assets.len() < 2 {
+            return Err("cross-clip evidence requires at least two distinct clips".into());
+        }
         if assets.len() > MAX_CLIPS {
             return Err(format!("evidence request exceeds {MAX_CLIPS} clips"));
         }
@@ -215,6 +228,9 @@ impl ChronologyEvidenceRequest {
         }
         let known: std::collections::HashSet<_> =
             self.frames.iter().map(|f| f.id.as_str()).collect();
+        if known.len() != self.frames.len() {
+            return Err("evidence frame IDs must be unique".into());
+        }
         if self
             .required_frame_ids
             .iter()
@@ -266,6 +282,25 @@ pub fn review_suggestion(
             inconsistencies.push(format!(
                 "match orders asset {} before itself",
                 pair.earlier_asset_id
+            ));
+        }
+        if pair.supporting_frame_ids.is_empty() {
+            inconsistencies.push(format!(
+                "match {} -> {} has no supporting frames",
+                pair.earlier_asset_id, pair.later_asset_id
+            ));
+        } else if pair.supporting_frame_ids.iter().any(|id| {
+            request
+                .frames
+                .iter()
+                .find(|frame| frame.id == *id)
+                .is_none_or(|frame| {
+                    frame.asset_id != pair.earlier_asset_id && frame.asset_id != pair.later_asset_id
+                })
+        }) {
+            inconsistencies.push(format!(
+                "match {} -> {} cites a frame not belonging to either matched clip",
+                pair.earlier_asset_id, pair.later_asset_id
             ));
         }
         if pair
@@ -355,13 +390,17 @@ mod tests {
     fn request() -> ChronologyEvidenceRequest {
         ChronologyEvidenceRequest {
             facts_revision: "revision".into(),
-            frames: vec![EvidenceFrame {
-                id: "frame-a".into(),
-                asset_id: "asset-a".into(),
-                timestamp_ms: 10,
-                proxy_data_uri: "data:image/jpeg;base64,AA==".into(),
-            }],
-            required_frame_ids: vec!["frame-a".into()],
+            frames: ["a", "b", "c"]
+                .into_iter()
+                .enumerate()
+                .map(|(index, asset)| EvidenceFrame {
+                    id: format!("frame-{asset}"),
+                    asset_id: format!("asset-{asset}"),
+                    timestamp_ms: index as u32 * 10,
+                    proxy_data_uri: "data:image/jpeg;base64,AA==".into(),
+                })
+                .collect(),
+            required_frame_ids: vec!["frame-a".into(), "frame-b".into(), "frame-c".into()],
         }
     }
 
@@ -378,7 +417,43 @@ mod tests {
         let review = review_suggestion(&request(), &output);
         assert_eq!(review.duplicate_frame_ids, vec!["frame-a"]);
         assert_eq!(review.unknown_frame_ids, vec!["unknown"]);
-        assert_eq!(review.semantic_inconsistencies.len(), 3);
+        assert!(review.semantic_inconsistencies.len() >= 3);
+    }
+
+    #[test]
+    fn matches_must_cite_frames_from_the_pair_and_nonempty_support() {
+        let request = request();
+        let unrelated = ChronologySuggestion {
+            matches: vec![PairMatch {
+                earlier_asset_id: "asset-a".into(),
+                later_asset_id: "asset-b".into(),
+                supporting_frame_ids: vec!["frame-c".into()],
+            }],
+            frame_ids: vec!["frame-a".into(), "frame-b".into(), "frame-c".into()],
+        };
+        let review = review_suggestion(&request, &unrelated);
+        assert!(
+            review
+                .semantic_inconsistencies
+                .iter()
+                .any(|issue| issue.contains("not belonging to either matched clip"))
+        );
+
+        let empty = ChronologySuggestion {
+            matches: vec![PairMatch {
+                earlier_asset_id: "asset-a".into(),
+                later_asset_id: "asset-b".into(),
+                supporting_frame_ids: vec![],
+            }],
+            frame_ids: vec!["frame-a".into(), "frame-b".into(), "frame-c".into()],
+        };
+        let review = review_suggestion(&request, &empty);
+        assert!(
+            review
+                .semantic_inconsistencies
+                .iter()
+                .any(|issue| issue.contains("no supporting frames"))
+        );
     }
 
     #[test]
@@ -400,7 +475,7 @@ mod tests {
             self.calls.lock().unwrap().push(model.into());
             Ok(crate::analysis::provider::VlmResponse {
                 model: model.into(),
-                body: r#"{"frameIds":["frame-a"],"matches":[]}"#.into(),
+                body: r#"{"frameIds":["frame-a","frame-b","frame-c"],"matches":[]}"#.into(),
                 prompt_tokens: 9,
                 completion_tokens: 4,
                 cost_usd: 0.001,
@@ -438,15 +513,30 @@ mod tests {
             false,
         )
         .unwrap();
-        let connection = rusqlite::Connection::open_in_memory().unwrap();
-        connection.execute_batch("CREATE TABLE analysis_chronology_suggestions(request_key TEXT PRIMARY KEY,project_id TEXT NOT NULL,facts_revision TEXT NOT NULL,status TEXT NOT NULL,result_json TEXT NOT NULL DEFAULT '',model TEXT NOT NULL DEFAULT '',attempts INTEGER NOT NULL DEFAULT 0,cost_usd REAL NOT NULL DEFAULT 0,prompt_tokens INTEGER NOT NULL DEFAULT 0,completion_tokens INTEGER NOT NULL DEFAULT 0,latency_ms INTEGER NOT NULL DEFAULT 0,created_at TEXT NOT NULL,updated_at TEXT NOT NULL);").unwrap();
-        assert!(reserve_request(&connection, "key", "project", "revision").unwrap());
+        let directory = tempfile::tempdir().unwrap();
+        let catalog_path = directory.path().join("suggestion.sqlite3");
+        let catalog = crate::Catalog::open(&catalog_path).unwrap();
+        let project = catalog.create_project("suggestion cache test").unwrap();
+        let connection = catalog.connection().unwrap();
+        assert!(reserve_request(&connection, "key", &project.id, "revision").unwrap());
         let result = request_suggestion(&provider, &chain, &request()).unwrap();
         store_result(&connection, "key", &result).unwrap();
-        let cached = load_cached(&connection, "key").unwrap().unwrap();
+        drop(connection);
+        drop(catalog);
+        let reopened = crate::Catalog::open(&catalog_path).unwrap();
+        let reopened_connection = reopened.connection().unwrap();
+        let project_fk: String = reopened_connection
+            .query_row(
+                "SELECT \"table\" FROM pragma_foreign_key_list('analysis_chronology_suggestions') WHERE \"from\"='project_id'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(project_fk, "projects");
+        let cached = load_cached(&reopened_connection, "key").unwrap().unwrap();
         assert!(cached.cached);
         assert_eq!(cached.provenance.cost_usd, 0.001);
         assert_eq!(provider.calls.lock().unwrap().len(), 1);
-        assert!(!reserve_request(&connection, "key", "project", "revision").unwrap());
+        assert!(!reserve_request(&reopened_connection, "key", &project.id, "revision").unwrap());
     }
 }

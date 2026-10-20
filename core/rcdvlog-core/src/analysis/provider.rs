@@ -92,15 +92,38 @@ pub struct ChainOutcome {
     pub attempts: u32,
     /// Whether the default model failed on this request.
     pub fell_back: bool,
+    pub attempted_models: Vec<String>,
+    /// False when a provider attempt failed without returning usage.
+    pub usage_complete: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderChainError {
+    pub attempted_models: Vec<String>,
+    pub message: String,
+}
+
+impl std::fmt::Display for ProviderChainError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ProviderChainError {}
+
 /// Default → fallback → breaker, for the lifetime of one process.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ProviderChain {
     default_failures: Arc<AtomicU32>,
     primary_model: &'static str,
     allowed_models: Vec<&'static str>,
     allow_fallback: bool,
+}
+
+impl Default for ProviderChain {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ProviderChain {
@@ -156,8 +179,8 @@ impl ProviderChain {
 
     /// The model this chain would try first right now.
     pub fn current_default(&self) -> &'static str {
-        if self.breaker_tripped() && self.allow_fallback {
-            FALLBACK_MODEL
+        if self.breaker_tripped() {
+            self.fallback_model().unwrap_or(self.primary_model)
         } else {
             self.primary_model
         }
@@ -179,12 +202,18 @@ impl ProviderChain {
                 response,
                 attempts: 1,
                 fell_back: false,
+                attempted_models: vec![first.to_string()],
+                usage_complete: true,
             }),
             Err(first_error) => {
                 let fallback = self.fallback_model();
                 if !self.allow_fallback || fallback == Some(first) {
                     // The breaker already routed here; there is nowhere else to go.
-                    return Err(first_error);
+                    return Err(ProviderChainError {
+                        attempted_models: vec![first.to_string()],
+                        message: format!("{first}: {first_error:#}"),
+                    }
+                    .into());
                 }
                 self.default_failures.fetch_add(1, Ordering::Relaxed);
                 let fallback = fallback.expect("fallback policy checked");
@@ -193,11 +222,13 @@ impl ProviderChain {
                         response,
                         attempts: 2,
                         fell_back: true,
+                        attempted_models: vec![first.to_string(), fallback.to_string()],
+                        usage_complete: false,
                     }),
-                    Err(fallback_error) => bail!(
-                        "both models failed: {first}: {first_error:#}; \
-                         {fallback}: {fallback_error:#}"
-                    ),
+                    Err(fallback_error) => Err(ProviderChainError {
+                        attempted_models: vec![first.to_string(), fallback.to_string()],
+                        message: format!("both models failed: {first}: {first_error:#}; {fallback}: {fallback_error:#}"),
+                    }.into()),
                 }
             }
         }
@@ -272,6 +303,13 @@ mod tests {
     }
 
     #[test]
+    fn default_constructs_the_same_usable_policy_as_new() {
+        let from_default = ProviderChain::default();
+        assert_eq!(from_default.current_default(), DEFAULT_MODEL);
+        assert_eq!(from_default.fallback_model(), Some(FALLBACK_MODEL));
+    }
+
+    #[test]
     fn a_failure_falls_back_once_and_records_the_serving_model() {
         let scripted = ScriptedProvider::new(vec![DEFAULT_MODEL]);
         let chain = ProviderChain::new();
@@ -327,6 +365,20 @@ mod tests {
             *scripted.calls.lock().unwrap(),
             vec![FALLBACK_MODEL, DEFAULT_MODEL]
         );
+    }
+
+    #[test]
+    fn breaker_routes_gemini_primary_to_its_qwen_alternate() {
+        let chain = ProviderChain::with_policy(
+            FALLBACK_MODEL,
+            &[FALLBACK_MODEL.to_string(), DEFAULT_MODEL.to_string()],
+            true,
+        )
+        .unwrap();
+        for _ in 0..BREAKER_THRESHOLD {
+            chain.record_default_failure();
+        }
+        assert_eq!(chain.current_default(), DEFAULT_MODEL);
     }
 
     #[test]

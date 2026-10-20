@@ -2148,6 +2148,7 @@ async fn analyze_project(
             fallback_served: 0,
             force_overwrite_warnings: 0,
             cost_usd: 0.0,
+            usage_complete: true,
             cancelled: transcripts.cancelled,
             budget_exhausted: false,
             outcomes: Vec::new(),

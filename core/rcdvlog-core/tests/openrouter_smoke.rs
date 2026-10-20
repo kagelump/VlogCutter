@@ -73,6 +73,8 @@ fn one_real_clip_round_trips_through_the_default_model() {
             response,
             attempts: 1,
             fell_back: model != DEFAULT_MODEL,
+            attempted_models: vec![model],
+            usage_complete: true,
         }
     } else {
         chain.analyze(&provider, &request).expect("provider chain")

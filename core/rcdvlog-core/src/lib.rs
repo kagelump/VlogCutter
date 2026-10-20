@@ -659,6 +659,8 @@ pub struct AnalyzeReport {
     pub fallback_served: usize,
     pub force_overwrite_warnings: usize,
     pub cost_usd: f64,
+    /// False when any attempted provider call returned no usage data.
+    pub usage_complete: bool,
     /// True when the caller stopped the batch early.
     pub cancelled: bool,
     /// True when the batch stopped because the run's cost ceiling was reached.
@@ -691,6 +693,27 @@ pub struct AnalysisRunOptions {
     pub allowed_models: Vec<String>,
     /// Whether one retry using the configured alternate model is permitted.
     pub allow_fallback: Option<bool>,
+}
+
+/// Resolves and validates the spend ceiling locally. Zero and negative ceilings
+/// are rejected; they do not mean "disable spend" or "allow free requests".
+fn resolve_analysis_budget(options: &AnalysisRunOptions) -> Result<f64> {
+    let budget = if let Some(value) = options.budget_usd {
+        value
+    } else {
+        match std::env::var("RCDVLOG_VLM_MAX_COST_USD") {
+            Ok(value) => value
+                .parse::<f64>()
+                .with_context(|| "RCDVLOG_VLM_MAX_COST_USD must be a finite positive number")?,
+            Err(std::env::VarError::NotPresent) => return Ok(f64::INFINITY),
+            Err(std::env::VarError::NotUnicode(_)) => {
+                anyhow::bail!("RCDVLOG_VLM_MAX_COST_USD is not valid Unicode")
+            }
+        }
+    };
+    anyhow::ensure!(budget.is_finite(), "analysis budget must be finite");
+    anyhow::ensure!(budget > 0.0, "analysis budget must be greater than zero");
+    Ok(budget)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -3005,6 +3028,7 @@ impl Catalog {
     where
         F: FnMut(AnalyzeBatchProgress) -> ControlFlow<()>,
     {
+        let _budget_usd = resolve_analysis_budget(options)?;
         let primary = options.primary_model.as_deref().unwrap_or(DEFAULT_MODEL);
         let allowed = if options.allowed_models.is_empty() {
             vec![DEFAULT_MODEL.to_string(), FALLBACK_MODEL.to_string()]
@@ -3110,6 +3134,7 @@ impl Catalog {
             fallback_served: 0,
             force_overwrite_warnings,
             cost_usd: 0.0,
+            usage_complete: true,
             cancelled: start.is_break(),
             budget_exhausted: false,
             outcomes: Vec::new(),
@@ -3118,14 +3143,7 @@ impl Catalog {
         if report.cancelled {
             return Ok(report);
         }
-        let budget_usd = options
-            .budget_usd
-            .or_else(|| {
-                std::env::var("RCDVLOG_VLM_MAX_COST_USD")
-                    .ok()
-                    .and_then(|value| value.parse::<f64>().ok())
-            })
-            .unwrap_or(f64::INFINITY);
+        let budget_usd = resolve_analysis_budget(options)?;
         let queue = Arc::new(Mutex::new(
             prepared
                 .into_iter()
@@ -3193,6 +3211,7 @@ impl Catalog {
                         estimator.record_completion(frames, elapsed);
                         report.analyzed += 1;
                         report.cost_usd += outcome.cost_usd;
+                        report.usage_complete &= outcome.usage_complete;
                         if outcome.observation.is_none() {
                             report.rejected += 1;
                         }
@@ -3771,10 +3790,7 @@ impl Catalog {
         provider: &dyn VlmProvider,
         chain: &ProviderChain,
     ) -> Result<SuggestionResult> {
-        anyhow::ensure!(
-            !asset_ids.is_empty() && asset_ids.len() <= 8,
-            "select 1..=8 clips"
-        );
+        anyhow::ensure!((2..=8).contains(&asset_ids.len()), "select 2..=8 clips");
         anyhow::ensure!(
             asset_ids.iter().collect::<HashSet<_>>().len() == asset_ids.len(),
             "each clip may be selected only once"
@@ -3808,8 +3824,8 @@ impl Catalog {
                 "proxy frame pack is empty or incomplete for {asset_id}"
             );
             // Two deterministic samples per selected clip keep cross-clip requests small.
-            let indexes = if paths.len() <= 2 {
-                vec![0, paths.len().saturating_sub(1)]
+            let indexes = if paths.len() == 1 {
+                vec![0]
             } else {
                 vec![0, paths.len() - 1]
             };
@@ -5430,6 +5446,42 @@ pub(crate) fn now() -> String {
 mod tests {
     use super::*;
     use tempfile::{TempDir, tempdir};
+
+    #[test]
+    fn analysis_budget_requires_finite_positive_value() {
+        for value in [0.0, -0.01, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let options = AnalysisRunOptions {
+                budget_usd: Some(value),
+                ..Default::default()
+            };
+            assert!(
+                resolve_analysis_budget(&options).is_err(),
+                "accepted {value:?}"
+            );
+        }
+        let options = AnalysisRunOptions {
+            budget_usd: Some(0.01),
+            ..Default::default()
+        };
+        assert_eq!(resolve_analysis_budget(&options).unwrap(), 0.01);
+    }
+
+    #[test]
+    fn invalid_budget_is_rejected_before_key_resolution_or_network_setup() {
+        let directory = tempdir().unwrap();
+        let catalog = Catalog::open(directory.path().join("budget.sqlite3")).unwrap();
+        let error = catalog
+            .analyze_missing_with_options(
+                "missing-project",
+                &AnalysisRunOptions {
+                    budget_usd: Some(f64::NAN),
+                    ..Default::default()
+                },
+                |_| ControlFlow::Continue(()),
+            )
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("finite"));
+    }
 
     /// Inserts an asset whose stored fingerprint is the real sampled fingerprint
     /// of the file on disk, so location verification has something honest to

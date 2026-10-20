@@ -46,6 +46,7 @@ export interface AnalysisStep {
 export interface AnalysisOutcome {
   status?: "completed" | "cancelled" | "failed";
   budgetExhausted?: boolean;
+  usageComplete?: boolean;
   failures?: Array<{ path: string; error: string }>;
 }
 
@@ -114,6 +115,7 @@ function runReport(state: DesktopHarnessState, tally: RunTally, outcome: Analysi
       rejected: 0,
       fallbackServed: 0,
       costUsd: tally.costUsd,
+      usageComplete: outcome.usageComplete ?? true,
       cancelled: status === "cancelled",
       budgetExhausted: Boolean(outcome.budgetExhausted),
       failures,
