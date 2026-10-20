@@ -106,8 +106,7 @@ pub use analysis::{FRAMEPACK_RECIPE_KEY, STT_RECIPE_KEY, STT_TASK_KEY, VLM_PROMP
 pub use cameras::{
     CAMERA_PATTERNS, CameraEvidence, CameraIdentity, CameraIdentitySource, CameraMapping,
     CameraMergePreview, CameraMergeReport, CameraPattern, CameraRepairAssignment,
-    CameraRepairPreview, PatternConfidence, UNKNOWN_CAMERA,
-    identify_camera, pattern_counter,
+    CameraRepairPreview, PatternConfidence, UNKNOWN_CAMERA, identify_camera, pattern_counter,
 };
 pub use chronology::{
     AppliedCorrection, AssetChronology, AssetTimeHypothesis, CaptureSequence,

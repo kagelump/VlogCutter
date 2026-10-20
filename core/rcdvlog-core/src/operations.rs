@@ -1839,7 +1839,9 @@ pub(crate) fn materialize_operation(
         CAMERA_IDENTITY_MERGED => {
             return materialize_camera_identity_merged(transaction, operation);
         }
-        CAMERA_ASSETS_REPAIRED => return materialize_camera_assets_repaired(transaction, operation),
+        CAMERA_ASSETS_REPAIRED => {
+            return materialize_camera_assets_repaired(transaction, operation);
+        }
         CAPTURE_SEQUENCE_DECLARED => {
             return materialize_capture_sequence_declared(transaction, operation);
         }
@@ -2127,7 +2129,11 @@ fn materialize_camera_assets_repaired(
     if payload.camera.trim().is_empty() || payload.assignments.is_empty() {
         bail!("cameraAssetsRepaired requires a camera and at least one assignment");
     }
-    if payload.assignments.iter().any(|assignment| assignment.filename_counter.is_some_and(|counter| i64::try_from(counter).is_err())) {
+    if payload.assignments.iter().any(|assignment| {
+        assignment
+            .filename_counter
+            .is_some_and(|counter| i64::try_from(counter).is_err())
+    }) {
         bail!("cameraAssetsRepaired filename counter exceeds SQLite integer range");
     }
     if !revision_guard_passes(transaction, operation)? {
@@ -2149,8 +2155,16 @@ fn materialize_camera_assets_repaired(
             "SELECT project_id,camera_key,label,volume_hint,filename_prefix FROM capture_sequences WHERE id=?1",
             [&sequence.id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
         ).optional()?;
-        if let Some(existing)=existing {
-            if existing!=(operation.project_id.clone(),sequence.camera_key.clone(),sequence.label.clone(),sequence.volume_hint.clone(),sequence.filename_prefix.clone()) {
+        if let Some(existing) = existing {
+            if existing
+                != (
+                    operation.project_id.clone(),
+                    sequence.camera_key.clone(),
+                    sequence.label.clone(),
+                    sequence.volume_hint.clone(),
+                    sequence.filename_prefix.clone(),
+                )
+            {
                 bail!("cameraAssetsRepaired destination sequence identity collision");
             }
         } else {
@@ -2160,13 +2174,23 @@ fn materialize_camera_assets_repaired(
             )?;
         }
     }
-    let new_sequence_ids = payload.new_sequences.iter().map(|s| s.id.as_str()).collect::<BTreeSet<_>>();
+    let new_sequence_ids = payload
+        .new_sequences
+        .iter()
+        .map(|s| s.id.as_str())
+        .collect::<BTreeSet<_>>();
     for sequence_id in sequences {
-        if new_sequence_ids.contains(sequence_id) { continue; }
+        if new_sequence_ids.contains(sequence_id) {
+            continue;
+        }
         let total: i64 = transaction.query_row(
             "SELECT COUNT(*) FROM asset_capture_sequence WHERE project_id=?1 AND capture_sequence_id=?2",
             params![operation.project_id, sequence_id], |row| row.get(0))?;
-        let selected = payload.assignments.iter().filter(|a| a.capture_sequence_id == sequence_id).count() as i64;
+        let selected = payload
+            .assignments
+            .iter()
+            .filter(|a| a.capture_sequence_id == sequence_id)
+            .count() as i64;
         if total != selected {
             bail!("cameraAssetsRepaired must select every asset in each affected capture sequence");
         }
@@ -2180,15 +2204,31 @@ fn materialize_camera_assets_repaired(
             "UPDATE assets SET camera=?1 WHERE id=?2 AND project_id=?3",
             params![payload.camera, assignment.asset_id, operation.project_id],
         )?;
-        if affected != 1 { bail!("cameraAssetsRepaired asset is missing during replay: {}", assignment.asset_id); }
+        if affected != 1 {
+            bail!(
+                "cameraAssetsRepaired asset is missing during replay: {}",
+                assignment.asset_id
+            );
+        }
         let affected = transaction.execute(
             "UPDATE asset_capture_sequence SET capture_sequence_id=?1, filename_counter=?2 WHERE asset_id=?3 AND project_id=?4 AND capture_sequence_id=?5",
             params![assignment.capture_sequence_id, assignment.filename_counter.map(|value| value as i64), assignment.asset_id, operation.project_id, assignment.source_capture_sequence_id],
         )?;
-        if affected != 1 { bail!("cameraAssetsRepaired sequence membership is missing: {}", assignment.asset_id); }
-        let mut affected_aggregates=vec![("projectAsset", assignment.asset_id.as_str()),("captureSequence", assignment.source_capture_sequence_id.as_str())];
-        if assignment.source_capture_sequence_id!=assignment.capture_sequence_id {
-            affected_aggregates.push(("captureSequence",assignment.capture_sequence_id.as_str()));
+        if affected != 1 {
+            bail!(
+                "cameraAssetsRepaired sequence membership is missing: {}",
+                assignment.asset_id
+            );
+        }
+        let mut affected_aggregates = vec![
+            ("projectAsset", assignment.asset_id.as_str()),
+            (
+                "captureSequence",
+                assignment.source_capture_sequence_id.as_str(),
+            ),
+        ];
+        if assignment.source_capture_sequence_id != assignment.capture_sequence_id {
+            affected_aggregates.push(("captureSequence", assignment.capture_sequence_id.as_str()));
         }
         for (aggregate_type, aggregate_id) in affected_aggregates {
             transaction.execute(

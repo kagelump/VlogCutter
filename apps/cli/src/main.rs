@@ -237,13 +237,17 @@ enum CameraMappingsCommand {
 enum CamerasCommand {
     /// Preview exact selected asset identity and parsed counter repairs.
     RepairPreview {
-        #[arg(long)] project: String,
-        #[arg(long)] camera: String,
-        #[arg(long="asset", required=true, num_args=1..)] assets: Vec<String>,
+        #[arg(long)]
+        project: String,
+        #[arg(long)]
+        camera: String,
+        #[arg(long="asset", required=true, num_args=1..)]
+        assets: Vec<String>,
     },
     /// Apply an unchanged repair preview JSON file.
     Repair {
-        #[arg(long)] preview: PathBuf,
+        #[arg(long)]
+        preview: PathBuf,
     },
     /// Count the clips and cards that would move. Does not mutate the catalog.
     MergePreview {
