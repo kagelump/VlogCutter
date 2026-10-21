@@ -39,6 +39,30 @@ pub struct CameraPattern {
 /// Every shape here was confirmed against real footage, not invented from a
 /// manual.
 pub const CAMERA_PATTERNS: &[CameraPattern] = &[
+    // Timestamp-prefixed exports preserve the camera's original token after
+    // the date. Keep the timestamp exact so malformed/date-only names remain
+    // unidentified rather than inheriting a camera claim.
+    CameraPattern {
+        id: "dji-pocket-3-date-first",
+        label: "DJI Pocket 3",
+        stem_pattern: r"^\d{14}_DJI_(\d{4})_D$",
+        counter_group: 1,
+        confidence: PatternConfidence::Strong,
+    },
+    CameraPattern {
+        id: "insta360-ultra-go-date-first",
+        label: "Insta360 Ultra Go",
+        stem_pattern: r"^\d{14}_VID_(\d+)$",
+        counter_group: 1,
+        confidence: PatternConfidence::Strong,
+    },
+    CameraPattern {
+        id: "sony-c-series-date-first",
+        label: "Sony (C-series)",
+        stem_pattern: r"^\d{14}_C(\d{4})$",
+        counter_group: 1,
+        confidence: PatternConfidence::Weak,
+    },
     CameraPattern {
         id: "dji-pocket-3",
         label: "DJI Pocket 3",

@@ -41,6 +41,9 @@ Evaluated in order; the first match wins. Strong patterns precede weak ones.
 | `dji-pocket-3` | DJI Pocket 3 | `^DJI_\d{14}_(\d{4})_D$` | 1 | strong |
 | `insta360-ultra-go` | Insta360 Ultra Go | `^VID_\d{8}_\d{6}_(\d+)$` | 1 | strong |
 | `sony-c-series` | Sony (C-series) | `^C(\d{4})$` | 1 | weak |
+| `dji-pocket-3-date-first` | DJI Pocket 3 | `^\d{14}_DJI_(\d{4})_D$` | 1 | strong |
+| `insta360-ultra-go-date-first` | Insta360 Ultra Go | `^\d{14}_VID_(\d+)$` | 1 | strong |
+| `sony-c-series-date-first` | Sony (C-series) | `^\d{14}_C(\d{4})$` | 1 | weak |
 
 Worked examples:
 
@@ -50,6 +53,9 @@ Worked examples:
 | `VID_20251216_134946_113.mp4` | Insta360 Ultra Go | 113 |
 | `C0684.MP4` | Sony (C-series) | 684 |
 | `clip.mp4` | Unknown camera | *(none)* |
+| `20300102030405_DJI_0042_D.MP4` | DJI Pocket 3 | 42 |
+| `20300102030405_VID_007.mp4` | Insta360 Ultra Go | 7 |
+| `20300102030405_C0123.MP4` | Sony (C-series) | 123 |
 
 ## Confidence
 

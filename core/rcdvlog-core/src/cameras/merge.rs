@@ -5,10 +5,10 @@
 //! sequences together, without deleting or combining a capture sequence.
 
 use crate::operations::{
-    CAMERA_IDENTITY_MERGED, CameraIdentityMergedPayload, CameraSequenceAssignmentPayload,
-    NewOperation, commit_local_in_transaction,
+    CAMERA_ASSETS_REPAIRED, CAMERA_IDENTITY_MERGED, CameraIdentityMergedPayload,
+    CameraSequenceAssignmentPayload, NewOperation, commit_local_in_transaction, current_revision,
 };
-use crate::{Catalog, table_exists};
+use crate::{Catalog, chronology::CaptureSequence, table_exists};
 use anyhow::{Result, anyhow, bail};
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
@@ -34,6 +34,32 @@ pub struct CameraMergeReport {
     pub moved_clip_count: usize,
     pub moved_capture_sequence_count: usize,
     pub moved_mapping_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CameraRepairPreview {
+    pub project_id: String,
+    pub camera: String,
+    pub asset_ids: Vec<String>,
+    pub capture_sequence_ids: Vec<String>,
+    pub counters_to_repair: usize,
+    pub assignments: Vec<CameraRepairAssignment>,
+    pub expected_asset_revisions: Vec<(String, u64)>,
+    pub expected_asset_cameras: Vec<(String, String)>,
+    pub expected_sequence_revisions: Vec<(String, u64)>,
+    pub expected_sequence_cameras: Vec<(String, String)>,
+    pub expected_repair_revision: u64,
+    pub new_sequences: Vec<CaptureSequence>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CameraRepairAssignment {
+    pub asset_id: String,
+    pub source_capture_sequence_id: String,
+    pub capture_sequence_id: String,
+    pub filename_counter: Option<u64>,
 }
 
 fn normalized_pair<'a>(source: &'a str, destination: &'a str) -> Result<(&'a str, &'a str)> {
@@ -217,6 +243,193 @@ fn commit_identity_change(
 }
 
 impl Catalog {
+    /// Builds an exact identity/counter repair plan. Partial card selections
+    /// receive a new sequence, so neither card identities nor counter spaces
+    /// are combined.
+    pub fn preview_camera_repair(
+        &self,
+        project_id: &str,
+        camera: &str,
+        asset_ids: &[String],
+    ) -> Result<CameraRepairPreview> {
+        let camera = camera.trim();
+        if camera.is_empty() || asset_ids.is_empty() {
+            bail!("camera and exact asset selection are required");
+        }
+        let mut ids = asset_ids.to_vec();
+        ids.sort();
+        ids.dedup();
+        if ids.len() != asset_ids.len() {
+            bail!("asset selection contains duplicate IDs");
+        }
+        let connection = self.connection()?;
+        let mut assets = Vec::<(String, String, u64, Option<u64>, Option<u64>, String)>::new();
+        for id in &ids {
+            let (seq, revision, old_counter, old_camera): (String,u64,Option<i64>,String) = connection.query_row(
+                "SELECT acs.capture_sequence_id, COALESCE(mr.revision,0), acs.filename_counter, a.camera FROM assets a JOIN asset_capture_sequence acs ON acs.asset_id=a.id LEFT JOIN materialized_revisions mr ON mr.project_id=a.project_id AND mr.aggregate_type='projectAsset' AND mr.aggregate_id=a.id WHERE a.project_id=?1 AND a.id=?2",
+                params![project_id,id], |r| Ok((r.get(0)?,r.get::<_,i64>(1)? as u64,r.get(2)?,r.get(3)?)))?;
+            let parsed =
+                connection.query_row("SELECT filename FROM assets WHERE id=?1", [id], |r| {
+                    r.get::<_, String>(0)
+                })?;
+            let counter = crate::chronology::parse_filename_counter(&parsed);
+            assets.push((
+                id.clone(),
+                seq,
+                revision,
+                counter,
+                old_counter.map(|v| v as u64),
+                old_camera,
+            ));
+        }
+        let selected_sequences = assets
+            .iter()
+            .map(|a| a.1.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut new_sequences = Vec::new();
+        let mut revisions = Vec::new();
+        let mut sequence_cameras = Vec::new();
+        let mut sequence_ids = Vec::new();
+        let mut assignments = Vec::<CameraRepairAssignment>::new();
+        for seq_id in selected_sequences {
+            let members: Vec<String> = {
+                let mut stmt=connection.prepare("SELECT asset_id FROM asset_capture_sequence WHERE project_id=?1 AND capture_sequence_id=?2 ORDER BY asset_id")?;
+                let rows = stmt.query_map(params![project_id, seq_id], |r| r.get(0))?;
+                rows.collect::<rusqlite::Result<_>>()?
+            };
+            let selected = assets
+                .iter()
+                .filter(|a| a.1 == seq_id)
+                .map(|a| a.0.clone())
+                .collect::<Vec<_>>();
+            let old_seq: CaptureSequence = connection.query_row("SELECT id,camera_key,label,volume_hint,filename_prefix FROM capture_sequences WHERE project_id=?1 AND id=?2",params![project_id,seq_id],|r|Ok(CaptureSequence{id:r.get(0)?,camera_key:r.get(1)?,label:r.get(2)?,volume_hint:r.get(3)?,filename_prefix:r.get(4)?}))?;
+            sequence_cameras.push((seq_id.clone(), old_seq.camera_key.clone()));
+            let target_seq = if selected.len() == members.len() {
+                seq_id.clone()
+            } else {
+                let key = format!("{project_id}:{seq_id}:{}:{}", camera, selected.join(","));
+                let id = format!("sequence_repair_{}", blake3::hash(key.as_bytes()).to_hex());
+                let collision: bool = connection.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM capture_sequences WHERE id=?1)",
+                    [&id],
+                    |r| r.get(0),
+                )?;
+                if collision {
+                    bail!(
+                        "camera repair destination sequence already exists; preview a fresh selection"
+                    );
+                }
+                new_sequences.push(CaptureSequence {
+                    id: id.clone(),
+                    camera_key: camera.into(),
+                    label: format!("{} (repaired selection)", old_seq.label),
+                    volume_hint: old_seq.volume_hint,
+                    filename_prefix: old_seq.filename_prefix,
+                });
+                id
+            };
+            let rev: i64=connection.query_row("SELECT COALESCE(revision,0) FROM materialized_revisions WHERE project_id=?1 AND aggregate_type='captureSequence' AND aggregate_id=?2",params![project_id,seq_id],|r|r.get(0)).optional()?.unwrap_or(0);
+            revisions.push((seq_id.clone(), rev as u64));
+            sequence_ids.push(target_seq.clone());
+            for a in assets.iter().filter(|a| a.1 == seq_id) {
+                assignments.push(CameraRepairAssignment {
+                    asset_id: a.0.clone(),
+                    source_capture_sequence_id: seq_id.clone(),
+                    capture_sequence_id: target_seq.clone(),
+                    filename_counter: a.3.or(a.4),
+                });
+            }
+        }
+        revisions.sort();
+        sequence_cameras.sort();
+        sequence_ids.sort();
+        sequence_ids.dedup();
+        let expected_asset_revisions = assets.iter().map(|a| (a.0.clone(), a.2)).collect();
+        let expected_asset_cameras = assets.iter().map(|a| (a.0.clone(), a.5.clone())).collect();
+        let counters_to_repair = assets
+            .iter()
+            .filter(|a| a.4.is_none() && a.3.is_some())
+            .count();
+        let repair_revision = current_revision(&connection, project_id, "cameraRepair", "assets")?;
+        Ok(CameraRepairPreview {
+            project_id: project_id.into(),
+            camera: camera.into(),
+            asset_ids: ids,
+            capture_sequence_ids: sequence_ids,
+            counters_to_repair,
+            assignments,
+            expected_asset_revisions,
+            expected_asset_cameras,
+            expected_sequence_revisions: revisions,
+            expected_sequence_cameras: sequence_cameras,
+            expected_repair_revision: repair_revision,
+            new_sequences,
+        })
+    }
+
+    /// Applies an unchanged exact repair preview as one synchronized operation.
+    pub fn apply_camera_repair(&self, preview: &CameraRepairPreview) -> Result<usize> {
+        let current =
+            self.preview_camera_repair(&preview.project_id, &preview.camera, &preview.asset_ids)?;
+        if current != *preview {
+            bail!("camera repair preview is stale; preview again before applying");
+        }
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let revision =
+            current_revision(&transaction, &preview.project_id, "cameraRepair", "assets")?;
+        if revision != preview.expected_repair_revision {
+            bail!("camera repair preview is stale; preview again before applying");
+        }
+        for (id, expected) in &preview.expected_asset_revisions {
+            if current_revision(&transaction, &preview.project_id, "projectAsset", id)? != *expected
+            {
+                bail!("camera repair preview is stale; preview again before applying");
+            }
+        }
+        for (id, expected) in &preview.expected_asset_cameras {
+            let actual: String = transaction.query_row(
+                "SELECT camera FROM assets WHERE project_id=?1 AND id=?2",
+                params![preview.project_id, id],
+                |r| r.get(0),
+            )?;
+            if actual != *expected {
+                bail!("camera repair preview is stale; preview again before applying");
+            }
+        }
+        for (id, expected) in &preview.expected_sequence_revisions {
+            if current_revision(&transaction, &preview.project_id, "captureSequence", id)?
+                != *expected
+            {
+                bail!("camera repair preview is stale; preview again before applying");
+            }
+        }
+        for (id, expected) in &preview.expected_sequence_cameras {
+            let actual: String = transaction.query_row(
+                "SELECT camera_key FROM capture_sequences WHERE project_id=?1 AND id=?2",
+                params![preview.project_id, id],
+                |r| r.get(0),
+            )?;
+            if actual != *expected {
+                bail!("camera repair preview is stale; preview again before applying");
+            }
+        }
+        let payload = serde_json::json!({"camera":preview.camera,"assignments":preview.assignments,"newSequences":preview.new_sequences});
+        commit_local_in_transaction(
+            &transaction,
+            &preview.project_id,
+            vec![NewOperation {
+                aggregate_type: "cameraRepair",
+                aggregate_id: "assets".into(),
+                operation_type: CAMERA_ASSETS_REPAIRED,
+                base_revision: Some(revision),
+                payload,
+            }],
+        )?;
+        transaction.commit()?;
+        Ok(preview.asset_ids.len())
+    }
+
     /// Resolves a camera spelling through the durable merge equivalence.
     /// Import preflight uses this before showing an identity, so the preview
     /// cannot disagree with operation materialization at commit time.
@@ -379,6 +592,172 @@ mod tests {
             )
             .unwrap();
         (directory, catalog, project.id)
+    }
+
+    #[test]
+    fn exact_repair_changes_asset_and_sequence_identity_without_merging_cards() {
+        let (_directory, catalog, project_id) = fixture();
+        let selection = vec!["a_wrong_1".to_string()];
+        let preview = catalog
+            .preview_camera_repair(&project_id, "DJI Pocket 3", &selection)
+            .unwrap();
+        assert_eq!(preview.capture_sequence_ids, vec!["card_wrong_a"]);
+        assert_eq!(catalog.apply_camera_repair(&preview).unwrap(), 1);
+        let asset = catalog.get_asset("a_wrong_1").unwrap();
+        assert_eq!(asset.camera, "DJI Pocket 3");
+        let connection = catalog.connection().unwrap();
+        let camera: String = connection
+            .query_row(
+                "SELECT camera_key FROM capture_sequences WHERE id='card_wrong_a'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let other: String = connection
+            .query_row(
+                "SELECT camera_key FROM capture_sequences WHERE id='card_wrong_b'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(camera, "DJI Pocket 3");
+        assert_eq!(other, "Sony wrong");
+        assert!(
+            catalog
+                .apply_camera_repair(&preview)
+                .unwrap_err()
+                .to_string()
+                .contains("stale")
+        );
+    }
+
+    #[test]
+    fn exact_unknown_repair_keeps_an_unselected_card_and_its_counter_space() {
+        let (_directory, catalog, project_id) = fixture();
+        let connection = catalog.connection().unwrap();
+        connection
+            .execute(
+                "UPDATE assets SET camera='Unknown camera' WHERE id IN ('a_wrong_1','a_wrong_2')",
+                [],
+            )
+            .unwrap();
+        connection.execute("UPDATE assets SET filename=CASE id WHEN 'a_wrong_1' THEN 'synthetic-alpha.mp4' ELSE 'synthetic-beta.mp4' END WHERE id IN ('a_wrong_1','a_wrong_2')",[]).unwrap();
+        connection.execute("UPDATE capture_sequences SET camera_key='Unknown camera' WHERE id IN ('card_wrong_a','card_wrong_b')",[]).unwrap();
+        connection
+            .execute(
+                "UPDATE asset_capture_sequence SET filename_counter=42 WHERE asset_id='a_wrong_1'",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE asset_capture_sequence SET filename_counter=7 WHERE asset_id='a_wrong_2'",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+
+        let preview = catalog
+            .preview_camera_repair(&project_id, "DJI Pocket 3", &["a_wrong_1".into()])
+            .unwrap();
+        assert_eq!(preview.capture_sequence_ids, vec!["card_wrong_a"]);
+        catalog.apply_camera_repair(&preview).unwrap();
+
+        let connection = catalog.connection().unwrap();
+        let selected:(String,String,i64)=connection.query_row("SELECT a.camera,acs.capture_sequence_id,acs.filename_counter FROM assets a JOIN asset_capture_sequence acs ON acs.asset_id=a.id WHERE a.id='a_wrong_1'",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+        let retained:(String,String,String,i64)=connection.query_row("SELECT a.camera,acs.capture_sequence_id,cs.camera_key,acs.filename_counter FROM assets a JOIN asset_capture_sequence acs ON acs.asset_id=a.id JOIN capture_sequences cs ON cs.id=acs.capture_sequence_id WHERE a.id='a_wrong_2'",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
+        assert_eq!(selected, ("DJI Pocket 3".into(), "card_wrong_a".into(), 42));
+        assert_eq!(
+            retained,
+            (
+                "Unknown camera".into(),
+                "card_wrong_b".into(),
+                "Unknown camera".into(),
+                7
+            )
+        );
+    }
+
+    #[test]
+    fn partial_card_repair_creates_a_separate_sequence() {
+        let (_directory, catalog, project_id) = fixture();
+        catalog.connection().unwrap().execute("UPDATE asset_capture_sequence SET capture_sequence_id='card_wrong_a' WHERE asset_id='a_wrong_2'",[]).unwrap();
+        let preview = catalog
+            .preview_camera_repair(&project_id, "DJI Pocket 3", &["a_wrong_1".into()])
+            .unwrap();
+        assert_eq!(preview.new_sequences.len(), 1);
+        catalog.apply_camera_repair(&preview).unwrap();
+        let connection = catalog.connection().unwrap();
+        let selected: String = connection
+            .query_row(
+                "SELECT capture_sequence_id FROM asset_capture_sequence WHERE asset_id='a_wrong_1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let retained: String = connection
+            .query_row(
+                "SELECT capture_sequence_id FROM asset_capture_sequence WHERE asset_id='a_wrong_2'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_ne!(selected, retained);
+        assert_eq!(retained, "card_wrong_a");
+        let camera: String = connection
+            .query_row(
+                "SELECT camera_key FROM capture_sequences WHERE id=?1",
+                [selected],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(camera, "DJI Pocket 3");
+    }
+
+    #[test]
+    fn preview_repairs_legacy_null_counter_without_changing_filename() {
+        let (_directory, catalog, project_id) = fixture();
+        catalog.connection().unwrap().execute("UPDATE assets SET filename='20300102030405_DJI_0042_D.MP4',captured_at_raw='2030-01-02T03:04:05' WHERE id='a_wrong_1'",[]).unwrap();
+        catalog.connection().unwrap().execute("UPDATE asset_capture_sequence SET filename_counter=NULL WHERE asset_id='a_wrong_1'",[]).unwrap();
+        let preview = catalog
+            .preview_camera_repair(&project_id, "DJI Pocket 3", &["a_wrong_1".into()])
+            .unwrap();
+        assert_eq!(preview.counters_to_repair, 1);
+        catalog.apply_camera_repair(&preview).unwrap();
+        let connection = catalog.connection().unwrap();
+        let (filename,counter,raw):(String,i64,String)=connection.query_row("SELECT a.filename,acs.filename_counter,a.captured_at_raw FROM assets a JOIN asset_capture_sequence acs ON acs.asset_id=a.id WHERE a.id='a_wrong_1'",[],|r|Ok((r.get(0)?,r.get(1)?,r.get::<_,Option<String>>(2)?.unwrap_or_default()))).unwrap();
+        assert_eq!(filename, "20300102030405_DJI_0042_D.MP4");
+        assert_eq!(counter, 42);
+        assert_eq!(raw, "2030-01-02T03:04:05");
+    }
+
+    #[test]
+    fn stale_preview_refuses_before_any_repair_write() {
+        let (_directory, catalog, project_id) = fixture();
+        let preview = catalog
+            .preview_camera_repair(&project_id, "DJI Pocket 3", &["a_wrong_1".into()])
+            .unwrap();
+        catalog
+            .connection()
+            .unwrap()
+            .execute(
+                "UPDATE assets SET camera='changed after preview' WHERE id='a_wrong_1'",
+                [],
+            )
+            .unwrap();
+        assert!(
+            catalog
+                .apply_camera_repair(&preview)
+                .unwrap_err()
+                .to_string()
+                .contains("stale")
+        );
+        assert_eq!(
+            catalog.get_asset("a_wrong_1").unwrap().camera,
+            "changed after preview"
+        );
+        let operations:i64=catalog.connection().unwrap().query_row("SELECT COUNT(*) FROM project_operations WHERE operation_type='cameraAssetsRepaired'",[],|r|r.get(0)).unwrap();
+        assert_eq!(operations, 0);
     }
 
     #[test]

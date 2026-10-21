@@ -105,8 +105,8 @@ pub use analysis::vlm_store::StoredAnalysis as ClipAnalysis;
 pub use analysis::{FRAMEPACK_RECIPE_KEY, STT_RECIPE_KEY, STT_TASK_KEY, VLM_PROMPT_VERSION};
 pub use cameras::{
     CAMERA_PATTERNS, CameraEvidence, CameraIdentity, CameraIdentitySource, CameraMapping,
-    CameraMergePreview, CameraMergeReport, CameraPattern, PatternConfidence, UNKNOWN_CAMERA,
-    identify_camera, pattern_counter,
+    CameraMergePreview, CameraMergeReport, CameraPattern, CameraRepairAssignment,
+    CameraRepairPreview, PatternConfidence, UNKNOWN_CAMERA, identify_camera, pattern_counter,
 };
 pub use chronology::{
     AppliedCorrection, AssetChronology, AssetTimeHypothesis, CaptureSequence,
@@ -1069,6 +1069,38 @@ impl Catalog {
         &self,
         project_id: &str,
         root: impl AsRef<Path>,
+        on_progress: F,
+    ) -> Result<IngestReport>
+    where
+        F: FnMut(usize, usize, &Path),
+    {
+        self.ingest_folder_with_camera_and_progress(project_id, root, None, on_progress)
+    }
+
+    /// Imports a folder with an explicit camera identity chosen by the user.
+    /// The override is applied consistently to every newly ingested asset.
+    pub fn ingest_folder_with_camera<F>(
+        &self,
+        project_id: &str,
+        root: impl AsRef<Path>,
+        camera: &str,
+        on_progress: F,
+    ) -> Result<IngestReport>
+    where
+        F: FnMut(usize, usize, &Path),
+    {
+        let camera = camera.trim();
+        if camera.is_empty() {
+            bail!("camera override must not be empty");
+        }
+        self.ingest_folder_with_camera_and_progress(project_id, root, Some(camera), on_progress)
+    }
+
+    fn ingest_folder_with_camera_and_progress<F>(
+        &self,
+        project_id: &str,
+        root: impl AsRef<Path>,
+        camera_override: Option<&str>,
         mut on_progress: F,
     ) -> Result<IngestReport>
     where
@@ -1099,7 +1131,10 @@ impl Catalog {
 
         let total = candidates.len();
         for (index, path) in candidates.into_iter().enumerate() {
-            match self.ingest_file(project_id, &path) {
+            match match camera_override {
+                Some(camera) => self.ingest_file_with_camera(project_id, &path, Some(camera)),
+                None => self.ingest_file(project_id, &path),
+            } {
                 Ok(IngestOutcome::Imported) => report.imported += 1,
                 Ok(IngestOutcome::Duplicate) => report.duplicates += 1,
                 Ok(IngestOutcome::Relinked) => report.relinked += 1,

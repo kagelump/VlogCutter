@@ -17,7 +17,9 @@ pub mod merge;
 pub mod patterns;
 
 pub use mapping::{CameraEvidence, CameraMapping};
-pub use merge::{CameraMergePreview, CameraMergeReport};
+pub use merge::{
+    CameraMergePreview, CameraMergeReport, CameraRepairAssignment, CameraRepairPreview,
+};
 pub use patterns::{CAMERA_PATTERNS, CameraPattern, PatternConfidence};
 
 use regex::Regex;
@@ -195,6 +197,34 @@ mod tests {
                 pattern_id: "sony-c-series".to_string(),
                 confidence: PatternConfidence::Weak,
             }
+        );
+    }
+
+    #[test]
+    fn date_first_renames_keep_camera_family_and_counter() {
+        for (filename, expected, counter) in [
+            ("20300102030405_DJI_0042_D.MP4", "DJI Pocket 3", 42),
+            ("20300102030405_VID_007.mp4", "Insta360 Ultra Go", 7),
+            ("20300102030405_C0123.MP4", "Sony (C-series)", 123),
+        ] {
+            assert_eq!(identify_camera(None, filename).camera, expected);
+            assert_eq!(pattern_counter(filename), Some(counter));
+        }
+        assert_eq!(
+            identify_camera(None, "20300102030405.mp4").camera,
+            UNKNOWN_CAMERA
+        );
+        assert_eq!(
+            identify_camera(None, "20300102030405_DJI_broken_D.MP4").camera,
+            UNKNOWN_CAMERA
+        );
+        assert_eq!(
+            pattern_counter("20300102030405_VID_999999999999999999999.mp4"),
+            None
+        );
+        assert_eq!(
+            identify_camera(Some("Camera from EXIF"), "20300102030405_VID_007.mp4").camera,
+            "Camera from EXIF"
         );
     }
 
