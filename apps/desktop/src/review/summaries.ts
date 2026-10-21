@@ -76,11 +76,12 @@ export function analysisNeedsAttention(observation: AssetAnalysisView | null): b
  * proxy is a fact to state quietly, while an offline original with no proxy is
  * a clip that cannot be played at all.
  */
-export type MediaAvailability = "available" | "proxy_only" | "blocked";
+export type MediaAvailability = "available" | "proxy_only" | "camera_proxy_only" | "blocked";
 
 export function mediaAvailability(asset: Asset): MediaAvailability {
   if (asset.originalAvailable) return "available";
-  return asset.proxyAvailable ? "proxy_only" : "blocked";
+  if (asset.proxyAvailable) return "proxy_only";
+  return asset.cameraProxyAvailable ? "camera_proxy_only" : "blocked";
 }
 
 /** What the offline mark means, for a tooltip and for the accessible name. */
@@ -88,6 +89,8 @@ export function mediaAvailabilityDescription(asset: Asset): string {
   switch (mediaAvailability(asset)) {
     case "proxy_only":
       return "Original is offline — reviewing from the 720p proxy";
+    case "camera_proxy_only":
+      return "Original is offline — reviewing from the verified camera sidecar";
     case "blocked":
       return "Original is offline and there is no proxy — this clip cannot be played";
     default:

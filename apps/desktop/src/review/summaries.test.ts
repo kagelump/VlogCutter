@@ -240,6 +240,10 @@ describe("mediaAvailability", () => {
     expect(mediaAvailability(asset({ id: "a", originalAvailable: false, proxyAvailable: true }))).toBe("proxy_only");
   });
 
+  it("reports a camera sidecar as its own offline review representation", () => {
+    expect(mediaAvailability(asset({ id: "a", originalAvailable: false, proxyAvailable: false, cameraProxyAvailable: true }))).toBe("camera_proxy_only");
+  });
+
   it("is blocked when nothing can be played", () => {
     expect(mediaAvailability(asset({ id: "a", originalAvailable: false, proxyAvailable: false }))).toBe("blocked");
   });

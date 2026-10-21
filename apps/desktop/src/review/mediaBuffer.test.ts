@@ -56,6 +56,15 @@ describe("buildMediaBuffer", () => {
     expect(entry.mediaIsRawOriented).toBe(false);
   });
 
+  it("uses a verified camera sidecar only when both normal representations are offline", () => {
+    const ordered = assets({
+      proxyAvailable: false, proxyPath: null, proxyRepresentation: null,
+      originalAvailable: false, cameraProxyAvailable: true, available: true,
+    });
+    const [entry] = buildMediaBuffer(ordered, ordered[0].id, ORIGIN);
+    expect(entry.url).toContain("rep=camera_proxy");
+  });
+
   it("drops clips whose original and proxy are both gone", () => {
     const ordered = assets({ proxyAvailable: false, proxyPath: null, originalAvailable: false, available: false });
     expect(buildMediaBuffer(ordered, ordered[0].id, ORIGIN)).toEqual([]);

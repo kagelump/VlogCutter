@@ -63,6 +63,11 @@ enum Commands {
         #[command(subcommand)]
         command: CamerasCommand,
     },
+    /// Discover, verify, or inspect camera supplied `.LRF` review sidecars.
+    CameraProxy {
+        #[command(subcommand)]
+        command: CameraProxyCommand,
+    },
     /// Reference all supported media in a folder.
     Ingest {
         #[arg(long)]
@@ -392,6 +397,31 @@ enum ThumbnailCommand {
     },
 }
 
+#[derive(Debug, Subcommand)]
+enum CameraProxyCommand {
+    /// Read-only scan of one exact card root; does not register or change files.
+    Discover {
+        #[arg(long)]
+        project: String,
+        #[arg(long)]
+        card: PathBuf,
+    },
+    /// Explicitly register a candidate for an asset after full verification.
+    Register {
+        #[arg(long)]
+        asset: String,
+        #[arg(long)]
+        card: PathBuf,
+        #[arg(long)]
+        sidecar: PathBuf,
+    },
+    /// Check the currently registered sidecar and report review readiness.
+    Status {
+        #[arg(long)]
+        asset: String,
+    },
+}
+
 #[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DesktopContext {
@@ -461,6 +491,11 @@ fn command_name(command: &Commands) -> &'static str {
             CamerasCommand::Repair { .. } => "cameras.repair",
             CamerasCommand::MergePreview { .. } => "cameras.merge-preview",
             CamerasCommand::Merge { .. } => "cameras.merge",
+        },
+        Commands::CameraProxy { command } => match command {
+            CameraProxyCommand::Discover { .. } => "camera-proxy.discover",
+            CameraProxyCommand::Register { .. } => "camera-proxy.register",
+            CameraProxyCommand::Status { .. } => "camera-proxy.status",
         },
         Commands::Ingest { .. } => "ingest",
         Commands::Relink { .. } => "relink",
@@ -559,6 +594,8 @@ fn execute(cli: &Cli) -> Result<Value> {
             command: CamerasCommand::MergePreview { .. }
         } | Commands::Cameras {
             command: CamerasCommand::RepairPreview { .. }
+        } | Commands::CameraProxy {
+            command: CameraProxyCommand::Discover { .. } | CameraProxyCommand::Status { .. }
         }
     ) || match &cli.command {
         // Chronology read and preview commands use a read-only catalog; apply
@@ -609,6 +646,11 @@ fn execute(cli: &Cli) -> Result<Value> {
                     "cleared": true,
                 }))
             }
+        },
+        Commands::CameraProxy { command } => match command {
+            CameraProxyCommand::Discover { project, card } => Ok(serde_json::to_value(catalog.discover_camera_proxy_sidecars(project, card)?)?),
+            CameraProxyCommand::Register { asset, card, sidecar } => Ok(serde_json::to_value(catalog.register_camera_proxy_sidecar(asset, card, sidecar)?)?),
+            CameraProxyCommand::Status { asset } => Ok(serde_json::to_value(catalog.camera_proxy_sidecar(asset)?)?),
         },
         Commands::Cameras { command } => match command {
             CamerasCommand::RepairPreview { project, camera, assets } => Ok(serde_json::to_value(

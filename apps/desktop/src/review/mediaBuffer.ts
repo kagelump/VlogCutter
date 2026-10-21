@@ -35,9 +35,10 @@ export interface BufferedMedia {
 }
 
 /** Which bytes the origin should serve, or null when neither is reachable. */
-function representationOf(asset: Asset): "proxy" | "original" | null {
+function representationOf(asset: Asset): "proxy" | "original" | "camera_proxy" | null {
   if (asset.proxyAvailable && asset.proxyPath) return "proxy";
-  return asset.originalAvailable ? "original" : null;
+  if (asset.originalAvailable) return "original";
+  return asset.cameraProxyAvailable ? "camera_proxy" : null;
 }
 
 /**
