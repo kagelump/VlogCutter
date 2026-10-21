@@ -8,8 +8,9 @@ use rcdvlog_core::{
     ImportCutoff, ImportHistoryEntry, ImportOutcome, ImportPreflight, ImportPreviewItem,
     ImportPreviewRequest, ImportProgress as CoreImportProgress, ImportRollbackPreview,
     ImportSessionDetail, ImportStage as CoreImportStage, IngestReport, ModelStatus, MountedVolumes,
-    Project, ProjectRemovalAudit, ProjectStorageReport, ProxyReport, RelinkReport, ThumbnailReport,
-    ToolStatus, TranscribeReport, detect_cards, inspect_card,
+    OpenRouterProvider, Project, ProjectRemovalAudit, ProjectStorageReport, ProviderChain,
+    ProxyReport, RelinkReport, ThumbnailReport, ToolStatus, TranscribeReport, detect_cards,
+    inspect_card,
 };
 use rcdvlog_sync::BaselineEnvelope;
 use serde::{Deserialize, Serialize};
@@ -1852,6 +1853,12 @@ struct AnalysisRunRequest {
     /// Ceiling for this run's cloud spend, in USD.
     #[serde(default)]
     budget_usd: Option<f64>,
+    #[serde(default)]
+    primary_model: Option<String>,
+    #[serde(default)]
+    allowed_models: Vec<String>,
+    #[serde(default)]
+    allow_fallback: Option<bool>,
 }
 
 #[tauri::command]
@@ -1868,6 +1875,42 @@ fn analysis_readiness(
     readiness.api_key_present =
         readiness.api_key_present || matches!(keychain::get_openrouter_key(), Ok(Some(_)));
     Ok(readiness)
+}
+
+#[tauri::command]
+fn analysis_suggest_chronology(
+    project_id: String,
+    asset_ids: Vec<String>,
+    primary_model: String,
+    allowed_models: Vec<String>,
+    allow_fallback: bool,
+    state: State<'_, AppState>,
+) -> Result<rcdvlog_core::SuggestionResult, String> {
+    let catalog = state.catalog()?;
+    let allowed = if allowed_models.is_empty() && allow_fallback {
+        vec![
+            primary_model.clone(),
+            if primary_model == rcdvlog_core::DEFAULT_MODEL {
+                rcdvlog_core::FALLBACK_MODEL.to_string()
+            } else {
+                rcdvlog_core::DEFAULT_MODEL.to_string()
+            },
+        ]
+    } else if allowed_models.is_empty() {
+        vec![primary_model.clone()]
+    } else {
+        allowed_models
+    };
+    let chain = ProviderChain::with_policy(&primary_model, &allowed, allow_fallback)
+        .map_err(error_message)?;
+    let key = match keychain::get_openrouter_key().map_err(error_message)? {
+        Some(key) => key,
+        None => rcdvlog_core::resolve_api_key().map_err(error_message)?,
+    };
+    let provider = OpenRouterProvider::new(key).map_err(error_message)?;
+    catalog
+        .suggest_chronology_with_provider(&project_id, &asset_ids, &provider, &chain)
+        .map_err(error_message)
 }
 
 #[tauri::command]
@@ -2105,6 +2148,7 @@ async fn analyze_project(
             fallback_served: 0,
             force_overwrite_warnings: 0,
             cost_usd: 0.0,
+            usage_complete: true,
             cancelled: transcripts.cancelled,
             budget_exhausted: false,
             outcomes: Vec::new(),
@@ -2117,6 +2161,9 @@ async fn analyze_project(
                 api_key: api_key.clone(),
                 budget_usd: request.budget_usd,
                 worker_count: None,
+                primary_model: request.primary_model.clone(),
+                allowed_models: request.allowed_models.clone(),
+                allow_fallback: request.allow_fallback,
             };
             let mut spent = 0.0;
             analysis = catalog.analyze_missing_with_options(&project_id, &options, |progress| {
@@ -2772,6 +2819,7 @@ pub fn run() {
             analyze_project,
             cancel_analysis,
             analysis_readiness,
+            analysis_suggest_chronology,
             analysis_runs,
             project_analysis_index,
             set_clip_summary,

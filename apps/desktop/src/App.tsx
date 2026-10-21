@@ -240,6 +240,13 @@ function App() {
   const [showAnalysisDialog, setShowAnalysisDialog] = useState(false);
   const [budgetInput, setBudgetInput] = useState("1.00");
   const [forceReanalyze, setForceReanalyze] = useState(false);
+  const [analysisPrimaryModel, setAnalysisPrimaryModel] = useState("qwen/qwen3.7-flash");
+  const [analysisAllowedModels, setAnalysisAllowedModels] = useState(["qwen/qwen3.7-flash", "google/gemini-2.5-flash-lite"]);
+  const [analysisAllowFallback, setAnalysisAllowFallback] = useState(true);
+  const selectAnalysisPrimaryModel = (model: string) => {
+    setAnalysisPrimaryModel(model);
+    setAnalysisAllowedModels((current) => current.includes(model) ? current : [...current, model]);
+  };
   const [showUnusableOnly, setShowUnusableOnly] = useState(false);
   const [models, setModels] = useState<ModelStatus[]>([]);
   const [modelInstall, setModelInstall] = useState<ModelInstallProgress | null>(null);
@@ -2507,16 +2514,22 @@ function App() {
       const report = await api.analyzeProject(projectId, {
         force: forceReanalyze,
         budgetUsd: Number.isFinite(budget) && budget > 0 ? budget : null,
+        primaryModel: analysisPrimaryModel,
+        allowedModels: analysisAllowedModels,
+        allowFallback: analysisAllowFallback,
       });
       // Everything the run touched, including the evidence for the clip the
       // user is sitting on: the queue row's verdict and the rail beside it now
       // come from the same read.
       await reloadSession();
       const spent = formatCost(report.costUsd);
+      const spendSummary = report.analysis.usageComplete
+        ? `${spent} spent`
+        : `${spent} known cost (provider usage incomplete; failed attempts may add unpriced cost)`;
       if (report.status === "cancelled") {
-        setMessage(`Analysis stopped during ${analysisStageLabels[report.stageReached].toLocaleLowerCase()}; ${report.analysis.analyzed} clips analyzed, ${spent} spent. Run it again to resume.`);
+        setMessage(`Analysis stopped during ${analysisStageLabels[report.stageReached].toLocaleLowerCase()}; ${report.analysis.analyzed} clips analyzed, ${spendSummary}. Run it again to resume.`);
       } else {
-        setMessage(`Analyzed ${report.analysis.analyzed} clips and transcribed ${report.transcripts.transcribed}; ${spent} spent`);
+        setMessage(`Analyzed ${report.analysis.analyzed} clips and transcribed ${report.transcripts.transcribed}; ${spendSummary}`);
       }
       if (report.analysis.budgetExhausted) {
         setError(`Stopped at the ${formatCost(budget)} budget for this run. Raise it and run again to continue.`);
@@ -3360,8 +3373,14 @@ function App() {
           readiness={readiness}
           budget={budgetInput}
           forceReanalyze={forceReanalyze}
+          primaryModel={analysisPrimaryModel}
+          allowedModels={analysisAllowedModels}
+          allowFallback={analysisAllowFallback}
           onBudgetChange={setBudgetInput}
           onForceReanalyzeChange={setForceReanalyze}
+          onPrimaryModelChange={selectAnalysisPrimaryModel}
+          onAllowedModelsChange={setAnalysisAllowedModels}
+          onAllowFallbackChange={setAnalysisAllowFallback}
           onOpenSettings={() => { setShowAnalysisDialog(false); setShowSettings(true); }}
           onCancel={() => setShowAnalysisDialog(false)}
           onStart={runAnalysis}

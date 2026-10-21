@@ -226,6 +226,8 @@ export interface ClipAnalysis {
   costUsd: number;
   latencyMs: number;
   attempts: number;
+  attemptedModels: string[];
+  usageComplete: boolean;
   createdAt: string;
 }
 
@@ -316,6 +318,7 @@ export interface AnalysisRunReport {
     rejected: number;
     fallbackServed: number;
     costUsd: number;
+    usageComplete: boolean;
     cancelled: boolean;
     budgetExhausted: boolean;
     failures: Array<{ path: string; error: string }>;
@@ -326,6 +329,24 @@ export interface AnalysisRunReport {
 export interface AnalysisRunRequest {
   force?: boolean;
   budgetUsd?: number | null;
+  primaryModel?: string | null;
+  allowedModels?: string[];
+  allowFallback?: boolean | null;
+}
+
+export interface ChronologySuggestionRequest {
+  projectId: string;
+  assetIds: string[];
+  primaryModel: string;
+  allowedModels: string[];
+  allowFallback: boolean;
+}
+
+export interface ChronologySuggestionResult {
+  suggestion: { frameIds: string[]; matches: Array<{ earlierAssetId: string; laterAssetId: string; supportingFrameIds: string[] }> };
+  review: { missingFrameIds: string[]; duplicateFrameIds: string[]; unknownFrameIds: string[]; semanticInconsistencies: string[] };
+  provenance: { model: string; attempts: number; attemptedModels: string[]; usageComplete: boolean; costUsd: number; promptTokens: number; completionTokens: number; latencyMs: number };
+  cached: boolean;
 }
 
 export interface AssetPatch {

@@ -231,6 +231,8 @@ export function buildAnalysis(assetId: string, spec: AnalysisSpec = {}): AssetAn
       costUsd: spec.costUsd ?? 0.0001084,
       latencyMs: 3_820,
       attempts: 1,
+      attemptedModels: ["gemini-2.5-flash"],
+      usageComplete: true,
       createdAt: spec.createdAt ?? "2026-08-03T11:04:12.000Z",
     },
     aiLabels: spec.aiLabels ?? [],

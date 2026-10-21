@@ -6,6 +6,7 @@
 //! stale rather than silently mixed.
 
 pub mod audio;
+pub mod chronology_suggestions;
 pub mod consolidate;
 pub mod coverage;
 pub mod engine;

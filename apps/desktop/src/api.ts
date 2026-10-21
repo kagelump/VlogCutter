@@ -2,7 +2,7 @@ import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import type { EndpointProbe } from "./import/pausedImport";
-import type { AnalysisProgress, AnalysisReadiness, AnalysisRunRecord, AnalysisRunReport, AnalysisRunRequest, AnalysisStage, ArchiveRoot, Asset, AssetAnalysisIndexEntry, AssetAnalysisView, AssetPatch, AutoplayMode, BaselineImportResult, BaselinePreviewResult, CacheCleanupReport, CacheKind, CameraMapping, CameraMergePreview, CameraMergeReport, CardCandidate, ClipTranscript, DesktopSettings, GenerationProgress, ImportCutoff, ImportHistoryEntry, ImportPreflight, ImportPreviewItem, ImportPreviewRequest, ImportProgress, ImportRollbackPreview, ImportRunReport, ImportSessionDetail, LoadedCatalog, MediaOrigin, ModelInstallProgress, ModelStatus, PathAnalysis, Project, ProjectLibrary, ProjectRemovalAudit, ProjectStorageReport, ProjectPairingStatus, RelinkReport, RootMappingEntry, ServerConnectionStatus, ServerPairingResult, ServerVersionInfo, SyncStatus, ThumbnailReport } from "./types";
+import type { AnalysisProgress, AnalysisReadiness, AnalysisRunRecord, AnalysisRunReport, AnalysisRunRequest, ChronologySuggestionRequest, ChronologySuggestionResult, AnalysisStage, ArchiveRoot, Asset, AssetAnalysisIndexEntry, AssetAnalysisView, AssetPatch, AutoplayMode, BaselineImportResult, BaselinePreviewResult, CacheCleanupReport, CacheKind, CameraMapping, CameraMergePreview, CameraMergeReport, CardCandidate, ClipTranscript, DesktopSettings, GenerationProgress, ImportCutoff, ImportHistoryEntry, ImportPreflight, ImportPreviewItem, ImportPreviewRequest, ImportProgress, ImportRollbackPreview, ImportRunReport, ImportSessionDetail, LoadedCatalog, MediaOrigin, ModelInstallProgress, ModelStatus, PathAnalysis, Project, ProjectLibrary, ProjectRemovalAudit, ProjectStorageReport, ProjectPairingStatus, RelinkReport, RootMappingEntry, ServerConnectionStatus, ServerPairingResult, ServerVersionInfo, SyncStatus, ThumbnailReport } from "./types";
 
 /**
  * Whether a backend is answering behind `@tauri-apps/api`.
@@ -354,6 +354,16 @@ export const api = {
 
   async analysisReadiness(projectId: string): Promise<AnalysisReadiness> {
     return invoke("analysis_readiness", { projectId });
+  },
+
+  async suggestChronology(request: ChronologySuggestionRequest): Promise<ChronologySuggestionResult> {
+    return invoke("analysis_suggest_chronology", {
+      projectId: request.projectId,
+      assetIds: request.assetIds,
+      primaryModel: request.primaryModel,
+      allowedModels: request.allowedModels,
+      allowFallback: request.allowFallback,
+    });
   },
 
   async analyzeProject(projectId: string, request: AnalysisRunRequest = {}): Promise<AnalysisRunReport> {

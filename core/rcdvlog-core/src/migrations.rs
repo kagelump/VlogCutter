@@ -7,7 +7,7 @@ use thiserror::Error;
 
 use crate::chronology::forward_migrate_project_chronology;
 
-pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 28;
+pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 30;
 
 const MIGRATION_TABLE_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -252,7 +252,65 @@ pub const PROJECT_CATALOG_MIGRATIONS: &[SqliteMigration] = &[
         source_identity: "project-catalog/0028-camera-proxy-sidecars/20261021",
         apply: add_camera_proxy_sidecars,
     },
+    SqliteMigration {
+        id: 29,
+        name: "chronology_suggestions",
+        source_identity: "project-catalog/0029-chronology-suggestions/20261021",
+        apply: add_chronology_suggestions,
+    },
+    SqliteMigration {
+        id: 30,
+        name: "analysis_provider_attempt_provenance",
+        source_identity: "project-catalog/0030-analysis-provider-attempt-provenance/20261021",
+        apply: add_analysis_provider_attempt_provenance,
+    },
 ];
+
+fn add_analysis_provider_attempt_provenance(transaction: &Transaction<'_>) -> Result<()> {
+    if !column_exists(transaction, "asset_analyses", "attempted_models_json")? {
+        transaction.execute_batch(
+            "ALTER TABLE asset_analyses ADD COLUMN attempted_models_json TEXT NOT NULL DEFAULT '[]';",
+        )?;
+        transaction.execute(
+            "UPDATE asset_analyses SET attempted_models_json = CASE WHEN attempts=1 AND model<>'' THEN json_array(model) ELSE '[]' END",
+            [],
+        )?;
+    }
+    if !column_exists(transaction, "asset_analyses", "usage_complete")? {
+        transaction.execute(
+            "ALTER TABLE asset_analyses ADD COLUMN usage_complete INTEGER NOT NULL DEFAULT 1",
+            [],
+        )?;
+        transaction.execute(
+            "UPDATE asset_analyses SET usage_complete = CASE WHEN attempts=1 AND model<>'' THEN 1 ELSE 0 END",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+fn add_chronology_suggestions(transaction: &Transaction<'_>) -> Result<()> {
+    transaction.execute_batch(
+        r#"CREATE TABLE IF NOT EXISTS analysis_chronology_suggestions (
+            request_key TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            facts_revision TEXT NOT NULL,
+            status TEXT NOT NULL CHECK(status IN ('running','completed')),
+            result_json TEXT NOT NULL DEFAULT '',
+            model TEXT NOT NULL DEFAULT '',
+            attempts INTEGER NOT NULL DEFAULT 0,
+            cost_usd REAL NOT NULL DEFAULT 0,
+            prompt_tokens INTEGER NOT NULL DEFAULT 0,
+            completion_tokens INTEGER NOT NULL DEFAULT 0,
+            latency_ms INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS analysis_chronology_suggestions_project
+            ON analysis_chronology_suggestions(project_id, created_at DESC);"#,
+    )?;
+    Ok(())
+}
 
 fn add_camera_proxy_sidecars(transaction: &Transaction<'_>) -> Result<()> {
     transaction.execute_batch(
@@ -2063,6 +2121,72 @@ mod tests {
                 .unwrap()
                 .current_version,
             PROJECT_CATALOG_SCHEMA_VERSION
+        );
+    }
+
+    #[test]
+    fn migration_30_backfills_available_attempt_provenance_conservatively() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        run_sqlite_migrations(&mut connection, &PROJECT_CATALOG_MIGRATIONS[..29]).unwrap();
+        connection
+            .execute(
+                "INSERT INTO projects(id,name,created_at) VALUES ('p1','p','2026-01-01T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+        for id in ["a-single", "a-retried"] {
+            connection
+                .execute(
+                    "INSERT INTO assets(id,project_id,fingerprint,path,filename,size_bytes,duration_seconds,notes,labels_json,created_at) VALUES (?1,'p1',?2,?3,'x.mp4',1,1.0,'human note','[\"human label\"]','2026-01-01T00:00:00Z')",
+                    params![id, format!("fingerprint-{id}"), format!("/{id}.mp4")],
+                )
+                .unwrap();
+        }
+        connection
+            .execute(
+                "INSERT INTO asset_analyses(asset_id,recipe_key,prompt_version,provider,model,status,attempts,created_at) VALUES ('a-single','r','v','openrouter','served-model','ok',1,'2026-01-01T00:00:00Z'), ('a-retried','r','v','openrouter','served-model','ok',2,'2026-01-01T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+
+        migrate_project_catalog(&mut connection).unwrap();
+        let single: (String, bool) = connection
+            .query_row(
+                "SELECT attempted_models_json,usage_complete FROM asset_analyses WHERE asset_id='a-single'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(single, ("[\"served-model\"]".into(), true));
+        let retried: (String, bool) = connection
+            .query_row(
+                "SELECT attempted_models_json,usage_complete FROM asset_analyses WHERE asset_id='a-retried'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(retried, ("[]".into(), false));
+        let preserved: Vec<(String, String, String)> = connection
+            .prepare("SELECT id,notes,labels_json FROM assets ORDER BY id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            preserved,
+            vec![
+                (
+                    "a-retried".into(),
+                    "human note".into(),
+                    "[\"human label\"]".into()
+                ),
+                (
+                    "a-single".into(),
+                    "human note".into(),
+                    "[\"human label\"]".into()
+                ),
+            ]
         );
     }
 

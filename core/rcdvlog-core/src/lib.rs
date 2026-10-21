@@ -42,6 +42,7 @@ mod storage;
 mod volumes;
 
 use analysis::audio::{AudioExtractor, FfmpegAudioExtractor};
+use analysis::chronology_suggestions::request_suggestion;
 use analysis::consolidate::{
     apply_mapping as persist_label_mapping, assets_for_label, consolidation_prompt, mapping_schema,
     parse_mapping, proposals as label_proposals,
@@ -60,6 +61,11 @@ use analysis::vlm_store::{
 };
 use analysis::whisper_engine::{WhisperEngine, read_pcm};
 
+pub use analysis::chronology_suggestions::{
+    ChronologyEvidenceRequest, ChronologySuggestion, EvidenceFrame, PairMatch,
+    SuggestionProvenance, SuggestionResult, SuggestionReview, review_suggestion,
+    review_suggestion_against_facts,
+};
 pub use analysis::consolidate::{ConsolidationReport, LabelMapping, LabelProposal};
 pub use analysis::framepack::{FramePackManifest, build_frame_pack, encode_frames};
 pub use analysis::openrouter::{
@@ -654,6 +660,8 @@ pub struct AnalyzeReport {
     pub fallback_served: usize,
     pub force_overwrite_warnings: usize,
     pub cost_usd: f64,
+    /// False when any attempted provider call returned no usage data.
+    pub usage_complete: bool,
     /// True when the caller stopped the batch early.
     pub cancelled: bool,
     /// True when the batch stopped because the run's cost ceiling was reached.
@@ -680,6 +688,33 @@ pub struct AnalysisRunOptions {
     pub budget_usd: Option<f64>,
     /// Overrides `RCDVLOG_VLM_WORKERS` when set.
     pub worker_count: Option<usize>,
+    /// Model explicitly selected for this run. Defaults to the measured primary.
+    pub primary_model: Option<String>,
+    /// Complete set of models the run may call. Empty means the defaults.
+    pub allowed_models: Vec<String>,
+    /// Whether one retry using the configured alternate model is permitted.
+    pub allow_fallback: Option<bool>,
+}
+
+/// Resolves and validates the spend ceiling locally. Zero and negative ceilings
+/// are rejected; they do not mean "disable spend" or "allow free requests".
+fn resolve_analysis_budget(options: &AnalysisRunOptions) -> Result<f64> {
+    let budget = if let Some(value) = options.budget_usd {
+        value
+    } else {
+        match std::env::var("RCDVLOG_VLM_MAX_COST_USD") {
+            Ok(value) => value
+                .parse::<f64>()
+                .with_context(|| "RCDVLOG_VLM_MAX_COST_USD must be a finite positive number")?,
+            Err(std::env::VarError::NotPresent) => return Ok(f64::INFINITY),
+            Err(std::env::VarError::NotUnicode(_)) => {
+                anyhow::bail!("RCDVLOG_VLM_MAX_COST_USD is not valid Unicode")
+            }
+        }
+    };
+    anyhow::ensure!(budget.is_finite(), "analysis budget must be finite");
+    anyhow::ensure!(budget > 0.0, "analysis budget must be greater than zero");
+    Ok(budget)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2856,7 +2891,11 @@ impl Catalog {
                 prompt_version: VLM_PROMPT_VERSION.to_string(),
                 provider: "openrouter".to_string(),
                 model: outcome.model.clone(),
-                status: AnalysisStatus::Rejected,
+                status: if outcome.model.is_empty() {
+                    AnalysisStatus::Failed
+                } else {
+                    AnalysisStatus::Rejected
+                },
                 reject_reason: outcome.reject_reason.clone(),
                 usable: false,
                 unusable_reason: None,
@@ -2871,6 +2910,8 @@ impl Catalog {
                 cost_usd: 0.0,
                 latency_ms: 0,
                 attempts: outcome.attempts,
+                attempted_models: outcome.attempted_models.clone(),
+                usage_complete: outcome.usage_complete,
                 created_at: now(),
             }
         };
@@ -2880,6 +2921,8 @@ impl Catalog {
         stored.cost_usd = outcome.cost_usd;
         stored.latency_ms = outcome.latency_ms;
         stored.attempts = outcome.attempts;
+        stored.attempted_models = outcome.attempted_models.clone();
+        stored.usage_complete = outcome.usage_complete;
 
         if let Some(observation) = &outcome.observation {
             // Remove only labels whose local authorship side-table says this
@@ -2994,6 +3037,16 @@ impl Catalog {
     where
         F: FnMut(AnalyzeBatchProgress) -> ControlFlow<()>,
     {
+        let _budget_usd = resolve_analysis_budget(options)?;
+        let primary = options.primary_model.as_deref().unwrap_or(DEFAULT_MODEL);
+        let allowed = if options.allowed_models.is_empty() {
+            vec![DEFAULT_MODEL.to_string(), FALLBACK_MODEL.to_string()]
+        } else {
+            options.allowed_models.clone()
+        };
+        let allow_fallback = options.allow_fallback.unwrap_or(true);
+        // Validate before resolving credentials or constructing a network provider.
+        ProviderChain::with_policy(primary, &allowed, allow_fallback)?;
         let api_key = match options.api_key.clone() {
             Some(key) => key,
             None => resolve_api_key()?,
@@ -3090,6 +3143,7 @@ impl Catalog {
             fallback_served: 0,
             force_overwrite_warnings,
             cost_usd: 0.0,
+            usage_complete: true,
             cancelled: start.is_break(),
             budget_exhausted: false,
             outcomes: Vec::new(),
@@ -3098,14 +3152,7 @@ impl Catalog {
         if report.cancelled {
             return Ok(report);
         }
-        let budget_usd = options
-            .budget_usd
-            .or_else(|| {
-                std::env::var("RCDVLOG_VLM_MAX_COST_USD")
-                    .ok()
-                    .and_then(|value| value.parse::<f64>().ok())
-            })
-            .unwrap_or(f64::INFINITY);
+        let budget_usd = resolve_analysis_budget(options)?;
         let queue = Arc::new(Mutex::new(
             prepared
                 .into_iter()
@@ -3114,7 +3161,17 @@ impl Catalog {
                 .collect::<VecDeque<_>>(),
         ));
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let chain = ProviderChain::new();
+        let default_allowed = vec![DEFAULT_MODEL.to_string(), FALLBACK_MODEL.to_string()];
+        let allowed_models = if options.allowed_models.is_empty() {
+            &default_allowed
+        } else {
+            &options.allowed_models
+        };
+        let chain = ProviderChain::with_policy(
+            options.primary_model.as_deref().unwrap_or(DEFAULT_MODEL),
+            allowed_models,
+            options.allow_fallback.unwrap_or(true),
+        )?;
         let (sender, receiver) = mpsc::channel();
         let mut completed = vec![false; task_work.len()];
         thread::scope(|scope| -> Result<()> {
@@ -3163,6 +3220,7 @@ impl Catalog {
                         estimator.record_completion(frames, elapsed);
                         report.analyzed += 1;
                         report.cost_usd += outcome.cost_usd;
+                        report.usage_complete &= outcome.usage_complete;
                         if outcome.observation.is_none() {
                             report.rejected += 1;
                         }
@@ -3730,6 +3788,101 @@ impl Catalog {
             offset,
             limit,
         )
+    }
+
+    /// Makes one read-only, proxy-only cross-clip evidence request. Results are
+    /// suggestions and provenance; this method has no path to chronology writes.
+    pub fn suggest_chronology_with_provider(
+        &self,
+        project_id: &str,
+        asset_ids: &[String],
+        provider: &dyn VlmProvider,
+        chain: &ProviderChain,
+    ) -> Result<SuggestionResult> {
+        anyhow::ensure!((2..=8).contains(&asset_ids.len()), "select 2..=8 clips");
+        anyhow::ensure!(
+            asset_ids.iter().collect::<HashSet<_>>().len() == asset_ids.len(),
+            "each clip may be selected only once"
+        );
+        let facts = self.chronology_facts(project_id)?;
+        let facts_revision = blake3::hash(&serde_json::to_vec(&facts)?)
+            .to_hex()
+            .to_string();
+        let mut frames = Vec::new();
+        for asset_id in asset_ids {
+            let asset = self.get_asset(asset_id)?;
+            anyhow::ensure!(
+                asset.project_id == project_id && !asset.removed,
+                "clip is not an active member of this project"
+            );
+            let proxy = Self::require_proxy(&asset)?;
+            let manifest = self.analysis_frame_pack(&asset)?;
+            let parent = self
+                .database_path
+                .parent()
+                .ok_or_else(|| anyhow!("catalog has no parent directory"))?;
+            let directory = parent
+                .join("cache")
+                .join("framepacks")
+                .join(project_id)
+                .join(asset_id)
+                .join(&manifest.source_fingerprint);
+            let paths = encode_frames(&proxy, &manifest, &directory)?;
+            anyhow::ensure!(
+                !paths.is_empty() && paths.len() == manifest.timestamps_ms.len(),
+                "proxy frame pack is empty or incomplete for {asset_id}"
+            );
+            // Two deterministic samples per selected clip keep cross-clip requests small.
+            let indexes = if paths.len() == 1 {
+                vec![0]
+            } else {
+                vec![0, paths.len() - 1]
+            };
+            for index in indexes {
+                let timestamp_ms = manifest.timestamps_ms[index];
+                let bytes = fs::read(&paths[index])
+                    .with_context(|| format!("read proxy frame {}", paths[index].display()))?;
+                frames.push(EvidenceFrame {
+                    id: format!("{asset_id}@{timestamp_ms}"),
+                    asset_id: asset_id.clone(),
+                    timestamp_ms,
+                    proxy_data_uri: frame_data_uri(&bytes),
+                });
+            }
+        }
+        let required_frame_ids = frames.iter().map(|frame| frame.id.clone()).collect();
+        let request = ChronologyEvidenceRequest {
+            facts_revision,
+            frames,
+            required_frame_ids,
+        };
+        let request_key = blake3::hash(&serde_json::to_vec(&(
+            &request,
+            chain.current_default(),
+            chain.fallback_model(),
+        ))?)
+        .to_hex()
+        .to_string();
+        let connection = self.connection()?;
+        if let Some(result) =
+            analysis::chronology_suggestions::load_cached(&connection, &request_key)?
+        {
+            return Ok(result);
+        }
+        anyhow::ensure!(
+            analysis::chronology_suggestions::reserve_request(
+                &connection,
+                &request_key,
+                project_id,
+                &request.facts_revision
+            )?,
+            "an identical chronology suggestion request is already running or was interrupted; refusing a duplicate provider charge"
+        );
+        drop(connection);
+        let mut result = request_suggestion(provider, chain, &request)?;
+        result.review = review_suggestion_against_facts(&request, &result.suggestion, &facts);
+        analysis::chronology_suggestions::store_result(&self.connection()?, &request_key, &result)?;
+        Ok(result)
     }
 
     /// Writes the solution's derived times back into the `assets` projection
@@ -5302,6 +5455,42 @@ pub(crate) fn now() -> String {
 mod tests {
     use super::*;
     use tempfile::{TempDir, tempdir};
+
+    #[test]
+    fn analysis_budget_requires_finite_positive_value() {
+        for value in [0.0, -0.01, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let options = AnalysisRunOptions {
+                budget_usd: Some(value),
+                ..Default::default()
+            };
+            assert!(
+                resolve_analysis_budget(&options).is_err(),
+                "accepted {value:?}"
+            );
+        }
+        let options = AnalysisRunOptions {
+            budget_usd: Some(0.01),
+            ..Default::default()
+        };
+        assert_eq!(resolve_analysis_budget(&options).unwrap(), 0.01);
+    }
+
+    #[test]
+    fn invalid_budget_is_rejected_before_key_resolution_or_network_setup() {
+        let directory = tempdir().unwrap();
+        let catalog = Catalog::open(directory.path().join("budget.sqlite3")).unwrap();
+        let error = catalog
+            .analyze_missing_with_options(
+                "missing-project",
+                &AnalysisRunOptions {
+                    budget_usd: Some(f64::NAN),
+                    ..Default::default()
+                },
+                |_| ControlFlow::Continue(()),
+            )
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("finite"));
+    }
 
     /// Inserts an asset whose stored fingerprint is the real sampled fingerprint
     /// of the file on disk, so location verification has something honest to

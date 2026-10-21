@@ -331,6 +331,8 @@ rcdvlog --catalog /absolute/project/catalog.sqlite3 transcribe status --project 
 rcdvlog --catalog /absolute/project/catalog.sqlite3 analyze generate --asset <asset-id>
 rcdvlog --catalog /absolute/project/catalog.sqlite3 analyze missing --project <project-id>
 rcdvlog --catalog /absolute/project/catalog.sqlite3 analyze missing --project <project-id> --force
+rcdvlog --catalog /absolute/project/catalog.sqlite3 analyze missing --project <project-id> --primary-model google/gemini-2.5-flash-lite --allow-model google/gemini-2.5-flash-lite --no-fallback
+rcdvlog --catalog /absolute/project/catalog.sqlite3 analyze suggest-chronology --project <project-id> --asset <asset-a> --asset <asset-b>
 rcdvlog --catalog /absolute/project/catalog.sqlite3 analyze status --project <project-id>
 
 rcdvlog --catalog /absolute/project/catalog.sqlite3 labels consolidate --project <project-id>
@@ -341,12 +343,43 @@ Transcription is offline and reads proxies only. Vision analysis reads proxy-der
 
 `analyze status` and `labels vocabulary` are strictly read-only. Analysis progress is emitted as JSON on stderr.
 
+`analyze suggest-chronology` makes one bounded, read-only visual evidence request
+for 2–8 selected clips, using at most two selected proxy frames per clip. It
+returns coverage diagnostics and checkable conflicts against the current solved
+chronology. The result is stored separately from chronology facts and keyed by
+the facts revision, proxy frames, and model policy; repeating a completed
+request returns the saved result without another provider call. A request left
+`running` by an error or interrupted process is refused on retry to avoid an
+accidental duplicate charge. There is currently no automatic recovery or retry
+path for such reservations; they require manual catalog repair.
+
+`analyze missing` accepts `--primary-model`, repeatable `--allow-model`, and
+`--no-fallback`. The core validates this policy against its local model registry
+before resolving credentials or constructing a network provider. The desktop
+run request uses the same fields. The run ceiling is checked after each
+completed request: workers already in flight are allowed to finish, so the
+final spend can exceed the ceiling by the sum of those outstanding requests;
+there is no fixed dollar bound because providers do not offer a reliable
+pre-request charge cap. Budgets must be finite and greater than zero; zero and
+negative values are rejected before credentials or provider setup. The report
+records returned usage for successful and domain-rejected requests, including
+fallback attempts. A request with a failed provider attempt marks usage
+incomplete; known usage is retained and no cost is inferred for failed attempts.
+Per-clip analysis records persist `attemptedModels` and `usageComplete` with the
+model, attempt count, and returned usage. Existing single-attempt rows backfill
+their serving model; prior retry histories are not reconstructable, so those
+rows keep an empty attempted-model list and mark usage incomplete.
+
 `transcribe missing` and `analyze missing` reports include a `cancelled` flag,
-and the analysis report also includes `budgetExhausted`. Both are always `false`
-from the CLI, which never stops a batch early; they exist because the desktop
-shares these methods and can. A budget stop additionally appends a failure entry
-naming the ceiling, while a cancellation does not — stopping on request is not a
-failure. `labels consolidate` makes one text-only request and remaps only labels whose local authorship record says analysis created them; it never changes human-only labels.
+and the analysis report also includes `budgetExhausted`. `cancelled` is always
+`false` from the CLI, which does not expose cancellation. The CLI honors
+`analyze missing --budget-usd`; `budgetExhausted` is true when returned usage
+reaches the ceiling. The ceiling is checked after each completed request, so
+already in-flight requests can finish first. A budget stop additionally appends
+a failure entry naming the ceiling, while a cancellation does not — stopping on
+request is not a failure. `labels consolidate` makes one text-only request and
+remaps only labels whose local authorship record says analysis created them; it
+never changes human-only labels.
 
 Rough-cut selection and source ranges remain separate from the labeling phase.
 The core and desktop now have an initial edit-plan/preview/OTIO path, but the

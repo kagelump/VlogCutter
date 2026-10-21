@@ -173,6 +173,32 @@ enum AnalyzeCommand {
         /// Re-analyze current clips. The report counts non-empty AI-owned fields before overwrite.
         #[arg(long)]
         force: bool,
+        /// Stop claiming new clips once returned provider spend reaches this USD ceiling.
+        #[arg(long)]
+        budget_usd: Option<f64>,
+        /// Primary OpenRouter model for this run.
+        #[arg(long)]
+        primary_model: Option<String>,
+        /// Models permitted for this run (repeat for each model).
+        #[arg(long = "allow-model")]
+        allowed_models: Vec<String>,
+        /// Refuse automatic retry with the alternate model.
+        #[arg(long)]
+        no_fallback: bool,
+    },
+    /// Request a bounded cross-clip chronology suggestion from proxy frames.
+    SuggestChronology {
+        #[arg(long)]
+        project: String,
+        /// Selected clip IDs; repeat 1 to 8 times.
+        #[arg(long = "asset", required = true)]
+        assets: Vec<String>,
+        #[arg(long, default_value = "qwen/qwen3.7-flash")]
+        primary_model: String,
+        #[arg(long = "allow-model")]
+        allowed_models: Vec<String>,
+        #[arg(long)]
+        no_fallback: bool,
     },
     /// Report analysis coverage without network access or writes.
     Status {
@@ -521,6 +547,7 @@ fn command_name(command: &Commands) -> &'static str {
         Commands::Analyze { command } => match command {
             AnalyzeCommand::Generate { .. } => "analyze.generate",
             AnalyzeCommand::Missing { .. } => "analyze.missing",
+            AnalyzeCommand::SuggestChronology { .. } => "analyze.suggest-chronology",
             AnalyzeCommand::Status { .. } => "analyze.status",
         },
         Commands::Labels { command } => match command {
@@ -834,8 +861,15 @@ fn execute(cli: &Cli) -> Result<Value> {
             AnalyzeCommand::Generate { asset } => {
                 Ok(serde_json::to_value(catalog.analyze_asset(asset)?)?)
             }
-            AnalyzeCommand::Missing { project, force } => Ok(serde_json::to_value(
-                catalog.analyze_missing_with_progress(project, *force, |progress| {
+            AnalyzeCommand::Missing { project, force, budget_usd, primary_model, allowed_models, no_fallback } => Ok(serde_json::to_value(
+                catalog.analyze_missing_with_options(project, &rcdvlog_core::AnalysisRunOptions {
+                    force: *force,
+                    budget_usd: *budget_usd,
+                    primary_model: primary_model.clone(),
+                    allowed_models: allowed_models.clone(),
+                    allow_fallback: Some(!no_fallback),
+                    ..Default::default()
+                }, |progress| {
                     eprintln!(
                         "{}",
                         json!({
@@ -847,6 +881,18 @@ fn execute(cli: &Cli) -> Result<Value> {
                     ControlFlow::Continue(())
                 })?,
             )?),
+            AnalyzeCommand::SuggestChronology { project, assets, primary_model, allowed_models, no_fallback } => {
+                let allowed = if allowed_models.is_empty() && !no_fallback {
+                    vec![primary_model.clone(), if primary_model == rcdvlog_core::DEFAULT_MODEL { rcdvlog_core::FALLBACK_MODEL.to_string() } else { rcdvlog_core::DEFAULT_MODEL.to_string() }]
+                } else if allowed_models.is_empty() {
+                    vec![primary_model.clone()]
+                } else {
+                    allowed_models.clone()
+                };
+                let chain = rcdvlog_core::ProviderChain::with_policy(primary_model, &allowed, !no_fallback)?;
+                let provider = rcdvlog_core::OpenRouterProvider::new(rcdvlog_core::resolve_api_key()?)?;
+                Ok(serde_json::to_value(catalog.suggest_chronology_with_provider(project, assets, &provider, &chain)?)?)
+            }
             AnalyzeCommand::Status { project } => {
                 Ok(serde_json::to_value(catalog.analysis_coverage(project)?)?)
             }
@@ -1583,6 +1629,37 @@ mod tests {
         );
         assert!(Cli::try_parse_from(["rcdvlog", "analyze", "generate", "--asset", "a1"]).is_ok());
         assert!(Cli::try_parse_from(["rcdvlog", "analyze", "status", "--project", "p1"]).is_ok());
+        assert!(
+            Cli::try_parse_from([
+                "rcdvlog",
+                "analyze",
+                "missing",
+                "--project",
+                "p1",
+                "--budget-usd",
+                "1.5",
+                "--primary-model",
+                "google/gemini-2.5-flash-lite",
+                "--allow-model",
+                "google/gemini-2.5-flash-lite",
+                "--no-fallback",
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "rcdvlog",
+                "analyze",
+                "suggest-chronology",
+                "--project",
+                "p1",
+                "--asset",
+                "a1",
+                "--asset",
+                "a2",
+            ])
+            .is_ok()
+        );
         assert!(
             Cli::try_parse_from(["rcdvlog", "labels", "consolidate", "--project", "p1",]).is_ok()
         );

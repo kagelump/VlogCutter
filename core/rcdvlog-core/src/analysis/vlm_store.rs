@@ -66,7 +66,16 @@ pub struct StoredAnalysis {
     pub cost_usd: f64,
     pub latency_ms: u64,
     pub attempts: u32,
+    #[serde(default)]
+    pub attempted_models: Vec<String>,
+    /// False if any provider attempt returned without usage data.
+    #[serde(default = "historical_usage_is_complete")]
+    pub usage_complete: bool,
     pub created_at: String,
+}
+
+fn historical_usage_is_complete() -> bool {
+    true
 }
 
 impl StoredAnalysis {
@@ -92,6 +101,8 @@ impl StoredAnalysis {
             cost_usd: 0.0,
             latency_ms: 0,
             attempts: 1,
+            attempted_models: vec![model.to_string()],
+            usage_complete: true,
             created_at: now(),
         }
     }
@@ -112,8 +123,9 @@ pub fn save_analysis(connection: &Connection, analysis: &StoredAnalysis) -> Resu
             (asset_id, recipe_key, prompt_version, provider, model, status, reject_reason,
              usable, unusable_reason, best_moment_start_ms, best_moment_end_ms,
              thumbnail_timestamp_ms, camera_movement, ocr_json, transcript_used,
-             prompt_tokens, completion_tokens, cost_usd, latency_ms, attempts, created_at)
-        VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)
+             prompt_tokens, completion_tokens, cost_usd, latency_ms, attempts,
+             attempted_models_json, usage_complete, created_at)
+        VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23)
         ON CONFLICT(asset_id) DO UPDATE SET
             recipe_key=excluded.recipe_key, prompt_version=excluded.prompt_version,
             provider=excluded.provider, model=excluded.model, status=excluded.status,
@@ -126,6 +138,8 @@ pub fn save_analysis(connection: &Connection, analysis: &StoredAnalysis) -> Resu
             transcript_used=excluded.transcript_used, prompt_tokens=excluded.prompt_tokens,
             completion_tokens=excluded.completion_tokens, cost_usd=excluded.cost_usd,
             latency_ms=excluded.latency_ms, attempts=excluded.attempts,
+            attempted_models_json=excluded.attempted_models_json,
+            usage_complete=excluded.usage_complete,
             created_at=excluded.created_at
         "#,
         params![
@@ -153,6 +167,8 @@ pub fn save_analysis(connection: &Connection, analysis: &StoredAnalysis) -> Resu
             analysis.cost_usd,
             analysis.latency_ms as i64,
             analysis.attempts,
+            serde_json::to_string(&analysis.attempted_models)?,
+            analysis.usage_complete,
             analysis.created_at,
         ],
     )?;
@@ -166,7 +182,8 @@ pub fn load_analysis(connection: &Connection, asset_id: &str) -> Result<Option<S
             SELECT recipe_key,prompt_version,provider,model,status,reject_reason,usable,
                    unusable_reason,best_moment_start_ms,best_moment_end_ms,
                    thumbnail_timestamp_ms,camera_movement,ocr_json,transcript_used,
-                   prompt_tokens,completion_tokens,cost_usd,latency_ms,attempts,created_at
+                   prompt_tokens,completion_tokens,cost_usd,latency_ms,attempts,
+                   attempted_models_json,usage_complete,created_at
             FROM asset_analyses WHERE asset_id=?1
             "#,
             [asset_id],
@@ -194,6 +211,8 @@ pub fn load_analysis(connection: &Connection, asset_id: &str) -> Result<Option<S
                     row.get::<_, i64>(17)?,
                     row.get::<_, i64>(18)?,
                     row.get::<_, String>(19)?,
+                    row.get::<_, bool>(20)?,
+                    row.get::<_, String>(21)?,
                 ))
             },
         )
@@ -228,7 +247,10 @@ pub fn load_analysis(connection: &Connection, asset_id: &str) -> Result<Option<S
                 cost_usd: row.16,
                 latency_ms: row.17 as u64,
                 attempts: row.18 as u32,
-                created_at: row.19,
+                attempted_models: serde_json::from_str(&row.19)
+                    .context("parse attempted analysis models JSON")?,
+                usage_complete: row.20,
+                created_at: row.21,
             })
         })
         .transpose()
@@ -431,6 +453,8 @@ mod tests {
             cost_usd: 0.001,
             latency_ms: 44,
             attempts: 2,
+            attempted_models: vec!["model-primary".into(), "model-fallback".into()],
+            usage_complete: true,
             created_at: now(),
         }
     }
@@ -444,6 +468,60 @@ mod tests {
         assert_eq!(loaded.prompt_tokens, 12);
         assert_eq!(loaded.cost_usd, 0.001);
         assert_eq!(loaded.attempts, 2);
+        assert_eq!(loaded.attempted_models, analysis().attempted_models);
+        assert!(loaded.usage_complete);
+    }
+
+    #[test]
+    fn provider_provenance_survives_catalog_reopen_for_success_and_incomplete_usage() {
+        let directory = tempfile::tempdir().unwrap();
+        let catalog_path = directory.path().join("analysis-provenance.sqlite3");
+        let catalog = crate::Catalog::open(&catalog_path).unwrap();
+        let project = catalog.create_project("analysis provenance test").unwrap();
+        let connection = catalog.connection().unwrap();
+        for id in ["a-success", "a-failed"] {
+            connection
+                .execute(
+                    "INSERT INTO assets(id,project_id,fingerprint,path,filename,size_bytes,duration_seconds,created_at) VALUES (?1,?2,?3,?4,'x.mp4',1,1.0,'2026-01-01T00:00:00Z')",
+                    rusqlite::params![id, project.id, format!("fingerprint-{id}"), format!("/{id}.mp4")],
+                )
+                .unwrap();
+        }
+
+        let mut success = analysis();
+        success.asset_id = "a-success".into();
+        success.model = "fallback-model".into();
+        success.attempted_models = vec!["primary-model".into(), "fallback-model".into()];
+        success.usage_complete = true;
+        success.cost_usd = 0.002;
+        save_analysis(&connection, &success).unwrap();
+
+        let mut failed = analysis();
+        failed.asset_id = "a-failed".into();
+        failed.model.clear();
+        failed.status = AnalysisStatus::Failed;
+        failed.reject_reason = "both providers failed".into();
+        failed.attempts = 2;
+        failed.attempted_models = vec!["primary-model".into(), "fallback-model".into()];
+        failed.usage_complete = false;
+        failed.cost_usd = 0.001;
+        save_analysis(&connection, &failed).unwrap();
+
+        drop(connection);
+        drop(catalog);
+        let reopened = crate::Catalog::open(&catalog_path).unwrap();
+        let connection = reopened.connection().unwrap();
+        let loaded_success = load_analysis(&connection, "a-success").unwrap().unwrap();
+        assert_eq!(loaded_success.attempted_models, success.attempted_models);
+        assert!(loaded_success.usage_complete);
+        assert_eq!(loaded_success.cost_usd, 0.002);
+
+        let loaded_failed = load_analysis(&connection, "a-failed").unwrap().unwrap();
+        assert_eq!(loaded_failed.status, AnalysisStatus::Failed);
+        assert!(loaded_failed.model.is_empty());
+        assert_eq!(loaded_failed.attempted_models, failed.attempted_models);
+        assert!(!loaded_failed.usage_complete);
+        assert_eq!(loaded_failed.cost_usd, 0.001);
     }
 
     #[test]

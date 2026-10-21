@@ -15,13 +15,14 @@ import type {
   AnalysisRunReport,
   AnalysisStage,
   AssetAnalysisIndexEntry,
+  ChronologySuggestionResult,
   ModelStatus,
 } from "../../../types";
 import { buildAnalysis, buildTranscript, type AnalysisSpec, type TranscriptSpec } from "../builders";
 import type { JobBinding } from "../jobs";
 import { projectAssets, requireAsset, type DesktopHarnessState } from "../state";
 import type { CommandTable, HarnessContext } from "../registry";
-import { requireString } from "../registry";
+import { requireBoolean, requireString } from "../registry";
 
 const STAGES: AnalysisStage[] = ["proxies", "transcripts", "analysis"];
 
@@ -46,6 +47,7 @@ export interface AnalysisStep {
 export interface AnalysisOutcome {
   status?: "completed" | "cancelled" | "failed";
   budgetExhausted?: boolean;
+  usageComplete?: boolean;
   failures?: Array<{ path: string; error: string }>;
 }
 
@@ -114,6 +116,7 @@ function runReport(state: DesktopHarnessState, tally: RunTally, outcome: Analysi
       rejected: 0,
       fallbackServed: 0,
       costUsd: tally.costUsd,
+      usageComplete: outcome.usageComplete ?? true,
       cancelled: status === "cancelled",
       budgetExhausted: Boolean(outcome.budgetExhausted),
       failures,
@@ -219,6 +222,50 @@ export const analysisCommands: CommandTable = {
   asset_transcript: (args, { state }) => state.transcripts[requireString(args, "assetId")] ?? null,
 
   asset_analysis: (args, { state }) => state.analyses[requireString(args, "assetId")] ?? null,
+
+  analysis_suggest_chronology: (args, { state }): ChronologySuggestionResult => {
+    const projectId = requireString(args, "projectId");
+    const assetIds = args.assetIds;
+    if (!Array.isArray(assetIds) || assetIds.some((assetId) => typeof assetId !== "string")) {
+      throw new Error("Harness command argument \"assetIds\" must be an array of strings");
+    }
+    if (assetIds.length < 2 || assetIds.length > 8 || new Set(assetIds).size !== assetIds.length) {
+      throw new Error("Chronology evidence requires 2–8 distinct clips");
+    }
+    for (const assetId of assetIds) {
+      const asset = requireAsset(state, assetId);
+      if (asset.projectId !== projectId) throw new Error(`Asset ${assetId} does not belong to project ${projectId}`);
+    }
+    const primaryModel = requireString(args, "primaryModel");
+    const allowedModels = args.allowedModels;
+    if (!Array.isArray(allowedModels) || allowedModels.some((model) => typeof model !== "string")) {
+      throw new Error("Harness command argument \"allowedModels\" must be an array of strings");
+    }
+    if (allowedModels.length > 0 && !allowedModels.includes(primaryModel)) {
+      throw new Error("The primary model must be included in allowedModels");
+    }
+    requireBoolean(args, "allowFallback");
+
+    // This is a local deterministic harness response, not provider behavior.
+    // It cites two synthetic proxy-frame IDs per clip and makes no chronology
+    // changes; tests can exercise the DTO and command contract without a paid call.
+    const frameIds = assetIds.flatMap((assetId) => [`${assetId}:proxy-first`, `${assetId}:proxy-last`]);
+    return {
+      suggestion: { frameIds, matches: [] },
+      review: { missingFrameIds: [], duplicateFrameIds: [], unknownFrameIds: [], semanticInconsistencies: [] },
+      provenance: {
+        model: primaryModel,
+        attempts: 1,
+        attemptedModels: [primaryModel],
+        usageComplete: true,
+        costUsd: 0,
+        promptTokens: 0,
+        completionTokens: 0,
+        latencyMs: 0,
+      },
+      cached: false,
+    };
+  },
 
   analysis_runs: (args, { state }) => {
     const projectId = requireString(args, "projectId");
