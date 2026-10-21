@@ -111,9 +111,9 @@ pub use cameras::{
 pub use chronology::{
     AppliedCorrection, AssetChronology, AssetTimeHypothesis, CaptureSequence,
     CaptureSequenceMergePreview, CaptureSequenceReassignmentPreview, CaptureSequenceSplitPreview,
-    ChronologyError, ChronologyEvidenceAsset, ChronologyEvidencePage, ChronologyExplanation,
-    ChronologyFacts, ChronologyImpact, ChronologyImpactChange, ChronologySnapshot,
-    ChronologySolution, ClipTimeException, ClockEpoch, ClockEpochClearPreview,
+    ChronologyError, ChronologyEvidenceAsset, ChronologyEvidenceError, ChronologyEvidencePage,
+    ChronologyExplanation, ChronologyFacts, ChronologyImpact, ChronologyImpactChange,
+    ChronologySnapshot, ChronologySolution, ClipTimeException, ClockEpoch, ClockEpochClearPreview,
     ClockEpochImpactPreview, ConstraintStrength, Contradiction, ContradictionKind, DisplayMode,
     DisplayTime, EventOrderConstraint, Evidence, OrderKey, PhaseKind, PhaseSplitDirection,
     QuarantinedOperation, QueuePosition, SplitProposal, TimestampCandidate, TripPhase,
