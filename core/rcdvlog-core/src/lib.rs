@@ -111,11 +111,12 @@ pub use cameras::{
 pub use chronology::{
     AppliedCorrection, AssetChronology, AssetTimeHypothesis, CaptureSequence,
     CaptureSequenceMergePreview, CaptureSequenceReassignmentPreview, CaptureSequenceSplitPreview,
-    ChronologyError, ChronologyExplanation, ChronologyFacts, ChronologyImpact,
-    ChronologyImpactChange, ChronologySnapshot, ChronologySolution, ClipTimeException, ClockEpoch,
-    ClockEpochClearPreview, ClockEpochImpactPreview, ConstraintStrength, Contradiction,
-    ContradictionKind, DisplayMode, DisplayTime, EventOrderConstraint, Evidence, OrderKey,
-    PhaseKind, PhaseSplitDirection, QuarantinedOperation, QueuePosition, SplitProposal, TripPhase,
+    ChronologyError, ChronologyEvidenceAsset, ChronologyEvidenceError, ChronologyEvidencePage,
+    ChronologyExplanation, ChronologyFacts, ChronologyImpact, ChronologyImpactChange,
+    ChronologySnapshot, ChronologySolution, ClipTimeException, ClockEpoch, ClockEpochClearPreview,
+    ClockEpochImpactPreview, ConstraintStrength, Contradiction, ContradictionKind, DisplayMode,
+    DisplayTime, EventOrderConstraint, Evidence, OrderKey, PhaseKind, PhaseSplitDirection,
+    QuarantinedOperation, QueuePosition, SplitProposal, TimestampCandidate, TripPhase,
     VisualPlacementPreview, VisualPlacementSide, covering_phase, display_time, is_valid_timezone,
     resolve_anchored_phases, solve,
 };
@@ -882,6 +883,7 @@ struct MediaProbe {
     codec: String,
     camera: String,
     captured_at_raw: Option<String>,
+    timestamp_candidates: Vec<chronology::TimestampCandidate>,
     best_time: Option<String>,
     metadata_rotation_degrees: u16,
     default_rotation_degrees: u16,
@@ -1387,6 +1389,7 @@ impl Catalog {
                 codec: probe.codec,
                 camera: probe.camera,
                 captured_at_raw: probe.captured_at_raw,
+                timestamp_candidates: Some(probe.timestamp_candidates),
                 best_time: probe.best_time,
                 metadata_rotation_degrees: probe.metadata_rotation_degrees,
                 default_rotation_degrees: probe.default_rotation_degrees,
@@ -3473,6 +3476,22 @@ impl Catalog {
         Ok(solve(&self.chronology_facts(project_id)?))
     }
 
+    /// Read-only, revision-pinned page of chronology facts and solved evidence.
+    pub fn chronology_evidence_page(
+        &self,
+        project_id: &str,
+        expected_revision: Option<&str>,
+        offset: usize,
+        limit: usize,
+    ) -> Result<ChronologyEvidencePage> {
+        chronology::evidence_page(
+            self.chronology_facts(project_id)?,
+            expected_revision,
+            offset,
+            limit,
+        )
+    }
+
     /// Writes the solution's derived times back into the `assets` projection
     /// columns.
     ///
@@ -4178,6 +4197,7 @@ fn sampled_fingerprint(path: &Path, size: u64) -> Result<String> {
 fn probe_media(path: &Path) -> Result<MediaProbe> {
     let document = probe_media_document(path)?;
     let stream = require_video_stream(&document)?;
+    let timestamp_candidates = collect_timestamp_candidates(path, &document);
     let raw_time = stream
         .pointer("/tags/creation_time")
         .or_else(|| document.pointer("/format/tags/creation_time"))
@@ -4217,6 +4237,7 @@ fn probe_media(path: &Path) -> Result<MediaProbe> {
         codec,
         camera,
         captured_at_raw: raw_time.clone(),
+        timestamp_candidates,
         best_time: raw_time
             .as_deref()
             .and_then(|value| normalize_datetime(value, 0)),
@@ -4226,6 +4247,303 @@ fn probe_media(path: &Path) -> Result<MediaProbe> {
             height,
             metadata_rotation_degrees,
         ),
+    })
+}
+
+fn collect_timestamp_candidates(
+    path: &Path,
+    document: &Value,
+) -> Vec<chronology::TimestampCandidate> {
+    let mut candidates = Vec::new();
+    let mut add = |origin: String, original_text: String, semantics: Option<String>| {
+        let parsed = chrono::DateTime::parse_from_rfc3339(&original_text).ok();
+        let timezone_claim = timestamp_timezone_claim(&original_text);
+        let parse_status = if parsed.is_some() {
+            "parsed"
+        } else {
+            "unparseable"
+        };
+        candidates.push(chronology::TimestampCandidate {
+            origin,
+            original_text,
+            parsed_value: parsed.map(|value| value.to_rfc3339()),
+            timezone_claim,
+            parse_status: parse_status.into(),
+            semantics,
+        });
+    };
+    if let Some(tags) = document.pointer("/format/tags").and_then(Value::as_object) {
+        for key in [
+            "creation_time",
+            "recording_start_time",
+            "recording_end_time",
+        ] {
+            if let Some(value) = tags.get(key).and_then(Value::as_str) {
+                add(
+                    format!("ffprobe.format.tags.{key}"),
+                    value.into(),
+                    timestamp_tag_semantics(key, "container_creation_time"),
+                );
+            }
+        }
+    }
+    if let Some(streams) = document.get("streams").and_then(Value::as_array) {
+        for (index, stream) in streams.iter().enumerate() {
+            if stream.get("codec_type").and_then(Value::as_str) == Some("video")
+                && let Some(tags) = stream.pointer("/tags").and_then(Value::as_object)
+            {
+                for key in [
+                    "creation_time",
+                    "recording_start_time",
+                    "recording_end_time",
+                ] {
+                    if let Some(value) = tags.get(key).and_then(Value::as_str) {
+                        add(
+                            format!("ffprobe.streams[{index}].tags.{key}"),
+                            value.into(),
+                            timestamp_tag_semantics(key, "stream_creation_time"),
+                        );
+                    }
+                }
+            }
+        }
+    }
+    if let Some(filename) = path.file_name().and_then(|value| value.to_str())
+        && let Some((start, len)) = find_compact_filename_timestamp(filename)
+    {
+        let value = &filename[start..start + len];
+        let parsed = chrono::NaiveDateTime::parse_from_str(value, "%Y%m%d%H%M%S")
+            .ok()
+            .map(|date| date.format("%Y-%m-%dT%H:%M:%S").to_string());
+        let parse_status = if parsed.is_some() {
+            "parsed_without_timezone"
+        } else {
+            "unparseable"
+        };
+        candidates.push(chronology::TimestampCandidate {
+            origin: "filename.compact_timestamp".into(),
+            original_text: value.into(),
+            parsed_value: parsed,
+            timezone_claim: None,
+            parse_status: parse_status.into(),
+            semantics: None,
+        });
+    }
+    candidates
+}
+
+fn timestamp_tag_semantics(tag: &str, creation_semantics: &str) -> Option<String> {
+    match tag {
+        // These are explicit semantic tag names. Generic creation_time tags do
+        // not establish whether a recording started or ended at that instant.
+        "recording_start_time" => Some("recording_start".into()),
+        "recording_end_time" => Some("recording_end".into()),
+        "creation_time" => Some(creation_semantics.into()),
+        _ => None,
+    }
+}
+
+fn timestamp_timezone_claim(raw: &str) -> Option<String> {
+    if raw.ends_with('Z') || raw.ends_with('z') {
+        return Some(raw[raw.len() - 1..].to_string());
+    }
+    let time_start = raw.find('T').or_else(|| raw.find(' '))? + 1;
+    let suffix = &raw[time_start..];
+    let sign_at = suffix.rfind(['+', '-'])?;
+    let claim = &suffix[sign_at..];
+    let digits = &claim[1..];
+    let compact = digits.replace(':', "");
+    let valid = (digits.len() == 5 && digits.as_bytes()[2] == b':' || digits.len() == 4)
+        && compact.len() == 4
+        && compact.bytes().all(|byte| byte.is_ascii_digit());
+    valid.then(|| claim.to_string())
+}
+
+#[cfg(test)]
+mod timestamp_candidate_tests {
+    use super::*;
+
+    #[cfg(unix)]
+    fn probe_with_explicit_start_end_tags() -> (tempfile::TempDir, NormalizedMediaProbe) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("20300102120415_synthetic.mp4");
+        std::fs::write(&media, b"synthetic media placeholder").unwrap();
+        let probe_json = dir.path().join("probe.json");
+        std::fs::write(
+            &probe_json,
+            serde_json::to_vec(&serde_json::json!({
+                "format": {"duration":"10", "tags": {
+                    "creation_time": "2030-01-02T03:04:05Z",
+                    "recording_start_time": "2030-01-02T03:04:05Z",
+                    "recording_end_time": "2030-01-02T03:04:15Z"
+                }},
+                "streams": [{"codec_type":"video", "width":16, "height":16,
+                    "codec_name":"synthetic", "r_frame_rate":"30/1", "duration":"10",
+                    "tags":{"creation_time":"2030-01-02T03:04:05Z"}}]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let ffprobe = dir.path().join("synthetic-ffprobe");
+        std::fs::write(
+            &ffprobe,
+            format!(
+                "#!/bin/sh\ncase \"$*\" in *recording_start_time*recording_end_time*) ;; *) exit 9 ;; esac\ncat '{}'\n",
+                probe_json.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&ffprobe).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&ffprobe, permissions).unwrap();
+        let probe = probe_media_normalized(&media, &ffprobe, None).unwrap();
+        (dir, probe)
+    }
+
+    #[test]
+    fn probe_candidates_preserve_origin_timezone_and_unparseable_text() {
+        let document = serde_json::json!({
+            "format": {"tags": {"creation_time": "2030-01-02T03:04:05Z"}},
+            "streams": [{"codec_type":"video", "tags":{"creation_time":"broken-camera-time"}}]
+        });
+        let found = collect_timestamp_candidates(Path::new("20300102030415_clip.mp4"), &document);
+        assert_eq!(found.len(), 3);
+        assert_eq!(found[0].origin, "ffprobe.format.tags.creation_time");
+        assert_eq!(found[0].timezone_claim.as_deref(), Some("Z"));
+        assert_eq!(found[0].parse_status, "parsed");
+        assert_eq!(found[1].origin, "ffprobe.streams[0].tags.creation_time");
+        assert_eq!(found[1].original_text, "broken-camera-time");
+        assert_eq!(found[1].parse_status, "unparseable");
+        assert_eq!(found[2].parse_status, "parsed_without_timezone");
+        assert_eq!(found[2].timezone_claim, None);
+        assert_eq!(found[2].semantics, None);
+    }
+
+    #[test]
+    fn invalid_calendar_text_keeps_its_explicit_timezone_claim() {
+        let found = collect_timestamp_candidates(
+            Path::new("clip.mp4"),
+            &serde_json::json!({"format":{"tags":{"creation_time":"2030-13-40T31:72:99-08:00"}},"streams":[]}),
+        );
+        assert_eq!(found[0].timezone_claim.as_deref(), Some("-08:00"));
+        assert_eq!(found[0].parse_status, "unparseable");
+        assert_eq!(found[0].parsed_value, None);
+    }
+
+    #[test]
+    fn absent_timestamp_candidates_are_an_empty_new_probe_result() {
+        let found = collect_timestamp_candidates(
+            Path::new("generic_clip.mp4"),
+            &serde_json::json!({"streams":[]}),
+        );
+        assert!(found.is_empty());
+    }
+
+    #[test]
+    fn filename_local_convention_changes_do_not_rewrite_embedded_utc() {
+        let document = serde_json::json!({
+            "format": {"tags": {"creation_time": "2030-01-02T03:04:05Z"}},
+            "streams": []
+        });
+        let before = collect_timestamp_candidates(Path::new("20300102030405_clip.mp4"), &document);
+        let after = collect_timestamp_candidates(Path::new("20300102120405_clip.mp4"), &document);
+        assert_eq!(before[0].original_text, after[0].original_text);
+        assert_ne!(before[1].original_text, after[1].original_text);
+        assert_eq!(after[1].timezone_claim, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_start_end_probe_evidence_survives_operation_baseline_and_export() {
+        let (_media_dir, probe) = probe_with_explicit_start_end_tags();
+        let candidates = probe.timestamp_candidates;
+        let start = candidates
+            .iter()
+            .find(|c| c.semantics.as_deref() == Some("recording_start"))
+            .unwrap();
+        let end = candidates
+            .iter()
+            .find(|c| c.semantics.as_deref() == Some("recording_end"))
+            .unwrap();
+        assert!(start.origin.ends_with("recording_start_time"));
+        assert!(end.origin.ends_with("recording_end_time"));
+        assert_eq!(probe.duration_seconds, 10.0);
+
+        let directory = tempfile::tempdir().unwrap();
+        let catalog = Catalog::open(directory.path().join("source.sqlite3")).unwrap();
+        let project = catalog
+            .create_project("Synthetic chronology fixture")
+            .unwrap();
+        catalog
+            .add_portable_project_asset(
+                &project.id,
+                operations::ProjectAssetAddedPayload {
+                    id: "asset_synthetic_evidence".into(),
+                    fingerprint: "fingerprint_synthetic_evidence".into(),
+                    filename: "20300102120415_synthetic.mp4".into(),
+                    size_bytes: 1,
+                    duration_seconds: 10.0,
+                    frame_rate: 30.0,
+                    width: 16,
+                    height: 16,
+                    codec: "synthetic".into(),
+                    camera: "Synthetic".into(),
+                    captured_at_raw: probe.captured_at_raw.clone(),
+                    timestamp_candidates: Some(candidates.clone()),
+                    best_time: probe.best_time.clone(),
+                    metadata_rotation_degrees: 0,
+                    default_rotation_degrees: 0,
+                    created_at: "2030-01-02T00:00:00Z".into(),
+                },
+            )
+            .unwrap();
+        let first = catalog
+            .chronology_evidence_page(&project.id, None, 0, 10)
+            .unwrap();
+        let comparison = first.assets[0]
+            .candidate_comparisons
+            .iter()
+            .find(|row| {
+                row.left_origin.ends_with("recording_start_time")
+                    && row.right_origin.ends_with("recording_end_time")
+            })
+            .unwrap();
+        assert_eq!(comparison.duration_delta_seconds, Some(0));
+        assert_eq!(comparison.duration_explains_difference, Some(true));
+
+        let snapshot = catalog.export_project_baseline(&project.id).unwrap();
+        let restore_dir = tempfile::tempdir().unwrap();
+        let restored = Catalog::import_project_baseline(
+            restore_dir.path().join("restored.sqlite3"),
+            &snapshot,
+            "synthetic-node",
+            1,
+            "synthetic-digest",
+        )
+        .unwrap();
+        let restored_page = restored
+            .chronology_evidence_page(&project.id, None, 0, 10)
+            .unwrap();
+        assert_eq!(
+            restored_page.assets[0].timestamp_candidates.as_deref(),
+            Some(candidates.as_slice())
+        );
+        assert_eq!(
+            restored_page.assets[0].candidate_comparisons,
+            first.assets[0].candidate_comparisons
+        );
+    }
+}
+
+fn find_compact_filename_timestamp(filename: &str) -> Option<(usize, usize)> {
+    let bytes = filename.as_bytes();
+    (0..bytes.len().saturating_sub(13)).find_map(|start| {
+        bytes[start..start + 14]
+            .iter()
+            .all(u8::is_ascii_digit)
+            .then_some((start, 14))
     })
 }
 
@@ -4242,6 +4560,8 @@ pub struct NormalizedMediaProbe {
     pub camera_model: Option<String>,
     pub camera_string: Option<String>,
     pub captured_at_raw: Option<String>,
+    #[serde(default)]
+    pub timestamp_candidates: Vec<chronology::TimestampCandidate>,
     pub best_time: Option<String>,
     pub metadata_rotation_degrees: u16,
     pub enrichment_status: String,
@@ -4354,6 +4674,7 @@ pub fn probe_media_normalized(
         _ => None,
     };
     let stream = require_video_stream(&document)?;
+    let timestamp_candidates = collect_timestamp_candidates(path, &document);
     let raw_time = stream
         .pointer("/tags/creation_time")
         .or_else(|| document.pointer("/format/tags/creation_time"))
@@ -4388,6 +4709,7 @@ pub fn probe_media_normalized(
         camera_model,
         camera_string,
         captured_at_raw: raw_time.clone(),
+        timestamp_candidates,
         best_time: raw_time
             .as_deref()
             .and_then(|value| normalize_datetime(value, 0)),
@@ -4407,7 +4729,7 @@ fn probe_media_document_with(path: &Path, ffprobe_program: &Path) -> Result<Valu
             "-select_streams",
             "v:0",
             "-show_entries",
-            "format=duration:format_tags=creation_time:stream=codec_type,width,height,codec_name,r_frame_rate,duration:stream_tags=creation_time,rotate:stream_side_data=rotation",
+            "format=duration:format_tags=creation_time,recording_start_time,recording_end_time:stream=codec_type,width,height,codec_name,r_frame_rate,duration:stream_tags=creation_time,recording_start_time,recording_end_time,rotate:stream_side_data=rotation",
             "-of",
             "json",
         ])
@@ -4530,7 +4852,7 @@ fn probe_media_document(path: &Path) -> Result<Value> {
             "-select_streams",
             "v:0",
             "-show_entries",
-            "format=duration:format_tags=creation_time:stream=codec_type,width,height,codec_name,r_frame_rate,duration:stream_tags=creation_time,rotate:stream_side_data=rotation",
+            "format=duration:format_tags=creation_time,recording_start_time,recording_end_time:stream=codec_type,width,height,codec_name,r_frame_rate,duration:stream_tags=creation_time,recording_start_time,recording_end_time,rotate:stream_side_data=rotation",
             "-of",
             "json",
         ])
@@ -5055,6 +5377,7 @@ mod tests {
                     codec: "h264".to_string(),
                     camera: "Sony".to_string(),
                     captured_at_raw: Some("2026-01-01T09:00:00Z".to_string()),
+                    timestamp_candidates: None,
                     best_time: Some("2026-01-01T09:00:00Z".to_string()),
                     metadata_rotation_degrees: 0,
                     default_rotation_degrees: 0,

@@ -560,7 +560,7 @@ fn order_is_byte_identical_before_and_after_migration_9_for_every_fixture_shape(
                 .iter()
                 .zip(after.iter())
                 .position(|(left, right)| left != right)
-                .map_or(before.len().min(after.len()), |index| index)
+                .unwrap_or(before.len().min(after.len()))
         );
         assert_eq!(before_projections, after_projections);
         assert_eq!(

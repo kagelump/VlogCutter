@@ -16,6 +16,72 @@ use rcdvlog_core::{
 use serde_json::json;
 use tempfile::tempdir;
 
+#[test]
+fn timestamp_candidates_survive_operation_replay_and_portable_baseline() {
+    let fixture = fixture(&[]);
+    let candidate = rcdvlog_core::TimestampCandidate {
+        origin: "ffprobe.format.tags.creation_time".into(),
+        original_text: "2030-01-02T03:04:05Z".into(),
+        parsed_value: Some("2030-01-02T03:04:05+00:00".into()),
+        timezone_claim: Some("Z".into()),
+        parse_status: "parsed".into(),
+        semantics: Some("container_creation_time".into()),
+    };
+    fixture
+        .catalog
+        .add_portable_project_asset(
+            &fixture.project_id,
+            ProjectAssetAddedPayload {
+                id: "asset_evidence".into(),
+                fingerprint: "fingerprint_evidence".into(),
+                filename: "20300102030415_clip.mp4".into(),
+                size_bytes: 1,
+                duration_seconds: 10.0,
+                frame_rate: 30.0,
+                width: 1,
+                height: 1,
+                codec: "h264".into(),
+                camera: "Synthetic".into(),
+                captured_at_raw: Some(candidate.original_text.clone()),
+                timestamp_candidates: Some(vec![candidate.clone()]),
+                best_time: Some(candidate.parsed_value.clone().unwrap()),
+                metadata_rotation_degrees: 0,
+                default_rotation_degrees: 0,
+                created_at: "2030-01-02T00:00:00Z".into(),
+            },
+        )
+        .unwrap();
+    let page = fixture
+        .catalog
+        .chronology_evidence_page(&fixture.project_id, None, 0, 1)
+        .unwrap();
+    assert_eq!(
+        page.assets[0].timestamp_candidates.as_deref(),
+        Some(&[candidate.clone()][..])
+    );
+
+    let snapshot = fixture
+        .catalog
+        .export_project_baseline(&fixture.project_id)
+        .unwrap();
+    let directory = tempdir().unwrap();
+    let restored = Catalog::import_project_baseline(
+        directory.path().join("restored.sqlite3"),
+        &snapshot,
+        "synthetic-node",
+        1,
+        "digest",
+    )
+    .unwrap();
+    let restored_page = restored
+        .chronology_evidence_page(&fixture.project_id, None, 0, 1)
+        .unwrap();
+    assert_eq!(
+        restored_page.assets[0].timestamp_candidates.as_deref(),
+        Some(&[candidate][..])
+    );
+}
+
 struct Fixture {
     catalog: Catalog,
     project_id: String,
@@ -46,6 +112,7 @@ fn fixture(clips: &[(&str, &str, &str)]) -> Fixture {
                     codec: "h264".to_string(),
                     camera: (*camera).to_string(),
                     captured_at_raw: Some((*raw).to_string()),
+                    timestamp_candidates: None,
                     best_time: Some((*raw).to_string()),
                     metadata_rotation_degrees: 0,
                     default_rotation_degrees: 0,
@@ -129,6 +196,7 @@ fn add_portable_asset(
                 codec: "h264".to_string(),
                 camera: camera.to_string(),
                 captured_at_raw: Some(captured_at_raw.to_string()),
+                timestamp_candidates: None,
                 best_time: Some(captured_at_raw.to_string()),
                 metadata_rotation_degrees: 0,
                 default_rotation_degrees: 0,

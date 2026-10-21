@@ -738,6 +738,7 @@ mod tests {
             capture_sequence_id: Some("seq_a".to_string()),
             filename_counter: counter,
             duration_seconds: 1.0,
+            timestamp_candidates: None,
         }
     }
 

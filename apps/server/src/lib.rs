@@ -4248,6 +4248,7 @@ mod tests {
                     codec: "h264".to_string(),
                     camera: "camera".to_string(),
                     captured_at_raw: None,
+                    timestamp_candidates: None,
                     best_time: None,
                     metadata_rotation_degrees: 0,
                     default_rotation_degrees: 0,

@@ -21,6 +21,7 @@ fn asset(
         capture_sequence_id: Some(sequence.to_string()),
         filename_counter: counter,
         duration_seconds: 4.0,
+        timestamp_candidates: None,
     }
 }
 

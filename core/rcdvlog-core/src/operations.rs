@@ -361,6 +361,8 @@ pub struct ProjectAssetAddedPayload {
     pub codec: String,
     pub camera: String,
     pub captured_at_raw: Option<String>,
+    #[serde(default)]
+    pub timestamp_candidates: Option<Vec<crate::chronology::TimestampCandidate>>,
     pub best_time: Option<String>,
     pub metadata_rotation_degrees: u16,
     pub default_rotation_degrees: u16,
@@ -1564,7 +1566,16 @@ pub(crate) fn commit_local_in_transaction(
             aggregate_type: new.aggregate_type.to_string(),
             aggregate_id: new.aggregate_id,
             operation_type: new.operation_type.to_string(),
-            payload_version: 1,
+            payload_version: if new.operation_type == PROJECT_ASSET_ADDED
+                && new
+                    .payload
+                    .get("timestampCandidates")
+                    .is_some_and(|value| value.is_array())
+            {
+                2
+            } else {
+                1
+            },
             base_revision: new.base_revision,
             payload: new.payload,
         };
@@ -2326,7 +2337,17 @@ fn materialize_asset_add(
     transaction: &Transaction<'_>,
     operation: &ProjectOperation,
 ) -> Result<bool> {
-    let payload: ProjectAssetAddedPayload = payload(operation)?;
+    if !matches!(operation.payload_version, 1 | 2) {
+        bail!(
+            "unsupported payload version {} for {}",
+            operation.payload_version,
+            operation.operation_type
+        );
+    }
+    let payload: ProjectAssetAddedPayload = serde_json::from_value(operation.payload.clone())?;
+    if operation.payload_version == 2 && payload.timestamp_candidates.is_none() {
+        bail!("projectAssetAdded payload version 2 requires timestamp candidate provenance");
+    }
     if payload.id != operation.aggregate_id {
         bail!("projectAssetAdded payload ID does not match aggregate ID");
     }
@@ -2343,10 +2364,11 @@ fn materialize_asset_add(
     }
     let camera = resolve_camera_alias(transaction, &operation.project_id, &payload.camera)?;
     transaction.execute(
-        "INSERT INTO assets(id, project_id, fingerprint, path, filename, size_bytes, duration_seconds, frame_rate, width, height, codec, camera, captured_at_raw, best_time, metadata_rotation_degrees, default_rotation_degrees, rotation_degrees, orientation_probed, created_at) VALUES (?1, ?2, ?3, '', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?15, 1, ?16)",
+        "INSERT INTO assets(id, project_id, fingerprint, path, filename, size_bytes, duration_seconds, frame_rate, width, height, codec, camera, captured_at_raw, best_time, metadata_rotation_degrees, default_rotation_degrees, rotation_degrees, orientation_probed, created_at, timestamp_candidates_json) VALUES (?1, ?2, ?3, '', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?15, 1, ?16, ?17)",
         params![payload.id, operation.project_id, payload.fingerprint, payload.filename, payload.size_bytes as i64,
             payload.duration_seconds, payload.frame_rate, payload.width, payload.height, payload.codec, camera,
-            payload.captured_at_raw, payload.best_time, payload.metadata_rotation_degrees, payload.default_rotation_degrees, payload.created_at],
+            payload.captured_at_raw, payload.best_time, payload.metadata_rotation_degrees, payload.default_rotation_degrees, payload.created_at,
+            payload.timestamp_candidates.as_ref().map(serde_json::to_string).transpose()?],
     )?;
     // Every asset belongs to exactly one capture sequence. A new asset joins
     // its camera's sequence (created on demand), using the same rule migration
@@ -3530,7 +3552,10 @@ fn validate_operation(operation: &ProjectOperation) -> Result<()> {
     if operation.logical_time.node_id != operation.origin_node_id {
         bail!("logical time node ID must match origin node ID");
     }
-    if operation.payload_version != 1 && is_known_operation_type(&operation.operation_type) {
+    if operation.payload_version != 1
+        && !(operation.operation_type == PROJECT_ASSET_ADDED && operation.payload_version == 2)
+        && is_known_operation_type(&operation.operation_type)
+    {
         bail!(
             "unsupported payload version {} for {}",
             operation.payload_version,
@@ -3715,6 +3740,7 @@ mod tests {
                     codec: "h264".to_string(),
                     camera: "DJI".to_string(),
                     captured_at_raw: Some("2026-01-01T00:00:00Z".to_string()),
+                    timestamp_candidates: None,
                     // This is what a probe would have supplied before an
                     // existing correction is projected at import commit.
                     best_time: Some("2026-01-01T00:00:00.000Z".to_string()),
@@ -3748,6 +3774,7 @@ mod tests {
             codec: "h264".to_string(),
             camera: "DJI".to_string(),
             captured_at_raw: Some("2026-01-01T00:00:00Z".to_string()),
+            timestamp_candidates: None,
             best_time: Some("2026-01-01T00:00:00.000Z".to_string()),
             metadata_rotation_degrees: 0,
             default_rotation_degrees: 0,

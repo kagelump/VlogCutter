@@ -900,6 +900,9 @@ impl ProjectReplicaManager {
             captured_at_raw: probe
                 .as_ref()
                 .and_then(|value| value.captured_at_raw.clone()),
+            timestamp_candidates: probe
+                .as_ref()
+                .map(|value| value.timestamp_candidates.clone()),
             best_time: probe.as_ref().and_then(|value| value.best_time.clone()),
             metadata_rotation_degrees: probe
                 .as_ref()
@@ -1262,6 +1265,7 @@ mod tests {
                     codec: "h264".to_string(),
                     camera: "camera".to_string(),
                     captured_at_raw: None,
+                    timestamp_candidates: None,
                     best_time: None,
                     metadata_rotation_degrees: 0,
                     default_rotation_degrees: 0,
@@ -1643,6 +1647,7 @@ mod tests {
             codec: "h264".to_string(),
             camera: "camera".to_string(),
             captured_at_raw: None,
+            timestamp_candidates: None,
             best_time: None,
             metadata_rotation_degrees: 0,
             default_rotation_degrees: 0,
