@@ -286,6 +286,11 @@ enum ClipsCommand {
         #[arg(long)]
         asset: String,
     },
+    /// Validate source video and persist its usable or quarantined state.
+    ValidateVideo {
+        #[arg(long)]
+        asset: String,
+    },
     /// Persist current orientation metadata from the immutable original.
     RefreshOrientation {
         #[arg(long)]
@@ -444,6 +449,7 @@ fn command_name(command: &Commands) -> &'static str {
             ClipsCommand::List { .. } => "clips.list",
             ClipsCommand::Get { .. } => "clips.get",
             ClipsCommand::Diagnose { .. } => "clips.diagnose",
+            ClipsCommand::ValidateVideo { .. } => "clips.validate-video",
             ClipsCommand::RefreshOrientation { .. } => "clips.refresh-orientation",
             ClipsCommand::Update { .. } => "clips.update",
         },
@@ -661,6 +667,9 @@ fn execute(cli: &Cli) -> Result<Value> {
             }
             ClipsCommand::Get { asset } => Ok(serde_json::to_value(catalog.get_asset(asset)?)?),
             ClipsCommand::Diagnose { asset } => clip_diagnosis(&catalog, asset),
+            ClipsCommand::ValidateVideo { asset } => {
+                Ok(serde_json::to_value(catalog.validate_asset_video(asset)?)?)
+            }
             ClipsCommand::RefreshOrientation { asset } => Ok(serde_json::to_value(
                 catalog.refresh_asset_orientation(asset)?,
             )?),
@@ -819,7 +828,17 @@ fn rotation_after(rotation: u16, addition: i32) -> u16 {
 fn clip_diagnosis(catalog: &Catalog, asset_id: &str) -> Result<Value> {
     let asset = catalog.get_asset(asset_id)?;
     let revision = catalog.asset_revision_diagnostics(asset_id)?;
+    let video_validation = catalog.asset_video_validation(asset_id)?;
     let (original_probe, original) = probe_value(&asset.path);
+    let no_video_stream = original["error"]
+        .as_str()
+        .is_some_and(|error| error.contains("no video stream"));
+    let original_bytes_reachable = video_validation.bytes_reachable;
+    let incomplete_video_stream = original_bytes_reachable
+        && original_probe.is_none()
+        && original["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("video stream"));
     let proxy_version = proxy_version(&asset);
     let proxy_probe = asset
         .proxy_path
@@ -891,6 +910,16 @@ fn clip_diagnosis(catalog: &Catalog, asset_id: &str) -> Result<Value> {
     };
 
     let mut warnings = Vec::new();
+    if original_bytes_reachable && original_probe.is_none() {
+        let issue = if no_video_stream {
+            "no video stream"
+        } else {
+            "unusable video stream or probe failure"
+        };
+        warnings.push(format!(
+            "original file bytes are reachable, but ffprobe found {issue}; this legacy catalog row is not usable video and should not be counted as ready"
+        ));
+    }
     if !asset.orientation_probed {
         warnings.push(
             "catalog orientation is unprobed; stored 0° means unknown, not confirmed".to_string(),
@@ -928,6 +957,16 @@ fn clip_diagnosis(catalog: &Catalog, asset_id: &str) -> Result<Value> {
     }
 
     let mut recommended_actions = Vec::new();
+    if video_validation.status != rcdvlog_core::AssetVideoValidationStatus::Usable {
+        recommended_actions.push(format!(
+            "rcdvlog --catalog {} clips validate-video --asset {}",
+            catalog.database_path().display(),
+            asset.id
+        ));
+    }
+    if original_bytes_reachable && original_probe.is_none() {
+        recommended_actions.push("verify the referenced file is the intended video and contains decodable video frames, valid dimensions, a frame rate, a codec, and a duration; keep it out of video review and chronology until those checks pass".to_string());
+    }
     if !asset.orientation_probed {
         recommended_actions.push(format!(
             "rcdvlog --catalog {} clips refresh-orientation --asset {}",
@@ -964,6 +1003,12 @@ fn clip_diagnosis(catalog: &Catalog, asset_id: &str) -> Result<Value> {
         },
         "representations": {
             "original": original,
+            "originalReadiness": {
+                "bytesReachable": original_bytes_reachable,
+                "usableVideo": original_probe.is_some(),
+                "diagnosis": if no_video_stream { "no_video_stream" } else if incomplete_video_stream { "incomplete_video_stream" } else if original_probe.is_some() { "video_stream_available" } else { "probe_failed" },
+            },
+            "catalogVideoValidation": video_validation,
             "proxy": {
                 "path": asset.proxy_path,
                 "version": proxy_version,
@@ -1085,19 +1130,115 @@ fn project_status(catalog: &Catalog, project_id: &str) -> Result<Value> {
         .find(|project| project.id == project_id)
         .ok_or_else(|| anyhow!("project not found: {project_id}"))?;
     let assets = catalog.list_assets(project_id)?;
-    let duration_seconds: f64 = assets.iter().map(|asset| asset.duration_seconds).sum();
+    let validations = assets
+        .iter()
+        .map(|asset| catalog.asset_video_validation(&asset.id))
+        .collect::<Result<Vec<_>>>()?;
+    let validation_by_asset = validations
+        .into_iter()
+        .map(|validation| (validation.asset_id.clone(), validation))
+        .collect::<std::collections::HashMap<_, _>>();
+    let active_assets = assets
+        .iter()
+        .filter(|asset| !asset.removed)
+        .collect::<Vec<_>>();
+    let usable_assets = active_assets
+        .iter()
+        .copied()
+        .filter(|asset| {
+            validation_by_asset
+                .get(&asset.id)
+                .is_some_and(|validation| {
+                    validation.status == rcdvlog_core::AssetVideoValidationStatus::Usable
+                })
+        })
+        .collect::<Vec<_>>();
+    let duration_seconds: f64 = usable_assets
+        .iter()
+        .map(|asset| asset.duration_seconds)
+        .sum();
+    let catalog_duration_seconds: f64 = active_assets
+        .iter()
+        .map(|asset| asset.duration_seconds)
+        .sum();
+    let usable_asset_ids = usable_assets
+        .iter()
+        .map(|asset| asset.id.clone())
+        .collect::<std::collections::HashSet<_>>();
+    let validation_counts = json!({
+        "usableVideo": usable_assets.len(),
+        "unverifiedVideo": active_assets
+            .iter()
+            .filter(|asset| {
+                validation_by_asset.get(&asset.id).is_some_and(|validation| {
+                    validation.status == rcdvlog_core::AssetVideoValidationStatus::Unverified
+                })
+            })
+            .count(),
+        "quarantinedVideo": active_assets
+            .iter()
+            .filter(|asset| {
+                validation_by_asset.get(&asset.id).is_some_and(|validation| {
+                    validation.status == rcdvlog_core::AssetVideoValidationStatus::Quarantined
+                })
+            })
+            .count(),
+        "reachableOriginals": active_assets
+            .iter()
+            .filter(|asset| {
+                validation_by_asset
+                    .get(&asset.id)
+                    .is_some_and(|validation| validation.bytes_reachable)
+            })
+            .count(),
+    });
+    let analysis_readiness = catalog.analysis_readiness(project_id)?;
     Ok(json!({
         "project": project,
+        "analysisReadiness": analysis_readiness,
         "media": {
             "assets": assets.len(),
             "durationSeconds": duration_seconds,
-            "originalsOffline": assets.iter().filter(|asset| !Path::new(&asset.path).exists()).count(),
-            "proxiesReady": assets.iter().filter(|asset| proxy_version(asset) == "current_raw_v3").count(),
-            "proxiesObsoleteV2": assets.iter().filter(|asset| proxy_version(asset) == "metadata_tagged_raw_v2").count(),
-            "proxiesLegacy": assets.iter().filter(|asset| proxy_version(asset) == "legacy_metadata_baked_v1").count(),
+            "catalogMetadataDurationSeconds": catalog_duration_seconds,
+            "videoValidation": validation_counts,
+            "originalsOffline": active_assets
+                .iter()
+                .filter(|asset| !Path::new(&asset.path).is_file())
+                .count(),
+            "proxiesReady": active_assets
+                .iter()
+                .filter(|asset| {
+                    usable_asset_ids.contains(&asset.id)
+                        && proxy_version(asset) == "current_raw_v3"
+                })
+                .count(),
+            "proxiesObsoleteV2": active_assets
+                .iter()
+                .filter(|asset| {
+                    usable_asset_ids.contains(&asset.id)
+                        && proxy_version(asset) == "metadata_tagged_raw_v2"
+                })
+                .count(),
+            "proxiesLegacy": active_assets
+                .iter()
+                .filter(|asset| {
+                    usable_asset_ids.contains(&asset.id)
+                        && proxy_version(asset) == "legacy_metadata_baked_v1"
+                })
+                .count(),
             "labeled": assets.iter().filter(|asset| !asset.labels.is_empty()).count(),
             "removed": assets.iter().filter(|asset| asset.removed).count(),
-            "thumbnailsReady": assets.iter().filter(|asset| asset.thumbnail_quality > 0 && asset.thumbnail_path.as_deref().is_some_and(|path| Path::new(path).exists())).count(),
+            "thumbnailsReady": active_assets
+                .iter()
+                .filter(|asset| {
+                    usable_asset_ids.contains(&asset.id)
+                        && asset.thumbnail_quality > 0
+                        && asset
+                            .thumbnail_path
+                            .as_deref()
+                            .is_some_and(|path| Path::new(path).exists())
+                })
+                .count(),
         }
     }))
 }

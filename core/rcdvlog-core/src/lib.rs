@@ -474,9 +474,17 @@ pub struct AnalysisRunOutcome {
 #[serde(rename_all = "camelCase")]
 pub struct AnalysisReadiness {
     pub project_id: String,
-    /// Clips currently in the labeling queue; removed clips are excluded
-    /// because no stage touches them.
+    /// Validated usable clips currently eligible for analysis. Removed,
+    /// unverified, quarantined, and unavailable clips are excluded.
     pub total_clips: usize,
+    /// Nonremoved catalog rows whose sources can currently be statted.
+    pub reachable_originals: usize,
+    /// Nonremoved legacy rows awaiting explicit media validation.
+    pub unverified_video_clips: usize,
+    /// Nonremoved rows durably quarantined after failed video validation.
+    pub quarantined_video_clips: usize,
+    /// Previously usable media whose original and proxy are both unavailable.
+    pub unavailable_video_clips: usize,
     pub missing_proxies: usize,
     pub missing_transcripts: usize,
     pub missing_analyses: usize,
@@ -491,6 +499,24 @@ pub struct AnalysisReadiness {
     pub cost_basis: AnalysisCostBasis,
     pub observed_cost_per_clip_usd: f64,
     pub last_run: Option<AnalysisRunRecord>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssetVideoValidationStatus {
+    Unverified,
+    Usable,
+    Quarantined,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AssetVideoValidation {
+    pub asset_id: String,
+    pub status: AssetVideoValidationStatus,
+    pub bytes_reachable: bool,
+    pub diagnostic: Option<String>,
+    pub validated_at: Option<String>,
 }
 
 /// Whether a cost projection is grounded in this project or in the reference
@@ -791,14 +817,14 @@ pub fn probe_media_stream(path: impl AsRef<Path>) -> Result<MediaStreamInfo> {
         bail!("media file not found: {}", path.display());
     }
     let probe = probe_media_document(path)?;
-    let stream = probe["streams"].as_array().and_then(|items| items.first());
-    let width = stream
-        .and_then(|value| value["width"].as_u64())
-        .unwrap_or(0) as u32;
-    let height = stream
-        .and_then(|value| value["height"].as_u64())
-        .unwrap_or(0) as u32;
-    let metadata_rotation_degrees = stream_rotation(stream);
+    let stream = require_video_stream(&probe)?;
+    let width = stream["width"]
+        .as_u64()
+        .ok_or_else(|| anyhow!("video stream has no usable width"))? as u32;
+    let height = stream["height"]
+        .as_u64()
+        .ok_or_else(|| anyhow!("video stream has no usable height"))? as u32;
+    let metadata_rotation_degrees = stream_rotation(Some(stream));
     let sideways = matches!(metadata_rotation_degrees, 90 | 270);
     let (display_width, display_height) = if sideways {
         (height, width)
@@ -810,9 +836,9 @@ pub fn probe_media_stream(path: impl AsRef<Path>) -> Result<MediaStreamInfo> {
         path: path.to_string_lossy().into_owned(),
         width,
         height,
-        codec: stream
-            .and_then(|value| value["codec_name"].as_str())
-            .unwrap_or("unknown")
+        codec: stream["codec_name"]
+            .as_str()
+            .ok_or_else(|| anyhow!("video stream has no codec name"))?
             .to_string(),
         metadata_rotation_degrees,
         display_width,
@@ -1080,8 +1106,8 @@ impl Catalog {
                 Err(error) => {
                     // The transient report is not enough: a rejected file must
                     // still be discoverable after the run, and after relaunch
-                    // (D01-T027). Deduped by folder, so a card full of `._*`
-                    // sidecars is one diagnostic with a count, not 400 rows.
+                    // (D01-T027). Sidecars remain folder-deduped, but each
+                    // actual media candidate retains its own failure details.
                     let folder = path
                         .parent()
                         .map(|parent| parent.to_string_lossy().into_owned())
@@ -1091,7 +1117,16 @@ impl Catalog {
                         .map(|name| name.to_string_lossy().into_owned())
                         .unwrap_or_default();
                     // Recording a diagnostic must never itself fail an ingest.
-                    let _ = self.record_unreadable_media(project_id, &folder, &filename);
+                    let reason = format!("{error:#}");
+                    let _ = if reason.contains("no video stream") {
+                        self.record_no_video_stream(project_id, &folder, &filename, &reason)
+                    } else if reason.contains("video stream") {
+                        self.record_invalid_video_stream(project_id, &folder, &filename, &reason)
+                    } else if filename.starts_with("._") {
+                        self.record_unreadable_media(project_id, &folder, &filename, &reason)
+                    } else {
+                        self.record_unreadable_media_file(project_id, &folder, &filename, &reason)
+                    };
                     report.failures.push(IngestFailure {
                         path: path.to_string_lossy().into_owned(),
                         error: format!("{error:#}"),
@@ -1306,8 +1341,8 @@ impl Catalog {
             project_id,
             &path.to_string_lossy(),
             operations::ProjectAssetAddedPayload {
-                id,
-                fingerprint,
+                id: id.clone(),
+                fingerprint: fingerprint.clone(),
                 filename: filename.to_string(),
                 size_bytes: metadata.len(),
                 duration_seconds: probe.duration_seconds,
@@ -1323,6 +1358,7 @@ impl Catalog {
                 created_at: now(),
             },
         )?;
+        self.store_video_validation(&id, &fingerprint, "usable", None)?;
         Ok(IngestOutcome::Imported)
     }
 
@@ -1930,6 +1966,10 @@ impl Catalog {
         let mut readiness = AnalysisReadiness {
             project_id: project_id.to_string(),
             total_clips: 0,
+            reachable_originals: 0,
+            unverified_video_clips: 0,
+            quarantined_video_clips: 0,
+            unavailable_video_clips: 0,
             missing_proxies: 0,
             missing_transcripts: 0,
             missing_analyses: 0,
@@ -1946,6 +1986,26 @@ impl Catalog {
         for asset in self.list_assets(project_id)? {
             if asset.removed {
                 continue;
+            }
+            let validation = self.asset_video_validation_for(&asset)?;
+            if validation.bytes_reachable {
+                readiness.reachable_originals += 1;
+            }
+            match validation.status {
+                AssetVideoValidationStatus::Usable => {
+                    if !validation.bytes_reachable && !asset.proxy_available {
+                        readiness.unavailable_video_clips += 1;
+                        continue;
+                    }
+                }
+                AssetVideoValidationStatus::Unverified => {
+                    readiness.unverified_video_clips += 1;
+                    continue;
+                }
+                AssetVideoValidationStatus::Quarantined => {
+                    readiness.quarantined_video_clips += 1;
+                    continue;
+                }
             }
             readiness.total_clips += 1;
             // A clip whose original is offline but whose proxy is present is not
@@ -1994,6 +2054,87 @@ impl Catalog {
         readiness.observed_cost_per_clip_usd = per_clip;
         readiness.estimated_cost_usd = per_clip * readiness.missing_analyses as f64;
         Ok(readiness)
+    }
+
+    /// Returns durable video eligibility separately from current byte reachability.
+    /// Catalog rows created before explicit validation are unverified until checked.
+    pub fn asset_video_validation(&self, asset_id: &str) -> Result<AssetVideoValidation> {
+        let asset = self.get_asset(asset_id)?;
+        self.asset_video_validation_for(&asset)
+    }
+
+    fn asset_video_validation_for(&self, asset: &Asset) -> Result<AssetVideoValidation> {
+        let connection = self.connection()?;
+        let has_validation_table = table_exists(&connection, "asset_video_validation")?;
+        let stored: Option<(String, String, Option<String>, String)> = if has_validation_table {
+            connection.query_row(
+                "SELECT fingerprint, status, diagnostic, validated_at FROM asset_video_validation WHERE asset_id = ?1",
+                [&asset.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            ).optional()?
+        } else {
+            None
+        };
+        let (status, diagnostic, validated_at) = match stored {
+            Some((fingerprint, status, diagnostic, validated_at))
+                if fingerprint == asset.fingerprint =>
+            {
+                let state = match status.as_str() {
+                    "usable" => AssetVideoValidationStatus::Usable,
+                    "quarantined" => AssetVideoValidationStatus::Quarantined,
+                    _ => AssetVideoValidationStatus::Unverified,
+                };
+                (state, diagnostic, Some(validated_at))
+            }
+            _ => (AssetVideoValidationStatus::Unverified, None, None),
+        };
+        Ok(AssetVideoValidation {
+            asset_id: asset.id.clone(),
+            status,
+            bytes_reachable: Path::new(&asset.path).is_file(),
+            diagnostic,
+            validated_at,
+        })
+    }
+
+    /// Explicitly validates a legacy or new asset and durably records its video eligibility.
+    /// Offline originals may validate against an existing proxy; neither representation is changed.
+    pub fn validate_asset_video(&self, asset_id: &str) -> Result<AssetVideoValidation> {
+        let asset = self.get_asset(asset_id)?;
+        let validation_path = if Path::new(&asset.path).is_file() {
+            PathBuf::from(&asset.path)
+        } else if let Some(proxy_path) = asset
+            .proxy_path
+            .as_deref()
+            .filter(|proxy_path| Path::new(proxy_path).is_file())
+        {
+            PathBuf::from(proxy_path)
+        } else {
+            bail!("original bytes and proxy are not reachable; video validation was not recorded");
+        };
+        let (status, diagnostic) = match probe_media_stream(&validation_path) {
+            Ok(_) => ("usable", None),
+            Err(error) => ("quarantined", Some(format!("{error:#}"))),
+        };
+        self.store_video_validation(asset_id, &asset.fingerprint, status, diagnostic.as_deref())?;
+        self.asset_video_validation(asset_id)
+    }
+
+    fn store_video_validation(
+        &self,
+        asset_id: &str,
+        fingerprint: &str,
+        status: &str,
+        diagnostic: Option<&str>,
+    ) -> Result<()> {
+        self.connection()?.execute(
+            "INSERT INTO asset_video_validation(asset_id, fingerprint, status, diagnostic, validated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(asset_id) DO UPDATE SET fingerprint=excluded.fingerprint,
+                status=excluded.status, diagnostic=excluded.diagnostic, validated_at=excluded.validated_at",
+            params![asset_id, fingerprint, status, diagnostic, now()],
+        )?;
+        Ok(())
     }
 
     /// Opens a run record so spend is attributable even if the app exits.
@@ -2224,6 +2365,12 @@ impl Catalog {
             let connection = self.connection()?;
             for asset in assets {
                 if asset.removed {
+                    continue;
+                }
+                if self.asset_video_validation(&asset.id)?.status
+                    != AssetVideoValidationStatus::Usable
+                {
+                    skipped += 1;
                     continue;
                 }
                 match self.proxy_fingerprint(&asset.id) {
@@ -2596,6 +2743,11 @@ impl Catalog {
             if asset.removed {
                 continue;
             }
+            if self.asset_video_validation(&asset.id)?.status != AssetVideoValidationStatus::Usable
+            {
+                skipped += 1;
+                continue;
+            }
             let current = self
                 .proxy_fingerprint(&asset.id)
                 .ok()
@@ -2890,9 +3042,20 @@ impl Catalog {
         F: FnMut(AssetBatchProgress) -> ControlFlow<()>,
     {
         let assets = self.list_assets(project_id)?;
-        let (ready, pending): (Vec<_>, Vec<_>) = assets.into_iter().partition(|asset| {
-            has_current_proxy(asset) || (!asset.original_available && asset.proxy_available)
-        });
+        let mut ready = Vec::new();
+        let mut pending = Vec::new();
+        for asset in assets {
+            if asset.removed
+                || self.asset_video_validation(&asset.id)?.status
+                    != AssetVideoValidationStatus::Usable
+                || has_current_proxy(&asset)
+                || (!asset.original_available && asset.proxy_available)
+            {
+                ready.push(asset);
+            } else {
+                pending.push(asset);
+            }
+        }
         let mut report = ProxyReport {
             generated: 0,
             skipped: ready.len(),
@@ -3979,11 +4142,9 @@ fn sampled_fingerprint(path: &Path, size: u64) -> Result<String> {
 /// Probes a media file with ffprobe and optional ExifTool enrichment.
 fn probe_media(path: &Path) -> Result<MediaProbe> {
     let document = probe_media_document(path)?;
-    let stream = document["streams"]
-        .as_array()
-        .and_then(|items| items.first());
+    let stream = require_video_stream(&document)?;
     let raw_time = stream
-        .and_then(|value| value.pointer("/tags/creation_time"))
+        .pointer("/tags/creation_time")
         .or_else(|| document.pointer("/format/tags/creation_time"))
         .and_then(Value::as_str)
         .map(str::to_owned);
@@ -3994,30 +4155,31 @@ fn probe_media(path: &Path) -> Result<MediaProbe> {
         &path.file_name().unwrap_or_default().to_string_lossy(),
     )
     .camera;
-    let duration_seconds = document["format"]["duration"]
+    let duration_seconds = video_duration(&document, stream)
+        .ok_or_else(|| anyhow!("video stream has no valid duration"))?;
+    let rate = stream["r_frame_rate"]
         .as_str()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(0.0);
-    let rate = stream
-        .and_then(|value| value["r_frame_rate"].as_str())
-        .map(parse_rate)
-        .unwrap_or(30.0);
-    let metadata_rotation_degrees = stream_rotation(stream);
-    let width = stream
-        .and_then(|value| value["width"].as_u64())
-        .unwrap_or(0) as u32;
-    let height = stream
-        .and_then(|value| value["height"].as_u64())
-        .unwrap_or(0) as u32;
+        .and_then(parse_rate)
+        .filter(|rate| *rate > 0.0)
+        .ok_or_else(|| anyhow!("video stream has no valid frame rate"))?;
+    let metadata_rotation_degrees = stream_rotation(Some(stream));
+    let width = stream["width"]
+        .as_u64()
+        .ok_or_else(|| anyhow!("video stream has no usable width"))? as u32;
+    let height = stream["height"]
+        .as_u64()
+        .ok_or_else(|| anyhow!("video stream has no usable height"))? as u32;
+    let codec = stream["codec_name"]
+        .as_str()
+        .filter(|codec| !codec.is_empty())
+        .ok_or_else(|| anyhow!("video stream has no codec name"))?
+        .to_string();
     Ok(MediaProbe {
         duration_seconds,
         frame_rate: rate,
         width,
         height,
-        codec: stream
-            .and_then(|value| value["codec_name"].as_str())
-            .unwrap_or("unknown")
-            .to_string(),
+        codec,
         camera,
         captured_at_raw: raw_time.clone(),
         best_time: raw_time
@@ -4049,6 +4211,43 @@ pub struct NormalizedMediaProbe {
     pub metadata_rotation_degrees: u16,
     pub enrichment_status: String,
     pub enrichment_warning: Option<String>,
+}
+
+fn require_video_stream(document: &Value) -> Result<&Value> {
+    let stream = document["streams"]
+        .as_array()
+        .and_then(|streams| streams.iter().find(|stream| stream["codec_type"] == "video"))
+        .ok_or_else(|| {
+            anyhow!("ffprobe found no video stream; file bytes are reachable but contain no usable video")
+        })?;
+    if stream["width"].as_u64().is_none_or(|value| value == 0) {
+        bail!("video stream has no usable width");
+    }
+    if stream["height"].as_u64().is_none_or(|value| value == 0) {
+        bail!("video stream has no usable height");
+    }
+    if stream["codec_name"].as_str().is_none_or(str::is_empty) {
+        bail!("video stream has no codec name");
+    }
+    if stream["r_frame_rate"]
+        .as_str()
+        .and_then(parse_rate)
+        .is_none_or(|rate| !rate.is_finite() || rate <= 0.0)
+    {
+        bail!("video stream has no valid frame rate");
+    }
+    if video_duration(document, stream).is_none() {
+        bail!("video stream has no valid duration");
+    }
+    Ok(stream)
+}
+
+fn video_duration(document: &Value, stream: &Value) -> Option<f64> {
+    document["format"]["duration"]
+        .as_str()
+        .or_else(|| stream["duration"].as_str())
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|duration| duration.is_finite() && *duration > 0.0)
 }
 
 /// A media executable exited unsuccessfully. Kept typed so CLI adapters can
@@ -4119,38 +4318,37 @@ pub fn probe_media_normalized(
         (Some(make), None) => Some(make.clone()),
         _ => None,
     };
-    let stream = document["streams"]
-        .as_array()
-        .and_then(|items| items.first());
+    let stream = require_video_stream(&document)?;
     let raw_time = stream
-        .and_then(|value| value.pointer("/tags/creation_time"))
+        .pointer("/tags/creation_time")
         .or_else(|| document.pointer("/format/tags/creation_time"))
         .and_then(Value::as_str)
         .map(str::to_owned);
-    let duration_seconds = document["format"]["duration"]
+    let duration_seconds = video_duration(&document, stream)
+        .ok_or_else(|| anyhow!("video stream has no valid duration"))?;
+    let rate = stream["r_frame_rate"]
         .as_str()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(0.0);
-    let rate = stream
-        .and_then(|value| value["r_frame_rate"].as_str())
-        .map(parse_rate)
-        .unwrap_or(30.0);
-    let metadata_rotation_degrees = stream_rotation(stream);
-    let width = stream
-        .and_then(|value| value["width"].as_u64())
-        .unwrap_or(0) as u32;
-    let height = stream
-        .and_then(|value| value["height"].as_u64())
-        .unwrap_or(0) as u32;
+        .and_then(parse_rate)
+        .filter(|rate| *rate > 0.0)
+        .ok_or_else(|| anyhow!("video stream has no valid frame rate"))?;
+    let metadata_rotation_degrees = stream_rotation(Some(stream));
+    let width = stream["width"]
+        .as_u64()
+        .ok_or_else(|| anyhow!("video stream has no usable width"))? as u32;
+    let height = stream["height"]
+        .as_u64()
+        .ok_or_else(|| anyhow!("video stream has no usable height"))? as u32;
+    let codec = stream["codec_name"]
+        .as_str()
+        .filter(|codec| !codec.is_empty())
+        .ok_or_else(|| anyhow!("video stream has no codec name"))?
+        .to_string();
     Ok(NormalizedMediaProbe {
         duration_seconds,
         frame_rate: rate,
         encoded_width: width,
         encoded_height: height,
-        codec: stream
-            .and_then(|value| value["codec_name"].as_str())
-            .unwrap_or("unknown")
-            .to_string(),
+        codec,
         camera_make,
         camera_model,
         camera_string,
@@ -4174,7 +4372,7 @@ fn probe_media_document_with(path: &Path, ffprobe_program: &Path) -> Result<Valu
             "-select_streams",
             "v:0",
             "-show_entries",
-            "format=duration:format_tags=creation_time:stream=width,height,codec_name,r_frame_rate:stream_tags=creation_time,rotate:stream_side_data=rotation",
+            "format=duration:format_tags=creation_time:stream=codec_type,width,height,codec_name,r_frame_rate,duration:stream_tags=creation_time,rotate:stream_side_data=rotation",
             "-of",
             "json",
         ])
@@ -4297,7 +4495,7 @@ fn probe_media_document(path: &Path) -> Result<Value> {
             "-select_streams",
             "v:0",
             "-show_entries",
-            "format=duration:format_tags=creation_time:stream=width,height,codec_name,r_frame_rate:stream_tags=creation_time,rotate:stream_side_data=rotation",
+            "format=duration:format_tags=creation_time:stream=codec_type,width,height,codec_name,r_frame_rate,duration:stream_tags=creation_time,rotate:stream_side_data=rotation",
             "-of",
             "json",
         ])
@@ -4366,21 +4564,15 @@ pub(crate) fn exif_camera(path: &Path) -> Option<String> {
     (!combined.is_empty()).then_some(combined)
 }
 
-fn parse_rate(value: &str) -> f64 {
-    let mut parts = value.split('/');
-    let numerator = parts
-        .next()
-        .and_then(|part| part.parse::<f64>().ok())
-        .unwrap_or(30.0);
-    let denominator = parts
-        .next()
-        .and_then(|part| part.parse::<f64>().ok())
-        .unwrap_or(1.0);
+fn parse_rate(value: &str) -> Option<f64> {
+    let (numerator, denominator) = value.split_once('/').unwrap_or((value, "1"));
+    let numerator = numerator.parse::<f64>().ok()?;
+    let denominator = denominator.parse::<f64>().ok()?;
     if denominator == 0.0 {
-        30.0
-    } else {
-        numerator / denominator
+        return None;
     }
+    let rate = numerator / denominator;
+    (rate.is_finite() && rate > 0.0).then_some(rate)
 }
 
 fn normalize_datetime(value: &str, offset_seconds: i64) -> Option<String> {
@@ -4887,6 +5079,13 @@ mod tests {
         proxy_path
     }
 
+    fn mark_asset_video_usable(catalog: &Catalog, asset_id: &str) {
+        let asset = catalog.get_asset(asset_id).unwrap();
+        catalog
+            .store_video_validation(asset_id, &asset.fingerprint, "usable", None)
+            .unwrap();
+    }
+
     #[test]
     fn proxy_fingerprint_changes_when_the_proxy_is_regenerated() {
         let (directory, catalog, project) = catalog_fixture();
@@ -4976,6 +5175,7 @@ mod tests {
             Path::new("/volumes/nas/DJI_0001.MP4"),
         );
         attach_stub_proxy(&catalog, "a1", directory.path(), b"proxy bytes");
+        mark_asset_video_usable(&catalog, "a1");
         let error = catalog.transcribe_missing(&project.id).unwrap_err();
         assert!(
             error.to_string().contains("is not installed"),
@@ -5320,6 +5520,12 @@ mod tests {
         assert!(asset.removed);
         assert_eq!(asset.rotation_degrees, 90);
         assert_eq!(catalog.list_operations("project_v4").unwrap().len(), 0);
+        let video_validation = catalog.asset_video_validation("asset_v4").unwrap();
+        assert_eq!(
+            video_validation.status,
+            AssetVideoValidationStatus::Unverified
+        );
+        assert!(!video_validation.bytes_reachable);
         let diagnostics = catalog.asset_revision_diagnostics("asset_v4").unwrap();
         assert_eq!(diagnostics.materialized_revision, 0);
         assert_eq!(diagnostics.note_revisions.len(), 1);
@@ -5701,6 +5907,7 @@ mod tests {
             "2026-07-18T00:00:00Z",
             directory.path().join("missing.mp4").as_path(),
         );
+        mark_asset_video_usable(&catalog, "asset_offline");
         assert!(!catalog.get_asset("asset_offline").unwrap().available);
         let report = catalog.generate_missing_proxies(&project.id).unwrap();
         assert_eq!(report.generated, 0);
@@ -5739,9 +5946,9 @@ mod tests {
             proxy_representation("asset.mp4"),
             ProxyRepresentation::MetadataBakedV1
         );
-        assert!((parse_rate("60000/1001") - 59.94005994).abs() < 0.0001);
-        assert_eq!(parse_rate("30/0"), 30.0);
-        assert_eq!(parse_rate("invalid"), 30.0);
+        assert!((parse_rate("60000/1001").unwrap() - 59.94005994).abs() < 0.0001);
+        assert_eq!(parse_rate("30/0"), None);
+        assert_eq!(parse_rate("invalid"), None);
     }
 
     #[test]

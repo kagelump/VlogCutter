@@ -8,6 +8,10 @@ function readiness(overrides: Partial<AnalysisReadiness> = {}): AnalysisReadines
   return {
     projectId: "project_1",
     totalClips: 5,
+    reachableOriginals: 5,
+    unverifiedVideoClips: 0,
+    quarantinedVideoClips: 0,
+    unavailableVideoClips: 0,
     missingProxies: 1,
     missingTranscripts: 2,
     missingAnalyses: 3,
@@ -56,5 +60,13 @@ describe("AnalysisDialog", () => {
   it("blocks Start when there is nothing to analyze", () => {
     renderDialog({ totalClips: 0 });
     expect(screen.getByRole("button", { name: "Start" })).toBeDisabled();
+  });
+
+  it("explains reachable originals that still need validation or are quarantined", () => {
+    renderDialog({ totalClips: 2, reachableOriginals: 4, unverifiedVideoClips: 1, quarantinedVideoClips: 1 });
+    expect(screen.getByRole("status")).toHaveTextContent("4 original files are reachable");
+    expect(screen.getByRole("status")).toHaveTextContent("1 clip needs validation");
+    expect(screen.getByRole("status")).toHaveTextContent("1 clip is quarantined");
+    expect(screen.getByRole("button", { name: "Start" })).toBeEnabled();
   });
 });

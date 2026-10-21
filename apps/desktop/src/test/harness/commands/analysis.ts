@@ -185,6 +185,10 @@ export const analysisCommands: CommandTable = {
     return {
       projectId,
       totalClips: active.length,
+      reachableOriginals: active.filter((asset) => asset.originalAvailable).length,
+      unverifiedVideoClips: 0,
+      quarantinedVideoClips: 0,
+      unavailableVideoClips: 0,
       missingProxies: active.filter((asset) => !asset.proxyAvailable).length,
       missingTranscripts: active.filter((asset) => !state.transcripts[asset.id]).length,
       missingAnalyses,

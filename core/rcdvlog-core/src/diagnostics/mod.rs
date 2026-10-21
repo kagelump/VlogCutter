@@ -188,6 +188,7 @@ impl Catalog {
         project_id: &str,
         containing_folder: &str,
         filename: &str,
+        reason: &str,
     ) -> Result<Diagnostic> {
         self.record_diagnostic(
             project_id,
@@ -197,14 +198,80 @@ impl Catalog {
                 kind: "ingest.unreadable_media".to_string(),
                 subject: DiagnosticSubject::Project,
                 message: format!(
-                    "Some files in {containing_folder} could not be read as media and were skipped, most recently {filename}."
+                    "Some files in {containing_folder} could not be read as usable video and were skipped, most recently {filename}: {reason}. Check that file contains a video stream and valid video metadata."
                 ),
                 context: serde_json::json!({
                     "folder": containing_folder,
                     "mostRecentFilename": filename,
+                    "mostRecentReason": reason,
                 }),
             },
         )
+    }
+
+    /// Records a rejected media candidate independently so every source keeps
+    /// its own filename and probe diagnosis. AppleDouble sidecars continue to
+    /// use the folder-aggregated recorder above.
+    pub fn record_unreadable_media_file(
+        &self,
+        project_id: &str,
+        containing_folder: &str,
+        filename: &str,
+        reason: &str,
+    ) -> Result<Diagnostic> {
+        self.record_diagnostic(project_id, DiagnosticRecord {
+            dedupe_key: format!("ingest.unreadable_media:{containing_folder}:{filename}"),
+            severity: DiagnosticSeverity::Warning,
+            kind: "ingest.unreadable_media".to_string(),
+            subject: DiagnosticSubject::Project,
+            message: format!("{filename} could not be read as usable video and was skipped: {reason}. Check that the file contains video frames and valid video metadata."),
+            context: serde_json::json!({
+                "folder": containing_folder,
+                "filename": filename,
+                "reason": reason,
+                "mostRecentFilename": filename,
+                "mostRecentReason": reason,
+                "bytesReachable": true,
+                "usableVideo": false,
+            }),
+        })
+    }
+
+    /// Records a reachable media candidate that ffprobe cannot identify as video.
+    /// These are per-file so each rejected asset remains diagnosable after ingest.
+    pub fn record_no_video_stream(
+        &self,
+        project_id: &str,
+        containing_folder: &str,
+        filename: &str,
+        reason: &str,
+    ) -> Result<Diagnostic> {
+        self.record_diagnostic(project_id, DiagnosticRecord {
+            dedupe_key: format!("ingest.no_video_stream:{containing_folder}:{filename}"),
+            severity: DiagnosticSeverity::Warning,
+            kind: "ingest.no_video_stream".to_string(),
+            subject: DiagnosticSubject::Project,
+            message: format!("{filename} is reachable but has no usable video stream and was skipped. Check that the intended source contains video frames and valid video metadata."),
+            context: serde_json::json!({ "folder": containing_folder, "filename": filename, "reason": reason, "bytesReachable": true, "usableVideo": false }),
+        })
+    }
+
+    /// Records per-file video streams that exist but lack usable technical metadata.
+    pub fn record_invalid_video_stream(
+        &self,
+        project_id: &str,
+        containing_folder: &str,
+        filename: &str,
+        reason: &str,
+    ) -> Result<Diagnostic> {
+        self.record_diagnostic(project_id, DiagnosticRecord {
+            dedupe_key: format!("ingest.invalid_video_stream:{containing_folder}:{filename}"),
+            severity: DiagnosticSeverity::Warning,
+            kind: "ingest.invalid_video_stream".to_string(),
+            subject: DiagnosticSubject::Project,
+            message: format!("{filename} contains a video stream with unusable technical metadata and was skipped. Repair or replace the source only after confirming what it contains."),
+            context: serde_json::json!({ "folder": containing_folder, "filename": filename, "reason": reason, "bytesReachable": true, "usableVideo": false }),
+        })
     }
 
     /// Producer: an operation this build does not recognize and has retained.
