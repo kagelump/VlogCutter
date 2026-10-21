@@ -1138,13 +1138,17 @@ fn chronology_reads_schema_25_without_migration_and_reports_revision_drift_stabl
                 [&project_id],
             )
             .unwrap();
-        // Reconstruct the published schema-25 boundary: migrations 26 and 27
-        // were not applied, so their table/column and history rows are absent.
+        // Reconstruct the published schema-25 boundary: migrations 26 through
+        // 30 were not applied, so their tables, columns, and history are absent.
         connection
             .execute_batch(
-                "ALTER TABLE assets DROP COLUMN timestamp_candidates_json;
+                "ALTER TABLE asset_analyses DROP COLUMN attempted_models_json;
+             ALTER TABLE asset_analyses DROP COLUMN usage_complete;
+             DROP TABLE analysis_chronology_suggestions;
+             DROP TABLE camera_proxy_sidecars;
+             ALTER TABLE assets DROP COLUMN timestamp_candidates_json;
              DROP TABLE asset_video_validation;
-             DELETE FROM schema_migrations WHERE migration_id IN (26, 27);",
+             DELETE FROM schema_migrations WHERE migration_id > 25;",
             )
             .unwrap();
     }
@@ -1172,6 +1176,26 @@ fn chronology_reads_schema_25_without_migration_and_reports_revision_drift_stabl
         "asset_old"
     );
     assert!(evidence.json["data"]["assets"][0]["timestampCandidates"].is_null());
+
+    let questions = success(
+        &catalog,
+        ["chronology", "questions", "--project", &project_id],
+    );
+    assert!(questions.json["data"]["openQuestions"].is_array());
+    assert!(questions.json["data"]["humanDecisions"].is_array());
+    assert!(
+        questions.json["data"]["openQuestions"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        questions.json["data"]["humanDecisions"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(fs::read(&catalog).unwrap(), before_reads);
 
     let stale = invoke(
         &catalog,
