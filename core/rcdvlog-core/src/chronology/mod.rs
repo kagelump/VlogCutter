@@ -22,7 +22,9 @@ pub use api::{
     VisualPlacementPreview, VisualPlacementSide,
 };
 pub use explain::{AppliedCorrection, ChronologyExplanation, QueuePosition};
-pub use export::{ChronologyEvidenceAsset, ChronologyEvidencePage, evidence_page};
+pub use export::{
+    ChronologyEvidenceAsset, ChronologyEvidenceError, ChronologyEvidencePage, evidence_page,
+};
 pub use model::{
     AssetTimeHypothesis, CaptureSequence, ChronologyFacts, ClipTimeException, ClockEpoch,
     ConstraintStrength, DisplayMode, EventOrderConstraint, PhaseKind, PhaseSplitDirection,
@@ -251,17 +253,25 @@ pub fn load_chronology_facts(connection: &Connection, project_id: &str) -> Resul
             constraints: Vec::new(),
         });
     }
-    let mut assets_statement = connection.prepare(
+    let timestamp_candidates = if column_exists(connection, "assets", "timestamp_candidates_json")?
+    {
+        "a.timestamp_candidates_json"
+    } else {
+        // Provenance was added after schema 25. Keep older catalogs useful for
+        // chronology reads while making the unavailable evidence explicit.
+        "NULL"
+    };
+    let mut assets_statement = connection.prepare(&format!(
         r#"
         SELECT a.id, a.filename, a.captured_at_raw, a.duration_seconds,
-               a.timestamp_candidates_json,
+               {timestamp_candidates},
                acs.capture_sequence_id, acs.filename_counter
         FROM assets a
         LEFT JOIN asset_capture_sequence acs ON acs.asset_id = a.id
         WHERE a.project_id = ?1
         ORDER BY a.id
-        "#,
-    )?;
+        "#
+    ))?;
     let assets = assets_statement
         .query_map([project_id], |row| {
             Ok(AssetTimeHypothesis {
@@ -482,6 +492,17 @@ fn table_exists(connection: &Connection, table: &str) -> Result<bool> {
         [table],
         |row| row.get(0),
     )?)
+}
+
+fn column_exists(connection: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+    for candidate in columns {
+        if candidate? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Re-dispatches persisted chronology operations that an older build

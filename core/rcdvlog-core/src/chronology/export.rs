@@ -3,6 +3,21 @@ use super::model::TimestampCandidate;
 use super::model::{AssetTimeHypothesis, ChronologyFacts};
 use super::solver::{AssetChronology, ChronologySolution, solve};
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum ChronologyEvidenceError {
+    #[error("chronology.facts_changed: restart pagination with the current facts revision")]
+    FactsChanged,
+}
+
+impl ChronologyEvidenceError {
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::FactsChanged => "chronology.facts_changed",
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -99,11 +114,10 @@ pub fn evidence_page(
     );
     let serialized = serde_json::to_vec(&facts)?;
     let revision = blake3::hash(&serialized).to_hex().to_string();
-    if let Some(expected) = expected_revision {
-        anyhow::ensure!(
-            expected == revision,
-            "chronology.facts_changed: restart pagination with the current facts revision"
-        );
+    if let Some(expected) = expected_revision
+        && expected != revision
+    {
+        return Err(ChronologyEvidenceError::FactsChanged.into());
     }
     let solution: ChronologySolution = solve(&facts);
     let total = facts.assets.len();
