@@ -1459,11 +1459,15 @@ fn main() -> ExitCode {
         Err(error) => {
             let message = format!("{error:#}");
             let remote = error.downcast_ref::<server_commands::RemoteCommandError>();
+            let chronology_evidence_error =
+                error.downcast_ref::<rcdvlog_core::ChronologyEvidenceError>();
             let media_tool_failure = error
                 .downcast_ref::<rcdvlog_core::MediaToolFailure>()
                 .is_some();
             let code = if let Some(remote) = remote {
                 remote.code.as_str()
+            } else if let Some(chronology_error) = chronology_evidence_error {
+                chronology_error.code()
             } else if media_tool_failure {
                 "media_tool_failed"
             } else {
