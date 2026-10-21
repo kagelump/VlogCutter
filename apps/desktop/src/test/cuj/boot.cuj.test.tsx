@@ -7,10 +7,10 @@
  * writes are observable, listeners are torn down, and fixtures are stable.
  */
 
-import { screen, waitFor } from "@testing-library/react";
+import { act, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 import { api } from "../../api";
-import { desktopScenario, renderApp } from "../harness";
+import { desktopScenario, queueFilenames, renderApp } from "../harness";
 
 function hokkaido() {
   return desktopScenario({ now: "2026-08-09T12:00:00.000Z" })
@@ -58,9 +58,58 @@ describe("booting the desktop against the harness", () => {
     }
 
     expect(harness.calls("list_assets")[0]).toEqual({ projectId: "project_hokkaido" });
-    expect(harness.calls("record_desktop_context")[0]).toEqual({
+    // `renderApp` settles on the stable selection write, not the initial
+    // debounced write that can legitimately run before the asset read lands.
+    expect(harness.calls("record_desktop_context").at(-1)).toEqual({
       projectId: "project_hokkaido",
       assetId: "asset_sony_a7c_ii_001",
+    });
+  });
+
+  it("waits for the queue selection when the initial context write is null", async () => {
+    const harness = hokkaido();
+    harness.next("list_assets").delayUntilReleased();
+
+    let settled = false;
+    const boot = renderApp(harness).then((app) => {
+      settled = true;
+      return app;
+    });
+
+    await waitFor(() => {
+      expect(harness.calls("record_desktop_context")).toContainEqual({
+        projectId: "project_hokkaido",
+        assetId: null,
+      });
+    });
+    // The null write is observable while the catalog read is still held. It
+    // must not satisfy renderApp's settle condition or let the caller continue
+    // with an empty queue.
+    expect(settled).toBe(false);
+
+    await act(async () => harness.release("list_assets"));
+    await boot;
+
+    expect(queueFilenames()[0]).toBe("SONY_001.MP4");
+    expect(harness.calls("record_desktop_context").at(-1)).toEqual({
+      projectId: "project_hokkaido",
+      assetId: "asset_sony_a7c_ii_001",
+    });
+  });
+
+  it("settles with a null context when a project has only removed clips", async () => {
+    const harness = desktopScenario({ now: "2026-08-09T12:00:00.000Z" })
+      .project("Archived project", { id: "project_archived" })
+      .camera("Sony A7C II", { clips: 1, withProxy: true })
+      .removed("asset_sony_a7c_ii_001")
+      .build();
+
+    await renderApp(harness);
+
+    expect(queueFilenames()).toEqual([]);
+    expect(harness.calls("record_desktop_context").at(-1)).toEqual({
+      projectId: "project_archived",
+      assetId: null,
     });
   });
 

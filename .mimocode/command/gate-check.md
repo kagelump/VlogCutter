@@ -12,8 +12,11 @@ the remaining checks after a failure so the final summary shows every result.
 ## Fast iteration
 
 Use `pnpm gate --scope fast` (or `node scripts/pre-pr-gate.mjs --scope fast`):
-it runs staged and unstaged `git diff --check`, pinned `cargo fmt`, and
-`pnpm check:frontend`. After Rust changes, run the relevant package test
+it runs `git diff --check origin/main...HEAD` for committed whitespace,
+staged and unstaged `git diff --check` for local changes, pinned `cargo fmt`,
+and `pnpm check:frontend`. Run `git fetch origin main` if the committed-candidate
+check reports that `origin/main` is unavailable; the gate fails closed. After
+Rust changes, run the relevant package test
 directly too. For one named test, use
 `pnpm test:focused <cargo-package> <exact-test-name>`; it pins the Rust
 toolchain and fails if Cargo reports zero tests or omits the requested result.
@@ -22,10 +25,12 @@ toolchain and fails if Cargo reports zero tests or omits the requested result.
 
 Run `pnpm gate` with no arguments for the pre-PR checks. For a direct push or
 PR creation, use `pnpm publish:after-gate push` or
-`pnpm publish:after-gate pr`; the wrapper runs the real gate immediately,
-then checks that HEAD and the index/worktree state match the pre-gate snapshot
-before invoking the fixed `git push` or `gh pr create --fill` command. It
-refuses to start with a dirty tree.
+`pnpm publish:after-gate pr`; the wrapper prints the candidate HEAD for the
+handoff receipt, runs the real gate once, then checks that HEAD and the
+index/worktree state still matches the pre-gate snapshot immediately before
+each external action. The `push` action runs the
+fixed upstream push; `pr` runs that same push followed by `gh pr create --fill`,
+and stops if the push fails. Both refuse to start with a dirty tree.
 
 The pre-PR gate checks diff whitespace, exact Rust version, fmt, clippy, the workspace tests,
 frontend type checks, desktop unit/CUJ/coverage/browser tests, web tests, CLI

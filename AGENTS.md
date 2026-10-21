@@ -894,9 +894,12 @@ Run the narrowest useful tests while iterating, then the full gate before handof
 
 `pnpm check` runs TypeScript checking followed by all Rust workspace tests. The process-level integration suite creates a real one-second FFmpeg fixture and validates CLI persistence, WAL reads, ingest, metadata, deduplication, labels/notes/removal, clock correction, thumbnails/proxies, and offline-original review. Its media portion skips when FFmpeg or ffprobe is missing.
 
-Run `pnpm gate --scope fast` while iterating; it runs `git diff --check`,
-`git diff --cached --check`,
-the pinned Rust formatter, and `pnpm check:frontend`. Run `pnpm gate` with no
+Run `pnpm gate --scope fast` while iterating; it runs
+`git diff --check origin/main...HEAD` for the committed candidate,
+`git diff --check` and `git diff --cached --check` for local changes, the pinned
+Rust formatter, and `pnpm check:frontend`. Run `git fetch origin main` if the
+candidate-base check reports that `origin/main` is unavailable; the gate never
+skips that check. Run `pnpm gate` with no
 arguments as the mandatory pre-PR gate. It follows the Ubuntu CI checks in
 `.github/workflows/ci.yml`, prints each command's complete output and exit
 status, continues to report later checks after a failure, and returns nonzero
@@ -917,8 +920,10 @@ one executed test. The fake-command regression cases are in
 Use `pnpm publish:after-gate push` or `pnpm publish:after-gate pr` when the
 gate must be enforced at the publication boundary. That wrapper runs the
 actual pre-PR gate from a clean tree, snapshots HEAD and tracked/untracked
-working-tree content, and refuses the fixed push/PR action if the gate fails
-or that identity changes.
+working-tree content, and rechecks that identity before each external action.
+It refuses publication if the gate fails or that identity changes. The `pr`
+action pushes the current branch upstream and then creates the PR, stopping if
+the push fails.
 
 After publication, inspect CI on meaningful status transitions and wait for
 jobs to finish before retrieving failure logs. Repair failures locally, rerun

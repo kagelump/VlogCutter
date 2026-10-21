@@ -28,6 +28,7 @@ export function runGate({ args = process.argv.slice(2), spawn = spawnSync, write
 
   const rust = (name, argv) => ({ name, command: "cargo", args: [`+${rustToolchain}`, ...argv] });
   const checks = [
+    { name: "git diff --check origin/main...HEAD", command: "git", args: ["diff", "--check", "origin/main...HEAD"], baseGuidance: true },
     { name: "git diff --check", command: "git", args: ["diff", "--check"] },
     { name: "git diff --cached --check", command: "git", args: ["diff", "--cached", "--check"] },
     { name: `Rust toolchain ${rustToolchain}`, command: "rustc", args: [`+${rustToolchain}`, "--version"], verifyRust: true },
@@ -79,6 +80,13 @@ export function runGate({ args = process.argv.slice(2), spawn = spawnSync, write
       if (summaries.length === 0 || observed === 0) {
         status = 1;
         detail = "cargo test exited 0 without reporting any executed tests";
+      }
+    }
+    if (check.baseGuidance && status !== 0) {
+      if (/unknown revision|ambiguous argument|bad revision|not a valid object name/i.test(output)) {
+        write("origin/main is unavailable; run `git fetch origin main` and rerun the gate.\n");
+      } else {
+        write("Committed-candidate whitespace check failed; fix the trailing-whitespace lines shown above.\n");
       }
     }
     if (status === 0) {

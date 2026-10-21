@@ -11,6 +11,8 @@ const expectedScenarios = [
   "missing cargo prerequisite",
   "wrong rust version is rejected",
   "successful test command with zero tests",
+  "committed candidate whitespace failure",
+  "missing candidate base requires fetch",
 ];
 const observedScenarios = new Set();
 
@@ -19,6 +21,11 @@ function runScenario(name, { fail, missingCargo = false, emptyTests = false, wro
   let output = "";
   const spawn = (command, args, options) => {
     assert.equal(options.env.RUSTUP_TOOLCHAIN, "1.97.1", "nested cargo commands inherit the CI pin");
+    if (command === "git" && args[0] === "diff" && args.includes("origin/main...HEAD")) {
+      assert.deepEqual(args, ["diff", "--check", "origin/main...HEAD"]);
+      if (fail === "missing-base") return { status: 128, stdout: "", stderr: "fatal: ambiguous argument 'origin/main...HEAD': unknown revision or path\n" };
+      return { status: fail === "committed-whitespace" ? 2 : 0, stdout: "", stderr: fail === "committed-whitespace" ? "trailing whitespace.\n" : "" };
+    }
     if (command === "cargo" && missingCargo) {
       return { status: null, stdout: "", stderr: "", error: { message: "spawnSync cargo ENOENT" } };
     }
@@ -49,17 +56,18 @@ test("clean pass runs every required pre-PR check", () => {
   assert.equal(result.code, 0, result.output);
   assert.match(result.output, /RESULT cargo fmt --all -- --check: PASS/);
   assert.match(result.output, /RESULT git diff --cached --check: PASS/);
+  assert.match(result.output, /RESULT git diff --check origin\/main\.\.\.HEAD: PASS/);
   assert.match(result.output, /RESULT cargo clippy --workspace --all-targets -- -D warnings: PASS/);
   assert.match(result.output, /RESULT cargo test --workspace: PASS/);
   assert.match(result.output, /RESULT pnpm check:frontend: PASS/);
-  assert.match(result.output, /Gate summary \(pre-pr\): 17 passed, 0 failed\./);
+  assert.match(result.output, /Gate summary \(pre-pr\): 18 passed, 0 failed\./);
 });
 
 test("format failure appears in summary and fails the gate", () => {
   const result = runScenario("format failure", { fail: "format" });
   assert.equal(result.code, 1);
   assert.match(result.output, /RESULT cargo fmt --all -- --check: FAIL \(exit 9\)/);
-  assert.match(result.output, /Gate summary \(pre-pr\): 16 passed, 1 failed\./);
+  assert.match(result.output, /Gate summary \(pre-pr\): 17 passed, 1 failed\./);
 });
 
 test("clippy failure appears in summary and fails the gate", () => {
@@ -100,8 +108,22 @@ test("a successful cargo command with zero reported tests fails closed", () => {
   assert.match(result.output, /cargo test exited 0 without reporting any executed tests/);
 });
 
+test("committed candidate whitespace failure fails the gate with fetch guidance", () => {
+  const result = runScenario("committed candidate whitespace failure", { fail: "committed-whitespace" });
+  assert.equal(result.code, 1);
+  assert.match(result.output, /Committed-candidate whitespace check failed; fix the trailing-whitespace lines shown above\./);
+  assert.doesNotMatch(result.output, /git fetch origin main/);
+  assert.match(result.output, /RESULT git diff --check origin\/main\.\.\.HEAD: FAIL \(exit 2\)/);
+});
+
+test("a missing origin/main base fails closed with fetch guidance", () => {
+  const result = runScenario("missing candidate base requires fetch", { fail: "missing-base" });
+  assert.equal(result.code, 1);
+  assert.match(result.output, /origin\/main is unavailable; run `git fetch origin main` and rerun the gate\./);
+});
+
 after(() => {
   assert.ok(observedScenarios.size > 0, "the focused regression helper must execute tests");
-  assert.equal(expectedScenarios.length, 8, "the regression matrix must retain its expected minimum test count");
+  assert.equal(expectedScenarios.length, 10, "the regression matrix must retain its expected minimum test count");
   assert.deepEqual([...observedScenarios].sort(), [...expectedScenarios].sort(), "every expected named scenario must execute");
 });

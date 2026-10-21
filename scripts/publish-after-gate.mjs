@@ -7,8 +7,11 @@ import { runGate } from "./pre-pr-gate.mjs";
 
 const root = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const actions = {
-  push: ["git", ["push", "--set-upstream", "origin", "HEAD"]],
-  pr: ["gh", ["pr", "create", "--fill"]],
+  push: [["git", ["push", "--set-upstream", "origin", "HEAD"]]],
+  pr: [
+    ["git", ["push", "--set-upstream", "origin", "HEAD"]],
+    ["gh", ["pr", "create", "--fill"]],
+  ],
 };
 
 function snapshot(spawn) {
@@ -29,8 +32,8 @@ function snapshot(spawn) {
 }
 
 export function publishAfterGate({ action, gate = runGate, spawn = spawnSync, write = (value) => process.stdout.write(value) }) {
-  const publish = actions[action];
-  if (!publish) {
+  const commands = actions[action];
+  if (!commands) {
     write("Usage: node scripts/publish-after-gate.mjs push|pr\n");
     return 2;
   }
@@ -44,25 +47,29 @@ export function publishAfterGate({ action, gate = runGate, spawn = spawnSync, wr
     write("Working tree is dirty before the gate; commit or discard changes before publication.\n");
     return 1;
   }
+  write(`Publication candidate HEAD: ${before.head}\n`);
   // The wrapper's action argument is not an argument to the verification gate.
   const gateStatus = gate({ args: [] });
   if (gateStatus !== 0) {
     write(`Pre-PR gate failed with exit ${gateStatus}; refusing publication.\n`);
     return gateStatus || 1;
   }
-  const after = snapshot(spawn);
-  if (!after || before.head !== after.head || before.tracked !== after.tracked || before.untracked !== after.untracked) {
-    write("HEAD or working-tree state changed while the gate ran; refusing publication.\n");
-    return 1;
-  }
 
-  write(`Gate passed; running ${publish[0]} ${publish[1].join(" ")}.\n`);
-  const result = spawn(publish[0], publish[1], { cwd: root, encoding: "utf8", stdio: "inherit" });
-  if (result.error) {
-    write(`${result.error.message}\n`);
-    return 127;
+  for (const [command, args] of commands) {
+    const current = snapshot(spawn);
+    if (!current || before.head !== current.head || before.tracked !== current.tracked || before.untracked !== current.untracked) {
+      write("HEAD or working-tree state changed since the gate; refusing publication.\n");
+      return 1;
+    }
+    write(`Gate passed; running ${command} ${args.join(" ")}.\n`);
+    const result = spawn(command, args, { cwd: root, encoding: "utf8", stdio: "inherit" });
+    if (result.error) {
+      write(`${result.error.message}\n`);
+      return 127;
+    }
+    if (result.status !== 0) return result.status ?? 1;
   }
-  return result.status ?? 1;
+  return 0;
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
