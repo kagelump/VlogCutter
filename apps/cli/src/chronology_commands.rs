@@ -1,9 +1,7 @@
 //! The chronology and diagnostics CLI surface (D01-T017).
 //!
-//! Read-only over project facts, with one deliberate exception:
-//! `diagnostics acknowledge`. Acknowledging an observation changes no project
-//! fact, emits no operation, and cannot alter derived order — it is the
-//! exception, not a precedent for chronology mutation from the CLI.
+//! Thin chronology adapters over the owning core APIs. Reads and previews are
+//! read-only; confirmed changes use typed core operations and tokened previews.
 //!
 //! Every command returns the *same* solved values the desktop shows, because
 //! both call the same pure solver. `chronology status` deliberately includes the
@@ -12,8 +10,12 @@
 
 use anyhow::Result;
 use clap::Subcommand;
-use rcdvlog_core::{Catalog, DiagnosticFilter, DiagnosticSeverity};
+use rcdvlog_core::{
+    CaptureSequence, Catalog, ChronologyMutation, ChronologyMutationPreview, ClipTimeException,
+    DiagnosticFilter, DiagnosticSeverity, EventOrderConstraint,
+};
 use serde_json::{Value, json};
+use std::io::Read;
 
 #[derive(Debug, Subcommand)]
 pub enum ChronologyCommand {
@@ -71,6 +73,22 @@ pub enum ChronologyCommand {
         #[arg(long)]
         facts_revision: Option<String>,
     },
+    /// Preview a typed chronology change from JSON stdin or a request file.
+    Preview {
+        #[arg(long)]
+        project: String,
+        /// JSON file, or - to read stdin. The request has a `kind` field.
+        #[arg(long)]
+        input: String,
+    },
+    /// Apply an unchanged core preview or a direct typed chronology operation.
+    Apply {
+        #[arg(long)]
+        project: String,
+        /// JSON file, or - to read stdin. Preview requests include the returned preview.
+        #[arg(long)]
+        input: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -107,6 +125,8 @@ pub fn chronology_command_name(command: &ChronologyCommand) -> &'static str {
         ChronologyCommand::Explain { .. } => "chronology.explain",
         ChronologyCommand::Status { .. } => "chronology.status",
         ChronologyCommand::Evidence { .. } => "chronology.evidence",
+        ChronologyCommand::Preview { .. } => "chronology.preview",
+        ChronologyCommand::Apply { .. } => "chronology.apply",
     }
 }
 
@@ -117,11 +137,10 @@ pub fn diagnostics_command_name(command: &DiagnosticsCommand) -> &'static str {
     }
 }
 
-/// Only `diagnostics acknowledge` writes, so everything else can be served from
-/// a read-only catalog open — which is also the strongest possible statement
-/// that these commands cannot corrupt a project.
-pub fn chronology_is_read_only(_command: &ChronologyCommand) -> bool {
-    true
+/// Read-only commands use a read-only catalog connection; only explicit apply
+/// opens the catalog for typed chronology writes.
+pub fn chronology_is_read_only(command: &ChronologyCommand) -> bool {
+    !matches!(command, ChronologyCommand::Apply { .. })
 }
 
 pub fn diagnostics_is_read_only(command: &DiagnosticsCommand) -> bool {
@@ -217,6 +236,223 @@ pub fn execute_chronology(catalog: &Catalog, command: &ChronologyCommand) -> Res
             *offset,
             *limit,
         )?)?),
+        ChronologyCommand::Preview { project, input } => {
+            let request = read_json(input)?;
+            let kind = request["kind"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("request.kind is required"))?;
+            let data = match kind {
+                "split" => {
+                    let asset_ids: Vec<String> =
+                        serde_json::from_value(request["assetIds"].clone())?;
+                    serde_json::to_value(
+                        catalog.preview_capture_sequence_split(
+                            project,
+                            request["sourceSequenceId"]
+                                .as_str()
+                                .ok_or_else(|| anyhow::anyhow!("sourceSequenceId is required"))?,
+                            request["atCounter"]
+                                .as_u64()
+                                .ok_or_else(|| anyhow::anyhow!("atCounter is required"))?,
+                            request["label"].as_str().unwrap_or(""),
+                            &asset_ids,
+                        )?,
+                    )?
+                }
+                "reassign" => {
+                    let asset_ids: Vec<String> =
+                        serde_json::from_value(request["assetIds"].clone())?;
+                    serde_json::to_value(
+                        catalog.preview_capture_sequence_assets(
+                            project,
+                            request["fromSequenceId"]
+                                .as_str()
+                                .ok_or_else(|| anyhow::anyhow!("fromSequenceId is required"))?,
+                            request["intoSequenceId"]
+                                .as_str()
+                                .ok_or_else(|| anyhow::anyhow!("intoSequenceId is required"))?,
+                            &asset_ids,
+                        )?,
+                    )?
+                }
+                "merge" => serde_json::to_value(
+                    catalog.preview_capture_sequence_merge(
+                        project,
+                        request["fromSequenceId"]
+                            .as_str()
+                            .ok_or_else(|| anyhow::anyhow!("fromSequenceId is required"))?,
+                        request["intoSequenceId"]
+                            .as_str()
+                            .ok_or_else(|| anyhow::anyhow!("intoSequenceId is required"))?,
+                    )?,
+                )?,
+                "epochSet" => serde_json::to_value(catalog.preview_clock_epoch_impact(
+                    project,
+                    &serde_json::from_value(request["epoch"].clone())?,
+                )?)?,
+                "epochClear" => serde_json::to_value(
+                    catalog.preview_clear_clock_epoch_impact(
+                        project,
+                        request["epochId"]
+                            .as_str()
+                            .ok_or_else(|| anyhow::anyhow!("epochId is required"))?,
+                    )?,
+                )?,
+                "sequenceDeclare" | "sameCard" | "sameCardRestore" | "exceptionSet"
+                | "exceptionClear" | "phaseSet" | "phaseRemove" | "phaseSplit"
+                | "constraintSet" | "constraintClear" => {
+                    let mutation = parse_direct_mutation(kind, &request)?;
+                    serde_json::to_value(catalog.preview_chronology_mutation(project, &mutation)?)?
+                }
+                _ => anyhow::bail!("unsupported preview kind: {kind}"),
+            };
+            Ok(json!({"kind": kind, "data": data}))
+        }
+        ChronologyCommand::Apply { project, input } => {
+            let request = read_json(input)?;
+            let kind = request["kind"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("request.kind is required"))?;
+            let data = match kind {
+                "split" => serde_json::to_value(catalog.apply_capture_sequence_split(
+                    project,
+                    &serde_json::from_value(request["preview"].clone())?,
+                )?)?,
+                "reassign" => serde_json::to_value(catalog.apply_capture_sequence_reassignment(
+                    project,
+                    &serde_json::from_value(request["preview"].clone())?,
+                )?)?,
+                "merge" => {
+                    catalog.apply_capture_sequence_merge(
+                        project,
+                        &serde_json::from_value(request["preview"].clone())?,
+                    )?;
+                    json!({"applied": true})
+                }
+                "epochSet" => serde_json::to_value(catalog.apply_clock_epoch_preview(
+                    project,
+                    &serde_json::from_value(request["preview"].clone())?,
+                )?)?,
+                "epochClear" => {
+                    catalog.apply_clear_clock_epoch_preview(
+                        project,
+                        &serde_json::from_value(request["preview"].clone())?,
+                    )?;
+                    json!({"applied": true})
+                }
+                "sequenceDeclare" | "sameCard" | "sameCardRestore" | "exceptionSet"
+                | "exceptionClear" | "phaseSet" | "phaseRemove" | "phaseSplit"
+                | "constraintSet" | "constraintClear" => {
+                    let preview: ChronologyMutationPreview =
+                        serde_json::from_value(request["preview"].clone())?;
+                    let preview_kind = direct_mutation_name(&preview.mutation);
+                    anyhow::ensure!(
+                        kind == preview_kind,
+                        "preview kind does not match request kind"
+                    );
+                    serde_json::to_value(
+                        catalog.apply_chronology_mutation_preview(project, &preview)?,
+                    )?
+                }
+                _ => anyhow::bail!("unsupported apply kind: {kind}"),
+            };
+            Ok(json!({"kind": kind, "data": data}))
+        }
+    }
+}
+
+fn read_json(input: &str) -> Result<Value> {
+    let mut bytes = Vec::new();
+    if input == "-" {
+        std::io::stdin().read_to_end(&mut bytes)?;
+    } else {
+        bytes = std::fs::read(input)?;
+    }
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+fn required_string<'a>(request: &'a Value, field: &str) -> Result<&'a str> {
+    request[field]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("{field} is required"))
+}
+
+fn required_u64(request: &Value, field: &str) -> Result<u64> {
+    request[field]
+        .as_u64()
+        .ok_or_else(|| anyhow::anyhow!("{field} is required"))
+}
+
+fn parse_direct_mutation(kind: &str, request: &Value) -> Result<ChronologyMutation> {
+    Ok(match kind {
+        "sequenceDeclare" => ChronologyMutation::SequenceDeclare {
+            sequence: CaptureSequence {
+                id: String::new(),
+                camera_key: request["cameraKey"].as_str().unwrap_or("").into(),
+                label: request["label"].as_str().unwrap_or("").into(),
+                volume_hint: request["volumeHint"].as_str().unwrap_or("").into(),
+                filename_prefix: request["filenamePrefix"].as_str().unwrap_or("").into(),
+            },
+        },
+        "sameCard" => ChronologyMutation::SameCard {
+            sequence_id: required_string(request, "sequenceId")?.into(),
+            at_counter: required_u64(request, "atCounter")?,
+            reason: request["reason"].as_str().unwrap_or("").into(),
+        },
+        "sameCardRestore" => ChronologyMutation::SameCardRestore {
+            sequence_id: required_string(request, "sequenceId")?.into(),
+            at_counter: required_u64(request, "atCounter")?,
+        },
+        "exceptionSet" => ChronologyMutation::ExceptionSet {
+            exception: ClipTimeException {
+                asset_id: required_string(request, "assetId")?.into(),
+                trip_time: required_string(request, "tripTime")?.into(),
+                reason: request["reason"].as_str().unwrap_or("").into(),
+            },
+        },
+        "exceptionClear" => ChronologyMutation::ExceptionClear {
+            asset_id: required_string(request, "assetId")?.into(),
+        },
+        "phaseSet" => ChronologyMutation::PhaseSet {
+            phase: serde_json::from_value(request["phase"].clone())?,
+        },
+        "phaseRemove" => ChronologyMutation::PhaseRemove {
+            phase_id: required_string(request, "phaseId")?.into(),
+        },
+        "phaseSplit" => ChronologyMutation::PhaseSplit {
+            existing_phase_id: required_string(request, "existingPhaseId")?.into(),
+            boundary_asset_id: required_string(request, "boundaryAssetId")?.into(),
+            direction: serde_json::from_value(request["direction"].clone())?,
+            phase: serde_json::from_value(request["phase"].clone())?,
+        },
+        "constraintSet" => ChronologyMutation::ConstraintSet {
+            constraint: EventOrderConstraint {
+                id: String::new(),
+                earlier_asset_id: required_string(request, "earlierAssetId")?.into(),
+                later_asset_id: required_string(request, "laterAssetId")?.into(),
+                strength: serde_json::from_value(request["strength"].clone())?,
+                source: request["source"].as_str().unwrap_or("").into(),
+            },
+        },
+        "constraintClear" => ChronologyMutation::ConstraintClear {
+            constraint_id: required_string(request, "constraintId")?.into(),
+        },
+        _ => anyhow::bail!("unsupported direct chronology kind: {kind}"),
+    })
+}
+
+fn direct_mutation_name(mutation: &ChronologyMutation) -> &'static str {
+    match mutation {
+        ChronologyMutation::SequenceDeclare { .. } => "sequenceDeclare",
+        ChronologyMutation::SameCard { .. } => "sameCard",
+        ChronologyMutation::SameCardRestore { .. } => "sameCardRestore",
+        ChronologyMutation::ExceptionSet { .. } => "exceptionSet",
+        ChronologyMutation::ExceptionClear { .. } => "exceptionClear",
+        ChronologyMutation::PhaseSet { .. } => "phaseSet",
+        ChronologyMutation::PhaseRemove { .. } => "phaseRemove",
+        ChronologyMutation::PhaseSplit { .. } => "phaseSplit",
+        ChronologyMutation::ConstraintSet { .. } => "constraintSet",
+        ChronologyMutation::ConstraintClear { .. } => "constraintClear",
     }
 }
 

@@ -9,9 +9,9 @@
 use rcdvlog_core::{
     ApplyOperationResult, CAPTURE_SEQUENCE_MERGED, CAPTURE_SEQUENCE_REASSIGNED,
     CAPTURE_SEQUENCE_SPLIT_EXACT, Catalog, ChronologyError, ChronologyImpactChange,
-    ChronologySolution, ClockEpoch, ClockEpochImpactPreview, ConstraintStrength, DisplayMode,
-    PhaseKind, PhaseSplitDirection, ProjectAssetAddedPayload, TripPhase, VisualPlacementSide,
-    solve,
+    ChronologyMutation, ChronologySolution, ClockEpoch, ClockEpochImpactPreview,
+    ConstraintStrength, DisplayMode, PhaseKind, PhaseSplitDirection, ProjectAssetAddedPayload,
+    TripPhase, VisualPlacementSide, solve,
 };
 use serde_json::json;
 use tempfile::tempdir;
@@ -1520,6 +1520,93 @@ fn a_visible_trip_phase_can_be_cut_from_either_side_atomically() {
     assert_eq!(
         remaining.end_anchor_asset_id.as_deref(),
         Some(ids[1].as_str())
+    );
+}
+
+#[test]
+fn previewed_trip_phase_split_is_revision_safe_and_retry_idempotent() {
+    let fixture = fixture(&[
+        ("C0001.MP4", "DJIPocket3", "2026-01-15T03:00:00Z"),
+        ("C0002.MP4", "DJIPocket3", "2026-01-15T04:00:00Z"),
+        ("C0003.MP4", "DJIPocket3", "2026-01-15T05:00:00Z"),
+    ]);
+    let ids = asset_ids_in_order(&fixture);
+    let phase = fixture
+        .catalog
+        .set_trip_phase(
+            &fixture.project_id,
+            &TripPhase {
+                id: String::new(),
+                label: "Synthetic whole trip".into(),
+                kind: PhaseKind::Location,
+                start_anchor_asset_id: Some(ids[0].clone()),
+                end_anchor_asset_id: Some(ids[2].clone()),
+                start_trip_time: String::new(),
+                end_trip_time: String::new(),
+                timezone: Some("Etc/UTC".into()),
+                origin_timezone: None,
+                destination_timezone: None,
+                display_mode: DisplayMode::Local,
+            },
+        )
+        .unwrap();
+    let request = ChronologyMutation::PhaseSplit {
+        existing_phase_id: phase.id.clone(),
+        boundary_asset_id: ids[1].clone(),
+        direction: PhaseSplitDirection::Through,
+        phase: TripPhase {
+            id: String::new(),
+            label: "Synthetic first leg".into(),
+            kind: PhaseKind::Transit,
+            start_anchor_asset_id: None,
+            end_anchor_asset_id: None,
+            start_trip_time: String::new(),
+            end_trip_time: String::new(),
+            timezone: Some("Etc/UTC".into()),
+            origin_timezone: None,
+            destination_timezone: None,
+            display_mode: DisplayMode::Local,
+        },
+    };
+    let preview = fixture
+        .catalog
+        .preview_chronology_mutation(&fixture.project_id, &request)
+        .unwrap();
+    assert_eq!(preview.affected_asset_ids, ids);
+    let before = fixture
+        .catalog
+        .list_operations(&fixture.project_id)
+        .unwrap()
+        .len();
+    fixture
+        .catalog
+        .apply_chronology_mutation_preview(&fixture.project_id, &preview)
+        .unwrap();
+    let applied_count = fixture
+        .catalog
+        .list_operations(&fixture.project_id)
+        .unwrap()
+        .len();
+    assert_eq!(applied_count, before + 2);
+    fixture
+        .catalog
+        .apply_chronology_mutation_preview(&fixture.project_id, &preview)
+        .unwrap();
+    assert_eq!(
+        fixture
+            .catalog
+            .list_operations(&fixture.project_id)
+            .unwrap()
+            .len(),
+        applied_count
+    );
+    assert_eq!(
+        fixture
+            .catalog
+            .trip_phases(&fixture.project_id)
+            .unwrap()
+            .len(),
+        2
     );
 }
 
