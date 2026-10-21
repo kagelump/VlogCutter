@@ -1643,15 +1643,19 @@ impl Catalog {
         fs::create_dir_all(&proxy_dir)?;
         let output = proxy_dir.join(format!("{}.{}.mp4", asset.id, PROXY_CACHE_VERSION));
         let temporary = proxy_dir.join(format!("{}.{}.tmp.mp4", asset.id, PROXY_CACHE_VERSION));
-        let status = run_proxy_ffmpeg(
+        let result = run_proxy_ffmpeg(
             Path::new(&asset.path),
             &temporary,
             asset.duration_seconds,
             &mut on_progress,
         )?;
-        if !status.success() {
+        if !result.status.success() {
             let _ = fs::remove_file(&temporary);
-            bail!("ffmpeg proxy generation failed with {status}");
+            return Err(media_tool_failure(
+                "ffmpeg proxy generation",
+                result.status,
+                result.diagnostic,
+            ));
         }
         let proxy_probe = probe_media_stream(&temporary);
         match proxy_probe {
@@ -3076,7 +3080,8 @@ impl Catalog {
         let output = thumbnail_dir.join(format!("q{quality}.{THUMBNAIL_CACHE_VERSION}.jpg"));
         let temporary = thumbnail_dir.join(format!("q{quality}.{THUMBNAIL_CACHE_VERSION}.tmp.jpg"));
         let seek = (asset.duration_seconds.max(0.0) * 0.2).to_string();
-        let status = tool_command("ffmpeg")
+        let mut command = tool_command("ffmpeg");
+        command
             .args([
                 "-y",
                 "-hide_banner",
@@ -3096,12 +3101,16 @@ impl Catalog {
                 "-q:v",
                 "3",
             ])
-            .arg(&temporary)
-            .status()
+            .arg(&temporary);
+        let (status, diagnostic) = run_captured_media_command(&mut command, &input, &temporary)
             .context("start ffmpeg thumbnail process")?;
         if !status.success() {
             let _ = fs::remove_file(&temporary);
-            bail!("ffmpeg thumbnail generation failed with {status}");
+            return Err(media_tool_failure(
+                "ffmpeg thumbnail generation",
+                status,
+                diagnostic,
+            ));
         }
         fs::rename(&temporary, &output)?;
         self.connection()?.execute(
@@ -3753,12 +3762,17 @@ fn proxy_ffmpeg_command(source: &Path, output: &Path, encoder: ProxyEncoder) -> 
     command
 }
 
+struct ProxyProcessResult {
+    status: std::process::ExitStatus,
+    diagnostic: String,
+}
+
 fn run_proxy_ffmpeg<F>(
     source: &Path,
     output: &Path,
     duration_seconds: f64,
     on_progress: &mut F,
-) -> Result<std::process::ExitStatus>
+) -> Result<ProxyProcessResult>
 where
     F: FnMut(f64),
 {
@@ -3772,7 +3786,7 @@ where
             on_progress,
         )
         .context("start VideoToolbox ffmpeg proxy process")?;
-        if hardware_status.success() {
+        if hardware_status.status.success() {
             return Ok(hardware_status);
         }
         let _ = fs::remove_file(output);
@@ -3795,21 +3809,23 @@ fn run_proxy_ffmpeg_encoder<F>(
     encoder: ProxyEncoder,
     duration_seconds: f64,
     on_progress: &mut F,
-) -> Result<std::process::ExitStatus>
+) -> Result<ProxyProcessResult>
 where
     F: FnMut(f64),
 {
     let mut command = proxy_ffmpeg_command(source, output, encoder);
     command.stdout(Stdio::piped());
-    #[cfg(target_os = "macos")]
-    if matches!(encoder, ProxyEncoder::VideoToolbox) {
-        command.stderr(Stdio::null());
-    }
+    command.stderr(Stdio::piped());
     let mut child = command.spawn().context("spawn ffmpeg proxy process")?;
     let stdout = child
         .stdout
         .take()
         .ok_or_else(|| anyhow!("ffmpeg progress pipe was not available"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow!("ffmpeg stderr pipe was not available"))?;
+    let stderr_reader = drain_child_stderr(stderr);
     for line in BufReader::new(stdout)
         .lines()
         .map_while(std::result::Result::ok)
@@ -3818,7 +3834,68 @@ where
             on_progress(fraction);
         }
     }
-    child.wait().context("wait for ffmpeg proxy process")
+    let status = child.wait().context("wait for ffmpeg proxy process")?;
+    let stderr = stderr_reader.join().unwrap_or_default();
+    let stderr = String::from_utf8_lossy(&stderr).into_owned();
+    let diagnostic = redact_media_diagnostic(&stderr, source, output);
+    Ok(ProxyProcessResult { status, diagnostic })
+}
+
+fn drain_child_stderr(mut stderr: impl Read + Send + 'static) -> thread::JoinHandle<Vec<u8>> {
+    thread::spawn(move || {
+        let mut kept = Vec::new();
+        let mut buffer = [0u8; 4096];
+        loop {
+            let count = match stderr.read(&mut buffer) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            if kept.len() < 4096 {
+                kept.extend_from_slice(&buffer[..count.min(4096 - kept.len())]);
+            }
+        }
+        kept
+    })
+}
+
+pub(crate) fn run_captured_media_command(
+    command: &mut Command,
+    input: &Path,
+    output: &Path,
+) -> Result<(std::process::ExitStatus, String)> {
+    command.stdout(Stdio::null()).stderr(Stdio::piped());
+    let mut child = command.spawn().context("spawn media tool process")?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow!("media tool stderr pipe was not available"))?;
+    let stderr_reader = drain_child_stderr(stderr);
+    let status = child.wait().context("wait for media tool process")?;
+    let stderr = stderr_reader.join().unwrap_or_default();
+    let stderr = String::from_utf8_lossy(&stderr).into_owned();
+    let diagnostic = redact_media_diagnostic(&stderr, input, output);
+    Ok((status, diagnostic))
+}
+
+fn redact_media_diagnostic(stderr: &str, source: &Path, output: &Path) -> String {
+    let exact_redacted = stderr
+        .replace(&source.to_string_lossy().to_string(), "<source>")
+        .replace(&output.to_string_lossy().to_string(), "<output>");
+    let absolute_paths = regex::Regex::new(
+        r#"'(?:[A-Za-z]:\\|/)[^']*'|"(?:[A-Za-z]:\\|/)[^"]*"|(?:[A-Za-z]:\\|/)[^\s:'"<>]+"#,
+    )
+    .expect("constant media path pattern");
+    let redacted = absolute_paths.replace_all(&exact_redacted, "<path>");
+    let trimmed = redacted.trim();
+    let mut end = trimmed.len().min(4094);
+    while !trimmed.is_char_boundary(end) {
+        end -= 1;
+    }
+    if end == 0 {
+        String::new()
+    } else {
+        format!(": {}", &trimmed[..end])
+    }
 }
 
 fn ffmpeg_progress_fraction(line: &str, duration_seconds: f64) -> Option<f64> {
@@ -3974,6 +4051,29 @@ pub struct NormalizedMediaProbe {
     pub enrichment_warning: Option<String>,
 }
 
+/// A media executable exited unsuccessfully. Kept typed so CLI adapters can
+/// preserve the stable `media_tool_failed` code regardless of child wording.
+#[derive(Debug, thiserror::Error)]
+#[error("{tool} failed with {status}{diagnostic}")]
+pub struct MediaToolFailure {
+    tool: &'static str,
+    status: String,
+    diagnostic: String,
+}
+
+fn media_tool_failure(
+    tool: &'static str,
+    status: impl std::fmt::Display,
+    diagnostic: String,
+) -> anyhow::Error {
+    MediaToolFailure {
+        tool,
+        status: status.to_string(),
+        diagnostic,
+    }
+    .into()
+}
+
 /// Probes a media file with configured ffprobe and optional ExifTool,
 /// returning a normalized DTO suitable for cross-node persistence.
 pub fn probe_media_normalized(
@@ -4085,10 +4185,9 @@ fn probe_media_document_with(path: &Path, ffprobe_program: &Path) -> Result<Valu
         crate::stall::io_stall_timeout(),
     )?;
     if !output.status.success() {
-        bail!(
-            "ffprobe failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
+        let diagnostic =
+            redact_media_diagnostic(&String::from_utf8_lossy(&output.stderr), path, path);
+        return Err(media_tool_failure("ffprobe", output.status, diagnostic));
     }
     serde_json::from_slice(&output.stdout).context("parse ffprobe JSON")
 }
@@ -4209,10 +4308,9 @@ fn probe_media_document(path: &Path) -> Result<Value> {
         crate::stall::io_stall_timeout(),
     )?;
     if !output.status.success() {
-        bail!(
-            "ffprobe failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
+        let diagnostic =
+            redact_media_diagnostic(&String::from_utf8_lossy(&output.stderr), path, path);
+        return Err(media_tool_failure("ffprobe", output.status, diagnostic));
     }
     serde_json::from_slice(&output.stdout).context("parse ffprobe JSON")
 }
@@ -5663,6 +5761,23 @@ mod tests {
             residual_work_units(&[1_000, 500], &[false, true], &[250, 0]),
             vec![750]
         );
+    }
+
+    #[test]
+    fn media_diagnostics_redact_paths_and_bound_the_redacted_text() {
+        let stderr = "failure ".to_owned() + &"/a ".repeat(2_000);
+        let diagnostic = redact_media_diagnostic(&stderr, Path::new("/a"), Path::new("/output"));
+        assert!(diagnostic.len() <= 4096);
+        assert!(!diagnostic.contains("/a"));
+        assert!(diagnostic.contains("<source>"));
+
+        let quoted = redact_media_diagnostic(
+            "could not read '/private area/clip.mp4': invalid data",
+            Path::new("/source"),
+            Path::new("/output"),
+        );
+        assert!(!quoted.contains("/private area/clip.mp4"));
+        assert!(quoted.contains("invalid data"));
     }
 
     #[cfg(target_os = "macos")]

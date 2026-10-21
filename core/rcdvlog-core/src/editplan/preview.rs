@@ -12,7 +12,7 @@
 //! with a stream copy and the segments are concatenated, so there is no filter
 //! graph that could add one.
 
-use crate::{Catalog, tool_command};
+use crate::{Catalog, media_tool_failure, run_captured_media_command, tool_command};
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -152,7 +152,8 @@ impl Catalog {
             // Arguments are structured through `Command`, never assembled as a
             // shell string: media paths contain spaces and non-ASCII characters
             // (`AGENTS.md` §15).
-            let status = tool_command("ffmpeg")
+            let mut command = tool_command("ffmpeg");
+            command
                 .args(["-y", "-hide_banner", "-loglevel", "error", "-ss"])
                 .arg(format!("{:.3}", operation.source_in_seconds))
                 .arg("-t")
@@ -177,12 +178,14 @@ impl Catalog {
                     "-map_metadata",
                     "-1",
                 ])
-                .arg(&segment)
-                .status()
-                .context("start ffmpeg preview segment process")?;
+                .arg(&segment);
+            let (status, diagnostic) =
+                run_captured_media_command(&mut command, std::path::Path::new(source), &segment)
+                    .context("start ffmpeg preview segment process")?;
 
             if !status.success() {
-                let message = format!("ffmpeg failed with {status}");
+                let message =
+                    media_tool_failure("ffmpeg preview segment", status, diagnostic).to_string();
                 progress(PreviewProgress::ClipFailed {
                     position: operation.position,
                     message: message.clone(),
@@ -230,7 +233,8 @@ impl Catalog {
 
         let output = workspace.join("preview.mp4");
         let temporary = workspace.join("preview.tmp.mp4");
-        let status = tool_command("ffmpeg")
+        let mut command = tool_command("ffmpeg");
+        command
             .args([
                 "-y",
                 "-hide_banner",
@@ -244,12 +248,16 @@ impl Catalog {
             ])
             .arg(&list_path)
             .args(["-c", "copy", "-movflags", "+faststart"])
-            .arg(&temporary)
-            .status()
+            .arg(&temporary);
+        let (status, diagnostic) = run_captured_media_command(&mut command, &list_path, &temporary)
             .context("start ffmpeg preview concat process")?;
         if !status.success() {
             let _ = fs::remove_file(&temporary);
-            bail!("ffmpeg preview concat failed with {status}");
+            return Err(media_tool_failure(
+                "ffmpeg preview concat",
+                status,
+                diagnostic,
+            ));
         }
         // Renamed only once complete, so a crash mid-render never leaves a
         // truncated file sitting at the preview's path.

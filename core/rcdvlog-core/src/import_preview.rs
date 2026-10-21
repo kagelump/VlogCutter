@@ -21,6 +21,7 @@
 //! that one file's row to a placeholder; it is never surfaced as an import
 //! blocker.
 
+use crate::{media_tool_failure, run_captured_media_command};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
@@ -216,7 +217,8 @@ fn extract_poster(
     // `rename`s with "no such file" once the other had already moved it.
     let temporary = unique_temp_path(cache_dir, &safe_key);
     let seek = (duration_seconds.max(0.0) * 0.2).to_string();
-    let status = std::process::Command::new(ffmpeg_program)
+    let mut command = std::process::Command::new(ffmpeg_program);
+    command
         .args([
             "-y",
             "-hide_banner",
@@ -236,12 +238,16 @@ fn extract_poster(
             "-q:v",
             "3",
         ])
-        .arg(&temporary)
-        .status()
+        .arg(&temporary);
+    let (status, diagnostic) = run_captured_media_command(&mut command, input, &temporary)
         .context("start ffmpeg import-preview poster process")?;
     if !status.success() {
         let _ = std::fs::remove_file(&temporary);
-        anyhow::bail!("ffmpeg import-preview poster generation failed with {status}");
+        return Err(media_tool_failure(
+            "ffmpeg import-preview poster generation",
+            status,
+            diagnostic,
+        ));
     }
     std::fs::rename(&temporary, &output)?;
     Ok(output.to_string_lossy().into_owned())
