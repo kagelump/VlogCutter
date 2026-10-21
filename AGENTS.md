@@ -338,11 +338,8 @@ Minimum documented environment:
 
 - Apple Silicon Mac, macOS 13+
 - Xcode command-line tools
-- Rust 1.85+ and Cargo (CI pins one version: `RUST_TOOLCHAIN` in
-  `.github/workflows/ci.yml`, currently 1.97.1 — raise it there and here
-  together, in its own commit, after running the gate on the new toolchain)
-- Node.js 22+
-- pnpm 10
+- Rust 1.85+ and Cargo.
+- Node.js 22+ and pnpm 10.
 - FFmpeg 7+ and ffprobe on `PATH`
 - ExifTool on `PATH`
 
@@ -367,6 +364,30 @@ Install JavaScript dependencies from the repository root:
 ```bash
 pnpm install
 ```
+
+The full pre-PR gate uses the CI-pinned toolchain: Rust 1.97.1,
+Node.js 24.11.0, and pnpm 10.17.0. When running that gate, install its Rust
+components and package manager with:
+
+```bash
+rustup toolchain install 1.97.1 --component rustfmt --component clippy
+corepack prepare pnpm@10.17.0 --activate
+pnpm install --frozen-lockfile
+```
+
+Use a Node.js version manager or the official Node installer to select
+24.11.0. Do not let a missing pinned tool silently fall back to another Rust
+version; `pnpm gate` verifies and uses the Rust pin before running Rust checks.
+
+Find Cargo with `command -v cargo` and `command -v rustup`; for a standard
+installation, load `~/.cargo/env` or add `~/.cargo/bin` to `PATH`. If a host
+uses a project-local installation, explicitly set `CARGO_HOME` to its Cargo
+directory, `RUSTUP_HOME` to its Rustup directory, and prepend
+`$CARGO_HOME/bin` to `PATH` before installing or invoking the pinned toolchain.
+These directories are host configuration, not paths to assume in a checkout.
+For example, an observed video workspace used `data/tools/cargo` and
+`data/tools/rustup`; other workspaces need not contain either directory.
+Never substitute the installed stable formatter when the CI pin is absent.
 
 Rust dependencies are resolved by Cargo from the checked-in `Cargo.lock`.
 
@@ -872,6 +893,38 @@ Run the narrowest useful tests while iterating, then the full gate before handof
 | Full repository | — | `pnpm check` |
 
 `pnpm check` runs TypeScript checking followed by all Rust workspace tests. The process-level integration suite creates a real one-second FFmpeg fixture and validates CLI persistence, WAL reads, ingest, metadata, deduplication, labels/notes/removal, clock correction, thumbnails/proxies, and offline-original review. Its media portion skips when FFmpeg or ffprobe is missing.
+
+Run `pnpm gate --scope fast` while iterating; it runs `git diff --check`,
+`git diff --cached --check`,
+the pinned Rust formatter, and `pnpm check:frontend`. Run `pnpm gate` with no
+arguments as the mandatory pre-PR gate. It follows the Ubuntu CI checks in
+`.github/workflows/ci.yml`, prints each command's complete output and exit
+status, continues to report later checks after a failure, and returns nonzero
+if any command or prerequisite is missing. The workspace test check also
+requires a nonzero count of executed tests. The gate's isolated regression
+suite is `node --test scripts/pre-pr-gate.test.mjs`; `pnpm test:scripts`
+includes it. Re-run relevant checks after every code change because earlier
+results are stale, and include the complete gate output or completed CI run
+URL and failed-step logs in a handoff.
+
+For one Rust test during iteration, run
+`pnpm test:focused <cargo-package> <exact-test-name>` (for example,
+`pnpm test:focused rcdvlog-core migrations::tests::the_schema_version_constant_tracks_the_migration_list`). It uses the CI Rust
+pin and `--exact`, then requires Cargo to report the named test and at least
+one executed test. The fake-command regression cases are in
+`scripts/run-focused-test.test.mjs`.
+
+Use `pnpm publish:after-gate push` or `pnpm publish:after-gate pr` when the
+gate must be enforced at the publication boundary. That wrapper runs the
+actual pre-PR gate from a clean tree, snapshots HEAD and tracked/untracked
+working-tree content, and refuses the fixed push/PR action if the gate fails
+or that identity changes.
+
+After publication, inspect CI on meaningful status transitions and wait for
+jobs to finish before retrieving failure logs. Repair failures locally, rerun
+the gate on the repaired code, and push the new commit. Confirm CI passes on
+that exact commit before declaring an issue complete; neither an in-progress
+run nor a green run for an older commit is confirmation.
 
 The CI encoding of this gate table lives in `.github/workflows/ci.yml` (two
 jobs, `ubuntu` and `macos`; runs on every push to `main` and every pull request
