@@ -14,6 +14,9 @@ use super::model::{
     EventOrderConstraint, PhaseKind, PhaseSplitDirection, TripPhase,
 };
 use super::phases::{is_valid_timezone, parse_utc};
+use super::questions::{
+    ClockBlockQuestion, ClockQuestionDecision, ClockQuestionDecisionKind, ClockQuestionOutcome,
+};
 use super::solver::{
     ChronologySolution, Contradiction, ContradictionKind, resolve_anchored_phases, solve,
 };
@@ -22,11 +25,12 @@ use crate::operations::{
     CAPTURE_SEQUENCE_DECLARED, CAPTURE_SEQUENCE_MERGED, CAPTURE_SEQUENCE_REASSIGNED,
     CAPTURE_SEQUENCE_SPLIT, CAPTURE_SEQUENCE_SPLIT_DECLINED, CAPTURE_SEQUENCE_SPLIT_EXACT,
     CAPTURE_SEQUENCE_SPLIT_RESTORED, CLIP_TIME_EXCEPTION_CLEARED, CLIP_TIME_EXCEPTION_SET,
-    CLOCK_EPOCH_CLEARED, CLOCK_EPOCH_SET, CaptureSequenceDeclaredPayload,
-    CaptureSequenceMergedPayload, CaptureSequenceReassignedPayload,
-    CaptureSequenceSplitDeclinedPayload, CaptureSequenceSplitExactPayload,
-    CaptureSequenceSplitPayload, CaptureSequenceSplitRestoredPayload, ClipTimeExceptionSetPayload,
-    ClockEpochClearedPayload, ClockEpochSetPayload, EVENT_ORDER_CONSTRAINT_CLEARED,
+    CLOCK_EPOCH_CLEARED, CLOCK_EPOCH_SET, CLOCK_QUESTION_DECISION_RECORDED,
+    CLOCK_QUESTION_PROPOSED, CaptureSequenceDeclaredPayload, CaptureSequenceMergedPayload,
+    CaptureSequenceReassignedPayload, CaptureSequenceSplitDeclinedPayload,
+    CaptureSequenceSplitExactPayload, CaptureSequenceSplitPayload,
+    CaptureSequenceSplitRestoredPayload, ClipTimeExceptionSetPayload, ClockEpochClearedPayload,
+    ClockEpochSetPayload, ClockQuestionDecisionPayload, EVENT_ORDER_CONSTRAINT_CLEARED,
     EVENT_ORDER_CONSTRAINT_SET, EventOrderConstraintClearedPayload, EventOrderConstraintSetPayload,
     NewOperation, TRIP_PHASE_REMOVED, TRIP_PHASE_SET, TripPhaseRemovedPayload, TripPhaseSetPayload,
     commit_local_in_transaction, current_revision,
@@ -191,6 +195,25 @@ pub struct ChronologyMutationPreview {
     pub impact: ChronologyImpact,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClockQuestionDecisionPreview {
+    pub decision: ClockQuestionDecision,
+    pub question: ClockBlockQuestion,
+    pub question_revision: u64,
+    pub facts_token: String,
+    pub clock_epoch_preview: Option<ClockEpochImpactPreview>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClockQuestionProposalPreview {
+    pub question: ClockBlockQuestion,
+    pub question_revision: u64,
+    pub facts_token: String,
+    pub alternative_impacts: Vec<ClockEpochImpactPreview>,
+}
+
 /// One internally coherent read for the desktop calibration surface. Facts,
 /// solution, and proposals are all derived from the same loaded catalog state.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -202,6 +225,14 @@ pub struct ChronologySnapshot {
     /// Boundaries the user has already answered "same card" to. Carried so the
     /// desk can list and reverse those answers; they never affect the solve.
     pub declined_splits: Vec<DeclinedSplit>,
+    /// Proposed human-anchor questions with no current decision. Accepted or
+    /// rejected questions are omitted and remain in the operation history.
+    #[serde(default)]
+    pub clock_questions: Vec<ClockBlockQuestion>,
+    /// Durable human outcomes, kept visible so solver consistency is distinct
+    /// from external anchoring and owner acceptance.
+    #[serde(default)]
+    pub clock_question_decisions: Vec<ClockQuestionOutcome>,
 }
 
 /// The conditions a chronology write refuses on, each with a stable code so the
@@ -321,6 +352,198 @@ fn refuse_hard_impact(impact: &ChronologyImpact) -> Result<()> {
         return Err(ChronologyError::HardContradiction(blocking.message.clone()).into());
     }
     Ok(())
+}
+
+fn load_open_clock_questions(
+    connection: &rusqlite::Connection,
+    project_id: &str,
+) -> Result<Vec<ClockBlockQuestion>> {
+    let mut statement = connection.prepare(
+        "SELECT o.operation_type, o.payload_json FROM materialized_revisions r \
+         JOIN project_operations o ON o.operation_id=r.last_operation_id \
+         WHERE r.project_id=?1 AND r.aggregate_type='clockQuestion' ORDER BY r.aggregate_id",
+    )?;
+    let rows = statement
+        .query_map([project_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    rows.into_iter()
+        .filter_map(|(kind, json)| (kind == CLOCK_QUESTION_PROPOSED).then_some(json))
+        .map(|json| Ok(serde_json::from_str(&json)?))
+        .collect()
+}
+
+fn load_clock_question_decisions(
+    connection: &rusqlite::Connection,
+    project_id: &str,
+) -> Result<Vec<ClockQuestionOutcome>> {
+    let mut statement = connection.prepare(
+        "SELECT o.payload_json, o.base_revision FROM project_operations o WHERE o.project_id=?1 \
+         AND o.operation_type=?2 AND NOT EXISTS (SELECT 1 FROM operation_conflicts c \
+         WHERE c.incoming_operation_id=o.operation_id) \
+         ORDER BY o.hlc_wall_millis, o.hlc_counter, o.origin_node_id, o.operation_id",
+    )?;
+    let rows = statement
+        .query_map(
+            rusqlite::params![project_id, CLOCK_QUESTION_DECISION_RECORDED],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?)),
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    rows.into_iter()
+        .map(|(json, revision)| {
+            let payload: ClockQuestionDecisionPayload = serde_json::from_str(&json)?;
+            Ok(ClockQuestionOutcome {
+                decision: ClockQuestionDecision {
+                    question_id: payload.question_id,
+                    kind: if payload.accepted {
+                        ClockQuestionDecisionKind::Accepted
+                    } else {
+                        ClockQuestionDecisionKind::Rejected
+                    },
+                    alternative_id: payload.alternative_id,
+                    note: payload.note,
+                },
+                proposal_revision: revision.unwrap_or(0) as u64,
+            })
+        })
+        .collect()
+}
+
+pub(crate) fn validate_question_scope(
+    question: &ClockBlockQuestion,
+    facts: &super::model::ChronologyFacts,
+) -> Result<()> {
+    if !facts
+        .sequences
+        .iter()
+        .any(|sequence| sequence.id == question.capture_sequence_id)
+    {
+        return Err(ChronologyError::InvalidReference(
+            "clock question capture sequence is missing".into(),
+        )
+        .into());
+    }
+    let scoped: BTreeSet<&str> = facts
+        .assets
+        .iter()
+        .filter(|asset| {
+            asset.capture_sequence_id.as_deref() == Some(question.capture_sequence_id.as_str())
+                && asset.filename_counter.is_some_and(|counter| {
+                    counter >= question.start_counter
+                        && question.end_counter.is_none_or(|end| counter <= end)
+                })
+        })
+        .map(|asset| asset.asset_id.as_str())
+        .collect();
+    if scoped.is_empty() {
+        return Err(ChronologyError::InvalidReference(
+            "clock question scope contains no project clips".into(),
+        )
+        .into());
+    }
+    if scoped.len() > 5_000 {
+        return Err(ChronologyError::InvalidReference(
+            "clock question block exceeds the 5000-clip scope limit".into(),
+        )
+        .into());
+    }
+    let anchor_asset = facts
+        .assets
+        .iter()
+        .find(|asset| asset.asset_id == question.anchor.asset_id)
+        .ok_or_else(|| {
+            ChronologyError::InvalidReference("clock question anchor clip is missing".into())
+        })?;
+    if !scoped.contains(anchor_asset.asset_id.as_str()) {
+        return Err(ChronologyError::InvalidReference(
+            "human anchor must identify a clip in the questioned block".into(),
+        )
+        .into());
+    }
+    for excerpt in &question.proxy_excerpts {
+        if excerpt.role == "selected_proxy" && !scoped.contains(excerpt.asset_id.as_str()) {
+            return Err(ChronologyError::InvalidReference(
+                "selected proxy excerpt clip is outside the questioned block".into(),
+            )
+            .into());
+        }
+        if excerpt.role == "independent_reference" {
+            let Some(asset) = facts
+                .assets
+                .iter()
+                .find(|asset| asset.asset_id == excerpt.asset_id)
+            else {
+                return Err(ChronologyError::InvalidReference(
+                    "independent reference excerpt clip is missing".into(),
+                )
+                .into());
+            };
+            if scoped.contains(asset.asset_id.as_str()) {
+                return Err(ChronologyError::InvalidReference(
+                    "independent reference excerpt must be outside the questioned block".into(),
+                )
+                .into());
+            }
+        }
+        if excerpt.role != "selected_proxy" && excerpt.role != "independent_reference" {
+            return Err(ChronologyError::InvalidReference(
+                "proxy excerpt role must be selected_proxy or independent_reference".into(),
+            )
+            .into());
+        }
+    }
+    if let Some(reference) = &question.anchor.reference_asset_id
+        && !facts
+            .assets
+            .iter()
+            .any(|asset| &asset.asset_id == reference)
+    {
+        return Err(
+            ChronologyError::InvalidReference("anchor reference clip is missing".into()).into(),
+        );
+    }
+    if question.anchor.reference_asset_id.as_deref() == Some(question.anchor.asset_id.as_str()) {
+        return Err(ChronologyError::InvalidReference(
+            "relative-order anchor must reference a different clip".into(),
+        )
+        .into());
+    }
+    if let Some(utc) = &question.anchor.utc_time
+        && parse_utc(utc).is_none()
+    {
+        return Err(ChronologyError::InvalidInterval("anchor UTC time is invalid".into()).into());
+    }
+    Ok(())
+}
+
+fn validate_decision(
+    question: &ClockBlockQuestion,
+    decision: &ClockQuestionDecision,
+) -> Result<()> {
+    if decision.question_id != question.id {
+        return Err(ChronologyError::InvalidReference(
+            "decision question identity does not match".into(),
+        )
+        .into());
+    }
+    match decision.kind {
+        ClockQuestionDecisionKind::Accepted
+            if decision.alternative_id.as_deref().is_some_and(|id| {
+                question
+                    .alternatives
+                    .iter()
+                    .any(|alternative| alternative.id == id)
+            }) =>
+        {
+            Ok(())
+        }
+        ClockQuestionDecisionKind::Rejected if decision.alternative_id.is_none() => Ok(()),
+        _ => Err(ChronologyError::InvalidReference(
+            "acceptance must select a listed alternative; rejection must not select one".into(),
+        )
+        .into()),
+    }
 }
 
 fn chronology_facts_token(facts: &super::model::ChronologyFacts) -> Result<String> {
@@ -1882,13 +2105,248 @@ impl Catalog {
             .map(|entry| (entry.capture_sequence_id.clone(), entry.at_counter))
             .collect();
         let proposed_splits = Self::proposed_capture_sequence_splits(&facts, &declined_lookup);
+        let clock_questions = load_open_clock_questions(&transaction, project_id)?;
+        let clock_question_decisions = load_clock_question_decisions(&transaction, project_id)?;
         transaction.commit()?;
         Ok(ChronologySnapshot {
             facts,
             solution,
             proposed_splits,
             declined_splits,
+            clock_questions,
+            clock_question_decisions,
         })
+    }
+
+    /// Validate a proposal and preview the ordering impact for every discrete
+    /// alternative without writing it.
+    pub fn preview_clock_block_question(
+        &self,
+        project_id: &str,
+        question: &ClockBlockQuestion,
+    ) -> Result<ClockQuestionProposalPreview> {
+        question
+            .validate()
+            .map_err(ChronologyError::InvalidReference)?;
+        self.require_project(project_id)?;
+        let connection = self.connection()?;
+        let facts = super::load_chronology_facts(&connection, project_id)?;
+        validate_question_scope(question, &facts)?;
+        let revision = current_revision(&connection, project_id, "clockQuestion", &question.id)?;
+        let facts_token = chronology_facts_token(&facts)?;
+        let alternative_impacts = question
+            .alternatives
+            .iter()
+            .map(|alternative| {
+                Self::clock_epoch_impact_from_facts(facts.clone(), &alternative.epoch)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(ClockQuestionProposalPreview {
+            question: question.clone(),
+            question_revision: revision,
+            facts_token,
+            alternative_impacts,
+        })
+    }
+
+    /// Persist a proposal only after its evidence and every alternative impact
+    /// have been reviewed. Reusing its identity revises it with a revision guard.
+    pub fn apply_clock_block_question_preview(
+        &self,
+        project_id: &str,
+        preview: &ClockQuestionProposalPreview,
+    ) -> Result<u64> {
+        self.require_project(project_id)?;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let facts = super::load_chronology_facts(&transaction, project_id)?;
+        validate_question_scope(&preview.question, &facts)?;
+        let recomputed = ClockQuestionProposalPreview {
+            question: preview.question.clone(),
+            question_revision: preview.question_revision,
+            facts_token: chronology_facts_token(&facts)?,
+            alternative_impacts: preview
+                .question
+                .alternatives
+                .iter()
+                .map(|alternative| {
+                    Self::clock_epoch_impact_from_facts(facts.clone(), &alternative.epoch)
+                })
+                .collect::<Result<Vec<_>>>()?,
+        };
+        if recomputed != *preview
+            || current_revision(
+                &transaction,
+                project_id,
+                "clockQuestion",
+                &preview.question.id,
+            )? != preview.question_revision
+            || chronology_facts_token(&facts)? != preview.facts_token
+        {
+            return Err(ChronologyError::InvalidReference(
+                "clock question proposal preview is stale; review it again".into(),
+            )
+            .into());
+        }
+        let revision = preview.question_revision;
+        commit_local_in_transaction(
+            &transaction,
+            project_id,
+            vec![NewOperation {
+                aggregate_type: "clockQuestion",
+                aggregate_id: preview.question.id.clone(),
+                operation_type: CLOCK_QUESTION_PROPOSED,
+                base_revision: Some(revision),
+                payload: serde_json::to_value(&preview.question)?,
+            }],
+        )?;
+        transaction.commit()?;
+        Ok(revision + 1)
+    }
+
+    pub fn propose_clock_block_question(
+        &self,
+        project_id: &str,
+        question: &ClockBlockQuestion,
+    ) -> Result<u64> {
+        let preview = self.preview_clock_block_question(project_id, question)?;
+        self.apply_clock_block_question_preview(project_id, &preview)
+    }
+
+    /// Builds the exact decision preview from a currently open question.
+    /// One anchor answer resolves the whole bounded block.
+    pub fn preview_clock_question_decision(
+        &self,
+        project_id: &str,
+        decision: &ClockQuestionDecision,
+    ) -> Result<ClockQuestionDecisionPreview> {
+        self.require_project(project_id)?;
+        let connection = self.connection()?;
+        let facts = super::load_chronology_facts(&connection, project_id)?;
+        let question = load_open_clock_questions(&connection, project_id)?
+            .into_iter()
+            .find(|question| question.id == decision.question_id)
+            .ok_or_else(|| {
+                ChronologyError::InvalidReference("clock question is no longer open".into())
+            })?;
+        validate_decision(&question, decision)?;
+        let question_revision =
+            current_revision(&connection, project_id, "clockQuestion", &question.id)?;
+        let facts_token = chronology_facts_token(&facts)?;
+        let clock_epoch_preview = if decision.kind == ClockQuestionDecisionKind::Accepted {
+            let alternative = question
+                .alternatives
+                .iter()
+                .find(|alternative| {
+                    Some(alternative.id.as_str()) == decision.alternative_id.as_deref()
+                })
+                .unwrap();
+            Some(Self::clock_epoch_impact_from_facts(
+                facts,
+                &alternative.epoch,
+            )?)
+        } else {
+            None
+        };
+        Ok(ClockQuestionDecisionPreview {
+            decision: decision.clone(),
+            question,
+            question_revision,
+            facts_token,
+            clock_epoch_preview,
+        })
+    }
+
+    /// Commits the selected clock epoch and question decision in one SQLite
+    /// transaction. Proposal revision and all chronology facts must still
+    /// match the preview; rejected decisions only append the human decision.
+    pub fn apply_clock_question_decision(
+        &self,
+        project_id: &str,
+        preview: &ClockQuestionDecisionPreview,
+    ) -> Result<ClockQuestionDecision> {
+        self.require_project(project_id)?;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let facts = super::load_chronology_facts(&transaction, project_id)?;
+        let current = load_open_clock_questions(&transaction, project_id)?
+            .into_iter()
+            .find(|question| question.id == preview.question.id)
+            .ok_or_else(|| {
+                ChronologyError::InvalidReference("clock question is no longer open".into())
+            })?;
+        if current != preview.question
+            || current_revision(&transaction, project_id, "clockQuestion", &current.id)?
+                != preview.question_revision
+            || chronology_facts_token(&facts)? != preview.facts_token
+        {
+            return Err(ChronologyError::InvalidReference(
+                "clock question decision preview is stale; review it again".into(),
+            )
+            .into());
+        }
+        validate_decision(&current, &preview.decision)?;
+        let expected_epoch_preview = match preview.decision.kind {
+            ClockQuestionDecisionKind::Rejected => {
+                if preview.clock_epoch_preview.is_some() {
+                    return Err(ChronologyError::InvalidReference(
+                        "rejected decision must not include a clock correction preview".into(),
+                    )
+                    .into());
+                }
+                None
+            }
+            ClockQuestionDecisionKind::Accepted => {
+                let alternative = current
+                    .alternatives
+                    .iter()
+                    .find(|alternative| {
+                        Some(alternative.id.as_str()) == preview.decision.alternative_id.as_deref()
+                    })
+                    .expect("validated accepted decision selects an alternative");
+                let epoch_preview = preview.clock_epoch_preview.as_ref().ok_or_else(|| {
+                    ChronologyError::InvalidReference(
+                        "accepted decision has no clock correction preview".into(),
+                    )
+                })?;
+                if epoch_preview.epoch != alternative.epoch {
+                    return Err(ChronologyError::InvalidReference(
+                        "clock correction preview does not match the selected alternative".into(),
+                    )
+                    .into());
+                }
+                Some(epoch_preview)
+            }
+        };
+        if let Some(epoch_preview) = expected_epoch_preview {
+            let recomputed = Self::clock_epoch_impact_from_facts(facts, &epoch_preview.epoch)?;
+            if recomputed != *epoch_preview {
+                return Err(ChronologyError::InvalidReference(
+                    "clock correction preview is stale; review it again".into(),
+                )
+                .into());
+            }
+            Self::commit_clock_epoch(&transaction, project_id, &recomputed)?;
+        }
+        let revision = current_revision(&transaction, project_id, "clockQuestion", &current.id)?;
+        let accepted = preview.decision.kind == ClockQuestionDecisionKind::Accepted;
+        commit_local_in_transaction(
+            &transaction,
+            project_id,
+            vec![NewOperation {
+                aggregate_type: "clockQuestion",
+                aggregate_id: current.id.clone(),
+                operation_type: CLOCK_QUESTION_DECISION_RECORDED,
+                base_revision: Some(revision),
+                payload: serde_json::json!({"questionId": current.id, "accepted": accepted,
+                "alternativeId": preview.decision.alternative_id, "note": preview.decision.note}),
+            }],
+        )?;
+        if accepted {
+            Self::project_current_chronology_in_transaction(&transaction, project_id)?;
+        }
+        transaction.commit()?;
+        Ok(preview.decision.clone())
     }
 
     // --- D01-T010: clock epochs --------------------------------------------

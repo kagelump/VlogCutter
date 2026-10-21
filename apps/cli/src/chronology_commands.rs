@@ -73,6 +73,11 @@ pub enum ChronologyCommand {
         #[arg(long)]
         facts_revision: Option<String>,
     },
+    /// Review persisted clock-block alternatives and anchor evidence.
+    Questions {
+        #[arg(long)]
+        project: String,
+    },
     /// Preview a typed chronology change from JSON stdin or a request file.
     Preview {
         #[arg(long)]
@@ -125,6 +130,7 @@ pub fn chronology_command_name(command: &ChronologyCommand) -> &'static str {
         ChronologyCommand::Explain { .. } => "chronology.explain",
         ChronologyCommand::Status { .. } => "chronology.status",
         ChronologyCommand::Evidence { .. } => "chronology.evidence",
+        ChronologyCommand::Questions { .. } => "chronology.questions",
         ChronologyCommand::Preview { .. } => "chronology.preview",
         ChronologyCommand::Apply { .. } => "chronology.apply",
     }
@@ -236,6 +242,13 @@ pub fn execute_chronology(catalog: &Catalog, command: &ChronologyCommand) -> Res
             *offset,
             *limit,
         )?)?),
+        ChronologyCommand::Questions { project } => {
+            let snapshot = catalog.chronology_snapshot(project)?;
+            Ok(json!({
+                "openQuestions": snapshot.clock_questions,
+                "humanDecisions": snapshot.clock_question_decisions,
+            }))
+        }
         ChronologyCommand::Preview { project, input } => {
             let request = read_json(input)?;
             let kind = request["kind"]
@@ -298,6 +311,16 @@ pub fn execute_chronology(catalog: &Catalog, command: &ChronologyCommand) -> Res
                             .ok_or_else(|| anyhow::anyhow!("epochId is required"))?,
                     )?,
                 )?,
+                "questionDecision" => {
+                    serde_json::to_value(catalog.preview_clock_question_decision(
+                        project,
+                        &serde_json::from_value(request["decision"].clone())?,
+                    )?)?
+                }
+                "questionPropose" => serde_json::to_value(catalog.preview_clock_block_question(
+                    project,
+                    &serde_json::from_value(request["question"].clone())?,
+                )?)?,
                 "sequenceDeclare" | "sameCard" | "sameCardRestore" | "exceptionSet"
                 | "exceptionClear" | "phaseSet" | "phaseRemove" | "phaseSplit"
                 | "constraintSet" | "constraintClear" => {
@@ -339,6 +362,19 @@ pub fn execute_chronology(catalog: &Catalog, command: &ChronologyCommand) -> Res
                         &serde_json::from_value(request["preview"].clone())?,
                     )?;
                     json!({"applied": true})
+                }
+                "questionPropose" => {
+                    let revision = catalog.apply_clock_block_question_preview(
+                        project,
+                        &serde_json::from_value(request["preview"].clone())?,
+                    )?;
+                    json!({"revision": revision})
+                }
+                "questionDecision" => {
+                    serde_json::to_value(catalog.apply_clock_question_decision(
+                        project,
+                        &serde_json::from_value(request["preview"].clone())?,
+                    )?)?
                 }
                 "sequenceDeclare" | "sameCard" | "sameCardRestore" | "exceptionSet"
                 | "exceptionClear" | "phaseSet" | "phaseRemove" | "phaseSplit"

@@ -7,11 +7,12 @@
 //! materializer that disagrees with the write API fails here.
 
 use rcdvlog_core::{
-    ApplyOperationResult, CAPTURE_SEQUENCE_MERGED, CAPTURE_SEQUENCE_REASSIGNED,
+    AnchorKind, ApplyOperationResult, CAPTURE_SEQUENCE_MERGED, CAPTURE_SEQUENCE_REASSIGNED,
     CAPTURE_SEQUENCE_SPLIT_EXACT, Catalog, ChronologyError, ChronologyImpactChange,
-    ChronologyMutation, ChronologySolution, ClockEpoch, ClockEpochImpactPreview,
-    ConstraintStrength, DisplayMode, PhaseKind, PhaseSplitDirection, ProjectAssetAddedPayload,
-    TripPhase, VisualPlacementSide, solve,
+    ChronologyMutation, ChronologySolution, ClockAlternative, ClockBlockQuestion, ClockEpoch,
+    ClockEpochImpactPreview, ClockQuestionDecision, ClockQuestionDecisionKind, ConstraintStrength,
+    DisplayMode, HumanAnchor, PhaseKind, PhaseSplitDirection, ProjectAssetAddedPayload,
+    ProxyExcerpt, TripPhase, VisualPlacementSide, solve,
 };
 use serde_json::json;
 use tempfile::tempdir;
@@ -3220,6 +3221,324 @@ fn chronology_snapshot_derives_solution_and_proposals_from_its_returned_facts() 
     assert_eq!(snapshot.proposed_splits.len(), 1);
     assert_eq!(snapshot.proposed_splits[0].at_counter, 1);
     assert_eq!(snapshot.facts.assets.len(), snapshot.solution.assets.len());
+}
+
+fn synthetic_clock_question(fixture: &Fixture) -> ClockBlockQuestion {
+    let facts = fixture
+        .catalog
+        .chronology_facts(&fixture.project_id)
+        .unwrap();
+    let first = &facts.assets[0];
+    let sequence = first.capture_sequence_id.clone().unwrap();
+    let end_counter = first.filename_counter.unwrap() + 1;
+    let reference = facts
+        .assets
+        .iter()
+        .find(|asset| {
+            asset.capture_sequence_id.as_deref() == Some(sequence.as_str())
+                && asset
+                    .filename_counter
+                    .is_some_and(|counter| counter > end_counter)
+        })
+        .unwrap();
+    let counter = first.filename_counter.unwrap();
+    let epoch = |id: &str, offset_seconds| ClockEpoch {
+        id: id.into(),
+        capture_sequence_id: sequence.clone(),
+        start_counter: counter,
+        end_counter: Some(counter + 1),
+        offset_seconds,
+        confidence: 1.0,
+        evidence: vec!["synthetic independent reference".into()],
+        label: id.into(),
+    };
+    ClockBlockQuestion {
+        id: "synthetic-clock-question".into(),
+        capture_sequence_id: sequence.clone(),
+        start_counter: counter,
+        end_counter: Some(counter + 1),
+        alternatives: vec![
+            ClockAlternative {
+                id: "date-a".into(),
+                label: "Synthetic date A".into(),
+                epoch: epoch("epoch-a", 0),
+                evidence: vec!["synthetic reference A".into()],
+            },
+            ClockAlternative {
+                id: "date-b".into(),
+                label: "Synthetic date B".into(),
+                epoch: epoch("epoch-b", 86_400),
+                evidence: vec!["synthetic reference B".into()],
+            },
+        ],
+        proxy_excerpts: vec![
+            ProxyExcerpt {
+                asset_id: first.asset_id.clone(),
+                start_seconds: 0.0,
+                end_seconds: 2.0,
+                role: "selected_proxy".into(),
+            },
+            ProxyExcerpt {
+                asset_id: reference.asset_id.clone(),
+                start_seconds: 1.0,
+                end_seconds: 3.0,
+                role: "independent_reference".into(),
+            },
+        ],
+        anchor: HumanAnchor {
+            kind: AnchorKind::EventAtUtc,
+            asset_id: first.asset_id.clone(),
+            reference_asset_id: Some(reference.asset_id.clone()),
+            event_label: "synthetic event".into(),
+            utc_time: Some("2026-01-01T12:00:00Z".into()),
+        },
+        contextual_evidence: vec!["operator overlap supplied by reviewer".into()],
+    }
+}
+
+#[test]
+fn clock_question_accept_reject_revise_and_stale_preview_are_revision_safe() {
+    let fixture = fixture(&[
+        ("C0001.MP4", "SyntheticCamera", "2026-01-01T09:00:00Z"),
+        ("C0002.MP4", "SyntheticCamera", "2026-01-01T10:00:00Z"),
+        ("C0003.MP4", "SyntheticCamera", "2026-01-01T11:00:00Z"),
+        ("C0001.MP4", "IndependentReference", "2025-12-31T12:00:00Z"),
+    ]);
+    let original_raw: Vec<_> = fixture
+        .catalog
+        .chronology_facts(&fixture.project_id)
+        .unwrap()
+        .assets
+        .iter()
+        .map(|a| a.captured_at_raw.clone())
+        .collect();
+    let question = synthetic_clock_question(&fixture);
+    let mut invalid_reference = question.clone();
+    let selected_asset = invalid_reference
+        .proxy_excerpts
+        .iter()
+        .find(|excerpt| excerpt.role == "selected_proxy")
+        .unwrap()
+        .asset_id
+        .clone();
+    invalid_reference
+        .proxy_excerpts
+        .iter_mut()
+        .find(|excerpt| excerpt.role == "independent_reference")
+        .unwrap()
+        .asset_id = selected_asset;
+    assert!(
+        fixture
+            .catalog
+            .preview_clock_block_question(&fixture.project_id, &invalid_reference)
+            .unwrap_err()
+            .to_string()
+            .contains("must be outside the questioned block")
+    );
+    let proposal_preview = fixture
+        .catalog
+        .preview_clock_block_question(&fixture.project_id, &question)
+        .unwrap();
+    assert_eq!(proposal_preview.alternative_impacts.len(), 2);
+    assert_eq!(
+        proposal_preview.alternative_impacts[1].epoch.offset_seconds
+            - proposal_preview.alternative_impacts[0].epoch.offset_seconds,
+        86_400
+    );
+    assert_eq!(
+        fixture
+            .catalog
+            .apply_clock_block_question_preview(&fixture.project_id, &proposal_preview)
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        fixture
+            .catalog
+            .chronology_snapshot(&fixture.project_id)
+            .unwrap()
+            .clock_questions,
+        vec![question.clone()]
+    );
+
+    let rejected = ClockQuestionDecision {
+        question_id: question.id.clone(),
+        kind: ClockQuestionDecisionKind::Rejected,
+        alternative_id: None,
+        note: "synthetic answer: insufficient evidence".into(),
+    };
+    let preview = fixture
+        .catalog
+        .preview_clock_question_decision(&fixture.project_id, &rejected)
+        .unwrap();
+    let before_tampered_rejection = fixture
+        .catalog
+        .chronology_facts(&fixture.project_id)
+        .unwrap();
+    let mut tampered_rejection = preview.clone();
+    let mut forged_accepted = fixture
+        .catalog
+        .preview_clock_question_decision(
+            &fixture.project_id,
+            &ClockQuestionDecision {
+                question_id: question.id.clone(),
+                kind: ClockQuestionDecisionKind::Accepted,
+                alternative_id: Some("date-b".into()),
+                note: "synthetic candidate".into(),
+            },
+        )
+        .unwrap();
+    tampered_rejection.clock_epoch_preview = forged_accepted.clock_epoch_preview.take();
+    let error = fixture
+        .catalog
+        .apply_clock_question_decision(&fixture.project_id, &tampered_rejection)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("chronology.invalid_reference"));
+    assert!(error.contains("rejected decision must not include a clock correction preview"));
+    assert_eq!(
+        fixture
+            .catalog
+            .chronology_facts(&fixture.project_id)
+            .unwrap(),
+        before_tampered_rejection
+    );
+    assert_eq!(
+        fixture
+            .catalog
+            .chronology_snapshot(&fixture.project_id)
+            .unwrap()
+            .clock_questions,
+        vec![question.clone()]
+    );
+    fixture
+        .catalog
+        .apply_clock_question_decision(&fixture.project_id, &preview)
+        .unwrap();
+    let after_rejection = fixture
+        .catalog
+        .chronology_snapshot(&fixture.project_id)
+        .unwrap();
+    assert!(after_rejection.clock_questions.is_empty());
+    assert_eq!(
+        after_rejection.clock_question_decisions[0].decision.kind,
+        ClockQuestionDecisionKind::Rejected
+    );
+    assert_eq!(
+        after_rejection.clock_question_decisions[0].proposal_revision,
+        1
+    );
+
+    // A revised proposal reopens the same question at the next aggregate revision.
+    let mut revised = question.clone();
+    revised
+        .contextual_evidence
+        .push("synthetic additional reference".into());
+    assert_eq!(
+        fixture
+            .catalog
+            .propose_clock_block_question(&fixture.project_id, &revised)
+            .unwrap(),
+        3
+    );
+    let accepted = ClockQuestionDecision {
+        question_id: revised.id.clone(),
+        kind: ClockQuestionDecisionKind::Accepted,
+        alternative_id: Some("date-b".into()),
+        note: "synthetic owner anchor accepted".into(),
+    };
+    let preview = fixture
+        .catalog
+        .preview_clock_question_decision(&fixture.project_id, &accepted)
+        .unwrap();
+    let mut mismatched_epoch = preview.clone();
+    mismatched_epoch
+        .clock_epoch_preview
+        .as_mut()
+        .unwrap()
+        .epoch
+        .offset_seconds += 1;
+    let before_mismatched_acceptance = fixture
+        .catalog
+        .chronology_facts(&fixture.project_id)
+        .unwrap();
+    let error = fixture
+        .catalog
+        .apply_clock_question_decision(&fixture.project_id, &mismatched_epoch)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("chronology.invalid_reference"));
+    assert!(error.contains("clock correction preview does not match the selected alternative"));
+    assert_eq!(
+        fixture
+            .catalog
+            .chronology_facts(&fixture.project_id)
+            .unwrap(),
+        before_mismatched_acceptance
+    );
+    assert_eq!(
+        fixture
+            .catalog
+            .chronology_snapshot(&fixture.project_id)
+            .unwrap()
+            .clock_questions,
+        vec![revised.clone()]
+    );
+    assert!(
+        preview
+            .clock_epoch_preview
+            .as_ref()
+            .unwrap()
+            .impact
+            .changes
+            .len()
+            <= 3
+    );
+
+    // Change chronology after preview to prove the facts token protects confirmation.
+    fixture
+        .catalog
+        .set_clock_epoch(
+            &fixture.project_id,
+            &ClockEpoch {
+                id: "independent-epoch".into(),
+                capture_sequence_id: revised.capture_sequence_id.clone(),
+                start_counter: 1,
+                end_counter: Some(1),
+                offset_seconds: 0,
+                confidence: 1.0,
+                evidence: vec!["synthetic".into()],
+                label: "synthetic independent edit".into(),
+            },
+        )
+        .unwrap();
+    assert!(
+        fixture
+            .catalog
+            .apply_clock_question_decision(&fixture.project_id, &preview)
+            .unwrap_err()
+            .to_string()
+            .contains("stale")
+    );
+    assert_eq!(
+        fixture
+            .catalog
+            .chronology_snapshot(&fixture.project_id)
+            .unwrap()
+            .clock_questions,
+        vec![revised]
+    );
+    assert_eq!(
+        fixture
+            .catalog
+            .chronology_facts(&fixture.project_id)
+            .unwrap()
+            .assets
+            .iter()
+            .map(|a| a.captured_at_raw.clone())
+            .collect::<Vec<_>>(),
+        original_raw
+    );
 }
 
 /// Confirmed chronology changes refresh `best_time` and `offset_seconds`

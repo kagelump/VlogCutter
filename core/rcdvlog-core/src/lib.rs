@@ -115,17 +115,19 @@ pub use cameras::{
     CameraRepairPreview, PatternConfidence, UNKNOWN_CAMERA, identify_camera, pattern_counter,
 };
 pub use chronology::{
-    AppliedCorrection, AssetChronology, AssetTimeHypothesis, CaptureSequence,
+    AnchorKind, AppliedCorrection, AssetChronology, AssetTimeHypothesis, CaptureSequence,
     CaptureSequenceMergePreview, CaptureSequenceReassignmentPreview, CaptureSequenceSplitPreview,
     ChronologyError, ChronologyEvidenceAsset, ChronologyEvidenceError, ChronologyEvidencePage,
     ChronologyExplanation, ChronologyFacts, ChronologyImpact, ChronologyImpactChange,
     ChronologyMutation, ChronologyMutationPreview, ChronologySnapshot, ChronologySolution,
-    ClipTimeException, ClockEpoch, ClockEpochClearPreview, ClockEpochImpactPreview,
+    ClipTimeException, ClockAlternative, ClockBlockQuestion, ClockEpoch, ClockEpochClearPreview,
+    ClockEpochImpactPreview, ClockQuestionDecision, ClockQuestionDecisionKind,
+    ClockQuestionDecisionPreview, ClockQuestionOutcome, ClockQuestionProposalPreview,
     ConstraintStrength, Contradiction, ContradictionKind, DisplayMode, DisplayTime,
-    EventOrderConstraint, Evidence, OrderKey, PhaseKind, PhaseSplitDirection, QuarantinedOperation,
-    QueuePosition, SplitProposal, TimestampCandidate, TripPhase, VisualPlacementPreview,
-    VisualPlacementSide, covering_phase, display_time, is_valid_timezone, resolve_anchored_phases,
-    solve,
+    EventOrderConstraint, Evidence, HumanAnchor, OrderKey, PhaseKind, PhaseSplitDirection,
+    ProxyExcerpt, QuarantinedOperation, QueuePosition, SplitProposal, TimestampCandidate,
+    TripPhase, VisualPlacementPreview, VisualPlacementSide, covering_phase, display_time,
+    is_valid_timezone, resolve_anchored_phases, solve,
 };
 pub use diagnostics::{
     Diagnostic, DiagnosticCounts, DiagnosticFilter, DiagnosticRecord, DiagnosticSeverity,

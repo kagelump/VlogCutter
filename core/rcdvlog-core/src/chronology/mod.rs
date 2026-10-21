@@ -11,13 +11,15 @@ pub mod explain;
 pub mod export;
 pub mod model;
 pub mod phases;
+pub mod questions;
 pub mod solver;
 
 pub use api::{
     CaptureSequenceMergePreview, CaptureSequenceReassignmentPreview, CaptureSequenceSplitPreview,
     ChronologyError, ChronologyImpact, ChronologyImpactChange, ChronologyMutation,
     ChronologyMutationPreview, ChronologySnapshot, ClockEpochClearPreview, ClockEpochImpactPreview,
-    SplitProposal, VisualPlacementPreview, VisualPlacementSide,
+    ClockQuestionDecisionPreview, ClockQuestionProposalPreview, SplitProposal,
+    VisualPlacementPreview, VisualPlacementSide,
 };
 pub use explain::{AppliedCorrection, ChronologyExplanation, QueuePosition};
 pub use export::{
@@ -30,6 +32,10 @@ pub use model::{
 };
 pub(crate) use phases::parse_utc;
 pub use phases::{DisplayTime, covering_phase, display_time, is_valid_timezone};
+pub use questions::{
+    AnchorKind, ClockAlternative, ClockBlockQuestion, ClockQuestionDecision,
+    ClockQuestionDecisionKind, ClockQuestionOutcome, HumanAnchor, ProxyExcerpt,
+};
 pub use solver::{
     AssetChronology, ChronologySolution, Contradiction, ContradictionKind, Evidence, OrderKey,
     resolve_anchored_phases, solve,

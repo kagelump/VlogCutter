@@ -1,4 +1,4 @@
-use rcdvlog_core::{Catalog, PROJECT_CATALOG_SCHEMA_VERSION};
+use rcdvlog_core::{Catalog, PROJECT_CATALOG_SCHEMA_VERSION, ProjectAssetAddedPayload};
 use rusqlite::{Connection, params};
 use serde_json::Value;
 use std::env;
@@ -504,6 +504,221 @@ fn chronology_preview_is_reusable_revision_guarded_and_process_safe() {
 }
 
 #[test]
+fn chronology_clock_question_cli_previews_applies_and_keeps_human_decision_visible() {
+    let directory = tempdir().expect("temporary catalog directory");
+    let catalog_path = directory.path().join("catalog.sqlite3");
+    let project = create_project(&catalog_path, "synthetic clock question");
+    let catalog = Catalog::open(&catalog_path).unwrap();
+    for (index, (filename, raw, camera)) in [
+        ("C0001.MP4", "2030-01-01T09:00:00Z", "Synthetic Camera"),
+        ("C0002.MP4", "2030-01-01T10:00:00Z", "Synthetic Camera"),
+        ("R0001.MP4", "2029-12-31T12:00:00Z", "Reference Camera"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        catalog
+            .add_portable_project_asset(
+                &project,
+                ProjectAssetAddedPayload {
+                    id: format!("synthetic-asset-{index}"),
+                    fingerprint: format!("synthetic-fingerprint-{index}"),
+                    filename: filename.into(),
+                    size_bytes: 1,
+                    duration_seconds: 2.0,
+                    frame_rate: 30.0,
+                    width: 1,
+                    height: 1,
+                    codec: "h264".into(),
+                    camera: camera.into(),
+                    captured_at_raw: Some(raw.into()),
+                    timestamp_candidates: None,
+                    best_time: Some(raw.into()),
+                    metadata_rotation_degrees: 0,
+                    default_rotation_degrees: 0,
+                    created_at: "2030-01-01T00:00:00Z".into(),
+                },
+            )
+            .unwrap();
+    }
+    let facts = catalog.chronology_facts(&project).unwrap();
+    let first = &facts.assets[0];
+    let sequence = first.capture_sequence_id.clone().unwrap();
+    let reference = facts
+        .assets
+        .iter()
+        .find(|asset| asset.capture_sequence_id.as_deref() != Some(sequence.as_str()))
+        .unwrap();
+    let counter = first.filename_counter.unwrap();
+    let question = serde_json::json!({
+        "id":"synthetic-question", "captureSequenceId":sequence,
+        "startCounter":counter, "endCounter":counter + 1,
+        "alternatives":[
+            {"id":"date-a","label":"Synthetic date A","epoch":{"id":"synthetic-epoch-a","captureSequenceId":sequence,"startCounter":counter,"endCounter":counter + 1,"offsetSeconds":0,"confidence":1.0,"evidence":["synthetic reference A"],"label":"Date A"},"evidence":["synthetic reference A"]},
+            {"id":"date-b","label":"Synthetic date B","epoch":{"id":"synthetic-epoch-b","captureSequenceId":sequence,"startCounter":counter,"endCounter":counter + 1,"offsetSeconds":86400,"confidence":1.0,"evidence":["synthetic reference B"],"label":"Date B"},"evidence":["synthetic reference B"]}
+        ],
+        "proxyExcerpts":[{"assetId":first.asset_id,"startSeconds":0.0,"endSeconds":1.0,"role":"selected_proxy"},{"assetId":reference.asset_id,"startSeconds":0.0,"endSeconds":1.0,"role":"independent_reference"}],
+        "anchor":{"kind":"event_at_utc","assetId":first.asset_id,"referenceAssetId":reference.asset_id,"eventLabel":"Synthetic event","utcTime":"2030-01-01T12:00:00Z"},
+        "contextualEvidence":["reviewer supplied overlap context"]
+    });
+    let preview_output = invoke_with_stdin(
+        &catalog_path,
+        [
+            "chronology",
+            "preview",
+            "--project",
+            &project,
+            "--input",
+            "-",
+        ],
+        &serde_json::json!({"kind":"questionPropose","question":question}).to_string(),
+    );
+    assert!(
+        preview_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&preview_output.stderr)
+    );
+    let preview: Value = serde_json::from_slice(&preview_output.stdout).unwrap();
+    assert_eq!(
+        preview["data"]["data"]["alternativeImpacts"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    let proposal_apply = invoke_with_stdin(
+        &catalog_path,
+        ["chronology", "apply", "--project", &project, "--input", "-"],
+        &serde_json::json!({"kind":"questionPropose","preview":preview["data"]["data"]})
+            .to_string(),
+    );
+    assert!(
+        proposal_apply.status.success(),
+        "{}",
+        String::from_utf8_lossy(&proposal_apply.stderr)
+    );
+    let listing = success(
+        &catalog_path,
+        ["chronology", "questions", "--project", &project],
+    )
+    .json;
+    assert_eq!(
+        listing["data"]["openQuestions"].as_array().unwrap().len(),
+        1
+    );
+
+    let decision_preview = invoke_with_stdin(
+        &catalog_path,
+        ["chronology", "preview", "--project", &project, "--input", "-"],
+        &serde_json::json!({"kind":"questionDecision","decision":{"questionId":"synthetic-question","kind":"accepted","alternativeId":"date-b","note":"synthetic owner anchor"}}).to_string(),
+    );
+    assert!(
+        decision_preview.status.success(),
+        "{}",
+        String::from_utf8_lossy(&decision_preview.stderr)
+    );
+    let decision_preview: Value = serde_json::from_slice(&decision_preview.stdout).unwrap();
+    let mut rejected_with_epoch = decision_preview["data"]["data"].clone();
+    rejected_with_epoch["decision"]["kind"] = Value::String("rejected".into());
+    rejected_with_epoch["decision"]["alternativeId"] = Value::Null;
+    let rejected_attempt = invoke_with_stdin(
+        &catalog_path,
+        ["chronology", "apply", "--project", &project, "--input", "-"],
+        &serde_json::json!({"kind":"questionDecision","preview":rejected_with_epoch}).to_string(),
+    );
+    assert!(!rejected_attempt.status.success());
+    assert!(rejected_attempt.stdout.is_empty());
+    let rejected_error: Value = serde_json::from_slice(&rejected_attempt.stderr).unwrap();
+    assert_eq!(
+        rejected_error["error"]["code"],
+        "chronology.invalid_reference"
+    );
+    assert!(
+        rejected_error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("rejected decision must not include a clock correction preview")
+    );
+
+    let mut mismatched_epoch = decision_preview["data"]["data"].clone();
+    mismatched_epoch["clockEpochPreview"]["epoch"]["offsetSeconds"] =
+        Value::Number((86_401_i64).into());
+    let mismatch_attempt = invoke_with_stdin(
+        &catalog_path,
+        ["chronology", "apply", "--project", &project, "--input", "-"],
+        &serde_json::json!({"kind":"questionDecision","preview":mismatched_epoch}).to_string(),
+    );
+    assert!(!mismatch_attempt.status.success());
+    assert!(mismatch_attempt.stdout.is_empty());
+    let mismatch_error: Value = serde_json::from_slice(&mismatch_attempt.stderr).unwrap();
+    assert_eq!(
+        mismatch_error["error"]["code"],
+        "chronology.invalid_reference"
+    );
+    assert!(
+        mismatch_error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("clock correction preview does not match the selected alternative")
+    );
+    let still_open = success(
+        &catalog_path,
+        ["chronology", "questions", "--project", &project],
+    );
+    assert_eq!(
+        still_open.json["data"]["openQuestions"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        still_open.json["data"]["humanDecisions"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let epochs_after_failed_applies = success(
+        &catalog_path,
+        ["chronology", "epochs", "--project", &project],
+    );
+    assert!(
+        epochs_after_failed_applies.json["data"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+
+    let applied = invoke_with_stdin(
+        &catalog_path,
+        ["chronology", "apply", "--project", &project, "--input", "-"],
+        &serde_json::json!({"kind":"questionDecision","preview":decision_preview["data"]["data"]})
+            .to_string(),
+    );
+    assert!(
+        applied.status.success(),
+        "{}",
+        String::from_utf8_lossy(&applied.stderr)
+    );
+    let listing = success(
+        &catalog_path,
+        ["chronology", "questions", "--project", &project],
+    )
+    .json;
+    assert!(
+        listing["data"]["openQuestions"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        listing["data"]["humanDecisions"][0]["decision"]["kind"],
+        "accepted"
+    );
+    assert_eq!(listing["data"]["humanDecisions"][0]["proposalRevision"], 1);
+}
+
+#[test]
 fn chronology_direct_preview_apply_can_be_retried_after_cli_restart() {
     let directory = tempdir().unwrap();
     let catalog = directory.path().join("catalog.sqlite3");
@@ -923,13 +1138,17 @@ fn chronology_reads_schema_25_without_migration_and_reports_revision_drift_stabl
                 [&project_id],
             )
             .unwrap();
-        // Reconstruct the published schema-25 boundary: migrations 26 and 27
-        // were not applied, so their table/column and history rows are absent.
+        // Reconstruct the published schema-25 boundary: migrations 26 through
+        // 30 were not applied, so their tables, columns, and history are absent.
         connection
             .execute_batch(
-                "ALTER TABLE assets DROP COLUMN timestamp_candidates_json;
+                "ALTER TABLE asset_analyses DROP COLUMN attempted_models_json;
+             ALTER TABLE asset_analyses DROP COLUMN usage_complete;
+             DROP TABLE analysis_chronology_suggestions;
+             DROP TABLE camera_proxy_sidecars;
+             ALTER TABLE assets DROP COLUMN timestamp_candidates_json;
              DROP TABLE asset_video_validation;
-             DELETE FROM schema_migrations WHERE migration_id IN (26, 27);",
+             DELETE FROM schema_migrations WHERE migration_id > 25;",
             )
             .unwrap();
     }
@@ -957,6 +1176,26 @@ fn chronology_reads_schema_25_without_migration_and_reports_revision_drift_stabl
         "asset_old"
     );
     assert!(evidence.json["data"]["assets"][0]["timestampCandidates"].is_null());
+
+    let questions = success(
+        &catalog,
+        ["chronology", "questions", "--project", &project_id],
+    );
+    assert!(questions.json["data"]["openQuestions"].is_array());
+    assert!(questions.json["data"]["humanDecisions"].is_array());
+    assert!(
+        questions.json["data"]["openQuestions"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        questions.json["data"]["humanDecisions"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(fs::read(&catalog).unwrap(), before_reads);
 
     let stale = invoke(
         &catalog,
