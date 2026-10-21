@@ -618,6 +618,77 @@ fn chronology_clock_question_cli_previews_applies_and_keeps_human_decision_visib
         String::from_utf8_lossy(&decision_preview.stderr)
     );
     let decision_preview: Value = serde_json::from_slice(&decision_preview.stdout).unwrap();
+    let mut rejected_with_epoch = decision_preview["data"]["data"].clone();
+    rejected_with_epoch["decision"]["kind"] = Value::String("rejected".into());
+    rejected_with_epoch["decision"]["alternativeId"] = Value::Null;
+    let rejected_attempt = invoke_with_stdin(
+        &catalog_path,
+        ["chronology", "apply", "--project", &project, "--input", "-"],
+        &serde_json::json!({"kind":"questionDecision","preview":rejected_with_epoch}).to_string(),
+    );
+    assert!(!rejected_attempt.status.success());
+    assert!(rejected_attempt.stdout.is_empty());
+    let rejected_error: Value = serde_json::from_slice(&rejected_attempt.stderr).unwrap();
+    assert_eq!(
+        rejected_error["error"]["code"],
+        "chronology.invalid_reference"
+    );
+    assert!(
+        rejected_error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("rejected decision must not include a clock correction preview")
+    );
+
+    let mut mismatched_epoch = decision_preview["data"]["data"].clone();
+    mismatched_epoch["clockEpochPreview"]["epoch"]["offsetSeconds"] =
+        Value::Number((86_401_i64).into());
+    let mismatch_attempt = invoke_with_stdin(
+        &catalog_path,
+        ["chronology", "apply", "--project", &project, "--input", "-"],
+        &serde_json::json!({"kind":"questionDecision","preview":mismatched_epoch}).to_string(),
+    );
+    assert!(!mismatch_attempt.status.success());
+    assert!(mismatch_attempt.stdout.is_empty());
+    let mismatch_error: Value = serde_json::from_slice(&mismatch_attempt.stderr).unwrap();
+    assert_eq!(
+        mismatch_error["error"]["code"],
+        "chronology.invalid_reference"
+    );
+    assert!(
+        mismatch_error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("clock correction preview does not match the selected alternative")
+    );
+    let still_open = success(
+        &catalog_path,
+        ["chronology", "questions", "--project", &project],
+    );
+    assert_eq!(
+        still_open.json["data"]["openQuestions"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        still_open.json["data"]["humanDecisions"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let epochs_after_failed_applies = success(
+        &catalog_path,
+        ["chronology", "epochs", "--project", &project],
+    );
+    assert!(
+        epochs_after_failed_applies.json["data"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+
     let applied = invoke_with_stdin(
         &catalog_path,
         ["chronology", "apply", "--project", &project, "--input", "-"],

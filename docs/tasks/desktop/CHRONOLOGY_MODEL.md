@@ -324,8 +324,12 @@ distinguishing solver-consistent placement from externally anchored and
 owner-accepted chronology. For a decision, preview with
 `kind: "questionDecision"` and a decision containing `questionId`, `kind`
 (`accepted` or `rejected`), `alternativeId` for acceptance, and `note`; apply
-the returned preview unchanged. Excerpts are project asset ids and
-clip-relative ranges, so a UI or media client can open the selected proxies and
+the returned preview unchanged. The core verifies that a rejected decision
+has no epoch preview and that an accepted preview's epoch exactly matches its
+chosen alternative before committing either operation. A forged or altered
+preview fails with `chronology.invalid_reference` and leaves the question
+unanswered. Excerpts are project asset ids and clip-relative ranges, so a UI
+or media client can open the selected proxies and
 independent reference clips without embedding media bytes in chronology
 operations.
 

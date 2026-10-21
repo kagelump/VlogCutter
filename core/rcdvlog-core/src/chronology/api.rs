@@ -2286,7 +2286,39 @@ impl Catalog {
             .into());
         }
         validate_decision(&current, &preview.decision)?;
-        if let Some(epoch_preview) = &preview.clock_epoch_preview {
+        let expected_epoch_preview = match preview.decision.kind {
+            ClockQuestionDecisionKind::Rejected => {
+                if preview.clock_epoch_preview.is_some() {
+                    return Err(ChronologyError::InvalidReference(
+                        "rejected decision must not include a clock correction preview".into(),
+                    )
+                    .into());
+                }
+                None
+            }
+            ClockQuestionDecisionKind::Accepted => {
+                let alternative = current
+                    .alternatives
+                    .iter()
+                    .find(|alternative| {
+                        Some(alternative.id.as_str()) == preview.decision.alternative_id.as_deref()
+                    })
+                    .expect("validated accepted decision selects an alternative");
+                let epoch_preview = preview.clock_epoch_preview.as_ref().ok_or_else(|| {
+                    ChronologyError::InvalidReference(
+                        "accepted decision has no clock correction preview".into(),
+                    )
+                })?;
+                if epoch_preview.epoch != alternative.epoch {
+                    return Err(ChronologyError::InvalidReference(
+                        "clock correction preview does not match the selected alternative".into(),
+                    )
+                    .into());
+                }
+                Some(epoch_preview)
+            }
+        };
+        if let Some(epoch_preview) = expected_epoch_preview {
             let recomputed = Self::clock_epoch_impact_from_facts(facts, &epoch_preview.epoch)?;
             if recomputed != *epoch_preview {
                 return Err(ChronologyError::InvalidReference(
@@ -2295,11 +2327,6 @@ impl Catalog {
                 .into());
             }
             Self::commit_clock_epoch(&transaction, project_id, &recomputed)?;
-        } else if preview.decision.kind == ClockQuestionDecisionKind::Accepted {
-            return Err(ChronologyError::InvalidReference(
-                "accepted decision has no clock correction preview".into(),
-            )
-            .into());
         }
         let revision = current_revision(&transaction, project_id, "clockQuestion", &current.id)?;
         let accepted = preview.decision.kind == ClockQuestionDecisionKind::Accepted;

@@ -3371,6 +3371,46 @@ fn clock_question_accept_reject_revise_and_stale_preview_are_revision_safe() {
         .catalog
         .preview_clock_question_decision(&fixture.project_id, &rejected)
         .unwrap();
+    let before_tampered_rejection = fixture
+        .catalog
+        .chronology_facts(&fixture.project_id)
+        .unwrap();
+    let mut tampered_rejection = preview.clone();
+    let mut forged_accepted = fixture
+        .catalog
+        .preview_clock_question_decision(
+            &fixture.project_id,
+            &ClockQuestionDecision {
+                question_id: question.id.clone(),
+                kind: ClockQuestionDecisionKind::Accepted,
+                alternative_id: Some("date-b".into()),
+                note: "synthetic candidate".into(),
+            },
+        )
+        .unwrap();
+    tampered_rejection.clock_epoch_preview = forged_accepted.clock_epoch_preview.take();
+    let error = fixture
+        .catalog
+        .apply_clock_question_decision(&fixture.project_id, &tampered_rejection)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("chronology.invalid_reference"));
+    assert!(error.contains("rejected decision must not include a clock correction preview"));
+    assert_eq!(
+        fixture
+            .catalog
+            .chronology_facts(&fixture.project_id)
+            .unwrap(),
+        before_tampered_rejection
+    );
+    assert_eq!(
+        fixture
+            .catalog
+            .chronology_snapshot(&fixture.project_id)
+            .unwrap()
+            .clock_questions,
+        vec![question.clone()]
+    );
     fixture
         .catalog
         .apply_clock_question_decision(&fixture.project_id, &preview)
@@ -3411,6 +3451,39 @@ fn clock_question_accept_reject_revise_and_stale_preview_are_revision_safe() {
         .catalog
         .preview_clock_question_decision(&fixture.project_id, &accepted)
         .unwrap();
+    let mut mismatched_epoch = preview.clone();
+    mismatched_epoch
+        .clock_epoch_preview
+        .as_mut()
+        .unwrap()
+        .epoch
+        .offset_seconds += 1;
+    let before_mismatched_acceptance = fixture
+        .catalog
+        .chronology_facts(&fixture.project_id)
+        .unwrap();
+    let error = fixture
+        .catalog
+        .apply_clock_question_decision(&fixture.project_id, &mismatched_epoch)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("chronology.invalid_reference"));
+    assert!(error.contains("clock correction preview does not match the selected alternative"));
+    assert_eq!(
+        fixture
+            .catalog
+            .chronology_facts(&fixture.project_id)
+            .unwrap(),
+        before_mismatched_acceptance
+    );
+    assert_eq!(
+        fixture
+            .catalog
+            .chronology_snapshot(&fixture.project_id)
+            .unwrap()
+            .clock_questions,
+        vec![revised.clone()]
+    );
     assert!(
         preview
             .clock_epoch_preview
