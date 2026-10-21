@@ -910,6 +910,80 @@ fn available_tool(doctor: &Value, name: &str) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+#[test]
+fn chronology_reads_schema_25_without_migration_and_reports_revision_drift_stably() {
+    let directory = tempdir().unwrap();
+    let catalog = directory.path().join("schema-25.sqlite");
+    let project_id = create_project(&catalog, "schema-25 chronology");
+    {
+        let connection = Connection::open(&catalog).unwrap();
+        connection
+            .execute(
+                "INSERT INTO assets(id, project_id, fingerprint, path, filename, size_bytes, duration_seconds, camera, created_at) VALUES ('asset_old', ?1, 'fingerprint', '', 'clip_0001.mp4', 0, 1.0, 'Camera', '2025-12-01T00:00:00Z')",
+                [&project_id],
+            )
+            .unwrap();
+        // Reconstruct the published schema-25 boundary: migrations 26 and 27
+        // were not applied, so their table/column and history rows are absent.
+        connection
+            .execute_batch(
+                "ALTER TABLE assets DROP COLUMN timestamp_candidates_json;
+             DROP TABLE asset_video_validation;
+             DELETE FROM schema_migrations WHERE migration_id IN (26, 27);",
+            )
+            .unwrap();
+    }
+
+    let inspection = success(&catalog, ["catalog", "inspect"]);
+    assert_eq!(inspection.json["data"]["schemaStatus"], "upgrade_available");
+    let before_reads = fs::read(&catalog).unwrap();
+
+    let status = success(&catalog, ["chronology", "status", "--project", &project_id]);
+    assert_eq!(status.json["data"]["counts"]["assets"], 1);
+    assert_eq!(status.json["data"]["orderedAssetIds"][0], "asset_old");
+
+    let sequences = success(
+        &catalog,
+        ["chronology", "sequences", "--project", &project_id],
+    );
+    assert!(sequences.json["data"]["proposedSplits"].is_array());
+    success(&catalog, ["chronology", "epochs", "--project", &project_id]);
+    let evidence = success(
+        &catalog,
+        ["chronology", "evidence", "--project", &project_id],
+    );
+    assert_eq!(
+        evidence.json["data"]["assets"][0]["asset"]["assetId"],
+        "asset_old"
+    );
+    assert!(evidence.json["data"]["assets"][0]["timestampCandidates"].is_null());
+
+    let stale = invoke(
+        &catalog,
+        [
+            "chronology",
+            "evidence",
+            "--project",
+            &project_id,
+            "--facts-revision",
+            "stale-revision",
+        ],
+    );
+    assert!(!stale.status.success());
+    assert!(stale.stdout.is_empty());
+    let stderr: Value = serde_json::from_slice(&stale.stderr).unwrap();
+    assert_eq!(stderr["ok"], false);
+    assert_eq!(stderr["command"], "chronology.evidence");
+    assert_eq!(stderr["error"]["code"], "chronology.facts_changed");
+    assert!(
+        stderr["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("chronology.facts_changed")
+    );
+    assert_eq!(fs::read(&catalog).unwrap(), before_reads);
+}
+
 fn create_media_fixture(ffmpeg: &Path, output: &Path) {
     let status = Command::new(ffmpeg)
         .args([

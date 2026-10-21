@@ -111,14 +111,15 @@ pub use cameras::{
 pub use chronology::{
     AppliedCorrection, AssetChronology, AssetTimeHypothesis, CaptureSequence,
     CaptureSequenceMergePreview, CaptureSequenceReassignmentPreview, CaptureSequenceSplitPreview,
-    ChronologyError, ChronologyEvidenceAsset, ChronologyEvidencePage, ChronologyExplanation,
-    ChronologyFacts, ChronologyImpact, ChronologyImpactChange, ChronologyMutation,
-    ChronologyMutationPreview, ChronologySnapshot, ChronologySolution, ClipTimeException,
-    ClockEpoch, ClockEpochClearPreview, ClockEpochImpactPreview, ConstraintStrength, Contradiction,
-    ContradictionKind, DisplayMode, DisplayTime, EventOrderConstraint, Evidence, OrderKey,
-    PhaseKind, PhaseSplitDirection, QuarantinedOperation, QueuePosition, SplitProposal,
-    TimestampCandidate, TripPhase, VisualPlacementPreview, VisualPlacementSide, covering_phase,
-    display_time, is_valid_timezone, resolve_anchored_phases, solve,
+    ChronologyError, ChronologyEvidenceAsset, ChronologyEvidenceError, ChronologyEvidencePage,
+    ChronologyExplanation, ChronologyFacts, ChronologyImpact, ChronologyImpactChange,
+    ChronologyMutation, ChronologyMutationPreview, ChronologySnapshot, ChronologySolution,
+    ClipTimeException, ClockEpoch, ClockEpochClearPreview, ClockEpochImpactPreview,
+    ConstraintStrength, Contradiction, ContradictionKind, DisplayMode, DisplayTime,
+    EventOrderConstraint, Evidence, OrderKey, PhaseKind, PhaseSplitDirection, QuarantinedOperation,
+    QueuePosition, SplitProposal, TimestampCandidate, TripPhase, VisualPlacementPreview,
+    VisualPlacementSide, covering_phase, display_time, is_valid_timezone, resolve_anchored_phases,
+    solve,
 };
 pub use diagnostics::{
     Diagnostic, DiagnosticCounts, DiagnosticFilter, DiagnosticRecord, DiagnosticSeverity,
