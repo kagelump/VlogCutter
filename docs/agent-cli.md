@@ -419,6 +419,59 @@ Transcription is offline and reads proxies only. Vision analysis reads proxy-der
 
 `analyze status` and `labels vocabulary` are strictly read-only. Analysis progress is emitted as JSON on stderr.
 
+### Bounded within-clip moment discovery
+
+```bash
+rcdvlog --catalog /absolute/project/catalog.sqlite3 moments plan \
+  --project <project-id> --asset <asset-id> \
+  --provider openrouter --model qwen/qwen3.7-flash --payload frames \
+  --budget-usd 0.25
+rcdvlog --catalog /absolute/project/catalog.sqlite3 moments discover \
+  --project <project-id> --all-usable --provider openrouter \
+  --model qwen/qwen3.7-flash --payload frames-and-transcript --budget-usd 2.00
+rcdvlog --catalog /absolute/project/catalog.sqlite3 moments discover \
+  --project <project-id> --asset <asset-id> --provider openrouter \
+  --model qwen/qwen3.7-flash --payload frames --budget-usd 0.25 \
+  --force --retry-uncertain
+rcdvlog --catalog /absolute/project/catalog.sqlite3 moments list \
+  --project <project-id> --offset 0 --limit 20
+rcdvlog --catalog /absolute/project/catalog.sqlite3 moments get \
+  --asset <asset-id> --offset 0 --limit 8
+```
+
+`moments plan` validates the selected project, assets, model, payload and budget
+without credentials, provider calls, or catalog writes. `discover` requires the
+same explicit project and either one or more repeated `--asset` values or
+`--all-usable`; the latter selects non-removed assets with usable recorded video
+validation in that project. There is no implicit desktop/global asset scope.
+The provider is currently OpenRouter and the model must be in the existing
+approved model registry. `--budget-usd` is required and must be finite and
+positive. Requested provider and the provider actually reported by the selected
+endpoint are recorded separately; missing upstream identity stays missing.
+The artifact also records whether its selected payload included frames alone
+or frames with accepted timed transcript evidence.
+The defaults are 96 coarse frames, 384 refinement frames, at most 8
+candidates per asset, and an edit profile of 3–8 seconds for selects and 20–30
+seconds for justified holds. These frame limits are bounded request budgets,
+not continuous decoding guarantees. Sampling reports its measured sparse gaps;
+the final timestamp is backed off by at least one proxy frame period so the
+extractor requests a decodable frame near the tail. This does not certify the
+unobserved interval or every possible cut.
+
+Use `--payload frames-and-transcript` to include only accepted, timed speech
+derived from the current proxy. `--force` explicitly replaces completed derived
+evidence. A pending or interrupted request with unknown usage blocks automatic
+duplicate calls; `--retry-uncertain` is the explicit recovery authorization and
+should be used only after reviewing the prior report. A completed run can be
+`ready`, `no_candidates`, `needs_review`, or `unavailable`. `ready` means the
+bounded evidence passed the current checks; sparse frame sampling never
+certifies every instant or a final edit cut. Candidates are suggestions, and
+human review of timing, interpretation, and edit handles remains a separate
+acceptance step. `moments list` and `moments get` are read-only paginated views;
+their offsets page candidates, coverage, request receipts, and review questions
+independently, with totals and `nextOffset` for continuation. Discovery progress
+is emitted as JSON lines on stderr.
+
 `analyze suggest-chronology` makes one bounded, read-only visual evidence request
 for 2–8 selected clips, using at most two selected proxy frames per clip. It
 returns coverage diagnostics and checkable conflicts against the current solved

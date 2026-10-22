@@ -141,6 +141,225 @@ fn create_project(catalog: &Path, name: &str) -> String {
         .to_string()
 }
 
+fn insert_moment_scope_asset(catalog: &Path, project: &str, id: &str, path: &Path) {
+    fs::write(path, b"synthetic clip placeholder").unwrap();
+    let connection = Connection::open(catalog).unwrap();
+    connection.execute(
+        "INSERT INTO assets(id,project_id,fingerprint,path,filename,size_bytes,duration_seconds,created_at)
+         VALUES (?1,?2,?3,?4,?5,24,10,'2026-10-22T00:00:00Z')",
+        params![id, project, format!("fp-{id}"), path.to_string_lossy(), path.file_name().unwrap().to_string_lossy()],
+    ).unwrap();
+    connection.execute(
+        "INSERT INTO asset_video_validation(asset_id,fingerprint,status,diagnostic,validated_at)
+         VALUES (?1,?2,'usable',NULL,'2026-10-22T00:00:00Z')",
+        params![id, format!("fp-{id}")],
+    ).unwrap();
+}
+
+#[test]
+fn moments_plan_and_inventory_are_explicit_scoped_read_only_commands() {
+    let directory = tempdir().unwrap();
+    let catalog = directory.path().join("catalog.sqlite3");
+    let project = create_project(&catalog, "Moment scope CLI");
+    let clip = directory.path().join("fixture.mp4");
+    insert_moment_scope_asset(&catalog, &project, "moment_asset", &clip);
+    let before = fs::read(&catalog).unwrap();
+
+    let planned = success(
+        &catalog,
+        [
+            "moments",
+            "plan",
+            "--project",
+            &project,
+            "--asset",
+            "moment_asset",
+            "--provider",
+            "openrouter",
+            "--model",
+            "qwen/qwen3.7-flash",
+            "--payload",
+            "frames",
+            "--budget-usd",
+            "0.5",
+        ],
+    );
+    assert_eq!(
+        planned.json["data"]["assetIds"],
+        serde_json::json!(["moment_asset"])
+    );
+    assert_eq!(planned.json["data"]["coarseFramesPerAsset"], 96);
+    assert_eq!(planned.json["data"]["refinementFramesPerAsset"], 384);
+
+    let all_usable = success(
+        &catalog,
+        [
+            "moments",
+            "plan",
+            "--project",
+            &project,
+            "--all-usable",
+            "--provider",
+            "openrouter",
+            "--model",
+            "qwen/qwen3.7-flash",
+            "--payload",
+            "frames",
+            "--budget-usd",
+            "0.5",
+        ],
+    );
+    assert_eq!(
+        all_usable.json["data"]["assetIds"],
+        serde_json::json!(["moment_asset"])
+    );
+
+    let listed = success(
+        &catalog,
+        [
+            "moments",
+            "list",
+            "--project",
+            &project,
+            "--offset",
+            "0",
+            "--limit",
+            "1",
+        ],
+    );
+    assert_eq!(listed.json["data"]["items"][0]["assetId"], "moment_asset");
+    assert_eq!(listed.json["data"]["schemaReady"], true);
+
+    let missing_evidence = invoke(&catalog, ["moments", "get", "--asset", "moment_asset"]);
+    assert!(!missing_evidence.status.success());
+    assert!(missing_evidence.stdout.is_empty());
+    let get_error: Value = serde_json::from_slice(&missing_evidence.stderr).unwrap();
+    assert_eq!(get_error["command"], "moments.get");
+    assert!(
+        get_error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("no moment evidence")
+    );
+    assert_eq!(
+        fs::read(&catalog).unwrap(),
+        before,
+        "read-only commands changed catalog bytes"
+    );
+}
+
+#[test]
+fn moments_cli_rejects_implicit_or_invalid_scope_with_json_errors() {
+    let directory = tempdir().unwrap();
+    let catalog = directory.path().join("catalog.sqlite3");
+    let project = create_project(&catalog, "Moment invalid scope CLI");
+
+    let missing_scope = invoke(
+        &catalog,
+        [
+            "moments",
+            "plan",
+            "--project",
+            &project,
+            "--budget-usd",
+            "1",
+        ],
+    );
+    assert!(!missing_scope.status.success());
+    assert!(missing_scope.stdout.is_empty());
+    let parse_error: Value = serde_json::from_slice(&missing_scope.stderr).unwrap();
+    assert_eq!(parse_error["ok"], false);
+    assert_eq!(parse_error["error"]["code"], "invalid_arguments");
+
+    for omitted in ["--provider", "--model", "--payload"] {
+        let mut args = vec![
+            "moments",
+            "plan",
+            "--project",
+            &project,
+            "--asset",
+            "missing_asset",
+            "--provider",
+            "openrouter",
+            "--model",
+            "qwen/qwen3.7-flash",
+            "--payload",
+            "frames",
+            "--budget-usd",
+            "1",
+        ];
+        let option_index = args.iter().position(|arg| *arg == omitted).unwrap();
+        args.drain(option_index..=option_index + 1);
+        let missing_selection = invoke(&catalog, args);
+        assert!(
+            !missing_selection.status.success(),
+            "{omitted} must be explicit"
+        );
+        assert!(missing_selection.stdout.is_empty());
+        let error: Value = serde_json::from_slice(&missing_selection.stderr).unwrap();
+        assert_eq!(error["error"]["code"], "invalid_arguments");
+    }
+
+    let empty_usable = failure(
+        &catalog,
+        [
+            "moments",
+            "plan",
+            "--project",
+            &project,
+            "--all-usable",
+            "--provider",
+            "openrouter",
+            "--model",
+            "qwen/qwen3.7-flash",
+            "--payload",
+            "frames",
+            "--budget-usd",
+            "1",
+        ],
+    );
+    assert!(
+        empty_usable["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("selected no non-removed assets")
+    );
+
+    let clip = directory.path().join("budget-fixture.mp4");
+    insert_moment_scope_asset(&catalog, &project, "budget_asset", &clip);
+    let invalid_budget = invoke(
+        &catalog,
+        [
+            "moments",
+            "plan",
+            "--project",
+            &project,
+            "--asset",
+            "budget_asset",
+            "--provider",
+            "openrouter",
+            "--model",
+            "qwen/qwen3.7-flash",
+            "--payload",
+            "frames",
+            "--budget-usd",
+            "NaN",
+        ],
+    );
+    assert!(!invalid_budget.status.success());
+    assert!(invalid_budget.stdout.is_empty());
+    let error: Value = serde_json::from_slice(&invalid_budget.stderr).unwrap();
+    assert_eq!(error["ok"], false);
+    assert_eq!(error["command"], "moments.plan");
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("finite and positive"),
+        "unexpected budget error: {error}"
+    );
+}
+
 #[test]
 fn camera_proxy_cli_commands_are_discoverable_and_have_clear_empty_missing_results() {
     let directory = tempdir().unwrap();

@@ -71,12 +71,13 @@ pub use analysis::chronology_suggestions::{
 };
 pub use analysis::consolidate::{ConsolidationReport, LabelMapping, LabelProposal};
 pub use analysis::framepack::{FramePackManifest, build_frame_pack, encode_frames};
+pub use analysis::moments;
 pub use analysis::openrouter::{
     OpenRouterProvider, frame_data_uri, key_file_path, resolve_api_key,
 };
 pub use analysis::provider::{
     ChainOutcome, DEFAULT_MODEL, FALLBACK_MODEL, MODELS, ModelSpec, ProviderChain, VlmProvider,
-    VlmRequest, VlmResponse, model_spec,
+    VlmReceipt, VlmRequest, VlmResponse, model_spec,
 };
 pub use archive::{ArchiveRoot, EndpointProbe};
 pub use batch_estimator::BatchEstimate as BatchProgressEstimate;
@@ -112,6 +113,10 @@ pub use prerequisites::{
 };
 pub use representation::{ProxyWrite, RepresentationBusy, RepresentationClaim, RepresentationKind};
 
+pub use analysis::moments::{
+    EditProfile, MomentArtifact, MomentCandidate, MomentInventoryPage, MomentPage, MomentPayload,
+    MomentPlan, MomentProgress, MomentRunOptions, MomentRunReport, MomentStatus,
+};
 pub use analysis::quality::DecodedSegment;
 pub use analysis::schema::{
     CameraMovement, ClipObservation, DomainError, UnusableReason, output_schema,
@@ -6332,6 +6337,44 @@ pub(crate) mod tests {
 
     #[test]
     fn unversioned_current_catalog_upgrades_once_without_changing_ids_or_annotations() {
+        type ArtifactRow = (String, String, String, String);
+        type StepRow = (String, String, String, String, String);
+
+        fn moment_rows(catalog: &Catalog) -> (ArtifactRow, StepRow, i64, i64) {
+            let connection = catalog.connection().unwrap();
+            let artifact = connection
+                .query_row(
+                    "SELECT asset_id,identity,body_json,created_at FROM moment_artifacts",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .unwrap();
+            let step = connection
+                .query_row(
+                    "SELECT asset_id,identity,step_key,body_json,created_at FROM moment_steps",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ))
+                    },
+                )
+                .unwrap();
+            let artifact_count = connection
+                .query_row("SELECT COUNT(*) FROM moment_artifacts", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            let step_count = connection
+                .query_row("SELECT COUNT(*) FROM moment_steps", [], |row| row.get(0))
+                .unwrap();
+            (artifact, step, artifact_count, step_count)
+        }
+
         let directory = tempdir().unwrap();
         let path = directory.path().join("catalog.sqlite3");
         let catalog = Catalog::open(&path).unwrap();
@@ -6358,6 +6401,17 @@ pub(crate) mod tests {
                 },
             )
             .unwrap();
+        catalog.connection().unwrap().execute(
+            "INSERT INTO moment_artifacts(asset_id,identity,body_json,created_at) VALUES ('asset_existing','base-identity','{\"preserved\":\"artifact\"}','artifact-created')",
+            [],
+        ).unwrap();
+        catalog.connection().unwrap().execute(
+            "INSERT INTO moment_steps(asset_id,identity,step_key,body_json,created_at) VALUES ('asset_existing','base-identity','coarse:0','{\"preserved\":\"step\"}','step-created')",
+            [],
+        ).unwrap();
+        let expected_moment_rows = moment_rows(&catalog);
+        assert_eq!(expected_moment_rows.2, 1);
+        assert_eq!(expected_moment_rows.3, 1);
         drop(catalog);
 
         Connection::open(&path)
@@ -6379,6 +6433,11 @@ pub(crate) mod tests {
         assert_eq!(upgraded_asset.notes, "preserved note");
         assert_eq!(upgraded_asset.labels, vec!["arrival"]);
         assert!(upgraded_asset.removed);
+        assert_eq!(
+            moment_rows(&upgraded),
+            expected_moment_rows,
+            "migration replay must preserve cached moment artifacts and resumable steps"
+        );
         drop(upgraded);
 
         let first_history = inspect_catalog(&path).unwrap().applied_migrations;
@@ -6387,6 +6446,11 @@ pub(crate) mod tests {
         assert_eq!(
             reopened.get_asset("asset_existing").unwrap().id,
             "asset_existing"
+        );
+        assert_eq!(
+            moment_rows(&reopened),
+            expected_moment_rows,
+            "reopening the upgraded catalog must retain the exact moment rows"
         );
         drop(reopened);
         let reopened_inspection = inspect_catalog(&path).unwrap();

@@ -223,6 +223,7 @@ pub fn analyze_clip(
             ) {
                 Ok(observation) => {
                     let usage = aggregate(&fallback);
+                    let usage_complete = first.usage_complete && fallback.receipt.usage_complete;
                     Ok(AnalysisOutcome {
                         observation: Some(observation),
                         reject_reason: String::new(),
@@ -239,11 +240,12 @@ pub fn analyze_clip(
                             .cloned()
                             .chain([fallback_model.to_string()])
                             .collect(),
-                        usage_complete: first.usage_complete,
+                        usage_complete,
                     })
                 }
                 Err(fallback_error) => {
                     let usage = aggregate(&fallback);
+                    let usage_complete = first.usage_complete && fallback.receipt.usage_complete;
                     let mut outcome = rejected(
                         &fallback,
                         first.attempts + 1,
@@ -259,7 +261,7 @@ pub fn analyze_clip(
                             .cloned()
                             .chain([fallback_model.to_string()])
                             .collect(),
-                        first.usage_complete,
+                        usage_complete,
                     );
                     outcome.prompt_tokens = usage.0;
                     outcome.completion_tokens = usage.1;
@@ -319,13 +321,22 @@ mod tests {
             if response == "__ERROR__" {
                 bail!("scripted provider failure")
             }
+            let (response, usage_complete) = response
+                .strip_prefix("__INCOMPLETE_RECEIPT__")
+                .map_or((response.as_str(), true), |body| (body, false));
             Ok(VlmResponse {
                 model: model.into(),
-                body: response,
+                body: response.to_owned(),
                 prompt_tokens: 10,
                 completion_tokens: 2,
                 cost_usd: 0.001,
                 latency_ms: 5,
+                receipt: crate::analysis::provider::VlmReceipt {
+                    actual_model: Some(model.into()),
+                    provider: Some("fake".into()),
+                    generation_id: Some("fake-generation".into()),
+                    usage_complete,
+                },
             })
         }
     }
@@ -374,6 +385,27 @@ mod tests {
             vec![DEFAULT_MODEL, FALLBACK_MODEL]
         );
         assert!(outcome.usage_complete);
+    }
+
+    #[test]
+    fn domain_invalid_fallback_usage_requires_both_provider_receipts() {
+        let fake = Fake {
+            bodies: Mutex::new(vec![
+                "{}".into(),
+                format!("__INCOMPLETE_RECEIPT__{}", valid()),
+            ]),
+            calls: Mutex::default(),
+        };
+        let outcome = analyze_clip(
+            &fake,
+            &ProviderChain::new(),
+            &context(TranscriptStatus::NoSpeech),
+            vec![],
+        )
+        .unwrap();
+        assert!(outcome.observation.is_some());
+        assert_eq!(outcome.cost_usd, 0.002);
+        assert!(!outcome.usage_complete);
     }
 
     #[test]

@@ -525,7 +525,7 @@ Always pass `--catalog` in agent automation, tests, and temporary workflows. A d
 
 SQLite connections enable foreign keys, WAL journal mode, and a five-second busy timeout. Read operations can continue during an uncommitted writer. Project mutations append typed operations with materialized revisions. Adopted projects synchronize bounded operation pages between independent local catalogs; live SQLite/WAL files are never copied or placed on NAS.
 
-Project catalogs use an explicit `schema_migrations` history and are currently at version 23. The server control catalog is version 10; backup format is version 1. Migration definitions have immutable names/source identities and each migration commits atomically. Migration 18 includes a one-time compatibility reconciliation for catalogs created on the import feature branch before its migration IDs were merged with main. When changing the schema:
+Project catalogs use an explicit `schema_migrations` history and are currently at version 31. The server control catalog is version 10; backup format is version 1. Migration definitions have immutable names/source identities and each migration commits atomically. Migration 18 includes a one-time compatibility reconciliation for catalogs created on the import feature branch before its migration IDs were merged with main. When changing the schema:
 
 - Preserve existing catalogs; never solve migration issues by deleting the database.
 - Add a forward migration and an upgrade test using an older schema fixture.
@@ -726,6 +726,15 @@ when one is current. The OpenRouter key resolves from `OPENROUTER_API_KEY` or
   this project's own observed cost per clip, falling back to
   `REFERENCE_COST_PER_CLIP_USD` until the first run. Like `analysis_labels`, the
   table is local and unsynced.
+
+Within-clip moment discovery lives in `analysis/moments` and is exposed through
+the thin `moments plan/discover/list/get` CLI adapter. It requires explicit
+project/asset scope, provider, model, payload and spend ceiling, reuses current
+proxies and accepted timed speech, and stores resumable steps and evidence in
+SQLite. Reuse the shared representation claims and analysis-run accounting;
+unknown usage blocks new paid requests until explicit recovery authorization.
+Sparse coverage and candidate ranges remain suggestions requiring manual
+review; discovery never changes inclusion, human annotations or chronology.
 
 **Measured end to end**, 2026-08-04, M3 MacBook Air, four workers, 273-clip
 Osaka/Expo project:

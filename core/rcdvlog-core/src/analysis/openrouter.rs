@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use crate::analysis::provider::{FALLBACK_MODEL, VlmProvider, VlmRequest, VlmResponse};
+use crate::analysis::provider::{FALLBACK_MODEL, VlmProvider, VlmReceipt, VlmRequest, VlmResponse};
 
 const DEFAULT_BASE_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
@@ -208,6 +208,47 @@ pub fn extract_usage(payload: &Value) -> (u32, u32, f64) {
     )
 }
 
+/// Captures only provenance fields explicitly reported by OpenRouter.
+pub fn extract_receipt(payload: &Value) -> VlmReceipt {
+    // Oversized or blank metadata is unknown provenance, never a truncated
+    // identity that could be confused with a different provider execution.
+    let bounded = |value: &str, limit| !value.trim().is_empty() && value.len() <= limit;
+    let model = payload["model"]
+        .as_str()
+        .filter(|value| bounded(value, 256));
+    let generation_id = payload["id"].as_str().filter(|value| bounded(value, 512));
+    let provider = payload["openrouter_metadata"]["endpoints"]["available"]
+        .as_array()
+        .and_then(|endpoints| {
+            endpoints.iter().find_map(|endpoint| {
+                (endpoint["selected"].as_bool() == Some(true))
+                    .then(|| endpoint["provider"].as_str())
+                    .flatten()
+                    .filter(|value| bounded(value, 256))
+            })
+        })
+        .or_else(|| {
+            payload["provider"]
+                .as_str()
+                .filter(|value| bounded(value, 256))
+        });
+
+    let usage = &payload["usage"];
+    let cost = usage["cost"].as_f64();
+    let prompt_tokens = usage["prompt_tokens"].as_u64();
+    let completion_tokens = usage["completion_tokens"].as_u64();
+    let usage_complete = cost.is_some_and(|value| value.is_finite() && value >= 0.0)
+        && prompt_tokens.is_some_and(|value| u32::try_from(value).is_ok())
+        && completion_tokens.is_some_and(|value| u32::try_from(value).is_ok());
+
+    VlmReceipt {
+        actual_model: model.map(str::to_owned),
+        provider: provider.map(str::to_owned),
+        generation_id: generation_id.map(str::to_owned),
+        usage_complete,
+    }
+}
+
 impl VlmProvider for OpenRouterProvider {
     fn analyze(&self, model: &str, request: &VlmRequest) -> Result<VlmResponse> {
         let body = build_request_body(model, &request.prompt, &request.frames, &request.schema);
@@ -217,6 +258,7 @@ impl VlmProvider for OpenRouterProvider {
             .post(&self.base_url)
             .bearer_auth(&self.api_key)
             .header("Content-Type", "application/json")
+            .header("X-OpenRouter-Metadata", "enabled")
             .json(&body)
             .send()
             .context("send OpenRouter request")?;
@@ -232,6 +274,7 @@ impl VlmProvider for OpenRouterProvider {
 
         let payload: Value = response.json().context("decode OpenRouter response")?;
         let (prompt_tokens, completion_tokens, cost_usd) = extract_usage(&payload);
+        let receipt = extract_receipt(&payload);
         let mut content = extract_content(&payload)?;
         if model == FALLBACK_MODEL {
             content = normalize_gemini_content(content)?;
@@ -243,6 +286,7 @@ impl VlmProvider for OpenRouterProvider {
             completion_tokens,
             cost_usd,
             latency_ms: started.elapsed().as_millis() as u64,
+            receipt,
         })
     }
 }
@@ -267,6 +311,78 @@ mod tests {
         assert!(content.iter().any(|part| part["type"] == "text"));
         assert!(body["response_format"]["json_schema"]["schema"].is_object());
         assert_eq!(body["response_format"]["json_schema"]["strict"], true);
+    }
+
+    #[test]
+    fn receipt_parses_actual_model_selected_provider_and_complete_usage() {
+        let requested_model = "router/model-alias";
+        let receipt = extract_receipt(&json!({
+            "id": "gen-42",
+            "model": "provider/actual-model",
+            "openrouter_metadata": {"endpoints": {"available": [
+                {"provider": "Other", "selected": false},
+                {"provider": "Provider A", "selected": true}
+            ]}},
+            "usage": {"cost": 0.004, "prompt_tokens": 20, "completion_tokens": 7}
+        }));
+        assert_eq!(
+            receipt.actual_model.as_deref(),
+            Some("provider/actual-model")
+        );
+        assert_ne!(receipt.actual_model.as_deref(), Some(requested_model));
+        assert_eq!(receipt.provider.as_deref(), Some("Provider A"));
+        assert_eq!(receipt.generation_id.as_deref(), Some("gen-42"));
+        assert!(receipt.usage_complete);
+    }
+
+    #[test]
+    fn receipt_does_not_infer_missing_provenance_or_usage() {
+        let receipt = extract_receipt(&json!({
+            "usage": {"prompt_tokens": 1, "completion_tokens": 2}
+        }));
+        assert_eq!(receipt.actual_model, None);
+        assert_eq!(receipt.provider, None);
+        assert_eq!(receipt.generation_id, None);
+        assert!(!receipt.usage_complete);
+
+        let zero_cost = extract_receipt(&json!({
+            "provider": "legacy-provider",
+            "usage": {"cost": 0, "prompt_tokens": 0, "completion_tokens": 0}
+        }));
+        assert_eq!(zero_cost.provider.as_deref(), Some("legacy-provider"));
+        assert!(zero_cost.usage_complete);
+    }
+
+    #[test]
+    fn receipt_bounds_reported_metadata_without_discarding_valid_usage() {
+        let oversized_model = "m".repeat(257);
+        let oversized_provider = "p".repeat(257);
+        let oversized_id = "i".repeat(513);
+        let receipt = extract_receipt(&json!({
+            "id": oversized_id,
+            "model": oversized_model,
+            "openrouter_metadata": {"endpoints": {"available": [
+                {"provider": oversized_provider, "selected": true}
+            ]}},
+            "usage": {"cost": 0.01, "prompt_tokens": 10, "completion_tokens": 5}
+        }));
+        assert_eq!(receipt.actual_model, None);
+        assert_eq!(receipt.provider, None);
+        assert_eq!(receipt.generation_id, None);
+        assert!(
+            receipt.usage_complete,
+            "valid cost and token counts remain usable"
+        );
+
+        let blank = extract_receipt(&json!({
+            "id": "  ", "model": "\t",
+            "provider": " ",
+            "usage": {"cost": 0, "prompt_tokens": 0, "completion_tokens": 0}
+        }));
+        assert_eq!(blank.actual_model, None);
+        assert_eq!(blank.provider, None);
+        assert_eq!(blank.generation_id, None);
+        assert!(blank.usage_complete);
     }
 
     #[test]

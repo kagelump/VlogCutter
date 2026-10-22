@@ -103,12 +103,20 @@ export async function settle(harness: DesktopHarness, options: { waitFor?: "read
         expect(harness.calls("record_desktop_context")).toContainEqual({ projectId, assetId: null });
         return;
       }
+      // Read the cheap command log first. Repeated accessible-role traversal
+      // while the debounced context write is still pending can monopolize the
+      // event loop on a large queue and delay the write this poll is waiting for.
+      const latestContext = harness.calls("record_desktop_context").at(-1);
+      expect(latestContext).toMatchObject({
+        projectId,
+        assetId: expect.any(String),
+      });
       const selected = selectedRow();
       expect(selected).toBeDefined();
       const position = Number(selected?.getAttribute("aria-posinset"));
       const selectedAsset = visibleAssets[position - 1];
       expect(selectedAsset).toBeDefined();
-      expect(harness.calls("record_desktop_context")).toContainEqual({
+      expect(latestContext).toEqual({
         projectId,
         assetId: selectedAsset.id,
       });
@@ -146,5 +154,6 @@ export function queueHeadlines(): string[] {
 }
 
 export function selectedRow(): HTMLElement | undefined {
-  return queueRows().find((row) => row.getAttribute("aria-selected") === "true");
+  return within(screen.getByRole("listbox", { name: "Clips" }))
+    .queryByRole<HTMLElement>("option", { selected: true }) ?? undefined;
 }
