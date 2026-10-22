@@ -39,6 +39,7 @@ mod migrations;
 mod operations;
 mod preflight;
 mod prerequisites;
+mod representation;
 mod stall;
 mod storage;
 mod volumes;
@@ -109,6 +110,7 @@ pub use prerequisites::{
     MediaPrerequisiteError, ToolPrerequisiteStatus, ToolStatus, ensure_media_prerequisites,
     prerequisite_status,
 };
+pub use representation::{ProxyWrite, RepresentationBusy, RepresentationClaim, RepresentationKind};
 
 pub use analysis::quality::DecodedSegment;
 pub use analysis::schema::{
@@ -1970,54 +1972,31 @@ impl Catalog {
     where
         F: FnMut(f64),
     {
+        let write = self
+            .begin_proxy_write(asset_id)?
+            .ok_or_else(|| RepresentationBusy {
+                asset_id: asset_id.to_owned(),
+                kind: RepresentationKind::Proxy,
+            })?;
         let asset = self.refresh_asset_orientation(asset_id)?;
-        // Proves the bytes are still this clip's before spending a transcode on
-        // them. A proxy built from a reused pathname would be wrong footage
-        // wearing the right name, and nothing downstream would catch it.
+        // Prove this is still the original clip before transcoding.
         self.resolve_original(asset_id)?;
-        let parent = self
-            .database_path
-            .parent()
-            .ok_or_else(|| anyhow!("catalog has no parent directory"))?;
-        let proxy_dir = parent.join("cache").join("proxies").join(&asset.project_id);
-        fs::create_dir_all(&proxy_dir)?;
-        let output = proxy_dir.join(format!("{}.{}.mp4", asset.id, PROXY_CACHE_VERSION));
-        let temporary = proxy_dir.join(format!("{}.{}.tmp.mp4", asset.id, PROXY_CACHE_VERSION));
+        let temporary = write.temporary_path();
         let result = run_proxy_ffmpeg(
             Path::new(&asset.path),
-            &temporary,
+            temporary,
             asset.duration_seconds,
             &mut on_progress,
         )?;
         if !result.status.success() {
-            let _ = fs::remove_file(&temporary);
+            let _ = fs::remove_file(temporary);
             return Err(media_tool_failure(
                 "ffmpeg proxy generation",
                 result.status,
                 result.diagnostic,
             ));
         }
-        let proxy_probe = probe_media_stream(&temporary);
-        match proxy_probe {
-            Ok(probe) if probe.metadata_rotation_degrees == 0 => {}
-            Ok(probe) => {
-                let _ = fs::remove_file(&temporary);
-                bail!(
-                    "ffmpeg proxy validation failed: output retains a {}° display rotation",
-                    probe.metadata_rotation_degrees
-                );
-            }
-            Err(error) => {
-                let _ = fs::remove_file(&temporary);
-                return Err(error).context("validate generated proxy");
-            }
-        }
-        fs::rename(&temporary, &output).context("commit generated proxy")?;
-        self.connection()?.execute(
-            "UPDATE assets SET proxy_path = ?2 WHERE id = ?1",
-            params![asset_id, output.to_string_lossy()],
-        )?;
-        self.get_asset(asset_id)
+        self.commit_proxy_write(write, None)
     }
 
     /// Explicitly refreshes legacy orientation metadata from the immutable original.
@@ -2936,7 +2915,11 @@ impl Catalog {
                     .join("thumbnails")
                     .join(asset_id)
                     .join("q10.v1.jpg");
-                commit_thumbnail(&self.connection()?, asset_id, source, &destination)?;
+                if let Some(_claim) =
+                    self.try_claim_representation(asset_id, RepresentationKind::Thumbnail)?
+                {
+                    commit_thumbnail(&self.connection()?, asset_id, source, &destination)?;
+                }
             }
         }
         save_analysis(&self.connection()?, &stored)?;
@@ -3505,6 +3488,12 @@ impl Catalog {
                                 self.save_batch_history(task_kind, estimator.history())?;
                                 Some(updated)
                             }
+                            Err(error) if error.is::<RepresentationBusy>() => {
+                                // Advance completion without training throughput.
+                                estimator.record_failure(asset.size_bytes);
+                                report.skipped += 1;
+                                None
+                            }
                             Err(error) => {
                                 estimator.record_failure(asset.size_bytes);
                                 report.failures.push(IngestFailure {
@@ -3541,6 +3530,21 @@ impl Catalog {
         if quality != 1 {
             bail!("invalid thumbnail quality {quality}; MVP supports quality 1");
         }
+        let claim = self.claim_representation(asset_id, RepresentationKind::Thumbnail)?;
+        self.generate_thumbnail_with_claim(&claim, quality)
+    }
+
+    /// Execute an already-reserved thumbnail without reacquiring its claim.
+    pub fn generate_thumbnail_with_claim(
+        &self,
+        claim: &RepresentationClaim,
+        quality: u8,
+    ) -> Result<Asset> {
+        if quality != 1 {
+            bail!("invalid thumbnail quality {quality}; MVP supports quality 1");
+        }
+        let asset_id = claim.asset_id();
+        self.validate_representation_claim(claim, asset_id, RepresentationKind::Thumbnail)?;
         let asset = self.get_asset(asset_id)?;
         let input = if let Some(proxy) = asset
             .proxy_path
@@ -3558,7 +3562,10 @@ impl Catalog {
         let thumbnail_dir = parent.join("cache").join("thumbnails").join(&asset.id);
         fs::create_dir_all(&thumbnail_dir)?;
         let output = thumbnail_dir.join(format!("q{quality}.{THUMBNAIL_CACHE_VERSION}.jpg"));
-        let temporary = thumbnail_dir.join(format!("q{quality}.{THUMBNAIL_CACHE_VERSION}.tmp.jpg"));
+        let temporary = thumbnail_dir.join(format!(
+            "q{quality}.{THUMBNAIL_CACHE_VERSION}.{}.tmp.jpg",
+            Uuid::new_v4().simple()
+        ));
         let seek = (asset.duration_seconds.max(0.0) * 0.2).to_string();
         let mut command = tool_command("ffmpeg");
         command
@@ -3644,6 +3651,37 @@ impl Catalog {
         &self,
         asset_ids: &[String],
         quality: u8,
+        on_progress: F,
+    ) -> Result<ThumbnailReport>
+    where
+        F: FnMut(AssetBatchProgress),
+    {
+        self.generate_thumbnail_batch(asset_ids, quality, None, on_progress)
+    }
+
+    /// Batch reserved before entering a desktop execution queue. Claims remain
+    /// held for the whole batch, including validation and catalog commits.
+    pub fn generate_thumbnails_with_claims_with_progress<F>(
+        &self,
+        claims: &[RepresentationClaim],
+        quality: u8,
+        on_progress: F,
+    ) -> Result<ThumbnailReport>
+    where
+        F: FnMut(AssetBatchProgress),
+    {
+        let ids = claims
+            .iter()
+            .map(|claim| claim.asset_id().to_owned())
+            .collect::<Vec<_>>();
+        self.generate_thumbnail_batch(&ids, quality, Some(claims), on_progress)
+    }
+
+    fn generate_thumbnail_batch<F>(
+        &self,
+        asset_ids: &[String],
+        quality: u8,
+        claims: Option<&[RepresentationClaim]>,
         mut on_progress: F,
     ) -> Result<ThumbnailReport>
     where
@@ -3651,6 +3689,15 @@ impl Catalog {
     {
         if quality != 1 {
             bail!("invalid thumbnail quality {quality}; MVP supports quality 1");
+        }
+        if let Some(claims) = claims {
+            for claim in claims {
+                self.validate_representation_claim(
+                    claim,
+                    claim.asset_id(),
+                    RepresentationKind::Thumbnail,
+                )?;
+            }
         }
         let mut seen = HashSet::new();
         let mut pending = Vec::new();
@@ -3687,12 +3734,26 @@ impl Catalog {
         });
         for (index, asset) in pending.into_iter().enumerate() {
             let started = Instant::now();
-            let updated = match self.generate_thumbnail(&asset.id, quality) {
+            let result = if let Some(claims) = claims {
+                let claim = claims
+                    .iter()
+                    .find(|claim| claim.asset_id() == asset.id)
+                    .ok_or_else(|| anyhow!("missing thumbnail claim"))?;
+                self.generate_thumbnail_with_claim(claim, quality)
+            } else {
+                self.generate_thumbnail(&asset.id, quality)
+            };
+            let updated = match result {
                 Ok(updated) => {
                     report.generated += 1;
                     estimator.record_completion(asset.size_bytes, started.elapsed());
                     self.save_batch_history(THUMBNAIL_TASK_KIND, estimator.history())?;
                     Some(updated)
+                }
+                Err(error) if error.is::<RepresentationBusy>() => {
+                    estimator.record_failure(asset.size_bytes);
+                    report.skipped += 1;
+                    None
                 }
                 Err(error) => {
                     estimator.record_failure(asset.size_bytes);
@@ -5433,7 +5494,7 @@ pub(crate) fn now() -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use tempfile::{TempDir, tempdir};
 
