@@ -14,6 +14,7 @@ use std::process::ExitCode;
 
 mod agent_commands;
 mod chronology_commands;
+mod moment_commands;
 mod server_commands;
 
 #[derive(Debug, Parser)]
@@ -141,6 +142,11 @@ enum Commands {
     Analyze {
         #[command(subcommand)]
         command: AnalyzeCommand,
+    },
+    /// Discover and review bounded evidence-backed candidate moments.
+    Moments {
+        #[command(subcommand)]
+        command: moment_commands::MomentCommand,
     },
     /// Consolidate or inspect the AI-authored label vocabulary.
     Labels {
@@ -560,6 +566,7 @@ fn command_name(command: &Commands) -> &'static str {
             AnalyzeCommand::SuggestChronology { .. } => "analyze.suggest-chronology",
             AnalyzeCommand::Status { .. } => "analyze.status",
         },
+        Commands::Moments { command } => moment_commands::command_name(command),
         Commands::Labels { command } => match command {
             LabelsCommand::Consolidate { .. } => "labels.consolidate",
             LabelsCommand::Vocabulary { .. } => "labels.vocabulary",
@@ -635,14 +642,19 @@ fn execute(cli: &Cli) -> Result<Value> {
         } | Commands::CameraProxy {
             command: CameraProxyCommand::Discover { .. } | CameraProxyCommand::Status { .. }
         }
-    ) || match &cli.command {
-        // Chronology read and preview commands use a read-only catalog; apply
-        // opens the writable catalog. Diagnostics acknowledge is a separate
-        // write that changes no project fact (D01-T017).
-        Commands::Chronology { command } => chronology_commands::chronology_is_read_only(command),
-        Commands::Diagnostics { command } => chronology_commands::diagnostics_is_read_only(command),
-        _ => false,
-    };
+    ) || matches!(&cli.command, Commands::Moments { command } if moment_commands::is_read_only(command))
+        || match &cli.command {
+            // Chronology read and preview commands use a read-only catalog; apply
+            // opens the writable catalog. Diagnostics acknowledge is a separate
+            // write that changes no project fact (D01-T017).
+            Commands::Chronology { command } => {
+                chronology_commands::chronology_is_read_only(command)
+            }
+            Commands::Diagnostics { command } => {
+                chronology_commands::diagnostics_is_read_only(command)
+            }
+            _ => false,
+        };
     let catalog = if read_only {
         Catalog::open_read_only_existing(&catalog_path)?
     } else {
@@ -654,6 +666,7 @@ fn execute(cli: &Cli) -> Result<Value> {
         Commands::Chronology { command } => {
             chronology_commands::execute_chronology(&catalog, command)
         }
+        Commands::Moments { command } => moment_commands::execute(&catalog, command),
         Commands::Diagnostics { command } => {
             chronology_commands::execute_diagnostics(&catalog, command)
         }
@@ -1605,6 +1618,7 @@ mod tests {
             "thumbnails",
             "transcribe",
             "analyze",
+            "moments",
             "labels",
         ] {
             assert!(help.contains(command));

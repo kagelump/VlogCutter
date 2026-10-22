@@ -72,16 +72,32 @@ pub struct VlmRequest {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct VlmResponse {
+    /// Requested model retained for compatibility with existing fallback logic.
     pub model: String,
     pub body: String,
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub cost_usd: f64,
     pub latency_ms: u64,
+    pub receipt: VlmReceipt,
+}
+
+/// Provider-reported execution provenance. Missing values stay missing rather
+/// than being inferred from the request.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct VlmReceipt {
+    pub actual_model: Option<String>,
+    pub provider: Option<String>,
+    pub generation_id: Option<String>,
+    pub usage_complete: bool,
 }
 
 /// A transport that can run one request against one named model.
 pub trait VlmProvider: Send + Sync {
+    /// Local-only credential/client preparation, before recording transmission.
+    fn prepare(&self) -> Result<()> {
+        Ok(())
+    }
     fn analyze(&self, model: &str, request: &VlmRequest) -> Result<VlmResponse>;
 }
 
@@ -198,13 +214,16 @@ impl ProviderChain {
     ) -> Result<ChainOutcome> {
         let first = self.current_default();
         match provider.analyze(first, request) {
-            Ok(response) => Ok(ChainOutcome {
-                response,
-                attempts: 1,
-                fell_back: false,
-                attempted_models: vec![first.to_string()],
-                usage_complete: true,
-            }),
+            Ok(response) => {
+                let usage_complete = response.receipt.usage_complete;
+                Ok(ChainOutcome {
+                    response,
+                    attempts: 1,
+                    fell_back: false,
+                    attempted_models: vec![first.to_string()],
+                    usage_complete,
+                })
+            }
             Err(first_error) => {
                 let fallback = self.fallback_model();
                 if !self.allow_fallback || fallback == Some(first) {
@@ -287,6 +306,28 @@ mod tests {
                 completion_tokens: 1,
                 cost_usd: 0.0,
                 latency_ms: 1,
+                receipt: crate::analysis::provider::VlmReceipt {
+                    actual_model: Some(model.to_string()),
+                    provider: Some("fake".into()),
+                    generation_id: Some("fake-generation".into()),
+                    usage_complete: true,
+                },
+            })
+        }
+    }
+
+    struct IncompleteUsageProvider;
+
+    impl VlmProvider for IncompleteUsageProvider {
+        fn analyze(&self, model: &str, _request: &VlmRequest) -> Result<VlmResponse> {
+            Ok(VlmResponse {
+                model: model.to_owned(),
+                body: "{}".into(),
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                cost_usd: 0.0,
+                latency_ms: 0,
+                receipt: VlmReceipt::default(),
             })
         }
     }
@@ -300,6 +341,16 @@ mod tests {
         assert_eq!(outcome.attempts, 1);
         assert!(!outcome.fell_back);
         assert_eq!(*scripted.calls.lock().unwrap(), vec![DEFAULT_MODEL]);
+    }
+
+    #[test]
+    fn successful_chain_usage_completeness_comes_from_the_provider_receipt() {
+        let outcome = ProviderChain::new()
+            .analyze(&IncompleteUsageProvider, &VlmRequest::default())
+            .unwrap();
+        assert!(!outcome.usage_complete);
+        assert_eq!(outcome.response.model, DEFAULT_MODEL);
+        assert_eq!(outcome.response.receipt.actual_model, None);
     }
 
     #[test]
@@ -317,6 +368,10 @@ mod tests {
         assert_eq!(outcome.response.model, FALLBACK_MODEL);
         assert_eq!(outcome.attempts, 2);
         assert!(outcome.fell_back);
+        assert!(
+            !outcome.usage_complete,
+            "a failed first attempt keeps fallback usage incomplete"
+        );
     }
 
     #[test]

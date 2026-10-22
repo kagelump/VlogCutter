@@ -21,6 +21,7 @@ const LOCK_DIRECTORY: &str = ".representation-locks";
 pub enum RepresentationKind {
     Proxy,
     Thumbnail,
+    Moments,
 }
 
 impl RepresentationKind {
@@ -28,6 +29,7 @@ impl RepresentationKind {
         match self {
             Self::Proxy => "proxy",
             Self::Thumbnail => "thumbnail",
+            Self::Moments => "moments",
         }
     }
 }

@@ -7,7 +7,7 @@ use thiserror::Error;
 
 use crate::chronology::forward_migrate_project_chronology;
 
-pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 30;
+pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 31;
 
 const MIGRATION_TABLE_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -264,7 +264,34 @@ pub const PROJECT_CATALOG_MIGRATIONS: &[SqliteMigration] = &[
         source_identity: "project-catalog/0030-analysis-provider-attempt-provenance/20261021",
         apply: add_analysis_provider_attempt_provenance,
     },
+    SqliteMigration {
+        id: 31,
+        name: "analysis_moment_artifacts",
+        source_identity: "project-catalog/0031-analysis-moment-artifacts/20261022",
+        apply: add_analysis_moment_artifacts,
+    },
 ];
+
+fn add_analysis_moment_artifacts(transaction: &Transaction<'_>) -> Result<()> {
+    transaction.execute_batch(
+        r#"CREATE TABLE IF NOT EXISTS moment_artifacts (
+            asset_id TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+            identity TEXT NOT NULL,
+            body_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY(asset_id, identity)
+        );
+        CREATE TABLE IF NOT EXISTS moment_steps (
+            asset_id TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+            identity TEXT NOT NULL,
+            step_key TEXT NOT NULL,
+            body_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY(asset_id, identity, step_key)
+        );"#,
+    )?;
+    Ok(())
+}
 
 fn add_analysis_provider_attempt_provenance(transaction: &Transaction<'_>) -> Result<()> {
     if !column_exists(transaction, "asset_analyses", "attempted_models_json")? {
@@ -2255,6 +2282,38 @@ mod tests {
             PROJECT_CATALOG_SCHEMA_VERSION,
             PROJECT_CATALOG_MIGRATIONS.last().unwrap().id,
             "bump PROJECT_CATALOG_SCHEMA_VERSION when adding a migration"
+        );
+    }
+
+    #[test]
+    fn migration_31_adds_moment_tables_without_changing_existing_assets() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        run_sqlite_migrations(&mut connection, &PROJECT_CATALOG_MIGRATIONS[..30]).unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO projects(id,name,created_at) VALUES ('p1','project','before');
+                 INSERT INTO assets(id,project_id,fingerprint,path,filename,size_bytes,duration_seconds,created_at)
+                 VALUES ('a1','p1','fp1','/clip.mp4','clip.mp4',123,9.0,'before');",
+            )
+            .unwrap();
+
+        migrate_project_catalog(&mut connection).unwrap();
+
+        assert!(table_exists(&connection, "moment_artifacts").unwrap());
+        assert!(table_exists(&connection, "moment_steps").unwrap());
+        let retained: (String, String, i64) = connection
+            .query_row(
+                "SELECT project_id, path, size_bytes FROM assets WHERE id='a1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(retained, ("p1".into(), "/clip.mp4".into(), 123));
+        assert_eq!(
+            inspect_project_catalog_migrations(&connection)
+                .unwrap()
+                .current_version,
+            31
         );
     }
 

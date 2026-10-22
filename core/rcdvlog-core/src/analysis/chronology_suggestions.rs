@@ -480,6 +480,12 @@ mod tests {
                 completion_tokens: 4,
                 cost_usd: 0.001,
                 latency_ms: 12,
+                receipt: crate::analysis::provider::VlmReceipt {
+                    actual_model: Some(model.into()),
+                    provider: Some("fake".into()),
+                    generation_id: Some("fake-generation".into()),
+                    usage_complete: true,
+                },
             })
         }
     }

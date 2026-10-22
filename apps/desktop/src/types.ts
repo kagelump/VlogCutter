@@ -269,7 +269,7 @@ export interface AnalysisRunRecord {
   startedAt: string;
   finishedAt: string;
   status: "running" | "completed" | "cancelled" | "failed";
-  stageReached: AnalysisStage;
+  stageReached: AnalysisStage | "moments";
   proxiesGenerated: number;
   clipsTranscribed: number;
   clipsAnalyzed: number;

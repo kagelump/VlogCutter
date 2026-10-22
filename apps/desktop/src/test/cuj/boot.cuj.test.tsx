@@ -20,6 +20,17 @@ function hokkaido() {
     .build();
 }
 
+function bootProjectWithClips(clipCount: number) {
+  if (clipCount === 5) return hokkaido();
+  return desktopScenario({ now: "2026-08-09T12:00:00.000Z" })
+    .project("Antarctica field test", { id: "project_antarctica" })
+    .camera("Sony A7C II", { clips: 200, withProxy: true, startAt: "2026-02-01T08:00:00.000Z", spacingSeconds: 600 })
+    .camera("DJI Pocket 3", { clips: 200, withProxy: true, startAt: "2026-02-01T08:02:00.000Z", spacingSeconds: 600 })
+    .camera("Insta360 X5", { clips: 100, startAt: "2026-02-01T08:04:00.000Z", spacingSeconds: 1_200 })
+    .camera("Apple iPhone 17 Pro", { clips: 100, startAt: "2026-02-01T08:06:00.000Z", spacingSeconds: 1_200 })
+    .build();
+}
+
 describe("booting the desktop against the harness", () => {
   it("renders the real App through the real adapters", async () => {
     const harness = hokkaido();
@@ -66,36 +77,44 @@ describe("booting the desktop against the harness", () => {
     });
   });
 
-  it("waits for the queue selection when the initial context write is null", async () => {
-    const harness = hokkaido();
-    harness.next("list_assets").delayUntilReleased();
+  for (const clipCount of [5, 600]) {
+    it(
+      `waits for the queue selection when initial context is null (${clipCount} clips)`,
+      async () => {
+        const harness = bootProjectWithClips(clipCount);
+        const projectId = clipCount === 5 ? "project_hokkaido" : "project_antarctica";
+        harness.next("list_assets").delayUntilReleased();
 
-    let settled = false;
-    const boot = renderApp(harness).then((app) => {
-      settled = true;
-      return app;
-    });
+        let settled = false;
+        const boot = renderApp(harness).then((app) => {
+          settled = true;
+          return app;
+        });
 
-    await waitFor(() => {
-      expect(harness.calls("record_desktop_context")).toContainEqual({
-        projectId: "project_hokkaido",
-        assetId: null,
-      });
-    });
-    // The null write is observable while the catalog read is still held. It
-    // must not satisfy renderApp's settle condition or let the caller continue
-    // with an empty queue.
-    expect(settled).toBe(false);
+        await waitFor(() => {
+          expect(harness.calls("record_desktop_context")).toContainEqual({
+            projectId,
+            assetId: null,
+          });
+        });
+        // The null write is observable while the catalog read is still held.
+        // Boot must not settle until the queue selection has been persisted.
+        expect(settled).toBe(false);
 
-    await act(async () => harness.release("list_assets"));
-    await boot;
+        await act(async () => harness.release("list_assets"));
+        await boot;
 
-    expect(queueFilenames()[0]).toBe("SONY_001.MP4");
-    expect(harness.calls("record_desktop_context").at(-1)).toEqual({
-      projectId: "project_hokkaido",
-      assetId: "asset_sony_a7c_ii_001",
-    });
-  });
+        const filenames = queueFilenames();
+        expect(filenames).toHaveLength(clipCount);
+        expect(filenames[0]).toBe("SONY_001.MP4");
+        expect(harness.calls("record_desktop_context").at(-1)).toEqual({
+          projectId,
+          assetId: "asset_sony_a7c_ii_001",
+        });
+      },
+      clipCount === 600 ? 30_000 : undefined,
+    );
+  }
 
   it("settles with a null context when a project has only removed clips", async () => {
     const harness = desktopScenario({ now: "2026-08-09T12:00:00.000Z" })

@@ -12,6 +12,7 @@ pub mod coverage;
 pub mod engine;
 pub mod framepack;
 pub mod frames;
+pub mod moments;
 pub mod openrouter;
 pub mod provider;
 pub mod quality;
