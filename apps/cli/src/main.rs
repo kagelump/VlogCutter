@@ -1483,6 +1483,7 @@ fn main() -> ExitCode {
         Err(error) => {
             let message = format!("{error:#}");
             let remote = error.downcast_ref::<server_commands::RemoteCommandError>();
+            let job_agent = error.downcast_ref::<server_commands::JobAgentError>();
             let chronology_evidence_error =
                 error.downcast_ref::<rcdvlog_core::ChronologyEvidenceError>();
             let media_tool_failure = error
@@ -1491,7 +1492,9 @@ fn main() -> ExitCode {
             let readiness_error = error.downcast_ref::<rcdvlog_core::AgentReadinessError>();
             let prerequisite_error = error.downcast_ref::<rcdvlog_core::MediaPrerequisiteError>();
             let representation_busy = error.downcast_ref::<rcdvlog_core::RepresentationBusy>();
-            let code = if let Some(readiness) = readiness_error {
+            let code = if let Some(job_agent) = job_agent {
+                job_agent.code
+            } else if let Some(readiness) = readiness_error {
                 readiness.code
             } else if representation_busy.is_some() {
                 rcdvlog_core::RepresentationBusy::CODE
@@ -1514,7 +1517,7 @@ fn main() -> ExitCode {
                         "code": code,
                         "message": message,
                         "requestId": remote.and_then(|error| error.request_id.as_deref()),
-                        "details": readiness_error.and_then(|error| error.details.as_deref()),
+                        "details": job_agent.map(|error| error.details.clone()).or_else(|| readiness_error.and_then(|error| error.details.as_deref()).cloned()),
                     }
                 }),
                 cli.pretty,

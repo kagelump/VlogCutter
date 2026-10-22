@@ -2,6 +2,11 @@
 
 Server work is persisted in the local control catalog. Jobs move through `queued`, `running`, `succeeded`, `retry_wait`, `failed`, or `canceled`, with durable attempts, dependencies, leases, progress, safe errors, and replayable events. Restart recovers expired work; idempotency keys reuse equivalent requests. Retry is allowed only for eligible failures, and cancellation is durable and polled by handlers.
 
+Agents can block quietly with `rcdvlog server ... jobs wait --job <id>`.
+Terminal events also support [durable completion subscriptions and external
+callbacks](job-callbacks.md). Both use the same job state and event log;
+callbacks never run inside a database transaction or on the server.
+
 Default resource caps are one proxy worker, one full-hash worker, and up to two lightweight workers. At least one worker remains enabled. Media children are structured processes, not shell strings. Shutdown stops claims and converts interrupted handlers to retryable work unless user cancellation already won.
 
 Scans, metadata probes, full hashes, thumbnails, proxies, representation registration, and backups all use the durable engine. Schedules store IANA time zones, coalesce missed runs, and do not overlap an active identical scope. Agents inspect/retry/cancel through `rcdvlog server ... jobs`; Chrome provides the same bounded projections and polling recovery when WebSockets are unavailable.

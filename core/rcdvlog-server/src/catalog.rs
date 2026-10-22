@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 use crate::ConfigDiagnostics;
 
-pub const CONTROL_CATALOG_SCHEMA_VERSION: u32 = 10;
+pub const CONTROL_CATALOG_SCHEMA_VERSION: u32 = 11;
 pub const CONTROL_DATABASE_FILENAME: &str = "control.sqlite3";
 pub const INSTANCE_LOCK_FILENAME: &str = "server.lock";
 
@@ -81,6 +81,12 @@ pub const CONTROL_CATALOG_MIGRATIONS: &[SqliteMigration] = &[
         name: "backup_restore_operations",
         source_identity: "server-control/0010-backup-restore-operations/20260728",
         apply: create_backup_restore_operations,
+    },
+    SqliteMigration {
+        id: 11,
+        name: "job_completion_callbacks",
+        source_identity: "server-control/0011-job-completion-callbacks/20261022",
+        apply: crate::job_callbacks::migrate,
     },
 ];
 
@@ -1128,6 +1134,58 @@ mod tests {
             ),
         ]))
         .unwrap()
+    }
+
+    #[test]
+    fn callback_migration_upgrades_schema_ten_and_reopens_without_losing_jobs() {
+        let root = TempDir::new().unwrap();
+        let config = config(&root);
+        let path = config.data_dir.join(CONTROL_DATABASE_FILENAME);
+        let mut c = open_writable_connection(&path).unwrap();
+        run_sqlite_migrations(&mut c, &CONTROL_CATALOG_MIGRATIONS[..10]).unwrap();
+        // Seed a real terminal job using the pre-callback event schema. The
+        // engine's new emitter deliberately is not used until after upgrade.
+        c.execute("INSERT INTO operational_metadata(key,value,updated_at) VALUES('callback-sentinel','preserved','2026-10-22T00:00:00Z')",[]).unwrap();
+        c.execute("INSERT INTO jobs(job_id,job_type,payload_version,payload_json,immutable_identity_json,requirements_json,target_node_id,recipe_key,job_class,idempotency_key,idempotency_identity_hash,enqueue_sequence,state,max_attempts,retry_initial_seconds,retry_max_seconds,available_at,total_work_units,total_items,created_at,updated_at,completed_at) VALUES('job_pre_callbacks','test.v1',1,'{}','{}',?1,'node_old','test.v1','lightweight','old-key',?2,1,'canceled',2,1,2,?3,1,1,?3,?3,?3)",params![r#"{"schemaVersion":1,"requiresOriginal":false,"requiresDerivedWrite":false,"capabilities":[]}"#,"a".repeat(64),"2026-10-22T00:00:00Z"]).unwrap();
+        c.execute("INSERT INTO job_events(job_id,event_type,state,details_json,created_at) VALUES('job_pre_callbacks','canceled','canceled','{}','2026-10-22T00:00:00Z')",[]).unwrap();
+        drop(c);
+        for _ in 0..2 {
+            let catalog =
+                ControlCatalog::open_or_create(&config.data_dir, &config.diagnostics()).unwrap();
+            assert_eq!(
+                catalog.inspect_migrations().unwrap().status,
+                MigrationHistoryStatus::Current
+            );
+            let c = open_read_only_connection(catalog.database_path()).unwrap();
+            assert_eq!(
+                c.query_row(
+                    "SELECT value FROM operational_metadata WHERE key='callback-sentinel'",
+                    [],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+                "preserved"
+            );
+            assert_eq!(
+                c.query_row(
+                    "SELECT state FROM jobs WHERE job_id='job_pre_callbacks'",
+                    [],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+                "canceled"
+            );
+            let callbacks = catalog.jobs().callbacks();
+            callbacks
+                .subscribe(
+                    &crate::JobId::parse("job_pre_callbacks").unwrap(),
+                    "upgraded-editor",
+                )
+                .unwrap();
+            let page = callbacks.list("upgraded-editor", 10, None).unwrap();
+            assert_eq!(page.items.len(), 1);
+            assert_eq!(page.items[0].event.state, crate::JobState::Canceled);
+        }
     }
 
     #[test]

@@ -54,6 +54,10 @@ export const API_PATHS = {
   adminJob: "/api/v1/admin/jobs/{jobId}",
   adminJobCancel: "/api/v1/admin/jobs/{jobId}/cancel",
   adminJobRetry: "/api/v1/admin/jobs/{jobId}/retry",
+  adminJobCallbacks: "/api/v1/admin/jobs/{jobId}/callbacks",
+  adminJobCallbackDeliveries: "/api/v1/admin/job-callbacks",
+  adminJobCallbackClaim: "/api/v1/admin/job-callbacks/claim",
+  adminJobCallbackSettle: "/api/v1/admin/job-callbacks/{deliveryId}/settle",
   adminSync: "/api/v1/admin/sync",
   adminRepresentationBatch: "/api/v1/admin/representations/batch",
 } as const;

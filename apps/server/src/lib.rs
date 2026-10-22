@@ -1,5 +1,7 @@
 #![recursion_limit = "256"]
 
+mod job_callback_http;
+
 use anyhow::{Context, Result, anyhow};
 use axum::body::Body;
 use axum::extract::rejection::JsonRejection;
@@ -807,6 +809,19 @@ pub fn router(state: HttpState) -> Router {
         .route("/api/v1/admin/jobs/{job_id}/cancel", post(cancel_admin_job))
         .route("/api/v1/admin/jobs/{job_id}/retry", post(retry_admin_job))
         .route(
+            "/api/v1/admin/jobs/{job_id}/callbacks",
+            post(job_callback_http::subscribe),
+        )
+        .route("/api/v1/admin/job-callbacks", get(job_callback_http::list))
+        .route(
+            "/api/v1/admin/job-callbacks/claim",
+            post(job_callback_http::claim),
+        )
+        .route(
+            "/api/v1/admin/job-callbacks/{delivery_id}/settle",
+            post(job_callback_http::settle),
+        )
+        .route(
             "/api/v1/admin/backups",
             get(list_admin_backups).post(request_admin_backup),
         )
@@ -1061,6 +1076,10 @@ pub fn openapi_document() -> serde_json::Value {
             "/api/v1/admin/jobs/{jobId}": { "get": { "operationId": "getAdminJob", "parameters": [{"name":"jobId","in":"path","required":true,"schema":{"type":"string"}}], "responses": { "200": { "$ref": "#/components/responses/AdminPayload" } } } },
             "/api/v1/admin/jobs/{jobId}/cancel": { "post": { "operationId": "cancelAdminJob", "parameters": [{"name":"jobId","in":"path","required":true,"schema":{"type":"string"}}], "responses": { "200": { "$ref": "#/components/responses/AdminPayload" } } } },
             "/api/v1/admin/jobs/{jobId}/retry": { "post": { "operationId": "retryAdminJob", "parameters": [{"name":"jobId","in":"path","required":true,"schema":{"type":"string"}}], "responses": { "200": { "$ref": "#/components/responses/AdminPayload" } } } },
+            "/api/v1/admin/jobs/{jobId}/callbacks": { "post": { "operationId": "subscribeJobCallback", "parameters": [{"name":"jobId","in":"path","required":true,"schema":{"type":"string"}}], "requestBody": {"required":true,"content":{"application/json":{"schema":{"$ref":"#/components/schemas/CallbackSubscriptionRequest"}}}}, "responses": { "200": { "$ref": "#/components/responses/AdminPayload" } } } },
+            "/api/v1/admin/job-callbacks": { "get": { "operationId": "listJobCallbacks", "parameters": [{"name":"target","in":"query","required":true,"schema":{"type":"string"}},{"name":"limit","in":"query","schema":{"type":"integer","minimum":1,"maximum":200}},{"name":"before","in":"query","schema":{"type":"integer","minimum":0}}], "responses": { "200": { "$ref": "#/components/responses/AdminPayload" } } } },
+            "/api/v1/admin/job-callbacks/claim": { "post": { "operationId": "claimJobCallback", "requestBody": {"required":true,"content":{"application/json":{"schema":{"$ref":"#/components/schemas/CallbackClaimRequest"}}}}, "responses": { "200": { "$ref": "#/components/responses/AdminPayload" } } } },
+            "/api/v1/admin/job-callbacks/{deliveryId}/settle": { "post": { "operationId": "settleJobCallback", "parameters": [{"name":"deliveryId","in":"path","required":true,"schema":{"type":"string"}}], "requestBody": {"required":true,"content":{"application/json":{"schema":{"$ref":"#/components/schemas/CallbackSettleRequest"}}}}, "responses": { "200": { "$ref": "#/components/responses/AdminPayload" } } } },
             "/api/v1/admin/sync": { "get": { "operationId": "listAdminSync", "responses": { "200": { "$ref": "#/components/responses/AdminPayload" } } } },
             "/api/v1/admin/backups": {
                 "get": { "operationId": "listAdminBackups", "responses": { "200": { "$ref": "#/components/responses/AdminPayload" } } },
@@ -1071,6 +1090,9 @@ pub fn openapi_document() -> serde_json::Value {
         },
         "components": {
             "schemas": {
+                "CallbackSubscriptionRequest": {"type":"object","additionalProperties":false,"required":["target"],"properties":{"target":{"type":"string","minLength":1,"maxLength":128,"pattern":"^[A-Za-z0-9._-]+$"}}},
+                "CallbackClaimRequest": {"type":"object","additionalProperties":false,"required":["target","leaseSeconds"],"properties":{"target":{"type":"string","minLength":1,"maxLength":128,"pattern":"^[A-Za-z0-9._-]+$"},"leaseSeconds":{"type":"integer","minimum":1,"maximum":3600}}},
+                "CallbackSettleRequest": {"type":"object","additionalProperties":false,"required":["leaseToken","succeeded"],"properties":{"leaseToken":{"type":"string"},"succeeded":{"type":"boolean"}}},
                 "AdminPayload": { "type": "object", "additionalProperties": true },
                 "BootstrapExchangeRequest": {
                     "type": "object",
@@ -3687,6 +3709,9 @@ async fn retry_admin_job(
 
 fn job_admin_error(request_id: &RequestId, error: JobEngineError) -> Response {
     match error {
+        JobEngineError::StaleLease => {
+            query_error_response(request_id, "conflict", StatusCode::CONFLICT)
+        }
         JobEngineError::InvalidInput(_) => {
             query_error_response(request_id, "invalid_input", StatusCode::BAD_REQUEST)
         }
@@ -4213,6 +4238,158 @@ mod tests {
             .exchange_pairing(pairing.code.expose(), "Test Mac")
             .unwrap();
         device.token.expose().to_string()
+    }
+
+    #[tokio::test]
+    async fn callback_routes_authenticate_claim_and_acknowledge_terminal_events() {
+        use rcdvlog_server_core::{JobClass, JobDefinition, JobRequirements, RetryPolicy};
+        let fixture = Fixture::new(false);
+        let token = device_auth_token(&fixture);
+        let job = JobId::parse("job_callback_http").unwrap();
+        fixture
+            .foundation
+            .jobs()
+            .enqueue(JobDefinition {
+                job_id: job.clone(),
+                job_type: "test.v1".into(),
+                payload_version: 1,
+                payload: serde_json::json!({}),
+                immutable_identity: serde_json::json!({}),
+                requirements: JobRequirements {
+                    schema_version: 1,
+                    ..Default::default()
+                },
+                target_node_id: fixture.foundation.catalog().node_id().clone(),
+                project_id: None,
+                media_object_id: None,
+                storage_root_id: None,
+                representation_id: None,
+                recipe_key: "test.v1".into(),
+                job_class: JobClass::Lightweight,
+                idempotency_key: "callback-http".into(),
+                priority: 0,
+                total_work_units: 1,
+                total_items: 1,
+                retry_policy: RetryPolicy::default(),
+                dependencies: vec![],
+            })
+            .unwrap();
+        let request = |method: &str, path: &str, body: Value, authenticated: bool| {
+            let mut builder = Request::builder()
+                .method(method)
+                .uri(path)
+                .header(header::HOST, "rcdvlog.local")
+                .header(header::CONTENT_TYPE, "application/json");
+            if authenticated {
+                builder = builder.header(header::AUTHORIZATION, format!("Bearer {token}"));
+            }
+            builder
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap()
+        };
+        let path = "/api/v1/admin/jobs/job_callback_http/callbacks";
+        let denied = fixture
+            .app()
+            .oneshot(request(
+                "POST",
+                path,
+                serde_json::json!({"target":"editor"}),
+                false,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+        let response = fixture
+            .app()
+            .oneshot(request(
+                "POST",
+                path,
+                serde_json::json!({"target":"editor","command":"must-not-run"}),
+                true,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let registered = fixture
+            .app()
+            .oneshot(request(
+                "POST",
+                path,
+                serde_json::json!({"target":"editor"}),
+                true,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(registered.status(), StatusCode::OK);
+        fixture
+            .foundation
+            .jobs()
+            .request_cancel(&job, None)
+            .unwrap();
+        let claimed = fixture
+            .app()
+            .oneshot(request(
+                "POST",
+                "/api/v1/admin/job-callbacks/claim",
+                serde_json::json!({"target":"editor","leaseSeconds":30}),
+                true,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(claimed.status(), StatusCode::OK);
+        let claimed = json(claimed).await;
+        assert_eq!(claimed["claim"]["delivery"]["event"]["state"], "canceled");
+        let id = claimed["claim"]["delivery"]["deliveryId"].as_str().unwrap();
+        let lease = claimed["claim"]["leaseToken"].as_str().unwrap();
+        let ack = format!("/api/v1/admin/job-callbacks/{id}/settle");
+        let rejected = fixture
+            .app()
+            .oneshot(request(
+                "POST",
+                &ack,
+                serde_json::json!({"leaseToken":"stale","succeeded":true}),
+                true,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::CONFLICT);
+        let response = fixture
+            .app()
+            .oneshot(request(
+                "POST",
+                &ack,
+                serde_json::json!({"leaseToken":lease,"succeeded":true}),
+                true,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(json(response).await["state"], "delivered");
+        let listed = fixture
+            .app()
+            .oneshot(request(
+                "GET",
+                "/api/v1/admin/job-callbacks?target=editor&limit=1",
+                Value::Null,
+                true,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(listed.status(), StatusCode::OK);
+        let listed = json(listed).await;
+        assert_eq!(listed["items"][0]["state"], "delivered");
+        assert!(!listed.to_string().contains(lease));
+        let claimed = fixture
+            .app()
+            .oneshot(request(
+                "POST",
+                "/api/v1/admin/job-callbacks/claim",
+                serde_json::json!({"target":"editor","leaseSeconds":30}),
+                true,
+            ))
+            .await
+            .unwrap();
+        assert!(json(claimed).await["claim"].is_null());
     }
 
     fn browser_auth(fixture: &Fixture) -> (String, String, String) {

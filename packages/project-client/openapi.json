@@ -329,6 +329,58 @@
         ],
         "type": "object"
       },
+      "CallbackClaimRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "leaseSeconds": {
+            "maximum": 3600,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "target": {
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9._-]+$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "target",
+          "leaseSeconds"
+        ],
+        "type": "object"
+      },
+      "CallbackSettleRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "leaseToken": {
+            "type": "string"
+          },
+          "succeeded": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "leaseToken",
+          "succeeded"
+        ],
+        "type": "object"
+      },
+      "CallbackSubscriptionRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "target": {
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9._-]+$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "target"
+        ],
+        "type": "object"
+      },
       "Error": {
         "properties": {
           "code": {
@@ -1188,6 +1240,93 @@
         }
       }
     },
+    "/api/v1/admin/job-callbacks": {
+      "get": {
+        "operationId": "listJobCallbacks",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "target",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "schema": {
+              "maximum": 200,
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "before",
+            "schema": {
+              "minimum": 0,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/AdminPayload"
+          }
+        }
+      }
+    },
+    "/api/v1/admin/job-callbacks/claim": {
+      "post": {
+        "operationId": "claimJobCallback",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CallbackClaimRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/AdminPayload"
+          }
+        }
+      }
+    },
+    "/api/v1/admin/job-callbacks/{deliveryId}/settle": {
+      "post": {
+        "operationId": "settleJobCallback",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "deliveryId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CallbackSettleRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/AdminPayload"
+          }
+        }
+      }
+    },
     "/api/v1/admin/jobs": {
       "get": {
         "operationId": "listAdminJobs",
@@ -1211,6 +1350,36 @@
             }
           }
         ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/AdminPayload"
+          }
+        }
+      }
+    },
+    "/api/v1/admin/jobs/{jobId}/callbacks": {
+      "post": {
+        "operationId": "subscribeJobCallback",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "jobId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CallbackSubscriptionRequest"
+              }
+            }
+          },
+          "required": true
+        },
         "responses": {
           "200": {
             "$ref": "#/components/responses/AdminPayload"

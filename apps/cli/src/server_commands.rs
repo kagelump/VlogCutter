@@ -17,6 +17,9 @@ use uuid::Uuid;
 const TOKEN_ENVIRONMENT_VARIABLE: &str = "RCDVLOG_SERVER_TOKEN";
 const KEYCHAIN_SERVICE: &str = "com.rcd.vlogcutter.server";
 
+mod job_agents;
+pub use job_agents::JobAgentError;
+
 #[derive(Debug, Args)]
 pub struct ServerConnectionArgs {
     /// Server origin, for example https://rcdvlog.example.ts.net.
@@ -128,6 +131,13 @@ pub enum ScanCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum JobCommand {
+    /// Quietly wait for a durable job to succeed, fail, or be canceled.
+    Wait(job_agents::WaitArgs),
+    /// Durable completion subscriptions and external callback delivery.
+    Callbacks {
+        #[command(subcommand)]
+        command: job_agents::CallbackCommand,
+    },
     List {
         #[arg(long, default_value_t = 50, value_parser = clap::value_parser!(u32).range(1..=200))]
         limit: u32,
@@ -230,6 +240,12 @@ pub fn command_name(command: &ServerCommand) -> &'static str {
             ScanCommand::Request { .. } => "server.scans.request",
         },
         ServerCommand::Jobs { command } => match command {
+            JobCommand::Wait(_) => "server.jobs.wait",
+            JobCommand::Callbacks { command } => match command {
+                job_agents::CallbackCommand::Register { .. } => "server.jobs.callbacks.register",
+                job_agents::CallbackCommand::List { .. } => "server.jobs.callbacks.list",
+                job_agents::CallbackCommand::Deliver { .. } => "server.jobs.callbacks.deliver",
+            },
             JobCommand::List { .. } => "server.jobs.list",
             JobCommand::Diagnose { .. } => "server.jobs.diagnose",
             JobCommand::Retry { .. } => "server.jobs.retry",
@@ -327,6 +343,8 @@ pub fn execute(
             )?,
         },
         ServerCommand::Jobs { command } => match command {
+            JobCommand::Wait(args) => job_agents::wait(&client, args)?,
+            JobCommand::Callbacks { command } => job_agents::callback(&client, command)?,
             JobCommand::List {
                 limit,
                 before,

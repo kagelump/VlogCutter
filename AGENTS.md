@@ -147,7 +147,7 @@ Implemented now:
 - A non-interactive JSON CLI for catalog, clip annotation, chronology, and media operations.
 - Immutable typed project operations for asset membership, notes, labels, removal, rotation, and fixed clock events, with deterministic materialized views and conflict diagnostics.
 - Read-only catalog/project/clip/proxy diagnostics, including the desktop's persisted last-selected catalog, project, and asset breadcrumb.
-- Optional Ubuntu companion runtime with a local-SSD control catalog (schema 10), local project replicas, logical storage roots/node bindings, a global verified-content library, and scoped availability observations.
+- Optional Ubuntu companion runtime with a local-SSD control catalog (schema 11), local project replicas, logical storage roots/node bindings, a global verified-content library, and scoped availability observations.
 - Durable leased jobs, cancellation/retry/restart recovery, scans/schedules, full hashing, shared proxy/thumbnail generation, node-scoped ETA history, and authenticated byte-range streaming.
 - Baseline format 1 and sync protocol 1.0 with bounded operation pages, per-origin cursors/acknowledgements, deterministic conflict handling, WebSocket hints, and polling recovery.
 - Browser bootstrap/session auth, revocable desktop credentials, Keychain storage, CSRF/Host/Origin/proxy validation, LAN Caddy and Tailscale Serve deployment assets.
@@ -525,7 +525,7 @@ Always pass `--catalog` in agent automation, tests, and temporary workflows. A d
 
 SQLite connections enable foreign keys, WAL journal mode, and a five-second busy timeout. Read operations can continue during an uncommitted writer. Project mutations append typed operations with materialized revisions. Adopted projects synchronize bounded operation pages between independent local catalogs; live SQLite/WAL files are never copied or placed on NAS.
 
-Project catalogs use an explicit `schema_migrations` history and are currently at version 31. The server control catalog is version 10; backup format is version 1. Migration definitions have immutable names/source identities and each migration commits atomically. Migration 18 includes a one-time compatibility reconciliation for catalogs created on the import feature branch before its migration IDs were merged with main. When changing the schema:
+Project catalogs use an explicit `schema_migrations` history and are currently at version 31. The server control catalog is version 11; backup format is version 1. Migration definitions have immutable names/source identities and each migration commits atomically. Migration 18 includes a one-time compatibility reconciliation for catalogs created on the import feature branch before its migration IDs were merged with main. When changing the schema:
 
 - Preserve existing catalogs; never solve migration issues by deleting the database.
 - Add a forward migration and an upgrade test using an older schema fixture.
@@ -894,6 +894,15 @@ When adding a selectable UI entity or a failure-prone representation, extend thi
 Never parse human prose from the CLI. Add/extend JSON contract tests whenever commands, fields, errors, or progress events change.
 
 Remote server commands require an explicit `--endpoint`/`RCDVLOG_SERVER_ENDPOINT` and use a paired device token from `RCDVLOG_SERVER_TOKEN`, an owner-only credential file, or interactive Keychain fallback. Never pass a token in argv. Read-only families cover status, projects, library, storage, scans, jobs, sync, representations, credentials, and backups; mutations are deliberately named. `rcdvlog-server admin` owns offline bootstrap, restore, recovery, and redacted diagnostics. See `docs/agent-cli.md` and `docs/server/troubleshooting.md`.
+
+Use `server ... jobs wait --job <id>` for a quiet terminal result instead of
+agent-driven polling. `jobs callbacks register/list/deliver` expose durable
+completion delivery; the local consumer runs an explicit absolute executable
+with literal argv and a JSON stdin envelope. Callback delivery is at least
+once: consumers deduplicate durable acceptance by `deliveryId`. Opaque targets,
+leases, events and receipts live in the server control catalog; executable paths
+and Codex session management remain in the external consumer. See
+`docs/server/job-callbacks.md` for timeout, retry and acknowledgement contracts.
 
 ## 12. Testing and verification
 

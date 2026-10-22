@@ -3210,6 +3210,7 @@ dependencies = [
  "clap",
  "dirs",
  "keyring",
+ "libc",
  "rcdvlog-core",
  "rcdvlog-server-core",
  "rcdvlog-sync",

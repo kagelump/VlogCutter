@@ -576,6 +576,15 @@ rcdvlog server --endpoint https://<server-host>:8443 backups create --idempotenc
 
 Pairing-code creation removes the plaintext code from JSON and writes it once to a new owner-only file. `sync now` signals the running desktop when it owns the project sync manager; otherwise it performs one exclusive bounded reconciliation and reports which path ran.
 
+### Waiting and callbacks
+
+For long jobs, use `server ... jobs wait --job <id> --wait-seconds 1800` to
+receive one terminal JSON result without agent-driven polling. Durable
+`jobs callbacks register/list/deliver` commands support external consumers via
+opaque targets and a `job.completion.v1` stdin envelope. See
+[agent waits and callbacks](server/job-callbacks.md) for complete examples,
+stable timeout/error codes, leases and at-least-once delivery semantics.
+
 ## Server-local administration
 
 `rcdvlog-server admin` is the offline, server-host-only recovery surface. It uses environment-selected data/backup roots, returns one JSON result, and refuses exclusive work against a running server.

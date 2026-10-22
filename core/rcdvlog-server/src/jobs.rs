@@ -37,6 +37,9 @@ pub enum JobState {
     Canceled,
 }
 impl JobState {
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Succeeded | Self::Failed | Self::Canceled)
+    }
     fn as_str(self) -> &'static str {
         match self {
             Self::Queued => "queued",
@@ -349,6 +352,12 @@ struct JobSnapshotRow {
 }
 
 impl JobEngine {
+    pub fn callbacks(&self) -> crate::JobCallbacks {
+        crate::JobCallbacks {
+            database_path: self.database_path.clone(),
+            clock: self.clock.clone(),
+        }
+    }
     pub(crate) fn new(database_path: PathBuf, node_id: NodeId) -> Self {
         Self::with_clock(database_path, node_id, Arc::new(SystemClock))
     }
@@ -1373,6 +1382,19 @@ fn emit(
     valid_token(typ, "event type")?;
     validate_event(details, MAX_EVENT_BYTES)?;
     tx.execute("INSERT INTO job_events(job_id,attempt_number,event_type,state,details_json,created_at) VALUES(?1,?2,?3,?4,?5,?6)",params![id,attempt,typ,state.as_str(),canonical_json(details,MAX_EVENT_BYTES)?,now])?;
+    crate::job_callbacks::record_terminal(
+        tx,
+        &JobEvent {
+            event_sequence: tx.last_insert_rowid() as u64,
+            job_id: JobId::parse(id.to_owned())
+                .map_err(|_| JobEngineError::InvalidInput("invalid job ID".into()))?,
+            attempt_number: attempt,
+            event_type: typ.into(),
+            state,
+            details: details.clone(),
+            created_at: now.into(),
+        },
+    )?;
     Ok(())
 }
 fn promote_retry_wait(tx: &Transaction<'_>, now: &str) -> Result<(), JobEngineError> {
@@ -1893,6 +1915,226 @@ mod tests {
             dependencies: vec![],
         }
     }
+    #[test]
+    fn callbacks_are_atomic_durable_idempotent_and_catch_up_after_completion() {
+        let (_dir, engine, _clock) = engine();
+        let definition = job(801, engine.node_id());
+        engine.enqueue(definition.clone()).unwrap();
+        let callbacks = engine.callbacks();
+        let subscription = callbacks.subscribe(&definition.job_id, "editor").unwrap();
+        assert_eq!(
+            callbacks
+                .subscribe(&definition.job_id, "editor")
+                .unwrap()
+                .subscription_id,
+            subscription.subscription_id
+        );
+        assert!(callbacks.claim("editor", 30).unwrap().is_none());
+        let claimed = engine
+            .claim_next("worker", Duration::from_secs(60))
+            .unwrap()
+            .unwrap();
+        let result = JobResultCommit {
+            output_identity: Some("artifact".into()),
+            details: json!({"artifact":"result.v1"}),
+        };
+        assert!(
+            engine
+                .complete(&claimed, result.clone(), |_| Err(
+                    JobEngineError::InvalidInput("rollback".into())
+                ))
+                .is_err()
+        );
+        assert!(callbacks.claim("editor", 30).unwrap().is_none());
+        engine.complete(&claimed, result, |_| Ok(())).unwrap();
+        // Reopening the service uses the same persisted outbox.
+        let callbacks = engine.callbacks();
+        let delivery = callbacks.claim("editor", 30).unwrap().unwrap();
+        assert_eq!(delivery.delivery.event.state, JobState::Succeeded);
+        assert_eq!(
+            delivery.delivery.event.details,
+            json!({"artifact":"result.v1"})
+        );
+        assert!(callbacks.claim("editor", 30).unwrap().is_none());
+        callbacks
+            .settle(&delivery.delivery.delivery_id, &delivery.lease_token, true)
+            .unwrap();
+        callbacks
+            .settle(&delivery.delivery.delivery_id, &delivery.lease_token, true)
+            .unwrap();
+        callbacks
+            .subscribe(&definition.job_id, "late-editor")
+            .unwrap();
+        let late = callbacks.claim("late-editor", 30).unwrap().unwrap();
+        assert_eq!(
+            late.delivery.event.event_sequence,
+            delivery.delivery.event.event_sequence
+        );
+        assert!(
+            !serde_json::to_string(&callbacks.list("editor", 1, None).unwrap())
+                .unwrap()
+                .contains(&delivery.lease_token)
+        );
+        assert!(callbacks.claim("editor", 30).unwrap().is_none());
+    }
+
+    #[test]
+    fn callbacks_recover_expired_leases_and_fence_stale_acknowledgements() {
+        let (_dir, engine, clock) = engine();
+        let definition = job(802, engine.node_id());
+        engine.enqueue(definition.clone()).unwrap();
+        engine
+            .callbacks()
+            .subscribe(&definition.job_id, "consumer")
+            .unwrap();
+        engine.request_cancel(&definition.job_id, None).unwrap();
+        let callbacks = engine.callbacks();
+        let first = callbacks.claim("consumer", 5).unwrap().unwrap();
+        assert_eq!(first.delivery.event.state, JobState::Canceled);
+        clock.advance(6);
+        let second = callbacks.claim("consumer", 5).unwrap().unwrap();
+        assert_eq!(first.delivery.delivery_id, second.delivery.delivery_id);
+        assert_eq!(second.delivery.attempt_count, 2);
+        assert!(matches!(
+            callbacks.settle(&first.delivery.delivery_id, &first.lease_token, true),
+            Err(JobEngineError::StaleLease)
+        ));
+        callbacks
+            .settle(&second.delivery.delivery_id, &second.lease_token, false)
+            .unwrap();
+        let third = callbacks.claim("consumer", 5).unwrap().unwrap();
+        assert_eq!(third.delivery.attempt_count, 3);
+        callbacks
+            .settle(&third.delivery.delivery_id, &third.lease_token, true)
+            .unwrap();
+        assert!(callbacks.claim("consumer", 5).unwrap().is_none());
+    }
+
+    #[test]
+    fn callbacks_ignore_retry_wait_and_preserve_terminal_failure_events() {
+        let (_dir, engine, clock) = engine();
+        let definition = job(803, engine.node_id());
+        engine.enqueue(definition.clone()).unwrap();
+        engine
+            .callbacks()
+            .subscribe(&definition.job_id, "editor")
+            .unwrap();
+        let first = engine
+            .claim_next("worker", Duration::from_secs(60))
+            .unwrap()
+            .unwrap();
+        engine
+            .fail(
+                &first,
+                FailureKind::Retryable,
+                "retryable_job_failure",
+                json!({}),
+            )
+            .unwrap();
+        assert!(engine.callbacks().claim("editor", 30).unwrap().is_none());
+        clock.advance(5);
+        let second = engine
+            .claim_next("worker", Duration::from_secs(60))
+            .unwrap()
+            .unwrap();
+        engine
+            .fail(
+                &second,
+                FailureKind::Retryable,
+                "retryable_job_failure",
+                json!({"reason":"exhausted"}),
+            )
+            .unwrap();
+        let delivery = engine.callbacks().claim("editor", 30).unwrap().unwrap();
+        assert_eq!(delivery.delivery.event.state, JobState::Failed);
+        assert_eq!(delivery.delivery.event.attempt_number, Some(2));
+        assert_eq!(
+            delivery.delivery.event.details,
+            json!({"reason":"exhausted"})
+        );
+    }
+
+    #[test]
+    fn callbacks_bound_pages_validate_targets_and_upgrade_existing_terminal_jobs() {
+        let (_dir, engine, _clock) = engine();
+        for n in 804..807 {
+            let definition = job(n, engine.node_id());
+            engine.enqueue(definition.clone()).unwrap();
+            engine.request_cancel(&definition.job_id, None).unwrap();
+            engine
+                .callbacks()
+                .subscribe(&definition.job_id, "editor")
+                .unwrap();
+        }
+        let callbacks = engine.callbacks();
+        let first = callbacks.list("editor", 2, None).unwrap();
+        let second = callbacks.list("editor", 2, first.next_before).unwrap();
+        assert_eq!(first.items.len(), 2);
+        assert_eq!(second.items.len(), 1);
+        assert!(second.next_before.is_none());
+        assert!(callbacks.list("editor", 0, None).is_err());
+        assert!(callbacks.list("editor", 1, Some(u64::MAX)).is_err());
+        assert!(callbacks.claim("https://untrusted", 5).is_err());
+        assert!(callbacks.claim("editor", 0).is_err());
+        assert!(
+            callbacks
+                .subscribe(&JobId::parse("job_absent").unwrap(), "editor")
+                .is_err()
+        );
+        // A different late consumer receives the original canonical event.
+        let id = JobId::parse("job_804").unwrap();
+        callbacks.subscribe(&id, "upgraded-consumer").unwrap();
+        assert_eq!(
+            callbacks
+                .claim("upgraded-consumer", 5)
+                .unwrap()
+                .unwrap()
+                .delivery
+                .event
+                .job_id,
+            id
+        );
+    }
+
+    #[test]
+    fn callbacks_capture_dependency_cancellation_and_claim_concurrently_once() {
+        let (_dir, engine, _clock) = engine();
+        let parent = job(808, engine.node_id());
+        let mut child = job(809, engine.node_id());
+        child.dependencies.push(parent.job_id.clone());
+        engine.enqueue(parent.clone()).unwrap();
+        engine.enqueue(child.clone()).unwrap();
+        engine
+            .callbacks()
+            .subscribe(&child.job_id, "dependency-editor")
+            .unwrap();
+        engine.request_cancel(&parent.job_id, None).unwrap();
+        assert!(
+            engine
+                .claim_next("worker", Duration::from_secs(60))
+                .unwrap()
+                .is_none()
+        );
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let workers = (0..2)
+            .map(|_| {
+                let callbacks = engine.callbacks();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    callbacks.claim("dependency-editor", 30).unwrap()
+                })
+            })
+            .collect::<Vec<_>>();
+        let claims = workers
+            .into_iter()
+            .filter_map(|w| w.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].delivery.event.state, JobState::Canceled);
+        assert_eq!(claims[0].delivery.event.event_type, "dependency_terminal");
+    }
+
     fn estimate_input(
         worker_count: usize,
         remaining_task_work_units: &[u64],

@@ -5,6 +5,7 @@ mod catalog;
 mod config;
 mod error_codes;
 mod foundation;
+mod job_callbacks;
 mod jobs;
 mod library;
 pub mod library_query;
@@ -52,6 +53,9 @@ pub use config::{
 pub use error_codes::{STABLE_ERROR_CODES, is_stable_error_code};
 pub use foundation::{
     CheckStatus, ReadinessCheck, ReadinessReport, ReadinessStatus, RuntimeFoundation,
+};
+pub use job_callbacks::{
+    CallbackClaim, CallbackDelivery, CallbackPage, CallbackSubscription, JobCallbacks,
 };
 pub use jobs::{
     CancellableChild, ClaimedJob, Clock, FailureKind, ItemCompletion, JobClass, JobDefinition,

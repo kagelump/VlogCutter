@@ -13,6 +13,7 @@ anyhow.workspace = true
 clap.workspace = true
 dirs.workspace = true
 keyring = "3.6"
+libc.workspace = true
 rcdvlog-core = { path = "../../core/rcdvlog-core" }
 rcdvlog-server-core = { path = "../../core/rcdvlog-server" }
 rcdvlog-sync = { path = "../../core/rcdvlog-sync" }
