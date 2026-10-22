@@ -206,7 +206,9 @@ Important gaps; do not accidentally describe these as complete:
   joins that label rather than opening a second one. Nothing is renamed,
   merged, or deleted: `apps/desktop/src/review/labelVocabulary.ts` is a
   read-only view over the labels already written.
-- No key moments, chapters, events, or scripts. Edit-plan revisions, validation,
+- Sparse suggested key moments and a bounded preparation evidence CLI now exist;
+  they do not certify arbitrary cut ranges or replace human review. Chapters,
+  events, and scripts remain unimplemented. Edit-plan revisions, validation,
   preview rendering, and OTIO writing exist, but the desktop edit-plan workflow
   still lacks reordering, trimming, removal, preview playback, export history,
   and overwrite confirmation; there is no edit-plan CLI yet.
@@ -266,7 +268,9 @@ Before implementing persisted trip context, resolve the domain question of wheth
 ├── apps/
 │   ├── cli/
 │   │   ├── src/main.rs               # clap CLI, JSON envelopes, error mapping
-│   │   └── tests/cli_workflow.rs     # Process-level CLI/media integration tests
+│   │   ├── src/preparation_commands.rs # Thin bounded preparation adapter
+│   │   ├── tests/cli_workflow.rs     # Process-level CLI/media integration tests
+│   │   └── tests/preparation_workflow.rs # Preparation CLI contracts
 │   ├── desktop/
 │   │   ├── src/                      # React UI, API boundary, types, styles
 │   │   └── src-tauri/                # Tauri commands, settings, native entry point
@@ -735,6 +739,16 @@ SQLite. Reuse the shared representation claims and analysis-run accounting;
 unknown usage blocks new paid requests until explicit recovery authorization.
 Sparse coverage and candidate ranges remain suggestions requiring manual
 review; discovery never changes inclusion, human annotations or chronology.
+
+The `prepare preflight/run/evidence` CLI composes existing representation,
+transcript, orientation, and moment evidence for an explicit project/asset
+scope. Preflight and evidence require an existing explicit catalog and open it
+read-only; only `prepare run` mutates, and paid moments work requires its
+explicit provider/model/payload/budget policy. Pagination outcomes describe
+only the current page, scope fingerprints are selectors rather than snapshots,
+and sparse samples never certify arbitrary edit ranges. Full proxy replacement
+invalidates transcript binding. Preparation preserves originals, human
+annotations, orientation choices, and chronology; see `docs/agent-cli.md`.
 
 **Measured end to end**, 2026-08-04, M3 MacBook Air, four workers, 273-clip
 Osaka/Expo project:

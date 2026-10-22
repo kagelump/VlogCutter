@@ -121,6 +121,7 @@ fn executable() -> Result<CliExecutable> {
             ("speech.local.v1".into(), 1),
             ("video.validation.v1".into(), 1),
             ("moments.discovery.v1".into(), 1),
+            ("prepare.evidence.v1".into(), 1),
         ]),
         commands,
     })

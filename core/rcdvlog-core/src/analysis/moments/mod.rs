@@ -12,6 +12,7 @@ pub use catalog::{
     MomentFailure, MomentInventoryItem, MomentInventoryPage, MomentPage, MomentPlan,
     MomentProgress, MomentRunReport,
 };
+pub(crate) use logic::RECIPE_VERSION;
 pub use logic::{MomentPayload, MomentRunOptions};
 pub use model::{
     CoverageLevel, CoverageSegment, EditProfile, MomentArtifact, MomentCandidate,

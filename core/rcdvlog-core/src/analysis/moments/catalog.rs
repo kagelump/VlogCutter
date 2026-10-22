@@ -12,10 +12,7 @@ use crate::analysis::{
     store::{TranscriptStatus, load_transcript},
     vlm_store::{analysis_is_current, load_analysis},
 };
-use crate::{
-    AnalysisRunOutcome, Asset, AssetVideoValidationStatus, Catalog, RepresentationBusy,
-    RepresentationKind,
-};
+use crate::{AnalysisRunOutcome, Asset, Catalog, RepresentationBusy, RepresentationKind};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use batch_estimator::{BatchEstimate, BatchEstimator};
 use rusqlite::{OptionalExtension, params};
@@ -422,60 +419,12 @@ impl Catalog {
     }
 
     fn moment_source(&self, asset: &Asset) -> Result<SourceContext> {
-        ensure!(
-            asset.duration_seconds.is_finite() && asset.duration_seconds > 0.0,
-            "source has no finite positive duration"
-        );
-        ensure!(
-            !asset.removed,
-            "asset is explicitly excluded from preparation"
-        );
-        ensure!(
-            self.asset_video_validation(&asset.id)?.status == AssetVideoValidationStatus::Usable,
-            "asset is unverified or quarantined; explicit video validation required"
-        );
-        ensure!(
-            crate::has_current_proxy(asset),
-            "a current validated v3 proxy is required for moment discovery"
-        );
-        let proxy = Self::require_proxy(asset)?;
-        let document = crate::probe_media_document(&proxy)?;
-        let stream = crate::require_video_stream(&document)?;
-        ensure!(
-            stream["codec_name"].as_str() == Some("h264"),
-            "current v3 moment input must be an H.264 proxy"
-        );
-        ensure!(
-            stream["width"]
-                .as_u64()
-                .is_some_and(|width| width > 0 && width <= 1280),
-            "proxy dimensions do not match the current recipe"
-        );
-        ensure!(
-            crate::stream_rotation(Some(stream)) == 0,
-            "proxy display rotation must be zero"
-        );
-        let duration = crate::video_duration(&document, stream)
-            .ok_or_else(|| anyhow!("proxy has no valid duration"))?;
-        ensure!(
-            duration * 1000.0 < u32::MAX as f64,
-            "source duration exceeds supported time range"
-        );
-        ensure!(
-            (duration - asset.duration_seconds).abs()
-                <= 0.25_f64.max(asset.duration_seconds * 0.01),
-            "proxy/source duration mismatch; compatible time mapping must be verified"
-        );
-        let duration_ms = (duration.min(asset.duration_seconds) * 1000.0).round() as u32;
-        ensure!(duration_ms > 0, "source has no positive duration");
-        let frame_rate = stream["r_frame_rate"]
-            .as_str()
-            .and_then(crate::parse_rate)
-            .filter(|rate| rate.is_finite() && *rate > 0.0)
-            .ok_or_else(|| anyhow!("proxy has no finite positive frame rate"))?;
-        let tail_ms = ((1000.0 / frame_rate).ceil().min(u32::MAX as f64) as u32).saturating_add(1);
-        let fingerprint = crate::full_file_blake3(&proxy, &|| false)?.hex_digest;
-        let sampled = self.proxy_fingerprint(&asset.id)?;
+        let source = self.analysis_proxy_source(asset)?;
+        let proxy = source.proxy;
+        let duration_ms = source.duration_ms;
+        let last_safe_sample_ms = source.last_safe_sample_ms;
+        let fingerprint = source.fingerprint;
+        let sampled = source.sampled_fingerprint;
         let connection = self.connection()?;
         let transcript = load_transcript(&connection, &asset.id)?.filter(|t| {
             t.source_fingerprint == sampled && t.recipe_key == crate::analysis::STT_RECIPE_KEY
@@ -513,7 +462,7 @@ impl Catalog {
         Ok(SourceContext {
             proxy,
             duration_ms,
-            last_safe_sample_ms: duration_ms.saturating_sub(tail_ms),
+            last_safe_sample_ms,
             fingerprint,
             transcript_fingerprint,
             observation_fingerprint,

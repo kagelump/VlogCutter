@@ -7,7 +7,7 @@ use thiserror::Error;
 
 use crate::chronology::forward_migrate_project_chronology;
 
-pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 31;
+pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 32;
 
 const MIGRATION_TABLE_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -270,7 +270,25 @@ pub const PROJECT_CATALOG_MIGRATIONS: &[SqliteMigration] = &[
         source_identity: "project-catalog/0031-analysis-moment-artifacts/20261022",
         apply: add_analysis_moment_artifacts,
     },
+    SqliteMigration {
+        id: 32,
+        name: "preparation_validation_receipts",
+        source_identity: "project-catalog/0032-preparation-validation-receipts/20261022",
+        apply: add_preparation_validation_receipts,
+    },
 ];
+
+fn add_preparation_validation_receipts(transaction: &Transaction<'_>) -> Result<()> {
+    transaction.execute_batch(
+        "CREATE TABLE IF NOT EXISTS preparation_validation_receipts (
+            asset_id TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+            representation_fingerprint TEXT NOT NULL,
+            body_json TEXT NOT NULL,
+            PRIMARY KEY(asset_id, representation_fingerprint)
+        );",
+    )?;
+    Ok(())
+}
 
 fn add_analysis_moment_artifacts(transaction: &Transaction<'_>) -> Result<()> {
     transaction.execute_batch(
@@ -2313,7 +2331,7 @@ mod tests {
             inspect_project_catalog_migrations(&connection)
                 .unwrap()
                 .current_version,
-            31
+            PROJECT_CATALOG_SCHEMA_VERSION
         );
     }
 

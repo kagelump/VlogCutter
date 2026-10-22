@@ -4,7 +4,7 @@
 //! coordinate simultaneous attempts to create the same cache representation.
 
 use crate::{Asset, Catalog, PROXY_CACHE_VERSION, probe_media_stream};
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use fs2::FileExt;
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
@@ -144,7 +144,82 @@ impl Drop for ProxyWrite {
     }
 }
 
+pub(crate) struct AnalysisProxySource {
+    pub(crate) proxy: PathBuf,
+    pub(crate) duration_ms: u32,
+    pub(crate) last_safe_sample_ms: u32,
+    pub(crate) fingerprint: String,
+    pub(crate) sampled_fingerprint: String,
+}
+
 impl Catalog {
+    /// Validate the accepted analysis proxy and return its time mapping and
+    /// fingerprints for consumers that need identical source acceptance.
+    pub(crate) fn analysis_proxy_source(&self, asset: &Asset) -> Result<AnalysisProxySource> {
+        ensure!(
+            asset.duration_seconds.is_finite() && asset.duration_seconds > 0.0,
+            "source has no finite positive duration"
+        );
+        ensure!(
+            !asset.removed,
+            "asset is explicitly excluded from preparation"
+        );
+        ensure!(
+            self.asset_video_validation(&asset.id)?.status
+                == crate::AssetVideoValidationStatus::Usable,
+            "asset is unverified or quarantined; explicit video validation required"
+        );
+        ensure!(
+            crate::has_current_proxy(asset),
+            "a current validated v3 proxy is required for moment discovery"
+        );
+        let proxy = Self::require_proxy(asset)?;
+        let document = crate::probe_media_document(&proxy)?;
+        let stream = crate::require_video_stream(&document)?;
+        ensure!(
+            stream["codec_name"].as_str() == Some("h264"),
+            "current v3 moment input must be an H.264 proxy"
+        );
+        ensure!(
+            stream["width"]
+                .as_u64()
+                .is_some_and(|width| width > 0 && width <= 1280),
+            "proxy dimensions do not match the current recipe"
+        );
+        ensure!(
+            crate::stream_rotation(Some(stream)) == 0,
+            "proxy display rotation must be zero"
+        );
+        let duration = crate::video_duration(&document, stream)
+            .ok_or_else(|| anyhow!("proxy has no valid duration"))?;
+        ensure!(
+            duration * 1000.0 < u32::MAX as f64,
+            "source duration exceeds supported time range"
+        );
+        ensure!(
+            (duration - asset.duration_seconds).abs()
+                <= 0.25_f64.max(asset.duration_seconds * 0.01),
+            "proxy/source duration mismatch; compatible time mapping must be verified"
+        );
+        let duration_ms = (duration.min(asset.duration_seconds) * 1000.0).round() as u32;
+        ensure!(duration_ms > 0, "source has no positive duration");
+        let frame_rate = stream["r_frame_rate"]
+            .as_str()
+            .and_then(crate::parse_rate)
+            .filter(|rate| rate.is_finite() && *rate > 0.0)
+            .ok_or_else(|| anyhow!("proxy has no finite positive frame rate"))?;
+        let tail_ms = ((1000.0 / frame_rate).ceil().min(u32::MAX as f64) as u32).saturating_add(1);
+        let fingerprint = crate::full_file_blake3(&proxy, &|| false)?.hex_digest;
+        let sampled_fingerprint = self.proxy_fingerprint(&asset.id)?;
+        Ok(AnalysisProxySource {
+            proxy,
+            duration_ms,
+            last_safe_sample_ms: duration_ms.saturating_sub(tail_ms),
+            fingerprint,
+            sampled_fingerprint,
+        })
+    }
+
     fn representation_cache_root(&self) -> Result<PathBuf> {
         Ok(self
             .database_path

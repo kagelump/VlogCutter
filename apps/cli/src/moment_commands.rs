@@ -126,25 +126,46 @@ fn scope(catalog: &Catalog, run: &MomentRunArgs) -> Result<Vec<String>> {
 }
 
 fn options(run: &MomentRunArgs, force: bool, retry_uncertain: bool) -> MomentRunOptions {
+    let mut options = default_options(
+        run.model.clone(),
+        run.provider.clone(),
+        run.payload.as_str(),
+        run.budget_usd,
+    );
+    options.coarse_frames = run.coarse_frames;
+    options.refinement_frames = run.refinement_frames;
+    options.max_candidates = run.max_candidates;
+    options.profile = EditProfile {
+        select_min_ms: run.select_min_ms,
+        select_max_ms: run.select_max_ms,
+        hold_min_ms: run.hold_min_ms,
+        hold_max_ms: run.hold_max_ms,
+    };
+    options.force = force;
+    options.retry_uncertain = retry_uncertain;
+    options
+}
+
+pub fn default_options(
+    model: String,
+    provider: String,
+    payload: &str,
+    budget_usd: f64,
+) -> MomentRunOptions {
     MomentRunOptions {
-        model: run.model.clone(),
-        provider: run.provider.clone(),
-        payload: match run.payload.as_str() {
+        model,
+        provider,
+        payload: match payload {
             "frames-and-transcript" => MomentPayload::FramesAndTranscript,
             _ => MomentPayload::Frames,
         },
-        budget_usd: run.budget_usd,
-        coarse_frames: run.coarse_frames,
-        refinement_frames: run.refinement_frames,
-        max_candidates: run.max_candidates,
-        profile: EditProfile {
-            select_min_ms: run.select_min_ms,
-            select_max_ms: run.select_max_ms,
-            hold_min_ms: run.hold_min_ms,
-            hold_max_ms: run.hold_max_ms,
-        },
-        force,
-        retry_uncertain,
+        budget_usd,
+        coarse_frames: 96,
+        refinement_frames: 384,
+        max_candidates: 8,
+        profile: EditProfile::default(),
+        force: false,
+        retry_uncertain: false,
     }
 }
 
