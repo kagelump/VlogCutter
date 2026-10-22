@@ -2331,7 +2331,7 @@ mod tests {
             inspect_project_catalog_migrations(&connection)
                 .unwrap()
                 .current_version,
-            31
+            PROJECT_CATALOG_SCHEMA_VERSION
         );
     }
 
