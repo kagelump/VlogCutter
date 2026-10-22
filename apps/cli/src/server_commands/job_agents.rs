@@ -237,9 +237,16 @@ fn run_callback(
     };
     if matches!(outcome, Ok(Some(0))) {
         // Confirmation is bounded even when a grandchild retains the pipe.
-        receiver
+        let input = receiver
             .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-            .map_err(|_| anyhow!("callback input delivery was not confirmed"))??;
+            .map_err(|_| anyhow!("callback input delivery was not confirmed"))
+            .and_then(|result| result.map_err(Into::into));
+        if let Err(error) = input {
+            // The direct child may already have exited while its descendants
+            // still hold stdin. They must not survive an input timeout either.
+            kill_callback(&mut child);
+            return Err(error);
+        }
     }
     outcome
 }

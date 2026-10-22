@@ -323,3 +323,57 @@ fn callback_ack_failure_does_not_execute_the_consumer_twice() {
     assert_eq!(std::fs::read_to_string(receipts).unwrap(), "accepted\n");
     assert_eq!(server.join().unwrap().len(), 3);
 }
+
+#[test]
+#[cfg(unix)]
+fn callback_input_timeout_kills_descendants_after_parent_exits() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempdir().unwrap();
+    let program = root.path().join("parent-exits-before-input");
+    let marker = root.path().join("descendant-side-effect");
+    std::fs::write(
+        &program,
+        "#!/bin/sh\nsh -c 'sleep 2; : > \"$1\"' sh \"$1\" <&0 &\nexit 0\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+    // Larger than the OS pipe capacity: writing cannot finish while the
+    // surviving descendant holds stdin open without reading it.
+    let mut large_delivery = delivery();
+    large_delivery["event"]["details"]["large"] = json!("x".repeat(2_000_000));
+    let (endpoint, server) = fixture(vec![
+        version(),
+        json!({"claim":{"delivery":large_delivery,"leaseToken":"fixture-lease"}}),
+        delivery(),
+    ]);
+    let start = Instant::now();
+    let output = cli(&root, &endpoint)
+        .args([
+            "callbacks",
+            "deliver",
+            "--target",
+            "editor",
+            "--program",
+            program.to_str().unwrap(),
+            "--arg",
+            marker.to_str().unwrap(),
+            "--wait-seconds",
+            "0",
+            "--execution-timeout-seconds",
+            "1",
+        ])
+        .output()
+        .unwrap();
+    let requests = server.join().unwrap();
+    assert!(!output.status.success());
+    assert_eq!(envelope(&output)["error"]["code"], "callback_failed");
+    assert_eq!(requests[2].1["succeeded"], false);
+    // Wait beyond the descendant's delayed write. This checks process cleanup,
+    // rather than treating a timely CLI exit as proof of cleanup.
+    let observation = Duration::from_millis(3500).saturating_sub(start.elapsed());
+    thread::sleep(observation);
+    assert!(
+        !marker.exists(),
+        "callback descendant survived the input timeout"
+    );
+}
