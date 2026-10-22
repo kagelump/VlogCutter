@@ -392,7 +392,8 @@ pub fn commit_thumbnail(
         .parent()
         .ok_or_else(|| anyhow::anyhow!("thumbnail has no parent directory"))?;
     std::fs::create_dir_all(parent)?;
-    let temporary = destination.with_extension("tmp.jpg");
+    let temporary =
+        destination.with_extension(format!("{}.tmp.jpg", uuid::Uuid::new_v4().simple()));
     std::fs::copy(source, &temporary).context("stage VLM thumbnail")?;
     std::fs::rename(&temporary, destination).context("commit VLM thumbnail")?;
     connection.execute(

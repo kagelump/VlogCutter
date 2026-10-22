@@ -1,4 +1,6 @@
-use rcdvlog_core::{Catalog, PROJECT_CATALOG_SCHEMA_VERSION, ProjectAssetAddedPayload};
+use rcdvlog_core::{
+    Catalog, PROJECT_CATALOG_SCHEMA_VERSION, ProjectAssetAddedPayload, RepresentationKind,
+};
 use rusqlite::{Connection, params};
 use serde_json::Value;
 use std::env;
@@ -1596,6 +1598,50 @@ fn process_contract_persists_across_invocations_and_routes_errors() {
     let missing = failure(&catalog, ["clips", "get", "--asset", "asset_missing"]);
     assert_eq!(missing["command"], "clips.get");
     assert_eq!(missing["error"]["code"], "not_found");
+}
+
+#[test]
+fn process_media_writers_return_stable_busy_code_without_running_tools() {
+    let directory = tempdir().unwrap();
+    let catalog_path = directory.path().join("catalog.sqlite3");
+    let project_id = create_project(&catalog_path, "Busy media writer");
+    Connection::open(&catalog_path)
+        .unwrap()
+        .execute(
+            "INSERT INTO assets(id, project_id, fingerprint, path, filename, size_bytes, duration_seconds, frame_rate, width, height, codec, camera, captured_at_raw, best_time, notes, labels_json, removed, rotation_degrees, created_at) VALUES ('asset_busy', ?1, 'synthetic-fingerprint', '/synthetic/asset_busy.mp4', 'asset_busy.mp4', 100, 1, 30, 1920, 1080, 'h264', 'Synthetic Camera', NULL, NULL, '', '[]', 0, 0, '2026-01-01T00:00:00Z')",
+            [&project_id],
+        )
+        .unwrap();
+    let catalog = Catalog::open(&catalog_path).unwrap();
+
+    for (kind, arguments) in [
+        (
+            RepresentationKind::Proxy,
+            vec!["proxy", "generate", "--asset", "asset_busy"],
+        ),
+        (
+            RepresentationKind::Thumbnail,
+            vec![
+                "thumbnails",
+                "generate",
+                "--asset",
+                "asset_busy",
+                "--quality",
+                "1",
+            ],
+        ),
+    ] {
+        let _claim = catalog
+            .try_claim_representation("asset_busy", kind)
+            .unwrap()
+            .unwrap();
+        let output = invoke(&catalog_path, arguments);
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        let error: Value = serde_json::from_slice(&output.stderr).expect("JSON error envelope");
+        assert_eq!(error["ok"], false);
+        assert_eq!(error["error"]["code"], "representation_busy");
+    }
 }
 
 #[cfg(unix)]

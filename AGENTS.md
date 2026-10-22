@@ -601,9 +601,13 @@ does not provide a usable timestamp.
 
 Only the original is accepted as proxy input. If the original is offline, proxy generation fails explicitly. Version-3 proxies are written to a temporary file, verified with ffprobe to have 0° display rotation, and then atomically committed asset-by-asset. Version-2 proxies are obsolete because they may retain the source display matrix; a later “missing” run regenerates them and skips only valid current-version paths that still exist.
 
+Proxy and thumbnail writers share cross-process claims in the managed `cache/.representation-locks` directory. Claims use the canonical cache root, asset ID, and representation kind; lock files persist after release and must never be unlinked. SQLite remains canonical. A busy single-item CLI writer exits with JSON code `representation_busy`; batch writers count contention as skipped work without recording a failure or throughput sample. Proxy downloads claim before requesting content and stream into unique staging paths, so a stale writer cannot overwrite a later transaction.
+
 ### Thumbnails
 
-Only quality 1 is implemented. It is a JPEG at 20% of clip duration, at most 480 px wide, generated first to `q1.v2.tmp.jpg` and atomically renamed to `q1.v2.jpg`. Input preference is original, then available proxy. Qualities 2–10 are reserved and must continue to fail clearly until intentionally implemented.
+Only quality 1 is implemented. It is a JPEG at 20% of clip duration, at most 480 px wide, generated to a unique staging file and atomically renamed to `q1.v2.jpg`. Input preference is original, then available proxy. Qualities 2–10 are reserved and must continue to fail clearly until intentionally implemented.
+
+Q1 thumbnails and analysis-selected Q10 representative thumbnails use the same cross-process thumbnail claim as desktop and sync work. See the proxy section above for busy-result and persistent-lockfile behavior; keep the existing output names and recipes unchanged.
 
 ### Transcription
 
@@ -856,7 +860,7 @@ Contract rules:
 - Failure: stdout stays empty; exactly one JSON error envelope goes to stderr with nonzero exit.
 - Long ingest progress may write newline-delimited JSON events to stderr before the final stdout result.
 - Stable command names and error codes are public automation contracts.
-- Desktop-local error codes are `invalid_arguments`, `invalid_input`, `not_found`, `media_offline`, `media_tool_failed`, and `internal_error`; remote server commands preserve the shared server registry.
+- Desktop-local error codes are `invalid_arguments`, `invalid_input`, `not_found`, `media_offline`, `media_tool_failed`, `representation_busy`, and `internal_error`; remote server commands preserve the shared server registry.
 - `doctor` must not create or mutate the selected catalog.
 - `doctor` is observational and does not use the desktop catalog fallback;
   `--check` or repeatable `--require-*` options opt into explicit readiness

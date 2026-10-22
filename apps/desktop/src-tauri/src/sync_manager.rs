@@ -845,13 +845,7 @@ impl SyncLoopHandle {
             Err(_) => return,
         };
 
-        // Build a map from media_object_id -> representation
-        // Pick the first available proxy for each media object
-        let proxy_dir = match catalog.database_path().parent() {
-            Some(p) => p.join("cache").join("proxies").join(project_id),
-            None => return,
-        };
-
+        // Pick the first available proxy for each media object.
         for asset in &missing {
             let Some(ref media_id) = asset.media_object_id else {
                 continue;
@@ -863,18 +857,20 @@ impl SyncLoopHandle {
                 continue;
             };
 
-            if let Err(e) =
-                download_and_register_proxy(client, catalog, &asset.id, rep, &proxy_dir).await
-            {
-                // Log but continue — one failed download shouldn't block others
-                eprintln!(
-                    "failed to download proxy for asset {} (rep {}): {e}",
-                    asset.id, rep.id
-                );
-            } else {
-                // Emit updated asset to refresh UI
-                if let Ok(updated) = catalog.get_asset(&asset.id) {
-                    let _ = self.app_handle.emit("asset-updated", updated);
+            match download_and_register_proxy(client, catalog, &asset.id, rep).await {
+                Ok(true) => {
+                    // Emit updated asset to refresh UI only after a committed write.
+                    if let Ok(updated) = catalog.get_asset(&asset.id) {
+                        let _ = self.app_handle.emit("asset-updated", updated);
+                    }
+                }
+                Ok(false) => {} // Another process owns this proxy; a later cycle retries.
+                Err(e) => {
+                    // Log but continue — one failed download shouldn't block others.
+                    eprintln!(
+                        "failed to download proxy for asset {} (rep {}): {e}",
+                        asset.id, rep.id
+                    );
                 }
             }
         }
@@ -917,7 +913,9 @@ impl SyncLoopHandle {
             }
 
             let result = match job.kind.as_str() {
-                "proxy" => match catalog.generate_proxy(&asset.id) {
+                "proxy" => match generate_proxy_for_node_job(catalog.clone(), asset.id.clone())
+                    .await
+                {
                     Ok(updated) => {
                         let output_path = updated.proxy_path.as_deref().unwrap_or("");
                         let output = std::path::Path::new(output_path);
@@ -928,26 +926,44 @@ impl SyncLoopHandle {
                             output_path,
                         )
                     }
+                    Err(error)
+                        if error
+                            .downcast_ref::<rcdvlog_core::RepresentationBusy>()
+                            .is_some() =>
+                    {
+                        // Leave the server job queued; a later reconciliation retries it.
+                        continue;
+                    }
                     Err(e) => {
                         CompleteNodeJobResult::failure("proxy_generation_failed", &format!("{e:#}"))
                     }
                 },
-                "thumbnail" => match catalog.generate_thumbnail(&asset.id, 1) {
-                    Ok(updated) => {
-                        let thumb_path = updated.thumbnail_path.as_deref().unwrap_or("");
-                        let output = std::path::Path::new(thumb_path);
-                        let byte_len = std::fs::metadata(output).ok().map(|m| m.len());
-                        CompleteNodeJobResult::success(
-                            job.representation_id.clone(),
-                            byte_len,
-                            thumb_path,
-                        )
+                "thumbnail" => {
+                    match generate_thumbnail_for_node_job(catalog.clone(), asset.id.clone()).await {
+                        Ok(updated) => {
+                            let thumb_path = updated.thumbnail_path.as_deref().unwrap_or("");
+                            let output = std::path::Path::new(thumb_path);
+                            let byte_len = std::fs::metadata(output).ok().map(|m| m.len());
+                            CompleteNodeJobResult::success(
+                                job.representation_id.clone(),
+                                byte_len,
+                                thumb_path,
+                            )
+                        }
+                        Err(error)
+                            if error
+                                .downcast_ref::<rcdvlog_core::RepresentationBusy>()
+                                .is_some() =>
+                        {
+                            // Leave the server job queued; a later reconciliation retries it.
+                            continue;
+                        }
+                        Err(e) => CompleteNodeJobResult::failure(
+                            "thumbnail_generation_failed",
+                            &format!("{e:#}"),
+                        ),
                     }
-                    Err(e) => CompleteNodeJobResult::failure(
-                        "thumbnail_generation_failed",
-                        &format!("{e:#}"),
-                    ),
-                },
+                }
                 _ => continue,
             };
 
@@ -1122,48 +1138,37 @@ async fn connect_async_with_auth(
 
 // ── Representation download ────────────────────────────────────────
 
-const PROXY_CACHE_VERSION: &str = "v3";
-
 /// Download a server representation and register it in the local project cache.
-/// Uses authenticated streaming from `GET /api/v1/media/{id}/content`, verifies
-/// the output with ffprobe, and atomically commits to the project-local proxy path.
+/// The shared claim is acquired before the authenticated request, and core owns
+/// validation, atomic publication, and catalog registration.
 async fn download_and_register_proxy(
     client: &ServerClient,
     catalog: &Catalog,
     asset_id: &str,
     representation: &crate::server_client::RepresentationDto,
-    proxy_dir: &std::path::Path,
-) -> Result<(), String> {
-    let response = client
-        .download_representation(&representation.id)
-        .await
-        .map_err(|e| format!("download request failed: {e}"))?;
+) -> Result<bool, String> {
+    let Some((write, response)) = request_under_proxy_claim(catalog, asset_id, || {
+        client.download_representation(&representation.id)
+    })
+    .await?
+    else {
+        return Ok(false);
+    };
 
     let status = response.status();
     if !status.is_success() {
         return Err(format!("server returned HTTP {status}"));
     }
 
-    let expected_length = representation.byte_length;
-
-    let output = proxy_dir.join(format!("{asset_id}.{PROXY_CACHE_VERSION}.mp4"));
-    let temporary = proxy_dir.join(format!("{asset_id}.{PROXY_CACHE_VERSION}.tmp.mp4"));
-
-    // Ensure the proxy directory exists
-    std::fs::create_dir_all(proxy_dir).map_err(|e| format!("create proxy dir: {e}"))?;
-
-    // Stream response body to temp file
-    let mut temp_file = tokio::fs::File::create(&temporary)
+    let mut temp_file = tokio::fs::File::create(write.temporary_path())
         .await
         .map_err(|e| format!("create temp file: {e}"))?;
-    let mut downloaded: u64 = 0;
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| format!("download stream error: {e}"))?;
         tokio::io::AsyncWriteExt::write_all(&mut temp_file, &chunk)
             .await
             .map_err(|e| format!("write temp file: {e}"))?;
-        downloaded += chunk.len() as u64;
     }
     temp_file
         .flush()
@@ -1171,56 +1176,57 @@ async fn download_and_register_proxy(
         .map_err(|e| format!("flush temp file: {e}"))?;
     drop(temp_file);
 
-    // Verify downloaded length if server reported it
-    if let Some(expected) = expected_length
-        && downloaded != expected
-    {
-        let _ = std::fs::remove_file(&temporary);
-        return Err(format!(
-            "downloaded {downloaded} bytes, expected {expected}"
-        ));
-    }
-
-    // Validate the downloaded proxy with ffprobe
-    let result = tokio::task::spawn_blocking({
-        let temp = temporary.clone();
-        move || {
-            let probe = rcdvlog_core::probe_media_stream(std::path::Path::new(&temp));
-            match probe {
-                Ok(info) if info.metadata_rotation_degrees == 0 => Ok(()),
-                Ok(info) => Err(format!(
-                    "proxy retains {}° display rotation",
-                    info.metadata_rotation_degrees
-                )),
-                Err(e) => Err(format!("proxy validation failed: {e:#}")),
-            }
-        }
+    let expected_length = representation.byte_length;
+    let catalog = catalog.clone();
+    tokio::task::spawn_blocking(move || {
+        catalog
+            .commit_proxy_write(write, expected_length)
+            .map(|_| ())
     })
     .await
-    .map_err(|e| format!("validation task panicked: {e}"))?;
-    result?;
+    .map_err(|e| format!("proxy commit task panicked: {e}"))?
+    .map_err(|e| format!("proxy commit failed: {e:#}"))?;
 
-    // Atomically commit
-    std::fs::rename(&temporary, &output).map_err(|e| format!("commit proxy: {e}"))?;
+    Ok(true)
+}
 
-    // Update the catalog
-    let output_str = output.to_string_lossy().to_string();
-    let asset_id_owned = asset_id.to_string();
-    let db_path = catalog.database_path().to_path_buf();
-    tokio::task::spawn_blocking(move || -> Result<(), String> {
-        let conn =
-            rusqlite::Connection::open(&db_path).map_err(|e| format!("open catalog: {e}"))?;
-        conn.execute(
-            "UPDATE assets SET proxy_path = ?2 WHERE id = ?1",
-            rusqlite::params![asset_id_owned, output_str],
-        )
-        .map_err(|e| format!("update proxy_path: {e}"))?;
-        Ok(())
-    })
-    .await
-    .map_err(|e| format!("catalog update panicked: {e}"))??;
+async fn request_under_proxy_claim<T, F, Fut>(
+    catalog: &Catalog,
+    asset_id: &str,
+    request: F,
+) -> Result<Option<(rcdvlog_core::ProxyWrite, T)>, String>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<T, crate::server_client::ClientError>>,
+{
+    let Some(write) = catalog
+        .begin_proxy_write(asset_id)
+        .map_err(|e| format!("reserve proxy write: {e:#}"))?
+    else {
+        return Ok(None);
+    };
+    let response = request()
+        .await
+        .map_err(|e| format!("download request failed: {e}"))?;
+    Ok(Some((write, response)))
+}
 
-    Ok(())
+async fn generate_proxy_for_node_job(
+    catalog: Catalog,
+    asset_id: String,
+) -> anyhow::Result<rcdvlog_core::Asset> {
+    tokio::task::spawn_blocking(move || catalog.generate_proxy(&asset_id))
+        .await
+        .map_err(anyhow::Error::new)?
+}
+
+async fn generate_thumbnail_for_node_job(
+    catalog: Catalog,
+    asset_id: String,
+) -> anyhow::Result<rcdvlog_core::Asset> {
+    tokio::task::spawn_blocking(move || catalog.generate_thumbnail(&asset_id, 1))
+        .await
+        .map_err(anyhow::Error::new)?
 }
 
 // ── Conflict enrichment helpers ──────────────────────────────────────
@@ -1258,4 +1264,56 @@ fn operation_summary_for(
         offset_seconds,
         label,
     })
+}
+
+#[cfg(test)]
+mod representation_claim_tests {
+    use super::*;
+    use rcdvlog_core::RepresentationKind;
+    use tempfile::tempdir;
+
+    #[test]
+    fn proxy_download_skips_before_request_when_claim_is_busy() {
+        let directory = tempdir().unwrap();
+        let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).unwrap();
+        let _claim = catalog
+            .try_claim_representation("asset-1", RepresentationKind::Proxy)
+            .unwrap()
+            .unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = runtime.block_on(request_under_proxy_claim(&catalog, "asset-1", || async {
+            panic!("busy proxy must not trigger an HTTP request");
+            #[allow(unreachable_code)]
+            Ok::<(), crate::server_client::ClientError>(())
+        }));
+        assert!(result.unwrap().is_none());
+    }
+
+    #[test]
+    fn node_thumbnail_job_preserves_busy_error_across_blocking_boundary() {
+        let directory = tempdir().unwrap();
+        let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).unwrap();
+        let _claim = catalog
+            .try_claim_representation("asset-1", RepresentationKind::Thumbnail)
+            .unwrap()
+            .unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let error = runtime
+            .block_on(generate_thumbnail_for_node_job(
+                catalog,
+                "asset-1".to_string(),
+            ))
+            .unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<rcdvlog_core::RepresentationBusy>()
+                .is_some()
+        );
+    }
 }

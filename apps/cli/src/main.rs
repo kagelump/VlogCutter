@@ -1477,8 +1477,11 @@ fn main() -> ExitCode {
                 .is_some();
             let readiness_error = error.downcast_ref::<rcdvlog_core::AgentReadinessError>();
             let prerequisite_error = error.downcast_ref::<rcdvlog_core::MediaPrerequisiteError>();
+            let representation_busy = error.downcast_ref::<rcdvlog_core::RepresentationBusy>();
             let code = if let Some(readiness) = readiness_error {
                 readiness.code
+            } else if representation_busy.is_some() {
+                rcdvlog_core::RepresentationBusy::CODE
             } else if prerequisite_error.is_some() {
                 "media_prerequisite_failed"
             } else if let Some(remote) = remote {

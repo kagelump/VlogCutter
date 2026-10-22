@@ -82,7 +82,7 @@ Failure is one JSON value on stderr with a nonzero exit code:
 }
 ```
 
-Local desktop commands use `invalid_arguments`, `invalid_input`, `not_found`, `media_offline`, `media_tool_failed`, `stale_revision`, and `internal_error`. `stale_revision` is the only one whose correct handling is to retry: re-read the clip, re-apply the edit, send it again with the new revision. Server commands preserve the server's shared stable registry, including authentication, protocol, mount, job, backup, and security codes. The registry is [`core/rcdvlog-server/src/error_codes.rs`](../core/rcdvlog-server/src/error_codes.rs); clients must branch on `error.code`, not prose. Remote failures also return the server `requestId` when available.
+Local desktop commands use `invalid_arguments`, `invalid_input`, `not_found`, `media_offline`, `media_tool_failed`, `representation_busy`, `stale_revision`, and `internal_error`. A `representation_busy` writer can retry after the current owner finishes. For `stale_revision`, recovery must re-read canonical state: re-read the clip, re-apply the edit, send it again with the new revision. Server commands preserve the server's shared stable registry, including authentication, protocol, mount, job, backup, and security codes. The registry is [`core/rcdvlog-server/src/error_codes.rs`](../core/rcdvlog-server/src/error_codes.rs); clients must branch on `error.code`, not prose. Remote failures also return the server `requestId` when available.
 
 Proxy and thumbnail generation capture FFmpeg diagnostics and keep failures inside the JSON `error.message` with the stable `media_tool_failed` code. Proxy stderr is drained concurrently with its progress stream; thumbnail stderr is drained concurrently with the child process. Diagnostics redact absolute paths and are bounded to 4 KiB after redaction, so failures never prepend raw tool output to stderr.
 
@@ -384,6 +384,8 @@ rcdvlog --catalog /absolute/project/catalog.sqlite3 proxy status --project <proj
 
 `proxy status` is read-only and distinguishes verified raw-orientation v3 proxies, obsolete metadata-tagged raw v2 proxies, legacy metadata-baked v1 proxies, and missing files. Listed v3 items are live-probed and are ready only when their display rotation is 0°. `proxy missing` may be long-running and regenerates obsolete representations when originals are available. Completed proxies remain committed if the command is interrupted.
 
+Proxy and thumbnail writes coordinate across CLI, desktop, and sync through OS file claims under the managed `cache/.representation-locks` directory, keyed by cache root, asset, and kind. Lock files persist after release and must not be deleted: removing one could let two processes own different inodes for the same representation. A contended single-item generate command exits nonzero with `error.code: "representation_busy"`; batch commands count contended work as skipped, without a failure or throughput sample. Proxy downloads acquire the claim before requesting content, stream into unique staging files, and publish through the same validation/registration path as generated proxies.
+
 ### Thumbnails
 
 ```bash
@@ -392,6 +394,8 @@ rcdvlog --catalog /absolute/project/catalog.sqlite3 thumbnails missing --project
 ```
 
 Quality 1 is a 480-pixel-wide JPEG sampled at 20% of the clip. It is stored under the project folder at `cache/thumbnails/<asset-id>/q1.v2.jpg`. The original is preferred; an available proxy is used when the original is offline. Qualities 2–10 are reserved and currently rejected.
+
+Analysis-selected Q10 representative thumbnails also take the shared thumbnail claim. Their output recipe and `q10.v1.jpg` name remain unchanged.
 
 ### Local transcription and cloud clip analysis
 

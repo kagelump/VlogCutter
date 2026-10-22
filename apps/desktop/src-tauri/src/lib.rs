@@ -9,8 +9,8 @@ use rcdvlog_core::{
     ImportPreviewRequest, ImportProgress as CoreImportProgress, ImportRollbackPreview,
     ImportSessionDetail, ImportStage as CoreImportStage, IngestReport, ModelStatus, MountedVolumes,
     OpenRouterProvider, Project, ProjectRemovalAudit, ProjectStorageReport, ProviderChain,
-    ProxyReport, RelinkReport, ThumbnailReport, ToolStatus, TranscribeReport, detect_cards,
-    inspect_card,
+    ProxyReport, RelinkReport, RepresentationClaim, RepresentationKind, ThumbnailReport,
+    ToolStatus, TranscribeReport, detect_cards, inspect_card,
 };
 use rcdvlog_sync::BaselineEnvelope;
 use serde::{Deserialize, Serialize};
@@ -114,9 +114,8 @@ pub(crate) struct AppState {
     analysis_cancel: Arc<AtomicBool>,
     /// Shared by preflight, copy/verification, and the optional proxy tail.
     import_cancel: Arc<AtomicBool>,
-    /// Session-local ownership for thumbnail output paths. Import-triggered
-    /// work and explicit repair batches share it so they cannot write the same
-    /// temporary/output file concurrently.
+    /// Serializes desktop thumbnail batches after their shared cross-process
+    /// representation claims have been reserved.
     thumbnail_coordinator: Arc<ThumbnailCoordinator>,
     /// Resolves asset ids to on-disk media for the loopback origin. Held here so
     /// a restarted origin reads the same live catalog and settings.
@@ -131,45 +130,43 @@ pub(crate) struct AppState {
 
 #[derive(Default)]
 struct ThumbnailCoordinator {
-    in_flight: Mutex<HashSet<String>>,
     /// Serializes batches as well as per-asset ownership, preserving the
     /// measured one-worker policy across overlapping command invocations.
     execution: Mutex<()>,
 }
 
 impl ThumbnailCoordinator {
-    fn claim(self: &Arc<Self>, asset_ids: impl IntoIterator<Item = String>) -> ThumbnailClaims {
-        let mut in_flight = self
-            .in_flight
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+    fn claim(
+        self: &Arc<Self>,
+        catalog: &Catalog,
+        asset_ids: impl IntoIterator<Item = String>,
+    ) -> anyhow::Result<ThumbnailClaims> {
+        let mut guards = Vec::new();
         let mut claimed = Vec::new();
+        let mut seen = HashSet::new();
         for asset_id in asset_ids {
-            if in_flight.insert(asset_id.clone()) {
+            if !seen.insert(asset_id.clone()) {
+                continue;
+            }
+            if let Some(guard) =
+                catalog.try_claim_representation(&asset_id, RepresentationKind::Thumbnail)?
+            {
                 claimed.push(asset_id);
+                guards.push(guard);
             }
         }
-        drop(in_flight);
-        ThumbnailClaims {
+        Ok(ThumbnailClaims {
             coordinator: self.clone(),
             asset_ids: claimed,
-        }
+            guards,
+        })
     }
 }
 
 struct ThumbnailClaims {
     coordinator: Arc<ThumbnailCoordinator>,
     asset_ids: Vec<String>,
-}
-
-impl Drop for ThumbnailClaims {
-    fn drop(&mut self) {
-        if let Ok(mut in_flight) = self.coordinator.in_flight.lock() {
-            for asset_id in &self.asset_ids {
-                in_flight.remove(asset_id);
-            }
-        }
-    }
+    guards: Vec<RepresentationClaim>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1492,7 +1489,14 @@ fn schedule_background_thumbnails_with<F, S>(
     F: FnMut(rcdvlog_core::AssetBatchProgress) + Send + 'static,
     S: FnOnce(Box<dyn FnOnce() -> anyhow::Result<ThumbnailReport> + Send>),
 {
-    let claims = coordinator.claim(asset_ids);
+    let claims = match coordinator.claim(&catalog, asset_ids) {
+        Ok(claims) => claims,
+        Err(error) => {
+            // Thumbnail ownership is ancillary to the already completed import.
+            eprintln!("could not reserve detached thumbnail work: {error:#}");
+            return;
+        }
+    };
     if claims.asset_ids.is_empty() {
         return;
     }
@@ -1505,7 +1509,7 @@ fn schedule_background_thumbnails_with<F, S>(
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         // Import success is already final. Individual failures stay in this
         // quiet report and the explicit backfill action remains the recovery path.
-        generate_detached_q1_thumbnails(&catalog, &_claims.asset_ids, &mut on_progress)
+        generate_detached_q1_thumbnails(&catalog, &_claims.guards, &mut on_progress)
     }));
 }
 
@@ -1513,13 +1517,13 @@ fn schedule_background_thumbnails_with<F, S>(
 /// report. A failed clip stays eligible for the explicit thumbnail backfill.
 fn generate_detached_q1_thumbnails<F>(
     catalog: &Catalog,
-    asset_ids: &[String],
+    claims: &[RepresentationClaim],
     on_progress: F,
 ) -> anyhow::Result<ThumbnailReport>
 where
     F: FnMut(rcdvlog_core::AssetBatchProgress),
 {
-    catalog.generate_thumbnails_for_assets_with_progress(asset_ids, 1, on_progress)
+    catalog.generate_thumbnails_with_claims_with_progress(claims, 1, on_progress)
 }
 
 #[tauri::command]
@@ -1739,7 +1743,8 @@ async fn generate_thumbnail(
     let catalog = state.catalog()?;
     let claims = state
         .thumbnail_coordinator
-        .claim(std::iter::once(asset_id.clone()));
+        .claim(&catalog, std::iter::once(asset_id.clone()))
+        .map_err(error_message)?;
     if claims.asset_ids.is_empty() {
         return catalog.get_asset(&asset_id).map_err(error_message);
     }
@@ -1750,7 +1755,7 @@ async fn generate_thumbnail(
             .execution
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        catalog.generate_thumbnail(&asset_id, quality)
+        catalog.generate_thumbnail_with_claim(&_claims.guards[0], quality)
     })
     .await
     .map_err(error_message)?
@@ -1772,7 +1777,10 @@ async fn generate_missing_thumbnails(
         .map(|asset| asset.id)
         .collect::<Vec<_>>();
     let total = asset_ids.len();
-    let claims = state.thumbnail_coordinator.claim(asset_ids);
+    let claims = state
+        .thumbnail_coordinator
+        .claim(&catalog, asset_ids)
+        .map_err(error_message)?;
     let already_in_flight = total.saturating_sub(claims.asset_ids.len());
     tauri::async_runtime::spawn_blocking(move || -> anyhow::Result<ThumbnailReport> {
         let _claims = claims;
@@ -1781,8 +1789,8 @@ async fn generate_missing_thumbnails(
             .execution
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut report = catalog.generate_thumbnails_for_assets_with_progress(
-            &_claims.asset_ids,
+        let mut report = catalog.generate_thumbnails_with_claims_with_progress(
+            &_claims.guards,
             quality,
             |progress| {
                 let _ = app.emit("thumbnail-progress", progress);
@@ -2872,16 +2880,41 @@ mod tests {
 
     #[test]
     fn thumbnail_coordinator_deduplicates_overlapping_batches_until_release() {
+        let directory = tempdir().unwrap();
+        let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).unwrap();
         let coordinator = Arc::new(ThumbnailCoordinator::default());
-        let first = coordinator.claim(["asset_a".to_string(), "asset_b".to_string()]);
+        let first = coordinator
+            .claim(&catalog, ["asset_a".to_string(), "asset_b".to_string()])
+            .unwrap();
         assert_eq!(first.asset_ids, ["asset_a", "asset_b"]);
 
-        let overlap = coordinator.claim(["asset_b".to_string(), "asset_c".to_string()]);
+        let overlap = coordinator
+            .claim(&catalog, ["asset_b".to_string(), "asset_c".to_string()])
+            .unwrap();
         assert_eq!(overlap.asset_ids, ["asset_c"]);
         drop(first);
 
-        let resumed = coordinator.claim(["asset_a".to_string(), "asset_b".to_string()]);
+        let resumed = coordinator
+            .claim(&catalog, ["asset_a".to_string(), "asset_b".to_string()])
+            .unwrap();
         assert_eq!(resumed.asset_ids, ["asset_a", "asset_b"]);
+
+        let external = catalog
+            .try_claim_representation("asset_external", RepresentationKind::Thumbnail)
+            .unwrap()
+            .unwrap();
+        let skipped = coordinator
+            .claim(&catalog, ["asset_external".to_string()])
+            .unwrap();
+        assert!(skipped.asset_ids.is_empty());
+        drop(external);
+        assert_eq!(
+            coordinator
+                .claim(&catalog, ["asset_external".to_string()])
+                .unwrap()
+                .asset_ids,
+            ["asset_external"]
+        );
     }
 
     #[test]
