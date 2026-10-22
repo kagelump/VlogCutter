@@ -40,10 +40,10 @@ async function openProject(app: Awaited<ReturnType<typeof renderApp>>, projectId
 describe("switching projects while a read is in flight", () => {
   it("does not let the first project's clips land in the second", async () => {
     const harness = twoProjects();
-    // Hokkaido's queue read never answers until this test says so.
+    // Hokkaido's initial queue read never answers until this test says so.
     harness.command("list_assets", (args) => args.projectId === A).delayUntilReleased();
-
-    const app = await renderApp(harness);
+    const app = await renderApp(harness, { waitFor: "shell" });
+    await waitFor(() => expect(harness.calls("list_assets").some((call) => call.projectId === A)).toBe(true));
     await openProject(app, B);
 
     await waitFor(() => expect(queueFilenames()).toEqual(["DJI_001.MP4", "DJI_002.MP4"]));
@@ -61,8 +61,8 @@ describe("switching projects while a read is in flight", () => {
     const harness = twoProjects();
     harness.command("list_assets", (args) => args.projectId === A)
       .delayThenReject("catalog unavailable: database is locked");
-
-    const app = await renderApp(harness);
+    const app = await renderApp(harness, { waitFor: "shell" });
+    await waitFor(() => expect(harness.calls("list_assets").some((call) => call.projectId === A)).toBe(true));
     await openProject(app, B);
     await waitFor(() => expect(queueFilenames()).toHaveLength(2));
 

@@ -11,6 +11,7 @@ import { act, cleanup, render, screen, waitFor, within, type RenderResult } from
 import userEvent from "@testing-library/user-event";
 import App from "../../App";
 import type { ActWrapper, DesktopHarness } from "./DesktopHarness";
+import { projectAssets } from "./state";
 
 let activeHarness: DesktopHarness | null = null;
 
@@ -49,13 +50,16 @@ export interface BootedApp extends RenderResult {
 }
 
 /** Boot and wait until the shell and the first clip are on screen. */
-export async function renderApp(harness: DesktopHarness): Promise<BootedApp> {
+export async function renderApp(
+  harness: DesktopHarness,
+  options: { waitFor?: "ready" | "shell" } = {},
+): Promise<BootedApp> {
   harness.useActWrapper(actWrapper);
   if (!harness.installed) harness.install();
   activeHarness = harness;
 
   const rendered = render(<App />);
-  await settle(harness);
+  await settle(harness, options);
 
   const user = userEvent.setup();
   const booted: BootedApp = {
@@ -64,7 +68,7 @@ export async function renderApp(harness: DesktopHarness): Promise<BootedApp> {
     user,
     remount: async () => {
       rendered.unmount();
-      return renderApp(harness);
+      return renderApp(harness, options);
     },
   };
   return booted;
@@ -73,15 +77,42 @@ export async function renderApp(harness: DesktopHarness): Promise<BootedApp> {
 /**
  * Wait for the boot reads to land.
  *
- * The context write is deliberately included: `App` schedules it 100 ms after a
- * project opens, and a test that finished before it fired would leave a timer
- * updating an unmounted tree.
+ * The context write is deliberately included: `App` schedules it 100 ms after
+ * a project opens and again when the selection resolves. Wait for the write
+ * containing that stable selection, not merely the initial null-valued write;
+ * finishing before it fires would leave a timer updating an unmounted tree.
  */
-export async function settle(harness: DesktopHarness) {
+export async function settle(harness: DesktopHarness, options: { waitFor?: "ready" | "shell" } = {}) {
   await screen.findByTestId("operation-slot");
+  if (options.waitFor === "shell") return;
   if (harness.state.projects.length > 0) {
+    const projectId = harness.state.projects[0].id;
+    const visibleAssets = projectAssets(harness.state, projectId).filter((asset) => !asset.removed);
     await waitFor(() => expect(harness.calls("list_assets").length).toBeGreaterThan(0));
-    await waitFor(() => expect(harness.calls("record_desktop_context").length).toBeGreaterThan(0), {
+    await waitFor(() => {
+      const latestRead = harness.commandLog()
+        .filter((entry) => entry.command === "list_assets" && entry.args.projectId === projectId)
+        .at(-1);
+      if (latestRead?.outcome === "rejected") {
+        // A failed initial read has no queue selection to persist. Treat it as
+        // settled only once the retry affordance reflects that terminal result.
+        expect(screen.getByRole("button", { name: "Try again" })).toBeVisible();
+        return;
+      }
+      if (visibleAssets.length === 0) {
+        expect(harness.calls("record_desktop_context")).toContainEqual({ projectId, assetId: null });
+        return;
+      }
+      const selected = selectedRow();
+      expect(selected).toBeDefined();
+      const position = Number(selected?.getAttribute("aria-posinset"));
+      const selectedAsset = visibleAssets[position - 1];
+      expect(selectedAsset).toBeDefined();
+      expect(harness.calls("record_desktop_context")).toContainEqual({
+        projectId,
+        assetId: selectedAsset.id,
+      });
+    }, {
       timeout: 2_000,
     });
   }

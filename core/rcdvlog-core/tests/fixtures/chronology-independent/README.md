@@ -50,6 +50,18 @@ runtime in a tempdir through the same construction method.
 | `counter_parsing_examples` | 6 | 1 | 0 | the frozen documented parsing examples (C0101.MP4 -> 101 etc.) |
 | `large_three_camera_500` | 500 | 3 | 3 | 500 assets across three cameras with overlapping counters and interleaved times |
 
+Filename counters for newly identified footage give an explicit camera pattern
+priority over the generic trailing-digit fallback. For example,
+`DJI_20251221092058_0001_D.MP4` uses the DJI pattern's counter `1`; its trailing
+14-digit timestamp is not a counter. The `counter_parsing_examples` fixture
+freezes the generic trailing-digit cases, while the pattern table examples and
+unit tests in `core/rcdvlog-core/src/cameras/` freeze this precedence rule.
+
+Camera repair prefers a parseable filename counter over the stored card-derived
+counter. To exercise the card fallback, use synthetic filenames without
+parseable trailing digits or a recognized camera pattern; a name such as
+`clip_0001.mp4` would exercise filename precedence instead.
+
 ## Media file
 
 `media/sample.mp4` is a tiny synthetic file (deterministic bytes, not a real

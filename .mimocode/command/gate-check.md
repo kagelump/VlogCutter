@@ -1,84 +1,56 @@
 ---
-description: Run the project verification gate — format check, clippy, Rust workspace tests, TypeScript check, and frontend tests. Use after every meaningful code change before commit or handoff. Accepts an optional scope argument: "backend" (Rust only), "full" (everything including CLI doctor), or omit for default (Rust + TypeScript).
+description: Run the checked-in VlogCutter verification gate. Use --scope fast while iterating and the default pre-pr gate before review or handoff. Reports every check and exits nonzero when any check or prerequisite fails.
 ---
 
 # Verification Gate
 
-Run the verification gate for RCD VlogCutter. This is the "definition of done" check from AGENTS.md §12 and §16.
+Run `pnpm gate` at the repository root. The executable implementation is
+`scripts/pre-pr-gate.mjs`; it reads the Rust toolchain pin from
+`.github/workflows/ci.yml`, prints each command's output and status, and runs
+the remaining checks after a failure so the final summary shows every result.
 
-## Scope
+## Fast iteration
 
-Determine scope from the argument `$ARGUMENTS`:
+Use `pnpm gate --scope fast` (or `node scripts/pre-pr-gate.mjs --scope fast`):
+it runs `git diff --check origin/main...HEAD` for committed whitespace,
+staged and unstaged `git diff --check` for local changes, pinned `cargo fmt`,
+and `pnpm check:frontend`. Run `git fetch origin main` if the committed-candidate
+check reports that `origin/main` is unavailable; the gate fails closed. After
+Rust changes, run the relevant package test
+directly too. For one named test, use
+`pnpm test:focused <cargo-package> <exact-test-name>`; it pins the Rust
+toolchain and fails if Cargo reports zero tests or omits the requested result.
 
-- `backend` or `rust` — Rust-only gate (fmt + clippy + workspace tests)
-- `full` — Everything including CLI doctor and all frontend checks
-- *(empty)* — Default: Rust + TypeScript check (the most common form)
+## Mandatory pre-PR gate
 
-## Default gate (no argument)
+Run `pnpm gate` with no arguments for the pre-PR checks. For a direct push or
+PR creation, use `pnpm publish:after-gate push` or
+`pnpm publish:after-gate pr`; the wrapper prints the candidate HEAD for the
+handoff receipt, runs the real gate once, then checks that HEAD and the
+index/worktree state still matches the pre-gate snapshot immediately before
+each external action. The `push` action runs the
+fixed upstream push; `pr` runs that same push followed by `gh pr create --fill`,
+and stops if the push fails. Both refuse to start with a dirty tree.
 
-```bash
-echo "=== cargo fmt ===" && \
-cargo fmt --all --check 2>&1 && \
-echo "=== cargo clippy ===" && \
-cargo clippy --workspace --all-targets -- -D warnings 2>&1 | tail -1 && \
-echo "=== cargo test ===" && \
-cargo test --workspace 2>&1 | grep "test result" && \
-echo "=== pnpm check ===" && \
-pnpm --dir apps/desktop check 2>&1 | tail -3
-```
-
-## Backend-only gate (`backend` or `rust`)
-
-```bash
-echo "=== cargo fmt ===" && \
-cargo fmt --all --check 2>&1 && \
-echo "=== cargo clippy ===" && \
-cargo clippy --workspace --all-targets -- -D warnings 2>&1 | tail -1 && \
-echo "=== cargo test ===" && \
-cargo test --workspace 2>&1 | grep "test result"
-```
-
-## Full gate (`full`)
-
-```bash
-echo "=== git diff ===" && \
-git diff --check 2>&1 && \
-echo "=== cargo fmt ===" && \
-cargo fmt --all --check 2>&1 && \
-echo "=== cargo clippy ===" && \
-cargo clippy --workspace --all-targets -- -D warnings 2>&1 | tail -1 && \
-echo "=== cargo test ===" && \
-cargo test --workspace 2>&1 | grep "test result" && \
-echo "=== pnpm check ===" && \
-pnpm check 2>&1 | tail -1 && \
-echo "=== pnpm test ===" && \
-pnpm test 2>&1 | tail -4 && \
-echo "=== CLI doctor ===" && \
-cargo run -p rcdvlog-cli -- doctor --json 2>&1
-```
-
-## Additional desktop-specific checks
-
-For UI changes, also run:
-
-```bash
-pnpm --dir apps/desktop test 2>&1 | tail -8
-```
-
-For browser/layout/scroll changes:
-
-```bash
-pnpm test:desktop:browser 2>&1 | tail -8
-```
+The pre-PR gate checks diff whitespace, exact Rust version, fmt, clippy, the workspace tests,
+frontend type checks, desktop unit/CUJ/coverage/browser tests, web tests, CLI
+integration, OpenAPI, docs, script tests, and deployment config. Install
+dependencies first (`pnpm install --frozen-lockfile`) and install Playwright's
+desktop Chromium with `pnpm --dir apps/desktop exec playwright install
+chromium` if it is not already present. These commands match the Ubuntu job in
+`.github/workflows/ci.yml`.
 
 ## Failure handling
 
-- If `cargo fmt --check` fails: run `cargo fmt --all` to auto-fix, then re-run the gate.
-- If `cargo clippy` fails: fix the warnings (they are errors with `-D warnings`).
-- If tests fail: investigate and fix before proceeding.
-- If `pnpm check` fails: fix TypeScript errors.
-- Report each gate's result separately so failures are easy to locate.
+The gate preserves each command's exit code, prints all output (including
+`test result` lines on a failed test command), and ends with one PASS/FAIL line
+per check. Missing commands and a Rust toolchain other than the CI pin fail the
+gate. A successful `cargo test` must report at least one executed test.
 
-## Reference
+After changing code, re-run checks affected by that change; an earlier green
+result is stale. After the pre-PR run, report its full output or the completed
+CI run URL and its failed-step logs. Do not summarize an incomplete or failed
+run as a pass.
 
-AGENTS.md §12 defines the full gate table. This command encodes the most common patterns observed in trajectory data (34 instances across 8+ sessions in 30 days).
+See `AGENTS.md` §6 and §12 for portable prerequisites and the verification
+contract.

@@ -6,7 +6,27 @@ Runs on every push to `main` and every pull request targeting `main`.
 
 ### `ubuntu` job (ubuntu-latest)
 
-Proves the full headless verification gate passes on Linux:
+Proves the full headless verification gate passes on Linux. The local
+equivalent is `pnpm gate` from the repository root. The local gate also checks
+committed whitespace with `git diff --check origin/main...HEAD`; fetch `origin
+committed whitespace with `git diff --check origin/main...HEAD`; run
+`git fetch origin main` when that ref is unavailable. Use
+`pnpm gate --scope fast` for quick iteration; only the default pre-PR scope is
+the CI-equivalent gate. The checked-in runner reads Rust 1.97.1 from the
+workflow, fails when a required command is absent, preserves command exit
+codes, and prints a per-check summary after running all checks. The publication
+wrapper prints candidate HEAD before the gate for the handoff receipt. It
+verifies that the workspace test command reports executed tests. Regression coverage
+runs with `node --test scripts/pre-pr-gate.test.mjs` (also part of
+`pnpm test:scripts`).
+
+For local publication, `pnpm publish:after-gate push` and
+`pnpm publish:after-gate pr` run the gate once at the boundary, then verify
+HEAD and the working-tree content before each external action. The `pr` action
+pushes the current branch and creates the PR, stopping if push fails. The
+wrapper refuses a dirty starting tree. For focused Rust iteration,
+`pnpm test:focused <cargo-package> <exact-test-name>` runs the pinned Cargo
+test with `--exact` and verifies that the requested name executed.
 
 - Rust: formatting, clippy (deny warnings), and the full workspace test suite
 - TypeScript: type checking across all frontend packages, the desktop vitest
