@@ -31,12 +31,33 @@ function snapshot(spawn) {
   return { dirty: false, head: head.stdout.trim(), tracked: tracked.stdout, untracked: untrackedContent.join("\0") };
 }
 
-export function publishAfterGate({ action, gate = runGate, spawn = spawnSync, write = (value) => process.stdout.write(value) }) {
+export function publishAfterGate({ action, gate = runGate, gateArgs = [], spawn = spawnSync, write = (value) => process.stdout.write(value) }) {
   const commands = actions[action];
   if (!commands) {
-    write("Usage: node scripts/publish-after-gate.mjs push|pr\n");
+    write("Usage: node scripts/publish-after-gate.mjs push|pr [--scope local|pre-pr] [--checks <JSON file>]\n");
     return 2;
   }
+  let selectedScope = "local";
+  let sawScope = false;
+  let sawChecks = false;
+  for (let index = 0; index < gateArgs.length; index += 1) {
+    if (gateArgs[index] === "--scope" && gateArgs[index + 1]) {
+      if (sawScope) { write("Repeated --scope option.\n"); return 2; }
+      sawScope = true;
+      selectedScope = gateArgs[++index];
+    } else if (gateArgs[index] === "--checks" && gateArgs[index + 1]) {
+      if (sawChecks) { write("Repeated --checks option.\n"); return 2; }
+      sawChecks = true;
+      index += 1;
+    } else {
+      write(`Unknown gate argument: ${gateArgs[index]}\n`);
+      return 2;
+    }
+  }
+  if (selectedScope === "fast") { write("Publication requires --scope local or --scope pre-pr; fast is iteration-only.\n"); return 2; }
+  if (!["local", "pre-pr"].includes(selectedScope)) { write(`Unknown publication scope: ${selectedScope}\n`); return 2; }
+  if (selectedScope === "pre-pr" && sawChecks) { write("--checks is only valid with --scope local.\n"); return 2; }
+  if (selectedScope === "local" && !sawChecks) { write("Local publication requires --checks <JSON file>.\n"); return 2; }
 
   const before = snapshot(spawn);
   if (!before) {
@@ -49,7 +70,7 @@ export function publishAfterGate({ action, gate = runGate, spawn = spawnSync, wr
   }
   write(`Publication candidate HEAD: ${before.head}\n`);
   // The wrapper's action argument is not an argument to the verification gate.
-  const gateStatus = gate({ args: [] });
+  const gateStatus = gate({ args: gateArgs });
   if (gateStatus !== 0) {
     write(`Pre-PR gate failed with exit ${gateStatus}; refusing publication.\n`);
     return gateStatus || 1;
@@ -73,5 +94,5 @@ export function publishAfterGate({ action, gate = runGate, spawn = spawnSync, wr
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  process.exitCode = publishAfterGate({ action: process.argv[2] });
+  process.exitCode = publishAfterGate({ action: process.argv[2], gateArgs: process.argv.slice(3) });
 }

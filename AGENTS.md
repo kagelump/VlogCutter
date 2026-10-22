@@ -920,7 +920,11 @@ and Codex session management remain in the external consumer. See
 
 ## 12. Testing and verification
 
-Run the narrowest useful tests while iterating, then the full gate before handoff.
+Run focused local checks for the changed behavior and its dependencies before
+PR, then require passing Ubuntu and macOS CI on the exact candidate head before
+merge. The broader automated checks below are supplied by CI; select additional
+local checks according to the changed boundaries and risk. Manual acceptance
+requirements remain explicit.
 
 | Change area | Fast check | Required broader check |
 | --- | --- | --- |
@@ -941,21 +945,26 @@ Run the narrowest useful tests while iterating, then the full gate before handof
 
 `pnpm check` runs TypeScript checking followed by all Rust workspace tests. The process-level integration suite creates a real one-second FFmpeg fixture and validates CLI persistence, WAL reads, ingest, metadata, deduplication, labels/notes/removal, clock correction, thumbnails/proxies, and offline-original review. Its media portion skips when FFmpeg or ffprobe is missing.
 
-Run `pnpm gate --scope fast` while iterating; it runs
-`git diff --check origin/main...HEAD` for the committed candidate,
-`git diff --check` and `git diff --cached --check` for local changes, the pinned
-Rust formatter, and `pnpm check:frontend`. Run `git fetch origin main` if the
-candidate-base check reports that `origin/main` is unavailable; the gate never
-skips that check. Run `pnpm gate` with no
-arguments as the mandatory pre-PR gate. It follows the Ubuntu CI checks in
-`.github/workflows/ci.yml`, prints each command's complete output and exit
-status, continues to report later checks after a failure, and returns nonzero
-if any command or prerequisite is missing. The workspace test check also
-requires a nonzero count of executed tests. The gate's isolated regression
-suite is `node --test scripts/pre-pr-gate.test.mjs`; `pnpm test:scripts`
-includes it. Re-run relevant checks after every code change because earlier
-results are stale, and include the complete gate output or completed CI run
-URL and failed-step logs in a handoff.
+Use `pnpm gate --scope fast` for a quick iteration check. The default local
+gate requires a JSON focused-check plan and runs the candidate diff checks,
+pinned formatter/toolchain, workspace Clippy, frontend typecheck, and the
+named checks in that plan. For example, save
+`{"checks":[{"name":"migration test","command":"pnpm","args":["test:focused","rcdvlog-core","migrations::tests::the_schema_version_constant_tracks_the_migration_list"]}]}`
+to `/absolute/path/focused-checks.json`, then run
+`pnpm gate --checks /absolute/path/focused-checks.json`. Commands are spawned directly
+with argument arrays; shell strings are not accepted. Local verification should
+cover the changed behavior and its dependencies, including targeted integration
+checks for migrations, integrity, concurrency, cancellation, or paid accounting
+when those boundaries change. Use the full pre-PR scope only when a specific
+risk or repeated CI failure justifies its broader cost:
+`pnpm gate --scope pre-pr`. It follows all Ubuntu CI checks in
+`.github/workflows/ci.yml`, prints each command's output and status, and fails
+if any prerequisite or command fails. `pnpm gate --scope fast` remains
+iteration-only. Before merge, completed Ubuntu and macOS CI must pass on the
+exact candidate head; coverage and safety checks remain mandatory. The gate's
+isolated regression suite is `node --test scripts/pre-pr-gate.test.mjs`, and
+`pnpm test:scripts` includes it. Re-run relevant checks after each code change
+and include results or exact-head CI links and failed-step logs in a handoff.
 
 For one Rust test during iteration, run
 `pnpm test:focused <cargo-package> <exact-test-name>` (for example,
@@ -964,9 +973,11 @@ pin and `--exact`, then requires Cargo to report the named test and at least
 one executed test. The fake-command regression cases are in
 `scripts/run-focused-test.test.mjs`.
 
-Use `pnpm publish:after-gate push` or `pnpm publish:after-gate pr` when the
-gate must be enforced at the publication boundary. That wrapper runs the
-actual pre-PR gate from a clean tree, snapshots HEAD and tracked/untracked
+Use `pnpm publish:after-gate push --checks /absolute/path/focused-checks.json` or
+`pnpm publish:after-gate pr --checks /absolute/path/focused-checks.json` to publish after
+the focused local gate. Choose the broader policy explicitly with
+`--scope pre-pr`; the fast scope is refused at the publication boundary. The
+wrapper runs the actual gate from a clean tree, snapshots HEAD and tracked/untracked
 working-tree content, and rechecks that identity before each external action.
 It refuses publication if the gate fails or that identity changes. The `pr`
 action pushes the current branch upstream and then creates the PR, stopping if
