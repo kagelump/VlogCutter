@@ -19,6 +19,7 @@ use std::time::Instant;
 use uuid::Uuid;
 use walkdir::WalkDir;
 
+mod agent;
 mod analysis;
 mod archive;
 mod baseline;
@@ -37,6 +38,7 @@ mod locations;
 mod migrations;
 mod operations;
 mod preflight;
+mod prerequisites;
 mod stall;
 mod storage;
 mod volumes;
@@ -92,11 +94,20 @@ pub use lifecycle::{
     ProjectStorageReport,
 };
 
+pub use agent::{
+    AgentReadinessError, BindingCheck, CatalogReadiness, CliBinding, CliBuild, CliExecutable,
+    CliSelection, DoctorReport, ReadinessRequirements, catalog_readiness, check_cli_binding,
+    doctor_report, ensure_agent_readiness, refresh_cli_binding, speech_model_status,
+};
 pub use preflight::{
     Classification, ImportDestination, ImportOutcome, ImportPreflight, ImportProgress,
     ImportSequenceBoundary, ImportSequenceBoundaryEvidence, ImportSequencePreview,
     ImportSequenceRunDecision, ImportSequenceRunPreview, ImportStage,
     LARGE_CAPTURE_SEQUENCE_GAP_SECONDS, PreflightItem, human_bytes, import_source_present,
+};
+pub use prerequisites::{
+    MediaPrerequisiteError, ToolPrerequisiteStatus, ToolStatus, ensure_media_prerequisites,
+    prerequisite_status,
 };
 
 pub use analysis::quality::DecodedSegment;
@@ -732,14 +743,6 @@ pub struct AnalyzeBatchProgress {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ToolStatus {
-    pub name: String,
-    pub path: String,
-    pub available: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct CatalogInspection {
     pub path: String,
     pub read_only: bool,
@@ -906,20 +909,6 @@ pub fn probe_media_stream(path: impl AsRef<Path>) -> Result<MediaStreamInfo> {
         display_height,
         display_orientation,
     })
-}
-
-pub fn prerequisite_status() -> Vec<ToolStatus> {
-    ["ffmpeg", "ffprobe", "exiftool"]
-        .into_iter()
-        .map(|name| {
-            let path = resolve_tool(name);
-            ToolStatus {
-                name: name.to_string(),
-                path: path.to_string_lossy().into_owned(),
-                available: path.is_file(),
-            }
-        })
-        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2526,17 +2515,7 @@ impl Catalog {
     ///
     /// Read-only and offline: it never downloads and never creates directories.
     pub fn model_status(&self) -> Result<Vec<ModelStatus>> {
-        let directory = model_dir(&self.database_path)?;
-        Ok([WHISPER_MODEL, VAD_MODEL]
-            .into_iter()
-            .map(|model| ModelStatus {
-                name: model.file_name.to_string(),
-                installed: model_is_installed(&directory, &model),
-                bytes: model.bytes,
-                url: model.url.to_string(),
-                directory: directory.to_string_lossy().into_owned(),
-            })
-            .collect())
+        speech_model_status(&self.database_path)
     }
 
     /// Downloads whichever speech models are missing, into the shared directory.

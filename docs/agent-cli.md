@@ -7,11 +7,10 @@
 This document describes the CLI as implemented today.
 
 The accepted product architecture (PRD §6.3, §15, §25.1 item 18) pairs this CLI
-with a project-local *agent workspace*. Issue #48 will make a VlogCutter video
-project root self-describing to a general-purpose coding agent: a generated
-`AGENTS.md` and `PROJECT.md` inside the project folder will tell an agent what
-the project is and how to use this CLI, so a cold Claude Code or Codex session
-opened at the project root needs no bespoke setup from the user.
+with a project-local *agent workspace*. The CLI now reports its own build and
+readiness, and can explicitly bind or verify the selected executable and
+catalog for an existing project root. Issue #48 still owns materializing
+project context such as generated `AGENTS.md` and `PROJECT.md` files.
 
 The two layers have different jobs:
 
@@ -26,15 +25,23 @@ revision-safe CLI command or a future explicit, validated apply/import
 operation. Human- and agent-authored files are different: the planned
 `script.md` is a versioned input that may be edited directly.
 
-None of the workspace materialization, script revisions, or edit-plan commands
-exist yet. Everything below is implemented; anything marked planned is not.
+Workspace binding does not generate or rewrite project instructions. Script
+revisions and workspace materialization remain planned. Everything below is
+implemented; anything marked planned is not.
 
 ## Build and catalog selection
 
 ```bash
-cargo build -p rcdvlog-cli
-target/debug/rcdvlog --catalog /absolute/project/catalog.sqlite3 doctor
+rustup toolchain install 1.97.1 --component rustfmt --component clippy
+cargo +1.97.1 build --locked -p rcdvlog-cli
+target/debug/rcdvlog doctor
 ```
+
+For a development binding, build from the intended checkout with that pinned
+toolchain. Use the same `CARGO_TARGET_DIR` for the build and its resulting
+binary; pass the binary's absolute path to `workspace refresh`. For an installed
+selection, pass the absolute path of the installed binary. Do not build or
+resolve another executable during workspace checks.
 
 Catalog selection, in precedence order:
 
@@ -43,7 +50,12 @@ Catalog selection, in precedence order:
 3. The desktop app's persisted `lastCatalogPath`
 4. The legacy desktop catalog under macOS Application Support
 
-Agents should pass `--catalog <project folder>/catalog.sqlite3` explicitly for desktop projects, tests, and temporary workflows.
+Ordinary catalog commands retain the selection precedence above. `doctor` is
+observational and never falls back to the desktop catalog: without explicit
+`--catalog` or `RCDVLOG_CATALOG` it reports `catalog_required`. Agent automation should pass
+`--catalog <project folder>/catalog.sqlite3` explicitly. `workspace refresh`
+requires that explicit catalog (or `RCDVLOG_CATALOG`) and never creates or
+migrates it.
 
 ## Output contract
 
@@ -85,8 +97,68 @@ Long ingest commands emit JSON progress objects to stderr every 25 assets and on
 ### Prerequisites
 
 ```bash
-rcdvlog --catalog /absolute/project/catalog.sqlite3 doctor
+rcdvlog doctor
+rcdvlog --catalog /absolute/project/catalog.sqlite3 doctor --check
+rcdvlog --catalog /absolute/project/catalog.sqlite3 doctor \
+  --require-tool ffmpeg --require-models
 ```
+
+`doctor` succeeds as a report even when the selected environment is not ready.
+Its `data.executable` contains the canonical path of the running binary,
+compile-time version/revision/dirty/profile/target/rustc metadata, capabilities,
+and leaf command names. The `tools` and `models` sections report observed
+readiness, while `catalogStatus` is read-only. `--check` is strict: it requires
+a compatible explicit catalog, all three supported media tools, and installed
+speech models. Repeat `--require-tool <name>`, `--require-models`,
+`--require-capability <capability-or-exact-command>`, and
+`--expect-revision <full-revision>` to ask for a narrower explicit contract.
+Strict failures use JSON error codes such as `catalog_missing`,
+`catalog_upgrade_required`, `media_prerequisite_failed`, `model_unavailable`,
+`capability_unavailable`, and `revision_mismatch`; readiness errors include
+the report in `error.details`. Model readiness reuses the existing presence
+and configured-checksum policy. It does not load an inference engine or fetch
+models; provisioning remains explicit.
+
+### Project-local CLI binding
+
+The binding records which absolute executable and existing catalog an agent
+selected for a project root. It is stored only at
+`<project-root>/.vlogcutter/cli-binding.json`:
+
+```bash
+rcdvlog --catalog /absolute/project/catalog.sqlite3 workspace refresh \
+  --root "/absolute/project root" \
+  --executable /absolute/checkout/target/debug/rcdvlog \
+  --selection development
+rcdvlog --catalog /absolute/project/catalog.sqlite3 workspace check \
+  --root "/absolute/project root" --check
+```
+
+Use `--selection installed` with an installed binary, or `development` with a
+binary built from the intended checkout and pinned toolchain. Refresh requires
+absolute paths, probes the exact selected executable, checks its versioned
+doctor contract, and records its build identity and BLAKE3 digest. It can bind
+an unready environment so setup can happen first; pass the same readiness
+flags (`--check`, `--require-tool`, `--require-models`,
+`--require-capability`, `--expect-revision`) when refresh must enforce them.
+Check verifies the existing binding and returns an `invocation` string array
+containing the selected executable, `--catalog`, and catalog path. Treat this
+as structured argv; never concatenate it into a shell command. Without strict
+readiness flags, `check` requires the bound compatible catalog and executable
+contract but does not require media tools or speech models. Use `--check` before
+scheduling work that needs the full tool and model set, or provide only the
+specific `--require-*` options that operation needs.
+
+Check rejects moved, missing, replaced, or incompatible executables without
+falling back to PATH or a desktop installation. Repair is explicit: build or
+select the intended executable, then run `workspace refresh` again. It does
+not rewrite authored `AGENTS.md` or `PROJECT.md`, materialize any workspace
+instructions, or change unknown files in `.vlogcutter/`.
+
+Binding failures use `binding_missing`, `binding_invalid`, `binding_stale`,
+`binding_catalog_mismatch`, `executable_unavailable`, or
+`capability_unavailable`. Preserve an unrecognized binding file before manual
+repair; refresh refuses to overwrite it.
 
 ### Screenshot-driven diagnosis
 

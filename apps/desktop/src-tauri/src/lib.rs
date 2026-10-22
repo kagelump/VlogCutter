@@ -721,8 +721,10 @@ pub(crate) fn error_message(error: impl std::fmt::Display) -> String {
 }
 
 #[tauri::command]
-fn prerequisite_status() -> Vec<ToolStatus> {
-    rcdvlog_core::prerequisite_status()
+async fn prerequisite_status() -> Result<Vec<ToolStatus>, String> {
+    tauri::async_runtime::spawn_blocking(rcdvlog_core::prerequisite_status)
+        .await
+        .map_err(error_message)
 }
 
 #[tauri::command]
