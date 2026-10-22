@@ -12,6 +12,7 @@ use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+mod agent_commands;
 mod chronology_commands;
 mod server_commands;
 
@@ -36,8 +37,16 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
-    /// Report required external tools and the selected catalog.
-    Doctor,
+    /// Inspect the running build, explicit catalog, tools, and speech readiness.
+    Doctor {
+        #[command(flatten)]
+        readiness: agent_commands::ReadinessArgs,
+    },
+    /// Bind or verify an explicitly selected project-local executable and catalog.
+    Workspace {
+        #[command(subcommand)]
+        command: agent_commands::WorkspaceCommand,
+    },
     /// Inspect catalog structure without migrations or writes.
     Catalog {
         #[command(subcommand)]
@@ -498,7 +507,8 @@ fn selected_catalog(cli: &Cli) -> Result<PathBuf> {
 
 fn command_name(command: &Commands) -> &'static str {
     match command {
-        Commands::Doctor => "doctor",
+        Commands::Doctor { .. } => "doctor",
+        Commands::Workspace { command } => agent_commands::command_name(command),
         Commands::Catalog { .. } => "catalog.inspect",
         Commands::Desktop { .. } => "desktop.last-opened",
         Commands::Project { command } => match command {
@@ -565,6 +575,14 @@ fn command_name(command: &Commands) -> &'static str {
 }
 
 fn execute(cli: &Cli) -> Result<Value> {
+    // Agent readiness never consults the desktop breadcrumb or opens a catalog
+    // writable. Dispatch before legacy catalog selection.
+    if let Commands::Doctor { readiness } = &cli.command {
+        return agent_commands::doctor(cli.catalog.as_deref(), readiness);
+    }
+    if let Commands::Workspace { command } = &cli.command {
+        return agent_commands::workspace(cli.catalog.as_deref(), command);
+    }
     let catalog_path = selected_catalog(cli)?;
     if let Commands::Server {
         connection,
@@ -573,13 +591,6 @@ fn execute(cli: &Cli) -> Result<Value> {
     {
         return server_commands::execute(connection, command, &catalog_path);
     }
-    if matches!(cli.command, Commands::Doctor) {
-        return Ok(json!({
-            "catalog": catalog_path,
-            "tools": rcdvlog_core::prerequisite_status(),
-        }));
-    }
-
     if matches!(cli.command, Commands::Desktop { .. }) {
         let context = desktop_context()?;
         return Ok(json!({
@@ -638,7 +649,7 @@ fn execute(cli: &Cli) -> Result<Value> {
         Catalog::open(&catalog_path)?
     };
     match &cli.command {
-        Commands::Doctor => unreachable!(),
+        Commands::Doctor { .. } | Commands::Workspace { .. } => unreachable!(),
         Commands::Catalog { .. } | Commands::Desktop { .. } => unreachable!(),
         Commands::Chronology { command } => {
             chronology_commands::execute_chronology(&catalog, command)
@@ -1464,7 +1475,13 @@ fn main() -> ExitCode {
             let media_tool_failure = error
                 .downcast_ref::<rcdvlog_core::MediaToolFailure>()
                 .is_some();
-            let code = if let Some(remote) = remote {
+            let readiness_error = error.downcast_ref::<rcdvlog_core::AgentReadinessError>();
+            let prerequisite_error = error.downcast_ref::<rcdvlog_core::MediaPrerequisiteError>();
+            let code = if let Some(readiness) = readiness_error {
+                readiness.code
+            } else if prerequisite_error.is_some() {
+                "media_prerequisite_failed"
+            } else if let Some(remote) = remote {
                 remote.code.as_str()
             } else if let Some(chronology_error) = chronology_evidence_error {
                 chronology_error.code()
@@ -1481,6 +1498,7 @@ fn main() -> ExitCode {
                         "code": code,
                         "message": message,
                         "requestId": remote.and_then(|error| error.request_id.as_deref()),
+                        "details": readiness_error.and_then(|error| error.details.as_deref()),
                     }
                 }),
                 cli.pretty,

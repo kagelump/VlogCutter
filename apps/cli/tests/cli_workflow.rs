@@ -1728,6 +1728,542 @@ fn read_commands_remain_available_during_an_uncommitted_writer() {
     transaction.rollback().unwrap();
 }
 
+fn agent_process<I, S>(home: &Path, path: Option<&OsStr>, arguments: I) -> Output
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let data_home = home.join("xdg-data");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_rcdvlog"));
+    command
+        .env("HOME", home)
+        .env("XDG_DATA_HOME", data_home)
+        .env_remove("RCDVLOG_CATALOG")
+        .args(arguments);
+    if let Some(path) = path {
+        command.env("PATH", path);
+    }
+    command.output().expect("run actual rcdvlog binary")
+}
+
+fn agent_success<I, S>(home: &Path, path: Option<&OsStr>, arguments: I) -> Value
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let output = agent_process(home, path, arguments);
+    assert!(
+        output.status.success(),
+        "CLI failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).expect("JSON success envelope");
+    assert_eq!(value["ok"], true);
+    value
+}
+
+fn agent_failure<I, S>(home: &Path, path: Option<&OsStr>, arguments: I) -> Value
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let output = agent_process(home, path, arguments);
+    assert!(!output.status.success(), "CLI unexpectedly succeeded");
+    assert!(output.stdout.is_empty(), "failure wrote to stdout");
+    let value: Value = serde_json::from_slice(&output.stderr).expect("JSON error envelope");
+    assert_eq!(value["ok"], false);
+    value
+}
+
+#[test]
+fn doctor_process_reports_running_build_and_strict_requirements_without_writes() {
+    let directory = tempdir().unwrap();
+    let home = directory.path().join("isolated home");
+    fs::create_dir(&home).unwrap();
+    let catalog = directory.path().join("not-created.sqlite3");
+
+    let doctor = agent_success(&home, None, ["doctor"]);
+    let data = &doctor["data"];
+    let executable = &data["executable"];
+    assert_eq!(doctor["command"], "doctor");
+    assert_eq!(data["schemaVersion"], 1);
+    assert!(executable["path"].as_str().unwrap().starts_with('/'));
+    assert_eq!(
+        executable["path"],
+        fs::canonicalize(env!("CARGO_BIN_EXE_rcdvlog"))
+            .unwrap()
+            .to_string_lossy()
+            .as_ref()
+    );
+    assert!(executable["build"]["version"].as_str().is_some());
+    assert!(executable["build"]["profile"].as_str().is_some());
+    assert!(executable["build"]["target"].as_str().is_some());
+    assert!(executable["build"]["rustc"].as_str().is_some());
+    assert!(executable["build"].get("revision").is_some());
+    if let Some(revision) = option_env!("RCDVLOG_BUILD_REVISION")
+        && revision != "unknown"
+    {
+        assert_eq!(executable["build"]["revision"], revision);
+    }
+    assert!(
+        executable["commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|command| command == "doctor")
+    );
+    assert!(executable["capabilities"]["agent.readiness.v1"].is_number());
+    assert_eq!(data["catalogStatus"]["status"], "catalog_required");
+    assert!(!data["ready"].as_bool().unwrap());
+    assert!(!catalog.exists(), "observational doctor created a catalog");
+    assert!(!home.join("xdg-data").exists(), "doctor wrote model state");
+
+    let missing_models = agent_failure(&home, None, ["doctor", "--require-models"]);
+    assert_eq!(missing_models["error"]["code"], "model_unavailable");
+    assert_eq!(missing_models["error"]["details"]["modelsReady"], false);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let fake_bin = directory.path().join("fake bin");
+        fs::create_dir(&fake_bin).unwrap();
+        let fake_tool = fake_bin.join("ffmpeg");
+        let staging = fake_bin.join(".ffmpeg.tmp");
+        fs::write(&staging, "#!/bin/sh\nprintf 'ffmpeg version 6.0.0\\n'\n").unwrap();
+        fs::set_permissions(&staging, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::rename(staging, &fake_tool).unwrap();
+        let path = fake_bin.as_os_str();
+        let rejected = agent_failure(&home, Some(path), ["doctor", "--require-tool", "ffmpeg"]);
+        assert_eq!(rejected["error"]["code"], "media_prerequisite_failed");
+        let tools = &rejected["error"]["details"]["tools"];
+        assert_eq!(
+            tools
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|tool| tool["name"] == "ffmpeg")
+                .unwrap()["status"],
+            "unsupported_version"
+        );
+        assert_eq!(
+            tools
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|tool| tool["name"] == "ffmpeg")
+                .unwrap()["path"],
+            fake_tool.to_string_lossy().as_ref()
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn workspace_process_binds_exact_unicode_executable_and_preserves_project_files() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    let directory = tempdir().unwrap();
+    let home = directory.path().join("isolated home");
+    fs::create_dir(&home).unwrap();
+    let catalog = directory.path().join("catalog with spaces.sqlite3");
+    let project = agent_success(
+        &home,
+        None,
+        [
+            "--catalog",
+            catalog.to_str().unwrap(),
+            "project",
+            "create",
+            "--name",
+            "Agent workspace process test",
+        ],
+    );
+    assert_eq!(project["command"], "project.create");
+
+    let root = directory.path().join("Project workspace Ω");
+    fs::create_dir(&root).unwrap();
+    let agents = root.join("AGENTS.md");
+    let project_doc = root.join("PROJECT.md");
+    fs::write(&agents, "authored instructions\n").unwrap();
+    fs::write(&project_doc, "authored project notes\n").unwrap();
+    let executable_dir = directory.path().join("Selected CLI Ω");
+    fs::create_dir(&executable_dir).unwrap();
+    let selected = executable_dir.join("rcdvlog executable");
+    symlink(env!("CARGO_BIN_EXE_rcdvlog"), &selected).unwrap();
+
+    let rejected_missing_catalog = agent_failure(
+        &home,
+        None,
+        [
+            "workspace",
+            "refresh",
+            "--root",
+            root.to_str().unwrap(),
+            "--executable",
+            selected.to_str().unwrap(),
+            "--selection",
+            "development",
+        ],
+    );
+    assert_eq!(
+        rejected_missing_catalog["error"]["code"],
+        "catalog_required"
+    );
+    assert!(!root.join(".vlogcutter").exists());
+
+    let unbound_check = agent_failure(
+        &home,
+        None,
+        ["workspace", "check", "--root", root.to_str().unwrap()],
+    );
+    assert_eq!(unbound_check["error"]["code"], "binding_missing");
+
+    let relative_catalog = agent_failure(
+        &home,
+        None,
+        [
+            "--catalog",
+            "relative-catalog.sqlite3",
+            "workspace",
+            "refresh",
+            "--root",
+            root.to_str().unwrap(),
+            "--executable",
+            selected.to_str().unwrap(),
+            "--selection",
+            "development",
+        ],
+    );
+    assert_eq!(relative_catalog["error"]["code"], "invalid_arguments");
+    assert!(!directory.path().join("relative-catalog.sqlite3").exists());
+
+    let relative_executable = agent_failure(
+        &home,
+        None,
+        [
+            "--catalog",
+            catalog.to_str().unwrap(),
+            "workspace",
+            "refresh",
+            "--root",
+            root.to_str().unwrap(),
+            "--executable",
+            "relative-rcdvlog",
+            "--selection",
+            "development",
+        ],
+    );
+    assert_eq!(relative_executable["error"]["code"], "invalid_arguments");
+
+    let refreshed = agent_success(
+        &home,
+        None,
+        [
+            "--catalog",
+            catalog.to_str().unwrap(),
+            "workspace",
+            "refresh",
+            "--root",
+            root.to_str().unwrap(),
+            "--executable",
+            selected.to_str().unwrap(),
+            "--selection",
+            "development",
+        ],
+    );
+    let binding = &refreshed["data"]["binding"];
+    assert_eq!(
+        binding["root"],
+        fs::canonicalize(&root).unwrap().to_string_lossy().as_ref()
+    );
+    assert_eq!(
+        binding["catalog"],
+        fs::canonicalize(&catalog)
+            .unwrap()
+            .to_string_lossy()
+            .as_ref()
+    );
+    assert_eq!(binding["selectedPath"], selected.to_string_lossy().as_ref());
+    assert_eq!(binding["selection"], "development");
+    assert_eq!(
+        binding["executable"]["path"],
+        fs::canonicalize(env!("CARGO_BIN_EXE_rcdvlog"))
+            .unwrap()
+            .to_string_lossy()
+            .as_ref()
+    );
+
+    let binding_path = root.join(".vlogcutter/cli-binding.json");
+    let unknown = root.join(".vlogcutter/operator-notes.json");
+    fs::write(&unknown, "{\"ownedBy\":\"operator\"}\n").unwrap();
+    let binding_bytes = fs::read(&binding_path).unwrap();
+    let binding_modified = fs::metadata(&binding_path).unwrap().modified().unwrap();
+    let catalog_bytes = fs::read(&catalog).unwrap();
+    let catalog_modified = fs::metadata(&catalog).unwrap().modified().unwrap();
+    for _ in 0..2 {
+        let checked = agent_success(
+            &home,
+            None,
+            [
+                "--catalog",
+                catalog.to_str().unwrap(),
+                "workspace",
+                "check",
+                "--root",
+                root.to_str().unwrap(),
+            ],
+        );
+        assert_eq!(
+            checked["data"]["invocation"][0],
+            selected.to_string_lossy().as_ref()
+        );
+        assert_eq!(checked["data"]["invocation"][1], "--catalog");
+        assert_eq!(
+            checked["data"]["invocation"][2],
+            fs::canonicalize(&catalog)
+                .unwrap()
+                .to_string_lossy()
+                .as_ref()
+        );
+        assert_eq!(
+            checked["data"]["readiness"]["executable"]["path"],
+            binding["executable"]["path"]
+        );
+    }
+    assert_eq!(fs::read(&binding_path).unwrap(), binding_bytes);
+    assert_eq!(
+        fs::metadata(&binding_path).unwrap().modified().unwrap(),
+        binding_modified
+    );
+    assert_eq!(fs::read(&catalog).unwrap(), catalog_bytes);
+    assert_eq!(
+        fs::metadata(&catalog).unwrap().modified().unwrap(),
+        catalog_modified
+    );
+    assert_eq!(fs::read(&agents).unwrap(), b"authored instructions\n");
+    assert_eq!(fs::read(&project_doc).unwrap(), b"authored project notes\n");
+    assert_eq!(fs::read(&unknown).unwrap(), b"{\"ownedBy\":\"operator\"}\n");
+
+    let wrong_revision = agent_failure(
+        &home,
+        None,
+        [
+            "--catalog",
+            catalog.to_str().unwrap(),
+            "workspace",
+            "check",
+            "--root",
+            root.to_str().unwrap(),
+            "--expect-revision",
+            "0000000000000000000000000000000000000000",
+        ],
+    );
+    assert_eq!(wrong_revision["error"]["code"], "revision_mismatch");
+    let unsupported_capability = agent_failure(
+        &home,
+        None,
+        [
+            "--catalog",
+            catalog.to_str().unwrap(),
+            "workspace",
+            "check",
+            "--root",
+            root.to_str().unwrap(),
+            "--require-capability",
+            "operator.magic.v99",
+        ],
+    );
+    assert_eq!(
+        unsupported_capability["error"]["code"],
+        "capability_unavailable"
+    );
+
+    fs::remove_file(&selected).unwrap();
+    let missing = agent_failure(
+        &home,
+        None,
+        [
+            "--catalog",
+            catalog.to_str().unwrap(),
+            "workspace",
+            "check",
+            "--root",
+            root.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(missing["error"]["code"], "executable_unavailable");
+
+    let marker = directory.path().join("fallback-was-executed");
+    let selected_staging = executable_dir.join(".replacement.tmp");
+    fs::write(
+        &selected_staging,
+        format!("#!/bin/sh\ntouch '{}'\nexit 0\n", marker.display()),
+    )
+    .unwrap();
+    fs::set_permissions(&selected_staging, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::rename(&selected_staging, &selected).unwrap();
+    let replaced = agent_failure(
+        &home,
+        None,
+        [
+            "--catalog",
+            catalog.to_str().unwrap(),
+            "workspace",
+            "check",
+            "--root",
+            root.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(replaced["error"]["code"], "binding_stale");
+    assert!(
+        !marker.exists(),
+        "changed selected executable was invoked as a fallback"
+    );
+
+    fs::remove_file(&selected).unwrap();
+    symlink(env!("CARGO_BIN_EXE_rcdvlog"), &selected).unwrap();
+    let repaired = agent_success(
+        &home,
+        None,
+        [
+            "--catalog",
+            catalog.to_str().unwrap(),
+            "workspace",
+            "refresh",
+            "--root",
+            root.to_str().unwrap(),
+            "--executable",
+            selected.to_str().unwrap(),
+            "--selection",
+            "development",
+        ],
+    );
+    assert_eq!(
+        repaired["data"]["binding"]["selectedPath"],
+        selected.to_string_lossy().as_ref()
+    );
+}
+
+#[test]
+fn strict_catalog_readiness_rejects_missing_legacy_and_newer_catalogs_read_only() {
+    let directory = tempdir().unwrap();
+    let home = directory.path().join("isolated home");
+    fs::create_dir(&home).unwrap();
+    let missing = directory.path().join("missing.sqlite3");
+    let missing_error = agent_failure(
+        &home,
+        None,
+        ["--catalog", missing.to_str().unwrap(), "doctor", "--check"],
+    );
+    assert_eq!(missing_error["error"]["code"], "catalog_missing");
+    assert!(!missing.exists());
+
+    let legacy = directory.path().join("legacy.sqlite3");
+    agent_success(
+        &home,
+        None,
+        [
+            "--catalog",
+            legacy.to_str().unwrap(),
+            "project",
+            "create",
+            "--name",
+            "Legacy readiness fixture",
+        ],
+    );
+    Connection::open(&legacy)
+        .unwrap()
+        .execute_batch("DROP TABLE schema_migrations;")
+        .unwrap();
+    let legacy_bytes = fs::read(&legacy).unwrap();
+    let legacy_error = agent_failure(
+        &home,
+        None,
+        ["--catalog", legacy.to_str().unwrap(), "doctor", "--check"],
+    );
+    assert_eq!(legacy_error["error"]["code"], "catalog_upgrade_required");
+    assert_eq!(fs::read(&legacy).unwrap(), legacy_bytes);
+
+    let newer = directory.path().join("newer.sqlite3");
+    agent_success(
+        &home,
+        None,
+        [
+            "--catalog",
+            newer.to_str().unwrap(),
+            "project",
+            "create",
+            "--name",
+            "Newer readiness fixture",
+        ],
+    );
+    Connection::open(&newer)
+        .unwrap()
+        .execute(
+            "INSERT INTO schema_migrations (migration_id, name, source_identity, applied_at) VALUES (?1, 'future', ?2, '2026-01-01T00:00:00Z')",
+            params![PROJECT_CATALOG_SCHEMA_VERSION + 1, format!("future/{}", PROJECT_CATALOG_SCHEMA_VERSION + 1)],
+        )
+        .unwrap();
+    let newer_bytes = fs::read(&newer).unwrap();
+    let newer_error = agent_failure(
+        &home,
+        None,
+        ["--catalog", newer.to_str().unwrap(), "doctor", "--check"],
+    );
+    assert_eq!(newer_error["error"]["code"], "schema_incompatible");
+    assert_eq!(fs::read(&newer).unwrap(), newer_bytes);
+}
+
+#[cfg(unix)]
+#[test]
+fn workspace_rejects_old_doctor_contracts_and_preserves_unrecognized_binding_files() {
+    use std::os::unix::fs::PermissionsExt;
+    let directory = tempdir().unwrap();
+    let home = directory.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let root = directory.path().join("project");
+    fs::create_dir(&root).unwrap();
+    let catalog = directory.path().join("catalog.sqlite3");
+    create_project(&catalog, "Binding rejection fixture");
+    let executable = directory.path().join("old executable");
+    let staging = directory.path().join(".old-executable.tmp");
+    fs::write(&staging, "#!/bin/sh\nprintf '%s\\n' '{\"ok\":true,\"command\":\"doctor\",\"data\":{\"tools\":[]}}'\n").unwrap();
+    fs::set_permissions(&staging, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::rename(staging, &executable).unwrap();
+    let refresh = [
+        "--catalog",
+        catalog.to_str().unwrap(),
+        "workspace",
+        "refresh",
+        "--root",
+        root.to_str().unwrap(),
+        "--executable",
+        executable.to_str().unwrap(),
+        "--selection",
+        "installed",
+    ];
+    let rejected = agent_failure(&home, None, refresh);
+    assert_eq!(rejected["error"]["code"], "capability_unavailable");
+    assert!(!root.join(".vlogcutter").exists());
+
+    let managed_directory = root.join(".vlogcutter");
+    fs::write(&managed_directory, b"operator authored file").unwrap();
+    let rejected = agent_failure(&home, None, refresh);
+    assert_eq!(rejected["error"]["code"], "binding_invalid");
+    assert_eq!(
+        fs::read(&managed_directory).unwrap(),
+        b"operator authored file"
+    );
+    fs::remove_file(&managed_directory).unwrap();
+    fs::create_dir(&managed_directory).unwrap();
+    let binding = managed_directory.join("cli-binding.json");
+    fs::write(&binding, b"operator authored content").unwrap();
+    let rejected = agent_failure(&home, None, refresh);
+    assert_eq!(rejected["error"]["code"], "binding_invalid");
+    assert_eq!(fs::read(binding).unwrap(), b"operator authored content");
+}
+
 #[test]
 fn camera_mapping_commands_list_rename_and_clear_project_scoped_state() {
     let directory = tempdir().unwrap();

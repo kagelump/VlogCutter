@@ -210,14 +210,13 @@ Important gaps; do not accidentally describe these as complete:
   preview rendering, and OTIO writing exist, but the desktop edit-plan workflow
   still lacks reordering, trimming, removal, preview playback, export history,
   and overwrite confirmation; there is no edit-plan CLI yet.
-- No project-local agent workspace. A created project folder contains
-  `catalog.sqlite3`, `cache/`, and `exports/` and nothing else. Materializing
-  `AGENTS.md`, `PROJECT.md`, `script.md`, `project.json`, and `edit-plan.json`
-  into the video project root — so a cold Claude Code or Codex session opened
-  there can learn the project and safely create an edit-plan revision without
-  the user bootstrapping the integration — is a planned capability tracked by
-  issue #48 and PRD Milestone 5. Script revisions do not exist either. Do not
-  document or describe any of this as shipped.
+- No materialized project-local agent workspace. The CLI can report its build
+  and readiness, and can explicitly bind/check the selected executable and
+  catalog in `<project-root>/.vlogcutter/cli-binding.json`. This binding never
+  generates or edits project instructions. Materializing `AGENTS.md`,
+  `PROJECT.md`, `script.md`, `project.json`, and `edit-plan.json` into the
+  video project root remains planned under issue #48 and PRD Milestone 5.
+  Script revisions do not exist either.
 - Trip phases and timezone display are persisted and solved, and the ribbon can
   add a location/transit phase forward or backward from a hovered clip, edit an
   existing phase, and atomically cut a new phase from either side of a filled
@@ -390,6 +389,13 @@ For example, an observed video workspace used `data/tools/cargo` and
 Never substitute the installed stable formatter when the CI pin is absent.
 
 Rust dependencies are resolved by Cargo from the checked-in `Cargo.lock`.
+
+For an agent development binding, build the CLI from the intended checkout
+with `rustup toolchain install 1.97.1 --component rustfmt --component clippy`
+and `cargo +1.97.1 build --locked -p rcdvlog-cli`. Respect the checkout's
+`CARGO_TARGET_DIR` and pass the resulting binary's absolute path to
+`workspace refresh`; `workspace check` verifies that exact path, build
+metadata, and digest and never resolves a replacement executable.
 
 ## 7. Running the app
 
@@ -852,6 +858,11 @@ Contract rules:
 - Stable command names and error codes are public automation contracts.
 - Desktop-local error codes are `invalid_arguments`, `invalid_input`, `not_found`, `media_offline`, `media_tool_failed`, and `internal_error`; remote server commands preserve the shared server registry.
 - `doctor` must not create or mutate the selected catalog.
+- `doctor` is observational and does not use the desktop catalog fallback;
+  `--check` or repeatable `--require-*` options opt into explicit readiness
+  requirements. Workspace refresh/check require an existing explicit catalog
+  and a selected absolute executable. They manage only
+  `.vlogcutter/cli-binding.json`, never project instruction files.
 - Read commands should remain usable while another connection has an uncommitted WAL write.
 
 Typical explicit-catalog workflow:
