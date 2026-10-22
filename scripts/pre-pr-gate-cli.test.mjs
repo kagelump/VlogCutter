@@ -7,10 +7,10 @@ import { after, test } from "node:test";
 import { fileURLToPath } from "node:url";
 
 const source = fileURLToPath(new URL("./pre-pr-gate.mjs", import.meta.url));
-const expected = ["valid CLI pass", "format command failure", "clippy command failure", "test command failure preserves output", "frontend command failure", "missing command fails closed", "clean committed candidate with whitespace fails"];
+const expected = ["valid CLI pass", "format command failure", "clippy command failure", "test command failure preserves output", "frontend command failure", "missing command fails closed", "clean committed candidate with whitespace fails", "default local requires plan", "structured local plan runs", "failed focused check blocks gate"];
 const observed = new Set();
 
-function runCli(name, { fail = "", omit = "" } = {}) {
+function runCli(name, { fail = "", omit = "", args = ["--scope", "pre-pr"], plan = null } = {}) {
   observed.add(name);
   const temp = mkdtempSync(join(tmpdir(), "vlogcutter-gate-cli-"));
   const scripts = join(temp, "scripts");
@@ -21,6 +21,7 @@ function runCli(name, { fail = "", omit = "" } = {}) {
   mkdirSync(bin);
   copyFileSync(source, join(scripts, "pre-pr-gate.mjs"));
   writeFileSync(join(workflow, "ci.yml"), 'env:\n  RUST_TOOLCHAIN: "1.97.1"\n');
+  if (plan) writeFileSync(join(temp, "checks.json"), JSON.stringify(plan));
 
   const commands = {
     git: '#!/bin/sh\nexit 0\n',
@@ -34,6 +35,10 @@ case "$2" in
     if [ "$FAKE_FAIL" = test ]; then echo "forced cargo test failure" >&2; exit 13; fi
     ;;
 esac
+if [ "$1" = test ]; then
+  echo "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out"
+  if [ "$FAKE_FAIL" = focused ]; then echo "forced focused failure" >&2; exit 15; fi
+fi
 exit 0
 `,
     pnpm: `#!/bin/sh
@@ -49,7 +54,7 @@ exit 0
   }
 
   try {
-    return spawnSync(process.execPath, [join(scripts, "pre-pr-gate.mjs")], {
+    return spawnSync(process.execPath, [join(scripts, "pre-pr-gate.mjs"), ...args.map((arg) => arg === "$PLAN" ? join(temp, "checks.json") : arg)], {
       cwd: temp,
       encoding: "utf8",
       env: { ...process.env, PATH: bin, FAKE_FAIL: fail },
@@ -62,8 +67,35 @@ exit 0
 
 test("CLI succeeds when every fake prerequisite and check succeeds", () => {
   const result = runCli("valid CLI pass");
-  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+  assert.equal(result.status, 0, JSON.stringify(result));
   assert.match(result.stdout, /Gate summary \(pre-pr\): 18 passed, 0 failed\./);
+});
+
+test("CLI defaults to local scope and requires a focused checks plan", () => {
+  const result = runCli("default local requires plan", { args: [] });
+  assert.equal(result.status, 2);
+  assert.match(result.stdout, /Local scope requires --checks/);
+  assert.doesNotMatch(result.stdout, /===/);
+});
+
+test("CLI runs commands from a valid structured local plan", () => {
+  const result = runCli("structured local plan runs", {
+    args: ["--checks", "$PLAN"],
+    plan: { checks: [{ name: "focused cargo tests", command: "cargo", args: ["test", "-p", "fixture"] }] },
+  });
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+  assert.match(result.stdout, /=== focused cargo tests ===/);
+  assert.match(result.stdout, /Gate summary \(local\): 8 passed, 0 failed\./);
+});
+
+test("CLI reports focused failure and blocks gate success", () => {
+  const result = runCli("failed focused check blocks gate", {
+    fail: "focused",
+    args: ["--checks", "$PLAN"],
+    plan: { checks: [{ name: "focused cargo tests", command: "cargo", args: ["test", "-p", "fixture"] }] },
+  });
+  assert.equal(result.status, 1);
+  assert.match(result.stdout, /RESULT focused cargo tests: FAIL \(exit 15\)/);
 });
 
 test("CLI exits nonzero when the fake formatter fails", () => {
@@ -140,7 +172,7 @@ exit 0
     git(["update-ref", "refs/remotes/origin/main", base]);
     assert.equal(git(["status", "--porcelain=v1"]), "", "feature worktree must be clean");
 
-    const result = spawnSync(process.execPath, [join(scripts, "pre-pr-gate.mjs")], {
+    const result = spawnSync(process.execPath, [join(scripts, "pre-pr-gate.mjs"), "--scope", "pre-pr"], {
       cwd: temp,
       encoding: "utf8",
       env: { ...process.env, PATH: `${bin}:${process.env.PATH}` },
@@ -159,6 +191,6 @@ exit 0
 
 after(() => {
   assert.ok(observed.size > 0, "the subprocess regression must invoke the CLI");
-  assert.equal(expected.length, 7, "all expected CLI subprocess scenarios must remain present");
+  assert.equal(expected.length, 10, "all expected CLI subprocess scenarios must remain present");
   assert.deepEqual([...observed].sort(), [...expected].sort());
 });

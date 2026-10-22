@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
 import { after, test } from "node:test";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { runGate } from "./pre-pr-gate.mjs";
 
 const expectedScenarios = [
@@ -47,7 +50,7 @@ function runScenario(name, { fail, missingCargo = false, emptyTests = false, wro
     }
     return { status: 0, stdout: "", stderr: "" };
   };
-  const code = runGate({ spawn, write: (chunk) => { output += chunk; } });
+  const code = runGate({ args: ["--scope", "pre-pr"], spawn, write: (chunk) => { output += chunk; } });
   return { code, output };
 }
 
@@ -61,6 +64,55 @@ test("clean pass runs every required pre-PR check", () => {
   assert.match(result.output, /RESULT cargo test --workspace: PASS/);
   assert.match(result.output, /RESULT pnpm check:frontend: PASS/);
   assert.match(result.output, /Gate summary \(pre-pr\): 18 passed, 0 failed\./);
+});
+
+test("local scope requires and runs structured focused checks after baseline checks", () => {
+  const dir = mkdtempSync(join(tmpdir(), "vlog-gate-"));
+  try {
+    const file = join(dir, "checks.json");
+    writeFileSync(file, JSON.stringify({ checks: [{ name: "focused case", command: "node", args: ["--test", "focused.test.mjs"] }] }));
+    const calls = [];
+    const output = [];
+    const code = runGate({ args: ["--checks", file], spawn: (command, args) => {
+      calls.push([command, args]);
+      if (command === "rustc") return { status: 0, stdout: "rustc 1.97.1 (fake)", stderr: "" };
+      return { status: 0, stdout: "", stderr: "" };
+    }, write: (chunk) => output.push(chunk) });
+    assert.equal(code, 0, output.join(""));
+    assert.ok(calls.some(([command, args]) => command === "node" && args[0] === "--test"));
+    assert.match(output.join(""), /Gate summary \(local\)/);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("local scope rejects missing, malformed, empty, and invalid plans before checks", () => {
+  const dir = mkdtempSync(join(tmpdir(), "vlog-gate-invalid-"));
+  try {
+    const empty = join(dir, "empty.json"); writeFileSync(empty, JSON.stringify({ checks: [] }));
+    const malformed = join(dir, "bad.json"); writeFileSync(malformed, "{");
+    const invalidCommand = join(dir, "command.json"); writeFileSync(invalidCommand, JSON.stringify({ checks: [{ name: "bad", command: " ", args: [] }] }));
+    const invalidArgs = join(dir, "args.json"); writeFileSync(invalidArgs, JSON.stringify({ checks: [{ name: "bad", command: "node", args: [1] }] }));
+    for (const args of [[], ["--checks", empty], ["--checks", malformed], ["--checks", join(dir, "missing.json")], ["--checks", invalidCommand], ["--checks", invalidArgs], ["--checks", empty, "--checks", empty]]) {
+      let called = false;
+      assert.equal(runGate({ args, spawn: () => { called = true; return { status: 0 }; }, write: () => {} }), 2);
+      assert.equal(called, false);
+    }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("local focused cargo test requires at least one reported executed test", () => {
+  const dir = mkdtempSync(join(tmpdir(), "vlog-gate-zero-tests-"));
+  try {
+    const file = join(dir, "checks.json");
+    writeFileSync(file, JSON.stringify({ checks: [{ name: "focused cargo test", command: "cargo", args: ["test", "-p", "fixture"] }] }));
+    const output = [];
+    const code = runGate({ args: ["--checks", file], spawn: (command, args) => {
+      if (command === "rustc") return { status: 0, stdout: "rustc 1.97.1 (fake)", stderr: "" };
+      if (command === "cargo" && args[0] === "test") return { status: 0, stdout: "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out", stderr: "" };
+      return { status: 0, stdout: "", stderr: "" };
+    }, write: (chunk) => output.push(chunk) });
+    assert.equal(code, 1);
+    assert.match(output.join(""), /cargo test exited 0 without reporting any executed tests/);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
 test("format failure appears in summary and fails the gate", () => {

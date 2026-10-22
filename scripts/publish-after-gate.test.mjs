@@ -5,7 +5,7 @@ import { publishAfterGate } from "./publish-after-gate.mjs";
 const expected = ["dirty tree blocks before gate", "gate failure blocks publishing", "changed tree blocks publishing", "changed head blocks publishing", "changed untracked content blocks publishing", "unchanged tree permits fixed PR command", "PR publication stops when push fails", "HEAD change during push prevents PR"];
 const observed = new Set();
 
-function attempt({ gateStatus = 0, dirty = false, changeTree = false, changeHead = false, changeUntracked = false, failPush = false, changeHeadAfterPush = false, action = "pr" } = {}) {
+function attempt({ gateStatus = 0, dirty = false, changeTree = false, changeHead = false, changeUntracked = false, failPush = false, changeHeadAfterPush = false, action = "pr", gateArgs = ["--scope", "pre-pr"] } = {}) {
   const calls = [];
   let headChangedAfterPush = false;
   let output = "";
@@ -25,7 +25,8 @@ function attempt({ gateStatus = 0, dirty = false, changeTree = false, changeHead
   };
   const code = publishAfterGate({
     action,
-    gate: (options) => { assert.deepEqual(options.args, []); calls.push(["gate", []]); return gateStatus; },
+    gateArgs,
+    gate: (options) => { assert.deepEqual(options.args, gateArgs); calls.push(["gate", gateArgs]); return gateStatus; },
     spawn,
     write: (chunk) => { output += chunk; },
   });
@@ -107,6 +108,28 @@ test("push establishes the current branch upstream explicitly", () => {
   const result = attempt({ action: "push" });
   assert.equal(result.code, 0);
   assert.deepEqual(result.calls.at(-1), ["git", ["push", "--set-upstream", "origin", "HEAD"]]);
+});
+
+test("publication rejects fast, missing plans, unknown and repeated options before snapshot", () => {
+  for (const gateArgs of [["--scope", "fast"], [], ["--scope", "fast", "--checks", "x"], ["--scope", "pre-pr", "--scope", "local"], ["--scope", "local", "--checks", "x", "--checks", "y"], ["--scope", "pre-pr", "--checks", "x"], ["--oops"]]) {
+    const result = attempt({ gateArgs });
+    assert.equal(result.code, 2);
+    assert.equal(result.calls.some(([name]) => name === "gate" || name === "gh"), false);
+  }
+});
+
+test("local publication forwards the plan and scope to the gate", () => {
+  const result = attempt({ gateArgs: ["--scope", "local", "--checks", "/tmp/focused.json"] });
+  assert.equal(result.code, 0);
+  assert.ok(result.calls.some(([name, args]) => name === "gate" && args.join(" ") === "--scope local --checks /tmp/focused.json"));
+});
+
+test("failed focused local gate blocks both publication actions", () => {
+  for (const action of ["push", "pr"]) {
+    const result = attempt({ action, gateStatus: 1, gateArgs: ["--scope", "local", "--checks", "/tmp/focused.json"] });
+    assert.equal(result.code, 1);
+    assert.equal(result.calls.some(([name, args]) => name === "gh" || name === "git" && args[0] === "push"), false);
+  }
 });
 
 after(() => {

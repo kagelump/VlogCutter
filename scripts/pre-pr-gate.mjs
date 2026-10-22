@@ -12,17 +12,52 @@ if (!toolchainMatch) throw new Error("Cannot determine pinned RUST_TOOLCHAIN fro
 const rustToolchain = toolchainMatch[1];
 
 export function runGate({ args = process.argv.slice(2), spawn = spawnSync, write = (value) => process.stdout.write(value) } = {}) {
-  let scope = "pre-pr";
+  let scope = "local";
+  let checksPath;
+  let scopeSeen = false;
+  let checksSeen = false;
   for (let i = 0; i < args.length; i += 1) {
     if (args[i] === "--scope" && args[i + 1]) {
+      if (scopeSeen) { write("Repeated --scope option.\n"); return 2; }
+      scopeSeen = true;
       scope = args[++i];
+    } else if (args[i] === "--checks" && args[i + 1]) {
+      if (checksSeen) { write("Repeated --checks option.\n"); return 2; }
+      checksSeen = true;
+      checksPath = args[++i];
     } else {
-      write(`Unknown argument: ${args[i]}\nUsage: pnpm gate [--scope fast|pre-pr]\n`);
+      write(`Unknown argument: ${args[i]}\nUsage: pnpm gate [--scope local|fast|pre-pr] [--checks <JSON file>]\n`);
       return 2;
     }
   }
-  if (!["fast", "pre-pr"].includes(scope)) {
-    write(`Unknown scope: ${scope}\nUsage: pnpm gate [--scope fast|pre-pr]\n`);
+  if (!["local", "fast", "pre-pr"].includes(scope)) {
+    write(`Unknown scope: ${scope}\nUsage: pnpm gate [--scope local|fast|pre-pr] [--checks <JSON file>]\n`);
+    return 2;
+  }
+
+  let focusedChecks = [];
+  if (scope === "local") {
+    if (!checksPath) {
+      write("Local scope requires --checks <JSON file> with a nonempty checks array.\n");
+      return 2;
+    }
+    let plan;
+    try {
+      plan = JSON.parse(readFileSync(resolve(checksPath), "utf8"));
+    } catch (error) {
+      write(`Cannot read focused checks plan: ${error.message}\n`);
+      return 2;
+    }
+    if (!plan || !Array.isArray(plan.checks) || plan.checks.length === 0 || plan.checks.some((check) =>
+      !check || typeof check.name !== "string" || !check.name.trim() || typeof check.command !== "string" || !check.command.trim() ||
+      !Array.isArray(check.args) || check.args.some((arg) => typeof arg !== "string")
+    )) {
+      write("Invalid focused checks plan: expected { checks: [{ name, command, args }] } with a nonempty array of named commands and string arguments.\n");
+      return 2;
+    }
+    focusedChecks = plan.checks.map(({ name, command, args }) => ({ name, command, args }));
+  } else if (checksPath) {
+    write("--checks is only valid with --scope local.\n");
     return 2;
   }
 
@@ -37,6 +72,12 @@ export function runGate({ args = process.argv.slice(2), spawn = spawnSync, write
 
   if (scope === "fast") {
     checks.push({ name: "pnpm check:frontend", command: "pnpm", args: ["check:frontend"] });
+  } else if (scope === "local") {
+    checks.push(
+      rust("cargo clippy --workspace --all-targets -- -D warnings", ["clippy", "--workspace", "--all-targets", "--", "-D", "warnings"]),
+      { name: "pnpm check:frontend", command: "pnpm", args: ["check:frontend"] },
+      ...focusedChecks.map((check) => ({ ...check, requireTests: check.command === "cargo" && check.args.includes("test") })),
+    );
   } else {
     checks.push(
       rust("cargo clippy --workspace --all-targets -- -D warnings", ["clippy", "--workspace", "--all-targets", "--", "-D", "warnings"]),
