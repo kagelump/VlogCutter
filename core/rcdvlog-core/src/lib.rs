@@ -38,6 +38,7 @@ mod locations;
 mod migrations;
 mod operations;
 mod preflight;
+mod preparation;
 mod prerequisites;
 mod representation;
 mod stall;
@@ -107,6 +108,7 @@ pub use preflight::{
     ImportSequenceRunDecision, ImportSequenceRunPreview, ImportStage,
     LARGE_CAPTURE_SEQUENCE_GAP_SECONDS, PreflightItem, human_bytes, import_source_present,
 };
+pub use preparation::*;
 pub use prerequisites::{
     MediaPrerequisiteError, ToolPrerequisiteStatus, ToolStatus, ensure_media_prerequisites,
     prerequisite_status,
@@ -1972,6 +1974,18 @@ impl Catalog {
     fn generate_proxy_untracked_with_progress<F>(
         &self,
         asset_id: &str,
+        on_progress: F,
+    ) -> Result<Asset>
+    where
+        F: FnMut(f64),
+    {
+        self.generate_proxy_untracked_with_orientation_policy(asset_id, true, on_progress)
+    }
+
+    fn generate_proxy_untracked_with_orientation_policy<F>(
+        &self,
+        asset_id: &str,
+        refresh_orientation: bool,
         mut on_progress: F,
     ) -> Result<Asset>
     where
@@ -1983,7 +1997,11 @@ impl Catalog {
                 asset_id: asset_id.to_owned(),
                 kind: RepresentationKind::Proxy,
             })?;
-        let asset = self.refresh_asset_orientation(asset_id)?;
+        let asset = if refresh_orientation {
+            self.refresh_asset_orientation(asset_id)?
+        } else {
+            self.get_asset(asset_id)?
+        };
         // Prove this is still the original clip before transcoding.
         self.resolve_original(asset_id)?;
         let temporary = write.temporary_path();
@@ -2041,9 +2059,17 @@ impl Catalog {
         self.generate_proxy_with_progress(asset_id, |_| {})
     }
 
-    pub fn generate_proxy_with_progress<F>(
+    pub fn generate_proxy_with_progress<F>(&self, asset_id: &str, on_progress: F) -> Result<Asset>
+    where
+        F: FnMut(AssetBatchProgress),
+    {
+        self.generate_proxy_with_orientation_policy(asset_id, true, on_progress)
+    }
+
+    fn generate_proxy_with_orientation_policy<F>(
         &self,
         asset_id: &str,
+        refresh_orientation: bool,
         mut on_progress: F,
     ) -> Result<Asset>
     where
@@ -2058,14 +2084,19 @@ impl Catalog {
             estimate: estimator.estimate(&task_work),
         });
         let started = Instant::now();
-        let result = self.generate_proxy_untracked_with_progress(asset_id, |fraction| {
-            let partial_work = work_units_from_fraction(asset.size_bytes, fraction);
-            let remaining_work = asset.size_bytes.saturating_sub(partial_work);
-            on_progress(AssetBatchProgress {
-                asset: None,
-                estimate: estimator.estimate_with_partial_progress(&[remaining_work], partial_work),
-            });
-        });
+        let result = self.generate_proxy_untracked_with_orientation_policy(
+            asset_id,
+            refresh_orientation,
+            |fraction| {
+                let partial_work = work_units_from_fraction(asset.size_bytes, fraction);
+                let remaining_work = asset.size_bytes.saturating_sub(partial_work);
+                on_progress(AssetBatchProgress {
+                    asset: None,
+                    estimate: estimator
+                        .estimate_with_partial_progress(&[remaining_work], partial_work),
+                });
+            },
+        );
         let updated = match &result {
             Ok(updated) => {
                 estimator.record_completion(asset.size_bytes, started.elapsed());
@@ -2554,7 +2585,7 @@ impl Catalog {
             .ok_or_else(|| anyhow!("catalog has no parent directory"))?;
         let audio_dir = parent.join("cache").join("audio").join(&asset.project_id);
         fs::create_dir_all(&audio_dir)?;
-        let pcm_path = audio_dir.join(format!("{asset_id}.16k.wav"));
+        let pcm_path = audio_dir.join(format!("{asset_id}.{}.16k.wav", Uuid::new_v4()));
 
         let result = (|| -> Result<StoredTranscript> {
             FfmpegAudioExtractor.extract_pcm16k(&proxy_path, &pcm_path)?;

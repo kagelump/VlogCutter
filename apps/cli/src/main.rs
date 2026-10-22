@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, ensure};
 #[cfg(test)]
 use clap::CommandFactory;
 use clap::{Parser, Subcommand, error::ErrorKind};
@@ -15,6 +15,7 @@ use std::process::ExitCode;
 mod agent_commands;
 mod chronology_commands;
 mod moment_commands;
+mod preparation_commands;
 mod server_commands;
 
 #[derive(Debug, Parser)]
@@ -147,6 +148,11 @@ enum Commands {
     Moments {
         #[command(subcommand)]
         command: moment_commands::MomentCommand,
+    },
+    /// Preflight, run, or inspect bounded preparation evidence.
+    Prepare {
+        #[command(subcommand)]
+        command: preparation_commands::PreparationCommand,
     },
     /// Consolidate or inspect the AI-authored label vocabulary.
     Labels {
@@ -567,6 +573,7 @@ fn command_name(command: &Commands) -> &'static str {
             AnalyzeCommand::Status { .. } => "analyze.status",
         },
         Commands::Moments { command } => moment_commands::command_name(command),
+        Commands::Prepare { command } => preparation_commands::command_name(command),
         Commands::Labels { command } => match command {
             LabelsCommand::Consolidate { .. } => "labels.consolidate",
             LabelsCommand::Vocabulary { .. } => "labels.vocabulary",
@@ -589,6 +596,22 @@ fn execute(cli: &Cli) -> Result<Value> {
     }
     if let Commands::Workspace { command } = &cli.command {
         return agent_commands::workspace(cli.catalog.as_deref(), command);
+    }
+    if let Commands::Prepare { command } = &cli.command {
+        let path = cli.catalog.as_deref().ok_or_else(|| {
+            anyhow!("invalid input: prepare commands require --catalog or RCDVLOG_CATALOG")
+        })?;
+        ensure!(
+            path.is_file(),
+            "catalog not found: prepare commands require an existing file at {}",
+            path.display()
+        );
+        let catalog = if preparation_commands::is_read_only(command) {
+            Catalog::open_read_only_existing(path)?
+        } else {
+            Catalog::open(path)?
+        };
+        return preparation_commands::execute(&catalog, command);
     }
     let catalog_path = selected_catalog(cli)?;
     if let Commands::Server {
@@ -667,6 +690,7 @@ fn execute(cli: &Cli) -> Result<Value> {
             chronology_commands::execute_chronology(&catalog, command)
         }
         Commands::Moments { command } => moment_commands::execute(&catalog, command),
+        Commands::Prepare { .. } => unreachable!(),
         Commands::Diagnostics { command } => {
             chronology_commands::execute_diagnostics(&catalog, command)
         }

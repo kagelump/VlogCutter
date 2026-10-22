@@ -472,6 +472,59 @@ their offsets page candidates, coverage, request receipts, and review questions
 independently, with totals and `nextOffset` for continuation. Discovery progress
 is emitted as JSON lines on stderr.
 
+### Preparation evidence for editing
+
+Preparation adds a bounded, local-first view over proxy validation, timed
+transcript provenance, sparse moment suggestions, and orientation/review
+questions. Every command requires an existing explicit project catalog via
+`--catalog` or `RCDVLOG_CATALOG`; it never consults the desktop breadcrumb or
+creates a missing catalog.
+
+```bash
+rcdvlog --catalog /absolute/project/catalog.sqlite3 prepare preflight \
+  --project <project-id> --asset <asset-id> --offset 0 --limit 10
+rcdvlog --catalog /absolute/project/catalog.sqlite3 prepare preflight \
+  --project <project-id> --all --offset 10 --limit 10
+rcdvlog --catalog /absolute/project/catalog.sqlite3 prepare evidence \
+  --project <project-id> --asset <asset-id> --kind transcript --offset 0 --limit 10
+rcdvlog --catalog /absolute/project/catalog.sqlite3 prepare evidence \
+  --project <project-id> --asset <asset-id> --kind moments --offset 0 --limit 10
+rcdvlog --catalog /absolute/project/catalog.sqlite3 prepare run \
+  --project <project-id> --asset <asset-id> --transcribe
+rcdvlog --catalog /absolute/project/catalog.sqlite3 prepare run \
+  --project <project-id> --asset <asset-id> --moments \
+  --provider openrouter --model qwen/qwen3.7-flash \
+  --payload frames-and-transcript --budget-usd 0.25
+```
+
+`prepare preflight` and `prepare evidence` open SQLite read-only: they do not
+migrate the catalog, validate media by decoding, write cache state, download
+models, or contact a provider. Pages have `limit` 1–50 and `offset` at most
+1,000,000. Manifest `pageOutcome` describes only the returned page, while its
+scope fingerprint identifies the selector, not a frozen project snapshot.
+`--all` includes removed/excluded rows so the inventory remains truthful.
+Moment evidence pages reuse the existing bounded moments projection.
+
+`prepare run` is the only mutating preparation command. With no stage flags it
+validates/reuses existing local proxies and current receipts; `--proxies`,
+`--transcribe`, and `--revalidate` explicitly add local work. `--moments` is the
+only paid-work authorization and requires the provider, model, payload, and
+positive USD budget together. It reuses the approved model validation and one
+budget over the eligible explicit scope. Models must already be installed for
+transcription. Missing usage receipts are not retried implicitly; use the
+existing explicit `moments` recovery commands after reviewing unknown charges.
+
+The manifest distinguishes the actual proxy recipe from the required current
+recipe and binds validation to full content identity. Existing transcript
+bindings cannot be carried across a full proxy replacement. Source bytes,
+human notes/labels/title/removal, rotation, and chronology remain untouched by
+preparation. A `ready` result means the available technical evidence passed
+its checks; sparse moment samples are suggestions and do not certify an
+arbitrary source interval or edit cut. Synthetic fixture tests verify these
+workflow contracts, not transcription quality or subjective moment selection.
+
+### Analysis policy and recovery
+
 `analyze suggest-chronology` makes one bounded, read-only visual evidence request
 for 2–8 selected clips, using at most two selected proxy frames per clip. It
 returns coverage diagnostics and checkable conflicts against the current solved
