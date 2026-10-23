@@ -311,7 +311,7 @@ impl Catalog {
                     asset_id: asset.id.clone(),
                     phase: phase.into(),
                     cost_usd: cost,
-                    estimate,
+                    estimate: estimate.clone(),
                 })
             };
             if notify("preflight", state.spent).is_break() {

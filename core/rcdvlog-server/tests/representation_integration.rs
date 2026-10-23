@@ -332,17 +332,39 @@ fn proxy_job_records_actual_encoder_validation_and_fallback_provenance() {
             .expect("encoder name"),
     )
     .unwrap();
-    let expected_rate_key = proxy_rate_history_key(actual_encoder, 1);
-    assert_eq!(provenance["rateHistoryKey"], expected_rate_key);
+    let expected_base_key = proxy_rate_history_key(actual_encoder, 1);
+    let observed_rate_key = provenance["rateHistoryKey"]
+        .as_str()
+        .expect("qualified rate key");
+    assert!(
+        observed_rate_key.starts_with(&expected_base_key),
+        "{observed_rate_key} must retain the actual encoder base"
+    );
+    assert!(observed_rate_key.contains(".h"));
+    assert!(observed_rate_key.contains(".c"));
     let connection = open_writable_connection(fixture.catalog.database_path()).unwrap();
-    let rate_samples: i64 = connection
+    let (rate_samples, semantic_recipe, identity_json): (i64, String, String) = connection
         .query_row(
-            "SELECT samples FROM job_rate_history WHERE recipe_key=?1",
-            [&expected_rate_key],
-            |row| row.get(0),
+            "SELECT samples,semantic_recipe_key,estimator_identity_json FROM job_rate_history WHERE recipe_key=?1",
+            [observed_rate_key],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .unwrap();
     assert_eq!(rate_samples, 1);
+    assert_eq!(semantic_recipe, "proxy.h264-720p.orientation-v3");
+    let identity: rcdvlog_core::MediaEstimatorIdentity =
+        serde_json::from_str(&identity_json).unwrap();
+    assert_eq!(identity.semantic_recipe_key, semantic_recipe);
+    assert_eq!(identity.encoder.as_deref(), Some(actual_encoder.as_str()));
+    assert_eq!(identity.worker_count, 1);
+    assert_eq!(identity.environment.tools.len(), 2);
+    assert!(
+        identity
+            .environment
+            .tools
+            .iter()
+            .all(|tool| tool.executable_key != "unresolved")
+    );
     engine
         .complete(&claimed, result.clone(), |tx| {
             handler.commit_result(tx, &claimed, &result)
@@ -537,7 +559,7 @@ fn cancellation_stops_an_in_flight_silent_proxy_process() {
         .unwrap();
     let marker = fixture._root.path().join("encoder-started");
     let script = fixture._root.path().join("silent-ffmpeg");
-    fs::write(&script, format!("#!/bin/sh\nfor arg in \"$@\"; do\n if [ \"$arg\" = -encoders ]; then echo libx264; exit 0; fi\ndone\ntouch '{}'\nexec sleep 30\n", marker.display())).unwrap();
+    fs::write(&script, format!("#!/bin/sh\nfor arg in \"$@\"; do\n if [ \"$arg\" = -encoders ]; then echo libx264; exit 0; fi\n if [ \"$arg\" = -version ]; then echo synthetic-ffmpeg-v1; exit 0; fi\ndone\ntouch '{}'\nexec sleep 30\n", marker.display())).unwrap();
     fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
     let handler = RepresentationJobHandler::new(
         fixture.catalog.storage_library(),
@@ -549,18 +571,33 @@ fn cancellation_stops_an_in_flight_silent_proxy_process() {
     .with_proxy_encoder_policy(rcdvlog_core::ProxyEncoderPolicy::Software);
     let cancellation = CancellationToken::new();
     let token = cancellation.clone();
+    let job_id = claimed.job.job_id.clone();
     let started = std::time::Instant::now();
     let worker = std::thread::spawn(move || handler.run(claimed, token));
     while !marker.exists() && started.elapsed() < std::time::Duration::from_secs(5) {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
     let entered_encoder = marker.exists();
+    // The real handler must publish a known software context while encoding,
+    // before successful completion can record any rate observation.
+    let connection = open_writable_connection(fixture.catalog.database_path()).unwrap();
+    let identity_json: Option<String> = connection
+        .query_row(
+            "SELECT estimator_identity_json FROM job_attempts WHERE job_id=?1",
+            [job_id.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
     cancellation.cancel();
     let failure = worker.join().unwrap().unwrap_err();
     assert!(
         entered_encoder,
         "test must cancel a running encoder, not only preflight"
     );
+    let identity: rcdvlog_core::MediaEstimatorIdentity =
+        serde_json::from_str(&identity_json.expect("running software context")).unwrap();
+    assert_eq!(identity.encoder.as_deref(), Some("software"));
+    assert_eq!(identity.worker_count, 1);
     assert_eq!(failure.code, "canceled");
     assert!(started.elapsed() < std::time::Duration::from_secs(7));
     assert!(walk_files(&fixture.derived).is_empty());

@@ -651,9 +651,21 @@ fn unsupported_platform_probe(ffmpeg: &Path) -> ProxyEncoderProbeReport {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static ENCODER_PLAN_RESOLUTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn encoder_plan_resolution_count() -> usize {
+    ENCODER_PLAN_RESOLUTIONS.with(std::cell::Cell::get)
+}
+
 /// Resolve claim order without running a clip. Auto on Linux uses the cached
 /// bounded probe, so a batch does not re-probe hardware once per asset.
 pub fn resolve_proxy_encoder_plan(policy: ProxyEncoderPolicy) -> ProxyEncoderPlan {
+    #[cfg(test)]
+    ENCODER_PLAN_RESOLUTIONS.with(|count| count.set(count.get().saturating_add(1)));
     resolve_proxy_encoder_plan_with_tools(policy, &resolve_tool("ffmpeg"), &resolve_tool("ffprobe"))
 }
 
@@ -793,8 +805,13 @@ where
         let process = match process {
             Ok(process) => process,
             Err(error) => {
-                let diagnostic =
-                    bound_diagnostic(&redact_media_diagnostic(&error.to_string(), source, output));
+                // Keep the complete anyhow chain for startup failures: an OS
+                // spawn error must remain distinguishable from cancellation.
+                let diagnostic = bound_diagnostic(&redact_media_diagnostic(
+                    &format!("{error:#}"),
+                    source,
+                    output,
+                ));
                 attempts.push(ProxyEncoderAttempt {
                     encoder: target.encoder.as_str().to_string(),
                     device: target.device.clone(),
@@ -1680,10 +1697,15 @@ mod tests {
     #[test]
     fn cancellation_kills_a_silent_encoder_and_does_not_start_fallback() {
         let directory = TempDir::new().unwrap();
-        let script = directory.path().join("silent-encoder");
-        fs::write(&script, "#!/bin/sh\nexec sleep 30\n").unwrap();
-        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        // Execute a checked-in fixture rather than writing an executable just
+        // before spawn. Parallel tests fork children, which can briefly inherit
+        // a writable script descriptor and make Linux execve fail with ETXTBSY.
+        let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/silent-encoder.sh");
         let output = directory.path().join("canceled.mp4");
+        // Signal only after the child process has actually started. Cancel on
+        // that handshake rather than an absolute wall-clock deadline so a slow
+        // process start cannot race with the fallback decision.
+        let started_marker = PathBuf::from(format!("{}.started", output.display()));
         let mut plan = software_plan();
         // A cancellation must suppress even an otherwise valid fallback.
         plan.targets.push(ProxyEncoderTarget::software());
@@ -1697,12 +1719,31 @@ mod tests {
             false,
             &plan,
             |_| {},
-            || started.elapsed() >= Duration::from_millis(200),
+            || started_marker.exists(),
         )
         .unwrap_err();
         assert!(started.elapsed() < Duration::from_secs(3));
-        assert!(failure.message.contains("canceled"));
-        assert_eq!(failure.outcome.attempts.len(), 1);
+        assert!(
+            failure.message.contains("canceled"),
+            "unexpected failure message: {}",
+            failure.message
+        );
+        assert_eq!(
+            failure.outcome.attempts.len(),
+            1,
+            "cancellation must suppress fallback; message={}; attempts={:#?}",
+            failure.message,
+            failure.outcome.attempts
+        );
+        assert!(
+            failure.outcome.attempts[0]
+                .diagnostic
+                .as_deref()
+                .is_some_and(|diagnostic| diagnostic.contains("canceled")),
+            "initial encoder attempt did not end by cancellation; message={}; attempts={:#?}",
+            failure.message,
+            failure.outcome.attempts
+        );
         assert!(!output.exists());
     }
 

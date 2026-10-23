@@ -115,9 +115,13 @@ Actual encoder, attempt, fallback, and validation evidence is stored in the
 server job result details (`proxyProvenance`) in canonical SQLite for both
 successful and failed attempts; failed jobs never publish a representation.
 Server throughput observations for representation jobs are recorded under the
-encoder/worker-scoped key that actually succeeded (reported as
-`rateHistoryKey`), while the public representation recipe remains the semantic
-v3 proxy contract.
+encoder/worker-scoped key that actually succeeded, additionally qualified by the
+exact configured FFmpeg/FFprobe identities, host/build/device facts, and current
+worker/thread configuration (reported as `rateHistoryKey`). The per-attempt
+context is stored in the control catalog with the rate row and on the leased job
+attempt. The public representation recipe and representation ID remain the
+semantic v3 proxy contract. Legacy unqualified proxy history is never used for a
+current ETA; missing or mismatched context is surfaced as uncertainty.
 
 ## 2026-08-03 M3 benchmark
 

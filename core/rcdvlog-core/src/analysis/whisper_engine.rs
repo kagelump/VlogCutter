@@ -71,10 +71,39 @@ pub fn read_pcm(path: &Path) -> Result<Vec<f32>> {
 pub struct WhisperEngine {
     context: whisper_rs::WhisperContext,
     vad_model_path: PathBuf,
+    vad_threads: i32,
+    decode_threads: i32,
 }
 
 impl WhisperEngine {
+    /// Default engine. Thread counts remain explicit calibration candidates;
+    /// this constructor does not claim they are universally optimal.
     pub fn new(whisper_model: &Path, vad_model: &Path) -> Result<Self> {
+        Self::with_threads(
+            whisper_model,
+            vad_model,
+            DECODE_THREADS as usize,
+            DECODE_THREADS as usize,
+        )
+    }
+
+    /// Open the same models with explicit, bounded VAD and decode thread
+    /// settings. Callers must validate the range and keep the settings in their
+    /// calibration/history identity.
+    pub fn with_threads(
+        whisper_model: &Path,
+        vad_model: &Path,
+        vad_threads: usize,
+        decode_threads: usize,
+    ) -> Result<Self> {
+        let vad_threads = i32::try_from(vad_threads)
+            .ok()
+            .filter(|threads| (1..=64).contains(threads))
+            .ok_or_else(|| anyhow::anyhow!("vadThreads must be 1..=64"))?;
+        let decode_threads = i32::try_from(decode_threads)
+            .ok()
+            .filter(|threads| (1..=64).contains(threads))
+            .ok_or_else(|| anyhow::anyhow!("decodeThreads must be 1..=64"))?;
         let context = whisper_rs::WhisperContext::new_with_params(
             whisper_model,
             whisper_rs::WhisperContextParameters::default(),
@@ -83,17 +112,19 @@ impl WhisperEngine {
         Ok(Self {
             context,
             vad_model_path: vad_model.to_path_buf(),
+            vad_threads,
+            decode_threads,
         })
     }
 }
 
 impl SttEngine for WhisperEngine {
     fn detect_speech(&self, pcm: &[f32]) -> Result<Vec<SpeechRegion>> {
-        let mut vad = whisper_rs::WhisperVadContext::new(
-            &self.vad_model_path.to_string_lossy(),
-            whisper_rs::WhisperVadContextParams::default(),
-        )
-        .context("load VAD model")?;
+        let mut vad_params = whisper_rs::WhisperVadContextParams::default();
+        vad_params.set_n_threads(self.vad_threads);
+        let mut vad =
+            whisper_rs::WhisperVadContext::new(&self.vad_model_path.to_string_lossy(), vad_params)
+                .context("load VAD model")?;
         let segments = vad
             .segments_from_samples(whisper_rs::WhisperVadParams::default(), pcm)
             .context("run VAD")?;
@@ -118,7 +149,7 @@ impl SttEngine for WhisperEngine {
             .context("create whisper state")?;
         let mut params =
             whisper_rs::FullParams::new(whisper_rs::SamplingStrategy::Greedy { best_of: 1 });
-        params.set_n_threads(DECODE_THREADS);
+        params.set_n_threads(self.decode_threads);
         // `None` selects whisper's internal auto-detect. A separate LID pass
         // costs 34% more for identical decisions.
         params.set_language(None);

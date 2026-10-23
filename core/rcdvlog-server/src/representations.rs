@@ -6,9 +6,11 @@ use crate::{
 };
 use chrono::{SecondsFormat, Utc};
 use rcdvlog_core::{
-    JobId, MediaObjectId, NodeId, ProxyEncoderKind, ProxyEncoderPolicy, RepresentationId,
+    JobId, MediaEstimatorEnvironment, MediaEstimatorIdentity, MediaObjectId, NodeId,
+    PROXY_REPRESENTATION_KIND, ProxyEncoderKind, ProxyEncoderPolicy, RepresentationId,
     StorageObjectId, probe_source_audio_present, proxy_rate_history_key,
-    resolve_proxy_encoder_plan_with_tools, run_proxy_transcode_with_plan_and_cancellation,
+    resolve_proxy_encoder_plan_with_tools, resolve_tool_program,
+    run_proxy_transcode_with_plan_and_cancellation,
 };
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
@@ -649,8 +651,10 @@ impl RepresentationJobHandler {
             library,
             jobs,
             derived_root,
-            ffmpeg_program,
-            ffprobe_program,
+            // Resolve configured bare command names once. The same resolved
+            // executable is used for execution and estimator identity.
+            ffmpeg_program: resolve_tool_program(&ffmpeg_program),
+            ffprobe_program: resolve_tool_program(&ffprobe_program),
             proxy_encoder_policy: ProxyEncoderPolicy::Auto,
         }
     }
@@ -658,6 +662,26 @@ impl RepresentationJobHandler {
     pub fn with_proxy_encoder_policy(mut self, policy: ProxyEncoderPolicy) -> Self {
         self.proxy_encoder_policy = policy;
         self
+    }
+
+    fn estimator_environment(&self) -> MediaEstimatorEnvironment {
+        // The handler's resolved programs are the authoritative execution
+        // tools. A bound engine with a different identity is rejected by the
+        // recording call instead of silently attributing timing to the wrong
+        // binary.
+        MediaEstimatorEnvironment::from_tools(&self.ffmpeg_program, &self.ffprobe_program)
+    }
+
+    fn attach_estimator_context(
+        &self,
+        job: &ClaimedJob,
+        identity: &MediaEstimatorIdentity,
+    ) -> Result<(), JobHandlerFailure> {
+        self.jobs
+            .clone()
+            .with_media_estimator_environment(identity.environment.clone())
+            .attach_attempt_estimator_identity(job, identity)
+            .map_err(|_| retryable("job_progress_failed"))
     }
 
     fn execute(
@@ -697,9 +721,8 @@ impl RepresentationJobHandler {
         ));
         let _cleanup = TempArtifact(temporary.clone());
         let started = Instant::now();
-        let mut proxy_rate_key = None;
         let mut proxy_success_elapsed = None;
-        let proxy_provenance = match payload.kind {
+        let (proxy_provenance, estimator_identity) = match payload.kind {
             RepresentationKind::Proxy => {
                 let duration = media_duration(&source, &self.ffprobe_program)?;
                 let source_audio_present =
@@ -710,6 +733,22 @@ impl RepresentationJobHandler {
                     &self.ffmpeg_program,
                     &self.ffprobe_program,
                 );
+                // Only a single-target plan has a known execution context
+                // throughout the run. Hardware plans may fall back, so retain
+                // uncertainty until their actual successful encoder is known.
+                if let [target] = plan.targets.as_slice() {
+                    let identity = MediaEstimatorIdentity::new(
+                        self.estimator_environment(),
+                        PROXY_REPRESENTATION_KIND,
+                        payload.kind.recipe_key(),
+                        proxy_rate_history_key(target.encoder, 1),
+                        Some(target.encoder.as_str()),
+                        1,
+                        0,
+                        0,
+                    );
+                    self.attach_estimator_context(job, &identity)?;
+                }
                 let outcome = run_proxy_transcode_with_plan_and_cancellation(
                     &self.ffmpeg_program,
                     &self.ffprobe_program,
@@ -732,6 +771,30 @@ impl RepresentationJobHandler {
                     );
                     let provenance = server_safe_proxy_provenance(&failure.outcome)
                         .unwrap_or_else(|_| json!({"status": "failed"}));
+                    // Preserve which encoder/context actually failed, but do
+                    // not teach success rate history from failed overhead.
+                    let attempted_encoder = failure
+                        .outcome
+                        .attempts
+                        .last()
+                        .and_then(|attempt| ProxyEncoderKind::parse(&attempt.encoder).ok())
+                        .unwrap_or(ProxyEncoderKind::Software);
+                    let execution_recipe_key = proxy_rate_history_key(attempted_encoder, 1);
+                    let identity = MediaEstimatorIdentity::new(
+                        self.estimator_environment(),
+                        PROXY_REPRESENTATION_KIND,
+                        payload.kind.recipe_key(),
+                        execution_recipe_key,
+                        Some(attempted_encoder.as_str()),
+                        1,
+                        0,
+                        0,
+                    );
+                    let _ = self
+                        .jobs
+                        .clone()
+                        .with_media_estimator_environment(identity.environment.clone())
+                        .attach_attempt_estimator_identity(job, &identity);
                     JobHandlerFailure {
                         kind: FailureKind::Retryable,
                         code: "media_tool_failed".into(),
@@ -744,16 +807,38 @@ impl RepresentationJobHandler {
                 let actual_encoder = ProxyEncoderKind::parse(&outcome.selected_encoder)
                     .unwrap_or(ProxyEncoderKind::Software);
                 proxy_success_elapsed = Some(outcome.successful_elapsed());
-                let rate_key = proxy_rate_history_key(actual_encoder, 1);
-                proxy_rate_key = Some(rate_key.clone());
+                let execution_recipe_key = proxy_rate_history_key(actual_encoder, 1);
+                let identity = MediaEstimatorIdentity::new(
+                    self.estimator_environment(),
+                    PROXY_REPRESENTATION_KIND,
+                    payload.kind.recipe_key(),
+                    execution_recipe_key.clone(),
+                    Some(actual_encoder.as_str()),
+                    1,
+                    0,
+                    0,
+                );
+                let rate_key = identity.qualified_history_key(&execution_recipe_key);
                 let mut provenance =
                     server_safe_proxy_provenance(&outcome).map_err(handler_error)?;
                 provenance["rateHistoryKey"] = Value::String(rate_key);
-                Some(provenance)
+                (Some(provenance), Some(identity))
             }
             RepresentationKind::Thumbnail => {
                 let duration = media_duration(&source, &self.ffprobe_program)?;
                 let seek = (duration.max(0.0) * 0.2).to_string();
+                let execution_recipe_key = payload.kind.recipe_key().to_string();
+                let identity = MediaEstimatorIdentity::new(
+                    self.estimator_environment(),
+                    "generated_thumbnail",
+                    payload.kind.recipe_key(),
+                    execution_recipe_key,
+                    Some("ffmpeg-image"),
+                    1,
+                    0,
+                    0,
+                );
+                self.attach_estimator_context(job, &identity)?;
                 let mut command = Command::new(&self.ffmpeg_program);
                 command
                     .args(["-y", "-hide_banner", "-loglevel", "error"])
@@ -778,7 +863,7 @@ impl RepresentationJobHandler {
                 if !status.success() {
                     return Err(retryable("media_tool_failed"));
                 }
-                None
+                (None, Some(identity))
             }
         };
         validate_output(&temporary, payload.kind, &self.ffprobe_program)
@@ -801,21 +886,28 @@ impl RepresentationJobHandler {
             .as_millis()
             .max(1)
             .min(u128::from(u64::MAX)) as u64;
-        self.jobs
-            .record_item_completion_with_rate_key(
-                job,
-                ItemCompletion {
-                    work_units: job.job.total_work_units,
-                    succeeded: true,
-                    worker_elapsed_millis: elapsed,
-                },
-                ProgressEstimateInput {
-                    worker_count: 1,
-                    remaining_task_work_units: vec![],
-                },
-                proxy_rate_key.as_deref(),
-            )
-            .map_err(|_| retryable("job_progress_failed"))?;
+        let jobs = estimator_identity.as_ref().map_or_else(
+            || self.jobs.clone(),
+            |identity| {
+                self.jobs
+                    .clone()
+                    .with_media_estimator_environment(identity.environment.clone())
+            },
+        );
+        jobs.record_item_completion_with_estimator_identity(
+            job,
+            ItemCompletion {
+                work_units: job.job.total_work_units,
+                succeeded: true,
+                worker_elapsed_millis: elapsed,
+            },
+            ProgressEstimateInput {
+                worker_count: 1,
+                remaining_task_work_units: vec![],
+            },
+            estimator_identity.as_ref(),
+        )
+        .map_err(|_| retryable("job_progress_failed"))?;
         Ok(generated)
     }
 }

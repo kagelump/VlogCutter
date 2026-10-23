@@ -48,7 +48,7 @@ impl RateHistory {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct BatchEstimate {
     pub completed_items: usize,
@@ -59,6 +59,12 @@ pub struct BatchEstimate {
     pub work_units_per_worker_second: Option<f64>,
     pub elapsed_seconds: f64,
     pub estimated_remaining_seconds: Option<f64>,
+    /// Explicit uncertainty for calibrated ETA consumers. Ordinary learned
+    /// histories leave this unset rather than inventing a confidence level.
+    #[serde(default)]
+    pub confidence: String,
+    #[serde(default)]
+    pub estimated_remaining_seconds_range: Option<[f64; 2]>,
 }
 
 pub struct BatchEstimator {
@@ -159,6 +165,8 @@ impl BatchEstimator {
             work_units_per_worker_second: rate,
             elapsed_seconds: self.started_at.elapsed().as_secs_f64(),
             estimated_remaining_seconds: remaining_seconds,
+            confidence: String::new(),
+            estimated_remaining_seconds_range: None,
         }
     }
 }

@@ -23,6 +23,7 @@ pub use rcdvlog_core::{
     ProjectAssetAddedPayload, ProjectAssetItem, ProjectAssetPage, ProjectId, RepresentationId,
     RootAssociationConfirmation, RootAssociationConfirmationStatus, RootAssociationEvidence,
     RootRelativePath, StorageObjectId, StorageProtocol, StorageRootId,
+    default_local_heavy_lock_path,
 };
 pub use rcdvlog_sync::{
     BASELINE_VERSION, BaselineEnvelope, BaselinePayload, BaselinePreview, NodeTargetedJob,
@@ -77,7 +78,7 @@ pub use media_facts::{
     FullHashFact, MediaFactsError, MediaMismatchEvidence, ProbeFact, QuickFingerprintFact,
     ScanFileDiagnostic,
 };
-pub use rcdvlog_core::StorageAccessMode;
+pub use rcdvlog_core::{MediaEstimatorEnvironment, MediaEstimatorIdentity, StorageAccessMode};
 pub use replicas::{
     AddToProjectDisposition, AddToProjectItem, AddToProjectPreview, AddToProjectRequest,
     AddToProjectResult, MAX_ADD_TO_PROJECT_ITEMS, ProjectPage, ProjectReplica, ProjectReplicaError,

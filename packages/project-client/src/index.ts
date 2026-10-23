@@ -181,7 +181,7 @@ export interface ScanSchedule { scheduleId: string; storageRootId: string; scope
 export type AdminJobState = "queued" | "running" | "retry_wait" | "succeeded" | "failed" | "canceled";
 export interface AdminJob {
   enqueueSequence?: number; definition: { jobId: string; jobType: string; jobClass: string; targetNodeId: string; projectId: string | null; mediaObjectId: string | null; recipeKey: string; totalItems: number };
-  estimate?: { completedItems: number; totalItems: number; completedWorkUnits: number; totalWorkUnits: number; workerCount: number; workUnitsPerWorkerSecond: number | null; elapsedSeconds: number; estimatedRemainingSeconds: number | null };
+  estimate?: { completedItems: number; totalItems: number; completedWorkUnits: number; totalWorkUnits: number; workerCount: number; workUnitsPerWorkerSecond: number | null; elapsedSeconds: number; estimatedRemainingSeconds: number | null; confidence?: string; estimatedRemainingSecondsRange?: [number, number] | null };
   state: AdminJobState; attemptCount: number; retryable: boolean; availableAt: string; cancelRequestedAt: string | null; leaseActive: boolean; leaseExpiresAt: string | null; completedWorkUnits: number; totalWorkUnits: number;
   completedItems: number; failedItems: number; totalItems: number; error: { code: string; details: unknown } | null;
   outputIdentity: string | null; createdAt: string; startedAt: string | null; updatedAt: string; completedAt: string | null;

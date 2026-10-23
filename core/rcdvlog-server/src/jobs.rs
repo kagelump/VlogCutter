@@ -1,11 +1,13 @@
 use batch_estimator::{BatchEstimate, BatchEstimator, RateHistory};
 use chrono::{DateTime, Duration as ChronoDuration, SecondsFormat, Utc};
-use rcdvlog_core::{JobId, MediaObjectId, NodeId, ProjectId, RepresentationId, StorageRootId};
+use rcdvlog_core::{
+    JobId, MediaEstimatorEnvironment, MediaEstimatorIdentity, MediaObjectId, NodeId, ProjectId,
+    RepresentationId, StorageRootId, media_estimator_process_key,
+};
 use rcdvlog_sync::NodeTargetedJob;
-use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -71,6 +73,12 @@ pub enum JobClass {
     Lightweight,
 }
 impl JobClass {
+    /// #53's one shared local-heavy class predicate. Future local VLM or other
+    /// heavy workers must join this set rather than introduce a parallel lane.
+    pub fn is_local_heavy(self) -> bool {
+        matches!(self, Self::Proxy | Self::FullHash)
+    }
+
     fn as_str(self) -> &'static str {
         match self {
             Self::Proxy => "proxy",
@@ -79,6 +87,15 @@ impl JobClass {
         }
     }
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaimScope {
+    Any,
+    Class(JobClass),
+    Heavy,
+    HeavyOne(JobClass),
+    Lightweight,
+}
+
 fn job_class(value: String) -> Result<JobClass, JobEngineError> {
     match value.as_str() {
         "proxy" => Ok(JobClass::Proxy),
@@ -329,6 +346,10 @@ pub struct JobEngine {
     database_path: PathBuf,
     node_id: NodeId,
     clock: Arc<dyn Clock>,
+    /// Exact host/tool/device identity used to validate representation timing
+    /// reuse. Adapters set this from their runtime media-tool configuration;
+    /// unit tests may leave it unset to model an unknown environment.
+    media_estimator_environment: Option<MediaEstimatorEnvironment>,
 }
 
 struct JobSnapshotRow {
@@ -366,8 +387,25 @@ impl JobEngine {
             database_path,
             node_id,
             clock,
+            media_estimator_environment: None,
         }
     }
+
+    /// Bind the exact configured media-tool environment to this engine. This
+    /// clone-safe builder is used by every server-side read path so HTTP and
+    /// job workers evaluate the same compatibility rules.
+    pub fn with_media_estimator_environment(
+        mut self,
+        environment: MediaEstimatorEnvironment,
+    ) -> Self {
+        self.media_estimator_environment = Some(environment);
+        self
+    }
+
+    pub fn media_estimator_environment(&self) -> Option<&MediaEstimatorEnvironment> {
+        self.media_estimator_environment.as_ref()
+    }
+
     pub fn node_id(&self) -> &NodeId {
         &self.node_id
     }
@@ -594,19 +632,70 @@ impl JobEngine {
 
     fn estimate_snapshot(&self, snapshot: &JobSnapshot) -> Result<BatchEstimate, JobEngineError> {
         let connection = open_read_only_connection(&self.database_path)?;
-        let history = connection
-            .query_row(
-                "SELECT work_units_per_worker_second,samples FROM job_rate_history WHERE node_id=?1 AND recipe_key=?2",
-                params![self.node_id.as_str(), &snapshot.definition.recipe_key],
-                |row| {
-                    Ok(RateHistory {
-                        work_units_per_worker_second: row.get(0)?,
-                        samples: row.get::<_, i64>(1)? as u64,
-                    })
-                },
-            )
-            .optional()?
-            .unwrap_or_default();
+        let media_job = is_media_representation_job(&snapshot.definition);
+        let (history, compatibility, uncertainty_reason) =
+            if snapshot.state == JobState::Running && snapshot.lease_active {
+                if media_job {
+                    match load_attempt_estimator_identity(
+                        &connection,
+                        snapshot.definition.job_id.as_str(),
+                        snapshot.attempt_count,
+                    )? {
+                        Some(identity)
+                            if self.media_estimator_environment.as_ref().is_some_and(
+                                |environment| {
+                                    identity.is_compatible_with(
+                                        environment,
+                                        &snapshot.definition.recipe_key,
+                                    )
+                                },
+                            ) =>
+                        {
+                            let rate_key =
+                                identity.qualified_history_key(&identity.execution_recipe_key);
+                            (
+                                qualified_rate_history_for_read(
+                                    &connection,
+                                    self.node_id.as_str(),
+                                    &rate_key,
+                                    &identity,
+                                )?,
+                                TimingCompatibility::Compatible,
+                                "no_qualified_media_observations",
+                            )
+                        }
+                        Some(_) => (
+                            RateHistory::default(),
+                            TimingCompatibility::Unknown,
+                            "stale_estimator_context",
+                        ),
+                        None => (
+                            RateHistory::default(),
+                            TimingCompatibility::Unknown,
+                            "missing_attempt_estimator_context",
+                        ),
+                    }
+                } else {
+                    (
+                        legacy_rate_history_for_read(
+                            &connection,
+                            self.node_id.as_str(),
+                            &snapshot.definition.recipe_key,
+                        )?,
+                        TimingCompatibility::Legacy,
+                        "no_history",
+                    )
+                }
+            } else {
+                let reason = match snapshot.state {
+                    JobState::Queued | JobState::RetryWait => "waiting_for_eligible_slot",
+                    JobState::Running => "interrupted_attempt",
+                    JobState::Succeeded | JobState::Failed | JobState::Canceled => {
+                        "terminal_not_executing"
+                    }
+                };
+                (RateHistory::default(), TimingCompatibility::Unknown, reason)
+            };
         let estimator = BatchEstimator::with_explicit_progress(
             snapshot.total_items as usize,
             snapshot.total_work_units,
@@ -618,11 +707,21 @@ impl JobEngine {
         let remaining = snapshot
             .total_work_units
             .saturating_sub(snapshot.completed_work_units);
-        Ok(estimator.estimate(if remaining == 0 {
+        let mut estimate = estimator.estimate(if remaining == 0 {
             &[]
         } else {
             std::slice::from_ref(&remaining)
-        }))
+        });
+        match compatibility {
+            TimingCompatibility::Compatible => {
+                estimate = annotate_measured_estimate(estimate, history);
+            }
+            TimingCompatibility::Unknown | TimingCompatibility::UnverifiedMedia => {
+                estimate = uncertain_estimate(estimate, uncertainty_reason);
+            }
+            TimingCompatibility::Legacy => {}
+        }
+        Ok(estimate)
     }
 
     pub fn retry_failed(&self, id: &JobId) -> Result<JobSnapshot, JobEngineError> {
@@ -718,6 +817,67 @@ impl JobEngine {
         lease_for: Duration,
         class: Option<JobClass>,
     ) -> Result<Option<ClaimedJob>, JobEngineError> {
+        self.claim_next_scoped(
+            lease_owner,
+            lease_for,
+            class.map(ClaimScope::Class).unwrap_or(ClaimScope::Any),
+        )
+    }
+
+    /// Claim the next eligible local-heavy job across every heavy class in one
+    /// shared queue. #53 accepts one heavy slot, so proxy/transcode and
+    /// full-hash work cannot occupy separate lanes. Explicitly queued work is
+    /// intentional LIFO here: the newest eligible heavy job runs next.
+    pub fn claim_next_heavy(
+        &self,
+        lease_owner: &str,
+        lease_for: Duration,
+    ) -> Result<Option<ClaimedJob>, JobEngineError> {
+        self.claim_next_scoped(lease_owner, lease_for, ClaimScope::Heavy)
+    }
+
+    /// Claim across only the heavy classes explicitly enabled by the server
+    /// configuration. The durable queue remains one shared eligible pool, so an
+    /// empty proxy queue cannot idle an enabled full-hash class (or vice versa).
+    pub fn claim_next_heavy_enabled(
+        &self,
+        lease_owner: &str,
+        lease_for: Duration,
+        proxy_enabled: bool,
+        full_hash_enabled: bool,
+    ) -> Result<Option<ClaimedJob>, JobEngineError> {
+        match (proxy_enabled, full_hash_enabled) {
+            (true, true) => self.claim_next_scoped(lease_owner, lease_for, ClaimScope::Heavy),
+            (true, false) => self.claim_next_scoped(
+                lease_owner,
+                lease_for,
+                ClaimScope::HeavyOne(JobClass::Proxy),
+            ),
+            (false, true) => self.claim_next_scoped(
+                lease_owner,
+                lease_for,
+                ClaimScope::HeavyOne(JobClass::FullHash),
+            ),
+            (false, false) => Ok(None),
+        }
+    }
+
+    /// Claim the next eligible lightweight job. Lightweight work may overlap
+    /// the shared heavy slot and remains FIFO within its safety limit.
+    pub fn claim_next_lightweight(
+        &self,
+        lease_owner: &str,
+        lease_for: Duration,
+    ) -> Result<Option<ClaimedJob>, JobEngineError> {
+        self.claim_next_scoped(lease_owner, lease_for, ClaimScope::Lightweight)
+    }
+
+    fn claim_next_scoped(
+        &self,
+        lease_owner: &str,
+        lease_for: Duration,
+        scope: ClaimScope,
+    ) -> Result<Option<ClaimedJob>, JobEngineError> {
         validate_lease_duration(lease_for)?;
         valid_token(lease_owner, "lease owner")?;
         let now = self.clock.now();
@@ -729,10 +889,13 @@ impl JobEngine {
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
         settle_dependency_terminal(&tx, &now_s)?;
         promote_retry_wait(&tx, &now_s)?;
-        let base = " AND j.cancel_requested_at IS NULL AND NOT EXISTS(SELECT 1 FROM job_dependencies d JOIN jobs parent ON parent.job_id=d.depends_on_job_id WHERE d.job_id=j.job_id AND parent.state!='succeeded') ORDER BY j.priority DESC,j.enqueue_sequence ASC LIMIT 1";
-        let id = match class {
-            Some(class) => tx.query_row(&format!("SELECT j.job_id FROM jobs j WHERE j.target_node_id=?1 AND j.job_class=?2 AND j.state='queued' AND j.available_at<=?3{base}"), params![self.node_id.as_str(), class.as_str(), now_s], |row| row.get::<_, String>(0)).optional()?,
-            None => tx.query_row(&format!("SELECT j.job_id FROM jobs j WHERE j.target_node_id=?1 AND j.state='queued' AND j.available_at<=?2{base}"), params![self.node_id.as_str(), now_s], |row| row.get::<_, String>(0)).optional()?,
+        let dependency = " AND j.cancel_requested_at IS NULL AND NOT EXISTS(SELECT 1 FROM job_dependencies d JOIN jobs parent ON parent.job_id=d.depends_on_job_id WHERE d.job_id=j.job_id AND parent.state!='succeeded')";
+        let id = match scope {
+            ClaimScope::Any => tx.query_row(&format!("SELECT j.job_id FROM jobs j WHERE j.target_node_id=?1 AND j.state='queued' AND j.available_at<=?2{dependency} ORDER BY j.priority DESC,j.enqueue_sequence ASC LIMIT 1"), params![self.node_id.as_str(), now_s], |row| row.get::<_, String>(0)).optional()?,
+            ClaimScope::Class(class) => tx.query_row(&format!("SELECT j.job_id FROM jobs j WHERE j.target_node_id=?1 AND j.job_class=?2 AND j.state='queued' AND j.available_at<=?3{dependency} ORDER BY j.priority DESC,j.enqueue_sequence ASC LIMIT 1"), params![self.node_id.as_str(), class.as_str(), now_s], |row| row.get::<_, String>(0)).optional()?,
+            ClaimScope::Heavy => tx.query_row(&format!("SELECT j.job_id FROM jobs j WHERE j.target_node_id=?1 AND j.job_class IN ('proxy','full_hash') AND j.state='queued' AND j.available_at<=?2{dependency} ORDER BY j.priority DESC,j.enqueue_sequence DESC LIMIT 1"), params![self.node_id.as_str(), now_s], |row| row.get::<_, String>(0)).optional()?,
+            ClaimScope::HeavyOne(class) => tx.query_row(&format!("SELECT j.job_id FROM jobs j WHERE j.target_node_id=?1 AND j.job_class=?2 AND j.state='queued' AND j.available_at<=?3{dependency} ORDER BY j.priority DESC,j.enqueue_sequence DESC LIMIT 1"), params![self.node_id.as_str(), class.as_str(), now_s], |row| row.get::<_, String>(0)).optional()?,
+            ClaimScope::Lightweight => tx.query_row(&format!("SELECT j.job_id FROM jobs j WHERE j.target_node_id=?1 AND j.job_class='lightweight' AND j.state='queued' AND j.available_at<=?2{dependency} ORDER BY j.priority DESC,j.enqueue_sequence ASC LIMIT 1"), params![self.node_id.as_str(), now_s], |row| row.get::<_, String>(0)).optional()?,
         };
         let Some(id) = id else {
             tx.commit()?;
@@ -819,7 +982,52 @@ impl JobEngine {
                 "UPDATE jobs SET completed_work_units=?1,updated_at=?2 WHERE job_id=?3",
                 params![completed as i64, now, job.job.job_id.as_str()],
             )?;
-            let hist = rate_history(tx, self.node_id.as_str(), &recipe)?;
+            let media_job = is_media_representation_job(&job.job);
+            let (hist, compatibility, uncertainty_reason) = if media_job {
+                match load_attempt_estimator_identity(
+                    tx,
+                    job.job.job_id.as_str(),
+                    job.attempt_number,
+                )? {
+                    Some(identity)
+                        if self
+                            .media_estimator_environment
+                            .as_ref()
+                            .is_some_and(|environment| {
+                                identity.is_compatible_with(environment, &recipe)
+                            }) =>
+                    {
+                        let rate_key =
+                            identity.qualified_history_key(&identity.execution_recipe_key);
+                        (
+                            qualified_rate_history(
+                                tx,
+                                self.node_id.as_str(),
+                                &rate_key,
+                                &identity,
+                            )?,
+                            TimingCompatibility::Compatible,
+                            "no_qualified_media_observations",
+                        )
+                    }
+                    Some(_) => (
+                        RateHistory::default(),
+                        TimingCompatibility::Unknown,
+                        "stale_estimator_context",
+                    ),
+                    None => (
+                        RateHistory::default(),
+                        TimingCompatibility::Unknown,
+                        "missing_attempt_estimator_context",
+                    ),
+                }
+            } else {
+                (
+                    rate_history(tx, self.node_id.as_str(), &recipe)?,
+                    TimingCompatibility::Legacy,
+                    "no_history",
+                )
+            };
             let estimator = BatchEstimator::with_explicit_progress(
                 total_items as usize,
                 total as u64,
@@ -828,7 +1036,16 @@ impl JobEngine {
                 completed_items as usize,
                 completed,
             );
-            let estimate = estimator.estimate(&estimate_input.remaining_task_work_units);
+            let mut estimate = estimator.estimate(&estimate_input.remaining_task_work_units);
+            match compatibility {
+                TimingCompatibility::Compatible => {
+                    estimate = annotate_measured_estimate(estimate, hist);
+                }
+                TimingCompatibility::Unknown | TimingCompatibility::UnverifiedMedia => {
+                    estimate = uncertain_estimate(estimate, uncertainty_reason);
+                }
+                TimingCompatibility::Legacy => {}
+            }
             emit(
                 tx,
                 job.job.job_id.as_str(),
@@ -867,16 +1084,101 @@ impl JobEngine {
         estimate_input: ProgressEstimateInput,
         rate_key: Option<&str>,
     ) -> Result<JobProgress, JobEngineError> {
+        self.record_item_completion_internal(
+            job,
+            item,
+            estimate_input,
+            RateObservation::Legacy(rate_key),
+        )
+    }
+
+    /// Record a media item together with the exact estimator identity observed
+    /// by the handler. Successful observations train only this qualified key;
+    /// failed or interrupted attempts update counters but never learn a rate.
+    /// The semantic representation recipe remains on the job and is checked
+    /// but is never rewritten by this method.
+    pub fn record_item_completion_with_estimator_identity(
+        &self,
+        job: &ClaimedJob,
+        item: ItemCompletion,
+        estimate_input: ProgressEstimateInput,
+        estimator_identity: Option<&MediaEstimatorIdentity>,
+    ) -> Result<JobProgress, JobEngineError> {
+        self.record_item_completion_internal(
+            job,
+            item,
+            estimate_input,
+            RateObservation::Media(estimator_identity),
+        )
+    }
+
+    fn record_item_completion_internal(
+        &self,
+        job: &ClaimedJob,
+        item: ItemCompletion,
+        estimate_input: ProgressEstimateInput,
+        observation: RateObservation<'_>,
+    ) -> Result<JobProgress, JobEngineError> {
         self.with_current_attempt(job, |tx, now| {
             let (completed_work, total_work, completed_items, failed_items, total_items, recipe): (i64, i64, i64, i64, i64, String) = tx.query_row(
                 "SELECT completed_work_units,total_work_units,completed_items,failed_items,total_items,recipe_key FROM jobs WHERE job_id=?1",
                 [job.job.job_id.as_str()],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
             )?;
-            let history_recipe = rate_key.unwrap_or(&recipe);
             if completed_items >= total_items || item.work_units > (total_work as u64).saturating_sub(completed_work as u64) {
                 return Err(JobEngineError::InvalidInput("item completion exceeds declared job totals".into()));
             }
+
+            let (history_recipe, estimator_identity, compatibility) = match observation {
+                RateObservation::Legacy(rate_key) => {
+                    if is_media_representation_job(&job.job) {
+                        // The old semantic/rate-key-only path has no durable
+                        // estimator context. It may advance work counters but
+                        // must not seed or train a media timing.
+                        (
+                            recipe.clone(),
+                            None,
+                            TimingCompatibility::UnverifiedMedia,
+                        )
+                    } else {
+                        (
+                            rate_key.unwrap_or(&recipe).to_string(),
+                            None,
+                            TimingCompatibility::Legacy,
+                        )
+                    }
+                }
+                RateObservation::Media(identity) => {
+                    let Some(identity) = identity else {
+                        return Err(JobEngineError::InvalidInput(
+                            "media item completion requires an estimator identity".into(),
+                        ));
+                    };
+                    if identity.semantic_recipe_key != recipe {
+                        return Err(JobEngineError::InvalidInput(
+                            "estimator identity does not match the immutable semantic recipe".into(),
+                        ));
+                    }
+                    let compatibility = match self.media_estimator_environment.as_ref() {
+                        Some(environment) if identity.is_compatible_with(environment, &recipe) => {
+                            TimingCompatibility::Compatible
+                        }
+                        Some(_) => {
+                            return Err(JobEngineError::InvalidInput(
+                                "estimator identity does not match the configured media-tool environment"
+                                    .into(),
+                            ));
+                        }
+                        None => TimingCompatibility::Unknown,
+                    };
+                    (
+                        identity.qualified_history_key(&identity.execution_recipe_key),
+                        Some(identity),
+                        compatibility,
+                    )
+                }
+            };
+
             let next_completed = completed_items + 1;
             let next_failed = failed_items + i64::from(!item.succeeded);
             let next_work = completed_work + item.work_units as i64;
@@ -889,8 +1191,59 @@ impl JobEngine {
                 total_work as u64,
             )?;
             tx.execute("UPDATE jobs SET completed_work_units=?1,completed_items=?2,failed_items=?3,updated_at=?4 WHERE job_id=?5", params![next_work,next_completed,next_failed,now,job.job.job_id.as_str()])?;
-            let mut history = rate_history(tx, self.node_id.as_str(), history_recipe)?;
-            if item.succeeded { history.observe(item.work_units, Duration::from_millis(item.worker_elapsed_millis)); persist_rate_history(tx, self.node_id.as_str(), history_recipe, history, now)?; }
+
+            if let Some(identity) = estimator_identity {
+                persist_attempt_estimator_identity(
+                    tx,
+                    job.job.job_id.as_str(),
+                    job.attempt_number,
+                    identity,
+                    &history_recipe,
+                )?;
+            }
+
+            let mut history = match compatibility {
+                TimingCompatibility::Compatible => qualified_rate_history(
+                    tx,
+                    self.node_id.as_str(),
+                    &history_recipe,
+                    estimator_identity.expect("compatible observations carry an identity"),
+                )?,
+                TimingCompatibility::Legacy => {
+                    rate_history(tx, self.node_id.as_str(), &history_recipe)?
+                }
+                TimingCompatibility::UnverifiedMedia | TimingCompatibility::Unknown => {
+                    RateHistory::default()
+                }
+            };
+            if item.succeeded {
+                history.observe(item.work_units, Duration::from_millis(item.worker_elapsed_millis));
+                match compatibility {
+                    TimingCompatibility::Compatible | TimingCompatibility::Unknown => {
+                        if let Some(identity) = estimator_identity {
+                            // Unknown persist provenance but consumers will not
+                            // present the rate as an established ETA until a
+                            // configured environment proves compatibility.
+                            persist_qualified_rate_history(
+                                tx,
+                                self.node_id.as_str(),
+                                &history_recipe,
+                                identity,
+                                history,
+                                now,
+                            )?;
+                        }
+                    }
+                    TimingCompatibility::Legacy => persist_rate_history(
+                        tx,
+                        self.node_id.as_str(),
+                        &history_recipe,
+                        history,
+                        now,
+                    )?,
+                    TimingCompatibility::UnverifiedMedia => {}
+                }
+            }
             let estimator = BatchEstimator::with_explicit_progress(
                 total_items as usize,
                 total_work as u64,
@@ -899,11 +1252,64 @@ impl JobEngine {
                 next_completed as usize,
                 next_work as u64,
             );
-            let estimate = estimator.estimate(&estimate_input.remaining_task_work_units);
+            let mut estimate = estimator.estimate(&estimate_input.remaining_task_work_units);
+            match compatibility {
+                TimingCompatibility::Compatible => {
+                    estimate = annotate_measured_estimate(estimate, history);
+                }
+                TimingCompatibility::Unknown => {
+                    estimate = uncertain_estimate(
+                        estimate,
+                        "estimator_environment_not_configured",
+                    );
+                }
+                TimingCompatibility::UnverifiedMedia => {
+                    estimate = uncertain_estimate(estimate, "media_requires_estimator_context");
+                }
+                TimingCompatibility::Legacy => {}
+            }
             emit(tx, job.job.job_id.as_str(), Some(job.attempt_number), "item_completed", JobState::Running, &json!({"succeeded":item.succeeded,"workUnits":item.work_units}), now)?;
             Ok(JobProgress { completed_items: next_completed as u64, failed_items: next_failed as u64, total_items: total_items as u64, completed_work_units: next_work as u64, total_work_units: total_work as u64, estimate })
         })
     }
+
+    /// Persist the estimator context for an attempt without teaching rate
+    /// history. Failure and fallback paths use this to retain actual execution
+    /// provenance while keeping failed overhead out of successful rates.
+    pub fn attach_attempt_estimator_identity(
+        &self,
+        job: &ClaimedJob,
+        estimator_identity: &MediaEstimatorIdentity,
+    ) -> Result<(), JobEngineError> {
+        self.with_current_attempt(job, |tx, _now| {
+            let recipe: String = tx.query_row(
+                "SELECT recipe_key FROM jobs WHERE job_id=?1",
+                [job.job.job_id.as_str()],
+                |row| row.get(0),
+            )?;
+            if estimator_identity.semantic_recipe_key != recipe {
+                return Err(JobEngineError::InvalidInput(
+                    "estimator identity does not match the immutable semantic recipe".into(),
+                ));
+            }
+            if let Some(environment) = self.media_estimator_environment.as_ref()
+                && !estimator_identity.is_compatible_with(environment, &recipe)
+            {
+                return Err(JobEngineError::InvalidInput(
+                    "estimator identity does not match the configured media-tool environment"
+                        .into(),
+                ));
+            }
+            persist_attempt_estimator_identity(
+                tx,
+                job.job.job_id.as_str(),
+                job.attempt_number,
+                estimator_identity,
+                &estimator_identity.qualified_history_key(&estimator_identity.execution_recipe_key),
+            )
+        })
+    }
+
     pub fn request_cancel(&self, id: &JobId, reason: Option<&str>) -> Result<(), JobEngineError> {
         let now = timestamp(self.clock.now());
         let reason = reason.map(redact_text).transpose()?;
@@ -1482,6 +1888,209 @@ fn ack_cancel_simple(tx: &Transaction<'_>, job_id: &str, now: &str) -> Result<()
         now,
     )
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TimingCompatibility {
+    Legacy,
+    UnverifiedMedia,
+    Compatible,
+    Unknown,
+}
+
+enum RateObservation<'a> {
+    Legacy(Option<&'a str>),
+    Media(Option<&'a MediaEstimatorIdentity>),
+}
+
+/// Representation jobs use source-byte weights just like other media work, but
+/// their old semantic recipe key is not an estimator identity. Only a
+/// per-attempt identity observed by the actual handler can qualify their rate.
+fn is_media_representation_job(definition: &JobDefinition) -> bool {
+    definition.job_type == "representation.generate.v1"
+        || definition.representation_id.is_some()
+        || definition.recipe_key.starts_with("proxy.")
+        || definition.recipe_key.starts_with("thumbnail.")
+}
+
+fn uncertain_estimate(mut estimate: BatchEstimate, reason: &str) -> BatchEstimate {
+    estimate.work_units_per_worker_second = None;
+    estimate.estimated_remaining_seconds = None;
+    estimate.estimated_remaining_seconds_range = None;
+    estimate.confidence = format!("uncertain_{reason}");
+    estimate
+}
+
+fn annotate_measured_estimate(mut estimate: BatchEstimate, history: RateHistory) -> BatchEstimate {
+    if estimate.estimated_remaining_seconds.is_some() {
+        let eta = estimate.estimated_remaining_seconds.unwrap_or_default();
+        match history.samples {
+            0 => {
+                return uncertain_estimate(estimate, "no_qualified_media_observations");
+            }
+            1 => {
+                estimate.confidence = "low_single_qualified_observation".into();
+                estimate.estimated_remaining_seconds_range =
+                    Some([(eta * 0.5).max(0.0), (eta * 2.0).max(0.0)]);
+            }
+            2..=3 => {
+                estimate.confidence = "measured_qualified_history_small_sample".into();
+                estimate.estimated_remaining_seconds_range =
+                    Some([(eta * 0.75).max(0.0), (eta * 1.5).max(0.0)]);
+            }
+            _ => {
+                estimate.confidence = "measured_qualified_history".into();
+            }
+        }
+    } else {
+        estimate.confidence = "uncertain_no_qualified_media_observations".into();
+    }
+    estimate
+}
+
+fn qualified_rate_history(
+    tx: &Transaction<'_>,
+    node: &str,
+    rate_key: &str,
+    identity: &MediaEstimatorIdentity,
+) -> Result<RateHistory, JobEngineError> {
+    let identity_json = serde_json::to_string(identity)?;
+    tx.query_row(
+        "SELECT work_units_per_worker_second,samples FROM job_rate_history WHERE node_id=?1 AND recipe_key=?2 AND estimator_identity_json=?3",
+        params![node, rate_key, identity_json],
+        |row| {
+            Ok(RateHistory {
+                work_units_per_worker_second: row.get(0)?,
+                samples: row.get::<_, i64>(1)? as u64,
+            })
+        },
+    )
+    .optional()
+    .map(|history| history.unwrap_or_default())
+    .map_err(Into::into)
+}
+
+fn qualified_rate_history_for_read(
+    connection: &Connection,
+    node: &str,
+    rate_key: &str,
+    identity: &MediaEstimatorIdentity,
+) -> Result<RateHistory, JobEngineError> {
+    let identity_json = serde_json::to_string(identity)?;
+    connection
+        .query_row(
+            "SELECT work_units_per_worker_second,samples FROM job_rate_history WHERE node_id=?1 AND recipe_key=?2 AND estimator_identity_json=?3",
+            params![node, rate_key, identity_json],
+            |row| {
+                Ok(RateHistory {
+                    work_units_per_worker_second: row.get(0)?,
+                    samples: row.get::<_, i64>(1)? as u64,
+                })
+            },
+        )
+        .optional()
+        .map(|history| history.unwrap_or_default())
+        .map_err(Into::into)
+}
+
+fn legacy_rate_history_for_read(
+    connection: &Connection,
+    node: &str,
+    recipe: &str,
+) -> Result<RateHistory, JobEngineError> {
+    connection
+        .query_row(
+            "SELECT work_units_per_worker_second,samples FROM job_rate_history WHERE node_id=?1 AND recipe_key=?2",
+            params![node, recipe],
+            |row| {
+                Ok(RateHistory {
+                    work_units_per_worker_second: row.get(0)?,
+                    samples: row.get::<_, i64>(1)? as u64,
+                })
+            },
+        )
+        .optional()
+        .map(|history| history.unwrap_or_default())
+        .map_err(Into::into)
+}
+
+fn persist_qualified_rate_history(
+    tx: &Transaction<'_>,
+    node_id: &str,
+    rate_key: &str,
+    identity: &MediaEstimatorIdentity,
+    history: RateHistory,
+    now: &str,
+) -> Result<(), JobEngineError> {
+    let identity_json = serde_json::to_string(identity)?;
+    if identity_json.len() > 32_768 {
+        return Err(JobEngineError::InvalidInput(
+            "estimator identity exceeds the durable bound".into(),
+        ));
+    }
+    tx.execute(
+        "INSERT INTO job_rate_history(node_id,recipe_key,work_units_per_worker_second,samples,updated_at,semantic_recipe_key,representation_kind,estimator_identity_json) VALUES(?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(node_id,recipe_key) DO UPDATE SET work_units_per_worker_second=excluded.work_units_per_worker_second,samples=excluded.samples,updated_at=excluded.updated_at,semantic_recipe_key=excluded.semantic_recipe_key,representation_kind=excluded.representation_kind,estimator_identity_json=excluded.estimator_identity_json",
+        params![
+            node_id,
+            rate_key,
+            history.work_units_per_worker_second,
+            history.samples as i64,
+            now,
+            identity.semantic_recipe_key,
+            identity.representation_kind,
+            identity_json
+        ],
+    )?;
+    Ok(())
+}
+
+fn persist_attempt_estimator_identity(
+    tx: &Transaction<'_>,
+    job_id: &str,
+    attempt_number: u32,
+    identity: &MediaEstimatorIdentity,
+    rate_key: &str,
+) -> Result<(), JobEngineError> {
+    let identity_json = serde_json::to_string(identity)?;
+    if identity_json.len() > 32_768 || rate_key.len() > 1_024 {
+        return Err(JobEngineError::InvalidInput(
+            "estimator context exceeds the durable bound".into(),
+        ));
+    }
+    let process_key = media_estimator_process_key();
+    let updated = tx.execute(
+        "UPDATE job_attempts SET estimator_identity_json=?1,estimator_rate_key=?2,estimator_process_key=?3 WHERE job_id=?4 AND attempt_number=?5 AND state='running'",
+        params![identity_json, rate_key, process_key, job_id, attempt_number],
+    )?;
+    if updated != 1 {
+        return Err(JobEngineError::InvalidInput(
+            "estimator context can only be attached to the current running attempt".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn load_attempt_estimator_identity(
+    connection: &Connection,
+    job_id: &str,
+    attempt_number: u32,
+) -> Result<Option<MediaEstimatorIdentity>, JobEngineError> {
+    let row: Option<(Option<String>, Option<String>)> = connection
+        .query_row(
+            "SELECT estimator_identity_json,estimator_process_key FROM job_attempts WHERE job_id=?1 AND attempt_number=?2 AND state='running'",
+            params![job_id, attempt_number],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((identity_json, process_key)) = row else {
+        return Ok(None);
+    };
+    if process_key.as_deref() != Some(media_estimator_process_key()) {
+        // A running lease from another process/restart cannot supply a live
+        // ETA even if its persisted identity is otherwise well formed.
+        return Ok(None);
+    }
+    Ok(identity_json.and_then(|value| serde_json::from_str::<MediaEstimatorIdentity>(&value).ok()))
+}
+
 fn rate_history(
     tx: &Transaction<'_>,
     node: &str,
@@ -1631,12 +2240,19 @@ pub async fn cancel_child_safely(
 
 #[derive(Debug, Clone)]
 pub struct JobSchedulerConfig {
+    /// Enables the proxy class when positive; zero disables it. Proxy and
+    /// full-hash still share exactly one heavy slot when both are enabled.
     pub proxy_workers: usize,
+    /// Enables the full-hash class when positive; zero disables it. Proxy and
+    /// full-hash still share exactly one heavy slot when both are enabled.
     pub full_hash_workers: usize,
     pub lightweight_workers: usize,
     pub poll_interval: Duration,
     pub lease_duration: Duration,
     pub cancellation_poll_interval: Duration,
+    /// Optional cross-process local-heavy lock used by the server adapter. The
+    /// in-process scheduler already has one shared heavy permit.
+    pub local_heavy_lock_path: Option<PathBuf>,
 }
 impl Default for JobSchedulerConfig {
     fn default() -> Self {
@@ -1647,10 +2263,23 @@ impl Default for JobSchedulerConfig {
             poll_interval: Duration::from_millis(200),
             lease_duration: Duration::from_secs(30),
             cancellation_poll_interval: Duration::from_millis(200),
+            local_heavy_lock_path: None,
         }
     }
 }
 impl JobSchedulerConfig {
+    fn heavy_workers(&self) -> usize {
+        usize::from(self.proxy_workers > 0 || self.full_hash_workers > 0)
+    }
+
+    fn proxy_enabled(&self) -> bool {
+        self.proxy_workers > 0
+    }
+
+    fn full_hash_enabled(&self) -> bool {
+        self.full_hash_workers > 0
+    }
+
     pub fn validate(&self) -> Result<(), JobEngineError> {
         if self.proxy_workers > 1
             || self.full_hash_workers > 1
@@ -1700,37 +2329,42 @@ impl JobScheduler {
         &self,
         handler: Arc<H>,
     ) -> Result<(), JobEngineError> {
-        let limits = BTreeMap::from([
-            (
-                JobClass::Proxy,
-                Arc::new(Semaphore::new(self.config.proxy_workers)),
-            ),
-            (
-                JobClass::FullHash,
-                Arc::new(Semaphore::new(self.config.full_hash_workers)),
-            ),
-            (
-                JobClass::Lightweight,
-                Arc::new(Semaphore::new(self.config.lightweight_workers)),
-            ),
-        ]);
+        // One shared local-heavy permit and a separately bounded lightweight
+        // pool. A worker cannot be idle merely because one representation-kind
+        // queue emptied: each permit claims the next eligible job across its
+        // whole resource group using one shared durable queue.
+        let heavy_limit = Arc::new(Semaphore::new(self.config.heavy_workers()));
+        let lightweight_limit = Arc::new(Semaphore::new(self.config.lightweight_workers));
         let mut running = JoinSet::new();
         loop {
             self.engine.recover_expired()?;
             let mut claimed_any = false;
-            for class in [JobClass::Proxy, JobClass::FullHash, JobClass::Lightweight] {
+            for heavy in [true, false] {
                 if self.shutdown.is_cancelled() {
                     break;
                 }
-                let Ok(permit) = limits[&class].clone().try_acquire_owned() else {
-                    continue;
+                let (permit, job) = if heavy {
+                    let Ok(permit) = heavy_limit.clone().try_acquire_owned() else {
+                        continue;
+                    };
+                    let job = self.engine.claim_next_heavy_enabled(
+                        "server-local-worker",
+                        self.config.lease_duration,
+                        self.config.proxy_enabled(),
+                        self.config.full_hash_enabled(),
+                    )?;
+                    (permit, job)
+                } else {
+                    let Ok(permit) = lightweight_limit.clone().try_acquire_owned() else {
+                        continue;
+                    };
+                    let job = self.engine.claim_next_lightweight(
+                        "server-local-worker",
+                        self.config.lease_duration,
+                    )?;
+                    (permit, job)
                 };
-                let Some(job) = self.engine.claim_next_for_class(
-                    "server-local-worker",
-                    self.config.lease_duration,
-                    Some(class),
-                )?
-                else {
+                let Some(job) = job else {
                     drop(permit);
                     continue;
                 };
@@ -1742,6 +2376,7 @@ impl JobScheduler {
                 let heartbeat_every = self.config.lease_duration / 3;
                 let lease_duration = self.config.lease_duration;
                 let cancellation_poll = self.config.cancellation_poll_interval;
+                let local_heavy_lock_path = self.config.local_heavy_lock_path.clone();
                 running.spawn(async move {
                     let _permit = permit;
                     run_claimed_job(
@@ -1754,6 +2389,7 @@ impl JobScheduler {
                             heartbeat_every,
                             lease_duration,
                             cancellation_poll,
+                            local_heavy_lock_path,
                         },
                     )
                     .await
@@ -1785,6 +2421,7 @@ struct ClaimedJobRuntime {
     heartbeat_every: Duration,
     lease_duration: Duration,
     cancellation_poll: Duration,
+    local_heavy_lock_path: Option<PathBuf>,
 }
 
 async fn run_claimed_job<H: JobHandler + 'static>(
@@ -1795,10 +2432,39 @@ async fn run_claimed_job<H: JobHandler + 'static>(
 ) -> Result<(), JobEngineError> {
     let lease_lost = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let worker_cancellation = runtime.cancellation.clone();
+    let lock_cancellation = runtime.cancellation.clone();
     let worker_job = job.clone();
     let commit_handler = handler.clone();
-    let blocking =
-        tokio::task::spawn_blocking(move || handler.run(worker_job, worker_cancellation));
+    let heavy = job.job.job_class.is_local_heavy();
+    let local_heavy_lock_path = runtime.local_heavy_lock_path.clone();
+    let blocking = tokio::task::spawn_blocking(move || {
+        // Cross-process coordination is acquired only for the one heavy class.
+        // Lightweight/cloud jobs never touch this slot. The advisory host-user
+        // lock supplements, rather than replaces, the durable in-process permit.
+        let _heavy_lease = if heavy {
+            match local_heavy_lock_path.as_deref() {
+                Some(path) => match rcdvlog_core::acquire_local_heavy_at_cancellable(path, || {
+                    lock_cancellation.is_cancelled()
+                }) {
+                    Ok(lease) => {
+                        let _ = lease.scope();
+                        Some(lease)
+                    }
+                    Err(error) => {
+                        return Err(JobHandlerFailure {
+                            kind: FailureKind::Retryable,
+                            code: "local_heavy_lock_failed".into(),
+                            details: json!({"error": format!("{error:#}")}),
+                        });
+                    }
+                },
+                None => None,
+            }
+        } else {
+            None
+        };
+        handler.run(worker_job, worker_cancellation)
+    });
     tokio::pin!(blocking);
     let mut heartbeat = tokio::time::interval(
         runtime
@@ -2541,6 +3207,489 @@ mod tests {
         ));
     }
 
+    fn estimator_environment(version: &str) -> MediaEstimatorEnvironment {
+        use rcdvlog_core::{
+            CalibrationDeviceIdentity, CalibrationHostIdentity, CalibrationToolIdentity,
+        };
+        MediaEstimatorEnvironment {
+            schema_version: "media-estimator-environment.v1".into(),
+            host: CalibrationHostIdentity {
+                host_key: "host_a".into(),
+                os: "linux".into(),
+                arch: "x86_64".into(),
+                logical_cpus: 4,
+                application_build: "app_a".into(),
+            },
+            tools: vec![CalibrationToolIdentity {
+                role: "media_transcode".into(),
+                name: "ffmpeg".into(),
+                version: version.into(),
+                executable_key: "tool_a".into(),
+            }],
+            devices: vec![CalibrationDeviceIdentity {
+                kind: "cpu".into(),
+                name: "synthetic".into(),
+                identity: "cpu_a".into(),
+            }],
+        }
+    }
+
+    fn media_identity(
+        environment: MediaEstimatorEnvironment,
+        encoder: &str,
+        workers: usize,
+    ) -> MediaEstimatorIdentity {
+        let execution_key = format!("proxy.h264-720p.orientation-v3.linux-{encoder}-w{workers}-v1");
+        MediaEstimatorIdentity::new(
+            environment,
+            rcdvlog_core::PROXY_REPRESENTATION_KIND,
+            "proxy.h264-720p.orientation-v3",
+            execution_key,
+            Some(encoder),
+            workers,
+            0,
+            0,
+        )
+    }
+
+    fn media_job(n: u32, node: &NodeId) -> JobDefinition {
+        let mut definition = job(n, node);
+        definition.job_type = "representation.generate.v1".into();
+        definition.representation_id =
+            Some(RepresentationId::parse("representation_synthetic").unwrap());
+        definition.recipe_key = "proxy.h264-720p.orientation-v3".into();
+        definition.total_items = 2;
+        definition.total_work_units = 20;
+        definition
+    }
+
+    #[test]
+    fn unqualified_generic_proxy_history_never_seeds_a_current_media_eta() {
+        let (_dir, engine, _clock) = engine();
+        let definition = media_job(90, engine.node_id());
+        engine.enqueue(definition.clone()).unwrap();
+        let claimed = engine
+            .claim_next("worker", Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+        let connection = open_writable_connection(&engine.database_path).unwrap();
+        connection
+            .execute(
+                "INSERT INTO job_rate_history(node_id,recipe_key,work_units_per_worker_second,samples,updated_at) VALUES(?1,?2,100.0,8,?3)",
+                params![
+                    engine.node_id().as_str(),
+                    "proxy.h264-720p.orientation-v3",
+                    "2026-01-01T00:00:00.000Z"
+                ],
+            )
+            .unwrap();
+        drop(connection);
+
+        let progress = engine
+            .report_progress(&claimed, 0, estimate_input(1, &[10, 10]))
+            .unwrap();
+        assert_eq!(progress.estimate.work_units_per_worker_second, None);
+        assert_eq!(progress.estimate.estimated_remaining_seconds, None);
+        assert!(
+            progress.estimate.confidence.starts_with("uncertain_"),
+            "{}",
+            progress.estimate.confidence
+        );
+
+        let list = engine.list_jobs(10, None, None).unwrap();
+        assert_eq!(list.items.len(), 1);
+        assert_eq!(list.items[0].estimate.estimated_remaining_seconds, None);
+        assert!(list.items[0].estimate.confidence.starts_with("uncertain_"));
+    }
+
+    #[test]
+    fn compatible_actual_encoder_history_reaches_progress_and_stays_qualified() {
+        let (_dir, engine, _clock) = engine();
+        let environment = estimator_environment("ffmpeg-a");
+        let engine = engine.with_media_estimator_environment(environment.clone());
+        let definition = media_job(91, engine.node_id());
+        engine.enqueue(definition).unwrap();
+        let claimed = engine
+            .claim_next("worker", Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+        let identity = media_identity(environment.clone(), "software", 1);
+        let completion = engine
+            .record_item_completion_with_estimator_identity(
+                &claimed,
+                ItemCompletion {
+                    work_units: 10,
+                    succeeded: true,
+                    worker_elapsed_millis: 100,
+                },
+                estimate_input(1, &[10]),
+                Some(&identity),
+            )
+            .unwrap();
+        assert_eq!(completion.estimate.estimated_remaining_seconds, Some(0.1));
+        assert!(completion.estimate.confidence.contains("observation"));
+
+        let listed = engine.list_jobs(10, None, None).unwrap();
+        assert_eq!(
+            listed.items[0].estimate.estimated_remaining_seconds,
+            Some(0.1),
+            "the read-only job projection must use the same qualified history"
+        );
+
+        let progress = engine
+            .report_progress(&claimed, 10, estimate_input(1, &[10]))
+            .unwrap();
+        assert_eq!(progress.estimate.estimated_remaining_seconds, Some(0.1));
+        assert!(progress.estimate.confidence.contains("observation"));
+
+        let connection = open_writable_connection(&engine.database_path).unwrap();
+        let (rate_key, semantic_recipe, identity_json): (String, String, String) = connection
+            .query_row(
+                "SELECT recipe_key,semantic_recipe_key,estimator_identity_json FROM job_rate_history WHERE semantic_recipe_key=?1",
+                ["proxy.h264-720p.orientation-v3"],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert!(rate_key.starts_with("proxy.h264-720p.orientation-v3"));
+        assert!(rate_key.contains(".h"));
+        assert!(rate_key.contains(".c"));
+        assert_eq!(semantic_recipe, "proxy.h264-720p.orientation-v3");
+        let parsed: MediaEstimatorIdentity = serde_json::from_str(&identity_json).unwrap();
+        assert_eq!(parsed, identity);
+    }
+
+    #[test]
+    fn incompatible_tool_or_attempt_context_makes_media_eta_uncertain() {
+        let (_dir, engine, _clock) = engine();
+        let environment = estimator_environment("ffmpeg-a");
+        let engine = engine.with_media_estimator_environment(environment.clone());
+        let definition = media_job(92, engine.node_id());
+        engine.enqueue(definition).unwrap();
+        let claimed = engine
+            .claim_next("worker", Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+        let identity = media_identity(environment, "software", 1);
+        engine
+            .record_item_completion_with_estimator_identity(
+                &claimed,
+                ItemCompletion {
+                    work_units: 10,
+                    succeeded: true,
+                    worker_elapsed_millis: 100,
+                },
+                estimate_input(1, &[10]),
+                Some(&identity),
+            )
+            .unwrap();
+
+        let changed_tool_engine = engine
+            .clone()
+            .with_media_estimator_environment(estimator_environment("ffmpeg-b"));
+        let progress = changed_tool_engine
+            .report_progress(&claimed, 10, estimate_input(1, &[10]))
+            .unwrap();
+        assert_eq!(progress.estimate.estimated_remaining_seconds, None);
+        assert!(progress.estimate.confidence.contains("stale"));
+
+        let changed_encoder_engine = engine
+            .clone()
+            .with_media_estimator_environment(estimator_environment("ffmpeg-a"));
+        let changed_encoder = media_identity(estimator_environment("ffmpeg-a"), "vaapi", 1);
+        changed_encoder_engine
+            .attach_attempt_estimator_identity(&claimed, &changed_encoder)
+            .unwrap();
+        let progress = changed_encoder_engine
+            .report_progress(&claimed, 10, estimate_input(1, &[10]))
+            .unwrap();
+        assert_eq!(progress.estimate.estimated_remaining_seconds, None);
+        assert!(progress.estimate.confidence.starts_with("uncertain_"));
+    }
+
+    #[test]
+    fn legacy_rate_key_api_cannot_seed_or_train_media_timing() {
+        let (_dir, engine, _clock) = engine();
+        let definition = media_job(99, engine.node_id());
+        engine.enqueue(definition).unwrap();
+        let claimed = engine
+            .claim_next("worker", Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+        let progress = engine
+            .record_item_completion_with_rate_key(
+                &claimed,
+                ItemCompletion {
+                    work_units: 10,
+                    succeeded: true,
+                    worker_elapsed_millis: 100,
+                },
+                estimate_input(1, &[10]),
+                Some("legacy.proxy.rate"),
+            )
+            .unwrap();
+        assert_eq!(progress.estimate.work_units_per_worker_second, None);
+        assert_eq!(progress.estimate.estimated_remaining_seconds, None);
+        assert!(progress.estimate.confidence.starts_with("uncertain_"));
+        let connection = open_writable_connection(&engine.database_path).unwrap();
+        let rates: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM job_rate_history WHERE recipe_key='legacy.proxy.rate'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rates, 0);
+    }
+
+    #[test]
+    fn software_fallback_context_does_not_reuse_hardware_throughput() {
+        let (_dir, engine, _clock) = engine();
+        let environment = estimator_environment("ffmpeg-a");
+        let engine = engine.with_media_estimator_environment(environment.clone());
+
+        let mut failed_hardware_job = media_job(97, engine.node_id());
+        failed_hardware_job.total_items = 1;
+        failed_hardware_job.representation_id =
+            Some(RepresentationId::parse("representation_hardware").unwrap());
+        engine.enqueue(failed_hardware_job).unwrap();
+        let hardware_claim = engine
+            .claim_next("worker", Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+        let hardware_identity = media_identity(environment.clone(), "vaapi", 1);
+        engine
+            .record_item_completion_with_estimator_identity(
+                &hardware_claim,
+                ItemCompletion {
+                    work_units: 20,
+                    succeeded: true,
+                    worker_elapsed_millis: 100,
+                },
+                estimate_input(1, &[]),
+                Some(&hardware_identity),
+            )
+            .unwrap();
+        engine
+            .complete(
+                &hardware_claim,
+                JobResultCommit {
+                    output_identity: None,
+                    details: json!({}),
+                },
+                |_| Ok(()),
+            )
+            .unwrap();
+
+        let mut fallback_job = media_job(98, engine.node_id());
+        fallback_job.representation_id =
+            Some(RepresentationId::parse("representation_software").unwrap());
+        engine.enqueue(fallback_job).unwrap();
+        let fallback_claim = engine
+            .claim_next("worker", Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+        let software_identity = media_identity(environment, "software", 1);
+        engine
+            .attach_attempt_estimator_identity(&fallback_claim, &software_identity)
+            .unwrap();
+        let progress = engine
+            .report_progress(&fallback_claim, 0, estimate_input(1, &[10, 10]))
+            .unwrap();
+        assert_eq!(progress.estimate.work_units_per_worker_second, None);
+        assert_eq!(progress.estimate.estimated_remaining_seconds, None);
+        assert!(progress.estimate.confidence.starts_with("uncertain_"));
+    }
+
+    #[test]
+    fn restarted_process_context_is_not_reused_even_with_a_live_lease() {
+        let (_dir, engine, _clock) = engine();
+        let environment = estimator_environment("ffmpeg-a");
+        let engine = engine.with_media_estimator_environment(environment.clone());
+        let definition = media_job(100, engine.node_id());
+        engine.enqueue(definition).unwrap();
+        let claimed = engine
+            .claim_next("worker", Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+        let identity = media_identity(environment, "software", 1);
+        engine
+            .record_item_completion_with_estimator_identity(
+                &claimed,
+                ItemCompletion {
+                    work_units: 10,
+                    succeeded: true,
+                    worker_elapsed_millis: 100,
+                },
+                estimate_input(1, &[10]),
+                Some(&identity),
+            )
+            .unwrap();
+        let connection = open_writable_connection(&engine.database_path).unwrap();
+        connection
+            .execute(
+                "UPDATE job_attempts SET estimator_process_key='previous-process' WHERE job_id=?1 AND attempt_number=?2",
+                params![claimed.job.job_id.as_str(), claimed.attempt_number],
+            )
+            .unwrap();
+        drop(connection);
+        let progress = engine
+            .report_progress(&claimed, 10, estimate_input(1, &[10]))
+            .unwrap();
+        assert_eq!(progress.estimate.estimated_remaining_seconds, None);
+        assert!(progress.estimate.confidence.contains("missing"));
+    }
+
+    #[test]
+    fn malformed_attempt_context_fails_closed_to_uncertainty() {
+        let (_dir, engine, _clock) = engine();
+        let environment = estimator_environment("ffmpeg-a");
+        let engine = engine.with_media_estimator_environment(environment.clone());
+        let definition = media_job(96, engine.node_id());
+        engine.enqueue(definition).unwrap();
+        let claimed = engine
+            .claim_next("worker", Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+        let connection = open_writable_connection(&engine.database_path).unwrap();
+        connection
+            .execute(
+                "UPDATE job_attempts SET estimator_identity_json='{not-json' WHERE job_id=?1 AND attempt_number=?2",
+                params![claimed.job.job_id.as_str(), claimed.attempt_number],
+            )
+            .unwrap();
+        drop(connection);
+        let progress = engine
+            .report_progress(&claimed, 0, estimate_input(1, &[10, 10]))
+            .unwrap();
+        assert_eq!(progress.estimate.estimated_remaining_seconds, None);
+        assert!(progress.estimate.confidence.starts_with("uncertain_"));
+    }
+
+    #[test]
+    fn failed_attempts_do_not_train_the_qualified_media_rate() {
+        let (_dir, engine, _clock) = engine();
+        let environment = estimator_environment("ffmpeg-a");
+        let engine = engine.with_media_estimator_environment(environment.clone());
+        let definition = media_job(93, engine.node_id());
+        engine.enqueue(definition).unwrap();
+        let claimed = engine
+            .claim_next("worker", Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+        let identity = media_identity(environment, "software", 1);
+        let progress = engine
+            .record_item_completion_with_estimator_identity(
+                &claimed,
+                ItemCompletion {
+                    work_units: 10,
+                    succeeded: false,
+                    worker_elapsed_millis: 5_000,
+                },
+                estimate_input(1, &[10]),
+                Some(&identity),
+            )
+            .unwrap();
+        assert_eq!(progress.estimate.estimated_remaining_seconds, None);
+        assert!(progress.estimate.confidence.starts_with("uncertain_"));
+        let connection = open_writable_connection(&engine.database_path).unwrap();
+        let rates: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM job_rate_history WHERE estimator_identity_json IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rates, 0);
+    }
+
+    #[test]
+    fn expired_attempt_context_is_not_reused_after_recovery() {
+        let (_dir, engine, clock) = engine();
+        let environment = estimator_environment("ffmpeg-a");
+        let engine = engine.with_media_estimator_environment(environment.clone());
+        let definition = media_job(94, engine.node_id());
+        engine.enqueue(definition).unwrap();
+        let claimed = engine
+            .claim_next("worker", Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+        let identity = media_identity(environment, "software", 1);
+        engine
+            .record_item_completion_with_estimator_identity(
+                &claimed,
+                ItemCompletion {
+                    work_units: 10,
+                    succeeded: true,
+                    worker_elapsed_millis: 100,
+                },
+                estimate_input(1, &[10]),
+                Some(&identity),
+            )
+            .unwrap();
+
+        clock.advance(11);
+        engine.recover_expired().unwrap();
+        let retried = engine.get_job(&claimed.job.job_id).unwrap();
+        assert_eq!(retried.state, JobState::RetryWait);
+        clock.advance(3);
+        let reclaim = engine
+            .claim_next("worker", Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+        assert_eq!(reclaim.attempt_number, 2);
+        let progress = engine
+            .report_progress(&reclaim, 10, estimate_input(1, &[10]))
+            .unwrap();
+        assert_eq!(progress.estimate.estimated_remaining_seconds, None);
+        assert!(progress.estimate.confidence.contains("missing"));
+    }
+
+    #[test]
+    fn queued_and_interrupted_non_media_jobs_do_not_promise_an_eta() {
+        let (_dir, engine, _clock) = engine();
+        let definition = job(95, engine.node_id());
+        engine.enqueue(definition.clone()).unwrap();
+        let list = engine.list_jobs(10, None, None).unwrap();
+        assert_eq!(list.items[0].estimate.estimated_remaining_seconds, None);
+        assert!(list.items[0].estimate.confidence.contains("waiting"));
+
+        let claimed = engine
+            .claim_next("worker", Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+        engine
+            .record_item_completion(
+                &claimed,
+                ItemCompletion {
+                    work_units: 100,
+                    succeeded: true,
+                    worker_elapsed_millis: 1_000,
+                },
+                estimate_input(1, &[]),
+            )
+            .unwrap();
+        let running = engine.list_jobs(10, None, None).unwrap();
+        assert_eq!(
+            running.items[0].estimate.work_units_per_worker_second,
+            Some(100.0),
+            "running non-media history remains a valid measured estimate"
+        );
+        engine
+            .complete(
+                &claimed,
+                JobResultCommit {
+                    output_identity: None,
+                    details: json!({}),
+                },
+                |_| Ok(()),
+            )
+            .unwrap();
+        let list = engine.list_jobs(10, None, None).unwrap();
+        // Terminal state is authoritative and does not claim a future ETA.
+        assert_eq!(list.items[0].estimate.estimated_remaining_seconds, None);
+        assert!(list.items[0].estimate.confidence.contains("terminal"));
+    }
+
     #[test]
     fn job_totals_and_event_cursors_reject_sqlite_integer_overflow() {
         let (_dir, engine, _clock) = engine();
@@ -3264,8 +4413,10 @@ mod tests {
                 )))
                 .await
         });
-        wait_for_event(&engine, &first_id, JobState::Failed).await;
-        wait_for_event(&engine, &second_id, JobState::Succeeded).await;
+        // Heavy work is intentionally LIFO: the newest eligible job runs
+        // first, fails once here, and the older job then succeeds.
+        wait_for_event(&engine, &second_id, JobState::Failed).await;
+        wait_for_event(&engine, &first_id, JobState::Succeeded).await;
         shutdown.cancel();
         task.await.unwrap().unwrap();
     }
@@ -3514,10 +4665,12 @@ mod tests {
             }
         }
         let (_dir, engine, _clock) = engine();
+        // Heavy selection is intentional LIFO. Queue the terminal case first
+        // so the newest retryable probe observes the first handler failure.
         let retryable = job(181, engine.node_id());
         let terminal = job(182, engine.node_id());
-        engine.enqueue(retryable.clone()).unwrap();
         engine.enqueue(terminal.clone()).unwrap();
+        engine.enqueue(retryable.clone()).unwrap();
         let shutdown = CancellationToken::new();
         let scheduler = JobScheduler::new(
             engine.clone(),
@@ -3656,5 +4809,193 @@ mod tests {
         shutdown.cancel();
         wait_for_event(&engine, &succeeds_id, JobState::Succeeded).await;
         task.await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn heavy_claim_is_lifo_across_representation_kinds_and_work_conserving() {
+        let (_dir, engine, _clock) = engine();
+        let proxy = job(190, engine.node_id());
+        let proxy_id = proxy.job_id.clone();
+        let mut hash = job(191, engine.node_id());
+        hash.job_class = JobClass::FullHash;
+        let hash_id = hash.job_id.clone();
+        engine.enqueue(proxy).unwrap();
+        engine.enqueue(hash).unwrap();
+
+        // The newest eligible heavy job wins across classes.
+        let first = engine
+            .claim_next_heavy("worker", Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.job.job_id, hash_id);
+        let second = engine
+            .claim_next_heavy("worker", Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.job.job_id, proxy_id);
+        assert!(
+            engine
+                .claim_next_heavy("worker", Duration::from_secs(10))
+                .unwrap()
+                .is_none()
+        );
+
+        // A queue containing only one representation kind is still eligible;
+        // it cannot sit idle behind an empty sibling class.
+        let mut only_hash = job(192, engine.node_id());
+        only_hash.job_class = JobClass::FullHash;
+        let only_hash_id = only_hash.job_id.clone();
+        engine.enqueue(only_hash).unwrap();
+        let claimed = engine
+            .claim_next_heavy("worker", Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.job.job_id, only_hash_id);
+    }
+
+    #[test]
+    fn disabled_heavy_class_filters_shared_eligible_queue() {
+        let (_dir, engine, _clock) = engine();
+        let mut proxy = job(196, engine.node_id());
+        proxy.job_class = JobClass::Proxy;
+        let mut hash = job(197, engine.node_id());
+        hash.job_class = JobClass::FullHash;
+        let hash_id = hash.job_id.clone();
+        engine.enqueue(proxy).unwrap();
+        engine.enqueue(hash).unwrap();
+
+        // Proxy is newer and would win LIFO in the union, but it is disabled.
+        let claimed = engine
+            .claim_next_heavy_enabled("worker", Duration::from_secs(10), false, true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.job.job_id, hash_id);
+        assert_eq!(claimed.job.job_class, JobClass::FullHash);
+
+        // With only the disabled class queued, the eligible pool is empty
+        // rather than manufacturing work the configuration forbade.
+        let mut only_proxy = job(198, engine.node_id());
+        only_proxy.job_class = JobClass::Proxy;
+        let only_proxy_id = only_proxy.job_id.clone();
+        engine.enqueue(only_proxy).unwrap();
+        assert!(
+            engine
+                .claim_next_heavy_enabled("worker", Duration::from_secs(10), false, true,)
+                .unwrap()
+                .is_none(),
+            "a configured-off class must never be claimed"
+        );
+        let claimed = engine
+            .claim_next_heavy_enabled("worker", Duration::from_secs(10), true, false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.job.job_id, only_proxy_id);
+    }
+
+    #[tokio::test]
+    async fn scheduler_serializes_heavy_classes_but_overlaps_safe_lightweight_work() {
+        struct ResourceHandler {
+            started: std::sync::mpsc::Sender<(JobId, JobClass)>,
+            release: Arc<std::sync::atomic::AtomicBool>,
+            heavy_running: std::sync::atomic::AtomicUsize,
+            maximum_heavy: std::sync::atomic::AtomicUsize,
+        }
+        impl JobHandler for ResourceHandler {
+            fn run(
+                &self,
+                job: ClaimedJob,
+                _cancellation: CancellationToken,
+            ) -> Result<JobResultCommit, JobHandlerFailure> {
+                if job.job.job_class.is_local_heavy() {
+                    let current = self
+                        .heavy_running
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                        + 1;
+                    self.maximum_heavy
+                        .fetch_max(current, std::sync::atomic::Ordering::SeqCst);
+                }
+                self.started
+                    .send((job.job.job_id.clone(), job.job.job_class))
+                    .unwrap();
+                while !self.release.load(std::sync::atomic::Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                if job.job.job_class.is_local_heavy() {
+                    self.heavy_running
+                        .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                Ok(JobResultCommit {
+                    output_identity: None,
+                    details: json!({}),
+                })
+            }
+        }
+
+        let (_dir, engine, _clock) = engine();
+        let proxy = job(193, engine.node_id());
+        let mut hash = job(194, engine.node_id());
+        hash.job_class = JobClass::FullHash;
+        let mut light = job(195, engine.node_id());
+        light.job_class = JobClass::Lightweight;
+        engine.enqueue(proxy).unwrap();
+        engine.enqueue(hash).unwrap();
+        engine.enqueue(light).unwrap();
+
+        let shutdown = CancellationToken::new();
+        let scheduler = JobScheduler::new(
+            engine.clone(),
+            JobSchedulerConfig {
+                local_heavy_lock_path: None,
+                ..JobSchedulerConfig::default()
+            },
+            shutdown.clone(),
+        )
+        .unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let handler = Arc::new(ResourceHandler {
+            started: sender,
+            release: release.clone(),
+            heavy_running: std::sync::atomic::AtomicUsize::new(0),
+            maximum_heavy: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let observed = handler.clone();
+        let task = tokio::spawn(async move { scheduler.run(handler).await });
+
+        let first_two = tokio::task::spawn_blocking(move || {
+            vec![
+                receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
+                receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
+            ]
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            first_two
+                .iter()
+                .filter(|(_, class)| class.is_local_heavy())
+                .count(),
+            1,
+            "exactly one heavy job may run at a time"
+        );
+        assert_eq!(
+            first_two
+                .iter()
+                .filter(|(_, class)| *class == JobClass::Lightweight)
+                .count(),
+            1,
+            "lightweight work must overlap the heavy slot rather than wait for it"
+        );
+
+        release.store(true, std::sync::atomic::Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        shutdown.cancel();
+        task.await.unwrap().unwrap();
+        assert_eq!(
+            observed
+                .maximum_heavy
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
     }
 }

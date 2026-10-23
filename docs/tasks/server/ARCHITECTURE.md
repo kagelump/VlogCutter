@@ -796,7 +796,7 @@ MCP remains deferred.
 - All library/project collections are cursor-paginated and indexed for their sort/filter keys.
 - APIs never serialize an entire multi-thousand-asset project by default.
 - Scans enqueue incrementally and bound open file handles and memory.
-- Full hashing and FFmpeg have separate one-worker defaults to avoid saturating the four-core mobile CPU and NAS.
+- Full hashing and FFmpeg share one local-heavy slot to avoid saturating the four-core mobile CPU and NAS; lightweight metadata/probe work may overlap under its own cap.
 - Browser asset lists virtualize or page rather than rendering all clips.
 - Video delivery supports range requests and does not buffer entire proxies in Rust memory.
 - SQLite write transactions remain short; media processes never run inside a transaction.

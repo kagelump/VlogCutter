@@ -23,6 +23,7 @@ mod agent;
 mod analysis;
 mod archive;
 mod baseline;
+mod calibration;
 mod camera_proxy;
 mod cameras;
 mod cards;
@@ -43,6 +44,7 @@ mod preparation;
 mod prerequisites;
 mod proxy_encoding;
 mod representation;
+mod resources;
 mod stall;
 mod storage;
 mod transcription;
@@ -82,6 +84,22 @@ pub use analysis::provider::{
 };
 pub use archive::{ArchiveRoot, EndpointProbe};
 pub use batch_estimator::BatchEstimate as BatchProgressEstimate;
+pub use calibration::{
+    CalibrationCandidateSettings, CalibrationConditions, CalibrationDeviceIdentity, CalibrationEta,
+    CalibrationHostIdentity, CalibrationIdentity, CalibrationMedia, CalibrationMediaIdentity,
+    CalibrationModelIdentity, CalibrationQualityDecision, CalibrationState,
+    CalibrationStatusReport, CalibrationSummary, CalibrationTiming, CalibrationToolIdentity,
+    CalibrationUncertainty, DEFAULT_GENERATED_CALIBRATION_SECONDS, MAX_CALIBRATION_CANDIDATES,
+    MAX_CALIBRATION_THREADS, MAX_CALIBRATION_TOTAL_TRIALS, MAX_CALIBRATION_TRIALS,
+    MAX_CALIBRATION_WORKERS, MAX_GENERATED_CALIBRATION_SECONDS, MAX_REPRESENTATIVE_MEDIA_BYTES,
+    MAX_REPRESENTATIVE_MEDIA_DURATION_MS, MediaEstimatorEnvironment, MediaEstimatorIdentity,
+    PROXY_REPRESENTATION_KIND, ProxyCalibrationOptions, RESOURCE_CALIBRATION_RECIPE_VERSION,
+    RESOURCE_CALIBRATION_SCHEMA_VERSION, ResourceCalibrationReport, ResourceOverrides,
+    ResourceSelection, SPEECH_REPRESENTATION_KIND, SpeechCalibrationOptions,
+    SpeechRegionComparison, SpeechRegionDifference, calibration_hardware_device_identities,
+    calibration_host_identity, calibration_tool_identity_for_path, compare_speech_regions,
+    media_estimator_process_key,
+};
 pub use camera_proxy::{CameraProxySidecar, CameraSidecarProvenance, CameraTimeMapping};
 pub use cards::{
     CardCandidate, MountedVolumes, VolumeSource, card_session_slug, detect_cards, inspect_card,
@@ -128,6 +146,10 @@ pub use proxy_encoding::{
     validate_proxy_output,
 };
 pub use representation::{ProxyWrite, RepresentationBusy, RepresentationClaim, RepresentationKind};
+pub use resources::{
+    LocalHeavyLease, ResourceWaitCancelled, acquire_local_heavy_at,
+    acquire_local_heavy_at_cancellable, default_local_heavy_lock_path, try_acquire_local_heavy_at,
+};
 pub use transcription::{
     TranscriptionAssetOutcome, TranscriptionAssetState, TranscriptionBatchOptions,
     TranscriptionBatchProgress, TranscriptionBatchReport, TranscriptionReadinessError,
@@ -432,6 +454,20 @@ pub struct ProxyReport {
     /// serialized before cancellation existed still deserialize.
     #[serde(default)]
     pub cancelled: bool,
+    /// Actual execution provenance. These fields are defaulted for older
+    /// serialized reports and are never inferred from an unused calibration.
+    #[serde(default)]
+    pub resource_source: String,
+    #[serde(default)]
+    pub calibration_key: Option<String>,
+    #[serde(default)]
+    pub encoder: Option<String>,
+    #[serde(default)]
+    pub worker_count: usize,
+    #[serde(default)]
+    pub history_key: String,
+    #[serde(default)]
+    pub sample_compatibility: String,
     pub failures: Vec<IngestFailure>,
 }
 
@@ -699,6 +735,15 @@ pub struct TranscribeReport {
     /// True when the caller stopped the batch early. Distinct from a failure:
     /// the clips already transcribed are committed and a later run resumes.
     pub cancelled: bool,
+    /// Actual selected resource identity for this run.
+    pub resource_source: String,
+    pub calibration_key: Option<String>,
+    pub vad_threads: usize,
+    pub decode_threads: usize,
+    pub worker_count: usize,
+    pub history_key: String,
+    /// Calibration sample compatibility for any ETA/rate provenance.
+    pub sample_compatibility: String,
     pub outcomes: Vec<TranscribeOutcome>,
     pub failures: Vec<IngestFailure>,
 }
@@ -1026,6 +1071,7 @@ impl Catalog {
             read_only: false,
         };
         catalog.migrate()?;
+        catalog.recover_interrupted_resource_calibrations()?;
         // D01-T007 decision 4 "applies after upgrade": operations an older
         // build quarantined (persisted but not materialized) are re-dispatched
         // from the log by a build that knows their type. Writable open only —
@@ -1953,6 +1999,7 @@ impl Catalog {
     where
         F: FnMut(AssetBatchProgress),
     {
+        let _heavy = self.acquire_local_heavy()?;
         self.generate_proxy_with_orientation_policy_and_policy(asset_id, true, policy, on_progress)
     }
 
@@ -1983,12 +2030,55 @@ impl Catalog {
     where
         F: FnMut(AssetBatchProgress),
     {
+        // Internal path: callers already own the one shared local-heavy slot.
         let asset = self.get_asset(asset_id)?;
         let task_work = [asset.size_bytes];
-        let plan = resolve_proxy_encoder_plan(policy);
+        let selection = self.resolve_resource_selection(
+            PROXY_REPRESENTATION_KIND,
+            PROXY_SOFTWARE_RECIPE_KEY,
+            Some(asset.size_bytes),
+            None,
+            &ResourceOverrides::default(),
+        )?;
+        let effective_policy = if selection.source == "calibration"
+            && selection.encoder.as_deref() == Some("software")
+        {
+            ProxyEncoderPolicy::Software
+        } else {
+            policy
+        };
+        let plan = resolve_proxy_encoder_plan(effective_policy);
+        let planned_encoder = plan.preferred_encoder.as_str();
         let task_kind = proxy_task_kind_for_encoder(plan.preferred_encoder, 1);
-        let mut estimator =
-            BatchEstimator::new(&task_work, 1, self.load_batch_history(&task_kind)?);
+        let history_key = self.qualified_history_key(
+            &task_kind,
+            PROXY_REPRESENTATION_KIND,
+            PROXY_SOFTWARE_RECIPE_KEY,
+            Some(planned_encoder),
+            1,
+            0,
+            0,
+        )?;
+        let mut history = self.load_batch_history(&history_key)?;
+        if history.samples == 0
+            && selection.source == "calibration"
+            && selection.worker_count == 1
+            && selection.encoder.as_deref() == Some(planned_encoder)
+            && let Some(rate) = selection
+                .timing
+                .as_ref()
+                .and_then(|timing| timing.work_units_per_second)
+        {
+            history = RateHistory {
+                work_units_per_worker_second: rate,
+                samples: selection
+                    .timing
+                    .as_ref()
+                    .map(|timing| timing.samples_ms.len() as u64)
+                    .unwrap_or(0),
+            };
+        }
+        let mut estimator = BatchEstimator::new(&task_work, 1, history);
         on_progress(AssetBatchProgress {
             asset: None,
             estimate: estimator.estimate(&task_work),
@@ -2019,9 +2109,18 @@ impl Catalog {
                 let actual_encoder = ProxyEncoderKind::parse(&generated.outcome.selected_encoder)
                     .unwrap_or(ProxyEncoderKind::Software);
                 let actual_task_kind = proxy_task_kind_for_encoder(actual_encoder, 1);
-                let mut history = self.load_batch_history(&actual_task_kind)?;
+                let actual_history_key = self.qualified_history_key(
+                    &actual_task_kind,
+                    PROXY_REPRESENTATION_KIND,
+                    PROXY_SOFTWARE_RECIPE_KEY,
+                    Some(actual_encoder.as_str()),
+                    1,
+                    0,
+                    0,
+                )?;
+                let mut history = self.load_batch_history(&actual_history_key)?;
                 history.observe(asset.size_bytes, generated.outcome.successful_elapsed());
-                self.save_batch_history(&actual_task_kind, history)?;
+                self.save_batch_history(&actual_history_key, history)?;
                 Some(generated.asset.clone())
             }
             Err(_) => {
@@ -2473,15 +2572,53 @@ impl Catalog {
 
     /// Transcribes one clip, replacing any previous transcript.
     pub fn transcribe_asset(&self, asset_id: &str) -> Result<TranscribeOutcome> {
-        let engine = self.open_stt_engine()?;
+        self.transcribe_asset_with_resource_overrides(asset_id, &ResourceOverrides::default())
+    }
+
+    /// Transcribe one clip with explicit, validated resource overrides. An
+    /// override is provenance-bearing and never presented as calibrated.
+    pub fn transcribe_asset_with_resource_overrides(
+        &self,
+        asset_id: &str,
+        overrides: &ResourceOverrides,
+    ) -> Result<TranscribeOutcome> {
+        let _heavy = self.acquire_local_heavy()?;
+        let engine = self.open_stt_engine_for_overrides(overrides)?;
         self.transcribe_with_engine(asset_id, engine.as_ref())
     }
 
-    fn open_stt_engine(&self) -> Result<Box<dyn SttEngine>> {
+    pub(crate) fn open_stt_engine_for_overrides(
+        &self,
+        overrides: &ResourceOverrides,
+    ) -> Result<Box<dyn SttEngine>> {
+        let selection = self.resolve_resource_selection(
+            SPEECH_REPRESENTATION_KIND,
+            STT_RECIPE_KEY,
+            None,
+            None,
+            overrides,
+        )?;
+        self.open_stt_engine_with_threads(selection.vad_threads, selection.decode_threads)
+    }
+
+    pub(crate) fn open_stt_engine_with_threads(
+        &self,
+        vad_threads: usize,
+        decode_threads: usize,
+    ) -> Result<Box<dyn SttEngine>> {
         let directory = model_dir(&self.database_path)?;
         let whisper = ensure_model(&directory, &WHISPER_MODEL)?;
         let vad = ensure_model(&directory, &VAD_MODEL)?;
-        Ok(Box::new(WhisperEngine::new(&whisper, &vad)?))
+        if vad_threads == 4 && decode_threads == 4 {
+            Ok(Box::new(WhisperEngine::new(&whisper, &vad)?))
+        } else {
+            Ok(Box::new(WhisperEngine::with_threads(
+                &whisper,
+                &vad,
+                vad_threads,
+                decode_threads,
+            )?))
+        }
     }
 
     fn transcribe_with_engine(
@@ -2576,11 +2713,37 @@ impl Catalog {
     pub fn transcribe_missing_with_progress<F>(
         &self,
         project_id: &str,
+        on_progress: F,
+    ) -> Result<TranscribeReport>
+    where
+        F: FnMut(TranscribeBatchProgress) -> ControlFlow<()>,
+    {
+        self.transcribe_missing_with_resource_overrides_and_progress(
+            project_id,
+            &ResourceOverrides::default(),
+            on_progress,
+        )
+    }
+
+    /// Explicit resource-override form of `transcribe_missing`.
+    pub fn transcribe_missing_with_resource_overrides_and_progress<F>(
+        &self,
+        project_id: &str,
+        overrides: &ResourceOverrides,
         mut on_progress: F,
     ) -> Result<TranscribeReport>
     where
         F: FnMut(TranscribeBatchProgress) -> ControlFlow<()>,
     {
+        // Validate overrides and resolve the selected engine settings before
+        // acquiring the heavy slot or opening models.
+        let selection = self.resolve_resource_selection(
+            SPEECH_REPRESENTATION_KIND,
+            STT_RECIPE_KEY,
+            None,
+            None,
+            overrides,
+        )?;
         let assets = self.list_assets(project_id)?;
         let mut pending: Vec<Asset> = Vec::new();
         let mut skipped = 0_usize;
@@ -2612,17 +2775,28 @@ impl Catalog {
             }
         }
 
+        let history_key = selection.history_key.clone();
         let mut report = TranscribeReport {
             transcribed: 0,
             skipped,
             cancelled: false,
+            resource_source: selection.source.clone(),
+            calibration_key: selection.calibration_key.clone(),
+            vad_threads: selection.vad_threads,
+            decode_threads: selection.decode_threads,
+            worker_count: selection.worker_count,
+            history_key: history_key.clone(),
+            sample_compatibility: selection.sample_compatibility.clone(),
             outcomes: Vec::new(),
             failures: Vec::new(),
         };
 
         let task_work: Vec<u64> = vec![1; pending.len()];
-        let mut estimator =
-            BatchEstimator::new(&task_work, 1, self.load_batch_history(STT_TASK_KEY)?);
+        let mut estimator = BatchEstimator::new(
+            &task_work,
+            selection.worker_count.max(1),
+            self.load_batch_history(&history_key)?,
+        );
         let start = on_progress(TranscribeBatchProgress {
             outcome: None,
             estimate: estimator.estimate(&task_work),
@@ -2632,9 +2806,26 @@ impl Catalog {
             return Ok(report);
         }
 
+        let _heavy = match self.wait_for_local_heavy(|| {
+            let mut estimate = estimator.estimate(&task_work);
+            estimate.confidence = "waiting_for_resource".into();
+            estimate.estimated_remaining_seconds = None;
+            on_progress(TranscribeBatchProgress {
+                outcome: None,
+                estimate,
+            })
+            .is_break()
+        })? {
+            Some(lease) => lease,
+            None => {
+                report.cancelled = true;
+                return Ok(report);
+            }
+        };
         // Loading the model costs seconds and over a gigabyte of RSS, so it is
         // opened only once the batch is known to be non-empty and uncancelled.
-        let engine = self.open_stt_engine()?;
+        let engine =
+            self.open_stt_engine_with_threads(selection.vad_threads, selection.decode_threads)?;
         for (index, asset) in pending.iter().enumerate() {
             let started = Instant::now();
             let result = self.transcribe_with_engine(&asset.id, engine.as_ref());
@@ -2685,7 +2876,7 @@ impl Catalog {
             }
         }
 
-        self.save_batch_history(STT_TASK_KEY, estimator.history())?;
+        self.save_batch_history(&history_key, estimator.history())?;
         Ok(report)
     }
 
@@ -3313,6 +3504,27 @@ impl Catalog {
         &self,
         project_id: &str,
         policy: ProxyEncoderPolicy,
+        on_progress: F,
+    ) -> Result<ProxyReport>
+    where
+        F: FnMut(AssetBatchProgress) -> ControlFlow<()>,
+    {
+        self.generate_missing_proxies_with_resource_overrides_and_progress(
+            project_id,
+            policy,
+            &ResourceOverrides::default(),
+            on_progress,
+        )
+    }
+
+    /// Proxy batch entrypoint used by CLI adapters that can pass explicit
+    /// encoder/worker overrides. Calibration-selected worker counts are used
+    /// only from a complete host/tool/recipe/configuration match.
+    pub fn generate_missing_proxies_with_resource_overrides_and_progress<F>(
+        &self,
+        project_id: &str,
+        policy: ProxyEncoderPolicy,
+        overrides: &ResourceOverrides,
         mut on_progress: F,
     ) -> Result<ProxyReport>
     where
@@ -3337,23 +3549,117 @@ impl Catalog {
             generated: 0,
             skipped: ready.len(),
             cancelled: false,
+            resource_source: String::new(),
+            calibration_key: None,
+            encoder: None,
+            worker_count: 0,
+            history_key: String::new(),
+            sample_compatibility: "unknown".into(),
             failures: Vec::new(),
         };
+        if let Some(requested) = overrides.worker_count
+            && !pending.is_empty()
+            && requested > pending.len()
+        {
+            bail!(
+                "invalid input: workerCount {requested} exceeds the {} eligible proxy assets; the override cannot be honored without idling workers",
+                pending.len()
+            );
+        }
         let task_work: Vec<u64> = pending.iter().map(|asset| asset.size_bytes).collect();
-        let worker_count = pending.len().clamp(1, PROXY_WORKERS);
+        let total_work = task_work.iter().copied().sum::<u64>();
+        let selection = self.resolve_resource_selection(
+            PROXY_REPRESENTATION_KIND,
+            PROXY_SOFTWARE_RECIPE_KEY,
+            Some(total_work),
+            None,
+            overrides,
+        )?;
+        let requested_workers = overrides
+            .worker_count
+            .unwrap_or_else(|| {
+                if selection.source == "calibration" {
+                    selection.worker_count
+                } else {
+                    PROXY_WORKERS
+                }
+            })
+            .max(1);
+        let worker_count = pending
+            .len()
+            .clamp(1, MAX_CALIBRATION_WORKERS.min(requested_workers));
         tracing::info!(
             target: "rcdvlog_core::proxy",
             worker_count,
             pending = task_work.len(),
+            calibration_source = %selection.source,
             "generate_missing_proxies: begin"
         );
-        let plan = resolve_proxy_encoder_plan(policy);
+        let waiting_estimator =
+            BatchEstimator::new(&task_work, worker_count, RateHistory::default());
+        let _heavy = match self.wait_for_local_heavy(|| {
+            let mut estimate = waiting_estimator.estimate(&task_work);
+            estimate.confidence = "waiting_for_resource".into();
+            estimate.estimated_remaining_seconds = None;
+            on_progress(AssetBatchProgress {
+                asset: None,
+                estimate,
+            })
+            .is_break()
+        })? {
+            Some(lease) => lease,
+            None => {
+                report.cancelled = true;
+                return Ok(report);
+            }
+        };
+        let effective_policy = if overrides.encoder.as_deref() == Some("software")
+            || (overrides.encoder.is_none()
+                && selection.source == "calibration"
+                && selection.encoder.as_deref() == Some("software"))
+        {
+            ProxyEncoderPolicy::Software
+        } else {
+            policy
+        };
+        let plan = resolve_proxy_encoder_plan(effective_policy);
+        let planned_encoder = plan.preferred_encoder.as_str();
         let task_kind = proxy_task_kind_for_encoder(plan.preferred_encoder, worker_count);
-        let mut estimator = BatchEstimator::new(
-            &task_work,
+        let history_key = self.qualified_history_key(
+            &task_kind,
+            PROXY_REPRESENTATION_KIND,
+            PROXY_SOFTWARE_RECIPE_KEY,
+            Some(planned_encoder),
             worker_count,
-            self.load_batch_history(&task_kind)?,
-        );
+            0,
+            0,
+        )?;
+        let mut history = self.load_batch_history(&history_key)?;
+        if history.samples == 0
+            && selection.source == "calibration"
+            && selection.worker_count == worker_count
+            && selection.encoder.as_deref() == Some(planned_encoder)
+            && let Some(rate) = selection
+                .timing
+                .as_ref()
+                .and_then(|timing| timing.work_units_per_second)
+        {
+            history = RateHistory {
+                work_units_per_worker_second: rate / worker_count.max(1) as f64,
+                samples: selection
+                    .timing
+                    .as_ref()
+                    .map(|timing| timing.samples_ms.len() as u64)
+                    .unwrap_or(0),
+            };
+        }
+        report.resource_source = selection.source.clone();
+        report.calibration_key = selection.calibration_key.clone();
+        report.encoder = Some(planned_encoder.to_string());
+        report.worker_count = worker_count;
+        report.history_key = history_key.clone();
+        report.sample_compatibility = selection.sample_compatibility.clone();
+        let mut estimator = BatchEstimator::new(&task_work, worker_count, history);
         let ffmpeg = resolve_tool("ffmpeg");
         let ffprobe = resolve_tool("ffprobe");
         let start = on_progress(AssetBatchProgress {
@@ -3371,6 +3677,7 @@ impl Catalog {
         let stop = Arc::new(AtomicBool::new(false));
         let (outcome_sender, outcome_receiver) = mpsc::channel();
         let mut completed = vec![false; task_work.len()];
+        let mut actual_encoders = HashSet::new();
 
         thread::scope(|scope| -> Result<()> {
             for _ in 0..worker_count {
@@ -3478,14 +3785,24 @@ impl Catalog {
                                 let actual_encoder =
                                     ProxyEncoderKind::parse(&generated.outcome.selected_encoder)
                                         .unwrap_or(ProxyEncoderKind::Software);
+                                actual_encoders.insert(actual_encoder.as_str().to_string());
                                 let actual_task_kind =
                                     proxy_task_kind_for_encoder(actual_encoder, worker_count);
-                                let mut history = self.load_batch_history(&actual_task_kind)?;
+                                let actual_history_key = self.qualified_history_key(
+                                    &actual_task_kind,
+                                    PROXY_REPRESENTATION_KIND,
+                                    PROXY_SOFTWARE_RECIPE_KEY,
+                                    Some(actual_encoder.as_str()),
+                                    worker_count,
+                                    0,
+                                    0,
+                                )?;
+                                let mut history = self.load_batch_history(&actual_history_key)?;
                                 history.observe(
                                     asset.size_bytes,
                                     generated.outcome.successful_elapsed(),
                                 );
-                                self.save_batch_history(&actual_task_kind, history)?;
+                                self.save_batch_history(&actual_history_key, history)?;
                                 Some(generated.asset)
                             }
                             Err(error) if error.is::<RepresentationBusy>() => {
@@ -3520,6 +3837,28 @@ impl Catalog {
             Ok(())
         })?;
 
+        report.encoder = match actual_encoders.len() {
+            0 => Some(planned_encoder.to_string()),
+            1 => {
+                let actual_encoder = actual_encoders.iter().next().cloned();
+                if let Some(actual_encoder) = actual_encoder.as_deref() {
+                    let actual_kind = ProxyEncoderKind::parse(actual_encoder)
+                        .unwrap_or(ProxyEncoderKind::Software);
+                    let actual_base = proxy_task_kind_for_encoder(actual_kind, worker_count);
+                    report.history_key = self.qualified_history_key(
+                        &actual_base,
+                        PROXY_REPRESENTATION_KIND,
+                        PROXY_SOFTWARE_RECIPE_KEY,
+                        Some(actual_encoder),
+                        worker_count,
+                        0,
+                        0,
+                    )?;
+                }
+                actual_encoder
+            }
+            _ => Some("mixed".into()),
+        };
         report
             .failures
             .sort_by(|left, right| left.path.cmp(&right.path));
@@ -4711,6 +5050,16 @@ fn residual_work_units(task_work: &[u64], completed: &[bool], partial_work: &[u6
 /// name itself when no concrete path is found on PATH or standard directories.
 pub fn resolve_tool_path(name: &str) -> PathBuf {
     resolve_tool(name)
+}
+
+/// Resolves a configured program without replacing an explicit relative or
+/// absolute path. Bare command names are looked up on `PATH`; explicit paths
+/// are preserved so callers can identify the exact executable they execute.
+pub fn resolve_tool_program(program: &Path) -> PathBuf {
+    if program.is_absolute() || program.components().count() > 1 {
+        return program.to_path_buf();
+    }
+    resolve_tool(&program.to_string_lossy())
 }
 
 fn resolve_tool(name: &str) -> PathBuf {
@@ -7539,6 +7888,51 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn queued_proxy_batch_cancels_before_encoder_probe_or_generation() {
+        if tool_command("ffmpeg").arg("-version").output().is_err()
+            || tool_command("ffprobe").arg("-version").output().is_err()
+        {
+            return;
+        }
+        let (directory, catalog, project) = catalog_fixture();
+        let source = synthetic_proxy_source(directory.path());
+        catalog
+            .ingest_folder(&project.id, source.parent().unwrap())
+            .unwrap();
+        let asset = catalog.list_assets(&project.id).unwrap().remove(0);
+        let _held = catalog.acquire_local_heavy().unwrap();
+        let worker_catalog = catalog.clone();
+        let project_id = project.id.clone();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            sender
+                .send(worker_catalog.generate_missing_proxies_with_progress(
+                    &project_id,
+                    |progress| {
+                        assert_eq!(progress.estimate.confidence, "waiting_for_resource");
+                        ControlFlow::Break(())
+                    },
+                ))
+                .unwrap();
+        });
+        let report = receiver
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .expect("queued cancellation must remain responsive")
+            .unwrap();
+        worker.join().unwrap();
+        assert!(report.cancelled);
+        assert_eq!(report.generated, 0);
+        assert!(catalog.get_asset(&asset.id).unwrap().proxy_path.is_none());
+        assert!(
+            catalog
+                .proxy_generation_provenance(&asset.id, 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(catalog.proxy_rate_histories().unwrap().is_empty());
+    }
+
+    #[test]
     fn generated_proxy_commit_failure_restores_file_and_registered_provenance() {
         use std::io::Write;
         if tool_command("ffmpeg").arg("-version").output().is_err()
@@ -7924,9 +8318,20 @@ pub(crate) mod tests {
                 .selected_encoder,
         )
         .unwrap();
+        let first_history_key = catalog
+            .qualified_history_key(
+                &proxy_task_kind_for_encoder(first_encoder, 1),
+                PROXY_REPRESENTATION_KIND,
+                PROXY_SOFTWARE_RECIPE_KEY,
+                Some(first_encoder.as_str()),
+                1,
+                0,
+                0,
+            )
+            .unwrap();
         assert_eq!(
             catalog
-                .load_batch_history(&proxy_task_kind_for_encoder(first_encoder, 1))
+                .load_batch_history(&first_history_key)
                 .unwrap()
                 .samples,
             1
@@ -7982,9 +8387,20 @@ pub(crate) mod tests {
                 .selected_encoder,
         )
         .unwrap();
+        let second_history_key = catalog
+            .qualified_history_key(
+                &proxy_task_kind_for_encoder(second_encoder, 1),
+                PROXY_REPRESENTATION_KIND,
+                PROXY_SOFTWARE_RECIPE_KEY,
+                Some(second_encoder.as_str()),
+                1,
+                0,
+                0,
+            )
+            .unwrap();
         assert_eq!(
             catalog
-                .load_batch_history(&proxy_task_kind_for_encoder(second_encoder, 1))
+                .load_batch_history(&second_history_key)
                 .unwrap()
                 .samples,
             2

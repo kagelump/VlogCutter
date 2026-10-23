@@ -749,6 +749,8 @@ export interface BatchEstimate {
   workUnitsPerWorkerSecond: number | null;
   elapsedSeconds: number;
   estimatedRemainingSeconds: number | null;
+  confidence?: string;
+  estimatedRemainingSecondsRange?: [number, number] | null;
 }
 
 // ── Server pairing types ─────────────────────────────────────────────

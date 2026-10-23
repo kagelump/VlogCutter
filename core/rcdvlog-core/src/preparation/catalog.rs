@@ -921,8 +921,20 @@ impl Catalog {
                 whisper.is_file() && vad.is_file(),
                 "speech models are not installed; preparation never downloads them"
             );
+            let selection = self.resolve_resource_selection(
+                crate::SPEECH_REPRESENTATION_KIND,
+                crate::STT_RECIPE_KEY,
+                None,
+                None,
+                &crate::ResourceOverrides::default(),
+            )?;
             *engine = Some(Box::new(
-                crate::analysis::whisper_engine::WhisperEngine::new(&whisper, &vad)?,
+                crate::analysis::whisper_engine::WhisperEngine::with_threads(
+                    &whisper,
+                    &vad,
+                    selection.vad_threads,
+                    selection.decode_threads,
+                )?,
             ));
         }
         if let Err(error) =
@@ -1006,6 +1018,25 @@ impl Catalog {
             moments: None,
             manifest: self.preparation_preflight(&scope, 0, 10)?,
         };
+        // One shared local-heavy slot covers proxy generation, full-decode
+        // validation and speech transcription. It is released before any pure
+        // cloud/network moments phase below.
+        let local_heavy = match self.wait_for_local_heavy(|| {
+            notify(PreparationProgress {
+                run_id: report.run_id.clone(),
+                asset_id: String::new(),
+                stage: "waiting_for_resource".into(),
+                processed: 0,
+                total_assets: total,
+            })
+            .is_break()
+        })? {
+            Some(lease) => lease,
+            None => {
+                report.cancelled = true;
+                return Ok(report);
+            }
+        };
         let mut eligible = Vec::new();
         for id in ids {
             let asset = self.get_asset(&id)?;
@@ -1071,6 +1102,7 @@ impl Catalog {
                 }
             }
         }
+        drop(local_heavy);
         if !report.cancelled
             && !eligible.is_empty()
             && let Some(policy) = &options.moments
