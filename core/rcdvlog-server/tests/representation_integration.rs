@@ -350,6 +350,81 @@ fn proxy_job_records_actual_encoder_validation_and_fallback_provenance() {
         .unwrap();
 }
 
+#[test]
+fn queued_legacy_proxy_settings_are_not_reinterpreted_as_the_new_policy() {
+    if !tools_available() {
+        return;
+    }
+    let fixture = fixture();
+    let requested = service(&fixture)
+        .request(RepresentationRequest {
+            media_object_id: fixture.media_id.clone(),
+            kind: RepresentationKind::Proxy,
+        })
+        .unwrap();
+    let mut claimed = fixture
+        .catalog
+        .jobs()
+        .claim_next("legacy-settings", std::time::Duration::from_secs(30))
+        .unwrap()
+        .unwrap();
+    let current_job = claimed.clone();
+    let legacy_settings = "ffmpeg:display_rotation=0,noautorotate,scale=min(1280,iw):-2,h264-libx264,veryfast,crf23,yuv420p,aac128k,faststart,map_metadata=-1";
+    let settings_hash = blake3::hash(legacy_settings.as_bytes())
+        .to_hex()
+        .to_string();
+    let source_hash = &requested.representation.source_content_hash;
+    let source_size = requested.representation.source_size_bytes;
+    let identity = format!(
+        "v1\0{source_hash}\0{source_size}\0proxy\0proxy.h264-720p.orientation-v3\0{settings_hash}"
+    );
+    let legacy_id = rcdvlog_core::RepresentationId::parse(format!(
+        "representation_{}",
+        blake3::hash(identity.as_bytes()).to_hex()
+    ))
+    .unwrap();
+    claimed.job.payload["representationId"] = serde_json::json!(legacy_id);
+    claimed.job.representation_id = Some(legacy_id);
+    let failure = handler(&fixture)
+        .run(claimed, CancellationToken::new())
+        .unwrap_err();
+    assert_eq!(failure.code, "obsolete_representation_settings");
+    assert!(walk_files(&fixture.derived).is_empty());
+    // Discovery must ask for current settings even if an old recipe has an
+    // available output. Such old files remain present for existing review.
+    let current_handler = handler(&fixture);
+    let result = current_handler
+        .run(current_job.clone(), CancellationToken::new())
+        .unwrap();
+    fixture
+        .catalog
+        .jobs()
+        .complete(&current_job, result.clone(), |tx| {
+            current_handler.commit_result(tx, &current_job, &result)
+        })
+        .unwrap();
+    let connection = open_writable_connection(fixture.catalog.database_path()).unwrap();
+    connection
+        .execute(
+            "UPDATE representations SET settings_identity=?1 WHERE representation_id=?2",
+            rusqlite::params![settings_hash, requested.representation.id.as_str()],
+        )
+        .unwrap();
+    let needs = service(&fixture).list_needs(&fixture.media_id).unwrap();
+    assert!(
+        needs
+            .iter()
+            .any(|need| need.kind == RepresentationKind::Proxy && need.reason == "obsolete")
+    );
+    assert!(
+        service(&fixture)
+            .list_missing_or_obsolete(&fixture.media_id)
+            .unwrap()
+            .iter()
+            .any(|representation| representation.id == requested.representation.id)
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn failed_proxy_job_persists_attempt_and_fallback_evidence_without_registration() {

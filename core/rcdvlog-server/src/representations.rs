@@ -335,7 +335,9 @@ impl RepresentationService {
                    )
             FROM representations r
             WHERE r.media_object_id = ?1
-              AND (r.state != 'available' OR r.recipe_key NOT IN (?3, ?4))
+              AND (r.state != 'available' OR r.recipe_key NOT IN (?3, ?4)
+                   OR (r.kind='proxy' AND r.settings_identity<>?5)
+                   OR (r.kind='thumbnail' AND r.settings_identity<>?6))
             ORDER BY r.created_at, r.representation_id
             "#,
         )?;
@@ -344,7 +346,11 @@ impl RepresentationService {
                 media_id.as_str(),
                 self.library.local_node_id().as_str(),
                 PROXY_RECIPE_KEY,
-                THUMBNAIL_RECIPE_KEY
+                THUMBNAIL_RECIPE_KEY,
+                blake3::hash(PROXY_SETTINGS.as_bytes()).to_hex().to_string(),
+                blake3::hash(THUMBNAIL_SETTINGS.as_bytes())
+                    .to_hex()
+                    .to_string()
             ],
             representation_from_row,
         )?;
@@ -371,13 +377,17 @@ impl RepresentationService {
                     )
                     FROM representations r
                     WHERE r.media_object_id=?1 AND r.kind=?2 AND r.recipe_key=?3
+                      AND r.settings_identity=?5
                     LIMIT 1
                     "#,
                     params![
                         media_id.as_str(),
                         kind.as_str(),
                         kind.recipe_key(),
-                        self.library.local_node_id().as_str()
+                        self.library.local_node_id().as_str(),
+                        blake3::hash(kind.settings().as_bytes())
+                            .to_hex()
+                            .to_string()
                     ],
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )
@@ -389,8 +399,8 @@ impl RepresentationService {
                 continue;
             }
             let obsolete: bool = connection.query_row(
-                "SELECT EXISTS(SELECT 1 FROM representations WHERE media_object_id=?1 AND kind=?2 AND recipe_key<>?3)",
-                params![media_id.as_str(), kind.as_str(), kind.recipe_key()], |row| row.get::<_, i64>(0),
+                "SELECT EXISTS(SELECT 1 FROM representations WHERE media_object_id=?1 AND kind=?2 AND (recipe_key<>?3 OR settings_identity<>?4))",
+                params![media_id.as_str(), kind.as_str(), kind.recipe_key(), blake3::hash(kind.settings().as_bytes()).to_hex().to_string()], |row| row.get::<_, i64>(0),
             )? != 0;
             needs.push(RepresentationNeed {
                 kind,
@@ -838,6 +848,21 @@ impl JobHandler for RepresentationJobHandler {
                 != Some(payload.source_size_bytes)
         {
             return Err(terminal("job_identity_mismatch"));
+        }
+        // A queued job retains its immutable settings identity across upgrades.
+        // Never execute today's encoder policy under an older recipe's ID.
+        let settings_identity = blake3::hash(payload.kind.settings().as_bytes())
+            .to_hex()
+            .to_string();
+        let expected_id = representation_id(
+            &payload.source_content_hash,
+            payload.source_size_bytes,
+            payload.kind,
+            &settings_identity,
+        )
+        .map_err(|_| terminal("job_identity_mismatch"))?;
+        if payload.representation_id != expected_id {
+            return Err(terminal("obsolete_representation_settings"));
         }
         let generated = self.execute(&job, &payload, &cancellation)?;
         let mut details = json!({

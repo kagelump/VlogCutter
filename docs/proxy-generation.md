@@ -197,3 +197,9 @@ In-flight server cancellation kills encoding/validation children and suppresses
 fallback. Encoder rate histories exclude time spent in earlier failed attempts;
 total elapsed time and failures remain in transaction provenance. macOS uses
 new separate software/VideoToolbox history keys instead of its old mixed key.
+
+On upgrade, a queued server representation whose immutable settings ID predates
+the shared policy fails as `obsolete_representation_settings`; request the current
+representation to enqueue the current recipe. Discovery reports old settings as
+obsolete while retaining their files for existing review. Queued jobs are never
+silently interpreted as a different encoder policy under an old output identity.
