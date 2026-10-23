@@ -7,7 +7,7 @@ use thiserror::Error;
 
 use crate::chronology::forward_migrate_project_chronology;
 
-pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 33;
+pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 34;
 
 const MIGRATION_TABLE_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -282,7 +282,36 @@ pub const PROJECT_CATALOG_MIGRATIONS: &[SqliteMigration] = &[
         source_identity: "project-catalog/0033-camera-sidecar-time-mapping/20261023",
         apply: add_camera_sidecar_time_mapping,
     },
+    SqliteMigration {
+        id: 34,
+        name: "proxy_generation_provenance",
+        source_identity: "project-catalog/0034-proxy-generation-provenance/20261023",
+        apply: add_proxy_generation_provenance,
+    },
 ];
+
+fn add_proxy_generation_provenance(transaction: &Transaction<'_>) -> Result<()> {
+    add_column_if_missing(transaction, "assets", "proxy_generation_id", "INTEGER")?;
+    transaction.execute_batch(
+        r#"CREATE TABLE IF NOT EXISTS proxy_generation_provenance (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            asset_id TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+            recipe_key TEXT NOT NULL,
+            policy TEXT NOT NULL CHECK(policy IN ('auto','software')),
+            selected_encoder TEXT NOT NULL,
+            device TEXT,
+            fallback_used INTEGER NOT NULL CHECK(fallback_used IN (0,1)),
+            status TEXT NOT NULL CHECK(status IN ('succeeded','failed')),
+            elapsed_ms INTEGER NOT NULL CHECK(elapsed_ms >= 0),
+            attempts_json TEXT NOT NULL,
+            validation_json TEXT,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS proxy_generation_provenance_asset
+            ON proxy_generation_provenance(asset_id, id DESC);"#,
+    )?;
+    Ok(())
+}
 
 fn add_camera_sidecar_time_mapping(transaction: &Transaction<'_>) -> Result<()> {
     add_column_if_missing(

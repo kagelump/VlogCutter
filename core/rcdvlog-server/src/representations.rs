@@ -5,7 +5,11 @@ use crate::{
     open_read_only_connection, open_writable_connection,
 };
 use chrono::{SecondsFormat, Utc};
-use rcdvlog_core::{JobId, MediaObjectId, NodeId, RepresentationId, StorageObjectId};
+use rcdvlog_core::{
+    JobId, MediaObjectId, NodeId, ProxyEncoderKind, ProxyEncoderPolicy, RepresentationId,
+    StorageObjectId, probe_source_audio_present, proxy_rate_history_key,
+    resolve_proxy_encoder_plan_with_tools, run_proxy_transcode_with_plan_and_cancellation,
+};
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -20,7 +24,7 @@ use tokio_util::sync::CancellationToken;
 
 pub const PROXY_RECIPE_KEY: &str = "proxy.h264-720p.orientation-v3";
 pub const THUMBNAIL_RECIPE_KEY: &str = "thumbnail.q1.orientation-v2";
-const PROXY_SETTINGS: &str = "ffmpeg:display_rotation=0,noautorotate,scale=min(1280,iw):-2,h264-libx264,veryfast,crf23,yuv420p,aac128k,faststart,map_metadata=-1";
+const PROXY_SETTINGS: &str = "shared-proxy-policy-v2:display_rotation=0,noautorotate,maxwidth=1280,h264,yuv420p,aac128k,faststart,fps_mode=passthrough,map_metadata=-1,validated-source-correspondence;actual-encoder-in-provenance";
 const THUMBNAIL_SETTINGS: &str =
     "ffmpeg:seek=duration*0.2,noautorotate,frames=1,scale=min(480,iw):-2,jpeg-q3";
 const REPRESENTATION_JOB_TYPE: &str = "representation.generate.v1";
@@ -331,7 +335,9 @@ impl RepresentationService {
                    )
             FROM representations r
             WHERE r.media_object_id = ?1
-              AND (r.state != 'available' OR r.recipe_key NOT IN (?3, ?4))
+              AND (r.state != 'available' OR r.recipe_key NOT IN (?3, ?4)
+                   OR (r.kind='proxy' AND r.settings_identity<>?5)
+                   OR (r.kind='thumbnail' AND r.settings_identity<>?6))
             ORDER BY r.created_at, r.representation_id
             "#,
         )?;
@@ -340,7 +346,11 @@ impl RepresentationService {
                 media_id.as_str(),
                 self.library.local_node_id().as_str(),
                 PROXY_RECIPE_KEY,
-                THUMBNAIL_RECIPE_KEY
+                THUMBNAIL_RECIPE_KEY,
+                blake3::hash(PROXY_SETTINGS.as_bytes()).to_hex().to_string(),
+                blake3::hash(THUMBNAIL_SETTINGS.as_bytes())
+                    .to_hex()
+                    .to_string()
             ],
             representation_from_row,
         )?;
@@ -367,13 +377,17 @@ impl RepresentationService {
                     )
                     FROM representations r
                     WHERE r.media_object_id=?1 AND r.kind=?2 AND r.recipe_key=?3
+                      AND r.settings_identity=?5
                     LIMIT 1
                     "#,
                     params![
                         media_id.as_str(),
                         kind.as_str(),
                         kind.recipe_key(),
-                        self.library.local_node_id().as_str()
+                        self.library.local_node_id().as_str(),
+                        blake3::hash(kind.settings().as_bytes())
+                            .to_hex()
+                            .to_string()
                     ],
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )
@@ -385,8 +399,8 @@ impl RepresentationService {
                 continue;
             }
             let obsolete: bool = connection.query_row(
-                "SELECT EXISTS(SELECT 1 FROM representations WHERE media_object_id=?1 AND kind=?2 AND recipe_key<>?3)",
-                params![media_id.as_str(), kind.as_str(), kind.recipe_key()], |row| row.get::<_, i64>(0),
+                "SELECT EXISTS(SELECT 1 FROM representations WHERE media_object_id=?1 AND kind=?2 AND (recipe_key<>?3 OR settings_identity<>?4))",
+                params![media_id.as_str(), kind.as_str(), kind.recipe_key(), blake3::hash(kind.settings().as_bytes()).to_hex().to_string()], |row| row.get::<_, i64>(0),
             )? != 0;
             needs.push(RepresentationNeed {
                 kind,
@@ -620,6 +634,7 @@ pub struct RepresentationJobHandler {
     derived_root: PathBuf,
     ffmpeg_program: PathBuf,
     ffprobe_program: PathBuf,
+    proxy_encoder_policy: ProxyEncoderPolicy,
 }
 
 impl RepresentationJobHandler {
@@ -636,7 +651,13 @@ impl RepresentationJobHandler {
             derived_root,
             ffmpeg_program,
             ffprobe_program,
+            proxy_encoder_policy: ProxyEncoderPolicy::Auto,
         }
+    }
+
+    pub fn with_proxy_encoder_policy(mut self, policy: ProxyEncoderPolicy) -> Self {
+        self.proxy_encoder_policy = policy;
+        self
     }
 
     fn execute(
@@ -676,38 +697,66 @@ impl RepresentationJobHandler {
         ));
         let _cleanup = TempArtifact(temporary.clone());
         let started = Instant::now();
-        let mut command = Command::new(&self.ffmpeg_program);
-        command.args(["-y", "-hide_banner", "-loglevel", "error"]);
-        match payload.kind {
+        let mut proxy_rate_key = None;
+        let mut proxy_success_elapsed = None;
+        let proxy_provenance = match payload.kind {
             RepresentationKind::Proxy => {
-                command
-                    .args(["-display_rotation:v:0", "0", "-noautorotate", "-i"])
-                    .arg(&source)
-                    .args([
-                        "-vf",
-                        "scale='min(1280,iw)':-2:force_original_aspect_ratio=decrease",
-                        "-c:v",
-                        "libx264",
-                        "-preset",
-                        "veryfast",
-                        "-crf",
-                        "23",
-                        "-pix_fmt",
-                        "yuv420p",
-                        "-c:a",
-                        "aac",
-                        "-b:a",
-                        "128k",
-                        "-movflags",
-                        "+faststart",
-                        "-map_metadata",
-                        "-1",
-                    ]);
+                let duration = media_duration(&source, &self.ffprobe_program)?;
+                let source_audio_present =
+                    probe_source_audio_present(&self.ffprobe_program, &source)
+                        .map_err(|_| terminal("invalid_probe_output"))?;
+                let plan = resolve_proxy_encoder_plan_with_tools(
+                    self.proxy_encoder_policy,
+                    &self.ffmpeg_program,
+                    &self.ffprobe_program,
+                );
+                let outcome = run_proxy_transcode_with_plan_and_cancellation(
+                    &self.ffmpeg_program,
+                    &self.ffprobe_program,
+                    &source,
+                    &temporary,
+                    duration,
+                    source_audio_present,
+                    &plan,
+                    |_| {},
+                    || cancellation.is_cancelled(),
+                )
+                .map_err(|failure| {
+                    if cancellation.is_cancelled() {
+                        return retryable("canceled");
+                    }
+                    tracing::warn!(
+                        target: "rcdvlog_server::representations",
+                        error = %failure.message,
+                        "proxy generation failed after encoder fallback"
+                    );
+                    let provenance = server_safe_proxy_provenance(&failure.outcome)
+                        .unwrap_or_else(|_| json!({"status": "failed"}));
+                    JobHandlerFailure {
+                        kind: FailureKind::Retryable,
+                        code: "media_tool_failed".into(),
+                        details: json!({
+                            "code": "media_tool_failed",
+                            "proxyProvenance": provenance,
+                        }),
+                    }
+                })?;
+                let actual_encoder = ProxyEncoderKind::parse(&outcome.selected_encoder)
+                    .unwrap_or(ProxyEncoderKind::Software);
+                proxy_success_elapsed = Some(outcome.successful_elapsed());
+                let rate_key = proxy_rate_history_key(actual_encoder, 1);
+                proxy_rate_key = Some(rate_key.clone());
+                let mut provenance =
+                    server_safe_proxy_provenance(&outcome).map_err(handler_error)?;
+                provenance["rateHistoryKey"] = Value::String(rate_key);
+                Some(provenance)
             }
             RepresentationKind::Thumbnail => {
                 let duration = media_duration(&source, &self.ffprobe_program)?;
                 let seek = (duration.max(0.0) * 0.2).to_string();
+                let mut command = Command::new(&self.ffmpeg_program);
                 command
+                    .args(["-y", "-hide_banner", "-loglevel", "error"])
                     .args(["-ss", &seek, "-noautorotate", "-i"])
                     .arg(&source)
                     .args([
@@ -717,20 +766,21 @@ impl RepresentationJobHandler {
                         "scale='min(480,iw)':-2:force_original_aspect_ratio=decrease",
                         "-q:v",
                         "3",
-                    ]);
+                    ])
+                    .arg(&temporary)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null());
+                let mut child = command
+                    .spawn()
+                    .map_err(|_| retryable("media_tool_failed"))?;
+                let status = wait_for_child(&mut child, cancellation)?;
+                if !status.success() {
+                    return Err(retryable("media_tool_failed"));
+                }
+                None
             }
-        }
-        let mut child = command
-            .arg(&temporary)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|_| retryable("media_tool_failed"))?;
-        let status = wait_for_child(&mut child, cancellation)?;
-        if !status.success() {
-            return Err(retryable("media_tool_failed"));
-        }
+        };
         validate_output(&temporary, payload.kind, &self.ffprobe_program)
             .map_err(|_| terminal("invalid_media_output"))?;
         if cancellation.is_cancelled() {
@@ -744,14 +794,15 @@ impl RepresentationJobHandler {
                         .is_ok() => {}
             Err(_) => return Err(retryable("derived_root_unavailable")),
         }
-        let generated = inspect_output(&final_path).map_err(handler_error)?;
-        let elapsed = started
-            .elapsed()
+        let mut generated = inspect_output(&final_path).map_err(handler_error)?;
+        generated.proxy_provenance = proxy_provenance;
+        let elapsed = proxy_success_elapsed
+            .unwrap_or_else(|| started.elapsed())
             .as_millis()
             .max(1)
             .min(u128::from(u64::MAX)) as u64;
         self.jobs
-            .record_item_completion(
+            .record_item_completion_with_rate_key(
                 job,
                 ItemCompletion {
                     work_units: job.job.total_work_units,
@@ -762,6 +813,7 @@ impl RepresentationJobHandler {
                     worker_count: 1,
                     remaining_task_work_units: vec![],
                 },
+                proxy_rate_key.as_deref(),
             )
             .map_err(|_| retryable("job_progress_failed"))?;
         Ok(generated)
@@ -797,16 +849,35 @@ impl JobHandler for RepresentationJobHandler {
         {
             return Err(terminal("job_identity_mismatch"));
         }
+        // A queued job retains its immutable settings identity across upgrades.
+        // Never execute today's encoder policy under an older recipe's ID.
+        let settings_identity = blake3::hash(payload.kind.settings().as_bytes())
+            .to_hex()
+            .to_string();
+        let expected_id = representation_id(
+            &payload.source_content_hash,
+            payload.source_size_bytes,
+            payload.kind,
+            &settings_identity,
+        )
+        .map_err(|_| terminal("job_identity_mismatch"))?;
+        if payload.representation_id != expected_id {
+            return Err(terminal("obsolete_representation_settings"));
+        }
         let generated = self.execute(&job, &payload, &cancellation)?;
+        let mut details = json!({
+            "representationId": payload.representation_id,
+            "relativePath": payload.relative_path,
+            "outputContentHash": generated.hash,
+            "byteLength": generated.byte_length,
+            "contentType": payload.kind.content_type(),
+        });
+        if let Some(provenance) = generated.proxy_provenance {
+            details["proxyProvenance"] = provenance;
+        }
         Ok(JobResultCommit {
             output_identity: Some(payload.representation_id.to_string()),
-            details: json!({
-                "representationId": payload.representation_id,
-                "relativePath": payload.relative_path,
-                "outputContentHash": generated.hash,
-                "byteLength": generated.byte_length,
-                "contentType": payload.kind.content_type(),
-            }),
+            details,
         })
     }
 
@@ -937,6 +1008,42 @@ impl JobHandler for ServerJobHandler {
             self.scan.commit_result(tx, job, result)
         }
     }
+}
+
+fn server_safe_proxy_provenance(
+    outcome: &rcdvlog_core::ProxyGenerationOutcome,
+) -> anyhow::Result<Value> {
+    // Job result details are durable SQLite facts and must not become a path
+    // disclosure surface. Preserve the actual render-node identity but reduce
+    // absolute device paths to their final component.
+    let mut value = serde_json::to_value(outcome)?;
+    let device = value
+        .get("device")
+        .and_then(Value::as_str)
+        .map(safe_device_component);
+    if let Some(device) = device {
+        value["device"] = Value::String(device);
+    }
+    if let Some(attempts) = value.get_mut("attempts").and_then(Value::as_array_mut) {
+        for attempt in attempts {
+            let device = attempt
+                .get("device")
+                .and_then(Value::as_str)
+                .map(safe_device_component);
+            if let Some(device) = device {
+                attempt["device"] = Value::String(device);
+            }
+        }
+    }
+    Ok(value)
+}
+
+fn safe_device_component(device: &str) -> String {
+    Path::new(device)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(device)
+        .to_string()
 }
 
 fn representation_id(
@@ -1209,6 +1316,7 @@ fn validate_output(path: &Path, kind: RepresentationKind, ffprobe: &Path) -> any
 struct GeneratedOutput {
     hash: String,
     byte_length: u64,
+    proxy_provenance: Option<Value>,
 }
 
 fn inspect_output(path: &Path) -> anyhow::Result<GeneratedOutput> {
@@ -1228,6 +1336,7 @@ fn inspect_output(path: &Path) -> anyhow::Result<GeneratedOutput> {
     Ok(GeneratedOutput {
         hash: hasher.finalize().to_hex().to_string(),
         byte_length: length,
+        proxy_provenance: None,
     })
 }
 

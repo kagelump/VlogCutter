@@ -1,3 +1,4 @@
+use rcdvlog_core::ProxyEncoderPolicy;
 use serde::{Serialize, Serializer};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -38,6 +39,7 @@ const MIN_FREE_BYTES_FIELD: &str = "minimumFreeBytes";
 const FFMPEG_FIELD: &str = "ffmpegCommand";
 const FFPROBE_FIELD: &str = "ffprobeCommand";
 const EXIFTOOL_FIELD: &str = "exiftoolCommand";
+const PROXY_ENCODER_POLICY_FIELD: &str = "proxyEncoderPolicy";
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct SecretString(String);
@@ -85,6 +87,7 @@ pub enum ConfigErrorReason {
     EmptyValue,
     InvalidHostname,
     InvalidCidr,
+    InvalidProxyEncoderPolicy,
 }
 
 impl fmt::Display for ConfigErrorReason {
@@ -105,6 +108,7 @@ impl fmt::Display for ConfigErrorReason {
             Self::EmptyValue => "must not be empty",
             Self::InvalidHostname => "must be a valid LAN hostname",
             Self::InvalidCidr => "must be a valid CIDR notation (e.g. 127.0.0.1/32)",
+            Self::InvalidProxyEncoderPolicy => "must be auto or software",
         })
     }
 }
@@ -149,6 +153,7 @@ pub struct ServerConfig {
     pub ffmpeg_command: String,
     pub ffprobe_command: String,
     pub exiftool_command: String,
+    pub proxy_encoder_policy: ProxyEncoderPolicy,
 }
 
 impl fmt::Debug for ServerConfig {
@@ -179,6 +184,7 @@ pub struct ConfigDiagnostics {
     pub ffmpeg_command: String,
     pub ffprobe_command: String,
     pub exiftool_command: String,
+    pub proxy_encoder_policy: ProxyEncoderPolicy,
 }
 
 impl ServerConfig {
@@ -210,6 +216,7 @@ impl ServerConfig {
             ("RCDVLOG_FFMPEG", FFMPEG_FIELD),
             ("RCDVLOG_FFPROBE", FFPROBE_FIELD),
             ("RCDVLOG_EXIFTOOL", EXIFTOOL_FIELD),
+            ("RCDVLOG_PROXY_ENCODER_POLICY", PROXY_ENCODER_POLICY_FIELD),
         ] {
             match std::env::var(key) {
                 Ok(value) => {
@@ -304,6 +311,19 @@ impl ServerConfig {
             DEFAULT_MIN_FREE_BYTES,
         );
 
+        let proxy_encoder_policy = match values
+            .get("RCDVLOG_PROXY_ENCODER_POLICY")
+            .map(String::as_str)
+        {
+            None => ProxyEncoderPolicy::Auto,
+            Some(value) => ProxyEncoderPolicy::parse(value).map_err(|_| {
+                ConfigError::new(
+                    PROXY_ENCODER_POLICY_FIELD,
+                    ConfigErrorReason::InvalidProxyEncoderPolicy,
+                )
+            })?,
+        };
+
         let config = Self {
             data_dir,
             temp_dir,
@@ -328,6 +348,7 @@ impl ServerConfig {
             ffmpeg_command: configured_command(&values, "RCDVLOG_FFMPEG", "ffmpeg"),
             ffprobe_command: configured_command(&values, "RCDVLOG_FFPROBE", "ffprobe"),
             exiftool_command: configured_command(&values, "RCDVLOG_EXIFTOOL", "exiftool"),
+            proxy_encoder_policy,
         };
         config.validate()?;
         Ok(config)
@@ -490,6 +511,7 @@ impl ServerConfig {
             ffmpeg_command: self.ffmpeg_command.clone(),
             ffprobe_command: self.ffprobe_command.clone(),
             exiftool_command: self.exiftool_command.clone(),
+            proxy_encoder_policy: self.proxy_encoder_policy,
         }
     }
 }
@@ -570,6 +592,33 @@ mod tests {
         assert!(config.temp_dir.starts_with(&config.data_dir));
         assert!(config.listen_addr.ip().is_loopback());
         assert_eq!(config.shutdown_timeout.as_secs(), 10);
+    }
+
+    #[test]
+    fn proxy_encoder_policy_defaults_to_auto_and_accepts_software() {
+        let default = ServerConfig::from_values(BTreeMap::new()).unwrap();
+        assert_eq!(default.proxy_encoder_policy, ProxyEncoderPolicy::Auto);
+        assert_eq!(
+            serde_json::to_value(default.diagnostics()).unwrap()["proxyEncoderPolicy"],
+            json!("auto")
+        );
+
+        let mut input = values();
+        input.insert(
+            "RCDVLOG_PROXY_ENCODER_POLICY".to_string(),
+            "software".to_string(),
+        );
+        let software = ServerConfig::from_values(input).unwrap();
+        assert_eq!(software.proxy_encoder_policy, ProxyEncoderPolicy::Software);
+
+        let mut input = values();
+        input.insert(
+            "RCDVLOG_PROXY_ENCODER_POLICY".to_string(),
+            "surprise".to_string(),
+        );
+        let error = ServerConfig::from_values(input).unwrap_err();
+        assert_eq!(error.field, "proxyEncoderPolicy");
+        assert_eq!(error.reason, ConfigErrorReason::InvalidProxyEncoderPolicy);
     }
 
     #[test]

@@ -3,7 +3,10 @@
 //! SQLite remains the durable source of truth. These OS-managed locks only
 //! coordinate simultaneous attempts to create the same cache representation.
 
-use crate::{Asset, Catalog, PROXY_CACHE_VERSION, probe_media_stream};
+use crate::{
+    Asset, Catalog, PROXY_CACHE_VERSION, ProxyGenerationOutcome,
+    insert_proxy_generation_provenance, probe_media_stream,
+};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use fs2::FileExt;
 use rusqlite::params;
@@ -292,6 +295,98 @@ impl Catalog {
         }))
     }
 
+    /// Validate, publish, and register a strict generated proxy plus its
+    /// provenance transactionally. The runner has already checked metadata,
+    /// source-time correspondence, audio correspondence, orientation, and
+    /// decode. This method re-checks that the staged file remains probeable
+    /// before the output is published. If SQLite fails after publication the
+    /// previous registered output is restored.
+    pub(crate) fn commit_generated_proxy_write(
+        &self,
+        write: ProxyWrite,
+        outcome: &ProxyGenerationOutcome,
+    ) -> Result<Asset> {
+        let asset_id = write.claim.asset_id().to_owned();
+        self.validate_representation_claim(&write.claim, &asset_id, RepresentationKind::Proxy)?;
+        if outcome.status != "succeeded" {
+            bail!("refusing to register a proxy generation outcome that did not succeed");
+        }
+        let validation = outcome
+            .validation
+            .as_ref()
+            .ok_or_else(|| anyhow!("refusing to register a proxy without validation evidence"))?;
+        if !validation.decoded || validation.time_correspondence.is_none() {
+            bail!("refusing to register a proxy whose decode validation did not pass");
+        }
+        let probe = probe_media_stream(&write.temporary).context("revalidate generated proxy")?;
+        if probe.metadata_rotation_degrees != 0 {
+            bail!(
+                "ffmpeg proxy validation failed: output retains a {}° display rotation",
+                probe.metadata_rotation_degrees
+            );
+        }
+        if probe.codec != "h264" || probe.width == 0 || probe.width > 1280 {
+            bail!(
+                "generated proxy metadata is outside the v3 recipe: codec={}, width={}",
+                probe.codec,
+                probe.width
+            );
+        }
+
+        let backup = if write.output.is_file() {
+            let backup = write.output.with_file_name(format!(
+                ".{}.commit-backup.{}",
+                write
+                    .output
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("proxy"),
+                uuid::Uuid::new_v4().simple()
+            ));
+            // Keep the registered pathname readable until the atomic rename.
+            fs::hard_link(&write.output, &backup).context("preserve previous registered proxy")?;
+            Some(backup)
+        } else {
+            None
+        };
+
+        let mut published = false;
+        let publish = (|| -> Result<()> {
+            let mut connection = self.connection()?;
+            let transaction = connection.transaction()?;
+            insert_proxy_generation_provenance(&transaction, &asset_id, outcome)?;
+            transaction.execute(
+                "UPDATE assets SET proxy_path = ?2, proxy_generation_id = ?3 WHERE id = ?1",
+                params![
+                    asset_id,
+                    write.output.to_string_lossy(),
+                    transaction.last_insert_rowid()
+                ],
+            )?;
+            fs::rename(&write.temporary, &write.output).context("commit generated proxy")?;
+            published = true;
+            transaction.commit().context("register generated proxy")?;
+            Ok(())
+        })();
+        if let Err(error) = publish {
+            if published {
+                if let Some(backup) = &backup {
+                    fs::rename(backup, &write.output)
+                        .context("restore previous registered proxy")?;
+                } else {
+                    let _ = fs::remove_file(&write.output);
+                }
+            } else if let Some(backup) = &backup {
+                let _ = fs::remove_file(backup);
+            }
+            return Err(error);
+        }
+        if let Some(backup) = backup {
+            let _ = fs::remove_file(backup);
+        }
+        self.get_asset(&asset_id)
+    }
+
     /// Validate, publish, and register while still holding exclusive ownership.
     /// Catalog connections apply the same WAL/foreign-key/busy-timeout policy.
     pub fn commit_proxy_write(
@@ -316,7 +411,7 @@ impl Catalog {
         }
         fs::rename(&write.temporary, &write.output).context("commit generated proxy")?;
         self.connection()?.execute(
-            "UPDATE assets SET proxy_path = ?2 WHERE id = ?1",
+            "UPDATE assets SET proxy_path = ?2, proxy_generation_id = NULL WHERE id = ?1",
             params![asset_id, write.output.to_string_lossy()],
         )?;
         self.get_asset(asset_id)
@@ -369,7 +464,7 @@ mod tests {
             .connection()
             .unwrap()
             .execute(
-                "UPDATE assets SET proxy_path = ?2 WHERE id = ?1",
+                "UPDATE assets SET proxy_path = ?2, proxy_generation_id = NULL WHERE id = ?1",
                 rusqlite::params![asset_id, path.to_string_lossy()],
             )
             .unwrap();
@@ -528,7 +623,7 @@ mod tests {
         );
 
         let proxy_task = crate::proxy_task_kind(1);
-        let proxy_history_before = catalog.load_batch_history(proxy_task).unwrap();
+        let proxy_history_before = catalog.load_batch_history(&proxy_task).unwrap();
         let _proxy_claim = catalog
             .try_claim_representation("asset_claim", RepresentationKind::Proxy)
             .unwrap()
@@ -546,7 +641,7 @@ mod tests {
         assert_eq!(proxy_progress.len(), 2);
         assert_eq!(proxy_progress.last().unwrap().estimate.completed_items, 1);
         assert_eq!(
-            catalog.load_batch_history(proxy_task).unwrap(),
+            catalog.load_batch_history(&proxy_task).unwrap(),
             proxy_history_before
         );
         assert!(source.is_file());

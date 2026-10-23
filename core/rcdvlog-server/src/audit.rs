@@ -253,6 +253,7 @@ mod tests {
                 ffmpeg_command: "ffmpeg".into(),
                 ffprobe_command: "ffprobe".into(),
                 exiftool_command: "exiftool".into(),
+                proxy_encoder_policy: rcdvlog_core::ProxyEncoderPolicy::Auto,
             },
         )
         .unwrap()

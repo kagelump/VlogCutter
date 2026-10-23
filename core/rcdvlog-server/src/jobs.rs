@@ -854,12 +854,26 @@ impl JobEngine {
         item: ItemCompletion,
         estimate_input: ProgressEstimateInput,
     ) -> Result<JobProgress, JobEngineError> {
+        self.record_item_completion_with_rate_key(job, item, estimate_input, None)
+    }
+
+    /// Record success/failure and, when provided, train throughput under the
+    /// encoder/worker key that actually produced the output rather than the
+    /// job's semantic representation recipe.
+    pub fn record_item_completion_with_rate_key(
+        &self,
+        job: &ClaimedJob,
+        item: ItemCompletion,
+        estimate_input: ProgressEstimateInput,
+        rate_key: Option<&str>,
+    ) -> Result<JobProgress, JobEngineError> {
         self.with_current_attempt(job, |tx, now| {
             let (completed_work, total_work, completed_items, failed_items, total_items, recipe): (i64, i64, i64, i64, i64, String) = tx.query_row(
                 "SELECT completed_work_units,total_work_units,completed_items,failed_items,total_items,recipe_key FROM jobs WHERE job_id=?1",
                 [job.job.job_id.as_str()],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
             )?;
+            let history_recipe = rate_key.unwrap_or(&recipe);
             if completed_items >= total_items || item.work_units > (total_work as u64).saturating_sub(completed_work as u64) {
                 return Err(JobEngineError::InvalidInput("item completion exceeds declared job totals".into()));
             }
@@ -875,8 +889,8 @@ impl JobEngine {
                 total_work as u64,
             )?;
             tx.execute("UPDATE jobs SET completed_work_units=?1,completed_items=?2,failed_items=?3,updated_at=?4 WHERE job_id=?5", params![next_work,next_completed,next_failed,now,job.job.job_id.as_str()])?;
-            let mut history = rate_history(tx, self.node_id.as_str(), &recipe)?;
-            if item.succeeded { history.observe(item.work_units, Duration::from_millis(item.worker_elapsed_millis)); persist_rate_history(tx, self.node_id.as_str(), &recipe, history, now)?; }
+            let mut history = rate_history(tx, self.node_id.as_str(), history_recipe)?;
+            if item.succeeded { history.observe(item.work_units, Duration::from_millis(item.worker_elapsed_millis)); persist_rate_history(tx, self.node_id.as_str(), history_recipe, history, now)?; }
             let estimator = BatchEstimator::with_explicit_progress(
                 total_items as usize,
                 total_work as u64,
@@ -1869,6 +1883,7 @@ mod tests {
             ffmpeg_command: "ffmpeg".into(),
             ffprobe_command: "ffprobe".into(),
             exiftool_command: "exiftool".into(),
+            proxy_encoder_policy: rcdvlog_core::ProxyEncoderPolicy::Auto,
         };
         std::fs::create_dir_all(cfg.temp_dir.clone()).unwrap();
         let c = ControlCatalog::open_or_create(dir.path(), &cfg).unwrap();

@@ -582,7 +582,17 @@ The current compact story ribbon spaces clips by ordinal position, not duration 
 
 ### Proxies
 
-Proxy generation uses up to four local workers on macOS. Each worker first tries
+Proxy generation uses one shared explicit encoder policy. `auto` is the safe
+default; `software` never initializes hardware. Linux `auto` first runs a bounded
+synthetic FFmpeg probe and only then may use the VAAPI full-clip
+decode/scale/H.264-encode path. Device-file presence or an encoder listing alone
+never marks hardware usable. Capability JSON distinguishes `device_unavailable`,
+`device_permission_denied`, `ffmpeg_encoder_unavailable`,
+`initialization_failed`, and `usable`; `proxy probe --policy auto|software`
+exposes it. `proxy provenance --asset <id>` exposes durable attempt/fallback
+evidence, and `proxy history` exposes encoder/worker-scoped rates.
+
+On macOS up to four local workers run concurrently. Each first tries
 VideoToolbox hardware decode and H.264 encode with the CPU scaler retained for
 materially better downscale quality. The hardware settings are equivalent to:
 
@@ -592,8 +602,13 @@ materially better downscale quality. The hardware settings are equivalent to:
 - AAC 128 kb/s and `+faststart`.
 
 If VideoToolbox is unavailable, busy, or rejects an input, the Mac retries the
-existing software recipe automatically. The Ubuntu companion server continues
-to use the software recipe:
+existing software recipe automatically. On Linux the VAAPI recipe initializes
+one render node for hard decode, `-filter_hw_device`, `scale_vaapi`, and
+`h264_vaapi` at QP 23. A hardware process or validation failure removes only the
+unique staging output and retries software. The Ubuntu companion server reads
+`RCDVLOG_PROXY_ENCODER_POLICY` (default `auto`) and persists actual encoder,
+attempt, fallback, and validation evidence in server job details. The standard
+software recipe remains:
 
 - Override the input display rotation to 0 and disable autorotation, preserving raw encoded orientation without copying the camera display matrix.
 - Scale down to at most 1280 px wide while preserving aspect ratio.
@@ -608,7 +623,7 @@ full bytes and worker duration. Reset partial work if VideoToolbox fails before
 starting the software fallback, and retain completion-only behavior when FFmpeg
 does not provide a usable timestamp.
 
-Only the original is accepted as proxy input. If the original is offline, proxy generation fails explicitly. Version-3 proxies are written to a temporary file, verified with ffprobe to have 0° display rotation, and then atomically committed asset-by-asset. Version-2 proxies are obsolete because they may retain the source display matrix; a later “missing” run regenerates them and skips only valid current-version paths that still exist.
+Only the original is accepted as proxy input. If the original is offline, proxy generation fails explicitly. Generated candidates are written to unique staging files and validated for H.264, at most 1280 px wide, `yuv420p`, zero display rotation, source-time duration correspondence, source-audio presence as AAC, and successful video+audio decode before atomic commit. Each transaction writes `proxy_generation_provenance` (recipe, actual encoder, device, policy, timing, ordered failures, fallback flag, validation, timestamp) in canonical SQLite; a failed transaction never changes the registered `assets.proxy_path`. Version-2 proxies are obsolete because they may retain the source display matrix; a later “missing” run regenerates them and skips only valid current-version paths that still exist.
 
 Proxy and thumbnail writers share cross-process claims in the managed `cache/.representation-locks` directory. Claims use the canonical cache root, asset ID, and representation kind; lock files persist after release and must never be unlinked. SQLite remains canonical. A busy single-item CLI writer exits with JSON code `representation_busy`; batch writers count contention as skipped work without recording a failure or throughput sample. Proxy downloads claim before requesting content and stream into unique staging paths, so a stale writer cannot overwrite a later transaction.
 
@@ -784,8 +799,10 @@ Current task keys are versioned. macOS proxy generation has its own history
 because VideoToolbox throughput is not comparable to the server/software path:
 
 ```text
-proxy.h264-720p.orientation-v3.macos-videotoolbox-q36-w{1,2,3,4}-v1
-proxy.h264-720p.orientation-v3                 # server/non-macOS fallback history
+proxy.h264-720p.orientation-v3.macos-videotoolbox-w{1,2,3,4}-v2
+proxy.h264-720p.orientation-v3.macos-software-w{1,2,3,4}-v2
+proxy.h264-720p.orientation-v3.linux-vaapi-qp23-wN-v1
+proxy.h264-720p.orientation-v3.linux-software-wN-v1
 thumbnail.q1.orientation-v2
 stt.whisper-large-v3-turbo-q5_0.vad-silero-v5.win30.v1-w1
 vlm.observe-v2.framepack.2fps.skip400ms.max40.win3-8.sharp-bright-motion.dhash8-d5.v1-w{1,2,3,4}-v1

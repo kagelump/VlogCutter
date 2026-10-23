@@ -83,8 +83,20 @@ pub(crate) fn output_with_timeout(
     what: &str,
     limit: Duration,
 ) -> Result<std::process::Output> {
+    output_with_timeout_and_cancellation(command, what, limit, &|| false)
+}
+
+pub(crate) fn output_with_timeout_and_cancellation(
+    command: &mut std::process::Command,
+    what: &str,
+    limit: Duration,
+    is_cancelled: &impl Fn() -> bool,
+) -> Result<std::process::Output> {
     use std::io::Read;
     use std::process::Stdio;
+    if is_cancelled() {
+        bail!("{what} canceled");
+    }
 
     let mut child = command
         .stdout(Stdio::piped())
@@ -118,6 +130,13 @@ pub(crate) fn output_with_timeout(
                 stdout: stdout_reader.join().unwrap_or_default(),
                 stderr: stderr_reader.join().unwrap_or_default(),
             });
+        }
+        if is_cancelled() {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            bail!("{what} canceled");
         }
         if started.elapsed() >= limit {
             let _ = child.kill();
