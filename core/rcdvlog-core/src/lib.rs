@@ -8,7 +8,7 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom};
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -41,6 +41,7 @@ mod operations;
 mod preflight;
 mod preparation;
 mod prerequisites;
+mod proxy_encoding;
 mod representation;
 mod stall;
 mod storage;
@@ -113,6 +114,18 @@ pub use preparation::*;
 pub use prerequisites::{
     MediaPrerequisiteError, ToolPrerequisiteStatus, ToolStatus, ensure_media_prerequisites,
     prerequisite_status,
+};
+#[cfg(target_os = "macos")]
+pub use proxy_encoding::PROXY_VIDEOTOOLBOX_RECIPE_KEY;
+pub use proxy_encoding::{
+    EncoderCapability, PROXY_SOFTWARE_RECIPE_KEY, PROXY_VAAPI_RECIPE_KEY, ProxyAttemptStatus,
+    ProxyEncoderAttempt, ProxyEncoderKind, ProxyEncoderPlan, ProxyEncoderPolicy,
+    ProxyEncoderProbeReport, ProxyEncoderTarget, ProxyGenerationOutcome, ProxyOutputValidation,
+    ProxyTimeCorrespondence, ProxyTranscodeFailure, probe_proxy_encoder_capabilities,
+    probe_proxy_encoder_capabilities_with_tools, probe_source_audio_present,
+    proxy_rate_history_key, resolve_proxy_encoder_plan, resolve_proxy_encoder_plan_with_tools,
+    run_proxy_transcode_with_plan, run_proxy_transcode_with_plan_and_cancellation,
+    validate_proxy_output,
 };
 pub use representation::{ProxyWrite, RepresentationBusy, RepresentationClaim, RepresentationKind};
 pub use transcription::{
@@ -208,12 +221,8 @@ const PROXY_WORKERS: usize = 4;
 const PROXY_WORKERS: usize = 1;
 const THUMBNAIL_WORKERS: usize = 1;
 
-#[derive(Clone, Copy)]
-enum ProxyEncoder {
-    Software,
-    #[cfg(target_os = "macos")]
-    VideoToolbox,
-}
+#[cfg(all(test, target_os = "macos"))]
+type ProxyEncoder = ProxyEncoderKind;
 
 enum ProxyWorkerMessage {
     Progress {
@@ -223,26 +232,27 @@ enum ProxyWorkerMessage {
     Finished(Box<ProxyWorkerFinished>),
 }
 
+#[derive(Debug)]
+struct ProxyGenerated {
+    asset: Asset,
+    outcome: ProxyGenerationOutcome,
+}
+
 struct ProxyWorkerFinished {
     index: usize,
     asset: Asset,
     elapsed: std::time::Duration,
-    result: Result<Asset>,
+    result: Result<ProxyGenerated>,
 }
 
-#[cfg(target_os = "macos")]
-fn proxy_task_kind(worker_count: usize) -> &'static str {
-    match worker_count {
-        1 => "proxy.h264-720p.orientation-v3.macos-videotoolbox-q36-w1-v1",
-        2 => "proxy.h264-720p.orientation-v3.macos-videotoolbox-q36-w2-v1",
-        3 => "proxy.h264-720p.orientation-v3.macos-videotoolbox-q36-w3-v1",
-        _ => "proxy.h264-720p.orientation-v3.macos-videotoolbox-q36-w4-v1",
-    }
+fn proxy_task_kind_for_encoder(encoder: ProxyEncoderKind, worker_count: usize) -> String {
+    proxy_rate_history_key(encoder, worker_count)
 }
 
-#[cfg(not(target_os = "macos"))]
-fn proxy_task_kind(_worker_count: usize) -> &'static str {
-    "proxy.h264-720p.orientation-v3"
+#[cfg(test)]
+fn proxy_task_kind(worker_count: usize) -> String {
+    let plan = resolve_proxy_encoder_plan(ProxyEncoderPolicy::Auto);
+    proxy_task_kind_for_encoder(plan.preferred_encoder, worker_count)
 }
 
 #[derive(Debug, Clone)]
@@ -423,6 +433,40 @@ pub struct ProxyReport {
     #[serde(default)]
     pub cancelled: bool,
     pub failures: Vec<IngestFailure>,
+}
+
+/// Durable evidence for one proxy generation transaction. Kept separately
+/// from `Asset` so failed attempts remain inspectable without changing the
+/// registered proxy path.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyGenerationProvenance {
+    pub id: i64,
+    pub asset_id: String,
+    pub recipe_key: String,
+    pub policy: ProxyEncoderPolicy,
+    pub selected_encoder: String,
+    pub device: Option<String>,
+    pub fallback_used: bool,
+    pub status: String,
+    pub elapsed_ms: u64,
+    pub attempts: Vec<ProxyEncoderAttempt>,
+    pub validation: Option<ProxyOutputValidation>,
+    pub created_at: String,
+}
+
+/// Encoder-aware throughput observation. The scope note is deliberately not a
+/// benchmark claim: a rate is useful only for this host/catalog and corpus.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyRateHistoryEntry {
+    pub task_kind: String,
+    pub encoder: String,
+    pub worker_count: usize,
+    pub work_units_per_worker_second: f64,
+    pub samples: u64,
+    pub updated_at: String,
+    pub scope: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1773,23 +1817,20 @@ impl Catalog {
         self.create_clock_event_operation(project_id, camera, start_filename, offset_seconds, label)
     }
 
-    fn generate_proxy_untracked_with_progress<F>(
-        &self,
-        asset_id: &str,
-        on_progress: F,
-    ) -> Result<Asset>
-    where
-        F: FnMut(f64),
-    {
-        self.generate_proxy_untracked_with_orientation_policy(asset_id, true, on_progress)
-    }
-
-    fn generate_proxy_untracked_with_orientation_policy<F>(
+    /// Testable and adapter-reusable execution boundary. The caller supplies
+    /// explicit media tools and may supply a plan so deterministic fallback can
+    /// be exercised without pretending a device exists.
+    #[allow(clippy::too_many_arguments)]
+    fn generate_proxy_untracked_with_execution<F>(
         &self,
         asset_id: &str,
         refresh_orientation: bool,
+        policy: ProxyEncoderPolicy,
         mut on_progress: F,
-    ) -> Result<Asset>
+        ffmpeg: &Path,
+        ffprobe: &Path,
+        plan_override: Option<ProxyEncoderPlan>,
+    ) -> Result<ProxyGenerated>
     where
         F: FnMut(f64),
     {
@@ -1805,23 +1846,43 @@ impl Catalog {
             self.get_asset(asset_id)?
         };
         // Prove this is still the original clip before transcoding.
-        self.resolve_original(asset_id)?;
+        let original = self.resolve_original(asset_id)?;
+        let source_audio_present = probe_source_audio_present(ffprobe, &original)
+            .context("probe source audio before proxy generation")?;
+        let plan = plan_override.unwrap_or_else(|| resolve_proxy_encoder_plan(policy));
         let temporary = write.temporary_path();
-        let result = run_proxy_ffmpeg(
-            Path::new(&asset.path),
+        let outcome = match run_proxy_transcode_with_plan(
+            ffmpeg,
+            ffprobe,
+            &original,
             temporary,
             asset.duration_seconds,
+            source_audio_present,
+            &plan,
             &mut on_progress,
-        )?;
-        if !result.status.success() {
-            let _ = fs::remove_file(temporary);
-            return Err(media_tool_failure(
-                "ffmpeg proxy generation",
-                result.status,
-                result.diagnostic,
-            ));
-        }
-        self.commit_proxy_write(write, None)
+        ) {
+            Ok(outcome) => outcome,
+            Err(failure) => {
+                let _ = fs::remove_file(temporary);
+                if let Err(error) =
+                    self.persist_proxy_generation_provenance(asset_id, &failure.outcome)
+                {
+                    tracing::warn!(
+                        target: "rcdvlog_core::proxy",
+                        asset = %asset_id,
+                        error = %error,
+                        "failed to persist proxy generation failure provenance"
+                    );
+                }
+                return Err(anyhow::Error::new(failure).context("ffmpeg proxy generation failed"));
+            }
+        };
+        let outcome_for_result = outcome.clone();
+        let asset = self.commit_generated_proxy_write(write, &outcome)?;
+        Ok(ProxyGenerated {
+            asset,
+            outcome: outcome_for_result,
+        })
     }
 
     /// Explicitly refreshes legacy orientation metadata from the immutable original.
@@ -1865,13 +1926,58 @@ impl Catalog {
     where
         F: FnMut(AssetBatchProgress),
     {
-        self.generate_proxy_with_orientation_policy(asset_id, true, on_progress)
+        self.generate_proxy_with_policy_and_progress(
+            asset_id,
+            ProxyEncoderPolicy::Auto,
+            on_progress,
+        )
+    }
+
+    /// Generate one proxy with an explicit encoder policy. `Auto` uses the
+    /// shared capability probe and retains the software fallback; `Software`
+    /// is deterministic and never initializes hardware.
+    pub fn generate_proxy_with_policy(
+        &self,
+        asset_id: &str,
+        policy: ProxyEncoderPolicy,
+    ) -> Result<Asset> {
+        self.generate_proxy_with_policy_and_progress(asset_id, policy, |_| {})
+    }
+
+    pub fn generate_proxy_with_policy_and_progress<F>(
+        &self,
+        asset_id: &str,
+        policy: ProxyEncoderPolicy,
+        on_progress: F,
+    ) -> Result<Asset>
+    where
+        F: FnMut(AssetBatchProgress),
+    {
+        self.generate_proxy_with_orientation_policy_and_policy(asset_id, true, policy, on_progress)
     }
 
     fn generate_proxy_with_orientation_policy<F>(
         &self,
         asset_id: &str,
         refresh_orientation: bool,
+        on_progress: F,
+    ) -> Result<Asset>
+    where
+        F: FnMut(AssetBatchProgress),
+    {
+        self.generate_proxy_with_orientation_policy_and_policy(
+            asset_id,
+            refresh_orientation,
+            ProxyEncoderPolicy::Auto,
+            on_progress,
+        )
+    }
+
+    fn generate_proxy_with_orientation_policy_and_policy<F>(
+        &self,
+        asset_id: &str,
+        refresh_orientation: bool,
+        policy: ProxyEncoderPolicy,
         mut on_progress: F,
     ) -> Result<Asset>
     where
@@ -1879,16 +1985,21 @@ impl Catalog {
     {
         let asset = self.get_asset(asset_id)?;
         let task_work = [asset.size_bytes];
-        let task_kind = proxy_task_kind(1);
-        let mut estimator = BatchEstimator::new(&task_work, 1, self.load_batch_history(task_kind)?);
+        let plan = resolve_proxy_encoder_plan(policy);
+        let task_kind = proxy_task_kind_for_encoder(plan.preferred_encoder, 1);
+        let mut estimator =
+            BatchEstimator::new(&task_work, 1, self.load_batch_history(&task_kind)?);
         on_progress(AssetBatchProgress {
             asset: None,
             estimate: estimator.estimate(&task_work),
         });
         let started = Instant::now();
-        let result = self.generate_proxy_untracked_with_orientation_policy(
+        let ffmpeg = resolve_tool("ffmpeg");
+        let ffprobe = resolve_tool("ffprobe");
+        let result = self.generate_proxy_untracked_with_execution(
             asset_id,
             refresh_orientation,
+            policy,
             |fraction| {
                 let partial_work = work_units_from_fraction(asset.size_bytes, fraction);
                 let remaining_work = asset.size_bytes.saturating_sub(partial_work);
@@ -1898,12 +2009,20 @@ impl Catalog {
                         .estimate_with_partial_progress(&[remaining_work], partial_work),
                 });
             },
+            &ffmpeg,
+            &ffprobe,
+            Some(plan),
         );
         let updated = match &result {
-            Ok(updated) => {
+            Ok(generated) => {
                 estimator.record_completion(asset.size_bytes, started.elapsed());
-                self.save_batch_history(task_kind, estimator.history())?;
-                Some(updated.clone())
+                let actual_encoder = ProxyEncoderKind::parse(&generated.outcome.selected_encoder)
+                    .unwrap_or(ProxyEncoderKind::Software);
+                let actual_task_kind = proxy_task_kind_for_encoder(actual_encoder, 1);
+                let mut history = self.load_batch_history(&actual_task_kind)?;
+                history.observe(asset.size_bytes, generated.outcome.successful_elapsed());
+                self.save_batch_history(&actual_task_kind, history)?;
+                Some(generated.asset.clone())
             }
             Err(_) => {
                 estimator.record_failure(asset.size_bytes);
@@ -1914,7 +2033,7 @@ impl Catalog {
             asset: updated,
             estimate: estimator.estimate(&[]),
         });
-        result
+        result.map(|generated| generated.asset)
     }
 
     /// Fingerprint of the proxy a transcript would be derived from.
@@ -3159,7 +3278,18 @@ impl Catalog {
         self.generate_missing_proxies_with_progress(project_id, |_| ControlFlow::Continue(()))
     }
 
-    /// Generates every missing or stale proxy.
+    /// Generate missing proxies with an explicit encoder policy.
+    pub fn generate_missing_proxies_with_policy(
+        &self,
+        project_id: &str,
+        policy: ProxyEncoderPolicy,
+    ) -> Result<ProxyReport> {
+        self.generate_missing_proxies_with_policy_and_progress(project_id, policy, |_| {
+            ControlFlow::Continue(())
+        })
+    }
+
+    /// Generates every missing or stale proxy using the safe default policy.
     ///
     /// `on_progress` returning `ControlFlow::Break` stops the batch; workers
     /// finish the clip in flight and then stop claiming new work, so a
@@ -3167,6 +3297,22 @@ impl Catalog {
     pub fn generate_missing_proxies_with_progress<F>(
         &self,
         project_id: &str,
+        on_progress: F,
+    ) -> Result<ProxyReport>
+    where
+        F: FnMut(AssetBatchProgress) -> ControlFlow<()>,
+    {
+        self.generate_missing_proxies_with_policy_and_progress(
+            project_id,
+            ProxyEncoderPolicy::Auto,
+            on_progress,
+        )
+    }
+
+    pub fn generate_missing_proxies_with_policy_and_progress<F>(
+        &self,
+        project_id: &str,
+        policy: ProxyEncoderPolicy,
         mut on_progress: F,
     ) -> Result<ProxyReport>
     where
@@ -3201,12 +3347,15 @@ impl Catalog {
             pending = task_work.len(),
             "generate_missing_proxies: begin"
         );
-        let task_kind = proxy_task_kind(worker_count);
+        let plan = resolve_proxy_encoder_plan(policy);
+        let task_kind = proxy_task_kind_for_encoder(plan.preferred_encoder, worker_count);
         let mut estimator = BatchEstimator::new(
             &task_work,
             worker_count,
-            self.load_batch_history(task_kind)?,
+            self.load_batch_history(&task_kind)?,
         );
+        let ffmpeg = resolve_tool("ffmpeg");
+        let ffprobe = resolve_tool("ffprobe");
         let start = on_progress(AssetBatchProgress {
             asset: None,
             estimate: estimator.estimate(&task_work),
@@ -3229,6 +3378,9 @@ impl Catalog {
                 let queue = Arc::clone(&queue);
                 let stop = Arc::clone(&stop);
                 let outcome_sender = outcome_sender.clone();
+                let plan = plan.clone();
+                let ffmpeg = ffmpeg.clone();
+                let ffprobe = ffprobe.clone();
                 scope.spawn(move || {
                     loop {
                         if stop.load(Ordering::Relaxed) {
@@ -3249,8 +3401,11 @@ impl Catalog {
                             "proxy worker: spawn ffmpeg"
                         );
                         let started = Instant::now();
-                        let result =
-                            catalog.generate_proxy_untracked_with_progress(&asset.id, |fraction| {
+                        let result = catalog.generate_proxy_untracked_with_execution(
+                            &asset.id,
+                            true,
+                            policy,
+                            |fraction| {
                                 let _ = outcome_sender.send(ProxyWorkerMessage::Progress {
                                     index,
                                     completed_work_units: work_units_from_fraction(
@@ -3258,7 +3413,11 @@ impl Catalog {
                                         fraction,
                                     ),
                                 });
-                            });
+                            },
+                            &ffmpeg,
+                            &ffprobe,
+                            Some(plan.clone()),
+                        );
                         match &result {
                             Ok(_) => tracing::debug!(
                                 target: "rcdvlog_core::proxy",
@@ -3313,11 +3472,21 @@ impl Catalog {
                         completed[index] = true;
                         partial_work[index] = 0;
                         match result {
-                            Ok(updated) => {
+                            Ok(generated) => {
                                 report.generated += 1;
                                 estimator.record_completion(asset.size_bytes, elapsed);
-                                self.save_batch_history(task_kind, estimator.history())?;
-                                Some(updated)
+                                let actual_encoder =
+                                    ProxyEncoderKind::parse(&generated.outcome.selected_encoder)
+                                        .unwrap_or(ProxyEncoderKind::Software);
+                                let actual_task_kind =
+                                    proxy_task_kind_for_encoder(actual_encoder, worker_count);
+                                let mut history = self.load_batch_history(&actual_task_kind)?;
+                                history.observe(
+                                    asset.size_bytes,
+                                    generated.outcome.successful_elapsed(),
+                                );
+                                self.save_batch_history(&actual_task_kind, history)?;
+                                Some(generated.asset)
                             }
                             Err(error) if error.is::<RepresentationBusy>() => {
                                 // Advance completion without training throughput.
@@ -3899,6 +4068,146 @@ impl Catalog {
         chronology::load_quarantined_operations(&connection, project_id)
     }
 
+    /// Persist both successful and failed proxy-generation evidence. A failed
+    /// row never mutates `assets.proxy_path`; the previously registered output
+    /// remains canonical.
+    fn persist_proxy_generation_provenance(
+        &self,
+        asset_id: &str,
+        outcome: &ProxyGenerationOutcome,
+    ) -> Result<()> {
+        insert_proxy_generation_provenance(&self.connection()?, asset_id, outcome)
+    }
+
+    /// Latest-first proxy generation provenance for one asset. Attempts and
+    /// validation are decoded from the canonical SQLite JSON columns.
+    pub fn proxy_generation_provenance(
+        &self,
+        asset_id: &str,
+        limit: usize,
+    ) -> Result<Vec<ProxyGenerationProvenance>> {
+        self.load_proxy_generation_provenance(asset_id, limit.clamp(1, 1_000) as i64, None)
+    }
+
+    fn load_proxy_generation_provenance(
+        &self,
+        asset_id: &str,
+        limit: i64,
+        id: Option<i64>,
+    ) -> Result<Vec<ProxyGenerationProvenance>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            r#"
+            SELECT id, asset_id, recipe_key, policy, selected_encoder, device,
+                   fallback_used, status, elapsed_ms, attempts_json,
+                   validation_json, created_at
+            FROM proxy_generation_provenance
+            WHERE asset_id = ?1 AND (?3 IS NULL OR id = ?3)
+            ORDER BY id DESC
+            LIMIT ?2
+            "#,
+        )?;
+        let rows = statement.query_map(params![asset_id, limit, id], |row| {
+            let policy_value: String = row.get(3)?;
+            let attempts_json: String = row.get(9)?;
+            let validation_json: Option<String> = row.get(10)?;
+            Ok(ProxyGenerationProvenance {
+                id: row.get(0)?,
+                asset_id: row.get(1)?,
+                recipe_key: row.get(2)?,
+                policy: ProxyEncoderPolicy::parse(&policy_value).map_err(|_| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        3,
+                        rusqlite::types::Type::Text,
+                        format!("invalid proxy encoder policy {policy_value}").into(),
+                    )
+                })?,
+                selected_encoder: row.get(4)?,
+                device: row.get(5)?,
+                fallback_used: row.get::<_, i64>(6)? != 0,
+                status: row.get(7)?,
+                elapsed_ms: row.get::<_, i64>(8)? as u64,
+                attempts: serde_json::from_str(&attempts_json).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        9,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?,
+                validation: validation_json
+                    .as_deref()
+                    .map(serde_json::from_str)
+                    .transpose()
+                    .map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            10,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })?,
+                created_at: row.get(11)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Provenance attached to the currently registered generated proxy. A later
+    /// failed attempt never replaces this association; downloads clear it.
+    pub fn registered_proxy_generation_provenance(
+        &self,
+        asset_id: &str,
+    ) -> Result<Option<ProxyGenerationProvenance>> {
+        let id: Option<i64> = self.connection()?.query_row(
+            "SELECT proxy_generation_id FROM assets WHERE id = ?1",
+            [asset_id],
+            |row| row.get(0),
+        )?;
+        let Some(id) = id else {
+            return Ok(None);
+        };
+        Ok(self
+            .load_proxy_generation_provenance(asset_id, 1, Some(id))?
+            .pop())
+    }
+
+    /// Encoder- and worker-count-aware proxy rate histories in this catalog.
+    pub fn proxy_rate_histories(&self) -> Result<Vec<ProxyRateHistoryEntry>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            r#"
+            SELECT task_kind, work_units_per_worker_second, samples, updated_at
+            FROM batch_performance
+            WHERE task_kind LIKE 'proxy.h264-720p.orientation-v3%'
+            ORDER BY task_kind
+            "#,
+        )?;
+        let rows = statement.query_map([], |row| {
+            let task_kind: String = row.get(0)?;
+            let encoder = if task_kind.contains("videotoolbox") {
+                "videotoolbox"
+            } else if task_kind.contains("vaapi") {
+                "vaapi"
+            } else {
+                "software"
+            };
+            let worker_count = task_kind
+                .rsplit_once("-w")
+                .and_then(|(_, suffix)| suffix.split('-').next())
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(1);
+            Ok(ProxyRateHistoryEntry {
+                task_kind,
+                encoder: encoder.to_string(),
+                worker_count,
+                work_units_per_worker_second: row.get(1)?,
+                samples: row.get::<_, i64>(2)? as u64,
+                updated_at: row.get(3)?,
+                scope: "Observed only on this catalog's host with its successful hardware/software mix and worker count; not a cross-corpus benchmark.".to_string(),
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     fn load_batch_history(&self, task_kind: &str) -> Result<RateHistory> {
         Ok(self
             .connection()?
@@ -4128,6 +4437,44 @@ pub fn landscape_default_rotation(width: u32, height: u32, metadata_rotation_deg
     }
 }
 
+pub(crate) fn insert_proxy_generation_provenance(
+    connection: &Connection,
+    asset_id: &str,
+    outcome: &ProxyGenerationOutcome,
+) -> Result<()> {
+    let attempts_json =
+        serde_json::to_string(&outcome.attempts).context("serialize proxy encoder attempts")?;
+    let validation_json = outcome
+        .validation
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .context("serialize proxy output validation")?;
+    connection.execute(
+        r#"
+        INSERT INTO proxy_generation_provenance (
+            asset_id, recipe_key, policy, selected_encoder, device,
+            fallback_used, status, elapsed_ms, attempts_json,
+            validation_json, created_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+        "#,
+        params![
+            asset_id,
+            outcome.recipe_key,
+            outcome.policy.as_str(),
+            outcome.selected_encoder,
+            outcome.device,
+            i64::from(outcome.fallback_used),
+            outcome.status,
+            outcome.elapsed_ms.min(i64::MAX as u64) as i64,
+            attempts_json,
+            validation_json,
+            now(),
+        ],
+    )?;
+    Ok(())
+}
+
 fn row_to_asset(row: &rusqlite::Row<'_>) -> rusqlite::Result<Asset> {
     let path: String = row.get(2)?;
     let proxy_path: Option<String> = row.get(15)?;
@@ -4260,149 +4607,19 @@ pub(crate) fn tool_command(name: &str) -> Command {
     Command::new(resolve_tool(name))
 }
 
+#[cfg(all(test, target_os = "macos"))]
 fn proxy_ffmpeg_command(source: &Path, output: &Path, encoder: ProxyEncoder) -> Command {
-    let mut command = tool_command("ffmpeg");
-    command.args([
-        "-y",
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-stats_period",
-        "1",
-        "-progress",
-        "pipe:1",
-        "-nostats",
-    ]);
-
-    #[cfg(target_os = "macos")]
-    if matches!(encoder, ProxyEncoder::VideoToolbox) {
-        command.args(["-hwaccel", "videotoolbox"]);
-    }
-
-    command
-        .args(["-display_rotation:v:0", "0", "-noautorotate", "-i"])
-        .arg(source)
-        .args([
-            "-map",
-            "0:v:0",
-            "-map",
-            "0:a:0?",
-            "-vf",
-            "scale='min(1280,iw)':-2:force_original_aspect_ratio=decrease",
-        ]);
-
-    match encoder {
-        ProxyEncoder::Software => {
-            command.args([
-                "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p",
-            ]);
-        }
-        #[cfg(target_os = "macos")]
-        ProxyEncoder::VideoToolbox => {
-            command.args([
-                "-c:v",
-                "h264_videotoolbox",
-                "-profile:v",
-                "high",
-                "-q:v",
-                "36",
-                "-power_efficient",
-                "1",
-            ]);
-        }
-    }
-
-    command.args([
-        "-c:a",
-        "aac",
-        "-b:a",
-        "128k",
-        "-movflags",
-        "+faststart",
-        "-map_metadata",
-        "-1",
-    ]);
-    command.arg(output);
-    command
-}
-
-struct ProxyProcessResult {
-    status: std::process::ExitStatus,
-    diagnostic: String,
-}
-
-fn run_proxy_ffmpeg<F>(
-    source: &Path,
-    output: &Path,
-    duration_seconds: f64,
-    on_progress: &mut F,
-) -> Result<ProxyProcessResult>
-where
-    F: FnMut(f64),
-{
-    #[cfg(target_os = "macos")]
-    {
-        let hardware_status = run_proxy_ffmpeg_encoder(
-            source,
-            output,
-            ProxyEncoder::VideoToolbox,
-            duration_seconds,
-            on_progress,
-        )
-        .context("start VideoToolbox ffmpeg proxy process")?;
-        if hardware_status.status.success() {
-            return Ok(hardware_status);
-        }
-        let _ = fs::remove_file(output);
-        on_progress(0.0);
-    }
-
-    run_proxy_ffmpeg_encoder(
+    let target = ProxyEncoderTarget {
+        encoder,
+        device: None,
+        recipe_key: encoder.recipe_key().to_string(),
+    };
+    proxy_encoding::proxy_ffmpeg_command_with_program(
+        &resolve_tool("ffmpeg"),
         source,
         output,
-        ProxyEncoder::Software,
-        duration_seconds,
-        on_progress,
+        &target,
     )
-    .context("start software ffmpeg proxy process")
-}
-
-fn run_proxy_ffmpeg_encoder<F>(
-    source: &Path,
-    output: &Path,
-    encoder: ProxyEncoder,
-    duration_seconds: f64,
-    on_progress: &mut F,
-) -> Result<ProxyProcessResult>
-where
-    F: FnMut(f64),
-{
-    let mut command = proxy_ffmpeg_command(source, output, encoder);
-    command.stdout(Stdio::piped());
-    command.stderr(Stdio::piped());
-    let mut child = command.spawn().context("spawn ffmpeg proxy process")?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| anyhow!("ffmpeg progress pipe was not available"))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| anyhow!("ffmpeg stderr pipe was not available"))?;
-    let stderr_reader = drain_child_stderr(stderr);
-    for line in BufReader::new(stdout)
-        .lines()
-        .map_while(std::result::Result::ok)
-    {
-        if let Some(fraction) = ffmpeg_progress_fraction(&line, duration_seconds) {
-            on_progress(fraction);
-        }
-    }
-    let status = child.wait().context("wait for ffmpeg proxy process")?;
-    let stderr = stderr_reader.join().unwrap_or_default();
-    let stderr = String::from_utf8_lossy(&stderr).into_owned();
-    let diagnostic = redact_media_diagnostic(&stderr, source, output);
-    Ok(ProxyProcessResult { status, diagnostic })
 }
 
 fn drain_child_stderr(mut stderr: impl Read + Send + 'static) -> thread::JoinHandle<Vec<u8>> {
@@ -6879,9 +7096,12 @@ pub(crate) mod tests {
         }));
         assert_eq!(
             catalog
-                .load_batch_history(proxy_task_kind(4))
+                .proxy_rate_histories()
                 .unwrap()
-                .samples,
+                .iter()
+                .filter(|entry| entry.worker_count == 4)
+                .map(|entry| entry.samples)
+                .sum::<u64>(),
             4
         );
         assert_eq!(
@@ -7117,6 +7337,275 @@ pub(crate) mod tests {
             .unwrap();
         assert!(report.cancelled);
         assert_eq!(report.generated, 0);
+    }
+
+    fn synthetic_proxy_source(directory: &Path) -> PathBuf {
+        let source_dir = directory.join("proxy-source");
+        fs::create_dir_all(&source_dir).unwrap();
+        let source = source_dir.join("CLIP.MP4");
+        let status = tool_command("ffmpeg")
+            .args([
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=640x360:rate=24:duration=1",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:duration=1",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                "-shortest",
+            ])
+            .arg(&source)
+            .status()
+            .unwrap();
+        assert!(status.success(), "could not create synthetic proxy source");
+        source
+    }
+
+    #[test]
+    fn auto_proxy_generation_records_actual_encoder_recipe_timing_and_validation() {
+        if tool_command("ffmpeg").arg("-version").output().is_err()
+            || tool_command("ffprobe").arg("-version").output().is_err()
+        {
+            eprintln!("ffmpeg or ffprobe unavailable; skipping proxy provenance test");
+            return;
+        }
+        let (directory, catalog, project) = catalog_fixture();
+        let source = synthetic_proxy_source(directory.path());
+        let source_dir = source.parent().unwrap();
+        catalog.ingest_folder(&project.id, source_dir).unwrap();
+        let asset = catalog.list_assets(&project.id).unwrap().remove(0);
+        let proxied = catalog
+            .generate_proxy_with_policy(&asset.id, ProxyEncoderPolicy::Auto)
+            .unwrap();
+        assert_eq!(
+            proxied.proxy_representation,
+            Some(ProxyRepresentation::RawV3)
+        );
+        assert!(
+            proxied
+                .proxy_path
+                .as_deref()
+                .is_some_and(|path| Path::new(path).is_file())
+        );
+
+        let provenance = catalog.proxy_generation_provenance(&asset.id, 10).unwrap();
+        assert_eq!(provenance.len(), 1);
+        let latest = &provenance[0];
+        assert_eq!(latest.status, "succeeded");
+        assert!(
+            latest.fallback_used
+                || matches!(latest.selected_encoder.as_str(), "vaapi" | "videotoolbox")
+        );
+        let validation = latest.validation.as_ref().unwrap();
+        assert!(validation.decoded);
+        assert_eq!(validation.metadata_rotation_degrees, 0);
+        assert_eq!(validation.audio_stream_count, 1);
+        assert_eq!(validation.audio_codec.as_deref(), Some("aac"));
+        assert!(
+            latest
+                .attempts
+                .iter()
+                .any(|attempt| attempt.status == ProxyAttemptStatus::Succeeded)
+        );
+
+        let histories = catalog.proxy_rate_histories().unwrap();
+        let matching = histories
+            .iter()
+            .find(|history| {
+                history.encoder == latest.selected_encoder
+                    && history.task_kind.contains("proxy.h264-720p.orientation-v3")
+            })
+            .expect("actual encoder should have an encoder-aware rate history");
+        assert_eq!(matching.samples, 1);
+        assert!(matching.scope.contains("not a cross-corpus benchmark"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn both_encoder_failures_preserve_registered_proxy_and_record_failure() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if tool_command("ffmpeg").arg("-version").output().is_err()
+            || tool_command("ffprobe").arg("-version").output().is_err()
+        {
+            eprintln!("ffmpeg or ffprobe unavailable; skipping proxy failure provenance test");
+            return;
+        }
+        let (directory, catalog, project) = catalog_fixture();
+        let source = synthetic_proxy_source(directory.path());
+        catalog
+            .ingest_folder(&project.id, source.parent().unwrap())
+            .unwrap();
+        let asset = catalog.list_assets(&project.id).unwrap().remove(0);
+        let first = catalog
+            .generate_proxy_with_policy(&asset.id, ProxyEncoderPolicy::Software)
+            .unwrap();
+        let registered_path = PathBuf::from(first.proxy_path.as_deref().unwrap());
+        let registered_bytes = fs::read(&registered_path).unwrap();
+
+        let fake = directory.path().join("always-fail-ffmpeg");
+        fs::write(
+            &fake,
+            "#!/bin/sh\necho 'synthetic hardware and software failure' >&2\nexit 1\n",
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&fake).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&fake, permissions).unwrap();
+        let plan = ProxyEncoderPlan {
+            policy: ProxyEncoderPolicy::Auto,
+            preferred_encoder: ProxyEncoderKind::Vaapi,
+            targets: vec![
+                ProxyEncoderTarget {
+                    encoder: ProxyEncoderKind::Vaapi,
+                    device: Some("/dev/dri/renderD128".to_string()),
+                    recipe_key: PROXY_VAAPI_RECIPE_KEY.to_string(),
+                },
+                ProxyEncoderTarget {
+                    encoder: ProxyEncoderKind::Software,
+                    device: None,
+                    recipe_key: PROXY_SOFTWARE_RECIPE_KEY.to_string(),
+                },
+            ],
+            hardware_unavailable: None,
+            software_usable: true,
+            limitations: vec![],
+        };
+        let error = catalog
+            .generate_proxy_untracked_with_execution(
+                &asset.id,
+                true,
+                ProxyEncoderPolicy::Auto,
+                |_| {},
+                &fake,
+                &resolve_tool_path("ffprobe"),
+                Some(plan),
+            )
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("ffmpeg proxy generation failed"));
+
+        let unchanged = catalog.get_asset(&asset.id).unwrap();
+        assert_eq!(
+            unchanged.proxy_path.as_deref(),
+            Some(registered_path.to_string_lossy().as_ref())
+        );
+        assert_eq!(fs::read(&registered_path).unwrap(), registered_bytes);
+        let provenance = catalog.proxy_generation_provenance(&asset.id, 10).unwrap();
+        assert_eq!(provenance.len(), 2);
+        assert_eq!(provenance[0].status, "failed");
+        let registered = catalog
+            .registered_proxy_generation_provenance(&asset.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(registered.id, provenance[1].id);
+        assert_eq!(registered.status, "succeeded");
+        // A downloaded replacement has no locally generated encoder claim.
+        let replacement = catalog.begin_proxy_write(&asset.id).unwrap().unwrap();
+        fs::write(replacement.temporary_path(), &registered_bytes).unwrap();
+        catalog.commit_proxy_write(replacement, None).unwrap();
+        assert!(
+            catalog
+                .registered_proxy_generation_provenance(&asset.id)
+                .unwrap()
+                .is_none()
+        );
+
+        assert_eq!(provenance[0].attempts.len(), 2);
+        assert!(
+            provenance[0]
+                .attempts
+                .iter()
+                .all(|attempt| { attempt.status == ProxyAttemptStatus::ProcessFailed })
+        );
+        assert!(provenance[0].validation.is_none());
+        let proxy_directory = registered_path.parent().unwrap();
+        assert!(
+            fs::read_dir(proxy_directory)
+                .unwrap()
+                .filter_map(std::result::Result::ok)
+                .all(|entry| !entry.file_name().to_string_lossy().ends_with(".tmp.mp4"))
+        );
+    }
+
+    #[test]
+    fn generated_proxy_commit_failure_restores_file_and_registered_provenance() {
+        use std::io::Write;
+        if tool_command("ffmpeg").arg("-version").output().is_err()
+            || tool_command("ffprobe").arg("-version").output().is_err()
+        {
+            return;
+        }
+        let (directory, catalog, project) = catalog_fixture();
+        let source = synthetic_proxy_source(directory.path());
+        catalog
+            .ingest_folder(&project.id, source.parent().unwrap())
+            .unwrap();
+        let asset = catalog.list_assets(&project.id).unwrap().remove(0);
+        let generated = catalog
+            .generate_proxy_with_policy(&asset.id, ProxyEncoderPolicy::Software)
+            .unwrap();
+        let path = PathBuf::from(generated.proxy_path.unwrap());
+        // Distinguish the prior valid output from a deterministic regeneration.
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"previous_registered_proxy_marker")
+            .unwrap();
+        let old_bytes = fs::read(&path).unwrap();
+        let old_provenance = catalog
+            .registered_proxy_generation_provenance(&asset.id)
+            .unwrap()
+            .unwrap();
+        // Fail at COMMIT, after the staging file has been atomically published.
+        catalog
+            .connection()
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE proxy_commit_failure (
+                asset_id TEXT REFERENCES assets(id) DEFERRABLE INITIALLY DEFERRED);
+             CREATE TRIGGER fail_proxy_commit AFTER INSERT ON proxy_generation_provenance
+             BEGIN INSERT INTO proxy_commit_failure VALUES ('missing-asset'); END;",
+            )
+            .unwrap();
+        let error = catalog
+            .generate_proxy_with_policy(&asset.id, ProxyEncoderPolicy::Software)
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("register generated proxy"),
+            "{error:#}"
+        );
+        assert_eq!(fs::read(&path).unwrap(), old_bytes);
+        assert_eq!(
+            catalog
+                .registered_proxy_generation_provenance(&asset.id)
+                .unwrap()
+                .unwrap()
+                .id,
+            old_provenance.id
+        );
+        assert_eq!(
+            catalog
+                .proxy_generation_provenance(&asset.id, 20)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(fs::read_dir(path.parent().unwrap()).unwrap().all(|entry| {
+            let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+            !name.contains("commit-backup") && !name.ends_with(".tmp.mp4")
+        }));
     }
 
     #[test]
@@ -7402,10 +7891,14 @@ pub(crate) mod tests {
 
         let mut proxy_progress = Vec::new();
         let first_proxy_report = catalog
-            .generate_missing_proxies_with_progress(&project.id, |progress| {
-                proxy_progress.push(progress);
-                ControlFlow::Continue(())
-            })
+            .generate_missing_proxies_with_policy_and_progress(
+                &project.id,
+                ProxyEncoderPolicy::Software,
+                |progress| {
+                    proxy_progress.push(progress);
+                    ControlFlow::Continue(())
+                },
+            )
             .unwrap();
         assert_eq!(first_proxy_report.generated, 1);
         assert!(proxy_progress.len() >= 3);
@@ -7423,9 +7916,17 @@ pub(crate) mod tests {
                 .estimated_remaining_seconds,
             Some(0.0)
         );
+        let first_encoder = ProxyEncoderKind::parse(
+            &catalog
+                .proxy_generation_provenance(&asset.id, 1)
+                .unwrap()
+                .remove(0)
+                .selected_encoder,
+        )
+        .unwrap();
         assert_eq!(
             catalog
-                .load_batch_history(proxy_task_kind(1))
+                .load_batch_history(&proxy_task_kind_for_encoder(first_encoder, 1))
                 .unwrap()
                 .samples,
             1
@@ -7449,9 +7950,13 @@ pub(crate) mod tests {
         fs::remove_file(proxied.proxy_path.as_deref().unwrap()).unwrap();
         let mut single_proxy_progress = Vec::new();
         let regenerated_proxy = catalog
-            .generate_proxy_with_progress(&asset.id, |progress| {
-                single_proxy_progress.push(progress);
-            })
+            .generate_proxy_with_policy_and_progress(
+                &asset.id,
+                ProxyEncoderPolicy::Software,
+                |progress| {
+                    single_proxy_progress.push(progress);
+                },
+            )
             .unwrap();
         assert!(single_proxy_progress.len() >= 3);
         assert!(
@@ -7469,9 +7974,17 @@ pub(crate) mod tests {
             Some(0.0)
         );
         assert!(Path::new(regenerated_proxy.proxy_path.as_deref().unwrap()).is_file());
+        let second_encoder = ProxyEncoderKind::parse(
+            &catalog
+                .proxy_generation_provenance(&asset.id, 1)
+                .unwrap()
+                .remove(0)
+                .selected_encoder,
+        )
+        .unwrap();
         assert_eq!(
             catalog
-                .load_batch_history(proxy_task_kind(1))
+                .load_batch_history(&proxy_task_kind_for_encoder(second_encoder, 1))
                 .unwrap()
                 .samples,
             2

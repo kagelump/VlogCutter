@@ -1,10 +1,11 @@
 use anyhow::{Context, Result, anyhow, ensure};
 #[cfg(test)]
 use clap::CommandFactory;
-use clap::{Parser, Subcommand, error::ErrorKind};
+use clap::{Parser, Subcommand, ValueEnum, error::ErrorKind};
 use rcdvlog_core::{
-    Asset, AssetPatch, Catalog, MediaStreamInfo, ProxyRepresentation, inspect_catalog,
-    landscape_default_rotation, probe_media_stream,
+    Asset, AssetPatch, Catalog, MediaStreamInfo, ProxyEncoderPolicy, ProxyRepresentation,
+    inspect_catalog, landscape_default_rotation, probe_media_stream,
+    probe_proxy_encoder_capabilities,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -423,15 +424,39 @@ enum ClockCommand {
     },
 }
 
+#[derive(Debug, Clone, Copy, Default, ValueEnum)]
+enum ProxyPolicyArg {
+    /// Probe and use supported hardware, then safely fall back to software.
+    #[default]
+    Auto,
+    /// Never initialize hardware; deterministic software recipe.
+    Software,
+}
+
+impl From<ProxyPolicyArg> for ProxyEncoderPolicy {
+    fn from(value: ProxyPolicyArg) -> Self {
+        match value {
+            ProxyPolicyArg::Auto => Self::Auto,
+            ProxyPolicyArg::Software => Self::Software,
+        }
+    }
+}
+
 #[derive(Debug, Subcommand)]
 enum ProxyCommand {
     Generate {
         #[arg(long)]
         asset: String,
+        /// Encoder policy: auto (hardware probe with software fallback) or software.
+        #[arg(long, value_enum, default_value_t)]
+        policy: ProxyPolicyArg,
     },
     Missing {
         #[arg(long)]
         project: String,
+        /// Encoder policy: auto (hardware probe with software fallback) or software.
+        #[arg(long, value_enum, default_value_t)]
+        policy: ProxyPolicyArg,
     },
     /// Report missing and obsolete proxy representations without generating them.
     Status {
@@ -442,6 +467,20 @@ enum ProxyCommand {
         #[arg(long, default_value_t = 100)]
         limit: usize,
     },
+    /// Probe usable software/hardware encoder paths with bounded synthetic media.
+    Probe {
+        #[arg(long, value_enum, default_value_t)]
+        policy: ProxyPolicyArg,
+    },
+    /// Show durable encoder/recipe/timing/failure/fallback provenance.
+    Provenance {
+        #[arg(long)]
+        asset: String,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+    /// Show encoder- and worker-count-aware throughput observations.
+    History,
 }
 
 #[derive(Debug, Subcommand)]
@@ -583,6 +622,9 @@ fn command_name(command: &Commands) -> &'static str {
             ProxyCommand::Generate { .. } => "proxy.generate",
             ProxyCommand::Missing { .. } => "proxy.missing",
             ProxyCommand::Status { .. } => "proxy.status",
+            ProxyCommand::Probe { .. } => "proxy.probe",
+            ProxyCommand::Provenance { .. } => "proxy.provenance",
+            ProxyCommand::History => "proxy.history",
         },
         Commands::Transcribe { command } => match command {
             TranscribeCommand::Generate { .. } => "transcribe.generate",
@@ -640,6 +682,16 @@ fn execute(cli: &Cli) -> Result<Value> {
         };
         return preparation_commands::execute(&catalog, command);
     }
+    // Capability probing is a host diagnostic and intentionally does not need
+    // an existing catalog or create one as a side effect.
+    if let Commands::Proxy {
+        command: ProxyCommand::Probe { policy },
+    } = &cli.command
+    {
+        return Ok(serde_json::to_value(probe_proxy_encoder_capabilities(
+            (*policy).into(),
+        ))?);
+    }
     let catalog_path = selected_catalog(cli)?;
     if let Commands::Server {
         connection,
@@ -677,6 +729,8 @@ fn execute(cli: &Cli) -> Result<Value> {
             command: ClipsCommand::Diagnose { .. }
         } | Commands::Proxy {
             command: ProxyCommand::Status { .. }
+                | ProxyCommand::Provenance { .. }
+                | ProxyCommand::History
         } | Commands::Transcribe {
             command: TranscribeCommand::Status { .. }
         } | Commands::Analyze {
@@ -904,17 +958,24 @@ fn execute(cli: &Cli) -> Result<Value> {
             )?)?),
         },
         Commands::Proxy { command } => match command {
-            ProxyCommand::Generate { asset } => {
-                Ok(serde_json::to_value(catalog.generate_proxy(asset)?)?)
-            }
-            ProxyCommand::Missing { project } => Ok(serde_json::to_value(
-                catalog.generate_missing_proxies(project)?,
+            ProxyCommand::Generate { asset, policy } => Ok(serde_json::to_value(
+                catalog.generate_proxy_with_policy(asset, (*policy).into())?,
+            )?),
+            ProxyCommand::Missing { project, policy } => Ok(serde_json::to_value(
+                catalog.generate_missing_proxies_with_policy(project, (*policy).into())?,
             )?),
             ProxyCommand::Status {
                 asset,
                 project,
                 limit,
             } => proxy_status(&catalog, asset.as_deref(), project.as_deref(), *limit),
+            ProxyCommand::Probe { .. } => unreachable!(),
+            ProxyCommand::Provenance { asset, limit } => Ok(serde_json::to_value(
+                catalog.proxy_generation_provenance(asset, *limit)?,
+            )?),
+            ProxyCommand::History => {
+                Ok(serde_json::to_value(catalog.proxy_rate_histories()?)?)
+            }
         },
         Commands::Transcribe { command } => match command {
             TranscribeCommand::Generate { asset } => {
@@ -1291,6 +1352,18 @@ fn proxy_status(
             } else {
                 None
             };
+            let provenance = catalog
+                .proxy_generation_provenance(&asset.id, 1)
+                .ok()
+                .and_then(|mut entries| entries.pop());
+            let registered = if version == "current_raw_v3" {
+                catalog
+                    .registered_proxy_generation_provenance(&asset.id)
+                    .ok()
+                    .flatten()
+            } else {
+                None
+            };
             let ready = version == "current_raw_v3"
                 && validation
                     .as_ref()
@@ -1301,6 +1374,10 @@ fn proxy_status(
                 "filename": asset.filename,
                 "path": asset.proxy_path,
                 "version": version,
+                "recipeKey": registered.as_ref().map(|entry| entry.recipe_key.as_str()),
+                "encoder": registered.as_ref().map(|entry| entry.selected_encoder.as_str()),
+                "latestProvenance": provenance,
+                "registeredProvenance": registered,
                 "validation": validation,
                 "ready": ready,
                 "regenerationRequired": !ready,
@@ -1317,6 +1394,7 @@ fn proxy_status(
             "legacy": assets.iter().filter(|asset| proxy_version(asset) == "legacy_metadata_baked_v1").count(),
             "missing": assets.iter().filter(|asset| proxy_version(asset) == "missing").count(),
         },
+        "encoderRateHistories": catalog.proxy_rate_histories()?,
         "items": items,
     }))
 }
@@ -1579,7 +1657,10 @@ fn main() -> ExitCode {
                 error.downcast_ref::<rcdvlog_core::ChronologyEvidenceError>();
             let media_tool_failure = error
                 .downcast_ref::<rcdvlog_core::MediaToolFailure>()
-                .is_some();
+                .is_some()
+                || error
+                    .downcast_ref::<rcdvlog_core::ProxyTranscodeFailure>()
+                    .is_some();
             let readiness_error = error.downcast_ref::<rcdvlog_core::AgentReadinessError>();
             let transcription_selection_error =
                 error.downcast_ref::<rcdvlog_core::TranscriptionSelectionError>();
@@ -1932,6 +2013,47 @@ mod tests {
         assert_eq!(result["total"], 2);
         assert_eq!(result["items"].as_array().unwrap().len(), 1);
         assert_eq!(result["items"][0]["filename"], "DJI_B.MP4");
+    }
+
+    #[test]
+    fn proxy_probe_is_machine_readable_and_does_not_create_a_catalog() {
+        let directory = tempdir().unwrap();
+        let catalog_path = directory.path().join("not-created-probe.sqlite3");
+        let catalog_arg = catalog_path.to_string_lossy();
+        let probe = parse(&[
+            "rcdvlog",
+            "--catalog",
+            &catalog_arg,
+            "proxy",
+            "probe",
+            "--policy",
+            "software",
+        ]);
+        assert_eq!(command_name(&probe.command), "proxy.probe");
+        let result = execute(&probe).unwrap();
+        assert_eq!(result["policy"], "software");
+        assert_eq!(result["selectedEncoder"], "software");
+        assert!(
+            result["hardware"][0]["status"] == "not_requested"
+                || result["hardware"][0]["status"] == "unsupported_platform"
+        );
+        assert!(!catalog_path.exists());
+    }
+
+    #[test]
+    fn proxy_generate_accepts_explicit_encoder_policy() {
+        let generate = parse(&[
+            "rcdvlog",
+            "--catalog",
+            "/synthetic/catalog.sqlite3",
+            "proxy",
+            "generate",
+            "--asset",
+            "asset_synthetic",
+            "--policy",
+            "software",
+        ]);
+        assert_eq!(command_name(&generate.command), "proxy.generate");
     }
 
     #[test]

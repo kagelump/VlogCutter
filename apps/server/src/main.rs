@@ -417,7 +417,8 @@ async fn run() -> Result<()> {
             worker_config.derived_dir.clone(),
             std::path::PathBuf::from(&worker_config.ffmpeg_command),
             std::path::PathBuf::from(&worker_config.ffprobe_command),
-        );
+        )
+        .with_proxy_encoder_policy(worker_config.proxy_encoder_policy);
         let backup_manager = worker_catalog.backups(worker_config.clone());
         let backup_service = Arc::new(BackupService::new(
             backup_manager.clone(),

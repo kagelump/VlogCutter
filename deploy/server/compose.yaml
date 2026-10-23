@@ -47,7 +47,13 @@ services:
       RCDVLOG_BACKUP_DAILY_RETENTION: ${RCDVLOG_BACKUP_DAILY_RETENTION:-14}
       RCDVLOG_BACKUP_WEEKLY_RETENTION: ${RCDVLOG_BACKUP_WEEKLY_RETENTION:-8}
       RCDVLOG_MINIMUM_FREE_BYTES: ${RCDVLOG_MINIMUM_FREE_BYTES:-5368709120}
+      RCDVLOG_PROXY_ENCODER_POLICY: ${RCDVLOG_PROXY_ENCODER_POLICY:-auto}
       RUST_LOG: ${RUST_LOG:-info}
+    # Optional VAAPI acceleration. Uncomment both lines only when the host has
+    # a usable render node and the container user has render/video access. A
+    # failed probe reports the reason and auto falls back to software.
+    # devices:
+    #   - /dev/dri:/dev/dri
     volumes:
       - type: volume
         source: rcdvlog-state

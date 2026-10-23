@@ -198,6 +198,7 @@ fn executable() -> Result<CliExecutable> {
             ("transcribe.selected.v1".into(), 1),
             ("video.validation.v1".into(), 1),
             ("camera-sidecars.mapping.v1".into(), 1),
+            ("proxy.encoders.v1".into(), 1),
             ("moments.discovery.v1".into(), 1),
             ("prepare.evidence.v1".into(), 1),
         ]),

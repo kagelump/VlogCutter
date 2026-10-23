@@ -415,13 +415,36 @@ or reassignment, the selected IDs are explicit and cannot grow during retry.
 ### Proxies
 
 ```bash
-rcdvlog --catalog /absolute/project/catalog.sqlite3 proxy generate --asset <asset-id>
-rcdvlog --catalog /absolute/project/catalog.sqlite3 proxy missing --project <project-id>
+rcdvlog --catalog /absolute/project/catalog.sqlite3 proxy generate --asset <asset-id> --policy auto
+rcdvlog --catalog /absolute/project/catalog.sqlite3 proxy generate --asset <asset-id> --policy software
+rcdvlog --catalog /absolute/project/catalog.sqlite3 proxy missing --project <project-id> --policy auto
 rcdvlog --catalog /absolute/project/catalog.sqlite3 proxy status --asset <asset-id>
 rcdvlog --catalog /absolute/project/catalog.sqlite3 proxy status --project <project-id> --limit 100
+rcdvlog proxy probe --policy auto
+rcdvlog --catalog /absolute/project/catalog.sqlite3 proxy provenance --asset <asset-id>
+rcdvlog --catalog /absolute/project/catalog.sqlite3 proxy history
 ```
 
-`proxy status` is read-only and distinguishes verified raw-orientation v3 proxies, obsolete metadata-tagged raw v2 proxies, legacy metadata-baked v1 proxies, and missing files. Listed v3 items are live-probed and are ready only when their display rotation is 0°. `proxy missing` may be long-running and regenerates obsolete representations when originals are available. Completed proxies remain committed if the command is interrupted.
+`--policy auto` is the safe default: on Linux it uses only a capability after a
+real bounded VAAPI decode/scale/encode probe, then retains software fallback.
+`--policy software` never opens a DRM device and is deterministic for tests and
+operators. `proxy probe` is a host diagnostic and deliberately does not require
+an existing catalog. Its JSON separates device presence, device accessibility,
+FFmpeg encoder advertisement, actual initialization testing, and usability, and
+includes actionable status/detail for unavailable hardware.
+
+`proxy status` is read-only and distinguishes verified raw-orientation v3
+proxies, obsolete metadata-tagged raw v2 proxies, legacy metadata-baked v1
+proxies, and missing files. Listed v3 items are live-probed and are ready only
+when their display rotation is 0°. It also includes each item's latest recipe
+and actual encoder provenance plus encoder-aware rate histories with an explicit
+scope note. `proxy provenance` returns durable attempt/recipe/timing/failure/
+fallback/validation evidence newest first. `proxy history` returns throughput
+observations scoped by actual successful encoder and worker count; those rates
+describe only this host/catalog's observed corpus mix and are not universal
+benchmarks. `proxy missing` may be long-running and regenerates obsolete
+representations when originals are available. Completed proxies remain committed
+if the command is interrupted.
 
 Proxy and thumbnail writes coordinate across CLI, desktop, and sync through OS file claims under the managed `cache/.representation-locks` directory, keyed by cache root, asset, and kind. Lock files persist after release and must not be deleted: removing one could let two processes own different inodes for the same representation. A contended single-item generate command exits nonzero with `error.code: "representation_busy"`; batch commands count contended work as skipped, without a failure or throughput sample. Proxy downloads acquire the claim before requesting content, stream into unique staging files, and publish through the same validation/registration path as generated proxies.
 

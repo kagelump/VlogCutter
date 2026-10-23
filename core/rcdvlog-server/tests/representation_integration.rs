@@ -1,8 +1,8 @@
 use rcdvlog_core::{
     BindingVerificationStatus, GlobalMediaVerificationState, LocationVerificationState,
-    MediaObjectId, RootAssociationConfirmation, RootAssociationConfirmationStatus,
-    RootAssociationEvidence, RootRelativePath, StorageAccessMode, StorageObjectId, StorageProtocol,
-    StorageRootId,
+    MediaObjectId, ProxyEncoderKind, RootAssociationConfirmation,
+    RootAssociationConfirmationStatus, RootAssociationEvidence, RootRelativePath,
+    StorageAccessMode, StorageObjectId, StorageProtocol, StorageRootId, proxy_rate_history_key,
 };
 use rcdvlog_server_core::{
     ControlCatalog, FailureKind, JobHandler, LocalNodeRootBindingInput, NewMediaObject,
@@ -283,6 +283,140 @@ fn duplicate_requests_reuse_one_content_addressed_proxy_and_preserve_originals()
 }
 
 #[test]
+fn proxy_job_records_actual_encoder_validation_and_fallback_provenance() {
+    if !tools_available() {
+        return;
+    }
+    let fixture = fixture();
+    let _request = service(&fixture)
+        .request(RepresentationRequest {
+            media_object_id: fixture.media_id.clone(),
+            kind: RepresentationKind::Proxy,
+        })
+        .unwrap();
+    let engine = fixture.catalog.jobs();
+    let claimed = engine
+        .claim_next(
+            "representation-provenance",
+            std::time::Duration::from_secs(30),
+        )
+        .unwrap()
+        .expect("queued proxy job");
+    let handler = handler(&fixture);
+    let result = handler
+        .run(claimed.clone(), CancellationToken::new())
+        .unwrap();
+    let provenance = result
+        .details
+        .get("proxyProvenance")
+        .expect("proxy job must persist actual encoder provenance");
+    assert!(
+        matches!(
+            provenance["selectedEncoder"].as_str(),
+            Some("software" | "vaapi" | "videotoolbox")
+        ),
+        "{provenance}"
+    );
+    assert_eq!(provenance["status"], "succeeded");
+    assert_eq!(provenance["validation"]["decoded"], true);
+    assert_eq!(provenance["validation"]["metadataRotationDegrees"], 0);
+    assert_eq!(provenance["validation"]["audioStreamCount"], 1);
+    assert!(
+        provenance["attempts"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty())
+    );
+    let actual_encoder = ProxyEncoderKind::parse(
+        provenance["selectedEncoder"]
+            .as_str()
+            .expect("encoder name"),
+    )
+    .unwrap();
+    let expected_rate_key = proxy_rate_history_key(actual_encoder, 1);
+    assert_eq!(provenance["rateHistoryKey"], expected_rate_key);
+    let connection = open_writable_connection(fixture.catalog.database_path()).unwrap();
+    let rate_samples: i64 = connection
+        .query_row(
+            "SELECT samples FROM job_rate_history WHERE recipe_key=?1",
+            [&expected_rate_key],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(rate_samples, 1);
+    engine
+        .complete(&claimed, result.clone(), |tx| {
+            handler.commit_result(tx, &claimed, &result)
+        })
+        .unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn failed_proxy_job_persists_attempt_and_fallback_evidence_without_registration() {
+    use std::os::unix::fs::PermissionsExt;
+
+    if !tools_available() {
+        return;
+    }
+    let fixture = fixture();
+    let request = service(&fixture)
+        .request(RepresentationRequest {
+            media_object_id: fixture.media_id.clone(),
+            kind: RepresentationKind::Proxy,
+        })
+        .unwrap();
+    let fake = fixture._root.path().join("server-failing-ffmpeg");
+    fs::write(
+        &fake,
+        "#!/bin/sh\necho 'synthetic server hardware and software failure' >&2\nexit 1\n",
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&fake).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&fake, permissions).unwrap();
+    let engine = fixture.catalog.jobs();
+    let claimed = engine
+        .claim_next("representation-failure", std::time::Duration::from_secs(30))
+        .unwrap()
+        .expect("queued proxy job");
+    let handler = RepresentationJobHandler::new(
+        fixture.catalog.storage_library(),
+        fixture.catalog.jobs(),
+        fixture.derived.clone(),
+        fake,
+        PathBuf::from("ffprobe"),
+    );
+    let failure = handler
+        .run(claimed.clone(), CancellationToken::new())
+        .unwrap_err();
+    assert_eq!(failure.code, "media_tool_failed");
+    let provenance = &failure.details["proxyProvenance"];
+    assert_eq!(provenance["status"], "failed");
+    assert!(
+        provenance["attempts"]
+            .as_array()
+            .is_some_and(|attempts| !attempts.is_empty())
+    );
+    assert!(provenance["validation"].is_null());
+    engine
+        .fail(
+            &claimed,
+            failure.kind,
+            &failure.code,
+            failure.details.clone(),
+        )
+        .unwrap();
+    assert!(
+        service(&fixture)
+            .get(&request.representation.id)
+            .unwrap()
+            .state
+            == RepresentationState::Pending
+    );
+    assert!(walk_files(&fixture.derived).is_empty());
+}
+
+#[test]
 fn thumbnail_recipe_generates_valid_bounded_jpeg() {
     if !tools_available() {
         return;
@@ -304,6 +438,57 @@ fn thumbnail_recipe_generates_valid_bounded_jpeg() {
     let remaining_needs = service(&fixture).list_needs(&fixture.media_id).unwrap();
     assert_eq!(remaining_needs.len(), 1);
     assert_eq!(remaining_needs[0].kind, RepresentationKind::Proxy);
+}
+
+#[cfg(unix)]
+#[test]
+fn cancellation_stops_an_in_flight_silent_proxy_process() {
+    use std::os::unix::fs::PermissionsExt;
+    if !tools_available() {
+        return;
+    }
+    let fixture = fixture();
+    service(&fixture)
+        .request(RepresentationRequest {
+            media_object_id: fixture.media_id.clone(),
+            kind: RepresentationKind::Proxy,
+        })
+        .unwrap();
+    let claimed = fixture
+        .catalog
+        .jobs()
+        .claim_next("cancel-in-flight", std::time::Duration::from_secs(30))
+        .unwrap()
+        .unwrap();
+    let marker = fixture._root.path().join("encoder-started");
+    let script = fixture._root.path().join("silent-ffmpeg");
+    fs::write(&script, format!("#!/bin/sh\nfor arg in \"$@\"; do\n if [ \"$arg\" = -encoders ]; then echo libx264; exit 0; fi\ndone\ntouch '{}'\nexec sleep 30\n", marker.display())).unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    let handler = RepresentationJobHandler::new(
+        fixture.catalog.storage_library(),
+        fixture.catalog.jobs(),
+        fixture.derived.clone(),
+        script,
+        PathBuf::from("ffprobe"),
+    )
+    .with_proxy_encoder_policy(rcdvlog_core::ProxyEncoderPolicy::Software);
+    let cancellation = CancellationToken::new();
+    let token = cancellation.clone();
+    let started = std::time::Instant::now();
+    let worker = std::thread::spawn(move || handler.run(claimed, token));
+    while !marker.exists() && started.elapsed() < std::time::Duration::from_secs(5) {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let entered_encoder = marker.exists();
+    cancellation.cancel();
+    let failure = worker.join().unwrap().unwrap_err();
+    assert!(
+        entered_encoder,
+        "test must cancel a running encoder, not only preflight"
+    );
+    assert_eq!(failure.code, "canceled");
+    assert!(started.elapsed() < std::time::Duration::from_secs(7));
+    assert!(walk_files(&fixture.derived).is_empty());
 }
 
 #[test]
