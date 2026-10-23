@@ -23,6 +23,7 @@ mod agent;
 mod analysis;
 mod archive;
 mod baseline;
+mod camera_proxy;
 mod cameras;
 mod cards;
 mod chronology;
@@ -80,6 +81,7 @@ pub use analysis::provider::{
 };
 pub use archive::{ArchiveRoot, EndpointProbe};
 pub use batch_estimator::BatchEstimate as BatchProgressEstimate;
+pub use camera_proxy::{CameraProxySidecar, CameraSidecarProvenance, CameraTimeMapping};
 pub use cards::{
     CardCandidate, MountedVolumes, VolumeSource, card_session_slug, detect_cards, inspect_card,
 };
@@ -344,26 +346,6 @@ pub struct Asset {
     #[serde(default)]
     pub revision: u64,
 }
-
-/// A read-only discovery result or explicitly registered camera supplied proxy.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CameraProxySidecar {
-    pub asset_id: String,
-    pub path: String,
-    pub card_root: String,
-    pub status: String,
-    pub detail: String,
-    pub byte_length: Option<u64>,
-    pub fingerprint: Option<String>,
-    pub codec: Option<String>,
-    pub width: Option<u32>,
-    pub height: Option<u32>,
-    pub duration_seconds: Option<f64>,
-    pub verified_at: Option<String>,
-}
-
-type RegisteredCameraProxySidecarRow = (String, String, i64, String, String, u32, u32, f64, String);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -983,221 +965,6 @@ struct MediaProbe {
 }
 
 impl Catalog {
-    /// Discover `.LRF` siblings only within the caller's exact card root. This
-    /// method never writes catalog or media bytes.
-    pub fn discover_camera_proxy_sidecars(
-        &self,
-        project_id: &str,
-        card_root: impl AsRef<Path>,
-    ) -> Result<Vec<CameraProxySidecar>> {
-        let root = fs::canonicalize(card_root.as_ref())
-            .with_context(|| format!("open card root {}", card_root.as_ref().display()))?;
-        let root_text = root.to_string_lossy().into_owned();
-        let assets = self.list_assets(project_id)?;
-        let connection = self.connection()?;
-        let mut results = Vec::new();
-        for asset in assets {
-            let original = Path::new(&asset.path);
-            if !original.starts_with(&root) {
-                continue;
-            }
-            let Some(stem) = original.file_stem() else {
-                continue;
-            };
-            let candidate = original.with_file_name(format!("{}.LRF", stem.to_string_lossy()));
-            if !candidate.is_file() {
-                results.push(CameraProxySidecar {
-                    asset_id: asset.id,
-                    path: candidate.to_string_lossy().into_owned(),
-                    card_root: root_text.clone(),
-                    status: "missing".into(),
-                    detail: "no same-directory .LRF candidate on this card".into(),
-                    byte_length: None,
-                    fingerprint: None,
-                    codec: None,
-                    width: None,
-                    height: None,
-                    duration_seconds: None,
-                    verified_at: None,
-                });
-                continue;
-            }
-            let size = fs::metadata(&candidate)?.len();
-            let report = (|| -> Result<(MediaStreamInfo, f64, String)> {
-                let info = probe_media_stream(&candidate)?;
-                let doc = probe_media_document(&candidate)?;
-                verify_camera_sidecar_decode(&candidate)?;
-                let duration = doc["format"]["duration"]
-                    .as_str()
-                    .and_then(|v| v.parse::<f64>().ok())
-                    .unwrap_or(0.0);
-                let audio_aac = camera_sidecar_has_aac(&candidate)?;
-                if !info.codec.eq_ignore_ascii_case("h264") || !audio_aac {
-                    bail!(
-                        "unsupported: camera proxy must contain H.264 video and AAC audio (video={}, AAC={audio_aac})",
-                        info.codec
-                    )
-                }
-                if info.width >= asset.width || info.height >= asset.height {
-                    bail!("mismatch: candidate is not lower resolution than the original")
-                }
-                if duration <= 0.0 || (duration - asset.duration_seconds).abs() > 1.0 {
-                    bail!("mismatch: duration differs from original by more than 1 second")
-                }
-                let fingerprint = camera_sidecar_fingerprint(&candidate)?;
-                Ok((info, duration, fingerprint))
-            })();
-            match report {
-                Ok((info, duration, fingerprint)) => {
-                    let registered: Option<RegisteredCameraProxySidecarRow> = connection.query_row("SELECT path,card_root,byte_length,fingerprint,codec,width,height,duration_seconds,verified_at FROM camera_proxy_sidecars WHERE asset_id=?1", [&asset.id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?))).optional()?;
-                    let unchanged = registered.as_ref().is_some_and(|r| {
-                        Path::new(&r.0) == candidate
-                            && r.1 == root_text
-                            && r.2 == size as i64
-                            && r.3 == fingerprint
-                    });
-                    results.push(CameraProxySidecar { asset_id:asset.id, path:candidate.to_string_lossy().into_owned(), card_root:root_text.clone(), status:if unchanged {"registered"} else {"candidate"}.into(), detail:if unchanged {"registered sidecar still matches verified bytes"} else {"candidate passed codec, dimensions, duration, and identity-scope checks; explicit registration required"}.into(), byte_length:Some(size), fingerprint:Some(fingerprint), codec:Some(info.codec), width:Some(info.width), height:Some(info.height), duration_seconds:Some(duration), verified_at:registered.filter(|_| unchanged).map(|r|r.8) });
-                }
-                Err(error) => {
-                    let detail = error.to_string();
-                    let status = if detail.starts_with("unsupported:") {
-                        "unsupported"
-                    } else if detail.starts_with("mismatch:") {
-                        "mismatch"
-                    } else {
-                        "truncated_or_unreadable"
-                    };
-                    results.push(CameraProxySidecar {
-                        asset_id: asset.id,
-                        path: candidate.to_string_lossy().into_owned(),
-                        card_root: root_text.clone(),
-                        status: status.into(),
-                        detail,
-                        byte_length: Some(size),
-                        fingerprint: None,
-                        codec: None,
-                        width: None,
-                        height: None,
-                        duration_seconds: None,
-                        verified_at: None,
-                    });
-                }
-            }
-        }
-        Ok(results)
-    }
-
-    /// Explicitly register a sidecar after repeating all checks used by discovery.
-    pub fn register_camera_proxy_sidecar(
-        &self,
-        asset_id: &str,
-        card_root: impl AsRef<Path>,
-        sidecar: impl AsRef<Path>,
-    ) -> Result<CameraProxySidecar> {
-        if self.read_only {
-            bail!("catalog is read-only")
-        }
-        let asset = self.get_asset(asset_id)?;
-        let root = fs::canonicalize(card_root.as_ref())?;
-        let path = fs::canonicalize(sidecar.as_ref())?;
-        if !path.starts_with(&root) || !Path::new(&asset.path).starts_with(&root) {
-            bail!("sidecar and original must belong to the exact same card root")
-        }
-        if path.parent() != Path::new(&asset.path).parent()
-            || path.file_stem() != Path::new(&asset.path).file_stem()
-            || !path
-                .extension()
-                .is_some_and(|e| e.eq_ignore_ascii_case("LRF"))
-        {
-            bail!("sidecar must be the same-directory, same-name .LRF counterpart")
-        }
-        let info = probe_media_stream(&path)?;
-        let doc = probe_media_document(&path)?;
-        verify_camera_sidecar_decode(&path)?;
-        if !info.codec.eq_ignore_ascii_case("h264") || !camera_sidecar_has_aac(&path)? {
-            bail!("unsupported: expected H.264 video and AAC audio")
-        }
-        let duration = doc["format"]["duration"]
-            .as_str()
-            .and_then(|v| v.parse::<f64>().ok())
-            .unwrap_or(0.0);
-        if info.width >= asset.width
-            || info.height >= asset.height
-            || duration <= 0.0
-            || (duration - asset.duration_seconds).abs() > 1.0
-        {
-            bail!("mismatch: dimensions or duration do not match the source clip")
-        }
-        let size = fs::metadata(&path)?.len();
-        let fingerprint = camera_sidecar_fingerprint(&path)?;
-        let verified_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
-        let conn = self.connection()?;
-        conn.execute("INSERT INTO camera_proxy_sidecars(asset_id,path,card_root,byte_length,fingerprint,codec,width,height,duration_seconds,verified_at,verification) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,'verified') ON CONFLICT(asset_id) DO UPDATE SET path=excluded.path,card_root=excluded.card_root,byte_length=excluded.byte_length,fingerprint=excluded.fingerprint,codec=excluded.codec,width=excluded.width,height=excluded.height,duration_seconds=excluded.duration_seconds,verified_at=excluded.verified_at,verification='verified'", params![asset_id,path.to_string_lossy(),root.to_string_lossy(),size as i64,fingerprint,info.codec,info.width,info.height,duration,verified_at])?;
-        Ok(CameraProxySidecar {
-            asset_id: asset_id.into(),
-            path: path.to_string_lossy().into_owned(),
-            card_root: root.to_string_lossy().into_owned(),
-            status: "registered".into(),
-            detail: "verified camera sidecar registered separately from generated proxy recipes"
-                .into(),
-            byte_length: Some(size),
-            fingerprint: Some(fingerprint),
-            codec: Some(info.codec),
-            width: Some(info.width),
-            height: Some(info.height),
-            duration_seconds: Some(duration),
-            verified_at: Some(verified_at),
-        })
-    }
-
-    /// Resolve a registered, still-verifiable camera sidecar for bounded review.
-    pub fn camera_proxy_sidecar(&self, asset_id: &str) -> Result<Option<CameraProxySidecar>> {
-        self.get_asset(asset_id)?;
-        let conn = self.connection()?;
-        let row: Option<RegisteredCameraProxySidecarRow> = conn.query_row("SELECT path,card_root,byte_length,fingerprint,codec,width,height,duration_seconds,verified_at FROM camera_proxy_sidecars WHERE asset_id=?1",[asset_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?))).optional()?;
-        Ok(row.map(|r| {
-            let path = Path::new(&r.0);
-            let current = path.is_file()
-                && fs::metadata(path)
-                    .map(|m| m.len() == r.2 as u64)
-                    .unwrap_or(false)
-                && camera_sidecar_fingerprint(path)
-                    .map(|f| f == r.3)
-                    .unwrap_or(false);
-            CameraProxySidecar {
-                asset_id: asset_id.into(),
-                path: r.0,
-                card_root: r.1,
-                status: if current { "registered" } else { "stale" }.into(),
-                detail: if current {
-                    "registered sidecar verified and available"
-                } else {
-                    "registered sidecar is missing or changed; re-register after verification"
-                }
-                .into(),
-                byte_length: Some(r.2 as u64),
-                fingerprint: Some(r.3),
-                codec: Some(r.4),
-                width: Some(r.5),
-                height: Some(r.6),
-                duration_seconds: Some(r.7),
-                verified_at: Some(r.8),
-            }
-        }))
-    }
-
-    /// Resolve a currently verified camera sidecar for explicit offline review.
-    /// Callers stream the returned immutable source path using bounded ranges.
-    pub fn resolve_camera_proxy_for_review(
-        &self,
-        asset_id: &str,
-    ) -> Result<Option<CameraProxySidecar>> {
-        let Some(sidecar) = self.camera_proxy_sidecar(asset_id)? else {
-            return Ok(None);
-        };
-        Ok((sidecar.status == "registered").then_some(sidecar))
-    }
-
     pub fn open(database_path: impl AsRef<Path>) -> Result<Self> {
         let database_path = database_path.as_ref().to_path_buf();
         if database_path.is_file() {

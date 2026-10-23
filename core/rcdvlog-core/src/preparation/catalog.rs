@@ -557,7 +557,11 @@ impl Catalog {
             review_questions_truncated, representation,
             camera_sidecar_status: sidecar.as_ref().map(|s| s.status.clone()),
             camera_sidecar_reason: sidecar.map(|s| if s.status == "registered" {
-                "verified camera sidecar is available for review; analysis reuse needs an accepted source-time mapping".into()
+                if s.provenance.is_some() {
+                    "verified camera sidecar supports offline review and explicit camera-proxy frame-pack; generated analysis recipe readiness is separate".into()
+                } else {
+                    "legacy camera sidecar supports review; re-register for verified time-mapped frame packs".into()
+                }
             } else { clipped(&s.detail, 512).0 }),
             transcript, moments, moment_details_truncated, orientation, technical_range,
             range_certification: "technical source bounds only; sparse moment samples do not certify arbitrary edit ranges".into(),

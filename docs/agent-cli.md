@@ -263,6 +263,22 @@ receive a separate capture sequence, preserving the other assets and card
 counter spaces. A NULL counter is filled only when the preserved filename
 matches a known camera pattern.
 
+### Camera sidecars
+
+`camera-proxy discover --project <id> --card <root>` checks same-directory `.LRF`
+companions through recorded same-asset original locations, including verified
+alternates when the preferred original has been organized elsewhere.
+`camera-proxy register --asset <id> --card <root> --sidecar <path>` explicitly
+verifies and atomically registers the camera representation under the proxy
+claim. `camera-proxy status --asset <id>` reports bytes, availability and saved
+association/content/rate/time provenance. `camera-proxy frame-pack --asset <id>`
+returns a representation-aware manifest with source-relative sample timestamps
+and a fingerprint of the accepted bytes and mapping, including with offline
+originals. Discover, status and frame-pack are read-only; they never migrate a
+catalog or make a provider request. Generated-proxy readiness stays separate.
+See [camera sidecar verification](camera-proxy-sidecars.md) for supported integer
+rate reductions, rejection reasons and legacy behavior.
+
 ### Smart ingest camera mappings
 
 ```bash

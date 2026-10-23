@@ -74,6 +74,11 @@ Implemented now:
   it lists and counts only until the user asks to review the import.
 - Sampled fingerprint deduplication within a project, with rediscovered content
   repairing an asset whose original went offline rather than being discarded.
+- Verified camera `.LRF` sidecars can resolve through recorded same-asset
+  alternate originals, with persisted CFR integer-reduction time mappings and
+  bounded content checks. `camera-proxy frame-pack` samples that explicit camera
+  representation offline; generated-proxy readiness remains separate. See
+  `docs/camera-proxy-sidecars.md`.
 - Verified node-local media locations: availability requires that the bytes were
   checked, so a reformatted card reusing a pathname cannot bind an old asset to
   new footage.
