@@ -414,7 +414,7 @@ fn camera_proxy_cli_round_trips_a_generated_lrf_without_changing_media() {
     fs::create_dir_all(&dcim).unwrap();
     let original = dcim.join("CLIP0001.MP4");
     let sidecar = dcim.join("CLIP0001.LRF");
-    for (path, dimensions) in [(&original, "640x360"), (&sidecar, "320x180")] {
+    for (path, dimensions, rate) in [(&original, "640x360", 60), (&sidecar, "320x180", 30)] {
         let output = Command::new("ffmpeg")
             .args([
                 "-y",
@@ -424,7 +424,7 @@ fn camera_proxy_cli_round_trips_a_generated_lrf_without_changing_media() {
                 "-f",
                 "lavfi",
                 "-i",
-                &format!("color=c=green:s={dimensions}:r=24:d=2"),
+                &format!("color=c=green:s={dimensions}:r={rate}:d=2"),
                 "-f",
                 "lavfi",
                 "-i",
@@ -448,6 +448,20 @@ fn camera_proxy_cli_round_trips_a_generated_lrf_without_changing_media() {
             String::from_utf8_lossy(&output.stderr)
         );
     }
+    let organized = directory.path().join("organized");
+    fs::create_dir_all(&organized).unwrap();
+    let primary = organized.join("organized-name.MP4");
+    fs::copy(&original, &primary).unwrap();
+    success(
+        &catalog_path,
+        [
+            "ingest",
+            "--project",
+            &project,
+            "--folder",
+            organized.to_str().unwrap(),
+        ],
+    );
     let original_bytes = fs::read(&original).unwrap();
     let sidecar_bytes = fs::read(&sidecar).unwrap();
     success(
@@ -476,6 +490,31 @@ fn camera_proxy_cli_round_trips_a_generated_lrf_without_changing_media() {
     );
     assert_eq!(found.json["data"][0]["status"], "candidate");
     assert_eq!(found.json["data"][0]["assetId"], asset_id);
+    let wrong_card = directory.path().join("wrong-card");
+    fs::create_dir_all(wrong_card.join("DCIM")).unwrap();
+    let wrong_sidecar = wrong_card.join("DCIM/CLIP0001.LRF");
+    fs::copy(&original, wrong_card.join("DCIM/CLIP0001.MP4")).unwrap();
+    fs::copy(&sidecar, &wrong_sidecar).unwrap();
+    let wrong = failure(
+        &catalog_path,
+        [
+            "camera-proxy",
+            "register",
+            "--asset",
+            &asset_id,
+            "--card",
+            wrong_card.to_str().unwrap(),
+            "--sidecar",
+            wrong_sidecar.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(wrong["error"]["code"], "invalid_input");
+    assert!(
+        wrong["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("association_mismatch:")
+    );
     let registered = success(
         &catalog_path,
         [
@@ -490,6 +529,18 @@ fn camera_proxy_cli_round_trips_a_generated_lrf_without_changing_media() {
         ],
     );
     assert_eq!(registered.json["data"]["status"], "registered");
+    assert_eq!(
+        registered.json["data"]["provenance"]["timeMapping"]["frameReduction"],
+        2
+    );
+    assert_eq!(
+        registered.json["data"]["provenance"]["originalLocation"],
+        original.to_string_lossy().as_ref()
+    );
+    assert_eq!(
+        registered.json["data"]["provenance"]["originalRelativePath"],
+        "DCIM/CLIP0001.MP4"
+    );
     assert!(
         registered.json["data"]["fingerprint"]
             .as_str()
@@ -510,6 +561,43 @@ fn camera_proxy_cli_round_trips_a_generated_lrf_without_changing_media() {
     assert!(asset.proxy_path.is_none());
     assert_eq!(fs::read(&original).unwrap(), original_bytes);
     assert_eq!(fs::read(&sidecar).unwrap(), sidecar_bytes);
+    assert_eq!(asset.path, primary.to_string_lossy());
+    fs::rename(&primary, primary.with_extension("offline")).unwrap();
+    fs::rename(&original, original.with_extension("offline")).unwrap();
+    let frames = success(
+        &catalog_path,
+        ["camera-proxy", "frame-pack", "--asset", &asset_id],
+    );
+    assert_eq!(frames.json["command"], "camera-proxy.frame-pack");
+    assert_eq!(
+        frames.json["data"]["representation"],
+        "camera.h264-lrf.verified-v1"
+    );
+    assert!(
+        !frames.json["data"]["timestampsMs"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        frames.json["data"]["sourceFingerprint"]
+            .as_str()
+            .unwrap()
+            .len()
+            >= 64
+    );
+    let stale = directory.path().join("stale.LRF");
+    fs::rename(&sidecar, &stale).unwrap();
+    let result = failure(
+        &catalog_path,
+        ["camera-proxy", "frame-pack", "--asset", &asset_id],
+    );
+    assert!(
+        result["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("unavailable")
+    );
 }
 
 #[test]

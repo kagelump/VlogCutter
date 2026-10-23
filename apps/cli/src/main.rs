@@ -483,6 +483,11 @@ enum CameraProxyCommand {
         #[arg(long)]
         asset: String,
     },
+    /// Sample a verified camera sidecar with source-time and representation identity.
+    FramePack {
+        #[arg(long)]
+        asset: String,
+    },
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -561,6 +566,7 @@ fn command_name(command: &Commands) -> &'static str {
             CameraProxyCommand::Discover { .. } => "camera-proxy.discover",
             CameraProxyCommand::Register { .. } => "camera-proxy.register",
             CameraProxyCommand::Status { .. } => "camera-proxy.status",
+            CameraProxyCommand::FramePack { .. } => "camera-proxy.frame-pack",
         },
         Commands::Ingest { .. } => "ingest",
         Commands::Relink { .. } => "relink",
@@ -684,7 +690,9 @@ fn execute(cli: &Cli) -> Result<Value> {
         } | Commands::Cameras {
             command: CamerasCommand::RepairPreview { .. }
         } | Commands::CameraProxy {
-            command: CameraProxyCommand::Discover { .. } | CameraProxyCommand::Status { .. }
+            command: CameraProxyCommand::Discover { .. }
+                | CameraProxyCommand::Status { .. }
+                | CameraProxyCommand::FramePack { .. }
         }
     ) || matches!(&cli.command, Commands::Moments { command } if moment_commands::is_read_only(command))
         || match &cli.command {
@@ -749,6 +757,7 @@ fn execute(cli: &Cli) -> Result<Value> {
             CameraProxyCommand::Discover { project, card } => Ok(serde_json::to_value(catalog.discover_camera_proxy_sidecars(project, card)?)?),
             CameraProxyCommand::Register { asset, card, sidecar } => Ok(serde_json::to_value(catalog.register_camera_proxy_sidecar(asset, card, sidecar)?)?),
             CameraProxyCommand::Status { asset } => Ok(serde_json::to_value(catalog.camera_proxy_sidecar(asset)?)?),
+            CameraProxyCommand::FramePack { asset } => Ok(serde_json::to_value(catalog.camera_proxy_frame_pack(asset)?)?),
         },
         Commands::Cameras { command } => match command {
             CamerasCommand::RepairPreview { project, camera, assets } => Ok(serde_json::to_value(
@@ -1484,6 +1493,22 @@ fn error_code(message: &str) -> &'static str {
     } else if message.contains("not found") {
         "not_found"
     } else if message.contains("offline") {
+        "media_offline"
+    } else if [
+        "association_mismatch:",
+        "unsupported_rate_mapping:",
+        "unsupported_timing:",
+        "content_mismatch:",
+        "mismatch:",
+        "unsupported:",
+        "truncated_or_unreadable:",
+        "changed_during_verification:",
+    ]
+    .iter()
+    .any(|reason| message.contains(reason))
+    {
+        "invalid_input"
+    } else if message.contains("sidecar is unavailable") {
         "media_offline"
     } else if message.contains("empty") || message.contains("invalid") {
         "invalid_input"
