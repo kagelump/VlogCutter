@@ -653,11 +653,27 @@ touches the network. Design and measurements:
   gates `MTLResidencySetDescriptor` on the SDK rather than the deployment target,
   so a Metal build emits a macOS 15 symbol and will not launch on the documented
   OS floor. The dependency is declared `default-features = false`.
+- **Probe audio before extracting PCM.** Transcription reads the proxy and
+  calls the reviewed `probe_source_audio_present` FFprobe helper first. A valid
+  video with no audio stream completes as `no_audio` with zero VAD/ASR/model
+  work and is reused like any other terminal transcript. A probe or extraction
+  failure stays `failed` and retryable; corrupt media is never reclassified as
+  silence.
 - **The VAD gate is a correctness requirement, not an optimization.** Given
   silence, whisper invents fluent speech at high confidence. A clip with no
-  detected speech is stored as `no_speech` and is never handed to any model.
-  `no_speech` is a success and must never be conflated with `failed`, or every
-  silent clip is retried forever.
+  detected speech is stored as `no_speech` with reason `no_detected_speech` and
+  is never handed to any model. `no_speech` is a success and must never be
+  conflated with `failed`, or every silent clip is retried forever. Detected
+  speech followed by empty or unusable provider output is
+  `no_accepted_speech` with reason `empty_provider_output`, not silence.
+  Quality-gate rejections remain `rejected`; exact proxy fingerprints,
+  detected-speech duration, decode-window count, raw provider segment count,
+  mean token probability and repetition ratio stay attached to the outcome.
+- **Legacy compatibility is explicit.** Rows written before audio probing and
+  provider-output distinctions existed keep status `no_speech` but migrate with
+  reason `legacy_no_speech_unverified`. Preparation marks those rows
+  review-required because they cannot prove verified silence. Transcript
+  coverage reports `no_audio` and `no_accepted_speech` separately.
 - **Windows are 30 seconds.** whisper bills a full window per decode regardless
   of content, so speech regions are packed into as few windows as possible. Do
   not reintroduce the PRD's 8–25 second chunking: measured, it ran 30% slower on

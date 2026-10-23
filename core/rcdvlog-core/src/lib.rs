@@ -59,6 +59,9 @@ use analysis::consolidate::{
 use analysis::engine::{SttEngine, VAD_MODEL, WHISPER_MODEL, ensure_model, model_dir};
 use analysis::store::{StoredTranscript, is_current, load_transcript, save_transcript};
 use analysis::stt::transcribe_pcm;
+use analysis::stt::{
+    failed_transcript, failed_transcript_with_evidence, failure_evidence, no_audio_transcript,
+};
 use analysis::vlm::{PromptContext, PromptTranscript, analyze_clip as run_vlm};
 use analysis::vlm_store::{
     AnalysisStatus, StoredAnalysis, ai_labels_for_asset, analysis_is_current, clear_ai_labels,
@@ -165,7 +168,9 @@ pub use analysis::schema::{
     CameraMovement, ClipObservation, DomainError, UnusableReason, output_schema,
     validate as validate_observation,
 };
-pub use analysis::store::{StoredTranscript as ClipTranscript, TranscriptStatus};
+pub use analysis::store::{
+    StoredTranscript as ClipTranscript, TranscriptOutcomeReason, TranscriptStatus,
+};
 pub use analysis::stt::TranscribeOutcome;
 pub use analysis::vlm::AnalysisOutcome;
 pub use analysis::vlm_store::StoredAnalysis as ClipAnalysis;
@@ -718,6 +723,38 @@ pub struct ModelInstallReport {
     pub models: Vec<ModelStatus>,
 }
 
+fn transcribe_outcome(asset_id: &str, stored: &StoredTranscript) -> TranscribeOutcome {
+    TranscribeOutcome {
+        asset_id: asset_id.to_string(),
+        status: stored.status,
+        outcome_reason: stored.outcome_reason,
+        source_fingerprint: stored.source_fingerprint.clone(),
+        segment_count: stored.segments.len(),
+        window_count: stored.window_count,
+        speech_seconds: stored.speech_seconds,
+        provider_segment_count: stored.provider_segment_count,
+        mean_token_probability: stored.mean_token_probability,
+        repetition_ratio: stored.repetition_ratio,
+    }
+}
+
+enum ProjectPlannedAsset {
+    NoAudio {
+        asset: Asset,
+        source_fingerprint: String,
+    },
+    ProbeFailed {
+        asset: Asset,
+        source_fingerprint: String,
+        reason: String,
+    },
+    Ready {
+        asset: Asset,
+        proxy_path: PathBuf,
+        source_fingerprint: String,
+    },
+}
+
 /// Progress for a transcription batch, mirroring `AssetBatchProgress`.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -730,7 +767,13 @@ pub struct TranscribeBatchProgress {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TranscribeReport {
+    /// Terminal transcript outcomes persisted by this run, including
+    /// `no_audio`, `no_speech`, `no_accepted_speech`, and `rejected`.
     pub transcribed: usize,
+    /// Subset of `transcribed` that completed without an audio stream.
+    pub no_audio: usize,
+    /// Processing failures. These remain retryable and are not in `transcribed`.
+    pub failed: usize,
     pub skipped: usize,
     /// True when the caller stopped the batch early. Distinct from a failure:
     /// the clips already transcribed are committed and a later run resumes.
@@ -756,8 +799,16 @@ pub struct TranscriptCoverage {
     pub total: usize,
     /// Clips with usable speech.
     pub speech: usize,
-    /// Clips the VAD gate found silent. A success, not a failure.
+    /// Clips whose VAD gate ran and found no detected speech.
     pub no_speech: usize,
+    /// Subset of `no_speech` migrated from older catalogs where the schema
+    /// could not prove whether the clip was silent or audioless.
+    pub legacy_no_speech_unverified: usize,
+    /// Valid videos with no audio stream; no speech work was attempted.
+    pub no_audio: usize,
+    /// Clips where speech was detected but the provider returned no accepted
+    /// text. Distinct from literal silence.
+    pub no_accepted_speech: usize,
     /// Clips whose decode tripped the hallucination gate.
     pub rejected: usize,
     pub failed: usize,
@@ -2149,7 +2200,7 @@ impl Catalog {
         sampled_fingerprint(&proxy_path, size)
     }
 
-    fn require_proxy(asset: &Asset) -> Result<PathBuf> {
+    pub(crate) fn require_proxy(asset: &Asset) -> Result<PathBuf> {
         let path = asset
             .proxy_path
             .as_deref()
@@ -2577,20 +2628,17 @@ impl Catalog {
 
     /// Transcribe one clip with explicit, validated resource overrides. An
     /// override is provenance-bearing and never presented as calibrated.
+    ///
+    /// Audio presence is probed before the heavy slot or speech engine is
+    /// acquired. A valid clip with no audio therefore completes as `no_audio`
+    /// without initializing models, and a probe error remains a processing
+    /// failure rather than being reclassified as silence.
     pub fn transcribe_asset_with_resource_overrides(
         &self,
         asset_id: &str,
         overrides: &ResourceOverrides,
     ) -> Result<TranscribeOutcome> {
-        let _heavy = self.acquire_local_heavy()?;
-        let engine = self.open_stt_engine_for_overrides(overrides)?;
-        self.transcribe_with_engine(asset_id, engine.as_ref())
-    }
-
-    pub(crate) fn open_stt_engine_for_overrides(
-        &self,
-        overrides: &ResourceOverrides,
-    ) -> Result<Box<dyn SttEngine>> {
+        // Validate even when a no-audio fast path will not open an engine.
         let selection = self.resolve_resource_selection(
             SPEECH_REPRESENTATION_KIND,
             STT_RECIPE_KEY,
@@ -2598,7 +2646,65 @@ impl Catalog {
             None,
             overrides,
         )?;
-        self.open_stt_engine_with_threads(selection.vad_threads, selection.decode_threads)
+        let asset = self.get_asset(asset_id)?;
+        let proxy_path = Self::require_proxy(&asset)?;
+        let source_fingerprint = self.proxy_fingerprint(asset_id)?;
+        let audio_present = match self.transcription_audio_present(&proxy_path) {
+            Ok(present) => present,
+            Err(error) => {
+                let message = format!("{error:#}");
+                save_transcript(
+                    &self.connection()?,
+                    &failed_transcript(asset_id, &source_fingerprint, message.clone()),
+                )?;
+                return Err(error);
+            }
+        };
+        if !audio_present {
+            let stored = no_audio_transcript(asset_id, &source_fingerprint);
+            save_transcript(&self.connection()?, &stored)?;
+            return Ok(transcribe_outcome(asset_id, &stored));
+        }
+
+        let _heavy = self.acquire_local_heavy()?;
+        let engine = match self
+            .open_stt_engine_with_threads(selection.vad_threads, selection.decode_threads)
+        {
+            Ok(engine) => engine,
+            Err(error) => {
+                let message = format!("{error:#}");
+                save_transcript(
+                    &self.connection()?,
+                    &failed_transcript(asset_id, &source_fingerprint, message),
+                )?;
+                return Err(error);
+            }
+        };
+        match self.transcribe_source_with_engine(
+            asset_id,
+            &proxy_path,
+            &source_fingerprint,
+            engine.as_ref(),
+        ) {
+            Ok(outcome) => Ok(outcome),
+            Err(error) => {
+                let message = format!("{error:#}");
+                let (speech_seconds, window_count, provider_segment_count) =
+                    failure_evidence(&error);
+                save_transcript(
+                    &self.connection()?,
+                    &failed_transcript_with_evidence(
+                        asset_id,
+                        &source_fingerprint,
+                        message,
+                        speech_seconds,
+                        window_count,
+                        provider_segment_count,
+                    ),
+                )?;
+                Err(error)
+            }
+        }
     }
 
     pub(crate) fn open_stt_engine_with_threads(
@@ -2621,14 +2727,27 @@ impl Catalog {
         }
     }
 
-    fn transcribe_with_engine(
+    /// Probes the proxy that transcription will actually read. Reuses the
+    /// reviewed FFprobe helper from proxy generation so corrupt media and tool
+    /// failures stay errors; only a successful probe with no audio stream is a
+    /// no-audio outcome.
+    pub(crate) fn transcription_audio_present(&self, proxy_path: &Path) -> Result<bool> {
+        let ffprobe = resolve_tool_program(Path::new("ffprobe"));
+        probe_source_audio_present(&ffprobe, proxy_path)
+            .with_context(|| format!("probe proxy audio {}", proxy_path.display()))
+    }
+
+    /// Extracts PCM from an already-probed audio-bearing proxy and runs the
+    /// speech pipeline. Callers must probe first so the engine is never opened
+    /// solely to discover that a valid video has no audio stream.
+    pub(crate) fn transcribe_source_with_engine(
         &self,
         asset_id: &str,
+        proxy_path: &Path,
+        source_fingerprint: &str,
         engine: &dyn SttEngine,
     ) -> Result<TranscribeOutcome> {
         let asset = self.get_asset(asset_id)?;
-        let proxy_path = Self::require_proxy(&asset)?;
-        let source_fingerprint = self.proxy_fingerprint(asset_id)?;
 
         let parent = self
             .database_path
@@ -2639,12 +2758,13 @@ impl Catalog {
         let pcm_path = audio_dir.join(format!("{asset_id}.{}.16k.wav", Uuid::new_v4()));
 
         let result = (|| -> Result<StoredTranscript> {
-            FfmpegAudioExtractor.extract_pcm16k(&proxy_path, &pcm_path)?;
+            FfmpegAudioExtractor.extract_pcm16k(proxy_path, &pcm_path)?;
             // Read once per clip. The engine receives samples, never a path, so
             // a multi-window clip does not re-read and re-convert the whole file
             // for every window.
             let pcm = read_pcm(&pcm_path)?;
-            transcribe_pcm(engine, asset_id, &source_fingerprint, &pcm)
+            anyhow::ensure!(!pcm.is_empty(), "audio stream decoded to no PCM samples");
+            transcribe_pcm(engine, asset_id, source_fingerprint, &pcm)
         })();
         // The extracted PCM is scratch, not a retained representation, so it is
         // removed whether or not the decode succeeded.
@@ -2652,13 +2772,7 @@ impl Catalog {
         let stored = result?;
 
         save_transcript(&self.connection()?, &stored)?;
-        Ok(TranscribeOutcome {
-            asset_id: asset_id.to_string(),
-            status: stored.status,
-            segment_count: stored.segments.len(),
-            window_count: stored.window_count,
-            speech_seconds: stored.speech_seconds,
-        })
+        Ok(transcribe_outcome(asset_id, &stored))
     }
 
     pub fn transcribe_missing(&self, project_id: &str) -> Result<TranscribeReport> {
@@ -2680,19 +2794,38 @@ impl Catalog {
                 continue;
             }
             coverage.total += 1;
-            let current = match self.proxy_fingerprint(&asset.id) {
-                Ok(fingerprint) => is_current(&connection, &asset.id, &fingerprint)?,
-                Err(_) => false,
-            };
-            if !current {
+            let stored = load_transcript(&connection, &asset.id)?;
+            let matches_source =
+                self.proxy_fingerprint(&asset.id)
+                    .ok()
+                    .is_some_and(|fingerprint| {
+                        stored.as_ref().is_some_and(|row| {
+                            row.recipe_key == STT_RECIPE_KEY
+                                && row.source_fingerprint == fingerprint
+                        })
+                    });
+            if !matches_source {
                 coverage.missing += 1;
                 continue;
             }
-            match load_transcript(&connection, &asset.id)?.map(|stored| stored.status) {
-                Some(TranscriptStatus::Speech) => coverage.speech += 1,
-                Some(TranscriptStatus::NoSpeech) => coverage.no_speech += 1,
-                Some(TranscriptStatus::Rejected) => coverage.rejected += 1,
-                Some(TranscriptStatus::Failed) => coverage.failed += 1,
+            // A matching failed attempt is visible as failed coverage, while
+            // is_current still excludes it from automatic reuse.
+            match stored {
+                Some(stored) => match stored.status {
+                    TranscriptStatus::Speech => coverage.speech += 1,
+                    TranscriptStatus::NoSpeech => {
+                        coverage.no_speech += 1;
+                        if stored.outcome_reason
+                            == crate::analysis::store::TranscriptOutcomeReason::LegacyNoSpeechUnverified
+                        {
+                            coverage.legacy_no_speech_unverified += 1;
+                        }
+                    }
+                    TranscriptStatus::NoAudio => coverage.no_audio += 1,
+                    TranscriptStatus::NoAcceptedSpeech => coverage.no_accepted_speech += 1,
+                    TranscriptStatus::Rejected => coverage.rejected += 1,
+                    TranscriptStatus::Failed => coverage.failed += 1,
+                },
                 None => coverage.missing += 1,
             }
         }
@@ -2745,40 +2878,12 @@ impl Catalog {
             overrides,
         )?;
         let assets = self.list_assets(project_id)?;
-        let mut pending: Vec<Asset> = Vec::new();
-        let mut skipped = 0_usize;
-        {
-            let connection = self.connection()?;
-            for asset in assets {
-                if asset.removed {
-                    continue;
-                }
-                if self.asset_video_validation(&asset.id)?.status
-                    != AssetVideoValidationStatus::Usable
-                {
-                    skipped += 1;
-                    continue;
-                }
-                match self.proxy_fingerprint(&asset.id) {
-                    Ok(fingerprint) => {
-                        if is_current(&connection, &asset.id, &fingerprint)? {
-                            skipped += 1;
-                        } else {
-                            pending.push(asset);
-                        }
-                    }
-                    // A clip with no proxy cannot be transcribed at all. It is
-                    // reported as a failure per clip rather than aborting the
-                    // whole batch.
-                    Err(_) => pending.push(asset),
-                }
-            }
-        }
-
         let history_key = selection.history_key.clone();
         let mut report = TranscribeReport {
             transcribed: 0,
-            skipped,
+            no_audio: 0,
+            failed: 0,
+            skipped: 0,
             cancelled: false,
             resource_source: selection.source.clone(),
             calibration_key: selection.calibration_key.clone(),
@@ -2790,8 +2895,91 @@ impl Catalog {
             outcomes: Vec::new(),
             failures: Vec::new(),
         };
+        let probe_estimator = BatchEstimator::new(
+            &vec![1; assets.len()],
+            selection.worker_count.max(1),
+            Default::default(),
+        );
+        let mut pending: Vec<ProjectPlannedAsset> = Vec::new();
+        {
+            let connection = self.connection()?;
+            for asset in assets {
+                let mut estimate = probe_estimator.estimate(&[]);
+                estimate.estimated_remaining_seconds = None;
+                estimate.estimated_remaining_seconds_range = None;
+                estimate.confidence = "inspecting_audio".into();
+                if on_progress(TranscribeBatchProgress {
+                    outcome: None,
+                    estimate,
+                })
+                .is_break()
+                {
+                    report.cancelled = true;
+                    return Ok(report);
+                }
+                if asset.removed {
+                    continue;
+                }
+                if self.asset_video_validation(&asset.id)?.status
+                    != AssetVideoValidationStatus::Usable
+                {
+                    report.skipped += 1;
+                    continue;
+                }
+                let source_fingerprint = match self.proxy_fingerprint(&asset.id) {
+                    Ok(fingerprint) => fingerprint,
+                    // A clip with no usable proxy cannot be transcribed. It is
+                    // reported as a per-clip processing failure rather than
+                    // aborting the whole batch.
+                    Err(error) => {
+                        pending.push(ProjectPlannedAsset::ProbeFailed {
+                            asset,
+                            source_fingerprint: String::new(),
+                            reason: format!("{error:#}"),
+                        });
+                        continue;
+                    }
+                };
+                if is_current(&connection, &asset.id, &source_fingerprint)? {
+                    report.skipped += 1;
+                    continue;
+                }
+                let proxy_path = match Self::require_proxy(&asset) {
+                    Ok(path) => path,
+                    Err(error) => {
+                        pending.push(ProjectPlannedAsset::ProbeFailed {
+                            asset,
+                            source_fingerprint,
+                            reason: format!("{error:#}"),
+                        });
+                        continue;
+                    }
+                };
+                match self.transcription_audio_present(&proxy_path) {
+                    Ok(false) => pending.push(ProjectPlannedAsset::NoAudio {
+                        asset,
+                        source_fingerprint,
+                    }),
+                    Ok(true) => pending.push(ProjectPlannedAsset::Ready {
+                        asset,
+                        proxy_path,
+                        source_fingerprint,
+                    }),
+                    Err(error) => pending.push(ProjectPlannedAsset::ProbeFailed {
+                        asset,
+                        source_fingerprint,
+                        reason: format!("probe audio before transcription: {error:#}"),
+                    }),
+                }
+            }
+        }
 
-        let task_work: Vec<u64> = vec![1; pending.len()];
+        let audio_pending = pending
+            .iter()
+            .filter(|item| matches!(item, ProjectPlannedAsset::Ready { .. }))
+            .count();
+
+        let task_work: Vec<u64> = vec![1; audio_pending];
         let mut estimator = BatchEstimator::new(
             &task_work,
             selection.worker_count.max(1),
@@ -2806,66 +2994,128 @@ impl Catalog {
             return Ok(report);
         }
 
-        let _heavy = match self.wait_for_local_heavy(|| {
-            let mut estimate = estimator.estimate(&task_work);
-            estimate.confidence = "waiting_for_resource".into();
-            estimate.estimated_remaining_seconds = None;
-            on_progress(TranscribeBatchProgress {
-                outcome: None,
-                estimate,
-            })
-            .is_break()
-        })? {
-            Some(lease) => lease,
-            None => {
-                report.cancelled = true;
-                return Ok(report);
+        let _heavy = if audio_pending > 0 {
+            match self.wait_for_local_heavy(|| {
+                let mut estimate = estimator.estimate(&task_work);
+                estimate.confidence = "waiting_for_resource".into();
+                estimate.estimated_remaining_seconds = None;
+                on_progress(TranscribeBatchProgress {
+                    outcome: None,
+                    estimate,
+                })
+                .is_break()
+            })? {
+                Some(lease) => Some(lease),
+                None => {
+                    report.cancelled = true;
+                    return Ok(report);
+                }
             }
+        } else {
+            None
         };
         // Loading the model costs seconds and over a gigabyte of RSS, so it is
-        // opened only once the batch is known to be non-empty and uncancelled.
-        let engine =
-            self.open_stt_engine_with_threads(selection.vad_threads, selection.decode_threads)?;
-        for (index, asset) in pending.iter().enumerate() {
-            let started = Instant::now();
-            let result = self.transcribe_with_engine(&asset.id, engine.as_ref());
-            let remaining = &task_work[(index + 1).min(task_work.len())..];
+        // opened only for a clip that actually has an audio stream and only once
+        // the batch is known to be non-empty and uncancelled.
+        let mut engine: Option<Box<dyn SttEngine>> = None;
+        let mut audio_processed = 0_usize;
+        for item in pending.iter() {
+            let remaining = &task_work[audio_processed.min(task_work.len())..];
             let flow;
-            match result {
-                Ok(outcome) => {
-                    estimator.record_completion(1, started.elapsed());
+            match item {
+                ProjectPlannedAsset::NoAudio {
+                    asset,
+                    source_fingerprint,
+                } => {
+                    let stored = no_audio_transcript(&asset.id, source_fingerprint);
+                    save_transcript(&self.connection()?, &stored)?;
+                    let outcome = transcribe_outcome(&asset.id, &stored);
                     report.transcribed += 1;
+                    report.no_audio += 1;
                     flow = on_progress(TranscribeBatchProgress {
                         outcome: Some(outcome.clone()),
                         estimate: estimator.estimate(remaining),
                     });
                     report.outcomes.push(outcome);
                 }
-                Err(error) => {
-                    estimator.record_failure(1);
-                    let message = format!("{error:#}");
-                    // Record the failure so a later run can see why, without
-                    // marking the clip as having a usable transcript.
-                    let stored = StoredTranscript {
-                        asset_id: asset.id.clone(),
-                        recipe_key: STT_RECIPE_KEY.to_string(),
-                        source_fingerprint: String::new(),
-                        status: TranscriptStatus::Failed,
-                        reject_reason: message.clone(),
-                        primary_language: String::new(),
-                        speech_seconds: 0.0,
-                        window_count: 0,
-                        segments: Vec::new(),
-                    };
+                ProjectPlannedAsset::ProbeFailed {
+                    asset,
+                    source_fingerprint,
+                    reason,
+                } => {
+                    let stored = failed_transcript(&asset.id, source_fingerprint, reason.clone());
                     save_transcript(&self.connection()?, &stored)?;
+                    report.failed += 1;
                     report.failures.push(IngestFailure {
                         path: asset.path.clone(),
-                        error: message,
+                        error: reason.clone(),
                     });
                     flow = on_progress(TranscribeBatchProgress {
                         outcome: None,
                         estimate: estimator.estimate(remaining),
                     });
+                }
+                ProjectPlannedAsset::Ready {
+                    asset,
+                    proxy_path,
+                    source_fingerprint,
+                } => {
+                    if engine.is_none() {
+                        engine = Some(self.open_stt_engine_with_threads(
+                            selection.vad_threads,
+                            selection.decode_threads,
+                        )?);
+                    }
+                    let started = Instant::now();
+                    let result = self.transcribe_source_with_engine(
+                        &asset.id,
+                        proxy_path,
+                        source_fingerprint,
+                        engine
+                            .as_deref()
+                            .expect("engine opened for audio-bearing asset"),
+                    );
+                    audio_processed += 1;
+                    match result {
+                        Ok(outcome) => {
+                            estimator.record_completion(1, started.elapsed());
+                            report.transcribed += 1;
+                            flow = on_progress(TranscribeBatchProgress {
+                                outcome: Some(outcome.clone()),
+                                estimate: estimator
+                                    .estimate(&task_work[audio_processed.min(task_work.len())..]),
+                            });
+                            report.outcomes.push(outcome);
+                        }
+                        Err(error) => {
+                            estimator.record_failure(1);
+                            let message = format!("{error:#}");
+                            // Keep the exact source fingerprint, detected-speech
+                            // duration, and partial provider evidence while
+                            // leaving the failed row retryable.
+                            let (speech_seconds, window_count, provider_segment_count) =
+                                failure_evidence(&error);
+                            let stored = failed_transcript_with_evidence(
+                                &asset.id,
+                                source_fingerprint,
+                                message.clone(),
+                                speech_seconds,
+                                window_count,
+                                provider_segment_count,
+                            );
+                            save_transcript(&self.connection()?, &stored)?;
+                            report.failed += 1;
+                            report.failures.push(IngestFailure {
+                                path: asset.path.clone(),
+                                error: message,
+                            });
+                            flow = on_progress(TranscribeBatchProgress {
+                                outcome: None,
+                                estimate: estimator
+                                    .estimate(&task_work[audio_processed.min(task_work.len())..]),
+                            });
+                        }
+                    }
                 }
             }
             if flow.is_break() {
@@ -2876,7 +3126,9 @@ impl Catalog {
             }
         }
 
-        self.save_batch_history(&history_key, estimator.history())?;
+        if audio_pending > 0 {
+            self.save_batch_history(&history_key, estimator.history())?;
+        }
         Ok(report)
     }
 
@@ -6452,10 +6704,14 @@ pub(crate) mod tests {
                 recipe_key: STT_RECIPE_KEY.to_string(),
                 source_fingerprint: fingerprint,
                 status: TranscriptStatus::NoSpeech,
+                outcome_reason: crate::analysis::store::TranscriptOutcomeReason::NoDetectedSpeech,
                 reject_reason: String::new(),
                 primary_language: String::new(),
                 speech_seconds: 0.0,
                 window_count: 0,
+                provider_segment_count: 0,
+                mean_token_probability: None,
+                repetition_ratio: None,
                 segments: Vec::new(),
             },
         )
@@ -6470,7 +6726,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn transcribe_missing_reports_a_missing_model_rather_than_transcribing() {
+    fn transcribe_missing_reports_a_corrupt_proxy_as_a_processing_failure() {
         let (directory, catalog, project) = catalog_fixture();
         insert_asset(
             &catalog,
@@ -6483,11 +6739,25 @@ pub(crate) mod tests {
         );
         attach_stub_proxy(&catalog, "a1", directory.path(), b"proxy bytes");
         mark_asset_video_usable(&catalog, "a1");
-        let error = catalog.transcribe_missing(&project.id).unwrap_err();
+        let report = catalog.transcribe_missing(&project.id).unwrap();
+        assert_eq!(report.failed, 1);
+        assert_eq!(report.transcribed, 0);
+        assert_eq!(report.failures.len(), 1);
         assert!(
-            error.to_string().contains("is not installed"),
-            "expected an actionable model error, got: {error}"
+            report.failures[0].error.contains("probe audio"),
+            "expected a probe failure, got: {}",
+            report.failures[0].error
         );
+        let stored = catalog.asset_transcript("a1").unwrap().unwrap();
+        assert_eq!(stored.status, TranscriptStatus::Failed);
+        assert_eq!(
+            stored.outcome_reason,
+            crate::analysis::store::TranscriptOutcomeReason::ProcessingFailed
+        );
+        assert!(!stored.source_fingerprint.is_empty());
+        let coverage = catalog.transcript_coverage(&project.id).unwrap();
+        assert_eq!(coverage.failed, 1);
+        assert_eq!(coverage.missing, 0);
     }
 
     fn insert_asset(
@@ -7583,10 +7853,14 @@ pub(crate) mod tests {
                 recipe_key: STT_RECIPE_KEY.to_string(),
                 source_fingerprint: "proxy-1".to_string(),
                 status: TranscriptStatus::NoSpeech,
+                outcome_reason: crate::analysis::store::TranscriptOutcomeReason::NoDetectedSpeech,
                 reject_reason: String::new(),
                 primary_language: String::new(),
                 speech_seconds: 0.0,
                 window_count: 0,
+                provider_segment_count: 0,
+                mean_token_probability: None,
+                repetition_ratio: None,
                 segments: Vec::new(),
             },
         )

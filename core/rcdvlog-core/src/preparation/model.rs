@@ -59,10 +59,19 @@ pub struct PreparationRepresentation {
 pub struct PreparationTranscript {
     pub readiness: PreparationEvidenceState,
     pub status: Option<String>,
+    /// Stable distinction between silence, absent audio, empty provider output,
+    /// quality rejection and processing failure.
+    pub outcome_reason: Option<String>,
     pub recipe: Option<String>,
     pub source_fingerprint: Option<String>,
     pub segment_count: usize,
     pub speech_seconds: Option<f64>,
+    /// Provider decode windows and raw decoded segment count. Retained even
+    /// when no transcript was accepted so targeted recovery stays explainable.
+    pub window_count: Option<u32>,
+    pub provider_segment_count: Option<u32>,
+    pub mean_token_probability: Option<f32>,
+    pub repetition_ratio: Option<f32>,
     pub binding_origin: Option<String>,
 }
 

@@ -106,6 +106,8 @@ function runReport(state: DesktopHarnessState, tally: RunTally, outcome: Analysi
     proxies: { generated: tally.perStage.proxies, skipped: 0, cancelled: status === "cancelled", failures: [] },
     transcripts: {
       transcribed: tally.perStage.transcripts,
+      noAudio: 0,
+      failed: 0,
       skipped: 0,
       cancelled: status === "cancelled",
       failures: [],

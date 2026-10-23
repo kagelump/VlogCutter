@@ -12,6 +12,8 @@ export const transcriptStatusLabels: Record<TranscriptStatus, string> = {
   speech: "Speech",
   // Silence is a result, not a failure: roughly half of a real corpus is silent.
   no_speech: "No speech detected",
+  no_audio: "No audio stream",
+  no_accepted_speech: "Speech detected, no accepted transcript",
   rejected: "Discarded as unreliable",
   failed: "Transcription failed",
 };

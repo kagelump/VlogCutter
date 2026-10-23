@@ -57,10 +57,14 @@ function transcript(overrides: Partial<ClipTranscript> = {}): ClipTranscript {
     recipeKey: "whisper-v1",
     sourceFingerprint: "fp",
     status: "speech",
+    outcomeReason: "accepted",
     rejectReason: "",
     primaryLanguage: "en",
     speechSeconds: 4,
     windowCount: 2,
+    providerSegmentCount: 2,
+    meanTokenProbability: 0.9,
+    repetitionRatio: 0,
     segments: [
       { startMs: 4000, endMs: 6000, language: "en", text: "we finally found the place", meanTokenProbability: 0.9 },
       { startMs: 9000, endMs: 11000, language: "en", text: "it's like six seats total", meanTokenProbability: 0.9 },
@@ -109,6 +113,16 @@ describe("transcriptSummary", () => {
 
   it("says so plainly when there is no speech, which is half a real corpus", () => {
     expect(transcriptSummary(transcript({ status: "no_speech", segments: [] }))).toBe("No speech detected");
+  });
+
+  it("distinguishes no audio from literal silence", () => {
+    expect(transcriptSummary(transcript({ status: "no_audio", segments: [] }))).toBe("No audio stream");
+  });
+
+  it("distinguishes detected speech with no accepted provider output", () => {
+    expect(transcriptSummary(transcript({ status: "no_accepted_speech", segments: [] }))).toBe(
+      "Speech detected, no accepted transcript",
+    );
   });
 
   it("surfaces the reject reason when one exists", () => {

@@ -48,10 +48,14 @@ function transcript(overrides: Partial<ClipTranscript> = {}): ClipTranscript {
     recipeKey: "r",
     sourceFingerprint: "f",
     status: "speech",
+    outcomeReason: "accepted",
     rejectReason: "",
     primaryLanguage: "ja",
     speechSeconds: 4,
     windowCount: 2,
+    providerSegmentCount: 2,
+    meanTokenProbability: 0.9,
+    repetitionRatio: 0,
     segments: [
       { startMs: 4000, endMs: 6000, language: "ja", text: "we finally found the place", meanTokenProbability: 0.9 },
       { startMs: 9000, endMs: 11000, language: "ja", text: "it's like six seats total", meanTokenProbability: 0.9 },
@@ -97,6 +101,12 @@ function renderShelf(overrides: Partial<EvidenceShelfProps> = {}) {
   };
   return { props, ...render(<EvidenceShelf {...props} />) };
 }
+
+it("does not present legacy no_speech as verified silence", () => {
+  renderShelf({ transcript: transcript({ status: "no_speech", outcomeReason: "legacy_no_speech_unverified", segments: [] }) });
+  expect(screen.getByText("This older result could not verify silence. Transcribe again to check.")).toBeInTheDocument();
+  expect(screen.queryByText("No speech in this clip.")).not.toBeInTheDocument();
+});
 
 describe("collapsed state", () => {
   it("keeps the tab strip visible with no pane content, so nothing is hidden", () => {
@@ -150,6 +160,16 @@ describe("transcript pane", () => {
     const { container } = renderShelf({ transcript: transcript({ status: "no_speech", segments: [] }) });
     expect(container.querySelector(".segment")).toBeNull();
     expect(screen.getByText(/no speech in this clip/i)).toBeInTheDocument();
+  });
+
+  it("distinguishes a video with no audio stream from literal silence", () => {
+    renderShelf({ transcript: transcript({ status: "no_audio", segments: [] }) });
+    expect(screen.getByText(/no audio stream/i)).toBeInTheDocument();
+  });
+
+  it("distinguishes detected speech with no accepted provider output", () => {
+    renderShelf({ transcript: transcript({ status: "no_accepted_speech", segments: [] }) });
+    expect(screen.getByText(/speech was detected.*no usable text/i)).toBeInTheDocument();
   });
 
   it("says the clip was never transcribed when there is no transcript at all", () => {

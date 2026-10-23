@@ -12,9 +12,52 @@ use std::collections::HashMap;
 use crate::analysis::STT_RECIPE_KEY;
 use crate::analysis::coverage::{needs_resplit, resplit};
 use crate::analysis::engine::SttEngine;
-use crate::analysis::quality::{DecodedSegment, reject_reason};
-use crate::analysis::store::{StoredTranscript, TranscriptStatus};
+use crate::analysis::quality::{
+    DecodedSegment, mean_token_probability, reject_reason, repetition_ratio,
+};
+use crate::analysis::store::{StoredTranscript, TranscriptOutcomeReason, TranscriptStatus};
 use crate::analysis::windows::{PackedWindow, SpeechRegion, pack_windows, translate_span};
+
+/// Structured evidence carried by a processing failure. Keeping this as a
+/// typed error lets callers persist the speech duration and partial provider
+/// work they observed before a decode failed, instead of collapsing the whole
+/// attempt to a diagnostic string.
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+pub struct TranscriptionFailure {
+    pub message: String,
+    pub speech_seconds: f64,
+    pub window_count: u32,
+    pub provider_segment_count: u32,
+}
+
+fn processing_error(
+    error: anyhow::Error,
+    speech_seconds: f64,
+    window_count: u32,
+    provider_segment_count: u32,
+) -> anyhow::Error {
+    anyhow::Error::new(TranscriptionFailure {
+        message: format!("{error:#}"),
+        speech_seconds,
+        window_count,
+        provider_segment_count,
+    })
+}
+
+/// Recover any partial evidence attached to a processing error.
+pub(crate) fn failure_evidence(error: &anyhow::Error) -> (f64, u32, u32) {
+    error
+        .downcast_ref::<TranscriptionFailure>()
+        .map(|failure| {
+            (
+                failure.speech_seconds,
+                failure.window_count,
+                failure.provider_segment_count,
+            )
+        })
+        .unwrap_or((0.0, 0, 0))
+}
 
 /// Summary of one transcription, for progress reporting and CLI output.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -22,9 +65,16 @@ use crate::analysis::windows::{PackedWindow, SpeechRegion, pack_windows, transla
 pub struct TranscribeOutcome {
     pub asset_id: String,
     pub status: TranscriptStatus,
+    pub outcome_reason: TranscriptOutcomeReason,
+    /// Exact proxy fingerprint this outcome was derived from, including failed
+    /// attempts so callers can correlate recovery with the bytes they saw.
+    pub source_fingerprint: String,
     pub segment_count: usize,
     pub window_count: u32,
     pub speech_seconds: f64,
+    pub provider_segment_count: u32,
+    pub mean_token_probability: Option<f32>,
+    pub repetition_ratio: Option<f32>,
 }
 
 /// Transcribes one clip's extracted PCM.
@@ -39,27 +89,38 @@ pub fn transcribe_pcm(
     source_fingerprint: &str,
     pcm: &[f32],
 ) -> Result<StoredTranscript> {
-    let regions = engine.detect_speech(pcm)?;
+    let regions = engine
+        .detect_speech(pcm)
+        .map_err(|error| processing_error(error, 0.0, 0, 0))?;
     let speech_ms: u32 = regions.iter().map(SpeechRegion::duration_ms).sum();
+    let speech_seconds = f64::from(speech_ms) / 1_000.0;
 
     if regions.is_empty() || speech_ms == 0 {
         return Ok(empty_transcript(
             asset_id,
             source_fingerprint,
             TranscriptStatus::NoSpeech,
+            TranscriptOutcomeReason::NoDetectedSpeech,
             String::new(),
             0,
             0.0,
+            0,
+            None,
+            None,
         ));
     }
 
     let windows = pack_windows(&regions);
     let mut window_count = 0_u32;
+    let mut provider_segment_count = 0_u32;
     let mut segments: Vec<DecodedSegment> = Vec::new();
 
     for window in &windows {
         window_count += 1;
-        let decoded = engine.decode_window(pcm, window)?;
+        let decoded = engine.decode_window(pcm, window).map_err(|error| {
+            processing_error(error, speech_seconds, window_count, provider_segment_count)
+        })?;
+        provider_segment_count += decoded.len() as u32;
 
         if needs_resplit(window, &decoded) {
             // A whole language's speech went missing. Re-decode each speech
@@ -67,7 +128,10 @@ pub fn transcribe_pcm(
             // likely switch points.
             for narrow in resplit(window) {
                 window_count += 1;
-                let narrow_decoded = engine.decode_window(pcm, &narrow)?;
+                let narrow_decoded = engine.decode_window(pcm, &narrow).map_err(|error| {
+                    processing_error(error, speech_seconds, window_count, provider_segment_count)
+                })?;
+                provider_segment_count += narrow_decoded.len() as u32;
                 segments.extend(to_clip_time(&narrow, &narrow_decoded));
             }
         } else {
@@ -78,7 +142,9 @@ pub fn transcribe_pcm(
     segments.retain(|segment| !segment.text.trim().is_empty());
     segments.sort_by_key(|segment| (segment.start_ms, segment.end_ms));
 
-    let speech_seconds = f64::from(speech_ms) / 1_000.0;
+    let measured_mean_probability =
+        (!segments.is_empty()).then(|| mean_token_probability(&segments));
+    let measured_repetition = (!segments.is_empty()).then(|| repetition_ratio(&segments));
 
     if let Some(reason) = reject_reason(&segments) {
         // A rejected transcript keeps its reason and discards its content:
@@ -88,20 +154,31 @@ pub fn transcribe_pcm(
             asset_id,
             source_fingerprint,
             TranscriptStatus::Rejected,
+            TranscriptOutcomeReason::QualityRejected,
             reason.as_str().to_string(),
             window_count,
             speech_seconds,
+            provider_segment_count,
+            measured_mean_probability,
+            measured_repetition,
         ));
     }
 
     if segments.is_empty() {
+        // Speech was detected and the provider was invoked, but it returned no
+        // accepted text. This is not literal silence and must not be stored as
+        // `no_speech`; recovery with a different provider/settings may help.
         return Ok(empty_transcript(
             asset_id,
             source_fingerprint,
-            TranscriptStatus::NoSpeech,
+            TranscriptStatus::NoAcceptedSpeech,
+            TranscriptOutcomeReason::EmptyProviderOutput,
             String::new(),
             window_count,
             speech_seconds,
+            provider_segment_count,
+            measured_mean_probability,
+            measured_repetition,
         ));
     }
 
@@ -111,31 +188,94 @@ pub fn transcribe_pcm(
         recipe_key: STT_RECIPE_KEY.to_string(),
         source_fingerprint: source_fingerprint.to_string(),
         status: TranscriptStatus::Speech,
+        outcome_reason: TranscriptOutcomeReason::Accepted,
         reject_reason: String::new(),
         primary_language,
         speech_seconds,
         window_count,
+        provider_segment_count,
+        mean_token_probability: measured_mean_probability,
+        repetition_ratio: measured_repetition,
         segments,
     })
 }
 
+/// A successful terminal outcome for a valid video whose proxy has no audio
+/// stream. No VAD or provider work is implied or attempted.
+pub(crate) fn no_audio_transcript(asset_id: &str, source_fingerprint: &str) -> StoredTranscript {
+    empty_transcript(
+        asset_id,
+        source_fingerprint,
+        TranscriptStatus::NoAudio,
+        TranscriptOutcomeReason::NoAudioStream,
+        String::new(),
+        0,
+        0.0,
+        0,
+        None,
+        None,
+    )
+}
+
+/// A first-class processing failure. The source fingerprint is retained so the
+/// failed attempt remains correlated with the exact proxy; `is_current` still
+/// treats it as stale and retryable.
+pub(crate) fn failed_transcript(
+    asset_id: &str,
+    source_fingerprint: &str,
+    message: String,
+) -> StoredTranscript {
+    failed_transcript_with_evidence(asset_id, source_fingerprint, message, 0.0, 0, 0)
+}
+
+pub(crate) fn failed_transcript_with_evidence(
+    asset_id: &str,
+    source_fingerprint: &str,
+    message: String,
+    speech_seconds: f64,
+    window_count: u32,
+    provider_segment_count: u32,
+) -> StoredTranscript {
+    empty_transcript(
+        asset_id,
+        source_fingerprint,
+        TranscriptStatus::Failed,
+        TranscriptOutcomeReason::ProcessingFailed,
+        message,
+        window_count,
+        speech_seconds,
+        provider_segment_count,
+        None,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 fn empty_transcript(
     asset_id: &str,
     source_fingerprint: &str,
     status: TranscriptStatus,
+    outcome_reason: TranscriptOutcomeReason,
     reject_reason: String,
     window_count: u32,
     speech_seconds: f64,
+    provider_segment_count: u32,
+    mean_token_probability: Option<f32>,
+    repetition_ratio: Option<f32>,
 ) -> StoredTranscript {
     StoredTranscript {
         asset_id: asset_id.to_string(),
         recipe_key: STT_RECIPE_KEY.to_string(),
         source_fingerprint: source_fingerprint.to_string(),
         status,
+        outcome_reason,
         reject_reason,
         primary_language: String::new(),
         speech_seconds,
         window_count,
+        provider_segment_count,
+        mean_token_probability,
+        repetition_ratio,
         segments: Vec::new(),
     }
 }
@@ -228,6 +368,10 @@ mod tests {
         let engine = FakeEngine::new(Vec::new(), Vec::new());
         let stored = transcribe_pcm(&engine, "a1", "fp", &[]).unwrap();
         assert_eq!(stored.status, TranscriptStatus::NoSpeech);
+        assert_eq!(
+            stored.outcome_reason,
+            TranscriptOutcomeReason::NoDetectedSpeech
+        );
         assert!(stored.segments.is_empty());
         assert_eq!(stored.window_count, 0);
         assert_eq!(
@@ -235,6 +379,33 @@ mod tests {
             0,
             "model must not be invoked"
         );
+    }
+
+    #[test]
+    fn a_decode_failure_retains_detected_duration_and_partial_provider_evidence() {
+        struct FailsOnDecode;
+        impl SttEngine for FailsOnDecode {
+            fn detect_speech(&self, _pcm: &[f32]) -> Result<Vec<SpeechRegion>> {
+                Ok(vec![SpeechRegion {
+                    start_ms: 0,
+                    end_ms: 4_000,
+                }])
+            }
+
+            fn decode_window(
+                &self,
+                _pcm: &[f32],
+                _window: &PackedWindow,
+            ) -> Result<Vec<DecodedSegment>> {
+                anyhow::bail!("synthetic provider failure")
+            }
+        }
+
+        let error = transcribe_pcm(&FailsOnDecode, "a1", "fp", &[]).unwrap_err();
+        let (speech_seconds, window_count, provider_segment_count) = failure_evidence(&error);
+        assert!((speech_seconds - 4.0).abs() < 1e-6);
+        assert_eq!(window_count, 1);
+        assert_eq!(provider_segment_count, 0);
     }
 
     #[test]
@@ -254,6 +425,9 @@ mod tests {
         assert_eq!(stored.segments[0].end_ms, 8_000);
         assert_eq!(stored.window_count, 1);
         assert!((stored.speech_seconds - 3.0).abs() < 1e-6);
+        assert_eq!(stored.provider_segment_count, 1);
+        assert!(stored.mean_token_probability.is_some());
+        assert_eq!(stored.repetition_ratio, Some(0.0));
         assert_eq!(stored.primary_language, "ja");
     }
 
@@ -271,7 +445,13 @@ mod tests {
         );
         let stored = transcribe_pcm(&engine, "a1", "fp", &[]).unwrap();
         assert_eq!(stored.status, TranscriptStatus::Rejected);
+        assert_eq!(
+            stored.outcome_reason,
+            TranscriptOutcomeReason::QualityRejected
+        );
         assert_eq!(stored.reject_reason, "repetition");
+        assert!(stored.provider_segment_count > 0);
+        assert!(stored.repetition_ratio.is_some_and(|ratio| ratio >= 0.3));
         assert!(
             stored.segments.is_empty(),
             "rejected content must not be stored as usable"
@@ -349,7 +529,7 @@ mod tests {
     }
 
     #[test]
-    fn a_decode_returning_nothing_is_no_speech_not_rejected() {
+    fn a_decode_returning_nothing_after_detected_speech_is_not_no_speech() {
         let engine = FakeEngine::new(
             vec![SpeechRegion {
                 start_ms: 0,
@@ -358,8 +538,58 @@ mod tests {
             vec![vec![]],
         );
         let stored = transcribe_pcm(&engine, "a1", "fp", &[]).unwrap();
-        assert_eq!(stored.status, TranscriptStatus::NoSpeech);
+        assert_eq!(stored.status, TranscriptStatus::NoAcceptedSpeech);
+        assert_eq!(
+            stored.outcome_reason,
+            TranscriptOutcomeReason::EmptyProviderOutput
+        );
         assert!(stored.reject_reason.is_empty());
+        assert_eq!(stored.window_count, 1);
+        assert!((stored.speech_seconds - 4.0).abs() < 1e-6);
+        assert_eq!(stored.provider_segment_count, 0);
+    }
+
+    #[test]
+    fn whitespace_only_provider_output_keeps_provider_evidence_as_no_accepted_speech() {
+        let engine = FakeEngine::new(
+            vec![SpeechRegion {
+                start_ms: 0,
+                end_ms: 4_000,
+            }],
+            vec![vec![segment(0, 2_000, "  ", 0.7)]],
+        );
+        let stored = transcribe_pcm(&engine, "a1", "fp", &[]).unwrap();
+        assert_eq!(stored.status, TranscriptStatus::NoAcceptedSpeech);
+        assert_eq!(
+            stored.outcome_reason,
+            TranscriptOutcomeReason::EmptyProviderOutput
+        );
+        assert_eq!(stored.provider_segment_count, 1);
+        assert!((stored.speech_seconds - 4.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_low_confidence_response_preserves_quality_evidence() {
+        let engine = FakeEngine::new(
+            vec![SpeechRegion {
+                start_ms: 0,
+                end_ms: 4_000,
+            }],
+            vec![vec![segment(0, 4_000, "uncertain words", 0.1)]],
+        );
+        let stored = transcribe_pcm(&engine, "a1", "fp", &[]).unwrap();
+        assert_eq!(stored.status, TranscriptStatus::Rejected);
+        assert_eq!(
+            stored.outcome_reason,
+            TranscriptOutcomeReason::QualityRejected
+        );
+        assert_eq!(stored.reject_reason, "low_token_probability");
+        assert_eq!(stored.provider_segment_count, 1);
+        assert!(
+            stored
+                .mean_token_probability
+                .is_some_and(|value| value < 0.2)
+        );
     }
 
     #[test]

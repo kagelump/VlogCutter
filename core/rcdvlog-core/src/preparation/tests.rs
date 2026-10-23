@@ -41,9 +41,24 @@ fn make_asset(
     seconds: u32,
     with_proxy: bool,
 ) -> PathBuf {
+    make_asset_with_audio(
+        catalog, project_id, directory, id, seconds, with_proxy, true,
+    )
+}
+
+fn make_asset_with_audio(
+    catalog: &Catalog,
+    project_id: &str,
+    directory: &Path,
+    id: &str,
+    seconds: u32,
+    with_proxy: bool,
+    with_audio: bool,
+) -> PathBuf {
     let source = directory.join(format!("{id}.mp4"));
     let color = &blake3::hash(id.as_bytes()).to_hex()[..6];
-    let status = crate::tool_command("ffmpeg")
+    let mut command = crate::tool_command("ffmpeg");
+    command
         .args([
             "-y",
             "-hide_banner",
@@ -53,26 +68,31 @@ fn make_asset(
             "lavfi",
             "-i",
         ])
-        .arg(format!("color=c=0x{color}:s=320x180:r=24:d={seconds}"))
-        .args(["-f", "lavfi", "-i"])
-        .arg(format!(
-            "sine=frequency=440:sample_rate=48000:duration={seconds}"
-        ))
+        .arg(format!("color=c=0x{color}:s=320x180:r=24:d={seconds}"));
+    if with_audio {
+        command
+            .args(["-f", "lavfi", "-i"])
+            .arg(format!(
+                "sine=frequency=440:sample_rate=48000:duration={seconds}"
+            ))
+            .args(["-map", "0:v:0", "-map", "1:a:0"]);
+    } else {
+        command.args(["-map", "0:v:0"]);
+    }
+    let status = command
         .args([
-            "-map",
-            "0:v:0",
-            "-map",
-            "1:a:0",
             "-c:v",
             "libx264",
             "-preset",
             "ultrafast",
             "-pix_fmt",
             "yuv420p",
-            "-c:a",
-            "aac",
-            "-shortest",
         ])
+        .args(if with_audio {
+            vec!["-c:a", "aac", "-shortest"]
+        } else {
+            Vec::new()
+        })
         .arg(&source)
         .status()
         .expect("run ffmpeg for synthetic test media");
@@ -366,10 +386,14 @@ fn all_asset_and_transcript_pages_are_bounded_and_long_text_is_marked() {
             recipe_key: crate::STT_RECIPE_KEY.into(),
             source_fingerprint: "fixture-proxy-fingerprint".into(),
             status: TranscriptStatus::Speech,
+            outcome_reason: crate::analysis::store::TranscriptOutcomeReason::Accepted,
             reject_reason: String::new(),
             primary_language: "ja".into(),
             speech_seconds: 0.3,
             window_count: 1,
+            provider_segment_count: segments.len() as u32,
+            mean_token_probability: None,
+            repetition_ratio: None,
             segments,
         },
     )
@@ -583,10 +607,14 @@ fn cached_transcript_past_validated_proxy_end_requires_review_without_retranscri
             recipe_key: crate::STT_RECIPE_KEY.into(),
             source_fingerprint: proxy_fingerprint,
             status: TranscriptStatus::Speech,
+            outcome_reason: crate::analysis::store::TranscriptOutcomeReason::Accepted,
             reject_reason: String::new(),
             primary_language: "en".into(),
             speech_seconds: 0.1,
             window_count: 1,
+            provider_segment_count: 1,
+            mean_token_probability: None,
+            repetition_ratio: None,
             segments: vec![DecodedSegment {
                 start_ms: 1_900,
                 end_ms: 2_050,
@@ -708,6 +736,111 @@ fn cancellation_resumes_only_missing_transcript_work_and_busy_proxy_is_skipped()
     drop(claim);
     assert_eq!(busy.skipped, 1);
     assert_eq!(busy.failed, 0);
+}
+
+#[test]
+fn legacy_no_speech_is_review_required_rather_than_verified_silence() {
+    if !media_tools_available() {
+        eprintln!("skipping generated preparation legacy fixture: ffmpeg/ffprobe unavailable");
+        return;
+    }
+    let (directory, catalog, project_id) = fixture();
+    make_asset(&catalog, &project_id, directory.path(), "legacy", 1, true);
+    let fingerprint = catalog.proxy_fingerprint("legacy").unwrap();
+    save_transcript(
+        &catalog.connection().unwrap(),
+        &StoredTranscript {
+            asset_id: "legacy".into(),
+            recipe_key: crate::STT_RECIPE_KEY.into(),
+            source_fingerprint: fingerprint,
+            status: TranscriptStatus::NoSpeech,
+            outcome_reason:
+                crate::analysis::store::TranscriptOutcomeReason::LegacyNoSpeechUnverified,
+            reject_reason: String::new(),
+            primary_language: String::new(),
+            speech_seconds: 0.0,
+            window_count: 0,
+            provider_segment_count: 0,
+            mean_token_probability: None,
+            repetition_ratio: None,
+            segments: Vec::new(),
+        },
+    )
+    .unwrap();
+    let manifest = catalog
+        .preparation_preflight(&scope(&project_id, &["legacy"]), 0, 10)
+        .unwrap();
+    let transcript = &manifest.items[0].transcript;
+    assert_eq!(transcript.status.as_deref(), Some("no_speech"));
+    assert_eq!(
+        transcript.outcome_reason.as_deref(),
+        Some("legacy_no_speech_unverified")
+    );
+    assert_eq!(
+        transcript.readiness.state,
+        PreparationState::ReviewRequired,
+        "legacy no_speech must not be presented as verified silence"
+    );
+    assert!(
+        transcript
+            .readiness
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("cannot prove literal silence"))
+    );
+}
+
+#[test]
+fn no_audio_preparation_is_ready_without_engine_or_model_work() {
+    if !media_tools_available() {
+        eprintln!("skipping generated no-audio preparation fixture: ffmpeg/ffprobe unavailable");
+        return;
+    }
+    let (directory, catalog, project_id) = fixture();
+    make_asset_with_audio(
+        &catalog,
+        &project_id,
+        directory.path(),
+        "no-audio",
+        1,
+        true,
+        false,
+    );
+    let calls = Arc::new(AtomicUsize::new(0));
+    let engine = EmptySpeechEngine {
+        calls: calls.clone(),
+    };
+    let options = PreparationRunOptions {
+        generate_proxies: false,
+        transcribe: true,
+        revalidate: false,
+        moments: None,
+    };
+    let report = catalog
+        .prepare_with_services(
+            &scope(&project_id, &["no-audio"]),
+            &options,
+            Some(Box::new(engine)),
+            None,
+            |_| ControlFlow::Continue(()),
+        )
+        .unwrap();
+    assert_eq!(report.failed, 0);
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "a no-audio clip must not invoke VAD or ASR"
+    );
+    let transcript = &report.manifest.items[0].transcript;
+    assert_eq!(transcript.status.as_deref(), Some("no_audio"));
+    assert_eq!(
+        transcript.outcome_reason.as_deref(),
+        Some("no_audio_stream")
+    );
+    assert_eq!(transcript.readiness.state, PreparationState::Ready);
+    assert_eq!(transcript.speech_seconds, Some(0.0));
+    assert_eq!(transcript.window_count, Some(0));
+    assert_eq!(transcript.provider_segment_count, Some(0));
 }
 
 #[test]
@@ -879,10 +1012,14 @@ fn changing_only_unsampled_proxy_bytes_invalidates_full_decode_and_transcript_bi
         recipe_key: crate::STT_RECIPE_KEY.into(),
         source_fingerprint: sampled_before.clone(),
         status: TranscriptStatus::Speech,
+        outcome_reason: crate::analysis::store::TranscriptOutcomeReason::Accepted,
         reject_reason: String::new(),
         primary_language: "ja".into(),
         speech_seconds: 0.5,
         window_count: 1,
+        provider_segment_count: 1,
+        mean_token_probability: None,
+        repetition_ratio: None,
         segments: vec![DecodedSegment {
             start_ms: 250,
             end_ms: 750,

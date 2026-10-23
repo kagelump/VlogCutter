@@ -524,14 +524,31 @@ regenerates them. Failed attempts stay retryable and are never reported as reuse
 Transcript replacement never changes human-authored notes,
 labels, titles, descriptions, removals, rotation, or chronology. Removed assets,
 videos not durably validated as usable, and assets without a reachable proxy are
-reported per asset as `not_ready` and skip engine work. Missing or invalid speech
-models are a run-level readiness failure before any engine initialization. For
-ready assets, one engine lifecycle serves the compatible batch. The report has
-per-asset states (`transcribed`, `reused`, `not_ready`, `failed`, `cancelled`),
-counts, and `cancelled`/`cancelledAssets`; progress is emitted as bounded
+reported per asset as `not_ready` and skip engine work. Audio presence is probed
+before PCM extraction: a valid video with no audio stream is `no_audio`, requires
+no speech model or engine initialization, and is reused on later runs. A probe or
+extraction failure is `failed`, not silence. Missing or invalid speech models are
+a run-level readiness failure before any engine initialization for assets that
+actually contain audio. For ready assets, one engine lifecycle serves the
+compatible batch. The report has per-asset states (`transcribed`, `no_audio`,
+`reused`, `not_ready`, `failed`, `cancelled`), counts, and
+`cancelled`/`cancelledAssets`; progress is emitted as bounded
 `transcribe.batch.progress` JSON events on stderr, including a one-worker ETA
 based only on attempted transcription work. Ctrl-C stops after the current asset,
 preserves completed transcripts, and reports the remaining assets as cancelled.
+
+Transcript results carry `status` plus `outcomeReason`. `no_speech` means the VAD
+gate ran and found no detected speech; `no_audio` means the media had no audio
+stream; `no_accepted_speech` means speech was detected but the provider returned
+no accepted text; `rejected` means the quality gate discarded output; and
+`failed` is retryable. The result also retains the exact source fingerprint,
+detected `speechSeconds`, provider `windowCount`/`providerSegmentCount`, and
+quality evidence (`meanTokenProbability`, `repetitionRatio`). `transcribe status`
+reports `noAudio` and `noAcceptedSpeech` in addition to speech, no-speech,
+rejected, failed, and missing coverage. `legacyNoSpeechUnverified` is counted as
+a subset of no-speech coverage. Rows migrated from older catalogs keep
+`no_speech` with reason `legacy_no_speech_unverified`; preparation marks them
+review-required rather than asserting verified silence.
 
 Transcription is offline and reads proxies only. Vision analysis reads proxy-derived frame packs and any accepted speech transcript, then calls OpenRouter using `OPENROUTER_API_KEY` or `~/.openrouter.key`. A normal `analyze missing` run is idempotent; `--force` replaces current derived observations and reports how many clips already had non-empty title or description fields before overwrite. Notes remain human-only. OCR is a reviewable suggestion and is not indexed as fact.
 
