@@ -25,6 +25,11 @@ pub fn audio_extract_command(source: &Path, destination: &Path) -> Command {
         .arg("-loglevel")
         .arg("error")
         .arg("-y")
+        // Fail on damaged audio instead of accepting a partial/empty decode
+        // that could be misclassified as literal silence by VAD.
+        .arg("-xerror")
+        .arg("-err_detect")
+        .arg("explode")
         .arg("-i")
         .arg(source)
         .arg("-vn")
@@ -94,6 +99,61 @@ mod tests {
         let input_index = args.iter().position(|arg| arg == "-i").unwrap();
         assert_eq!(args[input_index + 1], "/cache/p.mp4");
         assert_eq!(args.last().unwrap(), "/tmp/o.wav");
+    }
+
+    #[test]
+    fn advertised_audio_with_corrupt_packets_is_a_decode_error() {
+        if !["ffmpeg", "ffprobe"].iter().all(|tool| {
+            crate::tool_command(tool)
+                .arg("-version")
+                .output()
+                .is_ok_and(|output| output.status.success())
+        }) {
+            return;
+        }
+        let directory = tempfile::TempDir::new().unwrap();
+        let source = directory.path().join("damaged.aac");
+        let status = crate::tool_command("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:duration=1",
+                "-c:a",
+                "aac",
+                "-f",
+                "adts",
+            ])
+            .arg(&source)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        // Preserve each ADTS header and destroy its AAC payload: FFprobe can
+        // still identify an audio stream, while decoding its packets must fail.
+        let mut bytes = std::fs::read(&source).unwrap();
+        let mut offset = 0;
+        while offset + 7 < bytes.len() {
+            let size = ((usize::from(bytes[offset + 3]) & 3) << 11)
+                | (usize::from(bytes[offset + 4]) << 3)
+                | (usize::from(bytes[offset + 5]) >> 5);
+            assert!(size >= 7 && offset + size <= bytes.len());
+            bytes[offset + 7..offset + size].fill(0xff);
+            offset += size;
+        }
+        std::fs::write(&source, bytes).unwrap();
+        assert!(
+            crate::probe_source_audio_present(
+                &crate::resolve_tool_program(Path::new("ffprobe")),
+                &source,
+            )
+            .unwrap()
+        );
+        let error = FfmpegAudioExtractor
+            .extract_pcm16k(&source, &directory.path().join("decoded.wav"))
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("ffmpeg audio extraction"));
     }
 
     #[test]

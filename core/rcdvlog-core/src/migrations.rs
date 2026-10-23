@@ -7,7 +7,7 @@ use thiserror::Error;
 
 use crate::chronology::forward_migrate_project_chronology;
 
-pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 35;
+pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 36;
 
 const MIGRATION_TABLE_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -294,7 +294,67 @@ pub const PROJECT_CATALOG_MIGRATIONS: &[SqliteMigration] = &[
         source_identity: "project-catalog/0035-resource-calibrations/20261024",
         apply: add_resource_calibrations,
     },
+    SqliteMigration {
+        id: 36,
+        name: "transcript_outcome_evidence",
+        source_identity: "project-catalog/0036-transcript-outcome-evidence/20261024",
+        apply: add_transcript_outcome_evidence,
+    },
 ];
+
+/// Migration 36. Separate terminal transcript outcomes that older schemas had
+/// to conflate.
+///
+/// A legacy `no_speech` row was produced before audio presence and empty
+/// provider output were distinguishable. It cannot retroactively prove literal
+/// silence, so it is retained as `no_speech` with an explicit
+/// `legacy_no_speech_unverified` reason rather than being silently rewritten or
+/// deleted. New rows written by this build record `no_detected_speech`,
+/// `no_audio_stream`, or `empty_provider_output` as appropriate.
+fn add_transcript_outcome_evidence(transaction: &Transaction<'_>) -> Result<()> {
+    transaction.execute_batch(
+        r#"
+        CREATE TABLE asset_transcripts_v36 (
+            asset_id TEXT PRIMARY KEY REFERENCES assets(id) ON DELETE CASCADE,
+            recipe_key TEXT NOT NULL,
+            source_kind TEXT NOT NULL DEFAULT 'proxy',
+            source_fingerprint TEXT NOT NULL,
+            status TEXT NOT NULL CHECK(status IN (
+                'speech','no_speech','no_audio','no_accepted_speech','rejected','failed'
+            )),
+            outcome_reason TEXT NOT NULL DEFAULT '',
+            reject_reason TEXT NOT NULL DEFAULT '',
+            primary_language TEXT NOT NULL DEFAULT '',
+            speech_seconds REAL NOT NULL DEFAULT 0,
+            window_count INTEGER NOT NULL DEFAULT 0,
+            provider_segment_count INTEGER NOT NULL DEFAULT 0,
+            mean_token_probability REAL,
+            repetition_ratio REAL,
+            created_at TEXT NOT NULL
+        );
+
+        INSERT INTO asset_transcripts_v36
+            (asset_id, recipe_key, source_kind, source_fingerprint, status,
+             outcome_reason, reject_reason, primary_language, speech_seconds,
+             window_count, provider_segment_count, mean_token_probability,
+             repetition_ratio, created_at)
+        SELECT asset_id, recipe_key, source_kind, source_fingerprint, status,
+            CASE status
+                WHEN 'no_speech' THEN 'legacy_no_speech_unverified'
+                WHEN 'rejected' THEN 'quality_rejected'
+                WHEN 'failed' THEN 'processing_failed'
+                ELSE 'accepted'
+            END,
+            reject_reason, primary_language, speech_seconds, window_count,
+            0, NULL, NULL, created_at
+        FROM asset_transcripts;
+
+        DROP TABLE asset_transcripts;
+        ALTER TABLE asset_transcripts_v36 RENAME TO asset_transcripts;
+        "#,
+    )?;
+    Ok(())
+}
 
 fn add_resource_calibrations(transaction: &Transaction<'_>) -> Result<()> {
     transaction.execute_batch(
@@ -2398,6 +2458,60 @@ mod tests {
             PROJECT_CATALOG_MIGRATIONS.last().unwrap().id,
             "bump PROJECT_CATALOG_SCHEMA_VERSION when adding a migration"
         );
+    }
+
+    #[test]
+    fn migration_36_preserves_legacy_rows_and_admits_no_speech_is_unverified() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        run_sqlite_migrations(
+            &mut connection,
+            &PROJECT_CATALOG_MIGRATIONS[..PROJECT_CATALOG_MIGRATIONS.len() - 1],
+        )
+        .unwrap();
+        connection
+            .execute_batch(
+                r#"
+                INSERT INTO projects(id,name,created_at)
+                    VALUES ('p1','project','2026-01-01T00:00:00Z');
+                INSERT INTO assets(id,project_id,fingerprint,path,filename,size_bytes,duration_seconds,created_at)
+                    VALUES ('a1','p1','fp1','/clip.mp4','clip.mp4',123,9.0,'2026-01-01T00:00:00Z');
+                INSERT INTO asset_transcripts
+                    (asset_id,recipe_key,source_kind,source_fingerprint,status,
+                     reject_reason,primary_language,speech_seconds,window_count,created_at)
+                VALUES
+                    ('a1','old-recipe','proxy','proxy-fp','no_speech','','',0,0,'before');
+                "#,
+            )
+            .unwrap();
+
+        migrate_project_catalog(&mut connection).unwrap();
+
+        let row = connection
+            .query_row(
+                "SELECT status, outcome_reason, source_fingerprint FROM asset_transcripts WHERE asset_id='a1'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(row.0, "no_speech");
+        assert_eq!(row.1, "legacy_no_speech_unverified");
+        assert_eq!(row.2, "proxy-fp");
+
+        // The migrated schema admits the new typed outcomes.
+        for status in ["no_audio", "no_accepted_speech"] {
+            connection
+                .execute(
+                    "UPDATE asset_transcripts SET status=?1, outcome_reason='' WHERE asset_id='a1'",
+                    [status],
+                )
+                .unwrap();
+        }
     }
 
     #[test]

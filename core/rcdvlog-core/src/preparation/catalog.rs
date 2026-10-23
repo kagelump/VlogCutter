@@ -89,10 +89,15 @@ fn exceptional_asset(asset: &Asset, state: PreparationState, reason: &str) -> Pr
         transcript: PreparationTranscript {
             readiness: evidence(state, reason),
             status: None,
+            outcome_reason: None,
             recipe: None,
             source_fingerprint: None,
             segment_count: 0,
             speech_seconds: None,
+            window_count: None,
+            provider_segment_count: None,
+            mean_token_probability: None,
+            repetition_ratio: None,
             binding_origin: None,
         },
         moments: None,
@@ -120,15 +125,33 @@ struct TranscriptHeader {
     recipe: String,
     source_fingerprint: String,
     status: String,
+    outcome_reason: String,
     reject_reason: String,
     speech_seconds: f64,
+    window_count: u32,
+    provider_segment_count: u32,
+    mean_token_probability: Option<f32>,
+    repetition_ratio: Option<f32>,
     segment_count: usize,
     timings_valid: bool,
     max_end_ms: u32,
     fingerprint: String,
 }
 
-type TranscriptHeaderRow = (String, String, String, String, f64, u32, String, String);
+type TranscriptHeaderRow = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    f64,
+    u32,
+    String,
+    String,
+    u32,
+    Option<f64>,
+    Option<f64>,
+);
 
 impl Catalog {
     fn preparation_asset_active(&self, asset_id: &str, project_id: &str) -> Result<bool> {
@@ -218,8 +241,11 @@ impl Catalog {
             return Ok(None);
         }
         let row: Option<TranscriptHeaderRow> = connection.query_row(
-            "SELECT recipe_key,source_fingerprint,status,reject_reason,speech_seconds,window_count,primary_language,created_at FROM asset_transcripts WHERE asset_id=?1",
-            [&asset.id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?)),
+            "SELECT recipe_key,source_fingerprint,status,outcome_reason,reject_reason,speech_seconds,window_count,primary_language,created_at,provider_segment_count,mean_token_probability,repetition_ratio FROM asset_transcripts WHERE asset_id=?1",
+            [&asset.id], |r| Ok((
+                r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,
+                r.get(6)?,r.get(7)?,r.get(8)?,r.get(9)?,r.get(10)?,r.get(11)?,
+            )),
         ).optional()?;
         let Some(row) = row else {
             return Ok(None);
@@ -251,8 +277,13 @@ impl Catalog {
             recipe: row.0,
             source_fingerprint: row.1,
             status: row.2,
-            reject_reason: row.3,
-            speech_seconds: row.4,
+            outcome_reason: row.3,
+            reject_reason: row.4,
+            speech_seconds: row.5,
+            window_count: row.6,
+            provider_segment_count: row.9,
+            mean_token_probability: row.10.map(|value| value as f32),
+            repetition_ratio: row.11.map(|value| value as f32),
             segment_count: count,
             timings_valid,
             max_end_ms,
@@ -279,10 +310,15 @@ impl Catalog {
                         .unwrap_or("transcript has not been prepared"),
                 ),
                 status: None,
+                outcome_reason: None,
                 recipe: None,
                 source_fingerprint: None,
                 segment_count: 0,
                 speech_seconds: None,
+                window_count: None,
+                provider_segment_count: None,
+                mean_token_probability: None,
+                repetition_ratio: None,
                 binding_origin: None,
             });
         };
@@ -305,12 +341,30 @@ impl Catalog {
                 PreparationState::ReviewRequired,
                 "transcript source-time bounds require review; repeated preparation will not repair them automatically",
             )
-        } else if !matches!(header.status.as_str(), "speech" | "no_speech") {
+        } else if header.status == "no_speech"
+            && header.outcome_reason == "legacy_no_speech_unverified"
+        {
+            // Older rows cannot prove whether the source had audio or whether a
+            // provider returned nothing. Do not present that as verified silence;
+            // keep the evidence visible and require explicit re-transcription.
+            evidence(
+                PreparationState::ReviewRequired,
+                "legacy no_speech outcome cannot prove literal silence; force explicit transcription to verify",
+            )
+        } else if header.status == "no_accepted_speech" {
             evidence(
                 PreparationState::ReviewRequired,
                 &format!(
-                    "transcript {}: {}; use explicit transcription recovery",
-                    header.status, header.reject_reason
+                    "speech was detected but the provider returned no accepted output ({} detected speech seconds, {} windows); targeted recovery may help",
+                    header.speech_seconds, header.window_count
+                ),
+            )
+        } else if !matches!(header.status.as_str(), "speech" | "no_speech" | "no_audio") {
+            evidence(
+                PreparationState::ReviewRequired,
+                &format!(
+                    "transcript {} ({}): {}; use explicit transcription recovery",
+                    header.status, header.outcome_reason, header.reject_reason
                 ),
             )
         } else if header.status == "speech" && header.segment_count == 0 {
@@ -329,10 +383,15 @@ impl Catalog {
         Ok(PreparationTranscript {
             readiness,
             status: Some(header.status),
+            outcome_reason: Some(header.outcome_reason),
             recipe: Some(header.recipe),
             source_fingerprint: Some(header.source_fingerprint),
             segment_count: header.segment_count,
             speech_seconds: Some(header.speech_seconds),
+            window_count: Some(header.window_count),
+            provider_segment_count: Some(header.provider_segment_count),
+            mean_token_probability: header.mean_token_probability,
+            repetition_ratio: header.repetition_ratio,
             binding_origin: binding.map(|b| b.origin.clone()),
         })
     }
@@ -625,7 +684,9 @@ impl Catalog {
         if header.recipe != crate::STT_RECIPE_KEY
             || !header.timings_valid
             || header.max_end_ms > receipt.validated_end_ms
-            || !matches!(header.status.as_str(), "speech" | "no_speech")
+            || !matches!(header.status.as_str(), "speech" | "no_speech" | "no_audio")
+            || (header.status == "no_speech"
+                && header.outcome_reason == "legacy_no_speech_unverified")
             || (header.status == "speech" && header.segment_count == 0)
             || !self
                 .proxy_fingerprint(&asset.id)
@@ -913,36 +974,77 @@ impl Catalog {
         if !self.preparation_asset_active(asset_id, &receipt.project_id)? {
             return Ok(ControlFlow::Continue(changed));
         }
-        if engine.is_none() {
-            let directory = crate::analysis::engine::model_dir(&self.database_path)?;
-            let whisper = directory.join(crate::analysis::engine::WHISPER_MODEL.file_name);
-            let vad = directory.join(crate::analysis::engine::VAD_MODEL.file_name);
-            ensure!(
-                whisper.is_file() && vad.is_file(),
-                "speech models are not installed; preparation never downloads them"
-            );
-            let selection = self.resolve_resource_selection(
-                crate::SPEECH_REPRESENTATION_KIND,
-                crate::STT_RECIPE_KEY,
-                None,
-                None,
-                &crate::ResourceOverrides::default(),
-            )?;
-            *engine = Some(Box::new(
-                crate::analysis::whisper_engine::WhisperEngine::with_threads(
-                    &whisper,
-                    &vad,
-                    selection.vad_threads,
-                    selection.decode_threads,
-                )?,
-            ));
-        }
-        if let Err(error) =
-            self.transcribe_with_engine(asset_id, engine.as_deref().expect("installed engine"))
-        {
-            receipt.transcript_error = Some(clipped(&format!("{error:#}"), 1024).0);
-            store::save(&self.connection()?, &receipt)?;
-            return Err(error);
+        let proxy_path = Self::require_proxy(&asset)?;
+        let source_fingerprint = self.proxy_fingerprint(asset_id)?;
+        let audio_present = match self.transcription_audio_present(&proxy_path) {
+            Ok(present) => present,
+            Err(error) => {
+                let message = format!("{error:#}");
+                crate::analysis::store::save_transcript(
+                    &self.connection()?,
+                    &crate::analysis::stt::failed_transcript(
+                        asset_id,
+                        &source_fingerprint,
+                        message.clone(),
+                    ),
+                )?;
+                receipt.transcript_error = Some(clipped(&message, 1024).0);
+                store::save(&self.connection()?, &receipt)?;
+                return Err(error);
+            }
+        };
+        if audio_present {
+            if engine.is_none() {
+                let directory = crate::analysis::engine::model_dir(&self.database_path)?;
+                let whisper = directory.join(crate::analysis::engine::WHISPER_MODEL.file_name);
+                let vad = directory.join(crate::analysis::engine::VAD_MODEL.file_name);
+                ensure!(
+                    whisper.is_file() && vad.is_file(),
+                    "speech models are not installed; preparation never downloads them"
+                );
+                let selection = self.resolve_resource_selection(
+                    crate::SPEECH_REPRESENTATION_KIND,
+                    crate::STT_RECIPE_KEY,
+                    None,
+                    None,
+                    &crate::ResourceOverrides::default(),
+                )?;
+                *engine = Some(Box::new(
+                    crate::analysis::whisper_engine::WhisperEngine::with_threads(
+                        &whisper,
+                        &vad,
+                        selection.vad_threads,
+                        selection.decode_threads,
+                    )?,
+                ));
+            }
+            if let Err(error) = self.transcribe_source_with_engine(
+                asset_id,
+                &proxy_path,
+                &source_fingerprint,
+                engine.as_deref().expect("installed engine"),
+            ) {
+                let message = format!("{error:#}");
+                let (speech_seconds, window_count, provider_segment_count) =
+                    crate::analysis::stt::failure_evidence(&error);
+                crate::analysis::store::save_transcript(
+                    &self.connection()?,
+                    &crate::analysis::stt::failed_transcript_with_evidence(
+                        asset_id,
+                        &source_fingerprint,
+                        message.clone(),
+                        speech_seconds,
+                        window_count,
+                        provider_segment_count,
+                    ),
+                )?;
+                receipt.transcript_error = Some(clipped(&message, 1024).0);
+                store::save(&self.connection()?, &receipt)?;
+                return Err(error);
+            }
+        } else {
+            let stored = crate::analysis::stt::no_audio_transcript(asset_id, &source_fingerprint);
+            crate::analysis::store::save_transcript(&self.connection()?, &stored)?;
         }
         let current = self.get_asset(asset_id)?;
         ensure!(

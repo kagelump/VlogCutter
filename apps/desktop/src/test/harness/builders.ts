@@ -169,10 +169,25 @@ export function buildTranscript(assetId: string, spec: TranscriptSpec = {}): Cli
     recipeKey: "stt.whisper-large-v3-turbo-q5_0.vad-silero-v5.win30.v1",
     sourceFingerprint: `proxy_${assetId}`,
     status,
+    outcomeReason:
+      status === "speech"
+        ? "accepted"
+        : status === "no_speech"
+          ? "no_detected_speech"
+          : status === "no_audio"
+            ? "no_audio_stream"
+            : status === "no_accepted_speech"
+              ? "empty_provider_output"
+              : status === "rejected"
+                ? "quality_rejected"
+                : "processing_failed",
     rejectReason: "",
     primaryLanguage: spec.language ?? (text ? "en" : ""),
     speechSeconds: spec.speechSeconds ?? (text ? 6.5 : 0),
     windowCount: text ? 1 : 0,
+    providerSegmentCount: text ? 1 : 0,
+    meanTokenProbability: text ? 0.82 : null,
+    repetitionRatio: text ? 0 : null,
     segments: spoken.length
       ? spoken.map((segment) => ({
           startMs: segment.startMs,

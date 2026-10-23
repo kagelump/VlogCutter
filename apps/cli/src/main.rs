@@ -1046,14 +1046,16 @@ fn execute(cli: &Cli) -> Result<Value> {
                     decode_threads: *decode_threads,
                     ..rcdvlog_core::ResourceOverrides::default()
                 }, |progress| {
-                    eprintln!(
-                        "{}",
-                        json!({
-                            "event": "transcribe.progress",
-                            "outcome": progress.outcome,
-                            "estimate": progress.estimate,
-                        })
-                    );
+                    if progress.estimate.confidence != "inspecting_audio" {
+                        eprintln!(
+                            "{}",
+                            json!({
+                                "event": "transcribe.progress",
+                                "outcome": progress.outcome,
+                                "estimate": progress.estimate,
+                            })
+                        );
+                    }
                     ControlFlow::Continue(())
                 })?,
             )?),
@@ -1075,10 +1077,15 @@ fn execute(cli: &Cli) -> Result<Value> {
                         ..rcdvlog_core::ResourceOverrides::default()
                     },
                     |progress| {
-                        eprintln!(
-                            "{}",
-                            json!({"event": "transcribe.batch.progress", "progress": progress})
-                        );
+                        // Planning callbacks keep cancellation responsive before
+                        // model readiness is known. Keep prerequisite errors as
+                        // one JSON value instead of prepending progress events.
+                        if progress.phase != "probing_audio" {
+                            eprintln!(
+                                "{}",
+                                json!({"event": "transcribe.batch.progress", "progress": progress})
+                            );
+                        }
                         cancellation.flow()
                     },
                 )?)?)
@@ -2041,6 +2048,9 @@ mod tests {
         let value = execute(&status).unwrap();
         assert_eq!(value["total"], 0);
         assert_eq!(value["missing"], 0);
+        assert_eq!(value["noAudio"], 0);
+        assert_eq!(value["noAcceptedSpeech"], 0);
+        assert_eq!(value["legacyNoSpeechUnverified"], 0);
         assert_eq!(value["recipeKey"], rcdvlog_core::STT_RECIPE_KEY);
     }
 

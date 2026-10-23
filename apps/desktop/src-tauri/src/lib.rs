@@ -2134,6 +2134,8 @@ async fn analyze_project(
         let mut stage_reached = AnalysisStage::Proxies;
         let mut transcripts = TranscribeReport {
             transcribed: 0,
+            no_audio: 0,
+            failed: 0,
             skipped: 0,
             cancelled: proxies.cancelled,
             resource_source: "default_uncalibrated".into(),

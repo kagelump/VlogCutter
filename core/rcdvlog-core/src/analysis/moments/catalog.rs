@@ -2660,10 +2660,14 @@ mod tests {
                 recipe_key: crate::analysis::STT_RECIPE_KEY.into(),
                 source_fingerprint,
                 status: TranscriptStatus::Speech,
+                outcome_reason: crate::analysis::store::TranscriptOutcomeReason::Accepted,
                 reject_reason: String::new(),
                 primary_language: "en".into(),
                 speech_seconds: 2.4,
                 window_count: 1,
+                provider_segment_count: 2,
+                mean_token_probability: None,
+                repetition_ratio: None,
                 segments: vec![
                     DecodedSegment {
                         start_ms: 3_500,

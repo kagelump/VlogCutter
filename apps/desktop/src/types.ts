@@ -178,7 +178,22 @@ export interface Asset {
 
 export type AnalysisStage = "proxies" | "transcripts" | "analysis";
 
-export type TranscriptStatus = "speech" | "no_speech" | "rejected" | "failed";
+export type TranscriptStatus =
+  | "speech"
+  | "no_speech"
+  | "no_audio"
+  | "no_accepted_speech"
+  | "rejected"
+  | "failed";
+
+export type TranscriptOutcomeReason =
+  | "accepted"
+  | "no_audio_stream"
+  | "no_detected_speech"
+  | "empty_provider_output"
+  | "quality_rejected"
+  | "processing_failed"
+  | "legacy_no_speech_unverified";
 
 export type CameraMovement = "static" | "pan" | "tilt" | "handheld" | "tracking" | "zoom" | "other";
 
@@ -196,12 +211,23 @@ export interface ClipTranscript {
   assetId: string;
   recipeKey: string;
   sourceFingerprint: string;
-  /** `no_speech` is a success, not a failure: the VAD gate found silence. */
+  /**
+   * Terminal outcome. `no_speech` means the VAD gate ran and found no speech;
+   * `no_audio` means the media had no audio stream; `no_accepted_speech` means
+   * speech was detected but the provider returned no usable output.
+   */
   status: TranscriptStatus;
+  outcomeReason: TranscriptOutcomeReason;
   rejectReason: string;
   primaryLanguage: string;
+  /** Detected speech duration, retained even when no transcript was accepted. */
   speechSeconds: number;
+  /** Provider decode windows attempted. */
   windowCount: number;
+  /** Raw decoded segments before filtering and quality gates. */
+  providerSegmentCount: number;
+  meanTokenProbability: number | null;
+  repetitionRatio: number | null;
   segments: TranscriptSegment[];
 }
 
@@ -318,7 +344,14 @@ export interface AnalysisRunReport {
   status: "completed" | "cancelled" | "failed";
   stageReached: AnalysisStage;
   proxies: { generated: number; skipped: number; cancelled: boolean; failures: Array<{ path: string; error: string }> };
-  transcripts: { transcribed: number; skipped: number; cancelled: boolean; failures: Array<{ path: string; error: string }> };
+  transcripts: {
+    transcribed: number;
+    noAudio: number;
+    failed: number;
+    skipped: number;
+    cancelled: boolean;
+    failures: Array<{ path: string; error: string }>;
+  };
   analysis: {
     analyzed: number;
     skipped: number;

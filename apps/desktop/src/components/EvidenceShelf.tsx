@@ -162,11 +162,21 @@ export function EvidenceShelf({
           {tab === "transcript" && (
             segments.length === 0 ? (
               <p className="pane-empty">
-                {transcript
-                  ? transcript.status === "no_speech"
-                    ? "No speech in this clip."
-                    : transcript.rejectReason || transcriptStatusLabels[transcript.status]
-                  : "This clip has not been transcribed."}
+                {transcript ? (
+                  transcript.status === "no_speech" ? (
+                    transcript.outcomeReason === "legacy_no_speech_unverified"
+                      ? "This older result could not verify silence. Transcribe again to check."
+                      : "No speech in this clip."
+                  ) : transcript.status === "no_audio" ? (
+                    "This video has no audio stream."
+                  ) : transcript.status === "no_accepted_speech" ? (
+                    "Speech was detected, but the transcriber returned no usable text."
+                  ) : (
+                    transcript.rejectReason || transcriptStatusLabels[transcript.status]
+                  )
+                ) : (
+                  "This clip has not been transcribed."
+                )}
               </p>
             ) : (
               <>

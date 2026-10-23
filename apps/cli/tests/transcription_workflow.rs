@@ -83,6 +83,41 @@ fn add_asset(path: &Path, project: &str, id: &str, with_proxy: bool) -> PathBuf 
     proxy
 }
 
+fn write_synthetic_audio_video(path: &Path) {
+    let status = Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=black:s=160x90:r=24:d=1",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=48000:duration=1",
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-shortest",
+        ])
+        .arg(path)
+        .status()
+        .expect("run ffmpeg for audio-bearing transcription CLI fixture");
+    assert!(status.success(), "could not generate synthetic audio video");
+}
+
 fn mark_usable(path: &Path, asset_id: &str, fingerprint: &str) {
     Connection::open(path)
         .unwrap()
@@ -222,7 +257,8 @@ fn selected_batch_reports_missing_models_explicitly_without_downloading_or_media
     let data_home = directory.path().join("data-home");
     fs::create_dir_all(&data_home).unwrap();
     let project = create_catalog(&catalog_path);
-    add_asset(&catalog_path, &project, "ready", true);
+    let proxy = add_asset(&catalog_path, &project, "ready", true);
+    write_synthetic_audio_video(&proxy);
     mark_usable(&catalog_path, "ready", "fp-ready");
 
     let value = failure(invoke_with_data_home(
@@ -256,4 +292,49 @@ fn selected_batch_reports_missing_models_explicitly_without_downloading_or_media
         })
         .unwrap();
     assert_eq!(transcript_count, 0);
+}
+
+#[test]
+fn corrupt_proxy_is_a_processing_failure_rather_than_a_model_readiness_error() {
+    let directory = tempdir().unwrap();
+    let catalog_path = directory.path().join("catalog.sqlite3");
+    let data_home = directory.path().join("data-home");
+    fs::create_dir_all(&data_home).unwrap();
+    let project = create_catalog(&catalog_path);
+    // The placeholder proxy exists but is not readable media. ffprobe must fail;
+    // that is a processing failure, not silence and not a missing-model error.
+    add_asset(&catalog_path, &project, "corrupt", true);
+    mark_usable(&catalog_path, "corrupt", "fp-corrupt");
+
+    let value = success(invoke_with_data_home(
+        &catalog_path,
+        &data_home,
+        [
+            "transcribe",
+            "batch",
+            "--project",
+            &project,
+            "--asset",
+            "corrupt",
+        ],
+    ));
+    assert_eq!(value["command"], "transcribe.batch");
+    assert_eq!(value["data"]["failed"], 1);
+    assert_eq!(value["data"]["transcribed"], 0);
+    assert_eq!(value["data"]["noAudio"], 0);
+    assert!(
+        value["data"]["outcomes"][0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("probe audio")
+    );
+    let connection = Connection::open(&catalog_path).unwrap();
+    let transcript: (String, String) = connection
+        .query_row(
+            "SELECT status, outcome_reason FROM asset_transcripts WHERE asset_id='corrupt'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(transcript, ("failed".into(), "processing_failed".into()));
 }
