@@ -18,7 +18,20 @@ const settings: DesktopSettings = {
   mediaOrigin: null,
 };
 
-const models: ModelStatus[] = [{ name: "whisper-base", installed: false, bytes: 148_000_000, url: "", directory: "" }];
+const models: ModelStatus[] = [{
+  name: "whisper-base",
+  role: "speech_to_text",
+  installed: false,
+  ready: false,
+  present: false,
+  integrity: "missing",
+  detail: null,
+  bytes: 148_000_000,
+  url: "",
+  directory: "",
+  path: "",
+  expectedBlake3: null,
+}];
 
 function renderSettings(over: Partial<React.ComponentProps<typeof SettingsModal>> = {}) {
   const props = {

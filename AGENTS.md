@@ -647,13 +647,20 @@ touches the network. Design and measurements:
   `repetition_ratio >= 0.3 OR mean_token_probability < 0.20`.
 - **A batch never downloads a model.** It fails with an actionable error naming
   the file, its size, and where it belongs. Installation is a separate, explicit
-  user action: global settings offers it, and `Catalog::install_models_with_progress`
-  is the only code path that fetches anything. Preserve this split; a 574 MB
+  user action: global settings and CLI `models install` share
+  `install_speech_models_with_progress`. Preserve this split; a 574 MB
   transfer must never begin as a side effect of pressing Analyze.
 - Models live in a shared application-support directory
   (`<data dir>/com.rcd.vlogcutter/models/`) so one copy serves every project. The
   older per-project `<project folder>/cache/models/` location is still read when
   it holds the model, so existing installs are not re-downloaded.
+- CLI `models status` reads identity, integrity, readiness and managed location
+  without catalog writes, downloads or engine initialization. CLI `transcribe
+  batch` validates an exact project-owned selection, reuses current non-failed
+  transcripts, and opens one engine for pending clips. Progress includes per-asset
+  outcomes and a one-worker estimate; cancellation preserves completed work and
+  failures remain retryable. Existing single-clip and whole-project commands stay
+  compatible. See `docs/agent-cli.md`.
 
 **Measured end to end**, release build, M3 MacBook Air (fanless), one worker,
 273-clip Osaka/Expo project, 129.1 minutes of footage:

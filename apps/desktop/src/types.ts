@@ -251,10 +251,17 @@ export interface AssetAnalysisIndexEntry {
 
 export interface ModelStatus {
   name: string;
+  role: "speech_to_text" | "voice_activity_detection" | string;
   installed: boolean;
+  ready: boolean;
+  present: boolean;
+  integrity: "verified" | "present_unverified" | "invalid" | "missing" | string;
+  detail: string | null;
   bytes: number;
   url: string;
   directory: string;
+  path: string;
+  expectedBlake3: string | null;
 }
 
 export interface ModelInstallProgress {

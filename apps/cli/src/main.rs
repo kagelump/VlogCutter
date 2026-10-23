@@ -49,6 +49,11 @@ enum Commands {
         #[command(subcommand)]
         command: agent_commands::WorkspaceCommand,
     },
+    /// Inspect or explicitly install local speech models.
+    Models {
+        #[command(subcommand)]
+        command: agent_commands::ModelsCommand,
+    },
     /// Inspect catalog structure without migrations or writes.
     Catalog {
         #[command(subcommand)]
@@ -172,6 +177,17 @@ enum TranscribeCommand {
     Missing {
         #[arg(long)]
         project: String,
+    },
+    /// Transcribe an explicit, validated selection with one engine lifecycle.
+    Batch {
+        #[arg(long)]
+        project: String,
+        /// Exact project-owned asset ID (repeat for each selected asset).
+        #[arg(long = "asset", required = true)]
+        assets: Vec<String>,
+        /// Regenerate current transcripts. Default reuses current fingerprinted work.
+        #[arg(long)]
+        force: bool,
     },
     /// Report transcript coverage without transcribing anything.
     Status {
@@ -521,6 +537,7 @@ fn command_name(command: &Commands) -> &'static str {
     match command {
         Commands::Doctor { .. } => "doctor",
         Commands::Workspace { command } => agent_commands::command_name(command),
+        Commands::Models { command } => agent_commands::models_command_name(command),
         Commands::Catalog { .. } => "catalog.inspect",
         Commands::Desktop { .. } => "desktop.last-opened",
         Commands::Project { command } => match command {
@@ -564,6 +581,7 @@ fn command_name(command: &Commands) -> &'static str {
         Commands::Transcribe { command } => match command {
             TranscribeCommand::Generate { .. } => "transcribe.generate",
             TranscribeCommand::Missing { .. } => "transcribe.missing",
+            TranscribeCommand::Batch { .. } => "transcribe.batch",
             TranscribeCommand::Status { .. } => "transcribe.status",
         },
         Commands::Analyze { command } => match command {
@@ -596,6 +614,9 @@ fn execute(cli: &Cli) -> Result<Value> {
     }
     if let Commands::Workspace { command } = &cli.command {
         return agent_commands::workspace(cli.catalog.as_deref(), command);
+    }
+    if let Commands::Models { command } = &cli.command {
+        return agent_commands::models(cli.catalog.as_deref(), command);
     }
     if let Commands::Prepare { command } = &cli.command {
         let path = cli.catalog.as_deref().ok_or_else(|| {
@@ -684,7 +705,9 @@ fn execute(cli: &Cli) -> Result<Value> {
         Catalog::open(&catalog_path)?
     };
     match &cli.command {
-        Commands::Doctor { .. } | Commands::Workspace { .. } => unreachable!(),
+        Commands::Doctor { .. } | Commands::Workspace { .. } | Commands::Models { .. } => {
+            unreachable!()
+        }
         Commands::Catalog { .. } | Commands::Desktop { .. } => unreachable!(),
         Commands::Chronology { command } => {
             chronology_commands::execute_chronology(&catalog, command)
@@ -901,6 +924,25 @@ fn execute(cli: &Cli) -> Result<Value> {
                     ControlFlow::Continue(())
                 })?,
             )?),
+            TranscribeCommand::Batch {
+                project,
+                assets,
+                force,
+            } => {
+                let cancellation = agent_commands::CommandCancellation::arm()?;
+                Ok(serde_json::to_value(catalog.transcribe_selected_with_progress(
+                    project,
+                    assets,
+                    &rcdvlog_core::TranscriptionBatchOptions { force: *force },
+                    |progress| {
+                        eprintln!(
+                            "{}",
+                            json!({"event": "transcribe.batch.progress", "progress": progress})
+                        );
+                        cancellation.flow()
+                    },
+                )?)?)
+            }
             TranscribeCommand::Status { project } => {
                 Ok(serde_json::to_value(catalog.transcript_coverage(project)?)?)
             }
@@ -1514,11 +1556,19 @@ fn main() -> ExitCode {
                 .downcast_ref::<rcdvlog_core::MediaToolFailure>()
                 .is_some();
             let readiness_error = error.downcast_ref::<rcdvlog_core::AgentReadinessError>();
+            let transcription_selection_error =
+                error.downcast_ref::<rcdvlog_core::TranscriptionSelectionError>();
+            let transcription_readiness_error =
+                error.downcast_ref::<rcdvlog_core::TranscriptionReadinessError>();
             let prerequisite_error = error.downcast_ref::<rcdvlog_core::MediaPrerequisiteError>();
             let representation_busy = error.downcast_ref::<rcdvlog_core::RepresentationBusy>();
             let code = if let Some(job_agent) = job_agent {
                 job_agent.code
             } else if let Some(readiness) = readiness_error {
+                readiness.code
+            } else if let Some(selection) = transcription_selection_error {
+                selection.code
+            } else if let Some(readiness) = transcription_readiness_error {
                 readiness.code
             } else if representation_busy.is_some() {
                 rcdvlog_core::RepresentationBusy::CODE
@@ -1645,6 +1695,7 @@ mod tests {
             "thumbnails",
             "transcribe",
             "analyze",
+            "models",
             "moments",
             "labels",
         ] {
@@ -1659,6 +1710,20 @@ mod tests {
         );
         assert!(
             Cli::try_parse_from(["rcdvlog", "transcribe", "generate", "--asset", "a1"]).is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "rcdvlog",
+                "transcribe",
+                "batch",
+                "--project",
+                "p1",
+                "--asset",
+                "a1",
+                "--asset",
+                "a2",
+            ])
+            .is_ok()
         );
         assert!(
             Cli::try_parse_from(["rcdvlog", "transcribe", "status", "--project", "p1"]).is_ok()

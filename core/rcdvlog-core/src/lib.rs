@@ -43,6 +43,7 @@ mod prerequisites;
 mod representation;
 mod stall;
 mod storage;
+mod transcription;
 mod volumes;
 
 use analysis::audio::{AudioExtractor, FfmpegAudioExtractor};
@@ -51,10 +52,7 @@ use analysis::consolidate::{
     apply_mapping as persist_label_mapping, assets_for_label, consolidation_prompt, mapping_schema,
     parse_mapping, proposals as label_proposals,
 };
-use analysis::engine::{
-    SttEngine, VAD_MODEL, WHISPER_MODEL, ensure_model, install_model, model_dir,
-    model_is_installed, shared_model_dir,
-};
+use analysis::engine::{SttEngine, VAD_MODEL, WHISPER_MODEL, ensure_model, model_dir};
 use analysis::store::{StoredTranscript, is_current, load_transcript, save_transcript};
 use analysis::stt::transcribe_pcm;
 use analysis::vlm::{PromptContext, PromptTranscript, analyze_clip as run_vlm};
@@ -100,7 +98,8 @@ pub use lifecycle::{
 pub use agent::{
     AgentReadinessError, BindingCheck, CatalogReadiness, CliBinding, CliBuild, CliExecutable,
     CliSelection, DoctorReport, ReadinessRequirements, catalog_readiness, check_cli_binding,
-    doctor_report, ensure_agent_readiness, refresh_cli_binding, speech_model_status,
+    doctor_report, ensure_agent_readiness, install_speech_models_with_progress,
+    refresh_cli_binding, speech_model_status,
 };
 pub use preflight::{
     Classification, ImportDestination, ImportOutcome, ImportPreflight, ImportProgress,
@@ -114,6 +113,11 @@ pub use prerequisites::{
     prerequisite_status,
 };
 pub use representation::{ProxyWrite, RepresentationBusy, RepresentationClaim, RepresentationKind};
+pub use transcription::{
+    TranscriptionAssetOutcome, TranscriptionAssetState, TranscriptionBatchOptions,
+    TranscriptionBatchProgress, TranscriptionBatchReport, TranscriptionReadinessError,
+    TranscriptionSelectionError,
+};
 
 pub use analysis::moments::{
     EditProfile, MomentArtifact, MomentCandidate, MomentInventoryPage, MomentPage, MomentPayload,
@@ -600,16 +604,33 @@ pub struct AnalysisRunRecord {
     pub error: String,
 }
 
-/// Whether one speech model is installed, and what installing it would cost.
+/// Whether one speech model is present, intact, and ready to load.
+///
+/// `installed` is retained as the readiness-compatible field used by existing
+/// desktop consumers. `present`, `integrity`, and `ready` separate file
+/// existence from verified readiness so a corrupt file is not presented as an
+/// installed model.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelStatus {
+    /// Stable artifact filename used as the model identity.
     pub name: String,
+    /// `speech_to_text` or `voice_activity_detection`.
+    pub role: String,
     pub installed: bool,
+    pub ready: bool,
+    pub present: bool,
+    /// `verified`, `present_unverified`, `invalid`, or `missing`.
+    pub integrity: String,
+    pub detail: Option<String>,
+    /// Published artifact size in bytes.
     pub bytes: u64,
     pub url: String,
     /// The directory this catalog reads the model from.
     pub directory: String,
+    /// The exact path expected for this model in `directory`.
+    pub path: String,
+    pub expected_blake3: Option<String>,
 }
 
 /// Progress for an explicit model download.
@@ -619,6 +640,20 @@ pub struct ModelInstallProgress {
     pub name: String,
     pub downloaded_bytes: u64,
     pub total_bytes: u64,
+}
+
+/// Result of an explicit model installation attempt.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelInstallReport {
+    /// True when the progress callback stopped the transfer. The partial file is
+    /// removed and is not counted as installed. Earlier completed downloads stay
+    /// installed and remain included in `installed`.
+    pub cancelled: bool,
+    /// Number of model files downloaded by this attempt, excluding already-ready
+    /// models.
+    pub installed: usize,
+    pub models: Vec<ModelStatus>,
 }
 
 /// Progress for a transcription batch, mirroring `AssetBatchProgress`.
@@ -2533,28 +2568,21 @@ impl Catalog {
         speech_model_status(&self.database_path)
     }
 
-    /// Downloads whichever speech models are missing, into the shared directory.
+    /// Downloads whichever speech models are missing.
     ///
     /// This is the only path that fetches a model. It exists so installation is
-    /// an explicit user action; no batch calls it.
-    pub fn install_models_with_progress<F>(&self, mut on_progress: F) -> Result<Vec<ModelStatus>>
+    /// an explicit user action; no batch calls it. The legacy return type keeps
+    /// desktop compatibility; use `install_speech_models_with_progress` when the
+    /// caller needs an explicit cancellation outcome.
+    pub fn install_models_with_progress<F>(&self, on_progress: F) -> Result<Vec<ModelStatus>>
     where
         F: FnMut(ModelInstallProgress) -> ControlFlow<()>,
     {
-        let directory = shared_model_dir()?;
-        for model in [WHISPER_MODEL, VAD_MODEL] {
-            if model_is_installed(&directory, &model) {
-                continue;
-            }
-            install_model(&directory, &model, |downloaded, total| {
-                on_progress(ModelInstallProgress {
-                    name: model.file_name.to_string(),
-                    downloaded_bytes: downloaded,
-                    total_bytes: total,
-                })
-            })?;
+        let report = install_speech_models_with_progress(&self.database_path, on_progress)?;
+        if report.cancelled {
+            bail!("model download cancelled");
         }
-        self.model_status()
+        Ok(report.models)
     }
 
     /// Transcribes one clip, replacing any previous transcript.
