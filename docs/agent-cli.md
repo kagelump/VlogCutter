@@ -119,6 +119,29 @@ the report in `error.details`. Model readiness reuses the existing presence
 and configured-checksum policy. It does not load an inference engine or fetch
 models; provisioning remains explicit.
 
+### Speech model management
+
+```bash
+rcdvlog --catalog /absolute/project/catalog.sqlite3 models status
+rcdvlog --catalog /absolute/project/catalog.sqlite3 models install
+```
+
+`models status` is strictly read-only and offline. For each speech artifact it
+reports a stable `name`/`role`, `present`, `ready`, `installed`, `integrity`
+(`verified`, `present_unverified`, `invalid`, or `missing`), an actionable
+`detail`, the expected `path`, and the catalog-managed `directory`. It never
+creates the model directory, migrates the catalog, downloads a file, or loads an
+inference engine.
+
+`models install` is the separate explicit provisioning operation. It downloads
+only missing or invalid artifacts, emits `models.install.progress` JSON events
+on stderr, and checks for Ctrl-C through the existing bounded-callback path.
+Cancellation is checked before each download and at transfer progress callbacks;
+it removes the partial file and returns a success envelope with `cancelled: true`.
+Earlier completed downloads remain installed. Transcription never calls this
+operation, so a batch with unavailable models fails with
+`speech_models_not_ready` instead of starting a hidden download.
+
 ### Project-local CLI binding
 
 The binding records which absolute executable and existing catalog an agent
@@ -402,6 +425,8 @@ Analysis-selected Q10 representative thumbnails also take the shared thumbnail c
 ```bash
 rcdvlog --catalog /absolute/project/catalog.sqlite3 transcribe generate --asset <asset-id>
 rcdvlog --catalog /absolute/project/catalog.sqlite3 transcribe missing --project <project-id>
+rcdvlog --catalog /absolute/project/catalog.sqlite3 transcribe batch --project <project-id> --asset <asset-a> --asset <asset-b>
+rcdvlog --catalog /absolute/project/catalog.sqlite3 transcribe batch --project <project-id> --asset <asset-a> --force
 rcdvlog --catalog /absolute/project/catalog.sqlite3 transcribe status --project <project-id>
 
 rcdvlog --catalog /absolute/project/catalog.sqlite3 analyze generate --asset <asset-id>
@@ -414,6 +439,30 @@ rcdvlog --catalog /absolute/project/catalog.sqlite3 analyze status --project <pr
 rcdvlog --catalog /absolute/project/catalog.sqlite3 labels consolidate --project <project-id>
 rcdvlog --catalog /absolute/project/catalog.sqlite3 labels vocabulary --project <project-id>
 ```
+
+`transcribe batch` is the incremental preparation surface. It validates the
+entire explicit selection before work starts: an empty selection, duplicate
+asset IDs, unknown IDs, and IDs owned by another project fail with
+`empty_asset_selection`, `duplicate_asset_id`, `unknown_asset_id`, or
+`asset_project_mismatch` respectively in the core API. The CLI requires at least
+one `--asset`, reporting `invalid_arguments` for an omitted selection. The
+selection is capped at 10,000 assets (`selection_too_large`); a missing project
+reports `project_not_found`.
+Only the requested project-owned assets are touched.
+
+Current fingerprinted transcripts are reused by default; `--force` explicitly
+regenerates them. Failed attempts stay retryable and are never reported as reused.
+Transcript replacement never changes human-authored notes,
+labels, titles, descriptions, removals, rotation, or chronology. Removed assets,
+videos not durably validated as usable, and assets without a reachable proxy are
+reported per asset as `not_ready` and skip engine work. Missing or invalid speech
+models are a run-level readiness failure before any engine initialization. For
+ready assets, one engine lifecycle serves the compatible batch. The report has
+per-asset states (`transcribed`, `reused`, `not_ready`, `failed`, `cancelled`),
+counts, and `cancelled`/`cancelledAssets`; progress is emitted as bounded
+`transcribe.batch.progress` JSON events on stderr, including a one-worker ETA
+based only on attempted transcription work. Ctrl-C stops after the current asset,
+preserves completed transcripts, and reports the remaining assets as cancelled.
 
 Transcription is offline and reads proxies only. Vision analysis reads proxy-derived frame packs and any accepted speech transcript, then calls OpenRouter using `OPENROUTER_API_KEY` or `~/.openrouter.key`. A normal `analyze missing` run is idempotent; `--force` replaces current derived observations and reports how many clips already had non-empty title or description fields before overwrite. Notes remain human-only. OCR is a reviewable suggestion and is not indexed as fact.
 

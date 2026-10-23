@@ -1,9 +1,69 @@
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, ensure};
 use clap::{Args, CommandFactory, Subcommand, ValueEnum};
-use rcdvlog_core::{CliBuild, CliExecutable, CliSelection, ReadinessRequirements};
-use serde_json::Value;
+use rcdvlog_core::{
+    Catalog, CliBuild, CliExecutable, CliSelection, ReadinessRequirements,
+    install_speech_models_with_progress,
+};
+use serde_json::{Value, json};
 use std::collections::BTreeMap;
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::sync::atomic::{AtomicBool, Ordering};
+
+#[cfg(unix)]
+static COMMAND_CANCELLED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(unix)]
+extern "C" fn cancel_command(_signal: libc::c_int) {
+    COMMAND_CANCELLED.store(true, Ordering::SeqCst);
+}
+
+pub struct CommandCancellation {
+    #[cfg(unix)]
+    previous: libc::sighandler_t,
+}
+
+impl CommandCancellation {
+    pub fn arm() -> Result<Self> {
+        #[cfg(unix)]
+        {
+            COMMAND_CANCELLED.store(false, Ordering::SeqCst);
+            // The signal handler only flips an atomic flag. Domain callbacks
+            // stop at a transfer chunk or completed asset, preserving results.
+            let previous = unsafe {
+                libc::signal(
+                    libc::SIGINT,
+                    cancel_command as *const () as libc::sighandler_t,
+                )
+            };
+            ensure!(
+                previous != libc::SIG_ERR,
+                "could not install cancellation handler"
+            );
+            Ok(Self { previous })
+        }
+        #[cfg(not(unix))]
+        Ok(Self {})
+    }
+
+    pub fn flow(&self) -> ControlFlow<()> {
+        #[cfg(unix)]
+        if COMMAND_CANCELLED.load(Ordering::SeqCst) {
+            return ControlFlow::Break(());
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+#[cfg(unix)]
+impl Drop for CommandCancellation {
+    fn drop(&mut self) {
+        unsafe {
+            libc::signal(libc::SIGINT, self.previous);
+        }
+    }
+}
 
 #[derive(Debug, Default, Args)]
 pub struct ReadinessArgs {
@@ -46,6 +106,21 @@ impl ReadinessArgs {
 pub enum Selection {
     Installed,
     Development,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ModelsCommand {
+    /// Read-only model identity, integrity, readiness, and managed location.
+    Status,
+    /// Explicitly download missing speech models with progress and Ctrl-C cancellation.
+    Install,
+}
+
+pub fn models_command_name(command: &ModelsCommand) -> &'static str {
+    match command {
+        ModelsCommand::Status => "models.status",
+        ModelsCommand::Install => "models.install",
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -119,6 +194,8 @@ fn executable() -> Result<CliExecutable> {
                 rcdvlog_core::PROJECT_CATALOG_SCHEMA_VERSION,
             ),
             ("speech.local.v1".into(), 1),
+            ("speech.models.v1".into(), 1),
+            ("transcribe.selected.v1".into(), 1),
             ("video.validation.v1".into(), 1),
             ("moments.discovery.v1".into(), 1),
             ("prepare.evidence.v1".into(), 1),
@@ -169,4 +246,37 @@ pub fn workspace(catalog: Option<&Path>, command: &WorkspaceCommand) -> Result<V
         }
     };
     Ok(serde_json::to_value(result)?)
+}
+
+/// Explicit model management. Status is strictly read-only and offline;
+/// installation is a separate command that never runs implicitly.
+pub fn models(catalog: Option<&Path>, command: &ModelsCommand) -> Result<Value> {
+    let catalog_path = catalog.ok_or_else(|| {
+        anyhow!("invalid input: model commands require --catalog or RCDVLOG_CATALOG")
+    })?;
+    ensure!(
+        catalog_path.is_file(),
+        "catalog not found: model commands require an existing file at {}",
+        catalog_path.display()
+    );
+    match command {
+        ModelsCommand::Status => {
+            let catalog = Catalog::open_read_only_existing(catalog_path)?;
+            Ok(serde_json::to_value(catalog.model_status()?)?)
+        }
+        ModelsCommand::Install => {
+            // Validate the catalog without migrating or writing it. Installation
+            // only writes managed model files, never catalog state.
+            let _catalog = Catalog::open_read_only_existing(catalog_path)?;
+            let cancellation = CommandCancellation::arm()?;
+            let report = install_speech_models_with_progress(catalog_path, |progress| {
+                eprintln!(
+                    "{}",
+                    json!({"event": "models.install.progress", "progress": progress})
+                );
+                cancellation.flow()
+            })?;
+            Ok(serde_json::to_value(report)?)
+        }
+    }
 }

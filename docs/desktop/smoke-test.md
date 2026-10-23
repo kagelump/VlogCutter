@@ -56,22 +56,23 @@ the Rust side is doing it — record which.
 Local speech-to-text is CLI-only for now; there is no desktop surface yet. It
 runs fully offline and needs no API key.
 
-Install both models into the project's cache first — a batch deliberately does
-not download them for you:
+Inspect model integrity/readiness and install explicitly first. A batch
+deliberately does not download models for you:
 
 ```bash
-curl -L -o "$PROJECT/cache/models/ggml-silero-v5.1.2.bin" https://huggingface.co/ggml-org/whisper-vad/resolve/main/ggml-silero-v5.1.2.bin
+rcdvlog --catalog <c> models status
+rcdvlog --catalog <c> models install
 ```
 
-```bash
-curl -L -o "$PROJECT/cache/models/ggml-large-v3-turbo-q5_0.bin" https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin
-```
+Installation emits progress on stderr. Ctrl-C cancels the transfer, removes the
+partial file, and reports `cancelled: true`; no model is claimed installed.
 
 | # | Check | How | Expected |
 | --- | --- | --- | --- |
 | T1 | Coverage before | `rcdvlog --catalog <c> transcribe status --project <p>` | `total` matches the clip count; everything in `missing`; `recipeKey` is the current STT recipe. |
 | T2 | Missing model is actionable | Move a model aside, run `transcribe missing`. | Fails naming the file, its size, and the directory to put it in. Nothing is written. |
 | T3 | Batch run | `rcdvlog --catalog <c> transcribe missing --project <p>` | JSON envelope on stdout; `transcribe.progress` events on stderr with a live estimate. |
+| T3b | Selected batch | `rcdvlog --catalog <c> transcribe batch --project <p> --asset <a> --asset <b>` | Only those assets are considered; current transcripts are reused and progress is bounded. |
 | T4 | VAD gates silence | Inspect `transcribe status` after the run. | A large fraction land in `noSpeech` — roughly two thirds on travel footage. Zero would mean the gate is broken. |
 | T5 | Idempotent | Re-run `transcribe missing`. | `skipped` equals the clip count, `transcribed` is 0, and no model work happens. |
 | T6 | Proxy regeneration invalidates | Regenerate one clip's proxy, then re-run `transcribe missing`. | That one clip is transcribed again; the rest are skipped. |

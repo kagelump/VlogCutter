@@ -2,7 +2,10 @@
 //! The binding is configuration, never a projection or alternate catalog.
 
 use crate::prerequisites::run_bounded_command;
-use crate::{MigrationHistoryStatus, ModelStatus, PROJECT_CATALOG_SCHEMA_VERSION, ToolStatus};
+use crate::{
+    MigrationHistoryStatus, ModelInstallProgress, ModelInstallReport, ModelStatus,
+    PROJECT_CATALOG_SCHEMA_VERSION, ToolStatus,
+};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -10,6 +13,7 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -162,17 +166,282 @@ pub fn speech_model_status(catalog_path: &Path) -> Result<Vec<ModelStatus>> {
 }
 
 fn speech_models_in(directory: PathBuf) -> Result<Vec<ModelStatus>> {
-    use crate::analysis::engine::{VAD_MODEL, WHISPER_MODEL, model_is_installed};
-    Ok([WHISPER_MODEL, VAD_MODEL]
-        .into_iter()
-        .map(|model| ModelStatus {
+    use crate::analysis::engine::{VAD_MODEL, WHISPER_MODEL};
+    Ok([
+        (WHISPER_MODEL, "speech_to_text"),
+        (VAD_MODEL, "voice_activity_detection"),
+    ]
+    .into_iter()
+    .map(|(model, role)| model_status_in(&directory, &model, role))
+    .collect())
+}
+
+fn model_status_in(
+    directory: &Path,
+    model: &crate::analysis::engine::ModelAsset,
+    role: &str,
+) -> ModelStatus {
+    let path = directory.join(model.file_name);
+    let present = path.is_file();
+    let expected_blake3 = (!model.blake3.is_empty()).then(|| model.blake3.to_string());
+    let (integrity, ready, detail) = if !present {
+        (
+            "missing",
+            false,
+            Some(format!(
+                "not installed; expected at {} (run `rcdvlog models install` explicitly)",
+                path.display()
+            )),
+        )
+    } else if model.blake3.is_empty() {
+        (
+            "present_unverified",
+            true,
+            Some("present; this build has no pinned digest for the artifact".into()),
+        )
+    } else {
+        match fs::read(&path) {
+            Ok(bytes) => {
+                let digest = blake3::hash(&bytes).to_hex().to_string();
+                if digest == model.blake3 {
+                    ("verified", true, None)
+                } else {
+                    (
+                        "invalid",
+                        false,
+                        Some(format!(
+                            "digest mismatch: expected {}, found {digest}",
+                            model.blake3
+                        )),
+                    )
+                }
+            }
+            Err(error) => (
+                "invalid",
+                false,
+                Some(format!("model file is unreadable: {error}")),
+            ),
+        }
+    };
+    ModelStatus {
+        name: model.file_name.to_string(),
+        role: role.to_string(),
+        installed: ready,
+        ready,
+        present,
+        integrity: integrity.to_string(),
+        detail,
+        bytes: model.bytes,
+        url: model.url.to_string(),
+        directory: directory.to_string_lossy().into_owned(),
+        path: path.to_string_lossy().into_owned(),
+        expected_blake3,
+    }
+}
+
+/// Explicitly download missing speech models into the directory this catalog
+/// reads from. This is the only model-fetching path; status and transcription
+/// never call it.
+pub fn install_speech_models_with_progress<F>(
+    catalog_path: &Path,
+    on_progress: F,
+) -> Result<ModelInstallReport>
+where
+    F: FnMut(ModelInstallProgress) -> ControlFlow<()>,
+{
+    use crate::analysis::engine::{VAD_MODEL, WHISPER_MODEL, model_dir};
+    let directory = model_dir(catalog_path)?;
+    let (cancelled, installed) =
+        install_models_into(&directory, &[WHISPER_MODEL, VAD_MODEL], on_progress)?;
+    Ok(ModelInstallReport {
+        cancelled,
+        installed,
+        models: speech_model_status(catalog_path)?,
+    })
+}
+
+fn install_models_into<F>(
+    directory: &Path,
+    models: &[crate::analysis::engine::ModelAsset],
+    mut on_progress: F,
+) -> Result<(bool, usize)>
+where
+    F: FnMut(ModelInstallProgress) -> ControlFlow<()>,
+{
+    use crate::analysis::engine::{install_model, model_is_installed};
+    let mut cancelled = false;
+    let mut installed = 0_usize;
+    for model in models {
+        if model_is_installed(directory, model) {
+            continue;
+        }
+        if on_progress(ModelInstallProgress {
             name: model.file_name.to_string(),
-            installed: model_is_installed(&directory, &model),
-            bytes: model.bytes,
-            url: model.url.to_string(),
-            directory: directory.to_string_lossy().into_owned(),
+            downloaded_bytes: 0,
+            total_bytes: model.bytes,
         })
-        .collect())
+        .is_break()
+        {
+            return Ok((true, installed));
+        }
+        let mut cancelled_this_transfer = false;
+        let result = install_model(directory, model, |downloaded, total| {
+            let flow = on_progress(ModelInstallProgress {
+                name: model.file_name.to_string(),
+                downloaded_bytes: downloaded,
+                total_bytes: total,
+            });
+            if flow.is_break() {
+                cancelled_this_transfer = true;
+            }
+            flow
+        });
+        if cancelled_this_transfer {
+            cancelled = true;
+            break;
+        }
+        result?;
+        installed += 1;
+    }
+    Ok((cancelled, installed))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analysis::engine::ModelAsset;
+    use std::net::TcpListener;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tempfile::tempdir;
+
+    fn serve_body_once(body: Vec<u8>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = socket.read(&mut request);
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = socket.write_all(header.as_bytes());
+            let _ = socket.write_all(&body);
+        });
+        format!("http://{address}/model.bin")
+    }
+
+    #[test]
+    fn model_status_separates_presence_integrity_and_readiness() {
+        let directory = tempdir().unwrap();
+        let model = ModelAsset {
+            file_name: "candidate.bin",
+            url: "https://example.invalid/candidate.bin",
+            blake3: "",
+            bytes: 12,
+        };
+        let missing = model_status_in(directory.path(), &model, "speech_to_text");
+        assert!(!missing.present);
+        assert!(!missing.ready);
+        assert_eq!(missing.integrity, "missing");
+        assert!(missing.path.ends_with("candidate.bin"));
+
+        fs::write(directory.path().join(model.file_name), b"hello model").unwrap();
+        let present = model_status_in(directory.path(), &model, "speech_to_text");
+        assert!(present.present);
+        assert!(present.ready);
+        assert_eq!(present.integrity, "present_unverified");
+
+        let pinned = ModelAsset {
+            blake3: "0000000000000000000000000000000000000000000000000000000000000000",
+            ..model
+        };
+        let invalid = model_status_in(directory.path(), &pinned, "speech_to_text");
+        assert!(invalid.present);
+        assert!(!invalid.ready);
+        assert!(!invalid.installed);
+        assert_eq!(invalid.integrity, "invalid");
+    }
+
+    #[test]
+    fn cancelled_install_reports_cancellation_and_removes_the_partial_file() {
+        let directory = tempdir().unwrap();
+        let url = serve_body_once(vec![7_u8; 4 * 1024 * 1024]);
+        let leaked_url = Box::leak(url.into_boxed_str());
+        let model = ModelAsset {
+            file_name: "cancel.bin",
+            url: leaked_url,
+            blake3: "",
+            bytes: 4 * 1024 * 1024,
+        };
+        let progress_calls = Arc::new(AtomicUsize::new(0));
+        let calls = progress_calls.clone();
+        let (cancelled, installed) =
+            install_models_into(directory.path(), &[model], move |progress| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                if progress.downloaded_bytes == 0 {
+                    ControlFlow::Continue(())
+                } else {
+                    ControlFlow::Break(())
+                }
+            })
+            .unwrap();
+        assert!(cancelled);
+        assert_eq!(installed, 0);
+        assert_eq!(progress_calls.load(Ordering::SeqCst), 2);
+        assert!(!directory.path().join("cancel.bin").exists());
+        assert!(!directory.path().join("cancel.bin.partial").exists());
+    }
+
+    #[test]
+    fn installation_can_cancel_before_network_or_directory_creation() {
+        let directory = tempdir().unwrap();
+        let missing = directory.path().join("models");
+        let model = ModelAsset {
+            file_name: "cancel.bin",
+            url: "https://example.invalid/must-not-be-requested",
+            blake3: "",
+            bytes: 4,
+        };
+        assert_eq!(
+            install_models_into(&missing, &[model], |_| ControlFlow::Break(())).unwrap(),
+            (true, 0)
+        );
+        assert!(!missing.exists());
+    }
+
+    #[test]
+    fn installation_verifies_then_reuses_a_completed_download() {
+        let directory = tempdir().unwrap();
+        let body = b"synthetic model".to_vec();
+        let digest = blake3::hash(&body).to_hex().to_string();
+        let url = serve_body_once(body.clone());
+        let model = ModelAsset {
+            file_name: "installed.bin",
+            url: Box::leak(url.into_boxed_str()),
+            blake3: Box::leak(digest.into_boxed_str()),
+            bytes: body.len() as u64,
+        };
+        assert_eq!(
+            install_models_into(directory.path(), &[model], |_| ControlFlow::Continue(())).unwrap(),
+            (false, 1)
+        );
+        let status = model_status_in(directory.path(), &model, "speech_to_text");
+        assert!(status.ready);
+        assert_eq!(status.integrity, "verified");
+        assert_eq!(
+            install_models_into(directory.path(), &[model], |_| panic!(
+                "must reuse the model"
+            ))
+            .unwrap(),
+            (false, 0)
+        );
+        assert_eq!(
+            fs::read(directory.path().join(model.file_name)).unwrap(),
+            body
+        );
+    }
 }
 
 pub fn doctor_report(executable: CliExecutable, catalog: Option<&Path>) -> Result<DoctorReport> {
