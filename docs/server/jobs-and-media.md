@@ -24,7 +24,20 @@ Chrome streams only representations through opaque-ID URLs. `GET` and `HEAD` sup
 
 The Mac can download a compatible server proxy or thumbnail into its project-local cache. If the required recipe is Mac-only, the server records a node-targeted request and the desktop can fulfill it after reconnect. Original media never transfers in this epic.
 
-Worker ETA uses source-byte weights and node-scoped, recipe-versioned rate history. Only successful item observations update throughput. See [batch-estimation.md](../batch-estimation.md).
+Worker ETA uses source-byte weights. Representation outputs keep an immutable
+semantic recipe/identity, but their timing is stored separately under a
+qualified estimator identity built from the exact configured FFmpeg/FFprobe
+programs, actual selected encoder/execution recipe, worker/thread configuration,
+host/build, and lightweight device facts. The identity is attached to the
+current SQLite job attempt under lease checks; failed or interrupted attempts do
+not train success rates. A per-attempt context is reusable only while it still
+matches the runtime environment and the current process session; an interrupted
+or restarted process cannot advertise the old live-attempt ETA. Generic or
+legacy proxy recipe history cannot
+seed a current media ETA, and queued/interrupted/unknown contexts report an
+explicit uncertain ETA instead of a completion promise. Non-media
+full-hash/lightweight history continues to use its existing task keys. See
+[batch-estimation.md](../batch-estimation.md).
 
 Automated tests cover real generated media, atomic output, restart reconciliation, cancellation cleanup, RFC-style ranges, 10,000 queued jobs, and bounded worker claims. Chrome-over-LAN seek behavior, physical NAS loss, and target thermal/resource observations remain manual.
 

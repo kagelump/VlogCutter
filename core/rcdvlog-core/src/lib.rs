@@ -92,11 +92,13 @@ pub use calibration::{
     CalibrationUncertainty, DEFAULT_GENERATED_CALIBRATION_SECONDS, MAX_CALIBRATION_CANDIDATES,
     MAX_CALIBRATION_THREADS, MAX_CALIBRATION_TOTAL_TRIALS, MAX_CALIBRATION_TRIALS,
     MAX_CALIBRATION_WORKERS, MAX_GENERATED_CALIBRATION_SECONDS, MAX_REPRESENTATIVE_MEDIA_BYTES,
-    MAX_REPRESENTATIVE_MEDIA_DURATION_MS, PROXY_REPRESENTATION_KIND, ProxyCalibrationOptions,
-    RESOURCE_CALIBRATION_RECIPE_VERSION, RESOURCE_CALIBRATION_SCHEMA_VERSION,
-    ResourceCalibrationReport, ResourceOverrides, ResourceSelection, SPEECH_REPRESENTATION_KIND,
-    SpeechCalibrationOptions, SpeechRegionComparison, SpeechRegionDifference,
-    compare_speech_regions,
+    MAX_REPRESENTATIVE_MEDIA_DURATION_MS, MediaEstimatorEnvironment, MediaEstimatorIdentity,
+    PROXY_REPRESENTATION_KIND, ProxyCalibrationOptions, RESOURCE_CALIBRATION_RECIPE_VERSION,
+    RESOURCE_CALIBRATION_SCHEMA_VERSION, ResourceCalibrationReport, ResourceOverrides,
+    ResourceSelection, SPEECH_REPRESENTATION_KIND, SpeechCalibrationOptions,
+    SpeechRegionComparison, SpeechRegionDifference, calibration_hardware_device_identities,
+    calibration_host_identity, calibration_tool_identity_for_path, compare_speech_regions,
+    media_estimator_process_key,
 };
 pub use camera_proxy::{CameraProxySidecar, CameraSidecarProvenance, CameraTimeMapping};
 pub use cards::{
@@ -5048,6 +5050,16 @@ fn residual_work_units(task_work: &[u64], completed: &[bool], partial_work: &[u6
 /// name itself when no concrete path is found on PATH or standard directories.
 pub fn resolve_tool_path(name: &str) -> PathBuf {
     resolve_tool(name)
+}
+
+/// Resolves a configured program without replacing an explicit relative or
+/// absolute path. Bare command names are looked up on `PATH`; explicit paths
+/// are preserved so callers can identify the exact executable they execute.
+pub fn resolve_tool_program(program: &Path) -> PathBuf {
+    if program.is_absolute() || program.components().count() > 1 {
+        return program.to_path_buf();
+    }
+    resolve_tool(&program.to_string_lossy())
 }
 
 fn resolve_tool(name: &str) -> PathBuf {

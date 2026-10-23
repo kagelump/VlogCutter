@@ -1697,14 +1697,15 @@ mod tests {
     #[test]
     fn cancellation_kills_a_silent_encoder_and_does_not_start_fallback() {
         let directory = TempDir::new().unwrap();
-        let script = directory.path().join("silent-encoder");
+        // Execute a checked-in fixture rather than writing an executable just
+        // before spawn. Parallel tests fork children, which can briefly inherit
+        // a writable script descriptor and make Linux execve fail with ETXTBSY.
+        let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/silent-encoder.sh");
+        let output = directory.path().join("canceled.mp4");
         // Signal only after the child process has actually started. Cancel on
         // that handshake rather than an absolute wall-clock deadline so a slow
         // process start cannot race with the fallback decision.
-        fs::write(&script, "#!/bin/sh\n: > \"$0.started\"\nexec sleep 30\n").unwrap();
-        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
-        let started_marker = PathBuf::from(format!("{}.started", script.display()));
-        let output = directory.path().join("canceled.mp4");
+        let started_marker = PathBuf::from(format!("{}.started", output.display()));
         let mut plan = software_plan();
         // A cancellation must suppress even an otherwise valid fallback.
         plan.targets.push(ProxyEncoderTarget::software());

@@ -6,9 +6,9 @@ use rcdvlog_server::{
 use rcdvlog_server_core::{
     APPLICATION_VERSION, BackupJobHandler, BackupService, CONTROL_CATALOG_SCHEMA_VERSION,
     CatalogSchemaError, ConfigError, InstanceLockError, JobScheduler, JobSchedulerConfig,
-    PROTOCOL_MAJOR_VERSION, PROTOCOL_MINOR_VERSION, RepresentationJobHandler, RuntimeFoundation,
-    ScanJobHandler, ScanService, ScanSource, ScanToolConfig, ServerConfig, ServerJobHandler,
-    compute_next_run_utc,
+    MediaEstimatorEnvironment, PROTOCOL_MAJOR_VERSION, PROTOCOL_MINOR_VERSION,
+    RepresentationJobHandler, RuntimeFoundation, ScanJobHandler, ScanService, ScanSource,
+    ScanToolConfig, ServerConfig, ServerJobHandler, compute_next_run_utc,
 };
 use serde::Serialize;
 use std::fs::OpenOptions;
@@ -411,9 +411,16 @@ async fn run() -> Result<()> {
         let library = worker_catalog.storage_library();
         let scan_service = Arc::new(ScanService::new(library.clone(), tool_config));
         let scan_handler = ScanJobHandler::new(library.clone(), scan_service.clone());
+        let estimator_environment = MediaEstimatorEnvironment::from_tools(
+            std::path::Path::new(&worker_config.ffmpeg_command),
+            std::path::Path::new(&worker_config.ffprobe_command),
+        );
+        let engine = worker_catalog
+            .jobs()
+            .with_media_estimator_environment(estimator_environment);
         let representation_handler = RepresentationJobHandler::new(
             library,
-            worker_catalog.jobs(),
+            engine.clone(),
             worker_config.derived_dir.clone(),
             std::path::PathBuf::from(&worker_config.ffmpeg_command),
             std::path::PathBuf::from(&worker_config.ffprobe_command),
@@ -431,7 +438,6 @@ async fn run() -> Result<()> {
             backup_handler,
         ));
 
-        let engine = worker_catalog.jobs();
         let scheduler_config = JobSchedulerConfig {
             local_heavy_lock_path: Some(rcdvlog_server_core::default_local_heavy_lock_path()),
             ..JobSchedulerConfig::default()

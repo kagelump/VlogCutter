@@ -42,4 +42,17 @@ Desktop batches persist separate histories in each project catalog using version
 
 The server scheduler caps proxy work at one worker, full-hash work at one worker, and lightweight work at two workers by default. Every progress update supplies the actual worker count and exact remaining item weights; the durable job engine rejects inconsistent counts, excessive concurrency, or aggregate totals that do not match durable progress. A restored job uses `with_explicit_progress` plus the remaining individual weights, so its ETA remains a slowest-shard estimate after restart.
 
+Server representation timings are not keyed by the semantic representation recipe
+alone. A successful media observation is qualified by the exact configured
+FFmpeg/FFprobe executable identities, host/build/device facts, actual selected
+encoder and execution recipe, and worker/thread configuration. The context is
+persisted with the current leased attempt and with the rate row. Attempt
+contexts are also fenced by a process-session key, so a lease left behind by a
+restarted server cannot keep advertising the old ETA. Queued, waiting,
+interrupted, missing, or stale contexts yield `None` ETA and explicit
+`uncertain_*` confidence rather than reusing generic legacy proxy history. A
+hardware-to-software fallback records only the successful software attempt and
+never lets hardware throughput estimate software progress. Non-media full-hash
+and lightweight estimates retain their existing recipe-scoped histories.
+
 History uses a bounded eight-sample exponential window so recent hardware, codec, storage, or service behavior gradually replaces older measurements. Successful item observations update speed; failures and cancellations advance durable work state without poisoning throughput. Change the versioned task key whenever recipe or cost semantics make older measurements incomparable.

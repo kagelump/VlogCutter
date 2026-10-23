@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 use crate::ConfigDiagnostics;
 
-pub const CONTROL_CATALOG_SCHEMA_VERSION: u32 = 11;
+pub const CONTROL_CATALOG_SCHEMA_VERSION: u32 = 12;
 pub const CONTROL_DATABASE_FILENAME: &str = "control.sqlite3";
 pub const INSTANCE_LOCK_FILENAME: &str = "server.lock";
 
@@ -87,6 +87,12 @@ pub const CONTROL_CATALOG_MIGRATIONS: &[SqliteMigration] = &[
         name: "job_completion_callbacks",
         source_identity: "server-control/0011-job-completion-callbacks/20261022",
         apply: crate::job_callbacks::migrate,
+    },
+    SqliteMigration {
+        id: 12,
+        name: "media_estimator_history_context",
+        source_identity: "server-control/0012-media-estimator-history-context/20261024",
+        apply: create_media_estimator_history_context,
     },
 ];
 
@@ -1107,6 +1113,37 @@ fn create_representation_store_media_jobs(transaction: &Transaction<'_>) -> Resu
     Ok(())
 }
 
+/// Per-attempt estimator identity is deliberately additive metadata. The
+/// semantic job/representation recipe and representation IDs are unchanged;
+/// only timing reuse gains an exact environment/execution context.
+fn create_media_estimator_history_context(transaction: &Transaction<'_>) -> Result<()> {
+    transaction.execute_batch(
+        r#"
+        ALTER TABLE job_attempts
+            ADD COLUMN estimator_identity_json TEXT
+            CHECK(estimator_identity_json IS NULL OR length(estimator_identity_json) <= 32768);
+        ALTER TABLE job_attempts
+            ADD COLUMN estimator_rate_key TEXT
+            CHECK(estimator_rate_key IS NULL OR length(estimator_rate_key) <= 1024);
+        ALTER TABLE job_attempts
+            ADD COLUMN estimator_process_key TEXT
+            CHECK(estimator_process_key IS NULL OR length(estimator_process_key) <= 128);
+        ALTER TABLE job_rate_history
+            ADD COLUMN semantic_recipe_key TEXT
+            CHECK(semantic_recipe_key IS NULL OR length(semantic_recipe_key) <= 255);
+        ALTER TABLE job_rate_history
+            ADD COLUMN representation_kind TEXT
+            CHECK(representation_kind IS NULL OR length(representation_kind) <= 128);
+        ALTER TABLE job_rate_history
+            ADD COLUMN estimator_identity_json TEXT
+            CHECK(estimator_identity_json IS NULL OR length(estimator_identity_json) <= 32768);
+        CREATE INDEX job_rate_history_semantic
+            ON job_rate_history(node_id, semantic_recipe_key, updated_at DESC);
+        "#,
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1426,6 +1463,40 @@ mod tests {
                 .status,
             MigrationHistoryStatus::Current
         );
+    }
+
+    #[test]
+    fn media_estimator_migration_preserves_legacy_rate_rows_and_adds_context() {
+        let root = TempDir::new().unwrap();
+        let database_path = root.path().join(CONTROL_DATABASE_FILENAME);
+        let mut connection = open_writable_connection(&database_path).unwrap();
+        run_sqlite_migrations(&mut connection, &CONTROL_CATALOG_MIGRATIONS[..11]).unwrap();
+        connection
+            .execute(
+                "INSERT INTO job_rate_history(node_id,recipe_key,work_units_per_worker_second,samples,updated_at) VALUES('node_legacy','legacy.recipe',42.0,3,'2026-01-01T00:00:00.000Z')",
+                [],
+            )
+            .unwrap();
+        run_sqlite_migrations(&mut connection, CONTROL_CATALOG_MIGRATIONS).unwrap();
+        let (rate, semantic_recipe, estimator_identity): (f64, Option<String>, Option<String>) =
+            connection
+                .query_row(
+                    "SELECT work_units_per_worker_second,semantic_recipe_key,estimator_identity_json FROM job_rate_history WHERE recipe_key='legacy.recipe'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+        assert_eq!(rate, 42.0);
+        assert!(semantic_recipe.is_none());
+        assert!(estimator_identity.is_none());
+        let attempt_column_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('job_attempts') WHERE name IN ('estimator_identity_json','estimator_process_key')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(attempt_column_count, 2);
     }
 
     #[test]

@@ -53,6 +53,173 @@ pub const DEFAULT_DECODE_THREADS: usize = 4;
 pub const PROXY_REPRESENTATION_KIND: &str = "generated_proxy";
 pub const SPEECH_REPRESENTATION_KIND: &str = "speech_vad";
 
+/// Immutable environment facts that qualify a throughput observation. Only
+/// lightweight host/tool/device identity is collected here; constructing one
+/// never probes an encoder or runs media.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MediaEstimatorEnvironment {
+    pub schema_version: String,
+    pub host: CalibrationHostIdentity,
+    pub tools: Vec<CalibrationToolIdentity>,
+    pub devices: Vec<CalibrationDeviceIdentity>,
+}
+
+impl MediaEstimatorEnvironment {
+    /// Build the environment from the exact configured FFmpeg/FFprobe
+    /// programs. Tool version discovery is bounded and cached; no media is
+    /// transcoded or probed.
+    pub fn from_tools(ffmpeg_program: &Path, ffprobe_program: &Path) -> Self {
+        let ffmpeg = crate::resolve_tool_program(ffmpeg_program);
+        let ffprobe = crate::resolve_tool_program(ffprobe_program);
+        Self {
+            schema_version: "media-estimator-environment.v1".into(),
+            host: host_identity(),
+            tools: vec![
+                tool_identity_for_path("media_transcode", "ffmpeg", &ffmpeg),
+                tool_identity_for_path("media_probe", "ffprobe", &ffprobe),
+            ],
+            devices: hardware_device_identities(),
+        }
+    }
+}
+
+/// Estimator-only identity for actual media work. It deliberately does not
+/// participate in `RepresentationId` or the semantic representation recipe;
+/// changing a host, tool, encoder, or worker setting invalidates only timing
+/// reuse.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MediaEstimatorIdentity {
+    pub schema_version: String,
+    /// Semantic output kind, e.g. `generated_proxy`.
+    pub representation_kind: String,
+    /// Public representation recipe; remains stable when the encoder changes.
+    pub semantic_recipe_key: String,
+    /// Actual execution recipe selected for this attempt.
+    pub execution_recipe_key: String,
+    pub encoder: Option<String>,
+    pub worker_count: usize,
+    pub vad_threads: usize,
+    pub decode_threads: usize,
+    pub environment: MediaEstimatorEnvironment,
+}
+
+impl MediaEstimatorIdentity {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        environment: MediaEstimatorEnvironment,
+        representation_kind: impl Into<String>,
+        semantic_recipe_key: impl Into<String>,
+        execution_recipe_key: impl Into<String>,
+        encoder: Option<impl Into<String>>,
+        worker_count: usize,
+        vad_threads: usize,
+        decode_threads: usize,
+    ) -> Self {
+        Self {
+            schema_version: "media-estimator-identity.v1".into(),
+            representation_kind: representation_kind.into(),
+            semantic_recipe_key: semantic_recipe_key.into(),
+            execution_recipe_key: execution_recipe_key.into(),
+            encoder: encoder.map(Into::into),
+            worker_count: worker_count.max(1),
+            vad_threads,
+            decode_threads,
+            environment,
+        }
+    }
+
+    fn configuration_key(&self) -> String {
+        let configuration = serde_json::json!({
+            "schemaVersion": self.schema_version,
+            "representationKind": self.representation_kind,
+            "semanticRecipeKey": self.semantic_recipe_key,
+            "executionRecipeKey": self.execution_recipe_key,
+            "encoder": self.encoder,
+            "workerCount": self.worker_count,
+            "vadThreads": self.vad_threads,
+            "decodeThreads": self.decode_threads,
+        });
+        blake3::hash(&serde_json::to_vec(&configuration).expect("estimator config is serializable"))
+            .to_hex()
+            .to_string()
+    }
+
+    fn environment_key(environment: &MediaEstimatorEnvironment) -> String {
+        blake3::hash(
+            &serde_json::to_vec(environment).expect("estimator environment is serializable"),
+        )
+        .to_hex()
+        .to_string()
+    }
+
+    /// Appends environment/configuration digests to the existing versioned
+    /// execution key. The base keeps encoder/worker semantics readable.
+    pub fn qualified_history_key(&self, base_key: &str) -> String {
+        let environment = Self::environment_key(&self.environment);
+        let configuration = self.configuration_key();
+        format!(
+            "{base_key}.h{}.c{}",
+            &environment[..16],
+            &configuration[..16]
+        )
+    }
+
+    /// A persisted observation is reusable only when it was produced by the
+    /// same immutable semantic output and the current exact environment.
+    pub fn is_compatible_with(
+        &self,
+        environment: &MediaEstimatorEnvironment,
+        semantic_recipe_key: &str,
+    ) -> bool {
+        self.schema_version == "media-estimator-identity.v1"
+            && self.semantic_recipe_key == semantic_recipe_key
+            && &self.environment == environment
+    }
+}
+
+/// Opaque process-session identity used only to fence a live job attempt's
+/// estimator context. New processes get a new key, so a lease left over from a
+/// restarted server cannot keep advertising an ETA from the dead process.
+pub fn media_estimator_process_key() -> &'static str {
+    static KEY: OnceLock<String> = OnceLock::new();
+    KEY.get_or_init(|| {
+        let started = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let executable = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("unresolved"));
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(std::process::id().to_le_bytes().as_slice());
+        hasher.update(started.to_le_bytes().as_slice());
+        hasher.update(executable.to_string_lossy().as_bytes());
+        hasher.finalize().to_hex().to_string()[..32].to_string()
+    })
+}
+
+/// Public wrapper for the host/build identity used by estimator keys.
+pub fn calibration_host_identity() -> CalibrationHostIdentity {
+    host_identity()
+}
+
+/// Public wrapper for the lightweight device identity bundle used by estimator
+/// keys. It does not run encoder or media probes.
+pub fn calibration_hardware_device_identities() -> Vec<CalibrationDeviceIdentity> {
+    hardware_device_identities()
+}
+
+/// Identity for a configured media tool path. Bare names are resolved once so
+/// a later `PATH` change cannot silently swap the measured executable.
+pub fn calibration_tool_identity_for_path(
+    role: &str,
+    name: &str,
+    program: &Path,
+) -> CalibrationToolIdentity {
+    let resolved = crate::resolve_tool_program(program);
+    tool_identity_for_path(role, name, &resolved)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct CalibrationHostIdentity {
@@ -658,11 +825,15 @@ struct CachedToolIdentity {
 }
 
 fn tool_identity(role: &str, name: &str) -> CalibrationToolIdentity {
-    static IDENTITIES: OnceLock<Mutex<HashMap<String, CachedToolIdentity>>> = OnceLock::new();
     let path = resolve_tool_path(name);
+    tool_identity_for_path(role, name, &path)
+}
+
+fn tool_identity_for_path(role: &str, name: &str, path: &Path) -> CalibrationToolIdentity {
+    static IDENTITIES: OnceLock<Mutex<HashMap<String, CachedToolIdentity>>> = OnceLock::new();
     let fingerprint = format!(
         "stat={};epoch={:?}",
-        file_stat_fingerprint(&path).unwrap_or_else(|| "missing".into()),
+        file_stat_fingerprint(path).unwrap_or_else(|| "missing".into()),
         std::env::var("RCDVLOG_IDENTITY_EPOCH").ok(),
     );
     let cache = IDENTITIES.get_or_init(|| Mutex::new(HashMap::new()));
@@ -680,7 +851,7 @@ fn tool_identity(role: &str, name: &str) -> CalibrationToolIdentity {
     }
     let version = if path.is_file() {
         crate::prerequisites::run_bounded_command(
-            &path,
+            path,
             &[OsString::from("-version")],
             Duration::from_secs(3),
             16 * 1024,
@@ -703,7 +874,7 @@ fn tool_identity(role: &str, name: &str) -> CalibrationToolIdentity {
         role: role.to_string(),
         name: name.to_string(),
         version,
-        executable_key: file_identity(&path),
+        executable_key: file_identity(path),
     };
     let mut guard = cache
         .lock()
@@ -4516,6 +4687,114 @@ mod tests {
         let report = catalog.calibrate_proxy(&options).unwrap();
         assert_eq!(report.cache_key, cache_key);
         assert_eq!(report.selection_reason, "returned from exact cache");
+    }
+
+    fn synthetic_estimator_environment(tool_version: &str) -> MediaEstimatorEnvironment {
+        MediaEstimatorEnvironment {
+            schema_version: "media-estimator-environment.v1".into(),
+            host: CalibrationHostIdentity {
+                host_key: "host".into(),
+                os: "linux".into(),
+                arch: "x86_64".into(),
+                logical_cpus: 4,
+                application_build: "build-a".into(),
+            },
+            tools: vec![CalibrationToolIdentity {
+                role: "media_transcode".into(),
+                name: "ffmpeg".into(),
+                version: tool_version.into(),
+                executable_key: "exact-program-a".into(),
+            }],
+            devices: vec![CalibrationDeviceIdentity {
+                kind: "cpu".into(),
+                name: "synthetic".into(),
+                identity: "cpu-a".into(),
+            }],
+        }
+    }
+
+    #[test]
+    fn media_estimator_keys_separate_semantic_identity_from_execution_and_environment() {
+        let identity = MediaEstimatorIdentity::new(
+            synthetic_estimator_environment("ffmpeg-a"),
+            PROXY_REPRESENTATION_KIND,
+            PROXY_SOFTWARE_RECIPE_KEY,
+            "proxy.h264-720p.orientation-v3.linux-software-w1-v1",
+            Some("software"),
+            1,
+            0,
+            0,
+        );
+        let base = "proxy.h264-720p.orientation-v3.linux-software-w1-v1";
+        let qualified = identity.qualified_history_key(base);
+        assert!(qualified.starts_with(base));
+        assert!(qualified.contains(".h"));
+        assert!(qualified.contains(".c"));
+        assert_eq!(
+            identity.semantic_recipe_key, PROXY_SOFTWARE_RECIPE_KEY,
+            "estimator qualification must not rewrite the semantic recipe"
+        );
+        assert!(identity.is_compatible_with(
+            &synthetic_estimator_environment("ffmpeg-a"),
+            PROXY_SOFTWARE_RECIPE_KEY
+        ));
+
+        let changed_tool = MediaEstimatorIdentity::new(
+            synthetic_estimator_environment("ffmpeg-b"),
+            PROXY_REPRESENTATION_KIND,
+            PROXY_SOFTWARE_RECIPE_KEY,
+            "proxy.h264-720p.orientation-v3.linux-software-w1-v1",
+            Some("software"),
+            1,
+            0,
+            0,
+        );
+        let changed_encoder = MediaEstimatorIdentity::new(
+            synthetic_estimator_environment("ffmpeg-a"),
+            PROXY_REPRESENTATION_KIND,
+            PROXY_SOFTWARE_RECIPE_KEY,
+            "proxy.h264-720p.orientation-v3.linux-vaapi-qp23-w1-v1",
+            Some("vaapi"),
+            1,
+            0,
+            0,
+        );
+        assert_ne!(qualified, changed_tool.qualified_history_key(base));
+        assert_ne!(qualified, changed_encoder.qualified_history_key(base));
+        assert!(!changed_tool.is_compatible_with(
+            &synthetic_estimator_environment("ffmpeg-a"),
+            PROXY_SOFTWARE_RECIPE_KEY
+        ));
+        assert!(!identity.is_compatible_with(
+            &synthetic_estimator_environment("ffmpeg-a"),
+            "thumbnail.q1.orientation-v2"
+        ));
+    }
+
+    #[test]
+    fn configured_tool_identity_uses_the_exact_program_not_the_global_name() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("ffmpeg-a");
+        let second = directory.path().join("ffmpeg-b");
+        fs::write(&first, "#!/bin/sh\necho 'ffmpeg version synthetic-a'\n").unwrap();
+        fs::write(&second, "#!/bin/sh\necho 'ffmpeg version synthetic-b'\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for path in [&first, &second] {
+                fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+            }
+        }
+        let first_identity =
+            calibration_tool_identity_for_path("media_transcode", "ffmpeg", &first);
+        let second_identity =
+            calibration_tool_identity_for_path("media_transcode", "ffmpeg", &second);
+        assert!(first_identity.version.contains("synthetic-a"));
+        assert!(second_identity.version.contains("synthetic-b"));
+        assert_ne!(
+            first_identity.executable_key,
+            second_identity.executable_key
+        );
     }
 
     #[test]

@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, anyhow};
+use rcdvlog_core::MediaEstimatorEnvironment;
 use rusqlite::OptionalExtension;
 use serde::Serialize;
 use std::fs;
@@ -143,7 +144,16 @@ impl RuntimeFoundation {
     }
 
     pub fn jobs(&self) -> crate::JobEngine {
-        self.catalog.jobs()
+        // Rebuild the cheap identity bundle for each projection so a changed
+        // configured tool/device is visible without a process restart. Tool
+        // version discovery is bounded and cached by exact executable.
+        let environment = MediaEstimatorEnvironment::from_tools(
+            Path::new(&self.config.ffmpeg_command),
+            Path::new(&self.config.ffprobe_command),
+        );
+        self.catalog
+            .jobs()
+            .with_media_estimator_environment(environment)
     }
 
     pub fn readiness(&self) -> ReadinessReport {
