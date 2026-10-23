@@ -2136,6 +2136,13 @@ async fn analyze_project(
             transcribed: 0,
             skipped: 0,
             cancelled: proxies.cancelled,
+            resource_source: "default_uncalibrated".into(),
+            calibration_key: None,
+            vad_threads: 4,
+            decode_threads: 4,
+            worker_count: 1,
+            history_key: rcdvlog_core::STT_TASK_KEY.into(),
+            sample_compatibility: "unknown".into(),
             outcomes: Vec::new(),
             failures: Vec::new(),
         };
@@ -3043,6 +3050,8 @@ mod tests {
                 work_units_per_worker_second: None,
                 elapsed_seconds: 1.0,
                 estimated_remaining_seconds: None,
+                confidence: String::new(),
+                estimated_remaining_seconds_range: None,
             },
             cost_usd: 0.5,
         };

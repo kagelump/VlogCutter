@@ -448,6 +448,36 @@ if the command is interrupted.
 
 Proxy and thumbnail writes coordinate across CLI, desktop, and sync through OS file claims under the managed `cache/.representation-locks` directory, keyed by cache root, asset, and kind. Lock files persist after release and must not be deleted: removing one could let two processes own different inodes for the same representation. A contended single-item generate command exits nonzero with `error.code: "representation_busy"`; batch commands count contended work as skipped, without a failure or throughput sample. Proxy downloads acquire the claim before requesting content, stream into unique staging files, and publish through the same validation/registration path as generated proxies.
 
+### Host resource calibration
+
+```bash
+rcdvlog --catalog /absolute/project/catalog.sqlite3 calibrate capabilities
+rcdvlog --catalog /absolute/project/catalog.sqlite3 calibrate status
+rcdvlog --catalog /absolute/project/catalog.sqlite3 calibrate run --recipe proxy \
+  --policy software --worker-counts 1 --trials 1 --generated-duration-seconds 1
+rcdvlog --catalog /absolute/project/catalog.sqlite3 calibrate run --recipe speech \
+  --vad-threads 1,2,4 --decode-threads 4 --trials 1
+rcdvlog --catalog /absolute/project/catalog.sqlite3 calibrate run --recipe proxy \
+  --media /absolute/authorized/representative.mp4 --trials 2
+```
+
+`calibrate capabilities` and `calibrate status` are read-only and never benchmark. `calibrate run` is explicit opt-in and bounded: generated synthetic media is the default, and `--media` is the only way to select a representative file. Representative media is rejected before full-file hashing/PCM expansion when it exceeds 30 seconds or the documented byte bound, and candidate/total-trial caps bound the matrix. A completed exact-key result is reused without rerunning the benchmark; `--force` requests an intentional recalibration. It never downloads missing speech models; a speech run without ready models reports `not_ready` and adopts nothing. Results are keyed by host, build, media-tool executable/version, device/model, recipe, representation kind, and candidate configuration. Only a complete matching result can seed a range-bearing ETA. Interrupted, failed, not-ready, stale, and explicit-override states are reported as uncertainty rather than a completion promise. Speech candidates are adopted only after their detected regions exactly match the validated baseline; the tool does not assume one VAD thread is universally optimal. VAD calibration fixes decode threads at the default because it does not measure decode quality; decode tuning is available only as an explicit, uncalibrated override. Proxy candidates retain the existing output validation and render/audio contract checks. Synthetic 320x180 proxy calibration reports `generatedContractOnly` compatibility and a deliberately wider ETA range; it is not presented as representative 4K/HEVC coverage.
+
+Explicit runtime overrides are available without calibration:
+
+```bash
+rcdvlog --catalog /absolute/project/catalog.sqlite3 transcribe generate --asset <asset-id> \
+  --vad-threads 2 --decode-threads 4
+rcdvlog --catalog /absolute/project/catalog.sqlite3 transcribe batch --project <project-id> \
+  --asset <asset-a> --asset <asset-b> --vad-threads 2 --decode-threads 4
+rcdvlog --catalog /absolute/project/catalog.sqlite3 proxy missing --project <project-id> \
+  --workers 2
+```
+
+Override values are bounded, provenance-bearing, and never relabelled as calibrated. A settings-qualified history key is used when VAD/decode/worker settings differ from defaults. One shared local-heavy slot serializes proxy/transcode, full-hash, transcription, and calibration entrypoints; safe lightweight, metadata, review, import, and cloud/network work may overlap. The CLI/server use an advisory same-host/same-user lock, which is not a distributed cluster lock.
+
+The automated checks establish the deterministic reuse/invalidation, region-comparison, override, and scheduling rules plus a bounded real generated-media FFmpeg proxy benchmark. Real GPU/VAD/target-device throughput acceptance requires ready models and that specific hardware; absence is reported rather than fabricated.
+
 ### Thumbnails
 
 ```bash
@@ -746,3 +776,20 @@ Restore always targets a new directory and requires the server to be stopped. Se
 ## Concurrency
 
 Desktop and server SQLite files use WAL mode only for same-host concurrency. Read commands can run while another local connection holds an uncommitted write. Cross-node concurrency uses immutable typed operations, per-origin cursors, deterministic materialization, and explicit conflicts—not shared SQLite files. Avoid competing full-patch desktop/CLI edits to the same asset fields; use the operation-specific server/web mutations where available.
+
+Calibration status and selection compare lightweight model file identity;
+full model content digests are evidence collected only by explicit calibration.
+Queued proxy, transcription and preparation batches expose
+`waiting_for_resource` progress and honor cancellation before opening an engine
+or probing an encoder. Process-local waiters are served LIFO; independent
+processes sharing the same lock path have mutual exclusion without a global
+ordering guarantee. Set `RCDVLOG_RESOURCE_LOCK_ROOT` to a shared host-visible
+location when crossing service/container filesystem namespaces. VAD calibration
+keeps decode threads at four because it does not measure Whisper decoding;
+decode thread overrides remain explicit, uncalibrated settings.
+
+Generated calibration timing is evidence about its fixture, not a byte-rate
+prediction for unrelated footage. Runtime ETA starts uncertain until compatible
+sample timing or configuration-matching observations of actual work exist.
+Calibration can still recommend bounded resource settings without inventing a
+corpus completion time.

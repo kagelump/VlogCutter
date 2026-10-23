@@ -23,6 +23,7 @@ pub use rcdvlog_core::{
     ProjectAssetAddedPayload, ProjectAssetItem, ProjectAssetPage, ProjectId, RepresentationId,
     RootAssociationConfirmation, RootAssociationConfirmationStatus, RootAssociationEvidence,
     RootRelativePath, StorageObjectId, StorageProtocol, StorageRootId,
+    default_local_heavy_lock_path,
 };
 pub use rcdvlog_sync::{
     BASELINE_VERSION, BaselineEnvelope, BaselinePayload, BaselinePreview, NodeTargetedJob,

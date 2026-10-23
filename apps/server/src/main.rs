@@ -432,21 +432,22 @@ async fn run() -> Result<()> {
         ));
 
         let engine = worker_catalog.jobs();
-        let scheduler = match JobScheduler::new(
-            engine,
-            JobSchedulerConfig::default(),
-            worker_shutdown.child_token(),
-        ) {
-            Ok(scheduler) => scheduler,
-            Err(error) => {
-                tracing::error!(
-                    component = "scheduler",
-                    error = %error,
-                    "job_scheduler_creation_failed"
-                );
-                return;
-            }
+        let scheduler_config = JobSchedulerConfig {
+            local_heavy_lock_path: Some(rcdvlog_server_core::default_local_heavy_lock_path()),
+            ..JobSchedulerConfig::default()
         };
+        let scheduler =
+            match JobScheduler::new(engine, scheduler_config, worker_shutdown.child_token()) {
+                Ok(scheduler) => scheduler,
+                Err(error) => {
+                    tracing::error!(
+                        component = "scheduler",
+                        error = %error,
+                        "job_scheduler_creation_failed"
+                    );
+                    return;
+                }
+            };
 
         // Start the schedule loop in a separate task
         let schedule_shutdown = worker_shutdown.clone();

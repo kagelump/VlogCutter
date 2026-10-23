@@ -115,6 +115,15 @@ pub struct TranscriptionBatchReport {
     pub cancelled: bool,
     /// Number of selected assets not processed because the callback stopped.
     pub cancelled_assets: usize,
+    /// Actual engine/resource provenance for this batch. Explicit overrides
+    /// remain explicit; they are not relabelled as calibrated.
+    pub resource_source: String,
+    pub calibration_key: Option<String>,
+    pub vad_threads: usize,
+    pub decode_threads: usize,
+    pub worker_count: usize,
+    pub history_key: String,
+    pub sample_compatibility: String,
     pub outcomes: Vec<TranscriptionAssetOutcome>,
 }
 
@@ -170,21 +179,101 @@ impl Catalog {
     where
         F: FnMut(TranscriptionBatchProgress) -> ControlFlow<()>,
     {
-        self.transcribe_selected_inner(
+        self.transcribe_selected_with_resource_overrides(
             project_id,
             asset_ids,
             options,
-            Some(|| self.model_status()),
-            || self.open_stt_engine(),
+            &crate::ResourceOverrides::default(),
             on_progress,
         )
     }
 
+    /// Transcribe an exact selection while making explicit VAD/decode/worker
+    /// overrides visible to the caller. Bounded validation happens before the
+    /// heavy slot, engine open, or any transcript write.
+    pub fn transcribe_selected_with_resource_overrides<F>(
+        &self,
+        project_id: &str,
+        asset_ids: &[String],
+        options: &TranscriptionBatchOptions,
+        overrides: &crate::ResourceOverrides,
+        on_progress: F,
+    ) -> Result<TranscriptionBatchReport>
+    where
+        F: FnMut(TranscriptionBatchProgress) -> ControlFlow<()>,
+    {
+        let selection = self.resolve_resource_selection(
+            crate::SPEECH_REPRESENTATION_KIND,
+            crate::STT_RECIPE_KEY,
+            None,
+            None,
+            overrides,
+        )?;
+        let history_key = selection.history_key.clone();
+        self.transcribe_selected_inner_with_resource(
+            project_id,
+            asset_ids,
+            options,
+            selection.vad_threads,
+            selection.decode_threads,
+            selection.worker_count.max(1),
+            &selection.source,
+            selection.calibration_key.as_deref(),
+            &selection.sample_compatibility,
+            &history_key,
+            Some(|| self.model_status()),
+            || self.open_stt_engine_with_threads(selection.vad_threads, selection.decode_threads),
+            on_progress,
+        )
+    }
+
+    /// Test/fixture seam retaining uncalibrated default resource identity.
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
     fn transcribe_selected_inner<F, E, M>(
         &self,
         project_id: &str,
         asset_ids: &[String],
         options: &TranscriptionBatchOptions,
+        model_preflight: Option<M>,
+        open_engine: E,
+        on_progress: F,
+    ) -> Result<TranscriptionBatchReport>
+    where
+        F: FnMut(TranscriptionBatchProgress) -> ControlFlow<()>,
+        E: FnOnce() -> Result<Box<dyn SttEngine>>,
+        M: FnOnce() -> Result<Vec<ModelStatus>>,
+    {
+        self.transcribe_selected_inner_with_resource(
+            project_id,
+            asset_ids,
+            options,
+            4,
+            4,
+            1,
+            "default_uncalibrated",
+            None,
+            "unknown",
+            crate::analysis::STT_TASK_KEY,
+            model_preflight,
+            open_engine,
+            on_progress,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn transcribe_selected_inner_with_resource<F, E, M>(
+        &self,
+        project_id: &str,
+        asset_ids: &[String],
+        options: &TranscriptionBatchOptions,
+        vad_threads: usize,
+        decode_threads: usize,
+        worker_count: usize,
+        resource_source: &str,
+        calibration_key: Option<&str>,
+        sample_compatibility: &str,
+        history_key: &str,
         model_preflight: Option<M>,
         open_engine: E,
         mut on_progress: F,
@@ -284,8 +373,8 @@ impl Catalog {
         let task_work = vec![1; pending_count];
         let mut estimator = BatchEstimator::new(
             &task_work,
-            1,
-            self.load_batch_history(crate::analysis::STT_TASK_KEY)?,
+            worker_count.max(1),
+            self.load_batch_history(history_key)?,
         );
         let mut attempted = 0;
         let mut report = TranscriptionBatchReport {
@@ -297,6 +386,13 @@ impl Catalog {
             failed: 0,
             cancelled: false,
             cancelled_assets: 0,
+            resource_source: resource_source.to_string(),
+            calibration_key: calibration_key.map(str::to_string),
+            vad_threads,
+            decode_threads,
+            worker_count: worker_count.max(1),
+            history_key: history_key.to_string(),
+            sample_compatibility: sample_compatibility.to_string(),
             outcomes: Vec::with_capacity(total),
         };
 
@@ -323,6 +419,40 @@ impl Catalog {
             return Ok(report);
         }
 
+        let _heavy = if pending_count > 0 {
+            match self.wait_for_local_heavy(|| {
+                let mut estimate = estimator.estimate(&task_work);
+                estimate.confidence = "waiting_for_resource".into();
+                estimate.estimated_remaining_seconds = None;
+                on_progress(TranscriptionBatchProgress {
+                    asset_id: None,
+                    phase: "waiting_for_resource".into(),
+                    completed: 0,
+                    total,
+                    estimate,
+                    outcome: None,
+                })
+                .is_break()
+            })? {
+                Some(lease) => Some(lease),
+                None => {
+                    report.cancelled = true;
+                    report.cancelled_assets = total;
+                    report.outcomes = planned
+                        .iter()
+                        .map(|plan| match plan {
+                            PlannedAsset::Reused(item) | PlannedAsset::NotReady(item) => {
+                                cancelled_outcome(&item.asset_id)
+                            }
+                            PlannedAsset::Pending { asset } => cancelled_outcome(&asset.id),
+                        })
+                        .collect();
+                    return Ok(report);
+                }
+            }
+        } else {
+            None
+        };
         let mut open_engine = Some(open_engine);
         let mut engine: Option<Box<dyn SttEngine>> = None;
         for (index, plan) in planned.iter().enumerate() {
@@ -421,7 +551,7 @@ impl Catalog {
         }
 
         if attempted > 0 {
-            self.save_batch_history(crate::analysis::STT_TASK_KEY, estimator.history())?;
+            self.save_batch_history(history_key, estimator.history())?;
         }
         Ok(report)
     }

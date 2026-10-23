@@ -5,7 +5,6 @@ use rcdvlog_sync::NodeTargetedJob;
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -71,6 +70,12 @@ pub enum JobClass {
     Lightweight,
 }
 impl JobClass {
+    /// #53's one shared local-heavy class predicate. Future local VLM or other
+    /// heavy workers must join this set rather than introduce a parallel lane.
+    pub fn is_local_heavy(self) -> bool {
+        matches!(self, Self::Proxy | Self::FullHash)
+    }
+
     fn as_str(self) -> &'static str {
         match self {
             Self::Proxy => "proxy",
@@ -79,6 +84,15 @@ impl JobClass {
         }
     }
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaimScope {
+    Any,
+    Class(JobClass),
+    Heavy,
+    HeavyOne(JobClass),
+    Lightweight,
+}
+
 fn job_class(value: String) -> Result<JobClass, JobEngineError> {
     match value.as_str() {
         "proxy" => Ok(JobClass::Proxy),
@@ -718,6 +732,67 @@ impl JobEngine {
         lease_for: Duration,
         class: Option<JobClass>,
     ) -> Result<Option<ClaimedJob>, JobEngineError> {
+        self.claim_next_scoped(
+            lease_owner,
+            lease_for,
+            class.map(ClaimScope::Class).unwrap_or(ClaimScope::Any),
+        )
+    }
+
+    /// Claim the next eligible local-heavy job across every heavy class in one
+    /// shared queue. #53 accepts one heavy slot, so proxy/transcode and
+    /// full-hash work cannot occupy separate lanes. Explicitly queued work is
+    /// intentional LIFO here: the newest eligible heavy job runs next.
+    pub fn claim_next_heavy(
+        &self,
+        lease_owner: &str,
+        lease_for: Duration,
+    ) -> Result<Option<ClaimedJob>, JobEngineError> {
+        self.claim_next_scoped(lease_owner, lease_for, ClaimScope::Heavy)
+    }
+
+    /// Claim across only the heavy classes explicitly enabled by the server
+    /// configuration. The durable queue remains one shared eligible pool, so an
+    /// empty proxy queue cannot idle an enabled full-hash class (or vice versa).
+    pub fn claim_next_heavy_enabled(
+        &self,
+        lease_owner: &str,
+        lease_for: Duration,
+        proxy_enabled: bool,
+        full_hash_enabled: bool,
+    ) -> Result<Option<ClaimedJob>, JobEngineError> {
+        match (proxy_enabled, full_hash_enabled) {
+            (true, true) => self.claim_next_scoped(lease_owner, lease_for, ClaimScope::Heavy),
+            (true, false) => self.claim_next_scoped(
+                lease_owner,
+                lease_for,
+                ClaimScope::HeavyOne(JobClass::Proxy),
+            ),
+            (false, true) => self.claim_next_scoped(
+                lease_owner,
+                lease_for,
+                ClaimScope::HeavyOne(JobClass::FullHash),
+            ),
+            (false, false) => Ok(None),
+        }
+    }
+
+    /// Claim the next eligible lightweight job. Lightweight work may overlap
+    /// the shared heavy slot and remains FIFO within its safety limit.
+    pub fn claim_next_lightweight(
+        &self,
+        lease_owner: &str,
+        lease_for: Duration,
+    ) -> Result<Option<ClaimedJob>, JobEngineError> {
+        self.claim_next_scoped(lease_owner, lease_for, ClaimScope::Lightweight)
+    }
+
+    fn claim_next_scoped(
+        &self,
+        lease_owner: &str,
+        lease_for: Duration,
+        scope: ClaimScope,
+    ) -> Result<Option<ClaimedJob>, JobEngineError> {
         validate_lease_duration(lease_for)?;
         valid_token(lease_owner, "lease owner")?;
         let now = self.clock.now();
@@ -729,10 +804,13 @@ impl JobEngine {
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
         settle_dependency_terminal(&tx, &now_s)?;
         promote_retry_wait(&tx, &now_s)?;
-        let base = " AND j.cancel_requested_at IS NULL AND NOT EXISTS(SELECT 1 FROM job_dependencies d JOIN jobs parent ON parent.job_id=d.depends_on_job_id WHERE d.job_id=j.job_id AND parent.state!='succeeded') ORDER BY j.priority DESC,j.enqueue_sequence ASC LIMIT 1";
-        let id = match class {
-            Some(class) => tx.query_row(&format!("SELECT j.job_id FROM jobs j WHERE j.target_node_id=?1 AND j.job_class=?2 AND j.state='queued' AND j.available_at<=?3{base}"), params![self.node_id.as_str(), class.as_str(), now_s], |row| row.get::<_, String>(0)).optional()?,
-            None => tx.query_row(&format!("SELECT j.job_id FROM jobs j WHERE j.target_node_id=?1 AND j.state='queued' AND j.available_at<=?2{base}"), params![self.node_id.as_str(), now_s], |row| row.get::<_, String>(0)).optional()?,
+        let dependency = " AND j.cancel_requested_at IS NULL AND NOT EXISTS(SELECT 1 FROM job_dependencies d JOIN jobs parent ON parent.job_id=d.depends_on_job_id WHERE d.job_id=j.job_id AND parent.state!='succeeded')";
+        let id = match scope {
+            ClaimScope::Any => tx.query_row(&format!("SELECT j.job_id FROM jobs j WHERE j.target_node_id=?1 AND j.state='queued' AND j.available_at<=?2{dependency} ORDER BY j.priority DESC,j.enqueue_sequence ASC LIMIT 1"), params![self.node_id.as_str(), now_s], |row| row.get::<_, String>(0)).optional()?,
+            ClaimScope::Class(class) => tx.query_row(&format!("SELECT j.job_id FROM jobs j WHERE j.target_node_id=?1 AND j.job_class=?2 AND j.state='queued' AND j.available_at<=?3{dependency} ORDER BY j.priority DESC,j.enqueue_sequence ASC LIMIT 1"), params![self.node_id.as_str(), class.as_str(), now_s], |row| row.get::<_, String>(0)).optional()?,
+            ClaimScope::Heavy => tx.query_row(&format!("SELECT j.job_id FROM jobs j WHERE j.target_node_id=?1 AND j.job_class IN ('proxy','full_hash') AND j.state='queued' AND j.available_at<=?2{dependency} ORDER BY j.priority DESC,j.enqueue_sequence DESC LIMIT 1"), params![self.node_id.as_str(), now_s], |row| row.get::<_, String>(0)).optional()?,
+            ClaimScope::HeavyOne(class) => tx.query_row(&format!("SELECT j.job_id FROM jobs j WHERE j.target_node_id=?1 AND j.job_class=?2 AND j.state='queued' AND j.available_at<=?3{dependency} ORDER BY j.priority DESC,j.enqueue_sequence DESC LIMIT 1"), params![self.node_id.as_str(), class.as_str(), now_s], |row| row.get::<_, String>(0)).optional()?,
+            ClaimScope::Lightweight => tx.query_row(&format!("SELECT j.job_id FROM jobs j WHERE j.target_node_id=?1 AND j.job_class='lightweight' AND j.state='queued' AND j.available_at<=?2{dependency} ORDER BY j.priority DESC,j.enqueue_sequence ASC LIMIT 1"), params![self.node_id.as_str(), now_s], |row| row.get::<_, String>(0)).optional()?,
         };
         let Some(id) = id else {
             tx.commit()?;
@@ -1631,12 +1709,19 @@ pub async fn cancel_child_safely(
 
 #[derive(Debug, Clone)]
 pub struct JobSchedulerConfig {
+    /// Enables the proxy class when positive; zero disables it. Proxy and
+    /// full-hash still share exactly one heavy slot when both are enabled.
     pub proxy_workers: usize,
+    /// Enables the full-hash class when positive; zero disables it. Proxy and
+    /// full-hash still share exactly one heavy slot when both are enabled.
     pub full_hash_workers: usize,
     pub lightweight_workers: usize,
     pub poll_interval: Duration,
     pub lease_duration: Duration,
     pub cancellation_poll_interval: Duration,
+    /// Optional cross-process local-heavy lock used by the server adapter. The
+    /// in-process scheduler already has one shared heavy permit.
+    pub local_heavy_lock_path: Option<PathBuf>,
 }
 impl Default for JobSchedulerConfig {
     fn default() -> Self {
@@ -1647,10 +1732,23 @@ impl Default for JobSchedulerConfig {
             poll_interval: Duration::from_millis(200),
             lease_duration: Duration::from_secs(30),
             cancellation_poll_interval: Duration::from_millis(200),
+            local_heavy_lock_path: None,
         }
     }
 }
 impl JobSchedulerConfig {
+    fn heavy_workers(&self) -> usize {
+        usize::from(self.proxy_workers > 0 || self.full_hash_workers > 0)
+    }
+
+    fn proxy_enabled(&self) -> bool {
+        self.proxy_workers > 0
+    }
+
+    fn full_hash_enabled(&self) -> bool {
+        self.full_hash_workers > 0
+    }
+
     pub fn validate(&self) -> Result<(), JobEngineError> {
         if self.proxy_workers > 1
             || self.full_hash_workers > 1
@@ -1700,37 +1798,42 @@ impl JobScheduler {
         &self,
         handler: Arc<H>,
     ) -> Result<(), JobEngineError> {
-        let limits = BTreeMap::from([
-            (
-                JobClass::Proxy,
-                Arc::new(Semaphore::new(self.config.proxy_workers)),
-            ),
-            (
-                JobClass::FullHash,
-                Arc::new(Semaphore::new(self.config.full_hash_workers)),
-            ),
-            (
-                JobClass::Lightweight,
-                Arc::new(Semaphore::new(self.config.lightweight_workers)),
-            ),
-        ]);
+        // One shared local-heavy permit and a separately bounded lightweight
+        // pool. A worker cannot be idle merely because one representation-kind
+        // queue emptied: each permit claims the next eligible job across its
+        // whole resource group using one shared durable queue.
+        let heavy_limit = Arc::new(Semaphore::new(self.config.heavy_workers()));
+        let lightweight_limit = Arc::new(Semaphore::new(self.config.lightweight_workers));
         let mut running = JoinSet::new();
         loop {
             self.engine.recover_expired()?;
             let mut claimed_any = false;
-            for class in [JobClass::Proxy, JobClass::FullHash, JobClass::Lightweight] {
+            for heavy in [true, false] {
                 if self.shutdown.is_cancelled() {
                     break;
                 }
-                let Ok(permit) = limits[&class].clone().try_acquire_owned() else {
-                    continue;
+                let (permit, job) = if heavy {
+                    let Ok(permit) = heavy_limit.clone().try_acquire_owned() else {
+                        continue;
+                    };
+                    let job = self.engine.claim_next_heavy_enabled(
+                        "server-local-worker",
+                        self.config.lease_duration,
+                        self.config.proxy_enabled(),
+                        self.config.full_hash_enabled(),
+                    )?;
+                    (permit, job)
+                } else {
+                    let Ok(permit) = lightweight_limit.clone().try_acquire_owned() else {
+                        continue;
+                    };
+                    let job = self.engine.claim_next_lightweight(
+                        "server-local-worker",
+                        self.config.lease_duration,
+                    )?;
+                    (permit, job)
                 };
-                let Some(job) = self.engine.claim_next_for_class(
-                    "server-local-worker",
-                    self.config.lease_duration,
-                    Some(class),
-                )?
-                else {
+                let Some(job) = job else {
                     drop(permit);
                     continue;
                 };
@@ -1742,6 +1845,7 @@ impl JobScheduler {
                 let heartbeat_every = self.config.lease_duration / 3;
                 let lease_duration = self.config.lease_duration;
                 let cancellation_poll = self.config.cancellation_poll_interval;
+                let local_heavy_lock_path = self.config.local_heavy_lock_path.clone();
                 running.spawn(async move {
                     let _permit = permit;
                     run_claimed_job(
@@ -1754,6 +1858,7 @@ impl JobScheduler {
                             heartbeat_every,
                             lease_duration,
                             cancellation_poll,
+                            local_heavy_lock_path,
                         },
                     )
                     .await
@@ -1785,6 +1890,7 @@ struct ClaimedJobRuntime {
     heartbeat_every: Duration,
     lease_duration: Duration,
     cancellation_poll: Duration,
+    local_heavy_lock_path: Option<PathBuf>,
 }
 
 async fn run_claimed_job<H: JobHandler + 'static>(
@@ -1795,10 +1901,39 @@ async fn run_claimed_job<H: JobHandler + 'static>(
 ) -> Result<(), JobEngineError> {
     let lease_lost = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let worker_cancellation = runtime.cancellation.clone();
+    let lock_cancellation = runtime.cancellation.clone();
     let worker_job = job.clone();
     let commit_handler = handler.clone();
-    let blocking =
-        tokio::task::spawn_blocking(move || handler.run(worker_job, worker_cancellation));
+    let heavy = job.job.job_class.is_local_heavy();
+    let local_heavy_lock_path = runtime.local_heavy_lock_path.clone();
+    let blocking = tokio::task::spawn_blocking(move || {
+        // Cross-process coordination is acquired only for the one heavy class.
+        // Lightweight/cloud jobs never touch this slot. The advisory host-user
+        // lock supplements, rather than replaces, the durable in-process permit.
+        let _heavy_lease = if heavy {
+            match local_heavy_lock_path.as_deref() {
+                Some(path) => match rcdvlog_core::acquire_local_heavy_at_cancellable(path, || {
+                    lock_cancellation.is_cancelled()
+                }) {
+                    Ok(lease) => {
+                        let _ = lease.scope();
+                        Some(lease)
+                    }
+                    Err(error) => {
+                        return Err(JobHandlerFailure {
+                            kind: FailureKind::Retryable,
+                            code: "local_heavy_lock_failed".into(),
+                            details: json!({"error": format!("{error:#}")}),
+                        });
+                    }
+                },
+                None => None,
+            }
+        } else {
+            None
+        };
+        handler.run(worker_job, worker_cancellation)
+    });
     tokio::pin!(blocking);
     let mut heartbeat = tokio::time::interval(
         runtime
@@ -3264,8 +3399,10 @@ mod tests {
                 )))
                 .await
         });
-        wait_for_event(&engine, &first_id, JobState::Failed).await;
-        wait_for_event(&engine, &second_id, JobState::Succeeded).await;
+        // Heavy work is intentionally LIFO: the newest eligible job runs
+        // first, fails once here, and the older job then succeeds.
+        wait_for_event(&engine, &second_id, JobState::Failed).await;
+        wait_for_event(&engine, &first_id, JobState::Succeeded).await;
         shutdown.cancel();
         task.await.unwrap().unwrap();
     }
@@ -3514,10 +3651,12 @@ mod tests {
             }
         }
         let (_dir, engine, _clock) = engine();
+        // Heavy selection is intentional LIFO. Queue the terminal case first
+        // so the newest retryable probe observes the first handler failure.
         let retryable = job(181, engine.node_id());
         let terminal = job(182, engine.node_id());
-        engine.enqueue(retryable.clone()).unwrap();
         engine.enqueue(terminal.clone()).unwrap();
+        engine.enqueue(retryable.clone()).unwrap();
         let shutdown = CancellationToken::new();
         let scheduler = JobScheduler::new(
             engine.clone(),
@@ -3656,5 +3795,193 @@ mod tests {
         shutdown.cancel();
         wait_for_event(&engine, &succeeds_id, JobState::Succeeded).await;
         task.await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn heavy_claim_is_lifo_across_representation_kinds_and_work_conserving() {
+        let (_dir, engine, _clock) = engine();
+        let proxy = job(190, engine.node_id());
+        let proxy_id = proxy.job_id.clone();
+        let mut hash = job(191, engine.node_id());
+        hash.job_class = JobClass::FullHash;
+        let hash_id = hash.job_id.clone();
+        engine.enqueue(proxy).unwrap();
+        engine.enqueue(hash).unwrap();
+
+        // The newest eligible heavy job wins across classes.
+        let first = engine
+            .claim_next_heavy("worker", Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.job.job_id, hash_id);
+        let second = engine
+            .claim_next_heavy("worker", Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.job.job_id, proxy_id);
+        assert!(
+            engine
+                .claim_next_heavy("worker", Duration::from_secs(10))
+                .unwrap()
+                .is_none()
+        );
+
+        // A queue containing only one representation kind is still eligible;
+        // it cannot sit idle behind an empty sibling class.
+        let mut only_hash = job(192, engine.node_id());
+        only_hash.job_class = JobClass::FullHash;
+        let only_hash_id = only_hash.job_id.clone();
+        engine.enqueue(only_hash).unwrap();
+        let claimed = engine
+            .claim_next_heavy("worker", Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.job.job_id, only_hash_id);
+    }
+
+    #[test]
+    fn disabled_heavy_class_filters_shared_eligible_queue() {
+        let (_dir, engine, _clock) = engine();
+        let mut proxy = job(196, engine.node_id());
+        proxy.job_class = JobClass::Proxy;
+        let mut hash = job(197, engine.node_id());
+        hash.job_class = JobClass::FullHash;
+        let hash_id = hash.job_id.clone();
+        engine.enqueue(proxy).unwrap();
+        engine.enqueue(hash).unwrap();
+
+        // Proxy is newer and would win LIFO in the union, but it is disabled.
+        let claimed = engine
+            .claim_next_heavy_enabled("worker", Duration::from_secs(10), false, true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.job.job_id, hash_id);
+        assert_eq!(claimed.job.job_class, JobClass::FullHash);
+
+        // With only the disabled class queued, the eligible pool is empty
+        // rather than manufacturing work the configuration forbade.
+        let mut only_proxy = job(198, engine.node_id());
+        only_proxy.job_class = JobClass::Proxy;
+        let only_proxy_id = only_proxy.job_id.clone();
+        engine.enqueue(only_proxy).unwrap();
+        assert!(
+            engine
+                .claim_next_heavy_enabled("worker", Duration::from_secs(10), false, true,)
+                .unwrap()
+                .is_none(),
+            "a configured-off class must never be claimed"
+        );
+        let claimed = engine
+            .claim_next_heavy_enabled("worker", Duration::from_secs(10), true, false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.job.job_id, only_proxy_id);
+    }
+
+    #[tokio::test]
+    async fn scheduler_serializes_heavy_classes_but_overlaps_safe_lightweight_work() {
+        struct ResourceHandler {
+            started: std::sync::mpsc::Sender<(JobId, JobClass)>,
+            release: Arc<std::sync::atomic::AtomicBool>,
+            heavy_running: std::sync::atomic::AtomicUsize,
+            maximum_heavy: std::sync::atomic::AtomicUsize,
+        }
+        impl JobHandler for ResourceHandler {
+            fn run(
+                &self,
+                job: ClaimedJob,
+                _cancellation: CancellationToken,
+            ) -> Result<JobResultCommit, JobHandlerFailure> {
+                if job.job.job_class.is_local_heavy() {
+                    let current = self
+                        .heavy_running
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                        + 1;
+                    self.maximum_heavy
+                        .fetch_max(current, std::sync::atomic::Ordering::SeqCst);
+                }
+                self.started
+                    .send((job.job.job_id.clone(), job.job.job_class))
+                    .unwrap();
+                while !self.release.load(std::sync::atomic::Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                if job.job.job_class.is_local_heavy() {
+                    self.heavy_running
+                        .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                Ok(JobResultCommit {
+                    output_identity: None,
+                    details: json!({}),
+                })
+            }
+        }
+
+        let (_dir, engine, _clock) = engine();
+        let proxy = job(193, engine.node_id());
+        let mut hash = job(194, engine.node_id());
+        hash.job_class = JobClass::FullHash;
+        let mut light = job(195, engine.node_id());
+        light.job_class = JobClass::Lightweight;
+        engine.enqueue(proxy).unwrap();
+        engine.enqueue(hash).unwrap();
+        engine.enqueue(light).unwrap();
+
+        let shutdown = CancellationToken::new();
+        let scheduler = JobScheduler::new(
+            engine.clone(),
+            JobSchedulerConfig {
+                local_heavy_lock_path: None,
+                ..JobSchedulerConfig::default()
+            },
+            shutdown.clone(),
+        )
+        .unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let handler = Arc::new(ResourceHandler {
+            started: sender,
+            release: release.clone(),
+            heavy_running: std::sync::atomic::AtomicUsize::new(0),
+            maximum_heavy: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let observed = handler.clone();
+        let task = tokio::spawn(async move { scheduler.run(handler).await });
+
+        let first_two = tokio::task::spawn_blocking(move || {
+            vec![
+                receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
+                receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
+            ]
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            first_two
+                .iter()
+                .filter(|(_, class)| class.is_local_heavy())
+                .count(),
+            1,
+            "exactly one heavy job may run at a time"
+        );
+        assert_eq!(
+            first_two
+                .iter()
+                .filter(|(_, class)| *class == JobClass::Lightweight)
+                .count(),
+            1,
+            "lightweight work must overlap the heavy slot rather than wait for it"
+        );
+
+        release.store(true, std::sync::atomic::Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        shutdown.cancel();
+        task.await.unwrap().unwrap();
+        assert_eq!(
+            observed
+                .maximum_heavy
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
     }
 }

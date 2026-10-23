@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 mod agent_commands;
+mod calibration_commands;
 mod chronology_commands;
 mod moment_commands;
 mod preparation_commands;
@@ -160,6 +161,11 @@ enum Commands {
         #[command(subcommand)]
         command: preparation_commands::PreparationCommand,
     },
+    /// Explicitly benchmark and cache host encoder/VAD resource settings.
+    Calibrate {
+        #[command(subcommand)]
+        command: calibration_commands::CalibrationCommand,
+    },
     /// Consolidate or inspect the AI-authored label vocabulary.
     Labels {
         #[command(subcommand)]
@@ -173,11 +179,23 @@ enum TranscribeCommand {
     Generate {
         #[arg(long)]
         asset: String,
+        /// Explicit VAD thread override; bounded and provenance-bearing.
+        #[arg(long)]
+        vad_threads: Option<usize>,
+        /// Explicit whisper decode thread override; bounded and provenance-bearing.
+        #[arg(long)]
+        decode_threads: Option<usize>,
     },
     /// Transcribe every clip in the project without a current transcript.
     Missing {
         #[arg(long)]
         project: String,
+        /// Explicit VAD thread override; bounded and provenance-bearing.
+        #[arg(long)]
+        vad_threads: Option<usize>,
+        /// Explicit whisper decode thread override; bounded and provenance-bearing.
+        #[arg(long)]
+        decode_threads: Option<usize>,
     },
     /// Transcribe an explicit, validated selection with one engine lifecycle.
     Batch {
@@ -189,6 +207,12 @@ enum TranscribeCommand {
         /// Regenerate current transcripts. Default reuses current fingerprinted work.
         #[arg(long)]
         force: bool,
+        /// Explicit VAD thread override; bounded and provenance-bearing.
+        #[arg(long)]
+        vad_threads: Option<usize>,
+        /// Explicit whisper decode thread override; bounded and provenance-bearing.
+        #[arg(long)]
+        decode_threads: Option<usize>,
     },
     /// Report transcript coverage without transcribing anything.
     Status {
@@ -457,6 +481,9 @@ enum ProxyCommand {
         /// Encoder policy: auto (hardware probe with software fallback) or software.
         #[arg(long, value_enum, default_value_t)]
         policy: ProxyPolicyArg,
+        /// Explicit internal proxy worker-count override (1..=4).
+        #[arg(long)]
+        workers: Option<usize>,
     },
     /// Report missing and obsolete proxy representations without generating them.
     Status {
@@ -640,6 +667,7 @@ fn command_name(command: &Commands) -> &'static str {
         },
         Commands::Moments { command } => moment_commands::command_name(command),
         Commands::Prepare { command } => preparation_commands::command_name(command),
+        Commands::Calibrate { command } => calibration_commands::command_name(command),
         Commands::Labels { command } => match command {
             LabelsCommand::Consolidate { .. } => "labels.consolidate",
             LabelsCommand::Vocabulary { .. } => "labels.vocabulary",
@@ -681,6 +709,22 @@ fn execute(cli: &Cli) -> Result<Value> {
             Catalog::open(path)?
         };
         return preparation_commands::execute(&catalog, command);
+    }
+    if let Commands::Calibrate { command } = &cli.command {
+        let path = cli.catalog.as_deref().ok_or_else(|| {
+            anyhow!("invalid input: calibrate commands require --catalog or RCDVLOG_CATALOG")
+        })?;
+        ensure!(
+            path.is_file(),
+            "catalog not found: calibrate commands require an existing file at {}",
+            path.display()
+        );
+        let catalog = if calibration_commands::is_read_only(command) {
+            Catalog::open_read_only_existing(path)?
+        } else {
+            Catalog::open(path)?
+        };
+        return calibration_commands::execute(&catalog, command);
     }
     // Capability probing is a host diagnostic and intentionally does not need
     // an existing catalog or create one as a side effect.
@@ -775,7 +819,7 @@ fn execute(cli: &Cli) -> Result<Value> {
             chronology_commands::execute_chronology(&catalog, command)
         }
         Commands::Moments { command } => moment_commands::execute(&catalog, command),
-        Commands::Prepare { .. } => unreachable!(),
+        Commands::Prepare { .. } | Commands::Calibrate { .. } => unreachable!(),
         Commands::Diagnostics { command } => {
             chronology_commands::execute_diagnostics(&catalog, command)
         }
@@ -961,8 +1005,16 @@ fn execute(cli: &Cli) -> Result<Value> {
             ProxyCommand::Generate { asset, policy } => Ok(serde_json::to_value(
                 catalog.generate_proxy_with_policy(asset, (*policy).into())?,
             )?),
-            ProxyCommand::Missing { project, policy } => Ok(serde_json::to_value(
-                catalog.generate_missing_proxies_with_policy(project, (*policy).into())?,
+            ProxyCommand::Missing { project, policy, workers } => Ok(serde_json::to_value(
+                catalog.generate_missing_proxies_with_resource_overrides_and_progress(
+                    project,
+                    (*policy).into(),
+                    &rcdvlog_core::ResourceOverrides {
+                        worker_count: *workers,
+                        ..rcdvlog_core::ResourceOverrides::default()
+                    },
+                    |_| ControlFlow::Continue(()),
+                )?,
             )?),
             ProxyCommand::Status {
                 asset,
@@ -978,11 +1030,22 @@ fn execute(cli: &Cli) -> Result<Value> {
             }
         },
         Commands::Transcribe { command } => match command {
-            TranscribeCommand::Generate { asset } => {
-                Ok(serde_json::to_value(catalog.transcribe_asset(asset)?)?)
+            TranscribeCommand::Generate { asset, vad_threads, decode_threads } => {
+                Ok(serde_json::to_value(catalog.transcribe_asset_with_resource_overrides(
+                    asset,
+                    &rcdvlog_core::ResourceOverrides {
+                        vad_threads: *vad_threads,
+                        decode_threads: *decode_threads,
+                        ..rcdvlog_core::ResourceOverrides::default()
+                    },
+                )?)?)
             }
-            TranscribeCommand::Missing { project } => Ok(serde_json::to_value(
-                catalog.transcribe_missing_with_progress(project, |progress| {
+            TranscribeCommand::Missing { project, vad_threads, decode_threads } => Ok(serde_json::to_value(
+                catalog.transcribe_missing_with_resource_overrides_and_progress(project, &rcdvlog_core::ResourceOverrides {
+                    vad_threads: *vad_threads,
+                    decode_threads: *decode_threads,
+                    ..rcdvlog_core::ResourceOverrides::default()
+                }, |progress| {
                     eprintln!(
                         "{}",
                         json!({
@@ -998,12 +1061,19 @@ fn execute(cli: &Cli) -> Result<Value> {
                 project,
                 assets,
                 force,
+                vad_threads,
+                decode_threads,
             } => {
                 let cancellation = agent_commands::CommandCancellation::arm()?;
-                Ok(serde_json::to_value(catalog.transcribe_selected_with_progress(
+                Ok(serde_json::to_value(catalog.transcribe_selected_with_resource_overrides(
                     project,
                     assets,
                     &rcdvlog_core::TranscriptionBatchOptions { force: *force },
+                    &rcdvlog_core::ResourceOverrides {
+                        vad_threads: *vad_threads,
+                        decode_threads: *decode_threads,
+                        ..rcdvlog_core::ResourceOverrides::default()
+                    },
                     |progress| {
                         eprintln!(
                             "{}",
@@ -1804,6 +1874,8 @@ mod tests {
             "models",
             "moments",
             "labels",
+            "prepare",
+            "calibrate",
         ] {
             assert!(help.contains(command));
         }
@@ -1834,6 +1906,54 @@ mod tests {
         assert!(
             Cli::try_parse_from(["rcdvlog", "transcribe", "status", "--project", "p1"]).is_ok()
         );
+    }
+
+    #[test]
+    fn calibration_and_resource_override_flags_parse() {
+        let status = parse(&["rcdvlog", "calibrate", "status", "--recipe", "speech"]);
+        assert_eq!(command_name(&status.command), "calibrate.status");
+        let capabilities = parse(&["rcdvlog", "calibrate", "capabilities"]);
+        assert_eq!(
+            command_name(&capabilities.command),
+            "calibrate.capabilities"
+        );
+        let run = parse(&[
+            "rcdvlog",
+            "calibrate",
+            "run",
+            "--recipe",
+            "proxy",
+            "--worker-counts",
+            "1,2",
+            "--trials",
+            "2",
+            "--force",
+        ]);
+        assert_eq!(command_name(&run.command), "calibrate.run");
+        let transcribe = parse(&[
+            "rcdvlog",
+            "transcribe",
+            "batch",
+            "--project",
+            "p1",
+            "--asset",
+            "a1",
+            "--vad-threads",
+            "2",
+            "--decode-threads",
+            "4",
+        ]);
+        assert_eq!(command_name(&transcribe.command), "transcribe.batch");
+        let proxy = parse(&[
+            "rcdvlog",
+            "proxy",
+            "missing",
+            "--project",
+            "p1",
+            "--workers",
+            "2",
+        ]);
+        assert_eq!(command_name(&proxy.command), "proxy.missing");
     }
 
     #[test]

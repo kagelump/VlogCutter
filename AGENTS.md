@@ -810,7 +810,15 @@ vlm.observe-v2.framepack.2fps.skip400ms.max40.win3-8.sharp-bright-motion.dhash8-
 
 Change the task key when settings or concurrency change enough that old throughput is no longer comparable. Proxy and thumbnail weights are source bytes. macOS proxy batches use up to four workers, single-proxy calls and thumbnails use one, and the non-macOS/server proxy path remains one worker. A future cloud/VLM task must pass its real shard concurrency.
 
-The server persists histories in its control catalog scoped to its stable node and task key. Default caps are one proxy worker, one full-hash worker, and up to two lightweight workers. Durable progress must supply the exact remaining weights and actual worker count; only successful item observations update throughput.
+The server persists histories in its control catalog scoped to its stable node and task key. The default resource model is one shared local-heavy slot (proxy/transcode and full-hash cannot overlap) plus up to two overlapping lightweight workers. Durable progress must supply the exact remaining weights and actual worker count; only successful item observations update throughput.
+
+### Host calibration and the shared local-heavy slot
+
+`rcdvlog calibrate run` is an explicit, bounded, opt-in benchmark. It uses generated synthetic media by default; `--media` is required to authorize one representative file, whose bytes are read but whose path/filename are never persisted. Readiness, preflight, import, and normal analysis must never start a benchmark or download a model. Calibration results live in canonical SQLite and are reused only when host, build, media-tool executable/version, device/model, recipe, representation kind, and candidate configuration identities all match. Running/interrupted rows, failures, not-ready model conditions, changed tools, and explicit overrides remain uncertainty and must not be turned into a calibrated ETA or a completion promise.
+
+One progress/eta range rule applies: a single timing sample widens the reported range rather than pretending a point estimate is precise. Speech calibration compares finite, non-overlapping, in-range detected regions against the baseline before adopting a faster VAD thread setting; it never assumes one thread is universally optimal. Proxy calibration uses the existing output validation/render/audio contract and records the actual selected encoder. Explicit encoder/worker/VAD/decode overrides are validated, carry explicit provenance, and use settings-qualified history keys when they differ from the defaults.
+
+The accepted #53 resource model is one shared local-heavy slot across proxy/transcode, full-hash, speech, and future local VLM/analysis work. The server scheduler claims the union of heavy classes from one durable eligible-work queue (newest explicit heavy work first, intentional LIFO), and lightweight work may overlap under its own cap. Proxy, transcription, preparation, and calibration entrypoints take one advisory same-host/same-user filesystem lease; batch internals must not nested-acquire it. This lock coordinates processes on one host only and is not a distributed cluster scheduler. Existing per-asset representation claims remain separate integrity locks.
 
 ### Edit planning and export
 

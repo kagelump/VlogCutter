@@ -7,7 +7,7 @@ use thiserror::Error;
 
 use crate::chronology::forward_migrate_project_chronology;
 
-pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 34;
+pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 35;
 
 const MIGRATION_TABLE_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -288,7 +288,59 @@ pub const PROJECT_CATALOG_MIGRATIONS: &[SqliteMigration] = &[
         source_identity: "project-catalog/0034-proxy-generation-provenance/20261023",
         apply: add_proxy_generation_provenance,
     },
+    SqliteMigration {
+        id: 35,
+        name: "resource_calibrations",
+        source_identity: "project-catalog/0035-resource-calibrations/20261024",
+        apply: add_resource_calibrations,
+    },
 ];
+
+fn add_resource_calibrations(transaction: &Transaction<'_>) -> Result<()> {
+    transaction.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS resource_calibrations (
+            cache_key TEXT PRIMARY KEY,
+            schema_version TEXT NOT NULL,
+            recipe_key TEXT NOT NULL,
+            representation_kind TEXT NOT NULL,
+            media_kind TEXT NOT NULL,
+            sample_identity TEXT NOT NULL,
+            state TEXT NOT NULL CHECK(state IN (
+                'running','complete','failed','not_ready','interrupted','invalidated'
+            )),
+            identity_json TEXT NOT NULL,
+            report_json TEXT,
+            selected_settings_json TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            completed_at TEXT,
+            invalidated_at TEXT,
+            invalidation_reason TEXT,
+            owner_id TEXT,
+            owner_pid INTEGER,
+            owner_process_start TEXT,
+            heartbeat_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS resource_calibrations_lookup
+            ON resource_calibrations(recipe_key, representation_kind, state, updated_at DESC);
+        CREATE INDEX IF NOT EXISTS resource_calibrations_host_lookup
+            ON resource_calibrations(representation_kind, state, updated_at DESC);
+        CREATE TABLE IF NOT EXISTS resource_calibration_observations (
+            observation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            cache_key TEXT NOT NULL REFERENCES resource_calibrations(cache_key) ON DELETE CASCADE,
+            candidate_label TEXT NOT NULL,
+            succeeded INTEGER NOT NULL CHECK(succeeded IN (0,1)),
+            duration_ms INTEGER CHECK(duration_ms IS NULL OR duration_ms >= 0),
+            failure TEXT,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS resource_calibration_observations_run
+            ON resource_calibration_observations(cache_key, observation_id);
+        "#,
+    )?;
+    Ok(())
+}
 
 fn add_proxy_generation_provenance(transaction: &Transaction<'_>) -> Result<()> {
     add_column_if_missing(transaction, "assets", "proxy_generation_id", "INTEGER")?;
