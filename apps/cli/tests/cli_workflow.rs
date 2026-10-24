@@ -3363,3 +3363,278 @@ fn media_workflow_runs_end_to_end_through_the_agent_cli() {
     );
     assert_eq!(all.json["data"]["total"], 1);
 }
+
+#[test]
+fn analysis_accounting_cli_inspects_reconciles_authorizes_and_rejects_bad_retry_locally() {
+    let directory = tempdir().unwrap();
+    let catalog_path = directory.path().join("catalog.sqlite3");
+    let catalog = Catalog::open(&catalog_path).unwrap();
+    let project = catalog.create_project("Accounting recovery CLI").unwrap();
+    let operation = rcdvlog_core::CHRONOLOGY_SUGGESTIONS_OPERATION;
+    catalog
+        .initialize_analysis_accounting_authority(&rcdvlog_core::AnalysisBudgetAuthorityContext {
+            project_id: project.id.clone(),
+            policy_id: String::new(),
+            policy_fingerprint: "synthetic-cli-operation-v1".into(),
+            operation: operation.into(),
+            provider: "openrouter".into(),
+            budget_scope_id: String::new(),
+            budget_usd: 1.0,
+        })
+        .unwrap();
+    let run_id = catalog
+        .begin_accounted_analysis_run(&project.id, "", "targeted_retry")
+        .unwrap();
+    let payload = rcdvlog_core::VlmRequest {
+        prompt: "private CLI prompt canary".into(),
+        frames: vec!["data:image/jpeg;base64,PRIVATE_CLI_FRAME_CANARY".into()],
+        schema: serde_json::json!({"type": "object"}),
+    };
+    let payload_fingerprint =
+        rcdvlog_core::analysis_request_payload_fingerprint(rcdvlog_core::DEFAULT_MODEL, &payload)
+            .unwrap();
+    let request = catalog
+        .reserve_analysis_request(
+            &rcdvlog_core::AnalysisAccountingContext {
+                project_id: project.id.clone(),
+                policy_id: String::new(),
+                policy_fingerprint: "synthetic-cli-operation-v1".into(),
+                run_id,
+                operation: operation.into(),
+                intended_attempt_key: "synthetic-cli-request".into(),
+                source_fingerprint: "synthetic-cli-source".into(),
+                provider: "openrouter".into(),
+                budget_scope_id: String::new(),
+                budget_usd: 1.0,
+                explicit_retry: false,
+            },
+            rcdvlog_core::DEFAULT_MODEL,
+            &payload_fingerprint,
+            &rcdvlog_core::AnalysisRequestCostBound::declared_for_synthetic_transport(0.01),
+        )
+        .unwrap();
+    catalog
+        .mark_analysis_request_dispatched(&request.request_key)
+        .unwrap();
+    catalog
+        .mark_analysis_request_uncertain(&request.request_key, "provider_error:transport")
+        .unwrap();
+    drop(catalog);
+
+    let inspected = success(
+        &catalog_path,
+        [
+            "analyze",
+            "accounting",
+            "inspect",
+            "--project",
+            &project.id,
+            "--operation",
+            operation,
+            "--request",
+            &request.request_key,
+        ],
+    );
+    assert_eq!(
+        inspected.json["data"]["requests"][0]["request"]["lifecycle"],
+        "uncertain"
+    );
+    assert_eq!(
+        inspected.json["data"]["requests"][0]["attemptHistory"][0]["attemptEpoch"],
+        0
+    );
+    assert!(
+        inspected.json["data"]["budgets"][0]["uncertainUsageReserveUsd"]
+            .as_f64()
+            .unwrap()
+            > 0.0
+    );
+    assert!(
+        !inspected
+            .json
+            .to_string()
+            .contains("private CLI prompt canary"),
+        "inspection must not expose prompt content"
+    );
+
+    let receipt_file = directory.path().join("receipt.json");
+    fs::write(
+        &receipt_file,
+        serde_json::to_string(&serde_json::json!({
+            "provider": "synthetic-cli",
+            "providerGenerationId": "synthetic-cli-late-generation",
+            "actualModel": rcdvlog_core::DEFAULT_MODEL,
+            "reportedCostUsd": 0.03,
+            "promptTokens": 10,
+            "completionTokens": 5,
+            "usageComplete": true
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let reconciled = success(
+        &catalog_path,
+        [
+            "analyze",
+            "accounting",
+            "reconcile",
+            "--project",
+            &project.id,
+            "--request",
+            &request.request_key,
+            "--receipt-file",
+            receipt_file.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(reconciled.json["data"]["request"]["lifecycle"], "completed");
+    assert_eq!(
+        reconciled.json["data"]["receipts"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+
+    let authorized = success(
+        &catalog_path,
+        [
+            "analyze",
+            "accounting",
+            "retry-authorize",
+            "--project",
+            &project.id,
+            "--request",
+            &request.request_key,
+        ],
+    );
+    assert_eq!(authorized.json["data"]["nextAttemptEpoch"], 1);
+    assert_eq!(authorized.json["data"]["maxAttempts"], 4);
+
+    let changed_payload_file = directory.path().join("changed-payload.json");
+    fs::write(
+        &changed_payload_file,
+        serde_json::to_string(&serde_json::json!({
+            "prompt": "different prompt",
+            "frames": ["data:image/jpeg;base64,AA=="],
+            "schema": {"type": "object"}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let invalid_payload = failure(
+        &catalog_path,
+        [
+            "analyze",
+            "accounting",
+            "targeted-retry-dispatch",
+            "--project",
+            &project.id,
+            "--request",
+            &request.request_key,
+            "--expected-next-attempt-epoch",
+            "1",
+            "--payload-file",
+            changed_payload_file.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(invalid_payload["error"]["code"], "invalid_input");
+    assert!(
+        invalid_payload["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("payload does not match")
+    );
+    assert!(
+        !invalid_payload.to_string().contains("different prompt"),
+        "sensitive payload content must not be echoed in parse/validation errors"
+    );
+
+    let wrong_epoch = failure(
+        &catalog_path,
+        [
+            "analyze",
+            "accounting",
+            "targeted-retry-dispatch",
+            "--project",
+            &project.id,
+            "--request",
+            &request.request_key,
+            "--expected-next-attempt-epoch",
+            "2",
+            "--payload-file",
+            changed_payload_file.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(wrong_epoch["error"]["code"], "invalid_input");
+}
+
+#[test]
+fn analysis_accounting_inspect_is_read_only_and_missing_operations_fail_locally() {
+    let directory = tempdir().unwrap();
+    let missing_catalog = directory.path().join("must-not-be-created.sqlite3");
+    let missing = failure(
+        &missing_catalog,
+        [
+            "analyze",
+            "accounting",
+            "inspect",
+            "--project",
+            "synthetic-project",
+        ],
+    );
+    assert_eq!(missing["error"]["code"], "not_found");
+    assert!(
+        !missing_catalog.exists(),
+        "read-only inspection must not create or migrate a catalog"
+    );
+
+    let catalog_path = directory.path().join("catalog.sqlite3");
+    let catalog = Catalog::open(&catalog_path).unwrap();
+    let project = catalog.create_project("Accounting CLI zero I/O").unwrap();
+    drop(catalog);
+    let before = fs::read(&catalog_path).unwrap();
+    let inspected = success(
+        &catalog_path,
+        [
+            "analyze",
+            "accounting",
+            "inspect",
+            "--project",
+            &project.id,
+            "--limit",
+            "10",
+            "--offset",
+            "0",
+        ],
+    );
+    assert_eq!(
+        inspected.json["data"]["requests"].as_array().unwrap().len(),
+        0
+    );
+    assert_eq!(fs::read(&catalog_path).unwrap(), before);
+
+    for arguments in [
+        vec![
+            "analyze",
+            "accounting",
+            "reconcile",
+            "--project",
+            project.id.as_str(),
+            "--request",
+            "missing-request",
+            "--unknown-outcome",
+        ],
+        vec![
+            "analyze",
+            "accounting",
+            "retry-authorize",
+            "--project",
+            project.id.as_str(),
+            "--request",
+            "missing-request",
+        ],
+    ] {
+        let response = failure(&catalog_path, arguments);
+        assert_eq!(response["error"]["code"], "not_found");
+    }
+}

@@ -1694,7 +1694,7 @@ fn mixed_pilot_and_bulk_operation_aggregates_do_not_mix_charges() {
         &project,
         policy_id,
         "run-current",
-        "completed",
+        "running",
         "bulk",
         0.0,
     );
@@ -1796,7 +1796,7 @@ fn frozen_legacy_evidence_is_included_once_in_whole_policy_projection() {
         &project,
         policy_id,
         "run-current",
-        "completed",
+        "running",
         "bulk",
         0.0,
     );
@@ -1839,22 +1839,10 @@ fn late_old_run_receipt_contributes_charge_without_overwriting_current_provenanc
         .initialize_analysis_accounting_authority(&policy_authority(&project, policy_id, 2.0))
         .unwrap();
     insert_accounted_run(
-        &catalog,
-        &project,
-        policy_id,
-        "run-old",
-        "completed",
-        "bulk",
-        0.0,
+        &catalog, &project, policy_id, "run-old", "running", "bulk", 0.0,
     );
     insert_accounted_run(
-        &catalog,
-        &project,
-        policy_id,
-        "run-new",
-        "completed",
-        "bulk",
-        0.0,
+        &catalog, &project, policy_id, "run-new", "running", "bulk", 0.0,
     );
 
     let mut old_context =
@@ -3707,4 +3695,795 @@ fn provenance_is_scoped_to_policy_and_preserves_known_metadata_when_receipt_enri
         .unwrap();
     assert_eq!(other.current_run_actual_provider, None);
     assert_eq!(other.current_run_generation_id, None);
+}
+
+#[test]
+fn targeted_retry_dispatches_exact_authorized_payload_once_and_retains_old_unknown() {
+    let (directory, catalog, project) = fixture();
+    catalog
+        .initialize_analysis_accounting_authority(&operation_authority(
+            &project,
+            CHRONOLOGY_SUGGESTIONS_OPERATION,
+            1.0,
+        ))
+        .unwrap();
+    let payload = VlmRequest {
+        prompt: "PRIVATE_ORIGINAL_PROMPT_CANARY".into(),
+        frames: vec!["data:image/jpeg;base64,PRIVATE_FRAME_CANARY".into()],
+        schema: json!({"type": "object"}),
+    };
+    let mut context = operation_context(
+        &project,
+        CHRONOLOGY_SUGGESTIONS_OPERATION,
+        "targeted-intent",
+        1.0,
+    );
+    context.source_fingerprint = "targeted-source-identity".into();
+    let payload_fingerprint =
+        analysis_request_payload_fingerprint(DEFAULT_MODEL, &payload).unwrap();
+    let first = catalog
+        .reserve_analysis_request(&context, DEFAULT_MODEL, &payload_fingerprint, &bound(0.01))
+        .unwrap();
+    catalog
+        .mark_analysis_request_dispatched(&first.request_key)
+        .unwrap();
+    catalog
+        .mark_analysis_request_uncertain(&first.request_key, "provider_error:transport")
+        .unwrap();
+    let authorization = catalog
+        .authorize_analysis_request_retry_for_project(&project, &first.request_key)
+        .unwrap();
+    assert_eq!(authorization.next_attempt_epoch, 1);
+
+    let mut provider = BoundaryProvider::new(0.01);
+    provider.body = "PRIVATE_PROVIDER_RESPONSE_BODY_CANARY".into();
+    let reopened = Catalog::open(directory.path().join("catalog.sqlite3")).unwrap();
+    let report = reopened
+        .dispatch_targeted_analysis_retry_with_provider(
+            &project,
+            &first.request_key,
+            1,
+            &payload,
+            &provider,
+        )
+        .unwrap();
+
+    assert_eq!(provider.call_count(), 1);
+    assert_eq!(report.request.attempt_epoch, 1);
+    assert_eq!(
+        report.request.lifecycle,
+        AnalysisRequestLifecycle::Completed
+    );
+    assert_eq!(report.attempt_history.len(), 2);
+    assert_eq!(
+        report.attempt_history[0].lifecycle,
+        AnalysisRequestLifecycle::Uncertain
+    );
+    assert_eq!(report.receipts.len(), 1);
+    assert_eq!(
+        report.provider_response.as_ref().unwrap().body,
+        "PRIVATE_PROVIDER_RESPONSE_BODY_CANARY"
+    );
+    assert!(report.review_required);
+    assert!((report.accounting.confirmed_cost_usd - 0.01).abs() < 1e-12);
+    assert!((report.budget.confirmed_cost_usd - 0.01).abs() < 1e-12);
+    assert!((report.budget.uncertain_usage_reserve_usd - 0.01).abs() < 1e-12);
+    assert!(report.budget.uncertain_usage_reserve_usd > 0.0);
+
+    let connection = reopened.connection().unwrap();
+    let stored_events: String = connection
+        .query_row(
+            "SELECT group_concat(detail_json, '') FROM analysis_request_events",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(!stored_events.contains("PRIVATE_ORIGINAL_PROMPT_CANARY"));
+    assert!(!stored_events.contains("PRIVATE_FRAME_CANARY"));
+    assert!(!stored_events.contains("PRIVATE_PROVIDER_RESPONSE_BODY_CANARY"));
+
+    // A late final receipt can still resolve the old uncertainty exactly once
+    // after the newer retry completed; neither attempt erases the other.
+    reopened
+        .record_analysis_request_receipt(
+            &first.request_key,
+            &receipt("fake", "old-late-final", DEFAULT_MODEL, 0.01, true),
+        )
+        .unwrap();
+    let after_late = reopened
+        .analysis_budget_snapshot(&report.budget.budget_scope_id)
+        .unwrap()
+        .unwrap();
+    assert!((after_late.confirmed_cost_usd - 0.02).abs() < 1e-12);
+    assert!(after_late.uncertain_usage_reserve_usd.abs() < 1e-12);
+    assert_eq!(
+        reopened
+            .analysis_attempt_history(&first.request_key)
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+#[test]
+fn targeted_retry_fails_closed_before_any_call_for_payload_epoch_or_cost_mismatch() {
+    let (_directory, catalog, project) = fixture();
+    catalog
+        .initialize_analysis_accounting_authority(&operation_authority(
+            &project,
+            CHRONOLOGY_SUGGESTIONS_OPERATION,
+            1.0,
+        ))
+        .unwrap();
+    let payload = boundary_request();
+    let payload_fingerprint =
+        analysis_request_payload_fingerprint(DEFAULT_MODEL, &payload).unwrap();
+    let mut context = operation_context(
+        &project,
+        CHRONOLOGY_SUGGESTIONS_OPERATION,
+        "targeted-mismatch-intent",
+        1.0,
+    );
+    context.source_fingerprint = "targeted-source-identity".into();
+    let first = catalog
+        .reserve_analysis_request(&context, DEFAULT_MODEL, &payload_fingerprint, &bound(0.01))
+        .unwrap();
+    catalog
+        .mark_analysis_request_dispatched(&first.request_key)
+        .unwrap();
+    catalog
+        .mark_analysis_request_uncertain(&first.request_key, "provider_error:transport")
+        .unwrap();
+    catalog
+        .authorize_analysis_request_retry_for_project(&project, &first.request_key)
+        .unwrap();
+
+    let changed_payload = VlmRequest {
+        prompt: "different payload".into(),
+        ..payload.clone()
+    };
+    let provider = BoundaryProvider::new(0.01);
+    assert!(
+        catalog
+            .dispatch_targeted_analysis_retry_with_provider(
+                &project,
+                &first.request_key,
+                1,
+                &changed_payload,
+                &provider,
+            )
+            .is_err()
+    );
+    assert_eq!(provider.call_count(), 0);
+
+    assert!(
+        catalog
+            .dispatch_targeted_analysis_retry_with_provider(
+                &project,
+                &first.request_key,
+                2,
+                &payload,
+                &provider,
+            )
+            .is_err()
+    );
+    assert_eq!(provider.call_count(), 0);
+
+    let changed_cost_provider = BoundaryProvider::new(0.02);
+    assert!(
+        catalog
+            .dispatch_targeted_analysis_retry_with_provider(
+                &project,
+                &first.request_key,
+                1,
+                &payload,
+                &changed_cost_provider,
+            )
+            .is_err()
+    );
+    assert_eq!(changed_cost_provider.call_count(), 0);
+    assert_eq!(
+        catalog
+            .analysis_attempt_history(&first.request_key)
+            .unwrap()
+            .len(),
+        1,
+        "failed preflight cannot append a retry epoch"
+    );
+}
+
+#[test]
+fn reconciliation_requires_project_ownership_and_is_idempotent() {
+    let (_directory, catalog, project) = fixture();
+    catalog
+        .initialize_analysis_accounting_authority(&operation_authority(
+            &project,
+            "reconcile-project",
+            1.0,
+        ))
+        .unwrap();
+    let first = catalog
+        .reserve_analysis_request(
+            &operation_context(&project, "reconcile-project", "intent", 1.0),
+            DEFAULT_MODEL,
+            "reconcile-payload",
+            &bound(0.10),
+        )
+        .unwrap();
+    catalog
+        .mark_analysis_request_dispatched(&first.request_key)
+        .unwrap();
+    let late = receipt("fake", "late-idempotent", DEFAULT_MODEL, 0.03, true);
+    let evidence = AnalysisRequestReconciliation::LateReceipt {
+        receipt: late.clone(),
+    };
+    let first_report = catalog
+        .reconcile_analysis_request_for_project(&project, &first.request_key, &evidence)
+        .unwrap();
+    let second_report = catalog
+        .reconcile_analysis_request_for_project(&project, &first.request_key, &evidence)
+        .unwrap();
+    assert_eq!(
+        first_report.request.lifecycle,
+        AnalysisRequestLifecycle::Completed
+    );
+    assert_eq!(
+        second_report.request.lifecycle,
+        AnalysisRequestLifecycle::Completed
+    );
+    assert_eq!(
+        catalog
+            .analysis_provider_receipts(&first.request_key)
+            .unwrap()
+            .len(),
+        1,
+        "repeated late-receipt reconciliation must not grow history"
+    );
+    assert_eq!(
+        catalog
+            .analysis_request_events(&first.request_key)
+            .unwrap()
+            .iter()
+            .filter(|event| event.event_kind == "receipt")
+            .count(),
+        1
+    );
+    let other_project = catalog.create_project("Other accounting project").unwrap();
+    let error = catalog
+        .reconcile_analysis_request_for_project(&other_project.id, &first.request_key, &evidence)
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("does not belong"));
+}
+
+#[test]
+fn targeted_retry_concurrent_epoch_consumers_allow_exactly_one_paid_call() {
+    let (directory, catalog, project) = fixture();
+    catalog
+        .initialize_analysis_accounting_authority(&operation_authority(
+            &project,
+            CHRONOLOGY_SUGGESTIONS_OPERATION,
+            1.0,
+        ))
+        .unwrap();
+    let payload = boundary_request();
+    let payload_fingerprint =
+        analysis_request_payload_fingerprint(DEFAULT_MODEL, &payload).unwrap();
+    let mut context = operation_context(
+        &project,
+        CHRONOLOGY_SUGGESTIONS_OPERATION,
+        "targeted-race-intent",
+        1.0,
+    );
+    context.source_fingerprint = "targeted-race-source".into();
+    let first = catalog
+        .reserve_analysis_request(&context, DEFAULT_MODEL, &payload_fingerprint, &bound(0.01))
+        .unwrap();
+    catalog
+        .mark_analysis_request_dispatched(&first.request_key)
+        .unwrap();
+    catalog
+        .mark_analysis_request_uncertain(&first.request_key, "provider_error:transport")
+        .unwrap();
+    catalog
+        .authorize_analysis_request_retry_for_project(&project, &first.request_key)
+        .unwrap();
+
+    let other_catalog = Catalog::open(directory.path().join("catalog.sqlite3")).unwrap();
+    let barrier = Arc::new(Barrier::new(2));
+    let mut handles = Vec::new();
+    for runner in [catalog.clone(), other_catalog] {
+        let barrier = Arc::clone(&barrier);
+        let project = project.clone();
+        let request_key = first.request_key.clone();
+        let payload = payload.clone();
+        handles.push(thread::spawn(move || {
+            let provider = BoundaryProvider::new(0.01);
+            let calls = Arc::new(provider.calls.clone());
+            barrier.wait();
+            let result = runner.dispatch_targeted_analysis_retry_with_provider(
+                &project,
+                &request_key,
+                1,
+                &payload,
+                &provider,
+            );
+            (result, calls.load(Ordering::SeqCst))
+        }));
+    }
+    let results = handles
+        .into_iter()
+        .map(|handle| handle.join().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        results.iter().filter(|(result, _)| result.is_ok()).count(),
+        1
+    );
+    assert_eq!(
+        results.iter().filter(|(result, _)| result.is_err()).count(),
+        1
+    );
+    assert_eq!(results.iter().map(|(_, calls)| calls).sum::<usize>(), 1);
+    assert_eq!(
+        catalog
+            .analysis_attempt_history(&first.request_key)
+            .unwrap()
+            .len(),
+        2,
+        "only the authorized next epoch may be admitted"
+    );
+}
+
+#[test]
+fn uncertain_premarker_request_cannot_bypass_the_inflight_admission_cap() {
+    let (_directory, catalog, project) = fixture();
+    catalog
+        .initialize_analysis_accounting_authority(&operation_authority(
+            &project,
+            "uncertain-cap",
+            10.0,
+        ))
+        .unwrap();
+    let mut requests = Vec::new();
+    for index in 0..4 {
+        let context = operation_context(
+            &project,
+            "uncertain-cap",
+            &format!("uncertain-cap-{index}"),
+            10.0,
+        );
+        requests.push(
+            catalog
+                .reserve_analysis_request(
+                    &context,
+                    DEFAULT_MODEL,
+                    &format!("uncertain-cap-payload-{index}"),
+                    &bound(0.01),
+                )
+                .unwrap(),
+        );
+    }
+    // A marker-absent local unknown is releasable/retryable evidence, not a
+    // dispatched in-flight request. It must not later become a fifth wire call
+    // while four other reservations still occupy the authority cap.
+    catalog
+        .mark_analysis_request_uncertain(
+            &requests[0].request_key,
+            "local_interrupted_before_marker",
+        )
+        .unwrap();
+    let fifth = catalog
+        .reserve_analysis_request(
+            &operation_context(&project, "uncertain-cap", "uncertain-cap-fifth", 10.0),
+            DEFAULT_MODEL,
+            "uncertain-cap-payload-fifth",
+            &bound(0.01),
+        )
+        .unwrap();
+    assert_eq!(fifth.lifecycle, AnalysisRequestLifecycle::Reserved);
+
+    let error = catalog
+        .mark_analysis_request_dispatched(&requests[0].request_key)
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("cannot be marked dispatched"),
+        "{error:#}"
+    );
+    let unchanged = catalog
+        .analysis_request(&requests[0].request_key)
+        .unwrap()
+        .unwrap();
+    assert_eq!(unchanged.lifecycle, AnalysisRequestLifecycle::Uncertain);
+    assert!(unchanged.dispatch_at.is_none());
+    let snapshot = catalog
+        .analysis_budget_snapshot(&analysis_operation_budget_scope_id(
+            &project,
+            "uncertain-cap",
+        ))
+        .unwrap()
+        .unwrap();
+    assert_eq!(snapshot.active_requests, 4);
+}
+
+#[test]
+fn targeted_retry_claim_uses_the_same_owner_checks_as_initial_admission() {
+    let (_directory, catalog, project) = fixture();
+    let other = catalog
+        .create_project("Other targeted owner project")
+        .unwrap();
+    let policy_id = "targeted-owner-policy";
+    let source = "targeted-owner-source";
+    let policy = project_policy(&project, policy_id, 1.0, source);
+    insert_authorization(&catalog, &policy, ANALYSIS_ACCOUNTING_SCHEMA_VERSION);
+    catalog
+        .initialize_analysis_accounting_authority(&policy_authority(&project, policy_id, 1.0))
+        .unwrap();
+    let first_run = catalog
+        .begin_accounted_analysis_run(&project, policy_id, "pilot")
+        .unwrap();
+    let payload_fingerprint = "targeted-owner-payload";
+    let first = catalog
+        .reserve_analysis_request(
+            &policy_context(
+                &project,
+                policy_id,
+                &first_run,
+                "targeted-owner-intent",
+                1.0,
+                source,
+            ),
+            DEFAULT_MODEL,
+            payload_fingerprint,
+            &bound(0.01),
+        )
+        .unwrap();
+    catalog
+        .mark_analysis_request_dispatched(&first.request_key)
+        .unwrap();
+    catalog
+        .mark_analysis_request_uncertain(&first.request_key, "provider_error:transport")
+        .unwrap();
+    catalog
+        .authorize_analysis_request_retry_for_project(&project, &first.request_key)
+        .unwrap();
+    let cost_bound = bound(0.01);
+    let cost_bound_fingerprint = analysis_request_cost_bound_fingerprint(&cost_bound).unwrap();
+    let retry_run = catalog
+        .begin_accounted_analysis_run(&project, policy_id, "targeted_retry")
+        .unwrap();
+
+    let mut admission = AnalysisTargetedRetryAdmission {
+        project_id: project.clone(),
+        prior_request_key: first.request_key.clone(),
+        expected_next_attempt_epoch: 1,
+        run_id: retry_run.clone(),
+    };
+    catalog
+        .validate_analysis_targeted_retry_claim(
+            &admission,
+            DEFAULT_MODEL,
+            payload_fingerprint,
+            &cost_bound_fingerprint,
+        )
+        .unwrap();
+
+    admission.run_id = first_run.clone();
+    assert!(
+        catalog
+            .validate_analysis_targeted_retry_claim(
+                &admission,
+                DEFAULT_MODEL,
+                payload_fingerprint,
+                &cost_bound_fingerprint,
+            )
+            .is_err(),
+        "the prior interrupted run cannot be reused as a new retry run"
+    );
+    admission.run_id = retry_run.clone();
+
+    // A run from another project is rejected by the shared owner check.
+    insert_accounted_run(
+        &catalog,
+        &other.id,
+        "",
+        "targeted-other-project-run",
+        "running",
+        "targeted_retry",
+        0.0,
+    );
+    admission.run_id = "targeted-other-project-run".into();
+    let error = catalog
+        .validate_analysis_targeted_retry_claim(
+            &admission,
+            DEFAULT_MODEL,
+            payload_fingerprint,
+            &cost_bound_fingerprint,
+        )
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("different project"),
+        "{error:#}"
+    );
+
+    // A legacy/non-accounted run cannot own a new paid admission.
+    insert_run(
+        &catalog,
+        &project,
+        policy_id,
+        "targeted-legacy-run",
+        "running",
+        "targeted_retry",
+        0.0,
+    );
+    admission.run_id = "targeted-legacy-run".into();
+    let error = catalog
+        .validate_analysis_targeted_retry_claim(
+            &admission,
+            DEFAULT_MODEL,
+            payload_fingerprint,
+            &cost_bound_fingerprint,
+        )
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("durable request accounting"),
+        "{error:#}"
+    );
+
+    // A terminal run is not a fresh paid permit.
+    let finished_run = catalog
+        .begin_accounted_analysis_run(&project, policy_id, "targeted_retry")
+        .unwrap();
+    catalog
+        .finish_analysis_run(
+            &finished_run,
+            &crate::AnalysisRunOutcome {
+                status: "failed".into(),
+                stage_reached: "targeted_retry".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    admission.run_id = finished_run;
+    let error = catalog
+        .validate_analysis_targeted_retry_claim(
+            &admission,
+            DEFAULT_MODEL,
+            payload_fingerprint,
+            &cost_bound_fingerprint,
+        )
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("currently running"),
+        "{error:#}"
+    );
+
+    // Project ownership is checked before any retry epoch is consumed.
+    admission.project_id = other.id.clone();
+    admission.run_id = retry_run;
+    let error = catalog
+        .validate_analysis_targeted_retry_claim(
+            &admission,
+            DEFAULT_MODEL,
+            payload_fingerprint,
+            &cost_bound_fingerprint,
+        )
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("does not belong"),
+        "{error:#}"
+    );
+
+    // Changed source scope/provider authorization is rejected through the same
+    // load_authorized_policy owner used by initial admission.
+    let mut changed_scope = policy.clone();
+    changed_scope.scope[0].source_identity = "changed-targeted-source".into();
+    catalog
+        .connection()
+        .unwrap()
+        .execute(
+            "DELETE FROM analysis_run_authorizations WHERE policy_id=?1",
+            [policy_id],
+        )
+        .unwrap();
+    insert_authorization(&catalog, &changed_scope, ANALYSIS_ACCOUNTING_SCHEMA_VERSION);
+    admission.project_id = project.clone();
+    let error = catalog
+        .validate_analysis_targeted_retry_claim(
+            &admission,
+            DEFAULT_MODEL,
+            payload_fingerprint,
+            &cost_bound_fingerprint,
+        )
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("outside the frozen authorized scope"),
+        "{error:#}"
+    );
+
+    let mut changed_provider = policy.clone();
+    changed_provider.provider = "changed-targeted-provider".into();
+    catalog
+        .connection()
+        .unwrap()
+        .execute(
+            "DELETE FROM analysis_run_authorizations WHERE policy_id=?1",
+            [policy_id],
+        )
+        .unwrap();
+    insert_authorization(
+        &catalog,
+        &changed_provider,
+        ANALYSIS_ACCOUNTING_SCHEMA_VERSION,
+    );
+    let error = catalog
+        .validate_analysis_targeted_retry_claim(
+            &admission,
+            DEFAULT_MODEL,
+            payload_fingerprint,
+            &cost_bound_fingerprint,
+        )
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("does not match the frozen authorization"),
+        "{error:#}"
+    );
+
+    // Revoked authorization cannot be bypassed by a direct boundary caller.
+    catalog
+        .connection()
+        .unwrap()
+        .execute(
+            "DELETE FROM analysis_run_authorizations WHERE policy_id=?1",
+            [policy_id],
+        )
+        .unwrap();
+    let error = catalog
+        .validate_analysis_targeted_retry_claim(
+            &admission,
+            DEFAULT_MODEL,
+            payload_fingerprint,
+            &cost_bound_fingerprint,
+        )
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("not canonically authorized"),
+        "{error:#}"
+    );
+    assert_eq!(
+        catalog
+            .analysis_attempt_history(&first.request_key)
+            .unwrap()
+            .len(),
+        1,
+        "rejected claims must not append retry epochs"
+    );
+}
+
+#[test]
+fn inspection_request_or_run_filters_show_only_the_selected_budget_scopes() {
+    let (_directory, catalog, project) = fixture();
+    for operation in ["inspect-one", "inspect-two"] {
+        catalog
+            .initialize_analysis_accounting_authority(&operation_authority(
+                &project, operation, 1.0,
+            ))
+            .unwrap();
+        let run_id = catalog
+            .begin_accounted_analysis_run(&project, "", operation)
+            .unwrap();
+        let mut context = operation_context(&project, operation, operation, 1.0);
+        context.run_id = run_id;
+        catalog
+            .reserve_analysis_request(&context, DEFAULT_MODEL, operation, &bound(0.01))
+            .unwrap();
+    }
+    let request = catalog
+        .list_analysis_requests(&project, None, 10)
+        .unwrap()
+        .into_iter()
+        .find(|request| request.operation == "inspect-one")
+        .unwrap();
+    let inspection = catalog
+        .inspect_analysis_accounting(
+            &project,
+            None,
+            Some("inspect-one"),
+            None,
+            Some(&request.request_key),
+            10,
+            0,
+        )
+        .unwrap();
+    assert_eq!(inspection.requests.len(), 1);
+    assert_eq!(inspection.budgets.len(), 1);
+    assert_eq!(
+        inspection.budgets[0].budget_scope_id,
+        analysis_operation_budget_scope_id(&project, "inspect-one")
+    );
+    assert_eq!(inspection.selection.matching_request_count, 1);
+
+    let run_inspection = catalog
+        .inspect_analysis_accounting(
+            &project,
+            None,
+            Some("inspect-two"),
+            Some(&request.run_id),
+            None,
+            10,
+            0,
+        )
+        .unwrap();
+    assert!(run_inspection.requests.is_empty());
+    assert!(run_inspection.budgets.is_empty());
+
+    let other = catalog.create_project("Other inspection project").unwrap();
+    let error = catalog
+        .inspect_analysis_accounting(
+            &other.id,
+            None,
+            None,
+            None,
+            Some(&request.request_key),
+            10,
+            0,
+        )
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("not found"), "{error:#}");
+}
+
+#[test]
+fn production_targeted_retry_rejects_non_openrouter_route_before_credentials_or_transport() {
+    let (_directory, catalog, project) = fixture();
+    catalog
+        .initialize_analysis_accounting_authority(&AnalysisBudgetAuthorityContext {
+            project_id: project.clone(),
+            policy_id: String::new(),
+            policy_fingerprint: "synthetic-other-route".into(),
+            operation: CHRONOLOGY_SUGGESTIONS_OPERATION.into(),
+            provider: "synthetic-other-provider".into(),
+            budget_scope_id: String::new(),
+            budget_usd: 1.0,
+        })
+        .unwrap();
+    let run_id = catalog
+        .begin_accounted_analysis_run(&project, "", "targeted_retry")
+        .unwrap();
+    let payload = boundary_request();
+    let payload_fingerprint =
+        analysis_request_payload_fingerprint(DEFAULT_MODEL, &payload).unwrap();
+    let mut context = operation_context(
+        &project,
+        CHRONOLOGY_SUGGESTIONS_OPERATION,
+        "other-route-intent",
+        1.0,
+    );
+    context.run_id = run_id;
+    context.provider = "synthetic-other-provider".into();
+    context.policy_fingerprint = "synthetic-other-route".into();
+    let first = catalog
+        .reserve_analysis_request(&context, DEFAULT_MODEL, &payload_fingerprint, &bound(0.01))
+        .unwrap();
+    catalog
+        .mark_analysis_request_dispatched(&first.request_key)
+        .unwrap();
+    catalog
+        .mark_analysis_request_uncertain(&first.request_key, "provider_error:transport")
+        .unwrap();
+    catalog
+        .authorize_analysis_request_retry_for_project(&project, &first.request_key)
+        .unwrap();
+    let error = catalog
+        .dispatch_targeted_analysis_retry(&project, &first.request_key, 1, &payload)
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("not the configured OpenRouter route"),
+        "{error:#}"
+    );
+    assert_eq!(
+        catalog
+            .analysis_attempt_history(&first.request_key)
+            .unwrap()
+            .len(),
+        1,
+        "route rejection happens before a new paid run or epoch"
+    );
 }

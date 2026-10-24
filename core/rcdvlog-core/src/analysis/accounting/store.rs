@@ -18,9 +18,10 @@ use super::model::{
     AnalysisBudgetAuthorityContext, AnalysisBudgetExhausted, AnalysisBudgetSnapshot,
     AnalysisOperationAttemptProjection, AnalysisProviderReceipt, AnalysisRequestEvent,
     AnalysisRequestLifecycle, AnalysisRequestRecord, AnalysisRetryAuthorization,
-    LEGACY_UNKNOWN_USAGE_STOP_REASON, MAX_IN_FLIGHT_REQUESTS_PER_BUDGET_AUTHORITY,
-    MAX_REQUEST_ATTEMPTS, ProviderReceiptEvidence, analysis_request_cost_bound_fingerprint,
-    attempt_base_key, bounded_failure_code, digest_bytes, digest_json, request_key,
+    AnalysisTargetedRetryAdmission, LEGACY_UNKNOWN_USAGE_STOP_REASON,
+    MAX_IN_FLIGHT_REQUESTS_PER_BUDGET_AUTHORITY, MAX_REQUEST_ATTEMPTS, ProviderReceiptEvidence,
+    analysis_request_cost_bound_fingerprint, attempt_base_key, bounded_failure_code, digest_bytes,
+    digest_json, request_key,
 };
 use super::settlement::{
     ExistingReceipt, ReceiptDisposition, classify_receipt, settlement_for_receipt,
@@ -142,6 +143,186 @@ pub(crate) fn initialize_authority(
     Ok(snapshot)
 }
 
+/// Immutable identity fields shared by initial and targeted-retry admission.
+struct AdmissionIdentity {
+    request_key: String,
+    budget_scope_id: String,
+    project_id: String,
+    policy_id: String,
+    run_id: String,
+    operation: String,
+    attempt_base_key: String,
+    attempt_epoch: u32,
+    requested_provider: String,
+    requested_model: String,
+    policy_fingerprint: String,
+    payload_fingerprint: String,
+    source_fingerprint: String,
+    request_fingerprint: String,
+    cost_bound_fingerprint: String,
+}
+
+/// Immutable owner fields shared by fresh admission and an explicitly
+/// authorized targeted retry. Both paths run the same canonical project,
+/// policy, provider/model/source and owned-run checks before inserting a
+/// reservation; targeted retry never fabricates a replacement accounting
+/// context merely to reach those checks.
+struct OwnerIdentity<'a> {
+    project_id: &'a str,
+    policy_id: &'a str,
+    policy_fingerprint: &'a str,
+    provider: &'a str,
+    budget_usd: f64,
+    model: &'a str,
+    source_fingerprint: &'a str,
+    run_id: &'a str,
+}
+
+impl<'a> OwnerIdentity<'a> {
+    fn from_context(context: &'a AnalysisAccountingContext, model: &'a str) -> Self {
+        Self {
+            project_id: &context.project_id,
+            policy_id: &context.policy_id,
+            policy_fingerprint: &context.policy_fingerprint,
+            provider: &context.provider,
+            budget_usd: context.budget_usd,
+            model,
+            source_fingerprint: &context.source_fingerprint,
+            run_id: &context.run_id,
+        }
+    }
+
+    fn from_targeted_retry(
+        prior: &'a AnalysisRequestRecord,
+        run_id: &'a str,
+        budget_usd: f64,
+    ) -> Self {
+        Self {
+            project_id: &prior.project_id,
+            policy_id: &prior.policy_id,
+            policy_fingerprint: &prior.policy_fingerprint,
+            provider: &prior.provider,
+            budget_usd,
+            model: &prior.requested_model,
+            source_fingerprint: &prior.source_fingerprint,
+            run_id,
+        }
+    }
+}
+
+/// Caller-supplied immutable claim for one explicit targeted retry. The durable
+/// authorization, exact prior payload/model and current full cost contract are
+/// proved together inside the admission transaction.
+pub(crate) struct TargetedRetryClaim<'a> {
+    pub project_id: &'a str,
+    pub prior_request_key: &'a str,
+    pub expected_next_attempt_epoch: u32,
+    pub run_id: Option<&'a str>,
+    pub model: &'a str,
+    pub payload_fingerprint: &'a str,
+    pub cost_bound_fingerprint: &'a str,
+}
+
+fn merged_event_detail(base: Value, extra: Value) -> Value {
+    match (base, extra) {
+        (Value::Object(mut base), Value::Object(extra)) => {
+            base.extend(extra);
+            Value::Object(base)
+        }
+        (base, _) => base,
+    }
+}
+
+/// The one balance/admission calculation used by both a fresh request and an
+/// explicit targeted retry. The caller owns the outer IMMEDIATE transaction and
+/// has already proved request-specific identity/authorization. This function
+/// recomputes every conservative total and performs the single unclipped
+/// full-bound insert.
+fn admit_reservation(
+    connection: &Connection,
+    authority: &Authority,
+    identity: AdmissionIdentity,
+    cost_bound: &AnalysisRequestCostBound,
+    event_detail: Value,
+) -> Result<AnalysisRequestRecord> {
+    let totals = totals_for_scope(connection, &identity.budget_scope_id)?;
+    ensure!(
+        totals.active_requests < MAX_IN_FLIGHT_REQUESTS_PER_BUDGET_AUTHORITY,
+        "analysis budget authority already has {MAX_IN_FLIGHT_REQUESTS_PER_BUDGET_AUTHORITY} requests in flight"
+    );
+    let untracked = untracked_totals(connection, &identity.budget_scope_id, None)?;
+    let committed = authority.legacy_confirmed_cost_usd
+        + authority.legacy_uncertain_usage_reserve_usd
+        + untracked.reserve
+        + totals.committed();
+    let available = (authority.budget_usd - committed).max(0.0);
+    let requested = cost_bound.maximum_cost_usd;
+    ensure!(
+        requested.is_finite() && requested > 0.0,
+        "analysis request cost bound must be finite and greater than zero"
+    );
+    if available + 1e-12 < requested {
+        return Err(AnalysisBudgetExhausted {
+            available_usd: available,
+            requested_usd: requested,
+        }
+        .into());
+    }
+
+    let now = crate::now();
+    connection.execute(
+        "INSERT INTO analysis_request_reservations(
+            request_key,budget_scope_id,project_id,policy_id,run_id,operation,attempt_base_key,
+            attempt_epoch,requested_provider,requested_model,policy_fingerprint,payload_fingerprint,
+            source_fingerprint,request_fingerprint,cost_bound_fingerprint,cost_bound_json,
+            lifecycle,reserved_cost_usd,created_at,updated_at)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,
+                'reserved',?17,?18,?18)",
+        params![
+            identity.request_key,
+            identity.budget_scope_id,
+            identity.project_id,
+            identity.policy_id,
+            identity.run_id,
+            identity.operation,
+            identity.attempt_base_key,
+            identity.attempt_epoch as i64,
+            identity.requested_provider,
+            identity.requested_model,
+            identity.policy_fingerprint,
+            identity.payload_fingerprint,
+            identity.source_fingerprint,
+            identity.request_fingerprint,
+            identity.cost_bound_fingerprint,
+            serde_json::to_string(cost_bound)?,
+            requested,
+            now,
+        ],
+    )?;
+    append_event(
+        connection,
+        &identity.request_key,
+        "reserved",
+        merged_event_detail(
+            json!({
+                "attemptEpoch": identity.attempt_epoch,
+                "reservedCostUsd": requested,
+                "budgetScopeId": identity.budget_scope_id,
+                "legacyConfirmedCostUsd": authority.legacy_confirmed_cost_usd,
+                "legacyUncertainUsageReserveUsd": authority.legacy_uncertain_usage_reserve_usd,
+                "confirmedCostUsd": totals.confirmed,
+                "activeReservedCostUsd": totals.active_reserved,
+                "uncertainUsageReserveUsd": totals.uncertain,
+                "costBoundFingerprint": identity.cost_bound_fingerprint,
+                "costBound": cost_bound,
+            }),
+            event_detail,
+        ),
+    )?;
+    load_request(connection, &identity.request_key)?
+        .ok_or_else(|| anyhow!("reserved analysis request disappeared"))
+}
+
 /// Atomically check the full conservative bound against the one canonical
 /// authority, then append a reservation. The bound is never clipped.
 pub(crate) fn reserve(
@@ -171,7 +352,7 @@ pub(crate) fn reserve(
         context.budget_usd,
         &scope,
     )?;
-    validate_request_identity(&transaction, context, model)?;
+    validate_owner_identity(&transaction, &OwnerIdentity::from_context(context, model))?;
     if let Some(stop_reason) =
         persist_untracked_denial_boundary(&transaction, &authority, context.budget_usd)?
     {
@@ -188,83 +369,241 @@ pub(crate) fn reserve(
         "an identical analysis request already exists; it is already reserved or in flight; refusing a duplicate paid dispatch"
     );
     let next_epoch = next_attempt_epoch(context, &prior, &transaction)?;
-
-    let totals = totals_for_scope(&transaction, &scope)?;
-    ensure!(
-        totals.active_requests < MAX_IN_FLIGHT_REQUESTS_PER_BUDGET_AUTHORITY,
-        "analysis budget authority already has {MAX_IN_FLIGHT_REQUESTS_PER_BUDGET_AUTHORITY} requests in flight"
-    );
-    let untracked = untracked_totals(&transaction, &scope, None)?;
-    let committed = authority.legacy_confirmed_cost_usd
-        + authority.legacy_uncertain_usage_reserve_usd
-        + untracked.reserve
-        + totals.committed();
-    let available = (authority.budget_usd - committed).max(0.0);
-    let requested = cost_bound.maximum_cost_usd;
-    ensure!(
-        requested.is_finite() && requested > 0.0,
-        "analysis request cost bound must be finite and greater than zero"
-    );
-    if available + 1e-12 < requested {
-        return Err(AnalysisBudgetExhausted {
-            available_usd: available,
-            requested_usd: requested,
-        }
-        .into());
-    }
-
     let key = request_key(&base, next_epoch);
-    let now = crate::now();
-    transaction.execute(
-        "INSERT INTO analysis_request_reservations(
-            request_key,budget_scope_id,project_id,policy_id,run_id,operation,attempt_base_key,
-            attempt_epoch,requested_provider,requested_model,policy_fingerprint,payload_fingerprint,
-            source_fingerprint,request_fingerprint,cost_bound_fingerprint,cost_bound_json,
-            lifecycle,reserved_cost_usd,created_at,updated_at)
-         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,
-                'reserved',?17,?18,?18)",
-        params![
-            key,
-            scope,
-            context.project_id,
-            context.policy_id,
-            context.run_id,
-            context.operation,
-            base,
-            next_epoch as i64,
-            context.provider,
-            model,
-            context.policy_fingerprint,
-            payload_fingerprint,
-            context.source_fingerprint,
-            base,
-            cost_bound_fingerprint,
-            serde_json::to_string(cost_bound)?,
-            requested,
-            now,
-        ],
-    )?;
-    append_event(
+    let record = admit_reservation(
         &transaction,
-        &key,
-        "reserved",
-        json!({
-            "attemptEpoch": next_epoch,
-            "reservedCostUsd": requested,
-            "budgetScopeId": scope,
-            "legacyConfirmedCostUsd": authority.legacy_confirmed_cost_usd,
-            "legacyUncertainUsageReserveUsd": authority.legacy_uncertain_usage_reserve_usd,
-            "confirmedCostUsd": totals.confirmed,
-            "activeReservedCostUsd": totals.active_reserved,
-            "uncertainUsageReserveUsd": totals.uncertain,
-            "costBoundFingerprint": cost_bound_fingerprint,
-            "costBound": cost_bound,
-        }),
+        &authority,
+        AdmissionIdentity {
+            request_key: key,
+            budget_scope_id: scope,
+            project_id: context.project_id.clone(),
+            policy_id: context.policy_id.clone(),
+            run_id: context.run_id.clone(),
+            operation: context.operation.clone(),
+            attempt_base_key: base.clone(),
+            attempt_epoch: next_epoch,
+            requested_provider: context.provider.clone(),
+            requested_model: model.to_string(),
+            policy_fingerprint: context.policy_fingerprint.clone(),
+            payload_fingerprint: payload_fingerprint.to_string(),
+            source_fingerprint: context.source_fingerprint.clone(),
+            request_fingerprint: base,
+            cost_bound_fingerprint,
+        },
+        cost_bound,
+        json!({}),
     )?;
-    let record = load_request(&transaction, &key)?
-        .ok_or_else(|| anyhow!("reserved analysis request disappeared"))?;
     transaction.commit()?;
     Ok(record)
+}
+
+/// Validate the durable authorization and latest-epoch fence without writing.
+/// Recovery preparation uses this before creating any new run row; admission
+/// repeats it inside its own IMMEDIATE transaction.
+pub(crate) fn validate_retry_authorization(
+    connection: &Connection,
+    project_id: &str,
+    prior_request_key: &str,
+    expected_next_attempt_epoch: u32,
+) -> Result<AnalysisRequestRecord> {
+    let prior = load_request(connection, prior_request_key)?
+        .ok_or_else(|| anyhow!("prior analysis request not found"))?;
+    ensure!(
+        prior.project_id == project_id,
+        "prior analysis request does not belong to this project"
+    );
+    verify_targeted_retry_authorization(connection, &prior, expected_next_attempt_epoch)?;
+    Ok(prior)
+}
+
+/// Validate the exact original payload/model and current provider cost contract
+/// against a durable retry authorization. This is a read-only preflight; the
+/// targeted admission transaction repeats these checks while it consumes the
+/// expected epoch.
+pub(crate) fn validate_targeted_retry_claim(
+    connection: &Connection,
+    claim: &TargetedRetryClaim<'_>,
+) -> Result<AnalysisRequestRecord> {
+    let prior = validate_retry_authorization(
+        connection,
+        claim.project_id,
+        claim.prior_request_key,
+        claim.expected_next_attempt_epoch,
+    )?;
+    ensure!(
+        prior.requested_model == claim.model,
+        "targeted retry requested model differs from the immutable prior request"
+    );
+    ensure!(
+        prior.payload_fingerprint == claim.payload_fingerprint,
+        "targeted retry payload does not match the original request payload fingerprint"
+    );
+    ensure!(
+        prior.cost_bound_fingerprint == claim.cost_bound_fingerprint,
+        "targeted retry provider cost contract differs from the immutable prior request"
+    );
+    let authority = load_authority(connection, &prior.budget_scope_id)?;
+    verify_authority(
+        &authority,
+        &prior.project_id,
+        &prior.policy_id,
+        &prior.policy_fingerprint,
+        &prior.provider,
+        authority.budget_usd,
+        &prior.budget_scope_id,
+    )?;
+    ensure!(
+        !authority.dispatch_stopped,
+        "analysis budget authority dispatch is stopped: {}",
+        authority.stop_reason
+    );
+    if let Some(run_id) = claim.run_id {
+        ensure!(
+            run_id != prior.run_id,
+            "targeted retry requires a new owned run, not the prior request's run"
+        );
+    }
+    validate_owner_identity(
+        connection,
+        &OwnerIdentity::from_targeted_retry(
+            &prior,
+            claim.run_id.unwrap_or(""),
+            authority.budget_usd,
+        ),
+    )?;
+    Ok(prior)
+}
+
+/// Atomically consume one exact durable retry authorization for the prior
+/// request and expected next epoch. The prior immutable identity supplies the
+/// attempt base, source, policy and provider; callers cannot substitute a new
+/// intended key, scope or payload. All earlier confirmed and uncertain usage
+/// remains in the same balance calculation.
+pub(crate) fn reserve_targeted_retry(
+    connection: &mut Connection,
+    admission: &AnalysisTargetedRetryAdmission,
+    model: &str,
+    payload_fingerprint: &str,
+    cost_bound: &AnalysisRequestCostBound,
+) -> Result<AnalysisRequestRecord> {
+    admission.validate()?;
+    cost_bound.validate()?;
+    let cost_bound_fingerprint = analysis_request_cost_bound_fingerprint(cost_bound)?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let prior = validate_targeted_retry_claim(
+        &transaction,
+        &TargetedRetryClaim {
+            project_id: &admission.project_id,
+            prior_request_key: &admission.prior_request_key,
+            expected_next_attempt_epoch: admission.expected_next_attempt_epoch,
+            run_id: Some(&admission.run_id),
+            model,
+            payload_fingerprint,
+            cost_bound_fingerprint: &cost_bound_fingerprint,
+        },
+    )?;
+    let authority = load_authority(&transaction, &prior.budget_scope_id)?;
+    if let Some(stop_reason) =
+        persist_untracked_denial_boundary(&transaction, &authority, authority.budget_usd)?
+    {
+        transaction.commit()?;
+        bail!("analysis budget authority dispatch is stopped: {stop_reason}");
+    }
+    let next_epoch = admission.expected_next_attempt_epoch;
+    let key = request_key(&prior.attempt_base_key, next_epoch);
+    let record = admit_reservation(
+        &transaction,
+        &authority,
+        AdmissionIdentity {
+            request_key: key,
+            budget_scope_id: prior.budget_scope_id.clone(),
+            project_id: prior.project_id.clone(),
+            policy_id: prior.policy_id.clone(),
+            run_id: admission.run_id.clone(),
+            operation: prior.operation.clone(),
+            attempt_base_key: prior.attempt_base_key.clone(),
+            attempt_epoch: next_epoch,
+            requested_provider: prior.provider.clone(),
+            requested_model: prior.requested_model.clone(),
+            policy_fingerprint: prior.policy_fingerprint.clone(),
+            payload_fingerprint: prior.payload_fingerprint.clone(),
+            source_fingerprint: prior.source_fingerprint.clone(),
+            request_fingerprint: prior.request_fingerprint.clone(),
+            cost_bound_fingerprint,
+        },
+        cost_bound,
+        json!({
+            "priorRequestKey": prior.request_key,
+            "attemptBaseKey": prior.attempt_base_key,
+            "targetedRetry": true,
+        }),
+    )?;
+    transaction.commit()?;
+    Ok(record)
+}
+
+/// Prove the authorized retry is for the latest attempt and exactly the next
+/// bounded epoch. A competing consumer or stale authorization is denied.
+fn verify_targeted_retry_authorization(
+    connection: &Connection,
+    prior: &AnalysisRequestRecord,
+    expected_next_attempt_epoch: u32,
+) -> Result<()> {
+    ensure!(
+        prior.lifecycle.is_terminal(),
+        "prior analysis request is still active; wait for or reconcile its outcome before retry"
+    );
+    let attempts = load_attempts(connection, &prior.attempt_base_key)?;
+    let latest = attempts
+        .last()
+        .ok_or_else(|| anyhow!("analysis request attempt history disappeared"))?;
+    ensure!(
+        latest.request_key == prior.request_key && latest.attempt_epoch == prior.attempt_epoch,
+        "stale retry request: a newer attempt already exists for this request identity"
+    );
+    ensure!(
+        attempts.len() < MAX_REQUEST_ATTEMPTS as usize,
+        "analysis request retry limit reached"
+    );
+    ensure!(
+        expected_next_attempt_epoch == prior.attempt_epoch + 1,
+        "targeted retry expected epoch must be exactly the next attempt epoch"
+    );
+    let epoch_exists: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM analysis_request_reservations
+         WHERE attempt_base_key=?1 AND attempt_epoch=?2)",
+        params![prior.attempt_base_key, expected_next_attempt_epoch as i64],
+        |row| row.get(0),
+    )?;
+    ensure!(
+        !epoch_exists,
+        "targeted retry attempt epoch already exists; stale authorization is rejected"
+    );
+    let authorized: bool = connection.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM analysis_request_events
+            WHERE request_key=?1 AND event_kind='retry_authorized'
+              AND json_extract(detail_json,'$.nextAttemptEpoch')=?2
+        )",
+        params![prior.request_key, expected_next_attempt_epoch as i64],
+        |row| row.get(0),
+    )?;
+    ensure!(
+        authorized,
+        "explicit retry has not been authorized for attempt epoch {expected_next_attempt_epoch}"
+    );
+    Ok(())
+}
+
+/// Return every attempt for the immutable base identity, oldest first. Used by
+/// inspection and retry preparation; never includes prompt/frame content.
+pub(crate) fn attempt_history(
+    connection: &Connection,
+    request_key: &str,
+) -> Result<Vec<AnalysisRequestRecord>> {
+    let request = load_request(connection, request_key)?
+        .ok_or_else(|| anyhow!("analysis request not found"))?;
+    load_attempts(connection, &request.attempt_base_key)
 }
 
 /// Validate and return the next attempt epoch. A retry can only proceed with a
@@ -332,10 +671,7 @@ pub(crate) fn mark_dispatched(
         return Ok(current);
     }
     ensure!(
-        matches!(
-            current.lifecycle,
-            AnalysisRequestLifecycle::Reserved | AnalysisRequestLifecycle::Uncertain
-        ) && current.dispatch_at.is_none(),
+        current.lifecycle == AnalysisRequestLifecycle::Reserved && current.dispatch_at.is_none(),
         "analysis request cannot be marked dispatched from lifecycle {}",
         current.lifecycle.as_str()
     );
@@ -909,6 +1245,138 @@ pub(crate) fn list_requests(
     Ok(records)
 }
 
+/// Exact scoped inspection query. It filters in SQLite rather than loading a
+/// global page and discarding non-matching rows.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn scoped_requests(
+    connection: &Connection,
+    project_id: &str,
+    policy_id: Option<&str>,
+    operation: Option<&str>,
+    run_id: Option<&str>,
+    request_key_filter: Option<&str>,
+    limit: usize,
+    offset: usize,
+) -> Result<Vec<AnalysisRequestRecord>> {
+    let mut statement = connection.prepare(&format!(
+        "{REQUEST_SELECT}
+         WHERE project_id=?1
+           AND (?2='' OR policy_id=?2)
+           AND (?3='' OR operation=?3)
+           AND (?4='' OR run_id=?4)
+           AND (?5='' OR request_key=?5)
+         ORDER BY created_at DESC, request_key ASC
+         LIMIT ?6 OFFSET ?7"
+    ))?;
+    let requests = statement
+        .query_map(
+            params![
+                project_id,
+                policy_id.unwrap_or(""),
+                operation.unwrap_or(""),
+                run_id.unwrap_or(""),
+                request_key_filter.unwrap_or(""),
+                limit as i64,
+                offset as i64,
+            ],
+            row_to_request,
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(requests)
+}
+
+pub(crate) fn scoped_request_count(
+    connection: &Connection,
+    project_id: &str,
+    policy_id: Option<&str>,
+    operation: Option<&str>,
+    run_id: Option<&str>,
+    request_key_filter: Option<&str>,
+) -> Result<usize> {
+    let count: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM analysis_request_reservations
+         WHERE project_id=?1
+           AND (?2='' OR policy_id=?2)
+           AND (?3='' OR operation=?3)
+           AND (?4='' OR run_id=?4)
+           AND (?5='' OR request_key=?5)",
+        params![
+            project_id,
+            policy_id.unwrap_or(""),
+            operation.unwrap_or(""),
+            run_id.unwrap_or(""),
+            request_key_filter.unwrap_or(""),
+        ],
+        |row| row.get(0),
+    )?;
+    Ok(count as usize)
+}
+
+/// Exact authority-scope ids matching the same project/policy/operation
+/// selection, without fetching all authority rows or all request rows.
+pub(crate) fn budget_scope_ids_for_selection(
+    connection: &Connection,
+    project_id: &str,
+    policy_id: Option<&str>,
+    operation: Option<&str>,
+) -> Result<Vec<String>> {
+    let operation_scope = operation
+        .map(|operation| super::model::analysis_operation_budget_scope_id(project_id, operation));
+    let mut statement = connection.prepare(
+        "SELECT budget_scope_id FROM analysis_budget_authorities
+         WHERE project_id=?1
+           AND (?2='' OR policy_id=?2)
+           AND (?2<>'' OR ?3='' OR budget_scope_id=?4)
+         ORDER BY budget_scope_id ASC",
+    )?;
+    let scopes = statement
+        .query_map(
+            params![
+                project_id,
+                policy_id.unwrap_or(""),
+                operation.unwrap_or(""),
+                operation_scope.unwrap_or_default(),
+            ],
+            |row| row.get::<_, String>(0),
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(scopes)
+}
+
+/// Exact budget scopes for a request/run-filtered inspection. This avoids
+/// showing every authority in the project when the operator selected one
+/// request or run.
+pub(crate) fn budget_scope_ids_for_request_selection(
+    connection: &Connection,
+    project_id: &str,
+    policy_id: Option<&str>,
+    operation: Option<&str>,
+    run_id: Option<&str>,
+    request_key_filter: Option<&str>,
+) -> Result<Vec<String>> {
+    let mut statement = connection.prepare(
+        "SELECT DISTINCT budget_scope_id FROM analysis_request_reservations
+         WHERE project_id=?1
+           AND (?2='' OR policy_id=?2)
+           AND (?3='' OR operation=?3)
+           AND (?4='' OR run_id=?4)
+           AND (?5='' OR request_key=?5)
+         ORDER BY budget_scope_id ASC",
+    )?;
+    Ok(statement
+        .query_map(
+            params![
+                project_id,
+                policy_id.unwrap_or(""),
+                operation.unwrap_or(""),
+                run_id.unwrap_or(""),
+                request_key_filter.unwrap_or(""),
+            ],
+            |row| row.get::<_, String>(0),
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
 pub(crate) fn events(
     connection: &Connection,
     request_key: &str,
@@ -990,57 +1458,66 @@ fn validate_authority_input(
     Ok(())
 }
 
-/// Validate request-specific identities against the canonical project, policy
-/// authorization and owned run. This deliberately runs only after authority
-/// initialization and reservation admission has begun; it never invents a
-/// transmitted payload from runtime state.
-fn validate_request_identity(
-    connection: &Connection,
-    context: &AnalysisAccountingContext,
-    model: &str,
-) -> Result<()> {
-    if !context.policy_id.trim().is_empty() {
+/// Validate immutable request-owner identities against the canonical project,
+/// active policy authorization and owned run. Fresh admission and targeted
+/// retry both call this exact function; an empty run id is only accepted by
+/// lower-level operation callers that do not use the accounted provider
+/// boundary, while a provided run id must be the real accounted running row.
+fn validate_owner_identity(connection: &Connection, identity: &OwnerIdentity<'_>) -> Result<()> {
+    if !identity.policy_id.trim().is_empty() {
         let policy = load_authorized_policy(
             connection,
-            &context.project_id,
-            &context.policy_id,
-            &context.policy_fingerprint,
-            &context.provider,
-            context.budget_usd,
+            identity.project_id,
+            identity.policy_id,
+            identity.policy_fingerprint,
+            identity.provider,
+            identity.budget_usd,
         )?;
         ensure!(
-            policy.allowed_models.iter().any(|allowed| allowed == model)
-                || policy.primary_model == model,
+            policy
+                .allowed_models
+                .iter()
+                .any(|allowed| allowed == identity.model)
+                || policy.primary_model == identity.model,
             "analysis accounting model is outside the frozen authorized model allowlist"
         );
         ensure!(
             policy
                 .scope
                 .iter()
-                .any(|scope| scope.source_identity == context.source_fingerprint),
+                .any(|scope| scope.source_identity == identity.source_fingerprint),
             "analysis accounting source identity is outside the frozen authorized scope"
         );
     }
-    if !context.run_id.trim().is_empty() {
-        let run: Option<(String, String)> = connection
+    if !identity.run_id.trim().is_empty() {
+        let run: Option<(String, String, String, String)> = connection
             .query_row(
-                "SELECT project_id,policy_id FROM analysis_runs WHERE id=?1",
-                [&context.run_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                "SELECT project_id,policy_id,accounting_contract,status
+                 FROM analysis_runs WHERE id=?1",
+                [identity.run_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .optional()?;
-        let (run_project, run_policy) =
+        let (run_project, run_policy, accounting_contract, status) =
             run.ok_or_else(|| anyhow!("analysis run does not exist"))?;
         ensure!(
-            run_project == context.project_id,
+            run_project == identity.project_id,
             "analysis run belongs to a different project"
         );
-        if !context.policy_id.trim().is_empty() {
+        if !identity.policy_id.trim().is_empty() {
             ensure!(
-                run_policy == context.policy_id,
+                run_policy == identity.policy_id,
                 "analysis run identity does not belong to the frozen policy/project authority"
             );
         }
+        ensure!(
+            accounting_contract == ANALYSIS_ACCOUNTING_SCHEMA_VERSION,
+            "analysis run predates durable request accounting; a real accounted run is required"
+        );
+        ensure!(
+            status == "running",
+            "analysis request requires a currently running owned analysis run"
+        );
     }
     Ok(())
 }

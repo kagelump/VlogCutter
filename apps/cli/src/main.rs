@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 mod agent_commands;
+mod analysis_recovery_commands;
 mod calibration_commands;
 mod chronology_commands;
 mod moment_commands;
@@ -262,6 +263,11 @@ enum AnalyzeCommand {
         /// Existing CLI runs otherwise materialize that context explicitly.
         #[arg(long)]
         no_project_vocabulary: bool,
+    },
+    /// Inspect and recover canonical paid-request accounting.
+    Accounting {
+        #[command(subcommand)]
+        command: analysis_recovery_commands::AnalysisAccountingCommand,
     },
     /// Request a bounded cross-clip chronology suggestion from proxy frames.
     SuggestChronology {
@@ -736,6 +742,9 @@ fn command_name(command: &Commands) -> &'static str {
             AnalyzeCommand::Authorize(_) => "analyze.authorize",
             AnalyzeCommand::Pilot(_) => "analyze.pilot",
             AnalyzeCommand::Run { .. } => "analyze.run",
+            AnalyzeCommand::Accounting { command } => {
+                analysis_recovery_commands::command_name(command)
+            }
             AnalyzeCommand::Missing { .. } => "analyze.missing",
             AnalyzeCommand::SuggestChronology { .. } => "analyze.suggest-chronology",
             AnalyzeCommand::Status { .. } => "analyze.status",
@@ -840,46 +849,49 @@ fn execute(cli: &Cli) -> Result<Value> {
         return Ok(serde_json::to_value(inspect_catalog(&catalog_path)?)?);
     }
 
-    let read_only = matches!(
-        cli.command,
+    let read_only = match &cli.command {
         Commands::Project {
-            command: ProjectCommand::Diagnose { .. }
-        } | Commands::Clips {
-            command: ClipsCommand::Diagnose { .. }
-        } | Commands::Proxy {
-            command: ProxyCommand::Status { .. }
-                | ProxyCommand::Provenance { .. }
-                | ProxyCommand::History
-        } | Commands::Transcribe {
-            command: TranscribeCommand::Status { .. }
-        } | Commands::Analyze {
-            command: AnalyzeCommand::Status { .. } | AnalyzeCommand::Preflight(_)
-        } | Commands::Labels {
-            command: LabelsCommand::Vocabulary { .. }
-        } | Commands::CameraMappings {
-            command: CameraMappingsCommand::List { .. }
-        } | Commands::Cameras {
-            command: CamerasCommand::MergePreview { .. }
-        } | Commands::Cameras {
-            command: CamerasCommand::RepairPreview { .. }
-        } | Commands::CameraProxy {
-            command: CameraProxyCommand::Discover { .. }
-                | CameraProxyCommand::Status { .. }
-                | CameraProxyCommand::FramePack { .. }
+            command: ProjectCommand::Diagnose { .. },
         }
-    ) || matches!(&cli.command, Commands::Moments { command } if moment_commands::is_read_only(command))
-        || match &cli.command {
-            // Chronology read and preview commands use a read-only catalog; apply
-            // opens the writable catalog. Diagnostics acknowledge is a separate
-            // write that changes no project fact (D01-T017).
-            Commands::Chronology { command } => {
-                chronology_commands::chronology_is_read_only(command)
-            }
-            Commands::Diagnostics { command } => {
-                chronology_commands::diagnostics_is_read_only(command)
-            }
-            _ => false,
-        };
+        | Commands::Clips {
+            command: ClipsCommand::Diagnose { .. },
+        }
+        | Commands::Proxy {
+            command:
+                ProxyCommand::Status { .. } | ProxyCommand::Provenance { .. } | ProxyCommand::History,
+        }
+        | Commands::Transcribe {
+            command: TranscribeCommand::Status { .. },
+        }
+        | Commands::Analyze {
+            command: AnalyzeCommand::Status { .. } | AnalyzeCommand::Preflight(_),
+        }
+        | Commands::Labels {
+            command: LabelsCommand::Vocabulary { .. },
+        }
+        | Commands::CameraMappings {
+            command: CameraMappingsCommand::List { .. },
+        }
+        | Commands::Cameras {
+            command: CamerasCommand::MergePreview { .. },
+        }
+        | Commands::Cameras {
+            command: CamerasCommand::RepairPreview { .. },
+        }
+        | Commands::CameraProxy {
+            command:
+                CameraProxyCommand::Discover { .. }
+                | CameraProxyCommand::Status { .. }
+                | CameraProxyCommand::FramePack { .. },
+        } => true,
+        Commands::Analyze {
+            command: AnalyzeCommand::Accounting { command },
+        } => analysis_recovery_commands::is_read_only(command),
+        Commands::Moments { command } => moment_commands::is_read_only(command),
+        Commands::Chronology { command } => chronology_commands::chronology_is_read_only(command),
+        Commands::Diagnostics { command } => chronology_commands::diagnostics_is_read_only(command),
+        _ => false,
+    };
     let catalog = if read_only {
         Catalog::open_read_only_existing(&catalog_path)?
     } else {
@@ -1215,6 +1227,9 @@ fn execute(cli: &Cli) -> Result<Value> {
                         ControlFlow::Continue(())
                     },
                 )?)?)
+            }
+            AnalyzeCommand::Accounting { command } => {
+                analysis_recovery_commands::execute(&catalog, command)
             }
             AnalyzeCommand::Missing { project, force, budget_usd, primary_model, allowed_models, no_fallback, no_project_vocabulary } => Ok(serde_json::to_value(
                 catalog.analyze_missing_with_options(project, &rcdvlog_core::AnalysisRunOptions {
@@ -1776,9 +1791,24 @@ fn error_code(message: &str) -> &'static str {
         // Distinct from every other failure because the caller's correct
         // response is distinct: re-read, re-decide, retry.
         "stale_revision"
+    } else if message.contains("analysis request not found")
+        || message.contains("prior analysis request not found")
+    {
+        "not_found"
     } else if message.contains("not ready")
         || message.contains("not authorized")
         || message.contains("does not match")
+        || message.contains("targeted retry")
+        || message.contains("analysis request")
+        || message.contains("receipt evidence file")
+        || message.contains("analysis_accounting:admission_denied")
+        || message.contains("analysis_accounting:pre_upload_failed")
+        || message.contains("analysis_accounting:cancelled")
+        || message.contains("analysis inspection")
+        || message.contains("provider receipt")
+        || message.contains("local no-upload")
+        || message.contains("reconciliation project")
+        || message.contains("retry authorization project")
         || message.contains("unsupported")
         || message.contains("budget")
     {
@@ -2163,6 +2193,80 @@ mod tests {
         );
         assert!(
             Cli::try_parse_from(["rcdvlog", "labels", "vocabulary", "--project", "p1",]).is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "rcdvlog",
+                "analyze",
+                "accounting",
+                "inspect",
+                "--project",
+                "p1",
+                "--operation",
+                "pilot",
+                "--limit",
+                "20",
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "rcdvlog",
+                "analyze",
+                "accounting",
+                "reconcile",
+                "--project",
+                "p1",
+                "--request",
+                "r1",
+                "--local-no-upload",
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "rcdvlog",
+                "analyze",
+                "accounting",
+                "reconcile",
+                "--project",
+                "p1",
+                "--request",
+                "r1",
+                "--local-no-upload",
+                "--unknown-outcome",
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "rcdvlog",
+                "analyze",
+                "accounting",
+                "retry-authorize",
+                "--project",
+                "p1",
+                "--request",
+                "r1",
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "rcdvlog",
+                "analyze",
+                "accounting",
+                "targeted-retry-dispatch",
+                "--project",
+                "p1",
+                "--request",
+                "r1",
+                "--expected-next-attempt-epoch",
+                "1",
+                "--payload-file",
+                "/tmp/payload.json",
+            ])
+            .is_ok()
         );
     }
 

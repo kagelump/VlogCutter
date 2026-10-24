@@ -79,17 +79,23 @@ usage-completeness, stable failure code, structural/semantic validation
 conclusions and a warning. They never contain prompts, frame/transcript content,
 raw response bodies, credentials, provider error text or absolute source paths.
 An interrupted or unknown-usage pilot is recorded as `uncertain` and blocks
-further provider calls until its receipt is reconciled. An explicit retry flag
-cannot clear unknown spending. Retrying a fully accounted failed pilot retains
-its known cost within the same policy ceiling. #122 owns concurrent atomic reservations; this
-feature does not claim a general ledger.
+further provider calls until its receipt is reconciled. The operator inspects
+the immutable request/receipt/event history, imports trusted late receipt
+evidence, proves a marker-absent local failure, or explicitly retains an unknown
+outcome. Reconciliation can refresh the existing pilot projection but cannot
+invent a capability pass. An explicit retry flag alone cannot clear unknown
+spending; a separate durable authorization for that particular request and
+exact next epoch is required before one targeted paid dispatch. Retrying a fully
+accounted failed pilot retains its known cost within the same immutable policy
+ceiling.
 
 ## Provider cost-bound contract (#122 foundation)
 
-This change adds the provider-side cost contract that later #122 accounting and
-reconciliation work will consume. It does **not** enable a durable admission
-ledger, atomic cross-process reservations, or interrupted-request recovery yet,
-and it makes no claim that concurrent budget safety is already solved.
+This section describes the provider-side cost contract consumed by the canonical
+#122 accounting owner. The full conservative bound is an input to durable
+atomic admission, not a confirmed charge. Cross-process reservations, append-only
+receipts and interrupted-request reconciliation are implemented in
+[`analysis-accounting.md`](analysis-accounting.md).
 
 For each registered OpenRouter model, the contract records:
 
@@ -122,8 +128,8 @@ missing, non-finite, negative or internally inconsistent bounds fail closed
 before paid network I/O. The bound is only a reservation input: it is never
 presented as a confirmed provider charge. Provider adherence to routing
 metadata is assumed, arbitrary external invoice components are not controlled,
-and a returned charge above the bound must be retained as an overrun by the
-later receipt/accounting path.
+and a returned charge above the bound is retained as confirmed provider evidence
+and durably stops further dispatch under that authority.
 
 ## JSON Schema dependency
 
@@ -160,6 +166,16 @@ rcdvlog ... analyze pilot ...same policy flags...
 # Execute only the stored exact policy and matching passed pilot.
 rcdvlog ... analyze run --policy-id <policy-id>
 
+# Inspect and recover interrupted paid requests without network I/O.
+rcdvlog ... analyze accounting inspect --project <project-id>
+rcdvlog ... analyze accounting reconcile --project <project-id> \
+  --request <request-key> --receipt-file <path>
+rcdvlog ... analyze accounting retry-authorize --project <project-id> \
+  --request <request-key>
+rcdvlog ... analyze accounting targeted-retry-dispatch --project <project-id> \
+  --request <request-key> --expected-next-attempt-epoch <next> \
+  --payload-file <original-vlm-request.json>
+
 # Moment discovery uses the same lifetime:
 rcdvlog ... moments plan ...      # describe, includes runPolicy
 rcdvlog ... moments authorize ... # persist exact approval
@@ -175,8 +191,10 @@ only path that carries a matching approval and pilot into bulk work.
 
 - No cloud audio/STT backend is implemented here. Audio payloads are represented
   so preflight fails readiness explicitly; issue #119 remains separate.
-- Concurrent atomic reservations and a general spend ledger are issue #122 work.
-  This change only binds one run ceiling and refuses unsafe unknown-usage retries.
+- Concurrent atomic full-bound reservations, append-only receipt reconciliation
+  and explicit targeted retry are owned by #122's canonical catalog accounting.
+  No second general-purpose spend ledger, cloud scheduler or provider invoice
+  query is introduced.
 - The pilot is a synthetic/public-fixture capability check. It does not replace
   human editorial review and it does not claim that a prompt bypasses external
   approval review.
