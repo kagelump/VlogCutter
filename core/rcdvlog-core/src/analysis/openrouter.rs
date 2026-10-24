@@ -14,14 +14,12 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::analysis::provider::{
-    FALLBACK_MODEL, ProviderFailure, VlmProvider, VlmReceipt, VlmRequest, VlmResponse,
+    AnalysisRequestCostBound, FALLBACK_MODEL, OPENROUTER_MAX_OUTPUT_TOKENS, ProviderFailure,
+    VlmProvider, VlmReceipt, VlmRequest, VlmResponse, analysis_cost_bound_contract_id, model_spec,
 };
 
 const DEFAULT_BASE_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
-/// Generous: a truncated response is a rejected result, so the limit should not
-/// be the thing that truncates it.
-const MAX_TOKENS: u32 = 1_500;
 
 /// Where the key file lives when `OPENROUTER_API_KEY` is unset.
 pub fn key_file_path() -> Option<PathBuf> {
@@ -76,6 +74,80 @@ pub fn frame_data_uri(bytes: &[u8]) -> String {
     )
 }
 
+/// OpenRouter provider-routing preferences that make the cost bound
+/// enforceable. `max_price.prompt`/`completion` are USD per million tokens;
+/// `image` is a per-image ceiling and `request` is a separate per-request fee,
+/// never a cap on total request price.
+pub fn provider_routing_preferences(model: &str) -> Option<Value> {
+    let spec = model_spec(model)?;
+    Some(json!({
+        "require_parameters": true,
+        "max_price": {
+            "prompt": spec.prompt_price_usd_per_million,
+            "completion": spec.completion_price_usd_per_million,
+            "image": spec.image_price_usd_each,
+            "request": spec.request_price_usd_each
+        }
+    }))
+}
+
+/// Derive a conservative upper bound for one OpenRouter transmission.
+///
+/// The bound uses the registered model context window as the maximum prompt
+/// tokens, the exact `max_tokens` wire value as the completion limit, the exact
+/// frame count for separately-priced images, and one per-request fee. The same
+/// numeric price ceilings are sent in `provider.max_price`, so a provider above
+/// those ceilings is not selected. This is an admission reservation, not a
+/// confirmed charge: the provider invoice remains the external fact, and a
+/// returned cost above this bound is an external fact for later receipt
+/// reconciliation rather than a reason to trust this reservation.
+pub fn openrouter_request_cost_bound(
+    model: &str,
+    request: &VlmRequest,
+) -> Result<AnalysisRequestCostBound> {
+    let spec = model_spec(model).ok_or_else(|| {
+        anyhow!(
+            "no enforceable OpenRouter context/pricing contract is registered for model {model}; refusing paid dispatch"
+        )
+    })?;
+    anyhow::ensure!(
+        spec.context_window_tokens > 0,
+        "registered OpenRouter model {model} has no bounded prompt context"
+    );
+    anyhow::ensure!(
+        spec.max_completion_tokens >= OPENROUTER_MAX_OUTPUT_TOKENS,
+        "registered OpenRouter model {model} cannot accept the exact max_tokens wire cap"
+    );
+    anyhow::ensure!(
+        request.frames.is_empty() || spec.supports_image_input,
+        "registered OpenRouter model {model} does not support the requested image payload"
+    );
+    let image_count = u32::try_from(request.frames.len())
+        .context("request has more image frames than the cost contract supports")?;
+    let mut bound = AnalysisRequestCostBound {
+        maximum_cost_usd: 0.0,
+        contract_version: analysis_cost_bound_contract_id(),
+        prompt_tokens_max: spec.context_window_tokens,
+        completion_tokens_max: OPENROUTER_MAX_OUTPUT_TOKENS,
+        image_count,
+        prompt_price_usd_per_million: spec.prompt_price_usd_per_million,
+        completion_price_usd_per_million: spec.completion_price_usd_per_million,
+        image_price_usd_each: spec.image_price_usd_each,
+        request_price_usd_each: spec.request_price_usd_each,
+        assumptions: vec![
+            "prompt tokens cannot exceed the registered model context window".into(),
+            "completion tokens are capped by the exact request max_tokens and the registered model completion limit".into(),
+            "OpenRouter provider.max_price at these prompt/completion/image/request ceilings is enforced during routing".into(),
+            "image_count counts exactly the transmitted frames and image pricing is a separate per-image ceiling".into(),
+            "max_price.request is one per-request fee, not a cap on total request cost".into(),
+            "unmodelled provider fees or a returned charge above this bound are external provider facts; this bound is never a confirmed charge".into(),
+        ],
+    };
+    bound.maximum_cost_usd = bound.computed_maximum_cost_usd()?;
+    bound.validate()?;
+    Ok(bound)
+}
+
 /// Builds the request body. Pure, so the wire contract is testable offline.
 pub fn build_request_body(model: &str, prompt: &str, frames: &[String], schema: &Value) -> Value {
     let schema = if model == FALLBACK_MODEL {
@@ -93,7 +165,7 @@ pub fn build_request_body(model: &str, prompt: &str, frames: &[String], schema: 
         // has reviewed: a re-analysis that churns labels is worse than a
         // slightly less imaginative one.
         "temperature": 0,
-        "max_tokens": MAX_TOKENS,
+        "max_tokens": OPENROUTER_MAX_OUTPUT_TOKENS,
         "reasoning": {"enabled": false},
         "messages": [{"role": "user", "content": content}],
         "response_format": {
@@ -103,7 +175,8 @@ pub fn build_request_body(model: &str, prompt: &str, frames: &[String], schema: 
                 "strict": true,
                 "schema": schema
             }
-        }
+        },
+        "provider": provider_routing_preferences(model)
     })
 }
 
@@ -259,7 +332,19 @@ pub fn extract_receipt(payload: &Value) -> VlmReceipt {
 }
 
 impl VlmProvider for OpenRouterProvider {
+    fn analysis_cost_bound(
+        &self,
+        model: &str,
+        request: &VlmRequest,
+    ) -> Result<AnalysisRequestCostBound> {
+        openrouter_request_cost_bound(model, request)
+    }
+
     fn analyze(&self, model: &str, request: &VlmRequest) -> Result<VlmResponse> {
+        // Fail closed before any network I/O when no enforceable context/price
+        // contract is registered, even if a caller bypassed the accounting
+        // wrapper.
+        openrouter_request_cost_bound(model, request)?;
         let body = build_request_body(model, &request.prompt, &request.frames, &request.schema);
         let started = Instant::now();
         let response = self
@@ -305,6 +390,7 @@ impl VlmProvider for OpenRouterProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analysis::provider::DEFAULT_MODEL;
     use std::io::Write;
 
     #[test]
@@ -322,6 +408,72 @@ mod tests {
         assert!(content.iter().any(|part| part["type"] == "text"));
         assert!(body["response_format"]["json_schema"]["schema"].is_object());
         assert_eq!(body["response_format"]["json_schema"]["strict"], true);
+        assert_eq!(body["max_tokens"], OPENROUTER_MAX_OUTPUT_TOKENS);
+        assert_eq!(body["provider"]["require_parameters"], true);
+        assert!(body["provider"]["max_price"]["prompt"].is_number());
+        assert!(body["provider"]["max_price"]["completion"].is_number());
+        assert!(body["provider"]["max_price"]["image"].is_number());
+        assert!(body["provider"]["max_price"]["request"].is_number());
+    }
+
+    #[test]
+    fn cost_bound_and_wire_caps_share_the_same_registered_contract_offline() {
+        let request = VlmRequest {
+            prompt: "prompt".into(),
+            frames: vec!["data:image/jpeg;base64,AAAA".into(); 3],
+            schema: json!({"type": "object"}),
+        };
+        for model in [DEFAULT_MODEL, FALLBACK_MODEL] {
+            let spec = model_spec(model).unwrap();
+            let bound = openrouter_request_cost_bound(model, &request).unwrap();
+            let body = build_request_body(model, &request.prompt, &request.frames, &request.schema);
+            assert_eq!(bound.prompt_tokens_max, spec.context_window_tokens);
+            assert_eq!(bound.completion_tokens_max, OPENROUTER_MAX_OUTPUT_TOKENS);
+            assert_eq!(
+                body["provider"]["max_price"]["prompt"].as_f64(),
+                Some(bound.prompt_price_usd_per_million)
+            );
+            assert_eq!(
+                body["provider"]["max_price"]["completion"].as_f64(),
+                Some(bound.completion_price_usd_per_million)
+            );
+            assert_eq!(
+                body["provider"]["max_price"]["image"].as_f64(),
+                Some(bound.image_price_usd_each)
+            );
+            assert_eq!(
+                body["provider"]["max_price"]["request"].as_f64(),
+                Some(bound.request_price_usd_each)
+            );
+            assert_eq!(body["max_tokens"], bound.completion_tokens_max);
+            assert_eq!(bound.image_count, 3);
+            let expected = bound.prompt_tokens_max as f64 * bound.prompt_price_usd_per_million
+                / 1_000_000.0
+                + bound.completion_tokens_max as f64 * bound.completion_price_usd_per_million
+                    / 1_000_000.0
+                + bound.image_count as f64 * bound.image_price_usd_each
+                + bound.request_price_usd_each;
+            assert!((bound.maximum_cost_usd - expected).abs() < 1e-12);
+            assert!(bound.maximum_cost_usd > bound.request_price_usd_each);
+            assert!(!bound.assumptions.is_empty());
+        }
+        assert!(openrouter_request_cost_bound("unregistered/model", &request).is_err());
+        assert!(provider_routing_preferences("unregistered/model").is_none());
+    }
+
+    #[test]
+    fn unsupported_model_is_rejected_before_network_io() {
+        let provider = OpenRouterProvider::new("sk-or-v1-test".into())
+            .unwrap()
+            .with_base_url("http://127.0.0.1:9/unreachable");
+        let error = provider
+            .analyze("unregistered/model", &VlmRequest::default())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("no enforceable OpenRouter context/pricing contract"),
+            "{error}"
+        );
     }
 
     #[test]

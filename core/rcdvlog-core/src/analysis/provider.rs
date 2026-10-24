@@ -11,6 +11,7 @@
 //! hidden.
 
 use anyhow::{Result, bail};
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -22,12 +23,154 @@ pub const FALLBACK_MODEL: &str = "google/gemini-2.5-flash-lite";
 /// Sustained-failure threshold, per process.
 pub const BREAKER_THRESHOLD: u32 = 10;
 
+/// Hard `max_tokens` value sent to OpenRouter for every VLM request. The
+/// conservative request bound uses this exact value, so changing it changes the
+/// admission quote and therefore the policy identity.
+pub const OPENROUTER_MAX_OUTPUT_TOKENS: u32 = 1_500;
+
+/// Version of the provider-routing/cost-bound contract. It is part of request
+/// identity because a changed wire cap, model limit or price ceiling is a
+/// different paid request even when the prompt and model are byte-identical.
+pub const ANALYSIS_COST_BOUND_CONTRACT_VERSION: &str = "openrouter.provider-max-price.v1";
+
+fn analysis_cost_bound_contract_id_for(models: &[ModelSpec]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    let add = |hasher: &mut blake3::Hasher, bytes: &[u8]| {
+        hasher.update(&(bytes.len() as u64).to_le_bytes());
+        hasher.update(bytes);
+    };
+    add(&mut hasher, ANALYSIS_COST_BOUND_CONTRACT_VERSION.as_bytes());
+    hasher.update(&(OPENROUTER_MAX_OUTPUT_TOKENS.to_le_bytes()));
+    for spec in models {
+        add(&mut hasher, spec.id.as_bytes());
+        hasher.update(&spec.context_window_tokens.to_le_bytes());
+        hasher.update(&spec.max_completion_tokens.to_le_bytes());
+        hasher.update(&spec.prompt_price_usd_per_million.to_bits().to_le_bytes());
+        hasher.update(
+            &spec
+                .completion_price_usd_per_million
+                .to_bits()
+                .to_le_bytes(),
+        );
+        hasher.update(&spec.image_price_usd_each.to_bits().to_le_bytes());
+        hasher.update(&spec.request_price_usd_each.to_bits().to_le_bytes());
+    }
+    format!(
+        "{ANALYSIS_COST_BOUND_CONTRACT_VERSION}:{}",
+        hasher.finalize().to_hex()
+    )
+}
+
+/// Deterministic identity of the exact registered context windows, completion
+/// limits and provider price ceilings. Policy and request identities bind this
+/// value so a cap change cannot silently reuse an old approval.
+pub fn analysis_cost_bound_contract_id() -> String {
+    analysis_cost_bound_contract_id_for(MODELS)
+}
+
+/// A conservative upper bound for one actual provider transmission.
+///
+/// This is an admission reservation, not a provider charge. Production
+/// transports derive it from enforceable wire caps (OpenRouter
+/// `provider.max_price`), the registered model context window and the exact
+/// `max_tokens`; synthetic transports may declare a deterministic test-only
+/// bound. The fields stay explicit so reports can distinguish the bound from
+/// returned/confirmed/uncertain usage.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnalysisRequestCostBound {
+    pub maximum_cost_usd: f64,
+    pub contract_version: String,
+    pub prompt_tokens_max: u64,
+    pub completion_tokens_max: u32,
+    pub image_count: u32,
+    pub prompt_price_usd_per_million: f64,
+    pub completion_price_usd_per_million: f64,
+    pub image_price_usd_each: f64,
+    pub request_price_usd_each: f64,
+    pub assumptions: Vec<String>,
+}
+
+impl AnalysisRequestCostBound {
+    /// Deterministic bound for a synthetic transport used only by tests. The
+    /// production trait default fails closed, so this cannot become an implicit
+    /// fallback for a real transport.
+    pub fn declared_for_synthetic_transport(maximum_cost_usd: f64) -> Self {
+        Self {
+            maximum_cost_usd,
+            contract_version: "synthetic.transport-declared.v1".into(),
+            prompt_tokens_max: 1,
+            completion_tokens_max: 1,
+            image_count: 0,
+            prompt_price_usd_per_million: 0.0,
+            completion_price_usd_per_million: 0.0,
+            image_price_usd_each: 0.0,
+            request_price_usd_each: maximum_cost_usd,
+            assumptions: vec![
+                "synthetic transport declares a deterministic test-only bound".into(),
+            ],
+        }
+    }
+
+    /// Recomputes the bound from its separately recorded components. This keeps
+    /// a persisted maximum from drifting away from the numeric policy that was
+    /// approved and sent on the wire.
+    pub(crate) fn computed_maximum_cost_usd(&self) -> Result<f64> {
+        let prompt =
+            self.prompt_tokens_max as f64 * self.prompt_price_usd_per_million / 1_000_000.0;
+        let completion =
+            self.completion_tokens_max as f64 * self.completion_price_usd_per_million / 1_000_000.0;
+        let images = self.image_count as f64 * self.image_price_usd_each;
+        let computed = prompt + completion + images + self.request_price_usd_each;
+        anyhow::ensure!(
+            computed.is_finite(),
+            "analysis request cost bound computation must be finite"
+        );
+        Ok(computed)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        let components = [
+            self.maximum_cost_usd,
+            self.prompt_price_usd_per_million,
+            self.completion_price_usd_per_million,
+            self.image_price_usd_each,
+            self.request_price_usd_each,
+        ];
+        anyhow::ensure!(
+            components
+                .iter()
+                .all(|value| value.is_finite() && *value >= 0.0),
+            "analysis request cost bound components must be finite and non-negative"
+        );
+        anyhow::ensure!(
+            self.maximum_cost_usd.is_finite() && self.maximum_cost_usd > 0.0,
+            "analysis request cost bound must be finite and greater than zero"
+        );
+        anyhow::ensure!(
+            !self.contract_version.trim().is_empty(),
+            "analysis request cost bound contract version is required"
+        );
+        anyhow::ensure!(
+            self.prompt_tokens_max > 0 && self.completion_tokens_max > 0,
+            "analysis request token bounds must be greater than zero"
+        );
+        let computed = self.computed_maximum_cost_usd()?;
+        let tolerance = self.maximum_cost_usd.abs().max(computed.abs()).max(1.0) * 1e-12;
+        anyhow::ensure!(
+            (self.maximum_cost_usd - computed).abs() <= tolerance,
+            "analysis request cost bound maximum is internally inconsistent with its components"
+        );
+        Ok(())
+    }
+}
+
 /// What a model costs and what it can be asked to do.
 ///
 /// `image_tokens_per_frame` is **measured**, not derived from published prices:
 /// identical images billed 1,235 to 6,026 prompt tokens across models, so a cost
 /// model built from frames times price-per-token is wrong by up to 5x.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ModelSpec {
     pub id: &'static str,
     pub image_tokens_per_frame: u32,
@@ -47,6 +190,23 @@ pub struct ModelSpec {
     pub supports_transcript_input: bool,
     /// Whether the provider/model accepts a JSON Schema response format.
     pub supports_json_schema: bool,
+    /// Authoritative model context window in tokens. Prompt tokens cannot
+    /// exceed this provider-enforced limit.
+    pub context_window_tokens: u64,
+    /// Maximum completion length accepted by the model. A registered model
+    /// must accept `OPENROUTER_MAX_OUTPUT_TOKENS` before it can be dispatched.
+    pub max_completion_tokens: u32,
+    /// Routing ceiling mirrored into `provider.max_price.prompt` (USD per
+    /// million prompt tokens). OpenRouter only routes to providers at or below
+    /// this ceiling; actual charges remain external provider facts.
+    pub prompt_price_usd_per_million: f64,
+    /// Routing ceiling mirrored into `provider.max_price.completion`.
+    pub completion_price_usd_per_million: f64,
+    /// Per-image routing ceiling mirrored into `provider.max_price.image`.
+    pub image_price_usd_each: f64,
+    /// Per-request fee ceiling mirrored into `provider.max_price.request`.
+    /// This is a request fee, not a cap on total request price.
+    pub request_price_usd_each: f64,
 }
 
 pub const MODELS: &[ModelSpec] = &[
@@ -60,6 +220,15 @@ pub const MODELS: &[ModelSpec] = &[
         supports_audio_input: false,
         supports_transcript_input: true,
         supports_json_schema: true,
+        // Public OpenRouter model metadata checked 2026-10-24.
+        context_window_tokens: 1_000_000,
+        max_completion_tokens: 65_536,
+        // Routing ceilings, not live-price claims. The per-million ceilings
+        // cover the highest public context-tier metadata.
+        prompt_price_usd_per_million: 0.20,
+        completion_price_usd_per_million: 0.80,
+        image_price_usd_each: 0.01,
+        request_price_usd_each: 0.01,
     },
     ModelSpec {
         // ~1,235 prompt tokens over a median 5-frame pack; Google normalises
@@ -72,6 +241,14 @@ pub const MODELS: &[ModelSpec] = &[
         supports_audio_input: false,
         supports_transcript_input: true,
         supports_json_schema: true,
+        // Public OpenRouter model metadata checked 2026-10-24.
+        context_window_tokens: 1_048_576,
+        max_completion_tokens: 65_535,
+        // Routing ceilings, not live-price claims.
+        prompt_price_usd_per_million: 0.10,
+        completion_price_usd_per_million: 0.40,
+        image_price_usd_each: 0.01,
+        request_price_usd_each: 0.01,
     },
 ];
 
@@ -206,6 +383,18 @@ pub trait VlmProvider: Send + Sync {
     fn prepare(&self) -> Result<()> {
         Ok(())
     }
+
+    /// Conservative maximum charge for this exact model/request. Production
+    /// transports must derive this from enforceable wire caps; the default
+    /// fails closed so a transport cannot silently receive a generic estimate.
+    fn analysis_cost_bound(
+        &self,
+        _model: &str,
+        _request: &VlmRequest,
+    ) -> Result<AnalysisRequestCostBound> {
+        bail!("provider does not declare a conservative analysis request cost bound")
+    }
+
     fn analyze(&self, model: &str, request: &VlmRequest) -> Result<VlmResponse>;
 }
 
@@ -641,5 +830,55 @@ mod tests {
         assert!(model_spec(DEFAULT_MODEL).is_some());
         assert!(model_spec(FALLBACK_MODEL).is_some());
         assert!(model_spec("nonexistent/model").is_none());
+    }
+
+    #[test]
+    fn every_registered_model_has_an_enforceable_cost_contract() {
+        for model in MODELS {
+            assert!(model.context_window_tokens > 0, "{}", model.id);
+            assert!(
+                model.max_completion_tokens >= OPENROUTER_MAX_OUTPUT_TOKENS,
+                "{} cannot accept the exact max_tokens wire cap",
+                model.id
+            );
+            for value in [
+                model.prompt_price_usd_per_million,
+                model.completion_price_usd_per_million,
+                model.image_price_usd_each,
+                model.request_price_usd_each,
+            ] {
+                assert!(value.is_finite() && value >= 0.0, "{}", model.id);
+            }
+        }
+    }
+
+    #[test]
+    fn contract_identity_changes_with_context_and_price_ceilings() {
+        let baseline = analysis_cost_bound_contract_id_for(MODELS);
+        let mut changed = MODELS.to_vec();
+        changed[0].context_window_tokens += 1;
+        assert_ne!(analysis_cost_bound_contract_id_for(&changed), baseline);
+
+        let mut changed = MODELS.to_vec();
+        changed[1].request_price_usd_each += 0.001;
+        assert_ne!(analysis_cost_bound_contract_id_for(&changed), baseline);
+    }
+
+    #[test]
+    fn cost_bound_validation_rejects_nonfinite_negative_and_inconsistent_quotes() {
+        let valid = AnalysisRequestCostBound::declared_for_synthetic_transport(0.05);
+        valid.validate().unwrap();
+
+        let mut negative = valid.clone();
+        negative.request_price_usd_each = -0.01;
+        assert!(negative.validate().is_err());
+
+        let mut nonfinite = valid.clone();
+        nonfinite.prompt_price_usd_per_million = f64::INFINITY;
+        assert!(nonfinite.validate().is_err());
+
+        let mut inconsistent = valid;
+        inconsistent.maximum_cost_usd += 1.0;
+        assert!(inconsistent.validate().is_err());
     }
 }

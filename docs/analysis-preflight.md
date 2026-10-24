@@ -28,7 +28,10 @@ single-asset/sample result into project-wide or different-model authorization.
      batch/pilot runners load vocabulary only when this approval is present;
    - expected cost, requested ceiling, cost basis and bounded readiness
      blockers;
-   - prompt, output-schema, recipe and tool versions.
+   - prompt, output-schema, recipe and tool versions;
+   - a deterministic provider cost-bound contract fingerprint over the exact
+     registered context, completion and provider price ceilings used for
+     admission and wire routing.
 
    Description is read-only and never resolves a key into the output. It may
    report only `credentialsPresent: true|false`.
@@ -80,6 +83,47 @@ further provider calls until its receipt is reconciled. An explicit retry flag
 cannot clear unknown spending. Retrying a fully accounted failed pilot retains
 its known cost within the same policy ceiling. #122 owns concurrent atomic reservations; this
 feature does not claim a general ledger.
+
+## Provider cost-bound contract (#122 foundation)
+
+This change adds the provider-side cost contract that later #122 accounting and
+reconciliation work will consume. It does **not** enable a durable admission
+ledger, atomic cross-process reservations, or interrupted-request recovery yet,
+and it makes no claim that concurrent budget safety is already solved.
+
+For each registered OpenRouter model, the contract records:
+
+- the public model context window and maximum completion length;
+- routing ceilings in USD per million prompt/completion tokens, per image, and
+  per request. `max_price.request` is one request fee, never a cap on the total
+  request price;
+- the exact `max_tokens` value sent on the wire (currently 1,500).
+
+Public source evidence as of 2026-10-24 is the OpenRouter model metadata at
+`https://openrouter.ai/api/v1/models` and the provider-routing documentation at
+`https://github.com/OpenRouterTeam/docs/blob/main/guides/routing/provider-selection.mdx`.
+The context/completion limits come from that public metadata. The prompt and
+completion ceilings are explicit configured values at or above the highest
+public context-tier metadata; the image and request ceilings are also explicit
+configured routing limits. None of these are claims about current live prices.
+
+`openrouter_request_cost_bound` computes a conservative admission bound from the
+full model context window, that exact `max_tokens` value, the exact transmitted
+frame count, and the separate price components. The same numeric ceilings are
+sent to OpenRouter as `provider.max_price` with `require_parameters: true`.
+Routing ceilings are configured limits, not claims about current live prices.
+OpenRouter documents that `max_price` prevents a request from running when a
+provider at or below the ceiling is unavailable.
+
+The deterministic contract fingerprint is stored in `RunPolicy` and included in
+its policy ID, so changing a context, completion or price ceiling invalidates
+prior approvals rather than silently reusing them. Unregistered models and
+missing, non-finite, negative or internally inconsistent bounds fail closed
+before paid network I/O. The bound is only a reservation input: it is never
+presented as a confirmed provider charge. Provider adherence to routing
+metadata is assumed, arbitrary external invoice components are not controlled,
+and a returned charge above the bound must be retained as an overrun by the
+later receipt/accounting path.
 
 ## JSON Schema dependency
 
