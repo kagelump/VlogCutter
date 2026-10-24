@@ -1,6 +1,8 @@
 use super::*;
 use crate::analysis::engine::SttEngine;
-use crate::analysis::provider::{DEFAULT_MODEL, VlmProvider, VlmReceipt, VlmRequest, VlmResponse};
+use crate::analysis::provider::{
+    AnalysisRequestCostBound, DEFAULT_MODEL, VlmProvider, VlmReceipt, VlmRequest, VlmResponse,
+};
 use crate::analysis::quality::DecodedSegment;
 use crate::analysis::store::{StoredTranscript, TranscriptStatus, save_transcript};
 use crate::analysis::windows::{PackedWindow, SpeechRegion};
@@ -174,6 +176,16 @@ impl ScriptedProvider {
 }
 
 impl VlmProvider for ScriptedProvider {
+    fn analysis_cost_bound(
+        &self,
+        _model: &str,
+        _request: &VlmRequest,
+    ) -> Result<AnalysisRequestCostBound> {
+        Ok(AnalysisRequestCostBound::declared_for_synthetic_transport(
+            0.02,
+        ))
+    }
+
     fn analyze(&self, model: &str, _request: &VlmRequest) -> Result<VlmResponse> {
         let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
         self.models.lock().unwrap().push(model.into());

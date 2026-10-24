@@ -332,6 +332,18 @@ pub fn extract_receipt(payload: &Value) -> VlmReceipt {
 }
 
 impl VlmProvider for OpenRouterProvider {
+    fn prepare(&self) -> Result<()> {
+        // Local-only: prove the client/credential/endpoint prerequisites are
+        // present before the accounting wrapper commits a dispatch marker.
+        if self.api_key.trim().is_empty() {
+            return Err(ProviderFailure::configuration().into());
+        }
+        if self.base_url.trim().is_empty() {
+            return Err(ProviderFailure::configuration().into());
+        }
+        Ok(())
+    }
+
     fn analysis_cost_bound(
         &self,
         model: &str,
@@ -367,23 +379,36 @@ impl VlmProvider for OpenRouterProvider {
         let payload: Value = response
             .json()
             .map_err(|_| ProviderFailure::invalid_response())?;
-        let (prompt_tokens, completion_tokens, cost_usd) = extract_usage(&payload);
-        let receipt = extract_receipt(&payload);
-        let mut content =
-            extract_content(&payload).map_err(|_| ProviderFailure::invalid_response())?;
-        if model == FALLBACK_MODEL {
-            content = normalize_gemini_content(content)
-                .map_err(|_| ProviderFailure::invalid_response())?;
-        }
-        Ok(VlmResponse {
-            model: model.to_string(),
-            body: content,
-            prompt_tokens,
-            completion_tokens,
-            cost_usd,
-            latency_ms: started.elapsed().as_millis() as u64,
-            receipt,
+        Ok(decode_paid_response(
+            model,
+            &payload,
+            started.elapsed().as_millis() as u64,
+        ))
+    }
+}
+
+/// A parsed paid envelope is usage evidence even when its content is unusable.
+/// Keep that evidence on the existing response so the accounting boundary can
+/// persist it before the domain validator rejects the empty/invalid body.
+fn decode_paid_response(model: &str, payload: &Value, latency_ms: u64) -> VlmResponse {
+    let (prompt_tokens, completion_tokens, cost_usd) = extract_usage(payload);
+    let content = extract_content(payload)
+        .and_then(|content| {
+            if model == FALLBACK_MODEL {
+                normalize_gemini_content(content)
+            } else {
+                Ok(content)
+            }
         })
+        .unwrap_or_default();
+    VlmResponse {
+        model: model.to_string(),
+        body: content,
+        prompt_tokens,
+        completion_tokens,
+        cost_usd,
+        latency_ms,
+        receipt: extract_receipt(payload),
     }
 }
 
@@ -675,5 +700,38 @@ mod tests {
         // reasoning tokens.
         let payload = json!({"choices": [{"message": {}}], "usage": {}});
         assert!(extract_content(&payload).is_err());
+    }
+    #[test]
+    fn unusable_paid_content_preserves_actual_usage_and_identity_for_accounting() {
+        for (model, choices) in [
+            (DEFAULT_MODEL, json!([{"message": {}}])),
+            (
+                FALLBACK_MODEL,
+                json!([{"message": {"content": "malformed-provider-content"}}]),
+            ),
+        ] {
+            let response = decode_paid_response(
+                model,
+                &json!({
+                    "choices": choices, "id": "paid-generation", "model": "actual-model",
+                    "provider": "actual-upstream", "usage": {"cost": 0.03, "prompt_tokens": 20, "completion_tokens": 4}
+                }),
+                7,
+            );
+            assert!(response.body.is_empty());
+            assert_eq!(response.cost_usd, 0.03);
+            assert_eq!(response.prompt_tokens, 20);
+            assert_eq!(response.completion_tokens, 4);
+            assert!(response.receipt.usage_complete);
+            assert_eq!(
+                response.receipt.generation_id.as_deref(),
+                Some("paid-generation")
+            );
+            assert_eq!(
+                response.receipt.actual_model.as_deref(),
+                Some("actual-model")
+            );
+            assert!(crate::ProviderReceiptEvidence::from_response(&response).is_complete_charge());
+        }
     }
 }

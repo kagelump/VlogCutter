@@ -182,7 +182,7 @@ fn pilot_observed_unknown_floor(pilot: Option<&Value>, budget_usd: f64) -> f64 {
     }
 }
 
-pub(crate) fn run_is_accounted(connection: &Connection, run_id: &str) -> Result<bool> {
+pub(super) fn run_is_accounted(connection: &Connection, run_id: &str) -> Result<bool> {
     if run_id.trim().is_empty() {
         return Ok(false);
     }

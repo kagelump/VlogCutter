@@ -11,20 +11,23 @@
 mod catalog;
 mod legacy;
 mod model;
+mod provider_boundary;
 mod settlement;
 mod store;
 
 pub use model::{
     ANALYSIS_ACCOUNTING_SCHEMA_VERSION, AnalysisAccountingAggregate, AnalysisAccountingContext,
     AnalysisAccountingReport, AnalysisBudgetAuthorityContext, AnalysisBudgetSnapshot,
-    AnalysisProviderReceipt, AnalysisRequestEvent, AnalysisRequestLifecycle,
-    AnalysisRequestReconciliation, AnalysisRequestRecord, AnalysisRetryAuthorization,
-    LEGACY_UNKNOWN_USAGE_STOP_REASON, MAX_IN_FLIGHT_REQUESTS_PER_BUDGET_AUTHORITY,
-    MAX_REQUEST_ATTEMPTS, ProviderReceiptEvidence, UNTRACKED_POST_INITIALIZATION_USAGE_STOP_REASON,
-    analysis_operation_budget_scope_id, analysis_policy_budget_scope_id,
-    analysis_request_cost_bound_fingerprint, analysis_request_payload_fingerprint,
-    bounded_failure_code,
+    AnalysisOperationAttemptProjection, AnalysisProviderReceipt, AnalysisRequestEvent,
+    AnalysisRequestLifecycle, AnalysisRequestReconciliation, AnalysisRequestRecord,
+    AnalysisRetryAuthorization, LEGACY_UNKNOWN_USAGE_STOP_REASON,
+    MAX_IN_FLIGHT_REQUESTS_PER_BUDGET_AUTHORITY, MAX_REQUEST_ATTEMPTS, ProviderReceiptEvidence,
+    UNTRACKED_POST_INITIALIZATION_USAGE_STOP_REASON, analysis_operation_budget_scope_id,
+    analysis_policy_budget_scope_id, analysis_request_cost_bound_fingerprint,
+    analysis_request_payload_fingerprint, bounded_failure_code,
 };
 
 #[cfg(test)]
 mod tests;
+
+pub use provider_boundary::AccountedVlmProvider;

@@ -300,6 +300,18 @@ pub struct AnalysisProviderReceipt {
     pub created_at: String,
 }
 
+/// Factual attempt/token projection over durable dispatched requests. Cost
+/// remains on `AnalysisAccountingAggregate`; this type never performs a second
+/// cost calculation.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnalysisOperationAttemptProjection {
+    pub actual_attempt_count: u32,
+    pub attempted_models: Vec<String>,
+    pub prompt_tokens: u32,
+    pub completion_tokens: u32,
+}
+
 /// One canonical budget calculation. Confirmed historical/ledger charges,
 /// active reservations and unresolved-usage reserves are exposed separately
 /// and then summed once for admission.

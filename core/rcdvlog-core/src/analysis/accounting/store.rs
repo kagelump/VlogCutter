@@ -15,8 +15,8 @@ use super::legacy::{
 };
 use super::model::{
     ANALYSIS_ACCOUNTING_SCHEMA_VERSION, AnalysisAccountingAggregate, AnalysisAccountingContext,
-    AnalysisBudgetAuthorityContext, AnalysisBudgetSnapshot, AnalysisProviderReceipt,
-    AnalysisRequestEvent, AnalysisRequestLifecycle, AnalysisRequestRecord,
+    AnalysisBudgetAuthorityContext, AnalysisBudgetSnapshot, AnalysisOperationAttemptProjection,
+    AnalysisProviderReceipt, AnalysisRequestEvent, AnalysisRequestLifecycle, AnalysisRequestRecord,
     AnalysisRetryAuthorization, LEGACY_UNKNOWN_USAGE_STOP_REASON,
     MAX_IN_FLIGHT_REQUESTS_PER_BUDGET_AUTHORITY, MAX_REQUEST_ATTEMPTS, ProviderReceiptEvidence,
     analysis_request_cost_bound_fingerprint, attempt_base_key, bounded_failure_code, digest_bytes,
@@ -794,6 +794,29 @@ pub(crate) fn load_request(
         .context("read analysis request")
 }
 
+/// Unresolved attempts for one exact source/operation. A generated replacement
+/// policy must not bypass prior unknown paid work for the same asset.
+pub(crate) fn unresolved_requests_for_source(
+    connection: &Connection,
+    project_id: &str,
+    operation: &str,
+    source_fingerprint: &str,
+) -> Result<Vec<AnalysisRequestRecord>> {
+    let mut statement = connection.prepare(&format!(
+        "{REQUEST_SELECT}
+         WHERE project_id=?1 AND operation=?2 AND source_fingerprint=?3
+           AND lifecycle IN ('reserved','dispatched','uncertain')
+         ORDER BY created_at ASC, request_key ASC"
+    ))?;
+    statement
+        .query_map(
+            params![project_id, operation, source_fingerprint],
+            row_to_request,
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .context("list unresolved analysis requests for source")
+}
+
 pub(crate) fn list_requests(
     connection: &Connection,
     project_id: &str,
@@ -1371,20 +1394,15 @@ pub(crate) fn accounting_aggregate(
             }
             AnalysisRequestLifecycle::Released => aggregate.released_request_count += 1,
         }
-        let is_current_run = current_run_id.is_some_and(|run_id| run_id == request.run_id);
-        let newer_than_provenance = aggregate
-            .current_run_settled_at
-            .as_deref()
-            .is_none_or(|settled| request.settled_at.as_deref().unwrap_or("") >= settled);
-        if is_current_run
-            && request.lifecycle == AnalysisRequestLifecycle::Completed
-            && newer_than_provenance
-        {
-            aggregate.current_run_settled_at = request.settled_at.clone();
-            aggregate.current_run_actual_provider = request.actual_provider.clone();
-            aggregate.current_run_actual_model = request.actual_model.clone();
-            aggregate.current_run_generation_id = request.provider_generation_id.clone();
-        }
+    }
+    if let Some(run_id) = current_run_id
+        && let Some(provenance) =
+            current_run_receipt_provenance(connection, policy_id, run_id, operation)?
+    {
+        aggregate.current_run_actual_provider = nonempty(provenance.provider);
+        aggregate.current_run_actual_model = nonempty(provenance.model);
+        aggregate.current_run_generation_id = nonempty(provenance.generation);
+        aggregate.current_run_settled_at = provenance.settled_at;
     }
     if legacy_included {
         aggregate.confirmed_cost_usd += legacy_confirmed;
@@ -1403,6 +1421,60 @@ pub(crate) fn accounting_aggregate(
         && (!legacy_included || legacy_usage_complete)
         && untracked.count == 0;
     Ok(aggregate)
+}
+
+/// Factual attempts are durable dispatched reservation rows, not chain error
+/// metadata or local denials. Token totals select the latest token-bearing
+/// provider-receipt event by append-only event sequence, so metadata-only
+/// enrichment cannot erase known usage and clock ties cannot multiply it.
+/// Cost is deliberately absent; callers use the canonical accounting aggregate.
+pub(crate) fn operation_attempt_projection(
+    connection: &Connection,
+    policy_id: &str,
+    operation: &str,
+) -> Result<AnalysisOperationAttemptProjection> {
+    let mut statement = connection.prepare(
+        "SELECT request_key,requested_model
+         FROM analysis_request_reservations
+         WHERE policy_id=?1 AND operation=?2 AND dispatch_at IS NOT NULL
+         ORDER BY created_at ASC, request_key ASC",
+    )?;
+    let attempts = statement
+        .query_map(params![policy_id, operation], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut projection = AnalysisOperationAttemptProjection::default();
+    for (request_key, requested_model) in attempts {
+        projection.actual_attempt_count = projection.actual_attempt_count.saturating_add(1);
+        projection.attempted_models.push(requested_model);
+        let tokens: Option<(Option<i64>, Option<i64>)> = connection
+            .query_row(
+                "SELECT receipt.prompt_tokens,receipt.completion_tokens
+                 FROM analysis_request_events AS event
+                 JOIN analysis_provider_receipts AS receipt
+                   ON receipt.request_key=event.request_key
+                  AND receipt.receipt_key=json_extract(event.detail_json,'$.receiptKey')
+                 WHERE event.request_key=?1 AND event.event_kind='receipt'
+                   AND (receipt.prompt_tokens IS NOT NULL
+                        OR receipt.completion_tokens IS NOT NULL)
+                 ORDER BY event.event_id DESC
+                 LIMIT 1",
+                [&request_key],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if let Some((prompt, completion)) = tokens {
+            if let Some(prompt) = prompt.and_then(|value| u32::try_from(value).ok()) {
+                projection.prompt_tokens = projection.prompt_tokens.saturating_add(prompt);
+            }
+            if let Some(completion) = completion.and_then(|value| u32::try_from(value).ok()) {
+                projection.completion_tokens =
+                    projection.completion_tokens.saturating_add(completion);
+            }
+        }
+    }
+    Ok(projection)
 }
 
 /// Filter only frozen entries whose operation is provable. Legacy pilot rows
@@ -1455,6 +1527,51 @@ fn aggregate_legacy_evidence(
         }
     }
     Some(legacy)
+}
+
+struct CurrentRunReceiptProvenance {
+    provider: String,
+    model: String,
+    generation: String,
+    settled_at: Option<String>,
+}
+
+/// Select the latest completed receipt for the current run using the append-only
+/// event sequence, never wall-clock timestamps or receipt-key ordering. A late
+/// receipt from an older run cannot participate because the owning request's
+/// run identity is filtered before ordering.
+fn current_run_receipt_provenance(
+    connection: &Connection,
+    policy_id: &str,
+    run_id: &str,
+    operation: Option<&str>,
+) -> Result<Option<CurrentRunReceiptProvenance>> {
+    connection
+        .query_row(
+            "SELECT COALESCE(request.actual_provider,''),COALESCE(request.actual_model,''),
+                COALESCE(request.provider_generation_id,''),request.settled_at
+         FROM analysis_request_reservations AS request
+         JOIN analysis_request_events AS event ON event.request_key=request.request_key
+         WHERE request.policy_id=?1 AND request.run_id=?2
+           AND (?3 IS NULL OR request.operation=?3)
+           AND request.lifecycle='completed' AND event.event_kind='receipt'
+         ORDER BY event.event_id DESC LIMIT 1",
+            params![policy_id, run_id, operation],
+            |row| {
+                Ok(CurrentRunReceiptProvenance {
+                    provider: row.get(0)?,
+                    model: row.get(1)?,
+                    generation: row.get(2)?,
+                    settled_at: row.get(3)?,
+                })
+            },
+        )
+        .optional()
+        .context("select current-run receipt provenance by event sequence")
+}
+
+fn nonempty(value: String) -> Option<String> {
+    (!value.trim().is_empty()).then_some(value)
 }
 
 fn load_authority_by_policy_optional(
