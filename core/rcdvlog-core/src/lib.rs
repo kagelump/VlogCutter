@@ -104,6 +104,17 @@ pub use analysis::openrouter::{
     OpenRouterProvider, api_credential_present, frame_data_uri, key_file_path,
     openrouter_request_cost_bound, resolve_api_key,
 };
+pub use analysis::openrouter_stt::{
+    MAX_NATIVE_STT_RESPONSE_BYTES, NATIVE_STT_MODELS, NATIVE_STT_REQUEST_TIMEOUT,
+    NativeSttAudioWindow, NativeSttCallResult, NativeSttClientError, NativeSttCost,
+    NativeSttModelSpec, NativeSttOutcome, NativeSttProtocolError, NativeSttProviderPolicy,
+    NativeSttReceipt, NativeSttRequest, NativeSttSegment, NativeSttTranscript, NativeSttUsage,
+    NativeSttWord, OPENROUTER_STT_ENDPOINT, OPENROUTER_STT_PROVIDER, OPENROUTER_WHISPER_MODEL,
+    OpenRouterSttClient, ResolvedSpeechBackend, SpeechBackendSelection, SttDataCollection,
+    build_native_stt_request_body, decode_native_stt_body, decode_native_stt_value,
+    parse_native_stt_receipt, plan_native_stt_audio_windows, resolve_native_stt_model,
+    resolve_speech_backend, seconds_to_window_ms, validate_iso639_1,
+};
 pub use analysis::provider::{
     ANALYSIS_COST_BOUND_CONTRACT_VERSION, AnalysisRequestCostBound, ChainOutcome, DEFAULT_MODEL,
     FALLBACK_MODEL, MODELS, ModelSpec, OPENROUTER_MAX_OUTPUT_TOKENS, ProviderChain,

@@ -1,4 +1,6 @@
-//! Derived per-clip analysis: local speech-to-text today, cloud vision later.
+//! Derived per-clip analysis: local speech-to-text today, with protocol-only
+//! native cloud STT and cloud vision leaves; production selection and accounting
+//! remain explicit follow-up slices.
 //!
 //! Results are derived artifacts with recipe identity, in the same style as
 //! proxies and thumbnails: re-running an unchanged recipe against an unchanged
@@ -15,11 +17,14 @@ pub mod framepack;
 pub mod frames;
 pub mod moments;
 pub mod openrouter;
+pub mod openrouter_stt;
 pub mod pilot_runtime;
 pub mod provider;
 pub mod quality;
 pub mod run_policy;
 pub mod schema;
+pub mod silero_vad;
+pub mod speech_audio;
 pub mod store;
 pub mod stt;
 pub mod vlm;

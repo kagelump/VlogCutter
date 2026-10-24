@@ -1,8 +1,8 @@
-//! The OpenRouter transport.
+//! The OpenRouter chat-completions transport for cloud vision analysis.
 //!
-//! This is the only file in the crate that performs network I/O. Requests go to
-//! the configured base URL and nowhere else; nothing here follows a URL that
-//! came from model output or project data.
+//! This leaf performs only chat-completions network I/O. Native audio
+//! transcription has its own typed leaf in `openrouter_stt`; a VLM request is
+//! never used as a stand-in for speech input.
 //!
 //! The API key is never logged, never placed in a URL or argv, and never written
 //! into the catalog or an error message.

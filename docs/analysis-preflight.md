@@ -189,8 +189,11 @@ only path that carries a matching approval and pilot into bulk work.
 
 ## Boundaries and non-goals
 
-- No cloud audio/STT backend is implemented here. Audio payloads are represented
-  so preflight fails readiness explicitly; issue #119 remains separate.
+- No cloud audio/STT production backend is wired here. A protocol-only native
+  transcription leaf exists under `analysis/openrouter_stt.rs`, but it is not
+  selectable from CLI/desktop/preparation and has no accounting authorization
+  path yet. Audio payloads are represented so preflight fails readiness
+  explicitly; issue #119 remains separate.
 - Concurrent atomic full-bound reservations, append-only receipt reconciliation
   and explicit targeted retry are owned by #122's canonical catalog accounting.
   No second general-purpose spend ledger, cloud scheduler or provider invoice

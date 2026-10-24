@@ -94,6 +94,56 @@ values.
 
 **Recipe key:** `stt.whisper-large-v3-turbo-q5_0.vad-silero-v5.win30.v1`
 
+### Native cloud STT protocol boundary (slice A, not enabled)
+
+The optional cloud-speech adapter is split from the local offline workflow and
+from the production workflow. `analysis/openrouter_stt/` owns a typed native
+transcription leaf; it is not connected to the catalog, CLI, preparation or
+desktop selection yet. `SpeechBackendSelection` requires an explicit
+`LocalWhisper` or provider-qualified `NativeOpenRouter { provider, model }`
+choice. The only verified cloud entry is `openrouter` +
+`openai/whisper-1`, checked against the current public transcription-model and
+endpoint snapshots. An arbitrary chat slug, an unqualified model id, a silent
+default and a fallback model are all rejected.
+
+Silero detection now lives in `analysis/silero_vad.rs`. It loads the VAD model
+without constructing a whisper ASR context, so a future cloud path can run the
+same local gate without loading the 574 MB local model. The request planner
+concatenates only the VAD-selected, packed speech regions into genuine 16 kHz
+mono signed 16-bit PCM WAV windows, capped at 30 seconds and a bounded byte
+size. An empty VAD result produces no audio windows and therefore no provider
+request; an audio-less clip remains the existing `no_audio` outcome before this
+boundary is reached.
+
+The cloud wire contract is the native
+`POST /api/v1/audio/transcriptions` endpoint, not chat completions. It sends raw
+base64 WAV in `input_audio.data` with `format: "wav"`,
+`response_format: "verbose_json"` and `timestamp_granularities: ["segment"]`.
+The `provider` object accepts only the supported data-policy fields `zdr` and
+`data_collection`; routing restrictions such as `order`, `only`, `ignore` and
+`max_price` fail locally because they are not applied by the STT endpoint and
+must not be presented as enforceable. Temperature is explicit and bounded to
+`0..=1`; language is an optional explicit ISO 639-1 code.
+
+Response validation is strict and window-relative: text, language, duration and
+nonempty segments are required; segment timestamps must be finite, nonnegative,
+ordered and inside the window. Optional confidence, average log-probability and
+word confidence remain optional measured evidence (missing never becomes 0 or
+1). Provider/header provenance is retained only when actually returned, and the
+`X-Generation-Id` header is accepted only when it is a bounded valid id. A
+malformed or unusable body, including a non-2xx response, returns a typed unusable outcome while keeping
+the receipt, known cost and latency for future canonical settlement; unknown
+cost/tokens stay separately unknown. Response bodies, audio bytes, transcripts
+and credentials are never embedded in error text.
+
+This slice deliberately performs no catalog writes, schema changes, budget
+reservation, payload/scope authorization, transcript persistence, automatic
+retry, fallback or provider invoice query. Those remain the next accounting and
+orchestration slices; the existing repetition/low-token-probability rejection
+gate stays unchanged and is not duplicated here. Credentials reuse the existing
+`OPENROUTER_API_KEY` / `~/.openrouter.key` convention only when the explicit
+cloud client is constructed. Redirects are disabled: one invocation cannot resend audio to a redirected endpoint. The test endpoint override is unavailable in production builds.
+
 **Batch estimation, two-phase.** VAD sweeps the whole project first — at RTF
 0.0019 this is effectively free — which yields exact 30-second window counts.
 Transcription then runs with real weights. Weight is **30 s windows**, not
