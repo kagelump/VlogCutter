@@ -276,6 +276,10 @@ enum AnalyzeCommand {
         allowed_models: Vec<String>,
         #[arg(long)]
         no_fallback: bool,
+        /// Finite spend ceiling for this operation. Required unless
+        /// RCDVLOG_VLM_MAX_COST_USD is configured.
+        #[arg(long)]
+        budget_usd: Option<f64>,
     },
     /// Report analysis coverage without network access or writes.
     Status {
@@ -338,6 +342,10 @@ enum LabelsCommand {
     Consolidate {
         #[arg(long)]
         project: String,
+        /// Finite spend ceiling for this operation. Required unless
+        /// RCDVLOG_VLM_MAX_COST_USD is configured.
+        #[arg(long)]
+        budget_usd: Option<f64>,
     },
     /// Read the current consolidated vocabulary and usage counts.
     Vocabulary {
@@ -1229,7 +1237,7 @@ fn execute(cli: &Cli) -> Result<Value> {
                     ControlFlow::Continue(())
                 })?,
             )?),
-            AnalyzeCommand::SuggestChronology { project, assets, primary_model, allowed_models, no_fallback } => {
+            AnalyzeCommand::SuggestChronology { project, assets, primary_model, allowed_models, no_fallback, budget_usd } => {
                 let allowed = if allowed_models.is_empty() && !no_fallback {
                     vec![primary_model.clone(), if primary_model == rcdvlog_core::DEFAULT_MODEL { rcdvlog_core::FALLBACK_MODEL.to_string() } else { rcdvlog_core::DEFAULT_MODEL.to_string() }]
                 } else if allowed_models.is_empty() {
@@ -1239,15 +1247,27 @@ fn execute(cli: &Cli) -> Result<Value> {
                 };
                 let chain = rcdvlog_core::ProviderChain::with_policy(primary_model, &allowed, !no_fallback)?;
                 let provider = rcdvlog_core::OpenRouterProvider::new(rcdvlog_core::resolve_api_key()?)?;
-                Ok(serde_json::to_value(catalog.suggest_chronology_with_provider(project, assets, &provider, &chain)?)?)
+                let result = match budget_usd {
+                    Some(budget_usd) => catalog.suggest_chronology_with_provider_and_budget(
+                        project, assets, &provider, &chain, *budget_usd,
+                    )?,
+                    None => catalog.suggest_chronology_with_provider(
+                        project, assets, &provider, &chain,
+                    )?,
+                };
+                Ok(serde_json::to_value(result)?)
             }
             AnalyzeCommand::Status { project } => {
                 Ok(serde_json::to_value(catalog.analysis_coverage(project)?)?)
             }
         },
         Commands::Labels { command } => match command {
-            LabelsCommand::Consolidate { project } => {
-                Ok(serde_json::to_value(catalog.consolidate_labels(project)?)?)
+            LabelsCommand::Consolidate { project, budget_usd } => {
+                let report = match budget_usd {
+                    Some(budget_usd) => catalog.consolidate_labels_with_budget(project, *budget_usd)?,
+                    None => catalog.consolidate_labels(project)?,
+                };
+                Ok(serde_json::to_value(report)?)
             }
             LabelsCommand::Vocabulary { project } => {
                 Ok(serde_json::to_value(catalog.label_vocabulary(project)?)?)

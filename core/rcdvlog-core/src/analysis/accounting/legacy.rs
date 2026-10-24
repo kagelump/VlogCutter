@@ -302,7 +302,7 @@ pub(super) fn refresh_untracked_evidence(
     budget_usd: f64,
 ) -> Result<()> {
     if authority.policy_id.trim().is_empty() {
-        return Ok(());
+        return refresh_untracked_operation(connection, authority, budget_usd);
     }
     ensure!(
         budget_usd.is_finite() && budget_usd > 0.0,
@@ -318,6 +318,178 @@ pub(super) fn refresh_untracked_evidence(
         &frozen_run_ids,
         &pilot_owned_run_ids,
     )?;
+    let total = untracked_totals(connection, &authority.budget_scope_id, None)?;
+    if appended || total.count > 0 {
+        stop_authority_for_untracked(connection, authority)?;
+    }
+    Ok(())
+}
+
+fn operation_for_authority(authority: &Authority) -> Option<&str> {
+    let prefix = format!("operation:{}:", authority.project_id);
+    authority
+        .budget_scope_id
+        .strip_prefix(&prefix)
+        .filter(|operation| !operation.trim().is_empty())
+}
+
+fn frozen_operation_floor_credit(authority: &Authority, base_key: &str) -> f64 {
+    authority
+        .legacy_evidence
+        .get("entries")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|entry| entry.get("baseKey").and_then(Value::as_str) == Some(base_key))
+        .and_then(|entry| entry.get("reservedFloorUsd").and_then(Value::as_f64))
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .unwrap_or(0.0)
+}
+
+fn cache_observed_floor(
+    status: &str,
+    raw_cost: Option<&str>,
+    result_json: &str,
+    budget_usd: f64,
+) -> (f64, bool, Option<f64>) {
+    let cost = raw_cost
+        .and_then(|raw| raw.trim().parse::<f64>().ok())
+        .filter(|cost| cost.is_finite() && *cost >= 0.0);
+    let explicit_complete = serde_json::from_str::<Value>(result_json)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("provenance")
+                .and_then(|provenance| provenance.get("usageComplete"))
+                .and_then(Value::as_bool)
+        });
+    let complete = status == "completed" && explicit_complete == Some(true) && cost.is_some();
+    let floor = if complete {
+        cost.unwrap_or(0.0)
+    } else {
+        match cost {
+            Some(cost) if cost > 0.0 => cost,
+            _ => budget_usd,
+        }
+    };
+    (floor, complete, cost)
+}
+
+/// New spending written by an unwired operation runtime after the authority
+/// snapshot. Chronology cache rows and unmarked operation runs remain separate
+/// append-only unknown floors; they are never rewritten into confirmed charges.
+fn refresh_untracked_operation(
+    connection: &Connection,
+    authority: &Authority,
+    budget_usd: f64,
+) -> Result<()> {
+    let Some(operation) = operation_for_authority(authority) else {
+        return Ok(());
+    };
+    ensure!(
+        budget_usd.is_finite() && budget_usd > 0.0,
+        "analysis budget must be finite and greater than zero"
+    );
+    let mut appended = false;
+    if operation == super::model::CHRONOLOGY_SUGGESTIONS_OPERATION {
+        let mut statement = connection.prepare(
+            "SELECT cache.request_key,cache.status,CAST(cache.cost_usd AS TEXT),cache.result_json
+             FROM analysis_chronology_suggestions AS cache
+             WHERE cache.project_id=?1
+               AND NOT EXISTS (
+                   SELECT 1 FROM analysis_request_events AS event
+                   WHERE event.event_kind='cache_result'
+                     AND json_extract(event.detail_json,'$.cacheKey')=cache.request_key
+               )
+             ORDER BY cache.created_at ASC,cache.request_key ASC",
+        )?;
+        let rows = statement
+            .query_map([&authority.project_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if !rows.is_empty() {
+            for (request_key, status, raw_cost, result_json) in rows {
+                let base_key = format!("chronology-cache:{request_key}");
+                let frozen_credit = frozen_operation_floor_credit(authority, &base_key);
+                let (desired_floor, complete, cost) =
+                    cache_observed_floor(&status, raw_cost.as_deref(), &result_json, budget_usd);
+                appended |= append_untracked_floor(
+                    connection,
+                    authority,
+                    UntrackedUsageFloor {
+                        evidence_kind: "untracked_operation_cache",
+                        base_key: &base_key,
+                        operation: super::model::CHRONOLOGY_SUGGESTIONS_OPERATION,
+                        desired_floor_usd: desired_floor,
+                        frozen_credit_usd: frozen_credit,
+                        evidence: json!({
+                            "source": "analysis_chronology_suggestions_after_snapshot",
+                            "requestKey": request_key,
+                            "status": status,
+                            "costUsd": cost,
+                            "usageComplete": complete,
+                        }),
+                    },
+                )?;
+            }
+        }
+    }
+    // Cache evidence never suppresses run evidence: both owners can contain
+    // independent post-snapshot work. Ledger-linked cache rows are excluded by
+    // the query above and marked runs are skipped below.
+    let mut statement = connection.prepare(
+        "SELECT id,status,stage_reached,CAST(cost_usd AS TEXT),accounting_contract
+         FROM analysis_runs
+         WHERE project_id=?1 AND policy_id='' AND stage_reached=?2
+         ORDER BY started_at ASC,id ASC",
+    )?;
+    let rows = statement
+        .query_map(params![authority.project_id, operation], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for (run_id, status, stage, raw_cost, accounting_contract) in rows {
+        if accounting_contract == ANALYSIS_ACCOUNTING_SCHEMA_VERSION {
+            continue;
+        }
+        let base_key = format!("run:{run_id}");
+        let frozen_credit = frozen_operation_floor_credit(authority, &base_key);
+        let cost = raw_cost
+            .as_deref()
+            .and_then(|raw| raw.trim().parse::<f64>().ok())
+            .filter(|cost| cost.is_finite() && *cost >= 0.0);
+        let desired_floor = cost.unwrap_or(budget_usd);
+        appended |= append_untracked_floor(
+            connection,
+            authority,
+            UntrackedUsageFloor {
+                evidence_kind: "untracked_operation_run",
+                base_key: &base_key,
+                operation,
+                desired_floor_usd: desired_floor,
+                frozen_credit_usd: frozen_credit,
+                evidence: json!({
+                    "source": "analysis_runs_after_snapshot",
+                    "runId": run_id,
+                    "status": status,
+                    "stageReached": stage,
+                    "costUsd": cost,
+                }),
+            },
+        )?;
+    }
     let total = untracked_totals(connection, &authority.budget_scope_id, None)?;
     if appended || total.count > 0 {
         stop_authority_for_untracked(connection, authority)?;

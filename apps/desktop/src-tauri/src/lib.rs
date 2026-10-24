@@ -1894,6 +1894,7 @@ fn analysis_suggest_chronology(
     primary_model: String,
     allowed_models: Vec<String>,
     allow_fallback: bool,
+    budget_usd: Option<f64>,
     state: State<'_, AppState>,
 ) -> Result<rcdvlog_core::SuggestionResult, String> {
     let catalog = state.catalog()?;
@@ -1918,9 +1919,19 @@ fn analysis_suggest_chronology(
         None => rcdvlog_core::resolve_api_key().map_err(error_message)?,
     };
     let provider = OpenRouterProvider::new(key).map_err(error_message)?;
-    catalog
-        .suggest_chronology_with_provider(&project_id, &asset_ids, &provider, &chain)
-        .map_err(error_message)
+    let result = match budget_usd {
+        Some(budget_usd) => catalog.suggest_chronology_with_provider_and_budget(
+            &project_id,
+            &asset_ids,
+            &provider,
+            &chain,
+            budget_usd,
+        ),
+        None => {
+            catalog.suggest_chronology_with_provider(&project_id, &asset_ids, &provider, &chain)
+        }
+    };
+    result.map_err(error_message)
 }
 
 #[tauri::command]

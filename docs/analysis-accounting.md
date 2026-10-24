@@ -1,12 +1,12 @@
 # Analysis request accounting: admission and receipt reconciliation
 
-This document describes the canonical persistence foundation and the C1/C2
-runtime integrations added for issue #122. The authorized run-policy pilot,
-bulk observation, and policy-bound moment discovery, including transport and
-domain-validation fallback, are wired through the accounted provider boundary.
-Chronology suggestions, ad-hoc analysis (for example label consolidation), CLI
-inspection/reconciliation/retry commands, and non-policy helper entry points are
-still follow-up work and must not be described as concurrent-runtime-safe yet.
+This document describes the canonical persistence foundation and the runtime
+integrations added for issue #122. The authorized run-policy pilot, bulk
+observation, policy-bound moment discovery, chronology suggestions and label
+consolidation, including transport and domain-validation fallback, are wired
+through the accounted provider boundary. CLI/desktop inspection, reconciliation
+and explicit targeted-retry commands remain follow-up work; issue #122 stays open
+until those workflows and restart acceptance are complete.
 
 ## Canonical owner
 
@@ -244,10 +244,11 @@ the authority.
 ## Compatibility with spending after an authority snapshot
 
 Migration 40 extends the existing analysis-run owner with an accounting-contract
-marker. The C1 pilot creates marked runs only after initializing its budget
-authority. A marked zero-request cancelled run does not invent unknown paid
-usage. Other production paid call sites remain unwired in this slice; the marker
-creation API alone is not evidence of runtime integration.
+marker. Every accounted pilot, bulk, moment and non-policy operation run sets
+that marker only after initializing its budget authority. A marked zero-request
+cancelled run does not invent unknown paid usage. The marker alone is not a
+confirmed charge; it only distinguishes ledger-owned lifecycle rows from
+untracked legacy summaries.
 
 An older runtime may have written run or pilot spending after an authority was
 initialized by migrations 38/39. Admission and dispatch recheck that history in
@@ -258,26 +259,60 @@ it never rewrites the frozen legacy authority or claims a confirmed charge.
 
 Pilot summaries own their represented run's floor. Frozen amounts receive credit
 once, repeated observations append only increases, and independent runs keep
-separate evidence. Unknown zero-cost legacy work remains unknown; unreadable
-frozen pilot records retain their prior reserve. Direct evidence deletion is
-rejected while project-owned cleanup still cascades.
+separate evidence. Operation compatibility scans unlinked chronology cache rows
+and unmarked operation runs independently, so presence of one owner cannot hide
+the other. Frozen operation entries carry the same per-owner base key and floor
+credit used by later delta appends; a later cost increase therefore adds only the
+increase and a repeated observation adds nothing. Unknown zero-cost legacy work
+remains unknown; unreadable frozen pilot records retain their prior reserve.
+Direct evidence deletion is rejected while project-owned cleanup still cascades.
 
-## Remaining #122 integration (not implemented here)
+## Non-policy operation authorities
 
-Bulk observation and policy-bound moment discovery now use the accounted
-boundary. The following paid runtime call sites still bypass
-`AccountedVlmProvider` and must be wired before issue #122 can be considered
-complete:
+Chronology suggestions and label consolidation are not RunPolicy-owned, so they
+use the same canonical authority machinery with a project/operation scope such as
+`operation:<project>:chronology_suggestions`. The authority fingerprint binds the
+provider cost contract, requested route, model allowlist/fallback settings,
+operation recipe and finite budget. It intentionally excludes the run id and
+per-request payload, so a new process cannot manufacture a fresh ceiling merely
+by creating a new run or request identity.
 
-- chronology suggestions: `Catalog::suggest_chronology_with_provider` and
-  `analysis::chronology_suggestions::suggest_with_provider`;
-- ad-hoc analysis paths that are not run-policy scoped, including label
-  consolidation;
-- CLI/desktop/HTTP inspection, reconciliation, explicit retry, and recovery
-  workflows. No CLI command is added by this slice; the core inspect/reconcile
-  APIs exist, but an operator-facing command is still required;
-- any adapter-specific batch helper that reaches a paid transmission without the
-  real owned run id, source/payload identity, and whole-policy authority context.
+Each actual transmission, including a transport fallback or a domain-invalid
+fallback, crosses `AccountedVlmProvider` independently. The durable dispatch
+marker is committed before provider I/O, and the receipt is committed before the
+adapter parses or validates response JSON. Consequently a paid invalid response
+still leaves a confirmed receipt and cannot be blindly resent. Local cancellation,
+credential/preparation failure and admission denial release only while the
+dispatch marker is absent and do not consume a fallback attempt.
 
-Each remaining call site needs the same per-attempt boundary before paid
-dispatch is considered concurrent-safe. Issue #122 therefore stays open.
+Chronology keeps its original result-cache key solely as result identity. For a
+new request the canonical ledger is the only paid in-flight permit: no pending
+cache row is created before admission. After provider evidence and domain review,
+the canonical provenance (confirmed current-run cost, separate uncertainty,
+actual provider/model/generation, run id and request keys) is populated first.
+The completed cache row and one append-only `cache_result` link for every ledger
+attempt are then written in one `IMMEDIATE` transaction, so neither can exist
+without the other. Persisting either side cannot expose a cache row as unlinked
+legacy spending. A completed cache row is reused without a paid call. Historical
+running/interrupted cache rows remain visible legacy unknown evidence and block a
+blind resend, but they are not a second permit for new work. Existing legacy
+cache costs are collected once by the same compatibility owner. A completed old
+row counts as confirmed only when its provenance explicitly proves complete usage
+and it has a known non-negative cost. Missing completeness, unreadable entries,
+running rows and malformed amounts remain unknown-usage reserves and stop further
+dispatch.
+
+Operation reports expose confirmed current-run cost separately from active
+reservations and uncertain-usage reserves. Actual provider/model/generation
+identity is read exclusively from receipt evidence; missing identity stays
+`None`/empty rather than being inferred from the requested route.
+
+## Remaining #122 integration
+
+The two previously direct paid paths now use the accounted operation boundary.
+CLI/desktop/HTTP inspection, reconciliation, explicit targeted retry and recovery
+workflows are still follow-up work: the core inspect/reconcile/retry APIs exist,
+but no operator-facing command is added by this slice. Any adapter-specific batch
+helper that reaches a paid transmission without the real owned run id,
+source/payload identity and whole-authority context must also be wired before
+issue #122 is considered complete. Issue #122 therefore stays open.

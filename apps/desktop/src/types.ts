@@ -382,12 +382,31 @@ export interface ChronologySuggestionRequest {
   primaryModel: string;
   allowedModels: string[];
   allowFallback: boolean;
+  /** Finite ceiling for the shared budget authority. Required unless the environment supplies one. */
+  budgetUsd?: number | null;
 }
 
 export interface ChronologySuggestionResult {
   suggestion: { frameIds: string[]; matches: Array<{ earlierAssetId: string; laterAssetId: string; supportingFrameIds: string[] }> };
   review: { missingFrameIds: string[]; duplicateFrameIds: string[]; unknownFrameIds: string[]; semanticInconsistencies: string[] };
-  provenance: { model: string; attempts: number; attemptedModels: string[]; usageComplete: boolean; costUsd: number; promptTokens: number; completionTokens: number; latencyMs: number };
+  provenance: {
+    model: string;
+    attempts: number;
+    attemptedModels: string[];
+    usageComplete: boolean;
+    costUsd: number;
+    uncertainUsageReserveUsd?: number;
+    activeReservedCostUsd?: number;
+    committedOrReservedUsd?: number;
+    actualProvider?: string | null;
+    actualModel?: string | null;
+    providerGenerationId?: string | null;
+    runId?: string;
+    requestKeys?: string[];
+    promptTokens: number;
+    completionTokens: number;
+    latencyMs: number;
+  };
   cached: boolean;
 }
 
