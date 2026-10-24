@@ -132,6 +132,7 @@ function runReport(state: DesktopHarnessState, tally: RunTally, outcome: Analysi
     finishedAt: clock.iso(),
     status,
     stageReached: report.stageReached,
+    accountingContract: "",
     policyId: "",
     proxiesGenerated: report.proxies.generated,
     clipsTranscribed: report.transcripts.transcribed,

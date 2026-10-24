@@ -19,6 +19,11 @@ pub const MAX_IN_FLIGHT_REQUESTS_PER_BUDGET_AUTHORITY: usize = 4;
 pub const MAX_REQUEST_ATTEMPTS: u32 = 4;
 pub const LEGACY_UNKNOWN_USAGE_STOP_REASON: &str =
     "legacy_usage_unknown_requires_fresh_authorization";
+/// A runtime in the pre-C window wrote run/pilot spending after the canonical
+/// authority snapshot was frozen. The authority fails closed and preserves the
+/// newly discovered floor as append-only evidence.
+pub const UNTRACKED_POST_INITIALIZATION_USAGE_STOP_REASON: &str =
+    "untracked_post_initialization_usage_requires_reconciliation";
 
 /// The canonical authority for one explicitly authorized run policy.
 pub fn analysis_policy_budget_scope_id(project_id: &str, policy_id: &str) -> String {
@@ -319,6 +324,12 @@ pub struct AnalysisBudgetSnapshot {
     pub stop_reason: String,
     pub legacy_usage_complete: bool,
     pub legacy_evidence: Value,
+    /// Append-only evidence discovered after the authority snapshot was frozen.
+    /// Kept separate from the immutable legacy fields.
+    #[serde(default)]
+    pub post_initialization_untracked_usage_reserve_usd: f64,
+    #[serde(default)]
+    pub post_initialization_untracked_evidence_count: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -358,14 +369,33 @@ pub struct AnalysisAccountingAggregate {
     pub legacy_confirmed_cost_usd: f64,
     pub legacy_uncertain_usage_reserve_usd: f64,
     pub legacy_usage_complete: bool,
+    /// Append-only post-snapshot unknown usage, separate from frozen legacy
+    /// evidence and from active/uncertain request reservations.
+    #[serde(default)]
+    pub post_initialization_untracked_usage_reserve_usd: f64,
+    #[serde(default)]
+    pub post_initialization_untracked_evidence_count: usize,
     pub committed_or_reserved_usd: f64,
-    /// True only when relevant evidence exists and no relevant attempt is
-    /// active or uncertain.
+    /// True only when relevant evidence exists (or this is a known zero-work
+    /// operation) and no relevant attempt/evidence remains unresolved.
     pub usage_complete: bool,
     pub current_run_actual_provider: Option<String>,
     pub current_run_actual_model: Option<String>,
     pub current_run_generation_id: Option<String>,
     pub current_run_settled_at: Option<String>,
+}
+
+impl AnalysisAccountingAggregate {
+    /// Conservative unresolved-usage check used by runtime projections. A
+    /// known zero-request operation is not unresolved merely because it has no
+    /// ledger rows.
+    pub fn has_unresolved_usage(&self) -> bool {
+        self.active_request_count > 0
+            || self.uncertain_request_count > 0
+            || (self.legacy_included && !self.legacy_usage_complete)
+            || self.post_initialization_untracked_usage_reserve_usd > 0.0
+            || self.post_initialization_untracked_evidence_count > 0
+    }
 }
 
 /// Provider-returned evidence for one request. Missing facts stay missing; no

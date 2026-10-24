@@ -4,11 +4,12 @@
 //! This slice provides canonical authority initialization, atomic full-bound
 //! reservation, durable dispatch markers, pre-upload releases, uncertainty
 //! retention, append-only provider receipt settlement, explicit bounded retry
-//! authorization and canonical accounting projections. Provider wrappers,
-//! runtime run wiring, observation/moment/fallback dispatch and CLI adapters
-//! intentionally remain follow-up work.
+//! authorization and canonical projections. Compatibility evidence preserves
+//! spending written after a frozen legacy snapshot. Runtime transport wiring
+//! and CLI adapters remain follow-up work.
 
 mod catalog;
+mod legacy;
 mod model;
 mod settlement;
 mod store;
@@ -19,9 +20,10 @@ pub use model::{
     AnalysisProviderReceipt, AnalysisRequestEvent, AnalysisRequestLifecycle,
     AnalysisRequestReconciliation, AnalysisRequestRecord, AnalysisRetryAuthorization,
     LEGACY_UNKNOWN_USAGE_STOP_REASON, MAX_IN_FLIGHT_REQUESTS_PER_BUDGET_AUTHORITY,
-    MAX_REQUEST_ATTEMPTS, ProviderReceiptEvidence, analysis_operation_budget_scope_id,
-    analysis_policy_budget_scope_id, analysis_request_cost_bound_fingerprint,
-    analysis_request_payload_fingerprint, bounded_failure_code,
+    MAX_REQUEST_ATTEMPTS, ProviderReceiptEvidence, UNTRACKED_POST_INITIALIZATION_USAGE_STOP_REASON,
+    analysis_operation_budget_scope_id, analysis_policy_budget_scope_id,
+    analysis_request_cost_bound_fingerprint, analysis_request_payload_fingerprint,
+    bounded_failure_code,
 };
 
 #[cfg(test)]

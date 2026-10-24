@@ -76,9 +76,10 @@ pub use analysis::accounting::{
     AnalysisProviderReceipt, AnalysisRequestEvent, AnalysisRequestLifecycle,
     AnalysisRequestReconciliation, AnalysisRequestRecord, AnalysisRetryAuthorization,
     LEGACY_UNKNOWN_USAGE_STOP_REASON, MAX_IN_FLIGHT_REQUESTS_PER_BUDGET_AUTHORITY,
-    MAX_REQUEST_ATTEMPTS, ProviderReceiptEvidence, analysis_operation_budget_scope_id,
-    analysis_policy_budget_scope_id, analysis_request_cost_bound_fingerprint,
-    analysis_request_payload_fingerprint, bounded_failure_code,
+    MAX_REQUEST_ATTEMPTS, ProviderReceiptEvidence, UNTRACKED_POST_INITIALIZATION_USAGE_STOP_REASON,
+    analysis_operation_budget_scope_id, analysis_policy_budget_scope_id,
+    analysis_request_cost_bound_fingerprint, analysis_request_payload_fingerprint,
+    bounded_failure_code,
 };
 pub use analysis::chronology_suggestions::{
     ChronologyEvidenceRequest, ChronologySuggestion, EvidenceFrame, PairMatch,
@@ -691,6 +692,11 @@ pub struct AnalysisRunRecord {
     pub cost_usd: f64,
     pub budget_exhausted: bool,
     pub error: String,
+    /// Canonical accounting-contract marker. Empty means a legacy or not-yet
+    /// fully ledgered runtime row. The runtime integration must set the accounting
+    /// version before any paid attempt.
+    #[serde(default)]
+    pub accounting_contract: String,
 }
 
 /// Whether one speech model is present, intact, and ready to load.
@@ -2594,6 +2600,32 @@ impl Catalog {
         Ok(id)
     }
 
+    /// Opens a run owned by a fully ledgered runtime. The marker is written in
+    /// the same row as the run identity so a legitimate zero-request cancelled
+    /// pilot is distinguishable from untracked legacy spending.
+    pub fn begin_accounted_analysis_run(
+        &self,
+        project_id: &str,
+        policy_id: &str,
+        stage_reached: &str,
+    ) -> Result<String> {
+        let id = Uuid::new_v4().to_string();
+        self.connection()?.execute(
+            "INSERT INTO analysis_runs
+                (id, project_id, started_at, status, stage_reached, policy_id, accounting_contract)
+             VALUES (?1, ?2, ?3, 'running', ?4, ?5, ?6)",
+            params![
+                id,
+                project_id,
+                Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+                stage_reached,
+                policy_id,
+                crate::analysis::accounting::ANALYSIS_ACCOUNTING_SCHEMA_VERSION,
+            ],
+        )?;
+        Ok(id)
+    }
+
     /// Closes a run record with what it actually did.
     pub fn finish_analysis_run(&self, run_id: &str, outcome: &AnalysisRunOutcome) -> Result<()> {
         self.connection()?.execute(
@@ -2624,7 +2656,7 @@ impl Catalog {
         let mut statement = connection.prepare(
             "SELECT id, project_id, started_at, finished_at, status, stage_reached,
                     policy_id, proxies_generated, clips_transcribed, clips_analyzed,
-                    cost_usd, budget_exhausted, error
+                    cost_usd, budget_exhausted, error, accounting_contract
              FROM analysis_runs WHERE project_id=?1
              ORDER BY started_at DESC, id DESC LIMIT ?2",
         )?;
@@ -2644,6 +2676,7 @@ impl Catalog {
                     cost_usd: row.get(10)?,
                     budget_exhausted: row.get::<_, i64>(11)? != 0,
                     error: row.get(12)?,
+                    accounting_contract: row.get(13)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
