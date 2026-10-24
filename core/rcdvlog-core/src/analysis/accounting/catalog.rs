@@ -1,10 +1,6 @@
-//! Thin existing-owner APIs for canonical analysis request admission.
-//!
-//! This slice stops at transactional persistence. It does not wrap a provider,
-//! dispatch a request, reconcile receipts or expose a CLI command. Runtime
-//! integration is the next separately reviewable change and must call
-//! `initialize_analysis_accounting_authority` before creating its run/pilot
-//! rows.
+//! Thin Catalog APIs for canonical accounting, including frozen legacy evidence.
+//! Runtime transport and CLI integration remain separate changes. Runtime callers
+//! must initialize the authority before creating their accounted run/pilot rows.
 
 use anyhow::{Result, anyhow, ensure};
 use rusqlite::params;

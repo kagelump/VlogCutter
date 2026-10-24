@@ -5,10 +5,14 @@
 //! authority, its frozen historical evidence and the reservation rows. Provider
 //! I/O deliberately lives outside this module.
 
-use anyhow::{Context, Result, anyhow, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 use serde_json::{Value, json};
 
+use super::legacy::{
+    UntrackedTotals, persist_untracked_denial_boundary, refresh_untracked_evidence,
+    untracked_totals,
+};
 use super::model::{
     ANALYSIS_ACCOUNTING_SCHEMA_VERSION, AnalysisAccountingAggregate, AnalysisAccountingContext,
     AnalysisBudgetAuthorityContext, AnalysisBudgetSnapshot, AnalysisProviderReceipt,
@@ -117,7 +121,12 @@ pub(crate) fn initialize_authority(
             ],
         )?;
     }
-    let authority = load_authority(&transaction, &scope)?;
+    let mut authority = load_authority(&transaction, &scope)?;
+    // An older unwired runtime may have written run/pilot spending after this
+    // authority was frozen. Preserve that floor as append-only evidence and
+    // fail closed; never reset or loosen the frozen authority.
+    refresh_untracked_evidence(&transaction, &authority, context.budget_usd)?;
+    authority = load_authority(&transaction, &scope)?;
     verify_authority(
         &authority,
         &context.project_id,
@@ -162,11 +171,15 @@ pub(crate) fn reserve(
         &scope,
     )?;
     validate_request_identity(&transaction, context, model)?;
-    ensure!(
-        !authority.dispatch_stopped,
-        "analysis budget authority dispatch is stopped: {}",
-        authority.stop_reason
-    );
+    if let Some(stop_reason) =
+        persist_untracked_denial_boundary(&transaction, &authority, context.budget_usd)?
+    {
+        // The evidence refresh itself is durable evidence. Commit it before
+        // denying admission so a SQLite error return can never roll the newly
+        // discovered unknown floor/stop state back out of existence.
+        transaction.commit()?;
+        bail!("analysis budget authority dispatch is stopped: {stop_reason}");
+    }
 
     let prior = load_attempts(&transaction, &base)?;
     ensure!(
@@ -180,8 +193,10 @@ pub(crate) fn reserve(
         totals.active_requests < MAX_IN_FLIGHT_REQUESTS_PER_BUDGET_AUTHORITY,
         "analysis budget authority already has {MAX_IN_FLIGHT_REQUESTS_PER_BUDGET_AUTHORITY} requests in flight"
     );
+    let untracked = untracked_totals(&transaction, &scope, None)?;
     let committed = authority.legacy_confirmed_cost_usd
         + authority.legacy_uncertain_usage_reserve_usd
+        + untracked.reserve
         + totals.committed();
     let available = (authority.budget_usd - committed).max(0.0);
     let requested = cost_bound.maximum_cost_usd;
@@ -321,11 +336,15 @@ pub(crate) fn mark_dispatched(
         current.lifecycle.as_str()
     );
     let authority = load_authority(&transaction, &current.budget_scope_id)?;
-    ensure!(
-        !authority.dispatch_stopped,
-        "analysis budget authority dispatch is stopped: {}",
-        authority.stop_reason
-    );
+    if let Some(stop_reason) =
+        persist_untracked_denial_boundary(&transaction, &authority, authority.budget_usd)?
+    {
+        // Preserve the discovered unknown floor/stop state before denying the
+        // dispatch marker. The caller may then release its still-undispatched
+        // reservation, but cannot transmit.
+        transaction.commit()?;
+        bail!("analysis budget authority dispatch is stopped: {stop_reason}");
+    }
     let now = crate::now();
     transaction.execute(
         "UPDATE analysis_request_reservations
@@ -1052,7 +1071,7 @@ fn load_authority_optional(connection: &Connection, scope: &str) -> Result<Optio
         .context("read analysis budget authority")
 }
 
-fn load_authority(connection: &Connection, scope: &str) -> Result<Authority> {
+pub(super) fn load_authority(connection: &Connection, scope: &str) -> Result<Authority> {
     load_authority_optional(connection, scope)?
         .ok_or_else(|| anyhow!("analysis budget authority is not initialized"))
 }
@@ -1087,8 +1106,10 @@ fn snapshot_from_authority(
     authority: &Authority,
 ) -> Result<AnalysisBudgetSnapshot> {
     let totals = totals_for_scope(connection, &authority.budget_scope_id)?;
+    let untracked = untracked_totals(connection, &authority.budget_scope_id, None)?;
     let confirmed = authority.legacy_confirmed_cost_usd + totals.confirmed;
-    let uncertain = authority.legacy_uncertain_usage_reserve_usd + totals.uncertain;
+    let uncertain =
+        authority.legacy_uncertain_usage_reserve_usd + totals.uncertain + untracked.reserve;
     let committed = confirmed + totals.active_reserved + uncertain;
     Ok(AnalysisBudgetSnapshot {
         budget_scope_id: authority.budget_scope_id.clone(),
@@ -1101,6 +1122,8 @@ fn snapshot_from_authority(
         confirmed_cost_usd: confirmed,
         active_reserved_cost_usd: totals.active_reserved,
         uncertain_usage_reserve_usd: uncertain,
+        post_initialization_untracked_usage_reserve_usd: untracked.reserve,
+        post_initialization_untracked_evidence_count: untracked.count,
         committed_or_reserved_usd: committed,
         available_usd: (authority.budget_usd - committed).max(0.0),
         active_requests: totals.active_requests,
@@ -1147,7 +1170,9 @@ fn collect_legacy_evidence(
         )
         .optional()?;
     let has_pilot_record = pilot_json.is_some();
+    let mut pilot_run_id = String::new();
     if let Some(pilot_json) = pilot_json {
+        let record_fingerprint = blake3::hash(pilot_json.as_bytes()).to_hex().to_string();
         match serde_json::from_str::<Value>(&pilot_json) {
             Ok(pilot) => {
                 let raw_cost = pilot.get("costUsd").cloned();
@@ -1169,6 +1194,15 @@ fn collect_legacy_evidence(
                     malformed_amount_reserved |= cost.is_none();
                     usage_complete = false;
                 }
+                pilot_run_id = pilot
+                    .get("runId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let mut run_ids = Vec::new();
+                if !pilot_run_id.is_empty() {
+                    run_ids.push(pilot_run_id.clone());
+                }
                 entries.push(json!({
                     "source": "analysis_run_pilots",
                     "policyId": policy_id,
@@ -1177,6 +1211,8 @@ fn collect_legacy_evidence(
                     "usageComplete": complete,
                     "status": pilot.get("status").cloned().unwrap_or(Value::Null),
                     "runId": pilot.get("runId").cloned().unwrap_or(Value::Null),
+                    "runIds": run_ids,
+                    "recordFingerprint": record_fingerprint,
                 }));
             }
             Err(error) => {
@@ -1187,6 +1223,7 @@ fn collect_legacy_evidence(
                     "source": "analysis_run_pilots",
                     "policyId": policy_id,
                     "unreadable": true,
+                    "recordFingerprint": record_fingerprint,
                     "error": error.to_string(),
                 }));
             }
@@ -1209,7 +1246,7 @@ fn collect_legacy_evidence(
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     for (run_id, status, stage, raw_cost) in runs {
-        if has_pilot_record && stage == "pilot" {
+        if has_pilot_record && stage == "pilot" && run_id == pilot_run_id {
             continue;
         }
         let cost = legacy_amount(raw_cost.as_deref());
@@ -1246,7 +1283,7 @@ fn collect_legacy_evidence(
     })
 }
 
-fn legacy_amount(raw: Option<&str>) -> Option<f64> {
+pub(super) fn legacy_amount(raw: Option<&str>) -> Option<f64> {
     raw?.trim()
         .parse::<f64>()
         .ok()
@@ -1274,6 +1311,10 @@ pub(crate) fn accounting_aggregate(
         .query_map(params![policy_id, operation], row_to_request)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let authority = load_authority_by_policy_optional(connection, policy_id)?;
+    let untracked = match authority.as_ref() {
+        Some(authority) => untracked_totals(connection, &authority.budget_scope_id, operation)?,
+        None => UntrackedTotals::default(),
+    };
     let legacy = aggregate_legacy_evidence(authority.as_ref(), operation);
     let legacy_included = legacy.is_some();
     let legacy_confirmed = legacy.as_ref().map_or(0.0, |legacy| legacy.confirmed);
@@ -1307,6 +1348,8 @@ pub(crate) fn accounting_aggregate(
         legacy_confirmed_cost_usd: legacy_confirmed,
         legacy_uncertain_usage_reserve_usd: legacy_uncertain,
         legacy_usage_complete,
+        post_initialization_untracked_usage_reserve_usd: untracked.reserve,
+        post_initialization_untracked_evidence_count: untracked.count,
         committed_or_reserved_usd: 0.0,
         usage_complete: false,
         current_run_actual_provider: None,
@@ -1347,15 +1390,18 @@ pub(crate) fn accounting_aggregate(
         aggregate.confirmed_cost_usd += legacy_confirmed;
         aggregate.uncertain_usage_reserve_usd += legacy_uncertain;
     }
+    aggregate.uncertain_usage_reserve_usd += untracked.reserve;
     aggregate.committed_or_reserved_usd = aggregate.confirmed_cost_usd
         + aggregate.active_reserved_cost_usd
         + aggregate.uncertain_usage_reserve_usd;
-    let relevant_evidence_exists =
-        aggregate.request_count > 0 || (legacy_included && legacy_has_evidence);
+    let relevant_evidence_exists = aggregate.request_count > 0
+        || (legacy_included && legacy_has_evidence)
+        || untracked.count > 0;
     aggregate.usage_complete = relevant_evidence_exists
         && aggregate.active_request_count == 0
         && aggregate.uncertain_request_count == 0
-        && (!legacy_included || legacy_usage_complete);
+        && (!legacy_included || legacy_usage_complete)
+        && untracked.count == 0;
     Ok(aggregate)
 }
 

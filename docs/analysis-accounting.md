@@ -146,3 +146,25 @@ counting. Incomplete pilots, orphaned pilot-stage runs, missing/negative/
 non-finite amounts and unreadable pilot JSON all remain unknown usage rather than
 zero-charge proof. Original run and pilot history is preserved and frozen with
 the authority.
+
+
+## Compatibility with spending after an authority snapshot
+
+Migration 40 extends the existing analysis-run owner with an accounting-contract
+marker. The runtime integration will create marked runs only after initializing
+their budget authority. A marked zero-request cancelled run does not invent
+unknown paid usage. Existing production provider calls remain unwired in this
+slice; the marker creation API is not evidence of runtime integration.
+
+An older runtime may have written run or pilot spending after an authority was
+initialized by migrations 38/39. Admission and dispatch recheck that history in
+an IMMEDIATE transaction. Newly observed unknown floors and the dispatch stop
+commit before returning a denial. Append-only evidence belongs to the same
+Catalog/accounting owner and is included separately in canonical projections;
+it never rewrites the frozen legacy authority or claims a confirmed charge.
+
+Pilot summaries own their represented run's floor. Frozen amounts receive credit
+once, repeated observations append only increases, and independent runs keep
+separate evidence. Unknown zero-cost legacy work remains unknown; unreadable
+frozen pilot records retain their prior reserve. Direct evidence deletion is
+rejected while project-owned cleanup still cascades.

@@ -7,7 +7,7 @@ use thiserror::Error;
 
 use crate::chronology::forward_migrate_project_chronology;
 
-pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 39;
+pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 40;
 
 const MIGRATION_TABLE_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -317,6 +317,12 @@ pub const PROJECT_CATALOG_MIGRATIONS: &[SqliteMigration] = &[
         name: "analysis_receipt_generation_scope",
         source_identity: "project-catalog/0039-analysis-receipt-generation-scope/20261025",
         apply: add_analysis_receipt_generation_scope,
+    },
+    SqliteMigration {
+        id: 40,
+        name: "analysis_run_accounting_contract",
+        source_identity: "project-catalog/0040-analysis-run-accounting-contract/20261025",
+        apply: add_analysis_run_accounting_contract,
     },
 ];
 
@@ -697,6 +703,60 @@ fn add_analysis_receipt_generation_scope(transaction: &Transaction<'_>) -> Resul
                   AND prior_request.requested_provider = incoming_request.requested_provider
                   AND prior.provider_generation_id = NEW.provider_generation_id
             );
+        END;
+        "#,
+    )?;
+    Ok(())
+}
+
+/// Migration 40. Mark runs owned by the fully ledgered runtime and retain
+/// append-only evidence for spending that an unwired pre-C runtime writes
+/// after the authority's frozen snapshot.
+///
+/// Legacy `analysis_runs` rows have an empty marker. New runtime-created pilot
+/// runs set the canonical accounting-contract version when they are opened.
+/// Untracked post-initialization evidence is kept in child rows instead of
+/// rewriting the frozen authority fields, so old charges/reserves and newly
+/// discovered unknown floors remain separately auditable and are summed exactly
+/// once by the canonical accounting projections.
+fn add_analysis_run_accounting_contract(transaction: &Transaction<'_>) -> Result<()> {
+    add_column_if_missing(
+        transaction,
+        "analysis_runs",
+        "accounting_contract",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    transaction.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS analysis_untracked_usage_evidence (
+            evidence_key TEXT PRIMARY KEY,
+            budget_scope_id TEXT NOT NULL
+                REFERENCES analysis_budget_authorities(budget_scope_id) ON DELETE CASCADE,
+            project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            policy_id TEXT NOT NULL DEFAULT '',
+            operation TEXT NOT NULL DEFAULT '',
+            evidence_kind TEXT NOT NULL,
+            dedupe_key TEXT NOT NULL,
+            reserve_usd REAL NOT NULL CHECK(reserve_usd >= 0.0),
+            evidence_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL,
+            UNIQUE(budget_scope_id, dedupe_key)
+        );
+        CREATE INDEX IF NOT EXISTS analysis_untracked_usage_scope
+            ON analysis_untracked_usage_evidence(budget_scope_id, operation, created_at);
+        CREATE INDEX IF NOT EXISTS analysis_request_reservations_policy_dispatch
+            ON analysis_request_reservations(policy_id, operation, dispatch_at)
+            WHERE dispatch_at IS NOT NULL;
+        CREATE TRIGGER IF NOT EXISTS analysis_untracked_usage_append_only
+        BEFORE UPDATE ON analysis_untracked_usage_evidence
+        BEGIN
+            SELECT RAISE(ABORT, 'analysis untracked usage evidence is append-only');
+        END;
+        CREATE TRIGGER IF NOT EXISTS analysis_untracked_usage_no_direct_delete
+        BEFORE DELETE ON analysis_untracked_usage_evidence
+        WHEN EXISTS(SELECT 1 FROM projects WHERE id=OLD.project_id)
+        BEGIN
+            SELECT RAISE(ABORT, 'analysis untracked usage evidence is append-only');
         END;
         "#,
     )?;
@@ -2465,6 +2525,31 @@ mod tests {
         for column in ["status", "stage_reached", "cost_usd", "budget_exhausted"] {
             assert!(columns.contains(&column.to_string()), "missing {column}");
         }
+    }
+
+    #[test]
+    fn migration_40_adds_accounting_marker_and_untracked_evidence() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        migrate_project_catalog(&mut connection).unwrap();
+        assert!(column_exists(&connection, "analysis_runs", "accounting_contract").unwrap());
+        let table_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type='table' AND name='analysis_untracked_usage_evidence'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(table_count, 1);
+        let trigger_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type='trigger' AND name='analysis_untracked_usage_append_only'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(trigger_count, 1);
     }
 
     #[test]

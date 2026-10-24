@@ -1,8 +1,8 @@
 //! Focused offline admission tests.
 //!
-//! There is no production transport wrapper in this slice. Interruption is
-//! modeled at the durable boundaries: before the dispatch marker, after it, and
-//! after reopening the canonical catalog.
+//! Tests cover local release before dispatch, retained uncertainty after it,
+//! interruption, concurrent final-budget races, late receipts and legacy spending
+//! written after an authority snapshot. Runtime transport wiring is separate.
 
 use std::sync::{Arc, Barrier};
 use std::thread;
@@ -196,6 +196,45 @@ fn insert_authorization(catalog: &Catalog, policy: &RunPolicy, accounting_contra
         .unwrap();
 }
 
+fn pilot_record_json(
+    project_id: &str,
+    policy_id: &str,
+    run_id: &str,
+    cost_usd: serde_json::Value,
+    usage_complete: serde_json::Value,
+) -> String {
+    json!({
+        "schemaVersion": crate::RUN_PILOT_SCHEMA_VERSION,
+        "policyId": policy_id,
+        "projectId": project_id,
+        "status": "uncertain",
+        "startedAt": "2026-10-24T00:00:00Z",
+        "finishedAt": "2026-10-24T00:00:01Z",
+        "runId": run_id,
+        "assetId": "synthetic-asset",
+        "requestedModel": DEFAULT_MODEL,
+        "costUsd": cost_usd,
+        "usageComplete": usage_complete,
+    })
+    .to_string()
+}
+
+fn upsert_pilot_json(catalog: &Catalog, project_id: &str, policy_id: &str, record_json: &str) {
+    catalog
+        .connection()
+        .unwrap()
+        .execute(
+            "INSERT INTO analysis_run_pilots(
+                policy_id,project_id,status,record_json,started_at,finished_at)
+             VALUES(?1,?2,'uncertain',?3,'2026-10-24T00:00:00Z','2026-10-24T00:00:01Z')
+             ON CONFLICT(policy_id) DO UPDATE SET
+                status=excluded.status,record_json=excluded.record_json,
+                started_at=excluded.started_at,finished_at=excluded.finished_at",
+            rusqlite::params![policy_id, project_id, record_json],
+        )
+        .unwrap();
+}
+
 fn insert_pilot(
     catalog: &Catalog,
     project_id: &str,
@@ -203,30 +242,18 @@ fn insert_pilot(
     cost_usd: serde_json::Value,
     usage_complete: serde_json::Value,
 ) {
-    let record = json!({
-        "schemaVersion": crate::RUN_PILOT_SCHEMA_VERSION,
-        "policyId": policy_id,
-        "projectId": project_id,
-        "status": "uncertain",
-        "startedAt": "2026-10-24T00:00:00Z",
-        "finishedAt": "2026-10-24T00:00:01Z",
-        "runId": "legacy-pilot-run",
-        "assetId": "synthetic-asset",
-        "requestedModel": DEFAULT_MODEL,
-        "costUsd": cost_usd,
-        "usageComplete": usage_complete,
-    })
-    .to_string();
-    catalog
-        .connection()
-        .unwrap()
-        .execute(
-            "INSERT INTO analysis_run_pilots(
-                policy_id,project_id,status,record_json,started_at,finished_at)
-             VALUES(?1,?2,'uncertain',?3,'2026-10-24T00:00:00Z','2026-10-24T00:00:01Z')",
-            rusqlite::params![policy_id, project_id, record],
-        )
-        .unwrap();
+    upsert_pilot_json(
+        catalog,
+        project_id,
+        policy_id,
+        &pilot_record_json(
+            project_id,
+            policy_id,
+            "legacy-pilot-run",
+            cost_usd,
+            usage_complete,
+        ),
+    );
 }
 
 fn insert_run(
@@ -247,6 +274,28 @@ fn insert_run(
                 policy_id,clips_analyzed,cost_usd)
              VALUES(?1,?2,'2026-10-25T00:00:00Z','2026-10-25T00:00:01Z',?3,?4,?5,0,?6)",
             rusqlite::params![run_id, project_id, status, stage, policy_id, cost_usd],
+        )
+        .unwrap();
+}
+
+fn insert_accounted_run(
+    catalog: &Catalog,
+    project_id: &str,
+    policy_id: &str,
+    run_id: &str,
+    status: &str,
+    stage: &str,
+    cost_usd: f64,
+) {
+    insert_run(
+        catalog, project_id, policy_id, run_id, status, stage, cost_usd,
+    );
+    catalog
+        .connection()
+        .unwrap()
+        .execute(
+            "UPDATE analysis_runs SET accounting_contract=?2 WHERE id=?1",
+            rusqlite::params![run_id, ANALYSIS_ACCOUNTING_SCHEMA_VERSION],
         )
         .unwrap();
 }
@@ -501,7 +550,7 @@ fn valid_historical_pilot_is_counted_once_after_initialization_then_runtime_run_
     // This is the required C ordering: initialize first, then create the
     // runtime-owned run row, then reserve. The fresh run must not be snapshotted
     // as new legacy uncertainty.
-    insert_run(
+    insert_accounted_run(
         &catalog,
         &project,
         policy_id,
@@ -1637,7 +1686,7 @@ fn mixed_pilot_and_bulk_operation_aggregates_do_not_mix_charges() {
     catalog
         .initialize_analysis_accounting_authority(&policy_authority(&project, policy_id, 2.0))
         .unwrap();
-    insert_run(
+    insert_accounted_run(
         &catalog,
         &project,
         policy_id,
@@ -1739,7 +1788,7 @@ fn frozen_legacy_evidence_is_included_once_in_whole_policy_projection() {
     catalog
         .initialize_analysis_accounting_authority(&policy_authority(&project, policy_id, 1.0))
         .unwrap();
-    insert_run(
+    insert_accounted_run(
         &catalog,
         &project,
         policy_id,
@@ -1786,7 +1835,7 @@ fn late_old_run_receipt_contributes_charge_without_overwriting_current_provenanc
     catalog
         .initialize_analysis_accounting_authority(&policy_authority(&project, policy_id, 2.0))
         .unwrap();
-    insert_run(
+    insert_accounted_run(
         &catalog,
         &project,
         policy_id,
@@ -1795,7 +1844,7 @@ fn late_old_run_receipt_contributes_charge_without_overwriting_current_provenanc
         "bulk",
         0.0,
     );
-    insert_run(
+    insert_accounted_run(
         &catalog,
         &project,
         policy_id,
@@ -2147,4 +2196,561 @@ fn raw_prompt_and_frame_bytes_never_enter_accounting_rows() {
     .to_string();
     assert!(!evidence.contains("PRIVATE_PROMPT_CANARY"));
     assert!(!evidence.contains("PRIVATE_FRAME_CANARY"));
+}
+
+#[test]
+fn post_initialization_untracked_run_and_pilot_floors_are_preserved_and_fail_closed() {
+    let (_directory, catalog, project) = fixture();
+    let policy_id = "post-init-untracked";
+    let source = "source";
+    let policy = project_policy(&project, policy_id, 2.0, source);
+    insert_authorization(&catalog, &policy, ANALYSIS_ACCOUNTING_SCHEMA_VERSION);
+    insert_run(
+        &catalog,
+        &project,
+        policy_id,
+        "frozen-legacy-run",
+        "completed",
+        "bulk",
+        0.30,
+    );
+    let first = catalog
+        .initialize_analysis_accounting_authority(&policy_authority(&project, policy_id, 2.0))
+        .unwrap();
+    assert!((first.legacy_uncertain_usage_reserve_usd - 0.30).abs() < 1e-12);
+    assert!(first.dispatch_stopped);
+
+    // An old unwired runtime writes after the authority snapshot. It has no
+    // accounting marker, so it is new unknown usage rather than frozen history.
+    insert_run(
+        &catalog,
+        &project,
+        policy_id,
+        "post-init-untracked-run",
+        "completed",
+        "bulk",
+        0.70,
+    );
+    insert_pilot(&catalog, &project, policy_id, json!(0.40), json!(false));
+    let second = catalog
+        .initialize_analysis_accounting_authority(&policy_authority(&project, policy_id, 2.0))
+        .unwrap();
+    assert!((second.legacy_uncertain_usage_reserve_usd - 0.30).abs() < 1e-12);
+    assert!(second.post_initialization_untracked_usage_reserve_usd >= 0.70);
+    assert!(second.post_initialization_untracked_evidence_count >= 2);
+    assert!(second.dispatch_stopped);
+    let error = catalog
+        .reserve_analysis_request(
+            &policy_context(&project, policy_id, "", "blocked", 2.0, source),
+            DEFAULT_MODEL,
+            "payload-a",
+            &bound(0.10),
+        )
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("dispatch is stopped"));
+
+    // Re-initializing does not append duplicate evidence.
+    let third = catalog
+        .initialize_analysis_accounting_authority(&policy_authority(&project, policy_id, 2.0))
+        .unwrap();
+    assert_eq!(
+        third.post_initialization_untracked_evidence_count,
+        second.post_initialization_untracked_evidence_count
+    );
+}
+
+#[test]
+fn reserve_persists_new_untracked_evidence_before_denying_admission() {
+    let (directory, catalog, project) = fixture();
+    let policy_id = "post-init-reserve-boundary";
+    let source = "source";
+    let policy = project_policy(&project, policy_id, 2.0, source);
+    insert_authorization(&catalog, &policy, ANALYSIS_ACCOUNTING_SCHEMA_VERSION);
+    let initial = catalog
+        .initialize_analysis_accounting_authority(&policy_authority(&project, policy_id, 2.0))
+        .unwrap();
+    assert!(!initial.dispatch_stopped);
+    let run_id = catalog
+        .begin_accounted_analysis_run(&project, policy_id, "pilot")
+        .unwrap();
+    insert_run(
+        &catalog,
+        &project,
+        policy_id,
+        "late-untracked-before-direct-reserve",
+        "completed",
+        "bulk",
+        0.70,
+    );
+    let context = policy_context(
+        &project,
+        policy_id,
+        &run_id,
+        "direct-reserve-intent",
+        2.0,
+        source,
+    );
+    let error = catalog
+        .reserve_analysis_request(&context, DEFAULT_MODEL, "payload-direct", &bound(0.10))
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("dispatch is stopped"));
+
+    let reopened = Catalog::open(directory.path().join("catalog.sqlite3")).unwrap();
+    let scope = analysis_policy_budget_scope_id(&project, policy_id);
+    let snapshot = reopened
+        .analysis_budget_snapshot(&scope)
+        .unwrap()
+        .expect("authority must survive reopen");
+    assert!(snapshot.dispatch_stopped);
+    assert!(snapshot.post_initialization_untracked_usage_reserve_usd >= 0.70);
+    assert!(snapshot.post_initialization_untracked_evidence_count >= 1);
+    assert!(
+        reopened
+            .list_analysis_requests(&project, Some(policy_id), 10)
+            .unwrap()
+            .is_empty(),
+        "a persisted denial must not create a reservation"
+    );
+
+    let before = snapshot.post_initialization_untracked_evidence_count;
+    let error = reopened
+        .reserve_analysis_request(&context, DEFAULT_MODEL, "payload-direct", &bound(0.10))
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("dispatch is stopped"));
+    let after = reopened.analysis_budget_snapshot(&scope).unwrap().unwrap();
+    assert_eq!(
+        after.post_initialization_untracked_evidence_count, before,
+        "repeated denials must not append duplicate evidence"
+    );
+}
+
+#[test]
+fn dispatch_persists_new_untracked_evidence_before_denying_marker() {
+    let (directory, catalog, project) = fixture();
+    let policy_id = "post-init-dispatch-boundary";
+    let source = "source";
+    let policy = project_policy(&project, policy_id, 2.0, source);
+    insert_authorization(&catalog, &policy, ANALYSIS_ACCOUNTING_SCHEMA_VERSION);
+    let initial = catalog
+        .initialize_analysis_accounting_authority(&policy_authority(&project, policy_id, 2.0))
+        .unwrap();
+    assert!(!initial.dispatch_stopped);
+    let run_id = catalog
+        .begin_accounted_analysis_run(&project, policy_id, "pilot")
+        .unwrap();
+    let context = policy_context(
+        &project,
+        policy_id,
+        &run_id,
+        "direct-dispatch-intent",
+        2.0,
+        source,
+    );
+    let reservation = catalog
+        .reserve_analysis_request(&context, DEFAULT_MODEL, "payload-dispatch", &bound(0.10))
+        .unwrap();
+    assert_eq!(reservation.lifecycle, AnalysisRequestLifecycle::Reserved);
+
+    insert_run(
+        &catalog,
+        &project,
+        policy_id,
+        "late-untracked-before-dispatch-marker",
+        "completed",
+        "bulk",
+        0.70,
+    );
+    let error = catalog
+        .mark_analysis_request_dispatched(&reservation.request_key)
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("dispatch is stopped"));
+
+    let reopened = Catalog::open(directory.path().join("catalog.sqlite3")).unwrap();
+    let scope = analysis_policy_budget_scope_id(&project, policy_id);
+    let snapshot = reopened
+        .analysis_budget_snapshot(&scope)
+        .unwrap()
+        .expect("authority must survive reopen");
+    assert!(snapshot.dispatch_stopped);
+    assert!(snapshot.post_initialization_untracked_usage_reserve_usd >= 0.70);
+    let request = reopened
+        .analysis_request(&reservation.request_key)
+        .unwrap()
+        .unwrap();
+    assert_eq!(request.lifecycle, AnalysisRequestLifecycle::Reserved);
+    assert!(request.dispatch_at.is_none());
+    let before = snapshot.post_initialization_untracked_evidence_count;
+    let error = reopened
+        .mark_analysis_request_dispatched(&reservation.request_key)
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("dispatch is stopped"));
+    assert_eq!(
+        reopened
+            .analysis_budget_snapshot(&scope)
+            .unwrap()
+            .unwrap()
+            .post_initialization_untracked_evidence_count,
+        before
+    );
+}
+
+#[test]
+fn duplicate_post_initialization_pilot_and_owned_run_count_once_but_independent_runs_count() {
+    let (_directory, catalog, project) = fixture();
+    let policy_id = "post-init-duplicate-owner";
+    let source = "source";
+    let policy = project_policy(&project, policy_id, 2.0, source);
+    insert_authorization(&catalog, &policy, ANALYSIS_ACCOUNTING_SCHEMA_VERSION);
+    catalog
+        .initialize_analysis_accounting_authority(&policy_authority(&project, policy_id, 2.0))
+        .unwrap();
+    upsert_pilot_json(
+        &catalog,
+        &project,
+        policy_id,
+        &pilot_record_json(
+            &project,
+            policy_id,
+            "duplicate-owner-run",
+            json!(0.30),
+            json!(false),
+        ),
+    );
+    insert_run(
+        &catalog,
+        &project,
+        policy_id,
+        "duplicate-owner-run",
+        "completed",
+        "pilot",
+        0.30,
+    );
+    insert_run(
+        &catalog,
+        &project,
+        policy_id,
+        "independent-unmarked-run",
+        "completed",
+        "bulk",
+        0.20,
+    );
+    let snapshot = catalog
+        .initialize_analysis_accounting_authority(&policy_authority(&project, policy_id, 2.0))
+        .unwrap();
+    assert!((snapshot.post_initialization_untracked_usage_reserve_usd - 0.50).abs() < 1e-12);
+    assert_eq!(snapshot.post_initialization_untracked_evidence_count, 2);
+    let count = snapshot.post_initialization_untracked_evidence_count;
+    let repeated = catalog
+        .initialize_analysis_accounting_authority(&policy_authority(&project, policy_id, 2.0))
+        .unwrap();
+    assert_eq!(repeated.post_initialization_untracked_evidence_count, count);
+    assert!((repeated.post_initialization_untracked_usage_reserve_usd - 0.50).abs() < 1e-12);
+}
+
+#[test]
+fn frozen_complete_pilot_credits_its_historical_floor_and_observes_only_increases() {
+    let (_directory, catalog, project) = fixture();
+    let policy_id = "post-init-pilot-increase";
+    let source = "source";
+    let policy = project_policy(&project, policy_id, 2.0, source);
+    insert_authorization(&catalog, &policy, ANALYSIS_ACCOUNTING_SCHEMA_VERSION);
+    insert_pilot(&catalog, &project, policy_id, json!(0.20), json!(true));
+    let initial = catalog
+        .initialize_analysis_accounting_authority(&policy_authority(&project, policy_id, 2.0))
+        .unwrap();
+    assert!((initial.legacy_confirmed_cost_usd - 0.20).abs() < 1e-12);
+    assert!(!initial.dispatch_stopped);
+
+    upsert_pilot_json(
+        &catalog,
+        &project,
+        policy_id,
+        &pilot_record_json(
+            &project,
+            policy_id,
+            "legacy-pilot-run",
+            json!(0.30),
+            json!(true),
+        ),
+    );
+    insert_run(
+        &catalog,
+        &project,
+        policy_id,
+        "legacy-pilot-run",
+        "completed",
+        "pilot",
+        0.30,
+    );
+    let increased = catalog
+        .initialize_analysis_accounting_authority(&policy_authority(&project, policy_id, 2.0))
+        .unwrap();
+    assert!((increased.legacy_confirmed_cost_usd - 0.20).abs() < 1e-12);
+    assert!((increased.post_initialization_untracked_usage_reserve_usd - 0.10).abs() < 1e-12);
+
+    upsert_pilot_json(
+        &catalog,
+        &project,
+        policy_id,
+        &pilot_record_json(
+            &project,
+            policy_id,
+            "legacy-pilot-run",
+            json!(0.40),
+            json!(true),
+        ),
+    );
+    let later = catalog
+        .initialize_analysis_accounting_authority(&policy_authority(&project, policy_id, 2.0))
+        .unwrap();
+    assert!((later.post_initialization_untracked_usage_reserve_usd - 0.20).abs() < 1e-12);
+
+    upsert_pilot_json(
+        &catalog,
+        &project,
+        policy_id,
+        &pilot_record_json(
+            &project,
+            policy_id,
+            "legacy-pilot-run",
+            json!(0.35),
+            json!(true),
+        ),
+    );
+    let lower = catalog
+        .initialize_analysis_accounting_authority(&policy_authority(&project, policy_id, 2.0))
+        .unwrap();
+    assert!((lower.post_initialization_untracked_usage_reserve_usd - 0.20).abs() < 1e-12);
+    let repeated = catalog
+        .initialize_analysis_accounting_authority(&policy_authority(&project, policy_id, 2.0))
+        .unwrap();
+    assert!((repeated.post_initialization_untracked_usage_reserve_usd - 0.20).abs() < 1e-12);
+}
+
+#[test]
+fn unchanged_unreadable_frozen_pilot_is_matched_by_fingerprint_not_added_again() {
+    let (_directory, catalog, project) = fixture();
+    let policy_id = "post-init-unreadable-fingerprint";
+    let source = "source";
+    let policy = project_policy(&project, policy_id, 2.0, source);
+    insert_authorization(&catalog, &policy, ANALYSIS_ACCOUNTING_SCHEMA_VERSION);
+    upsert_pilot_json(&catalog, &project, policy_id, "{not valid pilot json");
+    let initial = catalog
+        .initialize_analysis_accounting_authority(&policy_authority(&project, policy_id, 2.0))
+        .unwrap();
+    assert!(initial.dispatch_stopped);
+    assert!((initial.legacy_uncertain_usage_reserve_usd - 2.0).abs() < 1e-12);
+    let repeated = catalog
+        .initialize_analysis_accounting_authority(&policy_authority(&project, policy_id, 2.0))
+        .unwrap();
+    assert_eq!(repeated.post_initialization_untracked_evidence_count, 0);
+    assert_eq!(
+        repeated.post_initialization_untracked_usage_reserve_usd,
+        0.0
+    );
+    assert!((repeated.legacy_uncertain_usage_reserve_usd - 2.0).abs() < 1e-12);
+}
+
+#[test]
+fn pre_fingerprint_frozen_pilot_keeps_its_floor_and_matches_identity_updates() {
+    let (_directory, catalog, project) = fixture();
+    let policy_id = "post-init-pre-fingerprint";
+    let source = "source";
+    let policy = project_policy(&project, policy_id, 2.0, source);
+    insert_authorization(&catalog, &policy, ANALYSIS_ACCOUNTING_SCHEMA_VERSION);
+    insert_pilot(&catalog, &project, policy_id, json!(0.20), json!(false));
+    // Simulate a frozen authority written by the pre-fingerprint schema. Its
+    // immutable floor is retained; the refresh must match the current pilot by
+    // identity rather than silently zeroing or double-counting it.
+    let scope = analysis_policy_budget_scope_id(&project, policy_id);
+    let legacy_evidence = json!({
+        "entries": [{
+            "source": "analysis_run_pilots",
+            "policyId": policy_id,
+            "costUsd": 0.20,
+            "rawCostUsd": 0.20,
+            "usageComplete": false,
+            "status": "uncertain",
+            "runId": "legacy-pilot-run",
+            "runIds": ["legacy-pilot-run"]
+        }],
+        "present": true
+    });
+    catalog
+        .connection()
+        .unwrap()
+        .execute(
+            "INSERT INTO analysis_budget_authorities(
+                budget_scope_id,project_id,policy_id,policy_fingerprint,requested_provider,budget_usd,
+                legacy_confirmed_cost_usd,legacy_uncertain_usage_reserve_usd,legacy_usage_complete,
+                legacy_evidence_json,dispatch_stopped,stop_reason,created_at,updated_at)
+             VALUES(?1,?2,?3,?3,'openrouter',2.0,0.0,0.20,0,?4,1,?5,?6,?6)",
+            rusqlite::params![
+                scope,
+                project,
+                policy_id,
+                serde_json::to_string(&legacy_evidence).unwrap(),
+                LEGACY_UNKNOWN_USAGE_STOP_REASON,
+                crate::now(),
+            ],
+        )
+        .unwrap();
+
+    let unchanged = catalog
+        .initialize_analysis_accounting_authority(&policy_authority(&project, policy_id, 2.0))
+        .unwrap();
+    assert_eq!(unchanged.post_initialization_untracked_evidence_count, 0);
+    assert!((unchanged.legacy_uncertain_usage_reserve_usd - 0.20).abs() < 1e-12);
+
+    upsert_pilot_json(
+        &catalog,
+        &project,
+        policy_id,
+        &pilot_record_json(
+            &project,
+            policy_id,
+            "legacy-pilot-run",
+            json!(0.30),
+            json!(false),
+        ),
+    );
+    let changed = catalog
+        .initialize_analysis_accounting_authority(&policy_authority(&project, policy_id, 2.0))
+        .unwrap();
+    assert!((changed.post_initialization_untracked_usage_reserve_usd - 0.10).abs() < 1e-12);
+}
+
+#[test]
+fn incomplete_zero_post_initialization_pilot_is_not_zero_spend_proof() {
+    let (_directory, catalog, project) = fixture();
+    let policy_id = "post-init-zero-floor";
+    let source = "source";
+    let policy = project_policy(&project, policy_id, 2.0, source);
+    insert_authorization(&catalog, &policy, ANALYSIS_ACCOUNTING_SCHEMA_VERSION);
+    catalog
+        .initialize_analysis_accounting_authority(&policy_authority(&project, policy_id, 2.0))
+        .unwrap();
+    upsert_pilot_json(
+        &catalog,
+        &project,
+        policy_id,
+        &pilot_record_json(
+            &project,
+            policy_id,
+            "zero-unknown-pilot-run",
+            json!(0.0),
+            json!(false),
+        ),
+    );
+    insert_run(
+        &catalog,
+        &project,
+        policy_id,
+        "zero-unknown-pilot-run",
+        "completed",
+        "pilot",
+        0.0,
+    );
+    let snapshot = catalog
+        .initialize_analysis_accounting_authority(&policy_authority(&project, policy_id, 2.0))
+        .unwrap();
+    assert!(snapshot.dispatch_stopped);
+    assert!(
+        (snapshot.post_initialization_untracked_usage_reserve_usd - 2.0).abs() < 1e-12,
+        "incomplete zero cost must reserve the full conservative ceiling"
+    );
+    assert_eq!(snapshot.post_initialization_untracked_evidence_count, 1);
+}
+
+#[test]
+fn new_accounted_zero_request_cancelled_run_is_not_legacy_unknown() {
+    let (_directory, catalog, project) = fixture();
+    let policy_id = "accounted-zero-request";
+    let source = "source";
+    let policy = project_policy(&project, policy_id, 1.0, source);
+    insert_authorization(&catalog, &policy, ANALYSIS_ACCOUNTING_SCHEMA_VERSION);
+    catalog
+        .initialize_analysis_accounting_authority(&policy_authority(&project, policy_id, 1.0))
+        .unwrap();
+    let run_id = catalog
+        .begin_accounted_analysis_run(&project, policy_id, "pilot")
+        .unwrap();
+    catalog
+        .finish_analysis_run(
+            &run_id,
+            &crate::AnalysisRunOutcome {
+                status: "cancelled".into(),
+                stage_reached: "pilot".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let snapshot = catalog
+        .initialize_analysis_accounting_authority(&policy_authority(&project, policy_id, 1.0))
+        .unwrap();
+    assert!(!snapshot.dispatch_stopped);
+    assert_eq!(snapshot.post_initialization_untracked_evidence_count, 0);
+    assert_eq!(
+        snapshot.post_initialization_untracked_usage_reserve_usd,
+        0.0
+    );
+    assert!(catalog.analysis_runs(&project, 10).unwrap().iter().any(
+        |run| run.id == run_id && run.accounting_contract == ANALYSIS_ACCOUNTING_SCHEMA_VERSION
+    ));
+}
+
+#[test]
+fn cumulative_legacy_pilot_preserves_credit_across_replacement_runs_and_immutable_evidence() {
+    let (_directory, catalog, project) = fixture();
+    let policy_id = "cumulative-post-snapshot";
+    let policy = project_policy(&project, policy_id, 2.0, "source");
+    insert_authorization(&catalog, &policy, ANALYSIS_ACCOUNTING_SCHEMA_VERSION);
+    insert_pilot(&catalog, &project, policy_id, json!(0.2), json!(true));
+    catalog
+        .initialize_analysis_accounting_authority(&policy_authority(&project, policy_id, 2.0))
+        .unwrap();
+    for (run, cost, expected) in [("later-pilot", 0.3, 0.1), ("latest-pilot", 0.4, 0.2)] {
+        insert_run(&catalog, &project, policy_id, run, "failed", "pilot", cost);
+        upsert_pilot_json(
+            &catalog,
+            &project,
+            policy_id,
+            &pilot_record_json(&project, policy_id, run, json!(cost), json!(false)),
+        );
+        let snapshot = catalog
+            .initialize_analysis_accounting_authority(&policy_authority(&project, policy_id, 2.0))
+            .unwrap();
+        assert!((snapshot.confirmed_cost_usd - 0.2).abs() < 1e-12);
+        assert!(
+            (snapshot.post_initialization_untracked_usage_reserve_usd - expected).abs() < 1e-12
+        );
+        assert!(snapshot.dispatch_stopped);
+    }
+    let connection = catalog.connection().unwrap();
+    assert!(
+        connection
+            .execute(
+                "UPDATE analysis_untracked_usage_evidence SET reserve_usd=0",
+                []
+            )
+            .is_err()
+    );
+    assert!(
+        connection
+            .execute("DELETE FROM analysis_untracked_usage_evidence", [])
+            .is_err()
+    );
+    connection
+        .execute("DELETE FROM projects WHERE id=?1", [&project])
+        .unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM analysis_untracked_usage_evidence",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0
+    );
 }

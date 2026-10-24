@@ -297,6 +297,7 @@ export interface ModelInstallProgress {
 }
 
 export interface AnalysisRunRecord {
+  accountingContract: string;
   id: string;
   projectId: string;
   startedAt: string;
