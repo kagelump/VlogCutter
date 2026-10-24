@@ -257,7 +257,12 @@ pub fn model_spec(id: &str) -> Option<&'static ModelSpec> {
 }
 
 /// One analysis request, independent of transport.
-#[derive(Debug, Clone, Default, PartialEq)]
+///
+/// `Serialize`/`Deserialize` is used only for explicit operator-supplied
+/// recovery payload files. Request accounting persists a digest, never this
+/// prompt or frame content.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct VlmRequest {
     pub prompt: String,
     /// Frames as `data:` URIs, already base64-encoded.

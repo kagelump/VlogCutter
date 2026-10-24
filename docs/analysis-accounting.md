@@ -4,9 +4,10 @@ This document describes the canonical persistence foundation and the runtime
 integrations added for issue #122. The authorized run-policy pilot, bulk
 observation, policy-bound moment discovery, chronology suggestions and label
 consolidation, including transport and domain-validation fallback, are wired
-through the accounted provider boundary. CLI/desktop inspection, reconciliation
-and explicit targeted-retry commands remain follow-up work; issue #122 stays open
-until those workflows and restart acceptance are complete.
+through the accounted provider boundary. CLI inspection, typed reconciliation
+and explicitly authorized targeted retry are now thin adapters over the same
+canonical owner. Process-interruption recovery is verified with synthetic
+transports; no live OpenRouter/native acceptance is claimed by this slice.
 
 ## Canonical owner
 
@@ -307,12 +308,116 @@ reservations and uncertain-usage reserves. Actual provider/model/generation
 identity is read exclusively from receipt evidence; missing identity stays
 `None`/empty rather than being inferred from the requested route.
 
-## Remaining #122 integration
+## Operator recovery commands
 
-The two previously direct paid paths now use the accounted operation boundary.
-CLI/desktop/HTTP inspection, reconciliation, explicit targeted retry and recovery
-workflows are still follow-up work: the core inspect/reconcile/retry APIs exist,
-but no operator-facing command is added by this slice. Any adapter-specific batch
-helper that reaches a paid transmission without the real owned run id,
-source/payload identity and whole-authority context must also be wired before
-issue #122 is considered complete. Issue #122 therefore stays open.
+The CLI exposes the canonical owner without a second ledger or scheduler:
+
+```bash
+rcdvlog --catalog /absolute/project/catalog.sqlite3 analyze accounting inspect \
+  --project <project-id> --policy <policy-id> --operation pilot \
+  --run <run-id> --request <request-key> --limit 100 --offset 0
+
+rcdvlog --catalog /absolute/project/catalog.sqlite3 analyze accounting reconcile \
+  --project <project-id> --request <request-key> \
+  --receipt-file /absolute/receipt-evidence.json
+
+rcdvlog --catalog /absolute/project/catalog.sqlite3 analyze accounting reconcile \
+  --project <project-id> --request <request-key> --local-no-upload \
+  --failure-code local_extraction_failed
+
+rcdvlog --catalog /absolute/project/catalog.sqlite3 analyze accounting reconcile \
+  --project <project-id> --request <request-key> --unknown-outcome
+
+rcdvlog --catalog /absolute/project/catalog.sqlite3 analyze accounting retry-authorize \
+  --project <project-id> --request <request-key>
+
+rcdvlog --catalog /absolute/project/catalog.sqlite3 analyze accounting targeted-retry-dispatch \
+  --project <project-id> --request <request-key> \
+  --expected-next-attempt-epoch 1 \
+  --payload-file /absolute/original-vlm-request.json
+```
+
+`inspect` opens SQLite read-only and filters in exact SQL scope. Request/run
+filters return only their matching budget scope or scopes. It returns canonical
+budget snapshots with confirmed, active-reserved and uncertain-usage
+amounts separate, plus each selected request's append-only events, provider
+receipts and full prior-attempt history. Actual provider/model/generation values
+come only from immutable receipt evidence. Prompts, frame bytes and provider
+bodies are not accounting columns.
+
+`reconcile` performs no provider I/O and accepts exactly one evidence mode.
+`--receipt-file` imports trusted typed user-provided receipt metadata bounded to
+256 KiB.
+`--local-no-upload` is accepted only when the durable dispatch marker is absent;
+the failure category must itself be typed local evidence. `--unknown-outcome`
+retains the conservative reserve when evidence is insufficient. Repeating the
+same receipt or failure evidence is idempotent and does not grow history. A
+receipt can complete an interrupted request but can never invent pilot
+capability/domain validation. When the request belongs to the currently recorded
+pilot run, the existing pilot projection is refreshed conservatively: known
+usage is kept, a crashed `running` pilot becomes failed/review-required if usage
+is settled or uncertain if it is not, and a late receipt from an older run does
+not replace current-run provenance.
+
+`retry-authorize` durably authorizes exactly the particular prior request's next
+epoch. It is deliberately separate from paid dispatch and cannot be replaced by
+a generic force flag. `targeted-retry-dispatch` then requires the expected epoch,
+the exact original `VlmRequest` JSON payload file and a real new owned analysis
+run. The payload file format is the camel-case `VlmRequest` shape:
+
+```json
+{"prompt":"...","frames":["data:image/jpeg;base64,..."],"schema":{"type":"object"}}
+```
+
+The operator must supply the original payload; it cannot be reconstructed from
+the stored fingerprint. Before resolving credentials or constructing a
+transport, the core re-proves project/request ownership, the latest attempt and
+durable authorization, the expected next epoch (four attempts including the
+first), the unchanged policy/source/vocabulary when policy-owned, and the exact
+payload/model fingerprints. Both fresh and targeted admission call the same
+canonical owner validator for active authorization/accounting contract,
+project, policy/provider, model allowlist, approved source scope, whole budget
+and real running owned run. The production wrapper rejects a requested route
+other than its actual OpenRouter route before constructing a client. After
+`provider.prepare` and immediately before the dispatch marker, the current
+policy/source/vocabulary proof is re-run; a provider that mutates local evidence
+is denied with zero transmission and a marker-absent release. It then compares
+the current provider-owned full cost bound fingerprint to the immutable prior
+contract. Any mismatch fails closed before a new run or paid call. Admission
+reuses the original
+`attempt_base_key`, consumes only the authorized next epoch atomically, retains
+all earlier confirmed and uncertain usage, and applies the same in-flight cap
+and whole-budget ceiling. A stale/concurrent consumer is denied.
+
+The targeted retry performs exactly one original-model transmission through
+`AccountedVlmProvider`; it never repeats the original domain's whole fallback
+chain. The returned provider body is present only in that command's JSON result.
+It is never stored in SQLite, events, logs, human actions or diagnostics, and it
+is not automatically applied to clip fields, labels, chronology, moments or
+analysis caches. Domain review remains an explicit separate action. A thin
+cancellation-aware core entry point checks before local preparation, before the
+quote/reservation/prepare phases and again through the existing accounted
+boundary before the wire. Cancellation before the dispatch marker releases only
+the absent-marker reservation; after the wire, known receipts are retained and
+unknown usage remains uncertain.
+
+## Production transport call-site audit
+
+Every production paid path reaches a raw `VlmProvider::analyze` only through
+`AccountedVlmProvider`: run-policy pilots and bulk observation, bulk/authorized
+moment discovery, chronology suggestions, label consolidation and the new
+targeted-retry entry point. The moments unaccounted pipeline is compiled only
+under `#[cfg(test)]`; synthetic fake providers in domain unit tests are not
+production call sites. This slice adds no alternate network implementation or
+credential/base-URL test flag.
+
+## Remaining acceptance boundary
+
+The canonical implementation and offline process-interruption tests are
+complete for this slice. Live OpenRouter streaming/native interruption and
+provider-receipt retrieval are not claimed by these tests: receipt evidence is
+explicitly user-provided, and inspection/reconciliation never query or resend a
+potentially completed paid request. Any future adapter-specific batch helper
+that reaches a paid transmission without a real owned run id, source/payload
+identity and whole-authority context must be wired through this owner before it
+can be a supported paid path.

@@ -202,6 +202,7 @@ fn executable() -> Result<CliExecutable> {
             ("prepare.calibration.v1".into(), 1),
             ("moments.discovery.v1".into(), 1),
             ("prepare.evidence.v1".into(), 1),
+            ("analysis.accounting.recovery.v1".into(), 1),
         ]),
         commands,
     })

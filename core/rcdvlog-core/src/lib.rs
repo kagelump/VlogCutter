@@ -75,17 +75,22 @@ use analysis::vlm_store::{
 use analysis::whisper_engine::{WhisperEngine, read_pcm};
 
 pub use analysis::accounting::{
-    ANALYSIS_ACCOUNTING_SCHEMA_VERSION, AccountedVlmProvider, AnalysisAccountingAggregate,
-    AnalysisAccountingContext, AnalysisAccountingReport, AnalysisBudgetAuthorityContext,
-    AnalysisBudgetExhausted, AnalysisBudgetSnapshot, AnalysisOperationAccountingSummary,
-    AnalysisOperationAttemptProjection, AnalysisProviderReceipt, AnalysisRequestEvent,
-    AnalysisRequestLifecycle, AnalysisRequestReconciliation, AnalysisRequestRecord,
-    AnalysisRetryAuthorization, CHRONOLOGY_SUGGESTIONS_OPERATION, LABEL_CONSOLIDATION_OPERATION,
-    LEGACY_UNKNOWN_USAGE_STOP_REASON, MAX_IN_FLIGHT_REQUESTS_PER_BUDGET_AUTHORITY,
-    MAX_REQUEST_ATTEMPTS, ProviderReceiptEvidence, UNTRACKED_POST_INITIALIZATION_USAGE_STOP_REASON,
-    analysis_operation_budget_scope_id, analysis_policy_budget_scope_id,
-    analysis_request_cost_bound_fingerprint, analysis_request_payload_fingerprint,
-    bounded_failure_code,
+    ANALYSIS_ACCOUNTING_SCHEMA_VERSION, ANALYSIS_RECOVERY_SCHEMA_VERSION, AccountedVlmProvider,
+    AnalysisAccountingAggregate, AnalysisAccountingContext, AnalysisAccountingInspection,
+    AnalysisAccountingInspectionSelection, AnalysisAccountingReport,
+    AnalysisAccountingRequestInspection, AnalysisBudgetAuthorityContext, AnalysisBudgetExhausted,
+    AnalysisBudgetSnapshot, AnalysisOperationAccountingSummary, AnalysisOperationAttemptProjection,
+    AnalysisProviderReceipt, AnalysisRequestEvent, AnalysisRequestLifecycle,
+    AnalysisRequestReconciliation, AnalysisRequestRecord, AnalysisRequestRecoveryReport,
+    AnalysisRetryAuthorization, AnalysisTargetedRetryAdmission, CHRONOLOGY_SUGGESTIONS_OPERATION,
+    LABEL_CONSOLIDATION_OPERATION, LEGACY_UNKNOWN_USAGE_STOP_REASON,
+    MAX_IN_FLIGHT_REQUESTS_PER_BUDGET_AUTHORITY, MAX_PROVIDER_RECEIPT_EVIDENCE_BYTES,
+    MAX_REQUEST_ATTEMPTS, MAX_TARGETED_RETRY_PAYLOAD_BYTES, ProviderReceiptEvidence,
+    TargetedAnalysisRetryProviderResponse, TargetedAnalysisRetryReport,
+    UNTRACKED_POST_INITIALIZATION_USAGE_STOP_REASON, analysis_operation_budget_scope_id,
+    analysis_policy_budget_scope_id, analysis_request_cost_bound_fingerprint,
+    analysis_request_payload_fingerprint, bounded_failure_code,
+    read_provider_receipt_evidence_file, read_targeted_retry_payload_file,
 };
 pub use analysis::chronology_suggestions::{
     ChronologyEvidenceRequest, ChronologySuggestion, EvidenceFrame, PairMatch,

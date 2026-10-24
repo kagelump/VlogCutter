@@ -721,23 +721,70 @@ for 2–8 selected clips, using at most two selected proxy frames per clip. It
 returns coverage diagnostics and checkable conflicts against the current solved
 chronology. The result is stored separately from chronology facts and keyed by
 the facts revision, proxy frames, and model policy; repeating a completed
-request returns the saved result without another provider call. A request left
-`running` by an error or interrupted process is refused on retry to avoid an
-accidental duplicate charge. There is currently no automatic recovery or retry
-path for such reservations; they require manual catalog repair.
+request returns the saved result without another provider call. Each actual
+transmission is admitted by the canonical accounting owner. An interrupted or
+uncertain request must be inspected and reconciled rather than resent blindly.
+
+### Analysis accounting inspection and recovery
+
+```bash
+rcdvlog --catalog /absolute/project/catalog.sqlite3 analyze accounting inspect \
+  --project <project-id> --operation <operation> --request <request-key>
+rcdvlog --catalog /absolute/project/catalog.sqlite3 analyze accounting reconcile \
+  --project <project-id> --request <request-key> \
+  --receipt-file /absolute/trusted-receipt.json
+rcdvlog --catalog /absolute/project/catalog.sqlite3 analyze accounting reconcile \
+  --project <project-id> --request <request-key> --local-no-upload \
+  --failure-code local_extraction_failed
+rcdvlog --catalog /absolute/project/catalog.sqlite3 analyze accounting reconcile \
+  --project <project-id> --request <request-key> --unknown-outcome
+rcdvlog --catalog /absolute/project/catalog.sqlite3 analyze accounting retry-authorize \
+  --project <project-id> --request <request-key>
+rcdvlog --catalog /absolute/project/catalog.sqlite3 analyze accounting targeted-retry-dispatch \
+  --project <project-id> --request <request-key> \
+  --expected-next-attempt-epoch 1 \
+  --payload-file /absolute/original-vlm-request.json
+```
+
+`inspect` is read-only and supports project, policy, operation, run and request
+selection plus bounded pagination. When a request or run is selected, only its
+matching budget scope or scopes are returned rather than every authority in the
+project. It reports canonical confirmed, active reservation and
+unresolved-uncertainty totals separately, together with
+append-only events, provider receipts, prior attempt epochs and provider-derived
+actual model/generation provenance. It never emits prompt, frame or response-body
+content. Reconciliation is offline and takes exactly one trusted evidence mode:
+a typed receipt file, a marker-absent local no-upload conclusion, or an explicit
+unknown outcome. Repeated identical reconciliation is idempotent. A reconciled
+pilot is projected conservatively from its existing validation/history and does
+not become a capability pass.
+
+Targeted retry has two mandatory steps: durable `retry-authorize` for that
+particular request and epoch, then a separate `targeted-retry-dispatch` naming
+the expected epoch and the exact original camel-case `VlmRequest` JSON file. The
+stored payload digest cannot reconstruct missing bytes. The core rechecks
+project, policy/source/vocabulary, operation, requested route/model, exact
+payload, current provider cost-bound contract and attempt bounds before
+credentials or transport. It reuses the prior immutable attempt base, retains all
+earlier costs/uncertainty, allows at most four attempts including the first and
+rejects stale/concurrent epoch consumers. Only one original-model transmission
+is made; no whole-chain retry or generic force path exists. The returned body is
+in that command's JSON only and is not persisted or applied automatically.
 
 `analyze missing` accepts `--primary-model`, repeatable `--allow-model`, and
 `--no-fallback`. The core validates this policy against its local model registry
 before resolving credentials or constructing a network provider. The desktop
-run request uses the same fields. The run ceiling is checked after each
-completed request: workers already in flight are allowed to finish, so the
-final spend can exceed the ceiling by the sum of those outstanding requests;
-there is no fixed dollar bound because providers do not offer a reliable
-pre-request charge cap. Budgets must be finite and greater than zero; zero and
-negative values are rejected before credentials or provider setup. The report
-records returned usage for successful and domain-rejected requests, including
-fallback attempts. A request with a failed provider attempt marks usage
-incomplete; known usage is retained and no cost is inferred for failed attempts.
+run request uses the same fields. Each concurrent worker/process atomically reserves the complete conservative
+provider-owned request bound in project SQLite before transport. A request is
+admitted only when that full bound fits the remaining whole-policy exposure; the
+in-flight cap is four. This prevents independent remaining-spend checks from
+oversubscribing the same budget. Provider-returned cost above the admitted bound
+is retained as confirmed evidence and durably stops further dispatch. Budgets
+must be finite and greater than zero; zero and negative values are rejected
+before credentials or provider setup. The report records returned usage for
+successful and domain-rejected requests, including fallback attempts. A request
+with a failed provider attempt retains honest uncertainty; known usage is kept
+and no cost is inferred for failed attempts.
 Per-clip analysis records persist `attemptedModels` and `usageComplete` with the
 model, attempt count, and returned usage. Existing single-attempt rows backfill
 their serving model; prior retry histories are not reconstructable, so those

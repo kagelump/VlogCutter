@@ -11,7 +11,8 @@ use super::model::{
     AnalysisAccountingReport, AnalysisBudgetAuthorityContext, AnalysisBudgetSnapshot,
     AnalysisOperationAttemptProjection, AnalysisProviderReceipt, AnalysisRequestEvent,
     AnalysisRequestLifecycle, AnalysisRequestReconciliation, AnalysisRequestRecord,
-    AnalysisRetryAuthorization, ProviderReceiptEvidence, bounded_failure_code,
+    AnalysisRetryAuthorization, AnalysisTargetedRetryAdmission, ProviderReceiptEvidence,
+    bounded_failure_code,
 };
 use super::store;
 use crate::Catalog;
@@ -44,6 +45,48 @@ impl Catalog {
         store::reserve(
             &mut self.connection()?,
             context,
+            model,
+            payload_fingerprint,
+            cost_bound,
+        )
+    }
+
+    /// Read-only proof of a targeted retry's exact original payload/model and
+    /// current provider quote against its durable prior authorization.
+    pub(crate) fn validate_analysis_targeted_retry_claim(
+        &self,
+        admission: &AnalysisTargetedRetryAdmission,
+        model: &str,
+        payload_fingerprint: &str,
+        cost_bound_fingerprint: &str,
+    ) -> Result<()> {
+        store::validate_targeted_retry_claim(
+            &self.connection()?,
+            &store::TargetedRetryClaim {
+                project_id: &admission.project_id,
+                prior_request_key: &admission.prior_request_key,
+                expected_next_attempt_epoch: admission.expected_next_attempt_epoch,
+                run_id: Some(&admission.run_id),
+                model,
+                payload_fingerprint,
+                cost_bound_fingerprint,
+            },
+        )?;
+        Ok(())
+    }
+
+    /// Atomically consume the particular durable retry authorization and append
+    /// exactly the expected next epoch under the prior immutable attempt base.
+    pub(crate) fn reserve_analysis_request_targeted_retry(
+        &self,
+        admission: &AnalysisTargetedRetryAdmission,
+        model: &str,
+        payload_fingerprint: &str,
+        cost_bound: &AnalysisRequestCostBound,
+    ) -> Result<AnalysisRequestRecord> {
+        store::reserve_targeted_retry(
+            &mut self.connection()?,
+            admission,
             model,
             payload_fingerprint,
             cost_bound,
@@ -179,6 +222,15 @@ impl Catalog {
         run_id: &str,
     ) -> Result<Vec<String>> {
         store::request_keys_for_run(&self.connection()?, project_id, operation, run_id)
+    }
+
+    /// Every immutable attempt under a request's `attempt_base_key`, oldest
+    /// first. This is the prior-retry-epoch history used by inspection.
+    pub fn analysis_attempt_history(
+        &self,
+        request_key: &str,
+    ) -> Result<Vec<AnalysisRequestRecord>> {
+        store::attempt_history(&self.connection()?, request_key)
     }
 
     pub fn analysis_request_events(&self, request_key: &str) -> Result<Vec<AnalysisRequestEvent>> {

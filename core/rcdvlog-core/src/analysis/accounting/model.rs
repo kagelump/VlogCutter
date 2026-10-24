@@ -24,6 +24,12 @@ pub const OPERATION_REQUESTED_PROVIDER: &str = "openrouter";
 pub const MAX_IN_FLIGHT_REQUESTS_PER_BUDGET_AUTHORITY: usize = 4;
 /// Explicit attempts per exact request identity, including the first attempt.
 pub const MAX_REQUEST_ATTEMPTS: u32 = 4;
+/// Bound for an operator-supplied original `VlmRequest` JSON file. The payload
+/// is never persisted by this recovery path; this only prevents an unbounded
+/// read while proving an exact prior payload fingerprint.
+pub const MAX_TARGETED_RETRY_PAYLOAD_BYTES: u64 = 32 * 1024 * 1024;
+/// Provider receipt evidence is small metadata; parse it from a bounded file.
+pub const MAX_PROVIDER_RECEIPT_EVIDENCE_BYTES: u64 = 256 * 1024;
 pub const LEGACY_UNKNOWN_USAGE_STOP_REASON: &str =
     "legacy_usage_unknown_requires_fresh_authorization";
 /// A runtime in the pre-C window wrote run/pilot spending after the canonical
@@ -559,6 +565,41 @@ pub enum AnalysisRequestReconciliation {
     /// Conservatively retain an unknown outcome for a potentially uploaded
     /// request. This never marks the request as a no-upload release.
     UncertainOutcome { failure_code: String },
+}
+
+/// Request-bound admission identity for one explicit targeted retry. It
+/// intentionally carries no invented intended-attempt key, payload or policy
+/// context: the canonical prior request supplies those immutable values and the
+/// admission transaction proves the expected next epoch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnalysisTargetedRetryAdmission {
+    pub project_id: String,
+    pub prior_request_key: String,
+    pub expected_next_attempt_epoch: u32,
+    pub run_id: String,
+}
+
+impl AnalysisTargetedRetryAdmission {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            !self.project_id.trim().is_empty(),
+            "targeted retry project is required"
+        );
+        ensure!(
+            !self.prior_request_key.trim().is_empty(),
+            "targeted retry prior request key is required"
+        );
+        ensure!(
+            !self.run_id.trim().is_empty(),
+            "targeted retry run id is required"
+        );
+        ensure!(
+            self.expected_next_attempt_epoch > 0,
+            "targeted retry must name the explicit next attempt epoch"
+        );
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
