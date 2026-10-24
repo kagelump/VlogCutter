@@ -2263,6 +2263,98 @@ fn post_initialization_untracked_run_and_pilot_floors_are_preserved_and_fail_clo
 }
 
 #[test]
+fn operation_refresh_combines_cache_and_unmarked_run_floors() {
+    let (_directory, catalog, project) = fixture();
+    let authority = operation_authority(&project, CHRONOLOGY_SUGGESTIONS_OPERATION, 1.0);
+    let first = catalog
+        .initialize_analysis_accounting_authority(&authority)
+        .unwrap();
+    assert!(!first.dispatch_stopped);
+
+    catalog
+        .connection()
+        .unwrap()
+        .execute(
+            "INSERT INTO analysis_chronology_suggestions(
+                request_key,project_id,facts_revision,status,result_json,model,attempts,
+                cost_usd,prompt_tokens,completion_tokens,latency_ms,created_at,updated_at)
+             VALUES('late-cache',?1,'rev','completed',?2,'old-model',1,0.005,1,1,1,?3,?3)",
+            rusqlite::params![
+                project,
+                r#"{"provenance":{"usageComplete":true}}"#,
+                crate::now()
+            ],
+        )
+        .unwrap();
+    insert_run(
+        &catalog,
+        &project,
+        "",
+        "late-unmarked-operation-run",
+        "completed",
+        CHRONOLOGY_SUGGESTIONS_OPERATION,
+        0.05,
+    );
+
+    let second = catalog
+        .initialize_analysis_accounting_authority(&authority)
+        .unwrap();
+    assert!(second.dispatch_stopped);
+    assert!(
+        second.post_initialization_untracked_usage_reserve_usd >= 0.055 - 1e-12,
+        "both cache and run evidence must contribute"
+    );
+    assert!(second.post_initialization_untracked_evidence_count >= 2);
+    let count = second.post_initialization_untracked_evidence_count;
+    let repeated = catalog
+        .initialize_analysis_accounting_authority(&authority)
+        .unwrap();
+    assert_eq!(repeated.post_initialization_untracked_evidence_count, count);
+}
+
+#[test]
+fn frozen_unmarked_operation_run_observes_later_cost_increase_without_duplicate_credit() {
+    let (_directory, catalog, project) = fixture();
+    let authority = operation_authority(&project, LABEL_CONSOLIDATION_OPERATION, 2.0);
+    insert_run(
+        &catalog,
+        &project,
+        "",
+        "frozen-operation-run",
+        "completed",
+        LABEL_CONSOLIDATION_OPERATION,
+        0.10,
+    );
+    let first = catalog
+        .initialize_analysis_accounting_authority(&authority)
+        .unwrap();
+    assert!(first.dispatch_stopped);
+    assert!((first.legacy_uncertain_usage_reserve_usd - 0.10).abs() < 1e-12);
+
+    catalog
+        .connection()
+        .unwrap()
+        .execute(
+            "UPDATE analysis_runs SET cost_usd=0.30 WHERE id='frozen-operation-run'",
+            [],
+        )
+        .unwrap();
+    let increased = catalog
+        .initialize_analysis_accounting_authority(&authority)
+        .unwrap();
+    assert!(
+        (increased.post_initialization_untracked_usage_reserve_usd - 0.20).abs() < 1e-12,
+        "the frozen credit must count once and only the later delta appended"
+    );
+    let count = increased.post_initialization_untracked_evidence_count;
+    let repeated = catalog
+        .initialize_analysis_accounting_authority(&authority)
+        .unwrap();
+    assert_eq!(repeated.post_initialization_untracked_evidence_count, count);
+    assert!((repeated.post_initialization_untracked_usage_reserve_usd - 0.20).abs() < 1e-12);
+}
+
+#[test]
 fn reserve_persists_new_untracked_evidence_before_denying_admission() {
     let (directory, catalog, project) = fixture();
     let policy_id = "post-init-reserve-boundary";

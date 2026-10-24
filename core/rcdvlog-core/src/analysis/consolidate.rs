@@ -4,11 +4,16 @@
 //! strings and counts. Human labels are absent because `analysis_labels` is the
 //! sole input and sole ownership boundary.
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use chrono::{SecondsFormat, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
+use crate::AnalysisOperationAccountingSummary;
+use crate::analysis::accounting::stable_operation_digest;
+use crate::analysis::provider::{
+    DEFAULT_MODEL, ProviderChain, ProviderFailure, VlmProvider, VlmRequest,
+};
 use crate::analysis::vlm_store::normalize_label;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -31,8 +36,149 @@ pub struct ConsolidationReport {
     pub remapped_assets: usize,
     pub vocabulary_size: usize,
     pub mappings: Vec<LabelMapping>,
+    /// Actual serving model from the canonical receipt when one exists. Missing
+    /// receipt identity remains empty rather than being inferred from the
+    /// requested route.
     pub model: String,
+    /// Confirmed current-run ledger cost. Never an admission reservation.
     pub cost_usd: f64,
+    /// Separately retained provider-returned/unknown usage exposure.
+    #[serde(default)]
+    pub uncertain_usage_reserve_usd: f64,
+    #[serde(default)]
+    pub active_reserved_cost_usd: f64,
+    #[serde(default)]
+    pub committed_or_reserved_usd: f64,
+    #[serde(default)]
+    pub usage_complete: bool,
+    #[serde(default)]
+    pub run_id: String,
+    #[serde(default)]
+    pub request_keys: Vec<String>,
+    #[serde(default)]
+    pub actual_provider: Option<String>,
+    #[serde(default)]
+    pub actual_model: Option<String>,
+    #[serde(default)]
+    pub provider_generation_id: Option<String>,
+}
+
+/// Local label-consolidation request preparation. The model sees only AI-authored
+/// proposals; the fingerprint freezes exactly that source before any paid work.
+pub struct PreparedConsolidation {
+    pub proposals: Vec<LabelProposal>,
+    pub source_fingerprint: String,
+    pub request: VlmRequest,
+    pub request_identity: String,
+}
+
+pub fn prepare(
+    connection: &Connection,
+    project_id: &str,
+    chain: &ProviderChain,
+) -> Result<Option<PreparedConsolidation>> {
+    let proposals = proposals(connection, project_id)?;
+    if proposals.is_empty() {
+        return Ok(None);
+    }
+    let source_fingerprint = source_fingerprint(connection, project_id)?;
+    let request = VlmRequest {
+        prompt: consolidation_prompt(&proposals),
+        frames: Vec::new(),
+        schema: mapping_schema(proposals.len()),
+    };
+    // The run id and process-local breaker state are deliberately absent: a
+    // restart cannot manufacture a fresh request identity or paid permission.
+    let request_identity = stable_operation_digest(&serde_json::json!({
+        "sourceFingerprint": source_fingerprint,
+        "primaryModel": chain.primary_model(),
+        "allowedModels": chain.allowed_models(),
+        "allowFallback": chain.allows_fallback(),
+        "prompt": request.prompt,
+        "schema": request.schema,
+        "frames": request.frames,
+    }))?;
+    Ok(Some(PreparedConsolidation {
+        proposals,
+        source_fingerprint,
+        request,
+        request_identity,
+    }))
+}
+
+pub fn source_fingerprint(connection: &Connection, project_id: &str) -> Result<String> {
+    stable_operation_digest(&serde_json::json!({
+        "projectId": project_id,
+        "proposals": proposals(connection, project_id)?,
+    }))
+}
+
+/// Re-read the AI-label source after local provider preparation or after the
+/// paid response. This never writes human labels and never holds a database
+/// transaction across transport I/O.
+pub fn validate_source_unchanged(
+    connection: &Connection,
+    project_id: &str,
+    expected_source_fingerprint: &str,
+) -> Result<()> {
+    ensure!(
+        source_fingerprint(connection, project_id)? == expected_source_fingerprint,
+        "AI label proposals changed before the consolidation mapping could be applied"
+    );
+    Ok(())
+}
+
+/// Runs the transport chain and the domain-validation fallback. Each actual call
+/// is admitted independently by the accounted provider. Cancellation after the
+/// primary attempt stops before any fallback transmission.
+pub fn run_with_cancel(
+    provider: &dyn VlmProvider,
+    chain: &ProviderChain,
+    request: &VlmRequest,
+    proposals: &[LabelProposal],
+    is_cancelled: &mut dyn FnMut() -> bool,
+) -> Result<Vec<LabelMapping>> {
+    let first = chain.analyze_with_cancel(provider, request, is_cancelled)?;
+    match parse_mapping(&first.response.body, proposals) {
+        Ok(mapping) => Ok(mapping),
+        Err(default_error) if first.response.model == DEFAULT_MODEL => {
+            chain.record_default_failure();
+            let fallback_model = chain.fallback_model().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "default mapping was invalid ({default_error:#}); no authorized fallback model remains"
+                )
+            })?;
+            if is_cancelled() {
+                return Err(ProviderFailure::cancelled().into());
+            }
+            let fallback = provider.analyze_with_cancel(fallback_model, request, is_cancelled)?;
+            parse_mapping(&fallback.body, proposals).with_context(|| {
+                format!("default mapping was invalid ({default_error:#}); fallback was invalid")
+            })
+        }
+        Err(error) => Err(error).context("validate consolidation mapping"),
+    }
+}
+
+/// Apply the canonical confirmed/reserved/uncertain projection to the report DTO
+/// without creating another balance calculation.
+pub fn with_accounting_projection(
+    mut report: ConsolidationReport,
+    summary: &AnalysisOperationAccountingSummary,
+    run_id: &str,
+) -> ConsolidationReport {
+    report.model = summary.actual_model.clone().unwrap_or_default();
+    report.cost_usd = summary.confirmed_cost_usd;
+    report.uncertain_usage_reserve_usd = summary.uncertain_usage_reserve_usd;
+    report.active_reserved_cost_usd = summary.active_reserved_cost_usd;
+    report.committed_or_reserved_usd = summary.committed_or_reserved_usd;
+    report.usage_complete = summary.usage_complete;
+    report.run_id = run_id.to_string();
+    report.request_keys = summary.request_keys.clone();
+    report.actual_provider = summary.actual_provider.clone();
+    report.actual_model = summary.actual_model.clone();
+    report.provider_generation_id = summary.provider_generation_id.clone();
+    report
 }
 
 pub fn proposals(connection: &Connection, project_id: &str) -> Result<Vec<LabelProposal>> {

@@ -89,6 +89,7 @@ pub(crate) fn initialize_authority(
             &transaction,
             &context.project_id,
             &context.policy_id,
+            &context.operation,
             context.budget_usd,
         )?;
         let dispatch_stopped = !legacy.usage_complete;
@@ -476,6 +477,60 @@ pub(crate) fn mark_uncertain(
     Ok(record)
 }
 
+/// Link a result-cache identity to the canonical paid requests that produced
+/// it. The event is append-only and never itself authorizes a transmission; it
+/// lets later compatibility refresh distinguish a ledger-owned cache row from
+/// genuinely untracked legacy work.
+pub(crate) fn associate_cache_result(
+    connection: &Connection,
+    request_key: &str,
+    cache_key: &str,
+) -> Result<()> {
+    ensure!(
+        !request_key.trim().is_empty() && !cache_key.trim().is_empty(),
+        "cache association requires request and cache identities"
+    );
+    let owned: bool = connection.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM analysis_request_reservations AS request
+            JOIN analysis_chronology_suggestions AS cache ON cache.request_key=?2
+            WHERE request.request_key=?1 AND request.operation=?3 AND request.run_id<>''
+              AND request.project_id=cache.project_id AND cache.status='completed'
+              AND json_extract(cache.result_json,'$.provenance.runId')=request.run_id
+              AND EXISTS(SELECT 1 FROM json_each(cache.result_json,'$.provenance.requestKeys')
+                         WHERE value=request.request_key)
+        )",
+        params![
+            request_key,
+            cache_key,
+            super::model::CHRONOLOGY_SUGGESTIONS_OPERATION
+        ],
+        |row| row.get(0),
+    )?;
+    ensure!(
+        owned,
+        "cache association must match the producing project, operation, run and request"
+    );
+    let already: bool = connection.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM analysis_request_events
+            WHERE request_key=?1 AND event_kind='cache_result'
+              AND json_extract(detail_json,'$.cacheKey')=?2
+         )",
+        params![request_key, cache_key],
+        |row| row.get(0),
+    )?;
+    if !already {
+        append_event(
+            connection,
+            request_key,
+            "cache_result",
+            json!({"cacheKey": cache_key}),
+        )?;
+    }
+    Ok(())
+}
+
 fn load_existing_receipts(connection: &Connection, key: &str) -> Result<Vec<ExistingReceipt>> {
     let mut statement = connection.prepare(
         "SELECT receipt_fingerprint,provider,provider_generation_id,actual_model,
@@ -818,6 +873,21 @@ pub(crate) fn unresolved_requests_for_source(
         )?
         .collect::<rusqlite::Result<Vec<_>>>()
         .context("list unresolved analysis requests for source")
+}
+
+pub(crate) fn request_keys_for_run(
+    connection: &Connection,
+    project_id: &str,
+    operation: &str,
+    run_id: &str,
+) -> Result<Vec<String>> {
+    let mut statement = connection.prepare(
+        "SELECT request_key FROM analysis_request_reservations
+         WHERE project_id=?1 AND operation=?2 AND run_id=?3 ORDER BY request_key",
+    )?;
+    Ok(statement
+        .query_map(params![project_id, operation, run_id], |row| row.get(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 pub(crate) fn list_requests(
@@ -1171,15 +1241,11 @@ fn collect_legacy_evidence(
     connection: &Connection,
     project_id: &str,
     policy_id: &str,
+    operation: &str,
     budget_usd: f64,
 ) -> Result<LegacyEvidence> {
     if policy_id.trim().is_empty() {
-        return Ok(LegacyEvidence {
-            confirmed: 0.0,
-            uncertain: 0.0,
-            usage_complete: true,
-            evidence: json!({"source": "no_policy", "present": false}),
-        });
+        return collect_operation_legacy_evidence(connection, project_id, operation, budget_usd);
     }
 
     let mut confirmed = 0.0;
@@ -1288,11 +1354,13 @@ fn collect_legacy_evidence(
         usage_complete = false;
         entries.push(json!({
             "source": "analysis_runs",
+            "baseKey": format!("run:{run_id}"),
             "runId": run_id,
             "status": status,
             "stageReached": stage,
             "costUsd": cost,
             "rawCostUsd": raw_cost,
+            "reservedFloorUsd": cost.unwrap_or(budget_usd),
             "usageComplete": false,
         }));
     }
@@ -1303,6 +1371,240 @@ fn collect_legacy_evidence(
         usage_complete,
         evidence: json!({
             "source": "pre_ledger_canonical_summaries",
+            "present": !entries.is_empty(),
+            "entries": entries,
+        }),
+    })
+}
+
+/// Legacy operation evidence belongs to the same canonical collector, never a
+/// second balance. Chronology's existing result cache is the only pre-ledger
+/// receipt owner for that operation; unmarked operation runs are used for the
+/// ad-hoc label path, which had no cache. Completed chronology entries with an
+/// explicit `provenance.usageComplete=true` and a known non-negative cost are
+/// counted once as confirmed history. A missing completeness field, running
+/// row, unreadable result or malformed amount remains unknown and stops the
+/// operation authority.
+fn collect_operation_legacy_evidence(
+    connection: &Connection,
+    project_id: &str,
+    operation: &str,
+    budget_usd: f64,
+) -> Result<LegacyEvidence> {
+    if operation.trim().is_empty() {
+        return Ok(no_operation_legacy_evidence());
+    }
+    let mut merged = no_operation_legacy_evidence();
+    if operation == super::model::CHRONOLOGY_SUGGESTIONS_OPERATION {
+        let cache = collect_chronology_cache_legacy(connection, project_id, budget_usd)?;
+        if cache.entries_observed > 0 {
+            merged = merge_operation_legacy_evidence(merged, cache.legacy);
+        }
+    }
+    // Cache and run rows are distinct historical owners. A cache row must never
+    // suppress independent unmarked run evidence in the same initial snapshot.
+    let runs = collect_unmarked_operation_runs(connection, project_id, operation, budget_usd)?;
+    Ok(merge_operation_legacy_evidence(merged, runs))
+}
+
+fn merge_operation_legacy_evidence(
+    mut base: LegacyEvidence,
+    extra: LegacyEvidence,
+) -> LegacyEvidence {
+    let extra_present = extra.evidence.get("present").and_then(Value::as_bool) == Some(true);
+    if !extra_present {
+        return base;
+    }
+    base.confirmed += extra.confirmed;
+    base.uncertain += extra.uncertain;
+    base.usage_complete &= extra.usage_complete;
+    let mut entries = Vec::new();
+    for evidence in [&base.evidence, &extra.evidence] {
+        if let Some(existing) = evidence.get("entries").and_then(Value::as_array) {
+            entries.extend(existing.iter().cloned());
+        }
+    }
+    base.evidence = json!({
+        "source": "pre_ledger_operation_evidence",
+        "present": true,
+        "entries": entries,
+    });
+    base
+}
+
+fn no_operation_legacy_evidence() -> LegacyEvidence {
+    LegacyEvidence {
+        confirmed: 0.0,
+        uncertain: 0.0,
+        usage_complete: true,
+        evidence: json!({"source": "no_policy", "present": false}),
+    }
+}
+
+struct ObservedChronologyCache {
+    cost_usd: Option<f64>,
+    usage_complete: bool,
+    reserved_floor_usd: f64,
+}
+
+fn classify_chronology_cache(
+    status: &str,
+    cost_usd: Option<f64>,
+    result_json: &str,
+    budget_usd: f64,
+) -> ObservedChronologyCache {
+    // The raw interpretation has to distinguish an absent old completeness
+    // field from an explicit true. Legacy JSON absent that field is not proof
+    // that the usage was complete or that zero is a known charge.
+    let explicit_complete = serde_json::from_str::<Value>(result_json)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("provenance")
+                .and_then(|provenance| provenance.get("usageComplete"))
+                .and_then(Value::as_bool)
+        });
+    let completed_with_known_cost =
+        status == "completed" && explicit_complete == Some(true) && cost_usd.is_some();
+    let usage_complete = completed_with_known_cost;
+    let reserved_floor_usd = if usage_complete {
+        cost_usd.unwrap_or(0.0)
+    } else {
+        match cost_usd {
+            Some(cost) if cost > 0.0 => cost,
+            _ => budget_usd,
+        }
+    };
+    ObservedChronologyCache {
+        cost_usd,
+        usage_complete,
+        reserved_floor_usd,
+    }
+}
+
+struct ChronologyLegacyEvidence {
+    legacy: LegacyEvidence,
+    entries_observed: usize,
+}
+
+fn collect_chronology_cache_legacy(
+    connection: &Connection,
+    project_id: &str,
+    budget_usd: f64,
+) -> Result<ChronologyLegacyEvidence> {
+    let mut statement = connection.prepare(
+        "SELECT request_key,status,CAST(cost_usd AS TEXT),result_json
+         FROM analysis_chronology_suggestions WHERE project_id=?1
+         ORDER BY created_at ASC,request_key ASC",
+    )?;
+    let rows = statement
+        .query_map([project_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut confirmed = 0.0;
+    let mut uncertain = 0.0;
+    let mut usage_complete = true;
+    let mut entries = Vec::new();
+    for (request_key, status, raw_cost, result_json) in &rows {
+        let cost = legacy_amount(raw_cost.as_deref());
+        let observed = classify_chronology_cache(status, cost, result_json, budget_usd);
+        if observed.usage_complete {
+            confirmed += observed.cost_usd.unwrap_or(0.0);
+        } else {
+            usage_complete = false;
+            uncertain += observed.reserved_floor_usd;
+        }
+        entries.push(json!({
+            "source": "analysis_chronology_suggestions",
+            "baseKey": format!("chronology-cache:{request_key}"),
+            "requestKey": request_key,
+            "status": status,
+            "costUsd": cost,
+            "rawCostUsd": raw_cost,
+            "usageComplete": observed.usage_complete,
+            "reservedFloorUsd": observed.reserved_floor_usd,
+            "completenessFieldPresent": serde_json::from_str::<Value>(result_json)
+                .ok()
+                .and_then(|value| value.get("provenance").cloned())
+                .and_then(|provenance| provenance.get("usageComplete").cloned())
+                .is_some(),
+        }));
+    }
+    Ok(ChronologyLegacyEvidence {
+        legacy: LegacyEvidence {
+            confirmed,
+            uncertain,
+            usage_complete,
+            evidence: json!({
+                "source": "pre_ledger_operation_cache",
+                "present": !entries.is_empty(),
+                "entries": entries,
+            }),
+        },
+        entries_observed: rows.len(),
+    })
+}
+
+fn collect_unmarked_operation_runs(
+    connection: &Connection,
+    project_id: &str,
+    operation: &str,
+    budget_usd: f64,
+) -> Result<LegacyEvidence> {
+    let mut statement = connection.prepare(
+        "SELECT id,status,stage_reached,CAST(cost_usd AS TEXT)
+         FROM analysis_runs
+         WHERE project_id=?1 AND policy_id='' AND stage_reached=?2
+         ORDER BY started_at ASC,id ASC",
+    )?;
+    let rows = statement
+        .query_map(rusqlite::params![project_id, operation], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if rows.is_empty() {
+        return Ok(no_operation_legacy_evidence());
+    }
+    let mut uncertain = 0.0;
+    let mut malformed_reserved = false;
+    let mut entries = Vec::new();
+    for (run_id, status, stage, raw_cost) in rows {
+        let cost = legacy_amount(raw_cost.as_deref());
+        if let Some(cost) = cost {
+            uncertain += cost;
+        } else if !malformed_reserved {
+            uncertain += budget_usd;
+            malformed_reserved = true;
+        }
+        entries.push(json!({
+            "source": "analysis_runs",
+            "baseKey": format!("run:{run_id}"),
+            "runId": run_id,
+            "status": status,
+            "stageReached": stage,
+            "costUsd": cost,
+            "rawCostUsd": raw_cost,
+            "reservedFloorUsd": cost.unwrap_or(budget_usd),
+            "usageComplete": false,
+        }));
+    }
+    Ok(LegacyEvidence {
+        confirmed: 0.0,
+        uncertain,
+        usage_complete: entries.is_empty(),
+        evidence: json!({
+            "source": "pre_ledger_operation_runs",
             "present": !entries.is_empty(),
             "entries": entries,
         }),
@@ -1329,7 +1631,14 @@ pub(crate) fn accounting_aggregate(
     operation: Option<&str>,
     current_run_id: Option<&str>,
 ) -> Result<AnalysisAccountingAggregate> {
-    accounting_aggregate_matching(connection, policy_id, operation, current_run_id, None, true)
+    accounting_aggregate_matching(
+        connection,
+        AggregateScope::Policy(policy_id),
+        operation,
+        current_run_id,
+        None,
+        true,
+    )
 }
 
 /// Canonical accounting projection for exactly one runtime run. It reuses the
@@ -1353,7 +1662,7 @@ pub(crate) fn accounting_aggregate_for_run(
     );
     accounting_aggregate_matching(
         connection,
-        policy_id,
+        AggregateScope::Policy(policy_id),
         Some(operation),
         Some(run_id),
         Some(run_id),
@@ -1361,33 +1670,153 @@ pub(crate) fn accounting_aggregate_for_run(
     )
 }
 
+/// Canonical whole-operation projection for a non-RunPolicy authority. The
+/// operation authority is selected by its project/operation scope id rather
+/// than by an empty policy id, which keeps the calculation shared with policy
+/// projections without permitting cross-project or cross-operation mixing.
+pub(crate) fn accounting_aggregate_for_operation_scope(
+    connection: &Connection,
+    project_id: &str,
+    operation: &str,
+    current_run_id: Option<&str>,
+    run_id_filter: Option<&str>,
+) -> Result<AnalysisAccountingAggregate> {
+    ensure!(
+        !project_id.trim().is_empty(),
+        "accounting aggregate project is required"
+    );
+    ensure!(
+        !operation.trim().is_empty(),
+        "accounting aggregate operation is required"
+    );
+    accounting_aggregate_matching(
+        connection,
+        AggregateScope::Operation {
+            project_id,
+            operation,
+        },
+        Some(operation),
+        current_run_id,
+        run_id_filter,
+        run_id_filter.is_none(),
+    )
+}
+
+/// Confirmed current-run projection for one non-policy operation.
+pub(crate) fn accounting_aggregate_for_operation_run(
+    connection: &Connection,
+    project_id: &str,
+    operation: &str,
+    run_id: &str,
+) -> Result<AnalysisAccountingAggregate> {
+    ensure!(
+        !run_id.trim().is_empty(),
+        "accounting aggregate run id is required"
+    );
+    accounting_aggregate_for_operation_scope(
+        connection,
+        project_id,
+        operation,
+        Some(run_id),
+        Some(run_id),
+    )
+}
+
+#[derive(Clone, Copy)]
+enum AggregateScope<'a> {
+    Policy(&'a str),
+    Operation {
+        project_id: &'a str,
+        operation: &'a str,
+    },
+}
+
+impl<'a> AggregateScope<'a> {
+    fn project_id(self) -> Option<&'a str> {
+        match self {
+            Self::Policy(_) => None,
+            Self::Operation { project_id, .. } => Some(project_id),
+        }
+    }
+
+    fn policy_id(self) -> &'a str {
+        match self {
+            Self::Policy(policy_id) => policy_id,
+            Self::Operation { .. } => "",
+        }
+    }
+}
+
 fn accounting_aggregate_matching(
     connection: &Connection,
-    policy_id: &str,
+    scope: AggregateScope<'_>,
     operation: Option<&str>,
     current_run_id: Option<&str>,
     run_id_filter: Option<&str>,
     include_authority_evidence: bool,
 ) -> Result<AnalysisAccountingAggregate> {
-    let requests = if let Some(run_id) = run_id_filter {
-        let mut statement = connection.prepare(&format!(
-            "{REQUEST_SELECT} WHERE policy_id=?1 AND (?2 IS NULL OR operation=?2) AND run_id=?3
-             ORDER BY created_at ASC, request_key ASC"
-        ))?;
-        statement
-            .query_map(params![policy_id, operation, run_id], row_to_request)?
-            .collect::<rusqlite::Result<Vec<_>>>()?
-    } else {
-        let mut statement = connection.prepare(&format!(
-            "{REQUEST_SELECT} WHERE policy_id=?1 AND (?2 IS NULL OR operation=?2)
-             ORDER BY created_at ASC, request_key ASC"
-        ))?;
-        statement
-            .query_map(params![policy_id, operation], row_to_request)?
-            .collect::<rusqlite::Result<Vec<_>>>()?
+    let requests = match scope {
+        AggregateScope::Policy(policy_id) => {
+            if let Some(run_id) = run_id_filter {
+                let mut statement = connection.prepare(&format!(
+                    "{REQUEST_SELECT} WHERE policy_id=?1 AND (?2 IS NULL OR operation=?2) AND run_id=?3
+                     ORDER BY created_at ASC, request_key ASC"
+                ))?;
+                statement
+                    .query_map(params![policy_id, operation, run_id], row_to_request)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            } else {
+                let mut statement = connection.prepare(&format!(
+                    "{REQUEST_SELECT} WHERE policy_id=?1 AND (?2 IS NULL OR operation=?2)
+                     ORDER BY created_at ASC, request_key ASC"
+                ))?;
+                statement
+                    .query_map(params![policy_id, operation], row_to_request)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            }
+        }
+        AggregateScope::Operation {
+            project_id,
+            operation: scoped_operation,
+        } => {
+            let budget_scope_id =
+                super::model::analysis_operation_budget_scope_id(project_id, scoped_operation);
+            if let Some(run_id) = run_id_filter {
+                let mut statement = connection.prepare(&format!(
+                    "{REQUEST_SELECT} WHERE budget_scope_id=?1 AND operation=?2 AND run_id=?3
+                     ORDER BY created_at ASC, request_key ASC"
+                ))?;
+                statement
+                    .query_map(
+                        params![budget_scope_id, scoped_operation, run_id],
+                        row_to_request,
+                    )?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            } else {
+                let mut statement = connection.prepare(&format!(
+                    "{REQUEST_SELECT} WHERE budget_scope_id=?1 AND operation=?2
+                     ORDER BY created_at ASC, request_key ASC"
+                ))?;
+                statement
+                    .query_map(params![budget_scope_id, scoped_operation], row_to_request)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            }
+        }
     };
     let authority = if include_authority_evidence {
-        load_authority_by_policy_optional(connection, policy_id)?
+        match scope {
+            AggregateScope::Policy(policy_id) => {
+                load_authority_by_policy_optional(connection, policy_id)?
+            }
+            AggregateScope::Operation {
+                project_id,
+                operation,
+            } => {
+                let budget_scope_id =
+                    super::model::analysis_operation_budget_scope_id(project_id, operation);
+                load_authority_optional(connection, &budget_scope_id)?
+            }
+        }
     } else {
         None
     };
@@ -1417,8 +1846,9 @@ fn accounting_aggregate_matching(
                     .as_ref()
                     .map(|authority| authority.project_id.clone())
             })
+            .or_else(|| scope.project_id().map(str::to_string))
             .unwrap_or_default(),
-        policy_id: policy_id.to_string(),
+        policy_id: scope.policy_id().to_string(),
         operation: operation.map(str::to_string),
         request_count: requests.len(),
         completed_request_count: 0,
@@ -1458,7 +1888,7 @@ fn accounting_aggregate_matching(
     }
     if let Some(run_id) = current_run_id
         && let Some(provenance) =
-            current_run_receipt_provenance(connection, policy_id, run_id, operation)?
+            current_run_receipt_provenance(connection, scope, run_id, operation)?
     {
         aggregate.current_run_actual_provider = nonempty(provenance.provider);
         aggregate.current_run_actual_model = nonempty(provenance.model);
@@ -1546,7 +1976,7 @@ fn aggregate_legacy_evidence(
     operation: Option<&str>,
 ) -> Option<LegacyEvidence> {
     let authority = authority?;
-    if operation.is_none() {
+    if operation.is_none() || authority.policy_id.trim().is_empty() {
         return Some(LegacyEvidence {
             confirmed: authority.legacy_confirmed_cost_usd,
             uncertain: authority.legacy_uncertain_usage_reserve_usd,
@@ -1603,30 +2033,46 @@ struct CurrentRunReceiptProvenance {
 /// run identity is filtered before ordering.
 fn current_run_receipt_provenance(
     connection: &Connection,
-    policy_id: &str,
+    scope: AggregateScope<'_>,
     run_id: &str,
     operation: Option<&str>,
 ) -> Result<Option<CurrentRunReceiptProvenance>> {
-    connection
-        .query_row(
+    let (sql, scope_id) = match scope {
+        AggregateScope::Policy(policy_id) => (
             "SELECT COALESCE(request.actual_provider,''),COALESCE(request.actual_model,''),
                 COALESCE(request.provider_generation_id,''),request.settled_at
-         FROM analysis_request_reservations AS request
-         JOIN analysis_request_events AS event ON event.request_key=request.request_key
-         WHERE request.policy_id=?1 AND request.run_id=?2
-           AND (?3 IS NULL OR request.operation=?3)
-           AND request.lifecycle='completed' AND event.event_kind='receipt'
-         ORDER BY event.event_id DESC LIMIT 1",
-            params![policy_id, run_id, operation],
-            |row| {
-                Ok(CurrentRunReceiptProvenance {
-                    provider: row.get(0)?,
-                    model: row.get(1)?,
-                    generation: row.get(2)?,
-                    settled_at: row.get(3)?,
-                })
-            },
-        )
+             FROM analysis_request_reservations AS request
+             JOIN analysis_request_events AS event ON event.request_key=request.request_key
+             WHERE request.policy_id=?1 AND request.run_id=?2
+               AND (?3 IS NULL OR request.operation=?3)
+               AND request.lifecycle='completed' AND event.event_kind='receipt'
+             ORDER BY event.event_id DESC LIMIT 1",
+            policy_id.to_string(),
+        ),
+        AggregateScope::Operation {
+            project_id,
+            operation: scoped_operation,
+        } => (
+            "SELECT COALESCE(request.actual_provider,''),COALESCE(request.actual_model,''),
+                COALESCE(request.provider_generation_id,''),request.settled_at
+             FROM analysis_request_reservations AS request
+             JOIN analysis_request_events AS event ON event.request_key=request.request_key
+             WHERE request.budget_scope_id=?1 AND request.run_id=?2
+               AND request.operation=?3
+               AND request.lifecycle='completed' AND event.event_kind='receipt'
+             ORDER BY event.event_id DESC LIMIT 1",
+            super::model::analysis_operation_budget_scope_id(project_id, scoped_operation),
+        ),
+    };
+    connection
+        .query_row(sql, params![scope_id, run_id, operation], |row| {
+            Ok(CurrentRunReceiptProvenance {
+                provider: row.get(0)?,
+                model: row.get(1)?,
+                generation: row.get(2)?,
+                settled_at: row.get(3)?,
+            })
+        })
         .optional()
         .context("select current-run receipt provenance by event sequence")
 }

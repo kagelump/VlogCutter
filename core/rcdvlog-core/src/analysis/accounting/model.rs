@@ -11,6 +11,13 @@ use serde_json::Value;
 use crate::analysis::provider::{AnalysisRequestCostBound, VlmRequest, VlmResponse};
 
 pub const ANALYSIS_ACCOUNTING_SCHEMA_VERSION: &str = "analysis.accounting.v1";
+/// Canonical non-policy operation names. They are part of the durable budget
+/// authority identity, so changing one is a migration rather than a cache-key
+/// detail.
+pub const CHRONOLOGY_SUGGESTIONS_OPERATION: &str = "chronology_suggestions";
+pub const LABEL_CONSOLIDATION_OPERATION: &str = "label_consolidation";
+/// Provider route used by the two paid operation paths in this slice.
+pub const OPERATION_REQUESTED_PROVIDER: &str = "openrouter";
 /// Hard admission cap for one durable budget authority. A full conservative
 /// request bound is still required to fit the remaining ceiling; this cap only
 /// bounds simultaneous in-flight exposure.
@@ -248,6 +255,28 @@ impl AnalysisAccountingContext {
         );
         Ok(canonical)
     }
+}
+
+/// Confirmed current-run operation summary. Reservations and unknown usage are
+/// kept in separate fields so an adapter never presents either as a confirmed
+/// provider charge.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnalysisOperationAccountingSummary {
+    pub run_id: String,
+    pub request_count: usize,
+    pub completed_request_count: usize,
+    pub active_request_count: usize,
+    pub uncertain_request_count: usize,
+    pub confirmed_cost_usd: f64,
+    pub active_reserved_cost_usd: f64,
+    pub uncertain_usage_reserve_usd: f64,
+    pub committed_or_reserved_usd: f64,
+    pub usage_complete: bool,
+    pub actual_provider: Option<String>,
+    pub actual_model: Option<String>,
+    pub provider_generation_id: Option<String>,
+    pub request_keys: Vec<String>,
 }
 
 /// Persisted admission/lifecycle state for one exact intended request.
