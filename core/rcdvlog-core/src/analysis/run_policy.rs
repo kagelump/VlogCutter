@@ -26,7 +26,7 @@ use crate::analysis::openrouter::{
 };
 use crate::analysis::provider::{
     DEFAULT_MODEL, FALLBACK_MODEL, ProviderChain, ProviderFailure, VlmProvider, VlmRequest,
-    model_spec,
+    analysis_cost_bound_contract_id, model_spec,
 };
 use crate::analysis::schema::{self, output_schema as observation_output_schema};
 use crate::analysis::vlm::{PromptContext, build_prompt};
@@ -36,7 +36,7 @@ use crate::{Asset, Catalog, REFERENCE_COST_PER_CLIP_USD};
 pub const RUN_POLICY_SCHEMA_VERSION: &str = "analysis.run-policy.v1";
 pub const RUN_AUTHORIZATION_SCHEMA_VERSION: &str = "analysis.run-authorization.v1";
 pub const RUN_PILOT_SCHEMA_VERSION: &str = "analysis.run-pilot.v1";
-pub const RUN_POLICY_TOOL_VERSION: &str = "rcdvlog.analysis-preflight.v1";
+pub const RUN_POLICY_TOOL_VERSION: &str = "rcdvlog.analysis-preflight.v2-provider-cap-bound";
 pub const MAX_SCOPE_ASSETS: usize = 10_000;
 
 const PILOT_WARNING: &str = "A passed pilot is an observed capability for this exact policy only. It does not guarantee future provider availability, pricing, schema compliance or semantic correctness.";
@@ -321,6 +321,10 @@ pub struct RunPolicy {
     pub output_schema_version: String,
     pub recipe_version: String,
     pub tool_version: String,
+    /// Versioned provider-routing/cost-bound contract used by the wire bodies
+    /// and admission reservations for this policy.
+    #[serde(default)]
+    pub provider_cost_bound_contract: String,
     pub capability_checks: Vec<CapabilityCheck>,
     pub readiness: RunPolicyReadiness,
 }
@@ -703,6 +707,7 @@ struct PolicyIdentity<'a> {
     output_schema_version: &'a str,
     recipe_version: &'a str,
     tool_version: &'a str,
+    provider_cost_bound_contract: &'a str,
     capability_checks: &'a [CapabilityCheck],
 }
 
@@ -726,6 +731,7 @@ fn run_policy_identity(policy: &RunPolicy) -> Result<String> {
         output_schema_version: &policy.output_schema_version,
         recipe_version: &policy.recipe_version,
         tool_version: &policy.tool_version,
+        provider_cost_bound_contract: &policy.provider_cost_bound_contract,
         capability_checks: &policy.capability_checks,
     })
 }
@@ -1010,6 +1016,7 @@ impl Catalog {
             output_schema_version: schema_version,
             recipe_version,
             tool_version: RUN_POLICY_TOOL_VERSION.into(),
+            provider_cost_bound_contract: analysis_cost_bound_contract_id(),
             capability_checks: checks,
             readiness,
         };
@@ -1943,6 +1950,19 @@ mod tests {
         let (_directory, catalog, project, asset) = fixture();
         let request = observation_request(&project, &asset, 1.0);
         let authorized = catalog.authorize_run_policy(&request).unwrap();
+        assert_eq!(
+            authorized.policy.provider_cost_bound_contract,
+            analysis_cost_bound_contract_id()
+        );
+        let mut changed_contract = authorized.policy.clone();
+        changed_contract
+            .provider_cost_bound_contract
+            .push_str("-changed");
+        assert_ne!(
+            run_policy_identity(&changed_contract).unwrap(),
+            authorized.policy.policy_id
+        );
+
         let mut changed_model = request.clone();
         changed_model.primary_model = FALLBACK_MODEL.into();
         changed_model.allowed_models = vec![FALLBACK_MODEL.into()];

@@ -79,11 +79,14 @@ pub use analysis::consolidate::{ConsolidationReport, LabelMapping, LabelProposal
 pub use analysis::framepack::{FramePackManifest, build_frame_pack, encode_frames};
 pub use analysis::moments;
 pub use analysis::openrouter::{
-    OpenRouterProvider, api_credential_present, frame_data_uri, key_file_path, resolve_api_key,
+    OpenRouterProvider, api_credential_present, frame_data_uri, key_file_path,
+    openrouter_request_cost_bound, resolve_api_key,
 };
 pub use analysis::provider::{
-    ChainOutcome, DEFAULT_MODEL, FALLBACK_MODEL, MODELS, ModelSpec, ProviderChain, ProviderFailure,
-    ProviderFailureCategory, VlmProvider, VlmReceipt, VlmRequest, VlmResponse, model_spec,
+    ANALYSIS_COST_BOUND_CONTRACT_VERSION, AnalysisRequestCostBound, ChainOutcome, DEFAULT_MODEL,
+    FALLBACK_MODEL, MODELS, ModelSpec, OPENROUTER_MAX_OUTPUT_TOKENS, ProviderChain,
+    ProviderFailure, ProviderFailureCategory, VlmProvider, VlmReceipt, VlmRequest, VlmResponse,
+    analysis_cost_bound_contract_id, model_spec,
 };
 pub use analysis::run_policy::{
     AnalysisPayload, AnalysisRunKind, AuthorizedPolicyState, CapabilityCheck, CapabilityStatus,
