@@ -1,20 +1,22 @@
-//! Typed analysis request admission values and domain checks.
+//! Typed analysis request admission, receipt and projection values.
 //!
-//! These values keep a conservative admission reservation distinct from the
-//! reported provider cost and from any confirmed charge. Nothing in this module
-//! performs provider I/O or treats an estimate as an invoice.
+//! These values keep a conservative admission reservation distinct from a
+//! provider-returned cost, a confirmed final charge and unresolved usage. They
+//! never perform provider I/O or treat an estimate/reservation as an invoice.
 
 use anyhow::{Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::analysis::provider::{AnalysisRequestCostBound, VlmRequest};
+use crate::analysis::provider::{AnalysisRequestCostBound, VlmRequest, VlmResponse};
 
 pub const ANALYSIS_ACCOUNTING_SCHEMA_VERSION: &str = "analysis.accounting.v1";
 /// Hard admission cap for one durable budget authority. A full conservative
 /// request bound is still required to fit the remaining ceiling; this cap only
 /// bounds simultaneous in-flight exposure.
 pub const MAX_IN_FLIGHT_REQUESTS_PER_BUDGET_AUTHORITY: usize = 4;
+/// Explicit attempts per exact request identity, including the first attempt.
+pub const MAX_REQUEST_ATTEMPTS: u32 = 4;
 pub const LEGACY_UNKNOWN_USAGE_STOP_REASON: &str =
     "legacy_usage_unknown_requires_fresh_authorization";
 
@@ -64,6 +66,10 @@ impl AnalysisRequestLifecycle {
 
     pub fn is_active(self) -> bool {
         matches!(self, Self::Reserved | Self::Dispatched)
+    }
+
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Completed | Self::Uncertain | Self::Released)
     }
 
     pub fn needs_reconciliation(self) -> bool {
@@ -151,6 +157,10 @@ pub struct AnalysisAccountingContext {
     #[serde(default)]
     pub budget_scope_id: String,
     pub budget_usd: f64,
+    /// This only permits consideration of a retry. A durable authorization for
+    /// this particular prior request and next epoch is also mandatory.
+    #[serde(default)]
+    pub explicit_retry: bool,
 }
 
 impl AnalysisAccountingContext {
@@ -225,7 +235,11 @@ pub struct AnalysisRequestRecord {
     pub operation: String,
     pub attempt_base_key: String,
     pub attempt_epoch: u32,
+    /// Requested provider/route supplied by the caller.
     pub provider: String,
+    /// Provider that actually served the request, exclusively from receipt
+    /// evidence. Missing evidence stays `None`; it is never inferred from the
+    /// requested route.
     pub actual_provider: Option<String>,
     pub requested_model: String,
     pub actual_model: Option<String>,
@@ -240,10 +254,10 @@ pub struct AnalysisRequestRecord {
     pub lifecycle: AnalysisRequestLifecycle,
     /// Durable admission reservation. Not a charge.
     pub reserved_cost_usd: f64,
-    /// Last provider-returned cost, retained separately from the reservation.
+    /// Last provider-returned observed cost, retained separately from the
+    /// reservation even when usage is incomplete.
     pub reported_cost_usd: Option<f64>,
-    /// Confirmed only by complete provider receipt evidence in the receipt
-    /// reconciliation slice.
+    /// Confirmed only by complete provider receipt evidence.
     pub confirmed_cost_usd: f64,
     /// Unresolved usage reserve, kept separate from confirmed spend.
     pub uncertain_usage_reserve_usd: f64,
@@ -261,6 +275,23 @@ pub struct AnalysisRequestEvent {
     pub request_key: String,
     pub event_kind: String,
     pub detail: Value,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnalysisProviderReceipt {
+    pub receipt_key: String,
+    pub request_key: String,
+    /// Actual serving provider from receipt metadata; empty remains unknown.
+    pub provider: String,
+    pub provider_generation_id: String,
+    pub actual_model: String,
+    pub reported_cost_usd: Option<f64>,
+    pub prompt_tokens: Option<u32>,
+    pub completion_tokens: Option<u32>,
+    pub usage_complete: bool,
+    pub receipt_fingerprint: String,
     pub created_at: String,
 }
 
@@ -298,6 +329,146 @@ pub struct AnalysisAccountingReport {
     pub policy_id: Option<String>,
     pub budgets: Vec<AnalysisBudgetSnapshot>,
     pub requests: Vec<AnalysisRequestRecord>,
+}
+
+/// Canonical projection over accounting attempts for one exact policy and,
+/// optionally, one operation. A pilot caller must request the `pilot` operation
+/// so fallback/primary attempts are included while bulk charges are excluded.
+/// The whole-policy projection includes every operation plus frozen legacy
+/// evidence exactly once. Pilot filtering retains provable frozen pilot evidence.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnalysisAccountingAggregate {
+    pub project_id: String,
+    pub policy_id: String,
+    /// `None` means all operations; `Some("pilot")` is the pilot projection.
+    pub operation: Option<String>,
+    pub request_count: usize,
+    pub completed_request_count: usize,
+    pub active_request_count: usize,
+    pub uncertain_request_count: usize,
+    pub released_request_count: usize,
+    pub confirmed_cost_usd: f64,
+    pub active_reserved_cost_usd: f64,
+    pub uncertain_usage_reserve_usd: f64,
+    /// Frozen evidence is included once for the whole policy, or filtered to
+    /// provable legacy pilot entries for the pilot operation. It is never
+    /// re-derived from post-ledger rows.
+    pub legacy_included: bool,
+    pub legacy_confirmed_cost_usd: f64,
+    pub legacy_uncertain_usage_reserve_usd: f64,
+    pub legacy_usage_complete: bool,
+    pub committed_or_reserved_usd: f64,
+    /// True only when relevant evidence exists and no relevant attempt is
+    /// active or uncertain.
+    pub usage_complete: bool,
+    pub current_run_actual_provider: Option<String>,
+    pub current_run_actual_model: Option<String>,
+    pub current_run_generation_id: Option<String>,
+    pub current_run_settled_at: Option<String>,
+}
+
+/// Provider-returned evidence for one request. Missing facts stay missing; no
+/// field is populated from the requested route or requested model.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderReceiptEvidence {
+    #[serde(default)]
+    pub provider: String,
+    #[serde(default)]
+    pub provider_generation_id: String,
+    #[serde(default)]
+    pub actual_model: String,
+    #[serde(default)]
+    pub reported_cost_usd: Option<f64>,
+    #[serde(default)]
+    pub prompt_tokens: Option<u32>,
+    #[serde(default)]
+    pub completion_tokens: Option<u32>,
+    #[serde(default)]
+    pub usage_complete: bool,
+}
+
+impl ProviderReceiptEvidence {
+    pub fn from_response(response: &VlmResponse) -> Self {
+        Self {
+            provider: response.receipt.provider.clone().unwrap_or_default(),
+            provider_generation_id: response.receipt.generation_id.clone().unwrap_or_default(),
+            actual_model: response.receipt.actual_model.clone().unwrap_or_default(),
+            reported_cost_usd: (response.cost_usd.is_finite() && response.cost_usd >= 0.0)
+                .then_some(response.cost_usd),
+            prompt_tokens: Some(response.prompt_tokens),
+            completion_tokens: Some(response.completion_tokens),
+            usage_complete: response.receipt.usage_complete,
+        }
+    }
+
+    /// Complete usage plus a trustworthy returned cost is required to confirm a
+    /// final charge. Complete usage without a cost remains unknown.
+    pub fn is_complete_charge(&self) -> bool {
+        self.usage_complete
+            && self
+                .reported_cost_usd
+                .is_some_and(|cost| cost.is_finite() && cost >= 0.0)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        for identity in [
+            &self.provider,
+            &self.provider_generation_id,
+            &self.actual_model,
+        ] {
+            ensure!(
+                identity == identity.trim(),
+                "provider receipt identity must not contain surrounding whitespace"
+            );
+        }
+        if let Some(cost) = self.reported_cost_usd {
+            ensure!(
+                cost.is_finite() && cost >= 0.0,
+                "provider receipt cost must be finite and non-negative"
+            );
+        }
+        ensure!(
+            self.provider.len() <= 256,
+            "provider receipt name is oversized"
+        );
+        ensure!(
+            self.actual_model.len() <= 256,
+            "provider receipt model identity is oversized"
+        );
+        ensure!(
+            self.provider_generation_id.len() <= 512,
+            "provider receipt generation identity is oversized"
+        );
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AnalysisRequestReconciliation {
+    /// Provider evidence arriving after the dispatching process exited.
+    LateReceipt { receipt: ProviderReceiptEvidence },
+    /// Reliable local evidence that transmission never began. The store also
+    /// verifies the durable dispatch marker is absent; a failure string alone
+    /// is never accepted as no-upload proof after dispatch.
+    LocalNoUpload { failure_code: String },
+    /// Conservatively retain an unknown outcome for a potentially uploaded
+    /// request. This never marks the request as a no-upload release.
+    UncertainOutcome { failure_code: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnalysisRetryAuthorization {
+    pub original_request_key: String,
+    pub attempt_base_key: String,
+    pub next_attempt_epoch: u32,
+    pub retained_uncertain_cost_usd: f64,
+    pub prior_reported_cost_usd: Option<f64>,
+    pub attempts_already_recorded: u32,
+    pub max_attempts: u32,
 }
 
 pub fn bounded_failure_code(value: &str) -> String {

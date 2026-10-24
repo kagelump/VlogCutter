@@ -7,7 +7,7 @@ use thiserror::Error;
 
 use crate::chronology::forward_migrate_project_chronology;
 
-pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 38;
+pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 39;
 
 const MIGRATION_TABLE_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -311,6 +311,12 @@ pub const PROJECT_CATALOG_MIGRATIONS: &[SqliteMigration] = &[
         name: "analysis_request_accounting",
         source_identity: "project-catalog/0038-analysis-request-accounting/20261025",
         apply: add_analysis_request_accounting,
+    },
+    SqliteMigration {
+        id: 39,
+        name: "analysis_receipt_generation_scope",
+        source_identity: "project-catalog/0039-analysis-receipt-generation-scope/20261025",
+        apply: add_analysis_receipt_generation_scope,
     },
 ];
 
@@ -658,6 +664,41 @@ fn add_analysis_request_accounting(transaction: &Transaction<'_>) -> Result<()> 
         "analysis_run_authorizations",
         "accounting_contract",
         "TEXT NOT NULL DEFAULT ''",
+    )?;
+    Ok(())
+}
+
+/// Migration 39. Scope provider generation IDs by the requested router/service.
+///
+/// OpenRouter generation IDs identify a request at that service; they are not
+/// scoped by the optional upstream provider name. A partial index makes the
+/// cross-request owner lookup efficient, and the trigger enforces the same
+/// invariant even for writes that bypass the normal reconciliation helper.
+fn add_analysis_receipt_generation_scope(transaction: &Transaction<'_>) -> Result<()> {
+    transaction.execute_batch(
+        r#"
+        CREATE INDEX IF NOT EXISTS analysis_provider_receipts_generation_id
+            ON analysis_provider_receipts(provider_generation_id)
+            WHERE provider_generation_id <> '';
+
+        CREATE TRIGGER IF NOT EXISTS analysis_provider_receipts_generation_owner
+        BEFORE INSERT ON analysis_provider_receipts
+        WHEN NEW.provider_generation_id <> ''
+        BEGIN
+            SELECT RAISE(ABORT, 'provider generation identity already belongs to a different analysis request')
+            WHERE EXISTS (
+                SELECT 1
+                FROM analysis_provider_receipts AS prior
+                JOIN analysis_request_reservations AS prior_request
+                  ON prior_request.request_key = prior.request_key
+                JOIN analysis_request_reservations AS incoming_request
+                  ON incoming_request.request_key = NEW.request_key
+                WHERE prior.request_key <> NEW.request_key
+                  AND prior_request.requested_provider = incoming_request.requested_provider
+                  AND prior.provider_generation_id = NEW.provider_generation_id
+            );
+        END;
+        "#,
     )?;
     Ok(())
 }

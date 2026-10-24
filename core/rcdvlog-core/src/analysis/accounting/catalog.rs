@@ -11,9 +11,11 @@ use rusqlite::params;
 use serde_json::Value;
 
 use super::model::{
-    ANALYSIS_ACCOUNTING_SCHEMA_VERSION, AnalysisAccountingContext, AnalysisAccountingReport,
-    AnalysisBudgetAuthorityContext, AnalysisBudgetSnapshot, AnalysisRequestEvent,
-    AnalysisRequestLifecycle, AnalysisRequestRecord, bounded_failure_code,
+    ANALYSIS_ACCOUNTING_SCHEMA_VERSION, AnalysisAccountingAggregate, AnalysisAccountingContext,
+    AnalysisAccountingReport, AnalysisBudgetAuthorityContext, AnalysisBudgetSnapshot,
+    AnalysisProviderReceipt, AnalysisRequestEvent, AnalysisRequestLifecycle,
+    AnalysisRequestReconciliation, AnalysisRequestRecord, AnalysisRetryAuthorization,
+    ProviderReceiptEvidence, bounded_failure_code,
 };
 use super::store;
 use crate::Catalog;
@@ -95,6 +97,48 @@ impl Catalog {
         store::mark_uncertain(&mut self.connection()?, request_key, failure_code)
     }
 
+    /// Record immutable provider evidence. Exact duplicate evidence is a no-op;
+    /// a complete receipt may correct a prior incomplete reported amount for the
+    /// same known identities, while an already confirmed final charge is frozen.
+    pub fn record_analysis_request_receipt(
+        &self,
+        request_key: &str,
+        evidence: &ProviderReceiptEvidence,
+    ) -> Result<AnalysisRequestRecord> {
+        store::record_receipt(&mut self.connection()?, request_key, evidence)
+    }
+
+    /// Idempotent reconciliation entry point for interrupted/uncertain requests.
+    /// A local no-upload release is only accepted when the durable dispatch
+    /// marker is absent. Unknown outcome never releases a dispatched request.
+    pub fn reconcile_analysis_request(
+        &self,
+        request_key: &str,
+        evidence: &AnalysisRequestReconciliation,
+    ) -> Result<AnalysisRequestRecord> {
+        match evidence {
+            AnalysisRequestReconciliation::LateReceipt { receipt } => {
+                self.record_analysis_request_receipt(request_key, receipt)
+            }
+            AnalysisRequestReconciliation::LocalNoUpload { failure_code } => {
+                self.release_analysis_request_before_dispatch(request_key, failure_code)
+            }
+            AnalysisRequestReconciliation::UncertainOutcome { failure_code } => {
+                self.mark_analysis_request_uncertain(request_key, failure_code)
+            }
+        }
+    }
+
+    /// Explicitly authorize one bounded retry for this particular prior request
+    /// and next epoch. Repeat authorization for the same epoch is idempotent.
+    /// Authorization never erases prior receipts, charges or uncertainty.
+    pub fn authorize_analysis_request_retry(
+        &self,
+        request_key: &str,
+    ) -> Result<AnalysisRetryAuthorization> {
+        store::authorize_retry(&mut self.connection()?, request_key)
+    }
+
     pub fn analysis_request(&self, request_key: &str) -> Result<Option<AnalysisRequestRecord>> {
         store::load_request(&self.connection()?, request_key)
     }
@@ -111,6 +155,14 @@ impl Catalog {
 
     pub fn analysis_request_events(&self, request_key: &str) -> Result<Vec<AnalysisRequestEvent>> {
         store::events(&self.connection()?, request_key)
+    }
+
+    /// Immutable provider receipt evidence for one request, oldest first.
+    pub fn analysis_provider_receipts(
+        &self,
+        request_key: &str,
+    ) -> Result<Vec<AnalysisProviderReceipt>> {
+        store::receipts(&self.connection()?, request_key)
     }
 
     pub fn analysis_budget_snapshot(
@@ -161,6 +213,48 @@ impl Catalog {
             budgets,
             requests,
         })
+    }
+
+    /// Whole-policy accounting projection. This includes every operation plus
+    /// the frozen legacy evidence exactly once. Runtime callers that need a
+    /// pilot-only projection must use `analysis_accounting_aggregate_for_operation`
+    /// so bulk charges are not mixed into pilot cost.
+    pub fn analysis_accounting_aggregate(
+        &self,
+        policy_id: &str,
+        current_run_id: Option<&str>,
+    ) -> Result<AnalysisAccountingAggregate> {
+        self.analysis_accounting_aggregate_scoped(policy_id, None, current_run_id)
+    }
+
+    /// One-operation accounting projection (for example `Some("pilot")`).
+    pub fn analysis_accounting_aggregate_for_operation(
+        &self,
+        policy_id: &str,
+        operation: &str,
+        current_run_id: Option<&str>,
+    ) -> Result<AnalysisAccountingAggregate> {
+        let operation = operation.trim();
+        ensure!(
+            !operation.is_empty(),
+            "accounting aggregate operation is required"
+        );
+        self.analysis_accounting_aggregate_scoped(policy_id, Some(operation), current_run_id)
+    }
+
+    /// Explicit optional-operation projection used by adapters that already
+    /// carry an optional filter. `None` is the whole-policy view.
+    pub fn analysis_accounting_aggregate_scoped(
+        &self,
+        policy_id: &str,
+        operation: Option<&str>,
+        current_run_id: Option<&str>,
+    ) -> Result<AnalysisAccountingAggregate> {
+        ensure!(
+            !policy_id.trim().is_empty(),
+            "accounting aggregate policy is required"
+        );
+        store::accounting_aggregate(&self.connection()?, policy_id, operation, current_run_id)
     }
 
     /// Read the frozen pre-ledger evidence without editing history.
