@@ -363,6 +363,7 @@ export const api = {
       primaryModel: request.primaryModel,
       allowedModels: request.allowedModels,
       allowFallback: request.allowFallback,
+      budgetUsd: request.budgetUsd ?? null,
     });
   },
 

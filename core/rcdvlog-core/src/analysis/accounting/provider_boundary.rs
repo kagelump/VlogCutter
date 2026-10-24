@@ -22,6 +22,7 @@ pub struct AccountedVlmProvider<'a> {
     provider: &'a dyn VlmProvider,
     context: AnalysisAccountingContext,
     explicit_retry: bool,
+    pre_dispatch_check: Option<Box<dyn Fn() -> Result<()> + Send + Sync + 'a>>,
 }
 
 impl<'a> AccountedVlmProvider<'a> {
@@ -35,6 +36,7 @@ impl<'a> AccountedVlmProvider<'a> {
             provider,
             context,
             explicit_retry: false,
+            pre_dispatch_check: None,
         }
     }
 
@@ -43,6 +45,17 @@ impl<'a> AccountedVlmProvider<'a> {
     /// request and next epoch before any new paid transmission is admitted.
     pub fn with_explicit_retry(mut self, explicit_retry: bool) -> Self {
         self.explicit_retry = explicit_retry;
+        self
+    }
+
+    /// Recheck operation-owned domain identity after local provider preparation
+    /// and immediately before the durable dispatch marker. The check runs on the
+    /// same thread and never holds a transaction across transport I/O.
+    pub fn with_pre_dispatch_check(
+        mut self,
+        check: impl Fn() -> Result<()> + Send + Sync + 'a,
+    ) -> Self {
+        self.pre_dispatch_check = Some(Box::new(check));
         self
     }
 
@@ -166,6 +179,18 @@ impl<'a> AccountedVlmProvider<'a> {
             return Err(ProviderFailure::cancelled().into());
         }
         self.prepare_before_dispatch(&reservation.request_key)?;
+        if let Some(check) = &self.pre_dispatch_check
+            && let Err(error) = check()
+        {
+            self.release_no_upload(&reservation.request_key, "local_domain_guard");
+            let observed = ProviderFailure::from_anyhow(&error);
+            let failure = if observed.category.is_local() {
+                observed
+            } else {
+                ProviderFailure::local_pre_upload()
+            };
+            return Err(failure.into());
+        }
         if is_cancelled() {
             self.release_no_upload(&reservation.request_key, "local_cancelled_before_dispatch");
             return Err(ProviderFailure::cancelled().into());

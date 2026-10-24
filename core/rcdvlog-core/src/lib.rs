@@ -50,11 +50,13 @@ mod storage;
 mod transcription;
 mod volumes;
 
+use analysis::accounting::{
+    begin_accounted_operation, operation_intended_attempt_key, operation_policy_fingerprint,
+};
 use analysis::audio::{AudioExtractor, FfmpegAudioExtractor};
-use analysis::chronology_suggestions::request_suggestion;
 use analysis::consolidate::{
-    apply_mapping as persist_label_mapping, assets_for_label, consolidation_prompt, mapping_schema,
-    parse_mapping, proposals as label_proposals,
+    apply_mapping as persist_label_mapping, assets_for_label, parse_mapping,
+    proposals as label_proposals,
 };
 use analysis::engine::{SttEngine, VAD_MODEL, WHISPER_MODEL, ensure_model, model_dir};
 use analysis::store::{StoredTranscript, is_current, load_transcript, save_transcript};
@@ -75,9 +77,10 @@ use analysis::whisper_engine::{WhisperEngine, read_pcm};
 pub use analysis::accounting::{
     ANALYSIS_ACCOUNTING_SCHEMA_VERSION, AccountedVlmProvider, AnalysisAccountingAggregate,
     AnalysisAccountingContext, AnalysisAccountingReport, AnalysisBudgetAuthorityContext,
-    AnalysisBudgetExhausted, AnalysisBudgetSnapshot, AnalysisOperationAttemptProjection,
-    AnalysisProviderReceipt, AnalysisRequestEvent, AnalysisRequestLifecycle,
-    AnalysisRequestReconciliation, AnalysisRequestRecord, AnalysisRetryAuthorization,
+    AnalysisBudgetExhausted, AnalysisBudgetSnapshot, AnalysisOperationAccountingSummary,
+    AnalysisOperationAttemptProjection, AnalysisProviderReceipt, AnalysisRequestEvent,
+    AnalysisRequestLifecycle, AnalysisRequestReconciliation, AnalysisRequestRecord,
+    AnalysisRetryAuthorization, CHRONOLOGY_SUGGESTIONS_OPERATION, LABEL_CONSOLIDATION_OPERATION,
     LEGACY_UNKNOWN_USAGE_STOP_REASON, MAX_IN_FLIGHT_REQUESTS_PER_BUDGET_AUTHORITY,
     MAX_REQUEST_ATTEMPTS, ProviderReceiptEvidence, UNTRACKED_POST_INITIALIZATION_USAGE_STOP_REASON,
     analysis_operation_budget_scope_id, analysis_policy_budget_scope_id,
@@ -954,6 +957,41 @@ fn resolve_analysis_budget(options: &AnalysisRunOptions) -> Result<f64> {
     };
     anyhow::ensure!(budget.is_finite(), "analysis budget must be finite");
     anyhow::ensure!(budget > 0.0, "analysis budget must be greater than zero");
+    Ok(budget)
+}
+
+fn empty_consolidation_report() -> ConsolidationReport {
+    ConsolidationReport {
+        remapped_assets: 0,
+        vocabulary_size: 0,
+        mappings: Vec::new(),
+        model: String::new(),
+        cost_usd: 0.0,
+        uncertain_usage_reserve_usd: 0.0,
+        active_reserved_cost_usd: 0.0,
+        committed_or_reserved_usd: 0.0,
+        usage_complete: true,
+        run_id: String::new(),
+        request_keys: Vec::new(),
+        actual_provider: None,
+        actual_model: None,
+        provider_generation_id: None,
+    }
+}
+
+/// Paid ad-hoc operations fail closed unless the existing budget resolver can
+/// produce a finite ceiling from the explicit option or the documented
+/// environment setting. An absent ceiling is not an unlimited allowance.
+fn resolve_paid_operation_budget(explicit: Option<f64>, operation: &str) -> Result<f64> {
+    let budget = resolve_analysis_budget(&AnalysisRunOptions {
+        budget_usd: explicit,
+        ..AnalysisRunOptions::default()
+    })
+    .with_context(|| format!("resolve {operation} analysis budget"))?;
+    anyhow::ensure!(
+        budget.is_finite(),
+        "{operation} requires a finite analysis budget; pass an explicit budget or set RCDVLOG_VLM_MAX_COST_USD"
+    );
     Ok(budget)
 }
 
@@ -2653,6 +2691,95 @@ impl Catalog {
         Ok(())
     }
 
+    /// Confirmed current-run projection plus separately visible reservation and
+    /// uncertainty fields for one non-policy paid operation. Request keys remain
+    /// inspectable for the follow-up reconciliation CLI.
+    pub fn analysis_operation_accounting_summary(
+        &self,
+        project_id: &str,
+        operation: &str,
+        run_id: &str,
+    ) -> Result<AnalysisOperationAccountingSummary> {
+        anyhow::ensure!(
+            !project_id.trim().is_empty() && !operation.trim().is_empty(),
+            "operation accounting project and operation are required"
+        );
+        anyhow::ensure!(
+            !run_id.trim().is_empty(),
+            "operation accounting run id is required"
+        );
+        let projection =
+            self.analysis_accounting_aggregate_for_operation_run(project_id, operation, run_id)?;
+        let request_keys = self.analysis_request_keys_for_run(project_id, operation, run_id)?;
+        Ok(AnalysisOperationAccountingSummary {
+            run_id: run_id.to_string(),
+            request_count: projection.request_count,
+            completed_request_count: projection.completed_request_count,
+            active_request_count: projection.active_request_count,
+            uncertain_request_count: projection.uncertain_request_count,
+            confirmed_cost_usd: projection.confirmed_cost_usd,
+            active_reserved_cost_usd: projection.active_reserved_cost_usd,
+            uncertain_usage_reserve_usd: projection.uncertain_usage_reserve_usd,
+            committed_or_reserved_usd: projection.committed_or_reserved_usd,
+            usage_complete: !projection.has_unresolved_usage(),
+            actual_provider: projection.current_run_actual_provider,
+            actual_model: projection.current_run_actual_model,
+            provider_generation_id: projection.current_run_generation_id,
+            request_keys,
+        })
+    }
+
+    /// Best-effort durable close after any post-admission failure. Only typed
+    /// safe failure detail is persisted; raw provider/parse text never enters run
+    /// history. Receipts and confirmed-ledger cost remain untouched.
+    fn fail_operation_run(
+        &self,
+        project_id: &str,
+        operation: &str,
+        run_id: &str,
+        error: &anyhow::Error,
+    ) {
+        let Ok(summary) = self.analysis_operation_accounting_summary(project_id, operation, run_id)
+        else {
+            return;
+        };
+        let failure = ProviderFailure::from_anyhow(error);
+        let _ = self.finish_operation_run(
+            run_id,
+            operation,
+            "failed",
+            &failure.safe_detail(),
+            failure.category == crate::ProviderFailureCategory::LocalBudgetExhausted,
+            &summary,
+        );
+    }
+
+    /// Closes an operation-owned accounted run with confirmed current-run cost.
+    /// Uncertainty remains on the ledger and is deliberately not copied into the
+    /// aggregate run `cost_usd` column.
+    fn finish_operation_run(
+        &self,
+        run_id: &str,
+        operation: &str,
+        status: &str,
+        error: &str,
+        budget_exhausted: bool,
+        summary: &AnalysisOperationAccountingSummary,
+    ) -> Result<()> {
+        self.finish_analysis_run(
+            run_id,
+            &AnalysisRunOutcome {
+                status: status.to_string(),
+                stage_reached: operation.to_string(),
+                clips_analyzed: usize::from(summary.completed_request_count > 0),
+                cost_usd: summary.confirmed_cost_usd,
+                budget_exhausted,
+                error: error.chars().take(240).collect(),
+                ..Default::default()
+            },
+        )
+    }
+
     /// Most recent runs for a project, newest first.
     pub fn analysis_runs(&self, project_id: &str, limit: usize) -> Result<Vec<AnalysisRunRecord>> {
         let connection = self.connection()?;
@@ -4269,54 +4396,179 @@ impl Catalog {
         }
         let (remapped_assets, vocabulary_size) =
             persist_label_mapping(&self.connection()?, project_id, mappings)?;
-        Ok(ConsolidationReport {
-            remapped_assets,
-            vocabulary_size,
-            mappings: mappings.to_vec(),
-            model: String::new(),
-            cost_usd: 0.0,
-        })
+        let mut report = empty_consolidation_report();
+        report.remapped_assets = remapped_assets;
+        report.vocabulary_size = vocabulary_size;
+        report.mappings = mappings.to_vec();
+        Ok(report)
     }
 
-    /// Performs one text-only vocabulary consolidation request, then remaps
-    /// only labels recorded as AI-authored.
+    /// Performs one text-only vocabulary consolidation request through the
+    /// canonical operation authority and accounted provider boundary. Production
+    /// credentials and the existing finite budget resolver are resolved here.
     pub fn consolidate_labels(&self, project_id: &str) -> Result<ConsolidationReport> {
-        let proposals = label_proposals(&self.connection()?, project_id)?;
-        if proposals.is_empty() {
-            return Ok(ConsolidationReport {
-                remapped_assets: 0,
-                vocabulary_size: 0,
-                mappings: Vec::new(),
-                model: String::new(),
-                cost_usd: 0.0,
-            });
+        if label_proposals(&self.connection()?, project_id)?.is_empty() {
+            return Ok(empty_consolidation_report());
         }
+        let budget_usd = resolve_paid_operation_budget(None, "label consolidation")?;
         let provider = OpenRouterProvider::new(resolve_api_key()?)?;
-        let request = VlmRequest {
-            prompt: consolidation_prompt(&proposals),
-            frames: Vec::new(),
-            schema: mapping_schema(proposals.len()),
-        };
         let chain = ProviderChain::new();
-        let first = chain.analyze(&provider, &request)?;
-        let (mapping, response, total_cost) = match parse_mapping(&first.response.body, &proposals)
-        {
-            Ok(mapping) => (mapping, first.response.clone(), first.response.cost_usd),
-            Err(default_error) if first.response.model == DEFAULT_MODEL => {
-                chain.record_default_failure();
-                let fallback = provider.analyze(FALLBACK_MODEL, &request)?;
-                let mapping = parse_mapping(&fallback.body, &proposals).with_context(|| {
-                    format!("default mapping was invalid ({default_error:#}); fallback was invalid")
-                })?;
-                let total_cost = first.response.cost_usd + fallback.cost_usd;
-                (mapping, fallback, total_cost)
+        self.consolidate_labels_with_provider(project_id, &provider, &chain, budget_usd)
+    }
+
+    /// Provider-injected label consolidation. The same production pipeline is
+    /// used by focused offline verification; callers only substitute transport
+    /// and an explicit finite budget.
+    pub fn consolidate_labels_with_provider(
+        &self,
+        project_id: &str,
+        provider: &dyn VlmProvider,
+        chain: &ProviderChain,
+        budget_usd: f64,
+    ) -> Result<ConsolidationReport> {
+        self.consolidate_labels_with_provider_and_cancel(
+            project_id,
+            provider,
+            chain,
+            budget_usd,
+            &mut || false,
+        )
+    }
+
+    /// Cancellation-aware provider-injected consolidation. Cancellation after a
+    /// primary attempt prevents the domain-validation fallback transmission.
+    pub fn consolidate_labels_with_provider_and_cancel(
+        &self,
+        project_id: &str,
+        provider: &dyn VlmProvider,
+        chain: &ProviderChain,
+        budget_usd: f64,
+        is_cancelled: &mut dyn FnMut() -> bool,
+    ) -> Result<ConsolidationReport> {
+        let budget_usd = resolve_paid_operation_budget(Some(budget_usd), "label consolidation")?;
+        self.consolidate_labels_accounted(project_id, provider, chain, budget_usd, is_cancelled)
+    }
+
+    /// Budget-first production wrapper used by adapters after resolving the
+    /// existing environment/options ceiling.
+    pub fn consolidate_labels_with_budget(
+        &self,
+        project_id: &str,
+        budget_usd: f64,
+    ) -> Result<ConsolidationReport> {
+        let provider = OpenRouterProvider::new(resolve_api_key()?)?;
+        let chain = ProviderChain::new();
+        self.consolidate_labels_with_provider(project_id, &provider, &chain, budget_usd)
+    }
+
+    fn consolidate_labels_accounted(
+        &self,
+        project_id: &str,
+        provider: &dyn VlmProvider,
+        chain: &ProviderChain,
+        budget_usd: f64,
+        is_cancelled: &mut dyn FnMut() -> bool,
+    ) -> Result<ConsolidationReport> {
+        const CONSOLIDATION_RECIPE_VERSION: &str = "labels.consolidation.v1";
+        let prepared = {
+            let connection = self.connection()?;
+            match analysis::consolidate::prepare(&connection, project_id, chain)? {
+                Some(prepared) => prepared,
+                None => return Ok(empty_consolidation_report()),
             }
-            Err(error) => return Err(error).context("validate consolidation mapping"),
         };
-        let mut report = self.apply_label_mapping(project_id, &mapping)?;
-        report.model = response.model;
-        report.cost_usd = total_cost;
-        Ok(report)
+        let intended_attempt_key = operation_intended_attempt_key(
+            project_id,
+            LABEL_CONSOLIDATION_OPERATION,
+            &prepared.source_fingerprint,
+            &prepared.request_identity,
+        )?;
+        let policy_fingerprint = operation_policy_fingerprint(
+            project_id,
+            LABEL_CONSOLIDATION_OPERATION,
+            chain,
+            CONSOLIDATION_RECIPE_VERSION,
+            budget_usd,
+        )?;
+        let session = begin_accounted_operation(
+            self,
+            project_id,
+            LABEL_CONSOLIDATION_OPERATION,
+            &policy_fingerprint,
+            budget_usd,
+            LABEL_CONSOLIDATION_OPERATION,
+        )?;
+        let outcome = (|| -> Result<ConsolidationReport> {
+            let context =
+                session.request_context(intended_attempt_key, prepared.source_fingerprint.clone());
+            let expected_source = prepared.source_fingerprint.clone();
+            let accounted = AccountedVlmProvider::new(self, context, provider)
+                .with_pre_dispatch_check(move || {
+                    let connection = self.connection()?;
+                    analysis::consolidate::validate_source_unchanged(
+                        &connection,
+                        project_id,
+                        &expected_source,
+                    )
+                });
+            let mapping = analysis::consolidate::run_with_cancel(
+                &accounted,
+                chain,
+                &prepared.request,
+                &prepared.proposals,
+                is_cancelled,
+            )?;
+            // The model may have been paid before a concurrent AI-label write.
+            // Never apply a mapping over different source evidence.
+            {
+                let connection = self.connection()?;
+                analysis::consolidate::validate_source_unchanged(
+                    &connection,
+                    project_id,
+                    &prepared.source_fingerprint,
+                )?;
+            }
+            let report = self.apply_label_mapping(project_id, &mapping)?;
+            let summary = self.analysis_operation_accounting_summary(
+                project_id,
+                LABEL_CONSOLIDATION_OPERATION,
+                &session.run_id,
+            )?;
+            let report = analysis::consolidate::with_accounting_projection(
+                report,
+                &summary,
+                &session.run_id,
+            );
+            self.finish_operation_run(
+                &session.run_id,
+                LABEL_CONSOLIDATION_OPERATION,
+                if summary.usage_complete {
+                    "completed"
+                } else {
+                    "failed"
+                },
+                if summary.usage_complete {
+                    ""
+                } else {
+                    "label consolidation returned incomplete usage evidence"
+                },
+                false,
+                &summary,
+            )?;
+            Ok(report)
+        })();
+        match outcome {
+            Ok(report) => Ok(report),
+            Err(error) => {
+                self.fail_operation_run(
+                    project_id,
+                    LABEL_CONSOLIDATION_OPERATION,
+                    &session.run_id,
+                    &error,
+                );
+                Err(error)
+            }
+        }
     }
 
     pub fn generate_missing_proxies(&self, project_id: &str) -> Result<ProxyReport> {
@@ -5027,6 +5279,8 @@ impl Catalog {
 
     /// Makes one read-only, proxy-only cross-clip evidence request. Results are
     /// suggestions and provenance; this method has no path to chronology writes.
+    /// The budget contract fails closed on a cache miss when no finite ceiling is
+    /// configured.
     pub fn suggest_chronology_with_provider(
         &self,
         project_id: &str,
@@ -5034,90 +5288,181 @@ impl Catalog {
         provider: &dyn VlmProvider,
         chain: &ProviderChain,
     ) -> Result<SuggestionResult> {
-        anyhow::ensure!((2..=8).contains(&asset_ids.len()), "select 2..=8 clips");
-        anyhow::ensure!(
-            asset_ids.iter().collect::<HashSet<_>>().len() == asset_ids.len(),
-            "each clip may be selected only once"
-        );
-        let facts = self.chronology_facts(project_id)?;
-        let facts_revision = blake3::hash(&serde_json::to_vec(&facts)?)
-            .to_hex()
-            .to_string();
-        let mut frames = Vec::new();
-        for asset_id in asset_ids {
-            let asset = self.get_asset(asset_id)?;
-            anyhow::ensure!(
-                asset.project_id == project_id && !asset.removed,
-                "clip is not an active member of this project"
-            );
-            let proxy = Self::require_proxy(&asset)?;
-            let manifest = self.analysis_frame_pack(&asset)?;
-            let parent = self
-                .database_path
-                .parent()
-                .ok_or_else(|| anyhow!("catalog has no parent directory"))?;
-            let directory = parent
-                .join("cache")
-                .join("framepacks")
-                .join(project_id)
-                .join(asset_id)
-                .join(&manifest.source_fingerprint);
-            let paths = encode_frames(&proxy, &manifest, &directory)?;
-            anyhow::ensure!(
-                !paths.is_empty() && paths.len() == manifest.timestamps_ms.len(),
-                "proxy frame pack is empty or incomplete for {asset_id}"
-            );
-            // Two deterministic samples per selected clip keep cross-clip requests small.
-            let indexes = if paths.len() == 1 {
-                vec![0]
-            } else {
-                vec![0, paths.len() - 1]
-            };
-            for index in indexes {
-                let timestamp_ms = manifest.timestamps_ms[index];
-                let bytes = fs::read(&paths[index])
-                    .with_context(|| format!("read proxy frame {}", paths[index].display()))?;
-                frames.push(EvidenceFrame {
-                    id: format!("{asset_id}@{timestamp_ms}"),
-                    asset_id: asset_id.clone(),
-                    timestamp_ms,
-                    proxy_data_uri: frame_data_uri(&bytes),
-                });
+        self.suggest_chronology_accounted(project_id, asset_ids, provider, chain, None, &mut || {
+            false
+        })
+    }
+
+    /// Paid chronology suggestion with an explicit finite budget. This is the
+    /// same provider-injected production pipeline used by adapters; the shared
+    /// ledger owns admission, dispatch and receipts.
+    pub fn suggest_chronology_with_provider_and_budget(
+        &self,
+        project_id: &str,
+        asset_ids: &[String],
+        provider: &dyn VlmProvider,
+        chain: &ProviderChain,
+        budget_usd: f64,
+    ) -> Result<SuggestionResult> {
+        self.suggest_chronology_with_provider_and_budget_and_cancel(
+            project_id,
+            asset_ids,
+            provider,
+            chain,
+            budget_usd,
+            &mut || false,
+        )
+    }
+
+    /// Cancellation-aware explicit-budget chronology suggestion. Cancellation is
+    /// checked before each actual primary/fallback transmission.
+    pub fn suggest_chronology_with_provider_and_budget_and_cancel(
+        &self,
+        project_id: &str,
+        asset_ids: &[String],
+        provider: &dyn VlmProvider,
+        chain: &ProviderChain,
+        budget_usd: f64,
+        is_cancelled: &mut dyn FnMut() -> bool,
+    ) -> Result<SuggestionResult> {
+        let budget_usd = resolve_paid_operation_budget(Some(budget_usd), "chronology suggestions")?;
+        self.suggest_chronology_accounted(
+            project_id,
+            asset_ids,
+            provider,
+            chain,
+            Some(budget_usd),
+            is_cancelled,
+        )
+    }
+
+    fn suggest_chronology_accounted(
+        &self,
+        project_id: &str,
+        asset_ids: &[String],
+        provider: &dyn VlmProvider,
+        chain: &ProviderChain,
+        explicit_budget_usd: Option<f64>,
+        is_cancelled: &mut dyn FnMut() -> bool,
+    ) -> Result<SuggestionResult> {
+        const CHRONOLOGY_SUGGESTION_RECIPE_VERSION: &str = "chronology.suggestions.v1";
+        let prepared = analysis::chronology_suggestions::prepare_request(
+            self,
+            project_id,
+            asset_ids,
+            chain,
+            is_cancelled,
+        )?;
+        // Completed result content is reusable without any paid admission. New
+        // requests never create a pending cache permit: the canonical ledger is
+        // the sole in-flight fence.
+        {
+            let connection = self.connection()?;
+            if let Some(result) = analysis::chronology_suggestions::load_cached(
+                &connection,
+                &prepared.cache_request_key,
+            )? {
+                return Ok(result);
             }
         }
-        let required_frame_ids = frames.iter().map(|frame| frame.id.clone()).collect();
-        let request = ChronologyEvidenceRequest {
-            facts_revision,
-            frames,
-            required_frame_ids,
-        };
-        let request_key = blake3::hash(&serde_json::to_vec(&(
-            &request,
-            chain.current_default(),
-            chain.fallback_model(),
-        ))?)
-        .to_hex()
-        .to_string();
-        let connection = self.connection()?;
-        if let Some(result) =
-            analysis::chronology_suggestions::load_cached(&connection, &request_key)?
-        {
-            return Ok(result);
-        }
-        anyhow::ensure!(
-            analysis::chronology_suggestions::reserve_request(
-                &connection,
-                &request_key,
+        let budget_usd =
+            resolve_paid_operation_budget(explicit_budget_usd, "chronology suggestions")?;
+        let intended_attempt_key = operation_intended_attempt_key(
+            project_id,
+            CHRONOLOGY_SUGGESTIONS_OPERATION,
+            &prepared.source_fingerprint,
+            &prepared.request_identity,
+        )?;
+        let policy_fingerprint = operation_policy_fingerprint(
+            project_id,
+            CHRONOLOGY_SUGGESTIONS_OPERATION,
+            chain,
+            CHRONOLOGY_SUGGESTION_RECIPE_VERSION,
+            budget_usd,
+        )?;
+        let session = begin_accounted_operation(
+            self,
+            project_id,
+            CHRONOLOGY_SUGGESTIONS_OPERATION,
+            &policy_fingerprint,
+            budget_usd,
+            CHRONOLOGY_SUGGESTIONS_OPERATION,
+        )?;
+        let outcome = (|| -> Result<SuggestionResult> {
+            let context =
+                session.request_context(intended_attempt_key, prepared.source_fingerprint.clone());
+            let accounted = AccountedVlmProvider::new(self, context, provider)
+                .with_pre_dispatch_check(|| {
+                    analysis::chronology_suggestions::validate_source_unchanged(
+                        self,
+                        project_id,
+                        &prepared.request,
+                        &prepared.source_identities,
+                    )
+                });
+            let mut result = analysis::chronology_suggestions::request_suggestion_with_cancel(
+                &accounted,
+                chain,
+                &prepared.request,
+                is_cancelled,
+            )?;
+            result.review = review_suggestion_against_facts(
+                &prepared.request,
+                &result.suggestion,
+                &prepared.facts,
+            );
+            let summary = self.analysis_operation_accounting_summary(
                 project_id,
-                &request.facts_revision
-            )?,
-            "an identical chronology suggestion request is already running or was interrupted; refusing a duplicate provider charge"
-        );
-        drop(connection);
-        let mut result = request_suggestion(provider, chain, &request)?;
-        result.review = review_suggestion_against_facts(&request, &result.suggestion, &facts);
-        analysis::chronology_suggestions::store_result(&self.connection()?, &request_key, &result)?;
-        Ok(result)
+                CHRONOLOGY_SUGGESTIONS_OPERATION,
+                &session.run_id,
+            )?;
+            // Canonical provenance is populated before persistence so reopening
+            // the cache cannot show only the last response or lose request keys.
+            let result = analysis::chronology_suggestions::with_accounting_projection(
+                result,
+                &summary,
+                &session.run_id,
+            );
+            {
+                let mut connection = self.connection()?;
+                analysis::chronology_suggestions::store_completed_with_associations(
+                    &mut connection,
+                    &prepared.cache_request_key,
+                    &prepared.request.facts_revision,
+                    &result,
+                    &summary.request_keys,
+                )?;
+            }
+            self.finish_operation_run(
+                &session.run_id,
+                CHRONOLOGY_SUGGESTIONS_OPERATION,
+                if summary.usage_complete {
+                    "completed"
+                } else {
+                    "failed"
+                },
+                if summary.usage_complete {
+                    ""
+                } else {
+                    "chronology suggestion returned incomplete usage evidence"
+                },
+                false,
+                &summary,
+            )?;
+            Ok(result)
+        })();
+        match outcome {
+            Ok(result) => Ok(result),
+            Err(error) => {
+                self.fail_operation_run(
+                    project_id,
+                    CHRONOLOGY_SUGGESTIONS_OPERATION,
+                    &session.run_id,
+                    &error,
+                );
+                Err(error)
+            }
+        }
     }
 
     /// Writes the solution's derived times back into the `assets` projection
@@ -9357,5 +9702,1591 @@ pub(crate) mod tests {
                 .error
                 .contains("not this clip any more")
         );
+    }
+
+    struct OperationFakeProvider {
+        calls: std::sync::Mutex<Vec<String>>,
+        behavior: OperationFakeBehavior,
+        prepare_error: Option<ProviderFailureCategory>,
+        receipt: VlmReceipt,
+    }
+
+    #[derive(Clone, Copy)]
+    enum OperationFakeBehavior {
+        Valid,
+        InvalidBody,
+        TransportPrimaryThenValid,
+    }
+
+    impl OperationFakeProvider {
+        fn new(behavior: OperationFakeBehavior) -> Self {
+            Self {
+                calls: std::sync::Mutex::new(Vec::new()),
+                behavior,
+                prepare_error: None,
+                receipt: VlmReceipt {
+                    actual_model: Some(DEFAULT_MODEL.into()),
+                    provider: Some("fake".into()),
+                    generation_id: Some("fake-generation".into()),
+                    usage_complete: true,
+                },
+            }
+        }
+
+        fn with_prepare_error(mut self, category: ProviderFailureCategory) -> Self {
+            self.prepare_error = Some(category);
+            self
+        }
+
+        fn with_unknown_identity(mut self) -> Self {
+            self.receipt = VlmReceipt {
+                actual_model: None,
+                provider: None,
+                generation_id: None,
+                usage_complete: true,
+            };
+            self
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl VlmProvider for OperationFakeProvider {
+        fn prepare(&self) -> Result<()> {
+            if let Some(category) = self.prepare_error {
+                return Err(match category {
+                    ProviderFailureCategory::LocalPreUpload => {
+                        ProviderFailure::local_pre_upload().into()
+                    }
+                    ProviderFailureCategory::Cancelled => ProviderFailure::cancelled().into(),
+                    _ => ProviderFailure::local_pre_upload().into(),
+                });
+            }
+            Ok(())
+        }
+
+        fn analysis_cost_bound(
+            &self,
+            _model: &str,
+            _request: &VlmRequest,
+        ) -> Result<AnalysisRequestCostBound> {
+            Ok(AnalysisRequestCostBound::declared_for_synthetic_transport(
+                0.01,
+            ))
+        }
+
+        fn analyze(&self, model: &str, _request: &VlmRequest) -> Result<VlmResponse> {
+            self.calls.lock().unwrap().push(model.to_string());
+            match self.behavior {
+                OperationFakeBehavior::InvalidBody => Ok(OperationFakeProvider::response(
+                    model,
+                    "not json",
+                    self.receipt.clone(),
+                )),
+                OperationFakeBehavior::TransportPrimaryThenValid if model == DEFAULT_MODEL => {
+                    Err(ProviderFailure::transport().into())
+                }
+                _ => Ok(OperationFakeProvider::response(
+                    model,
+                    r#"{"mappings":[{"from":"beach","to":"shore"}]}"#,
+                    self.receipt.clone(),
+                )),
+            }
+        }
+    }
+
+    impl OperationFakeProvider {
+        fn response(model: &str, body: &str, receipt: VlmReceipt) -> VlmResponse {
+            VlmResponse {
+                model: model.into(),
+                body: body.into(),
+                prompt_tokens: 11,
+                completion_tokens: 3,
+                cost_usd: 0.001,
+                latency_ms: 7,
+                receipt,
+            }
+        }
+    }
+
+    fn operation_fixture() -> (TempDir, Catalog, Project) {
+        let directory = tempdir().unwrap();
+        let catalog = Catalog::open(directory.path().join("operations.sqlite3")).unwrap();
+        let project = catalog.create_project("operation accounting").unwrap();
+        let first = directory.path().join("first.mov");
+        let second = directory.path().join("second.mov");
+        fs::write(&first, b"first").unwrap();
+        fs::write(&second, b"second").unwrap();
+        insert_asset(
+            &catalog,
+            &project.id,
+            "asset_one",
+            "first.mov",
+            "Sony",
+            "",
+            &first,
+        );
+        insert_asset(
+            &catalog,
+            &project.id,
+            "asset_two",
+            "second.mov",
+            "Sony",
+            "",
+            &second,
+        );
+        record_ai_labels(
+            &catalog.connection().unwrap(),
+            "asset_one",
+            &[("beach".into(), "Beach".into())],
+        )
+        .unwrap();
+        record_ai_labels(
+            &catalog.connection().unwrap(),
+            "asset_two",
+            &[("beach".into(), "Beaches".into())],
+        )
+        .unwrap();
+        catalog.add_label("asset_one", "HumanTag").unwrap();
+        (directory, catalog, project)
+    }
+
+    #[test]
+    fn consolidation_domain_fallback_uses_an_independent_ledger_attempt_and_keeps_ai_only_scope() {
+        let (_directory, catalog, project) = operation_fixture();
+        let provider = OperationFakeProvider {
+            behavior: OperationFakeBehavior::Valid,
+            calls: std::sync::Mutex::new(Vec::new()),
+            prepare_error: None,
+            receipt: VlmReceipt {
+                actual_model: Some(FALLBACK_MODEL.into()),
+                provider: Some("fake".into()),
+                generation_id: Some("fallback-generation".into()),
+                usage_complete: true,
+            },
+        };
+        // The first call returns syntactically valid JSON that names no mapping,
+        // so force a transport fallback explicitly with a chain wrapper fake.
+        struct DomainFallbackProvider {
+            inner: OperationFakeProvider,
+        }
+        impl VlmProvider for DomainFallbackProvider {
+            fn analysis_cost_bound(
+                &self,
+                model: &str,
+                request: &VlmRequest,
+            ) -> Result<AnalysisRequestCostBound> {
+                self.inner.analysis_cost_bound(model, request)
+            }
+            fn analyze(&self, model: &str, _request: &VlmRequest) -> Result<VlmResponse> {
+                self.inner.calls.lock().unwrap().push(model.to_string());
+                if model == DEFAULT_MODEL {
+                    Ok(OperationFakeProvider::response(
+                        model,
+                        r#"{"mappings":[{"from":"unknown-label","to":"x"}]}"#,
+                        VlmReceipt {
+                            actual_model: Some(DEFAULT_MODEL.into()),
+                            provider: Some("fake".into()),
+                            generation_id: Some("default-generation".into()),
+                            usage_complete: true,
+                        },
+                    ))
+                } else {
+                    Ok(OperationFakeProvider::response(
+                        model,
+                        r#"{"mappings":[{"from":"beach","to":"shore"}]}"#,
+                        VlmReceipt {
+                            actual_model: Some(FALLBACK_MODEL.into()),
+                            provider: Some("fake".into()),
+                            generation_id: Some("fallback-generation".into()),
+                            usage_complete: true,
+                        },
+                    ))
+                }
+            }
+        }
+        let fallback_provider = DomainFallbackProvider { inner: provider };
+        let chain = ProviderChain::with_policy(
+            DEFAULT_MODEL,
+            &[DEFAULT_MODEL.to_string(), FALLBACK_MODEL.to_string()],
+            true,
+        )
+        .unwrap();
+        let report = catalog
+            .consolidate_labels_with_provider(&project.id, &fallback_provider, &chain, 1.0)
+            .unwrap();
+        assert_eq!(fallback_provider.inner.calls().len(), 2);
+        assert_eq!(report.cost_usd, 0.002);
+        assert!(report.usage_complete);
+        assert_eq!(report.actual_model.as_deref(), Some(FALLBACK_MODEL));
+        let requests = catalog
+            .list_analysis_requests(&project.id, None, 20)
+            .unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.lifecycle == AnalysisRequestLifecycle::Completed)
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request.confirmed_cost_usd)
+                .sum::<f64>(),
+            report.cost_usd
+        );
+        let asset = catalog.get_asset("asset_one").unwrap();
+        assert!(asset.labels.iter().any(|label| label == "shore"));
+        assert!(asset.labels.iter().any(|label| label == "HumanTag"));
+    }
+
+    #[test]
+    fn consolidation_local_prepare_failure_releases_without_fallback_or_receipt() {
+        let (_directory, catalog, project) = operation_fixture();
+        let provider = OperationFakeProvider::new(OperationFakeBehavior::Valid)
+            .with_prepare_error(ProviderFailureCategory::LocalPreUpload);
+        let chain = ProviderChain::with_policy(
+            DEFAULT_MODEL,
+            &[DEFAULT_MODEL.to_string(), FALLBACK_MODEL.to_string()],
+            true,
+        )
+        .unwrap();
+        let error = catalog
+            .consolidate_labels_with_provider(&project.id, &provider, &chain, 1.0)
+            .unwrap_err();
+        assert_eq!(
+            ProviderFailure::from_anyhow(&error).category,
+            ProviderFailureCategory::LocalPreUpload
+        );
+        assert!(provider.calls().is_empty());
+        let requests = catalog
+            .list_analysis_requests(&project.id, None, 20)
+            .unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].lifecycle, AnalysisRequestLifecycle::Released);
+        assert_eq!(requests[0].reserved_cost_usd, 0.0);
+        assert!(
+            catalog
+                .analysis_provider_receipts(&requests[0].request_key)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn invalid_paid_consolidation_body_keeps_receipt_and_blocks_implicit_resend() {
+        let (_directory, catalog, project) = operation_fixture();
+        let provider = OperationFakeProvider::new(OperationFakeBehavior::InvalidBody);
+        let chain =
+            ProviderChain::with_policy(DEFAULT_MODEL, &[DEFAULT_MODEL.to_string()], false).unwrap();
+        assert!(
+            catalog
+                .consolidate_labels_with_provider(&project.id, &provider, &chain, 1.0)
+                .is_err()
+        );
+        assert_eq!(provider.calls().len(), 1);
+        let requests = catalog
+            .list_analysis_requests(&project.id, None, 20)
+            .unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].lifecycle, AnalysisRequestLifecycle::Completed);
+        assert_eq!(requests[0].confirmed_cost_usd, 0.001);
+        assert_eq!(requests[0].actual_provider.as_deref(), Some("fake"));
+        assert_eq!(
+            catalog
+                .analysis_provider_receipts(&requests[0].request_key)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // A second call with the same exact intent is denied before transport.
+        assert!(
+            catalog
+                .consolidate_labels_with_provider(&project.id, &provider, &chain, 1.0)
+                .is_err()
+        );
+        assert_eq!(provider.calls().len(), 1);
+    }
+
+    #[test]
+    fn transport_fallback_retains_uncertain_primary_reserve_separately() {
+        let (_directory, catalog, project) = operation_fixture();
+        let provider = OperationFakeProvider::new(OperationFakeBehavior::TransportPrimaryThenValid);
+        let chain = ProviderChain::with_policy(
+            DEFAULT_MODEL,
+            &[DEFAULT_MODEL.to_string(), FALLBACK_MODEL.to_string()],
+            true,
+        )
+        .unwrap();
+        let report = catalog
+            .consolidate_labels_with_provider(&project.id, &provider, &chain, 1.0)
+            .unwrap();
+        assert_eq!(provider.calls().len(), 2);
+        assert!(report.uncertain_usage_reserve_usd >= 0.01);
+        assert_eq!(report.cost_usd, 0.001);
+        assert!(!report.usage_complete);
+        let requests = catalog
+            .list_analysis_requests(&project.id, None, 20)
+            .unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.lifecycle == AnalysisRequestLifecycle::Uncertain)
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.lifecycle == AnalysisRequestLifecycle::Completed)
+        );
+    }
+
+    #[test]
+    fn missing_actual_identity_stays_none_in_consolidation_report() {
+        let (_directory, catalog, project) = operation_fixture();
+        let provider =
+            OperationFakeProvider::new(OperationFakeBehavior::Valid).with_unknown_identity();
+        let chain =
+            ProviderChain::with_policy(DEFAULT_MODEL, &[DEFAULT_MODEL.to_string()], false).unwrap();
+        let report = catalog
+            .consolidate_labels_with_provider(&project.id, &provider, &chain, 1.0)
+            .unwrap();
+        assert_eq!(report.model, "");
+        assert_eq!(report.actual_provider, None);
+        assert_eq!(report.actual_model, None);
+        assert_eq!(report.provider_generation_id, None);
+        let requests = catalog
+            .list_analysis_requests(&project.id, None, 20)
+            .unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].actual_provider, None);
+        assert_eq!(requests[0].actual_model, None);
+    }
+
+    #[test]
+    fn legacy_chronology_cache_cost_is_confirmed_once_and_pending_is_unknown() {
+        let directory = tempdir().unwrap();
+        let catalog = Catalog::open(directory.path().join("legacy-cache.sqlite3")).unwrap();
+        let project = catalog.create_project("legacy cache").unwrap();
+        catalog
+            .connection()
+            .unwrap()
+            .execute(
+                "INSERT INTO analysis_chronology_suggestions(
+                    request_key,project_id,facts_revision,status,result_json,model,attempts,
+                    cost_usd,prompt_tokens,completion_tokens,latency_ms,created_at,updated_at)
+                 VALUES('old-request',?1,'rev','completed',?2,'old-model',1,0.005,1,1,1,?3,?3)",
+                params![
+                    project.id,
+                    r#"{"provenance":{"usageComplete":true}}"#,
+                    now()
+                ],
+            )
+            .unwrap();
+        let authority = AnalysisBudgetAuthorityContext {
+            project_id: project.id.clone(),
+            policy_id: String::new(),
+            policy_fingerprint: "legacy-cache-policy".into(),
+            operation: CHRONOLOGY_SUGGESTIONS_OPERATION.into(),
+            provider: "openrouter".into(),
+            budget_scope_id: String::new(),
+            budget_usd: 1.0,
+        };
+        let first = catalog
+            .initialize_analysis_accounting_authority(&authority)
+            .unwrap();
+        assert_eq!(first.legacy_confirmed_cost_usd, 0.005);
+        assert!(first.legacy_usage_complete);
+        assert!(!first.dispatch_stopped);
+        let second = catalog
+            .initialize_analysis_accounting_authority(&authority)
+            .unwrap();
+        assert_eq!(second.legacy_confirmed_cost_usd, 0.005);
+        let aggregate = catalog
+            .analysis_accounting_aggregate_for_operation_scope(
+                &project.id,
+                CHRONOLOGY_SUGGESTIONS_OPERATION,
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(aggregate.legacy_confirmed_cost_usd, 0.005);
+        assert_eq!(aggregate.confirmed_cost_usd, 0.005);
+
+        // A separate pending legacy row has no complete receipt evidence and
+        // therefore reserves unknown usage and stops further dispatch.
+        let pending_project = catalog.create_project("pending cache").unwrap();
+        catalog
+            .connection()
+            .unwrap()
+            .execute(
+                "INSERT INTO analysis_chronology_suggestions(
+                    request_key,project_id,facts_revision,status,result_json,model,attempts,
+                    cost_usd,prompt_tokens,completion_tokens,latency_ms,created_at,updated_at)
+                 VALUES('pending-request',?1,'rev','running','', '',0,0,0,0,0,?2,?2)",
+                params![pending_project.id, now()],
+            )
+            .unwrap();
+        let pending = catalog
+            .initialize_analysis_accounting_authority(&AnalysisBudgetAuthorityContext {
+                project_id: pending_project.id.clone(),
+                policy_id: String::new(),
+                policy_fingerprint: "pending-policy".into(),
+                operation: CHRONOLOGY_SUGGESTIONS_OPERATION.into(),
+                provider: "openrouter".into(),
+                budget_scope_id: String::new(),
+                budget_usd: 1.0,
+            })
+            .unwrap();
+        assert!(pending.dispatch_stopped);
+        assert!(pending.legacy_uncertain_usage_reserve_usd >= 1.0);
+        assert!(!pending.legacy_usage_complete);
+    }
+
+    #[test]
+    fn ledger_linked_chronology_cache_is_not_reclassified_as_untracked_legacy_spend() {
+        let directory = tempdir().unwrap();
+        let catalog = Catalog::open(directory.path().join("cache-link.sqlite3")).unwrap();
+        let project = catalog.create_project("cache link").unwrap();
+        let authority = AnalysisBudgetAuthorityContext {
+            project_id: project.id.clone(),
+            policy_id: String::new(),
+            policy_fingerprint: "cache-link-policy".into(),
+            operation: CHRONOLOGY_SUGGESTIONS_OPERATION.into(),
+            provider: "openrouter".into(),
+            budget_scope_id: String::new(),
+            budget_usd: 1.0,
+        };
+        catalog
+            .initialize_analysis_accounting_authority(&authority)
+            .unwrap();
+        let run_id = catalog
+            .begin_accounted_analysis_run(&project.id, "", CHRONOLOGY_SUGGESTIONS_OPERATION)
+            .unwrap();
+        let context = AnalysisAccountingContext {
+            project_id: project.id.clone(),
+            policy_id: String::new(),
+            policy_fingerprint: "cache-link-policy".into(),
+            run_id: run_id.clone(),
+            operation: CHRONOLOGY_SUGGESTIONS_OPERATION.into(),
+            intended_attempt_key: "cache-link-intent".into(),
+            source_fingerprint: "cache-link-source".into(),
+            provider: "openrouter".into(),
+            budget_scope_id: String::new(),
+            budget_usd: 1.0,
+            explicit_retry: false,
+        };
+        let bound = AnalysisRequestCostBound::declared_for_synthetic_transport(0.1);
+        let request = catalog
+            .reserve_analysis_request(&context, DEFAULT_MODEL, "cache-link-payload", &bound)
+            .unwrap();
+        catalog
+            .mark_analysis_request_dispatched(&request.request_key)
+            .unwrap();
+        catalog
+            .record_analysis_request_receipt(
+                &request.request_key,
+                &ProviderReceiptEvidence {
+                    provider: "fake".into(),
+                    provider_generation_id: "generation".into(),
+                    actual_model: DEFAULT_MODEL.into(),
+                    reported_cost_usd: Some(0.001),
+                    prompt_tokens: Some(1),
+                    completion_tokens: Some(1),
+                    usage_complete: true,
+                },
+            )
+            .unwrap();
+        catalog
+            .connection()
+            .unwrap()
+            .execute(
+                "INSERT INTO analysis_chronology_suggestions(
+                    request_key,project_id,facts_revision,status,result_json,model,attempts,
+                    cost_usd,prompt_tokens,completion_tokens,latency_ms,created_at,updated_at)
+                 VALUES('ledger-owned-cache',?1,'rev','completed',?2,'model',1,0.001,1,1,1,?3,?3)",
+                params![
+                    project.id,
+                    serde_json::json!({"provenance":{"usageComplete":true,"runId":run_id,"requestKeys":[request.request_key]}}).to_string(),
+                    now()
+                ],
+            )
+            .unwrap();
+        let foreign = catalog.create_project("foreign cache owner").unwrap();
+        catalog
+            .connection()
+            .unwrap()
+            .execute(
+                "INSERT INTO analysis_chronology_suggestions(
+                request_key,project_id,facts_revision,status,result_json,created_at,updated_at)
+             VALUES('foreign-cache',?1,'rev','completed',?2,?3,?3)",
+                params![
+                    foreign.id,
+                    serde_json::json!({"provenance":{"runId":run_id,"requestKeys":[request.request_key]}})
+                        .to_string(),
+                    now()
+                ],
+            )
+            .unwrap();
+        assert!(
+            catalog
+                .associate_analysis_request_cache_result(&request.request_key, "foreign-cache")
+                .is_err()
+        );
+        catalog
+            .associate_analysis_request_cache_result(&request.request_key, "ledger-owned-cache")
+            .unwrap();
+        let reopened = catalog
+            .initialize_analysis_accounting_authority(&authority)
+            .unwrap();
+        assert!(
+            !reopened.dispatch_stopped,
+            "our own ledger-linked cache row must not become untracked legacy spend"
+        );
+        let other_run = catalog
+            .begin_accounted_analysis_run(&project.id, "", CHRONOLOGY_SUGGESTIONS_OPERATION)
+            .unwrap();
+        let connection = catalog.connection().unwrap();
+        let columns = connection
+            .prepare("PRAGMA table_info(analysis_request_reservations)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        let selection = columns
+            .iter()
+            .map(|column| match column.as_str() {
+                "request_key" => "'bulk-old-' || n".into(),
+                "attempt_base_key" => "'bulk-base-' || n".into(),
+                "run_id" => "?2".into(),
+                "lifecycle" => "'released'".into(),
+                "reserved_cost_usd" | "confirmed_cost_usd" | "uncertain_cost_usd" => "0.0".into(),
+                "reported_cost_usd"
+                | "actual_provider"
+                | "actual_model"
+                | "provider_generation_id"
+                | "dispatch_at" => "NULL".into(),
+                "created_at" => "'9999-01-01'".into(),
+                _ => column.clone(),
+            })
+            .collect::<Vec<String>>()
+            .join(",");
+        connection.execute(&format!(
+            "WITH RECURSIVE padding(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM padding WHERE n<1001)
+             INSERT INTO analysis_request_reservations({}) SELECT {} FROM analysis_request_reservations,padding WHERE request_key=?1",
+            columns.join(","), selection
+        ), params![request.request_key, other_run]).unwrap();
+        let summary = catalog
+            .analysis_operation_accounting_summary(
+                &project.id,
+                CHRONOLOGY_SUGGESTIONS_OPERATION,
+                &run_id,
+            )
+            .unwrap();
+        assert_eq!(summary.request_count, 1);
+        assert_eq!(summary.request_keys, vec![request.request_key]);
+
+        assert_eq!(reopened.post_initialization_untracked_evidence_count, 0);
+    }
+
+    #[derive(Clone, Copy)]
+    enum ChronologyFakeBehavior {
+        Valid,
+        InvalidBody,
+        TransportPrimaryThenValid,
+        PanicAfterDispatch,
+        SleepThenValid,
+    }
+
+    struct ChronologyFakeProvider {
+        calls: Mutex<Vec<String>>,
+        behavior: ChronologyFakeBehavior,
+        prepare_error: Option<ProviderFailureCategory>,
+        receipt: VlmReceipt,
+        prepared: Arc<AtomicBool>,
+    }
+
+    impl ChronologyFakeProvider {
+        fn new(behavior: ChronologyFakeBehavior) -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+                behavior,
+                prepare_error: None,
+                receipt: VlmReceipt {
+                    actual_model: Some(DEFAULT_MODEL.into()),
+                    provider: Some("fake".into()),
+                    generation_id: Some("chronology-generation".into()),
+                    usage_complete: true,
+                },
+                prepared: Arc::new(AtomicBool::new(false)),
+            }
+        }
+
+        fn with_prepare_error(mut self, category: ProviderFailureCategory) -> Self {
+            self.prepare_error = Some(category);
+            self
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+
+        fn response(&self, model: &str) -> VlmResponse {
+            let mut receipt = self.receipt.clone();
+            if receipt.actual_model.is_some() {
+                receipt.actual_model = Some(model.to_string());
+            }
+            if receipt.generation_id.is_some() {
+                receipt.generation_id = Some(format!("chronology-generation-{model}"));
+            }
+            VlmResponse {
+                model: model.into(),
+                body: r#"{"frameIds":[],"matches":[]}"#.into(),
+                prompt_tokens: 11,
+                completion_tokens: 3,
+                cost_usd: 0.001,
+                latency_ms: 7,
+                receipt,
+            }
+        }
+    }
+
+    impl VlmProvider for ChronologyFakeProvider {
+        fn prepare(&self) -> Result<()> {
+            if let Some(category) = self.prepare_error {
+                return Err(match category {
+                    ProviderFailureCategory::Cancelled => ProviderFailure::cancelled().into(),
+                    _ => ProviderFailure::local_pre_upload().into(),
+                });
+            }
+            self.prepared.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn analysis_cost_bound(
+            &self,
+            _model: &str,
+            _request: &VlmRequest,
+        ) -> Result<AnalysisRequestCostBound> {
+            Ok(AnalysisRequestCostBound::declared_for_synthetic_transport(
+                0.01,
+            ))
+        }
+
+        fn analyze(&self, model: &str, _request: &VlmRequest) -> Result<VlmResponse> {
+            self.calls.lock().unwrap().push(model.to_string());
+            match self.behavior {
+                ChronologyFakeBehavior::InvalidBody => Ok(VlmResponse {
+                    model: model.into(),
+                    body: "not json".into(),
+                    prompt_tokens: 11,
+                    completion_tokens: 3,
+                    cost_usd: 0.001,
+                    latency_ms: 7,
+                    receipt: self.receipt.clone(),
+                }),
+                ChronologyFakeBehavior::TransportPrimaryThenValid if model == DEFAULT_MODEL => {
+                    Err(ProviderFailure::transport().into())
+                }
+                ChronologyFakeBehavior::PanicAfterDispatch => {
+                    panic!("synthetic paid chronology interruption after dispatch marker")
+                }
+                ChronologyFakeBehavior::SleepThenValid => {
+                    std::thread::sleep(std::time::Duration::from_millis(750));
+                    // Charge the full declared bound so exactly one request
+                    // fits even when the shared preparation slot serializes
+                    // workers until the earlier response has already settled.
+                    let mut response = self.response(model);
+                    response.cost_usd = 0.01;
+                    Ok(response)
+                }
+                _ => Ok(self.response(model)),
+            }
+        }
+    }
+
+    fn synthetic_e2e_clip(directory: &Path, index: usize) -> PathBuf {
+        let source_dir = directory.join(format!("source-{index}"));
+        fs::create_dir_all(&source_dir).unwrap();
+        let source = source_dir.join(format!("CLIP{index}.MP4"));
+        let duration = 1.4 + index as f64 * 0.15;
+        let mut command = tool_command("ffmpeg");
+        command.args([
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+        ]);
+        command.arg(format!("testsrc2=size=320x180:rate=24:duration={duration}"));
+        command.args(["-f", "lavfi", "-i"]);
+        command.arg(format!(
+            "sine=frequency={}:duration={duration}",
+            440 + index * 37
+        ));
+        command
+            .args([
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                "-shortest",
+            ])
+            .arg(&source);
+        let status = command.status().unwrap();
+        assert!(
+            status.success(),
+            "could not create synthetic chronology clip"
+        );
+        source
+    }
+
+    fn chronology_operation_fixture(
+        clip_count: usize,
+    ) -> Option<(TempDir, Catalog, Project, Vec<String>, PathBuf)> {
+        if tool_command("ffmpeg").arg("-version").output().is_err()
+            || tool_command("ffprobe").arg("-version").output().is_err()
+        {
+            eprintln!("ffmpeg or ffprobe unavailable; skipping chronology Catalog E2E test");
+            return None;
+        }
+        let directory = tempdir().unwrap();
+        let catalog_path = directory.path().join("chronology-e2e.sqlite3");
+        let catalog = Catalog::open(&catalog_path).unwrap();
+        let project = catalog.create_project("chronology accounting e2e").unwrap();
+        let mut asset_ids = Vec::new();
+        for index in 0..clip_count {
+            let source = synthetic_e2e_clip(directory.path(), index);
+            let source_dir = source.parent().unwrap();
+            catalog.ingest_folder(&project.id, source_dir).unwrap();
+            let filename = source.file_name().unwrap().to_string_lossy().to_string();
+            let asset = catalog
+                .list_assets(&project.id)
+                .unwrap()
+                .into_iter()
+                .find(|asset| asset.filename == filename)
+                .unwrap();
+            let proxied = catalog
+                .generate_proxy_with_policy(&asset.id, ProxyEncoderPolicy::Auto)
+                .unwrap();
+            assert!(
+                proxied
+                    .proxy_path
+                    .as_deref()
+                    .is_some_and(|path| Path::new(path).is_file()),
+                "chronology E2E asset must have a generated proxy"
+            );
+            asset_ids.push(asset.id);
+        }
+        Some((directory, catalog, project, asset_ids, catalog_path))
+    }
+
+    fn default_chronology_chain() -> ProviderChain {
+        ProviderChain::with_policy(DEFAULT_MODEL, &[DEFAULT_MODEL.to_string()], false).unwrap()
+    }
+
+    fn fallback_chronology_chain() -> ProviderChain {
+        ProviderChain::with_policy(
+            DEFAULT_MODEL,
+            &[DEFAULT_MODEL.to_string(), FALLBACK_MODEL.to_string()],
+            true,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn chronology_catalog_success_caches_canonical_provenance_and_reuses_without_paid_call() {
+        let Some((_directory, catalog, project, asset_ids, catalog_path)) =
+            chronology_operation_fixture(2)
+        else {
+            return;
+        };
+        let provider = ChronologyFakeProvider::new(ChronologyFakeBehavior::Valid);
+        let chain = default_chronology_chain();
+        let first = catalog
+            .suggest_chronology_with_provider_and_budget(
+                &project.id,
+                &asset_ids,
+                &provider,
+                &chain,
+                1.0,
+            )
+            .unwrap();
+        assert_eq!(provider.calls().len(), 1);
+        assert!(!first.cached);
+        assert_eq!(first.provenance.cost_usd, 0.001);
+        assert_eq!(first.provenance.uncertain_usage_reserve_usd, 0.0);
+        assert!(first.provenance.usage_complete);
+        assert_eq!(first.provenance.actual_provider.as_deref(), Some("fake"));
+        assert_eq!(
+            first.provenance.actual_model.as_deref(),
+            Some(DEFAULT_MODEL)
+        );
+        assert_eq!(first.provenance.request_keys.len(), 1);
+        assert!(!first.provenance.run_id.is_empty());
+        let first_provenance = first.provenance.clone();
+
+        let requests = catalog
+            .list_analysis_requests(&project.id, None, 20)
+            .unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].lifecycle, AnalysisRequestLifecycle::Completed);
+        assert_eq!(requests[0].confirmed_cost_usd, 0.001);
+        assert_eq!(
+            catalog
+                .analysis_provider_receipts(&requests[0].request_key)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        drop(catalog);
+        let reopened = Catalog::open(&catalog_path).unwrap();
+        let cached_provider = ChronologyFakeProvider::new(ChronologyFakeBehavior::Valid);
+        let cached = reopened
+            .suggest_chronology_with_provider_and_budget(
+                &project.id,
+                &asset_ids,
+                &cached_provider,
+                &chain,
+                1.0,
+            )
+            .unwrap();
+        assert!(cached.cached);
+        assert!(cached_provider.calls().is_empty());
+        assert_eq!(cached.provenance, first_provenance);
+        assert_eq!(
+            reopened
+                .list_analysis_requests(&project.id, None, 20)
+                .unwrap()
+                .len(),
+            1,
+            "cache reuse must not create another paid request"
+        );
+    }
+
+    #[test]
+    fn chronology_catalog_transport_fallback_retains_both_attempts_and_whole_chain_cache() {
+        let Some((_directory, catalog, project, asset_ids, catalog_path)) =
+            chronology_operation_fixture(2)
+        else {
+            return;
+        };
+        let provider =
+            ChronologyFakeProvider::new(ChronologyFakeBehavior::TransportPrimaryThenValid);
+        let chain = fallback_chronology_chain();
+        let first = catalog
+            .suggest_chronology_with_provider_and_budget(
+                &project.id,
+                &asset_ids,
+                &provider,
+                &chain,
+                1.0,
+            )
+            .unwrap();
+        assert_eq!(provider.calls().len(), 2);
+        assert_eq!(first.provenance.cost_usd, 0.001);
+        assert!(first.provenance.uncertain_usage_reserve_usd >= 0.01);
+        assert!(!first.provenance.usage_complete);
+        assert_eq!(first.provenance.request_keys.len(), 2);
+        let requests = catalog
+            .list_analysis_requests(&project.id, None, 20)
+            .unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.lifecycle == AnalysisRequestLifecycle::Uncertain)
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.lifecycle == AnalysisRequestLifecycle::Completed)
+        );
+        let cache_links: i64 = catalog
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM analysis_request_events WHERE event_kind='cache_result'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(cache_links, 2);
+
+        drop(catalog);
+        let reopened = Catalog::open(&catalog_path).unwrap();
+        let cached_provider = ChronologyFakeProvider::new(ChronologyFakeBehavior::Valid);
+        let cached = reopened
+            .suggest_chronology_with_provider_and_budget(
+                &project.id,
+                &asset_ids,
+                &cached_provider,
+                &chain,
+                1.0,
+            )
+            .unwrap();
+        assert!(cached.cached);
+        assert!(cached_provider.calls().is_empty());
+        assert_eq!(cached.provenance, first.provenance);
+    }
+
+    #[test]
+    fn chronology_catalog_invalid_paid_body_keeps_receipt_fails_run_and_blocks_resend() {
+        let Some((_directory, catalog, project, asset_ids, _catalog_path)) =
+            chronology_operation_fixture(2)
+        else {
+            return;
+        };
+        let provider = ChronologyFakeProvider::new(ChronologyFakeBehavior::InvalidBody);
+        let chain = default_chronology_chain();
+        assert!(
+            catalog
+                .suggest_chronology_with_provider_and_budget(
+                    &project.id,
+                    &asset_ids,
+                    &provider,
+                    &chain,
+                    1.0,
+                )
+                .is_err()
+        );
+        assert_eq!(provider.calls().len(), 1);
+        let requests = catalog
+            .list_analysis_requests(&project.id, None, 20)
+            .unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].lifecycle, AnalysisRequestLifecycle::Completed);
+        assert_eq!(requests[0].confirmed_cost_usd, 0.001);
+        assert_eq!(
+            catalog
+                .analysis_provider_receipts(&requests[0].request_key)
+                .unwrap()
+                .len(),
+            1
+        );
+        let first_run = catalog.analysis_runs(&project.id, 1).unwrap().remove(0);
+        assert_eq!(first_run.status, "failed");
+        assert_eq!(first_run.cost_usd, 0.001);
+        assert_eq!(first_run.error, "provider_error:unclassified");
+
+        assert!(
+            catalog
+                .suggest_chronology_with_provider_and_budget(
+                    &project.id,
+                    &asset_ids,
+                    &provider,
+                    &chain,
+                    1.0,
+                )
+                .is_err()
+        );
+        assert_eq!(
+            provider.calls().len(),
+            1,
+            "a completed receipt must block an implicit retry"
+        );
+    }
+
+    #[test]
+    fn chronology_catalog_local_release_and_dispatched_crash_never_resend() {
+        let Some((_directory, catalog, project, asset_ids, _catalog_path)) =
+            chronology_operation_fixture(4)
+        else {
+            return;
+        };
+        let chain = default_chronology_chain();
+        let local_provider = ChronologyFakeProvider::new(ChronologyFakeBehavior::Valid)
+            .with_prepare_error(ProviderFailureCategory::LocalPreUpload);
+        assert!(
+            catalog
+                .suggest_chronology_with_provider_and_budget(
+                    &project.id,
+                    &asset_ids[0..2],
+                    &local_provider,
+                    &chain,
+                    1.0,
+                )
+                .is_err()
+        );
+        assert!(local_provider.calls().is_empty());
+        let released = catalog
+            .list_analysis_requests(&project.id, None, 20)
+            .unwrap();
+        assert_eq!(released.len(), 1);
+        assert_eq!(released[0].lifecycle, AnalysisRequestLifecycle::Released);
+        let scope =
+            analysis_operation_budget_scope_id(&project.id, CHRONOLOGY_SUGGESTIONS_OPERATION);
+        let snapshot = catalog.analysis_budget_snapshot(&scope).unwrap().unwrap();
+        assert!(
+            !snapshot.dispatch_stopped,
+            "a proven local pre-upload failure must not poison the authority"
+        );
+
+        let crashing = ChronologyFakeProvider::new(ChronologyFakeBehavior::PanicAfterDispatch);
+        let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            catalog.suggest_chronology_with_provider_and_budget(
+                &project.id,
+                &asset_ids[2..4],
+                &crashing,
+                &chain,
+                1.0,
+            )
+        }));
+        assert!(interrupted.is_err());
+        assert_eq!(crashing.calls().len(), 1);
+        let dispatches = catalog
+            .list_analysis_requests(&project.id, None, 20)
+            .unwrap();
+        let dispatched = dispatches
+            .iter()
+            .find(|request| {
+                request.requested_model == DEFAULT_MODEL && request.dispatch_at.is_some()
+            })
+            .unwrap();
+        assert_eq!(dispatched.lifecycle, AnalysisRequestLifecycle::Dispatched);
+        assert!(
+            catalog
+                .analysis_provider_receipts(&dispatched.request_key)
+                .unwrap()
+                .is_empty()
+        );
+
+        assert!(
+            catalog
+                .suggest_chronology_with_provider_and_budget(
+                    &project.id,
+                    &asset_ids[2..4],
+                    &crashing,
+                    &chain,
+                    1.0,
+                )
+                .is_err()
+        );
+        assert_eq!(
+            crashing.calls().len(),
+            1,
+            "an interrupted dispatched request must fence an implicit resend"
+        );
+    }
+
+    #[test]
+    fn chronology_catalog_legacy_pending_cache_remains_unknown_and_blocks_dispatch() {
+        let Some((_directory, catalog, project, asset_ids, _catalog_path)) =
+            chronology_operation_fixture(2)
+        else {
+            return;
+        };
+        catalog
+            .connection()
+            .unwrap()
+            .execute(
+                "INSERT INTO analysis_chronology_suggestions(
+                    request_key,project_id,facts_revision,status,result_json,model,attempts,
+                    cost_usd,prompt_tokens,completion_tokens,latency_ms,created_at,updated_at)
+                 VALUES('legacy-pending',?1,'rev','running','', '',0,0,0,0,0,?2,?2)",
+                params![project.id, now()],
+            )
+            .unwrap();
+        let provider = ChronologyFakeProvider::new(ChronologyFakeBehavior::Valid);
+        let chain = default_chronology_chain();
+        assert!(
+            catalog
+                .suggest_chronology_with_provider_and_budget(
+                    &project.id,
+                    &asset_ids,
+                    &provider,
+                    &chain,
+                    1.0,
+                )
+                .is_err()
+        );
+        assert!(provider.calls().is_empty());
+        let (status, result_json): (String, String) = catalog
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT status,result_json FROM analysis_chronology_suggestions WHERE request_key='legacy-pending'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "running");
+        assert!(result_json.is_empty());
+        assert!(
+            catalog
+                .list_analysis_requests(&project.id, None, 20)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn chronology_catalog_final_budget_race_across_independent_catalogs() {
+        let Some((_directory, catalog, project, asset_ids, catalog_path)) =
+            chronology_operation_fixture(4)
+        else {
+            return;
+        };
+        drop(catalog);
+        let provider = Arc::new(ChronologyFakeProvider::new(
+            ChronologyFakeBehavior::SleepThenValid,
+        ));
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let mut workers = Vec::new();
+        for selected in [asset_ids[0..2].to_vec(), asset_ids[2..4].to_vec()] {
+            let provider = Arc::clone(&provider);
+            let barrier = Arc::clone(&barrier);
+            let catalog_path = catalog_path.clone();
+            let project_id = project.id.clone();
+            workers.push(std::thread::spawn(move || {
+                let catalog = Catalog::open(&catalog_path).unwrap();
+                let chain = default_chronology_chain();
+                barrier.wait();
+                catalog
+                    .suggest_chronology_with_provider_and_budget(
+                        &project_id,
+                        &selected,
+                        provider.as_ref(),
+                        &chain,
+                        0.015,
+                    )
+                    .map(|_| ())
+            }));
+        }
+        barrier.wait();
+        let results = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            results.iter().filter(|result| result.is_ok()).count(),
+            1,
+            "concurrent catalogs must serialize the final conservative bound"
+        );
+        let error = results
+            .iter()
+            .find_map(|result| result.as_ref().err())
+            .unwrap();
+        assert!(
+            error.to_string().contains("budget_exhausted"),
+            "unexpected losing-race error: {error:#}"
+        );
+        assert_eq!(
+            provider.calls().len(),
+            1,
+            "the losing worker must be denied before transport"
+        );
+    }
+
+    struct LabelSourceMutatingProvider {
+        database: PathBuf,
+        during_prepare: bool,
+        calls: Mutex<usize>,
+    }
+
+    impl LabelSourceMutatingProvider {
+        fn new(database: PathBuf, during_prepare: bool) -> Self {
+            Self {
+                database,
+                during_prepare,
+                calls: Mutex::new(0),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            *self.calls.lock().unwrap()
+        }
+
+        fn mutate_ai_label_source(&self) {
+            let catalog = Catalog::open(&self.database).unwrap();
+            record_ai_labels(
+                &catalog.connection().unwrap(),
+                "asset_two",
+                &[("concurrent".into(), "Concurrent".into())],
+            )
+            .unwrap();
+        }
+
+        fn valid_response(&self, model: &str) -> VlmResponse {
+            VlmResponse {
+                model: model.into(),
+                body: r#"{"mappings":[{"from":"beach","to":"shore"}]}"#.into(),
+                prompt_tokens: 11,
+                completion_tokens: 3,
+                cost_usd: 0.001,
+                latency_ms: 7,
+                receipt: VlmReceipt {
+                    actual_model: Some(model.into()),
+                    provider: Some("fake".into()),
+                    generation_id: Some("mutating-generation".into()),
+                    usage_complete: true,
+                },
+            }
+        }
+    }
+
+    impl VlmProvider for LabelSourceMutatingProvider {
+        fn prepare(&self) -> Result<()> {
+            if self.during_prepare {
+                self.mutate_ai_label_source();
+            }
+            Ok(())
+        }
+
+        fn analysis_cost_bound(
+            &self,
+            _model: &str,
+            _request: &VlmRequest,
+        ) -> Result<AnalysisRequestCostBound> {
+            Ok(AnalysisRequestCostBound::declared_for_synthetic_transport(
+                0.01,
+            ))
+        }
+
+        fn analyze(&self, model: &str, _request: &VlmRequest) -> Result<VlmResponse> {
+            *self.calls.lock().unwrap() += 1;
+            if !self.during_prepare {
+                self.mutate_ai_label_source();
+            }
+            Ok(self.valid_response(model))
+        }
+    }
+
+    struct CancelDuringPrepareProvider {
+        prepared: Arc<AtomicBool>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl VlmProvider for CancelDuringPrepareProvider {
+        fn prepare(&self) -> Result<()> {
+            self.prepared.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn analysis_cost_bound(
+            &self,
+            _model: &str,
+            _request: &VlmRequest,
+        ) -> Result<AnalysisRequestCostBound> {
+            Ok(AnalysisRequestCostBound::declared_for_synthetic_transport(
+                0.01,
+            ))
+        }
+
+        fn analyze(&self, model: &str, _request: &VlmRequest) -> Result<VlmResponse> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(VlmResponse {
+                model: model.into(),
+                body: r#"{"mappings":[{"from":"beach","to":"shore"}]}"#.into(),
+                prompt_tokens: 11,
+                completion_tokens: 3,
+                cost_usd: 0.001,
+                latency_ms: 7,
+                receipt: VlmReceipt {
+                    actual_model: Some(model.into()),
+                    provider: Some("fake".into()),
+                    generation_id: Some("cancelled-generation".into()),
+                    usage_complete: true,
+                },
+            })
+        }
+    }
+
+    #[test]
+    fn consolidation_source_change_after_paid_response_keeps_receipt_and_closes_failed_run() {
+        let (_directory, catalog, project) = operation_fixture();
+        let provider =
+            LabelSourceMutatingProvider::new(catalog.database_path().to_path_buf(), false);
+        let chain = default_chronology_chain();
+        let error = catalog
+            .consolidate_labels_with_provider(&project.id, &provider, &chain, 1.0)
+            .unwrap_err();
+        assert!(provider.calls() == 1, "unexpected error: {error:#}");
+        let requests = catalog
+            .list_analysis_requests(&project.id, None, 20)
+            .unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].lifecycle, AnalysisRequestLifecycle::Completed);
+        assert_eq!(requests[0].confirmed_cost_usd, 0.001);
+        assert_eq!(
+            catalog
+                .analysis_provider_receipts(&requests[0].request_key)
+                .unwrap()
+                .len(),
+            1
+        );
+        let run = catalog.analysis_runs(&project.id, 1).unwrap().remove(0);
+        assert_eq!(run.status, "failed");
+        assert_eq!(run.cost_usd, 0.001);
+        assert_eq!(run.error, "provider_error:unclassified");
+        let asset = catalog.get_asset("asset_one").unwrap();
+        assert!(!asset.labels.iter().any(|label| label == "shore"));
+        assert!(asset.labels.iter().any(|label| label == "HumanTag"));
+    }
+
+    #[test]
+    fn consolidation_prepare_source_mutation_is_denied_before_dispatch_marker() {
+        let (_directory, catalog, project) = operation_fixture();
+        let provider =
+            LabelSourceMutatingProvider::new(catalog.database_path().to_path_buf(), true);
+        let chain = default_chronology_chain();
+        assert!(
+            catalog
+                .consolidate_labels_with_provider(&project.id, &provider, &chain, 1.0)
+                .is_err()
+        );
+        assert_eq!(provider.calls(), 0);
+        let requests = catalog
+            .list_analysis_requests(&project.id, None, 20)
+            .unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].lifecycle, AnalysisRequestLifecycle::Released);
+        assert!(requests[0].dispatch_at.is_none());
+        assert!(
+            catalog
+                .analysis_provider_receipts(&requests[0].request_key)
+                .unwrap()
+                .is_empty()
+        );
+        let run = catalog.analysis_runs(&project.id, 1).unwrap().remove(0);
+        assert_eq!(run.status, "failed");
+        assert_eq!(run.cost_usd, 0.0);
+        let scope = analysis_operation_budget_scope_id(&project.id, LABEL_CONSOLIDATION_OPERATION);
+        assert!(
+            !catalog
+                .analysis_budget_snapshot(&scope)
+                .unwrap()
+                .unwrap()
+                .dispatch_stopped
+        );
+        let asset = catalog.get_asset("asset_one").unwrap();
+        assert!(!asset.labels.iter().any(|label| label == "shore"));
+        assert!(asset.labels.iter().any(|label| label == "HumanTag"));
+    }
+
+    #[test]
+    fn consolidation_cancellation_before_dispatch_makes_zero_actual_calls() {
+        let (_directory, catalog, project) = operation_fixture();
+        let provider = CancelDuringPrepareProvider {
+            prepared: Arc::new(AtomicBool::new(false)),
+            calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        };
+        let chain = fallback_chronology_chain();
+        let prepared_for_cancel = Arc::clone(&provider.prepared);
+        let error = catalog
+            .consolidate_labels_with_provider_and_cancel(
+                &project.id,
+                &provider,
+                &chain,
+                1.0,
+                &mut || prepared_for_cancel.load(Ordering::SeqCst),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("cancelled") || error.to_string().contains("cancel"));
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(chain.default_failures(), 0);
+        let requests = catalog
+            .list_analysis_requests(&project.id, None, 20)
+            .unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].lifecycle, AnalysisRequestLifecycle::Released);
+        assert!(
+            catalog
+                .analysis_provider_receipts(&requests[0].request_key)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn consolidation_cancellation_after_invalid_primary_prevents_domain_fallback_call() {
+        let (_directory, catalog, project) = operation_fixture();
+        let provider = OperationFakeProvider::new(OperationFakeBehavior::InvalidBody);
+        let chain = fallback_chronology_chain();
+        assert!(
+            catalog
+                .consolidate_labels_with_provider_and_cancel(
+                    &project.id,
+                    &provider,
+                    &chain,
+                    1.0,
+                    &mut || !provider.calls().is_empty(),
+                )
+                .is_err()
+        );
+        assert_eq!(provider.calls().len(), 1);
+        assert_eq!(chain.default_failures(), 1);
+        let requests = catalog
+            .list_analysis_requests(&project.id, None, 20)
+            .unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].lifecycle, AnalysisRequestLifecycle::Completed);
+        assert_eq!(requests[0].confirmed_cost_usd, 0.001);
+        let run = catalog.analysis_runs(&project.id, 1).unwrap().remove(0);
+        assert_eq!(run.status, "failed");
+        assert_eq!(run.cost_usd, 0.001);
+    }
+
+    #[test]
+    fn chronology_completed_cache_and_links_roll_back_together_on_association_failure() {
+        let directory = tempdir().unwrap();
+        let catalog = Catalog::open(directory.path().join("atomic-cache.sqlite3")).unwrap();
+        let project = catalog.create_project("atomic cache").unwrap();
+        let authority = AnalysisBudgetAuthorityContext {
+            project_id: project.id.clone(),
+            policy_id: String::new(),
+            policy_fingerprint: "atomic-cache-policy".into(),
+            operation: CHRONOLOGY_SUGGESTIONS_OPERATION.into(),
+            provider: "openrouter".into(),
+            budget_scope_id: String::new(),
+            budget_usd: 1.0,
+        };
+        catalog
+            .initialize_analysis_accounting_authority(&authority)
+            .unwrap();
+        let run_id = catalog
+            .begin_accounted_analysis_run(&project.id, "", CHRONOLOGY_SUGGESTIONS_OPERATION)
+            .unwrap();
+        let context = AnalysisAccountingContext {
+            project_id: project.id.clone(),
+            policy_id: String::new(),
+            policy_fingerprint: "atomic-cache-policy".into(),
+            run_id: run_id.clone(),
+            operation: CHRONOLOGY_SUGGESTIONS_OPERATION.into(),
+            intended_attempt_key: "atomic-cache-intent".into(),
+            source_fingerprint: "atomic-cache-source".into(),
+            provider: "openrouter".into(),
+            budget_scope_id: String::new(),
+            budget_usd: 1.0,
+            explicit_retry: false,
+        };
+        let reservation = catalog
+            .reserve_analysis_request(
+                &context,
+                DEFAULT_MODEL,
+                "atomic-cache-payload",
+                &AnalysisRequestCostBound::declared_for_synthetic_transport(0.01),
+            )
+            .unwrap();
+        catalog
+            .mark_analysis_request_dispatched(&reservation.request_key)
+            .unwrap();
+        catalog
+            .record_analysis_request_receipt(
+                &reservation.request_key,
+                &ProviderReceiptEvidence {
+                    provider: "fake".into(),
+                    provider_generation_id: "atomic-cache-generation".into(),
+                    actual_model: DEFAULT_MODEL.into(),
+                    reported_cost_usd: Some(0.001),
+                    prompt_tokens: Some(1),
+                    completion_tokens: Some(1),
+                    usage_complete: true,
+                },
+            )
+            .unwrap();
+        let result: SuggestionResult = serde_json::from_value(serde_json::json!({
+            "suggestion": {"frameIds": [], "matches": []},
+            "review": {
+                "missingFrameIds": [],
+                "duplicateFrameIds": [],
+                "unknownFrameIds": [],
+                "semanticInconsistencies": []
+            },
+            "provenance": {
+                "model": DEFAULT_MODEL,
+                "attempts": 1,
+                "attemptedModels": [DEFAULT_MODEL],
+                "usageComplete": true,
+                "costUsd": 0.001,
+                "uncertainUsageReserveUsd": 0.0,
+                "activeReservedCostUsd": 0.0,
+                "committedOrReservedUsd": 0.001,
+                "actualProvider": "fake",
+                "actualModel": DEFAULT_MODEL,
+                "providerGenerationId": "atomic-cache-generation",
+                "runId": run_id,
+                "requestKeys": [reservation.request_key.clone()],
+                "promptTokens": 1,
+                "completionTokens": 1,
+                "latencyMs": 1
+            },
+            "cached": false
+        }))
+        .unwrap();
+        let mut connection = catalog.connection().unwrap();
+        let missing_request = "missing-ledger-request".to_string();
+        assert!(
+            analysis::chronology_suggestions::store_completed_with_associations(
+                &mut connection,
+                "atomic-cache-result",
+                "atomic-facts-revision",
+                &result,
+                &[reservation.request_key.clone(), missing_request],
+            )
+            .is_err()
+        );
+        let cache_rows: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM analysis_chronology_suggestions WHERE request_key='atomic-cache-result'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(cache_rows, 0);
+        let link_rows: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM analysis_request_events
+                 WHERE event_kind='cache_result'
+                   AND json_extract(detail_json,'$.cacheKey')='atomic-cache-result'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(link_rows, 0);
+        assert_eq!(
+            catalog
+                .analysis_provider_receipts(&reservation.request_key)
+                .unwrap()
+                .len(),
+            1,
+            "the paid receipt is external evidence and survives cache/link rollback"
+        );
+    }
+    #[test]
+    fn chronology_cancelled_while_heavy_slot_is_busy_creates_no_run_or_paid_request() {
+        let Some((_directory, catalog, project, assets, _)) = chronology_operation_fixture(2)
+        else {
+            return;
+        };
+        let provider = ChronologyFakeProvider::new(ChronologyFakeBehavior::Valid);
+        let lease = catalog.acquire_local_heavy().unwrap();
+        let result = catalog.suggest_chronology_with_provider_and_budget_and_cancel(
+            &project.id,
+            &assets,
+            &provider,
+            &default_chronology_chain(),
+            1.0,
+            &mut || true,
+        );
+        assert!(result.is_err());
+        assert!(provider.calls().is_empty());
+        assert!(catalog.analysis_runs(&project.id, 10).unwrap().is_empty());
+        assert!(
+            catalog
+                .list_analysis_requests(&project.id, None, 10)
+                .unwrap()
+                .is_empty()
+        );
+        drop(lease);
     }
 }

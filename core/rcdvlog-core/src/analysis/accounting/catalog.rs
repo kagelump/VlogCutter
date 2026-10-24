@@ -172,6 +172,15 @@ impl Catalog {
         )
     }
 
+    pub(crate) fn analysis_request_keys_for_run(
+        &self,
+        project_id: &str,
+        operation: &str,
+        run_id: &str,
+    ) -> Result<Vec<String>> {
+        store::request_keys_for_run(&self.connection()?, project_id, operation, run_id)
+    }
+
     pub fn analysis_request_events(&self, request_key: &str) -> Result<Vec<AnalysisRequestEvent>> {
         store::events(&self.connection()?, request_key)
     }
@@ -276,6 +285,69 @@ impl Catalog {
             "accounting aggregate policy is required"
         );
         store::accounting_aggregate_for_run(&self.connection()?, policy_id, operation, run_id)
+    }
+
+    /// Whole-operation projection for the canonical non-policy authority. This
+    /// includes frozen operation evidence only when `run_id_filter` is absent;
+    /// a current-run summary passes the run id so legacy spending is never
+    /// presented as a charge from this invocation.
+    pub fn analysis_accounting_aggregate_for_operation_scope(
+        &self,
+        project_id: &str,
+        operation: &str,
+        current_run_id: Option<&str>,
+        run_id_filter: Option<&str>,
+    ) -> Result<AnalysisAccountingAggregate> {
+        ensure!(
+            !project_id.trim().is_empty(),
+            "accounting aggregate project is required"
+        );
+        ensure!(
+            !operation.trim().is_empty(),
+            "accounting aggregate operation is required"
+        );
+        store::accounting_aggregate_for_operation_scope(
+            &self.connection()?,
+            project_id,
+            operation,
+            current_run_id,
+            run_id_filter,
+        )
+    }
+
+    /// Confirmed/reserved/uncertain projection for one operation-owned runtime
+    /// run. Legacy and post-snapshot evidence remain visible on the operation
+    /// authority rather than being attributed to this run.
+    pub fn analysis_accounting_aggregate_for_operation_run(
+        &self,
+        project_id: &str,
+        operation: &str,
+        run_id: &str,
+    ) -> Result<AnalysisAccountingAggregate> {
+        ensure!(
+            !project_id.trim().is_empty(),
+            "accounting aggregate project is required"
+        );
+        ensure!(
+            !operation.trim().is_empty(),
+            "accounting aggregate operation is required"
+        );
+        store::accounting_aggregate_for_operation_run(
+            &self.connection()?,
+            project_id,
+            operation,
+            run_id,
+        )
+    }
+
+    /// Associate a result-cache identity with canonical paid request evidence.
+    /// This is append-only metadata, not a second paid permit.
+    pub fn associate_analysis_request_cache_result(
+        &self,
+        request_key: &str,
+        cache_key: &str,
+    ) -> Result<()> {
+        store::associate_cache_result(&self.connection()?, request_key, cache_key)
     }
 
     /// Explicit optional-operation projection used by adapters that already
