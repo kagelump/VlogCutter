@@ -582,6 +582,7 @@ impl Catalog {
 
         let authorization = self.load_run_authorization(&prior.policy_id)?;
         let stored = authorization.policy;
+        crate::analysis::run_policy::ensure_vlm_run_kind(stored.kind)?;
         ensure!(
             stored.project_id == prior.project_id,
             "targeted retry request is outside the authorized project"

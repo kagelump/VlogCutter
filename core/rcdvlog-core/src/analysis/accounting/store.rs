@@ -1558,6 +1558,7 @@ fn load_authorized_policy(
         policy.project_id == project_id,
         "analysis policy authorization belongs to a different project"
     );
+    crate::analysis::run_policy::ensure_vlm_run_kind(policy.kind)?;
     ensure!(
         policy_fingerprint == policy.policy_id,
         "analysis accounting policy fingerprint does not match the frozen authorization"

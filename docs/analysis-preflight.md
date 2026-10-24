@@ -187,13 +187,55 @@ The legacy `analyze missing`, `moments discover` and preparation paths remain
 available, but policy-bound execution is the canonical paid boundary and is the
 only path that carries a matching approval and pilot into bulk work.
 
+## Native speech proposal (B2, not enabled)
+
+`AnalysisRunKind::NativeSpeechTranscription` / serialized
+`native_speech_transcription` is now representable in the existing `RunPolicy`
+owner as a proposal-only native cloud-speech choice. The common
+`RunPolicyRequest` provider/model/allowlist/budget/exact-asset fields remain
+authoritative; the native parameters carry only an optional lowercase ISO 639-1
+language, the supported `zdr`/`data_collection` data-policy fields, and `force`.
+The provider/model pair must resolve the exact registered native
+`openrouter` + `openai/whisper-1` audio-transcription contract. There is no
+default, chat-slug inference, fallback or extra allowlist, and native requests
+always canonicalize to the `audio` payload. Project vocabulary, transcripts,
+frames, prompts and trip context are never attached or bound by a native
+proposal. Unsupported provider routing such as `order`, `only`, `ignore` or
+`max_price`, and unknown parameter fields, fail during strict deserialization
+rather than being silently dropped.
+
+Describe reuses the existing ownership, excluded/duplicate, exact
+`RunAssetScope`, derived-proxy fingerprint, freshness and source-identity
+helpers. An offline original with a usable current derived proxy remains valid;
+a missing/stale proxy is blocked. The proposal binds the native endpoint/window/
+rate contract via `native_stt_cost_bound_contract_id()`, the shared Silero
+VAD/packing recipe, fixed protocol version labels, language, data policy, exact
+scope and budget. Its expected cost uses the registered full-window duration
+tariff and the conservative pre-VAD source-duration window upper bound
+`floor(2 * duration_ms / 30_000) + 1`; it never uses the VLM reference clip
+estimate or constructs a fake audio request. The cost basis and warnings state
+that the external duration tariff is not a wire-enforced hard invoice cap and
+that above-bound or unknown usage remains owned by receipt settlement.
+
+B2 is deliberately blocked: a failed `native_stt.accounted_runtime` capability
+and `native_accounted_runtime_unavailable` blocker keep both
+`ready_for_authorization` and `ready_for_pilot` false. `authorize_run_policy`
+therefore refuses native proposals before any authorization, run or budget row
+is written, and existing VLM pilot/bulk/recovery/provider-boundary entry points
+reject the kind before local preparation, credentials or a provider call. A
+future accounted native runtime must replace that blocker with its own shared
+reservation/dispatch/receipt boundary; the registered protocol check is not an
+observed pilot.
+
 ## Boundaries and non-goals
 
 - No cloud audio/STT production backend is wired here. A protocol-only native
   transcription leaf exists under `analysis/openrouter_stt.rs`, but it is not
   selectable from CLI/desktop/preparation and has no accounting authorization
-  path yet. Audio payloads are represented so preflight fails readiness
-  explicitly; issue #119 remains separate.
+  path yet. Native speech policies can be described with an explicit
+  provider/model contract but remain blocked by
+  `native_accounted_runtime_unavailable`; issue #119 remains open until the
+  accounted runtime and adapters exist.
 - Concurrent atomic full-bound reservations, append-only receipt reconciliation
   and explicit targeted retry are owned by #122's canonical catalog accounting.
   No second general-purpose spend ledger, cloud scheduler or provider invoice
@@ -203,3 +245,5 @@ only path that carries a matching approval and pilot into bulk work.
   approval review.
 - Original media and human-authored fields remain immutable. Pilot frame
   extraction writes only to the managed project cache.
+
+Native speech cost proposals reserve a conservative pre-VAD upper bound for bulk speech windows plus one separate capability-pilot window. Each window reserves the full registered 30-second duration; pilot and bulk spending use the same eventual policy ceiling. No pilot or bulk call is enabled by a proposal in this slice.

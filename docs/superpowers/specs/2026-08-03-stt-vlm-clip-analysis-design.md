@@ -136,6 +136,23 @@ the receipt, known cost and latency for future canonical settlement; unknown
 cost/tokens stay separately unknown. Response bodies, audio bytes, transcripts
 and credentials are never embedded in error text.
 
+**B2 proposal-only policy (issue #119).** The existing shared `RunPolicy` owner
+now has an explicit `native_speech_transcription` kind and native parameter
+variant, while this protocol leaf remains the only source of the registered
+endpoint/data-policy/window/rate contract. A proposal uses the common
+provider/model/allowlist/budget/exact-asset request fields; the native parameters
+carry only optional ISO 639-1 language, `zdr`/`data_collection` and `force`. It
+must canonicalize to the audio-only payload, bind the derived-proxy source
+identity and native cost-bound contract, and estimate cost from the registered
+full-window duration tariff with a conservative pre-VAD packed-window upper
+bound. No transcript, vocabulary, frames or chat prompt is bound. Because the
+shared accounted native runtime is not implemented, the proposal always reports
+`native_accounted_runtime_unavailable`, remains unready, and is refused by
+authorization. Existing VLM pilot/provider/recovery entry points explicitly
+reject the new kind before credential resolution, local preparation or a
+provider call. CLI/desktop cloud execution and native accounting remain future
+wiring; local offline transcription is unchanged.
+
 This slice deliberately performs no catalog writes, schema changes, budget
 reservation, payload/scope authorization, transcript persistence, automatic
 retry, fallback or provider invoice query. Those remain the next accounting and

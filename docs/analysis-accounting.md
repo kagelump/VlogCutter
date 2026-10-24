@@ -456,3 +456,24 @@ digest. Changed audio, language, model/provider policy, temperature, endpoint or
 window mapping changes the fingerprint. Production cloud selection, dispatch,
 CLI/desktop wiring and native retry recovery remain intentionally disconnected
 in this slice.
+
+## Native STT policy proposal (B2, proposal only)
+
+B2 extends the existing `RunPolicy` owner with the explicit
+`native_speech_transcription` kind. A native proposal binds the exact scoped
+asset/source identities, provider-qualified native endpoint/model contract,
+optional language, supported `zdr`/`data_collection` provider policy, local
+Silero/packing recipe, full-window tariff identity and budget. Its expected cost
+is windows x the registered full 30-second window x the registered external
+duration rate; before VAD runs, the window count is the conservative source
+duration upper bound `floor(2 * duration_ms / 30_000) + 1`. This estimate is not
+the VLM reference clip cost and is not a provider invoice cap.
+
+No native authorization, reservation, run row or provider call exists in B2.
+The proposal always carries `native_accounted_runtime_unavailable` (and a failed
+`native_stt.accounted_runtime` capability), so authorization is refused before a
+write and the existing VLM pilot/provider/recovery boundaries reject the kind
+before credentials or preparation. The contract ID and registered protocol check
+describe the reviewed native transport only; they are not observed capability.
+A later slice must route native audio through the same canonical reservation,
+dispatch, receipt and unknown-usage owners before relaxing this blocker.
