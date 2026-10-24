@@ -761,8 +761,14 @@ when one is current. The OpenRouter key resolves from `OPENROUTER_API_KEY` or
   the observation stale.
 - **Budget/concurrency**: the cost ceiling and worker count are parameters on
   `AnalysisRunOptions`, falling back to `RCDVLOG_VLM_MAX_COST_USD` and
-  `RCDVLOG_VLM_WORKERS` (default 4) when unset. The ceiling is checked before
-  each request against returned provider usage. Progress weights are the exact
+  `RCDVLOG_VLM_WORKERS` (default 4) when unset. The legacy runtime ceiling is
+  checked before each request against returned provider usage and is not yet
+  cross-process safe. The durable admission/dispatch foundation is
+  `analysis::accounting` plus migration 38: initialize its canonical authority
+  before creating new runtime run/pilot rows, then atomically reserve the full
+  provider-owned bound and commit the dispatch marker before transport. Provider
+  wrappers and runtime/CLI wiring are follow-up work; do not claim concurrent
+  runtime safety until they call this owner. Progress weights are the exact
   number of selected frames.
 - **Cancellation**: batch progress callbacks return `ControlFlow`. Returning
   `Break` sets the same stop flag the budget ceiling uses, so workers stop
