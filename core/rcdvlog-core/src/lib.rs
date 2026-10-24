@@ -62,7 +62,9 @@ use analysis::stt::transcribe_pcm;
 use analysis::stt::{
     failed_transcript, failed_transcript_with_evidence, failure_evidence, no_audio_transcript,
 };
-use analysis::vlm::{PromptContext, PromptTranscript, analyze_clip as run_vlm};
+use analysis::vlm::{
+    PromptContext, PromptTranscript, analyze_clip_with_cancel as run_vlm_with_cancel,
+};
 use analysis::vlm_store::{
     AnalysisStatus, StoredAnalysis, ai_labels_for_asset, analysis_is_current, clear_ai_labels,
     commit_thumbnail, load_analysis, load_frame_pack, record_ai_labels, save_analysis,
@@ -73,13 +75,14 @@ use analysis::whisper_engine::{WhisperEngine, read_pcm};
 pub use analysis::accounting::{
     ANALYSIS_ACCOUNTING_SCHEMA_VERSION, AccountedVlmProvider, AnalysisAccountingAggregate,
     AnalysisAccountingContext, AnalysisAccountingReport, AnalysisBudgetAuthorityContext,
-    AnalysisBudgetSnapshot, AnalysisOperationAttemptProjection, AnalysisProviderReceipt,
-    AnalysisRequestEvent, AnalysisRequestLifecycle, AnalysisRequestReconciliation,
-    AnalysisRequestRecord, AnalysisRetryAuthorization, LEGACY_UNKNOWN_USAGE_STOP_REASON,
-    MAX_IN_FLIGHT_REQUESTS_PER_BUDGET_AUTHORITY, MAX_REQUEST_ATTEMPTS, ProviderReceiptEvidence,
-    UNTRACKED_POST_INITIALIZATION_USAGE_STOP_REASON, analysis_operation_budget_scope_id,
-    analysis_policy_budget_scope_id, analysis_request_cost_bound_fingerprint,
-    analysis_request_payload_fingerprint, bounded_failure_code,
+    AnalysisBudgetExhausted, AnalysisBudgetSnapshot, AnalysisOperationAttemptProjection,
+    AnalysisProviderReceipt, AnalysisRequestEvent, AnalysisRequestLifecycle,
+    AnalysisRequestReconciliation, AnalysisRequestRecord, AnalysisRetryAuthorization,
+    LEGACY_UNKNOWN_USAGE_STOP_REASON, MAX_IN_FLIGHT_REQUESTS_PER_BUDGET_AUTHORITY,
+    MAX_REQUEST_ATTEMPTS, ProviderReceiptEvidence, UNTRACKED_POST_INITIALIZATION_USAGE_STOP_REASON,
+    analysis_operation_budget_scope_id, analysis_policy_budget_scope_id,
+    analysis_request_cost_bound_fingerprint, analysis_request_payload_fingerprint,
+    bounded_failure_code,
 };
 pub use analysis::chronology_suggestions::{
     ChronologyEvidenceRequest, ChronologySuggestion, EvidenceFrame, PairMatch,
@@ -3322,6 +3325,7 @@ impl Catalog {
         }))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn analyze_asset_with_provider(
         &self,
         asset_id: &str,
@@ -3330,6 +3334,7 @@ impl Catalog {
         include_transcript: bool,
         approved_vocabulary: &[String],
         policy: &crate::RunPolicy,
+        is_cancelled: &mut dyn FnMut() -> bool,
     ) -> Result<AnalysisOutcome> {
         let asset = self.get_asset(asset_id)?;
         let proxy = Self::require_proxy(&asset)?;
@@ -3369,7 +3374,7 @@ impl Catalog {
             trip_context: None,
         };
         self.validate_run_policy_asset(policy, asset_id)?;
-        let outcome = run_vlm(provider, chain, &context, frames)?;
+        let outcome = run_vlm_with_cancel(provider, chain, &context, frames, is_cancelled)?;
         let mut stored = if let Some(observation) = &outcome.observation {
             StoredAnalysis::from_observation(asset_id, &outcome.model, observation)
         } else {
@@ -3679,8 +3684,8 @@ impl Catalog {
 
     /// Validates caller-supplied flags against the stored policy and replaces
     /// them with the policy's authoritative scope, model, payload/context and
-    /// remaining budget. Model, payload, scope or budget approval for one run
-    /// can never be broadened by a caller argument.
+    /// immutable whole-policy budget. Model, payload, scope or budget approval
+    /// for one run can never be broadened by a caller argument.
     fn analysis_options_bound_to_policy(
         &self,
         project_id: &str,
@@ -3740,7 +3745,7 @@ impl Catalog {
             );
         }
         let mut effective = options.clone();
-        effective.budget_usd = Some(state.remaining_budget_usd);
+        effective.budget_usd = Some(policy.budget_usd);
         effective.primary_model = Some(policy.primary_model.clone());
         effective.allowed_models = policy.allowed_models.clone();
         effective.allow_fallback = Some(policy.allow_fallback);
@@ -3842,6 +3847,10 @@ impl Catalog {
         let state =
             self.authorized_policy_for_bulk(policy_id, crate::AnalysisRunKind::Observation)?;
         let policy = &state.authorization.policy;
+        // Verify the same frozen whole-policy authority before opening an
+        // accounted run row. The live remaining balance is an exposure
+        // projection and is never passed downstream as a new ceiling.
+        crate::analysis::run_policy::verify_bulk_authority(self, policy)?;
         let force = matches!(
             policy.parameters,
             crate::RunPolicyParameters::Observation { force: true }
@@ -3849,7 +3858,7 @@ impl Catalog {
         let options = AnalysisRunOptions {
             force,
             worker_count,
-            budget_usd: Some(state.remaining_budget_usd),
+            budget_usd: Some(policy.budget_usd),
             primary_model: Some(policy.primary_model.clone()),
             allowed_models: policy.allowed_models.clone(),
             allow_fallback: Some(policy.allow_fallback),
@@ -3865,22 +3874,27 @@ impl Catalog {
             policy_id: Some(policy_id.to_string()),
             ..AnalysisRunOptions::default()
         };
-        let run_id = self.begin_analysis_run(&policy.project_id)?;
-        self.connection()?.execute(
-            "UPDATE analysis_runs SET stage_reached='analysis',policy_id=?2 WHERE id=?1",
-            params![run_id, policy_id],
-        )?;
+        let run_id =
+            self.begin_accounted_analysis_run(&policy.project_id, policy_id, "analysis")?;
         let result = self.analyze_missing_with_provider(
             policy.project_id.as_str(),
             &options,
             provider,
+            &run_id,
             &mut on_progress,
         );
         match result {
-            Ok(report) => {
+            Ok(mut report) => {
+                let projection = self.analysis_accounting_aggregate_for_run(
+                    policy_id,
+                    policy.kind.as_str(),
+                    &run_id,
+                )?;
+                report.cost_usd = projection.confirmed_cost_usd;
+                report.usage_complete = !projection.has_unresolved_usage();
                 let status = if report.cancelled {
                     "cancelled"
-                } else if report.failures.is_empty() {
+                } else if report.failures.is_empty() && report.usage_complete {
                     "completed"
                 } else {
                     "failed"
@@ -3891,7 +3905,7 @@ impl Catalog {
                         status: status.into(),
                         stage_reached: "analysis".into(),
                         clips_analyzed: report.analyzed,
-                        cost_usd: report.cost_usd,
+                        cost_usd: projection.confirmed_cost_usd,
                         budget_exhausted: report.budget_exhausted,
                         error: if report.failures.is_empty() {
                             String::new()
@@ -3907,11 +3921,16 @@ impl Catalog {
                 Ok(report)
             }
             Err(error) => {
+                let cost = self
+                    .analysis_accounting_aggregate_for_run(policy_id, policy.kind.as_str(), &run_id)
+                    .map(|projection| projection.confirmed_cost_usd)
+                    .unwrap_or(0.0);
                 let _ = self.finish_analysis_run(
                     &run_id,
                     &AnalysisRunOutcome {
                         status: "failed".into(),
                         stage_reached: "analysis".into(),
+                        cost_usd: cost,
                         error: "analysis batch failed before completion".into(),
                         ..Default::default()
                     },
@@ -3926,6 +3945,7 @@ impl Catalog {
         project_id: &str,
         options: &AnalysisRunOptions,
         provider: &dyn VlmProvider,
+        run_id: &str,
         on_progress: &mut F,
     ) -> Result<AnalyzeReport>
     where
@@ -3962,8 +3982,8 @@ impl Catalog {
             "authorized analysis payload/context does not match the requested run"
         );
         ensure!(
-            options.budget_usd == Some(state.remaining_budget_usd),
-            "authorized analysis budget does not match the remaining policy ceiling"
+            options.budget_usd == Some(policy.budget_usd),
+            "authorized analysis budget does not match the frozen whole policy ceiling"
         );
         ensure!(
             options.force == policy.parameters.force(),
@@ -3999,8 +4019,9 @@ impl Catalog {
                     .ok()
                     .and_then(|value| value.parse::<usize>().ok())
             })
-            .unwrap_or(4)
-            .clamp(1, prepared.len().max(1));
+            .unwrap_or(MAX_IN_FLIGHT_REQUESTS_PER_BUDGET_AUTHORITY)
+            .clamp(1, prepared.len().max(1))
+            .min(MAX_IN_FLIGHT_REQUESTS_PER_BUDGET_AUTHORITY);
         let task_key = format!(
             "vlm.observe-v2.{}-w{worker_count}-v1",
             options
@@ -4035,7 +4056,8 @@ impl Catalog {
         if report.cancelled {
             return Ok(report);
         }
-        let budget_usd = resolve_analysis_budget(options)?;
+        let budget_usd = policy.budget_usd;
+        let policy_scope_id = analysis_policy_budget_scope_id(project_id, policy_id);
         let queue = Arc::new(Mutex::new(
             prepared
                 .into_iter()
@@ -4083,14 +4105,26 @@ impl Catalog {
                             .payload
                             .map(crate::AnalysisPayload::uses_transcript)
                             .unwrap_or(false);
-                        let result = catalog.analyze_asset_with_provider(
-                            &asset.id,
-                            provider,
-                            &worker_chain,
-                            include_transcript,
-                            approved_vocabulary,
-                            policy,
-                        );
+                        let result = (|| -> Result<crate::AnalysisOutcome> {
+                            let context =
+                                crate::analysis::run_policy::bulk_request_accounting_context(
+                                    policy,
+                                    run_id,
+                                    &asset.id,
+                                    format!("{}:{}", policy.kind.as_str(), asset.id),
+                                    false,
+                                )?;
+                            let accounted = AccountedVlmProvider::new(&catalog, context, provider);
+                            catalog.analyze_asset_with_provider(
+                                &asset.id,
+                                &accounted,
+                                &worker_chain,
+                                include_transcript,
+                                approved_vocabulary,
+                                policy,
+                                &mut || stop.load(std::sync::atomic::Ordering::Relaxed),
+                            )
+                        })();
                         if sender
                             .send((index, asset, frames, started.elapsed(), result))
                             .is_err()
@@ -4131,6 +4165,22 @@ impl Catalog {
                     }
                     Err(error) => {
                         estimator.record_failure(frames);
+                        let failure = ProviderFailure::from_anyhow(&error);
+                        if failure.category == crate::ProviderFailureCategory::Cancelled {
+                            report.cancelled = true;
+                            stop.store(true, Ordering::Relaxed);
+                        } else if failure.category
+                            == crate::ProviderFailureCategory::LocalBudgetExhausted
+                        {
+                            report.budget_exhausted = true;
+                            stop.store(true, Ordering::Relaxed);
+                        } else if failure.category == crate::ProviderFailureCategory::LocalAdmission
+                        {
+                            // Canonical admission denied this transmission. Stop
+                            // claiming new work; the final canonical snapshot
+                            // decides whether the denial was budget exhaustion.
+                            stop.store(true, Ordering::Relaxed);
+                        }
                         report.failures.push(IngestFailure {
                             path: asset.path,
                             error: format!("{error:#}"),
@@ -4146,21 +4196,35 @@ impl Catalog {
                     report.cancelled = true;
                     stop.store(true, Ordering::Relaxed);
                 }
-                if report.cost_usd >= budget_usd {
+                let budget_stop = self
+                    .analysis_budget_snapshot(&policy_scope_id)?
+                    .is_some_and(|snapshot| {
+                        snapshot.dispatch_stopped || snapshot.available_usd <= 1e-12
+                    });
+                if budget_stop {
                     report.budget_exhausted = true;
                     stop.store(true, Ordering::Relaxed);
                 }
             }
             Ok(())
         })?;
-        // A budget stop is reported as a failure because the batch did not do
-        // what was asked. Cancellation is not: the user asked it to stop.
+        // Use the canonical current-run projection for the report. Reported
+        // provider cost remains in outcomes; this summary is confirmed ledger
+        // cost and never invents a charge from a reservation or estimate.
+        let projection =
+            self.analysis_accounting_aggregate_for_run(policy_id, policy.kind.as_str(), run_id)?;
+        report.cost_usd = projection.confirmed_cost_usd;
+        report.usage_complete = !projection.has_unresolved_usage();
         if report.budget_exhausted {
+            let aggregate = self.analysis_accounting_aggregate(policy_id, Some(run_id))?;
             report.failures.push(IngestFailure {
                 path: project_id.to_string(),
                 error: format!(
-                    "analysis budget exhausted after ${:.6} (limit ${budget_usd:.2})",
-                    report.cost_usd
+                    "analysis budget exhausted; confirmed ${:.6}, reserved ${:.6}, uncertain ${:.6}, available ${:.6} (whole-policy limit ${budget_usd:.2})",
+                    aggregate.confirmed_cost_usd,
+                    aggregate.active_reserved_cost_usd,
+                    aggregate.uncertain_usage_reserve_usd,
+                    (budget_usd - aggregate.committed_or_reserved_usd).max(0.0)
                 ),
             });
         }

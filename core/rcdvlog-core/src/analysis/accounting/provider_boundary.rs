@@ -9,7 +9,8 @@
 use anyhow::Result;
 
 use super::model::{
-    AnalysisAccountingContext, ProviderReceiptEvidence, analysis_request_payload_fingerprint,
+    AnalysisAccountingContext, AnalysisBudgetExhausted, ProviderReceiptEvidence,
+    analysis_request_payload_fingerprint,
 };
 use crate::Catalog;
 use crate::analysis::provider::{
@@ -64,9 +65,18 @@ impl<'a> AccountedVlmProvider<'a> {
             .map_err(|_| ProviderFailure::local_pre_upload())?;
         let mut context = self.context.clone();
         context.explicit_retry = self.explicit_retry;
-        self.catalog
-            .reserve_analysis_request(&context, model, &payload_fingerprint, &cost_bound)
-            .map_err(|_| ProviderFailure::local_admission().into())
+        match self.catalog.reserve_analysis_request(
+            &context,
+            model,
+            &payload_fingerprint,
+            &cost_bound,
+        ) {
+            Ok(record) => Ok(record),
+            Err(error) if error.downcast_ref::<AnalysisBudgetExhausted>().is_some() => {
+                Err(ProviderFailure::local_budget_exhausted().into())
+            }
+            Err(_) => Err(ProviderFailure::local_admission().into()),
+        }
     }
 
     fn prepare_before_dispatch(&self, request_key: &str) -> Result<()> {

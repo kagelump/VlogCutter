@@ -1,12 +1,12 @@
 # Analysis request accounting: admission and receipt reconciliation
 
-This document describes the canonical persistence foundation and the C1
-authorized-pilot runtime integration added for issue #122. The authorized
-run-policy pilot, including transport and domain-validation fallback, is wired
-through the accounted provider boundary. Bulk observation, ad-hoc analysis,
-CLI inspection/reconciliation commands and the remaining runtime adapters are
-still follow-up work, so those paths are **not** yet made concurrent-runtime-safe
-by this slice.
+This document describes the canonical persistence foundation and the C1/C2
+runtime integrations added for issue #122. The authorized run-policy pilot,
+bulk observation, and policy-bound moment discovery, including transport and
+domain-validation fallback, are wired through the accounted provider boundary.
+Chronology suggestions, ad-hoc analysis (for example label consolidation), CLI
+inspection/reconciliation/retry commands, and non-policy helper entry points are
+still follow-up work and must not be described as concurrent-runtime-safe yet.
 
 ## Canonical owner
 
@@ -87,6 +87,56 @@ error code, process exit or local cleanup cannot prove no upload, so the request
 remains active/uncertain until supported reconciliation. An explicit retry for
 the same intended request requires the caller's consideration flag and a durable
 authorization for that exact prior request and next epoch.
+
+## C2 bulk observation runtime boundary
+
+`Catalog::analyze_authorized_with_provider_and_workers` verifies the existing
+whole-policy authority before creating an accounted analysis run, then opens
+that run with the real run id and policy marker. The run no longer takes its
+ceiling from a live remaining-balance projection: caller-visible options are
+checked against the policy's immutable `budget_usd`, while atomic admission
+recomputes confirmed, active, and uncertain exposure from the one canonical
+authority.
+
+Each pending asset is prepared locally first. Immediately before provider I/O,
+the worker constructs a fresh `AccountedVlmProvider` with the real run id,
+policy identity, authorized source identity, operation, and a restart-stable
+asset-level intended-request key. The existing `ProviderChain` receives that
+wrapper, so primary, transport fallback, and domain-invalid fallback each get an
+independent reservation and immutable receipt. Local frame extraction,
+credential/configuration, cancellation, and admission failures happen before a
+dispatch marker and never consume a paid fallback. Cancellation is checked
+again immediately before each primary/fallback transmission.
+
+Report `cost_usd` comes from the canonical current-run projection and therefore
+contains confirmed receipts only; provider-returned amounts stay in outcomes,
+and reservations/uncertainty stay separate on the canonical authority. Worker
+count is capped at the authority's in-flight bound. Unresolved or interrupted
+usage blocks a later bulk run, and the same asset-level intended request cannot
+be blindly replayed merely by starting a new run.
+
+## C2 moment-discovery runtime boundary
+
+Policy-bound moment discovery verifies the same frozen authority before opening
+an accounted run. Its provider-injectable boundary rejects caller mismatch in
+scope, payload, model/fallback, whole budget, parameters, or source identity
+rather than silently replacing the fields. The moment pipeline then creates a
+fresh accounted wrapper for every actual step transmission, using the real run
+id, asset source identity, and a step key derived from phase, span, samples, and
+the seed candidate. Multiple assets and multiple coarse/refinement windows
+therefore receive distinct durable request identities, while cached completed
+steps remain reusable without a new request.
+
+Step retries remain governed by the existing `retry_uncertain` consideration
+flag plus durable per-request authorization. A cache or force flag alone cannot
+authorize a new epoch after an interrupted/uncertain paid attempt. Report and
+run cost projections use the same current-run canonical confirmed spend as bulk
+observation; the moment store's per-step receipts remain cached content
+provenance, not a competing balance.
+
+The unaccounted moment pipeline is compiled only under `#[cfg(test)]` for
+focused domain tests. Production entry points always supply an authorized policy
+and therefore cannot silently bypass the accounted boundary.
 
 ## Strict admission and exposure bound
 
@@ -212,23 +262,22 @@ separate evidence. Unknown zero-cost legacy work remains unknown; unreadable
 frozen pilot records retain their prior reserve. Direct evidence deletion is
 rejected while project-owned cleanup still cascades.
 
-## Remaining C2 integration (not implemented here)
+## Remaining #122 integration (not implemented here)
 
-The following paid runtime call sites still bypass `AccountedVlmProvider` and
-must be wired before issue #122 can be considered complete:
+Bulk observation and policy-bound moment discovery now use the accounted
+boundary. The following paid runtime call sites still bypass
+`AccountedVlmProvider` and must be wired before issue #122 can be considered
+complete:
 
-- bulk observation: `Catalog::analyze_missing_with_options_and_provider`,
-  `Catalog::analyze_missing_with_provider`,
-  `Catalog::analyze_authorized_with_provider`, and
-  `Catalog::analyze_authorized_with_provider_and_workers` in
-  `core/rcdvlog-core/src/lib.rs`, including `analysis::vlm::analyze_clip`;
-- moment discovery: `Catalog::discover_moments_with_provider` and
-  `Catalog::discover_authorized_moments_with_provider`;
 - chronology suggestions: `Catalog::suggest_chronology_with_provider` and
   `analysis::chronology_suggestions::suggest_with_provider`;
-- CLI/desktop/HTTP adapters and any inspection/reconcile/retry commands. No CLI
-  command is added by C1.
+- ad-hoc analysis paths that are not run-policy scoped, including label
+  consolidation;
+- CLI/desktop/HTTP inspection, reconciliation, explicit retry, and recovery
+  workflows. No CLI command is added by this slice; the core inspect/reconcile
+  APIs exist, but an operator-facing command is still required;
+- any adapter-specific batch helper that reaches a paid transmission without the
+  real owned run id, source/payload identity, and whole-policy authority context.
 
-Each remaining call site needs a real owned run id, full-policy authority
-context, and the same per-attempt boundary before paid dispatch is considered
-concurrent-safe.
+Each remaining call site needs the same per-attempt boundary before paid
+dispatch is considered concurrent-safe. Issue #122 therefore stays open.

@@ -472,10 +472,14 @@ fn default_preparation_does_not_call_provider_but_explicit_scope_uses_one_shared
     );
     assert_eq!(
         known_provider.calls.load(Ordering::SeqCst),
-        2,
-        "one pilot plus one bulk request before the shared ceiling stops the run"
+        1,
+        "the pilot's full bound and confirmed cost leave less than the next conservative bulk bound"
     );
     assert!(moment_report.budget_exhausted);
+    assert!(
+        moment_report.usage_complete,
+        "a proven local admission denial is not unknown provider usage"
+    );
     assert!(
         moment_report.cost_usd <= 0.02,
         "pilot and bulk share one ceiling"
