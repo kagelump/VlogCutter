@@ -115,34 +115,56 @@ fn rejected(
 
 /// Runs one bounded request. A domain-invalid default response is retried once
 /// on the fallback just like a transport failure and counts toward the breaker.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn analyze_clip(
     provider: &dyn VlmProvider,
     chain: &ProviderChain,
     context: &PromptContext,
     frames: Vec<String>,
 ) -> Result<AnalysisOutcome> {
+    analyze_clip_with_cancel(provider, chain, context, frames, &mut || false)
+}
+
+/// Cancellation-aware variant used by bulk runtime callers. Cancellation is
+/// checked immediately before the primary transmission and again before any
+/// explicitly permitted domain-invalid fallback. Local cancellation/admission
+/// failures are returned as typed errors and never consume another paid call.
+pub fn analyze_clip_with_cancel(
+    provider: &dyn VlmProvider,
+    chain: &ProviderChain,
+    context: &PromptContext,
+    frames: Vec<String>,
+    is_cancelled: &mut dyn FnMut() -> bool,
+) -> Result<AnalysisOutcome> {
+    if is_cancelled() {
+        return Err(ProviderFailure::cancelled().into());
+    }
     let request = VlmRequest {
         prompt: build_prompt(context),
         frames,
         schema: output_schema(&context.frame_timestamps_ms, context.clip_duration_ms),
     };
-    let first = match chain.analyze(provider, &request) {
+    let first = match chain.analyze_with_cancel(provider, &request, is_cancelled) {
         Ok(outcome) => outcome,
         Err(error) => {
-            let Some(failure) = error.downcast_ref::<ProviderChainError>() else {
+            let failure = ProviderFailure::from_anyhow(&error);
+            if failure.category.is_local() {
+                return Err(error);
+            }
+            let Some(chain_failure) = error.downcast_ref::<ProviderChainError>() else {
                 return Err(ProviderFailure::from_anyhow(&error).into());
             };
             return Ok(AnalysisOutcome {
                 observation: None,
-                reject_reason: failure.message.clone(),
+                reject_reason: chain_failure.message.clone(),
                 model: String::new(),
-                attempts: failure.attempted_models.len() as u32,
-                fell_back: failure.attempted_models.len() > 1,
+                attempts: chain_failure.attempted_models.len() as u32,
+                fell_back: chain_failure.attempted_models.len() > 1,
                 prompt_tokens: 0,
                 completion_tokens: 0,
                 cost_usd: 0.0,
                 latency_ms: 0,
-                attempted_models: failure.attempted_models.clone(),
+                attempted_models: chain_failure.attempted_models.clone(),
                 usage_complete: false,
             });
         }
@@ -169,37 +191,47 @@ pub fn analyze_clip(
             if chain.fallback_model().is_some()
                 && chain.fallback_model() != Some(first.response.model.as_str()) =>
         {
+            if is_cancelled() {
+                return Err(ProviderFailure::cancelled().into());
+            }
             chain.record_default_failure();
             let fallback_model = chain
                 .fallback_model()
                 .expect("guard checked fallback policy");
-            let fallback = match provider.analyze(fallback_model, &request) {
-                Ok(response) => response,
-                Err(fallback_error) => {
-                    let mut outcome = rejected(
-                        &first.response,
-                        first.attempts + 1,
-                        true,
-                        format!(
-                            "{}; fallback {fallback_model} failed: {}",
-                            error.safe_code(),
-                            ProviderFailure::from_anyhow(&fallback_error).safe_detail()
-                        ),
-                        first
-                            .attempted_models
-                            .iter()
-                            .cloned()
-                            .chain([fallback_model.to_string()])
-                            .collect(),
-                        false,
-                    );
-                    outcome.prompt_tokens = first.response.prompt_tokens;
-                    outcome.completion_tokens = first.response.completion_tokens;
-                    outcome.cost_usd = first.response.cost_usd;
-                    outcome.latency_ms = first.response.latency_ms;
-                    return Ok(outcome);
-                }
-            };
+            let fallback =
+                match provider.analyze_with_cancel(fallback_model, &request, is_cancelled) {
+                    Ok(response) => response,
+                    Err(fallback_error) => {
+                        if ProviderFailure::from_anyhow(&fallback_error)
+                            .category
+                            .is_local()
+                        {
+                            return Err(fallback_error);
+                        }
+                        let mut outcome = rejected(
+                            &first.response,
+                            first.attempts + 1,
+                            true,
+                            format!(
+                                "{}; fallback {fallback_model} failed: {}",
+                                error.safe_code(),
+                                ProviderFailure::from_anyhow(&fallback_error).safe_detail()
+                            ),
+                            first
+                                .attempted_models
+                                .iter()
+                                .cloned()
+                                .chain([fallback_model.to_string()])
+                                .collect(),
+                            false,
+                        );
+                        outcome.prompt_tokens = first.response.prompt_tokens;
+                        outcome.completion_tokens = first.response.completion_tokens;
+                        outcome.cost_usd = first.response.cost_usd;
+                        outcome.latency_ms = first.response.latency_ms;
+                        return Ok(outcome);
+                    }
+                };
             let aggregate = |fallback: &VlmResponse| {
                 (
                     first

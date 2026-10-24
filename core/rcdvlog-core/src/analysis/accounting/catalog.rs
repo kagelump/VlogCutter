@@ -261,6 +261,23 @@ impl Catalog {
         self.analysis_accounting_aggregate_scoped(policy_id, Some(operation), current_run_id)
     }
 
+    /// Canonical confirmed/active/uncertain projection for exactly one runtime
+    /// run. Unlike the whole-policy projection this excludes frozen legacy and
+    /// post-snapshot evidence; those remain visible on the authority aggregate
+    /// and must not be presented as charges from the current run.
+    pub fn analysis_accounting_aggregate_for_run(
+        &self,
+        policy_id: &str,
+        operation: &str,
+        run_id: &str,
+    ) -> Result<AnalysisAccountingAggregate> {
+        ensure!(
+            !policy_id.trim().is_empty(),
+            "accounting aggregate policy is required"
+        );
+        store::accounting_aggregate_for_run(&self.connection()?, policy_id, operation, run_id)
+    }
+
     /// Explicit optional-operation projection used by adapters that already
     /// carry an optional filter. `None` is the whole-policy view.
     pub fn analysis_accounting_aggregate_scoped(

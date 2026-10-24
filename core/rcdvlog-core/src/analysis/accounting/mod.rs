@@ -5,8 +5,10 @@
 //! reservation, durable dispatch markers, pre-upload releases, uncertainty
 //! retention, append-only provider receipt settlement, explicit bounded retry
 //! authorization and canonical projections. Compatibility evidence preserves
-//! spending written after a frozen legacy snapshot. Runtime transport wiring
-//! and CLI adapters remain follow-up work.
+//! spending written after a frozen legacy snapshot. Policy-bound pilot, bulk
+//! observation, and moment-discovery runtime transmissions use the accounted
+//! provider wrapper; chronology, ad-hoc, and CLI recovery adapters remain
+//! follow-up work.
 
 mod catalog;
 mod legacy;
@@ -17,10 +19,10 @@ mod store;
 
 pub use model::{
     ANALYSIS_ACCOUNTING_SCHEMA_VERSION, AnalysisAccountingAggregate, AnalysisAccountingContext,
-    AnalysisAccountingReport, AnalysisBudgetAuthorityContext, AnalysisBudgetSnapshot,
-    AnalysisOperationAttemptProjection, AnalysisProviderReceipt, AnalysisRequestEvent,
-    AnalysisRequestLifecycle, AnalysisRequestReconciliation, AnalysisRequestRecord,
-    AnalysisRetryAuthorization, LEGACY_UNKNOWN_USAGE_STOP_REASON,
+    AnalysisAccountingReport, AnalysisBudgetAuthorityContext, AnalysisBudgetExhausted,
+    AnalysisBudgetSnapshot, AnalysisOperationAttemptProjection, AnalysisProviderReceipt,
+    AnalysisRequestEvent, AnalysisRequestLifecycle, AnalysisRequestReconciliation,
+    AnalysisRequestRecord, AnalysisRetryAuthorization, LEGACY_UNKNOWN_USAGE_STOP_REASON,
     MAX_IN_FLIGHT_REQUESTS_PER_BUDGET_AUTHORITY, MAX_REQUEST_ATTEMPTS, ProviderReceiptEvidence,
     UNTRACKED_POST_INITIALIZATION_USAGE_STOP_REASON, analysis_operation_budget_scope_id,
     analysis_policy_budget_scope_id, analysis_request_cost_bound_fingerprint,

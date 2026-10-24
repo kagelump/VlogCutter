@@ -6,9 +6,11 @@ use super::{
     store::{self, MomentStep},
 };
 use crate::analysis::{
+    accounting::{AccountedVlmProvider, analysis_policy_budget_scope_id},
     framepack,
     openrouter::{OpenRouterProvider, frame_data_uri, resolve_api_key},
-    provider::{ProviderChain, VlmProvider, VlmRequest, VlmResponse},
+    provider::{ProviderChain, ProviderFailure, VlmProvider, VlmRequest, VlmResponse},
+    run_policy::{AnalysisRunKind, bulk_request_accounting_context, verify_bulk_authority},
     store::{TranscriptStatus, load_transcript},
     vlm_store::{analysis_is_current, load_analysis},
 };
@@ -419,7 +421,84 @@ impl Catalog {
         asset_ids: &[String],
         options: &MomentRunOptions,
         provider: &dyn VlmProvider,
+        on_progress: F,
+    ) -> Result<MomentRunReport>
+    where
+        F: FnMut(MomentProgress) -> ControlFlow<()>,
+    {
+        options.validate()?;
+        let policy_id = options.policy_id.as_deref().ok_or_else(|| {
+            anyhow!("paid moment discovery must be bound to an authorized, piloted run policy")
+        })?;
+        let state = self.authorized_policy_for_bulk(policy_id, AnalysisRunKind::MomentDiscovery)?;
+        let policy = state.authorization.policy;
+        ensure!(
+            policy.project_id == project_id,
+            "authorized policy belongs to a different project"
+        );
+        let authorized_scope = policy
+            .scope
+            .iter()
+            .map(|scope| scope.asset_id.as_str())
+            .collect::<Vec<_>>();
+        let requested_scope = asset_ids.iter().map(String::as_str).collect::<Vec<_>>();
+        ensure!(
+            requested_scope == authorized_scope,
+            "authorized run scope does not exactly match the requested asset ids"
+        );
+        let bound_options = policy.moment_options()?;
+        ensure!(
+            options.policy_id.as_deref() == Some(policy.policy_id.as_str())
+                && options.model == bound_options.model
+                && options.provider == bound_options.provider
+                && options.payload == bound_options.payload
+                && (options.budget_usd - bound_options.budget_usd).abs() <= 1e-9
+                && options.coarse_frames == bound_options.coarse_frames
+                && options.refinement_frames == bound_options.refinement_frames
+                && options.max_candidates == bound_options.max_candidates
+                && options.profile == bound_options.profile
+                && options.force == bound_options.force
+                && options.retry_uncertain == bound_options.retry_uncertain
+                && options.allowed_models == bound_options.allowed_models
+                && options.allow_fallback == bound_options.allow_fallback,
+            "requested moment policy, payload or whole budget does not match the authorized policy"
+        );
+        self.discover_moments_pipeline(
+            project_id,
+            asset_ids,
+            &bound_options,
+            provider,
+            on_progress,
+            Some(policy),
+        )
+    }
+
+    /// The unaccounted core is retained only for focused domain tests. The
+    /// production entry points above always pass an authorized policy so each
+    /// actual step transmission crosses `AccountedVlmProvider`.
+    #[cfg(test)]
+    fn discover_moments_with_provider_for_domain_test<F>(
+        &self,
+        project_id: &str,
+        asset_ids: &[String],
+        options: &MomentRunOptions,
+        provider: &dyn VlmProvider,
+        on_progress: F,
+    ) -> Result<MomentRunReport>
+    where
+        F: FnMut(MomentProgress) -> ControlFlow<()>,
+    {
+        self.discover_moments_pipeline(project_id, asset_ids, options, provider, on_progress, None)
+    }
+
+    fn discover_moments_pipeline<F>(
+        &self,
+        project_id: &str,
+        asset_ids: &[String],
+        options: &MomentRunOptions,
+        provider: &dyn VlmProvider,
         mut on_progress: F,
+        accounted_policy: Option<crate::RunPolicy>,
     ) -> Result<MomentRunReport>
     where
         F: FnMut(MomentProgress) -> ControlFlow<()>,
@@ -430,60 +509,37 @@ impl Catalog {
         if effective_options.allowed_models.is_empty() {
             effective_options.allowed_models = vec![effective_options.model.clone()];
         }
-        let mut approved_policy = None;
-        if let Some(policy_id) = &options.policy_id {
-            let state = self.authorized_policy_for_bulk(
-                policy_id,
-                crate::analysis::run_policy::AnalysisRunKind::MomentDiscovery,
-            )?;
-            let policy = &state.authorization.policy;
+        if let Some(policy) = accounted_policy.as_ref() {
+            ensure!(
+                policy.kind == AnalysisRunKind::MomentDiscovery,
+                "authorized policy kind does not match moment discovery"
+            );
             ensure!(
                 policy.project_id == project_id,
                 "authorized policy belongs to a different project"
             );
-            let scoped = assets
-                .iter()
-                .map(|asset| asset.id.as_str())
-                .collect::<Vec<_>>();
-            let authorized = policy
-                .scope
-                .iter()
-                .map(|asset| asset.asset_id.as_str())
-                .collect::<Vec<_>>();
-            ensure!(
-                scoped == authorized,
-                "authorized run scope does not exactly match the requested asset ids"
-            );
-            ensure!(
-                policy.primary_model == options.model
-                    && policy.payload
-                        == match options.payload {
-                            MomentPayload::Frames => crate::AnalysisPayload::Frames,
-                            MomentPayload::FramesAndTranscript => {
-                                crate::AnalysisPayload::FramesAndTranscript
-                            }
-                        }
-                    && (policy.budget_usd - options.budget_usd).abs() < f64::EPSILON,
-                "run model, payload or requested budget does not match the authorized policy"
-            );
-            ensure!(
-                effective_options.policy_id.is_some()
-                    && policy_id == &effective_options.policy_id.clone().unwrap(),
-                "internal policy binding mismatch"
-            );
-            effective_options.budget_usd = state.remaining_budget_usd;
+            // The stored policy owns the immutable whole-policy ceiling. A live
+            // remaining balance is never substituted for this authority value.
+            effective_options.budget_usd = policy.budget_usd;
             effective_options.allowed_models = policy.allowed_models.clone();
             effective_options.allow_fallback = policy.allow_fallback;
-            approved_policy = Some(policy.clone());
+            effective_options.policy_id = Some(policy.policy_id.clone());
         }
         provider.prepare()?;
         let options = &effective_options;
-        let run_id = self.begin_analysis_run(project_id)?;
-        // Reuse the shared run account, identifying the stage before any call.
-        self.connection()?.execute(
-            "UPDATE analysis_runs SET stage_reached='moments',policy_id=?2 WHERE id=?1",
-            params![run_id, options.policy_id.clone().unwrap_or_default()],
-        )?;
+        let run_id = if let Some(policy) = accounted_policy.as_ref() {
+            // Freeze/verify before the accounted run row exists.
+            verify_bulk_authority(self, policy)?;
+            self.begin_accounted_analysis_run(&policy.project_id, &policy.policy_id, "moments")?
+        } else {
+            let run_id = self.begin_analysis_run(project_id)?;
+            // Test-only unaccounted pipeline still identifies its stage.
+            self.connection()?.execute(
+                "UPDATE analysis_runs SET stage_reached='moments',policy_id=?2 WHERE id=?1",
+                params![run_id, options.policy_id.clone().unwrap_or_default()],
+            )?;
+            run_id
+        };
         let task_key = format!(
             "{RECIPE_VERSION}.{}.w1",
             digest(&(
@@ -503,7 +559,7 @@ impl Catalog {
         let mut estimator = BatchEstimator::new(&weights, 1, self.load_batch_history(&task_key)?);
         let mut state = RunState {
             run_id: run_id.clone(),
-            approved_policy,
+            approved_policy: accounted_policy.clone(),
             ..Default::default()
         };
         let mut report = MomentRunReport {
@@ -580,6 +636,26 @@ impl Catalog {
                     estimator.record_failure(1);
                 }
                 Err(error) => {
+                    let failure = ProviderFailure::from_anyhow(&error);
+                    if failure.category == crate::ProviderFailureCategory::Cancelled {
+                        state.cancelled = true;
+                    } else if failure.category
+                        == crate::ProviderFailureCategory::LocalBudgetExhausted
+                    {
+                        state.budget_stopped = true;
+                    } else if failure.category == crate::ProviderFailureCategory::LocalAdmission
+                        && let Some(policy) = accounted_policy.as_ref()
+                        && self
+                            .analysis_budget_snapshot(&analysis_policy_budget_scope_id(
+                                &policy.project_id,
+                                &policy.policy_id,
+                            ))?
+                            .is_some_and(|snapshot| {
+                                snapshot.dispatch_stopped || snapshot.available_usd <= 1e-12
+                            })
+                    {
+                        state.budget_stopped = true;
+                    }
                     report.failed += 1;
                     estimator.record_failure(1);
                     if report.failures.len() < 100 {
@@ -611,17 +687,34 @@ impl Catalog {
                 break;
             }
         }
-        report.cost_usd = state.spent;
-        report.usage_complete = !state.unknown_usage && !state.historical_unknown;
+        let canonical_projection = if let Some(policy) = accounted_policy.as_ref() {
+            Some(self.analysis_accounting_aggregate_for_run(
+                &policy.policy_id,
+                policy.kind.as_str(),
+                &run_id,
+            )?)
+        } else {
+            None
+        };
+        if let Some(projection) = canonical_projection.as_ref() {
+            report.cost_usd = projection.confirmed_cost_usd;
+            report.usage_complete = !projection.has_unresolved_usage();
+        } else {
+            report.cost_usd = state.spent;
+            report.usage_complete = !state.unknown_usage && !state.historical_unknown;
+        }
         report.cancelled = state.cancelled;
         report.budget_exhausted = state.budget_stopped;
         self.save_batch_history(&task_key, estimator.history())?;
+        let confirmed_cost = canonical_projection
+            .as_ref()
+            .map_or(state.spent, |projection| projection.confirmed_cost_usd);
         self.finish_analysis_run(
             &run_id,
             &AnalysisRunOutcome {
                 status: if state.cancelled {
                     "cancelled"
-                } else if report.failed > 0 || state.unknown_usage {
+                } else if report.failed > 0 || !report.usage_complete {
                     "failed"
                 } else {
                     "completed"
@@ -629,9 +722,9 @@ impl Catalog {
                 .into(),
                 stage_reached: "moments".into(),
                 clips_analyzed: report.processed,
-                cost_usd: state.spent,
+                cost_usd: confirmed_cost,
                 budget_exhausted: state.budget_stopped,
-                error: if state.unknown_usage {
+                error: if !report.usage_complete {
                     "provider usage unknown; explicit recovery required".into()
                 } else {
                     String::new()
@@ -1124,6 +1217,9 @@ impl Catalog {
         while let Some(row) = rows.next()? {
             let step: MomentStep = serde_json::from_str(&row.get::<_, String>(0)?)?;
             let cached: CachedStep = serde_json::from_value(step.body)?;
+            if cached.state == "local_failure" {
+                continue;
+            }
             for mut receipt in cached.prior_receipts.into_iter().chain([cached.receipt]) {
                 if !receipt.usage_complete {
                     receipt.reused = true;
@@ -1290,6 +1386,18 @@ struct CachedStep {
 }
 
 impl StepRunner<'_> {
+    fn step_settled_attempts(&self) -> Result<usize> {
+        let Some(policy) = self.state.approved_policy.as_ref() else {
+            return Ok(0);
+        };
+        let projection = self.catalog.analysis_accounting_aggregate_for_run(
+            &policy.policy_id,
+            policy.kind.as_str(),
+            &self.state.run_id,
+        )?;
+        Ok(projection.completed_request_count + projection.uncertain_request_count)
+    }
+
     fn step(
         &mut self,
         phase: &str,
@@ -1444,6 +1552,10 @@ impl StepRunner<'_> {
             !self.state.unknown_usage,
             "provider usage unknown; no further paid requests allowed in this run"
         );
+        ensure!(
+            !self.state.budget_stopped,
+            "authorized moment budget exhausted; no further requests allowed in this run"
+        );
         let current_asset = self.catalog.get_asset(&self.asset.id)?;
         ensure!(
             !current_asset.removed
@@ -1451,7 +1563,24 @@ impl StepRunner<'_> {
                 && current_asset.duration_seconds == self.asset.duration_seconds,
             "source scope or time mapping changed; re-plan moment discovery"
         );
-        if self.state.spent >= self.options.budget_usd {
+        if let Some(policy) = self.state.approved_policy.as_ref() {
+            let snapshot = self
+                .catalog
+                .analysis_budget_snapshot(&analysis_policy_budget_scope_id(
+                    &policy.project_id,
+                    &policy.policy_id,
+                ))?
+                .ok_or_else(|| anyhow!("analysis budget authority is not initialized"))?;
+            if snapshot.dispatch_stopped || snapshot.available_usd <= 1e-12 {
+                self.state.budget_stopped = true;
+                bail!(
+                    "authorized moment budget exhausted; available ${:.6} of ${:.6}",
+                    snapshot.available_usd,
+                    snapshot.budget_usd
+                );
+            }
+        } else if self.state.spent >= self.options.budget_usd {
+            // Test-only unaccounted pipeline retains its local ceiling.
             self.state.budget_stopped = true;
             bail!("authorized moment budget exhausted");
         }
@@ -1545,9 +1674,64 @@ impl StepRunner<'_> {
             },
         )?;
         self.state.executed_steps += 1;
-        let outcome = match self.chain.analyze(self.provider, &request) {
+        ensure!(
+            !self.state.cancelled,
+            "moment run cancelled before the next paid transmission"
+        );
+        let settled_before = self.step_settled_attempts()?;
+        let outcome = match self.state.approved_policy.clone() {
+            Some(policy) => {
+                let context = bulk_request_accounting_context(
+                    &policy,
+                    &self.state.run_id,
+                    &self.asset.id,
+                    format!("{}:{}:{}", policy.kind.as_str(), self.asset.id, step_key),
+                    self.options.retry_uncertain,
+                )?;
+                let accounted = AccountedVlmProvider::new(self.catalog, context, self.provider)
+                    .with_explicit_retry(self.options.retry_uncertain);
+                let cancelled = &mut self.state.cancelled;
+                let spent = self.state.spent;
+                let notify = &mut self.notify;
+                self.chain
+                    .analyze_with_cancel(&accounted, &request, &mut || {
+                        if !*cancelled && notify(phase, spent).is_break() {
+                            *cancelled = true;
+                        }
+                        *cancelled
+                    })
+            }
+            None => self.chain.analyze(self.provider, &request),
+        };
+        let outcome = match outcome {
             Ok(outcome) => outcome,
             Err(error) => {
+                let failure = ProviderFailure::from_anyhow(&error);
+                if failure.category == crate::ProviderFailureCategory::LocalBudgetExhausted {
+                    self.state.budget_stopped = true;
+                }
+                if failure.category == crate::ProviderFailureCategory::Cancelled {
+                    self.state.cancelled = true;
+                }
+                if failure.category.is_pre_upload_local()
+                    && self.step_settled_attempts()? == settled_before
+                {
+                    // A fallback's local denial does not prove the earlier
+                    // primary was never uploaded. Only classify the whole step
+                    // as local when this chain added no completed/uncertain
+                    // paid attempt to its canonical run projection.
+                    self.save(
+                        &step_key,
+                        CachedStep {
+                            prior_receipts: prior_receipts.clone(),
+                            state: "local_failure".into(),
+                            reply: None,
+                            receipt: pending_receipt,
+                            error: failure.safe_detail(),
+                        },
+                    )?;
+                    return Err(error);
+                }
                 self.state.unknown_usage = true;
                 self.save(
                     &step_key,
@@ -2143,7 +2327,7 @@ mod tests {
         };
         let options = event_options();
         let report = catalog
-            .discover_moments_with_provider(
+            .discover_moments_with_provider_for_domain_test(
                 &project.id,
                 &["events".into()],
                 &options,
@@ -2276,7 +2460,7 @@ mod tests {
             "SELECT COALESCE(SUM(samples),0) FROM batch_performance WHERE task_kind LIKE 'moments.%'", [], |row| row.get(0),
         ).unwrap();
         let cached = catalog
-            .discover_moments_with_provider(
+            .discover_moments_with_provider_for_domain_test(
                 &project.id,
                 &["events".into()],
                 &options,
@@ -2336,7 +2520,7 @@ mod tests {
         let mut options = event_options();
         options.coarse_frames = 8;
         let report = catalog
-            .discover_moments_with_provider(
+            .discover_moments_with_provider_for_domain_test(
                 &project.id,
                 &["hold".into()],
                 &options,
@@ -2383,7 +2567,7 @@ mod tests {
         options.coarse_frames = 8;
         options.refinement_frames = 8;
         let report = catalog
-            .discover_moments_with_provider(
+            .discover_moments_with_provider_for_domain_test(
                 &project.id,
                 &["short".into()],
                 &options,
@@ -2422,7 +2606,7 @@ mod tests {
         let mut options = event_options();
         options.coarse_frames = 8;
         let report = catalog
-            .discover_moments_with_provider(
+            .discover_moments_with_provider_for_domain_test(
                 &project.id,
                 &["repetitive".into()],
                 &options,
@@ -2466,7 +2650,7 @@ mod tests {
         let mut options = event_options();
         options.budget_usd = 0.005;
         let report = catalog
-            .discover_moments_with_provider(
+            .discover_moments_with_provider_for_domain_test(
                 &project.id,
                 &["budget".into()],
                 &options,
@@ -2490,7 +2674,7 @@ mod tests {
         ).unwrap();
         options.budget_usd = 0.1;
         let resumed = catalog
-            .discover_moments_with_provider(
+            .discover_moments_with_provider_for_domain_test(
                 &project.id,
                 &["budget".into()],
                 &options,
@@ -2535,7 +2719,7 @@ mod tests {
         };
         let options = event_options();
         let report = catalog
-            .discover_moments_with_provider(
+            .discover_moments_with_provider_for_domain_test(
                 &project.id,
                 &["cancel".into()],
                 &options,
@@ -2570,7 +2754,7 @@ mod tests {
             .claim_representation("busy", RepresentationKind::Proxy)
             .unwrap();
         let busy = catalog
-            .discover_moments_with_provider(
+            .discover_moments_with_provider_for_domain_test(
                 &project.id,
                 &["busy".into()],
                 &options,
@@ -2588,7 +2772,7 @@ mod tests {
 
         let mut changed = false;
         let removed = catalog
-            .discover_moments_with_provider(
+            .discover_moments_with_provider_for_domain_test(
                 &project.id,
                 &["busy".into()],
                 &options,
@@ -2646,7 +2830,7 @@ mod tests {
         let options = event_options();
         let mut phase_callbacks = 0;
         let cancelled = catalog
-            .discover_moments_with_provider(
+            .discover_moments_with_provider_for_domain_test(
                 &project.id,
                 &["cancel_after_first".into()],
                 &options,
@@ -2668,7 +2852,7 @@ mod tests {
             "cancellation at the second request boundary follows one completed request"
         );
         let resumed = catalog
-            .discover_moments_with_provider(
+            .discover_moments_with_provider_for_domain_test(
                 &project.id,
                 &["cancel_after_first".into()],
                 &options,
@@ -2700,7 +2884,7 @@ mod tests {
         };
         let options = event_options();
         catalog
-            .discover_moments_with_provider(
+            .discover_moments_with_provider_for_domain_test(
                 &project.id,
                 &["orphaned".into()],
                 &options,
@@ -2763,7 +2947,7 @@ mod tests {
         for retry_uncertain in [false, true] {
             forced.retry_uncertain = retry_uncertain;
             let report = catalog
-                .discover_moments_with_provider(
+                .discover_moments_with_provider_for_domain_test(
                     &project.id,
                     &["orphaned".into()],
                     &forced,
@@ -2820,7 +3004,7 @@ mod tests {
         let mut options = event_options();
         options.coarse_frames = 8;
         let first = catalog
-            .discover_moments_with_provider(
+            .discover_moments_with_provider_for_domain_test(
                 &project.id,
                 &["interrupted".into()],
                 &options,
@@ -2834,7 +3018,7 @@ mod tests {
         let mut forced = options.clone();
         forced.force = true;
         let blocked = catalog
-            .discover_moments_with_provider(
+            .discover_moments_with_provider_for_domain_test(
                 &project.id,
                 &["interrupted".into()],
                 &forced,
@@ -2852,7 +3036,7 @@ mod tests {
         let mut retry = options;
         retry.retry_uncertain = true;
         let recovered = catalog
-            .discover_moments_with_provider(
+            .discover_moments_with_provider_for_domain_test(
                 &project.id,
                 &["interrupted".into()],
                 &retry,
@@ -2939,7 +3123,7 @@ mod tests {
         let mut options = event_options();
         options.payload = MomentPayload::FramesAndTranscript;
         let report = catalog
-            .discover_moments_with_provider(
+            .discover_moments_with_provider_for_domain_test(
                 &project.id,
                 &["dialogue".into()],
                 &options,
@@ -3020,7 +3204,7 @@ mod tests {
             provider: None,
         };
         let first = catalog
-            .discover_moments_with_provider(
+            .discover_moments_with_provider_for_domain_test(
                 &project.id,
                 &["receipt".into()],
                 &options,
@@ -3049,7 +3233,7 @@ mod tests {
             provider: Some("upstream-endpoint".into()),
         };
         let second = catalog
-            .discover_moments_with_provider(
+            .discover_moments_with_provider_for_domain_test(
                 &project.id,
                 &["receipt".into()],
                 &options,
@@ -3112,7 +3296,7 @@ mod tests {
         };
         let options = event_options();
         let offline = catalog
-            .discover_moments_with_provider(
+            .discover_moments_with_provider_for_domain_test(
                 &project.id,
                 &["offline".into()],
                 &options,
@@ -3127,7 +3311,7 @@ mod tests {
         assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
         for id in ["quarantined", "removed"] {
             let report = catalog
-                .discover_moments_with_provider(
+                .discover_moments_with_provider_for_domain_test(
                     &project.id,
                     &[id.into()],
                     &options,
@@ -3198,9 +3382,13 @@ mod tests {
         let assets = vec!["moment_asset".to_owned()];
         let run = || {
             catalog
-                .discover_moments_with_provider(&project.id, &assets, &options, &provider, |_| {
-                    ControlFlow::Continue(())
-                })
+                .discover_moments_with_provider_for_domain_test(
+                    &project.id,
+                    &assets,
+                    &options,
+                    &provider,
+                    |_| ControlFlow::Continue(()),
+                )
                 .unwrap()
         };
 
@@ -3275,9 +3463,13 @@ mod tests {
         changed_model.model = FALLBACK_MODEL.into();
         changed_model.allowed_models = vec![FALLBACK_MODEL.into()];
         catalog
-            .discover_moments_with_provider(&project.id, &assets, &changed_model, &provider, |_| {
-                ControlFlow::Continue(())
-            })
+            .discover_moments_with_provider_for_domain_test(
+                &project.id,
+                &assets,
+                &changed_model,
+                &provider,
+                |_| ControlFlow::Continue(()),
+            )
             .unwrap();
         assert_eq!(
             provider.calls.load(Ordering::SeqCst),
@@ -3297,7 +3489,7 @@ mod tests {
         let mut changed_profile = options.clone();
         changed_profile.profile.select_max_ms -= 1_000;
         catalog
-            .discover_moments_with_provider(
+            .discover_moments_with_provider_for_domain_test(
                 &project.id,
                 &assets,
                 &changed_profile,
@@ -3339,9 +3531,13 @@ mod tests {
         catalog.commit_proxy_write(write, None).unwrap();
         assert_eq!(fs::read(&source).unwrap(), original_bytes);
         catalog
-            .discover_moments_with_provider(&project.id, &assets, &options, &provider, |_| {
-                ControlFlow::Continue(())
-            })
+            .discover_moments_with_provider_for_domain_test(
+                &project.id,
+                &assets,
+                &options,
+                &provider,
+                |_| ControlFlow::Continue(()),
+            )
             .unwrap();
         assert_eq!(
             provider.calls.load(Ordering::SeqCst),
@@ -3372,9 +3568,13 @@ mod tests {
                 .current
         );
         let corrected = catalog
-            .discover_moments_with_provider(&project.id, &assets, &options, &provider, |_| {
-                ControlFlow::Continue(())
-            })
+            .discover_moments_with_provider_for_domain_test(
+                &project.id,
+                &assets,
+                &options,
+                &provider,
+                |_| ControlFlow::Continue(()),
+            )
             .unwrap();
         assert_eq!(corrected.no_candidates, 1);
         assert_eq!(provider.calls.load(Ordering::SeqCst), 5);

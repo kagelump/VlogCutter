@@ -15,12 +15,12 @@ use super::legacy::{
 };
 use super::model::{
     ANALYSIS_ACCOUNTING_SCHEMA_VERSION, AnalysisAccountingAggregate, AnalysisAccountingContext,
-    AnalysisBudgetAuthorityContext, AnalysisBudgetSnapshot, AnalysisOperationAttemptProjection,
-    AnalysisProviderReceipt, AnalysisRequestEvent, AnalysisRequestLifecycle, AnalysisRequestRecord,
-    AnalysisRetryAuthorization, LEGACY_UNKNOWN_USAGE_STOP_REASON,
-    MAX_IN_FLIGHT_REQUESTS_PER_BUDGET_AUTHORITY, MAX_REQUEST_ATTEMPTS, ProviderReceiptEvidence,
-    analysis_request_cost_bound_fingerprint, attempt_base_key, bounded_failure_code, digest_bytes,
-    digest_json, request_key,
+    AnalysisBudgetAuthorityContext, AnalysisBudgetExhausted, AnalysisBudgetSnapshot,
+    AnalysisOperationAttemptProjection, AnalysisProviderReceipt, AnalysisRequestEvent,
+    AnalysisRequestLifecycle, AnalysisRequestRecord, AnalysisRetryAuthorization,
+    LEGACY_UNKNOWN_USAGE_STOP_REASON, MAX_IN_FLIGHT_REQUESTS_PER_BUDGET_AUTHORITY,
+    MAX_REQUEST_ATTEMPTS, ProviderReceiptEvidence, analysis_request_cost_bound_fingerprint,
+    attempt_base_key, bounded_failure_code, digest_bytes, digest_json, request_key,
 };
 use super::settlement::{
     ExistingReceipt, ReceiptDisposition, classify_receipt, settlement_for_receipt,
@@ -204,10 +204,13 @@ pub(crate) fn reserve(
         requested.is_finite() && requested > 0.0,
         "analysis request cost bound must be finite and greater than zero"
     );
-    ensure!(
-        available + 1e-12 >= requested,
-        "conservative request bound ${requested:.6} does not fit the remaining analysis budget ${available:.6}; clipping is not allowed"
-    );
+    if available + 1e-12 < requested {
+        return Err(AnalysisBudgetExhausted {
+            available_usd: available,
+            requested_usd: requested,
+        }
+        .into());
+    }
 
     let key = request_key(&base, next_epoch);
     let now = crate::now();
@@ -1326,19 +1329,77 @@ pub(crate) fn accounting_aggregate(
     operation: Option<&str>,
     current_run_id: Option<&str>,
 ) -> Result<AnalysisAccountingAggregate> {
-    let mut statement = connection.prepare(&format!(
-        "{REQUEST_SELECT} WHERE policy_id=?1 AND (?2 IS NULL OR operation=?2)
-         ORDER BY created_at ASC, request_key ASC"
-    ))?;
-    let requests = statement
-        .query_map(params![policy_id, operation], row_to_request)?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    let authority = load_authority_by_policy_optional(connection, policy_id)?;
+    accounting_aggregate_matching(connection, policy_id, operation, current_run_id, None, true)
+}
+
+/// Canonical accounting projection for exactly one runtime run. It reuses the
+/// same request lifecycle calculation as the whole-policy aggregate but omits
+/// frozen legacy and post-snapshot evidence, which belong to the authority
+/// total rather than to this run. Runtime reports therefore show confirmed
+/// current-run cost without double-counting pilot or earlier bulk charges.
+pub(crate) fn accounting_aggregate_for_run(
+    connection: &Connection,
+    policy_id: &str,
+    operation: &str,
+    run_id: &str,
+) -> Result<AnalysisAccountingAggregate> {
+    ensure!(
+        !operation.trim().is_empty(),
+        "accounting aggregate operation is required"
+    );
+    ensure!(
+        !run_id.trim().is_empty(),
+        "accounting aggregate run id is required"
+    );
+    accounting_aggregate_matching(
+        connection,
+        policy_id,
+        Some(operation),
+        Some(run_id),
+        Some(run_id),
+        false,
+    )
+}
+
+fn accounting_aggregate_matching(
+    connection: &Connection,
+    policy_id: &str,
+    operation: Option<&str>,
+    current_run_id: Option<&str>,
+    run_id_filter: Option<&str>,
+    include_authority_evidence: bool,
+) -> Result<AnalysisAccountingAggregate> {
+    let requests = if let Some(run_id) = run_id_filter {
+        let mut statement = connection.prepare(&format!(
+            "{REQUEST_SELECT} WHERE policy_id=?1 AND (?2 IS NULL OR operation=?2) AND run_id=?3
+             ORDER BY created_at ASC, request_key ASC"
+        ))?;
+        statement
+            .query_map(params![policy_id, operation, run_id], row_to_request)?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    } else {
+        let mut statement = connection.prepare(&format!(
+            "{REQUEST_SELECT} WHERE policy_id=?1 AND (?2 IS NULL OR operation=?2)
+             ORDER BY created_at ASC, request_key ASC"
+        ))?;
+        statement
+            .query_map(params![policy_id, operation], row_to_request)?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let authority = if include_authority_evidence {
+        load_authority_by_policy_optional(connection, policy_id)?
+    } else {
+        None
+    };
     let untracked = match authority.as_ref() {
         Some(authority) => untracked_totals(connection, &authority.budget_scope_id, operation)?,
         None => UntrackedTotals::default(),
     };
-    let legacy = aggregate_legacy_evidence(authority.as_ref(), operation);
+    let legacy = if include_authority_evidence {
+        aggregate_legacy_evidence(authority.as_ref(), operation)
+    } else {
+        None
+    };
     let legacy_included = legacy.is_some();
     let legacy_confirmed = legacy.as_ref().map_or(0.0, |legacy| legacy.confirmed);
     let legacy_uncertain = legacy.as_ref().map_or(0.0, |legacy| legacy.uncertain);

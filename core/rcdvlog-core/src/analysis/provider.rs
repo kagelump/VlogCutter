@@ -298,8 +298,12 @@ pub enum ProviderFailureCategory {
     InvalidResponse,
     Configuration,
     /// Durable ledger admission rejected the attempt before any transmission
-    /// (stopped budget, saturation, duplicate fence, policy/source mismatch).
+    /// (saturation, duplicate fence, stopped authority, policy/source mismatch).
     LocalAdmission,
+    /// The complete conservative provider quote did not fit the remaining
+    /// whole-policy budget. Distinct from saturation/duplicate denial so runtime
+    /// reports can mark the budget as exhausted without parsing error text.
+    LocalBudgetExhausted,
     /// Local preparation or credential checks failed before the dispatch marker.
     LocalPreUpload,
     /// The provider call returned evidence, but persisting that evidence failed.
@@ -326,8 +330,23 @@ impl ProviderFailureCategory {
             self,
             Self::Configuration
                 | Self::LocalAdmission
+                | Self::LocalBudgetExhausted
                 | Self::LocalPreUpload
                 | Self::LocalPostDispatch
+                | Self::Cancelled
+        )
+    }
+
+    /// Local failure categories for which the accounted boundary has proven no
+    /// upload occurred (no dispatch marker). `LocalPostDispatch` is deliberately
+    /// excluded: the paid response existed but its receipt could not be stored.
+    pub fn is_pre_upload_local(self) -> bool {
+        matches!(
+            self,
+            Self::Configuration
+                | Self::LocalAdmission
+                | Self::LocalBudgetExhausted
+                | Self::LocalPreUpload
                 | Self::Cancelled
         )
     }
@@ -371,6 +390,13 @@ impl ProviderFailure {
     pub fn local_admission() -> Self {
         Self {
             category: ProviderFailureCategory::LocalAdmission,
+            http_status: None,
+        }
+    }
+
+    pub fn local_budget_exhausted() -> Self {
+        Self {
+            category: ProviderFailureCategory::LocalBudgetExhausted,
             http_status: None,
         }
     }
@@ -438,6 +464,9 @@ impl ProviderFailure {
             }
             ProviderFailureCategory::LocalAdmission => {
                 "analysis_accounting:admission_denied; inspect prior requests and reconcile uncertain usage before an explicit retry"
+            }
+            ProviderFailureCategory::LocalBudgetExhausted => {
+                "analysis_accounting:budget_exhausted; the full conservative request bound no longer fits the whole-policy ceiling"
             }
             ProviderFailureCategory::LocalPreUpload => {
                 "analysis_accounting:pre_upload_failed; no dispatch marker was committed"

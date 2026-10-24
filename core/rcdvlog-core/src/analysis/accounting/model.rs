@@ -25,6 +25,28 @@ pub const LEGACY_UNKNOWN_USAGE_STOP_REASON: &str =
 pub const UNTRACKED_POST_INITIALIZATION_USAGE_STOP_REASON: &str =
     "untracked_post_initialization_usage_requires_reconciliation";
 
+/// Typed, content-free admission failure for a provider quote that does not fit
+/// the remaining whole-policy exposure. Runtime callers use this category only
+/// to stop before the next transmission and report budget exhaustion; it is
+/// never persisted as a provider failure or as usage evidence.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AnalysisBudgetExhausted {
+    pub available_usd: f64,
+    pub requested_usd: f64,
+}
+
+impl std::fmt::Display for AnalysisBudgetExhausted {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "conservative request bound ${:.6} does not fit the remaining analysis budget ${:.6}; clipping is not allowed",
+            self.requested_usd, self.available_usd
+        )
+    }
+}
+
+impl std::error::Error for AnalysisBudgetExhausted {}
+
 /// The canonical authority for one explicitly authorized run policy.
 pub fn analysis_policy_budget_scope_id(project_id: &str, policy_id: &str) -> String {
     format!("policy:{project_id}:{policy_id}")
@@ -402,8 +424,17 @@ impl AnalysisAccountingAggregate {
     /// known zero-request operation is not unresolved merely because it has no
     /// ledger rows.
     pub fn has_unresolved_usage(&self) -> bool {
-        self.active_request_count > 0
-            || self.uncertain_request_count > 0
+        self.active_request_count > 0 || self.has_unknown_usage()
+    }
+
+    /// Unknown/unsettled usage that must block a new paid operation. Active
+    /// reservations are deliberately excluded: they are legitimate concurrent
+    /// attempts whose full bounds are already included by atomic admission, not
+    /// evidence of an interrupted request. Reconciliation of an interrupted
+    /// request is required only for dispatched/uncertain or otherwise unproven
+    /// historical spending.
+    pub fn has_unknown_usage(&self) -> bool {
+        self.uncertain_request_count > 0
             || (self.legacy_included && !self.legacy_usage_complete)
             || self.post_initialization_untracked_usage_reserve_usd > 0.0
             || self.post_initialization_untracked_evidence_count > 0

@@ -2978,7 +2978,7 @@ fn local_admission_denial_does_not_fallback_or_poison_provider_health() {
     let error = chain.analyze(&accounted, &boundary_request()).unwrap_err();
     assert_eq!(
         ProviderFailure::from_anyhow(&error).category,
-        ProviderFailureCategory::LocalAdmission
+        ProviderFailureCategory::LocalBudgetExhausted
     );
     assert_eq!(provider.call_count(), 0);
     assert_eq!(chain.default_failures(), 0);

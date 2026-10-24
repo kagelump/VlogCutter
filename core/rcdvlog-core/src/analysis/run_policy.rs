@@ -17,7 +17,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
 use crate::analysis::accounting::{
-    AnalysisAccountingContext, AnalysisBudgetAuthorityContext, AnalysisRetryAuthorization,
+    AnalysisAccountingContext, AnalysisBudgetAuthorityContext, AnalysisBudgetSnapshot,
+    AnalysisRetryAuthorization,
 };
 use crate::analysis::moments::{
     EditProfile, MOMENT_PROMPT_VERSION, MOMENT_RECIPE_VERSION, MOMENT_SCHEMA_VERSION, MomentPayload,
@@ -478,6 +479,67 @@ pub(crate) fn pilot_authority_context(policy: &RunPolicy) -> AnalysisBudgetAutho
         budget_scope_id: String::new(),
         budget_usd: policy.budget_usd,
     }
+}
+
+/// Verify (and, for a legacy-created policy, freeze) the one canonical budget
+/// authority before opening a new bulk run row. Runtime callers must never
+/// substitute a live remaining-balance value for this immutable whole-policy
+/// ceiling.
+pub(crate) fn verify_bulk_authority(
+    catalog: &Catalog,
+    policy: &RunPolicy,
+) -> Result<AnalysisBudgetSnapshot> {
+    let authority =
+        catalog.initialize_analysis_accounting_authority(&pilot_authority_context(policy))?;
+    ensure!(
+        !authority.dispatch_stopped,
+        "analysis budget authority dispatch is stopped: {}",
+        authority.stop_reason
+    );
+    Ok(authority)
+}
+
+/// Build the exact request identity for one bulk transmission against an
+/// already-authorized whole-policy authority. `intended_attempt_key` must be
+/// stable across restarts and independent of the run id so a completed or
+/// uncertain prior attempt cannot be replayed by creating a fresh run.
+pub(crate) fn bulk_request_accounting_context(
+    policy: &RunPolicy,
+    run_id: &str,
+    asset_id: &str,
+    intended_attempt_key: String,
+    explicit_retry: bool,
+) -> Result<AnalysisAccountingContext> {
+    ensure!(
+        !run_id.trim().is_empty(),
+        "bulk accounting run id is required"
+    );
+    ensure!(
+        !intended_attempt_key.trim().is_empty(),
+        "bulk accounting intended attempt key is required"
+    );
+    let scope = policy
+        .scope
+        .iter()
+        .find(|scope| scope.asset_id == asset_id)
+        .ok_or_else(|| anyhow::anyhow!("asset is outside the authorized bulk scope"))?;
+    ensure!(
+        !scope.source_identity.trim().is_empty(),
+        "authorized bulk source identity is missing"
+    );
+    Ok(AnalysisAccountingContext {
+        project_id: policy.project_id.clone(),
+        policy_id: policy.policy_id.clone(),
+        policy_fingerprint: policy.policy_id.clone(),
+        run_id: run_id.to_string(),
+        operation: policy.kind.as_str().to_string(),
+        intended_attempt_key,
+        source_fingerprint: scope.source_identity.clone(),
+        provider: policy.provider.clone(),
+        budget_scope_id: String::new(),
+        budget_usd: policy.budget_usd,
+        explicit_retry,
+    })
 }
 
 pub(crate) fn pilot_accounting_context(
@@ -1555,11 +1617,13 @@ impl Catalog {
             "capability pilot cost is invalid"
         );
         // Remaining budget is canonical whole-policy exposure, not a separate
-        // add-up of pilot summary fields. Any unresolved usage blocks bulk work.
+        // add-up of pilot summary fields. Active reservations are legitimate
+        // concurrent attempts and are accounted by atomic admission; only
+        // unknown/interrupted usage blocks a new bulk run before it starts.
         let aggregate = self.analysis_accounting_aggregate(policy_id, Some(&pilot.run_id))?;
         ensure!(
-            !aggregate.has_unresolved_usage(),
-            "canonical analysis usage is unresolved; reconcile interrupted request evidence before bulk work"
+            !aggregate.has_unknown_usage(),
+            "canonical analysis usage is unknown or interrupted; reconcile request evidence before bulk work"
         );
         let remaining_budget_usd = current.budget_usd - aggregate.committed_or_reserved_usd;
         ensure!(
@@ -1607,8 +1671,8 @@ mod tests {
     use rusqlite::params;
     use serde_json::{Value, json};
     use std::fs;
-    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Barrier, Mutex};
     use tempfile::tempdir;
 
     struct FakeProvider {
@@ -2256,6 +2320,35 @@ mod tests {
                     usage_complete: self.usage_complete,
                 },
             })
+        }
+    }
+
+    struct PrepareBreaksProxy {
+        calls: AtomicUsize,
+        proxy_path: std::path::PathBuf,
+    }
+
+    impl VlmProvider for PrepareBreaksProxy {
+        fn prepare(&self) -> Result<()> {
+            // Simulate local representation loss after run admission but before
+            // any paid upload. Repeated prepare calls are idempotent.
+            let _ = fs::remove_file(&self.proxy_path);
+            Ok(())
+        }
+
+        fn analysis_cost_bound(
+            &self,
+            _model: &str,
+            _request: &VlmRequest,
+        ) -> Result<AnalysisRequestCostBound> {
+            Ok(AnalysisRequestCostBound::declared_for_synthetic_transport(
+                0.02,
+            ))
+        }
+
+        fn analyze(&self, _model: &str, _request: &VlmRequest) -> Result<VlmResponse> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            bail!("local pre-upload test provider must never be called")
         }
     }
 
@@ -3169,7 +3262,7 @@ mod tests {
             .run_run_policy_pilot_with_provider(&request, &denied, true)
             .unwrap_err();
         assert!(
-            format!("{error:#}").contains("admission_denied"),
+            format!("{error:#}").contains("budget_exhausted"),
             "{error:#}"
         );
         assert_eq!(denied.calls.load(Ordering::SeqCst), 0);
@@ -3229,6 +3322,541 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_bulk_workers_cannot_oversubscribe_the_whole_policy_budget() {
+        let (directory, catalog, project, first_asset) = fixture();
+        let second_asset =
+            generated_asset(&catalog, &project, directory.path(), "clip-race-second", 2);
+        // Two assets cost $0.02 at the reference estimate. The pilot's returned
+        // $0.01 plus one $0.02 full request bound exactly exhausts this ceiling,
+        // so a second concurrent admission must fail atomically.
+        let request = RunPolicyRequest::observation(
+            project.clone(),
+            vec![first_asset, second_asset],
+            DEFAULT_MODEL,
+            vec![DEFAULT_MODEL.into()],
+            false,
+            0.03,
+            false,
+        );
+        catalog.authorize_run_policy(&request).unwrap();
+        let pilot_provider = FakeProvider::observation();
+        let pilot = catalog
+            .run_run_policy_pilot_with_provider(&request, &pilot_provider, false)
+            .unwrap();
+        assert_eq!(pilot.status, "passed", "{pilot:?}");
+        assert_eq!(pilot_provider.calls.load(Ordering::SeqCst), 1);
+
+        let provider = FakeProvider::observation();
+        let barrier = Barrier::new(2);
+        let left = catalog.clone();
+        let right = catalog.clone();
+        let policy_id = pilot.policy_id.clone();
+        let (left_report, right_report) = std::thread::scope(|scope| {
+            let left = scope.spawn(|| {
+                barrier.wait();
+                left.analyze_authorized_with_provider_and_workers(
+                    &policy_id,
+                    &provider,
+                    Some(2),
+                    |_| std::ops::ControlFlow::Continue(()),
+                )
+            });
+            let right = scope.spawn(|| {
+                barrier.wait();
+                right.analyze_authorized_with_provider_and_workers(
+                    &policy_id,
+                    &provider,
+                    Some(2),
+                    |_| std::ops::ControlFlow::Continue(()),
+                )
+            });
+            (left.join().unwrap(), right.join().unwrap())
+        });
+        let reports = [left_report, right_report];
+        assert!(
+            reports.iter().any(|report| report.is_ok()),
+            "at least one concurrent bulk attempt should be admitted: {reports:?}"
+        );
+        assert!(
+            reports
+                .iter()
+                .flatten()
+                .any(|report| report.budget_exhausted),
+            "the remaining whole-policy budget cannot fit another full request bound: {reports:?}"
+        );
+        // Exactly one bulk call can fit after the pilot; local admission denial
+        // must not consume a fallback or create an unpaid uncertainty row.
+        assert_eq!(
+            provider.calls.load(Ordering::SeqCst),
+            1,
+            "the canonical full-bound admission must prevent any oversubscription"
+        );
+        let aggregate = catalog
+            .analysis_accounting_aggregate(&policy_id, None)
+            .unwrap();
+        assert!(aggregate.confirmed_cost_usd <= 0.03 + 1e-9);
+        assert_eq!(aggregate.confirmed_cost_usd, 0.02);
+        assert_eq!(aggregate.active_request_count, 0);
+        assert_eq!(aggregate.uncertain_request_count, 0);
+        assert_eq!(
+            aggregate.committed_or_reserved_usd, aggregate.confirmed_cost_usd,
+            "reservations must settle to confirmed receipts without a second balance"
+        );
+    }
+
+    #[test]
+    fn cancelled_partial_bulk_work_keeps_receipts_and_restart_reuses_results() {
+        let (directory, catalog, project, first_asset) = fixture();
+        let second_asset = generated_asset(
+            &catalog,
+            &project,
+            directory.path(),
+            "clip-restart-second",
+            2,
+        );
+        let request = RunPolicyRequest::observation(
+            project.clone(),
+            vec![first_asset, second_asset],
+            DEFAULT_MODEL,
+            vec![DEFAULT_MODEL.into()],
+            false,
+            1.0,
+            false,
+        );
+        catalog.authorize_run_policy(&request).unwrap();
+        let pilot = catalog
+            .run_run_policy_pilot_with_provider(&request, &FakeProvider::observation(), false)
+            .unwrap();
+        assert_eq!(pilot.status, "passed", "{pilot:?}");
+
+        let first_provider = FakeProvider::observation();
+        let mut stopped = false;
+        let first_report = catalog
+            .analyze_authorized_with_provider_and_workers(
+                &pilot.policy_id,
+                &first_provider,
+                Some(1),
+                |progress| {
+                    if progress.outcome.is_some() && !stopped {
+                        stopped = true;
+                        return std::ops::ControlFlow::Break(());
+                    }
+                    std::ops::ControlFlow::Continue(())
+                },
+            )
+            .unwrap();
+        assert!(first_report.cancelled);
+        assert_eq!(first_report.analyzed, 1);
+        assert_eq!(first_provider.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(first_report.cost_usd, 0.01);
+
+        let observation_requests = catalog
+            .list_analysis_requests(&project, Some(&pilot.policy_id), 1000)
+            .unwrap()
+            .into_iter()
+            .filter(|request| request.operation == "observation")
+            .collect::<Vec<_>>();
+        assert_eq!(observation_requests.len(), 1);
+        assert_eq!(
+            observation_requests[0].lifecycle,
+            crate::AnalysisRequestLifecycle::Completed
+        );
+        assert_eq!(observation_requests[0].confirmed_cost_usd, 0.01);
+        let first_run_aggregate = catalog
+            .analysis_accounting_aggregate_for_run(
+                &pilot.policy_id,
+                "observation",
+                &observation_requests[0].run_id,
+            )
+            .unwrap();
+        assert_eq!(first_run_aggregate.confirmed_cost_usd, 0.01);
+        assert!(!first_run_aggregate.has_unresolved_usage());
+
+        let second_provider = FakeProvider::observation();
+        let second_report = catalog
+            .analyze_authorized_with_provider_and_workers(
+                &pilot.policy_id,
+                &second_provider,
+                Some(1),
+                |_| std::ops::ControlFlow::Continue(()),
+            )
+            .unwrap();
+        assert_eq!(second_provider.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(second_report.analyzed, 1, "{:?}", second_report.failures);
+        assert!(!second_report.cancelled);
+        let observation_aggregate = catalog
+            .analysis_accounting_aggregate_for_operation(&pilot.policy_id, "observation", None)
+            .unwrap();
+        assert_eq!(observation_aggregate.request_count, 2);
+        assert_eq!(observation_aggregate.confirmed_cost_usd, 0.02);
+        assert_eq!(observation_aggregate.uncertain_request_count, 0);
+    }
+
+    #[test]
+    fn unknown_bulk_usage_blocks_implicit_resend_and_is_not_treated_as_zero() {
+        let (_directory, catalog, project, asset) = fixture();
+        let request = observation_request(&project, &asset, 1.0);
+        catalog.authorize_run_policy(&request).unwrap();
+        let pilot = catalog
+            .run_run_policy_pilot_with_provider(&request, &FakeProvider::observation(), false)
+            .unwrap();
+        assert_eq!(pilot.status, "passed", "{pilot:?}");
+
+        let interrupted = FakeProvider {
+            calls: AtomicUsize::new(0),
+            body: String::new(),
+            fail_transport: true,
+            fail_prepare: false,
+        };
+        let report = catalog
+            .analyze_authorized_with_provider_and_workers(
+                &pilot.policy_id,
+                &interrupted,
+                Some(1),
+                |_| std::ops::ControlFlow::Continue(()),
+            )
+            .unwrap();
+        assert_eq!(interrupted.calls.load(Ordering::SeqCst), 1);
+        assert!(!report.usage_complete);
+        let observation_requests = catalog
+            .list_analysis_requests(&project, Some(&pilot.policy_id), 1000)
+            .unwrap()
+            .into_iter()
+            .filter(|request| request.operation == "observation")
+            .collect::<Vec<_>>();
+        assert_eq!(observation_requests.len(), 1);
+        assert_eq!(
+            observation_requests[0].lifecycle,
+            crate::AnalysisRequestLifecycle::Uncertain
+        );
+        assert!(observation_requests[0].uncertain_usage_reserve_usd > 0.0);
+
+        let replacement = FakeProvider::observation();
+        let error = catalog
+            .analyze_authorized_with_provider_and_workers(
+                &pilot.policy_id,
+                &replacement,
+                Some(1),
+                |_| std::ops::ControlFlow::Continue(()),
+            )
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("unknown or interrupted"),
+            "{error:#}"
+        );
+        assert_eq!(
+            replacement.calls.load(Ordering::SeqCst),
+            0,
+            "a potentially completed paid request must never be blindly resent"
+        );
+    }
+
+    #[test]
+    fn authorized_moment_bulk_accounts_distinct_per_asset_and_span_requests() {
+        let (directory, catalog, project, first_asset) = fixture();
+        let second_asset = generated_asset(
+            &catalog,
+            &project,
+            directory.path(),
+            "clip-moment-ledger-second",
+            2,
+        );
+        let request = RunPolicyRequest::moment_discovery(
+            project.clone(),
+            vec![first_asset.clone(), second_asset.clone()],
+            DEFAULT_MODEL,
+            vec![DEFAULT_MODEL.into()],
+            false,
+            AnalysisPayload::Frames,
+            1.0,
+            8,
+            8,
+            1,
+            EditProfile::default(),
+            false,
+            false,
+        );
+        let policy = catalog.authorize_run_policy(&request).unwrap().policy;
+        let pilot_provider = FakeProvider::moments(serde_json::json!({
+            "moments": [],
+            "uncertain": true,
+            "reason": "synthetic pilot"
+        }));
+        let pilot = catalog
+            .run_run_policy_pilot_with_provider(&request, &pilot_provider, false)
+            .unwrap();
+        assert_eq!(pilot.status, "passed", "{pilot:?}");
+
+        let bulk_provider = FakeProvider::moments(serde_json::json!({
+            "moments": [],
+            "uncertain": true,
+            "reason": "synthetic distinct span accounting"
+        }));
+        let report = catalog
+            .discover_authorized_moments_with_provider(&policy.policy_id, &bulk_provider, |_| {
+                std::ops::ControlFlow::Continue(())
+            })
+            .unwrap();
+        assert_eq!(report.processed, 2, "{:?}", report.failures);
+        assert!(bulk_provider.calls.load(Ordering::SeqCst) >= 2);
+
+        let requests = catalog
+            .list_analysis_requests(&project, Some(&policy.policy_id), 1000)
+            .unwrap()
+            .into_iter()
+            .filter(|request| {
+                request.operation == "moment_discovery" && request.run_id == report.run_id
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            requests.len() >= 2,
+            "expected per-span requests: {requests:?}"
+        );
+        let mut keys = requests
+            .iter()
+            .map(|request| request.attempt_base_key.clone())
+            .collect::<Vec<_>>();
+        keys.sort();
+        keys.dedup();
+        assert_eq!(
+            keys.len(),
+            requests.len(),
+            "each asset/span attempt must have its own identity"
+        );
+        let authorized_sources = policy
+            .scope
+            .iter()
+            .map(|scope| scope.source_identity.clone())
+            .collect::<Vec<_>>();
+        let mut observed_sources = requests
+            .iter()
+            .map(|request| request.source_fingerprint.clone())
+            .collect::<Vec<_>>();
+        observed_sources.sort();
+        observed_sources.dedup();
+        assert_eq!(
+            observed_sources.len(),
+            2,
+            "both authorized asset source identities must be represented"
+        );
+        assert!(
+            observed_sources
+                .iter()
+                .all(|source| authorized_sources.contains(source))
+        );
+        assert!(requests.iter().all(|request| {
+            request.lifecycle == crate::AnalysisRequestLifecycle::Completed
+                && request.dispatch_at.is_some()
+                && request.confirmed_cost_usd == 0.01
+        }));
+        let aggregate = catalog
+            .analysis_accounting_aggregate_for_run(
+                &policy.policy_id,
+                "moment_discovery",
+                &report.run_id,
+            )
+            .unwrap();
+        assert_eq!(aggregate.request_count, requests.len());
+        assert_eq!(aggregate.confirmed_cost_usd, requests.len() as f64 * 0.01);
+        assert_eq!(report.cost_usd, aggregate.confirmed_cost_usd);
+        assert!(!aggregate.has_unresolved_usage());
+    }
+
+    #[test]
+    fn bulk_domain_fallback_records_two_complete_ledger_receipts() {
+        let (_directory, catalog, project, asset) = fixture();
+        let request = RunPolicyRequest::observation(
+            project.clone(),
+            vec![asset],
+            DEFAULT_MODEL,
+            vec![DEFAULT_MODEL.into(), FALLBACK_MODEL.into()],
+            true,
+            1.0,
+            false,
+        );
+        catalog.authorize_run_policy(&request).unwrap();
+        let provider = ModelScriptProvider::new(0.02, |model, call| {
+            let body = if model == DEFAULT_MODEL {
+                r#"{"not":"a valid bulk observation"}"#.to_string()
+            } else {
+                valid_observation_body()
+            };
+            Ok(scripted_response(model, call, body, 0.01))
+        });
+        let pilot = catalog
+            .run_run_policy_pilot_with_provider(&request, &provider, false)
+            .unwrap();
+        assert_eq!(pilot.status, "passed", "{pilot:?}");
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+
+        let report = catalog
+            .analyze_authorized_with_provider(&pilot.policy_id, &provider, |_| {
+                std::ops::ControlFlow::Continue(())
+            })
+            .unwrap();
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 4);
+        assert_eq!(report.fallback_served, 1);
+        assert_eq!(report.cost_usd, 0.02);
+        let requests = catalog
+            .list_analysis_requests(&project, Some(&pilot.policy_id), 1000)
+            .unwrap()
+            .into_iter()
+            .filter(|request| request.operation == "observation")
+            .collect::<Vec<_>>();
+        assert_eq!(requests.len(), 2);
+        assert!(requests.iter().all(|request| {
+            request.lifecycle == crate::AnalysisRequestLifecycle::Completed
+                && request.confirmed_cost_usd == 0.01
+                && catalog
+                    .analysis_provider_receipts(&request.request_key)
+                    .unwrap()
+                    .len()
+                    == 1
+        }));
+        let aggregate = catalog
+            .analysis_accounting_aggregate_for_run(
+                &pilot.policy_id,
+                "observation",
+                &requests[0].run_id,
+            )
+            .unwrap();
+        assert_eq!(aggregate.confirmed_cost_usd, 0.02);
+        assert!(!aggregate.has_unresolved_usage());
+    }
+
+    #[test]
+    fn bulk_transport_fallback_retains_primary_uncertainty_and_fallback_receipt() {
+        let (_directory, catalog, project, asset) = fixture();
+        let request = RunPolicyRequest::observation(
+            project.clone(),
+            vec![asset],
+            DEFAULT_MODEL,
+            vec![DEFAULT_MODEL.into(), FALLBACK_MODEL.into()],
+            true,
+            1.0,
+            false,
+        );
+        catalog.authorize_run_policy(&request).unwrap();
+        let provider = ModelScriptProvider::new(0.02, |model, call| {
+            if call == 1 || model == FALLBACK_MODEL {
+                Ok(scripted_response(
+                    model,
+                    call,
+                    valid_observation_body(),
+                    0.01,
+                ))
+            } else {
+                Err(ProviderFailure::transport().into())
+            }
+        });
+        let pilot = catalog
+            .run_run_policy_pilot_with_provider(&request, &provider, false)
+            .unwrap();
+        assert_eq!(pilot.status, "passed", "{pilot:?}");
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+
+        let report = catalog
+            .analyze_authorized_with_provider(&pilot.policy_id, &provider, |_| {
+                std::ops::ControlFlow::Continue(())
+            })
+            .unwrap();
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 3);
+        assert!(!report.usage_complete);
+        assert_eq!(report.cost_usd, 0.01);
+        let requests = catalog
+            .list_analysis_requests(&project, Some(&pilot.policy_id), 1000)
+            .unwrap()
+            .into_iter()
+            .filter(|request| request.operation == "observation")
+            .collect::<Vec<_>>();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.lifecycle == crate::AnalysisRequestLifecycle::Uncertain)
+                .count(),
+            1
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.lifecycle == crate::AnalysisRequestLifecycle::Completed)
+                .count(),
+            1
+        );
+        assert!(requests.iter().any(|request| {
+            request.lifecycle == crate::AnalysisRequestLifecycle::Uncertain
+                && request.uncertain_usage_reserve_usd >= 0.02
+        }));
+        let aggregate = catalog
+            .analysis_accounting_aggregate_for_run(
+                &pilot.policy_id,
+                "observation",
+                &requests[0].run_id,
+            )
+            .unwrap();
+        assert_eq!(aggregate.confirmed_cost_usd, 0.01);
+        assert_eq!(aggregate.uncertain_request_count, 1);
+        assert!(aggregate.has_unresolved_usage());
+    }
+
+    #[test]
+    fn local_proxy_loss_after_admission_makes_zero_paid_calls_and_zero_reservations() {
+        let (_directory, catalog, project, asset) = fixture();
+        let request = observation_request(&project, &asset, 1.0);
+        catalog.authorize_run_policy(&request).unwrap();
+        let pilot = catalog
+            .run_run_policy_pilot_with_provider(&request, &FakeProvider::observation(), false)
+            .unwrap();
+        assert_eq!(pilot.status, "passed", "{pilot:?}");
+        let proxy_path = catalog
+            .get_asset(&asset)
+            .unwrap()
+            .proxy_path
+            .expect("synthetic asset has a proxy");
+        let provider = PrepareBreaksProxy {
+            calls: AtomicUsize::new(0),
+            proxy_path: proxy_path.into(),
+        };
+        let report = catalog
+            .analyze_authorized_with_provider(&pilot.policy_id, &provider, |_| {
+                std::ops::ControlFlow::Continue(())
+            })
+            .unwrap();
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(report.analyzed, 0);
+        assert_eq!(report.cost_usd, 0.0);
+        assert_eq!(report.failures.len(), 1);
+        assert!(
+            catalog
+                .list_analysis_requests(&project, Some(&pilot.policy_id), 1000)
+                .unwrap()
+                .iter()
+                .all(|request| request.operation != "observation"),
+            "a local pre-upload failure must not create a paid request row"
+        );
+        let analysis_run: (String, String) = catalog
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT id,accounting_contract FROM analysis_runs
+                 WHERE policy_id=?1 AND stage_reached='analysis'
+                 ORDER BY started_at DESC,id DESC LIMIT 1",
+                params![pilot.policy_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(analysis_run.1, crate::ANALYSIS_ACCOUNTING_SCHEMA_VERSION);
+        let aggregate = catalog
+            .analysis_accounting_aggregate_for_run(&pilot.policy_id, "observation", &analysis_run.0)
+            .unwrap();
+        assert_eq!(aggregate.request_count, 0);
+        assert_eq!(aggregate.confirmed_cost_usd, 0.0);
+        assert_eq!(aggregate.active_reserved_cost_usd, 0.0);
+        assert!(!aggregate.has_unresolved_usage());
+    }
+
+    #[test]
     fn force_policy_cannot_bypass_unresolved_prior_pilot_request() {
         let (_directory, catalog, project, asset) = fixture();
         let request = observation_request(&project, &asset, 1.0);
@@ -3248,5 +3876,106 @@ mod tests {
             .unwrap_err();
         assert!(format!("{error:#}").contains("replacement policy"));
         assert_eq!(replacement.calls.load(Ordering::SeqCst), 0);
+    }
+    #[test]
+    fn bulk_domain_fallback_local_denial_remains_typed_and_retains_primary_charge() {
+        let (_directory, catalog, project, asset) = fixture();
+        let request = RunPolicyRequest::observation(
+            project.clone(),
+            vec![asset],
+            DEFAULT_MODEL,
+            vec![DEFAULT_MODEL.into(), FALLBACK_MODEL.into()],
+            true,
+            0.05,
+            false,
+        );
+        catalog.authorize_run_policy(&request).unwrap();
+        let pilot = catalog
+            .run_run_policy_pilot_with_provider(&request, &FakeProvider::observation(), false)
+            .unwrap();
+        assert_eq!(pilot.status, "passed");
+        let provider = ModelScriptProvider::new(0.04, |model, call| {
+            Ok(scripted_response(model, call, "{}".into(), 0.01))
+        });
+        let report = catalog
+            .analyze_authorized_with_provider(&pilot.policy_id, &provider, |_| {
+                std::ops::ControlFlow::Continue(())
+            })
+            .unwrap();
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        assert!(report.budget_exhausted);
+        assert_eq!(report.cost_usd, 0.01);
+        assert!(report.usage_complete);
+        let aggregate = catalog
+            .analysis_accounting_aggregate(&pilot.policy_id, None)
+            .unwrap();
+        assert!((aggregate.confirmed_cost_usd - 0.02).abs() < 1e-12);
+        assert_eq!(aggregate.uncertain_request_count, 0);
+    }
+
+    #[test]
+    fn moment_fallback_local_denial_or_cancel_cannot_erase_paid_primary_uncertainty() {
+        for cancel in [false, true] {
+            let (_directory, catalog, project, asset) = fixture();
+            let request = RunPolicyRequest::moment_discovery(
+                project.clone(),
+                vec![asset.clone()],
+                DEFAULT_MODEL,
+                vec![DEFAULT_MODEL.into(), FALLBACK_MODEL.into()],
+                true,
+                AnalysisPayload::Frames,
+                0.07,
+                8,
+                8,
+                1,
+                EditProfile::default(),
+                false,
+                false,
+            );
+            catalog.authorize_run_policy(&request).unwrap();
+            let body = json!({"moments": [], "uncertain": true, "reason": "synthetic"}).to_string();
+            let pilot = catalog
+                .run_run_policy_pilot_with_provider(
+                    &request,
+                    &CapturingProvider::with_body(&body),
+                    false,
+                )
+                .unwrap();
+            assert_eq!(pilot.status, "passed", "{pilot:?}");
+            let provider =
+                ModelScriptProvider::new(0.05, |_, _| Err(ProviderFailure::transport().into()));
+            let report = catalog
+                .discover_authorized_moments_with_provider(&pilot.policy_id, &provider, |_| {
+                    if cancel && provider.calls.load(Ordering::SeqCst) > 0 {
+                        std::ops::ControlFlow::Break(())
+                    } else {
+                        std::ops::ControlFlow::Continue(())
+                    }
+                })
+                .unwrap();
+            assert_eq!(
+                provider.calls.load(Ordering::SeqCst),
+                1,
+                "local fallback denial must not transmit"
+            );
+            assert_eq!(report.cancelled, cancel);
+            assert!(!report.usage_complete);
+            let aggregate = catalog
+                .analysis_accounting_aggregate(&pilot.policy_id, None)
+                .unwrap();
+            assert_eq!(aggregate.uncertain_request_count, 1);
+            assert!((aggregate.uncertain_usage_reserve_usd - 0.05).abs() < 1e-12);
+            let states: Vec<String> = catalog.connection().unwrap().prepare(
+                "SELECT json_extract(body_json,'$.body.state') FROM moment_steps WHERE asset_id=?1"
+            ).unwrap().query_map([&asset], |row| row.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+            assert!(
+                states.iter().any(|state| state == "uncertain"),
+                "{states:?}"
+            );
+            assert!(
+                !states.iter().any(|state| state == "local_failure"),
+                "{states:?}"
+            );
+        }
     }
 }
