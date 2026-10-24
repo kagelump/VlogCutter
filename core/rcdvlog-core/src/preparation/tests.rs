@@ -133,6 +133,9 @@ fn moment_options(budget_usd: f64, payload: MomentPayload) -> MomentRunOptions {
         profile: Default::default(),
         force: false,
         retry_uncertain: false,
+        allowed_models: vec![DEFAULT_MODEL.to_string()],
+        allow_fallback: false,
+        policy_id: None,
     }
 }
 
@@ -442,7 +445,7 @@ fn default_preparation_does_not_call_provider_but_explicit_scope_uses_one_shared
 
     let known_provider = ScriptedProvider::new(0.01, true);
     let options = PreparationRunOptions {
-        moments: Some(moment_options(0.01, MomentPayload::Frames)),
+        moments: Some(moment_options(0.02, MomentPayload::Frames)),
         ..Default::default()
     };
     let paid = catalog
@@ -455,9 +458,16 @@ fn default_preparation_does_not_call_provider_but_explicit_scope_uses_one_shared
         moment_report.total_assets, 2,
         "only the explicit scope is analyzed"
     );
-    assert_eq!(known_provider.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        known_provider.calls.load(Ordering::SeqCst),
+        2,
+        "one pilot plus one bulk request before the shared ceiling stops the run"
+    );
     assert!(moment_report.budget_exhausted);
-    assert!(moment_report.cost_usd <= 0.01);
+    assert!(
+        moment_report.cost_usd <= 0.02,
+        "pilot and bulk share one ceiling"
+    );
     assert!(
         known_provider
             .models
@@ -473,32 +483,37 @@ fn default_preparation_does_not_call_provider_but_explicit_scope_uses_one_shared
         moments: Some(moment_options(0.5, MomentPayload::Frames)),
         ..Default::default()
     };
-    let uncertain = catalog
-        .prepare_with_services(
-            &uncertain_scope,
-            &uncertain_options,
-            None,
-            Some(&uncertain_provider),
-            |_| ControlFlow::Continue(()),
-        )
-        .unwrap();
-    assert!(!uncertain.moments.as_ref().unwrap().usage_complete);
+    let uncertain = catalog.prepare_with_services(
+        &uncertain_scope,
+        &uncertain_options,
+        None,
+        Some(&uncertain_provider),
+        |_| ControlFlow::Continue(()),
+    );
+    assert!(
+        uncertain.is_err(),
+        "an unknown-usage pilot must stop before bulk moment work"
+    );
     let calls_after_unknown_receipt = uncertain_provider.calls.load(Ordering::SeqCst);
-    assert!(calls_after_unknown_receipt > 0);
-    let resumed = catalog
-        .prepare_with_services(
-            &uncertain_scope,
-            &uncertain_options,
-            None,
-            Some(&uncertain_provider),
-            |_| ControlFlow::Continue(()),
-        )
-        .unwrap();
+    assert_eq!(
+        calls_after_unknown_receipt, 1,
+        "only the bounded pilot may have been transmitted"
+    );
+    let resumed = catalog.prepare_with_services(
+        &uncertain_scope,
+        &uncertain_options,
+        None,
+        Some(&uncertain_provider),
+        |_| ControlFlow::Continue(()),
+    );
+    assert!(
+        resumed.is_err(),
+        "unknown pilot usage is not retried implicitly"
+    );
     assert_eq!(
         uncertain_provider.calls.load(Ordering::SeqCst),
         calls_after_unknown_receipt
     );
-    assert!(resumed.moments.is_some());
 }
 
 #[test]

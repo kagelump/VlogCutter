@@ -20,6 +20,10 @@ const MAX_OCR: usize = 8;
 const MAX_TITLE_CHARS: usize = 60;
 const MAX_DESCRIPTION_CHARS: usize = 400;
 
+/// Stable identity of the observation response contract. Bump with any
+/// structural or semantic contract change so stored policy approvals invalidate.
+pub const CLIP_OBSERVATION_SCHEMA_VERSION: &str = "clip-observation.v2";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CameraMovement {
@@ -106,6 +110,13 @@ pub enum DomainError {
         field: &'static str,
         chars: usize,
     },
+    /// The parsed JSON did not satisfy the configured JSON Schema. Only the
+    /// stable failing keyword and an error count are retained; provider values,
+    /// property names and raw bodies are never copied into diagnostics.
+    SchemaViolation {
+        first_keyword: String,
+        count: usize,
+    },
 }
 
 impl DomainError {
@@ -127,6 +138,28 @@ impl DomainError {
                 format!("too_many_items: {field}={count}")
             }
             DomainError::TooLong { field, chars } => format!("too_long: {field}={chars}"),
+            DomainError::SchemaViolation {
+                first_keyword,
+                count,
+            } => format!("schema_violation: {first_keyword} ({count} errors)"),
+        }
+    }
+}
+
+impl DomainError {
+    /// Stable category suitable for persisted diagnostics. Unlike `as_reason`,
+    /// this never includes provider-supplied values (for example an unknown enum
+    /// value or a validation instance path).
+    pub const fn safe_code(&self) -> &'static str {
+        match self {
+            Self::Malformed(_) => "malformed_json",
+            Self::Truncated => "truncated_json",
+            Self::UnknownEnum { .. } => "unknown_enum",
+            Self::ThumbnailNotInPack { .. } => "thumbnail_not_in_pack",
+            Self::RangeOutOfBounds { .. } => "range_out_of_bounds",
+            Self::TooManyItems { .. } => "too_many_items",
+            Self::TooLong { .. } => "too_long",
+            Self::SchemaViolation { .. } => "schema_violation",
         }
     }
 }
@@ -169,14 +202,26 @@ pub fn validate(
     frame_timestamps: &[u32],
     clip_duration_ms: u32,
 ) -> Result<ClipObservation, DomainError> {
-    let parsed: RawObservation = serde_json::from_str(raw).map_err(|error| {
+    let value: Value = serde_json::from_str(raw).map_err(|error| {
         // serde reports an unexpected end of input for a response that hit the
         // token limit mid-structure, which is the failure bounded arrays exist
         // to prevent and is worth naming separately.
         if error.is_eof() {
             DomainError::Truncated
         } else {
-            DomainError::Malformed(error.to_string())
+            DomainError::Malformed("provider response is not JSON".to_string())
+        }
+    })?;
+    // Domain parsing deliberately runs first so the existing semantic error
+    // taxonomy survives. The schema pass below catches structural problems that
+    // serde's permissive structs can otherwise ignore, such as unknown fields.
+    let parsed: RawObservation = serde_json::from_value(value.clone()).map_err(|error| {
+        if error.is_eof() {
+            DomainError::Truncated
+        } else {
+            DomainError::Malformed(
+                "provider response does not match the observation shape".to_string(),
+            )
         }
     })?;
 
@@ -247,7 +292,7 @@ pub fn validate(
         _ => (None, None),
     };
 
-    Ok(ClipObservation {
+    let observation = ClipObservation {
         title: parsed.title.trim().to_string(),
         description: parsed.description.trim().to_string(),
         labels: parsed
@@ -268,6 +313,28 @@ pub fn validate(
             .map(|text| text.trim().to_string())
             .filter(|text| !text.is_empty())
             .collect(),
+    };
+    validate_json_structure(&value, &output_schema(frame_timestamps, clip_duration_ms))?;
+    Ok(observation)
+}
+
+/// Validate one already-parsed provider value against a supplied schema using
+/// the maintained `jsonschema` crate. References are explicitly offline: a
+/// schema or provider cannot cause HTTP/file retrieval. The returned error keeps
+/// only a bounded JSON-pointer and keyword, never instance content.
+pub fn validate_json_structure(value: &Value, schema: &Value) -> Result<(), DomainError> {
+    let validator = jsonschema::options()
+        .offline()
+        .build(schema)
+        .map_err(|_| DomainError::Malformed("configured output schema is invalid".to_string()))?;
+    let errors = validator.iter_errors(value).take(8).collect::<Vec<_>>();
+    if errors.is_empty() {
+        return Ok(());
+    }
+    let first = &errors[0];
+    Err(DomainError::SchemaViolation {
+        first_keyword: first.kind().keyword().to_string(),
+        count: errors.len(),
     })
 }
 
@@ -521,5 +588,24 @@ mod tests {
             .unwrap()
             .clone();
         assert!(allowed.contains(&json!("other")));
+    }
+    #[test]
+    fn the_runtime_schema_rejects_unknown_fields_and_never_resolves_references() {
+        let extra = ok_json().replace(
+            "\"ocrText\":[\"Kuala Lumpur\"]",
+            "\"ocrText\":[\"Kuala Lumpur\"],\"privateUnexpectedField\":\"must not persist\"",
+        );
+        assert!(matches!(
+            validate(&extra, &[400, 2_500], 12_000),
+            Err(DomainError::SchemaViolation { .. })
+        ));
+        let offline = validate_json_structure(
+            &json!({}),
+            &json!({"$ref": "https://example.invalid/private-content"}),
+        );
+        assert!(
+            offline.is_err(),
+            "external reference must be refused offline"
+        );
     }
 }

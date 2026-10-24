@@ -13,7 +13,9 @@ use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use crate::analysis::provider::{FALLBACK_MODEL, VlmProvider, VlmReceipt, VlmRequest, VlmResponse};
+use crate::analysis::provider::{
+    FALLBACK_MODEL, ProviderFailure, VlmProvider, VlmReceipt, VlmRequest, VlmResponse,
+};
 
 const DEFAULT_BASE_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
@@ -31,6 +33,13 @@ pub fn key_file_path() -> Option<PathBuf> {
 /// An OAuth2 flow is planned and will take precedence over both once it exists.
 /// Until then the file is the app's normal path and the environment variable is
 /// the agent/CI override.
+/// Whether credentials can be resolved without exposing the key or any path.
+/// Used by preflight/pilot readiness checks so an absent key fails before a
+/// provider client or request is constructed.
+pub fn api_credential_present() -> bool {
+    resolve_api_key().is_ok()
+}
+
 pub fn resolve_api_key() -> Result<String> {
     if let Ok(key) = std::env::var("OPENROUTER_API_KEY") {
         let key = key.trim().to_string();
@@ -261,23 +270,25 @@ impl VlmProvider for OpenRouterProvider {
             .header("X-OpenRouter-Metadata", "enabled")
             .json(&body)
             .send()
-            .context("send OpenRouter request")?;
+            .map_err(|_| ProviderFailure::transport())?;
 
         let status = response.status();
         if !status.is_success() {
-            // The body can echo request content but never the key, which travels
-            // only in the Authorization header.
-            let detail = response.text().unwrap_or_default();
-            let detail: String = detail.chars().take(300).collect();
-            bail!("OpenRouter returned {status}: {detail}");
+            // Response bodies can echo prompts, frame payloads or private
+            // provider diagnostics. Only the bounded status is retained.
+            return Err(ProviderFailure::http_status(status.as_u16()).into());
         }
 
-        let payload: Value = response.json().context("decode OpenRouter response")?;
+        let payload: Value = response
+            .json()
+            .map_err(|_| ProviderFailure::invalid_response())?;
         let (prompt_tokens, completion_tokens, cost_usd) = extract_usage(&payload);
         let receipt = extract_receipt(&payload);
-        let mut content = extract_content(&payload)?;
+        let mut content =
+            extract_content(&payload).map_err(|_| ProviderFailure::invalid_response())?;
         if model == FALLBACK_MODEL {
-            content = normalize_gemini_content(content)?;
+            content = normalize_gemini_content(content)
+                .map_err(|_| ProviderFailure::invalid_response())?;
         }
         Ok(VlmResponse {
             model: model.to_string(),

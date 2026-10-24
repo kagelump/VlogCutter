@@ -7,7 +7,7 @@ use thiserror::Error;
 
 use crate::chronology::forward_migrate_project_chronology;
 
-pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 36;
+pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 37;
 
 const MIGRATION_TABLE_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -300,6 +300,12 @@ pub const PROJECT_CATALOG_MIGRATIONS: &[SqliteMigration] = &[
         source_identity: "project-catalog/0036-transcript-outcome-evidence/20261024",
         apply: add_transcript_outcome_evidence,
     },
+    SqliteMigration {
+        id: 37,
+        name: "analysis_run_policy_provenance",
+        source_identity: "project-catalog/0037-analysis-run-policy-provenance/20261024",
+        apply: add_analysis_run_policy_provenance,
+    },
 ];
 
 /// Migration 36. Separate terminal transcript outcomes that older schemas had
@@ -431,6 +437,39 @@ fn add_camera_sidecar_time_mapping(transaction: &Transaction<'_>) -> Result<()> 
         "camera_proxy_sidecars",
         "provenance_json",
         "TEXT",
+    )?;
+    Ok(())
+}
+
+/// Migration 37. Durable, project-owned approval and pilot provenance for
+/// analysis run policies. Authorization is explicit human intent; pilot rows
+/// are runtime observations and never broaden it.
+fn add_analysis_run_policy_provenance(transaction: &Transaction<'_>) -> Result<()> {
+    transaction.execute_batch(
+        r#"CREATE TABLE IF NOT EXISTS analysis_run_authorizations (
+            policy_id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            policy_json TEXT NOT NULL,
+            authorized_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS analysis_run_authorizations_project
+            ON analysis_run_authorizations(project_id, authorized_at DESC);
+        CREATE TABLE IF NOT EXISTS analysis_run_pilots (
+            policy_id TEXT PRIMARY KEY REFERENCES analysis_run_authorizations(policy_id) ON DELETE CASCADE,
+            project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            status TEXT NOT NULL CHECK(status IN ('running','passed','failed','uncertain')),
+            record_json TEXT NOT NULL,
+            started_at TEXT NOT NULL,
+            finished_at TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS analysis_run_pilots_project
+            ON analysis_run_pilots(project_id, started_at DESC);"#,
+    )?;
+    add_column_if_missing(
+        transaction,
+        "analysis_runs",
+        "policy_id",
+        "TEXT NOT NULL DEFAULT ''",
     )?;
     Ok(())
 }
@@ -2113,6 +2152,17 @@ fn add_chronology_facts(transaction: &Transaction<'_>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The migration chain's last entry changes as features land. Tests that
+    /// exercise a specific migration must stop immediately before that id, not
+    /// relative to the current tail.
+    fn migrations_before_id(id: u32) -> &'static [SqliteMigration] {
+        let index = PROJECT_CATALOG_MIGRATIONS
+            .iter()
+            .position(|migration| migration.id == id)
+            .unwrap_or_else(|| panic!("migration {id} is not defined"));
+        &PROJECT_CATALOG_MIGRATIONS[..index]
+    }
     use anyhow::bail;
 
     #[test]
@@ -2463,11 +2513,7 @@ mod tests {
     #[test]
     fn migration_36_preserves_legacy_rows_and_admits_no_speech_is_unverified() {
         let mut connection = Connection::open_in_memory().unwrap();
-        run_sqlite_migrations(
-            &mut connection,
-            &PROJECT_CATALOG_MIGRATIONS[..PROJECT_CATALOG_MIGRATIONS.len() - 1],
-        )
-        .unwrap();
+        run_sqlite_migrations(&mut connection, migrations_before_id(36)).unwrap();
         connection
             .execute_batch(
                 r#"
@@ -2573,7 +2619,7 @@ mod tests {
         // A catalog stopped one migration short, carrying a location row written
         // before verification existed.
         let mut connection = Connection::open_in_memory().unwrap();
-        let previous = &PROJECT_CATALOG_MIGRATIONS[..PROJECT_CATALOG_MIGRATIONS.len() - 1];
+        let previous = migrations_before_id(17);
         run_sqlite_migrations(&mut connection, previous).unwrap();
         connection
             .execute_batch(

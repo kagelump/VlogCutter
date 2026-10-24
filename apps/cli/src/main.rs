@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, anyhow, ensure};
 #[cfg(test)]
 use clap::CommandFactory;
-use clap::{Parser, Subcommand, ValueEnum, error::ErrorKind};
+use clap::{Args, Parser, Subcommand, ValueEnum, error::ErrorKind};
 use rcdvlog_core::{
     Asset, AssetPatch, Catalog, MediaStreamInfo, ProxyEncoderPolicy, ProxyRepresentation,
     inspect_catalog, landscape_default_rotation, probe_media_stream,
@@ -228,6 +228,17 @@ enum AnalyzeCommand {
         #[arg(long)]
         asset: String,
     },
+    /// Describe the exact policy for a proposed observation batch without credentials or writes.
+    Preflight(AnalyzePolicyArgs),
+    /// Persist explicit approval for the exact described policy.
+    Authorize(AnalyzePolicyArgs),
+    /// Run one bounded capability/schema/source-time pilot for an authorized policy.
+    Pilot(AnalyzePolicyArgs),
+    /// Execute a stored policy and matching passed pilot over its exact scope.
+    Run {
+        #[arg(long)]
+        policy_id: String,
+    },
     /// Analyze clips without a current observation.
     Missing {
         #[arg(long)]
@@ -247,6 +258,10 @@ enum AnalyzeCommand {
         /// Refuse automatic retry with the alternate model.
         #[arg(long)]
         no_fallback: bool,
+        /// Do not attach the exact project label vocabulary to the prompt.
+        /// Existing CLI runs otherwise materialize that context explicitly.
+        #[arg(long)]
+        no_project_vocabulary: bool,
     },
     /// Request a bounded cross-clip chronology suggestion from proxy frames.
     SuggestChronology {
@@ -267,6 +282,54 @@ enum AnalyzeCommand {
         #[arg(long)]
         project: String,
     },
+}
+
+#[derive(Debug, Args, Clone)]
+pub struct AnalyzePolicyArgs {
+    #[arg(long)]
+    project: String,
+    /// Exact project-owned asset ID. Repeat for each asset in the proposed scope.
+    #[arg(long = "asset", required = true)]
+    assets: Vec<String>,
+    #[arg(long, value_parser = ["openrouter"])]
+    provider: String,
+    #[arg(long)]
+    primary_model: String,
+    /// Models permitted for this run (repeat for each model).
+    #[arg(long = "allow-model")]
+    allowed_models: Vec<String>,
+    /// Refuse automatic retry with the alternate model.
+    #[arg(long)]
+    no_fallback: bool,
+    #[arg(long, value_parser = ["frames", "frames-and-transcript", "audio", "audio-and-transcript", "transcript"])]
+    payload: String,
+    #[arg(long)]
+    budget_usd: f64,
+    #[arg(long)]
+    force: bool,
+    /// Explicitly approve attaching the exact current project label vocabulary.
+    #[arg(long)]
+    project_vocabulary: bool,
+    /// Explicitly recover an interrupted/unknown-usage pilot after review.
+    #[arg(long)]
+    retry_uncertain: bool,
+}
+
+fn analyze_policy_request(args: &AnalyzePolicyArgs) -> Result<rcdvlog_core::RunPolicyRequest> {
+    let payload = rcdvlog_core::AnalysisPayload::parse(&args.payload)
+        .ok_or_else(|| anyhow!("invalid input: unsupported analysis payload"))?;
+    Ok(rcdvlog_core::RunPolicyRequest {
+        project_id: args.project.clone(),
+        asset_ids: args.assets.clone(),
+        provider: args.provider.clone(),
+        primary_model: args.primary_model.clone(),
+        allowed_models: args.allowed_models.clone(),
+        allow_fallback: !args.no_fallback,
+        payload,
+        include_project_vocabulary: args.project_vocabulary,
+        budget_usd: args.budget_usd,
+        parameters: rcdvlog_core::RunPolicyParameters::Observation { force: args.force },
+    })
 }
 
 #[derive(Debug, Subcommand)]
@@ -661,6 +724,10 @@ fn command_name(command: &Commands) -> &'static str {
         },
         Commands::Analyze { command } => match command {
             AnalyzeCommand::Generate { .. } => "analyze.generate",
+            AnalyzeCommand::Preflight(_) => "analyze.preflight",
+            AnalyzeCommand::Authorize(_) => "analyze.authorize",
+            AnalyzeCommand::Pilot(_) => "analyze.pilot",
+            AnalyzeCommand::Run { .. } => "analyze.run",
             AnalyzeCommand::Missing { .. } => "analyze.missing",
             AnalyzeCommand::SuggestChronology { .. } => "analyze.suggest-chronology",
             AnalyzeCommand::Status { .. } => "analyze.status",
@@ -778,7 +845,7 @@ fn execute(cli: &Cli) -> Result<Value> {
         } | Commands::Transcribe {
             command: TranscribeCommand::Status { .. }
         } | Commands::Analyze {
-            command: AnalyzeCommand::Status { .. }
+            command: AnalyzeCommand::Status { .. } | AnalyzeCommand::Preflight(_)
         } | Commands::Labels {
             command: LabelsCommand::Vocabulary { .. }
         } | Commands::CameraMappings {
@@ -1098,13 +1165,57 @@ fn execute(cli: &Cli) -> Result<Value> {
             AnalyzeCommand::Generate { asset } => {
                 Ok(serde_json::to_value(catalog.analyze_asset(asset)?)?)
             }
-            AnalyzeCommand::Missing { project, force, budget_usd, primary_model, allowed_models, no_fallback } => Ok(serde_json::to_value(
+            AnalyzeCommand::Preflight(args) => {
+                let request = analyze_policy_request(args)?;
+                Ok(serde_json::to_value(catalog.describe_run_policy(&request)?)?)
+            }
+            AnalyzeCommand::Authorize(args) => {
+                let request = analyze_policy_request(args)?;
+                Ok(serde_json::to_value(catalog.authorize_run_policy(&request)?)?)
+            }
+            AnalyzeCommand::Pilot(args) => {
+                let request = analyze_policy_request(args)?;
+                Ok(serde_json::to_value(catalog.run_run_policy_pilot(
+                    &request,
+                    args.retry_uncertain,
+                )?)?)
+            }
+            AnalyzeCommand::Run { policy_id } => {
+                catalog.authorized_policy_for_bulk(
+                    policy_id,
+                    rcdvlog_core::AnalysisRunKind::Observation,
+                )?;
+                ensure!(
+                    rcdvlog_core::api_credential_present(),
+                    "OpenRouter credentials are not available; no analysis request was made"
+                );
+                let provider = rcdvlog_core::OpenRouterProvider::new(
+                    rcdvlog_core::resolve_api_key()?,
+                )?;
+                Ok(serde_json::to_value(catalog.analyze_authorized_with_provider(
+                    policy_id,
+                    &provider,
+                    |progress| {
+                        eprintln!(
+                            "{}",
+                            json!({
+                                "event": "analyze.run.progress",
+                                "outcome": progress.outcome,
+                                "estimate": progress.estimate,
+                            })
+                        );
+                        ControlFlow::Continue(())
+                    },
+                )?)?)
+            }
+            AnalyzeCommand::Missing { project, force, budget_usd, primary_model, allowed_models, no_fallback, no_project_vocabulary } => Ok(serde_json::to_value(
                 catalog.analyze_missing_with_options(project, &rcdvlog_core::AnalysisRunOptions {
                     force: *force,
                     budget_usd: *budget_usd,
                     primary_model: primary_model.clone(),
                     allowed_models: allowed_models.clone(),
                     allow_fallback: Some(!no_fallback),
+                    include_project_vocabulary: !no_project_vocabulary,
                     ..Default::default()
                 }, |progress| {
                     eprintln!(
@@ -1645,6 +1756,13 @@ fn error_code(message: &str) -> &'static str {
         // Distinct from every other failure because the caller's correct
         // response is distinct: re-read, re-decide, retry.
         "stale_revision"
+    } else if message.contains("not ready")
+        || message.contains("not authorized")
+        || message.contains("does not match")
+        || message.contains("unsupported")
+        || message.contains("budget")
+    {
+        "invalid_input"
     } else if message.contains("not found") {
         "not_found"
     } else if message.contains("offline") {

@@ -793,6 +793,22 @@ and sparse samples never certify arbitrary edit ranges. Full proxy replacement
 invalidates transcript binding. Preparation preserves originals, human
 annotations, orientation choices, and chronology; see `docs/agent-cli.md`.
 
+Paid analysis is admitted only through a concrete `RunPolicy` (see
+`docs/analysis-preflight.md`). The policy binds exact project-owned asset/source
+identities, provider/model allowlist and permitted fallbacks, frames/audio/
+transcript payload, explicitly approved project-vocabulary context, expected
+cost, requested ceiling, prompt/schema/recipe/tool versions and readiness.
+Authorization is a separate SQLite record from the bounded runtime pilot. An
+explicit CLI/desktop batch invocation materializes that policy automatically,
+records approval, runs the pilot, then executes the exact authorized scope; no
+sample or budget approval broadens model/payload/scope. Frames-only requests
+must not read or transmit transcripts; project vocabulary requires its own
+explicitly approved context and stays frozen to that snapshot during a run. Pilot spend counts against
+the same ceiling; unknown or interrupted usage is retained and fail-closed.
+Any policy/source/schema/context change invalidates the approval and pilot,
+including after restart. Provider diagnostics persist only stable categories,
+never response bodies or raw error strings.
+
 **Measured end to end**, 2026-08-04, M3 MacBook Air, four workers, 273-clip
 Osaka/Expo project:
 

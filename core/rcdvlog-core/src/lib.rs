@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use batch_estimator::{BatchEstimate, BatchEstimator, RateHistory};
 use blake3::Hasher;
 use chrono::{DateTime, Duration, NaiveDateTime, SecondsFormat, Utc};
@@ -79,11 +79,18 @@ pub use analysis::consolidate::{ConsolidationReport, LabelMapping, LabelProposal
 pub use analysis::framepack::{FramePackManifest, build_frame_pack, encode_frames};
 pub use analysis::moments;
 pub use analysis::openrouter::{
-    OpenRouterProvider, frame_data_uri, key_file_path, resolve_api_key,
+    OpenRouterProvider, api_credential_present, frame_data_uri, key_file_path, resolve_api_key,
 };
 pub use analysis::provider::{
-    ChainOutcome, DEFAULT_MODEL, FALLBACK_MODEL, MODELS, ModelSpec, ProviderChain, VlmProvider,
-    VlmReceipt, VlmRequest, VlmResponse, model_spec,
+    ChainOutcome, DEFAULT_MODEL, FALLBACK_MODEL, MODELS, ModelSpec, ProviderChain, ProviderFailure,
+    ProviderFailureCategory, VlmProvider, VlmReceipt, VlmRequest, VlmResponse, model_spec,
+};
+pub use analysis::run_policy::{
+    AnalysisPayload, AnalysisRunKind, AuthorizedPolicyState, CapabilityCheck, CapabilityStatus,
+    PilotValidation, RUN_AUTHORIZATION_SCHEMA_VERSION, RUN_PILOT_SCHEMA_VERSION,
+    RUN_POLICY_SCHEMA_VERSION, RUN_POLICY_TOOL_VERSION, RunAssetScope, RunAuthorization,
+    RunPilotRecord, RunPolicy, RunPolicyBlocker, RunPolicyContext, RunPolicyParameters,
+    RunPolicyReadiness, RunPolicyRequest,
 };
 pub use archive::{ArchiveRoot, EndpointProbe};
 pub use batch_estimator::BatchEstimate as BatchProgressEstimate;
@@ -663,6 +670,8 @@ pub struct AnalysisRunRecord {
     pub finished_at: String,
     pub status: String,
     pub stage_reached: String,
+    /// Exact run policy that admitted this work, or empty for legacy/local runs.
+    pub policy_id: String,
     pub proxies_generated: usize,
     pub clips_transcribed: usize,
     pub clips_analyzed: usize,
@@ -851,6 +860,24 @@ pub struct AnalyzeReport {
     pub failures: Vec<IngestFailure>,
 }
 
+impl AnalyzeReport {
+    fn cancelled_before_work() -> Self {
+        Self {
+            analyzed: 0,
+            skipped: 0,
+            rejected: 0,
+            fallback_served: 0,
+            force_overwrite_warnings: 0,
+            cost_usd: 0.0,
+            usage_complete: true,
+            cancelled: true,
+            budget_exhausted: false,
+            outcomes: Vec::new(),
+            failures: Vec::new(),
+        }
+    }
+}
+
 /// Explicit inputs for one cloud analysis run.
 ///
 /// The desktop supplies these from its Keychain entry and confirm dialog, while
@@ -873,6 +900,18 @@ pub struct AnalysisRunOptions {
     pub allowed_models: Vec<String>,
     /// Whether one retry using the configured alternate model is permitted.
     pub allow_fallback: Option<bool>,
+    /// Optional exact asset scope. The policy-bound bulk path sets this from
+    /// the authorized policy; `None` retains the legacy "missing" workflow.
+    pub selected_assets: Option<Vec<String>>,
+    /// Optional payload binding. Analysis always uses frames and may include
+    /// accepted transcript context.
+    pub payload: Option<crate::AnalysisPayload>,
+    /// Explicit approval to attach the exact current project label vocabulary.
+    /// Its digest/count is bound into the policy; text is never logged.
+    pub include_project_vocabulary: bool,
+    /// When set, the stored policy is authoritative for scope, model, payload
+    /// and remaining budget, and a matching passed pilot is mandatory.
+    pub policy_id: Option<String>,
 }
 
 /// Resolves and validates the spend ceiling locally. Zero and negative ceilings
@@ -2571,8 +2610,8 @@ impl Catalog {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
             "SELECT id, project_id, started_at, finished_at, status, stage_reached,
-                    proxies_generated, clips_transcribed, clips_analyzed, cost_usd,
-                    budget_exhausted, error
+                    policy_id, proxies_generated, clips_transcribed, clips_analyzed,
+                    cost_usd, budget_exhausted, error
              FROM analysis_runs WHERE project_id=?1
              ORDER BY started_at DESC, id DESC LIMIT ?2",
         )?;
@@ -2585,12 +2624,13 @@ impl Catalog {
                     finished_at: row.get(3)?,
                     status: row.get(4)?,
                     stage_reached: row.get(5)?,
-                    proxies_generated: row.get::<_, i64>(6)? as usize,
-                    clips_transcribed: row.get::<_, i64>(7)? as usize,
-                    clips_analyzed: row.get::<_, i64>(8)? as usize,
-                    cost_usd: row.get(9)?,
-                    budget_exhausted: row.get::<_, i64>(10)? != 0,
-                    error: row.get(11)?,
+                    policy_id: row.get(6)?,
+                    proxies_generated: row.get::<_, i64>(7)? as usize,
+                    clips_transcribed: row.get::<_, i64>(8)? as usize,
+                    clips_analyzed: row.get::<_, i64>(9)? as usize,
+                    cost_usd: row.get(10)?,
+                    budget_exhausted: row.get::<_, i64>(11)? != 0,
+                    error: row.get(12)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -3133,14 +3173,55 @@ impl Catalog {
     }
 
     /// Runs cloud vision for one clip. This is an explicit replacement action;
-    /// project-wide idempotence is provided by `analyze_missing`.
+    /// project-wide idempotence is provided by `analyze_missing`. The explicit
+    /// invocation materializes and records an exact one-asset policy, then runs
+    /// the same bounded capability pilot before the paid replacement call.
     pub fn analyze_asset(&self, asset_id: &str) -> Result<AnalysisOutcome> {
+        let asset = self.get_asset(asset_id)?;
+        let budget = resolve_analysis_budget(&AnalysisRunOptions::default())?;
+        anyhow::ensure!(
+            budget.is_finite(),
+            "an explicit finite analysis budget is required for paid observation"
+        );
+        anyhow::ensure!(
+            api_credential_present(),
+            "OpenRouter credentials are not available; no analysis request was made"
+        );
         let provider = OpenRouterProvider::new(resolve_api_key()?)?;
         let chain = ProviderChain::new();
-        self.analyze_asset_with_provider(asset_id, &provider, &chain)
+        let mut request = crate::RunPolicyRequest::observation(
+            asset.project_id.clone(),
+            vec![asset_id.to_string()],
+            chain.primary_model().to_string(),
+            chain
+                .allowed_models()
+                .iter()
+                .map(|model| (*model).to_string())
+                .collect(),
+            chain.allows_fallback(),
+            budget,
+            true,
+        );
+        request.include_project_vocabulary = true;
+        self.authorize_run_policy(&request)?;
+        let pilot = self.run_run_policy_pilot_with_provider(&request, &provider, false)?;
+        anyhow::ensure!(
+            pilot.status == "passed",
+            "capability pilot failed for this exact policy: {} ({})",
+            pilot.failure_code,
+            pilot.validation.detail
+        );
+        let mut report =
+            self.analyze_authorized_with_provider(&pilot.policy_id, &provider, |_| {
+                ControlFlow::Continue(())
+            })?;
+        report
+            .outcomes
+            .pop()
+            .ok_or_else(|| anyhow!("authorized single-asset analysis produced no result"))
     }
 
-    fn analysis_frame_pack(&self, asset: &Asset) -> Result<FramePackManifest> {
+    pub(crate) fn analysis_frame_pack(&self, asset: &Asset) -> Result<FramePackManifest> {
         let proxy = Self::require_proxy(asset)?;
         let fingerprint = self.proxy_fingerprint(&asset.id)?;
         let connection = self.connection()?;
@@ -3155,7 +3236,7 @@ impl Catalog {
         Ok(manifest)
     }
 
-    fn prompt_vocabulary(&self, project_id: &str) -> Result<Vec<String>> {
+    pub(crate) fn prompt_vocabulary(&self, project_id: &str) -> Result<Vec<String>> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
             "SELECT display_label FROM label_vocabulary WHERE project_id=?1 ORDER BY usage_count DESC, normalized_label",
@@ -3178,7 +3259,7 @@ impl Catalog {
         Ok(labels)
     }
 
-    fn prompt_transcript(&self, asset_id: &str) -> Result<Option<PromptTranscript>> {
+    pub(crate) fn prompt_transcript(&self, asset_id: &str) -> Result<Option<PromptTranscript>> {
         let Some(transcript) = load_transcript(&self.connection()?, asset_id)? else {
             return Ok(None);
         };
@@ -3200,6 +3281,9 @@ impl Catalog {
         asset_id: &str,
         provider: &dyn VlmProvider,
         chain: &ProviderChain,
+        include_transcript: bool,
+        approved_vocabulary: &[String],
+        policy: &crate::RunPolicy,
     ) -> Result<AnalysisOutcome> {
         let asset = self.get_asset(asset_id)?;
         let proxy = Self::require_proxy(&asset)?;
@@ -3223,7 +3307,11 @@ impl Catalog {
                     .with_context(|| format!("read frame {}", path.display()))
             })
             .collect::<Result<Vec<_>>>()?;
-        let transcript = self.prompt_transcript(asset_id)?;
+        let transcript = if include_transcript {
+            self.prompt_transcript(asset_id)?
+        } else {
+            None
+        };
         let transcript_used = transcript.as_ref().is_some_and(|value| {
             value.status == TranscriptStatus::Speech && !value.text.is_empty()
         });
@@ -3231,9 +3319,10 @@ impl Catalog {
             frame_timestamps_ms: manifest.timestamps_ms.clone(),
             clip_duration_ms: (asset.duration_seconds.max(0.0) * 1_000.0).round() as u32,
             transcript,
-            vocabulary: self.prompt_vocabulary(&asset.project_id)?,
+            vocabulary: approved_vocabulary.to_vec(),
             trip_context: None,
         };
+        self.validate_run_policy_asset(policy, asset_id)?;
         let outcome = run_vlm(provider, chain, &context, frames)?;
         let mut stored = if let Some(observation) = &outcome.observation {
             StoredAnalysis::from_observation(asset_id, &outcome.model, observation)
@@ -3382,52 +3471,271 @@ impl Catalog {
 
     /// Runs the cloud analysis batch with explicit key, budget, and concurrency.
     ///
-    /// `on_progress` returning `ControlFlow::Break` stops the batch; workers
-    /// observe the stop between clips, so cancelling never abandons a request
-    /// that has already been paid for.
+    /// An explicit adapter invocation is approval intent, but it is not a
+    /// bypass: the core first materializes the exact concrete policy, records
+    /// that approval, runs one bounded pilot, and only then admits the bulk
+    /// batch. A caller may instead pass `policy_id` to reuse an already-approved
+    /// and piloted policy.
+    ///
+    /// `on_progress` returning `ControlFlow::Break` stops the bulk batch;
+    /// workers observe the stop between clips, so cancelling never abandons a
+    /// request that has already been paid for.
     pub fn analyze_missing_with_options<F>(
         &self,
         project_id: &str,
         options: &AnalysisRunOptions,
+        on_progress: F,
+    ) -> Result<AnalyzeReport>
+    where
+        F: FnMut(AnalyzeBatchProgress) -> ControlFlow<()>,
+    {
+        self.analyze_missing_with_options_and_provider(project_id, options, None, on_progress)
+    }
+
+    /// Provider-injectable form of the default batch path. Tests and future
+    /// adapters can prove that an explicit invocation without a policy id still
+    /// materializes approval and runs a passed pilot before bulk transmission.
+    pub(crate) fn analyze_missing_with_options_and_provider<F>(
+        &self,
+        project_id: &str,
+        options: &AnalysisRunOptions,
+        injected_provider: Option<&dyn VlmProvider>,
         mut on_progress: F,
     ) -> Result<AnalyzeReport>
     where
         F: FnMut(AnalyzeBatchProgress) -> ControlFlow<()>,
     {
-        let _budget_usd = resolve_analysis_budget(options)?;
-        let primary = options.primary_model.as_deref().unwrap_or(DEFAULT_MODEL);
-        let allowed = if options.allowed_models.is_empty() {
-            vec![DEFAULT_MODEL.to_string(), FALLBACK_MODEL.to_string()]
+        let mut prepared_options = None;
+        let mut explicit_request = None;
+        if let Some(policy_id) = &options.policy_id {
+            prepared_options =
+                Some(self.analysis_options_bound_to_policy(project_id, options, policy_id)?);
         } else {
-            options.allowed_models.clone()
+            let requested_budget = resolve_analysis_budget(options)?;
+            anyhow::ensure!(
+                requested_budget.is_finite(),
+                "an explicit finite analysis budget is required for paid analysis"
+            );
+            self.require_project(project_id)?;
+            let (pending, skipped, force_overwrite_warnings) =
+                self.analysis_pending_assets(project_id, options)?;
+            if pending.is_empty() {
+                return Ok(AnalyzeReport {
+                    analyzed: 0,
+                    skipped,
+                    rejected: 0,
+                    fallback_served: 0,
+                    force_overwrite_warnings,
+                    cost_usd: 0.0,
+                    usage_complete: true,
+                    cancelled: false,
+                    budget_exhausted: false,
+                    outcomes: Vec::new(),
+                    failures: Vec::new(),
+                });
+            }
+
+            let primary = options
+                .primary_model
+                .clone()
+                .unwrap_or_else(|| DEFAULT_MODEL.to_string());
+            let allowed_models = if options.allowed_models.is_empty() {
+                vec![DEFAULT_MODEL.to_string(), FALLBACK_MODEL.to_string()]
+            } else {
+                options.allowed_models.clone()
+            };
+            let mut request = crate::RunPolicyRequest::observation(
+                project_id.to_string(),
+                pending.iter().map(|asset| asset.id.clone()).collect(),
+                primary,
+                allowed_models,
+                options.allow_fallback.unwrap_or(true),
+                requested_budget,
+                options.force,
+            );
+            request.payload = options
+                .payload
+                .unwrap_or(crate::AnalysisPayload::FramesAndTranscript);
+            request.include_project_vocabulary = options.include_project_vocabulary;
+            explicit_request = Some(request);
+        }
+
+        let provider_owned;
+        let provider: &dyn VlmProvider = match injected_provider {
+            Some(provider) => provider,
+            None => {
+                let api_key = match options.api_key.clone() {
+                    Some(key) => key,
+                    None => {
+                        anyhow::ensure!(
+                            api_credential_present(),
+                            "OpenRouter credentials are not available; no analysis request was made"
+                        );
+                        resolve_api_key()?
+                    }
+                };
+                provider_owned = OpenRouterProvider::new(api_key)?;
+                &provider_owned
+            }
         };
-        let allow_fallback = options.allow_fallback.unwrap_or(true);
-        // Validate before resolving credentials or constructing a network provider.
-        ProviderChain::with_policy(primary, &allowed, allow_fallback)?;
-        let api_key = match options.api_key.clone() {
-            Some(key) => key,
-            None => resolve_api_key()?,
+
+        let policy_id = if let Some(request) = explicit_request {
+            self.authorize_run_policy(&request)?;
+            let mut cancelled = false;
+            let pilot_result = self.run_run_policy_pilot_with_provider_and_cancel(
+                &request,
+                provider,
+                false,
+                || {
+                    let mut estimate =
+                        BatchEstimator::new(&[], 1, Default::default()).estimate(&[]);
+                    estimate.confidence = "capability_pilot".into();
+                    estimate.estimated_remaining_seconds = None;
+                    cancelled |= on_progress(AnalyzeBatchProgress {
+                        asset_id: None,
+                        outcome: None,
+                        estimate,
+                    })
+                    .is_break();
+                    cancelled
+                },
+            );
+            if cancelled {
+                return Ok(AnalyzeReport::cancelled_before_work());
+            }
+            let pilot = pilot_result?;
+            anyhow::ensure!(
+                pilot.status == "passed",
+                "capability pilot did not pass for this exact policy: {} ({}); no bulk requests were made",
+                pilot.failure_code,
+                pilot.validation.detail
+            );
+            self.analysis_options_bound_to_policy(project_id, options, &pilot.policy_id)?
+                .policy_id
+                .expect("bound policy id")
+        } else {
+            prepared_options
+                .expect("policy-bound branch prepared options")
+                .policy_id
+                .expect("bound policy id")
         };
-        let provider = OpenRouterProvider::new(api_key)?;
-        self.analyze_missing_with_provider(project_id, options, &provider, &mut on_progress)
+
+        // Route through the shared policy-bound run-accounting wrapper so both
+        // explicit and pre-authorized invocations record a bulk run with the
+        // same policy provenance.
+        self.analyze_authorized_with_provider_and_workers(
+            &policy_id,
+            provider,
+            options.worker_count,
+            &mut on_progress,
+        )
     }
 
-    fn analyze_missing_with_provider<F>(
+    /// Validates caller-supplied flags against the stored policy and replaces
+    /// them with the policy's authoritative scope, model, payload/context and
+    /// remaining budget. Model, payload, scope or budget approval for one run
+    /// can never be broadened by a caller argument.
+    fn analysis_options_bound_to_policy(
         &self,
         project_id: &str,
         options: &AnalysisRunOptions,
-        provider: &dyn VlmProvider,
-        on_progress: &mut F,
-    ) -> Result<AnalyzeReport>
-    where
-        F: FnMut(AnalyzeBatchProgress) -> ControlFlow<()>,
-    {
+        policy_id: &str,
+    ) -> Result<AnalysisRunOptions> {
+        let state =
+            self.authorized_policy_for_bulk(policy_id, crate::AnalysisRunKind::Observation)?;
+        let policy = &state.authorization.policy;
+        anyhow::ensure!(
+            policy.project_id == project_id,
+            "authorized analysis policy belongs to a different project"
+        );
+        anyhow::ensure!(
+            policy.payload.uses_frames(),
+            "authorized analysis policy does not select frames"
+        );
+        if let Some(requested) = options.primary_model.as_deref() {
+            anyhow::ensure!(
+                requested == policy.primary_model,
+                "requested model does not match the authorized policy"
+            );
+        }
+        if !options.allowed_models.is_empty() {
+            anyhow::ensure!(
+                options.allowed_models == policy.allowed_models,
+                "requested model allowlist does not match the authorized policy"
+            );
+        }
+        if let Some(requested) = options.budget_usd {
+            anyhow::ensure!(
+                (requested - policy.budget_usd).abs() < f64::EPSILON,
+                "requested budget does not match the authorized policy"
+            );
+        }
+        if let Some(requested) = options.allow_fallback {
+            anyhow::ensure!(
+                requested == policy.allow_fallback,
+                "requested fallback policy does not match the authorized policy"
+            );
+        }
+        if let Some(requested) = &options.selected_assets {
+            let authorized = policy
+                .scope
+                .iter()
+                .map(|asset| asset.asset_id.clone())
+                .collect::<Vec<_>>();
+            anyhow::ensure!(
+                requested == &authorized,
+                "requested asset scope does not exactly match the authorized policy"
+            );
+        }
+        if let Some(payload) = options.payload {
+            anyhow::ensure!(
+                payload == policy.payload,
+                "requested payload does not match the authorized policy"
+            );
+        }
+        let mut effective = options.clone();
+        effective.budget_usd = Some(state.remaining_budget_usd);
+        effective.primary_model = Some(policy.primary_model.clone());
+        effective.allowed_models = policy.allowed_models.clone();
+        effective.allow_fallback = Some(policy.allow_fallback);
+        effective.selected_assets = Some(
+            policy
+                .scope
+                .iter()
+                .map(|asset| asset.asset_id.clone())
+                .collect(),
+        );
+        effective.payload = Some(policy.payload);
+        effective.include_project_vocabulary = policy.context.project_vocabulary;
+        effective.policy_id = Some(policy_id.to_string());
+        Ok(effective)
+    }
+
+    /// Pending asset selection shared by policy materialization and execution,
+    /// so the approved IDs are the IDs the batch can actually consider.
+    fn analysis_pending_assets(
+        &self,
+        project_id: &str,
+        options: &AnalysisRunOptions,
+    ) -> Result<(Vec<Asset>, usize, usize)> {
         let force = options.force;
+        let selected = options.selected_assets.as_ref().map(|ids| {
+            ids.iter()
+                .cloned()
+                .collect::<std::collections::HashSet<_>>()
+        });
         let connection = self.connection()?;
         let mut skipped = 0;
         let mut force_overwrite_warnings = 0;
         let mut pending = Vec::new();
+        let mut selected_seen = std::collections::HashSet::new();
         for asset in self.list_assets(project_id)? {
+            if let Some(selected) = &selected {
+                if !selected.contains(&asset.id) {
+                    continue;
+                }
+                selected_seen.insert(asset.id.clone());
+            }
             if asset.removed {
                 continue;
             }
@@ -3451,7 +3759,175 @@ impl Catalog {
             }
             pending.push(asset);
         }
-        drop(connection);
+        if let Some(selected) = &selected {
+            anyhow::ensure!(
+                selected_seen.len() == selected.len(),
+                "authorized analysis scope contains assets outside this project"
+            );
+        }
+        Ok((pending, skipped, force_overwrite_warnings))
+    }
+
+    /// Provider-injectable policy-bound execution boundary used by adapters and
+    /// synthetic tests. The stored policy, not caller-supplied flags, determines
+    /// the exact asset scope, allowlist, payload and remaining budget.
+    pub fn analyze_authorized_with_provider<F>(
+        &self,
+        policy_id: &str,
+        provider: &dyn crate::VlmProvider,
+        on_progress: F,
+    ) -> Result<AnalyzeReport>
+    where
+        F: FnMut(AnalyzeBatchProgress) -> ControlFlow<()>,
+    {
+        self.analyze_authorized_with_provider_and_workers(policy_id, provider, None, on_progress)
+    }
+
+    fn analyze_authorized_with_provider_and_workers<F>(
+        &self,
+        policy_id: &str,
+        provider: &dyn crate::VlmProvider,
+        worker_count: Option<usize>,
+        mut on_progress: F,
+    ) -> Result<AnalyzeReport>
+    where
+        F: FnMut(AnalyzeBatchProgress) -> ControlFlow<()>,
+    {
+        let state =
+            self.authorized_policy_for_bulk(policy_id, crate::AnalysisRunKind::Observation)?;
+        let policy = &state.authorization.policy;
+        let force = matches!(
+            policy.parameters,
+            crate::RunPolicyParameters::Observation { force: true }
+        );
+        let options = AnalysisRunOptions {
+            force,
+            worker_count,
+            budget_usd: Some(state.remaining_budget_usd),
+            primary_model: Some(policy.primary_model.clone()),
+            allowed_models: policy.allowed_models.clone(),
+            allow_fallback: Some(policy.allow_fallback),
+            selected_assets: Some(
+                policy
+                    .scope
+                    .iter()
+                    .map(|asset| asset.asset_id.clone())
+                    .collect(),
+            ),
+            payload: Some(policy.payload),
+            include_project_vocabulary: policy.context.project_vocabulary,
+            policy_id: Some(policy_id.to_string()),
+            ..AnalysisRunOptions::default()
+        };
+        let run_id = self.begin_analysis_run(&policy.project_id)?;
+        self.connection()?.execute(
+            "UPDATE analysis_runs SET stage_reached='analysis',policy_id=?2 WHERE id=?1",
+            params![run_id, policy_id],
+        )?;
+        let result = self.analyze_missing_with_provider(
+            policy.project_id.as_str(),
+            &options,
+            provider,
+            &mut on_progress,
+        );
+        match result {
+            Ok(report) => {
+                let status = if report.cancelled {
+                    "cancelled"
+                } else if report.failures.is_empty() {
+                    "completed"
+                } else {
+                    "failed"
+                };
+                self.finish_analysis_run(
+                    &run_id,
+                    &AnalysisRunOutcome {
+                        status: status.into(),
+                        stage_reached: "analysis".into(),
+                        clips_analyzed: report.analyzed,
+                        cost_usd: report.cost_usd,
+                        budget_exhausted: report.budget_exhausted,
+                        error: if report.failures.is_empty() {
+                            String::new()
+                        } else {
+                            format!(
+                                "analysis batch completed with {} failures",
+                                report.failures.len()
+                            )
+                        },
+                        ..Default::default()
+                    },
+                )?;
+                Ok(report)
+            }
+            Err(error) => {
+                let _ = self.finish_analysis_run(
+                    &run_id,
+                    &AnalysisRunOutcome {
+                        status: "failed".into(),
+                        stage_reached: "analysis".into(),
+                        error: "analysis batch failed before completion".into(),
+                        ..Default::default()
+                    },
+                );
+                Err(error)
+            }
+        }
+    }
+
+    fn analyze_missing_with_provider<F>(
+        &self,
+        project_id: &str,
+        options: &AnalysisRunOptions,
+        provider: &dyn VlmProvider,
+        on_progress: &mut F,
+    ) -> Result<AnalyzeReport>
+    where
+        F: FnMut(AnalyzeBatchProgress) -> ControlFlow<()>,
+    {
+        let policy_id = options.policy_id.as_deref().ok_or_else(|| {
+            anyhow!("paid analysis must be bound to an authorized, piloted run policy")
+        })?;
+        let state =
+            self.authorized_policy_for_bulk(policy_id, crate::AnalysisRunKind::Observation)?;
+        let policy = &state.authorization.policy;
+        ensure!(
+            policy.project_id == project_id,
+            "authorized analysis policy belongs to a different project"
+        );
+        let authorized_scope = policy
+            .scope
+            .iter()
+            .map(|asset| asset.asset_id.clone())
+            .collect::<Vec<_>>();
+        ensure!(
+            options.selected_assets.as_ref() == Some(&authorized_scope),
+            "authorized analysis scope does not exactly match the requested asset ids"
+        );
+        ensure!(
+            options.primary_model.as_deref() == Some(policy.primary_model.as_str())
+                && options.allowed_models == policy.allowed_models
+                && options.allow_fallback == Some(policy.allow_fallback),
+            "authorized analysis model allowlist does not match the requested run"
+        );
+        ensure!(
+            options.payload == Some(policy.payload)
+                && options.include_project_vocabulary == policy.context.project_vocabulary,
+            "authorized analysis payload/context does not match the requested run"
+        );
+        ensure!(
+            options.budget_usd == Some(state.remaining_budget_usd),
+            "authorized analysis budget does not match the remaining policy ceiling"
+        );
+        ensure!(
+            options.force == policy.parameters.force(),
+            "authorized analysis force setting does not match the policy"
+        );
+        // Local-only credential/client preparation, before any run row or paid
+        // transmission. A missing credential therefore causes zero provider calls.
+        provider.prepare()?;
+        let (pending, skipped, force_overwrite_warnings) =
+            self.analysis_pending_assets(project_id, options)?;
 
         // Materialize frame packs first so the estimator's remaining weights
         // are exact frame counts, not clip-count or byte-size guesses.
@@ -3481,7 +3957,11 @@ impl Catalog {
             .clamp(1, prepared.len().max(1));
         let task_key = format!(
             "vlm.observe-v2.{}-w{worker_count}-v1",
-            DEFAULT_MODEL.replace('/', "-")
+            options
+                .primary_model
+                .as_deref()
+                .unwrap_or(DEFAULT_MODEL)
+                .replace('/', "-")
         );
         let mut estimator = BatchEstimator::new(
             &task_work,
@@ -3529,6 +4009,7 @@ impl Catalog {
             allowed_models,
             options.allow_fallback.unwrap_or(true),
         )?;
+        let approved_vocabulary = self.run_policy_vocabulary(policy)?;
         let (sender, receiver) = mpsc::channel();
         let mut completed = vec![false; task_work.len()];
         thread::scope(|scope| -> Result<()> {
@@ -3538,6 +4019,7 @@ impl Catalog {
                 let stop = Arc::clone(&stop);
                 let sender = sender.clone();
                 let worker_chain = chain.clone();
+                let approved_vocabulary = &approved_vocabulary;
                 scope.spawn(move || {
                     loop {
                         if stop.load(std::sync::atomic::Ordering::Relaxed) {
@@ -3551,8 +4033,18 @@ impl Catalog {
                             break;
                         };
                         let started = Instant::now();
-                        let result =
-                            catalog.analyze_asset_with_provider(&asset.id, provider, &worker_chain);
+                        let include_transcript = options
+                            .payload
+                            .map(crate::AnalysisPayload::uses_transcript)
+                            .unwrap_or(false);
+                        let result = catalog.analyze_asset_with_provider(
+                            &asset.id,
+                            provider,
+                            &worker_chain,
+                            include_transcript,
+                            approved_vocabulary,
+                            policy,
+                        );
                         if sender
                             .send((index, asset, frames, started.elapsed(), result))
                             .is_err()

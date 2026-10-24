@@ -303,6 +303,7 @@ export interface AnalysisRunRecord {
   finishedAt: string;
   status: "running" | "completed" | "cancelled" | "failed";
   stageReached: AnalysisStage | "moments";
+  policyId: string;
   proxiesGenerated: number;
   clipsTranscribed: number;
   clipsAnalyzed: number;

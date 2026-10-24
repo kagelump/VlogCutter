@@ -8,12 +8,12 @@ use anyhow::Result;
 use serde::Serialize;
 
 use crate::analysis::provider::{
-    ProviderChain, ProviderChainError, VlmProvider, VlmRequest, VlmResponse,
+    ProviderChain, ProviderChainError, ProviderFailure, VlmProvider, VlmRequest, VlmResponse,
 };
 use crate::analysis::schema::{ClipObservation, output_schema, validate};
 use crate::analysis::store::TranscriptStatus;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct PromptTranscript {
     pub status: TranscriptStatus,
     pub text: String,
@@ -130,7 +130,7 @@ pub fn analyze_clip(
         Ok(outcome) => outcome,
         Err(error) => {
             let Some(failure) = error.downcast_ref::<ProviderChainError>() else {
-                return Err(error);
+                return Err(ProviderFailure::from_anyhow(&error).into());
             };
             return Ok(AnalysisOutcome {
                 observation: None,
@@ -181,8 +181,9 @@ pub fn analyze_clip(
                         first.attempts + 1,
                         true,
                         format!(
-                            "{}; fallback {fallback_model} failed: {fallback_error:#}",
-                            error.as_reason()
+                            "{}; fallback {fallback_model} failed: {}",
+                            error.safe_code(),
+                            ProviderFailure::from_anyhow(&fallback_error).safe_detail()
                         ),
                         first
                             .attempted_models
@@ -252,8 +253,8 @@ pub fn analyze_clip(
                         true,
                         format!(
                             "default: {}; fallback: {}",
-                            error.as_reason(),
-                            fallback_error.as_reason()
+                            error.safe_code(),
+                            fallback_error.safe_code()
                         ),
                         first
                             .attempted_models
@@ -275,7 +276,7 @@ pub fn analyze_clip(
             &first.response,
             first.attempts,
             first.fell_back,
-            error.as_reason(),
+            error.safe_code().to_string(),
             first.attempted_models,
             first.usage_complete,
         )),

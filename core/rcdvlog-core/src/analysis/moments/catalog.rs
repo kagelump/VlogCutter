@@ -12,7 +12,9 @@ use crate::analysis::{
     store::{TranscriptStatus, load_transcript},
     vlm_store::{analysis_is_current, load_analysis},
 };
-use crate::{AnalysisRunOutcome, Asset, Catalog, RepresentationBusy, RepresentationKind};
+use crate::{
+    AnalysisRunOutcome, Asset, Catalog, RepresentationBusy, RepresentationKind, RunPolicyRequest,
+};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use batch_estimator::{BatchEstimate, BatchEstimator};
 use rusqlite::{OptionalExtension, params};
@@ -112,6 +114,9 @@ pub struct MomentPlan {
     pub max_candidates_per_asset: usize,
     pub profile: EditProfile,
     pub policy: String,
+    /// Fully materialized policy: exact scoped source identities, explicit
+    /// model allowlist/fallbacks, payload, expected cost, budget and readiness.
+    pub run_policy: crate::RunPolicy,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -126,10 +131,16 @@ impl DeferredProvider {
         match self.0.get_or_init(|| {
             resolve_api_key()
                 .and_then(OpenRouterProvider::new)
-                .map_err(|e| format!("{e:#}"))
+                .map_err(|_| {
+                    "OpenRouter credentials are not available; no moment request was made"
+                        .to_string()
+                })
         }) {
             Ok(provider) => Ok(provider),
-            Err(error) => Err(ProviderUnavailable(error.clone()).into()),
+            Err(_) => Err(ProviderUnavailable(
+                "OpenRouter credentials are not available; no moment request was made".into(),
+            )
+            .into()),
         }
     }
 }
@@ -152,6 +163,7 @@ struct RunState {
     unknown_usage: bool,
     cancelled: bool,
     budget_stopped: bool,
+    approved_policy: Option<crate::RunPolicy>,
 }
 
 struct SourceContext {
@@ -194,13 +206,32 @@ impl Catalog {
     ) -> Result<MomentPlan> {
         options.validate()?;
         let assets = self.moment_scope(project_id, asset_ids)?;
+        let policy = self.describe_run_policy(&crate::RunPolicyRequest::moment_discovery(
+            project_id.to_string(),
+            assets.iter().map(|asset| asset.id.clone()).collect(),
+            options.model.clone(),
+            options.allowed_models.clone(),
+            options.allow_fallback,
+            match options.payload {
+                MomentPayload::Frames => crate::AnalysisPayload::Frames,
+                MomentPayload::FramesAndTranscript => crate::AnalysisPayload::FramesAndTranscript,
+            },
+            options.budget_usd,
+            options.coarse_frames,
+            options.refinement_frames,
+            options.max_candidates,
+            options.profile,
+            options.force,
+            options.retry_uncertain,
+        ))?;
         Ok(MomentPlan {
             schema_version: SCHEMA_VERSION.into(), asset_ids: assets.iter().map(|a| a.id.clone()).collect(),
             provider: options.provider.clone(), requested_model: options.model.clone(), payload: options.payload,
             budget_usd: options.budget_usd, coarse_frames_per_asset: options.coarse_frames,
             refinement_frames_per_asset: options.refinement_frames, max_candidates_per_asset: options.max_candidates,
             profile: options.profile,
-            policy: "Explicit selected assets only; proxy JPEG frames and optionally accepted timed speech; no model fallback; stop before the next request at the spend ceiling or after unknown usage. No selection or human-metadata mutations.".into(),
+            policy: "Explicit selected assets only; proxy JPEG frames and optionally accepted timed speech; explicit model allowlist and permitted fallbacks; stop before the next request at the spend ceiling or after unknown usage. No selection or human-metadata mutations.".into(),
+            run_policy: policy,
         })
     }
 
@@ -236,11 +267,148 @@ impl Catalog {
     where
         F: FnMut(MomentProgress) -> ControlFlow<()>,
     {
-        self.discover_moments_with_provider(
+        self.discover_moments_for_assets_with_provider(
             project_id,
             asset_ids,
             options,
             &DeferredProvider(OnceLock::new()),
+            on_progress,
+        )
+    }
+
+    /// Public paid boundary for an explicit scope. If the caller has not
+    /// supplied a stored policy id, the explicit invocation materializes one,
+    /// persists approval separately, and runs a bounded pilot before discovery.
+    /// Caller flags can never broaden the stored policy.
+    pub(crate) fn discover_moments_for_assets_with_provider<F>(
+        &self,
+        project_id: &str,
+        asset_ids: &[String],
+        options: &MomentRunOptions,
+        provider: &dyn VlmProvider,
+        mut on_progress: F,
+    ) -> Result<MomentRunReport>
+    where
+        F: FnMut(MomentProgress) -> ControlFlow<()>,
+    {
+        if options.policy_id.is_some() {
+            return self.discover_moments_with_provider(
+                project_id,
+                asset_ids,
+                options,
+                provider,
+                on_progress,
+            );
+        }
+        options.validate()?;
+        let request = RunPolicyRequest::moment_discovery(
+            project_id.to_string(),
+            asset_ids.to_vec(),
+            options.model.clone(),
+            options.allowed_models.clone(),
+            options.allow_fallback,
+            match options.payload {
+                MomentPayload::Frames => crate::AnalysisPayload::Frames,
+                MomentPayload::FramesAndTranscript => crate::AnalysisPayload::FramesAndTranscript,
+            },
+            options.budget_usd,
+            options.coarse_frames,
+            options.refinement_frames,
+            options.max_candidates,
+            options.profile,
+            options.force,
+            options.retry_uncertain,
+        );
+        self.authorize_run_policy(&request)?;
+        let mut cancelled = false;
+        let pilot_result = self.run_run_policy_pilot_with_provider_and_cancel(
+            &request,
+            provider,
+            options.retry_uncertain,
+            || {
+                let mut estimate = BatchEstimator::new(&[], 1, Default::default()).estimate(&[]);
+                estimate.confidence = "capability_pilot".into();
+                estimate.estimated_remaining_seconds = None;
+                cancelled |= on_progress(MomentProgress {
+                    run_id: String::new(),
+                    asset_id: asset_ids.first().cloned().unwrap_or_default(),
+                    phase: "pilot".into(),
+                    cost_usd: 0.0,
+                    estimate,
+                })
+                .is_break();
+                cancelled
+            },
+        );
+        if cancelled {
+            return Ok(MomentRunReport {
+                run_id: String::new(),
+                total_assets: asset_ids.len(),
+                processed: 0,
+                ready: 0,
+                no_candidates: 0,
+                needs_review: 0,
+                skipped: 0,
+                failed: 0,
+                cost_usd: 0.0,
+                usage_complete: true,
+                cancelled: true,
+                budget_exhausted: false,
+                failures: Vec::new(),
+                failures_truncated: false,
+            });
+        }
+        let pilot = pilot_result?;
+        ensure!(
+            pilot.status == "passed",
+            "capability pilot did not pass for this exact moment policy: {} ({}); no moment requests were made",
+            pilot.failure_code,
+            pilot.validation.detail
+        );
+        let state = self.authorized_policy_for_bulk(
+            &pilot.policy_id,
+            crate::AnalysisRunKind::MomentDiscovery,
+        )?;
+        let bound_options = state.authorization.policy.moment_options()?;
+        self.discover_moments_with_provider(
+            project_id,
+            asset_ids,
+            &bound_options,
+            provider,
+            on_progress,
+        )
+    }
+
+    /// Execute only the exact scope and settings authorized by `policy_id`.
+    /// This is the provider-injectable bulk boundary used by adapters and
+    /// synthetic tests; the stored policy is authoritative.
+    pub fn discover_authorized_moments_with_provider<F>(
+        &self,
+        policy_id: &str,
+        provider: &dyn VlmProvider,
+        on_progress: F,
+    ) -> Result<MomentRunReport>
+    where
+        F: FnMut(MomentProgress) -> ControlFlow<()>,
+    {
+        let state = self.authorized_policy_for_bulk(
+            policy_id,
+            crate::analysis::run_policy::AnalysisRunKind::MomentDiscovery,
+        )?;
+        let options = state.authorization.policy.moment_options()?;
+        let project_id = state.authorization.policy.project_id.clone();
+        let asset_ids = state
+            .authorization
+            .policy
+            .scope
+            .iter()
+            .map(|asset| asset.asset_id.clone())
+            .collect::<Vec<_>>();
+        self.discover_moments_with_provider(
+            &project_id,
+            &asset_ids,
+            &options,
+            provider,
             on_progress,
         )
     }
@@ -258,28 +426,84 @@ impl Catalog {
     {
         options.validate()?;
         let assets = self.moment_scope(project_id, asset_ids)?;
+        let mut effective_options = options.clone();
+        if effective_options.allowed_models.is_empty() {
+            effective_options.allowed_models = vec![effective_options.model.clone()];
+        }
+        let mut approved_policy = None;
+        if let Some(policy_id) = &options.policy_id {
+            let state = self.authorized_policy_for_bulk(
+                policy_id,
+                crate::analysis::run_policy::AnalysisRunKind::MomentDiscovery,
+            )?;
+            let policy = &state.authorization.policy;
+            ensure!(
+                policy.project_id == project_id,
+                "authorized policy belongs to a different project"
+            );
+            let scoped = assets
+                .iter()
+                .map(|asset| asset.id.as_str())
+                .collect::<Vec<_>>();
+            let authorized = policy
+                .scope
+                .iter()
+                .map(|asset| asset.asset_id.as_str())
+                .collect::<Vec<_>>();
+            ensure!(
+                scoped == authorized,
+                "authorized run scope does not exactly match the requested asset ids"
+            );
+            ensure!(
+                policy.primary_model == options.model
+                    && policy.payload
+                        == match options.payload {
+                            MomentPayload::Frames => crate::AnalysisPayload::Frames,
+                            MomentPayload::FramesAndTranscript => {
+                                crate::AnalysisPayload::FramesAndTranscript
+                            }
+                        }
+                    && (policy.budget_usd - options.budget_usd).abs() < f64::EPSILON,
+                "run model, payload or requested budget does not match the authorized policy"
+            );
+            ensure!(
+                effective_options.policy_id.is_some()
+                    && policy_id == &effective_options.policy_id.clone().unwrap(),
+                "internal policy binding mismatch"
+            );
+            effective_options.budget_usd = state.remaining_budget_usd;
+            effective_options.allowed_models = policy.allowed_models.clone();
+            effective_options.allow_fallback = policy.allow_fallback;
+            approved_policy = Some(policy.clone());
+        }
+        provider.prepare()?;
+        let options = &effective_options;
         let run_id = self.begin_analysis_run(project_id)?;
         // Reuse the shared run account, identifying the stage before any call.
         self.connection()?.execute(
-            "UPDATE analysis_runs SET stage_reached='moments' WHERE id=?1",
-            [&run_id],
+            "UPDATE analysis_runs SET stage_reached='moments',policy_id=?2 WHERE id=?1",
+            params![run_id, options.policy_id.clone().unwrap_or_default()],
         )?;
         let task_key = format!(
             "{RECIPE_VERSION}.{}.w1",
             digest(&(
                 &options.provider,
                 &options.model,
+                &options.allowed_models,
+                options.allow_fallback,
                 options.payload,
                 options.coarse_frames,
                 options.refinement_frames,
                 options.max_candidates,
-                options.profile
+                options.profile,
+                options.policy_id.clone(),
             ))?
         );
         let weights = vec![1; assets.len()];
         let mut estimator = BatchEstimator::new(&weights, 1, self.load_batch_history(&task_key)?);
         let mut state = RunState {
             run_id: run_id.clone(),
+            approved_policy,
             ..Default::default()
         };
         let mut report = MomentRunReport {
@@ -300,8 +524,8 @@ impl Catalog {
         };
         let chain = ProviderChain::with_policy(
             &options.model,
-            std::slice::from_ref(&options.model),
-            false,
+            &options.allowed_models,
+            options.allow_fallback,
         )?;
         for (index, asset) in assets.iter().enumerate() {
             let estimate = estimator.estimate(&weights[index..]);
@@ -418,7 +642,7 @@ impl Catalog {
         Ok(report)
     }
 
-    fn moment_source(&self, asset: &Asset) -> Result<SourceContext> {
+    fn moment_source(&self, asset: &Asset, include_transcript: bool) -> Result<SourceContext> {
         let source = self.analysis_proxy_source(asset)?;
         let proxy = source.proxy;
         let duration_ms = source.duration_ms;
@@ -426,9 +650,13 @@ impl Catalog {
         let fingerprint = source.fingerprint;
         let sampled = source.sampled_fingerprint;
         let connection = self.connection()?;
-        let transcript = load_transcript(&connection, &asset.id)?.filter(|t| {
-            t.source_fingerprint == sampled && t.recipe_key == crate::analysis::STT_RECIPE_KEY
-        });
+        let transcript = if include_transcript {
+            load_transcript(&connection, &asset.id)?.filter(|t| {
+                t.source_fingerprint == sampled && t.recipe_key == crate::analysis::STT_RECIPE_KEY
+            })
+        } else {
+            None
+        };
         let transcript_fingerprint = transcript.as_ref().map(digest).transpose()?;
         let dialogue = transcript
             .filter(|t| t.status == TranscriptStatus::Speech)
@@ -492,7 +720,9 @@ impl Catalog {
             "asset changed project scope"
         );
         let asset = &refreshed;
-        let source = match self.moment_source(asset) {
+        let source = match self
+            .moment_source(asset, options.payload == MomentPayload::FramesAndTranscript)
+        {
             Ok(source) => source,
             Err(error) => {
                 return self.unavailable_moment_artifact(asset, options, format!("{error:#}"));
@@ -916,7 +1146,11 @@ impl Catalog {
         {
             return false;
         }
-        self.moment_source(asset).is_ok_and(|source| {
+        self.moment_source(
+            asset,
+            artifact.provenance.payload == MomentPayload::FramesAndTranscript,
+        )
+        .is_ok_and(|source| {
             source.fingerprint == artifact.provenance.representation_fingerprint
                 && source.duration_ms == artifact.provenance.source_duration_ms
                 && source.transcript_fingerprint == artifact.provenance.transcript_fingerprint
@@ -1285,6 +1519,10 @@ impl StepRunner<'_> {
             frames,
             schema: output_schema(limit, self.source.duration_ms, &keys),
         };
+        if let Some(policy) = &self.state.approved_policy {
+            self.catalog
+                .validate_run_policy_asset(policy, &self.asset.id)?;
+        }
         self.provider.prepare()?;
         let pending_receipt = MomentReceipt {
             run_id: self.state.run_id.clone(),
@@ -1836,6 +2074,9 @@ mod tests {
             profile: EditProfile::default(),
             force: false,
             retry_uncertain: false,
+            allowed_models: vec![DEFAULT_MODEL.to_string()],
+            allow_fallback: false,
+            policy_id: None,
         }
     }
 
@@ -2801,6 +3042,7 @@ mod tests {
         assert!(missing_page.artifact.provenance.usage_complete);
 
         options.model = FALLBACK_MODEL.into();
+        options.allowed_models = vec![FALLBACK_MODEL.into()];
         let mismatch = ReportedIdentityProvider {
             calls: AtomicUsize::new(0),
             actual_model: Some("upstream/other-model".into()),
@@ -2949,6 +3191,9 @@ mod tests {
             profile: EditProfile::default(),
             force: false,
             retry_uncertain: false,
+            allowed_models: vec![DEFAULT_MODEL.to_string()],
+            allow_fallback: false,
+            policy_id: None,
         };
         let assets = vec!["moment_asset".to_owned()];
         let run = || {
@@ -3028,6 +3273,7 @@ mod tests {
 
         let mut changed_model = options.clone();
         changed_model.model = FALLBACK_MODEL.into();
+        changed_model.allowed_models = vec![FALLBACK_MODEL.into()];
         catalog
             .discover_moments_with_provider(&project.id, &assets, &changed_model, &provider, |_| {
                 ControlFlow::Continue(())

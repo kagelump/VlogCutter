@@ -62,6 +62,9 @@ pub struct RunArgs {
     payload: Option<String>,
     #[arg(long)]
     budget_usd: Option<f64>,
+    /// Execute the exact paid moments policy and matching passed pilot.
+    #[arg(long)]
+    policy_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -153,10 +156,29 @@ pub fn execute(catalog: &Catalog, command: &PreparationCommand) -> Result<Value>
                 args.moments || policy_count == 0,
                 "invalid input: moment policy flags require --moments"
             );
-            let moments = if args.moments {
+            ensure!(
+                args.policy_id.is_none() || args.moments,
+                "invalid input: --policy-id requires --moments"
+            );
+            let moments = if let Some(policy_id) = &args.policy_id {
+                ensure!(
+                    !args.scope.all_assets,
+                    "invalid input: an authorized policy requires an explicit --asset scope"
+                );
+                ensure!(
+                    policy_count == 0,
+                    "invalid input: an authorized policy cannot be combined with provider, model, payload or budget overrides"
+                );
+                let authorization = catalog.load_run_authorization(policy_id)?;
+                ensure!(
+                    authorization.policy.kind == rcdvlog_core::AnalysisRunKind::MomentDiscovery,
+                    "invalid input: policy does not authorize moment discovery"
+                );
+                Some(authorization.policy.moment_options()?)
+            } else if args.moments {
                 ensure!(
                     policy_count == 4,
-                    "invalid input: --moments requires --provider, --model, --payload, and --budget-usd"
+                    "invalid input: --moments requires --provider, --model, --payload, and --budget-usd, or an authorized --policy-id"
                 );
                 let budget = args.budget_usd.unwrap();
                 ensure!(
