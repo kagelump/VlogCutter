@@ -568,14 +568,24 @@ rcdvlog --catalog /absolute/project/catalog.sqlite3 moments discover \
   --project <project-id> --asset <asset-id> --provider openrouter \
   --model qwen/qwen3.7-flash --payload frames --budget-usd 0.25 \
   --force --retry-uncertain
+rcdvlog --catalog /absolute/project/catalog.sqlite3 moments authorize \
+  --project <project-id> --asset <asset-id> --provider openrouter \
+  --model qwen/qwen3.7-flash --payload frames --budget-usd 0.25
+rcdvlog --catalog /absolute/project/catalog.sqlite3 moments pilot \
+  --project <project-id> --asset <asset-id> --provider openrouter \
+  --model qwen/qwen3.7-flash --payload frames --budget-usd 0.25
+rcdvlog --catalog /absolute/project/catalog.sqlite3 moments run \
+  --policy-id <policy-id>
 rcdvlog --catalog /absolute/project/catalog.sqlite3 moments list \
   --project <project-id> --offset 0 --limit 20
 rcdvlog --catalog /absolute/project/catalog.sqlite3 moments get \
   --asset <asset-id> --offset 0 --limit 8
 ```
 
-`moments plan` validates the selected project, assets, model, payload and budget
-without credentials, provider calls, or catalog writes. `discover` requires the
+`moments plan` validates the selected project, assets, model allowlist,
+permitted fallbacks, payload and budget without credentials, provider calls, or
+catalog writes. Its `runPolicy` member is the exact content-addressed policy used
+by `authorize`, `pilot` and `run`. `discover` requires the
 same explicit project and either one or more repeated `--asset` values or
 `--all-usable`; the latter selects non-removed assets with usable recorded video
 validation in that project. There is no implicit desktop/global asset scope.
@@ -640,7 +650,10 @@ scope fingerprint identifies the selector, not a frozen project snapshot.
 `--all` includes removed/excluded rows so the inventory remains truthful.
 Moment evidence pages reuse the existing bounded moments projection.
 
-`prepare run` is the only mutating preparation command. With no stage flags it
+`prepare run` is the only mutating preparation command. For paid moment
+discovery, pass `--moments --policy-id <policy-id>` with an explicit `--asset`
+scope that exactly matches the authorized policy; provider/model/payload/budget
+overrides are refused. With no stage flags it
 validates/reuses existing local proxies and current receipts; `--proxies`,
 `--transcribe`, and `--revalidate` explicitly add local work. `--moments` is the
 only paid-work authorization and requires the provider, model, payload, and
@@ -658,7 +671,50 @@ its checks; sparse moment samples are suggestions and do not certify an
 arbitrary source interval or edit cut. Synthetic fixture tests verify these
 workflow contracts, not transcription quality or subjective moment selection.
 
-### Analysis policy and recovery
+### Analysis policy, authorization and pilot
+
+Every paid batch should first be described and authorized as one exact
+`RunPolicy`. The policy includes the project-owned asset IDs and source/
+representation fingerprints, explicit model allowlist and permitted fallbacks,
+payload, expected cost, requested budget, prompt/schema/recipe/tool versions and
+readiness. Credentials are reported only as present or absent.
+
+```bash
+rcdvlog --catalog /absolute/project/catalog.sqlite3 analyze preflight \
+  --project <project-id> --asset <asset-a> --asset <asset-b> \
+  --provider openrouter --primary-model qwen/qwen3.7-flash \
+  --budget-usd 0.50 --payload frames-and-transcript --project-vocabulary
+rcdvlog --catalog /absolute/project/catalog.sqlite3 analyze authorize \
+  --project <project-id> --asset <asset-a> --asset <asset-b> \
+  --provider openrouter --primary-model qwen/qwen3.7-flash \
+  --budget-usd 0.50 --payload frames-and-transcript --project-vocabulary
+rcdvlog --catalog /absolute/project/catalog.sqlite3 analyze pilot \
+  --project <project-id> --asset <asset-a> --asset <asset-b> \
+  --provider openrouter --primary-model qwen/qwen3.7-flash \
+  --budget-usd 0.50 --payload frames-and-transcript
+rcdvlog --catalog /absolute/project/catalog.sqlite3 analyze run \
+  --policy-id <policy-id>
+```
+
+Authorization records approval of the exact scope, payload, model allowlist,
+fallbacks and budget. It is separate from the pilot, which is one bounded
+capability/schema/source-time observation and is never a guarantee of future
+provider availability or semantic correctness. A sample/single-clip pilot does
+not authorize any other clip. Budget approval does not authorize a different
+model or payload. Any source, model, payload, budget or schema/prompt/tool
+version change produces a different policy ID and invalidates existing approval
+and pilot records. The policy also records whether the exact project vocabulary
+is attached: omit `--project-vocabulary` to keep a request frames/transcript-only.
+A frames payload never reads or sends a transcript. Pilot spend counts against
+the same run ceiling. Retrying an interrupted or unknown-usage pilot retains the
+prior known cost and can never re-enable bulk work until the uncertainty is
+resolved. Missing credentials fail before provider construction. Existing
+explicit `analyze missing`/desktop batch invocations materialize the same
+policy, authorization and pilot automatically before bulk work.
+
+See [`docs/analysis-preflight.md`](analysis-preflight.md) for the data model and
+limits. `moments plan/authorize/pilot/run` expose the same lifecycle for
+editorial moment discovery; `moments plan` includes the full `runPolicy`.
 
 `analyze suggest-chronology` makes one bounded, read-only visual evidence request
 for 2–8 selected clips, using at most two selected proxy frames per clip. It

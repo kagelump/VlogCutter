@@ -33,6 +33,16 @@ pub struct MomentRunOptions {
     pub profile: EditProfile,
     pub force: bool,
     pub retry_uncertain: bool,
+    #[serde(default)]
+    pub allowed_models: Vec<String>,
+    #[serde(default = "default_allow_fallback")]
+    pub allow_fallback: bool,
+    #[serde(default)]
+    pub policy_id: Option<String>,
+}
+
+fn default_allow_fallback() -> bool {
+    true
 }
 
 impl MomentRunOptions {
@@ -46,6 +56,18 @@ impl MomentRunOptions {
             "unsupported moment model: {}",
             self.model
         );
+        if !self.allowed_models.is_empty() {
+            for model in &self.allowed_models {
+                ensure!(
+                    crate::analysis::provider::model_spec(model).is_some(),
+                    "unsupported allowed moment model: {model}"
+                );
+            }
+            ensure!(
+                self.allowed_models.iter().any(|model| model == &self.model),
+                "primary moment model is not in the allowed model list"
+            );
+        }
         ensure!(
             self.budget_usd.is_finite() && self.budget_usd > 0.0,
             "moment budget must be finite and positive"
@@ -213,13 +235,14 @@ pub fn validate_reply(
 ) -> Result<StepReply> {
     ensure!(body.len() <= 32_768, "moment response exceeds byte limit");
     let json: Value = serde_json::from_str(body)?;
+    let schema = output_schema(limit, span.end_ms, allowed_keys);
     ensure!(
         json["moments"].as_array().is_some_and(|values| values
             .iter()
             .all(|m| m.get("setup").is_some() && m.get("context").is_some())),
         "moment response omits required nullable fields"
     );
-    let mut reply: StepReply = serde_json::from_value(json)?;
+    let mut reply: StepReply = serde_json::from_value(json.clone())?;
     ensure!(
         reply.moments.len() <= limit && reply.reason.chars().count() <= 400,
         "moment response exceeds bounds"
@@ -320,6 +343,8 @@ pub fn validate_reply(
             );
         }
     }
+    crate::analysis::schema::validate_json_structure(&json, &schema)
+        .map_err(|error| anyhow::anyhow!("{}", error.as_reason()))?;
     Ok(reply)
 }
 

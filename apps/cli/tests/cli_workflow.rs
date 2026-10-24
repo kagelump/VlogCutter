@@ -1,5 +1,6 @@
 use rcdvlog_core::{
     Catalog, PROJECT_CATALOG_SCHEMA_VERSION, ProjectAssetAddedPayload, RepresentationKind,
+    RunPolicyRequest,
 };
 use rusqlite::{Connection, params};
 use serde_json::Value;
@@ -157,6 +158,193 @@ fn insert_moment_scope_asset(catalog: &Path, project: &str, id: &str, path: &Pat
 }
 
 #[test]
+fn analysis_pilot_with_absent_credentials_stops_before_provider_construction() {
+    let directory = tempdir().unwrap();
+    let source_dir = directory.path().join("source");
+    fs::create_dir(&source_dir).unwrap();
+    let source = source_dir.join("synthetic.mp4");
+    let generated = Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=blue:s=320x180:r=24:d=2",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+        ])
+        .arg(&source)
+        .status();
+    let Ok(status) = generated else {
+        eprintln!("skipping absent-credentials pilot test: ffmpeg unavailable");
+        return;
+    };
+    if !status.success() {
+        eprintln!("skipping absent-credentials pilot test: H.264 encoder unavailable");
+        return;
+    }
+    let path = directory.path().join("catalog.sqlite3");
+    let catalog = Catalog::open(&path).unwrap();
+    let project = catalog
+        .create_project("Synthetic absent credentials")
+        .unwrap()
+        .id;
+    catalog.ingest_folder(&project, &source_dir).unwrap();
+    let asset = catalog.list_assets(&project).unwrap().remove(0);
+    catalog.generate_proxy(&asset.id).unwrap();
+    let request = RunPolicyRequest::observation(
+        project.clone(),
+        vec![asset.id.clone()],
+        rcdvlog_core::DEFAULT_MODEL,
+        vec![
+            rcdvlog_core::DEFAULT_MODEL.into(),
+            rcdvlog_core::FALLBACK_MODEL.into(),
+        ],
+        true,
+        1.0,
+        false,
+    );
+    let authorization = catalog.authorize_run_policy(&request).unwrap();
+    drop(catalog);
+
+    let isolated_home = directory.path().join("isolated-home");
+    fs::create_dir(&isolated_home).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_rcdvlog"))
+        .arg("--catalog")
+        .arg(&path)
+        .args([
+            "analyze",
+            "pilot",
+            "--project",
+            &project,
+            "--asset",
+            &asset.id,
+            "--provider",
+            "openrouter",
+            "--primary-model",
+            rcdvlog_core::DEFAULT_MODEL,
+            "--allow-model",
+            rcdvlog_core::DEFAULT_MODEL,
+            "--allow-model",
+            rcdvlog_core::FALLBACK_MODEL,
+            "--budget-usd",
+            "1.0",
+            "--payload",
+            "frames",
+        ])
+        .env_remove("OPENROUTER_API_KEY")
+        .env("HOME", &isolated_home)
+        .output()
+        .expect("run absent-credentials pilot CLI");
+    assert!(!output.status.success());
+    let error: Value = serde_json::from_slice(&output.stderr).expect("single JSON error");
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("no pilot request was made"),
+        "unexpected error: {error}"
+    );
+    let catalog = Catalog::open(&path).unwrap();
+    assert!(
+        catalog
+            .load_run_pilot(&authorization.policy.policy_id)
+            .unwrap()
+            .is_none(),
+        "credential failure must not create a pilot transmission record"
+    );
+}
+
+#[test]
+fn analysis_policy_preflight_is_read_only_and_unsupported_payload_fails_before_authorization() {
+    let directory = tempdir().unwrap();
+    let catalog = directory.path().join("catalog.sqlite3");
+    let project = create_project(&catalog, "Analysis policy CLI");
+    let clip = directory.path().join("policy-fixture.mp4");
+    insert_moment_scope_asset(&catalog, &project, "policy_asset", &clip);
+    let before = fs::read(&catalog).unwrap();
+
+    let first = success(
+        &catalog,
+        [
+            "analyze",
+            "preflight",
+            "--project",
+            &project,
+            "--asset",
+            "policy_asset",
+            "--provider",
+            "openrouter",
+            "--primary-model",
+            "qwen/qwen3.7-flash",
+            "--budget-usd",
+            "1.0",
+            "--payload",
+            "frames",
+        ],
+    );
+    assert_eq!(first.json["data"]["scope"][0]["assetId"], "policy_asset");
+    assert_eq!(first.json["data"]["provider"], "openrouter");
+    assert_eq!(
+        first.json["data"]["allowedModels"],
+        serde_json::json!(["qwen/qwen3.7-flash", "google/gemini-2.5-flash-lite"])
+    );
+    assert!(
+        first.json["data"].get("apiKey").is_none(),
+        "preflight must never emit credentials"
+    );
+    assert_eq!(
+        fs::read(&catalog).unwrap(),
+        before,
+        "preflight changed catalog bytes"
+    );
+
+    let unsupported = failure(
+        &catalog,
+        [
+            "analyze",
+            "authorize",
+            "--project",
+            &project,
+            "--asset",
+            "policy_asset",
+            "--provider",
+            "openrouter",
+            "--primary-model",
+            "qwen/qwen3.7-flash",
+            "--budget-usd",
+            "1.0",
+            "--payload",
+            "audio",
+        ],
+    );
+    assert_eq!(unsupported["error"]["code"], "invalid_input");
+    assert!(
+        unsupported["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("audio")
+    );
+
+    let cannot_run_unapproved = failure(
+        &catalog,
+        ["analyze", "run", "--policy-id", "not-authorized"],
+    );
+    assert_eq!(cannot_run_unapproved["error"]["code"], "invalid_input");
+    assert!(
+        cannot_run_unapproved["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("not authorized")
+    );
+}
+
+#[test]
 fn moments_plan_and_inventory_are_explicit_scoped_read_only_commands() {
     let directory = tempdir().unwrap();
     let catalog = directory.path().join("catalog.sqlite3");
@@ -190,6 +378,18 @@ fn moments_plan_and_inventory_are_explicit_scoped_read_only_commands() {
     );
     assert_eq!(planned.json["data"]["coarseFramesPerAsset"], 96);
     assert_eq!(planned.json["data"]["refinementFramesPerAsset"], 384);
+    assert_eq!(
+        planned.json["data"]["runPolicy"]["scope"][0]["assetId"],
+        "moment_asset"
+    );
+    assert_eq!(planned.json["data"]["runPolicy"]["budgetUsd"], 0.5);
+    assert!(
+        planned.json["data"]["runPolicy"]["readiness"]["blockers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|blocker| blocker["code"] == "source_not_ready")
+    );
 
     let all_usable = success(
         &catalog,

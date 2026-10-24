@@ -1106,6 +1106,28 @@ impl Catalog {
             total <= MAX_SCOPE,
             "preparation run exceeds 10000 assets; select a bounded asset scope"
         );
+        if let Some(policy_id) = options
+            .moments
+            .as_ref()
+            .and_then(|policy| policy.policy_id.as_deref())
+        {
+            let state = self
+                .authorized_policy_for_bulk(policy_id, crate::AnalysisRunKind::MomentDiscovery)?;
+            let mut requested = ids.clone();
+            let mut authorized = state
+                .authorization
+                .policy
+                .scope
+                .iter()
+                .map(|asset| asset.asset_id.clone())
+                .collect::<Vec<_>>();
+            requested.sort();
+            authorized.sort();
+            ensure!(
+                requested == authorized,
+                "preparation scope does not exactly match the authorized policy"
+            );
+        }
         let mut report = PreparationRunReport {
             run_id: uuid::Uuid::new_v4().to_string(),
             total_assets: total,
@@ -1221,7 +1243,7 @@ impl Catalog {
                 })
             };
             let paid = match provider {
-                Some(provider) => self.discover_moments_with_provider(
+                Some(provider) => self.discover_moments_for_assets_with_provider(
                     &scope.project_id,
                     &eligible,
                     policy,

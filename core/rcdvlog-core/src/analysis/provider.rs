@@ -37,6 +37,16 @@ pub struct ModelSpec {
     /// Whether reasoning can be disabled. A model that burns reasoning tokens
     /// and returns empty content is unusable here.
     pub reasoning_disablable: bool,
+    /// Whether the model accepts image content blocks.
+    pub supports_image_input: bool,
+    /// Whether the model accepts audio content blocks. No registered model does
+    /// yet; keeping this explicit prevents a configured audio payload from being
+    /// silently treated as an image request.
+    pub supports_audio_input: bool,
+    /// Whether the model can consume accepted transcript text as context.
+    pub supports_transcript_input: bool,
+    /// Whether the provider/model accepts a JSON Schema response format.
+    pub supports_json_schema: bool,
 }
 
 pub const MODELS: &[ModelSpec] = &[
@@ -46,6 +56,10 @@ pub const MODELS: &[ModelSpec] = &[
         image_tokens_per_frame: 435,
         supports_max_items: true,
         reasoning_disablable: true,
+        supports_image_input: true,
+        supports_audio_input: false,
+        supports_transcript_input: true,
+        supports_json_schema: true,
     },
     ModelSpec {
         // ~1,235 prompt tokens over a median 5-frame pack; Google normalises
@@ -54,6 +68,10 @@ pub const MODELS: &[ModelSpec] = &[
         image_tokens_per_frame: 247,
         supports_max_items: true,
         reasoning_disablable: true,
+        supports_image_input: true,
+        supports_audio_input: false,
+        supports_transcript_input: true,
+        supports_json_schema: true,
     },
 ];
 
@@ -92,6 +110,96 @@ pub struct VlmReceipt {
     pub usage_complete: bool,
 }
 
+/// Stable provider failure categories safe to persist. Provider messages and
+/// response bodies may contain prompts, frame bytes or credentials, so they are
+/// never copied into policy or pilot diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderFailureCategory {
+    Transport,
+    HttpStatus,
+    InvalidResponse,
+    Configuration,
+    Unclassified,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderFailure {
+    pub category: ProviderFailureCategory,
+    pub http_status: Option<u16>,
+}
+
+impl ProviderFailure {
+    pub fn transport() -> Self {
+        Self {
+            category: ProviderFailureCategory::Transport,
+            http_status: None,
+        }
+    }
+
+    pub fn http_status(status: u16) -> Self {
+        Self {
+            category: ProviderFailureCategory::HttpStatus,
+            http_status: Some(status),
+        }
+    }
+
+    pub fn invalid_response() -> Self {
+        Self {
+            category: ProviderFailureCategory::InvalidResponse,
+            http_status: None,
+        }
+    }
+
+    pub fn unclassified() -> Self {
+        Self {
+            category: ProviderFailureCategory::Unclassified,
+            http_status: None,
+        }
+    }
+
+    /// Extracts only typed failure metadata from an error chain. Any unknown
+    /// error is deliberately collapsed to `unclassified`.
+    pub fn from_anyhow(error: &anyhow::Error) -> Self {
+        error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<ProviderFailure>().cloned())
+            .or_else(|| {
+                error
+                    .chain()
+                    .find_map(|cause| cause.downcast_ref::<ProviderChainError>())
+                    .map(|chain| Self {
+                        category: chain.category,
+                        http_status: chain.http_status,
+                    })
+            })
+            .unwrap_or_else(Self::unclassified)
+    }
+
+    pub fn safe_detail(&self) -> String {
+        match self.category {
+            ProviderFailureCategory::Transport => "provider_error:transport".into(),
+            ProviderFailureCategory::HttpStatus => {
+                format!(
+                    "provider_error:http_status:{}",
+                    self.http_status.unwrap_or(0)
+                )
+            }
+            ProviderFailureCategory::InvalidResponse => "provider_error:invalid_response".into(),
+            ProviderFailureCategory::Configuration => "provider_error:configuration".into(),
+            ProviderFailureCategory::Unclassified => "provider_error:unclassified".into(),
+        }
+    }
+}
+
+impl std::fmt::Display for ProviderFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.safe_detail())
+    }
+}
+
+impl std::error::Error for ProviderFailure {}
+
 /// A transport that can run one request against one named model.
 pub trait VlmProvider: Send + Sync {
     /// Local-only credential/client preparation, before recording transmission.
@@ -117,6 +225,8 @@ pub struct ChainOutcome {
 pub struct ProviderChainError {
     pub attempted_models: Vec<String>,
     pub message: String,
+    pub category: ProviderFailureCategory,
+    pub http_status: Option<u16>,
 }
 
 impl std::fmt::Display for ProviderChainError {
@@ -225,12 +335,16 @@ impl ProviderChain {
                 })
             }
             Err(first_error) => {
+                let _ = &first_error;
                 let fallback = self.fallback_model();
                 if !self.allow_fallback || fallback == Some(first) {
                     // The breaker already routed here; there is nowhere else to go.
+                    let failure = ProviderFailure::from_anyhow(&first_error);
                     return Err(ProviderChainError {
                         attempted_models: vec![first.to_string()],
-                        message: format!("{first}: {first_error:#}"),
+                        message: format!("provider request failed for {first}"),
+                        category: failure.category,
+                        http_status: failure.http_status,
                     }
                     .into());
                 }
@@ -244,10 +358,16 @@ impl ProviderChain {
                         attempted_models: vec![first.to_string(), fallback.to_string()],
                         usage_complete: false,
                     }),
-                    Err(fallback_error) => Err(ProviderChainError {
-                        attempted_models: vec![first.to_string(), fallback.to_string()],
-                        message: format!("both models failed: {first}: {first_error:#}; {fallback}: {fallback_error:#}"),
-                    }.into()),
+                    Err(fallback_error) => {
+                        let failure = ProviderFailure::from_anyhow(&fallback_error);
+                        Err(ProviderChainError {
+                            attempted_models: vec![first.to_string(), fallback.to_string()],
+                            message: format!("both models failed: {first}, {fallback}"),
+                            category: failure.category,
+                            http_status: failure.http_status,
+                        }
+                        .into())
+                    }
                 }
             }
         }
@@ -271,6 +391,18 @@ impl ProviderChain {
         self.allowed_models
             .contains(&candidate)
             .then_some(candidate)
+    }
+
+    pub fn primary_model(&self) -> &'static str {
+        self.primary_model
+    }
+
+    pub fn allowed_models(&self) -> &[&'static str] {
+        &self.allowed_models
+    }
+
+    pub fn allows_fallback(&self) -> bool {
+        self.allow_fallback
     }
 }
 

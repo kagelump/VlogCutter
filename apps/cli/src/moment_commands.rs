@@ -3,15 +3,22 @@
 use anyhow::{Context, Result, ensure};
 use clap::{Args, Subcommand};
 use rcdvlog_core::{
-    AssetVideoValidationStatus, Catalog, EditProfile, MomentPayload, MomentRunOptions,
+    AnalysisPayload, AnalysisRunKind, AssetVideoValidationStatus, Catalog, EditProfile,
+    MomentPayload, MomentRunOptions, RunPolicyParameters, RunPolicyRequest,
 };
 use serde_json::{Value, json};
 use std::ops::ControlFlow;
 
 #[derive(Debug, Subcommand)]
 pub enum MomentCommand {
-    /// Validate an explicit scope and report the proposed bounded run without credentials or writes.
+    /// Describe the exact policy for a proposed moment run without credentials or writes.
     Plan(MomentRunArgs),
+    /// Persist explicit approval for the exact planned policy.
+    Authorize(MomentRunArgs),
+    /// Run one bounded capability/schema/source-time pilot for an authorized policy.
+    Pilot(MomentRunArgs),
+    /// Execute a stored policy and matching passed pilot over its exact scope.
+    Run(AuthorizedRunArgs),
     /// Discover sparse candidate moments for an explicit scope.
     Discover(DiscoverArgs),
     /// List a bounded page of project assets and their moment status.
@@ -37,6 +44,12 @@ pub struct MomentRunArgs {
     provider: String,
     #[arg(long)]
     model: String,
+    /// Models permitted for this run (repeat for each model).
+    #[arg(long = "allow-model")]
+    allowed_models: Vec<String>,
+    /// Refuse automatic retry with the alternate model.
+    #[arg(long)]
+    no_fallback: bool,
     #[arg(long, value_parser = ["frames", "frames-and-transcript"])]
     payload: String,
     /// Maximum authorized spend for this run, in USD.
@@ -56,12 +69,24 @@ pub struct MomentRunArgs {
     hold_min_ms: u32,
     #[arg(long, default_value_t = 30000)]
     hold_max_ms: u32,
+    /// Explicitly recover an interrupted/unknown-usage pilot after review.
+    #[arg(long)]
+    retry_uncertain: bool,
 }
 
 #[derive(Debug, Args)]
 pub struct DiscoverArgs {
     #[command(flatten)]
     run: MomentRunArgs,
+    /// Explicitly replace completed candidate evidence.
+    #[arg(long)]
+    force: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct AuthorizedRunArgs {
+    #[arg(long)]
+    policy_id: String,
     /// Explicitly replace completed candidate evidence.
     #[arg(long)]
     force: bool,
@@ -93,6 +118,9 @@ pub struct GetArgs {
 pub fn command_name(command: &MomentCommand) -> &'static str {
     match command {
         MomentCommand::Plan(_) => "moments.plan",
+        MomentCommand::Authorize(_) => "moments.authorize",
+        MomentCommand::Pilot(_) => "moments.pilot",
+        MomentCommand::Run(_) => "moments.run",
         MomentCommand::Discover(_) => "moments.discover",
         MomentCommand::List(_) => "moments.list",
         MomentCommand::Get(_) => "moments.get",
@@ -100,7 +128,10 @@ pub fn command_name(command: &MomentCommand) -> &'static str {
 }
 
 pub fn is_read_only(command: &MomentCommand) -> bool {
-    !matches!(command, MomentCommand::Discover(_))
+    matches!(
+        command,
+        MomentCommand::Plan(_) | MomentCommand::List(_) | MomentCommand::Get(_)
+    )
 }
 
 fn scope(catalog: &Catalog, run: &MomentRunArgs) -> Result<Vec<String>> {
@@ -143,7 +174,51 @@ fn options(run: &MomentRunArgs, force: bool, retry_uncertain: bool) -> MomentRun
     };
     options.force = force;
     options.retry_uncertain = retry_uncertain;
+    options.allowed_models = if run.allowed_models.is_empty() {
+        vec![run.model.clone()]
+    } else {
+        run.allowed_models.clone()
+    };
+    options.allow_fallback = !run.no_fallback && options.allowed_models.len() > 1;
     options
+}
+
+fn policy_request(run: &MomentRunArgs, asset_ids: Vec<String>) -> Result<RunPolicyRequest> {
+    let payload = match run.payload.as_str() {
+        "frames-and-transcript" => AnalysisPayload::FramesAndTranscript,
+        "frames" => AnalysisPayload::Frames,
+        other => anyhow::bail!("invalid input: unsupported moment payload {other}"),
+    };
+    let allowed_models = if run.allowed_models.is_empty() {
+        vec![run.model.clone()]
+    } else {
+        run.allowed_models.clone()
+    };
+    let allow_fallback = !run.no_fallback && allowed_models.len() > 1;
+    Ok(RunPolicyRequest {
+        project_id: run.project.clone(),
+        asset_ids,
+        provider: run.provider.clone(),
+        primary_model: run.model.clone(),
+        allowed_models,
+        allow_fallback,
+        payload,
+        include_project_vocabulary: false,
+        budget_usd: run.budget_usd,
+        parameters: RunPolicyParameters::MomentDiscovery {
+            coarse_frames_per_asset: run.coarse_frames,
+            refinement_frames_per_asset: run.refinement_frames,
+            max_candidates_per_asset: run.max_candidates,
+            profile: EditProfile {
+                select_min_ms: run.select_min_ms,
+                select_max_ms: run.select_max_ms,
+                hold_min_ms: run.hold_min_ms,
+                hold_max_ms: run.hold_max_ms,
+            },
+            force: false,
+            retry_uncertain: false,
+        },
+    })
 }
 
 pub fn default_options(
@@ -153,6 +228,7 @@ pub fn default_options(
     budget_usd: f64,
 ) -> MomentRunOptions {
     MomentRunOptions {
+        allowed_models: vec![model.clone()],
         model,
         provider,
         payload: match payload {
@@ -166,6 +242,8 @@ pub fn default_options(
         profile: EditProfile::default(),
         force: false,
         retry_uncertain: false,
+        allow_fallback: false,
+        policy_id: None,
     }
 }
 
@@ -180,9 +258,56 @@ pub fn execute(catalog: &Catalog, command: &MomentCommand) -> Result<Value> {
                 &options,
             )?)?)
         }
+        MomentCommand::Authorize(run) => {
+            let ids = scope(catalog, run)?;
+            let request = policy_request(run, ids)?;
+            Ok(serde_json::to_value(
+                catalog.authorize_run_policy(&request)?,
+            )?)
+        }
+        MomentCommand::Pilot(run) => {
+            let ids = scope(catalog, run)?;
+            let request = policy_request(run, ids)?;
+            Ok(serde_json::to_value(
+                catalog.run_run_policy_pilot(&request, run.retry_uncertain)?,
+            )?)
+        }
+        MomentCommand::Run(args) => {
+            catalog
+                .authorized_policy_for_bulk(&args.policy_id, AnalysisRunKind::MomentDiscovery)?;
+            ensure!(
+                rcdvlog_core::api_credential_present(),
+                "OpenRouter credentials are not available; no moment request was made"
+            );
+            let provider = rcdvlog_core::OpenRouterProvider::new(rcdvlog_core::resolve_api_key()?)?;
+            ensure!(
+                !args.force && !args.retry_uncertain,
+                "force and uncertain-request recovery are bound by the authorized policy; change the policy instead"
+            );
+            Ok(serde_json::to_value(
+                catalog.discover_authorized_moments_with_provider(
+                    &args.policy_id,
+                    &provider,
+                    |progress| {
+                        eprintln!(
+                            "{}",
+                            json!({
+                                "event": "moments.run.progress",
+                                "runId": progress.run_id,
+                                "assetId": progress.asset_id,
+                                "phase": progress.phase,
+                                "costUsd": progress.cost_usd,
+                                "estimate": progress.estimate,
+                            })
+                        );
+                        ControlFlow::Continue(())
+                    },
+                )?,
+            )?)
+        }
         MomentCommand::Discover(args) => {
             let ids = scope(catalog, &args.run)?;
-            let options = options(&args.run, args.force, args.retry_uncertain);
+            let options = options(&args.run, args.force, args.run.retry_uncertain);
             Ok(serde_json::to_value(catalog.discover_moments_for_assets(
                 &args.run.project,
                 &ids,

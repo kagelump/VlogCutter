@@ -16,6 +16,7 @@ pub mod moments;
 pub mod openrouter;
 pub mod provider;
 pub mod quality;
+pub mod run_policy;
 pub mod schema;
 pub mod store;
 pub mod stt;

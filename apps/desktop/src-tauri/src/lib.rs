@@ -2183,6 +2183,10 @@ async fn analyze_project(
                 primary_model: request.primary_model.clone(),
                 allowed_models: request.allowed_models.clone(),
                 allow_fallback: request.allow_fallback,
+                selected_assets: None,
+                payload: None,
+                include_project_vocabulary: true,
+                policy_id: None,
             };
             let mut spent = 0.0;
             analysis = catalog.analyze_missing_with_options(&project_id, &options, |progress| {
