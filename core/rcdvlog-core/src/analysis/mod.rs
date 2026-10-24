@@ -5,6 +5,7 @@
 //! source is idempotent, and a changed recipe makes stored results detectably
 //! stale rather than silently mixed.
 
+pub mod accounting;
 pub mod audio;
 pub mod chronology_suggestions;
 pub mod consolidate;

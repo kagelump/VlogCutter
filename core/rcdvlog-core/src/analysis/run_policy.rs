@@ -1043,10 +1043,20 @@ impl Catalog {
         let policy_json = serde_json::to_string(&policy)?;
         let authorized_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
         self.connection()?.execute(
-            "INSERT INTO analysis_run_authorizations(policy_id,project_id,policy_json,authorized_at)
-             VALUES (?1,?2,?3,?4)
-             ON CONFLICT(policy_id) DO NOTHING",
-            params![policy.policy_id, policy.project_id, policy_json, authorized_at],
+            "INSERT INTO analysis_run_authorizations(
+                policy_id,project_id,policy_json,authorized_at,accounting_contract)
+             VALUES (?1,?2,?3,?4,?5)
+             ON CONFLICT(policy_id) DO UPDATE SET
+                policy_json=excluded.policy_json,
+                authorized_at=excluded.authorized_at,
+                accounting_contract=excluded.accounting_contract",
+            params![
+                policy.policy_id,
+                policy.project_id,
+                policy_json,
+                authorized_at,
+                crate::analysis::accounting::ANALYSIS_ACCOUNTING_SCHEMA_VERSION
+            ],
         )?;
         self.load_run_authorization(&policy.policy_id)
     }

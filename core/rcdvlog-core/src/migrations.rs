@@ -7,7 +7,7 @@ use thiserror::Error;
 
 use crate::chronology::forward_migrate_project_chronology;
 
-pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 37;
+pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 38;
 
 const MIGRATION_TABLE_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -306,6 +306,12 @@ pub const PROJECT_CATALOG_MIGRATIONS: &[SqliteMigration] = &[
         source_identity: "project-catalog/0037-analysis-run-policy-provenance/20261024",
         apply: add_analysis_run_policy_provenance,
     },
+    SqliteMigration {
+        id: 38,
+        name: "analysis_request_accounting",
+        source_identity: "project-catalog/0038-analysis-request-accounting/20261025",
+        apply: add_analysis_request_accounting,
+    },
 ];
 
 /// Migration 36. Separate terminal transcript outcomes that older schemas had
@@ -469,6 +475,188 @@ fn add_analysis_run_policy_provenance(transaction: &Transaction<'_>) -> Result<(
         transaction,
         "analysis_runs",
         "policy_id",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    Ok(())
+}
+
+/// Migration 38. Durable paid-request admission and future receipt
+/// reconciliation.
+///
+/// One authority per canonical project/policy (or project/operation) scope
+/// freezes the requested ceiling and any pre-ledger evidence. Reservations,
+/// append-only lifecycle events and immutable provider receipts are child rows
+/// in the same project catalog, so a conservative reservation can never be
+/// mistaken for a confirmed provider charge.
+///
+/// Authorizations created before this migration receive an empty
+/// `accounting_contract`; admission refuses them until explicitly re-authorized.
+/// Re-authorization updates the contract in place but never edits or removes a
+/// frozen authority, so prior known/unknown spending stays protected.
+fn add_analysis_request_accounting(transaction: &Transaction<'_>) -> Result<()> {
+    transaction.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS analysis_budget_authorities (
+            budget_scope_id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            policy_id TEXT NOT NULL DEFAULT '',
+            policy_fingerprint TEXT NOT NULL DEFAULT '',
+            requested_provider TEXT NOT NULL DEFAULT '',
+            budget_usd REAL NOT NULL CHECK(budget_usd > 0.0),
+            legacy_confirmed_cost_usd REAL NOT NULL DEFAULT 0.0
+                CHECK(legacy_confirmed_cost_usd >= 0.0),
+            legacy_uncertain_usage_reserve_usd REAL NOT NULL DEFAULT 0.0
+                CHECK(legacy_uncertain_usage_reserve_usd >= 0.0),
+            legacy_usage_complete INTEGER NOT NULL DEFAULT 1
+                CHECK(legacy_usage_complete IN (0,1)),
+            legacy_evidence_json TEXT NOT NULL DEFAULT '{}',
+            dispatch_stopped INTEGER NOT NULL DEFAULT 0
+                CHECK(dispatch_stopped IN (0,1)),
+            stop_reason TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS analysis_request_reservations (
+            request_key TEXT PRIMARY KEY,
+            budget_scope_id TEXT NOT NULL
+                REFERENCES analysis_budget_authorities(budget_scope_id) ON DELETE CASCADE,
+            project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            policy_id TEXT NOT NULL DEFAULT '',
+            run_id TEXT NOT NULL DEFAULT '',
+            operation TEXT NOT NULL,
+            attempt_base_key TEXT NOT NULL,
+            attempt_epoch INTEGER NOT NULL DEFAULT 0 CHECK(attempt_epoch >= 0),
+            requested_provider TEXT NOT NULL,
+            actual_provider TEXT,
+            requested_model TEXT NOT NULL,
+            actual_model TEXT,
+            provider_generation_id TEXT,
+            policy_fingerprint TEXT NOT NULL,
+            payload_fingerprint TEXT NOT NULL,
+            source_fingerprint TEXT NOT NULL DEFAULT '',
+            request_fingerprint TEXT NOT NULL,
+            cost_bound_fingerprint TEXT NOT NULL DEFAULT '',
+            cost_bound_json TEXT NOT NULL DEFAULT '{}',
+            lifecycle TEXT NOT NULL CHECK(lifecycle IN (
+                'reserved','dispatched','completed','uncertain','released'
+            )),
+            reserved_cost_usd REAL NOT NULL CHECK(reserved_cost_usd >= 0.0),
+            reported_cost_usd REAL,
+            confirmed_cost_usd REAL NOT NULL DEFAULT 0.0
+                CHECK(confirmed_cost_usd >= 0.0),
+            uncertain_cost_usd REAL NOT NULL DEFAULT 0.0
+                CHECK(uncertain_cost_usd >= 0.0),
+            failure_code TEXT NOT NULL DEFAULT '',
+            dispatch_at TEXT,
+            settled_at TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(attempt_base_key, attempt_epoch)
+        );
+        CREATE INDEX IF NOT EXISTS analysis_request_reservations_budget
+            ON analysis_request_reservations(budget_scope_id, lifecycle);
+        CREATE INDEX IF NOT EXISTS analysis_request_reservations_project
+            ON analysis_request_reservations(project_id, created_at DESC, request_key);
+        CREATE INDEX IF NOT EXISTS analysis_request_reservations_base
+            ON analysis_request_reservations(attempt_base_key, attempt_epoch DESC);
+
+        CREATE TABLE IF NOT EXISTS analysis_request_events (
+            event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            request_key TEXT NOT NULL
+                REFERENCES analysis_request_reservations(request_key) ON DELETE CASCADE,
+            event_kind TEXT NOT NULL,
+            detail_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS analysis_request_events_request
+            ON analysis_request_events(request_key, event_id);
+        CREATE TRIGGER IF NOT EXISTS analysis_request_events_append_only
+        BEFORE UPDATE ON analysis_request_events
+        BEGIN
+            SELECT RAISE(ABORT, 'analysis request events are append-only');
+        END;
+
+        CREATE TABLE IF NOT EXISTS analysis_provider_receipts (
+            receipt_key TEXT PRIMARY KEY,
+            request_key TEXT NOT NULL
+                REFERENCES analysis_request_reservations(request_key) ON DELETE CASCADE,
+            provider TEXT NOT NULL,
+            provider_generation_id TEXT NOT NULL DEFAULT '',
+            actual_model TEXT NOT NULL DEFAULT '',
+            reported_cost_usd REAL,
+            prompt_tokens INTEGER,
+            completion_tokens INTEGER,
+            usage_complete INTEGER NOT NULL CHECK(usage_complete IN (0,1)),
+            receipt_fingerprint TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS analysis_provider_receipts_generation
+            ON analysis_provider_receipts(provider, provider_generation_id)
+            WHERE provider <> '' AND provider_generation_id <> '';
+        CREATE INDEX IF NOT EXISTS analysis_provider_receipts_request
+            ON analysis_provider_receipts(request_key, created_at, receipt_key);
+        CREATE TRIGGER IF NOT EXISTS analysis_provider_receipts_append_only
+        BEFORE UPDATE ON analysis_provider_receipts
+        BEGIN
+            SELECT RAISE(ABORT, 'analysis provider receipts are append-only');
+        END;
+
+        -- Retain audit rows while the owning project exists. Parent cascades
+        -- are allowed after project/request removal so normal project deletion
+        -- still owns cleanup; individual history rows cannot be erased.
+        CREATE TRIGGER IF NOT EXISTS analysis_request_events_no_direct_delete
+        BEFORE DELETE ON analysis_request_events
+        WHEN EXISTS(SELECT 1 FROM analysis_request_reservations
+                    WHERE request_key=OLD.request_key)
+        BEGIN
+            SELECT RAISE(ABORT, 'analysis request events are append-only');
+        END;
+        CREATE TRIGGER IF NOT EXISTS analysis_provider_receipts_no_direct_delete
+        BEFORE DELETE ON analysis_provider_receipts
+        WHEN EXISTS(SELECT 1 FROM analysis_request_reservations
+                    WHERE request_key=OLD.request_key)
+        BEGIN
+            SELECT RAISE(ABORT, 'analysis provider receipts are append-only');
+        END;
+        CREATE TRIGGER IF NOT EXISTS analysis_requests_no_direct_delete
+        BEFORE DELETE ON analysis_request_reservations
+        WHEN EXISTS(SELECT 1 FROM projects WHERE id=OLD.project_id)
+        BEGIN
+            SELECT RAISE(ABORT, 'analysis request history cannot be deleted directly');
+        END;
+        CREATE TRIGGER IF NOT EXISTS analysis_authorities_no_direct_delete
+        BEFORE DELETE ON analysis_budget_authorities
+        WHEN EXISTS(SELECT 1 FROM projects WHERE id=OLD.project_id)
+        BEGIN
+            SELECT RAISE(ABORT, 'analysis budget history cannot be deleted directly');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS analysis_budget_authorities_frozen_fields
+        BEFORE UPDATE ON analysis_budget_authorities
+        WHEN NEW.budget_scope_id IS NOT OLD.budget_scope_id
+          OR NEW.project_id IS NOT OLD.project_id
+          OR NEW.policy_id IS NOT OLD.policy_id
+          OR NEW.policy_fingerprint IS NOT OLD.policy_fingerprint
+          OR NEW.requested_provider IS NOT OLD.requested_provider
+          OR NEW.budget_usd != OLD.budget_usd
+          OR NEW.legacy_confirmed_cost_usd != OLD.legacy_confirmed_cost_usd
+          OR NEW.legacy_uncertain_usage_reserve_usd != OLD.legacy_uncertain_usage_reserve_usd
+          OR NEW.legacy_usage_complete IS NOT OLD.legacy_usage_complete
+          OR NEW.legacy_evidence_json IS NOT OLD.legacy_evidence_json
+          OR NEW.created_at IS NOT OLD.created_at
+          OR (OLD.dispatch_stopped = 1 AND NEW.dispatch_stopped = 0)
+          OR (OLD.dispatch_stopped = 0 AND NEW.dispatch_stopped = 1
+              AND trim(NEW.stop_reason) = '')
+        BEGIN
+            SELECT RAISE(ABORT, 'analysis budget authority frozen fields are immutable');
+        END;
+        "#,
+    )?;
+    add_column_if_missing(
+        transaction,
+        "analysis_run_authorizations",
+        "accounting_contract",
         "TEXT NOT NULL DEFAULT ''",
     )?;
     Ok(())
