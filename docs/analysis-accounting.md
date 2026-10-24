@@ -421,3 +421,38 @@ potentially completed paid request. Any future adapter-specific batch helper
 that reaches a paid transmission without a real owned run id, source/payload
 identity and whole-authority context must be wired through this owner before it
 can be a supported paid path.
+
+## Native STT audio reservation contract (B1, not wired)
+
+B1 adds one optional `AnalysisAudioCostBound` component to the existing
+`AnalysisRequestCostBound`. It carries the actual bounded speech-window duration,
+the conservative full-window billable-seconds maximum, and the approved
+duration rate in USD/second. Native audio bounds use zero prompt, completion and
+image components; the existing canonical reservation table remains the only
+balance and continues to admit or deny the quote's whole `maximum_cost_usd`
+without clipping. A VLM quote omits the optional audio field during serialization,
+so prior VLM JSON and cost-bound fingerprints are byte-identical.
+
+`native_stt_request_cost_bound` is owner-local to the verified OpenRouter STT
+registry. It accepts only validated `NativeSttRequest`/`NativeSttAudioWindow`
+values and reserves the full registered 30-second window at the approved
+external-tariff ceiling, including when the actual speech window is shorter.
+The deterministic contract identity binds the registered provider, model,
+endpoint, window limit, integer micro-USD/second ceiling and billing semantics;
+route, window or rate drift therefore invalidates an old approval.
+
+The native STT endpoint does not enforce `provider.max_price`, `order`, `only`
+or `ignore`. This quote is an admission reservation, not a hard invoice cap and
+not a provider charge. A tariff drift or external invoice above the reservation
+remains an external fact: existing receipt settlement records it, retains unknown
+usage and stops the authority. No new billing account, price cap, ledger or
+provider retry path is introduced here.
+
+`analysis_native_stt_payload_fingerprint` hashes the exact output of the
+existing validated native request-body builder, the registered endpoint/model,
+and the complete packed-window source mapping. Raw base64 WAV remains transient
+hash input only; persisted request rows carry only the bounded content-free
+digest. Changed audio, language, model/provider policy, temperature, endpoint or
+window mapping changes the fingerprint. Production cloud selection, dispatch,
+CLI/desktop wiring and native retry recovery remain intentionally disconnected
+in this slice.

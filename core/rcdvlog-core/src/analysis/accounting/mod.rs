@@ -29,9 +29,10 @@ pub use model::{
     LABEL_CONSOLIDATION_OPERATION, LEGACY_UNKNOWN_USAGE_STOP_REASON,
     MAX_IN_FLIGHT_REQUESTS_PER_BUDGET_AUTHORITY, MAX_PROVIDER_RECEIPT_EVIDENCE_BYTES,
     MAX_REQUEST_ATTEMPTS, MAX_TARGETED_RETRY_PAYLOAD_BYTES, ProviderReceiptEvidence,
-    UNTRACKED_POST_INITIALIZATION_USAGE_STOP_REASON, analysis_operation_budget_scope_id,
-    analysis_policy_budget_scope_id, analysis_request_cost_bound_fingerprint,
-    analysis_request_payload_fingerprint, bounded_failure_code,
+    UNTRACKED_POST_INITIALIZATION_USAGE_STOP_REASON, analysis_native_stt_payload_fingerprint,
+    analysis_operation_budget_scope_id, analysis_policy_budget_scope_id,
+    analysis_request_cost_bound_fingerprint, analysis_request_payload_fingerprint,
+    bounded_failure_code,
 };
 pub(crate) use operation::{
     begin_accounted_operation, operation_intended_attempt_key, operation_policy_fingerprint,

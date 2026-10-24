@@ -87,10 +87,10 @@ pub use analysis::accounting::{
     MAX_IN_FLIGHT_REQUESTS_PER_BUDGET_AUTHORITY, MAX_PROVIDER_RECEIPT_EVIDENCE_BYTES,
     MAX_REQUEST_ATTEMPTS, MAX_TARGETED_RETRY_PAYLOAD_BYTES, ProviderReceiptEvidence,
     TargetedAnalysisRetryProviderResponse, TargetedAnalysisRetryReport,
-    UNTRACKED_POST_INITIALIZATION_USAGE_STOP_REASON, analysis_operation_budget_scope_id,
-    analysis_policy_budget_scope_id, analysis_request_cost_bound_fingerprint,
-    analysis_request_payload_fingerprint, bounded_failure_code,
-    read_provider_receipt_evidence_file, read_targeted_retry_payload_file,
+    UNTRACKED_POST_INITIALIZATION_USAGE_STOP_REASON, analysis_native_stt_payload_fingerprint,
+    analysis_operation_budget_scope_id, analysis_policy_budget_scope_id,
+    analysis_request_cost_bound_fingerprint, analysis_request_payload_fingerprint,
+    bounded_failure_code, read_provider_receipt_evidence_file, read_targeted_retry_payload_file,
 };
 pub use analysis::chronology_suggestions::{
     ChronologyEvidenceRequest, ChronologySuggestion, EvidenceFrame, PairMatch,
@@ -105,21 +105,22 @@ pub use analysis::openrouter::{
     openrouter_request_cost_bound, resolve_api_key,
 };
 pub use analysis::openrouter_stt::{
-    MAX_NATIVE_STT_RESPONSE_BYTES, NATIVE_STT_MODELS, NATIVE_STT_REQUEST_TIMEOUT,
-    NativeSttAudioWindow, NativeSttCallResult, NativeSttClientError, NativeSttCost,
-    NativeSttModelSpec, NativeSttOutcome, NativeSttProtocolError, NativeSttProviderPolicy,
-    NativeSttReceipt, NativeSttRequest, NativeSttSegment, NativeSttTranscript, NativeSttUsage,
-    NativeSttWord, OPENROUTER_STT_ENDPOINT, OPENROUTER_STT_PROVIDER, OPENROUTER_WHISPER_MODEL,
-    OpenRouterSttClient, ResolvedSpeechBackend, SpeechBackendSelection, SttDataCollection,
-    build_native_stt_request_body, decode_native_stt_body, decode_native_stt_value,
-    parse_native_stt_receipt, plan_native_stt_audio_windows, resolve_native_stt_model,
-    resolve_speech_backend, seconds_to_window_ms, validate_iso639_1,
+    MAX_NATIVE_STT_RESPONSE_BYTES, NATIVE_STT_COST_BOUND_CONTRACT_VERSION, NATIVE_STT_MODELS,
+    NATIVE_STT_REQUEST_TIMEOUT, NativeSttAudioWindow, NativeSttCallResult, NativeSttClientError,
+    NativeSttCost, NativeSttModelSpec, NativeSttOutcome, NativeSttProtocolError,
+    NativeSttProviderPolicy, NativeSttReceipt, NativeSttRequest, NativeSttSegment,
+    NativeSttTranscript, NativeSttUsage, NativeSttWord, OPENROUTER_STT_ENDPOINT,
+    OPENROUTER_STT_PROVIDER, OPENROUTER_WHISPER_MODEL, OpenRouterSttClient, ResolvedSpeechBackend,
+    SpeechBackendSelection, SttDataCollection, build_native_stt_request_body,
+    decode_native_stt_body, decode_native_stt_value, native_stt_cost_bound_contract_id,
+    native_stt_request_cost_bound, parse_native_stt_receipt, plan_native_stt_audio_windows,
+    resolve_native_stt_model, resolve_speech_backend, seconds_to_window_ms, validate_iso639_1,
 };
 pub use analysis::provider::{
-    ANALYSIS_COST_BOUND_CONTRACT_VERSION, AnalysisRequestCostBound, ChainOutcome, DEFAULT_MODEL,
-    FALLBACK_MODEL, MODELS, ModelSpec, OPENROUTER_MAX_OUTPUT_TOKENS, ProviderChain,
-    ProviderFailure, ProviderFailureCategory, VlmProvider, VlmReceipt, VlmRequest, VlmResponse,
-    analysis_cost_bound_contract_id, model_spec,
+    ANALYSIS_COST_BOUND_CONTRACT_VERSION, AnalysisAudioCostBound, AnalysisRequestCostBound,
+    ChainOutcome, DEFAULT_MODEL, FALLBACK_MODEL, MODELS, ModelSpec, OPENROUTER_MAX_OUTPUT_TOKENS,
+    ProviderChain, ProviderFailure, ProviderFailureCategory, VlmProvider, VlmReceipt, VlmRequest,
+    VlmResponse, analysis_cost_bound_contract_id, model_spec,
 };
 pub use analysis::run_policy::{
     AnalysisPayload, AnalysisRunKind, AuthorizedPolicyState, CapabilityCheck, CapabilityStatus,

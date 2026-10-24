@@ -231,6 +231,59 @@ fn request_body_uses_raw_base64_wav_native_fields_and_no_chat_contract() {
 }
 
 #[test]
+fn native_quote_reserves_full_registered_window_without_fake_chat_components() {
+    let request = request();
+    let audio = audio_window();
+    assert_eq!(audio.duration_ms(), 1_000);
+    let bound = native_stt_request_cost_bound(&request, &audio).unwrap();
+    bound.validate().unwrap();
+
+    let audio_bound = bound.audio.as_ref().expect("native audio component");
+    assert_eq!(audio_bound.input_duration_ms, 1_000);
+    assert_eq!(audio_bound.billable_seconds_max, 30);
+    assert!((audio_bound.duration_price_usd_per_second - 0.0001).abs() < f64::EPSILON);
+    assert!((bound.maximum_cost_usd - 0.003).abs() < 1e-15);
+    assert_eq!(bound.prompt_tokens_max, 0);
+    assert_eq!(bound.completion_tokens_max, 0);
+    assert_eq!(bound.image_count, 0);
+    assert_eq!(bound.prompt_price_usd_per_million, 0.0);
+    assert_eq!(bound.completion_price_usd_per_million, 0.0);
+    assert_eq!(bound.image_price_usd_each, 0.0);
+    assert_eq!(bound.request_price_usd_each, 0.0);
+    assert_eq!(bound.contract_version, native_stt_cost_bound_contract_id());
+    let assumptions = bound.assumptions.join("\n").to_lowercase();
+    assert!(assumptions.contains("does not enforce provider.max_price"));
+    assert!(assumptions.contains("external invoice"));
+    assert!(assumptions.contains("unknown usage"));
+
+    let body = build_native_stt_request_body(&request, &audio).unwrap();
+    assert!(body["provider"].get("max_price").is_none());
+}
+
+#[test]
+fn native_cost_contract_identity_tracks_exact_endpoint_window_and_tariff() {
+    let stable = native_stt_cost_bound_contract_id();
+    assert_eq!(stable, native_stt_cost_bound_contract_id());
+    assert!(stable.starts_with(NATIVE_STT_COST_BOUND_CONTRACT_VERSION));
+
+    let mut changed = NATIVE_STT_MODELS.to_vec();
+    changed[0].duration_price_micro_usd_per_second += 1;
+    assert_ne!(native_stt_cost_bound_contract_id_for(&changed), stable);
+
+    let mut changed = NATIVE_STT_MODELS.to_vec();
+    changed[0].max_window_ms += 1;
+    assert_ne!(native_stt_cost_bound_contract_id_for(&changed), stable);
+
+    let mut changed = NATIVE_STT_MODELS.to_vec();
+    changed[0].endpoint = "https://openrouter.ai/api/v1/audio/transcriptions-v2";
+    assert_ne!(native_stt_cost_bound_contract_id_for(&changed), stable);
+
+    let mut changed = NATIVE_STT_MODELS.to_vec();
+    changed[0].model = "openai/whisper-2";
+    assert_ne!(native_stt_cost_bound_contract_id_for(&changed), stable);
+}
+
+#[test]
 fn planning_silence_returns_no_bounded_audio_and_makes_no_provider_request() {
     let pcm = vec![0.0_f32; 16_000];
     let mut provider_request_count = 0_u32;

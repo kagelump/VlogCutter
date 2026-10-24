@@ -8,6 +8,9 @@ use anyhow::{Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::analysis::openrouter_stt::{
+    NativeSttAudioWindow, NativeSttRequest, build_native_stt_request_body, resolve_native_stt_model,
+};
 use crate::analysis::provider::{AnalysisRequestCostBound, VlmRequest, VlmResponse};
 
 pub const ANALYSIS_ACCOUNTING_SCHEMA_VERSION: &str = "analysis.accounting.v1";
@@ -655,6 +658,49 @@ pub fn analysis_request_payload_fingerprint(model: &str, request: &VlmRequest) -
         parts.push(frame.as_bytes());
     }
     Ok(digest_bytes(&parts))
+}
+
+/// Digest of a validated native audio request. The exact wire body (including
+/// transient raw base64 WAV) and the packed-window source mapping are hash input
+/// only; only the returned content-free digest may be persisted. The domain is
+/// intentionally separate from the VLM payload fingerprint domain.
+pub fn analysis_native_stt_payload_fingerprint(
+    request: &NativeSttRequest,
+    audio: &NativeSttAudioWindow,
+) -> Result<String> {
+    let spec = resolve_native_stt_model(request.provider(), request.model())?;
+    let body = build_native_stt_request_body(request, audio)?;
+    let body_bytes = serde_json::to_vec(&body)?;
+    let source_mapping: Vec<(u32, u32, u32)> = audio
+        .window()
+        .regions
+        .iter()
+        .map(|region| {
+            (
+                region.window_offset_ms,
+                region.source_start_ms,
+                region.duration_ms,
+            )
+        })
+        .collect();
+    let source_mapping_bytes = serde_json::to_vec(&source_mapping)?;
+
+    let mut hasher = blake3::Hasher::new();
+    let add = |hasher: &mut blake3::Hasher, bytes: &[u8]| {
+        hasher.update(&(bytes.len() as u64).to_le_bytes());
+        hasher.update(bytes);
+    };
+    add(
+        &mut hasher,
+        b"rcdvlog-native-stt-request-payload-admission-v1\0",
+    );
+    add(&mut hasher, b"POST");
+    add(&mut hasher, request.provider().as_bytes());
+    add(&mut hasher, request.model().as_bytes());
+    add(&mut hasher, spec.endpoint.as_bytes());
+    add(&mut hasher, &body_bytes);
+    add(&mut hasher, &source_mapping_bytes);
+    Ok(hasher.finalize().to_hex().to_string())
 }
 
 /// Digest of the complete provider-owned cost-bound contract. It participates

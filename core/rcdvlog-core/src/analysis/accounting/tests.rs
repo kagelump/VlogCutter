@@ -12,6 +12,11 @@ use serde_json::json;
 use tempfile::tempdir;
 
 use super::*;
+use crate::analysis::openrouter_stt::{
+    NativeSttAudioWindow, NativeSttProviderPolicy, NativeSttRequest, OPENROUTER_STT_PROVIDER,
+    OPENROUTER_WHISPER_MODEL, SttDataCollection, build_native_stt_request_body,
+    native_stt_request_cost_bound,
+};
 use crate::analysis::provider::{
     AnalysisRequestCostBound, DEFAULT_MODEL, FALLBACK_MODEL, ProviderChain, ProviderFailure,
     ProviderFailureCategory, VlmProvider, VlmReceipt, VlmRequest, VlmResponse,
@@ -21,6 +26,7 @@ use crate::analysis::run_policy::{
     AnalysisPayload, RunAssetScope, RunPolicy, RunPolicyContext, RunPolicyParameters,
     RunPolicyReadiness,
 };
+use crate::analysis::windows::{SpeechRegion, pack_windows};
 use crate::{AnalysisRunKind, Catalog};
 
 fn fixture() -> (tempfile::TempDir, Catalog, String) {
@@ -108,6 +114,40 @@ fn policy_context(
 
 fn bound(maximum_cost_usd: f64) -> AnalysisRequestCostBound {
     AnalysisRequestCostBound::declared_for_synthetic_transport(maximum_cost_usd)
+}
+
+fn native_request(
+    language: &str,
+    temperature: f64,
+    data_collection: SttDataCollection,
+) -> NativeSttRequest {
+    NativeSttRequest::new(
+        OPENROUTER_STT_PROVIDER,
+        OPENROUTER_WHISPER_MODEL,
+        Some(language.to_string()),
+        temperature,
+        NativeSttProviderPolicy::new(true, data_collection),
+    )
+    .unwrap()
+}
+
+fn native_audio_window(
+    sample_value: f32,
+    source_start_ms: u32,
+    duration_ms: u32,
+) -> NativeSttAudioWindow {
+    let source_end_ms = source_start_ms.checked_add(duration_ms).unwrap();
+    let pcm = vec![sample_value; source_end_ms as usize * 16];
+    let window = pack_windows(&[SpeechRegion {
+        start_ms: source_start_ms,
+        end_ms: source_end_ms,
+    }])
+    .remove(0);
+    NativeSttAudioWindow::from_pcm(&pcm, &window).unwrap()
+}
+
+fn legacy_native_absent_bound_json() -> &'static str {
+    r#"{"maximumCostUsd":0.01,"contractVersion":"synthetic.transport-declared.v1","promptTokensMax":1,"completionTokensMax":1,"imageCount":0,"promptPriceUsdPerMillion":0.0,"completionPriceUsdPerMillion":0.0,"imagePriceUsdEach":0.0,"requestPriceUsdEach":0.01,"assumptions":["synthetic transport declares a deterministic test-only bound"]}"#
 }
 
 fn receipt(
@@ -4486,4 +4526,186 @@ fn production_targeted_retry_rejects_non_openrouter_route_before_credentials_or_
         1,
         "route rejection happens before a new paid run or epoch"
     );
+}
+
+#[test]
+fn legacy_native_absent_request_roundtrips_and_remains_reconcilable() {
+    let (_directory, catalog, project) = fixture();
+    catalog
+        .initialize_analysis_accounting_authority(&operation_authority(
+            &project,
+            "legacy-native-absent",
+            0.02,
+        ))
+        .unwrap();
+    let legacy_json = legacy_native_absent_bound_json();
+    let legacy_bound: AnalysisRequestCostBound = serde_json::from_str(legacy_json).unwrap();
+    assert_eq!(legacy_bound.audio, None);
+    assert_eq!(serde_json::to_string(&legacy_bound).unwrap(), legacy_json);
+    let legacy_fingerprint = analysis_request_cost_bound_fingerprint(&legacy_bound).unwrap();
+    assert_eq!(
+        legacy_fingerprint,
+        blake3::hash(legacy_json.as_bytes()).to_hex().to_string()
+    );
+
+    let context = operation_context(&project, "legacy-native-absent", "legacy-intent", 0.02);
+    let record = catalog
+        .reserve_analysis_request(
+            &context,
+            DEFAULT_MODEL,
+            "legacy-payload-fingerprint",
+            &legacy_bound,
+        )
+        .unwrap();
+    catalog
+        .mark_analysis_request_dispatched(&record.request_key)
+        .unwrap();
+    let reconciled = catalog
+        .reconcile_analysis_request(
+            &record.request_key,
+            &AnalysisRequestReconciliation::UncertainOutcome {
+                failure_code: "provider_error:transport".into(),
+            },
+        )
+        .unwrap();
+    assert_eq!(reconciled.lifecycle, AnalysisRequestLifecycle::Uncertain);
+    assert!(reconciled.cost_bound.as_ref().unwrap().audio.is_none());
+    assert!((reconciled.uncertain_usage_reserve_usd - 0.01).abs() < 1e-12);
+    let inspected = catalog
+        .analysis_request(&record.request_key)
+        .unwrap()
+        .unwrap();
+    let inspected_json = serde_json::to_string(&inspected).unwrap();
+    assert!(!inspected_json.contains("\"audio\":null"));
+    assert_eq!(inspected.cost_bound_fingerprint, legacy_fingerprint);
+}
+
+#[test]
+fn native_payload_fingerprint_is_deterministic_content_free_and_field_sensitive() {
+    let request = native_request("en", 0.0, SttDataCollection::Deny);
+    let audio = native_audio_window(0.25, 100, 1_000);
+    let fingerprint = analysis_native_stt_payload_fingerprint(&request, &audio).unwrap();
+    assert_eq!(
+        fingerprint,
+        analysis_native_stt_payload_fingerprint(&request, &audio).unwrap()
+    );
+    assert_eq!(fingerprint.len(), 64);
+    assert!(fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit()));
+
+    let changed_audio = native_audio_window(0.5, 100, 1_000);
+    assert_ne!(
+        fingerprint,
+        analysis_native_stt_payload_fingerprint(&request, &changed_audio).unwrap()
+    );
+
+    // Same constant PCM and duration, but a different source mapping. The WAV
+    // bytes are identical while the clip-time origin changed, so only the
+    // source-map part of the fingerprint can detect this.
+    let remapped = native_audio_window(0.25, 200, 1_000);
+    assert_eq!(audio.wav_bytes(), remapped.wav_bytes());
+    assert_ne!(
+        fingerprint,
+        analysis_native_stt_payload_fingerprint(&request, &remapped).unwrap()
+    );
+
+    let changed_language = native_request("fr", 0.0, SttDataCollection::Deny);
+    assert_ne!(
+        fingerprint,
+        analysis_native_stt_payload_fingerprint(&changed_language, &audio).unwrap()
+    );
+
+    let changed_temperature = native_request("en", 0.5, SttDataCollection::Deny);
+    assert_ne!(
+        fingerprint,
+        analysis_native_stt_payload_fingerprint(&changed_temperature, &audio).unwrap()
+    );
+
+    let changed_policy = native_request("en", 0.0, SttDataCollection::Allow);
+    assert_ne!(
+        fingerprint,
+        analysis_native_stt_payload_fingerprint(&changed_policy, &audio).unwrap()
+    );
+
+    let body = build_native_stt_request_body(&request, &audio).unwrap();
+    let encoded_audio = body["input_audio"]["data"].as_str().unwrap();
+    assert!(!fingerprint.contains(encoded_audio));
+}
+
+#[test]
+fn native_audio_bound_fits_the_existing_ledger_and_race_denies_without_clipping() {
+    let (directory, catalog, project) = fixture();
+    let request = native_request("en", 0.0, SttDataCollection::Deny);
+    let audio = native_audio_window(0.25, 100, 1_000);
+    let native_bound = native_stt_request_cost_bound(&request, &audio).unwrap();
+    assert!((native_bound.maximum_cost_usd - 0.003).abs() < 1e-15);
+    let payload_fingerprint = analysis_native_stt_payload_fingerprint(&request, &audio).unwrap();
+
+    // Exactly the full native reservation fits. The existing canonical ledger
+    // must accept it without clipping or inventing chat-token components.
+    catalog
+        .initialize_analysis_accounting_authority(&operation_authority(
+            &project,
+            "native-race",
+            native_bound.maximum_cost_usd,
+        ))
+        .unwrap();
+    let second_catalog = Catalog::open(directory.path().join("catalog.sqlite3")).unwrap();
+    let barrier = Arc::new(Barrier::new(2));
+    let mut handles = Vec::new();
+    for (index, runner) in [catalog.clone(), second_catalog].into_iter().enumerate() {
+        let barrier = Arc::clone(&barrier);
+        let project = project.clone();
+        let model = request.model().to_string();
+        let payload_fingerprint = payload_fingerprint.clone();
+        let native_bound = native_bound.clone();
+        handles.push(thread::spawn(move || {
+            let context = operation_context(
+                &project,
+                "native-race",
+                &format!("native-intent-{index}"),
+                native_bound.maximum_cost_usd,
+            );
+            barrier.wait();
+            runner.reserve_analysis_request(&context, &model, &payload_fingerprint, &native_bound)
+        }));
+    }
+    let results: Vec<_> = handles
+        .into_iter()
+        .map(|handle| handle.join().unwrap())
+        .collect();
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);
+    let denied = results
+        .iter()
+        .find_map(|result| result.as_ref().err())
+        .unwrap();
+    assert!(
+        denied.downcast_ref::<AnalysisBudgetExhausted>().is_some(),
+        "race loser must be denied by the shared budget, not an unrelated error: {denied:#}"
+    );
+    let reserved = results
+        .into_iter()
+        .find_map(Result::ok)
+        .expect("one full native reservation must fit");
+
+    assert!((reserved.reserved_cost_usd - 0.003).abs() < 1e-15);
+    let persisted_audio = reserved
+        .cost_bound
+        .as_ref()
+        .and_then(|bound| bound.audio.as_ref())
+        .expect("audio component persisted with the request");
+    assert_eq!(persisted_audio.input_duration_ms, 1_000);
+    assert_eq!(persisted_audio.billable_seconds_max, 30);
+    let scope = analysis_operation_budget_scope_id(&project, "native-race");
+    let snapshot = catalog.analysis_budget_snapshot(&scope).unwrap().unwrap();
+    assert!((snapshot.active_reserved_cost_usd - 0.003).abs() < 1e-15);
+    assert_eq!(snapshot.active_requests, 1);
+
+    let body = build_native_stt_request_body(&request, &audio).unwrap();
+    let encoded_audio = body["input_audio"]["data"].as_str().unwrap();
+    let record_json = serde_json::to_string(&reserved).unwrap();
+    assert!(!record_json.contains(encoded_audio));
+    assert!(!record_json.contains("input_audio"));
+    assert_eq!(reserved.payload_fingerprint, payload_fingerprint);
+    assert_eq!(reserved.payload_fingerprint.len(), 64);
 }

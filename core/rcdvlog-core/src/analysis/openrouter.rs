@@ -134,6 +134,7 @@ pub fn openrouter_request_cost_bound(
         completion_price_usd_per_million: spec.completion_price_usd_per_million,
         image_price_usd_each: spec.image_price_usd_each,
         request_price_usd_each: spec.request_price_usd_each,
+        audio: None,
         assumptions: vec![
             "prompt tokens cannot exceed the registered model context window".into(),
             "completion tokens are capped by the exact request max_tokens and the registered model completion limit".into(),
