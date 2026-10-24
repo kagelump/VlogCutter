@@ -68,14 +68,39 @@ pub fn analysis_cost_bound_contract_id() -> String {
     analysis_cost_bound_contract_id_for(MODELS)
 }
 
-/// A conservative upper bound for one actual provider transmission.
+/// Conservative duration-based component for a native audio-transcription
+/// admission. The provider route is billed by audio duration rather than chat
+/// tokens or images, so those fields stay zero in the enclosing bound.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnalysisAudioCostBound {
+    /// Duration of the actual bounded speech window sent to the provider.
+    pub input_duration_ms: u32,
+    /// Full registered audio window billed by the conservative reservation.
+    pub billable_seconds_max: u32,
+    /// Approved external-tariff ceiling in USD per second. This is a
+    /// reservation input, never a provider-enforced invoice cap.
+    pub duration_price_usd_per_second: f64,
+}
+
+impl AnalysisAudioCostBound {
+    pub(crate) fn computed_maximum_cost_usd(&self) -> Result<f64> {
+        let computed = self.billable_seconds_max as f64 * self.duration_price_usd_per_second;
+        anyhow::ensure!(
+            computed.is_finite(),
+            "analysis audio cost bound computation must be finite"
+        );
+        Ok(computed)
+    }
+}
+
+/// A conservative admission reservation for one provider transmission.
 ///
-/// This is an admission reservation, not a provider charge. Production
-/// transports derive it from enforceable wire caps (OpenRouter
-/// `provider.max_price`), the registered model context window and the exact
-/// `max_tokens`; synthetic transports may declare a deterministic test-only
-/// bound. The fields stay explicit so reports can distinguish the bound from
-/// returned/confirmed/uncertain usage.
+/// VLM quotes bind provider routing caps, context limits and exact output-token
+/// limits. Native audio quotes bind an explicitly documented external duration
+/// tariff; that tariff is not enforced by a wire price cap. Neither type is a
+/// confirmed provider charge. Missing audio stays omitted to preserve the
+/// serialized identity of historical VLM quotes.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AnalysisRequestCostBound {
@@ -88,6 +113,10 @@ pub struct AnalysisRequestCostBound {
     pub completion_price_usd_per_million: f64,
     pub image_price_usd_each: f64,
     pub request_price_usd_each: f64,
+    /// Native audio duration component. Omitted for every existing chat/VLM
+    /// quote so prior serialized bounds and fingerprints remain byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio: Option<AnalysisAudioCostBound>,
     pub assumptions: Vec<String>,
 }
 
@@ -106,6 +135,7 @@ impl AnalysisRequestCostBound {
             completion_price_usd_per_million: 0.0,
             image_price_usd_each: 0.0,
             request_price_usd_each: maximum_cost_usd,
+            audio: None,
             assumptions: vec![
                 "synthetic transport declares a deterministic test-only bound".into(),
             ],
@@ -116,6 +146,14 @@ impl AnalysisRequestCostBound {
     /// a persisted maximum from drifting away from the numeric policy that was
     /// approved and sent on the wire.
     pub(crate) fn computed_maximum_cost_usd(&self) -> Result<f64> {
+        if let Some(audio) = &self.audio {
+            let computed = audio.computed_maximum_cost_usd()? + self.request_price_usd_each;
+            anyhow::ensure!(
+                computed.is_finite(),
+                "analysis request cost bound computation must be finite"
+            );
+            return Ok(computed);
+        }
         let prompt =
             self.prompt_tokens_max as f64 * self.prompt_price_usd_per_million / 1_000_000.0;
         let completion =
@@ -130,6 +168,20 @@ impl AnalysisRequestCostBound {
     }
 
     pub fn validate(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.maximum_cost_usd.is_finite() && self.maximum_cost_usd > 0.0,
+            "analysis request cost bound must be finite and greater than zero"
+        );
+        anyhow::ensure!(
+            !self.contract_version.trim().is_empty(),
+            "analysis request cost bound contract version is required"
+        );
+        if let Some(audio) = &self.audio {
+            return self.validate_audio_bound(audio);
+        }
+
+        // Existing chat/VLM validation remains strict and unchanged when no
+        // native audio component is present.
         let components = [
             self.maximum_cost_usd,
             self.prompt_price_usd_per_million,
@@ -144,16 +196,49 @@ impl AnalysisRequestCostBound {
             "analysis request cost bound components must be finite and non-negative"
         );
         anyhow::ensure!(
-            self.maximum_cost_usd.is_finite() && self.maximum_cost_usd > 0.0,
-            "analysis request cost bound must be finite and greater than zero"
-        );
-        anyhow::ensure!(
-            !self.contract_version.trim().is_empty(),
-            "analysis request cost bound contract version is required"
-        );
-        anyhow::ensure!(
             self.prompt_tokens_max > 0 && self.completion_tokens_max > 0,
             "analysis request token bounds must be greater than zero"
+        );
+        let computed = self.computed_maximum_cost_usd()?;
+        let tolerance = self.maximum_cost_usd.abs().max(computed.abs()).max(1.0) * 1e-12;
+        anyhow::ensure!(
+            (self.maximum_cost_usd - computed).abs() <= tolerance,
+            "analysis request cost bound maximum is internally inconsistent with its components"
+        );
+        Ok(())
+    }
+
+    fn validate_audio_bound(&self, audio: &AnalysisAudioCostBound) -> Result<()> {
+        anyhow::ensure!(
+            self.prompt_tokens_max == 0
+                && self.completion_tokens_max == 0
+                && self.image_count == 0
+                && self.prompt_price_usd_per_million == 0.0
+                && self.completion_price_usd_per_million == 0.0
+                && self.image_price_usd_each == 0.0,
+            "native audio cost bound must not mix imaginary chat token or image components"
+        );
+        anyhow::ensure!(
+            self.request_price_usd_each.is_finite() && self.request_price_usd_each >= 0.0,
+            "analysis request cost bound request fee must be finite and non-negative"
+        );
+        anyhow::ensure!(
+            audio.input_duration_ms > 0,
+            "native audio cost bound input duration must be greater than zero"
+        );
+        anyhow::ensure!(
+            audio.billable_seconds_max > 0,
+            "native audio cost bound billable seconds must be greater than zero"
+        );
+        anyhow::ensure!(
+            audio.duration_price_usd_per_second.is_finite()
+                && audio.duration_price_usd_per_second > 0.0,
+            "native audio cost bound duration rate must be finite and greater than zero"
+        );
+        let required_seconds = audio.input_duration_ms.div_ceil(1_000);
+        anyhow::ensure!(
+            audio.billable_seconds_max >= required_seconds,
+            "native audio cost bound billable seconds do not cover the input duration"
         );
         let computed = self.computed_maximum_cost_usd()?;
         let tolerance = self.maximum_cost_usd.abs().max(computed.abs()).max(1.0) * 1e-12;
@@ -1037,5 +1122,115 @@ mod tests {
         let mut inconsistent = valid;
         inconsistent.maximum_cost_usd += 1.0;
         assert!(inconsistent.validate().is_err());
+    }
+
+    #[test]
+    fn legacy_vlm_bound_json_and_fingerprint_remain_byte_identical_without_audio() {
+        // Captured from the pre-audio struct. The new optional field must be
+        // omitted rather than serialized as null so both the persisted JSON and
+        // its digest retain their prior identity.
+        let legacy_json = r#"{"maximumCostUsd":0.05,"contractVersion":"synthetic.transport-declared.v1","promptTokensMax":1,"completionTokensMax":1,"imageCount":0,"promptPriceUsdPerMillion":0.0,"completionPriceUsdPerMillion":0.0,"imagePriceUsdEach":0.0,"requestPriceUsdEach":0.05,"assumptions":["synthetic transport declares a deterministic test-only bound"]}"#;
+        let bound: AnalysisRequestCostBound = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(bound.audio, None);
+        assert_eq!(serde_json::to_string(&bound).unwrap(), legacy_json);
+        let fingerprint =
+            crate::analysis::accounting::analysis_request_cost_bound_fingerprint(&bound).unwrap();
+        let expected = blake3::hash(legacy_json.as_bytes()).to_hex().to_string();
+        assert_eq!(fingerprint, expected);
+        bound.validate().unwrap();
+    }
+
+    fn audio_cost_bound(
+        input_duration_ms: u32,
+        billable_seconds_max: u32,
+        duration_price_usd_per_second: f64,
+        request_fee_usd: f64,
+    ) -> AnalysisRequestCostBound {
+        let mut bound = AnalysisRequestCostBound {
+            maximum_cost_usd: 0.0,
+            contract_version: "openrouter.native-stt-duration-reservation.v1:test".into(),
+            prompt_tokens_max: 0,
+            completion_tokens_max: 0,
+            image_count: 0,
+            prompt_price_usd_per_million: 0.0,
+            completion_price_usd_per_million: 0.0,
+            image_price_usd_each: 0.0,
+            request_price_usd_each: request_fee_usd,
+            audio: Some(AnalysisAudioCostBound {
+                input_duration_ms,
+                billable_seconds_max,
+                duration_price_usd_per_second,
+            }),
+            assumptions: vec!["native audio external-tariff reservation".into()],
+        };
+        if let Ok(computed) = bound.computed_maximum_cost_usd() {
+            bound.maximum_cost_usd = computed;
+        }
+        bound
+    }
+
+    #[test]
+    fn audio_bound_uses_only_duration_components_and_never_mixes_chat_tokens_or_images() {
+        let valid = audio_cost_bound(1_000, 30, 0.0001, 0.0);
+        valid.validate().unwrap();
+        assert!((valid.maximum_cost_usd - 0.003).abs() < 1e-15);
+        assert!(
+            !serde_json::to_string(&valid)
+                .unwrap()
+                .contains("\"audio\":null")
+        );
+
+        let mut charged_fee = audio_cost_bound(1_000, 30, 0.0001, 0.0005);
+        charged_fee.maximum_cost_usd = charged_fee.computed_maximum_cost_usd().unwrap();
+        charged_fee.validate().unwrap();
+        assert!((charged_fee.maximum_cost_usd - 0.0035).abs() < 1e-15);
+
+        for mutate in [
+            |bound: &mut AnalysisRequestCostBound| bound.prompt_tokens_max = 1,
+            |bound: &mut AnalysisRequestCostBound| bound.completion_tokens_max = 1,
+            |bound: &mut AnalysisRequestCostBound| bound.image_count = 1,
+            |bound: &mut AnalysisRequestCostBound| bound.prompt_price_usd_per_million = 0.1,
+            |bound: &mut AnalysisRequestCostBound| bound.completion_price_usd_per_million = 0.1,
+            |bound: &mut AnalysisRequestCostBound| bound.image_price_usd_each = 0.1,
+        ] {
+            let mut mixed = audio_cost_bound(1_000, 30, 0.0001, 0.0);
+            mutate(&mut mixed);
+            assert!(
+                mixed.validate().is_err(),
+                "imaginary chat/image component must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn audio_bound_rejects_nonfinite_rates_and_nonconservative_durations() {
+        let valid = audio_cost_bound(1_500, 30, 0.0001, 0.0);
+        valid.validate().unwrap();
+
+        for rate in [0.0, -0.0001, f64::INFINITY, f64::NAN] {
+            let mut invalid = audio_cost_bound(1_500, 30, rate, 0.0);
+            invalid.maximum_cost_usd = 0.003;
+            assert!(invalid.validate().is_err(), "rate {rate} must be rejected");
+        }
+
+        let mut zero_input = audio_cost_bound(0, 30, 0.0001, 0.0);
+        zero_input.maximum_cost_usd = 0.003;
+        assert!(zero_input.validate().is_err());
+
+        let mut zero_billable = audio_cost_bound(1_500, 0, 0.0001, 0.0);
+        zero_billable.maximum_cost_usd = 0.0;
+        assert!(zero_billable.validate().is_err());
+
+        let mut too_small = audio_cost_bound(1_500, 1, 0.0001, 0.0);
+        too_small.maximum_cost_usd = 0.0001;
+        assert!(too_small.validate().is_err());
+
+        let mut inconsistent = audio_cost_bound(1_500, 30, 0.0001, 0.0);
+        inconsistent.maximum_cost_usd += 0.001;
+        assert!(inconsistent.validate().is_err());
+
+        let mut nonfinite_maximum = audio_cost_bound(1_500, 30, 0.0001, 0.0);
+        nonfinite_maximum.maximum_cost_usd = f64::INFINITY;
+        assert!(nonfinite_maximum.validate().is_err());
     }
 }

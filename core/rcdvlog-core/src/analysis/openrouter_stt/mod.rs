@@ -20,6 +20,7 @@ use std::time::Duration;
 
 use crate::analysis::engine::{VAD_MODEL, WHISPER_MODEL};
 use crate::analysis::openrouter::resolve_api_key;
+use crate::analysis::provider::{AnalysisAudioCostBound, AnalysisRequestCostBound};
 use crate::analysis::speech_audio::{
     MAX_SPEECH_WAV_BYTES, concatenate_regions_bounded, encode_pcm16_wav, validate_wav_16k_mono,
 };
@@ -30,6 +31,14 @@ pub const OPENROUTER_WHISPER_MODEL: &str = "openai/whisper-1";
 pub const OPENROUTER_STT_ENDPOINT: &str = "https://openrouter.ai/api/v1/audio/transcriptions";
 pub const NATIVE_STT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 pub const MAX_NATIVE_STT_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+/// Domain-separated version of the native-audio reservation contract. The chat
+/// VLM cost contract remains a separate identity.
+pub const NATIVE_STT_COST_BOUND_CONTRACT_VERSION: &str =
+    "openrouter.native-stt-duration-reservation.v1";
+/// The native STT endpoint has no `max_price` routing control. This contract is
+/// an explicit external-tariff reservation, never a hard provider invoice cap.
+const NATIVE_STT_BILLING_SEMANTICS: &str =
+    "full-registered-audio-window-admission-reservation;external-tariff-not-wire-enforced";
 
 mod client;
 mod decode;
@@ -53,6 +62,9 @@ pub struct NativeSttModelSpec {
     pub supported_input_formats: &'static [&'static str],
     pub supports_language: bool,
     pub max_window_ms: u32,
+    /// Approved external-tariff ceiling in integer micro-USD per second. Integer
+    /// units keep the registry `Eq` and make the contract identity deterministic.
+    pub duration_price_micro_usd_per_second: u64,
 }
 
 /// Public OpenRouter model and endpoint snapshots checked 2026-10-25. Only
@@ -67,7 +79,41 @@ pub const NATIVE_STT_MODELS: &[NativeSttModelSpec] = &[NativeSttModelSpec {
     supported_input_formats: &["wav"],
     supports_language: true,
     max_window_ms: WINDOW_MS,
+    // Public OpenRouter endpoint snapshot checked 2026-10-25:
+    // $0.0001 USD/second = 100 micro-USD/second.
+    duration_price_micro_usd_per_second: 100,
 }];
+
+fn native_stt_cost_bound_contract_id_for(models: &[NativeSttModelSpec]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    let add = |hasher: &mut blake3::Hasher, bytes: &[u8]| {
+        hasher.update(&(bytes.len() as u64).to_le_bytes());
+        hasher.update(bytes);
+    };
+    add(
+        &mut hasher,
+        NATIVE_STT_COST_BOUND_CONTRACT_VERSION.as_bytes(),
+    );
+    add(&mut hasher, NATIVE_STT_BILLING_SEMANTICS.as_bytes());
+    for spec in models {
+        add(&mut hasher, spec.provider.as_bytes());
+        add(&mut hasher, spec.model.as_bytes());
+        add(&mut hasher, spec.endpoint.as_bytes());
+        hasher.update(&spec.max_window_ms.to_le_bytes());
+        hasher.update(&spec.duration_price_micro_usd_per_second.to_le_bytes());
+    }
+    format!(
+        "{NATIVE_STT_COST_BOUND_CONTRACT_VERSION}:{}",
+        hasher.finalize().to_hex()
+    )
+}
+
+/// Deterministic identity of the registered native endpoint, window limit and
+/// approved duration-rate ceiling. Route/rate/window changes invalidate old
+/// approvals instead of silently reusing them.
+pub fn native_stt_cost_bound_contract_id() -> String {
+    native_stt_cost_bound_contract_id_for(NATIVE_STT_MODELS)
+}
 
 /// Resolves an explicit provider/model pair to its verified native transcription
 /// contract. No default model, hidden fallback or chat-model inference exists.
@@ -390,6 +436,51 @@ impl NativeSttAudioWindow {
         );
         Ok(())
     }
+}
+
+/// Produces the conservative admission quote for one already validated native
+/// audio request and one bounded speech window.
+///
+/// The quote reserves the full registered 30-second window at the approved
+/// external-tariff rate even when the actual speech window is shorter. The
+/// native endpoint does not enforce `provider.max_price`; this reservation is
+/// not a provider invoice cap. Any invoice above the bound remains an external
+/// fact for the existing receipt settlement owner to record.
+pub fn native_stt_request_cost_bound(
+    request: &NativeSttRequest,
+    audio: &NativeSttAudioWindow,
+) -> Result<AnalysisRequestCostBound> {
+    let spec = request.validate()?;
+    audio.validate_for(spec)?;
+    let billable_seconds_max = spec.max_window_ms.div_ceil(1_000);
+    let duration_price_usd_per_second =
+        spec.duration_price_micro_usd_per_second as f64 / 1_000_000.0;
+    let mut bound = AnalysisRequestCostBound {
+        maximum_cost_usd: 0.0,
+        contract_version: native_stt_cost_bound_contract_id(),
+        prompt_tokens_max: 0,
+        completion_tokens_max: 0,
+        image_count: 0,
+        prompt_price_usd_per_million: 0.0,
+        completion_price_usd_per_million: 0.0,
+        image_price_usd_each: 0.0,
+        request_price_usd_each: 0.0,
+        audio: Some(AnalysisAudioCostBound {
+            input_duration_ms: audio.duration_ms(),
+            billable_seconds_max,
+            duration_price_usd_per_second,
+        }),
+        assumptions: vec![
+            "the request uses the exact registered native audio-transcription provider/model endpoint and bounded WAV wire contract".into(),
+            "the reservation bills the full registered audio window rather than the shorter observed speech duration".into(),
+            "the reservation uses the registered approved external-tariff duration-rate ceiling and has no prompt, completion or image components".into(),
+            "the native STT endpoint does not enforce provider.max_price, order, only or ignore; this reservation is not a provider invoice cap".into(),
+            "an external invoice above this reservation and unknown usage remain explicit external facts for existing receipt settlement and authority stopping".into(),
+        ],
+    };
+    bound.maximum_cost_usd = bound.computed_maximum_cost_usd()?;
+    bound.validate()?;
+    Ok(bound)
 }
 
 /// Runs the supplied local detector and builds one bounded WAV per packed speech
