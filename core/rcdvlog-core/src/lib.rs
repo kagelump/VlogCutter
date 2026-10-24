@@ -71,10 +71,12 @@ use analysis::vlm_store::{
 use analysis::whisper_engine::{WhisperEngine, read_pcm};
 
 pub use analysis::accounting::{
-    ANALYSIS_ACCOUNTING_SCHEMA_VERSION, AnalysisAccountingContext, AnalysisAccountingReport,
-    AnalysisBudgetAuthorityContext, AnalysisBudgetSnapshot, AnalysisRequestEvent,
-    AnalysisRequestLifecycle, AnalysisRequestRecord, LEGACY_UNKNOWN_USAGE_STOP_REASON,
-    MAX_IN_FLIGHT_REQUESTS_PER_BUDGET_AUTHORITY, analysis_operation_budget_scope_id,
+    ANALYSIS_ACCOUNTING_SCHEMA_VERSION, AnalysisAccountingAggregate, AnalysisAccountingContext,
+    AnalysisAccountingReport, AnalysisBudgetAuthorityContext, AnalysisBudgetSnapshot,
+    AnalysisProviderReceipt, AnalysisRequestEvent, AnalysisRequestLifecycle,
+    AnalysisRequestReconciliation, AnalysisRequestRecord, AnalysisRetryAuthorization,
+    LEGACY_UNKNOWN_USAGE_STOP_REASON, MAX_IN_FLIGHT_REQUESTS_PER_BUDGET_AUTHORITY,
+    MAX_REQUEST_ATTEMPTS, ProviderReceiptEvidence, analysis_operation_budget_scope_id,
     analysis_policy_budget_scope_id, analysis_request_cost_bound_fingerprint,
     analysis_request_payload_fingerprint, bounded_failure_code,
 };

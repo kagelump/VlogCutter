@@ -10,10 +10,16 @@ use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 use serde_json::{Value, json};
 
 use super::model::{
-    ANALYSIS_ACCOUNTING_SCHEMA_VERSION, AnalysisAccountingContext, AnalysisBudgetAuthorityContext,
-    AnalysisBudgetSnapshot, AnalysisRequestEvent, AnalysisRequestLifecycle, AnalysisRequestRecord,
-    LEGACY_UNKNOWN_USAGE_STOP_REASON, MAX_IN_FLIGHT_REQUESTS_PER_BUDGET_AUTHORITY,
-    analysis_request_cost_bound_fingerprint, attempt_base_key, bounded_failure_code, request_key,
+    ANALYSIS_ACCOUNTING_SCHEMA_VERSION, AnalysisAccountingAggregate, AnalysisAccountingContext,
+    AnalysisBudgetAuthorityContext, AnalysisBudgetSnapshot, AnalysisProviderReceipt,
+    AnalysisRequestEvent, AnalysisRequestLifecycle, AnalysisRequestRecord,
+    AnalysisRetryAuthorization, LEGACY_UNKNOWN_USAGE_STOP_REASON,
+    MAX_IN_FLIGHT_REQUESTS_PER_BUDGET_AUTHORITY, MAX_REQUEST_ATTEMPTS, ProviderReceiptEvidence,
+    analysis_request_cost_bound_fingerprint, attempt_base_key, bounded_failure_code, digest_bytes,
+    digest_json, request_key,
+};
+use super::settlement::{
+    ExistingReceipt, ReceiptDisposition, classify_receipt, settlement_for_receipt,
 };
 use crate::analysis::provider::AnalysisRequestCostBound;
 
@@ -162,15 +168,12 @@ pub(crate) fn reserve(
         authority.stop_reason
     );
 
-    let duplicate: bool = transaction.query_row(
-        "SELECT EXISTS(SELECT 1 FROM analysis_request_reservations WHERE attempt_base_key=?1)",
-        [&base],
-        |row| row.get(0),
-    )?;
+    let prior = load_attempts(&transaction, &base)?;
     ensure!(
-        !duplicate,
-        "an identical analysis request already exists; refusing a duplicate paid dispatch"
+        !prior.iter().any(|record| record.lifecycle.is_active()),
+        "an identical analysis request already exists; it is already reserved or in flight; refusing a duplicate paid dispatch"
     );
+    let next_epoch = next_attempt_epoch(context, &prior, &transaction)?;
 
     let totals = totals_for_scope(&transaction, &scope)?;
     ensure!(
@@ -191,7 +194,7 @@ pub(crate) fn reserve(
         "conservative request bound ${requested:.6} does not fit the remaining analysis budget ${available:.6}; clipping is not allowed"
     );
 
-    let key = request_key(&base, 0);
+    let key = request_key(&base, next_epoch);
     let now = crate::now();
     transaction.execute(
         "INSERT INTO analysis_request_reservations(
@@ -199,8 +202,8 @@ pub(crate) fn reserve(
             attempt_epoch,requested_provider,requested_model,policy_fingerprint,payload_fingerprint,
             source_fingerprint,request_fingerprint,cost_bound_fingerprint,cost_bound_json,
             lifecycle,reserved_cost_usd,created_at,updated_at)
-         VALUES(?1,?2,?3,?4,?5,?6,?7,0,?8,?9,?10,?11,?12,?13,?14,?15,
-                'reserved',?16,?17,?17)",
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,
+                'reserved',?17,?18,?18)",
         params![
             key,
             scope,
@@ -209,6 +212,7 @@ pub(crate) fn reserve(
             context.run_id,
             context.operation,
             base,
+            next_epoch as i64,
             context.provider,
             model,
             context.policy_fingerprint,
@@ -226,6 +230,7 @@ pub(crate) fn reserve(
         &key,
         "reserved",
         json!({
+            "attemptEpoch": next_epoch,
             "reservedCostUsd": requested,
             "budgetScopeId": scope,
             "legacyConfirmedCostUsd": authority.legacy_confirmed_cost_usd,
@@ -243,6 +248,56 @@ pub(crate) fn reserve(
     Ok(record)
 }
 
+/// Validate and return the next attempt epoch. A retry can only proceed with a
+/// durable authorization event attached to the immediately prior request and
+/// its exact next epoch; the caller's `explicit_retry` flag alone is never
+/// sufficient. The subsequent IMMEDIATE insert and the unique
+/// `(attempt_base_key, attempt_epoch)` constraint fence competing consumers.
+fn next_attempt_epoch(
+    context: &AnalysisAccountingContext,
+    prior: &[AnalysisRequestRecord],
+    connection: &Connection,
+) -> Result<u32> {
+    let Some(last) = prior.last() else {
+        return Ok(0);
+    };
+    ensure!(
+        context.explicit_retry,
+        match last.lifecycle {
+            AnalysisRequestLifecycle::Completed =>
+                "a matching request already has a completed provider receipt; explicit retry authorization is required",
+            AnalysisRequestLifecycle::Uncertain =>
+                "a matching request outcome is uncertain; inspect/reconcile its receipt before explicit retry",
+            AnalysisRequestLifecycle::Released =>
+                "a matching request was released; explicit retry authorization is required",
+            _ => "a matching request already exists; explicit retry authorization is required",
+        }
+    );
+    ensure!(
+        last.lifecycle.is_terminal(),
+        "an identical analysis request is still active; refusing a duplicate paid dispatch"
+    );
+    ensure!(
+        prior.len() < MAX_REQUEST_ATTEMPTS as usize,
+        "analysis request retry limit reached; new evidence or a new policy is required"
+    );
+    let next_epoch = last.attempt_epoch + 1;
+    let authorized: bool = connection.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM analysis_request_events
+            WHERE request_key=?1 AND event_kind='retry_authorized'
+              AND json_extract(detail_json,'$.nextAttemptEpoch')=?2
+        )",
+        params![last.request_key, next_epoch as i64],
+        |row| row.get(0),
+    )?;
+    ensure!(
+        authorized,
+        "explicit retry has not been authorized for attempt epoch {next_epoch}"
+    );
+    Ok(next_epoch)
+}
+
 /// Commit the durable dispatch marker immediately before transport I/O. The
 /// marker is the only local evidence boundary that turns a later generic
 /// failure into uncertainty rather than a releasable pre-upload failure.
@@ -258,7 +313,10 @@ pub(crate) fn mark_dispatched(
         return Ok(current);
     }
     ensure!(
-        current.lifecycle == AnalysisRequestLifecycle::Reserved && current.dispatch_at.is_none(),
+        matches!(
+            current.lifecycle,
+            AnalysisRequestLifecycle::Reserved | AnalysisRequestLifecycle::Uncertain
+        ) && current.dispatch_at.is_none(),
         "analysis request cannot be marked dispatched from lifecycle {}",
         current.lifecycle.as_str()
     );
@@ -311,7 +369,10 @@ pub(crate) fn release_before_dispatch(
         return Ok(current);
     }
     ensure!(
-        current.lifecycle == AnalysisRequestLifecycle::Reserved && current.dispatch_at.is_none(),
+        matches!(
+            current.lifecycle,
+            AnalysisRequestLifecycle::Reserved | AnalysisRequestLifecycle::Uncertain
+        ) && current.dispatch_at.is_none(),
         "dispatch marker exists; local evidence cannot prove that no upload occurred"
     );
     let now = crate::now();
@@ -391,6 +452,313 @@ pub(crate) fn mark_uncertain(
         .ok_or_else(|| anyhow!("uncertain analysis request disappeared"))?;
     transaction.commit()?;
     Ok(record)
+}
+
+fn load_existing_receipts(connection: &Connection, key: &str) -> Result<Vec<ExistingReceipt>> {
+    let mut statement = connection.prepare(
+        "SELECT receipt_fingerprint,provider,provider_generation_id,actual_model,
+                reported_cost_usd,usage_complete
+         FROM analysis_provider_receipts WHERE request_key=?1
+         ORDER BY created_at ASC, receipt_key ASC",
+    )?;
+    let receipts = statement
+        .query_map([key], |row| {
+            Ok(ExistingReceipt {
+                fingerprint: row.get(0)?,
+                provider: row.get(1)?,
+                generation: row.get(2)?,
+                actual_model: row.get(3)?,
+                reported_cost_usd: row.get(4)?,
+                usage_complete: row.get::<_, i64>(5)? != 0,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(receipts)
+}
+
+/// Return all immutable receipt evidence for one request, oldest first.
+pub(crate) fn receipts(connection: &Connection, key: &str) -> Result<Vec<AnalysisProviderReceipt>> {
+    let mut statement = connection.prepare(
+        "SELECT receipt_key,request_key,provider,provider_generation_id,actual_model,
+                reported_cost_usd,prompt_tokens,completion_tokens,usage_complete,
+                receipt_fingerprint,created_at
+         FROM analysis_provider_receipts WHERE request_key=?1
+         ORDER BY created_at ASC, receipt_key ASC",
+    )?;
+    let receipts = statement
+        .query_map([key], |row| {
+            Ok(AnalysisProviderReceipt {
+                receipt_key: row.get(0)?,
+                request_key: row.get(1)?,
+                provider: row.get(2)?,
+                provider_generation_id: row.get(3)?,
+                actual_model: row.get(4)?,
+                reported_cost_usd: row.get(5)?,
+                prompt_tokens: row.get::<_, Option<i64>>(6)?.map(|value| value as u32),
+                completion_tokens: row.get::<_, Option<i64>>(7)?.map(|value| value as u32),
+                usage_complete: row.get::<_, i64>(8)? != 0,
+                receipt_fingerprint: row.get(9)?,
+                created_at: row.get(10)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(receipts)
+}
+
+/// Generation IDs belong to the requested router/service. The optional actual
+/// upstream provider is deliberately not part of this lookup, so missing or
+/// differing upstream metadata cannot launder a duplicate generation.
+fn enforce_generation_owner(
+    connection: &Connection,
+    key: &str,
+    requested_provider: &str,
+    generation_id: &str,
+) -> Result<()> {
+    if requested_provider.trim().is_empty() || generation_id.trim().is_empty() {
+        return Ok(());
+    }
+    let duplicate_owner: Option<String> = connection
+        .query_row(
+            "SELECT receipts.request_key
+             FROM analysis_provider_receipts AS receipts
+             JOIN analysis_request_reservations AS requests
+               ON requests.request_key = receipts.request_key
+             WHERE requests.requested_provider=?1
+               AND receipts.provider_generation_id=?2
+               AND receipts.request_key<>?3
+             LIMIT 1",
+            params![requested_provider, generation_id, key],
+            |row| row.get(0),
+        )
+        .optional()?;
+    ensure!(
+        duplicate_owner.is_none(),
+        "provider generation identity already belongs to a different analysis request; refusing duplicate paid receipt attribution"
+    );
+    Ok(())
+}
+
+fn insert_receipt(
+    transaction: &rusqlite::Transaction<'_>,
+    key: &str,
+    evidence: &ProviderReceiptEvidence,
+    fingerprint: &str,
+    now: &str,
+) -> Result<String> {
+    let receipt_key = digest_bytes(&[
+        key.as_bytes(),
+        evidence.provider.as_bytes(),
+        evidence.provider_generation_id.as_bytes(),
+        fingerprint.as_bytes(),
+    ]);
+    transaction.execute(
+        "INSERT INTO analysis_provider_receipts(
+            receipt_key,request_key,provider,provider_generation_id,actual_model,
+            reported_cost_usd,prompt_tokens,completion_tokens,usage_complete,
+            receipt_fingerprint,created_at)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+        params![
+            receipt_key,
+            key,
+            evidence.provider,
+            evidence.provider_generation_id,
+            evidence.actual_model,
+            evidence.reported_cost_usd,
+            evidence.prompt_tokens.map(|value| value as i64),
+            evidence.completion_tokens.map(|value| value as i64),
+            evidence.usage_complete as i64,
+            fingerprint,
+            now,
+        ],
+    )?;
+    Ok(receipt_key)
+}
+
+fn apply_receipt_settlement(
+    transaction: &rusqlite::Transaction<'_>,
+    current: &AnalysisRequestRecord,
+    settlement: &super::settlement::ReceiptSettlement,
+    now: &str,
+) -> Result<()> {
+    transaction.execute(
+        "UPDATE analysis_request_reservations
+         SET lifecycle=?2,actual_provider=?3,actual_model=?4,provider_generation_id=?5,
+             reported_cost_usd=?6,confirmed_cost_usd=?7,uncertain_cost_usd=?8,
+             failure_code=?9,settled_at=?10,updated_at=?10
+         WHERE request_key=?1",
+        params![
+            current.request_key,
+            settlement.lifecycle.as_str(),
+            settlement.actual_provider.as_deref(),
+            settlement.actual_model.as_deref(),
+            settlement.provider_generation_id.as_deref(),
+            settlement.reported_cost_usd,
+            settlement.confirmed_cost_usd,
+            settlement.uncertain_usage_reserve_usd,
+            settlement.failure_code,
+            now,
+        ],
+    )?;
+    Ok(())
+}
+
+fn stop_on_receipt_overrun(
+    transaction: &rusqlite::Transaction<'_>,
+    current: &AnalysisRequestRecord,
+    evidence: &ProviderReceiptEvidence,
+    settlement: &super::settlement::ReceiptSettlement,
+    now: &str,
+) -> Result<()> {
+    if !settlement.observed_cost_exceeded_bound {
+        return Ok(());
+    }
+    transaction.execute(
+        "UPDATE analysis_budget_authorities
+         SET dispatch_stopped=1,stop_reason='reported_cost_exceeded_reservation',updated_at=?2
+         WHERE budget_scope_id=?1",
+        params![current.budget_scope_id, now],
+    )?;
+    append_event(
+        transaction,
+        &current.request_key,
+        "overrun",
+        json!({
+            "reservedCostUsd": current.reserved_cost_usd,
+            "reportedCostUsd": evidence.reported_cost_usd,
+            "confirmedCostUsd": settlement.confirmed_cost_usd,
+            "uncertainUsageReserveUsd": settlement.uncertain_usage_reserve_usd,
+            "usageComplete": evidence.usage_complete,
+            "dispatchStopped": true,
+            "note": "external provider charge exceeded the software admission bound",
+        }),
+    )?;
+    Ok(())
+}
+
+/// Append immutable provider evidence and apply its settlement projection in one
+/// `IMMEDIATE` transaction. Exact duplicate evidence is a no-op. A reserved or
+/// locally released request can never be turned into a charged completion.
+pub(crate) fn record_receipt(
+    connection: &mut Connection,
+    key: &str,
+    evidence: &ProviderReceiptEvidence,
+) -> Result<AnalysisRequestRecord> {
+    evidence.validate()?;
+    let fingerprint = digest_json(evidence)?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let current =
+        load_request(&transaction, key)?.ok_or_else(|| anyhow!("analysis request not found"))?;
+    let existing = load_existing_receipts(&transaction, key)?;
+    match classify_receipt(&current, &existing, evidence, &fingerprint)? {
+        ReceiptDisposition::Idempotent => {
+            transaction.commit()?;
+            return Ok(current);
+        }
+        ReceiptDisposition::Append => {}
+    }
+    enforce_generation_owner(
+        &transaction,
+        key,
+        &current.provider,
+        &evidence.provider_generation_id,
+    )?;
+    let settlement = settlement_for_receipt(&current, evidence)?;
+    let now = crate::now();
+    let receipt_key = insert_receipt(&transaction, key, evidence, &fingerprint, &now)?;
+    stop_on_receipt_overrun(&transaction, &current, evidence, &settlement, &now)?;
+    apply_receipt_settlement(&transaction, &current, &settlement, &now)?;
+    append_event(
+        &transaction,
+        key,
+        "receipt",
+        json!({
+            "receiptKey": receipt_key,
+            "receiptFingerprint": fingerprint,
+            "usageComplete": evidence.usage_complete,
+            "reportedCostUsd": evidence.reported_cost_usd,
+            "confirmedCostUsd": settlement.confirmed_cost_usd,
+            "uncertainUsageReserveUsd": settlement.uncertain_usage_reserve_usd,
+            "metadataEnriched": settlement.metadata_enriched,
+            "actualProvider": evidence.provider,
+            "actualModel": evidence.actual_model,
+            "providerGenerationId": evidence.provider_generation_id,
+        }),
+    )?;
+    let record = load_request(&transaction, key)?
+        .ok_or_else(|| anyhow!("receipted analysis request disappeared"))?;
+    transaction.commit()?;
+    Ok(record)
+}
+
+/// Explicitly authorize one bounded retry. Only the latest attempt of an exact
+/// request identity can be authorized, and repeat authorization for the same
+/// next epoch is idempotent. Prior receipts/charges/uncertainty are untouched.
+pub(crate) fn authorize_retry(
+    connection: &mut Connection,
+    key: &str,
+) -> Result<AnalysisRetryAuthorization> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let current =
+        load_request(&transaction, key)?.ok_or_else(|| anyhow!("analysis request not found"))?;
+    ensure!(
+        current.lifecycle.is_terminal(),
+        "analysis request is still active; wait for or reconcile its outcome before retry"
+    );
+    let attempts = load_attempts(&transaction, &current.attempt_base_key)?;
+    let latest = attempts
+        .last()
+        .ok_or_else(|| anyhow!("analysis request attempt history disappeared"))?;
+    ensure!(
+        latest.request_key == current.request_key,
+        "stale retry authorization: a newer attempt already exists for this request identity"
+    );
+    ensure!(
+        attempts.len() < MAX_REQUEST_ATTEMPTS as usize,
+        "analysis request retry limit reached"
+    );
+    let next_epoch = current.attempt_epoch + 1;
+    let already_reserved: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM analysis_request_reservations
+         WHERE attempt_base_key=?1 AND attempt_epoch=?2)",
+        params![current.attempt_base_key, next_epoch as i64],
+        |row| row.get(0),
+    )?;
+    ensure!(
+        !already_reserved,
+        "attempt epoch {next_epoch} already exists; stale retry authorization is rejected"
+    );
+    let already_authorized: bool = transaction.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM analysis_request_events
+            WHERE request_key=?1 AND event_kind='retry_authorized'
+              AND json_extract(detail_json,'$.nextAttemptEpoch')=?2
+        )",
+        params![key, next_epoch as i64],
+        |row| row.get(0),
+    )?;
+    if !already_authorized {
+        append_event(
+            &transaction,
+            key,
+            "retry_authorized",
+            json!({
+                "nextAttemptEpoch": next_epoch,
+                "retainedUncertainCostUsd": current.uncertain_usage_reserve_usd,
+                "priorReportedCostUsd": current.reported_cost_usd,
+                "maxAttempts": MAX_REQUEST_ATTEMPTS,
+            }),
+        )?;
+    }
+    transaction.commit()?;
+    Ok(AnalysisRetryAuthorization {
+        original_request_key: current.request_key,
+        attempt_base_key: current.attempt_base_key,
+        next_attempt_epoch: next_epoch,
+        retained_uncertain_cost_usd: current.uncertain_usage_reserve_usd,
+        prior_reported_cost_usd: current.reported_cost_usd,
+        attempts_already_recorded: attempts.len() as u32,
+        max_attempts: MAX_REQUEST_ATTEMPTS,
+    })
 }
 
 pub(crate) fn load_request(
@@ -643,6 +1011,16 @@ fn verify_authority(
     Ok(())
 }
 
+fn load_attempts(connection: &Connection, base: &str) -> Result<Vec<AnalysisRequestRecord>> {
+    let mut statement = connection.prepare(&format!(
+        "{REQUEST_SELECT} WHERE attempt_base_key=?1 ORDER BY attempt_epoch ASC"
+    ))?;
+    let records = statement
+        .query_map([base], row_to_request)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(records)
+}
+
 fn load_authority_optional(connection: &Connection, scope: &str) -> Result<Option<Authority>> {
     connection
         .query_row(
@@ -873,6 +1251,182 @@ fn legacy_amount(raw: Option<&str>) -> Option<f64> {
         .parse::<f64>()
         .ok()
         .filter(|cost| cost.is_finite() && *cost >= 0.0)
+}
+
+/// Canonical aggregate over every matching ledger attempt. For a pilot caller
+/// `operation` is `Some("pilot")`, which excludes bulk charges while still
+/// including primary, fallback and prior-run pilot attempts. The unfiltered
+/// projection adds all frozen pre-ledger evidence exactly once; the pilot
+/// projection includes only provable frozen pilot entries. Because that
+/// evidence was captured before the first post-ledger reservation, no row is
+/// counted in both places.
+pub(crate) fn accounting_aggregate(
+    connection: &Connection,
+    policy_id: &str,
+    operation: Option<&str>,
+    current_run_id: Option<&str>,
+) -> Result<AnalysisAccountingAggregate> {
+    let mut statement = connection.prepare(&format!(
+        "{REQUEST_SELECT} WHERE policy_id=?1 AND (?2 IS NULL OR operation=?2)
+         ORDER BY created_at ASC, request_key ASC"
+    ))?;
+    let requests = statement
+        .query_map(params![policy_id, operation], row_to_request)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let authority = load_authority_by_policy_optional(connection, policy_id)?;
+    let legacy = aggregate_legacy_evidence(authority.as_ref(), operation);
+    let legacy_included = legacy.is_some();
+    let legacy_confirmed = legacy.as_ref().map_or(0.0, |legacy| legacy.confirmed);
+    let legacy_uncertain = legacy.as_ref().map_or(0.0, |legacy| legacy.uncertain);
+    let legacy_usage_complete = legacy.as_ref().is_none_or(|legacy| legacy.usage_complete);
+    let legacy_has_evidence = legacy.as_ref().is_some_and(|legacy| {
+        legacy.evidence.get("present").and_then(Value::as_bool) == Some(true)
+    });
+
+    let mut aggregate = AnalysisAccountingAggregate {
+        project_id: requests
+            .first()
+            .map(|request| request.project_id.clone())
+            .or_else(|| {
+                authority
+                    .as_ref()
+                    .map(|authority| authority.project_id.clone())
+            })
+            .unwrap_or_default(),
+        policy_id: policy_id.to_string(),
+        operation: operation.map(str::to_string),
+        request_count: requests.len(),
+        completed_request_count: 0,
+        active_request_count: 0,
+        uncertain_request_count: 0,
+        released_request_count: 0,
+        confirmed_cost_usd: 0.0,
+        active_reserved_cost_usd: 0.0,
+        uncertain_usage_reserve_usd: 0.0,
+        legacy_included,
+        legacy_confirmed_cost_usd: legacy_confirmed,
+        legacy_uncertain_usage_reserve_usd: legacy_uncertain,
+        legacy_usage_complete,
+        committed_or_reserved_usd: 0.0,
+        usage_complete: false,
+        current_run_actual_provider: None,
+        current_run_actual_model: None,
+        current_run_generation_id: None,
+        current_run_settled_at: None,
+    };
+    for request in requests {
+        aggregate.confirmed_cost_usd += request.confirmed_cost_usd;
+        match request.lifecycle {
+            AnalysisRequestLifecycle::Completed => aggregate.completed_request_count += 1,
+            AnalysisRequestLifecycle::Reserved | AnalysisRequestLifecycle::Dispatched => {
+                aggregate.active_request_count += 1;
+                aggregate.active_reserved_cost_usd += request.reserved_cost_usd;
+            }
+            AnalysisRequestLifecycle::Uncertain => {
+                aggregate.uncertain_request_count += 1;
+                aggregate.uncertain_usage_reserve_usd += request.uncertain_usage_reserve_usd;
+            }
+            AnalysisRequestLifecycle::Released => aggregate.released_request_count += 1,
+        }
+        let is_current_run = current_run_id.is_some_and(|run_id| run_id == request.run_id);
+        let newer_than_provenance = aggregate
+            .current_run_settled_at
+            .as_deref()
+            .is_none_or(|settled| request.settled_at.as_deref().unwrap_or("") >= settled);
+        if is_current_run
+            && request.lifecycle == AnalysisRequestLifecycle::Completed
+            && newer_than_provenance
+        {
+            aggregate.current_run_settled_at = request.settled_at.clone();
+            aggregate.current_run_actual_provider = request.actual_provider.clone();
+            aggregate.current_run_actual_model = request.actual_model.clone();
+            aggregate.current_run_generation_id = request.provider_generation_id.clone();
+        }
+    }
+    if legacy_included {
+        aggregate.confirmed_cost_usd += legacy_confirmed;
+        aggregate.uncertain_usage_reserve_usd += legacy_uncertain;
+    }
+    aggregate.committed_or_reserved_usd = aggregate.confirmed_cost_usd
+        + aggregate.active_reserved_cost_usd
+        + aggregate.uncertain_usage_reserve_usd;
+    let relevant_evidence_exists =
+        aggregate.request_count > 0 || (legacy_included && legacy_has_evidence);
+    aggregate.usage_complete = relevant_evidence_exists
+        && aggregate.active_request_count == 0
+        && aggregate.uncertain_request_count == 0
+        && (!legacy_included || legacy_usage_complete);
+    Ok(aggregate)
+}
+
+/// Filter only frozen entries whose operation is provable. Legacy pilot rows
+/// and orphaned pilot-stage runs belong to the pilot; generic bulk run summaries
+/// cannot be attributed to a more specific modern operation.
+fn aggregate_legacy_evidence(
+    authority: Option<&Authority>,
+    operation: Option<&str>,
+) -> Option<LegacyEvidence> {
+    let authority = authority?;
+    if operation.is_none() {
+        return Some(LegacyEvidence {
+            confirmed: authority.legacy_confirmed_cost_usd,
+            uncertain: authority.legacy_uncertain_usage_reserve_usd,
+            usage_complete: authority.legacy_usage_complete,
+            evidence: authority.legacy_evidence.clone(),
+        });
+    }
+    if operation != Some("pilot") {
+        return None;
+    }
+    let entries = authority.legacy_evidence.get("entries")?.as_array()?;
+    let mut legacy = LegacyEvidence {
+        confirmed: 0.0,
+        uncertain: 0.0,
+        usage_complete: true,
+        evidence: json!({"present": false}),
+    };
+    let mut malformed_reserved = false;
+    for entry in entries.iter().filter(|entry| {
+        entry.get("source").and_then(Value::as_str) == Some("analysis_run_pilots")
+            || (entry.get("source").and_then(Value::as_str) == Some("analysis_runs")
+                && entry.get("stageReached").and_then(Value::as_str) == Some("pilot"))
+    }) {
+        legacy.evidence = json!({"present": true});
+        let cost = entry
+            .get("costUsd")
+            .and_then(Value::as_f64)
+            .filter(|cost| cost.is_finite() && *cost >= 0.0);
+        if entry.get("usageComplete").and_then(Value::as_bool) == Some(true) && cost.is_some() {
+            legacy.confirmed += cost.unwrap_or(0.0);
+        } else {
+            legacy.usage_complete = false;
+            if let Some(cost) = cost {
+                legacy.uncertain += cost;
+            } else if !malformed_reserved {
+                legacy.uncertain += authority.budget_usd;
+                malformed_reserved = true;
+            }
+        }
+    }
+    Some(legacy)
+}
+
+fn load_authority_by_policy_optional(
+    connection: &Connection,
+    policy_id: &str,
+) -> Result<Option<Authority>> {
+    let scope: Option<String> = connection
+        .query_row(
+            "SELECT budget_scope_id FROM analysis_budget_authorities
+             WHERE policy_id=?1 ORDER BY created_at ASC, budget_scope_id ASC LIMIT 1",
+            [policy_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    match scope {
+        Some(scope) => load_authority_optional(connection, &scope),
+        None => Ok(None),
+    }
 }
 
 fn append_event(connection: &Connection, key: &str, kind: &str, detail: Value) -> Result<()> {

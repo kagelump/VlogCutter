@@ -76,6 +76,7 @@ fn operation_context(
         provider: "openrouter".into(),
         budget_scope_id: String::new(),
         budget_usd,
+        explicit_retry: false,
     }
 }
 
@@ -98,11 +99,30 @@ fn policy_context(
         provider: "openrouter".into(),
         budget_scope_id: String::new(),
         budget_usd,
+        explicit_retry: false,
     }
 }
 
 fn bound(maximum_cost_usd: f64) -> AnalysisRequestCostBound {
     AnalysisRequestCostBound::declared_for_synthetic_transport(maximum_cost_usd)
+}
+
+fn receipt(
+    provider: &str,
+    generation: &str,
+    model: &str,
+    cost: f64,
+    usage_complete: bool,
+) -> ProviderReceiptEvidence {
+    ProviderReceiptEvidence {
+        provider: provider.into(),
+        provider_generation_id: generation.into(),
+        actual_model: model.into(),
+        reported_cost_usd: Some(cost),
+        prompt_tokens: Some(10),
+        completion_tokens: Some(5),
+        usage_complete,
+    }
 }
 
 fn project_policy(
@@ -235,6 +255,7 @@ fn insert_run(
 fn schema_version_and_in_flight_limit_are_stable() {
     assert_eq!(ANALYSIS_ACCOUNTING_SCHEMA_VERSION, "analysis.accounting.v1");
     assert_eq!(MAX_IN_FLIGHT_REQUESTS_PER_BUDGET_AUTHORITY, 4);
+    assert_eq!(MAX_REQUEST_ATTEMPTS, 4);
 }
 
 #[test]
@@ -911,4 +932,1219 @@ fn direct_history_deletion_is_rejected_but_project_cleanup_cascades() {
             .unwrap()
             .is_none()
     );
+}
+
+#[test]
+fn late_receipt_settles_uncertainty_once_after_restart() {
+    let (directory, catalog, project) = fixture();
+    catalog
+        .initialize_analysis_accounting_authority(&operation_authority(&project, "late", 1.0))
+        .unwrap();
+    let request = catalog
+        .reserve_analysis_request(
+            &operation_context(&project, "late", "late-intent", 1.0),
+            DEFAULT_MODEL,
+            "payload-late",
+            &bound(0.10),
+        )
+        .unwrap();
+    catalog
+        .mark_analysis_request_dispatched(&request.request_key)
+        .unwrap();
+    let expected = receipt(
+        "actual-provider",
+        "generation-late",
+        "actual/model",
+        0.03,
+        true,
+    );
+
+    drop(catalog);
+    let reopened = Catalog::open(directory.path().join("catalog.sqlite3")).unwrap();
+    let reconciled = reopened
+        .reconcile_analysis_request(
+            &request.request_key,
+            &AnalysisRequestReconciliation::LateReceipt {
+                receipt: expected.clone(),
+            },
+        )
+        .unwrap();
+    assert_eq!(reconciled.lifecycle, AnalysisRequestLifecycle::Completed);
+    assert_eq!(
+        reconciled.actual_provider.as_deref(),
+        Some("actual-provider")
+    );
+    assert_eq!(reconciled.actual_model.as_deref(), Some("actual/model"));
+    assert_eq!(
+        reconciled.provider_generation_id.as_deref(),
+        Some("generation-late")
+    );
+    assert!((reconciled.confirmed_cost_usd - 0.03).abs() < 1e-12);
+    assert_eq!(reconciled.uncertain_usage_reserve_usd, 0.0);
+    let event_count = reopened
+        .analysis_request_events(&request.request_key)
+        .unwrap()
+        .len();
+    let receipt_count = reopened
+        .analysis_provider_receipts(&request.request_key)
+        .unwrap()
+        .len();
+    let duplicate = reopened
+        .reconcile_analysis_request(
+            &request.request_key,
+            &AnalysisRequestReconciliation::LateReceipt { receipt: expected },
+        )
+        .unwrap();
+    assert_eq!(duplicate.lifecycle, AnalysisRequestLifecycle::Completed);
+    assert_eq!(
+        reopened
+            .analysis_request_events(&request.request_key)
+            .unwrap()
+            .len(),
+        event_count,
+        "identical reconciliation must not append another audit event"
+    );
+    assert_eq!(
+        reopened
+            .analysis_provider_receipts(&request.request_key)
+            .unwrap()
+            .len(),
+        receipt_count,
+        "identical reconciliation must not append another receipt"
+    );
+    let snapshot = reopened
+        .analysis_budget_snapshot(&analysis_operation_budget_scope_id(&project, "late"))
+        .unwrap()
+        .unwrap();
+    assert!((snapshot.confirmed_cost_usd - 0.03).abs() < 1e-12);
+    assert_eq!(snapshot.active_reserved_cost_usd, 0.0);
+    assert_eq!(snapshot.uncertain_usage_reserve_usd, 0.0);
+}
+
+#[test]
+fn incomplete_receipt_keeps_bound_and_same_identity_complete_can_correct_cost() {
+    let (_directory, catalog, project) = fixture();
+    catalog
+        .initialize_analysis_accounting_authority(&operation_authority(&project, "correct", 1.0))
+        .unwrap();
+    let request = catalog
+        .reserve_analysis_request(
+            &operation_context(&project, "correct", "intent", 1.0),
+            DEFAULT_MODEL,
+            "payload",
+            &bound(0.10),
+        )
+        .unwrap();
+    catalog
+        .mark_analysis_request_dispatched(&request.request_key)
+        .unwrap();
+
+    let incomplete = catalog
+        .record_analysis_request_receipt(
+            &request.request_key,
+            &receipt("fake", "known-generation", "model-a", 0.02, false),
+        )
+        .unwrap();
+    assert_eq!(incomplete.lifecycle, AnalysisRequestLifecycle::Uncertain);
+    assert_eq!(incomplete.confirmed_cost_usd, 0.0);
+    assert!((incomplete.reported_cost_usd.unwrap() - 0.02).abs() < 1e-12);
+    assert!((incomplete.uncertain_usage_reserve_usd - 0.10).abs() < 1e-12);
+
+    let completed = catalog
+        .record_analysis_request_receipt(
+            &request.request_key,
+            &receipt("fake", "known-generation", "model-a", 0.03, true),
+        )
+        .unwrap();
+    assert_eq!(completed.lifecycle, AnalysisRequestLifecycle::Completed);
+    assert!((completed.confirmed_cost_usd - 0.03).abs() < 1e-12);
+    assert_eq!(completed.uncertain_usage_reserve_usd, 0.0);
+    assert!((completed.reported_cost_usd.unwrap() - 0.03).abs() < 1e-12);
+    assert_eq!(
+        catalog
+            .analysis_provider_receipts(&request.request_key)
+            .unwrap()
+            .len(),
+        2,
+        "both incomplete and final complete evidence remain immutable"
+    );
+
+    let conflicting_final = receipt("fake", "known-generation", "model-a", 0.04, true);
+    let error = catalog
+        .record_analysis_request_receipt(&request.request_key, &conflicting_final)
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("completed provider receipt"));
+    let snapshot = catalog
+        .analysis_budget_snapshot(&analysis_operation_budget_scope_id(&project, "correct"))
+        .unwrap()
+        .unwrap();
+    assert!((snapshot.confirmed_cost_usd - 0.03).abs() < 1e-12);
+}
+
+#[test]
+fn incomplete_higher_floor_never_shrinks_prior_uncertainty_and_overrun_stops_dispatch() {
+    let (_directory, catalog, project) = fixture();
+    catalog
+        .initialize_analysis_accounting_authority(&operation_authority(&project, "floor", 1.0))
+        .unwrap();
+    let request = catalog
+        .reserve_analysis_request(
+            &operation_context(&project, "floor", "intent", 1.0),
+            DEFAULT_MODEL,
+            "payload",
+            &bound(0.10),
+        )
+        .unwrap();
+    catalog
+        .mark_analysis_request_dispatched(&request.request_key)
+        .unwrap();
+    catalog
+        .record_analysis_request_receipt(
+            &request.request_key,
+            &receipt("fake", "floor-generation", "model", 0.02, false),
+        )
+        .unwrap();
+    let lower = catalog
+        .record_analysis_request_receipt(
+            &request.request_key,
+            &receipt("fake", "floor-generation", "model", 0.01, false),
+        )
+        .unwrap();
+    assert!((lower.uncertain_usage_reserve_usd - 0.10).abs() < 1e-12);
+    assert!((lower.reported_cost_usd.unwrap() - 0.02).abs() < 1e-12);
+
+    let higher = catalog
+        .record_analysis_request_receipt(
+            &request.request_key,
+            &receipt("fake", "floor-generation", "model", 0.15, false),
+        )
+        .unwrap();
+    assert_eq!(higher.lifecycle, AnalysisRequestLifecycle::Uncertain);
+    assert_eq!(higher.confirmed_cost_usd, 0.0);
+    assert!((higher.uncertain_usage_reserve_usd - 0.15).abs() < 1e-12);
+    assert!((higher.reported_cost_usd.unwrap() - 0.15).abs() < 1e-12);
+    let snapshot = catalog
+        .analysis_budget_snapshot(&analysis_operation_budget_scope_id(&project, "floor"))
+        .unwrap()
+        .unwrap();
+    assert!(snapshot.dispatch_stopped);
+    assert_eq!(snapshot.stop_reason, "reported_cost_exceeded_reservation");
+    let error = catalog
+        .reserve_analysis_request(
+            &operation_context(&project, "floor", "next", 1.0),
+            DEFAULT_MODEL,
+            "next-payload",
+            &bound(0.01),
+        )
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("dispatch is stopped"));
+}
+
+#[test]
+fn missing_actual_provider_does_not_allow_generation_reuse_across_requested_route() {
+    let (_directory, catalog, project) = fixture();
+    catalog
+        .initialize_analysis_accounting_authority(&operation_authority(&project, "generation", 1.0))
+        .unwrap();
+    let first = catalog
+        .reserve_analysis_request(
+            &operation_context(&project, "generation", "owner-a", 1.0),
+            DEFAULT_MODEL,
+            "payload-a",
+            &bound(0.10),
+        )
+        .unwrap();
+    let second = catalog
+        .reserve_analysis_request(
+            &operation_context(&project, "generation", "owner-b", 1.0),
+            DEFAULT_MODEL,
+            "payload-b",
+            &bound(0.10),
+        )
+        .unwrap();
+    catalog
+        .mark_analysis_request_dispatched(&first.request_key)
+        .unwrap();
+    catalog
+        .mark_analysis_request_dispatched(&second.request_key)
+        .unwrap();
+
+    let first_receipt = catalog
+        .record_analysis_request_receipt(
+            &first.request_key,
+            &receipt("", "shared-generation", "model", 0.01, true),
+        )
+        .unwrap();
+    assert_eq!(first_receipt.actual_provider, None);
+
+    let error = catalog
+        .record_analysis_request_receipt(
+            &second.request_key,
+            &receipt(
+                "different-upstream-provider",
+                "shared-generation",
+                "model",
+                0.01,
+                true,
+            ),
+        )
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("different analysis request"));
+    assert_eq!(
+        catalog
+            .analysis_request(&second.request_key)
+            .unwrap()
+            .unwrap()
+            .lifecycle,
+        AnalysisRequestLifecycle::Dispatched
+    );
+}
+
+#[test]
+fn completed_metadata_enrichment_is_preserved_once_then_idempotent() {
+    let (_directory, catalog, project) = fixture();
+    catalog
+        .initialize_analysis_accounting_authority(&operation_authority(&project, "enrich", 1.0))
+        .unwrap();
+    let request = catalog
+        .reserve_analysis_request(
+            &operation_context(&project, "enrich", "intent", 1.0),
+            DEFAULT_MODEL,
+            "payload",
+            &bound(0.10),
+        )
+        .unwrap();
+    catalog
+        .mark_analysis_request_dispatched(&request.request_key)
+        .unwrap();
+    let completed = catalog
+        .record_analysis_request_receipt(&request.request_key, &receipt("", "", "", 0.03, true))
+        .unwrap();
+    assert_eq!(completed.lifecycle, AnalysisRequestLifecycle::Completed);
+    assert_eq!(completed.actual_provider, None);
+    assert_eq!(completed.actual_model, None);
+    assert_eq!(completed.provider_generation_id, None);
+    assert!((completed.confirmed_cost_usd - 0.03).abs() < 1e-12);
+
+    let event_count = catalog
+        .analysis_request_events(&request.request_key)
+        .unwrap()
+        .len();
+    let enriched = receipt("actual-provider", "generation", "actual-model", 0.03, true);
+    let enriched_record = catalog
+        .record_analysis_request_receipt(&request.request_key, &enriched)
+        .unwrap();
+    assert_eq!(
+        enriched_record.actual_provider.as_deref(),
+        Some("actual-provider")
+    );
+    assert_eq!(
+        enriched_record.provider_generation_id.as_deref(),
+        Some("generation")
+    );
+    assert_eq!(
+        enriched_record.actual_model.as_deref(),
+        Some("actual-model")
+    );
+    assert!((enriched_record.confirmed_cost_usd - 0.03).abs() < 1e-12);
+    let receipt_count = catalog
+        .analysis_provider_receipts(&request.request_key)
+        .unwrap()
+        .len();
+    assert_eq!(receipt_count, 2);
+    assert_eq!(
+        catalog
+            .analysis_request_events(&request.request_key)
+            .unwrap()
+            .len(),
+        event_count + 1
+    );
+
+    let repeated = catalog
+        .record_analysis_request_receipt(&request.request_key, &enriched)
+        .unwrap();
+    assert_eq!(repeated, enriched_record);
+    assert_eq!(
+        catalog
+            .analysis_provider_receipts(&request.request_key)
+            .unwrap()
+            .len(),
+        receipt_count,
+        "repeated enriched evidence must be idempotent"
+    );
+    assert_eq!(
+        catalog
+            .analysis_request_events(&request.request_key)
+            .unwrap()
+            .len(),
+        event_count + 1
+    );
+
+    let conflicting = receipt("other-provider", "generation", "actual-model", 0.03, true);
+    assert!(
+        catalog
+            .record_analysis_request_receipt(&request.request_key, &conflicting)
+            .is_err(),
+        "known actual provider identity cannot change during enrichment"
+    );
+}
+
+#[test]
+fn reserved_released_and_unknown_outcomes_never_become_charged_completions() {
+    let (_directory, catalog, project) = fixture();
+    catalog
+        .initialize_analysis_accounting_authority(&operation_authority(&project, "never-paid", 1.0))
+        .unwrap();
+    let before = catalog
+        .reserve_analysis_request(
+            &operation_context(&project, "never-paid", "before", 1.0),
+            DEFAULT_MODEL,
+            "payload-before",
+            &bound(0.10),
+        )
+        .unwrap();
+    let error = catalog
+        .record_analysis_request_receipt(
+            &before.request_key,
+            &receipt("fake", "never-uploaded", DEFAULT_MODEL, 0.01, true),
+        )
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("never-dispatched or locally-released"));
+    catalog
+        .release_analysis_request_local_failure(&before.request_key, "local_extraction_failed")
+        .unwrap();
+    let error = catalog
+        .record_analysis_request_receipt(
+            &before.request_key,
+            &receipt("fake", "still-never-uploaded", DEFAULT_MODEL, 0.01, true),
+        )
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("never-dispatched or locally-released"));
+
+    let never_marked = catalog
+        .reserve_analysis_request(
+            &operation_context(&project, "never-paid", "never-marked", 1.0),
+            DEFAULT_MODEL,
+            "payload-never-marked",
+            &bound(0.10),
+        )
+        .unwrap();
+    catalog
+        .mark_analysis_request_uncertain(&never_marked.request_key, "provider_error:transport")
+        .unwrap();
+    let error = catalog
+        .record_analysis_request_receipt(
+            &never_marked.request_key,
+            &receipt("fake", "no-marker", DEFAULT_MODEL, 0.01, true),
+        )
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("durable dispatch marker"));
+    let released = catalog
+        .reconcile_analysis_request(
+            &never_marked.request_key,
+            &AnalysisRequestReconciliation::LocalNoUpload {
+                failure_code: "verified_no_dispatch".into(),
+            },
+        )
+        .unwrap();
+    assert_eq!(released.lifecycle, AnalysisRequestLifecycle::Released);
+    assert_eq!(released.uncertain_usage_reserve_usd, 0.0);
+
+    let after = catalog
+        .reserve_analysis_request(
+            &operation_context(&project, "never-paid", "after", 1.0),
+            DEFAULT_MODEL,
+            "payload-after",
+            &bound(0.10),
+        )
+        .unwrap();
+    catalog
+        .mark_analysis_request_dispatched(&after.request_key)
+        .unwrap();
+    let error = catalog
+        .reconcile_analysis_request(
+            &after.request_key,
+            &AnalysisRequestReconciliation::LocalNoUpload {
+                failure_code: "local_extraction_failed".into(),
+            },
+        )
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("dispatch marker exists"));
+    let unknown = catalog
+        .reconcile_analysis_request(
+            &after.request_key,
+            &AnalysisRequestReconciliation::UncertainOutcome {
+                failure_code: "provider_error:transport".into(),
+            },
+        )
+        .unwrap();
+    assert_eq!(unknown.lifecycle, AnalysisRequestLifecycle::Uncertain);
+    assert!(unknown.dispatch_at.is_some());
+    assert_eq!(unknown.confirmed_cost_usd, 0.0);
+    assert!((unknown.uncertain_usage_reserve_usd - 0.10).abs() < 1e-12);
+}
+
+#[test]
+fn explicit_retry_is_required_bounded_and_retains_prior_charges() {
+    let (_directory, catalog, project) = fixture();
+    catalog
+        .initialize_analysis_accounting_authority(&operation_authority(&project, "retry", 0.50))
+        .unwrap();
+    let mut context = operation_context(&project, "retry", "retry-intent", 0.50);
+    let first = catalog
+        .reserve_analysis_request(&context, DEFAULT_MODEL, "payload-a", &bound(0.10))
+        .unwrap();
+    catalog
+        .mark_analysis_request_dispatched(&first.request_key)
+        .unwrap();
+    catalog
+        .mark_analysis_request_uncertain(&first.request_key, "provider_error:transport")
+        .unwrap();
+
+    context.explicit_retry = true;
+    let error = catalog
+        .reserve_analysis_request(&context, DEFAULT_MODEL, "payload-a", &bound(0.10))
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("has not been authorized"));
+
+    let authorization = catalog
+        .authorize_analysis_request_retry(&first.request_key)
+        .unwrap();
+    assert_eq!(authorization.next_attempt_epoch, 1);
+    assert!((authorization.retained_uncertain_cost_usd - 0.10).abs() < 1e-12);
+    catalog
+        .authorize_analysis_request_retry(&first.request_key)
+        .unwrap();
+    assert_eq!(
+        catalog
+            .analysis_request_events(&first.request_key)
+            .unwrap()
+            .iter()
+            .filter(|event| event.event_kind == "retry_authorized")
+            .count(),
+        1,
+        "repeat authorization for the same next epoch is idempotent"
+    );
+
+    let retry = catalog
+        .reserve_analysis_request(&context, DEFAULT_MODEL, "payload-a", &bound(0.10))
+        .unwrap();
+    assert_eq!(retry.attempt_epoch, 1);
+    let snapshot = catalog
+        .analysis_budget_snapshot(&analysis_operation_budget_scope_id(&project, "retry"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(snapshot.confirmed_cost_usd, 0.0);
+    assert!((snapshot.active_reserved_cost_usd - 0.10).abs() < 1e-12);
+    assert!((snapshot.uncertain_usage_reserve_usd - 0.10).abs() < 1e-12);
+
+    catalog
+        .record_analysis_request_receipt(
+            &first.request_key,
+            &receipt("fake", "retry-late", DEFAULT_MODEL, 0.03, true),
+        )
+        .unwrap();
+    catalog
+        .mark_analysis_request_dispatched(&retry.request_key)
+        .unwrap();
+    catalog
+        .record_analysis_request_receipt(
+            &retry.request_key,
+            &receipt("fake", "retry-current", DEFAULT_MODEL, 0.04, true),
+        )
+        .unwrap();
+    let snapshot = catalog
+        .analysis_budget_snapshot(&analysis_operation_budget_scope_id(&project, "retry"))
+        .unwrap()
+        .unwrap();
+    assert!((snapshot.confirmed_cost_usd - 0.07).abs() < 1e-12);
+    assert_eq!(snapshot.uncertain_usage_reserve_usd, 0.0);
+    assert_eq!(
+        catalog
+            .list_analysis_requests(&project, None, 10)
+            .unwrap()
+            .len(),
+        2,
+        "all prior attempt rows remain in history"
+    );
+}
+
+#[test]
+fn stale_and_competing_retry_epochs_are_fenced() {
+    let (directory, catalog, project) = fixture();
+    catalog
+        .initialize_analysis_accounting_authority(&operation_authority(&project, "retry-race", 1.0))
+        .unwrap();
+    let mut context = operation_context(&project, "retry-race", "same-intent", 1.0);
+    let first = catalog
+        .reserve_analysis_request(&context, DEFAULT_MODEL, "payload", &bound(0.10))
+        .unwrap();
+    catalog
+        .mark_analysis_request_dispatched(&first.request_key)
+        .unwrap();
+    catalog
+        .mark_analysis_request_uncertain(&first.request_key, "provider_error:transport")
+        .unwrap();
+    catalog
+        .authorize_analysis_request_retry(&first.request_key)
+        .unwrap();
+    context.explicit_retry = true;
+    let second_catalog = Catalog::open(directory.path().join("catalog.sqlite3")).unwrap();
+    let barrier = Arc::new(Barrier::new(2));
+    let mut handles = Vec::new();
+    for runner in [catalog.clone(), second_catalog] {
+        let barrier = Arc::clone(&barrier);
+        let context = context.clone();
+        handles.push(thread::spawn(move || {
+            barrier.wait();
+            runner.reserve_analysis_request(&context, DEFAULT_MODEL, "payload", &bound(0.10))
+        }));
+    }
+    let results: Vec<_> = handles
+        .into_iter()
+        .map(|handle| handle.join().unwrap())
+        .collect();
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);
+    assert_eq!(
+        catalog
+            .list_analysis_requests(&project, None, 10)
+            .unwrap()
+            .len(),
+        2,
+        "only one competing retry epoch may be consumed"
+    );
+    let stale = catalog
+        .authorize_analysis_request_retry(&first.request_key)
+        .unwrap_err();
+    assert!(format!("{stale:#}").contains("stale retry authorization"));
+}
+
+#[test]
+fn retry_limit_is_four_attempts_and_all_confirmed_charges_are_retained() {
+    let (_directory, catalog, project) = fixture();
+    catalog
+        .initialize_analysis_accounting_authority(&operation_authority(
+            &project,
+            "retry-limit",
+            1.0,
+        ))
+        .unwrap();
+    let mut context = operation_context(&project, "retry-limit", "bounded-request", 1.0);
+    let mut current = catalog
+        .reserve_analysis_request(&context, DEFAULT_MODEL, "payload", &bound(0.01))
+        .unwrap();
+    catalog
+        .mark_analysis_request_dispatched(&current.request_key)
+        .unwrap();
+    catalog
+        .record_analysis_request_receipt(
+            &current.request_key,
+            &receipt("fake", "retry-generation-0", DEFAULT_MODEL, 0.01, true),
+        )
+        .unwrap();
+    for epoch in 1..MAX_REQUEST_ATTEMPTS {
+        catalog
+            .authorize_analysis_request_retry(&current.request_key)
+            .unwrap();
+        context.explicit_retry = true;
+        current = catalog
+            .reserve_analysis_request(&context, DEFAULT_MODEL, "payload", &bound(0.01))
+            .unwrap();
+        assert_eq!(current.attempt_epoch, epoch);
+        catalog
+            .mark_analysis_request_dispatched(&current.request_key)
+            .unwrap();
+        catalog
+            .record_analysis_request_receipt(
+                &current.request_key,
+                &receipt(
+                    "fake",
+                    &format!("retry-generation-{epoch}"),
+                    DEFAULT_MODEL,
+                    0.01,
+                    true,
+                ),
+            )
+            .unwrap();
+    }
+    let error = catalog
+        .authorize_analysis_request_retry(&current.request_key)
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("retry limit reached"));
+    let requests = catalog.list_analysis_requests(&project, None, 10).unwrap();
+    assert_eq!(requests.len(), MAX_REQUEST_ATTEMPTS as usize);
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.lifecycle == AnalysisRequestLifecycle::Completed)
+    );
+    let snapshot = catalog
+        .analysis_budget_snapshot(&analysis_operation_budget_scope_id(&project, "retry-limit"))
+        .unwrap()
+        .unwrap();
+    assert!((snapshot.confirmed_cost_usd - 0.04).abs() < 1e-12);
+}
+
+#[test]
+fn complete_returned_cost_above_bound_is_confirmed_and_stops_authority() {
+    let (_directory, catalog, project) = fixture();
+    catalog
+        .initialize_analysis_accounting_authority(&operation_authority(&project, "overrun", 1.0))
+        .unwrap();
+    let request = catalog
+        .reserve_analysis_request(
+            &operation_context(&project, "overrun", "intent", 1.0),
+            DEFAULT_MODEL,
+            "payload",
+            &bound(0.10),
+        )
+        .unwrap();
+    catalog
+        .mark_analysis_request_dispatched(&request.request_key)
+        .unwrap();
+    catalog
+        .record_analysis_request_receipt(
+            &request.request_key,
+            &receipt("fake", "overrun-generation", DEFAULT_MODEL, 0.15, true),
+        )
+        .unwrap();
+    let snapshot = catalog
+        .analysis_budget_snapshot(&analysis_operation_budget_scope_id(&project, "overrun"))
+        .unwrap()
+        .unwrap();
+    assert!((snapshot.confirmed_cost_usd - 0.15).abs() < 1e-12);
+    assert!(snapshot.dispatch_stopped);
+    assert_eq!(snapshot.stop_reason, "reported_cost_exceeded_reservation");
+    let error = catalog
+        .reserve_analysis_request(
+            &operation_context(&project, "overrun", "next", 1.0),
+            DEFAULT_MODEL,
+            "next-payload",
+            &bound(0.10),
+        )
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("dispatch is stopped"));
+}
+
+#[test]
+fn mixed_pilot_and_bulk_operation_aggregates_do_not_mix_charges() {
+    let (_directory, catalog, project) = fixture();
+    let policy_id = "mixed-operations";
+    let source = "source";
+    let policy = project_policy(&project, policy_id, 2.0, source);
+    insert_authorization(&catalog, &policy, ANALYSIS_ACCOUNTING_SCHEMA_VERSION);
+    catalog
+        .initialize_analysis_accounting_authority(&policy_authority(&project, policy_id, 2.0))
+        .unwrap();
+    insert_run(
+        &catalog,
+        &project,
+        policy_id,
+        "run-current",
+        "completed",
+        "bulk",
+        0.0,
+    );
+
+    let mut pilot_context = policy_context(
+        &project,
+        policy_id,
+        "run-current",
+        "pilot-intent",
+        2.0,
+        source,
+    );
+    pilot_context.operation = "pilot".into();
+    let pilot = catalog
+        .reserve_analysis_request(&pilot_context, DEFAULT_MODEL, "pilot-payload", &bound(0.10))
+        .unwrap();
+    catalog
+        .mark_analysis_request_dispatched(&pilot.request_key)
+        .unwrap();
+    catalog
+        .record_analysis_request_receipt(
+            &pilot.request_key,
+            &receipt(
+                "pilot-provider",
+                "pilot-generation",
+                DEFAULT_MODEL,
+                0.02,
+                true,
+            ),
+        )
+        .unwrap();
+
+    let mut bulk_context = policy_context(
+        &project,
+        policy_id,
+        "run-current",
+        "bulk-intent",
+        2.0,
+        source,
+    );
+    bulk_context.operation = "bulk".into();
+    let bulk = catalog
+        .reserve_analysis_request(&bulk_context, DEFAULT_MODEL, "bulk-payload", &bound(0.10))
+        .unwrap();
+    catalog
+        .mark_analysis_request_dispatched(&bulk.request_key)
+        .unwrap();
+    catalog
+        .record_analysis_request_receipt(
+            &bulk.request_key,
+            &receipt(
+                "bulk-provider",
+                "bulk-generation",
+                DEFAULT_MODEL,
+                0.07,
+                true,
+            ),
+        )
+        .unwrap();
+
+    let pilot_aggregate = catalog
+        .analysis_accounting_aggregate_for_operation(policy_id, "pilot", Some("run-current"))
+        .unwrap();
+    assert_eq!(pilot_aggregate.request_count, 1);
+    assert_eq!(pilot_aggregate.completed_request_count, 1);
+    assert!((pilot_aggregate.confirmed_cost_usd - 0.02).abs() < 1e-12);
+    assert_eq!(
+        pilot_aggregate.current_run_actual_provider.as_deref(),
+        Some("pilot-provider")
+    );
+    assert!(pilot_aggregate.usage_complete);
+
+    let whole_policy = catalog
+        .analysis_accounting_aggregate(policy_id, Some("run-current"))
+        .unwrap();
+    assert_eq!(whole_policy.request_count, 2);
+    assert!((whole_policy.confirmed_cost_usd - 0.09).abs() < 1e-12);
+    assert!(whole_policy.usage_complete);
+    let snapshot = catalog
+        .analysis_budget_snapshot(&analysis_policy_budget_scope_id(&project, policy_id))
+        .unwrap()
+        .unwrap();
+    assert!((snapshot.confirmed_cost_usd - 0.09).abs() < 1e-12);
+}
+
+#[test]
+fn frozen_legacy_evidence_is_included_once_in_whole_policy_projection() {
+    let (_directory, catalog, project) = fixture();
+    let policy_id = "legacy-aggregate";
+    let source = "source";
+    let policy = project_policy(&project, policy_id, 1.0, source);
+    insert_authorization(&catalog, &policy, ANALYSIS_ACCOUNTING_SCHEMA_VERSION);
+    insert_pilot(&catalog, &project, policy_id, json!(0.20), json!(true));
+    catalog
+        .initialize_analysis_accounting_authority(&policy_authority(&project, policy_id, 1.0))
+        .unwrap();
+    insert_run(
+        &catalog,
+        &project,
+        policy_id,
+        "run-current",
+        "completed",
+        "bulk",
+        0.0,
+    );
+    let context = policy_context(&project, policy_id, "run-current", "new-pilot", 1.0, source);
+    let request = catalog
+        .reserve_analysis_request(&context, DEFAULT_MODEL, "payload", &bound(0.10))
+        .unwrap();
+    catalog
+        .mark_analysis_request_dispatched(&request.request_key)
+        .unwrap();
+    catalog
+        .record_analysis_request_receipt(
+            &request.request_key,
+            &receipt("fake", "legacy-new-generation", DEFAULT_MODEL, 0.01, true),
+        )
+        .unwrap();
+
+    let whole = catalog
+        .analysis_accounting_aggregate(policy_id, Some("run-current"))
+        .unwrap();
+    assert!(whole.legacy_included);
+    assert!((whole.legacy_confirmed_cost_usd - 0.20).abs() < 1e-12);
+    assert!((whole.confirmed_cost_usd - 0.21).abs() < 1e-12);
+    let pilot = catalog
+        .analysis_accounting_aggregate_for_operation(policy_id, "pilot", Some("run-current"))
+        .unwrap();
+    assert!(pilot.legacy_included);
+    assert!((pilot.confirmed_cost_usd - 0.21).abs() < 1e-12);
+    assert!((pilot.legacy_confirmed_cost_usd - 0.20).abs() < 1e-12);
+}
+
+#[test]
+fn late_old_run_receipt_contributes_charge_without_overwriting_current_provenance() {
+    let (_directory, catalog, project) = fixture();
+    let policy_id = "aggregate-provenance";
+    let source = "source";
+    let policy = project_policy(&project, policy_id, 2.0, source);
+    insert_authorization(&catalog, &policy, ANALYSIS_ACCOUNTING_SCHEMA_VERSION);
+    catalog
+        .initialize_analysis_accounting_authority(&policy_authority(&project, policy_id, 2.0))
+        .unwrap();
+    insert_run(
+        &catalog,
+        &project,
+        policy_id,
+        "run-old",
+        "completed",
+        "bulk",
+        0.0,
+    );
+    insert_run(
+        &catalog,
+        &project,
+        policy_id,
+        "run-new",
+        "completed",
+        "bulk",
+        0.0,
+    );
+
+    let mut old_context =
+        policy_context(&project, policy_id, "run-old", "same-intent", 2.0, source);
+    let old = catalog
+        .reserve_analysis_request(&old_context, DEFAULT_MODEL, "payload", &bound(0.10))
+        .unwrap();
+    catalog
+        .mark_analysis_request_dispatched(&old.request_key)
+        .unwrap();
+    catalog
+        .mark_analysis_request_uncertain(&old.request_key, "provider_error:transport")
+        .unwrap();
+    catalog
+        .authorize_analysis_request_retry(&old.request_key)
+        .unwrap();
+    old_context.explicit_retry = true;
+    old_context.run_id = "run-new".into();
+    let current = catalog
+        .reserve_analysis_request(&old_context, DEFAULT_MODEL, "payload", &bound(0.10))
+        .unwrap();
+    catalog
+        .mark_analysis_request_dispatched(&current.request_key)
+        .unwrap();
+    catalog
+        .record_analysis_request_receipt(
+            &current.request_key,
+            &receipt("new-provider", "new-generation", "new-model", 0.02, true),
+        )
+        .unwrap();
+
+    let before_late = catalog
+        .analysis_accounting_aggregate(policy_id, Some("run-new"))
+        .unwrap();
+    assert_eq!(before_late.request_count, 2);
+    assert_eq!(before_late.completed_request_count, 1);
+    assert_eq!(before_late.uncertain_request_count, 1);
+    assert!(!before_late.usage_complete);
+    assert!((before_late.uncertain_usage_reserve_usd - 0.10).abs() < 1e-12);
+    assert_eq!(
+        before_late.current_run_actual_provider.as_deref(),
+        Some("new-provider")
+    );
+    assert_eq!(
+        before_late.current_run_actual_model.as_deref(),
+        Some("new-model")
+    );
+    assert_eq!(
+        before_late.current_run_generation_id.as_deref(),
+        Some("new-generation")
+    );
+
+    catalog
+        .reconcile_analysis_request(
+            &old.request_key,
+            &AnalysisRequestReconciliation::LateReceipt {
+                receipt: receipt("old-provider", "old-generation", "old-model", 0.01, true),
+            },
+        )
+        .unwrap();
+    let after_late = catalog
+        .analysis_accounting_aggregate(policy_id, Some("run-new"))
+        .unwrap();
+    assert!(after_late.usage_complete);
+    assert!((after_late.confirmed_cost_usd - 0.03).abs() < 1e-12);
+    assert_eq!(after_late.uncertain_usage_reserve_usd, 0.0);
+    assert_eq!(
+        after_late.current_run_actual_provider.as_deref(),
+        Some("new-provider"),
+        "late old-run receipt must not overwrite current-run provenance"
+    );
+    assert_eq!(
+        after_late.current_run_generation_id.as_deref(),
+        Some("new-generation")
+    );
+    let old_record = catalog.analysis_request(&old.request_key).unwrap().unwrap();
+    assert_eq!(old_record.actual_provider.as_deref(), Some("old-provider"));
+}
+
+#[test]
+fn history_immutability_includes_receipts_and_project_cleanup_cascades() {
+    let (_directory, catalog, project) = fixture();
+    catalog
+        .initialize_analysis_accounting_authority(&operation_authority(&project, "history", 1.0))
+        .unwrap();
+    let request = catalog
+        .reserve_analysis_request(
+            &operation_context(&project, "history", "intent", 1.0),
+            DEFAULT_MODEL,
+            "payload",
+            &bound(0.10),
+        )
+        .unwrap();
+    catalog
+        .mark_analysis_request_dispatched(&request.request_key)
+        .unwrap();
+    catalog
+        .record_analysis_request_receipt(
+            &request.request_key,
+            &receipt("fake", "history-generation", DEFAULT_MODEL, 0.01, true),
+        )
+        .unwrap();
+    let connection = catalog.connection().unwrap();
+    for statement in [
+        "DELETE FROM analysis_provider_receipts WHERE request_key=?1",
+        "UPDATE analysis_provider_receipts SET reported_cost_usd=99.0 WHERE request_key=?1",
+        "DELETE FROM analysis_request_events WHERE request_key=?1",
+        "DELETE FROM analysis_request_reservations WHERE request_key=?1",
+    ] {
+        assert!(
+            connection
+                .execute(statement, [&request.request_key])
+                .is_err(),
+            "append-only accounting history rejected: {statement}"
+        );
+    }
+    connection
+        .execute("DELETE FROM projects WHERE id=?1", [&project])
+        .unwrap();
+    let remaining_receipts: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM analysis_provider_receipts",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let remaining_events: i64 = connection
+        .query_row("SELECT COUNT(*) FROM analysis_request_events", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(remaining_receipts, 0);
+    assert_eq!(remaining_events, 0);
+}
+
+#[test]
+fn complete_usage_without_cost_stays_unknown_until_matching_cost_receipt() {
+    let (_directory, catalog, project) = fixture();
+    catalog
+        .initialize_analysis_accounting_authority(&operation_authority(
+            &project,
+            "missing-cost",
+            1.0,
+        ))
+        .unwrap();
+    let request = catalog
+        .reserve_analysis_request(
+            &operation_context(&project, "missing-cost", "intent", 1.0),
+            DEFAULT_MODEL,
+            "payload",
+            &bound(0.10),
+        )
+        .unwrap();
+    catalog
+        .mark_analysis_request_dispatched(&request.request_key)
+        .unwrap();
+    let missing_cost = ProviderReceiptEvidence {
+        provider: "actual-provider".into(),
+        provider_generation_id: "generation".into(),
+        actual_model: "actual-model".into(),
+        reported_cost_usd: None,
+        prompt_tokens: Some(10),
+        completion_tokens: Some(5),
+        usage_complete: true,
+    };
+    let unknown = catalog
+        .record_analysis_request_receipt(&request.request_key, &missing_cost)
+        .unwrap();
+    assert_eq!(unknown.lifecycle, AnalysisRequestLifecycle::Uncertain);
+    assert_eq!(unknown.failure_code, "usage_cost_missing");
+    assert_eq!(unknown.reported_cost_usd, None);
+    assert!((unknown.uncertain_usage_reserve_usd - 0.10).abs() < 1e-12);
+    assert_eq!(unknown.confirmed_cost_usd, 0.0);
+
+    let completed = catalog
+        .record_analysis_request_receipt(
+            &request.request_key,
+            &receipt("actual-provider", "generation", "actual-model", 0.03, true),
+        )
+        .unwrap();
+    assert_eq!(completed.lifecycle, AnalysisRequestLifecycle::Completed);
+    assert!((completed.confirmed_cost_usd - 0.03).abs() < 1e-12);
+    assert_eq!(completed.uncertain_usage_reserve_usd, 0.0);
+}
+
+#[test]
+fn schema_trigger_rejects_direct_cross_request_generation_reuse() {
+    let (_directory, catalog, project) = fixture();
+    catalog
+        .initialize_analysis_accounting_authority(&operation_authority(&project, "trigger", 1.0))
+        .unwrap();
+    let first = catalog
+        .reserve_analysis_request(
+            &operation_context(&project, "trigger", "first", 1.0),
+            DEFAULT_MODEL,
+            "payload-first",
+            &bound(0.10),
+        )
+        .unwrap();
+    let second = catalog
+        .reserve_analysis_request(
+            &operation_context(&project, "trigger", "second", 1.0),
+            DEFAULT_MODEL,
+            "payload-second",
+            &bound(0.10),
+        )
+        .unwrap();
+    let connection = catalog.connection().unwrap();
+    for (request_key, receipt_key, provider, fingerprint) in [
+        (&first.request_key, "receipt-1", "", "fingerprint-1"),
+        (
+            &second.request_key,
+            "receipt-2",
+            "different-upstream",
+            "fingerprint-2",
+        ),
+    ] {
+        let result = connection.execute(
+            "INSERT INTO analysis_provider_receipts(
+                receipt_key,request_key,provider,provider_generation_id,actual_model,
+                reported_cost_usd,prompt_tokens,completion_tokens,usage_complete,
+                receipt_fingerprint,created_at)
+             VALUES(?1,?2,?3,'shared-generation','model',0.01,1,1,1,?4,'2026-10-25T00:00:00Z')",
+            rusqlite::params![receipt_key, request_key, provider, fingerprint],
+        );
+        if receipt_key == "receipt-1" {
+            result.unwrap();
+        } else {
+            assert!(
+                format!("{:#}", result.unwrap_err()).contains("different analysis request"),
+                "migration 39 trigger must enforce requested-route generation ownership"
+            );
+        }
+    }
+}
+
+#[test]
+fn receipt_identity_whitespace_cannot_bypass_generation_ownership() {
+    let (_directory, catalog, project) = fixture();
+    catalog
+        .initialize_analysis_accounting_authority(&operation_authority(&project, "identity", 1.0))
+        .unwrap();
+    let request = catalog
+        .reserve_analysis_request(
+            &operation_context(&project, "identity", "intent", 1.0),
+            DEFAULT_MODEL,
+            "payload",
+            &bound(0.1),
+        )
+        .unwrap();
+    catalog
+        .mark_analysis_request_dispatched(&request.request_key)
+        .unwrap();
+    for evidence in [
+        receipt("upstream", " generation", "model", 0.01, true),
+        receipt(" upstream ", "generation", "model", 0.01, true),
+        receipt("upstream", "generation", "model ", 0.01, true),
+    ] {
+        assert!(
+            catalog
+                .record_analysis_request_receipt(&request.request_key, &evidence)
+                .is_err()
+        );
+    }
+    assert!(
+        catalog
+            .analysis_provider_receipts(&request.request_key)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn filtered_pilot_projection_retains_frozen_unknown_pilot_usage() {
+    let (_directory, catalog, project) = fixture();
+    let policy = project_policy(&project, "legacy-unknown-projection", 1.0, "source");
+    insert_authorization(&catalog, &policy, ANALYSIS_ACCOUNTING_SCHEMA_VERSION);
+    insert_pilot(
+        &catalog,
+        &project,
+        &policy.policy_id,
+        json!(0.2),
+        json!(false),
+    );
+    insert_run(
+        &catalog,
+        &project,
+        &policy.policy_id,
+        "old-bulk",
+        "completed",
+        "bulk",
+        0.3,
+    );
+    catalog
+        .initialize_analysis_accounting_authority(&policy_authority(
+            &project,
+            &policy.policy_id,
+            1.0,
+        ))
+        .unwrap();
+    let pilot = catalog
+        .analysis_accounting_aggregate_for_operation(&policy.policy_id, "pilot", None)
+        .unwrap();
+    assert!(pilot.legacy_included);
+    assert!(!pilot.usage_complete);
+    assert_eq!(pilot.confirmed_cost_usd, 0.0);
+    assert!((pilot.uncertain_usage_reserve_usd - 0.2).abs() < 1e-12);
+    let whole = catalog
+        .analysis_accounting_aggregate(&policy.policy_id, None)
+        .unwrap();
+    assert!((whole.uncertain_usage_reserve_usd - 0.5).abs() < 1e-12);
+}
+
+#[test]
+fn raw_prompt_and_frame_bytes_never_enter_accounting_rows() {
+    let (_directory, catalog, project) = fixture();
+    catalog
+        .initialize_analysis_accounting_authority(&operation_authority(&project, "privacy", 1.0))
+        .unwrap();
+    let payload = analysis_request_payload_fingerprint(
+        DEFAULT_MODEL,
+        &crate::VlmRequest {
+            prompt: "PRIVATE_PROMPT_CANARY".into(),
+            frames: vec!["data:image/jpeg;base64,PRIVATE_FRAME_CANARY".into()],
+            schema: json!({"type":"object"}),
+        },
+    )
+    .unwrap();
+    let record = catalog
+        .reserve_analysis_request(
+            &operation_context(&project, "privacy", "intent", 1.0),
+            DEFAULT_MODEL,
+            &payload,
+            &bound(0.1),
+        )
+        .unwrap();
+    let evidence = json!({
+        "request": record,
+        "events": catalog.analysis_request_events(&record.request_key).unwrap(),
+        "authority": catalog.analysis_budget_authority_evidence(&record.budget_scope_id).unwrap(),
+    })
+    .to_string();
+    assert!(!evidence.contains("PRIVATE_PROMPT_CANARY"));
+    assert!(!evidence.contains("PRIVATE_FRAME_CANARY"));
 }
