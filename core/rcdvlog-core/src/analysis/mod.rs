@@ -15,6 +15,7 @@ pub mod framepack;
 pub mod frames;
 pub mod moments;
 pub mod openrouter;
+pub mod pilot_runtime;
 pub mod provider;
 pub mod quality;
 pub mod run_policy;

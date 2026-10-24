@@ -297,7 +297,40 @@ pub enum ProviderFailureCategory {
     HttpStatus,
     InvalidResponse,
     Configuration,
+    /// Durable ledger admission rejected the attempt before any transmission
+    /// (stopped budget, saturation, duplicate fence, policy/source mismatch).
+    LocalAdmission,
+    /// Local preparation or credential checks failed before the dispatch marker.
+    LocalPreUpload,
+    /// The provider call returned evidence, but persisting that evidence failed.
+    /// The request must remain uncertain and must never be retried implicitly.
+    LocalPostDispatch,
+    /// The caller cancelled before a paid transmission began.
+    Cancelled,
     Unclassified,
+}
+
+impl ProviderFailureCategory {
+    /// Only an actual provider transmission outcome may consume another paid
+    /// fallback attempt. Local accounting/configuration/cancellation failures
+    /// must stop the chain and must not poison provider health.
+    pub fn allows_paid_fallback(self) -> bool {
+        matches!(
+            self,
+            Self::Transport | Self::HttpStatus | Self::InvalidResponse | Self::Unclassified
+        )
+    }
+
+    pub fn is_local(self) -> bool {
+        matches!(
+            self,
+            Self::Configuration
+                | Self::LocalAdmission
+                | Self::LocalPreUpload
+                | Self::LocalPostDispatch
+                | Self::Cancelled
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -335,6 +368,41 @@ impl ProviderFailure {
         }
     }
 
+    pub fn local_admission() -> Self {
+        Self {
+            category: ProviderFailureCategory::LocalAdmission,
+            http_status: None,
+        }
+    }
+
+    pub fn local_pre_upload() -> Self {
+        Self {
+            category: ProviderFailureCategory::LocalPreUpload,
+            http_status: None,
+        }
+    }
+
+    pub fn local_post_dispatch() -> Self {
+        Self {
+            category: ProviderFailureCategory::LocalPostDispatch,
+            http_status: None,
+        }
+    }
+
+    pub fn cancelled() -> Self {
+        Self {
+            category: ProviderFailureCategory::Cancelled,
+            http_status: None,
+        }
+    }
+
+    pub fn configuration() -> Self {
+        Self {
+            category: ProviderFailureCategory::Configuration,
+            http_status: None,
+        }
+    }
+
     /// Extracts only typed failure metadata from an error chain. Any unknown
     /// error is deliberately collapsed to `unclassified`.
     pub fn from_anyhow(error: &anyhow::Error) -> Self {
@@ -353,19 +421,36 @@ impl ProviderFailure {
             .unwrap_or_else(Self::unclassified)
     }
 
+    /// Stable, bounded diagnostics derived only from the typed category and
+    /// numeric HTTP status. Callers cannot supply provider-controlled text.
     pub fn safe_detail(&self) -> String {
-        match self.category {
-            ProviderFailureCategory::Transport => "provider_error:transport".into(),
+        let detail = match self.category {
+            ProviderFailureCategory::Transport => "provider_error:transport",
             ProviderFailureCategory::HttpStatus => {
-                format!(
+                return format!(
                     "provider_error:http_status:{}",
                     self.http_status.unwrap_or(0)
-                )
+                );
             }
-            ProviderFailureCategory::InvalidResponse => "provider_error:invalid_response".into(),
-            ProviderFailureCategory::Configuration => "provider_error:configuration".into(),
-            ProviderFailureCategory::Unclassified => "provider_error:unclassified".into(),
-        }
+            ProviderFailureCategory::InvalidResponse => "provider_error:invalid_response",
+            ProviderFailureCategory::Configuration => {
+                "provider_error:configuration; inspect local credentials or endpoint before retrying"
+            }
+            ProviderFailureCategory::LocalAdmission => {
+                "analysis_accounting:admission_denied; inspect prior requests and reconcile uncertain usage before an explicit retry"
+            }
+            ProviderFailureCategory::LocalPreUpload => {
+                "analysis_accounting:pre_upload_failed; no dispatch marker was committed"
+            }
+            ProviderFailureCategory::LocalPostDispatch => {
+                "analysis_accounting:post_dispatch_persistence_failed; manually reconcile uncertain usage before retrying"
+            }
+            ProviderFailureCategory::Cancelled => {
+                "analysis_accounting:cancelled; no paid transmission was dispatched"
+            }
+            ProviderFailureCategory::Unclassified => "provider_error:unclassified",
+        };
+        detail.chars().take(240).collect()
     }
 }
 
@@ -396,6 +481,22 @@ pub trait VlmProvider: Send + Sync {
     }
 
     fn analyze(&self, model: &str, request: &VlmRequest) -> Result<VlmResponse>;
+
+    /// Cancellation-aware single attempt. The default preserves the historical
+    /// raw-provider behavior while giving the accounted boundary a hook to check
+    /// cancellation before its durable dispatch marker. It is intentionally not
+    /// generic so `ProviderChain` can still use trait objects.
+    fn analyze_with_cancel(
+        &self,
+        model: &str,
+        request: &VlmRequest,
+        is_cancelled: &mut dyn FnMut() -> bool,
+    ) -> Result<VlmResponse> {
+        if is_cancelled() {
+            return Err(ProviderFailure::cancelled().into());
+        }
+        self.analyze(model, request)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -511,8 +612,21 @@ impl ProviderChain {
         provider: &dyn VlmProvider,
         request: &VlmRequest,
     ) -> Result<ChainOutcome> {
+        self.analyze_with_cancel(provider, request, &mut || false)
+    }
+
+    /// Cancellation-aware chain. Each provider call is still a separate paid
+    /// attempt; the accounted provider wrapper performs admission immediately
+    /// before each transmission. Local admission/config/pre-upload/cancellation
+    /// failures stop here and never consume a fallback attempt.
+    pub fn analyze_with_cancel(
+        &self,
+        provider: &dyn VlmProvider,
+        request: &VlmRequest,
+        is_cancelled: &mut dyn FnMut() -> bool,
+    ) -> Result<ChainOutcome> {
         let first = self.current_default();
-        match provider.analyze(first, request) {
+        match provider.analyze_with_cancel(first, request, is_cancelled) {
             Ok(response) => {
                 let usage_complete = response.receipt.usage_complete;
                 Ok(ChainOutcome {
@@ -524,14 +638,20 @@ impl ProviderChain {
                 })
             }
             Err(first_error) => {
-                let _ = &first_error;
+                let failure = ProviderFailure::from_anyhow(&first_error);
                 let fallback = self.fallback_model();
-                if !self.allow_fallback || fallback == Some(first) {
-                    // The breaker already routed here; there is nowhere else to go.
-                    let failure = ProviderFailure::from_anyhow(&first_error);
+                if !failure.category.allows_paid_fallback()
+                    || !self.allow_fallback
+                    || fallback == Some(first)
+                {
+                    // Local denial/cancellation and a tripped breaker have no
+                    // additional paid attempt. Preserve the typed category.
                     return Err(ProviderChainError {
                         attempted_models: vec![first.to_string()],
-                        message: format!("provider request failed for {first}"),
+                        message: format!(
+                            "provider request failed for {first}: {}",
+                            failure.safe_detail()
+                        ),
                         category: failure.category,
                         http_status: failure.http_status,
                     }
@@ -539,7 +659,7 @@ impl ProviderChain {
                 }
                 self.default_failures.fetch_add(1, Ordering::Relaxed);
                 let fallback = fallback.expect("fallback policy checked");
-                match provider.analyze(fallback, request) {
+                match provider.analyze_with_cancel(fallback, request, is_cancelled) {
                     Ok(response) => Ok(ChainOutcome {
                         response,
                         attempts: 2,
@@ -551,7 +671,10 @@ impl ProviderChain {
                         let failure = ProviderFailure::from_anyhow(&fallback_error);
                         Err(ProviderChainError {
                             attempted_models: vec![first.to_string(), fallback.to_string()],
-                            message: format!("both models failed: {first}, {fallback}"),
+                            message: format!(
+                                "both models failed: {first}, {fallback}: {}",
+                                failure.safe_detail()
+                            ),
                             category: failure.category,
                             http_status: failure.http_status,
                         }

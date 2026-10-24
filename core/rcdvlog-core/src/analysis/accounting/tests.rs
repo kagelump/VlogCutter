@@ -4,6 +4,7 @@
 //! interruption, concurrent final-budget races, late receipts and legacy spending
 //! written after an authority snapshot. Runtime transport wiring is separate.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
 
@@ -12,7 +13,9 @@ use tempfile::tempdir;
 
 use super::*;
 use crate::analysis::provider::{
-    AnalysisRequestCostBound, DEFAULT_MODEL, analysis_cost_bound_contract_id,
+    AnalysisRequestCostBound, DEFAULT_MODEL, FALLBACK_MODEL, ProviderChain, ProviderFailure,
+    ProviderFailureCategory, VlmProvider, VlmReceipt, VlmRequest, VlmResponse,
+    analysis_cost_bound_contract_id,
 };
 use crate::analysis::run_policy::{
     AnalysisPayload, RunAssetScope, RunPolicy, RunPolicyContext, RunPolicyParameters,
@@ -2753,4 +2756,863 @@ fn cumulative_legacy_pilot_preserves_credit_across_replacement_runs_and_immutabl
             .unwrap(),
         0
     );
+}
+
+struct BoundaryProvider {
+    calls: Arc<AtomicUsize>,
+    bound_usd: f64,
+    fail_first_typed_transport: bool,
+    body: String,
+    receipt_provider: String,
+    panic_after_dispatch: bool,
+}
+
+impl BoundaryProvider {
+    fn new(bound_usd: f64) -> Self {
+        Self {
+            calls: Arc::new(AtomicUsize::new(0)),
+            bound_usd,
+            fail_first_typed_transport: false,
+            body: json!({"ok": true}).to_string(),
+            receipt_provider: "synthetic-boundary".into(),
+            panic_after_dispatch: false,
+        }
+    }
+
+    fn call_count(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+impl VlmProvider for BoundaryProvider {
+    fn analysis_cost_bound(
+        &self,
+        _model: &str,
+        _request: &VlmRequest,
+    ) -> anyhow::Result<AnalysisRequestCostBound> {
+        Ok(AnalysisRequestCostBound::declared_for_synthetic_transport(
+            self.bound_usd,
+        ))
+    }
+
+    fn analyze(&self, model: &str, _request: &VlmRequest) -> anyhow::Result<VlmResponse> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+        if self.panic_after_dispatch {
+            panic!("synthetic process interruption after dispatch marker");
+        }
+        if self.fail_first_typed_transport && call == 1 {
+            return Err(ProviderFailure::transport().into());
+        }
+        Ok(VlmResponse {
+            model: model.into(),
+            body: self.body.clone(),
+            prompt_tokens: 4,
+            completion_tokens: 2,
+            cost_usd: 0.01,
+            latency_ms: 1,
+            receipt: VlmReceipt {
+                actual_model: Some(model.into()),
+                provider: Some(self.receipt_provider.clone()),
+                generation_id: Some(format!("boundary-generation-{call}")),
+                usage_complete: true,
+            },
+        })
+    }
+}
+
+fn boundary_request() -> VlmRequest {
+    VlmRequest {
+        prompt: "synthetic accounted boundary prompt".into(),
+        frames: vec!["data:image/jpeg;base64,AA==".into()],
+        schema: json!({"type": "object"}),
+    }
+}
+
+#[test]
+fn accounted_boundary_reserves_chain_fallback_attempts_independently() {
+    let (_directory, catalog, project) = fixture();
+    catalog
+        .initialize_analysis_accounting_authority(&operation_authority(
+            &project,
+            "boundary-chain",
+            1.0,
+        ))
+        .unwrap();
+    let run_id = catalog
+        .begin_accounted_analysis_run(&project, "", "pilot")
+        .unwrap();
+    let mut context = operation_context(&project, "boundary-chain", "intent", 1.0);
+    context.run_id = run_id;
+    let provider = BoundaryProvider {
+        fail_first_typed_transport: true,
+        ..BoundaryProvider::new(0.02)
+    };
+    let accounted = AccountedVlmProvider::new(&catalog, context, &provider);
+    let chain = ProviderChain::with_policy(
+        DEFAULT_MODEL,
+        &[DEFAULT_MODEL.into(), FALLBACK_MODEL.into()],
+        true,
+    )
+    .unwrap();
+
+    let outcome = chain.analyze(&accounted, &boundary_request()).unwrap();
+    assert_eq!(outcome.response.model, FALLBACK_MODEL);
+    assert_eq!(provider.call_count(), 2);
+
+    let requests = catalog.list_analysis_requests(&project, None, 10).unwrap();
+    assert_eq!(requests.len(), 2, "each chain attempt needs its own row");
+    let uncertain = requests
+        .iter()
+        .find(|request| request.lifecycle == AnalysisRequestLifecycle::Uncertain)
+        .expect("first transport failure must retain uncertainty");
+    assert!(uncertain.dispatch_at.is_some());
+    assert!(uncertain.confirmed_cost_usd == 0.0);
+    let completed = requests
+        .iter()
+        .find(|request| request.lifecycle == AnalysisRequestLifecycle::Completed)
+        .expect("fallback receipt must settle independently");
+    assert_eq!(
+        catalog
+            .analysis_provider_receipts(&completed.request_key)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        catalog
+            .analysis_provider_receipts(&uncertain.request_key)
+            .unwrap()
+            .is_empty(),
+        "a typed transport failure without receipt metadata stays unknown"
+    );
+}
+
+#[test]
+fn accounted_boundary_race_for_final_budget_has_zero_actual_calls_overrun() {
+    let (directory, catalog, project) = fixture();
+    catalog
+        .initialize_analysis_accounting_authority(&operation_authority(
+            &project,
+            "boundary-race",
+            0.10,
+        ))
+        .unwrap();
+    let run_id = catalog
+        .begin_accounted_analysis_run(&project, "", "pilot")
+        .unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let barrier = Arc::new(Barrier::new(2));
+    let second_catalog = Catalog::open(directory.path().join("catalog.sqlite3")).unwrap();
+    let mut handles = Vec::new();
+    for (index, runner) in [catalog.clone(), second_catalog].into_iter().enumerate() {
+        let barrier = Arc::clone(&barrier);
+        let calls = Arc::clone(&calls);
+        let project = project.clone();
+        let run_id = run_id.clone();
+        handles.push(thread::spawn(move || {
+            let mut context =
+                operation_context(&project, "boundary-race", &format!("intent-{index}"), 0.10);
+            context.run_id = run_id;
+            let provider = BoundaryProvider {
+                calls,
+                ..BoundaryProvider::new(0.10)
+            };
+            let accounted = AccountedVlmProvider::new(&runner, context, &provider);
+            barrier.wait();
+            accounted.analyze(DEFAULT_MODEL, &boundary_request())
+        }));
+    }
+    let results: Vec<_> = handles
+        .into_iter()
+        .map(|handle| handle.join().unwrap())
+        .collect();
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "the losing worker must make zero provider calls"
+    );
+    assert_eq!(
+        catalog
+            .list_analysis_requests(&project, None, 10)
+            .unwrap()
+            .len(),
+        1,
+        "the denied worker must not create a reservation"
+    );
+    let snapshot = catalog
+        .analysis_budget_snapshot(&analysis_operation_budget_scope_id(
+            &project,
+            "boundary-race",
+        ))
+        .unwrap()
+        .unwrap();
+    assert_eq!(snapshot.active_requests, 0);
+    assert!(snapshot.confirmed_cost_usd <= 0.10 + 1e-12);
+}
+
+#[test]
+fn local_admission_denial_does_not_fallback_or_poison_provider_health() {
+    let (_directory, catalog, project) = fixture();
+    catalog
+        .initialize_analysis_accounting_authority(&operation_authority(
+            &project,
+            "boundary-denial",
+            0.01,
+        ))
+        .unwrap();
+    let run_id = catalog
+        .begin_accounted_analysis_run(&project, "", "pilot")
+        .unwrap();
+    let mut context = operation_context(&project, "boundary-denial", "intent", 0.01);
+    context.run_id = run_id;
+    let provider = BoundaryProvider::new(0.02);
+    let accounted = AccountedVlmProvider::new(&catalog, context, &provider);
+    let chain = ProviderChain::with_policy(
+        DEFAULT_MODEL,
+        &[DEFAULT_MODEL.into(), FALLBACK_MODEL.into()],
+        true,
+    )
+    .unwrap();
+    let error = chain.analyze(&accounted, &boundary_request()).unwrap_err();
+    assert_eq!(
+        ProviderFailure::from_anyhow(&error).category,
+        ProviderFailureCategory::LocalAdmission
+    );
+    assert_eq!(provider.call_count(), 0);
+    assert_eq!(chain.default_failures(), 0);
+    assert!(
+        catalog
+            .list_analysis_requests(&project, None, 10)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn missing_run_id_is_typed_local_admission_without_calls_or_health_poison() {
+    let (_directory, catalog, project) = fixture();
+    catalog
+        .initialize_analysis_accounting_authority(&operation_authority(
+            &project,
+            "boundary-missing-run",
+            1.0,
+        ))
+        .unwrap();
+    let mut context =
+        operation_context(&project, "boundary-missing-run", "missing-run-intent", 1.0);
+    context.run_id.clear();
+    let provider = BoundaryProvider::new(0.02);
+    let accounted = AccountedVlmProvider::new(&catalog, context, &provider);
+    let chain = ProviderChain::with_policy(
+        DEFAULT_MODEL,
+        &[DEFAULT_MODEL.into(), FALLBACK_MODEL.into()],
+        true,
+    )
+    .unwrap();
+    let error = chain.analyze(&accounted, &boundary_request()).unwrap_err();
+    let failure = ProviderFailure::from_anyhow(&error);
+    assert_eq!(failure.category, ProviderFailureCategory::LocalAdmission);
+    assert!(failure.safe_detail().contains("reconcile"));
+    assert_eq!(provider.call_count(), 0);
+    assert_eq!(chain.default_failures(), 0);
+    assert!(
+        catalog
+            .list_analysis_requests(&project, None, 10)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn stable_provider_failure_text_never_contains_error_canaries() {
+    let canary = "PRIVATE_PROVIDER_BODY_AND_PATH_CANARY";
+    let error = anyhow::Error::new(ProviderFailure::transport())
+        .context(format!("synthetic exception {canary} /private/canary.mp4"));
+    let failure = ProviderFailure::from_anyhow(&error);
+    assert_eq!(failure.category, ProviderFailureCategory::Transport);
+    assert!(!failure.safe_detail().contains(canary));
+    assert!(!failure.to_string().contains(canary));
+    assert!(
+        ProviderFailure::local_admission()
+            .safe_detail()
+            .contains("explicit retry")
+    );
+    assert!(
+        ProviderFailure::local_post_dispatch()
+            .safe_detail()
+            .contains("reconcile")
+    );
+}
+
+#[test]
+fn crashed_process_after_dispatch_marker_is_never_blindly_resent() {
+    let (directory, catalog, project) = fixture();
+    catalog
+        .initialize_analysis_accounting_authority(&operation_authority(
+            &project,
+            "boundary-crash",
+            1.0,
+        ))
+        .unwrap();
+    let run_id = catalog
+        .begin_accounted_analysis_run(&project, "", "pilot")
+        .unwrap();
+    let mut context = operation_context(&project, "boundary-crash", "intent", 1.0);
+    context.run_id = run_id;
+    let crashing = BoundaryProvider {
+        panic_after_dispatch: true,
+        ..BoundaryProvider::new(0.02)
+    };
+    let accounted = AccountedVlmProvider::new(&catalog, context.clone(), &crashing);
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        accounted.analyze(DEFAULT_MODEL, &boundary_request())
+    }));
+
+    let reopened = Catalog::open(directory.path().join("catalog.sqlite3")).unwrap();
+    let requests = reopened.list_analysis_requests(&project, None, 10).unwrap();
+    assert_eq!(requests.len(), 1);
+    let request = &requests[0];
+    assert_eq!(request.lifecycle, AnalysisRequestLifecycle::Dispatched);
+    assert_eq!(
+        reopened
+            .analysis_request_needs_reconciliation(&request.request_key)
+            .unwrap(),
+        Some(AnalysisRequestLifecycle::Dispatched)
+    );
+
+    let retry_provider = BoundaryProvider::new(0.02);
+    let retry = AccountedVlmProvider::new(&reopened, context, &retry_provider);
+    let error = retry
+        .analyze(DEFAULT_MODEL, &boundary_request())
+        .unwrap_err();
+    assert_eq!(
+        ProviderFailure::from_anyhow(&error).category,
+        ProviderFailureCategory::LocalAdmission
+    );
+    assert_eq!(retry_provider.call_count(), 0);
+
+    let reconciled = reopened
+        .reconcile_analysis_request(
+            &request.request_key,
+            &AnalysisRequestReconciliation::UncertainOutcome {
+                failure_code: "process_interrupted_after_dispatch".into(),
+            },
+        )
+        .unwrap();
+    assert_eq!(reconciled.lifecycle, AnalysisRequestLifecycle::Uncertain);
+    assert!(reconciled.uncertain_usage_reserve_usd > 0.0);
+}
+
+#[test]
+fn cancellation_after_reservation_releases_only_before_dispatch_marker() {
+    let (_directory, catalog, project) = fixture();
+    catalog
+        .initialize_analysis_accounting_authority(&operation_authority(
+            &project,
+            "boundary-cancel",
+            1.0,
+        ))
+        .unwrap();
+    let run_id = catalog
+        .begin_accounted_analysis_run(&project, "", "pilot")
+        .unwrap();
+    let mut context = operation_context(&project, "boundary-cancel", "intent", 1.0);
+    context.run_id = run_id;
+    let provider = BoundaryProvider::new(0.02);
+    let accounted = AccountedVlmProvider::new(&catalog, context, &provider);
+    let probes = AtomicUsize::new(0);
+    let error = accounted
+        .analyze_with_cancel(DEFAULT_MODEL, &boundary_request(), &mut || {
+            probes.fetch_add(1, Ordering::SeqCst) == 1
+        })
+        .unwrap_err();
+    assert_eq!(
+        ProviderFailure::from_anyhow(&error).category,
+        ProviderFailureCategory::Cancelled
+    );
+    assert_eq!(provider.call_count(), 0);
+    let requests = catalog.list_analysis_requests(&project, None, 10).unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].lifecycle, AnalysisRequestLifecycle::Released);
+    assert!(requests[0].dispatch_at.is_none());
+    assert!(requests[0].uncertain_usage_reserve_usd == 0.0);
+}
+
+#[test]
+fn current_run_provenance_uses_receipt_event_order_not_timestamps() {
+    let (_directory, catalog, project) = fixture();
+    let policy_id = "event-order-provenance";
+    let source = "synthetic-source-fingerprint";
+    let mut policy = project_policy(&project, policy_id, 1.0, source);
+    policy.allowed_models = vec![DEFAULT_MODEL.into(), FALLBACK_MODEL.into()];
+    policy.allow_fallback = true;
+    insert_authorization(&catalog, &policy, ANALYSIS_ACCOUNTING_SCHEMA_VERSION);
+    catalog
+        .initialize_analysis_accounting_authority(&policy_authority(&project, policy_id, 1.0))
+        .unwrap();
+    let run_id = catalog
+        .begin_accounted_analysis_run(&project, policy_id, "pilot")
+        .unwrap();
+    let context = policy_context(&project, policy_id, &run_id, "same-intent", 1.0, source);
+
+    let primary = catalog
+        .reserve_analysis_request(&context, DEFAULT_MODEL, "primary-payload", &bound(0.10))
+        .unwrap();
+    catalog
+        .mark_analysis_request_dispatched(&primary.request_key)
+        .unwrap();
+    catalog
+        .record_analysis_request_receipt(
+            &primary.request_key,
+            &receipt(
+                "primary-provider",
+                "primary-generation",
+                DEFAULT_MODEL,
+                0.01,
+                true,
+            ),
+        )
+        .unwrap();
+    // Wall-clock skew: the first receipt claims a much later settlement time.
+    catalog
+        .connection()
+        .unwrap()
+        .execute(
+            "UPDATE analysis_request_reservations SET settled_at=?2 WHERE request_key=?1",
+            rusqlite::params![primary.request_key, "2999-01-01T00:00:00Z"],
+        )
+        .unwrap();
+
+    let fallback = catalog
+        .reserve_analysis_request(&context, FALLBACK_MODEL, "fallback-payload", &bound(0.10))
+        .unwrap();
+    catalog
+        .mark_analysis_request_dispatched(&fallback.request_key)
+        .unwrap();
+    catalog
+        .record_analysis_request_receipt(
+            &fallback.request_key,
+            &receipt(
+                "fallback-provider",
+                "fallback-generation",
+                FALLBACK_MODEL,
+                0.01,
+                true,
+            ),
+        )
+        .unwrap();
+    catalog
+        .connection()
+        .unwrap()
+        .execute(
+            "UPDATE analysis_request_reservations SET settled_at=?2 WHERE request_key=?1",
+            rusqlite::params![fallback.request_key, "2000-01-01T00:00:00Z"],
+        )
+        .unwrap();
+
+    let aggregate = catalog
+        .analysis_accounting_aggregate_for_operation(policy_id, "pilot", Some(&run_id))
+        .unwrap();
+    assert_eq!(
+        aggregate.current_run_actual_provider.as_deref(),
+        Some("fallback-provider"),
+        "event insertion order identifies the actual final fallback"
+    );
+    assert_eq!(
+        aggregate.current_run_actual_model.as_deref(),
+        Some(FALLBACK_MODEL)
+    );
+    assert_eq!(
+        aggregate.current_run_generation_id.as_deref(),
+        Some("fallback-generation")
+    );
+
+    // Even when both settlement timestamps are exactly equal, event insertion
+    // order still identifies the actual final fallback.
+    catalog
+        .connection()
+        .unwrap()
+        .execute(
+            "UPDATE analysis_request_reservations
+             SET settled_at='2026-01-01T00:00:00Z'
+             WHERE request_key IN (?1,?2)",
+            rusqlite::params![primary.request_key, fallback.request_key],
+        )
+        .unwrap();
+    let equal_timestamps = catalog
+        .analysis_accounting_aggregate_for_operation(policy_id, "pilot", Some(&run_id))
+        .unwrap();
+    assert_eq!(
+        equal_timestamps.current_run_actual_provider.as_deref(),
+        Some("fallback-provider"),
+        "equal timestamps must not fall back to summary/request-key ordering"
+    );
+    assert_eq!(
+        equal_timestamps.current_run_generation_id.as_deref(),
+        Some("fallback-generation")
+    );
+
+    let projection = catalog
+        .analysis_operation_attempt_projection(policy_id, "pilot")
+        .unwrap();
+    assert_eq!(projection.actual_attempt_count, 2);
+    assert_eq!(projection.prompt_tokens, 20);
+    assert_eq!(projection.completion_tokens, 10);
+
+    // A later metadata-only receipt event must not multiply or erase the known
+    // token evidence from the latest token-bearing receipt.
+    let metadata_only = ProviderReceiptEvidence {
+        provider: "fallback-provider".into(),
+        provider_generation_id: "fallback-generation".into(),
+        actual_model: FALLBACK_MODEL.into(),
+        reported_cost_usd: None,
+        prompt_tokens: None,
+        completion_tokens: None,
+        usage_complete: false,
+    };
+    catalog
+        .record_analysis_request_receipt(&fallback.request_key, &metadata_only)
+        .unwrap();
+    catalog
+        .record_analysis_request_receipt(&fallback.request_key, &metadata_only)
+        .unwrap();
+    let repeated = catalog
+        .analysis_operation_attempt_projection(policy_id, "pilot")
+        .unwrap();
+    assert_eq!(repeated.actual_attempt_count, 2);
+    assert_eq!(repeated.prompt_tokens, 20);
+    assert_eq!(repeated.completion_tokens, 10);
+}
+
+#[test]
+fn late_old_run_receipt_cannot_win_current_run_event_provenance() {
+    let (_directory, catalog, project) = fixture();
+    let policy_id = "event-order-old-run";
+    let source = "synthetic-source-fingerprint";
+    let mut policy = project_policy(&project, policy_id, 2.0, source);
+    policy.allowed_models = vec![DEFAULT_MODEL.into(), FALLBACK_MODEL.into()];
+    policy.allow_fallback = true;
+    insert_authorization(&catalog, &policy, ANALYSIS_ACCOUNTING_SCHEMA_VERSION);
+    catalog
+        .initialize_analysis_accounting_authority(&policy_authority(&project, policy_id, 2.0))
+        .unwrap();
+    for run_id in ["run-old-event", "run-new-event"] {
+        let id = catalog
+            .begin_accounted_analysis_run(&project, policy_id, "pilot")
+            .unwrap();
+        // begin generates a UUID; use a fixed test-only identity update so the
+        // aggregate can address each run explicitly.
+        catalog
+            .connection()
+            .unwrap()
+            .execute(
+                "UPDATE analysis_runs SET id=?2 WHERE id=?1",
+                rusqlite::params![id, run_id],
+            )
+            .unwrap();
+    }
+
+    let old_context = policy_context(
+        &project,
+        policy_id,
+        "run-old-event",
+        "old-intent",
+        2.0,
+        source,
+    );
+    let old = catalog
+        .reserve_analysis_request(&old_context, DEFAULT_MODEL, "old-payload", &bound(0.10))
+        .unwrap();
+    catalog
+        .mark_analysis_request_dispatched(&old.request_key)
+        .unwrap();
+    catalog
+        .mark_analysis_request_uncertain(&old.request_key, "provider_error:transport")
+        .unwrap();
+
+    let new_context = policy_context(
+        &project,
+        policy_id,
+        "run-new-event",
+        "new-intent",
+        2.0,
+        source,
+    );
+    let current = catalog
+        .reserve_analysis_request(&new_context, FALLBACK_MODEL, "new-payload", &bound(0.10))
+        .unwrap();
+    catalog
+        .mark_analysis_request_dispatched(&current.request_key)
+        .unwrap();
+    catalog
+        .record_analysis_request_receipt(
+            &current.request_key,
+            &receipt(
+                "current-provider",
+                "current-generation",
+                FALLBACK_MODEL,
+                0.02,
+                true,
+            ),
+        )
+        .unwrap();
+
+    // A late receipt for the older run appends a newer event globally, but the
+    // current-run provenance must filter by run identity before event ordering.
+    catalog
+        .reconcile_analysis_request(
+            &old.request_key,
+            &AnalysisRequestReconciliation::LateReceipt {
+                receipt: receipt(
+                    "late-old-provider",
+                    "late-old-generation",
+                    DEFAULT_MODEL,
+                    0.01,
+                    true,
+                ),
+            },
+        )
+        .unwrap();
+    let aggregate = catalog
+        .analysis_accounting_aggregate_for_operation(policy_id, "pilot", Some("run-new-event"))
+        .unwrap();
+    assert_eq!(
+        aggregate.current_run_actual_provider.as_deref(),
+        Some("current-provider")
+    );
+    assert_eq!(
+        aggregate.current_run_generation_id.as_deref(),
+        Some("current-generation")
+    );
+}
+
+#[test]
+fn missing_receipt_identity_stays_unknown_in_current_run_provenance() {
+    let (_directory, catalog, project) = fixture();
+    let policy_id = "event-order-unknown-provider";
+    let source = "synthetic-source-fingerprint";
+    let policy = project_policy(&project, policy_id, 1.0, source);
+    insert_authorization(&catalog, &policy, ANALYSIS_ACCOUNTING_SCHEMA_VERSION);
+    catalog
+        .initialize_analysis_accounting_authority(&policy_authority(&project, policy_id, 1.0))
+        .unwrap();
+    let run_id = catalog
+        .begin_accounted_analysis_run(&project, policy_id, "pilot")
+        .unwrap();
+    let context = policy_context(&project, policy_id, &run_id, "unknown-intent", 1.0, source);
+    let request = catalog
+        .reserve_analysis_request(&context, DEFAULT_MODEL, "unknown-payload", &bound(0.10))
+        .unwrap();
+    catalog
+        .mark_analysis_request_dispatched(&request.request_key)
+        .unwrap();
+    catalog
+        .record_analysis_request_receipt(
+            &request.request_key,
+            &receipt("", "", DEFAULT_MODEL, 0.01, true),
+        )
+        .unwrap();
+    let aggregate = catalog
+        .analysis_accounting_aggregate_for_operation(policy_id, "pilot", Some(&run_id))
+        .unwrap();
+    assert_eq!(aggregate.current_run_actual_provider, None);
+    assert_eq!(
+        aggregate.current_run_actual_model.as_deref(),
+        Some(DEFAULT_MODEL)
+    );
+    assert_eq!(aggregate.current_run_generation_id, None);
+}
+
+#[test]
+fn saturation_denial_does_not_fallback_or_poison_provider_health() {
+    let (_directory, catalog, project) = fixture();
+    catalog
+        .initialize_analysis_accounting_authority(&operation_authority(
+            &project,
+            "boundary-saturation",
+            1.0,
+        ))
+        .unwrap();
+    let run_id = catalog
+        .begin_accounted_analysis_run(&project, "", "pilot")
+        .unwrap();
+    for index in 0..MAX_IN_FLIGHT_REQUESTS_PER_BUDGET_AUTHORITY {
+        let mut context = operation_context(
+            &project,
+            "boundary-saturation",
+            &format!("held-{index}"),
+            1.0,
+        );
+        context.run_id = run_id.clone();
+        let request = catalog
+            .reserve_analysis_request(
+                &context,
+                DEFAULT_MODEL,
+                &format!("held-payload-{index}"),
+                &bound(0.02),
+            )
+            .unwrap();
+        catalog
+            .mark_analysis_request_dispatched(&request.request_key)
+            .unwrap();
+    }
+
+    let provider = BoundaryProvider::new(0.02);
+    let mut denied_context = operation_context(&project, "boundary-saturation", "denied", 1.0);
+    denied_context.run_id = run_id;
+    let accounted = AccountedVlmProvider::new(&catalog, denied_context, &provider);
+    let chain = ProviderChain::with_policy(
+        DEFAULT_MODEL,
+        &[DEFAULT_MODEL.into(), FALLBACK_MODEL.into()],
+        true,
+    )
+    .unwrap();
+    let error = chain
+        .analyze(&accounted, &boundary_request())
+        .expect_err("saturated authority must deny before transport");
+    assert_eq!(
+        ProviderFailure::from_anyhow(&error).category,
+        ProviderFailureCategory::LocalAdmission
+    );
+    assert_eq!(provider.call_count(), 0);
+    assert_eq!(
+        chain.default_failures(),
+        0,
+        "a local denial must not poison provider health"
+    );
+    assert_eq!(
+        catalog
+            .list_analysis_requests(&project, None, 20)
+            .unwrap()
+            .len(),
+        MAX_IN_FLIGHT_REQUESTS_PER_BUDGET_AUTHORITY,
+        "the denied worker must not create another reservation"
+    );
+}
+
+#[test]
+fn receipt_persistence_failure_after_dispatch_stays_uncertain_without_fallback() {
+    let (_directory, catalog, project) = fixture();
+    catalog
+        .initialize_analysis_accounting_authority(&operation_authority(
+            &project,
+            "boundary-receipt-failure",
+            1.0,
+        ))
+        .unwrap();
+    let run_id = catalog
+        .begin_accounted_analysis_run(&project, "", "pilot")
+        .unwrap();
+    catalog
+        .connection()
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER synthetic_receipt_persist_failure
+             BEFORE INSERT ON analysis_provider_receipts
+             WHEN NEW.provider='persist-fail'
+             BEGIN
+                 SELECT RAISE(ABORT, 'synthetic receipt persistence failure');
+             END;",
+        )
+        .unwrap();
+    let provider = BoundaryProvider {
+        receipt_provider: "persist-fail".into(),
+        ..BoundaryProvider::new(0.02)
+    };
+    let mut context = operation_context(&project, "boundary-receipt-failure", "intent", 1.0);
+    context.run_id = run_id;
+    let accounted = AccountedVlmProvider::new(&catalog, context, &provider);
+    let chain = ProviderChain::with_policy(
+        DEFAULT_MODEL,
+        &[DEFAULT_MODEL.into(), FALLBACK_MODEL.into()],
+        true,
+    )
+    .unwrap();
+    let error = chain
+        .analyze(&accounted, &boundary_request())
+        .expect_err("receipt persistence failure must stop after one paid call");
+    assert_eq!(
+        ProviderFailure::from_anyhow(&error).category,
+        ProviderFailureCategory::LocalPostDispatch
+    );
+    assert_eq!(provider.call_count(), 1);
+    assert_eq!(chain.default_failures(), 0);
+    let requests = catalog.list_analysis_requests(&project, None, 10).unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].lifecycle,
+        AnalysisRequestLifecycle::Uncertain,
+        "a paid response without a durable receipt must remain honestly uncertain"
+    );
+    assert!(requests[0].dispatch_at.is_some());
+    assert!(
+        catalog
+            .analysis_provider_receipts(&requests[0].request_key)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(requests[0].confirmed_cost_usd, 0.0);
+    assert!(requests[0].uncertain_usage_reserve_usd > 0.0);
+}
+
+#[test]
+fn provenance_is_scoped_to_policy_and_preserves_known_metadata_when_receipt_enriches() {
+    let (_directory, catalog, project) = fixture();
+    let policy = project_policy(&project, "provenance-policy", 1.0, "source");
+    insert_authorization(&catalog, &policy, ANALYSIS_ACCOUNTING_SCHEMA_VERSION);
+    catalog
+        .initialize_analysis_accounting_authority(&policy_authority(
+            &project,
+            &policy.policy_id,
+            1.0,
+        ))
+        .unwrap();
+    let run = catalog
+        .begin_accounted_analysis_run(&project, &policy.policy_id, "pilot")
+        .unwrap();
+    let request = catalog
+        .reserve_analysis_request(
+            &policy_context(&project, &policy.policy_id, &run, "intent", 1.0, "source"),
+            DEFAULT_MODEL,
+            "payload",
+            &bound(0.1),
+        )
+        .unwrap();
+    catalog
+        .mark_analysis_request_dispatched(&request.request_key)
+        .unwrap();
+    catalog
+        .record_analysis_request_receipt(
+            &request.request_key,
+            &receipt("actual-upstream", "generation", "", 0.01, true),
+        )
+        .unwrap();
+    let mut enriched = receipt("", "", "actual-model", 0.01, true);
+    enriched.prompt_tokens = None;
+    enriched.completion_tokens = None;
+    catalog
+        .record_analysis_request_receipt(&request.request_key, &enriched)
+        .unwrap();
+    let projection = catalog
+        .analysis_accounting_aggregate(&policy.policy_id, Some(&run))
+        .unwrap();
+    assert_eq!(
+        projection.current_run_actual_provider.as_deref(),
+        Some("actual-upstream")
+    );
+    assert_eq!(
+        projection.current_run_actual_model.as_deref(),
+        Some("actual-model")
+    );
+    assert_eq!(
+        projection.current_run_generation_id.as_deref(),
+        Some("generation")
+    );
+    let other = catalog
+        .analysis_accounting_aggregate("other-policy", Some(&run))
+        .unwrap();
+    assert_eq!(other.current_run_actual_provider, None);
+    assert_eq!(other.current_run_generation_id, None);
 }

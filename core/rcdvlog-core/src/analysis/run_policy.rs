@@ -14,22 +14,23 @@ use anyhow::{Context, Result, bail, ensure};
 use chrono::{SecondsFormat, Utc};
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
 use std::collections::HashSet;
 
-use crate::analysis::moments::{
-    EditProfile, MOMENT_PROMPT_VERSION, MOMENT_RECIPE_VERSION, MOMENT_SCHEMA_VERSION,
-    MomentPayload, MomentSpan, moment_output_schema, validate_reply,
+use crate::analysis::accounting::{
+    AnalysisAccountingContext, AnalysisBudgetAuthorityContext, AnalysisRetryAuthorization,
 };
-use crate::analysis::openrouter::{
-    OpenRouterProvider, api_credential_present, frame_data_uri, resolve_api_key,
+use crate::analysis::moments::{
+    EditProfile, MOMENT_PROMPT_VERSION, MOMENT_RECIPE_VERSION, MOMENT_SCHEMA_VERSION, MomentPayload,
+};
+use crate::analysis::openrouter::{OpenRouterProvider, api_credential_present, resolve_api_key};
+use crate::analysis::pilot_runtime::{
+    PilotAttemptBaseline, PilotSession, PilotSessionStart, execute_accounted_pilot_attempts,
+    prepare_pilot_session, prepare_pilot_transmission,
 };
 use crate::analysis::provider::{
-    DEFAULT_MODEL, FALLBACK_MODEL, ProviderChain, ProviderFailure, VlmProvider, VlmRequest,
-    analysis_cost_bound_contract_id, model_spec,
+    DEFAULT_MODEL, FALLBACK_MODEL, ProviderFailure, VlmProvider, analysis_cost_bound_contract_id,
+    model_spec,
 };
-use crate::analysis::schema::{self, output_schema as observation_output_schema};
-use crate::analysis::vlm::{PromptContext, build_prompt};
 use crate::analysis::{VLM_PROMPT_VERSION, framepack, store::TranscriptStatus};
 use crate::{Asset, Catalog, REFERENCE_COST_PER_CLIP_USD};
 
@@ -418,7 +419,16 @@ pub struct RunPilotRecord {
     pub attempts: u32,
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
+    /// Backward-compatible total recognized by this projection. It is the sum
+    /// of confirmed charges, unresolved uncertainty and active reservations,
+    /// never a claim that a reservation/estimate is a confirmed charge.
     pub cost_usd: f64,
+    #[serde(default)]
+    pub confirmed_cost_usd: f64,
+    #[serde(default)]
+    pub uncertain_usage_reserve_usd: f64,
+    #[serde(default)]
+    pub active_reserved_cost_usd: f64,
     pub usage_complete: bool,
     /// Stable machine category for why this record is not a clean pass.
     pub failure_code: String,
@@ -456,6 +466,44 @@ fn validate_budget(budget_usd: f64) -> Result<()> {
         "run budget must be finite and greater than zero"
     );
     Ok(())
+}
+
+pub(crate) fn pilot_authority_context(policy: &RunPolicy) -> AnalysisBudgetAuthorityContext {
+    AnalysisBudgetAuthorityContext {
+        project_id: policy.project_id.clone(),
+        policy_id: policy.policy_id.clone(),
+        policy_fingerprint: policy.policy_id.clone(),
+        operation: "pilot".into(),
+        provider: policy.provider.clone(),
+        budget_scope_id: String::new(),
+        budget_usd: policy.budget_usd,
+    }
+}
+
+pub(crate) fn pilot_accounting_context(
+    policy: &RunPolicy,
+    run_id: &str,
+    explicit_retry: bool,
+) -> Result<AnalysisAccountingContext> {
+    let first_scope = policy
+        .scope
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("run policy has no scoped asset for its pilot"))?;
+    Ok(AnalysisAccountingContext {
+        project_id: policy.project_id.clone(),
+        policy_id: policy.policy_id.clone(),
+        policy_fingerprint: policy.policy_id.clone(),
+        run_id: run_id.to_string(),
+        operation: "pilot".into(),
+        // Deliberately excludes run_id and remains stable across explicit
+        // retries, so a fresh run cannot bypass the duplicate/retry fence.
+        intended_attempt_key: format!("{}:{}", policy.kind.as_str(), first_scope.asset_id),
+        source_fingerprint: first_scope.source_identity.clone(),
+        provider: policy.provider.clone(),
+        budget_scope_id: String::new(),
+        budget_usd: policy.budget_usd,
+        explicit_retry,
+    })
 }
 
 fn canonical_models(request: &RunPolicyRequest) -> Vec<String> {
@@ -1147,222 +1195,192 @@ impl Catalog {
     where
         C: FnMut() -> bool,
     {
-        let policy = self.describe_run_policy(request)?;
-        ensure!(
-            policy.readiness.ready_for_authorization,
-            "run policy is not ready for a pilot: {}",
-            policy
-                .readiness
-                .blockers
-                .iter()
-                .map(|blocker| blocker.message.as_str())
-                .collect::<Vec<_>>()
-                .join("; ")
-        );
-        self.load_run_authorization(&policy.policy_id)?;
-
-        let previous = self.load_run_pilot(&policy.policy_id)?;
-        let mut prior_cost_usd = 0.0;
-        let mut prior_attempts = 0u32;
-        let mut prior_usage_complete = true;
-        let mut prior_models = Vec::new();
-        if let Some(existing) = previous {
-            if existing.status == "passed" {
-                return Ok(existing);
-            }
-            ensure!(
-                existing.usage_complete && existing.status != "running",
-                "pilot has interrupted or unknown usage; reconcile its receipt before any retry"
-            );
-            ensure!(
-                retry_uncertain,
-                "a prior pilot failed; inspect its receipt before an explicit retry"
-            );
-            prior_cost_usd = existing.cost_usd;
-            prior_attempts = existing.attempts;
-            prior_usage_complete = existing.usage_complete;
-            prior_models = existing.attempted_models;
-        }
-        ensure!(
-            prior_cost_usd.is_finite() && prior_cost_usd >= 0.0,
-            "prior pilot cost is invalid"
-        );
-        ensure!(
-            prior_cost_usd < policy.budget_usd,
-            "prior pilot attempts consumed the authorized run budget"
-        );
-
         if is_cancelled() {
             bail!("pilot cancelled before provider transmission");
         }
-        provider.prepare()?;
-        if is_cancelled() {
-            bail!("pilot cancelled before provider transmission");
-        }
-
-        let first_scope = &policy.scope[0];
-        let asset = self.get_asset(&first_scope.asset_id)?;
-        // Local frame extraction is heavy work shared with every other local
-        // media operation. Hold one cancellable lease only around extraction.
-        let heavy = self.acquire_local_heavy_cancellable(&mut is_cancelled)?;
-        let manifest = self.analysis_frame_pack(&asset)?;
-        if is_cancelled() {
-            drop(heavy);
-            bail!("pilot cancelled before provider transmission");
-        }
-        let proxy = asset
-            .proxy_path
-            .as_deref()
-            .filter(|path| std::path::Path::new(path).is_file())
-            .ok_or_else(|| anyhow::anyhow!("source proxy is no longer available"))?;
-        let parent = self
-            .database_path()
-            .parent()
-            .ok_or_else(|| anyhow::anyhow!("catalog has no parent directory"))?;
-        let frame_directory = parent
-            .join("cache")
-            .join("framepacks")
-            .join(&asset.project_id)
-            .join(&asset.id)
-            .join(&manifest.source_fingerprint);
-        let frame_paths =
-            framepack::encode_frames(std::path::Path::new(proxy), &manifest, &frame_directory)?;
-        drop(heavy);
-        let frames = frame_paths
-            .iter()
-            .map(|path| {
-                std::fs::read(path)
-                    .map(|bytes| frame_data_uri(&bytes))
-                    .with_context(|| "read pilot frame from managed cache")
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        // Payload promises are enforced at the point the request is built. A
-        // frames-only approval never reads a transcript; vocabulary is read only
-        // when the policy explicitly approved its exact identity.
-        let transcript = if policy.payload.uses_transcript() {
-            self.prompt_transcript(&asset.id)?
-        } else {
-            None
+        let session = match prepare_pilot_session(self, request, retry_uncertain)? {
+            PilotSessionStart::AlreadyPassed(record) => return Ok(*record),
+            PilotSessionStart::Ready(session) => *session,
         };
-        let vocabulary = if policy.context.project_vocabulary {
-            let current = self.prompt_vocabulary(&policy.project_id)?;
-            ensure!(
-                digest(&current)?
-                    == policy
-                        .context
-                        .vocabulary_fingerprint
-                        .clone()
-                        .unwrap_or_default(),
-                "project vocabulary changed after policy approval"
-            );
-            current
-        } else {
-            Vec::new()
-        };
-
-        let (request_body, schema, schema_validator) = match policy.kind {
-            AnalysisRunKind::Observation => {
-                let context = PromptContext {
-                    frame_timestamps_ms: manifest.timestamps_ms.clone(),
-                    clip_duration_ms: first_scope.source_duration_ms,
-                    transcript: transcript.clone(),
-                    vocabulary,
-                    trip_context: None,
-                };
-                (
-                    build_prompt(&context),
-                    observation_output_schema(
-                        &manifest.timestamps_ms,
-                        first_scope.source_duration_ms,
-                    ),
-                    ObservationSchemaKind::Observation,
-                )
-            }
-            AnalysisRunKind::MomentDiscovery => {
-                let keys = manifest
-                    .timestamps_ms
-                    .iter()
-                    .map(|at| format!("frame:{at}"))
-                    .collect::<Vec<_>>();
-                let schema = moment_output_schema(1, first_scope.source_duration_ms, &keys);
-                let evidence = manifest
-                    .timestamps_ms
-                    .iter()
-                    .map(|at| json!({"kind":"frame","key":format!("frame:{at}"),"timeMs":at}))
-                    .collect::<Vec<_>>();
-                let prompt = format!(
-                    "Editorial source-time capability pilot. Return ONLY JSON matching the configured schema. \
-                     Every source time is an integer number of milliseconds on the same source clock. \
-                     The enclosed inspectedSpan.startMs and inspectedSpan.endMs use those units. For every moment: \
-                     coreStartMs, coreEndMs, payoffStartMs and payoffEndMs are integer source milliseconds; \
-                     coreStartMs < coreEndMs and payoffStartMs < payoffEndMs; the inspected span must contain the core; \
-                     the core must contain the payoff; optional setup must precede the payoff and end at or before payoffStartMs; \
-                     optional context must contain the core; evidenceKeys may only contain supplied frame:<sourceMs> keys. \
-                     A schema-valid object with inverted, out-of-source or cross-field-inconsistent times is still invalid. \
-                     Sampled frames are sparse evidence, not continuous video. Use zero moments when nothing is supported. \
-                     EVIDENCE={}",
-                    json!({
-                        "inspectedSpan": {"startMs": 0, "endMs": first_scope.source_duration_ms},
-                        "sourceDurationMs": first_scope.source_duration_ms,
-                        "frameTimesMs": manifest.timestamps_ms,
-                        "evidence": evidence,
-                        "acceptedTimedSpeech": policy.payload.uses_transcript().then(|| {
-                            transcript.as_ref().map(|value| value.text.clone())
-                        }).flatten(),
-                        "editProfile": match &policy.parameters {
-                            RunPolicyParameters::MomentDiscovery { profile, .. } => Some(*profile),
-                            RunPolicyParameters::Observation { .. } => None,
-                        }
-                    })
-                );
-                (prompt, schema, ObservationSchemaKind::Moment)
-            }
-        };
-        let vlm_request = VlmRequest {
-            prompt: request_body,
-            frames,
-            schema,
-        };
-
-        // Cancellation is authoritative right up to the transmission boundary.
-        if is_cancelled() {
-            bail!("pilot cancelled before provider transmission");
-        }
-        // Source and approved context may have changed while waiting for the
-        // heavy lease or preparing frames. Never transmit under stale approval.
-        ensure!(
-            self.describe_run_policy(request)?.policy_id == policy.policy_id,
-            "run policy or source identity changed before pilot transmission"
-        );
-        let started_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
-        let run_id = self.begin_analysis_run(&policy.project_id)?;
-        self.connection()?.execute(
-            "UPDATE analysis_runs SET stage_reached='pilot',policy_id=?2 WHERE id=?1",
-            params![run_id, policy.policy_id],
+        let prepared = prepare_pilot_transmission(
+            self,
+            request,
+            &session.policy,
+            &session.first_scope,
+            &mut is_cancelled,
         )?;
+
+        let started_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+        let run_id = self.begin_accounted_analysis_run(
+            &session.policy.project_id,
+            &session.policy.policy_id,
+            "pilot",
+        )?;
+        let running = self.start_owned_pilot_run(&session, &run_id, &started_at)?;
+
+        if is_cancelled() {
+            self.finalize_pilot_projection(
+                &running,
+                &session.baseline,
+                PilotValidation {
+                    structural_schema_valid: false,
+                    source_time_semantics_valid: false,
+                    capability_observed: false,
+                    detail: "pilot_cancelled_before_transmission".into(),
+                },
+                Some("pilot_cancelled_before_transmission".into()),
+            )?;
+            bail!("pilot cancelled before provider transmission");
+        }
+
+        match execute_accounted_pilot_attempts(
+            self,
+            &session.policy,
+            provider,
+            &prepared,
+            &run_id,
+            retry_uncertain,
+            &mut is_cancelled,
+        ) {
+            Ok(execution) if execution.cancelled_before_domain_fallback => {
+                self.finalize_pilot_projection(
+                    &running,
+                    &session.baseline,
+                    execution.validation,
+                    Some("pilot_cancelled_before_domain_fallback".into()),
+                )?;
+                bail!("pilot cancelled before provider transmission");
+            }
+            Ok(execution) => self.finalize_pilot_projection(
+                &running,
+                &session.baseline,
+                execution.validation,
+                None,
+            ),
+            Err(error) => {
+                let failure = ProviderFailure::from_anyhow(&error);
+                let has_new_request = self
+                    .list_analysis_requests(
+                        &session.policy.project_id,
+                        Some(&session.policy.policy_id),
+                        1000,
+                    )?
+                    .iter()
+                    .any(|request| request.run_id == running.run_id);
+                if failure.category.is_local() && session.had_previous_pilot && !has_new_request {
+                    // A local denial never transmitted. Preserve the prior
+                    // pilot's unknown/failed evidence and close this audit run
+                    // at zero recognized cost.
+                    if let Some(prior) = session.previous_record.as_ref() {
+                        self.save_pilot(prior)?;
+                    }
+                    let safe = bounded(&failure.safe_detail(), 240);
+                    self.finish_analysis_run(
+                        &running.run_id,
+                        &crate::AnalysisRunOutcome {
+                            status: "failed".into(),
+                            stage_reached: "pilot".into(),
+                            cost_usd: 0.0,
+                            error: safe,
+                            ..Default::default()
+                        },
+                    )?;
+                    return Err(error);
+                }
+                let record = self.finalize_pilot_projection(
+                    &running,
+                    &session.baseline,
+                    PilotValidation {
+                        structural_schema_valid: false,
+                        source_time_semantics_valid: false,
+                        capability_observed: false,
+                        detail: failure.safe_detail(),
+                    },
+                    Some(failure.safe_detail()),
+                )?;
+                if failure.category.is_local() {
+                    return Err(error);
+                }
+                Ok(record)
+            }
+        }
+    }
+
+    /// Explicit, durable authorization for one exact prior pilot attempt. This
+    /// is the only way a later pilot run may consider a new epoch for that same
+    /// intended request. A generic `force` flag alone is not sufficient.
+    pub fn authorize_run_policy_pilot_retry(
+        &self,
+        policy_id: &str,
+        request_key: &str,
+    ) -> Result<AnalysisRetryAuthorization> {
+        self.load_run_authorization(policy_id)?;
+        let request = self
+            .analysis_request(request_key)?
+            .ok_or_else(|| anyhow::anyhow!("analysis request not found"))?;
+        ensure!(
+            request.policy_id == policy_id,
+            "prior analysis request does not belong to this exact run policy"
+        );
+        ensure!(
+            request.operation == "pilot",
+            "prior analysis request is not a pilot attempt"
+        );
+        self.authorize_analysis_request_retry(request_key)
+    }
+
+    /// Open the owned pilot row after authority initialization. Attempt/model
+    /// and token fields come from the canonical ledger plus any pre-ledger
+    /// historical baseline, never from optimistic runtime counters.
+    fn start_owned_pilot_run(
+        &self,
+        session: &PilotSession,
+        run_id: &str,
+        started_at: &str,
+    ) -> Result<RunPilotRecord> {
+        let initial = self.analysis_accounting_aggregate_for_operation(
+            &session.policy.policy_id,
+            "pilot",
+            Some(run_id),
+        )?;
+        let ledger =
+            self.analysis_operation_attempt_projection(&session.policy.policy_id, "pilot")?;
+        let mut attempted_models = session.baseline.attempted_models.clone();
+        attempted_models.extend(ledger.attempted_models);
         let running = RunPilotRecord {
             schema_version: RUN_PILOT_SCHEMA_VERSION.into(),
-            policy_id: policy.policy_id.clone(),
-            project_id: policy.project_id.clone(),
+            policy_id: session.policy.policy_id.clone(),
+            project_id: session.policy.project_id.clone(),
             status: "running".into(),
-            started_at: started_at.clone(),
+            started_at: started_at.to_string(),
             finished_at: String::new(),
-            run_id: run_id.clone(),
-            asset_id: first_scope.asset_id.clone(),
-            requested_model: policy.primary_model.clone(),
+            run_id: run_id.to_string(),
+            asset_id: session.first_scope.asset_id.clone(),
+            requested_model: session.policy.primary_model.clone(),
             actual_model: None,
             provider: None,
             generation_id: None,
-            attempted_models: prior_models.clone(),
-            attempts: prior_attempts,
-            prompt_tokens: 0,
-            completion_tokens: 0,
-            cost_usd: prior_cost_usd,
-            usage_complete: false,
+            attempted_models,
+            attempts: session
+                .baseline
+                .attempts
+                .saturating_add(ledger.actual_attempt_count),
+            prompt_tokens: session
+                .baseline
+                .prompt_tokens
+                .saturating_add(ledger.prompt_tokens),
+            completion_tokens: session
+                .baseline
+                .completion_tokens
+                .saturating_add(ledger.completion_tokens),
+            cost_usd: initial.committed_or_reserved_usd,
+            confirmed_cost_usd: initial.confirmed_cost_usd,
+            uncertain_usage_reserve_usd: initial.uncertain_usage_reserve_usd,
+            active_reserved_cost_usd: initial.active_reserved_cost_usd,
+            usage_complete: !initial.has_unresolved_usage(),
             failure_code: String::new(),
-            prior_cost_usd,
-            prior_attempts,
+            prior_cost_usd: session.prior_cost_usd,
+            prior_attempts: session.prior_attempts,
             validation: PilotValidation {
                 structural_schema_valid: false,
                 source_time_semantics_valid: false,
@@ -1373,176 +1391,99 @@ impl Catalog {
             warning: PILOT_WARNING.into(),
         };
         self.save_pilot(&running)?;
-        let chain = ProviderChain::with_policy(
-            &policy.primary_model,
-            &policy.allowed_models,
-            policy.allow_fallback,
+        Ok(running)
+    }
+
+    fn finalize_pilot_projection(
+        &self,
+        running: &RunPilotRecord,
+        baseline: &PilotAttemptBaseline,
+        validation: PilotValidation,
+        failure_hint: Option<String>,
+    ) -> Result<RunPilotRecord> {
+        let aggregate = self.analysis_accounting_aggregate_for_operation(
+            &running.policy_id,
+            "pilot",
+            Some(&running.run_id),
         )?;
-        // A cancellation observed after local preparation or run-record
-        // persistence but before this instruction must still make zero paid
-        // calls. Keep the audit row but fail closed.
-        if is_cancelled() {
-            let _ = self.finish_pilot_uncertain(
-                &running,
-                "pilot_cancelled_before_transmission".to_string(),
-                "cancelled",
-                prior_models,
-                prior_cost_usd,
-            );
-            bail!("pilot cancelled before provider transmission");
-        }
-
-        let first_outcome = match chain.analyze(provider, &vlm_request) {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                let failure = ProviderFailure::from_anyhow(&error);
-                return Ok(self.finish_pilot_uncertain(
-                    &running,
-                    failure.safe_detail(),
-                    "provider_error",
-                    prior_models,
-                    prior_cost_usd,
-                ));
-            }
-        };
-
-        let mut validated_response = first_outcome.response.clone();
-        let mut prompt_tokens = validated_response.prompt_tokens;
-        let mut completion_tokens = validated_response.completion_tokens;
-        let mut cost_usd = validated_response.cost_usd;
-        let mut usage_complete = first_outcome.usage_complete
-            && validated_response.receipt.usage_complete
-            && cost_usd.is_finite()
-            && cost_usd >= 0.0;
-        let mut attempted_models = prior_models.clone();
-        attempted_models.extend(first_outcome.attempted_models.clone());
-        let mut attempts = prior_attempts + first_outcome.attempts;
-        let mut validation = validate_pilot_response(
-            &validated_response.body,
-            &vlm_request.schema,
-            &policy,
-            first_scope.source_duration_ms,
-            &manifest.timestamps_ms,
-            &schema_validator,
-        );
-
-        // The provider chain retries transport failures automatically. A
-        // domain-invalid response gets one explicit permitted fallback attempt.
-        if !validation.capability_observed
-            && let Some(fallback_model) = chain.fallback_model()
-            && fallback_model != validated_response.model.as_str()
-        {
-            chain.record_default_failure();
-            match provider.analyze(fallback_model, &vlm_request) {
-                Ok(fallback) => {
-                    prompt_tokens = prompt_tokens.saturating_add(fallback.prompt_tokens);
-                    completion_tokens =
-                        completion_tokens.saturating_add(fallback.completion_tokens);
-                    let fallback_cost_valid =
-                        fallback.cost_usd.is_finite() && fallback.cost_usd >= 0.0;
-                    if fallback_cost_valid {
-                        cost_usd += fallback.cost_usd;
-                    } else {
-                        usage_complete = false;
-                    }
-                    usage_complete =
-                        usage_complete && fallback.receipt.usage_complete && fallback_cost_valid;
-                    attempted_models.push(fallback_model.to_string());
-                    attempts += 1;
-                    validated_response = fallback;
-                    validation = validate_pilot_response(
-                        &validated_response.body,
-                        &vlm_request.schema,
-                        &policy,
-                        first_scope.source_duration_ms,
-                        &manifest.timestamps_ms,
-                        &schema_validator,
-                    );
-                }
-                Err(error) => {
-                    let failure = ProviderFailure::from_anyhow(&error);
-                    let safe_cost = if cost_usd.is_finite() && cost_usd >= 0.0 {
-                        prior_cost_usd + cost_usd
-                    } else {
-                        prior_cost_usd
-                    };
-                    return Ok(self.finish_pilot_uncertain(
-                        &running,
-                        failure.safe_detail(),
-                        "provider_error",
-                        attempted_models,
-                        safe_cost,
-                    ));
-                }
-            }
-        }
-
-        let aggregated_cost = prior_cost_usd + cost_usd;
-        let cost_valid = aggregated_cost.is_finite() && aggregated_cost >= 0.0;
-        let total_usage_complete = prior_usage_complete && usage_complete && cost_valid;
-        let status = if validation.capability_observed && total_usage_complete {
+        let ledger = self.analysis_operation_attempt_projection(&running.policy_id, "pilot")?;
+        let mut attempted_models = baseline.attempted_models.clone();
+        attempted_models.extend(ledger.attempted_models);
+        let attempts = baseline
+            .attempts
+            .saturating_add(ledger.actual_attempt_count);
+        let prompt_tokens = baseline.prompt_tokens.saturating_add(ledger.prompt_tokens);
+        let completion_tokens = baseline
+            .completion_tokens
+            .saturating_add(ledger.completion_tokens);
+        let unresolved = aggregate.has_unresolved_usage();
+        let usage_complete = !unresolved;
+        let status = if validation.capability_observed && usage_complete {
             "passed"
-        } else if total_usage_complete {
-            "failed"
-        } else {
+        } else if unresolved {
             "uncertain"
+        } else {
+            "failed"
         };
         let failure_code = if status == "passed" {
             String::new()
-        } else if !total_usage_complete {
-            "usage_unknown".to_string()
+        } else if unresolved {
+            bounded(failure_hint.as_deref().unwrap_or("usage_unknown"), 80)
         } else if !validation.structural_schema_valid {
             "schema_validation_failed".to_string()
-        } else {
+        } else if !validation.source_time_semantics_valid {
             "source_time_semantics_failed".to_string()
-        };
-        let total_cost = if cost_valid {
-            aggregated_cost
         } else {
-            prior_cost_usd
+            bounded(failure_hint.as_deref().unwrap_or("analysis_error"), 80)
         };
-        let mut observed_capabilities = Vec::new();
-        if validation.structural_schema_valid {
-            observed_capabilities.push("configured JSON schema accepted this response".into());
-        }
-        if validation.source_time_semantics_valid {
-            observed_capabilities
-                .push("explicit source-time semantics accepted this response".into());
-        }
-        let warning = if prior_usage_complete {
+        let warning = if usage_complete {
             PILOT_WARNING.to_string()
         } else {
-            format!("{PILOT_WARNING} Prior attempt usage was unknown; this retry cannot pass.")
+            format!(
+                "{PILOT_WARNING} Canonical ledger usage is incomplete; the total below includes a reserve, not a confirmed charge."
+            )
         };
         let record = RunPilotRecord {
             schema_version: RUN_PILOT_SCHEMA_VERSION.into(),
-            policy_id: policy.policy_id.clone(),
-            project_id: policy.project_id.clone(),
+            policy_id: running.policy_id.clone(),
+            project_id: running.project_id.clone(),
             status: status.into(),
-            started_at: started_at.clone(),
+            started_at: running.started_at.clone(),
             finished_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
-            run_id: run_id.clone(),
-            asset_id: first_scope.asset_id.clone(),
-            requested_model: policy.primary_model.clone(),
-            actual_model: validated_response.receipt.actual_model.clone(),
-            provider: validated_response.receipt.provider.clone(),
-            generation_id: validated_response.receipt.generation_id.clone(),
+            run_id: running.run_id.clone(),
+            asset_id: running.asset_id.clone(),
+            requested_model: running.requested_model.clone(),
+            actual_model: aggregate.current_run_actual_model.clone(),
+            provider: aggregate.current_run_actual_provider.clone(),
+            generation_id: aggregate.current_run_generation_id.clone(),
             attempted_models,
             attempts,
             prompt_tokens,
             completion_tokens,
-            cost_usd: total_cost,
-            usage_complete: total_usage_complete,
+            cost_usd: aggregate.committed_or_reserved_usd,
+            confirmed_cost_usd: aggregate.confirmed_cost_usd,
+            uncertain_usage_reserve_usd: aggregate.uncertain_usage_reserve_usd,
+            active_reserved_cost_usd: aggregate.active_reserved_cost_usd,
+            usage_complete,
             failure_code: failure_code.clone(),
-            prior_cost_usd,
-            prior_attempts,
+            prior_cost_usd: running.prior_cost_usd,
+            prior_attempts: running.prior_attempts,
             validation: validation.clone(),
-            observed_capabilities,
+            observed_capabilities: {
+                let mut observed = Vec::new();
+                if validation.structural_schema_valid {
+                    observed.push("configured JSON schema accepted this response".into());
+                }
+                if validation.source_time_semantics_valid {
+                    observed.push("explicit source-time semantics accepted this response".into());
+                }
+                observed
+            },
             warning,
         };
         self.save_pilot(&record)?;
         self.finish_analysis_run(
-            &run_id,
+            &running.run_id,
             &crate::AnalysisRunOutcome {
                 status: if status == "passed" {
                     "completed".into()
@@ -1550,12 +1491,11 @@ impl Catalog {
                     "failed".into()
                 },
                 stage_reached: "pilot".into(),
-                clips_analyzed: 0,
                 cost_usd: record.cost_usd,
                 error: if status == "passed" {
                     String::new()
                 } else {
-                    record.validation.detail.clone()
+                    bounded(failure_hint.as_deref().unwrap_or(&validation.detail), 240)
                 },
                 ..Default::default()
             },
@@ -1614,7 +1554,14 @@ impl Catalog {
             pilot.cost_usd.is_finite() && pilot.cost_usd >= 0.0,
             "capability pilot cost is invalid"
         );
-        let remaining_budget_usd = current.budget_usd - pilot.cost_usd;
+        // Remaining budget is canonical whole-policy exposure, not a separate
+        // add-up of pilot summary fields. Any unresolved usage blocks bulk work.
+        let aggregate = self.analysis_accounting_aggregate(policy_id, Some(&pilot.run_id))?;
+        ensure!(
+            !aggregate.has_unresolved_usage(),
+            "canonical analysis usage is unresolved; reconcile interrupted request evidence before bulk work"
+        );
+        let remaining_budget_usd = current.budget_usd - aggregate.committed_or_reserved_usd;
         ensure!(
             remaining_budget_usd > 0.0,
             "capability pilot consumed the authorized run budget"
@@ -1644,119 +1591,21 @@ impl Catalog {
         )?;
         Ok(())
     }
-
-    fn finish_pilot_uncertain(
-        &self,
-        running: &RunPilotRecord,
-        detail: String,
-        failure_code: &str,
-        attempted_models: Vec<String>,
-        cost_usd: f64,
-    ) -> RunPilotRecord {
-        let safe_detail = bounded(&detail, 240);
-        let record = RunPilotRecord {
-            status: "uncertain".into(),
-            finished_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
-            attempted_models,
-            cost_usd: if cost_usd.is_finite() && cost_usd >= 0.0 {
-                cost_usd
-            } else {
-                running.prior_cost_usd
-            },
-            usage_complete: false,
-            failure_code: bounded(failure_code, 80),
-            validation: PilotValidation {
-                structural_schema_valid: false,
-                source_time_semantics_valid: false,
-                capability_observed: false,
-                detail: safe_detail.clone(),
-            },
-            ..running.clone()
-        };
-        let _ = self.save_pilot(&record);
-        let _ = self.finish_analysis_run(
-            &running.run_id,
-            &crate::AnalysisRunOutcome {
-                status: "failed".into(),
-                stage_reached: "pilot".into(),
-                cost_usd: record.cost_usd,
-                error: safe_detail,
-                ..Default::default()
-            },
-        );
-        record
-    }
-}
-
-#[derive(Clone, Copy)]
-enum ObservationSchemaKind {
-    Observation,
-    Moment,
-}
-
-fn validate_pilot_response(
-    body: &str,
-    schema: &Value,
-    policy: &RunPolicy,
-    source_duration_ms: u32,
-    frame_timestamps: &[u32],
-    kind: &ObservationSchemaKind,
-) -> PilotValidation {
-    let Ok(value) = serde_json::from_str::<Value>(body) else {
-        return PilotValidation {
-            structural_schema_valid: false,
-            source_time_semantics_valid: false,
-            capability_observed: false,
-            detail: "provider response was not JSON".into(),
-        };
-    };
-    let structural = schema::validate_json_structure(&value, schema);
-    let structural_schema_valid = structural.is_ok();
-    let semantic: Result<(), &'static str> = match kind {
-        ObservationSchemaKind::Observation => {
-            schema::validate(body, frame_timestamps, source_duration_ms)
-                .map(|_| ())
-                .map_err(|error| error.safe_code())
-        }
-        ObservationSchemaKind::Moment => {
-            let span = MomentSpan {
-                start_ms: 0,
-                end_ms: source_duration_ms,
-            };
-            let keys = frame_timestamps
-                .iter()
-                .map(|at| format!("frame:{at}"))
-                .collect::<Vec<_>>();
-            let profile = match &policy.parameters {
-                RunPolicyParameters::MomentDiscovery { profile, .. } => *profile,
-                RunPolicyParameters::Observation { .. } => EditProfile::default(),
-            };
-            validate_reply(body, span, profile, &keys, 1)
-                .map(|_| ())
-                .map_err(|_| "moment_source_time_semantics_invalid")
-        }
-    };
-    let detail = match (&structural, &semantic) {
-        (Ok(()), Ok(())) => "bounded_schema_and_source_time_semantics_passed".to_string(),
-        (Err(error), _) => format!("schema_validation:{}", error.safe_code()),
-        (_, Err(code)) => format!("source_time_semantics:{code}"),
-    };
-    PilotValidation {
-        structural_schema_valid,
-        source_time_semantics_valid: semantic.is_ok(),
-        capability_observed: structural_schema_valid && semantic.is_ok(),
-        detail,
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ProviderReceiptEvidence;
     use crate::analysis::moments::{MomentPayload, MomentRunOptions};
-    use crate::analysis::provider::{VlmReceipt, VlmRequest, VlmResponse};
+    use crate::analysis::provider::{
+        AnalysisRequestCostBound, ProviderFailure, ProviderFailureCategory, VlmReceipt, VlmRequest,
+        VlmResponse,
+    };
     use crate::analysis::quality::DecodedSegment;
     use crate::analysis::store::{StoredTranscript, TranscriptOutcomeReason, save_transcript};
     use rusqlite::params;
+    use serde_json::{Value, json};
     use std::fs;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1809,8 +1658,18 @@ mod tests {
             Ok(())
         }
 
+        fn analysis_cost_bound(
+            &self,
+            _model: &str,
+            _request: &VlmRequest,
+        ) -> Result<AnalysisRequestCostBound> {
+            Ok(AnalysisRequestCostBound::declared_for_synthetic_transport(
+                0.02,
+            ))
+        }
+
         fn analyze(&self, model: &str, _request: &VlmRequest) -> Result<VlmResponse> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
+            let _call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
             if self.fail_transport {
                 bail!("synthetic transport interruption");
             }
@@ -1824,7 +1683,7 @@ mod tests {
                 receipt: VlmReceipt {
                     actual_model: Some(model.into()),
                     provider: Some("synthetic".into()),
-                    generation_id: Some("generation-1".into()),
+                    generation_id: Some(format!("generation-{}", uuid::Uuid::new_v4())),
                     usage_complete: true,
                 },
             })
@@ -2367,8 +2226,18 @@ mod tests {
     }
 
     impl VlmProvider for CapturingProvider {
+        fn analysis_cost_bound(
+            &self,
+            _model: &str,
+            _request: &VlmRequest,
+        ) -> Result<AnalysisRequestCostBound> {
+            Ok(AnalysisRequestCostBound::declared_for_synthetic_transport(
+                0.02,
+            ))
+        }
+
         fn analyze(&self, model: &str, request: &VlmRequest) -> Result<VlmResponse> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
+            let _call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
             self.requests.lock().unwrap().push(request.clone());
             if let Some(message) = &self.fail_message {
                 bail!("{message}");
@@ -2383,7 +2252,7 @@ mod tests {
                 receipt: VlmReceipt {
                     actual_model: Some(model.into()),
                     provider: Some("synthetic".into()),
-                    generation_id: Some("generation-capture".into()),
+                    generation_id: Some(format!("generation-capture-{}", uuid::Uuid::new_v4())),
                     usage_complete: self.usage_complete,
                 },
             })
@@ -2495,6 +2364,26 @@ mod tests {
             assert!(!run.error.contains(canary), "run error leaked {canary}");
         }
 
+        // Reconcile the interrupted attempt before an explicitly different
+        // force-policy can proceed; force cannot bypass unknown paid work.
+        let interrupted = catalog
+            .list_analysis_requests(&project, Some(&record.policy_id), 10)
+            .unwrap()
+            .remove(0);
+        catalog
+            .record_analysis_request_receipt(
+                &interrupted.request_key,
+                &ProviderReceiptEvidence {
+                    provider: "synthetic".into(),
+                    provider_generation_id: "diagnostic-late-generation".into(),
+                    actual_model: DEFAULT_MODEL.into(),
+                    reported_cost_usd: Some(0.01),
+                    prompt_tokens: Some(10),
+                    completion_tokens: Some(5),
+                    usage_complete: true,
+                },
+            )
+            .unwrap();
         let mut different_request = request.clone();
         different_request.parameters = RunPolicyParameters::Observation { force: true };
         catalog.authorize_run_policy(&different_request).unwrap();
@@ -2522,7 +2411,9 @@ mod tests {
             .unwrap();
         assert_eq!(first_pilot.status, "uncertain");
         assert!(!first_pilot.usage_complete);
-        assert!((first_pilot.cost_usd - 0.01).abs() < 1e-9);
+        assert_eq!(first_pilot.confirmed_cost_usd, 0.0);
+        assert!(first_pilot.uncertain_usage_reserve_usd >= 0.01);
+        assert!((first_pilot.cost_usd - first_pilot.uncertain_usage_reserve_usd).abs() < 1e-9);
 
         let second = CapturingProvider::observation();
         let error = catalog
@@ -2928,5 +2819,434 @@ mod tests {
             format!("{error:#}").contains("contents no longer match"),
             "unexpected schema invalidation error: {error:#}"
         );
+    }
+
+    type ProviderScript = Box<dyn Fn(&str, usize) -> Result<VlmResponse> + Send + Sync>;
+
+    struct ModelScriptProvider {
+        calls: AtomicUsize,
+        bound_usd: f64,
+        script: ProviderScript,
+    }
+
+    impl ModelScriptProvider {
+        fn new(
+            bound_usd: f64,
+            script: impl Fn(&str, usize) -> Result<VlmResponse> + Send + Sync + 'static,
+        ) -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                bound_usd,
+                script: Box::new(script),
+            }
+        }
+    }
+
+    impl VlmProvider for ModelScriptProvider {
+        fn analysis_cost_bound(
+            &self,
+            _model: &str,
+            _request: &VlmRequest,
+        ) -> Result<AnalysisRequestCostBound> {
+            Ok(AnalysisRequestCostBound::declared_for_synthetic_transport(
+                self.bound_usd,
+            ))
+        }
+
+        fn analyze(&self, model: &str, _request: &VlmRequest) -> Result<VlmResponse> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            (self.script)(model, call)
+        }
+    }
+
+    fn scripted_response(model: &str, call: usize, body: String, cost: f64) -> VlmResponse {
+        VlmResponse {
+            model: model.into(),
+            body,
+            prompt_tokens: 10,
+            completion_tokens: 5,
+            cost_usd: cost,
+            latency_ms: 1,
+            receipt: VlmReceipt {
+                actual_model: Some(model.into()),
+                provider: Some("synthetic-script".into()),
+                generation_id: Some(format!("script-generation-{call}-{model}")),
+                usage_complete: true,
+            },
+        }
+    }
+
+    fn valid_observation_body() -> String {
+        serde_json::json!({
+            "title": "Synthetic fallback pilot",
+            "description": "A bounded synthetic observation.",
+            "labels": [],
+            "usable": true,
+            "unusableReason": null,
+            "bestMomentStartMs": null,
+            "bestMomentEndMs": null,
+            "thumbnailTimestampMs": null,
+            "cameraMovement": "static",
+            "ocrText": []
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn passed_pilot_is_idempotent_without_another_paid_call_or_run() {
+        let (_directory, catalog, project, asset) = fixture();
+        let request = observation_request(&project, &asset, 1.0);
+        catalog.authorize_run_policy(&request).unwrap();
+        let first_provider = CapturingProvider::observation();
+        let first = catalog
+            .run_run_policy_pilot_with_provider(&request, &first_provider, false)
+            .unwrap();
+        assert_eq!(first.status, "passed");
+        assert_eq!(first_provider.calls.load(Ordering::SeqCst), 1);
+
+        let second_provider = CapturingProvider::observation();
+        let second = catalog
+            .run_run_policy_pilot_with_provider(&request, &second_provider, false)
+            .unwrap();
+        assert_eq!(second, first);
+        assert_eq!(second_provider.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            catalog.analysis_runs(&project, 10).unwrap().len(),
+            1,
+            "a passed pilot must not open another paid run"
+        );
+        assert_eq!(
+            catalog
+                .list_analysis_requests(&project, Some(&first.policy_id), 10)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn domain_invalid_response_falls_back_through_a_second_accounted_request() {
+        let (_directory, catalog, project, asset) = fixture();
+        let request = RunPolicyRequest::observation(
+            project.clone(),
+            vec![asset],
+            DEFAULT_MODEL,
+            vec![DEFAULT_MODEL.into(), FALLBACK_MODEL.into()],
+            true,
+            1.0,
+            false,
+        );
+        catalog.authorize_run_policy(&request).unwrap();
+        let provider = ModelScriptProvider::new(0.02, |model, call| {
+            let body = if model == DEFAULT_MODEL {
+                r#"{"not":"a valid observation"}"#.to_string()
+            } else {
+                valid_observation_body()
+            };
+            Ok(scripted_response(model, call, body, 0.01))
+        });
+        let pilot = catalog
+            .run_run_policy_pilot_with_provider(&request, &provider, false)
+            .unwrap();
+        assert_eq!(pilot.status, "passed", "{pilot:?}");
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(pilot.actual_model.as_deref(), Some(FALLBACK_MODEL));
+        assert_eq!(pilot.confirmed_cost_usd, 0.02);
+        assert_eq!(pilot.uncertain_usage_reserve_usd, 0.0);
+        let requests = catalog
+            .list_analysis_requests(&project, Some(&pilot.policy_id), 10)
+            .unwrap();
+        assert_eq!(
+            requests.len(),
+            2,
+            "primary and domain fallback are separate"
+        );
+        assert!(requests.iter().all(|request| {
+            catalog
+                .analysis_provider_receipts(&request.request_key)
+                .unwrap()
+                .len()
+                == 1
+        }));
+    }
+
+    #[test]
+    fn transport_fallback_incomplete_attempt_is_retained_until_late_receipt() {
+        let (_directory, catalog, project, asset) = fixture();
+        let request = RunPolicyRequest::observation(
+            project.clone(),
+            vec![asset],
+            DEFAULT_MODEL,
+            vec![DEFAULT_MODEL.into(), FALLBACK_MODEL.into()],
+            true,
+            1.0,
+            false,
+        );
+        catalog.authorize_run_policy(&request).unwrap();
+        let provider = ModelScriptProvider::new(0.02, |model, call| {
+            if model == DEFAULT_MODEL {
+                Err(ProviderFailure::transport().into())
+            } else {
+                Ok(scripted_response(
+                    model,
+                    call,
+                    valid_observation_body(),
+                    0.01,
+                ))
+            }
+        });
+        let pilot = catalog
+            .run_run_policy_pilot_with_provider(&request, &provider, false)
+            .unwrap();
+        assert_eq!(pilot.status, "uncertain", "{pilot:?}");
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(pilot.confirmed_cost_usd, 0.01);
+        assert!(pilot.uncertain_usage_reserve_usd >= 0.02);
+        let requests = catalog
+            .list_analysis_requests(&project, Some(&pilot.policy_id), 10)
+            .unwrap();
+        assert_eq!(requests.len(), 2);
+        let incomplete = requests
+            .iter()
+            .find(|request| request.lifecycle == crate::AnalysisRequestLifecycle::Uncertain)
+            .unwrap();
+        let complete = requests
+            .iter()
+            .find(|request| request.lifecycle == crate::AnalysisRequestLifecycle::Completed)
+            .unwrap();
+
+        catalog
+            .record_analysis_request_receipt(
+                &incomplete.request_key,
+                &ProviderReceiptEvidence {
+                    provider: "synthetic-script".into(),
+                    provider_generation_id: "late-generation-primary".into(),
+                    actual_model: DEFAULT_MODEL.into(),
+                    reported_cost_usd: Some(0.01),
+                    prompt_tokens: Some(10),
+                    completion_tokens: Some(5),
+                    usage_complete: true,
+                },
+            )
+            .unwrap();
+        let aggregate = catalog
+            .analysis_accounting_aggregate_for_operation(&pilot.policy_id, "pilot", None)
+            .unwrap();
+        assert_eq!(aggregate.uncertain_request_count, 0);
+        assert!((aggregate.confirmed_cost_usd - 0.02).abs() < 1e-12);
+        assert!((aggregate.uncertain_usage_reserve_usd).abs() < 1e-12);
+        assert!(aggregate.usage_complete);
+        assert_eq!(
+            catalog
+                .analysis_provider_receipts(&complete.request_key)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            catalog
+                .analysis_provider_receipts(&incomplete.request_key)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn targeted_retry_authorization_retains_prior_unknown_cost_and_executes_once() {
+        let (_directory, catalog, project, asset) = fixture();
+        let request = observation_request(&project, &asset, 1.0);
+        catalog.authorize_run_policy(&request).unwrap();
+        let first = CapturingProvider::with_incomplete_usage();
+        let first_pilot = catalog
+            .run_run_policy_pilot_with_provider(&request, &first, false)
+            .unwrap();
+        assert_eq!(first_pilot.status, "uncertain");
+        let prior = catalog
+            .list_analysis_requests(&project, Some(&first_pilot.policy_id), 10)
+            .unwrap()
+            .remove(0);
+        assert_eq!(prior.lifecycle, crate::AnalysisRequestLifecycle::Uncertain);
+
+        // Generic `retry_uncertain` alone cannot mint a new paid attempt.
+        let unauthorized = CapturingProvider::observation();
+        let error = catalog
+            .run_run_policy_pilot_with_provider(&request, &unauthorized, true)
+            .unwrap_err();
+        let failure = ProviderFailure::from_anyhow(&error);
+        assert_eq!(failure.category, ProviderFailureCategory::LocalAdmission);
+        assert!(failure.safe_detail().contains("explicit retry"));
+        assert_eq!(unauthorized.calls.load(Ordering::SeqCst), 0);
+
+        catalog
+            .authorize_run_policy_pilot_retry(&first_pilot.policy_id, &prior.request_key)
+            .unwrap();
+        let second = CapturingProvider::observation();
+        let second_pilot = catalog
+            .run_run_policy_pilot_with_provider(&request, &second, true)
+            .unwrap();
+        assert_eq!(second.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(second_pilot.status, "uncertain");
+        assert!(!second_pilot.usage_complete);
+        assert_eq!(second_pilot.confirmed_cost_usd, 0.01);
+        assert!(second_pilot.uncertain_usage_reserve_usd >= 0.02);
+        let requests = catalog
+            .list_analysis_requests(&project, Some(&first_pilot.policy_id), 10)
+            .unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests.iter().any(|request| {
+            request.lifecycle == crate::AnalysisRequestLifecycle::Uncertain
+                && request.attempt_epoch == 0
+        }));
+        assert!(requests.iter().any(|request| {
+            request.lifecycle == crate::AnalysisRequestLifecycle::Completed
+                && request.attempt_epoch == 1
+        }));
+    }
+
+    #[test]
+    fn retry_history_counts_actual_ledger_attempts_and_budget_denial_adds_none() {
+        let (_directory, catalog, project, asset) = fixture();
+        let request = RunPolicyRequest::observation(
+            project.clone(),
+            vec![asset],
+            DEFAULT_MODEL,
+            vec![DEFAULT_MODEL.into()],
+            false,
+            0.05,
+            false,
+        );
+        catalog.authorize_run_policy(&request).unwrap();
+
+        let invalid = ModelScriptProvider::new(0.03, |model, call| {
+            Ok(scripted_response(
+                model,
+                call,
+                r#"{"not":"a valid observation"}"#.into(),
+                0.01,
+            ))
+        });
+        let first = catalog
+            .run_run_policy_pilot_with_provider(&request, &invalid, false)
+            .unwrap();
+        assert_eq!(first.status, "failed");
+        assert_eq!(first.attempts, 1);
+        assert_eq!(first.prompt_tokens, 10);
+        let first_request = catalog
+            .list_analysis_requests(&project, Some(&first.policy_id), 10)
+            .unwrap()
+            .remove(0);
+        catalog
+            .authorize_run_policy_pilot_retry(&first.policy_id, &first_request.request_key)
+            .unwrap();
+
+        let interrupted = ModelScriptProvider::new(0.03, |_model, _call| {
+            Err(ProviderFailure::transport().into())
+        });
+        let second = catalog
+            .run_run_policy_pilot_with_provider(&request, &interrupted, true)
+            .unwrap();
+        assert_eq!(interrupted.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(second.status, "uncertain");
+        assert_eq!(second.attempts, 2, "prior actual receipt must not be lost");
+        assert_eq!(second.attempted_models.len(), 2);
+        assert_eq!(second.prompt_tokens, 10, "all actual receipts stay visible");
+        assert_eq!(second.completion_tokens, 5);
+        let requests = catalog
+            .list_analysis_requests(&project, Some(&second.policy_id), 10)
+            .unwrap();
+        assert_eq!(requests.len(), 2);
+        let second_request = requests
+            .iter()
+            .find(|request| request.run_id == second.run_id)
+            .unwrap();
+        catalog
+            .authorize_run_policy_pilot_retry(&second.policy_id, &second_request.request_key)
+            .unwrap();
+
+        let denied = CapturingProvider::observation();
+        let error = catalog
+            .run_run_policy_pilot_with_provider(&request, &denied, true)
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("admission_denied"),
+            "{error:#}"
+        );
+        assert_eq!(denied.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            catalog
+                .list_analysis_requests(&project, Some(&second.policy_id), 10)
+                .unwrap()
+                .len(),
+            2,
+            "budget denial must not create a paid request row"
+        );
+        let preserved = catalog.load_run_pilot(&second.policy_id).unwrap().unwrap();
+        assert_eq!(preserved.attempts, 2);
+        assert_eq!(preserved.attempted_models.len(), 2);
+        assert_eq!(preserved.prompt_tokens, 10);
+        assert_eq!(preserved.completion_tokens, 5);
+    }
+
+    #[test]
+    fn prepare_failure_before_dispatch_records_zero_unknown_pilot() {
+        let (_directory, catalog, project, asset) = fixture();
+        let request = observation_request(&project, &asset, 1.0);
+        let policy = catalog.describe_run_policy(&request).unwrap();
+        catalog.authorize_run_policy(&request).unwrap();
+        let provider = FakeProvider {
+            calls: AtomicUsize::new(0),
+            body: String::new(),
+            fail_transport: false,
+            fail_prepare: true,
+        };
+        let error = catalog
+            .run_run_policy_pilot_with_provider(&request, &provider, false)
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("pre_upload"));
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+        let requests = catalog
+            .list_analysis_requests(&project, Some(&policy.policy_id), 10)
+            .unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].lifecycle,
+            crate::AnalysisRequestLifecycle::Released
+        );
+        assert!(requests[0].dispatch_at.is_none());
+        let aggregate = catalog
+            .analysis_accounting_aggregate_for_operation(&policy.policy_id, "pilot", None)
+            .unwrap();
+        assert_eq!(aggregate.confirmed_cost_usd, 0.0);
+        assert_eq!(aggregate.uncertain_usage_reserve_usd, 0.0);
+        assert!(aggregate.usage_complete);
+        let pilot = catalog.load_run_pilot(&policy.policy_id).unwrap().unwrap();
+        assert_eq!(pilot.status, "failed");
+        assert!(pilot.usage_complete);
+        assert_eq!(pilot.cost_usd, 0.0);
+        assert_eq!(pilot.confirmed_cost_usd, 0.0);
+        assert_eq!(pilot.uncertain_usage_reserve_usd, 0.0);
+    }
+
+    #[test]
+    fn force_policy_cannot_bypass_unresolved_prior_pilot_request() {
+        let (_directory, catalog, project, asset) = fixture();
+        let request = observation_request(&project, &asset, 1.0);
+        catalog.authorize_run_policy(&request).unwrap();
+        let first = CapturingProvider::with_incomplete_usage();
+        let first_pilot = catalog
+            .run_run_policy_pilot_with_provider(&request, &first, false)
+            .unwrap();
+        assert_eq!(first_pilot.status, "uncertain");
+
+        let mut forced = request.clone();
+        forced.parameters = RunPolicyParameters::Observation { force: true };
+        catalog.authorize_run_policy(&forced).unwrap();
+        let replacement = CapturingProvider::observation();
+        let error = catalog
+            .run_run_policy_pilot_with_provider(&forced, &replacement, true)
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("replacement policy"));
+        assert_eq!(replacement.calls.load(Ordering::SeqCst), 0);
     }
 }

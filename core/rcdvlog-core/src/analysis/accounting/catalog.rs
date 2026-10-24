@@ -9,9 +9,9 @@ use serde_json::Value;
 use super::model::{
     ANALYSIS_ACCOUNTING_SCHEMA_VERSION, AnalysisAccountingAggregate, AnalysisAccountingContext,
     AnalysisAccountingReport, AnalysisBudgetAuthorityContext, AnalysisBudgetSnapshot,
-    AnalysisProviderReceipt, AnalysisRequestEvent, AnalysisRequestLifecycle,
-    AnalysisRequestReconciliation, AnalysisRequestRecord, AnalysisRetryAuthorization,
-    ProviderReceiptEvidence, bounded_failure_code,
+    AnalysisOperationAttemptProjection, AnalysisProviderReceipt, AnalysisRequestEvent,
+    AnalysisRequestLifecycle, AnalysisRequestReconciliation, AnalysisRequestRecord,
+    AnalysisRetryAuthorization, ProviderReceiptEvidence, bounded_failure_code,
 };
 use super::store;
 use crate::Catalog;
@@ -149,6 +149,29 @@ impl Catalog {
         store::list_requests(&self.connection()?, project_id, policy_id, limit)
     }
 
+    /// Unresolved attempts for one exact source/operation. Runtime callers use
+    /// this to prevent a newly generated force-policy identity from bypassing a
+    /// prior unknown paid attempt that still needs reconciliation/authorization.
+    pub fn analysis_requests_needing_reconciliation_for_source(
+        &self,
+        project_id: &str,
+        operation: &str,
+        source_fingerprint: &str,
+    ) -> Result<Vec<AnalysisRequestRecord>> {
+        ensure!(
+            !project_id.trim().is_empty()
+                && !operation.trim().is_empty()
+                && !source_fingerprint.trim().is_empty(),
+            "project, operation and source identity are required"
+        );
+        store::unresolved_requests_for_source(
+            &self.connection()?,
+            project_id,
+            operation,
+            source_fingerprint,
+        )
+    }
+
     pub fn analysis_request_events(&self, request_key: &str) -> Result<Vec<AnalysisRequestEvent>> {
         store::events(&self.connection()?, request_key)
     }
@@ -251,6 +274,29 @@ impl Catalog {
             "accounting aggregate policy is required"
         );
         store::accounting_aggregate(&self.connection()?, policy_id, operation, current_run_id)
+    }
+
+    /// Whether an analysis run was created by the fully ledgered runtime.
+    pub(crate) fn analysis_run_is_accounted(&self, run_id: &str) -> Result<bool> {
+        super::legacy::run_is_accounted(&self.connection()?, run_id)
+    }
+
+    /// Canonical factual attempts for one policy operation, used to project
+    /// pilot provenance and token totals without parallel cost math.
+    pub(crate) fn analysis_operation_attempt_projection(
+        &self,
+        policy_id: &str,
+        operation: &str,
+    ) -> Result<AnalysisOperationAttemptProjection> {
+        ensure!(
+            !policy_id.trim().is_empty(),
+            "analysis attempt projection policy is required"
+        );
+        ensure!(
+            !operation.trim().is_empty(),
+            "analysis attempt projection operation is required"
+        );
+        store::operation_attempt_projection(&self.connection()?, policy_id, operation)
     }
 
     /// Read the frozen pre-ledger evidence without editing history.

@@ -1,15 +1,18 @@
 # Analysis request accounting: admission and receipt reconciliation
 
-This document describes the persistence/offline foundation added for issue #122.
-It is not the runtime integration. Provider wrappers, pilot/observation/moment/
-fallback call sites and CLI inspection commands remain follow-up work. Until
-that integration is complete, existing paid analysis execution is **not** made
-concurrent-runtime-safe by this slice.
+This document describes the canonical persistence foundation and the C1
+authorized-pilot runtime integration added for issue #122. The authorized
+run-policy pilot, including transport and domain-validation fallback, is wired
+through the accounted provider boundary. Bulk observation, ad-hoc analysis,
+CLI inspection/reconciliation commands and the remaining runtime adapters are
+still follow-up work, so those paths are **not** yet made concurrent-runtime-safe
+by this slice.
 
 ## Canonical owner
 
 The project SQLite catalog remains the single accounting owner. Migrations 38
-and 39 add child rows beneath the existing `analysis_runs`/run-policy ownership:
+through 40 add child rows and the run accounting marker beneath the existing
+`analysis_runs`/run-policy ownership:
 
 - `analysis_budget_authorities` stores exactly one frozen ceiling, policy and
   provider identity, historical evidence, and dispatch-stop state per canonical
@@ -49,6 +52,41 @@ The intended order is:
 The authority API takes no request payload fingerprint and does not invent one.
 Request-specific model, source, run-ownership and payload checks are separate
 and happen in reservation.
+
+## C1 accounted pilot boundary
+
+`analysis::accounting::AccountedVlmProvider` wraps exactly one provider
+transmission. Passing that wrapper into the existing `ProviderChain` means each
+primary, transport-fallback and domain-invalid-fallback attempt admits, reserves
+and receipts independently. The pilot runtime phase order is:
+
+1. validate the exact authorized policy and prior-pilot state;
+2. initialize/freeze the canonical authority before creating any new run row;
+3. prepare local frames/transcript/prompt without ledger admission or I/O;
+4. open the owned `analysis_runs` row with the accounting-contract marker;
+5. compute the full provider-owned cost bound and reserve it in one `IMMEDIATE`
+   transaction;
+6. run local provider preparation and cancellation checks;
+7. commit the dispatch marker immediately before the one transport call;
+8. record immutable receipt evidence before domain/schema validation;
+9. project attempted models and tokens from durable dispatch/receipt rows, and
+   project cost from the canonical accounting aggregate.
+
+A missing real run id is a typed `LocalAdmission` denial, not an unclassified
+provider error. Local admission, configuration, pre-upload, post-dispatch and
+cancellation categories stop the chain without consuming a fallback or poisoning
+provider health. Diagnostics derive only from the typed category and numeric
+HTTP status; caller/provider exception text is never marked safe or persisted.
+A post-dispatch receipt-persistence failure records uncertainty and asks for
+manual reconciliation; it never claims the receipt was retained. SQLite
+transactions never span provider I/O.
+
+A reservation is released only when the dispatch marker is absent and a local
+pre-upload failure or cancellation is proven. Once the marker exists, a generic
+error code, process exit or local cleanup cannot prove no upload, so the request
+remains active/uncertain until supported reconciliation. An explicit retry for
+the same intended request requires the caller's consideration flag and a durable
+authorization for that exact prior request and next epoch.
 
 ## Strict admission and exposure bound
 
@@ -122,12 +160,17 @@ bulk charges. Frozen generic bulk summaries remain in the whole-policy budget;
 they cannot be attributed to a more specific modern operation.
 
 Confirmed returned cost, active reservation and uncertain reserve remain separate
-fields. Current-run provenance is selected only from completed requests whose
-`run_id` equals the caller's current run. A late receipt from an older run adds
-its confirmed charge but cannot overwrite the current run's actual provider,
-model or generation. The projection is not a second balance: future runtime
-integration should update existing run-policy state from this canonical
-calculation.
+fields. Current-run provenance is selected by append-only
+`analysis_request_events.event_id` receipt insertion order after filtering to
+completed requests whose `run_id` equals the caller's current run. Wall-clock
+timestamp ties, clock skew and receipt-key ordering therefore cannot select an
+earlier primary attempt over the actual final fallback, and a late receipt from
+an older run adds its charge without overwriting current-run provenance.
+Missing actual provider identity stays `None`; it is never inferred from the
+requested route. Token projections likewise use the latest token-bearing receipt
+event, so metadata-only enrichment cannot erase known usage or multiply tokens.
+The projection is not a second balance: run-policy state is updated from this
+canonical calculation.
 
 ## Legacy evidence
 
@@ -151,10 +194,10 @@ the authority.
 ## Compatibility with spending after an authority snapshot
 
 Migration 40 extends the existing analysis-run owner with an accounting-contract
-marker. The runtime integration will create marked runs only after initializing
-their budget authority. A marked zero-request cancelled run does not invent
-unknown paid usage. Existing production provider calls remain unwired in this
-slice; the marker creation API is not evidence of runtime integration.
+marker. The C1 pilot creates marked runs only after initializing its budget
+authority. A marked zero-request cancelled run does not invent unknown paid
+usage. Other production paid call sites remain unwired in this slice; the marker
+creation API alone is not evidence of runtime integration.
 
 An older runtime may have written run or pilot spending after an authority was
 initialized by migrations 38/39. Admission and dispatch recheck that history in
@@ -168,3 +211,24 @@ once, repeated observations append only increases, and independent runs keep
 separate evidence. Unknown zero-cost legacy work remains unknown; unreadable
 frozen pilot records retain their prior reserve. Direct evidence deletion is
 rejected while project-owned cleanup still cascades.
+
+## Remaining C2 integration (not implemented here)
+
+The following paid runtime call sites still bypass `AccountedVlmProvider` and
+must be wired before issue #122 can be considered complete:
+
+- bulk observation: `Catalog::analyze_missing_with_options_and_provider`,
+  `Catalog::analyze_missing_with_provider`,
+  `Catalog::analyze_authorized_with_provider`, and
+  `Catalog::analyze_authorized_with_provider_and_workers` in
+  `core/rcdvlog-core/src/lib.rs`, including `analysis::vlm::analyze_clip`;
+- moment discovery: `Catalog::discover_moments_with_provider` and
+  `Catalog::discover_authorized_moments_with_provider`;
+- chronology suggestions: `Catalog::suggest_chronology_with_provider` and
+  `analysis::chronology_suggestions::suggest_with_provider`;
+- CLI/desktop/HTTP adapters and any inspection/reconcile/retry commands. No CLI
+  command is added by C1.
+
+Each remaining call site needs a real owned run id, full-policy authority
+context, and the same per-attempt boundary before paid dispatch is considered
+concurrent-safe.
