@@ -16,7 +16,8 @@ use crate::analysis::openrouter::frame_data_uri;
 use crate::analysis::provider::{ProviderChain, VlmProvider, VlmRequest};
 use crate::analysis::run_policy::{
     AnalysisRunKind, PilotValidation, RunAssetScope, RunPilotRecord, RunPolicy,
-    RunPolicyParameters, RunPolicyRequest, pilot_accounting_context, pilot_authority_context,
+    RunPolicyParameters, RunPolicyRequest, ensure_vlm_run_kind, pilot_accounting_context,
+    pilot_authority_context,
 };
 use crate::analysis::schema::{self, output_schema as observation_output_schema};
 use crate::analysis::vlm::{PromptContext, build_prompt};
@@ -62,6 +63,7 @@ pub(crate) fn prepare_pilot_session(
     request: &RunPolicyRequest,
     retry_uncertain: bool,
 ) -> Result<PilotSessionStart> {
+    ensure_vlm_run_kind(request.parameters.kind())?;
     let policy = catalog.describe_run_policy(request)?;
     ensure!(
         policy.readiness.ready_for_authorization,
@@ -190,6 +192,7 @@ pub(crate) fn prepare_pilot_transmission<C: FnMut() -> bool>(
     first_scope: &RunAssetScope,
     is_cancelled: &mut C,
 ) -> Result<PreparedPilotTransmission> {
+    ensure_vlm_run_kind(policy.kind)?;
     let (manifest, frames) = prepare_frames(catalog, first_scope, is_cancelled)?;
     let transcript = if policy.payload.uses_transcript() {
         catalog.prompt_transcript(&first_scope.asset_id)?
@@ -204,7 +207,7 @@ pub(crate) fn prepare_pilot_transmission<C: FnMut() -> bool>(
         frames,
         transcript,
         vocabulary,
-    );
+    )?;
     if is_cancelled() {
         bail!("pilot cancelled before provider transmission");
     }
@@ -270,7 +273,8 @@ fn build_pilot_request(
     frames: Vec<String>,
     transcript: Option<crate::analysis::vlm::PromptTranscript>,
     vocabulary: Vec<String>,
-) -> (VlmRequest, PilotSchemaKind) {
+) -> Result<(VlmRequest, PilotSchemaKind)> {
+    ensure_vlm_run_kind(policy.kind)?;
     match policy.kind {
         AnalysisRunKind::Observation => {
             let context = PromptContext {
@@ -280,7 +284,7 @@ fn build_pilot_request(
                 vocabulary,
                 trip_context: None,
             };
-            (
+            Ok((
                 VlmRequest {
                     prompt: build_prompt(&context),
                     frames,
@@ -290,7 +294,7 @@ fn build_pilot_request(
                     ),
                 },
                 PilotSchemaKind::Observation,
-            )
+            ))
         }
         AnalysisRunKind::MomentDiscovery => {
             let keys = frame_timestamps_ms
@@ -324,17 +328,25 @@ fn build_pilot_request(
                     "editProfile": match &policy.parameters {
                         RunPolicyParameters::MomentDiscovery { profile, .. } => Some(*profile),
                         RunPolicyParameters::Observation { .. } => None,
+                        RunPolicyParameters::NativeSpeechTranscription { .. } => {
+                            return Err(anyhow::anyhow!(
+                                "native speech transcription cannot be prepared as a VLM moment request"
+                            ));
+                        }
                     }
                 })
             );
-            (
+            Ok((
                 VlmRequest {
                     prompt,
                     frames,
                     schema,
                 },
                 PilotSchemaKind::Moment,
-            )
+            ))
+        }
+        AnalysisRunKind::NativeSpeechTranscription => {
+            bail!("native speech transcription cannot be prepared as a VLM request")
         }
     }
 }
@@ -356,6 +368,7 @@ pub(crate) fn execute_accounted_pilot_attempts<C: FnMut() -> bool>(
     retry_uncertain: bool,
     is_cancelled: &mut C,
 ) -> Result<PilotExecution> {
+    ensure_vlm_run_kind(policy.kind)?;
     let chain = ProviderChain::with_policy(
         &policy.primary_model,
         &policy.allowed_models,
@@ -441,6 +454,14 @@ fn validate_pilot_response(
             let profile = match &policy.parameters {
                 RunPolicyParameters::MomentDiscovery { profile, .. } => *profile,
                 RunPolicyParameters::Observation { .. } => EditProfile::default(),
+                RunPolicyParameters::NativeSpeechTranscription { .. } => {
+                    return PilotValidation {
+                        structural_schema_valid,
+                        source_time_semantics_valid: false,
+                        capability_observed: false,
+                        detail: "native_speech_transcription_is_not_a_vlm_pilot".into(),
+                    };
+                }
             };
             validate_reply(body, span, profile, &keys, 1)
                 .map(|_| ())

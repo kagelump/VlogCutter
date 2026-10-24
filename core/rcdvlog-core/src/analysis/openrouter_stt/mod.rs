@@ -15,6 +15,7 @@
 
 use anyhow::{Result, anyhow, bail, ensure};
 use base64::Engine;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Map, Value, json};
 use std::time::Duration;
 
@@ -168,7 +169,8 @@ pub fn resolve_speech_backend(selection: &SpeechBackendSelection) -> Result<Reso
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SttDataCollection {
     Allow,
     Deny,
@@ -223,7 +225,7 @@ impl NativeSttProviderPolicy {
         }
     }
 
-    fn validate(&self) -> Result<()> {
+    pub fn validate(&self) -> Result<()> {
         ensure!(
             self.zero_data_retention.is_some() || self.data_collection.is_some(),
             "native STT requires an explicit supported provider data policy"
@@ -273,6 +275,27 @@ impl NativeSttProviderPolicy {
         }
         policy.validate()?;
         Ok(policy)
+    }
+}
+
+impl Serialize for NativeSttProviderPolicy {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.to_wire_value()
+            .map_err(serde::ser::Error::custom)?
+            .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for NativeSttProviderPolicy {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        Self::from_wire_value(&value).map_err(serde::de::Error::custom)
     }
 }
 

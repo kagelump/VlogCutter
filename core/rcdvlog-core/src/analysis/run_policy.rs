@@ -24,6 +24,9 @@ use crate::analysis::moments::{
     EditProfile, MOMENT_PROMPT_VERSION, MOMENT_RECIPE_VERSION, MOMENT_SCHEMA_VERSION, MomentPayload,
 };
 use crate::analysis::openrouter::{OpenRouterProvider, api_credential_present, resolve_api_key};
+use crate::analysis::openrouter_stt::{
+    NativeSttProviderPolicy, native_stt_cost_bound_contract_id, resolve_native_stt_model,
+};
 use crate::analysis::pilot_runtime::{
     PilotAttemptBaseline, PilotSession, PilotSessionStart, execute_accounted_pilot_attempts,
     prepare_pilot_session, prepare_pilot_transmission,
@@ -34,6 +37,9 @@ use crate::analysis::provider::{
 };
 use crate::analysis::{VLM_PROMPT_VERSION, framepack, store::TranscriptStatus};
 use crate::{Asset, Catalog, REFERENCE_COST_PER_CLIP_USD};
+
+mod native_stt;
+use native_stt::{canonical_native_models, native_stt_blockers, native_stt_capability_checks};
 
 pub const RUN_POLICY_SCHEMA_VERSION: &str = "analysis.run-policy.v1";
 pub const RUN_AUTHORIZATION_SCHEMA_VERSION: &str = "analysis.run-authorization.v1";
@@ -48,6 +54,7 @@ const PILOT_WARNING: &str = "A passed pilot is an observed capability for this e
 pub enum AnalysisRunKind {
     Observation,
     MomentDiscovery,
+    NativeSpeechTranscription,
 }
 
 impl AnalysisRunKind {
@@ -55,7 +62,15 @@ impl AnalysisRunKind {
         match self {
             Self::Observation => "observation",
             Self::MomentDiscovery => "moment_discovery",
+            Self::NativeSpeechTranscription => "native_speech_transcription",
         }
+    }
+
+    /// Existing VLM pilot, provider-boundary and recovery entry points only
+    /// operate on these two kinds. Native speech must be rejected explicitly by
+    /// those owners rather than falling through to a vision request.
+    pub fn is_vlm(self) -> bool {
+        matches!(self, Self::Observation | Self::MomentDiscovery)
     }
 }
 
@@ -133,7 +148,7 @@ pub struct RunPolicyContext {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RunPolicyParameters {
     Observation {
         force: bool,
@@ -146,6 +161,11 @@ pub enum RunPolicyParameters {
         force: bool,
         retry_uncertain: bool,
     },
+    NativeSpeechTranscription {
+        language: Option<String>,
+        provider_policy: NativeSttProviderPolicy,
+        force: bool,
+    },
 }
 
 impl RunPolicyParameters {
@@ -153,12 +173,15 @@ impl RunPolicyParameters {
         match self {
             Self::Observation { .. } => AnalysisRunKind::Observation,
             Self::MomentDiscovery { .. } => AnalysisRunKind::MomentDiscovery,
+            Self::NativeSpeechTranscription { .. } => AnalysisRunKind::NativeSpeechTranscription,
         }
     }
 
     pub fn force(&self) -> bool {
         match self {
-            Self::Observation { force } | Self::MomentDiscovery { force, .. } => *force,
+            Self::Observation { force }
+            | Self::MomentDiscovery { force, .. }
+            | Self::NativeSpeechTranscription { force, .. } => *force,
         }
     }
 }
@@ -167,7 +190,7 @@ impl RunPolicyParameters {
 /// canonical ownership and source identity; the caller cannot supply a source
 /// fingerprint or representation identity.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RunPolicyRequest {
     pub project_id: String,
     pub asset_ids: Vec<String>,
@@ -243,6 +266,39 @@ impl RunPolicyRequest {
                 profile,
                 force,
                 retry_uncertain,
+            },
+        }
+    }
+
+    /// Explicit native cloud speech proposal. Provider and model remain in the
+    /// common authoritative request fields; the native parameters carry only
+    /// the exact language, supported data-policy fields and force flag.
+    #[allow(clippy::too_many_arguments)]
+    pub fn native_speech_transcription(
+        project_id: impl Into<String>,
+        asset_ids: Vec<String>,
+        provider: impl Into<String>,
+        primary_model: impl Into<String>,
+        budget_usd: f64,
+        language: Option<String>,
+        provider_policy: NativeSttProviderPolicy,
+        force: bool,
+    ) -> Self {
+        let primary_model = primary_model.into();
+        Self {
+            project_id: project_id.into(),
+            asset_ids,
+            provider: provider.into(),
+            primary_model: primary_model.clone(),
+            allowed_models: vec![primary_model],
+            allow_fallback: false,
+            payload: AnalysisPayload::Audio,
+            include_project_vocabulary: false,
+            budget_usd,
+            parameters: RunPolicyParameters::NativeSpeechTranscription {
+                language,
+                provider_policy,
+                force,
             },
         }
     }
@@ -718,10 +774,25 @@ fn capability_checks(
     checks
 }
 
+/// Existing vision pilot/provider/recovery entry points call this before any
+/// local preparation, credential resolution or provider request. A future
+/// native runtime must replace it with its own accounted boundary rather than
+/// routing native audio through a VLM request.
+pub(crate) fn ensure_vlm_run_kind(kind: AnalysisRunKind) -> Result<()> {
+    if kind.is_vlm() {
+        Ok(())
+    } else {
+        bail!(
+            "native speech transcription is not a VLM operation; its accounted runtime is unavailable"
+        )
+    }
+}
+
 fn source_scope(
     catalog: &Catalog,
     asset: &Asset,
     payload: AnalysisPayload,
+    add_legacy_audio_backend_blocker: bool,
 ) -> (RunAssetScope, Vec<RunPolicyBlocker>, Option<String>) {
     let source_duration_ms = (asset.duration_seconds.max(0.0) * 1_000.0).round() as u32;
     // A frames-only or audio-only policy must not even bind transcript content
@@ -757,7 +828,7 @@ fn source_scope(
                     ),
                     asset_id: Some(asset.id.clone()),
                 }];
-                if payload.uses_audio() {
+                if payload.uses_audio() && add_legacy_audio_backend_blocker {
                     blockers.push(RunPolicyBlocker {
                         code: "audio_backend_unavailable".into(),
                         message: "audio payload requires an implemented audio backend".into(),
@@ -893,7 +964,8 @@ impl Catalog {
             .iter()
             .find(|scope| scope.asset_id == asset_id)
             .ok_or_else(|| anyhow::anyhow!("asset is outside authorized scope"))?;
-        let (current, blockers, _) = source_scope(self, &asset, policy.payload);
+        let (current, blockers, _) =
+            source_scope(self, &asset, policy.payload, policy.kind.is_vlm());
         ensure!(
             blockers.is_empty() && &current == approved,
             "authorized source or transcript changed before transmission"
@@ -905,6 +977,7 @@ impl Catalog {
     /// Freeze the approved vocabulary for this run. Analysis may itself add
     /// labels, but requests must keep using the original approved snapshot.
     pub(crate) fn run_policy_vocabulary(&self, policy: &RunPolicy) -> Result<Vec<String>> {
+        ensure_vlm_run_kind(policy.kind)?;
         if !policy.context.project_vocabulary {
             return Ok(Vec::new());
         }
@@ -949,15 +1022,38 @@ impl Catalog {
             assets.push(asset);
         }
 
-        let allowed = canonical_models(request);
-        let fallbacks =
-            permitted_fallbacks(&request.primary_model, &allowed, request.allow_fallback);
-        let checks = capability_checks(request, &allowed, &fallbacks);
+        let kind = request.parameters.kind();
+        let native_stt = kind == AnalysisRunKind::NativeSpeechTranscription;
+        // Native speech is always represented as audio-only even when a
+        // malformed caller selected another payload. The request is still
+        // rejected by native_stt_blockers, but no transcript/vocabulary
+        // identity is ever bound into the blocked policy.
+        let effective_payload = if native_stt {
+            AnalysisPayload::Audio
+        } else {
+            request.payload
+        };
+        let allowed = if native_stt {
+            canonical_native_models(request)
+        } else {
+            canonical_models(request)
+        };
+        let fallbacks = if native_stt {
+            Vec::new()
+        } else {
+            permitted_fallbacks(&request.primary_model, &allowed, request.allow_fallback)
+        };
+        let checks = if native_stt {
+            native_stt_capability_checks(request, &allowed)
+        } else {
+            capability_checks(request, &allowed, &fallbacks)
+        };
         let mut blockers = Vec::new();
         let mut warnings = Vec::new();
         let mut scope = Vec::new();
         for asset in &assets {
-            let (entry, mut source_blockers, _) = source_scope(self, asset, request.payload);
+            let (entry, mut source_blockers, _) =
+                source_scope(self, asset, effective_payload, !native_stt);
             scope.push(entry);
             blockers.append(&mut source_blockers);
         }
@@ -973,82 +1069,114 @@ impl Catalog {
                 asset_id: None,
             });
         }
-        if request.provider != "openrouter" {
-            blockers.push(RunPolicyBlocker {
-                code: "unsupported_provider".into(),
-                message: "only the explicit OpenRouter provider is supported".into(),
-                asset_id: None,
-            });
-        }
-        if !model_spec(&request.primary_model).is_some_and(|spec| spec.supports_json_schema) {
-            blockers.push(RunPolicyBlocker {
-                code: "unsupported_schema".into(),
-                message: "selected primary model does not accept the configured JSON schema".into(),
-                asset_id: None,
-            });
-        }
-        if !allowed.iter().any(|model| model == &request.primary_model) {
-            blockers.push(RunPolicyBlocker {
-                code: "primary_model_not_allowed".into(),
-                message: "selected primary model is not present in the permitted allowlist".into(),
-                asset_id: None,
-            });
-        }
-        if request.allow_fallback && fallbacks.is_empty() {
-            blockers.push(RunPolicyBlocker {
-                code: "unsupported_fallback".into(),
-                message:
-                    "fallback was requested but no permitted fallback model is in the allowlist"
-                        .into(),
-                asset_id: None,
-            });
-        }
-        for fallback in &fallbacks {
-            if !model_spec(fallback)
-                .is_some_and(|spec| spec.supports_image_input && spec.supports_json_schema)
-            {
+        let native_spec = if native_stt {
+            blockers.extend(native_stt_blockers(request));
+            warnings.push(
+                "native STT expected cost uses the registered full-window duration tariff and a conservative pre-VAD packed-window upper bound from source duration; the actual window count is unknown until runtime".into(),
+            );
+            warnings.push(
+                "native STT max_price, order, only and ignore routing restrictions are not enforced by the transcription endpoint; the duration tariff is an external reservation assumption, not a hard invoice cap, and receipt settlement retains above-bound or unknown charges".into(),
+            );
+            warnings.push(
+                "native STT is proposal-only in this build: accounted pilot/bulk runtime orchestration is unavailable, so readiness remains blocked and authorization is refused".into(),
+            );
+            resolve_native_stt_model(&request.provider, &request.primary_model).ok()
+        } else {
+            None
+        };
+        if !native_stt {
+            if request.provider != "openrouter" {
                 blockers.push(RunPolicyBlocker {
-                    code: "unsupported_fallback".into(),
-                    message: format!("permitted fallback {fallback} lacks required capabilities"),
+                    code: "unsupported_provider".into(),
+                    message: "only the explicit OpenRouter provider is supported".into(),
                     asset_id: None,
                 });
             }
-        }
-        if request.payload.uses_audio() {
-            blockers.push(RunPolicyBlocker {
-                code: "audio_backend_unavailable".into(),
-                message:
-                    "audio analysis is represented in policy but no backend exists; readiness fails"
+            if !model_spec(&request.primary_model).is_some_and(|spec| spec.supports_json_schema) {
+                blockers.push(RunPolicyBlocker {
+                    code: "unsupported_schema".into(),
+                    message: "selected primary model does not accept the configured JSON schema"
                         .into(),
-                asset_id: None,
-            });
-        }
-        if request.payload == AnalysisPayload::Transcript {
-            blockers.push(RunPolicyBlocker {
-                code: "unsupported_payload".into(),
-                message: "transcript-only payload has no supported provider path".into(),
-                asset_id: None,
-            });
-        }
-        if !request.payload.uses_frames() {
-            blockers.push(RunPolicyBlocker {
-                code: "unsupported_payload".into(),
-                message: "registered vision models require an image payload".into(),
-                asset_id: None,
-            });
-        }
-        if request.payload.uses_transcript()
-            && scope
-                .iter()
-                .all(|item| item.transcript_fingerprint.is_none())
-        {
-            warnings.push(
-                "no accepted current transcript was found; the frames payload can still proceed but transcript context will be absent"
-                    .into(),
-            );
+                    asset_id: None,
+                });
+            }
+            if !allowed.iter().any(|model| model == &request.primary_model) {
+                blockers.push(RunPolicyBlocker {
+                    code: "primary_model_not_allowed".into(),
+                    message: "selected primary model is not present in the permitted allowlist"
+                        .into(),
+                    asset_id: None,
+                });
+            }
+            if request.allow_fallback && fallbacks.is_empty() {
+                blockers.push(RunPolicyBlocker {
+                    code: "unsupported_fallback".into(),
+                    message:
+                        "fallback was requested but no permitted fallback model is in the allowlist"
+                            .into(),
+                    asset_id: None,
+                });
+            }
+            for fallback in &fallbacks {
+                if !model_spec(fallback)
+                    .is_some_and(|spec| spec.supports_image_input && spec.supports_json_schema)
+                {
+                    blockers.push(RunPolicyBlocker {
+                        code: "unsupported_fallback".into(),
+                        message: format!(
+                            "permitted fallback {fallback} lacks required capabilities"
+                        ),
+                        asset_id: None,
+                    });
+                }
+            }
+            if request.payload.uses_audio() {
+                blockers.push(RunPolicyBlocker {
+                    code: "audio_backend_unavailable".into(),
+                    message:
+                        "audio analysis is represented in policy but no backend exists; readiness fails"
+                            .into(),
+                    asset_id: None,
+                });
+            }
+            if request.payload == AnalysisPayload::Transcript {
+                blockers.push(RunPolicyBlocker {
+                    code: "unsupported_payload".into(),
+                    message: "transcript-only payload has no supported provider path".into(),
+                    asset_id: None,
+                });
+            }
+            if !request.payload.uses_frames() {
+                blockers.push(RunPolicyBlocker {
+                    code: "unsupported_payload".into(),
+                    message: "registered vision models require an image payload".into(),
+                    asset_id: None,
+                });
+            }
+            if request.payload.uses_transcript()
+                && scope
+                    .iter()
+                    .all(|item| item.transcript_fingerprint.is_none())
+            {
+                warnings.push(
+                    "no accepted current transcript was found; the frames payload can still proceed but transcript context will be absent"
+                        .into(),
+                );
+            }
         }
 
-        let expected_cost_usd = assets.len() as f64 * REFERENCE_COST_PER_CLIP_USD;
+        let (expected_cost_usd, cost_basis) = match native_spec {
+            Some(spec) => native_stt::expected_cost_usd(&scope, spec)?,
+            None if native_stt => (
+                0.0,
+                "native STT expected cost unavailable: no verified provider/model duration tariff was resolved"
+                    .into(),
+            ),
+            None => (
+                assets.len() as f64 * REFERENCE_COST_PER_CLIP_USD,
+                "reference measurement; pilot spend is counted against the same ceiling".into(),
+            ),
+        };
         let capabilities_ready = checks
             .iter()
             .all(|check| check.status != CapabilityStatus::Failed);
@@ -1064,7 +1192,6 @@ impl Catalog {
             });
         }
         let credentials_present = api_credential_present();
-        let kind = request.parameters.kind();
         let (prompt_version, schema_version, recipe_version) = match kind {
             AnalysisRunKind::Observation => (
                 VLM_PROMPT_VERSION.to_string(),
@@ -1076,12 +1203,21 @@ impl Catalog {
                 MOMENT_SCHEMA_VERSION.to_string(),
                 MOMENT_RECIPE_VERSION.to_string(),
             ),
+            AnalysisRunKind::NativeSpeechTranscription => (
+                native_stt::NATIVE_STT_PROMPT_VERSION.to_string(),
+                native_stt::NATIVE_STT_OUTPUT_SCHEMA_VERSION.to_string(),
+                native_stt::NATIVE_STT_RECIPE_VERSION.to_string(),
+            ),
         };
-        let context = policy_context(
-            self,
-            &request.project_id,
-            request.include_project_vocabulary,
-        )?;
+        let context = if native_stt {
+            RunPolicyContext::default()
+        } else {
+            policy_context(
+                self,
+                &request.project_id,
+                request.include_project_vocabulary,
+            )?
+        };
         if kind == AnalysisRunKind::MomentDiscovery && context.project_vocabulary {
             blockers.push(RunPolicyBlocker {
                 code: "unsupported_payload_context".into(),
@@ -1112,21 +1248,28 @@ impl Catalog {
             provider: request.provider.clone(),
             primary_model: request.primary_model.clone(),
             allowed_models: allowed,
-            allow_fallback: request.allow_fallback,
+            allow_fallback: if native_stt {
+                false
+            } else {
+                request.allow_fallback
+            },
             permitted_fallbacks: fallbacks,
-            payload: request.payload,
+            payload: effective_payload,
             context,
             scope,
             expected_cost_usd,
-            cost_basis: "reference measurement; pilot spend is counted against the same ceiling"
-                .into(),
+            cost_basis,
             budget_usd: request.budget_usd,
             parameters: request.parameters.clone(),
             prompt_version,
             output_schema_version: schema_version,
             recipe_version,
             tool_version: RUN_POLICY_TOOL_VERSION.into(),
-            provider_cost_bound_contract: analysis_cost_bound_contract_id(),
+            provider_cost_bound_contract: if native_stt {
+                native_stt_cost_bound_contract_id()
+            } else {
+                analysis_cost_bound_contract_id()
+            },
             capability_checks: checks,
             readiness,
         };
@@ -1257,6 +1400,7 @@ impl Catalog {
     where
         C: FnMut() -> bool,
     {
+        ensure_vlm_run_kind(request.parameters.kind())?;
         if is_cancelled() {
             bail!("pilot cancelled before provider transmission");
         }
@@ -1572,6 +1716,7 @@ impl Catalog {
         request: &RunPolicyRequest,
         retry_uncertain: bool,
     ) -> Result<RunPilotRecord> {
+        ensure_vlm_run_kind(request.parameters.kind())?;
         ensure!(
             api_credential_present(),
             "OpenRouter credentials are not available; no pilot request was made"
@@ -1587,6 +1732,8 @@ impl Catalog {
         expected_kind: AnalysisRunKind,
     ) -> Result<AuthorizedPolicyState> {
         let authorization = self.load_run_authorization(policy_id)?;
+        ensure_vlm_run_kind(authorization.policy.kind)?;
+        ensure_vlm_run_kind(expected_kind)?;
         ensure!(
             authorization.policy.kind == expected_kind,
             "authorized policy kind does not match the requested bulk operation"
@@ -1705,6 +1852,7 @@ impl Catalog {
 
 #[cfg(test)]
 mod tests {
+    mod native_tests;
     use super::*;
     use crate::ProviderReceiptEvidence;
     use crate::analysis::moments::{MomentPayload, MomentRunOptions};
@@ -1828,8 +1976,7 @@ mod tests {
             .arg(&source)
             .status();
         let Ok(status) = status else {
-            eprintln!("ffmpeg unavailable; skipping synthetic run-policy test");
-            panic!("synthetic ftest requires ffmpeg")
+            panic!("synthetic run-policy fixture requires ffmpeg")
         };
         assert!(status.success(), "synthetic fixture generation failed");
         crate::tests::insert_asset_at(catalog, project_id, id, &source);
