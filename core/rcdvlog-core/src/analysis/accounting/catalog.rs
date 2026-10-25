@@ -16,6 +16,9 @@ use super::model::{
 };
 use super::store;
 use crate::Catalog;
+use crate::analysis::openrouter_stt::{
+    NativeSttAudioWindow, NativeSttRequest, native_stt_request_cost_bound,
+};
 use crate::analysis::provider::AnalysisRequestCostBound;
 
 impl Catalog {
@@ -51,6 +54,29 @@ impl Catalog {
         )
     }
 
+    /// Reserve one exact native speech window through the same canonical
+    /// reservation transaction as VLM work. The owner-local quote and payload
+    /// fingerprint helpers are called here; callers cannot substitute a chat
+    /// token quote or transport-invented request identity.
+    pub fn reserve_analysis_native_stt_request(
+        &self,
+        context: &AnalysisAccountingContext,
+        request: &NativeSttRequest,
+        audio: &NativeSttAudioWindow,
+    ) -> Result<AnalysisRequestRecord> {
+        let cost_bound = native_stt_request_cost_bound(request, audio)?;
+        let payload_fingerprint = super::analysis_native_stt_payload_fingerprint(request, audio)?;
+        context.validate_request(request.model(), &payload_fingerprint)?;
+        store::reserve_native_stt(
+            &mut self.connection()?,
+            context,
+            request,
+            audio,
+            &payload_fingerprint,
+            &cost_bound,
+        )
+    }
+
     /// Read-only proof of a targeted retry's exact original payload/model and
     /// current provider quote against its durable prior authorization.
     pub(crate) fn validate_analysis_targeted_retry_claim(
@@ -59,6 +85,7 @@ impl Catalog {
         model: &str,
         payload_fingerprint: &str,
         cost_bound_fingerprint: &str,
+        cost_bound: &AnalysisRequestCostBound,
     ) -> Result<()> {
         store::validate_targeted_retry_claim(
             &self.connection()?,
@@ -70,6 +97,7 @@ impl Catalog {
                 model,
                 payload_fingerprint,
                 cost_bound_fingerprint,
+                cost_bound,
             },
         )?;
         Ok(())

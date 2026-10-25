@@ -709,6 +709,7 @@ impl Catalog {
                 model: &prepared.model,
                 payload_fingerprint: &prepared.payload_fingerprint,
                 cost_bound_fingerprint: &cost_bound_fingerprint,
+                cost_bound: &cost_bound,
             },
         )?;
         if is_cancelled() {

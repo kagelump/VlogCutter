@@ -46,13 +46,15 @@ pub fn concatenate_regions(pcm: &[f32], window: &PackedWindow) -> Vec<f32> {
 ///
 /// Cloud requests must describe genuine, bounded audio. Unlike the local
 /// lenient clamp, this rejects a truncated region, inconsistent window offsets,
-/// arithmetic overflow, an empty window, or more than thirty seconds of audio.
+/// arithmetic overflow, an empty window, more than thirty seconds of audio, or
+/// source regions that overlap or run backwards in clip time.
 pub fn concatenate_regions_bounded(pcm: &[f32], window: &PackedWindow) -> Result<Vec<f32>> {
     ensure!(!window.regions.is_empty(), "speech window has no regions");
 
     let mut packed = Vec::new();
     let mut expected_offset_ms = 0_u32;
     let mut total_ms = 0_u32;
+    let mut previous_source_end_ms = None;
 
     for region in &window.regions {
         ensure!(region.duration_ms > 0, "speech region has no duration");
@@ -64,6 +66,13 @@ pub fn concatenate_regions_bounded(pcm: &[f32], window: &PackedWindow) -> Result
             .source_start_ms
             .checked_add(region.duration_ms)
             .ok_or_else(|| anyhow::anyhow!("speech region source range overflowed"))?;
+        if let Some(previous_end_ms) = previous_source_end_ms {
+            ensure!(
+                region.source_start_ms >= previous_end_ms,
+                "speech window source regions overlap or are out of order"
+            );
+        }
+        previous_source_end_ms = Some(source_end_ms);
         let start_samples = (region.source_start_ms as usize)
             .checked_mul(PCM_SAMPLES_PER_MS)
             .ok_or_else(|| anyhow::anyhow!("speech region start overflowed"))?;

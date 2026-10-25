@@ -12,6 +12,7 @@
 
 use anyhow::Result;
 
+use super::lifecycle::AccountingBoundary;
 use super::model::{
     AnalysisAccountingContext, AnalysisBudgetExhausted, AnalysisTargetedRetryAdmission,
     ProviderReceiptEvidence, analysis_request_cost_bound_fingerprint,
@@ -21,6 +22,16 @@ use crate::Catalog;
 use crate::analysis::provider::{
     AnalysisRequestCostBound, ProviderFailure, VlmProvider, VlmRequest, VlmResponse,
 };
+
+/// The VLM accounting wrapper may only admit chat/VLM token/image quote
+/// contracts. A lower-level non-policy operation context still must never let a
+/// provider smuggle a native duration quote into a VLM dispatch.
+fn ensure_vlm_cost_bound(cost_bound: &AnalysisRequestCostBound) -> Result<()> {
+    if cost_bound.audio.is_some() {
+        return Err(ProviderFailure::local_admission().into());
+    }
+    Ok(())
+}
 
 enum Admission {
     Initial {
@@ -102,12 +113,6 @@ impl<'a> AccountedVlmProvider<'a> {
         }
     }
 
-    fn release_no_upload(&self, request_key: &str, failure_code: &str) {
-        let _ = self
-            .catalog
-            .release_analysis_request_local_failure(request_key, failure_code);
-    }
-
     fn reserve_attempt(
         &self,
         model: &str,
@@ -119,6 +124,7 @@ impl<'a> AccountedVlmProvider<'a> {
             .provider
             .analysis_cost_bound(model, request)
             .map_err(|_| ProviderFailure::local_pre_upload())?;
+        ensure_vlm_cost_bound(&cost_bound)?;
         match &self.admission {
             Admission::Initial {
                 context,
@@ -150,6 +156,7 @@ impl<'a> AccountedVlmProvider<'a> {
                     model,
                     &payload_fingerprint,
                     &cost_bound_fingerprint,
+                    &cost_bound,
                 ) {
                     Ok(_) => {}
                     Err(error) if error.downcast_ref::<AnalysisBudgetExhausted>().is_some() => {
@@ -173,110 +180,25 @@ impl<'a> AccountedVlmProvider<'a> {
         }
     }
 
-    fn prepare_before_dispatch(&self, request_key: &str) -> Result<()> {
-        if let Err(error) = self.provider.prepare() {
-            let observed = ProviderFailure::from_anyhow(&error);
-            let failure = if observed.category.is_local() {
-                observed
-            } else {
-                ProviderFailure::local_pre_upload()
-            };
-            let release_code = if failure.category
-                == crate::analysis::provider::ProviderFailureCategory::Configuration
-            {
-                "provider_configuration"
-            } else {
-                "local_provider_prepare"
-            };
-            self.release_no_upload(request_key, release_code);
-            return Err(failure.into());
-        }
-        Ok(())
-    }
-
-    fn record_receipt_or_uncertain(&self, request_key: &str, response: &VlmResponse) -> Result<()> {
-        let evidence = ProviderReceiptEvidence::from_response(response);
-        if self
-            .catalog
-            .record_analysis_request_receipt(request_key, &evidence)
-            .is_err()
-        {
-            // The paid response is already an external fact. Retain uncertainty
-            // and refuse any implicit fallback/resend.
-            let _ = self
-                .catalog
-                .mark_analysis_request_uncertain(request_key, "local_receipt_persist_failed");
-            return Err(ProviderFailure::local_post_dispatch().into());
-        }
-        Ok(())
-    }
-
-    fn dispatch_and_receipt(
-        &self,
-        request_key: &str,
-        model: &str,
-        request: &VlmRequest,
-    ) -> Result<VlmResponse> {
-        // The durable marker is committed immediately before the one actual
-        // transport call. Any later failure can no longer prove no upload.
-        if self
-            .catalog
-            .mark_analysis_request_dispatched(request_key)
-            .is_err()
-        {
-            self.release_no_upload(request_key, "local_dispatch_marker_failed");
-            return Err(ProviderFailure::local_pre_upload().into());
-        }
-        match self.provider.analyze(model, request) {
-            Ok(response) => {
-                self.record_receipt_or_uncertain(request_key, &response)?;
-                Ok(response)
-            }
-            Err(error) => {
-                let failure = ProviderFailure::from_anyhow(&error);
-                let _ = self
-                    .catalog
-                    .mark_analysis_request_uncertain(request_key, &failure.safe_detail());
-                Err(error)
-            }
-        }
-    }
-
     fn transmit(
         &self,
         model: &str,
         request: &VlmRequest,
         is_cancelled: &mut dyn FnMut() -> bool,
     ) -> Result<VlmResponse> {
-        if self.run_id().trim().is_empty() {
-            return Err(ProviderFailure::local_admission().into());
-        }
-        if is_cancelled() {
-            return Err(ProviderFailure::cancelled().into());
-        }
-        let reservation = self.reserve_attempt(model, request)?;
-        if is_cancelled() {
-            self.release_no_upload(&reservation.request_key, "local_cancelled_before_dispatch");
-            return Err(ProviderFailure::cancelled().into());
-        }
-        self.prepare_before_dispatch(&reservation.request_key)?;
-        if let Some(check) = &self.pre_dispatch_check
-            && let Err(error) = check()
-        {
-            self.release_no_upload(&reservation.request_key, "local_domain_guard");
-            let observed = ProviderFailure::from_anyhow(&error);
-            let failure = if observed.category.is_local() {
-                observed
-            } else {
-                ProviderFailure::local_pre_upload()
-            };
-            return Err(failure.into());
-        }
-        if is_cancelled() {
-            self.release_no_upload(&reservation.request_key, "local_cancelled_before_dispatch");
-            return Err(ProviderFailure::cancelled().into());
-        }
-        self.dispatch_and_receipt(&reservation.request_key, model, request)
+        let pre_dispatch_check: Option<&dyn Fn() -> Result<()>> = self
+            .pre_dispatch_check
+            .as_deref()
+            .map(|check| check as &dyn Fn() -> Result<()>);
+        AccountingBoundary::new(self.catalog, self.run_id(), pre_dispatch_check)
+            .execute(
+                is_cancelled,
+                || self.reserve_attempt(model, request),
+                || self.provider.prepare(),
+                || self.provider.analyze(model, request),
+                |response| Ok(ProviderReceiptEvidence::from_response(response)),
+            )
+            .map(|transmission| transmission.value)
     }
 }
 
@@ -286,7 +208,9 @@ impl VlmProvider for AccountedVlmProvider<'_> {
         model: &str,
         request: &VlmRequest,
     ) -> Result<AnalysisRequestCostBound> {
-        self.provider.analysis_cost_bound(model, request)
+        let cost_bound = self.provider.analysis_cost_bound(model, request)?;
+        ensure_vlm_cost_bound(&cost_bound)?;
+        Ok(cost_bound)
     }
 
     fn analyze(&self, model: &str, request: &VlmRequest) -> Result<VlmResponse> {

@@ -75,22 +75,23 @@ use analysis::vlm_store::{
 use analysis::whisper_engine::{WhisperEngine, read_pcm};
 
 pub use analysis::accounting::{
-    ANALYSIS_ACCOUNTING_SCHEMA_VERSION, ANALYSIS_RECOVERY_SCHEMA_VERSION, AccountedVlmProvider,
-    AnalysisAccountingAggregate, AnalysisAccountingContext, AnalysisAccountingInspection,
-    AnalysisAccountingInspectionSelection, AnalysisAccountingReport,
-    AnalysisAccountingRequestInspection, AnalysisBudgetAuthorityContext, AnalysisBudgetExhausted,
-    AnalysisBudgetSnapshot, AnalysisOperationAccountingSummary, AnalysisOperationAttemptProjection,
-    AnalysisProviderReceipt, AnalysisRequestEvent, AnalysisRequestLifecycle,
-    AnalysisRequestReconciliation, AnalysisRequestRecord, AnalysisRequestRecoveryReport,
-    AnalysisRetryAuthorization, AnalysisTargetedRetryAdmission, CHRONOLOGY_SUGGESTIONS_OPERATION,
-    LABEL_CONSOLIDATION_OPERATION, LEGACY_UNKNOWN_USAGE_STOP_REASON,
-    MAX_IN_FLIGHT_REQUESTS_PER_BUDGET_AUTHORITY, MAX_PROVIDER_RECEIPT_EVIDENCE_BYTES,
-    MAX_REQUEST_ATTEMPTS, MAX_TARGETED_RETRY_PAYLOAD_BYTES, ProviderReceiptEvidence,
-    TargetedAnalysisRetryProviderResponse, TargetedAnalysisRetryReport,
-    UNTRACKED_POST_INITIALIZATION_USAGE_STOP_REASON, analysis_native_stt_payload_fingerprint,
-    analysis_operation_budget_scope_id, analysis_policy_budget_scope_id,
-    analysis_request_cost_bound_fingerprint, analysis_request_payload_fingerprint,
-    bounded_failure_code, read_provider_receipt_evidence_file, read_targeted_retry_payload_file,
+    ANALYSIS_ACCOUNTING_SCHEMA_VERSION, ANALYSIS_RECOVERY_SCHEMA_VERSION,
+    AccountedNativeSttProvider, AccountedVlmProvider, AnalysisAccountingAggregate,
+    AnalysisAccountingContext, AnalysisAccountingInspection, AnalysisAccountingInspectionSelection,
+    AnalysisAccountingReport, AnalysisAccountingRequestInspection, AnalysisBudgetAuthorityContext,
+    AnalysisBudgetExhausted, AnalysisBudgetSnapshot, AnalysisOperationAccountingSummary,
+    AnalysisOperationAttemptProjection, AnalysisProviderReceipt, AnalysisRequestEvent,
+    AnalysisRequestLifecycle, AnalysisRequestReconciliation, AnalysisRequestRecord,
+    AnalysisRequestRecoveryReport, AnalysisRetryAuthorization, AnalysisTargetedRetryAdmission,
+    CHRONOLOGY_SUGGESTIONS_OPERATION, LABEL_CONSOLIDATION_OPERATION,
+    LEGACY_UNKNOWN_USAGE_STOP_REASON, MAX_IN_FLIGHT_REQUESTS_PER_BUDGET_AUTHORITY,
+    MAX_PROVIDER_RECEIPT_EVIDENCE_BYTES, MAX_REQUEST_ATTEMPTS, MAX_TARGETED_RETRY_PAYLOAD_BYTES,
+    NativeSttAccountedResult, ProviderReceiptEvidence, TargetedAnalysisRetryProviderResponse,
+    TargetedAnalysisRetryReport, UNTRACKED_POST_INITIALIZATION_USAGE_STOP_REASON,
+    analysis_native_stt_payload_fingerprint, analysis_operation_budget_scope_id,
+    analysis_policy_budget_scope_id, analysis_request_cost_bound_fingerprint,
+    analysis_request_payload_fingerprint, bounded_failure_code,
+    read_provider_receipt_evidence_file, read_targeted_retry_payload_file,
 };
 pub use analysis::chronology_suggestions::{
     ChronologyEvidenceRequest, ChronologySuggestion, EvidenceFrame, PairMatch,
@@ -109,12 +110,13 @@ pub use analysis::openrouter_stt::{
     NATIVE_STT_REQUEST_TIMEOUT, NativeSttAudioWindow, NativeSttCallResult, NativeSttClientError,
     NativeSttCost, NativeSttModelSpec, NativeSttOutcome, NativeSttProtocolError,
     NativeSttProviderPolicy, NativeSttReceipt, NativeSttRequest, NativeSttSegment,
-    NativeSttTranscript, NativeSttUsage, NativeSttWord, OPENROUTER_STT_ENDPOINT,
-    OPENROUTER_STT_PROVIDER, OPENROUTER_WHISPER_MODEL, OpenRouterSttClient, ResolvedSpeechBackend,
-    SpeechBackendSelection, SttDataCollection, build_native_stt_request_body,
-    decode_native_stt_body, decode_native_stt_value, native_stt_cost_bound_contract_id,
-    native_stt_request_cost_bound, parse_native_stt_receipt, plan_native_stt_audio_windows,
-    resolve_native_stt_model, resolve_speech_backend, seconds_to_window_ms, validate_iso639_1,
+    NativeSttTranscript, NativeSttTransport, NativeSttUsage, NativeSttWord,
+    OPENROUTER_STT_ENDPOINT, OPENROUTER_STT_PROVIDER, OPENROUTER_WHISPER_MODEL,
+    OpenRouterSttClient, ResolvedSpeechBackend, SpeechBackendSelection, SttDataCollection,
+    build_native_stt_request_body, decode_native_stt_body, decode_native_stt_value,
+    native_stt_cost_bound_contract_id, native_stt_request_cost_bound, parse_native_stt_receipt,
+    plan_native_stt_audio_windows, resolve_native_stt_model, resolve_speech_backend,
+    seconds_to_window_ms, validate_iso639_1,
 };
 pub use analysis::provider::{
     ANALYSIS_COST_BOUND_CONTRACT_VERSION, AnalysisAudioCostBound, AnalysisRequestCostBound,
@@ -10214,6 +10216,7 @@ pub(crate) mod tests {
                     prompt_tokens: Some(1),
                     completion_tokens: Some(1),
                     usage_complete: true,
+                    billed_audio_seconds: None,
                 },
             )
             .unwrap();
@@ -11208,6 +11211,7 @@ pub(crate) mod tests {
                     prompt_tokens: Some(1),
                     completion_tokens: Some(1),
                     usage_complete: true,
+                    billed_audio_seconds: None,
                 },
             )
             .unwrap();

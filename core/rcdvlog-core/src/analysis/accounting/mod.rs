@@ -12,7 +12,9 @@
 
 mod catalog;
 mod legacy;
+mod lifecycle;
 mod model;
+mod native_stt;
 mod operation;
 mod provider_boundary;
 mod recovery;
@@ -42,6 +44,7 @@ pub(crate) use operation::{
 #[cfg(test)]
 mod tests;
 
+pub use native_stt::{AccountedNativeSttProvider, NativeSttAccountedResult};
 pub use provider_boundary::AccountedVlmProvider;
 pub use recovery::{
     ANALYSIS_RECOVERY_SCHEMA_VERSION, AnalysisAccountingInspection,

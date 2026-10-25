@@ -78,7 +78,7 @@ impl OpenRouterSttClient {
         self
     }
 
-    fn prepare(&self) -> Result<()> {
+    fn validate_configuration(&self) -> Result<()> {
         if self.api_key.trim().is_empty() || self.endpoint.trim().is_empty() {
             bail!(NativeSttClientError::Configuration);
         }
@@ -102,7 +102,7 @@ impl OpenRouterSttClient {
         audio: &NativeSttAudioWindow,
         is_cancelled: &mut dyn FnMut() -> bool,
     ) -> Result<NativeSttCallResult> {
-        self.prepare()?;
+        self.validate_configuration()?;
         let body = build_native_stt_request_body(request, audio)?;
         if is_cancelled() {
             bail!(NativeSttClientError::CancelledBeforeUpload);
@@ -164,4 +164,21 @@ impl OpenRouterSttClient {
 
 fn elapsed_ms(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+impl NativeSttTransport for OpenRouterSttClient {
+    fn prepare(&self) -> Result<()> {
+        OpenRouterSttClient::validate_configuration(self)
+    }
+
+    /// Uses the existing no-cancel leaf. The shared accounting boundary has
+    /// already committed the dispatch marker; a second cancellation check here
+    /// could be misreported as proof that no upload occurred.
+    fn transcribe(
+        &self,
+        request: &NativeSttRequest,
+        audio: &NativeSttAudioWindow,
+    ) -> Result<NativeSttCallResult> {
+        OpenRouterSttClient::transcribe(self, request, audio)
+    }
 }
