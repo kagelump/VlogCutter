@@ -261,4 +261,4 @@ observed pilot.
 
 Native speech cost proposals reserve a conservative pre-VAD upper bound for bulk speech windows plus one separate capability-pilot window. Each window reserves the full registered 30-second duration; pilot and bulk spending use the same eventual policy ceiling. No pilot or bulk call is enabled by a proposal in this slice.
 
-C4A adds only the deterministic native recipe/approval identity above. Native provenance persistence/links, pilot/bulk orchestration, typed retry recovery and CLI/desktop backend selection remain deferred to C4B and later integration slices; no SQLite migration or native execution is enabled by this change.
+C4A binds native approval/cache identity to the deterministic recipe above. C4B adds migration 43 and the read-only canonical transcript-to-accounting provenance projection. Native high-level pilot/bulk orchestration, VAD extraction/model installation, typed native targeted retry, backend selectors and CLI/desktop adapters remain deferred; no native execution is enabled by this change and `ready_for_pilot` stays false.

@@ -12,8 +12,48 @@ transports; no live OpenRouter/native acceptance is claimed by this slice.
 B3 additionally exposes one accounted native speech-transcription pilot request
 leaf. The VLM and native adapters share the same private admission -> prepare ->
 domain guard -> dispatch marker -> one send -> receipt lifecycle. High-level
-native pilot/bulk orchestration, VAD extraction, model loading, transcript
-persistence and CLI/desktop native selection remain unwired.
+native pilot/bulk orchestration, VAD extraction, model loading and CLI/desktop
+native selection remain unwired.
+
+## Native transcript provenance (C4B slice)
+
+Migration 43 extends the existing canonical transcript owner with a nullable
+native-policy association and native quality-recipe identity, plus
+`native_transcript_windows`, which links one transcript to the exact accounting
+request for each bounded provider window. Child rows store only window order,
+measured latency, recognized reported language and a bounded typed quality
+decision/reason/metric-coverage JSON. They store no raw audio, request/response
+body, prompt, path, candidate-text copy, monetary counter, or second
+provider/model identity.
+
+`Catalog::native_transcript_provenance(asset_id)` is a read-only projection over
+the canonical header, the frozen run authorization and the same accounting
+request/event/receipt/attempt-history rows. All projection reads share one SQLite
+read transaction. Requested provider/model/language/data policy/source come only
+from the frozen policy; actual provider/model/generation/cost and unresolved
+reserves come only from current accounting evidence. Requested broker and actual
+serving upstream remain distinct canonical fields; missing actual identities stay
+unknown and known differences remain visible. A late receipt reconciliation
+therefore changes the next read projection without rewriting or resending the
+transcript. Prior retry epochs remain visible from the same immutable attempt
+history.
+
+Historical reads validate the artifact against its own frozen recipe and source,
+without requiring the current tariff or applying current quality thresholds to
+an older quality recipe. Recorded decisions and finite metric facts remain
+inspectable under their recorded recipe; inspection does not make them current
+or authorize another request. New writes still require current quality rules.
+
+The transcript owner provides one deterministic native recipe helper binding the
+explicit provider-qualified request, registered endpoint/timestamp/window
+semantics, shared Silero VAD artifact and packing identity, and native quality
+recipe version. Native `RunPolicy.recipe_version` and the stored transcript
+`recipe_key` must equal that helper's identity. Ordinary local saves clear any
+prior native association atomically, and native saves validate the frozen
+policy, exact asset/source scope, owned accounted run and settled or honestly
+uncertain receipts inside the same `BEGIN IMMEDIATE` transaction that replaces
+the header, segments and window links. High-level native execution, backend
+selection, CLI/desktop adapters and `ready_for_pilot` remain unwired.
 
 ## Canonical owner
 

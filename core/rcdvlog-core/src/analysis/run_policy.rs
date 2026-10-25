@@ -12,7 +12,7 @@
 
 use anyhow::{Context, Result, bail, ensure};
 use chrono::{SecondsFormat, Utc};
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
@@ -526,6 +526,52 @@ fn validate_budget(budget_usd: f64) -> Result<()> {
         "run budget must be finite and greater than zero"
     );
     Ok(())
+}
+
+/// Load and re-validate one frozen run authorization on an existing SQLite
+/// connection. Native transcript provenance uses this inside its owning
+/// transaction so it consumes the same canonical policy identity check as the
+/// public catalog API instead of re-parsing policy JSON independently.
+///
+/// The returned accounting contract is the immutable contract recorded when the
+/// policy was authorized. Historical provenance reads inspect it but do not
+/// require it to equal a newer current contract.
+pub(crate) fn load_run_authorization_on_connection(
+    connection: &Connection,
+    policy_id: &str,
+) -> Result<(RunAuthorization, String)> {
+    let row: Option<(String, String, String, String)> = connection
+        .query_row(
+            "SELECT project_id,policy_json,authorized_at,accounting_contract
+             FROM analysis_run_authorizations WHERE policy_id=?1",
+            [policy_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?;
+    let (project_id, policy_json, authorized_at, accounting_contract) =
+        row.ok_or_else(|| anyhow::anyhow!("run policy is not authorized: {policy_id}"))?;
+    let policy: RunPolicy = serde_json::from_str(&policy_json)
+        .context("stored run authorization contains an unreadable policy")?;
+    ensure!(
+        policy.policy_id == policy_id,
+        "stored authorization policy id mismatch"
+    );
+    ensure!(
+        run_policy_identity(&policy)? == policy_id,
+        "stored authorization contents no longer match the policy identity"
+    );
+    ensure!(
+        policy.project_id == project_id,
+        "stored authorization project mismatch"
+    );
+    Ok((
+        RunAuthorization {
+            schema_version: RUN_AUTHORIZATION_SCHEMA_VERSION.into(),
+            authorized_at,
+            policy,
+        },
+        accounting_contract,
+    ))
 }
 
 pub(crate) fn pilot_authority_context(policy: &RunPolicy) -> AnalysisBudgetAuthorityContext {
@@ -1317,35 +1363,8 @@ impl Catalog {
     }
 
     pub fn load_run_authorization(&self, policy_id: &str) -> Result<RunAuthorization> {
-        let row: Option<(String, String, String)> = self
-            .connection()?
-            .query_row(
-                "SELECT project_id,policy_json,authorized_at FROM analysis_run_authorizations WHERE policy_id=?1",
-                [policy_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .optional()?;
-        let (project_id, policy_json, authorized_at) =
-            row.ok_or_else(|| anyhow::anyhow!("run policy is not authorized: {policy_id}"))?;
-        let policy: RunPolicy = serde_json::from_str(&policy_json)
-            .context("stored run authorization contains an unreadable policy")?;
-        ensure!(
-            policy.policy_id == policy_id,
-            "stored authorization policy id mismatch"
-        );
-        ensure!(
-            run_policy_identity(&policy)? == policy_id,
-            "stored authorization contents no longer match the policy identity"
-        );
-        ensure!(
-            policy.project_id == project_id,
-            "stored authorization project mismatch"
-        );
-        Ok(RunAuthorization {
-            schema_version: RUN_AUTHORIZATION_SCHEMA_VERSION.into(),
-            authorized_at,
-            policy,
-        })
+        let connection = self.connection()?;
+        Ok(load_run_authorization_on_connection(&connection, policy_id)?.0)
     }
 
     pub fn load_run_pilot(&self, policy_id: &str) -> Result<Option<RunPilotRecord>> {

@@ -29,6 +29,8 @@
 //! this pure evaluator still does not write it or enable native execution; the
 //! candidates remain unaccepted and must not be shown as accepted speech.
 
+use serde::{Deserialize, Serialize};
+
 use crate::analysis::openrouter_stt::{
     NativeSttAudioWindow, NativeSttSegment, NativeSttTranscript,
 };
@@ -60,7 +62,8 @@ pub const NATIVE_STT_AVG_LOGPROB_LN_0_20_REJECT_THRESHOLD: f64 = -1.609_437_912_
 pub const NATIVE_STT_PROVIDER_CONFIDENCE_REJECT_THRESHOLD: f64 = 0.20;
 
 /// Terminal quality decision for native provider output.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum NativeSttQualityDecision {
     /// At least one complete comparable quality metric passed and no known-bad
     /// evidence, invalid evidence or repetition was found.
@@ -87,7 +90,8 @@ impl NativeSttQualityDecision {
 ///
 /// The values intentionally contain no provider text, transcript text, audio,
 /// paths or credentials. [`Self::code`] is the stable machine-readable form.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum NativeSttQualityReason {
     /// At least one complete comparable metric passed.
     AcceptedCompleteEvidence,
@@ -149,7 +153,8 @@ impl NativeSttQualityReason {
 }
 
 /// Coverage and complete evidence for one segment-level native metric.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct NativeSttMetricSummary {
     /// Segments that supplied a valid value for this metric.
     pub known_segments: usize,
@@ -179,14 +184,16 @@ impl NativeSttMetricSummary {
 /// Word confidence is validated when supplied but is deliberately not used as
 /// segment confidence, full-transcript confidence or token probability, and no
 /// word-weighted aggregate is computed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct NativeSttWordConfidenceCoverage {
     pub known_words: usize,
     pub total_words: usize,
 }
 
 /// Comparable metric summaries and coverage for one native provider result.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct NativeSttQualityMetrics {
     pub avg_logprob: NativeSttMetricSummary,
     pub segment_confidence: NativeSttMetricSummary,
@@ -201,6 +208,54 @@ pub struct NativeSttQualityMetrics {
 }
 
 impl NativeSttQualityMetrics {
+    /// At least one comparable metric covered every candidate segment.
+    pub(crate) fn has_complete_comparable_evidence(&self) -> bool {
+        self.avg_logprob.mean.is_some()
+            || self.segment_confidence.mean.is_some()
+            || self.transcript_confidence.is_some()
+    }
+
+    /// At least one complete comparable metric exists and passes the existing
+    /// native quality thresholds. This is the same acceptance rule the pure C2
+    /// evaluator applies; persistence reuses it instead of introducing a second
+    /// calibration.
+    pub(crate) fn has_complete_passing_evidence(&self) -> bool {
+        self.avg_logprob
+            .mean
+            .is_some_and(|mean| mean >= NATIVE_STT_AVG_LOGPROB_LN_0_20_REJECT_THRESHOLD)
+            || self
+                .segment_confidence
+                .mean
+                .is_some_and(|mean| mean >= NATIVE_STT_PROVIDER_CONFIDENCE_REJECT_THRESHOLD)
+            || self.transcript_confidence.is_some_and(|confidence| {
+                confidence >= NATIVE_STT_PROVIDER_CONFIDENCE_REJECT_THRESHOLD
+            })
+    }
+
+    /// A complete comparable metric contains a known value below its existing
+    /// rejection threshold. An accepted artifact cannot hide this behind a
+    /// passing alternate metric.
+    pub(crate) fn has_known_low_complete_evidence(&self) -> bool {
+        self.avg_logprob
+            .mean
+            .is_some_and(|mean| mean < NATIVE_STT_AVG_LOGPROB_LN_0_20_REJECT_THRESHOLD)
+            || self
+                .segment_confidence
+                .mean
+                .is_some_and(|mean| mean < NATIVE_STT_PROVIDER_CONFIDENCE_REJECT_THRESHOLD)
+            || self.transcript_confidence.is_some_and(|confidence| {
+                confidence < NATIVE_STT_PROVIDER_CONFIDENCE_REJECT_THRESHOLD
+            })
+    }
+
+    /// Completely absent or partial comparable evidence: the exact C2 state
+    /// that requires human review rather than accepted speech.
+    pub(crate) fn has_any_comparable_evidence(&self) -> bool {
+        self.avg_logprob.known_segments > 0
+            || self.segment_confidence.known_segments > 0
+            || self.transcript_confidence.is_some()
+    }
+
     fn unavailable(total_segments: usize, total_words: usize) -> Self {
         Self {
             avg_logprob: NativeSttMetricSummary::from_values(&[], total_segments),
@@ -255,6 +310,12 @@ impl NativeSttQualityEvaluation {
     pub fn reason_code(&self) -> &'static str {
         self.reason.code()
     }
+}
+
+/// Repetition is safe only when measured and below the existing local
+/// repetition gate. Native persistence reuses this exact threshold.
+pub(crate) fn native_stt_repetition_is_safe(ratio: f32) -> bool {
+    ratio.is_finite() && (0.0..REPETITION_REJECT_RATIO).contains(&ratio)
 }
 
 /// Evaluates a decoded native transcript against the exact validated audio
@@ -509,6 +570,14 @@ struct RecognizedLanguage {
 /// whisper language registry.
 ///
 /// The unknown input is never passed to `get_lang_id`, which can log raw input.
+/// Resolve a provider-reported language using the same whisper registry and
+/// normalization rules as native quality evaluation. Unknown input is never
+/// passed to `get_lang_id`, so callers cannot make an unknown canary appear as
+/// recognized language metadata. The recognized provider spelling is returned.
+pub(crate) fn recognized_native_stt_reported_language(reported: &str) -> Option<String> {
+    normalize_language(reported).map(|language| language.reported)
+}
+
 fn normalize_language(reported: &str) -> Option<RecognizedLanguage> {
     let reported = reported.trim();
     if reported.is_empty() {

@@ -1361,3 +1361,7 @@ fn native_header_only_receipt_with_late_cost_reconciles_once_and_conflicts_fail(
             .is_err()
     );
 }
+
+#[cfg(test)]
+#[path = "native_provenance_tests.rs"]
+mod native_provenance_tests;

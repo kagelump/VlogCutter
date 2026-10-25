@@ -222,7 +222,10 @@ pub use analysis::schema::{
     validate as validate_observation,
 };
 pub use analysis::store::{
-    StoredTranscript as ClipTranscript, TranscriptOutcomeReason, TranscriptStatus,
+    NATIVE_TRANSCRIPT_PROVENANCE_SCHEMA_VERSION, NativeSttWindowObservation,
+    NativeSttWindowQualityObservation, NativeTranscriptProvenance,
+    NativeTranscriptWindowProvenance, StoredTranscript as ClipTranscript, TranscriptOutcomeReason,
+    TranscriptStatus,
 };
 pub use analysis::stt::TranscribeOutcome;
 pub use analysis::vlm::AnalysisOutcome;
