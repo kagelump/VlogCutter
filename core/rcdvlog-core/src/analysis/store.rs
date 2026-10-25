@@ -5,7 +5,7 @@
 //! result stale, which is what lets a "transcribe missing" run be idempotent
 //! while still regenerating anything a proxy rebuild invalidated.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use chrono::{SecondsFormat, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -13,7 +13,15 @@ use serde::{Deserialize, Serialize};
 use crate::analysis::STT_RECIPE_KEY;
 use crate::analysis::quality::DecodedSegment;
 
+pub(crate) mod native_provenance;
 pub(crate) mod native_recipe;
+#[allow(unused_imports)]
+pub(crate) use native_provenance::save_native_transcript;
+pub use native_provenance::{
+    NATIVE_TRANSCRIPT_PROVENANCE_SCHEMA_VERSION, NativeSttWindowObservation,
+    NativeSttWindowQualityObservation, NativeTranscriptProvenance,
+    NativeTranscriptWindowProvenance,
+};
 pub use native_recipe::native_stt_transcript_recipe;
 
 /// Terminal states of a transcription attempt.
@@ -197,35 +205,37 @@ fn validate_review_required_contract(transcript: &StoredTranscript) -> Result<()
     }
 }
 
-/// Writes a transcript and its segments, replacing any previous result.
-///
-/// The header row, the removal of the previous segments and the new segments
-/// are one transaction: a failure part-way through would otherwise leave a
-/// header claiming `speech` above a truncated or empty segment list, which is
-/// indistinguishable downstream from a genuinely short transcript. Validation
-/// happens before the transaction, so an invalid review candidate cannot
-/// replace a previously valid transcript.
-pub fn save_transcript(connection: &Connection, transcript: &StoredTranscript) -> Result<()> {
-    validate_review_required_contract(transcript)?;
-    validate_probability_evidence(transcript.mean_token_probability, "transcript header mean")?;
-    for (index, segment) in transcript.segments.iter().enumerate() {
-        validate_probability_evidence(
-            segment.mean_token_probability,
-            &format!("segment {index} mean"),
-        )?;
-    }
-
+/// Replace the canonical header, segments and any native associations in one
+/// caller-owned transaction. Local callers pass `None` and therefore atomically
+/// clear stale native provenance when replacing a cloud artifact with local
+/// output. Native callers pass the frozen policy/quality identities and then
+/// insert their exact request links before committing the same transaction.
+fn write_transcript_rows(
+    connection: &Connection,
+    transcript: &StoredTranscript,
+    native_policy_id: Option<&str>,
+    native_quality_recipe_version: Option<&str>,
+) -> Result<()> {
+    ensure!(
+        native_policy_id.is_some() == native_quality_recipe_version.is_some(),
+        "native policy and quality recipe identities must be written together"
+    );
     let now = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
-    let transaction = connection.unchecked_transaction()?;
-    let connection = &transaction;
+    connection
+        .execute(
+            "DELETE FROM native_transcript_windows WHERE asset_id = ?1",
+            params![transcript.asset_id],
+        )
+        .context("clear previous native transcript window provenance")?;
     connection
         .execute(
             r#"
             INSERT INTO asset_transcripts
                 (asset_id, recipe_key, source_kind, source_fingerprint, status, outcome_reason,
                  reject_reason, primary_language, speech_seconds, window_count,
-                 provider_segment_count, mean_token_probability, repetition_ratio, created_at)
-            VALUES (?1, ?2, 'proxy', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                 provider_segment_count, mean_token_probability, repetition_ratio, created_at,
+                 native_policy_id, native_quality_recipe_version)
+            VALUES (?1, ?2, 'proxy', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
             ON CONFLICT(asset_id) DO UPDATE SET
                 recipe_key = excluded.recipe_key,
                 source_fingerprint = excluded.source_fingerprint,
@@ -238,7 +248,9 @@ pub fn save_transcript(connection: &Connection, transcript: &StoredTranscript) -
                 provider_segment_count = excluded.provider_segment_count,
                 mean_token_probability = excluded.mean_token_probability,
                 repetition_ratio = excluded.repetition_ratio,
-                created_at = excluded.created_at
+                created_at = excluded.created_at,
+                native_policy_id = excluded.native_policy_id,
+                native_quality_recipe_version = excluded.native_quality_recipe_version
             "#,
             params![
                 transcript.asset_id,
@@ -254,6 +266,8 @@ pub fn save_transcript(connection: &Connection, transcript: &StoredTranscript) -
                 transcript.mean_token_probability,
                 transcript.repetition_ratio,
                 now,
+                native_policy_id,
+                native_quality_recipe_version,
             ],
         )
         .context("save transcript row")?;
@@ -283,6 +297,29 @@ pub fn save_transcript(connection: &Connection, transcript: &StoredTranscript) -
             ])?;
         }
     }
+    Ok(())
+}
+
+/// Writes a transcript and its segments, replacing any previous result.
+///
+/// The header row, the removal of the previous segments/native associations and
+/// the new segments are one transaction: a failure part-way through would
+/// otherwise leave a header claiming `speech` above a truncated or empty segment
+/// list, which is indistinguishable downstream from a genuinely short
+/// transcript. Validation happens before the transaction, so an invalid review
+/// candidate cannot replace a previously valid transcript.
+pub fn save_transcript(connection: &Connection, transcript: &StoredTranscript) -> Result<()> {
+    validate_review_required_contract(transcript)?;
+    validate_probability_evidence(transcript.mean_token_probability, "transcript header mean")?;
+    for (index, segment) in transcript.segments.iter().enumerate() {
+        validate_probability_evidence(
+            segment.mean_token_probability,
+            &format!("segment {index} mean"),
+        )?;
+    }
+
+    let transaction = connection.unchecked_transaction()?;
+    write_transcript_rows(&transaction, transcript, None, None)?;
     transaction.commit()?;
     Ok(())
 }

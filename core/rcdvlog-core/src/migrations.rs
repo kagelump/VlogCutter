@@ -7,7 +7,7 @@ use thiserror::Error;
 
 use crate::chronology::forward_migrate_project_chronology;
 
-pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 42;
+pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 43;
 
 const MIGRATION_TABLE_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -335,6 +335,12 @@ pub const PROJECT_CATALOG_MIGRATIONS: &[SqliteMigration] = &[
         name: "review_required_transcript_status",
         source_identity: "project-catalog/0042-review-required-transcript-status/20261027",
         apply: add_review_required_transcript_status,
+    },
+    SqliteMigration {
+        id: 43,
+        name: "native_transcript_provenance",
+        source_identity: "project-catalog/0043-native-transcript-provenance/20261028",
+        apply: add_native_transcript_provenance,
     },
 ];
 
@@ -851,6 +857,63 @@ fn add_review_required_transcript_status(transaction: &Transaction<'_>) -> Resul
 
         DROP TABLE asset_transcripts;
         ALTER TABLE asset_transcripts_v42 RENAME TO asset_transcripts;
+        "#,
+    )?;
+    Ok(())
+}
+
+/// Migration 43. Link a canonical transcript header to one explicitly
+/// authorized native speech policy and retain bounded per-window nonfinancial
+/// observations for the exact immutable accounting request that produced each
+/// window.
+///
+/// The transcript remains the owning artifact. Provider/model/cost truth stays
+/// in the existing accounting ledger and receipts; this schema only records the
+/// missing one-transcript-to-many-paid-windows relationship, measured latency,
+/// recognized reported language and a bounded typed quality observation. No raw
+/// audio, request/response body, prompt, path or duplicated money counter is
+/// stored here.
+fn add_native_transcript_provenance(transaction: &Transaction<'_>) -> Result<()> {
+    add_column_if_missing(transaction, "asset_transcripts", "native_policy_id", "TEXT")?;
+    add_column_if_missing(
+        transaction,
+        "asset_transcripts",
+        "native_quality_recipe_version",
+        "TEXT",
+    )?;
+    transaction.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS native_transcript_windows (
+            asset_id TEXT NOT NULL
+                REFERENCES asset_transcripts(asset_id) ON DELETE CASCADE,
+            window_index INTEGER NOT NULL CHECK(window_index >= 0),
+            request_key TEXT NOT NULL UNIQUE
+                REFERENCES analysis_request_reservations(request_key) ON DELETE CASCADE,
+            latency_ms INTEGER NOT NULL CHECK(latency_ms >= 0),
+            reported_language TEXT
+                CHECK(reported_language IS NULL OR
+                      (length(reported_language) BETWEEN 1 AND 64)),
+            quality_json TEXT NOT NULL CHECK(json_valid(quality_json)),
+            PRIMARY KEY(asset_id, window_index)
+        );
+        CREATE INDEX IF NOT EXISTS native_transcript_windows_request
+            ON native_transcript_windows(request_key);
+        CREATE TRIGGER IF NOT EXISTS asset_transcripts_native_metadata_pair_insert
+        BEFORE INSERT ON asset_transcripts
+        WHEN (NEW.native_policy_id IS NULL) != (NEW.native_quality_recipe_version IS NULL)
+          OR (NEW.native_policy_id IS NOT NULL AND
+              (trim(NEW.native_policy_id) = '' OR trim(NEW.native_quality_recipe_version) = ''))
+        BEGIN
+            SELECT RAISE(ABORT, 'native transcript policy and quality recipe must be present together');
+        END;
+        CREATE TRIGGER IF NOT EXISTS asset_transcripts_native_metadata_pair_update
+        BEFORE UPDATE OF native_policy_id, native_quality_recipe_version ON asset_transcripts
+        WHEN (NEW.native_policy_id IS NULL) != (NEW.native_quality_recipe_version IS NULL)
+          OR (NEW.native_policy_id IS NOT NULL AND
+              (trim(NEW.native_policy_id) = '' OR trim(NEW.native_quality_recipe_version) = ''))
+        BEGIN
+            SELECT RAISE(ABORT, 'native transcript policy and quality recipe must be present together');
+        END;
         "#,
     )?;
     Ok(())
@@ -2958,6 +3021,8 @@ mod tests {
                 "mean_token_probability",
                 "repetition_ratio",
                 "created_at",
+                "native_policy_id",
+                "native_quality_recipe_version",
             ]
         );
 
@@ -3498,6 +3563,188 @@ mod tests {
                 )
                 .unwrap();
         }
+    }
+
+    #[test]
+    fn migration_43_preserves_prior_transcript_rows_and_adds_native_provenance_schema() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        run_sqlite_migrations(&mut connection, migrations_before_id(43)).unwrap();
+        connection
+            .execute_batch(
+                r#"
+                INSERT INTO projects(id,name,created_at)
+                    VALUES ('p1','project','2026-01-01T00:00:00Z');
+                INSERT INTO assets(id,project_id,fingerprint,path,filename,size_bytes,duration_seconds,created_at)
+                    VALUES ('a1','p1','source-fp','/clip.mp4','clip.mp4',123,9.0,'2026-01-01T00:00:00Z');
+                INSERT INTO asset_transcripts
+                    (asset_id,recipe_key,source_kind,source_fingerprint,status,outcome_reason,
+                     reject_reason,primary_language,speech_seconds,window_count,
+                     provider_segment_count,mean_token_probability,repetition_ratio,created_at)
+                    VALUES ('a1','stt.legacy','proxy','proxy-fp','speech','accepted',
+                            '','en',2.5,2,3,0.73,NULL,'2026-01-01T00:00:01Z');
+                INSERT INTO transcript_segments
+                    (asset_id,segment_index,start_ms,end_ms,language,text,mean_token_probability)
+                    VALUES
+                    ('a1',0,0,1200,'en','legacy zero',0.0),
+                    ('a1',1,1200,2500,'en','legacy known',0.73);
+                "#,
+            )
+            .unwrap();
+        let history_before: Vec<(u32, String)> = {
+            let mut statement = connection
+                .prepare("SELECT migration_id,name FROM schema_migrations ORDER BY migration_id")
+                .unwrap();
+            statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+
+        migrate_project_catalog(&mut connection).unwrap();
+
+        assert!(column_exists(&connection, "asset_transcripts", "native_policy_id").unwrap());
+        assert!(
+            column_exists(
+                &connection,
+                "asset_transcripts",
+                "native_quality_recipe_version"
+            )
+            .unwrap()
+        );
+        assert!(table_exists(&connection, "native_transcript_windows").unwrap());
+        assert!(
+            connection
+                .execute(
+                    "UPDATE asset_transcripts SET native_policy_id='only-policy'
+                     WHERE asset_id='a1'",
+                    [],
+                )
+                .is_err(),
+            "native policy and quality recipe associations must be paired"
+        );
+        #[derive(Debug, PartialEq)]
+        struct MigratedHeaderRow {
+            recipe_key: String,
+            source_kind: String,
+            source_fingerprint: String,
+            status: String,
+            outcome_reason: String,
+            speech_seconds: f64,
+            window_count: i64,
+            provider_segment_count: i64,
+            mean_token_probability: f64,
+            repetition_ratio: Option<f64>,
+            created_at: String,
+            native_policy_id: Option<String>,
+            native_quality_recipe_version: Option<String>,
+        }
+        let after: MigratedHeaderRow = connection
+            .query_row(
+                "SELECT recipe_key,source_kind,source_fingerprint,status,outcome_reason,
+                        speech_seconds,window_count,provider_segment_count,
+                        mean_token_probability,repetition_ratio,created_at,
+                        native_policy_id,native_quality_recipe_version
+                 FROM asset_transcripts WHERE asset_id='a1'",
+                [],
+                |row| {
+                    Ok(MigratedHeaderRow {
+                        recipe_key: row.get(0)?,
+                        source_kind: row.get(1)?,
+                        source_fingerprint: row.get(2)?,
+                        status: row.get(3)?,
+                        outcome_reason: row.get(4)?,
+                        speech_seconds: row.get(5)?,
+                        window_count: row.get(6)?,
+                        provider_segment_count: row.get(7)?,
+                        mean_token_probability: row.get(8)?,
+                        repetition_ratio: row.get(9)?,
+                        created_at: row.get(10)?,
+                        native_policy_id: row.get(11)?,
+                        native_quality_recipe_version: row.get(12)?,
+                    })
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            after,
+            MigratedHeaderRow {
+                recipe_key: "stt.legacy".into(),
+                source_kind: "proxy".into(),
+                source_fingerprint: "proxy-fp".into(),
+                status: "speech".into(),
+                outcome_reason: "accepted".into(),
+                speech_seconds: 2.5,
+                window_count: 2,
+                provider_segment_count: 3,
+                mean_token_probability: 0.73,
+                repetition_ratio: None,
+                created_at: "2026-01-01T00:00:01Z".into(),
+                native_policy_id: None,
+                native_quality_recipe_version: None,
+            }
+        );
+        let segments: Vec<(i64, String, Option<f64>)> = connection
+            .prepare(
+                "SELECT segment_index,text,mean_token_probability
+                 FROM transcript_segments WHERE asset_id='a1' ORDER BY segment_index",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            segments,
+            vec![
+                (0, "legacy zero".to_string(), Some(0.0)),
+                (1, "legacy known".to_string(), Some(0.73)),
+            ]
+        );
+
+        let history_after: Vec<(u32, String)> = {
+            let mut statement = connection
+                .prepare("SELECT migration_id,name FROM schema_migrations ORDER BY migration_id")
+                .unwrap();
+            statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        assert_eq!(&history_after[..history_before.len()], &history_before[..]);
+        assert_eq!(history_after.len(), history_before.len() + 1);
+        assert_eq!(history_after.last().unwrap().0, 43);
+        let fk_violations: i64 = connection
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(fk_violations, 0);
+        let window_columns: Vec<String> = connection
+            .prepare("SELECT name FROM pragma_table_info('native_transcript_windows') ORDER BY cid")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            window_columns,
+            [
+                "asset_id",
+                "window_index",
+                "request_key",
+                "latency_ms",
+                "reported_language",
+                "quality_json",
+            ]
+        );
+        assert!(
+            !window_columns
+                .iter()
+                .any(|column| matches!(column.as_str(), "text" | "body" | "audio" | "prompt")),
+            "native provenance must not duplicate transcript or request bodies"
+        );
     }
 
     #[test]
