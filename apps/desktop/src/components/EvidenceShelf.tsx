@@ -68,6 +68,7 @@ export function EvidenceShelf({
   busy,
 }: EvidenceShelfProps) {
   const segments = transcript?.segments ?? [];
+  const reviewRequired = transcript?.status === "review_required";
   const badge = transcriptBadge(transcript);
   const attention = analysisNeedsAttention(observation);
   const activeSegment = activeSegmentIndex(segments, positionSeconds);
@@ -171,6 +172,8 @@ export function EvidenceShelf({
                     "This video has no audio stream."
                   ) : transcript.status === "no_accepted_speech" ? (
                     "Speech was detected, but the transcriber returned no usable text."
+                  ) : transcript.status === "review_required" ? (
+                    "This transcript needs review because quality evidence is incomplete; no candidate text was retained."
                   ) : (
                     transcript.rejectReason || transcriptStatusLabels[transcript.status]
                   )
@@ -180,6 +183,16 @@ export function EvidenceShelf({
               </p>
             ) : (
               <>
+                {reviewRequired && (
+                  <div
+                    className="transcript-review-warning"
+                    role="note"
+                    aria-label="Transcript requires review"
+                  >
+                    <strong>Transcript needs review.</strong> Quality evidence is incomplete.
+                    Check these candidate lines against the clip before using them.
+                  </div>
+                )}
                 {followSuspended && (
                   <button className="segment-follow" onClick={resumeFollowing}>
                     Follow playback

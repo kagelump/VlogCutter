@@ -125,6 +125,22 @@ describe("transcriptSummary", () => {
     );
   });
 
+  it("marks retained review candidates as unaccepted and never prints internal reason tokens", () => {
+    expect(
+      transcriptSummary(
+        transcript({
+          status: "review_required",
+          outcomeReason: "quality_evidence_incomplete",
+          meanTokenProbability: null,
+          repetitionRatio: null,
+          rejectReason: "quality_evidence_incomplete",
+        }),
+      ),
+    ).toBe(
+      "Review required — quality evidence incomplete · 2 candidate segments retained, not accepted",
+    );
+  });
+
   it("surfaces the reject reason when one exists", () => {
     expect(
       transcriptSummary(transcript({ status: "rejected", segments: [], rejectReason: "music only" })),

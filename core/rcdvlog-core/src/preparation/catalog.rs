@@ -359,6 +359,17 @@ impl Catalog {
                     header.speech_seconds, header.window_count
                 ),
             )
+        } else if header.status == "review_required" {
+            evidence(
+                PreparationState::ReviewRequired,
+                &format!(
+                    "candidate transcript requires human review because quality evidence is incomplete ({} timed candidate segments, {} detected speech seconds, {} provider segments across {} windows); candidate text is unaccepted and excluded from AI context",
+                    header.segment_count,
+                    header.speech_seconds,
+                    header.provider_segment_count,
+                    header.window_count
+                ),
+            )
         } else if !matches!(header.status.as_str(), "speech" | "no_speech" | "no_audio") {
             evidence(
                 PreparationState::ReviewRequired,

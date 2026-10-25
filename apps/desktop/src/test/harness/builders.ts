@@ -153,9 +153,14 @@ export function buildCameraAssets({ projectId, camera, spec }: BuildAssetsOption
 
 export interface TranscriptSpec {
   status?: ClipTranscript["status"];
+  outcomeReason?: ClipTranscript["outcomeReason"];
   language?: string;
   text?: string;
   speechSeconds?: number;
+  /** Explicit absence (`null`) means no comparable quality evidence. */
+  meanTokenProbability?: number | null;
+  repetitionRatio?: number | null;
+  segmentMeanTokenProbability?: number | null;
   /** Several spoken lines, for anything that has to cycle through them. */
   segments?: Array<{ startMs: number; text: string }>;
 }
@@ -164,13 +169,18 @@ export function buildTranscript(assetId: string, spec: TranscriptSpec = {}): Cli
   const spoken = spec.segments ?? [];
   const text = spec.text ?? spoken.map((segment) => segment.text).join(" ");
   const status = spec.status ?? (text ? "speech" : "no_speech");
+  const meanTokenProbability =
+    spec.meanTokenProbability === undefined ? (text ? 0.82 : null) : spec.meanTokenProbability;
+  const segmentMeanTokenProbability =
+    spec.segmentMeanTokenProbability === undefined ? 0.82 : spec.segmentMeanTokenProbability;
   return {
     assetId,
     recipeKey: "stt.whisper-large-v3-turbo-q5_0.vad-silero-v5.win30.v1",
     sourceFingerprint: `proxy_${assetId}`,
     status,
     outcomeReason:
-      status === "speech"
+      spec.outcomeReason ??
+      (status === "speech"
         ? "accepted"
         : status === "no_speech"
           ? "no_detected_speech"
@@ -180,21 +190,24 @@ export function buildTranscript(assetId: string, spec: TranscriptSpec = {}): Cli
               ? "empty_provider_output"
               : status === "rejected"
                 ? "quality_rejected"
-                : "processing_failed",
+                : status === "review_required"
+                  ? "quality_evidence_incomplete"
+                  : "processing_failed"),
     rejectReason: "",
     primaryLanguage: spec.language ?? (text ? "en" : ""),
     speechSeconds: spec.speechSeconds ?? (text ? 6.5 : 0),
     windowCount: text ? 1 : 0,
     providerSegmentCount: text ? 1 : 0,
-    meanTokenProbability: text ? 0.82 : null,
-    repetitionRatio: text ? 0 : null,
+    meanTokenProbability,
+    repetitionRatio:
+      spec.repetitionRatio === undefined ? (text ? 0 : null) : spec.repetitionRatio,
     segments: spoken.length
       ? spoken.map((segment) => ({
           startMs: segment.startMs,
           endMs: segment.startMs + 5_200,
           language: spec.language ?? "en",
           text: segment.text,
-          meanTokenProbability: 0.82,
+          meanTokenProbability: segmentMeanTokenProbability,
         }))
       : text
         ? [
@@ -203,7 +216,7 @@ export function buildTranscript(assetId: string, spec: TranscriptSpec = {}): Cli
               endMs: 6_400,
               language: spec.language ?? "en",
               text,
-              meanTokenProbability: 0.82,
+              meanTokenProbability: segmentMeanTokenProbability,
             },
           ]
         : [],

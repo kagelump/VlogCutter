@@ -871,6 +871,10 @@ pub struct TranscriptCoverage {
     pub no_accepted_speech: usize,
     /// Clips whose decode tripped the hallucination gate.
     pub rejected: usize,
+    /// Clips with retained candidate text whose quality evidence is
+    /// incomplete. These candidates are unaccepted and are never counted as
+    /// `speech`.
+    pub review_required: usize,
     pub failed: usize,
     /// Clips never transcribed, or whose proxy has since been regenerated.
     pub missing: usize,
@@ -3067,6 +3071,7 @@ impl Catalog {
                     TranscriptStatus::NoAcceptedSpeech => coverage.no_accepted_speech += 1,
                     TranscriptStatus::Rejected => coverage.rejected += 1,
                     TranscriptStatus::Failed => coverage.failed += 1,
+                    TranscriptStatus::ReviewRequired => coverage.review_required += 1,
                 },
                 None => coverage.missing += 1,
             }
@@ -3465,6 +3470,11 @@ impl Catalog {
         let Some(transcript) = load_transcript(&self.connection()?, asset_id)? else {
             return Ok(None);
         };
+        // Review candidates are retained for a human, not accepted speech. Do
+        // not gather or return their raw text to any downstream AI prompt.
+        if transcript.status == TranscriptStatus::ReviewRequired {
+            return Ok(None);
+        }
         let text = transcript
             .segments
             .iter()
@@ -7731,6 +7741,137 @@ pub(crate) mod tests {
         let coverage = catalog.transcript_coverage(&project.id).unwrap();
         assert_eq!(coverage.failed, 1);
         assert_eq!(coverage.missing, 0);
+    }
+
+    fn save_review_candidate(
+        catalog: &Catalog,
+        asset_id: &str,
+        source_fingerprint: &str,
+        text: &str,
+    ) {
+        save_transcript(
+            &catalog.connection().unwrap(),
+            &StoredTranscript {
+                asset_id: asset_id.to_string(),
+                recipe_key: STT_RECIPE_KEY.to_string(),
+                source_fingerprint: source_fingerprint.to_string(),
+                status: TranscriptStatus::ReviewRequired,
+                outcome_reason:
+                    crate::analysis::store::TranscriptOutcomeReason::QualityEvidenceIncomplete,
+                reject_reason: "review_missing_quality_evidence".to_string(),
+                primary_language: "en".to_string(),
+                speech_seconds: 2.0,
+                window_count: 1,
+                provider_segment_count: 1,
+                mean_token_probability: None,
+                repetition_ratio: None,
+                segments: vec![DecodedSegment {
+                    start_ms: 250,
+                    end_ms: 2_250,
+                    language: "en".to_string(),
+                    text: text.to_string(),
+                    mean_token_probability: None,
+                }],
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn transcript_coverage_counts_review_required_separately_from_speech() {
+        let (directory, catalog, project) = catalog_fixture();
+        insert_asset(
+            &catalog,
+            &project.id,
+            "review-only",
+            "review-only.MP4",
+            "DJI Pocket 3",
+            "2026-04-01T09:00:00Z",
+            Path::new("/volumes/nas/review-only.MP4"),
+        );
+        attach_stub_proxy(
+            &catalog,
+            "review-only",
+            directory.path(),
+            b"review candidate proxy",
+        );
+        let fingerprint = catalog.proxy_fingerprint("review-only").unwrap();
+        save_review_candidate(&catalog, "review-only", &fingerprint, "retained candidate");
+
+        let coverage = catalog.transcript_coverage(&project.id).unwrap();
+        assert_eq!(coverage.total, 1);
+        assert_eq!(coverage.review_required, 1);
+        assert_eq!(
+            coverage.speech, 0,
+            "review candidates are not accepted speech"
+        );
+        assert_eq!(coverage.rejected, 0);
+        assert_eq!(coverage.no_speech, 0);
+        assert_eq!(coverage.no_audio, 0);
+        assert_eq!(coverage.no_accepted_speech, 0);
+        assert_eq!(coverage.failed, 0);
+        assert_eq!(coverage.missing, 0);
+    }
+
+    #[test]
+    fn review_candidates_stay_human_readable_but_never_become_prompt_context() {
+        let (directory, catalog, project) = catalog_fixture();
+        insert_asset(
+            &catalog,
+            &project.id,
+            "a1",
+            "a1.MP4",
+            "DJI Pocket 3",
+            "2026-04-01T09:00:00Z",
+            Path::new("/volumes/nas/a1.MP4"),
+        );
+        attach_stub_proxy(&catalog, "a1", directory.path(), b"prompt review proxy");
+        let fingerprint = catalog.proxy_fingerprint("a1").unwrap();
+        save_review_candidate(&catalog, "a1", &fingerprint, "REVIEW_CANDIDATE_CANARY");
+
+        let stored = catalog.asset_transcript("a1").unwrap().unwrap();
+        assert_eq!(stored.status, TranscriptStatus::ReviewRequired);
+        assert_eq!(stored.segments[0].text, "REVIEW_CANDIDATE_CANARY");
+        assert!(
+            catalog.prompt_transcript("a1").unwrap().is_none(),
+            "review candidates must be absent from AI prompt context"
+        );
+        let index = catalog.project_analysis_index(&project.id).unwrap();
+        assert_eq!(index.len(), 1);
+        assert_eq!(
+            index[0].transcript_status.as_deref(),
+            Some("review_required")
+        );
+        assert_eq!(index[0].transcript_text, "REVIEW_CANDIDATE_CANARY");
+
+        save_transcript(
+            &catalog.connection().unwrap(),
+            &StoredTranscript {
+                asset_id: "a1".to_string(),
+                recipe_key: STT_RECIPE_KEY.to_string(),
+                source_fingerprint: fingerprint,
+                status: TranscriptStatus::Speech,
+                outcome_reason: crate::analysis::store::TranscriptOutcomeReason::Accepted,
+                reject_reason: String::new(),
+                primary_language: "en".to_string(),
+                speech_seconds: 2.0,
+                window_count: 1,
+                provider_segment_count: 1,
+                mean_token_probability: Some(0.8),
+                repetition_ratio: Some(0.0),
+                segments: vec![DecodedSegment {
+                    start_ms: 250,
+                    end_ms: 2_250,
+                    language: "en".to_string(),
+                    text: "ACCEPTED_SPEECH_CANARY".to_string(),
+                    mean_token_probability: Some(0.8),
+                }],
+            },
+        )
+        .unwrap();
+        let accepted = catalog.prompt_transcript("a1").unwrap().unwrap();
+        assert_eq!(accepted.status, TranscriptStatus::Speech);
+        assert!(accepted.text.contains("ACCEPTED_SPEECH_CANARY"));
     }
 
     fn insert_asset(

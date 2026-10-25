@@ -172,6 +172,37 @@ describe("transcript pane", () => {
     expect(screen.getByText(/speech was detected.*no usable text/i)).toBeInTheDocument();
   });
 
+  it("marks retained review candidates and keeps their seek controls usable", async () => {
+    const { props } = renderShelf({
+      transcript: transcript({
+        status: "review_required",
+        outcomeReason: "quality_evidence_incomplete",
+        meanTokenProbability: null,
+        repetitionRatio: null,
+        segments: [
+          {
+            startMs: 4000,
+            endMs: 6000,
+            language: "en",
+            text: "unaccepted candidate line",
+            meanTokenProbability: null,
+          },
+        ],
+      }),
+    });
+
+    const warning = screen.getByRole("note", { name: "Transcript requires review" });
+    expect(warning).toBeVisible();
+    expect(warning).toHaveTextContent(/quality evidence is incomplete/i);
+    expect(warning).toHaveTextContent(/check these candidate lines against the clip before using them/i);
+    expect(screen.queryByText(/speech detected, no accepted transcript/i)).not.toBeInTheDocument();
+
+    const candidate = screen.getByText("unaccepted candidate line");
+    expect(candidate).toBeVisible();
+    await userEvent.click(candidate);
+    expect(props.onSeek).toHaveBeenCalledWith(4);
+  });
+
   it("says the clip was never transcribed when there is no transcript at all", () => {
     renderShelf({ transcript: null });
     expect(screen.getByText(/has not been transcribed/i)).toBeInTheDocument();

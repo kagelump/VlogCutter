@@ -2574,6 +2574,72 @@ mod tests {
         .unwrap();
     }
 
+    fn save_review_private_transcript(catalog: &Catalog, asset_id: &str) {
+        save_transcript(
+            &catalog.connection().unwrap(),
+            &StoredTranscript {
+                asset_id: asset_id.to_string(),
+                recipe_key: crate::analysis::STT_RECIPE_KEY.to_string(),
+                source_fingerprint: "synthetic-review-source".into(),
+                status: TranscriptStatus::ReviewRequired,
+                outcome_reason: TranscriptOutcomeReason::QualityEvidenceIncomplete,
+                reject_reason: "review_missing_quality_evidence".into(),
+                primary_language: "en".into(),
+                speech_seconds: 1.0,
+                window_count: 1,
+                provider_segment_count: 1,
+                mean_token_probability: None,
+                repetition_ratio: None,
+                segments: vec![DecodedSegment {
+                    start_ms: 400,
+                    end_ms: 1_600,
+                    language: "en".into(),
+                    text: "REVIEW_CANDIDATE_PRIVATE_CANARY".into(),
+                    mean_token_probability: None,
+                }],
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn review_required_candidates_are_not_transcript_scope_or_prompt_evidence() {
+        let (_directory, catalog, project, asset) = fixture();
+        save_review_private_transcript(&catalog, &asset);
+
+        let mut request = observation_request(&project, &asset, 1.0);
+        request.parameters = RunPolicyParameters::Observation { force: true };
+        let described = catalog.describe_run_policy(&request).unwrap();
+        assert!(
+            described.scope[0].transcript_fingerprint.is_none(),
+            "review candidates must not be admitted as transcript scope, even with force"
+        );
+        assert!(
+            described
+                .readiness
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("no accepted current transcript")),
+            "{:?}",
+            described.readiness.warnings
+        );
+        catalog.authorize_run_policy(&request).unwrap();
+
+        let provider = CapturingProvider::observation();
+        let pilot = catalog
+            .run_run_policy_pilot_with_provider(&request, &provider, false)
+            .unwrap();
+        assert_eq!(pilot.status, "passed", "{pilot:?}");
+        let requests = provider.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(
+            !requests[0]
+                .prompt
+                .contains("REVIEW_CANDIDATE_PRIVATE_CANARY"),
+            "review candidate text escaped into a provider prompt"
+        );
+    }
+
     #[test]
     fn frames_only_pilot_and_bulk_never_transmit_transcript_or_vocabulary() {
         let (_directory, catalog, project, asset) = fixture();
