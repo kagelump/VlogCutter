@@ -52,6 +52,18 @@ pub struct SileroVad {
     context: whisper_rs::WhisperVadContext,
 }
 
+/// Narrow VAD-only seam. Native speech preparation can inject a fake detector
+/// in tests without constructing an ASR engine or a second generic pipeline.
+pub(crate) trait SpeechDetector {
+    fn detect_speech(&mut self, pcm: &[f32]) -> Result<Vec<SpeechRegion>>;
+}
+
+impl SpeechDetector for SileroVad {
+    fn detect_speech(&mut self, pcm: &[f32]) -> Result<Vec<SpeechRegion>> {
+        SileroVad::detect_speech(self, pcm)
+    }
+}
+
 impl SileroVad {
     /// Loads only the Silero VAD model. The ASR model is never touched.
     pub fn load(model_path: &Path, threads: usize) -> Result<Self> {

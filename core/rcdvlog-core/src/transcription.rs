@@ -10,9 +10,19 @@ use crate::analysis::store::{StoredTranscript, is_current, load_transcript, save
 use crate::analysis::stt::{
     failed_transcript, failed_transcript_with_evidence, failure_evidence, no_audio_transcript,
 };
-use crate::{Asset, AssetVideoValidationStatus, Catalog, ModelStatus, TranscribeOutcome};
+use crate::{
+    Asset, AssetVideoValidationStatus, Catalog, ModelStatus, RepresentationKind, TranscribeOutcome,
+};
 use anyhow::{Context, Result, ensure};
+
+#[allow(dead_code)] // Staged local owner for the next native orchestration slice.
+mod native_preparation;
 use batch_estimator::BatchEstimator;
+#[allow(unused_imports)] // Consumed by the next native orchestration slice and focused tests.
+pub(crate) use native_preparation::{
+    NativeSpeechLocalOutcome, NativeSpeechPreparation, NativeSpeechPreparationCanceled,
+    NativeSpeechPreparationEvidence, NativeSpeechPreparer, NativeVadEvidence,
+};
 use rusqlite::OptionalExtension;
 use serde::Serialize;
 use std::collections::HashSet;
@@ -534,92 +544,119 @@ impl Catalog {
         let mut open_engine = Some(open_engine);
         let mut engine: Option<Box<dyn SttEngine>> = None;
         for (index, plan) in planned.iter().enumerate() {
-            let item = match plan {
-                PlannedAsset::Reused(item) => item.clone(),
-                PlannedAsset::NotReady(item) => item.clone(),
-                PlannedAsset::NoAudio {
-                    asset,
-                    source_fingerprint,
-                } => {
-                    let stored = no_audio_transcript(&asset.id, source_fingerprint);
-                    save_transcript(&connection, &stored)?;
-                    report.transcribed += 1;
-                    report.no_audio += 1;
-                    outcome(
-                        &asset.id,
-                        TranscriptionAssetState::NoAudio,
-                        Some("video has no audio stream; no speech work was attempted".into()),
-                        Some(stored_outcome(&asset.id, &stored)),
-                    )
-                }
-                PlannedAsset::ProbeFailed {
-                    asset,
-                    source_fingerprint,
-                    reason,
-                } => {
-                    let stored = failed_transcript(&asset.id, source_fingerprint, reason.clone());
-                    save_transcript(&connection, &stored)?;
-                    report.failed += 1;
-                    outcome(
-                        &asset.id,
-                        TranscriptionAssetState::Failed,
-                        Some(reason.to_string()),
-                        Some(stored_outcome(&asset.id, &stored)),
-                    )
-                }
-                PlannedAsset::Pending {
-                    asset,
-                    proxy_path,
-                    source_fingerprint,
-                } => {
-                    if engine.is_none() {
-                        let open = open_engine.take().expect("engine factory is called once");
-                        engine = Some(open()?);
+            let planned_asset_id = match plan {
+                PlannedAsset::Reused(item) | PlannedAsset::NotReady(item) => item.asset_id.as_str(),
+                PlannedAsset::NoAudio { asset, .. }
+                | PlannedAsset::ProbeFailed { asset, .. }
+                | PlannedAsset::Pending { asset, .. } => asset.id.as_str(),
+            };
+            let writes_speech =
+                !matches!(plan, PlannedAsset::Reused(_) | PlannedAsset::NotReady(_));
+            // This is a nonblocking per-asset speech write claim. A prepared
+            // native result owns the same claim until its caller is done, so a
+            // local batch cannot overwrite that work even though the shared
+            // heavy lane is held for the batch.
+            let _speech_claim = if writes_speech {
+                self.try_claim_representation(planned_asset_id, RepresentationKind::Speech)?
+            } else {
+                None
+            };
+            let item = if writes_speech && _speech_claim.is_none() {
+                outcome(
+                    planned_asset_id,
+                    TranscriptionAssetState::NotReady,
+                    Some("speech transcription is already in progress for this asset".into()),
+                    None,
+                )
+            } else {
+                match plan {
+                    PlannedAsset::Reused(item) => item.clone(),
+                    PlannedAsset::NotReady(item) => item.clone(),
+                    PlannedAsset::NoAudio {
+                        asset,
+                        source_fingerprint,
+                    } => {
+                        let stored = no_audio_transcript(&asset.id, source_fingerprint);
+                        save_transcript(&connection, &stored)?;
+                        report.transcribed += 1;
+                        report.no_audio += 1;
+                        outcome(
+                            &asset.id,
+                            TranscriptionAssetState::NoAudio,
+                            Some("video has no audio stream; no speech work was attempted".into()),
+                            Some(stored_outcome(&asset.id, &stored)),
+                        )
                     }
-                    let started = Instant::now();
-                    let result = self.transcribe_source_with_engine(
-                        &asset.id,
+                    PlannedAsset::ProbeFailed {
+                        asset,
+                        source_fingerprint,
+                        reason,
+                    } => {
+                        let stored =
+                            failed_transcript(&asset.id, source_fingerprint, reason.clone());
+                        save_transcript(&connection, &stored)?;
+                        report.failed += 1;
+                        outcome(
+                            &asset.id,
+                            TranscriptionAssetState::Failed,
+                            Some(reason.to_string()),
+                            Some(stored_outcome(&asset.id, &stored)),
+                        )
+                    }
+                    PlannedAsset::Pending {
+                        asset,
                         proxy_path,
                         source_fingerprint,
-                        engine.as_deref().expect("engine opened for pending asset"),
-                    );
-                    match result {
-                        Ok(transcript) => {
-                            estimator.record_completion(1, started.elapsed());
-                            report.transcribed += 1;
-                            outcome(
-                                &asset.id,
-                                TranscriptionAssetState::Transcribed,
-                                None,
-                                Some(transcript),
-                            )
+                    } => {
+                        if engine.is_none() {
+                            let open = open_engine.take().expect("engine factory is called once");
+                            engine = Some(open()?);
                         }
-                        Err(error) => {
-                            estimator.record_failure(1);
-                            let message = format!("{error:#}");
-                            // Preserve an explicit per-asset failure record without
-                            // claiming a usable transcript. The exact source
-                            // fingerprint stays attached for recovery; is_current
-                            // still treats failed attempts as retryable. Human-
-                            // authored asset fields are never touched here.
-                            let (speech_seconds, window_count, provider_segment_count) =
-                                failure_evidence(&error);
-                            let stored = failed_transcript_with_evidence(
-                                &asset.id,
-                                source_fingerprint,
-                                message.clone(),
-                                speech_seconds,
-                                window_count,
-                                provider_segment_count,
-                            );
-                            save_transcript(&connection, &stored)?;
-                            report.failed += 1;
-                            outcome(
-                                &asset.id,
-                                TranscriptionAssetState::Failed,
-                                Some(message),
-                                Some(stored_outcome(&asset.id, &stored)),
-                            )
+                        let started = Instant::now();
+                        let result = self.transcribe_source_with_engine(
+                            &asset.id,
+                            proxy_path,
+                            source_fingerprint,
+                            engine.as_deref().expect("engine opened for pending asset"),
+                        );
+                        match result {
+                            Ok(transcript) => {
+                                estimator.record_completion(1, started.elapsed());
+                                report.transcribed += 1;
+                                outcome(
+                                    &asset.id,
+                                    TranscriptionAssetState::Transcribed,
+                                    None,
+                                    Some(transcript),
+                                )
+                            }
+                            Err(error) => {
+                                estimator.record_failure(1);
+                                let message = format!("{error:#}");
+                                // Preserve an explicit per-asset failure record without
+                                // claiming a usable transcript. The exact source
+                                // fingerprint stays attached for recovery; is_current
+                                // still treats failed attempts as retryable. Human-
+                                // authored asset fields are never touched here.
+                                let (speech_seconds, window_count, provider_segment_count) =
+                                    failure_evidence(&error);
+                                let stored = failed_transcript_with_evidence(
+                                    &asset.id,
+                                    source_fingerprint,
+                                    message.clone(),
+                                    speech_seconds,
+                                    window_count,
+                                    provider_segment_count,
+                                );
+                                save_transcript(&connection, &stored)?;
+                                report.failed += 1;
+                                outcome(
+                                    &asset.id,
+                                    TranscriptionAssetState::Failed,
+                                    Some(message),
+                                    Some(stored_outcome(&asset.id, &stored)),
+                                )
+                            }
                         }
                     }
                 }
@@ -1683,6 +1720,44 @@ mod tests {
         assert_eq!(
             catalog.asset_transcript("retry").unwrap().unwrap().status,
             TranscriptStatus::NoSpeech
+        );
+    }
+
+    #[test]
+    fn a_speech_claim_prevents_a_selected_batch_from_overwriting_native_work() {
+        if !media_tools_available() {
+            eprintln!("skipping generated claim fixture: ffmpeg/ffprobe unavailable");
+            return;
+        }
+        let (directory, catalog, project) = fixture();
+        make_ready_asset(&catalog, &project, directory.path(), "claimed");
+        let claim = catalog
+            .claim_representation("claimed", RepresentationKind::Speech)
+            .unwrap();
+        let report = catalog
+            .transcribe_selected_inner(
+                &project,
+                &selected(&["claimed"]),
+                &TranscriptionBatchOptions::default(),
+                None::<fn() -> Result<Vec<ModelStatus>>>,
+                || panic!("a busy speech claim must not open the local engine"),
+                |_| ControlFlow::Continue(()),
+            )
+            .unwrap();
+        assert_eq!(report.outcomes[0].state, TranscriptionAssetState::NotReady);
+        assert!(
+            report.outcomes[0]
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("already in progress"))
+        );
+        assert!(catalog.asset_transcript("claimed").unwrap().is_none());
+        drop(claim);
+        assert!(
+            catalog
+                .try_claim_representation("claimed", RepresentationKind::Speech)
+                .unwrap()
+                .is_some()
         );
     }
 

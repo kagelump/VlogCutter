@@ -523,13 +523,13 @@ pub fn native_stt_request_cost_bound(
     Ok(bound)
 }
 
-/// Runs the supplied local detector and builds one bounded WAV per packed speech
-/// window. Silence returns an empty vector, so callers have no request to send.
-/// This function performs no provider I/O.
-pub fn plan_native_stt_audio_windows<F>(
+/// Validates local VAD output and packs it into the strict native speech-window
+/// map. Empty speech is a successful zero-window result. Invalid ranges fail
+/// before any WAV bytes or provider request exist.
+pub(crate) fn plan_native_stt_speech_windows<F>(
     pcm: &[f32],
     mut detect_speech: F,
-) -> Result<Vec<NativeSttAudioWindow>>
+) -> Result<Vec<PackedWindow>>
 where
     F: FnMut(&[f32]) -> Result<Vec<SpeechRegion>>,
 {
@@ -554,7 +554,20 @@ where
     if speech_ms == 0 {
         return Ok(Vec::new());
     }
-    pack_windows(&regions)
+    Ok(pack_windows(&regions))
+}
+
+/// Runs the supplied local detector and builds one bounded WAV per packed speech
+/// window. Silence returns an empty vector, so callers have no request to send.
+/// This function performs no provider I/O.
+pub fn plan_native_stt_audio_windows<F>(
+    pcm: &[f32],
+    detect_speech: F,
+) -> Result<Vec<NativeSttAudioWindow>>
+where
+    F: FnMut(&[f32]) -> Result<Vec<SpeechRegion>>,
+{
+    plan_native_stt_speech_windows(pcm, detect_speech)?
         .into_iter()
         .map(|window| NativeSttAudioWindow::from_pcm(pcm, &window))
         .collect()

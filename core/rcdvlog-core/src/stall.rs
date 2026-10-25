@@ -25,7 +25,7 @@ pub(crate) const IO_STALL_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// How often a bounded child process is checked for exit. Short enough that a
 /// kill lands promptly, long enough not to spin a core while ffprobe works.
-const POLL_INTERVAL: Duration = Duration::from_millis(50);
+pub(crate) const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 thread_local! {
     static STALL_LIMIT: Cell<Duration> = const { Cell::new(IO_STALL_TIMEOUT) };

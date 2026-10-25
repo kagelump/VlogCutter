@@ -25,6 +25,10 @@ pub enum RepresentationKind {
     Proxy,
     Thumbnail,
     Moments,
+    /// Exclusive ownership of one asset's local speech write/result window.
+    /// Local transcription and a prepared native-cloud request share this
+    /// claim so one path cannot replace the other's result while it is active.
+    Speech,
 }
 
 impl RepresentationKind {
@@ -33,6 +37,7 @@ impl RepresentationKind {
             Self::Proxy => "proxy",
             Self::Thumbnail => "thumbnail",
             Self::Moments => "moments",
+            Self::Speech => "speech",
         }
     }
 }

@@ -837,7 +837,7 @@ pub(crate) fn ensure_vlm_run_kind(kind: AnalysisRunKind) -> Result<()> {
     }
 }
 
-fn source_scope(
+pub(crate) fn source_scope(
     catalog: &Catalog,
     asset: &Asset,
     payload: AnalysisPayload,
