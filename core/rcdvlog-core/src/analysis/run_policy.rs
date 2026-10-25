@@ -38,6 +38,9 @@ use crate::analysis::provider::{
 use crate::analysis::{VLM_PROMPT_VERSION, framepack, store::TranscriptStatus};
 use crate::{Asset, Catalog, REFERENCE_COST_PER_CLIP_USD};
 
+mod native_pilot;
+mod pilot_projection;
+use pilot_projection::{pilot_observed_capabilities, pilot_projection_status};
 mod native_pilot_evidence;
 mod native_stt;
 pub use native_pilot_evidence::{
@@ -45,6 +48,7 @@ pub use native_pilot_evidence::{
     NativePilotLocalOutcome, NativePilotLocalOutcomeFact, NativePilotPaidSample,
     NativePilotSampleCoverage, NativePilotSampleOutcome,
 };
+pub(crate) use native_stt::native_stt_request_from_policy;
 use native_stt::{
     canonical_native_models, native_stt_blockers, native_stt_capability_checks,
     native_stt_recipe_version,
@@ -520,6 +524,12 @@ pub struct AuthorizedPolicyState {
     pub remaining_budget_usd: f64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PilotProjectionDisposition {
+    Standard,
+    NativeNoProviderRequired,
+}
+
 fn bounded(value: &str, limit: usize) -> String {
     value.chars().take(limit).collect()
 }
@@ -657,6 +667,45 @@ pub(crate) fn bulk_request_accounting_context(
     })
 }
 
+/// Build the exact pilot-accounting context for an explicitly selected frozen
+/// scope entry. The VLM wrapper below retains its historical first-scope choice;
+/// native orchestration uses the actual first speech asset after local scanning.
+pub(crate) fn pilot_accounting_context_for_scope(
+    policy: &RunPolicy,
+    run_id: &str,
+    scope: &RunAssetScope,
+    explicit_retry: bool,
+) -> Result<AnalysisAccountingContext> {
+    ensure!(
+        !run_id.trim().is_empty(),
+        "pilot accounting run id is required"
+    );
+    ensure!(
+        policy
+            .scope
+            .iter()
+            .filter(|candidate| *candidate == scope)
+            .count()
+            == 1,
+        "pilot accounting scope is not one exact frozen policy entry"
+    );
+    Ok(AnalysisAccountingContext {
+        project_id: policy.project_id.clone(),
+        policy_id: policy.policy_id.clone(),
+        policy_fingerprint: policy.policy_id.clone(),
+        run_id: run_id.to_string(),
+        operation: "pilot".into(),
+        // Deliberately excludes run_id and remains stable across explicit
+        // retries, so a fresh run cannot bypass the duplicate/retry fence.
+        intended_attempt_key: format!("{}:{}", policy.kind.as_str(), scope.asset_id),
+        source_fingerprint: scope.source_identity.clone(),
+        provider: policy.provider.clone(),
+        budget_scope_id: String::new(),
+        budget_usd: policy.budget_usd,
+        explicit_retry,
+    })
+}
+
 pub(crate) fn pilot_accounting_context(
     policy: &RunPolicy,
     run_id: &str,
@@ -666,21 +715,7 @@ pub(crate) fn pilot_accounting_context(
         .scope
         .first()
         .ok_or_else(|| anyhow::anyhow!("run policy has no scoped asset for its pilot"))?;
-    Ok(AnalysisAccountingContext {
-        project_id: policy.project_id.clone(),
-        policy_id: policy.policy_id.clone(),
-        policy_fingerprint: policy.policy_id.clone(),
-        run_id: run_id.to_string(),
-        operation: "pilot".into(),
-        // Deliberately excludes run_id and remains stable across explicit
-        // retries, so a fresh run cannot bypass the duplicate/retry fence.
-        intended_attempt_key: format!("{}:{}", policy.kind.as_str(), first_scope.asset_id),
-        source_fingerprint: first_scope.source_identity.clone(),
-        provider: policy.provider.clone(),
-        budget_scope_id: String::new(),
-        budget_usd: policy.budget_usd,
-        explicit_retry,
-    })
+    pilot_accounting_context_for_scope(policy, run_id, first_scope, explicit_retry)
 }
 
 fn canonical_models(request: &RunPolicyRequest) -> Vec<String> {
@@ -1098,6 +1133,24 @@ impl Catalog {
     /// catalog writes. Unknown or non-owned asset IDs fail immediately; source
     /// availability and capability problems become readiness blockers.
     pub fn describe_run_policy(&self, request: &RunPolicyRequest) -> Result<RunPolicy> {
+        self.describe_run_policy_with_credentials(request, api_credential_present())
+    }
+
+    /// Canonical local preparation needs source/policy identity, not key access.
+    /// Transient credential readiness is deliberately left unprobed here; the
+    /// public descriptor still reports it and the paid transport resolves it.
+    pub(crate) fn describe_run_policy_for_local_preparation(
+        &self,
+        request: &RunPolicyRequest,
+    ) -> Result<RunPolicy> {
+        self.describe_run_policy_with_credentials(request, false)
+    }
+
+    fn describe_run_policy_with_credentials(
+        &self,
+        request: &RunPolicyRequest,
+        credentials_present: bool,
+    ) -> Result<RunPolicy> {
         validate_budget(request.budget_usd)?;
         ensure!(
             !request.project_id.trim().is_empty(),
@@ -1182,7 +1235,10 @@ impl Catalog {
             warnings.push(
                 "native STT max_price, order, only and ignore routing restrictions are not enforced by the transcription endpoint; the duration tariff is an external reservation assumption, not a hard invoice cap, and receipt settlement retains above-bound or unknown charges".into(),
             );
-            warnings.push(native_stt::NATIVE_STT_PILOT_UNAVAILABLE_WARNING.into());
+            warnings.push(native_stt::NATIVE_STT_BULK_UNAVAILABLE_WARNING.into());
+            warnings.push(
+                "an all-NoAudio/NoSpeech scope needs no provider credentials; detecting silence in audio-bearing sources requires VAD, while NoAudio needs no model. Paid speech-pilot readiness requires VAD and credentials".into(),
+            );
             resolve_native_stt_model(&request.provider, &request.primary_model).ok()
         } else {
             None
@@ -1294,7 +1350,37 @@ impl Catalog {
                 asset_id: None,
             });
         }
-        let credentials_present = api_credential_present();
+        // Transient VAD readiness is deliberately not a capability check and
+        // therefore does not enter the canonical policy/recipe identity. Native
+        // paid pilots need only the shared Silero artifact; the local ASR model is
+        // never inspected or required. This check is skipped for VLM policies.
+        let native_vad_ready = if native_stt {
+            let selection = crate::SpeechBackendSelection::NativeOpenRouter {
+                provider: request.provider.clone(),
+                model: request.primary_model.clone(),
+            };
+            match self.model_status_for(&selection) {
+                Ok(models) => models
+                    .iter()
+                    .any(|model| model.role == "voice_activity_detection" && model.ready),
+                Err(_) => false,
+            }
+        } else {
+            true
+        };
+        if native_stt && !native_vad_ready {
+            warnings.push(format!(
+                "native STT paid pilot requires the shared Silero VAD artifact; install it explicitly with `rcdvlog models install --backend native-openrouter --provider {} --model {}`. The all-local no-provider outcome can still run with no model when every selected source is truthfully NoAudio",
+                request.provider, request.primary_model
+            ));
+        }
+        if native_stt && !credentials_present {
+            warnings.push(
+                "native STT paid pilot provider credentials are not currently present; the all-local no-provider outcome may still run, while any speech window will fail locally before a provider request".into(),
+            );
+        }
+        let native_pilot_prerequisites_ready =
+            credentials_present && (!native_stt || native_vad_ready);
         let (prompt_version, schema_version, recipe_version) = match kind {
             AnalysisRunKind::Observation => (
                 VLM_PROMPT_VERSION.to_string(),
@@ -1336,11 +1422,10 @@ impl Catalog {
             budget_ready,
             credentials_present,
             ready_for_authorization: capabilities_ready && blockers.is_empty() && budget_ready,
-            ready_for_pilot: !native_stt
-                && capabilities_ready
+            ready_for_pilot: capabilities_ready
                 && blockers.is_empty()
                 && budget_ready
-                && credentials_present,
+                && native_pilot_prerequisites_ready,
             blockers,
             warnings,
         };
@@ -1464,7 +1549,9 @@ impl Catalog {
             bail!("pilot cancelled before provider transmission");
         }
         let session = match prepare_pilot_session(self, request, retry_uncertain)? {
-            PilotSessionStart::AlreadyPassed(record) => return Ok(*record),
+            PilotSessionStart::AlreadyPassed(record) | PilotSessionStart::Cached(record) => {
+                return Ok(*record);
+            }
             PilotSessionStart::Ready(session) => *session,
         };
         let prepared = prepare_pilot_transmission(
@@ -1668,6 +1755,47 @@ impl Catalog {
         validation: PilotValidation,
         failure_hint: Option<String>,
     ) -> Result<RunPilotRecord> {
+        self.finalize_pilot_projection_with_disposition(
+            running,
+            baseline,
+            validation,
+            failure_hint,
+            PilotProjectionDisposition::Standard,
+        )
+    }
+
+    /// Finalize the truthful all-local native outcome. This uses the exact same
+    /// immediate transaction, ledger projection and record writer as the paid
+    /// pilot; only the explicit status/warning differ. The same transaction
+    /// re-proves the native policy, complete distinct local facts, zero actual
+    /// attempts and no unresolved accounting evidence.
+    fn finalize_native_no_provider_projection(
+        &self,
+        running: &RunPilotRecord,
+        baseline: &PilotAttemptBaseline,
+    ) -> Result<RunPilotRecord> {
+        self.finalize_pilot_projection_with_disposition(
+            running,
+            baseline,
+            PilotValidation {
+                structural_schema_valid: false,
+                source_time_semantics_valid: false,
+                capability_observed: false,
+                detail: "native_local_scan_no_provider_request_required".into(),
+            },
+            Some("no_provider_required".into()),
+            PilotProjectionDisposition::NativeNoProviderRequired,
+        )
+    }
+
+    fn finalize_pilot_projection_with_disposition(
+        &self,
+        running: &RunPilotRecord,
+        baseline: &PilotAttemptBaseline,
+        validation: PilotValidation,
+        failure_hint: Option<String>,
+        disposition: PilotProjectionDisposition,
+    ) -> Result<RunPilotRecord> {
         let mut connection = self.connection()?;
         let transaction =
             connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -1687,6 +1815,24 @@ impl Catalog {
             &running.policy_id,
             "pilot",
         )?;
+        if disposition == PilotProjectionDisposition::NativeNoProviderRequired {
+            let current = current
+                .as_ref()
+                .filter(|current| current.run_id == running.run_id && current.status == "running")
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "native no-provider finalization lost ownership of the running pilot row"
+                    )
+                })?;
+            native_pilot_evidence::validate_native_no_provider_finalization(&transaction, current)?;
+            ensure!(
+                aggregate.request_count == 0
+                    && ledger.actual_attempt_count == 0
+                    && !aggregate.has_unresolved_usage()
+                    && aggregate.committed_or_reserved_usd == 0.0,
+                "native no-provider finalization requires zero actual requests, zero unresolved usage and zero ledger cost"
+            );
+        }
         let mut attempted_models = baseline.attempted_models.clone();
         attempted_models.extend(ledger.attempted_models);
         let attempts = baseline
@@ -1698,31 +1844,14 @@ impl Catalog {
             .saturating_add(ledger.completion_tokens);
         let unresolved = aggregate.has_unresolved_usage();
         let usage_complete = !unresolved;
-        let status = if validation.capability_observed && usage_complete {
-            "passed"
-        } else if unresolved {
-            "uncertain"
-        } else {
-            "failed"
-        };
-        let failure_code = if status == "passed" {
-            String::new()
-        } else if unresolved {
-            bounded(failure_hint.as_deref().unwrap_or("usage_unknown"), 80)
-        } else if !validation.structural_schema_valid {
-            "schema_validation_failed".to_string()
-        } else if !validation.source_time_semantics_valid {
-            "source_time_semantics_failed".to_string()
-        } else {
-            bounded(failure_hint.as_deref().unwrap_or("analysis_error"), 80)
-        };
-        let warning = if usage_complete {
-            PILOT_WARNING.to_string()
-        } else {
-            format!(
-                "{PILOT_WARNING} Canonical ledger usage is incomplete; the total below includes a reserve, not a confirmed charge."
-            )
-        };
+        let (status, failure_code, warning) = pilot_projection_status(
+            disposition,
+            &validation,
+            usage_complete,
+            failure_hint.as_deref(),
+        );
+        let observed_capabilities =
+            pilot_observed_capabilities(&validation, native_evidence.as_ref());
         let record = RunPilotRecord {
             schema_version: RUN_PILOT_SCHEMA_VERSION.into(),
             policy_id: running.policy_id.clone(),
@@ -1749,16 +1878,7 @@ impl Catalog {
             prior_cost_usd: running.prior_cost_usd,
             prior_attempts: running.prior_attempts,
             validation: validation.clone(),
-            observed_capabilities: {
-                let mut observed = Vec::new();
-                if validation.structural_schema_valid {
-                    observed.push("configured JSON schema accepted this response".into());
-                }
-                if validation.source_time_semantics_valid {
-                    observed.push("explicit source-time semantics accepted this response".into());
-                }
-                observed
-            },
+            observed_capabilities,
             warning,
             native_evidence,
         };
@@ -1774,14 +1894,14 @@ impl Catalog {
         self.finish_analysis_run(
             &running.run_id,
             &crate::AnalysisRunOutcome {
-                status: if status == "passed" {
+                status: if status == "passed" || status == "no_provider_required" {
                     "completed".into()
                 } else {
                     "failed".into()
                 },
                 stage_reached: "pilot".into(),
                 cost_usd: record.cost_usd,
-                error: if status == "passed" {
+                error: if status == "passed" || status == "no_provider_required" {
                     String::new()
                 } else {
                     bounded(failure_hint.as_deref().unwrap_or(&validation.detail), 240)
@@ -1792,13 +1912,93 @@ impl Catalog {
         Ok(record)
     }
 
-    /// CLI-facing pilot entry point. Credentials are checked before a provider
-    /// client is built; a missing key therefore performs zero provider calls.
+    /// Cancellation-aware native capability pilot with an injected transport.
+    /// The local VAD/FFmpeg work, accounting boundary and projection are the real
+    /// production owners; this seam exists so focused tests can avoid live HTTP.
+    pub fn run_native_speech_pilot_with_transport_and_cancel<C>(
+        &self,
+        request: &RunPolicyRequest,
+        transport: &dyn crate::NativeSttTransport,
+        retry_uncertain: bool,
+        mut is_cancelled: C,
+    ) -> Result<RunPilotRecord>
+    where
+        C: FnMut() -> bool,
+    {
+        let mut preparer = crate::transcription::NativeSpeechPreparer::new();
+        native_pilot::run_native_pilot_with_transport(
+            self,
+            request,
+            transport,
+            retry_uncertain,
+            &mut preparer,
+            &mut is_cancelled,
+        )
+    }
+
+    /// Convenience injected native pilot entry point without a cancellation hook.
+    pub fn run_native_speech_pilot_with_transport(
+        &self,
+        request: &RunPolicyRequest,
+        transport: &dyn crate::NativeSttTransport,
+        retry_uncertain: bool,
+    ) -> Result<RunPilotRecord> {
+        self.run_native_speech_pilot_with_transport_and_cancel(
+            request,
+            transport,
+            retry_uncertain,
+            || false,
+        )
+    }
+
+    /// Focused test seam for the same native orchestration with a locally
+    /// injected VAD loader/probe/extract hook. It is never production-visible.
+    #[cfg(test)]
+    pub(crate) fn run_native_speech_pilot_with_transport_and_preparer<C>(
+        &self,
+        request: &RunPolicyRequest,
+        transport: &dyn crate::NativeSttTransport,
+        retry_uncertain: bool,
+        preparer: &mut crate::transcription::NativeSpeechPreparer,
+        is_cancelled: &mut C,
+    ) -> Result<RunPilotRecord>
+    where
+        C: FnMut() -> bool,
+    {
+        native_pilot::run_native_pilot_with_transport(
+            self,
+            request,
+            transport,
+            retry_uncertain,
+            preparer,
+            is_cancelled,
+        )
+    }
+
+    /// Real native capability-pilot entry point. Credential resolution is
+    /// deferred inside the transport until a speech window actually reaches the
+    /// accounted pre-dispatch preparation step; all-local silence never reads a
+    /// key or opens a client.
+    pub fn run_native_speech_pilot(
+        &self,
+        request: &RunPolicyRequest,
+        retry_uncertain: bool,
+    ) -> Result<RunPilotRecord> {
+        let transport = native_pilot::DeferredEnvironmentNativeSttTransport::new();
+        self.run_native_speech_pilot_with_transport(request, &transport, retry_uncertain)
+    }
+
+    /// CLI-facing pilot entry point. VLM credentials are checked before a
+    /// provider client is built; the explicitly selected native kind routes to
+    /// its own deferred native transport and never constructs a chat request.
     pub fn run_run_policy_pilot(
         &self,
         request: &RunPolicyRequest,
         retry_uncertain: bool,
     ) -> Result<RunPilotRecord> {
+        if request.parameters.kind() == AnalysisRunKind::NativeSpeechTranscription {
+            return self.run_native_speech_pilot(request, retry_uncertain);
+        }
         ensure_vlm_run_kind(request.parameters.kind())?;
         ensure!(
             api_credential_present(),

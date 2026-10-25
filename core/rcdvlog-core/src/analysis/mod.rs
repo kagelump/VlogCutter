@@ -1,6 +1,7 @@
-//! Derived per-clip analysis: local speech-to-text today, with protocol-only
-//! native cloud STT and cloud vision leaves; production selection and accounting
-//! remain explicit follow-up slices.
+//! Derived per-clip analysis: local speech-to-text plus an explicit bounded
+//! native cloud STT capability pilot and cloud vision leaves. Native bulk,
+//! targeted retry and CLI/desktop selection/adapters remain explicit follow-up
+//! slices.
 //!
 //! Results are derived artifacts with recipe identity, in the same style as
 //! proxies and thumbnails: re-running an unchanged recipe against an unchanged

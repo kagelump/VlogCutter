@@ -41,7 +41,6 @@ impl NativePilotLocalOutcomeFact {
     /// Build a local fact from the existing prepared representation. A prepared
     /// speech asset returns `None`; only the two truthful local terminal outcomes
     /// become evidence.
-    #[allow(dead_code)] // Consumed by the next native runtime slice.
     pub(crate) fn from_preparation(preparation: &NativeSpeechPreparation) -> Result<Option<Self>> {
         let outcome = match preparation.outcome() {
             NativeSpeechLocalOutcome::NoAudio => NativePilotLocalOutcome::NoAudio,

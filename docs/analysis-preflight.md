@@ -6,6 +6,10 @@ are separate records bound to that exact policy.
 
 ## Lifecycle
 
+The lifecycle below describes existing VLM CLI/desktop batches. The bounded
+native speech pilot is described separately below; native bulk and CLI/desktop
+selection are not yet available.
+
 Existing explicit CLI/desktop batch invocations remain usable: the core treats
 that invocation as approval intent, materializes the exact concrete policy,
 records authorization, runs the bounded pilot, and only then starts bulk work.
@@ -61,7 +65,9 @@ single-asset/sample result into project-wide or different-model authorization.
    ceiling before bulk work begins.
 
 Any change to scope/source identity, model, allowlist/fallback, payload, budget,
-prompt/schema/recipe/tool versions, or readiness changes the policy digest.
+prompt/schema/recipe/tool versions, or static capability contract changes the
+policy digest. Transient credential/model presence and readiness do not change
+that digest.
 Old approvals and pilots therefore stop matching and cannot be reused for a
 broader or altered batch.
 
@@ -76,8 +82,11 @@ Migration 37 adds:
 Pilot records contain only bounded provenance: status, requested/actual model,
 reported provider/generation IDs, attempted models, token counts, returned cost,
 usage-completeness, stable failure code, structural/semantic validation
-conclusions and a warning. They never contain prompts, frame/transcript content,
-raw response bodies, credentials, provider error text or absolute source paths.
+conclusions and a warning. VLM records contain no prompt/frame/transcript content.
+Native records may additionally retain one explicitly partial, bounded typed
+sample with accepted or review-required source-mapped candidates, plus local
+NoAudio/NoSpeech facts. Rejected text is discarded. Neither kind retains raw audio
+or response bodies, credentials, provider error text or absolute source paths.
 An interrupted or unknown-usage pilot is recorded as `uncertain` and blocks
 further provider calls until its receipt is reconciled. The operator inspects
 the immutable request/receipt/event history, imports trusted late receipt
@@ -262,3 +271,36 @@ observed pilot.
 Native speech cost proposals reserve a conservative pre-VAD upper bound for bulk speech windows plus one separate capability-pilot window. Each window reserves the full registered 30-second duration; pilot and bulk spending use the same eventual policy ceiling. No pilot or bulk call is enabled by a proposal in this slice.
 
 C4A binds native approval/cache identity to the deterministic recipe above. C4B adds migration 43 and the read-only canonical transcript-to-accounting provenance projection. Native high-level pilot/bulk orchestration, VAD extraction/model installation, typed native targeted retry, backend selectors and CLI/desktop adapters remain deferred; no native execution is enabled by this change and `ready_for_pilot` stays false.
+
+
+## Bounded native speech pilot
+
+Core callers explicitly select `RunPolicyRequest::native_speech_transcription`
+and authorize that exact proposal before using
+`Catalog::run_native_speech_pilot` or its injected-transport/cancellation variant.
+The generic core pilot entrypoint routes an explicitly native kind to this path;
+it never converts native audio into a VLM request. Local/offline transcription
+remains the default, and these core APIs do not imply native CLI/desktop or bulk
+support.
+
+The pilot scans selected proxies with FFprobe and local Silero VAD, sends at most
+one 30-second packed speech window, and keeps a typed partial result under the
+existing pilot record. A passed native pilot observes protocol/source mapping
+with complete accounting usage; it is not a full-asset transcript or an accuracy
+claim. Candidates with insufficient confidence evidence remain explicitly
+review-required and unaccepted. Missing actual serving identities remain unknown.
+A different, unverified returned model identifier requires review rather than an
+assumed alias match. Requested broker and serving upstream are distinct fields.
+
+All selected sources with verified local NoAudio/NoSpeech facts produce
+`no_provider_required`, with no paid request and `capabilityObserved: false`.
+This does not unlock bulk. NoAudio requires no VAD model; successful VAD silence
+on an audio stream does. Native execution defers secure credential resolution
+until an actual speech transmission needs local transport preparation. Missing
+credentials/model files affect paid-pilot readiness and carry explicit
+remediation without changing the approved policy identity.
+
+Receipts settle before cached domain results and post-response cancellation.
+Unknown usage remains uncertain; repeated invocation, force or a generic retry
+flag cannot blindly resend prior native paid work. Receipt-only interruptions
+require explicit reconciliation and later targeted recovery support.

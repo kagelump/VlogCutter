@@ -3,7 +3,7 @@
 //! A native pilot may pay for exactly one bounded speech window before bulk
 //! work. This module retains that parsed window, or a body-free typed unusable
 //! outcome, inside the existing `analysis_run_pilots.record_json` owner. It also
-//! retains truthful local NoAudio/NoSpeech facts for a future deterministic
+//! retains truthful local NoAudio/NoSpeech facts from the deterministic bounded
 //! scope scan.
 //!
 //! It deliberately does not execute providers, scan assets, write a canonical
@@ -53,5 +53,6 @@ mod persistence;
 mod types;
 mod validation;
 
+pub(crate) use persistence::validate_native_no_provider_finalization;
 pub use types::*;
 use validation::*;

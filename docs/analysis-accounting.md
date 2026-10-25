@@ -9,11 +9,28 @@ and explicitly authorized targeted retry are now thin adapters over the same
 canonical owner. Process-interruption recovery is verified with synthetic
 transports; no live OpenRouter/native acceptance is claimed by this slice.
 
-B3 additionally exposes one accounted native speech-transcription pilot request
-leaf. The VLM and native adapters share the same private admission -> prepare ->
-domain guard -> dispatch marker -> one send -> receipt lifecycle. High-level
-native pilot/bulk orchestration, VAD extraction, model loading and CLI/desktop
-native selection remain unwired.
+Native speech uses the same private admission -> prepare -> domain guard ->
+dispatch marker -> one send -> receipt lifecycle as VLM requests. The core now
+implements a bounded native capability pilot using selected proxy audio, local
+FFprobe/FFmpeg and standalone whisper-rs Silero VAD. Native bulk, targeted retry
+and CLI/desktop native selection remain separate follow-up work.
+
+The pilot scans the explicitly authorized scope until the first speech asset and
+sends only its first bounded window. It stores that partial typed result in the
+existing SQLite pilot record before finalization or post-response cancellation;
+it does not create a full-asset transcript. Exact prepared PCM/source-map and
+canonical request/receipt proof allow later reuse. Known bad output is rejected,
+missing comparable quality evidence remains review-required and unaccepted, and
+unknown cost keeps the pilot uncertain. A default repeat cannot resend a cached
+sample or bypass receipt-only interrupted work.
+
+Migration 44 adds the explicit `no_provider_required` pilot status for a complete
+local NoAudio/NoSpeech scope. It requires zero requests and zero unresolved ledger
+usage, records no observed endpoint capability and does not authorize bulk.
+NoAudio requires no model; detecting silence in audio-bearing clips still needs
+VAD. Provider credentials are resolved by the native transport only when speech
+reaches pre-dispatch preparation. Local preparation releases the heavy lease
+before cloud I/O and keeps source/speech claims through result persistence.
 
 ## Native transcript provenance (C4B slice)
 
@@ -52,8 +69,11 @@ recipe version. Native `RunPolicy.recipe_version` and the stored transcript
 prior native association atomically, and native saves validate the frozen
 policy, exact asset/source scope, owned accounted run and settled or honestly
 uncertain receipts inside the same `BEGIN IMMEDIATE` transaction that replaces
-the header, segments and window links. High-level native execution, backend
-selection, CLI/desktop adapters and `ready_for_pilot` remain unwired.
+the header, segments and window links. The bounded core native pilot is wired;
+full native asset transcription, native bulk and CLI/desktop selection remain
+unavailable. Public policy readiness checks only the VAD artifact and credentials
+for paid native pilots; transient prerequisite presence does not change approval
+identity.
 
 ## Canonical owner
 

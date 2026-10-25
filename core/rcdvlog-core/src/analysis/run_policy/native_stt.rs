@@ -4,16 +4,17 @@
 //! the registered native duration tariff to a conservative pre-VAD window count
 //! so the accounted pilot leaf can reserve the same full-window units without
 //! inventing a provider charge or constructing a fake audio request. B3 exposes
-//! one explicit single-window accounted request; high-level native pilot/bulk
-//! orchestration and capability observation remain unwired.
+//! one explicit single-window accounted request. The bounded one-shot native
+//! capability pilot now consumes this leaf; native bulk and targeted retry
+//! remain separate future slices.
 
 use crate::analysis::openrouter_stt::NativeSttModelSpec;
 use crate::analysis::windows::WINDOW_MS;
 use anyhow::{Result, ensure};
 
 use super::{
-    AnalysisPayload, CapabilityCheck, CapabilityStatus, RunAssetScope, RunPolicyBlocker,
-    RunPolicyParameters, RunPolicyRequest,
+    AnalysisPayload, AnalysisRunKind, CapabilityCheck, CapabilityStatus, RunAssetScope, RunPolicy,
+    RunPolicyBlocker, RunPolicyParameters, RunPolicyRequest,
 };
 use crate::analysis::openrouter_stt::{
     NativeSttRequest, OPENROUTER_STT_PROVIDER, resolve_native_stt_model, validate_iso639_1,
@@ -170,8 +171,8 @@ pub(super) fn native_stt_capability_checks(
     });
     checks.push(CapabilityCheck {
         requirement: "native_stt.high_level_pilot".into(),
-        status: CapabilityStatus::NotRequired,
-        detail: "the accounted single-window request leaf exists, but high-level native pilot/bulk orchestration and observed capability remain unavailable".into(),
+        status: CapabilityStatus::Passed,
+        detail: "the bounded core native capability pilot is implemented through the same session, authorization, local VAD preparation, accounting and projection owners; it sends at most one supplied speech window and observed endpoint capability remains policy-specific".into(),
     });
     checks
 }
@@ -286,9 +287,66 @@ pub(super) fn native_stt_recipe_version(request: &RunPolicyRequest) -> Result<St
     }
 }
 
-/// Explicit warning that the single-window accounted leaf is not a high-level
-/// paid workflow or observed capability pilot.
-pub(super) const NATIVE_STT_PILOT_UNAVAILABLE_WARNING: &str = "native STT accounted single-window request leaf is available for explicit orchestration; high-level native pilot/bulk execution, quality/provenance and adapters remain unavailable, so ready_for_pilot stays false";
+/// Build the single explicit native request from the already frozen policy.
+///
+/// This is the only production constructor used by the pilot and local
+/// preparation owners. Provider, model, language, fixed temperature and provider
+/// data policy all come from the frozen policy; no chat model, fallback, sampling
+/// option or default is invented here.
+pub(crate) fn native_stt_request_from_policy(policy: &RunPolicy) -> Result<NativeSttRequest> {
+    ensure!(
+        policy.kind == AnalysisRunKind::NativeSpeechTranscription,
+        "authorized policy is not native speech transcription"
+    );
+    ensure!(
+        policy.payload == AnalysisPayload::Audio,
+        "authorized native speech policy payload is not audio"
+    );
+    ensure!(
+        !policy.allow_fallback
+            && policy.permitted_fallbacks.is_empty()
+            && policy.allowed_models == vec![policy.primary_model.clone()],
+        "authorized native speech policy must select exactly one model without fallback"
+    );
+    ensure!(
+        policy.readiness.ready_for_authorization && policy.readiness.budget_ready,
+        "authorized native speech policy is not ready"
+    );
+    ensure!(
+        policy.budget_usd.is_finite() && policy.budget_usd > 0.0,
+        "authorized native speech budget is invalid"
+    );
+    ensure!(
+        policy.expected_cost_usd.is_finite()
+            && policy.expected_cost_usd >= 0.0
+            && policy.expected_cost_usd <= policy.budget_usd,
+        "authorized native speech cost exceeds its budget"
+    );
+    ensure!(
+        policy.provider_cost_bound_contract == crate::native_stt_cost_bound_contract_id(),
+        "authorized native speech provider cost contract changed"
+    );
+    let RunPolicyParameters::NativeSpeechTranscription {
+        language,
+        provider_policy,
+        ..
+    } = &policy.parameters
+    else {
+        anyhow::bail!("authorized policy is missing native speech parameters");
+    };
+    NativeSttRequest::new(
+        policy.provider.clone(),
+        policy.primary_model.clone(),
+        language.clone(),
+        NATIVE_STT_TEMPERATURE,
+        *provider_policy,
+    )
+}
+
+/// Native bulk remains a separate future owner. This warning is shown alongside
+/// the now-implemented one-shot pilot so callers cannot infer that bulk or
+/// adapters are available.
+pub(super) const NATIVE_STT_BULK_UNAVAILABLE_WARNING: &str = "native STT bounded capability pilot is implemented, but native bulk execution, targeted retry and CLI/desktop native selection remain unavailable";
 
 /// Conservative upper bound on packed speech windows for a positive source
 /// duration. Greedy packing cannot produce more than

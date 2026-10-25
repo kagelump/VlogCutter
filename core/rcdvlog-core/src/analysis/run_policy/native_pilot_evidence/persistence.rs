@@ -292,6 +292,74 @@ impl Catalog {
     }
 }
 
+/// Validate the complete local-only native outcome inside the same transaction
+/// that will write its projection. This helper does not build or update any
+/// financial fields; the caller's existing aggregate/ledger projection proves
+/// zero actual attempts and no unresolved usage before choosing the explicit
+/// `no_provider_required` status.
+pub(crate) fn validate_native_no_provider_finalization(
+    connection: &Connection,
+    expected: &RunPilotRecord,
+) -> Result<()> {
+    ensure!(
+        expected.status == "running" && !expected.run_id.trim().is_empty(),
+        "native no-provider evidence requires the exact running owned pilot"
+    );
+    let (authorization, accounting_contract) =
+        load_run_authorization_on_connection(connection, &expected.policy_id)?;
+    ensure!(
+        accounting_contract == crate::analysis::accounting::ANALYSIS_ACCOUNTING_SCHEMA_VERSION,
+        "native no-provider finalization uses a stale accounting contract"
+    );
+    let policy = &authorization.policy;
+    ensure!(
+        policy.policy_id == expected.policy_id
+            && policy.project_id == expected.project_id
+            && policy.kind == AnalysisRunKind::NativeSpeechTranscription
+            && policy.payload == AnalysisPayload::Audio
+            && policy.readiness.ready_for_authorization,
+        "native no-provider policy/project identity or native readiness changed"
+    );
+    ensure!(
+        policy.allowed_models == vec![policy.primary_model.clone()]
+            && !policy.allow_fallback
+            && policy.permitted_fallbacks.is_empty()
+            && policy.provider_cost_bound_contract
+                == crate::analysis::openrouter_stt::native_stt_cost_bound_contract_id(),
+        "native no-provider evidence requires the exact no-fallback native policy contract"
+    );
+    validate_running_run_owner(connection, policy, expected)?;
+    let evidence = expected
+        .native_evidence
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("native no-provider pilot is missing its local facts"))?;
+    evidence.validate()?;
+    ensure!(
+        evidence.sample.is_none(),
+        "native no-provider finalization cannot carry a paid sample"
+    );
+    validate_evidence_against_policy(connection, policy, expected, evidence, None)?;
+    ensure!(
+        evidence.local_outcomes.len() == policy.scope.len(),
+        "native no-provider finalization requires exactly one local fact for every selected scope entry"
+    );
+    let policy_assets: HashSet<&str> = policy
+        .scope
+        .iter()
+        .map(|scope| scope.asset_id.as_str())
+        .collect();
+    let fact_assets: HashSet<&str> = evidence
+        .local_outcomes
+        .iter()
+        .map(|fact| fact.scope.asset_id.as_str())
+        .collect();
+    ensure!(
+        policy_assets == fact_assets && fact_assets.len() == policy.scope.len(),
+        "native no-provider local facts do not cover the complete frozen scope"
+    );
+    Ok(())
+}
+
 fn validate_running_run_owner(
     connection: &Connection,
     policy: &RunPolicy,
