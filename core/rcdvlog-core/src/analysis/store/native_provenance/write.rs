@@ -5,10 +5,9 @@ use std::collections::HashSet;
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
+use crate::analysis::accounting::ANALYSIS_ACCOUNTING_SCHEMA_VERSION;
 use crate::analysis::accounting::store as accounting_store;
-use crate::analysis::accounting::{
-    ANALYSIS_ACCOUNTING_SCHEMA_VERSION, AnalysisProviderReceipt, AnalysisRequestLifecycle,
-};
+use crate::analysis::accounting::store::NativeSettledResultProof;
 use crate::analysis::quality::native_stt::NATIVE_STT_QUALITY_RECIPE_VERSION;
 use crate::analysis::run_policy::{
     AnalysisRunKind, RunAssetScope, RunPolicy, load_run_authorization_on_connection,
@@ -189,103 +188,21 @@ fn validate_request_windows(
             "native transcript observation {index} accounting request is already linked to another asset"
         );
 
-        let request = accounting_store::load_request(connection, &observation.request_key)?
-            .ok_or_else(|| anyhow::anyhow!("native transcript accounting request was not found"))?;
-        ensure!(
-            request.project_id == policy.project_id
-                && request.policy_id == policy.policy_id
-                && request.policy_fingerprint == policy.policy_id,
-            "native transcript accounting request policy/project ownership changed"
-        );
-        ensure!(
-            request.operation == "pilot"
-                || request.operation == AnalysisRunKind::NativeSpeechTranscription.as_str(),
-            "native transcript accounting request is not an explicit native speech operation"
-        );
-        ensure!(
-            request.source_fingerprint == scope.source_identity
-                && request.provider == policy.provider
-                && request.requested_model == policy.primary_model,
-            "native transcript accounting request source/provider/model does not match the frozen policy"
-        );
-        ensure!(
-            !request.payload_fingerprint.trim().is_empty()
-                && !request.request_fingerprint.trim().is_empty()
-                && !request.cost_bound_fingerprint.trim().is_empty(),
-            "native transcript accounting request identity proof is incomplete"
-        );
-        ensure!(
-            request.dispatch_at.is_some()
-                && !matches!(
-                    request.lifecycle,
-                    AnalysisRequestLifecycle::Reserved
-                        | AnalysisRequestLifecycle::Dispatched
-                        | AnalysisRequestLifecycle::Released
-                ),
-            "native transcript cannot link an undispatched, active or released accounting request"
-        );
-        let receipts: Vec<AnalysisProviderReceipt> =
-            accounting_store::receipts(connection, &observation.request_key)?;
-        ensure!(
-            !receipts.is_empty(),
-            "native transcript accounting request has no immutable provider receipt"
-        );
-        let attempt_history =
-            accounting_store::attempt_history(connection, &observation.request_key)?;
-        ensure!(
-            attempt_history
-                .iter()
-                .any(|attempt| attempt.request_key == request.request_key),
-            "native transcript accounting request is absent from its immutable attempt history"
-        );
-        match request.lifecycle {
-            AnalysisRequestLifecycle::Completed => {
-                ensure!(
-                    request.settled_at.is_some()
-                        && request.confirmed_cost_usd.is_finite()
-                        && request.confirmed_cost_usd >= 0.0,
-                    "completed native transcript request is missing its settled receipt boundary"
-                );
-            }
-            AnalysisRequestLifecycle::Uncertain => {
-                ensure!(
-                    request.uncertain_usage_reserve_usd.is_finite()
-                        && request.uncertain_usage_reserve_usd > 0.0,
-                    "uncertain native transcript request has no honest unresolved-usage reserve"
-                );
-            }
-            _ => anyhow::bail!(
-                "native transcript requires a settled completed or honestly uncertain accounting request"
-            ),
-        }
-        let cost_bound = request.cost_bound.as_ref().ok_or_else(|| {
-            anyhow::anyhow!("native transcript accounting request has no cost bound")
-        })?;
-        cost_bound.validate()?;
-        ensure!(
-            cost_bound.audio.is_some()
-                && cost_bound.contract_version == policy.provider_cost_bound_contract,
-            "native transcript accounting request is not bound to the canonical native audio cost family"
-        );
-        ensure!(
-            !request.run_id.trim().is_empty(),
-            "native transcript accounting request has no owning accounted run"
-        );
-        let run: Option<(String, String, String)> = connection
-            .query_row(
-                "SELECT project_id,policy_id,accounting_contract FROM analysis_runs WHERE id=?1",
-                [&request.run_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .optional()?;
-        let (run_project, run_policy, run_contract) =
-            run.ok_or_else(|| anyhow::anyhow!("native transcript accounting run does not exist"))?;
-        ensure!(
-            run_project == policy.project_id
-                && run_policy == policy.policy_id
-                && run_contract == ANALYSIS_ACCOUNTING_SCHEMA_VERSION,
-            "native transcript accounting run ownership or contract does not match the frozen policy"
-        );
+        accounting_store::validate_native_settled_result_request(
+            connection,
+            &observation.request_key,
+            &NativeSettledResultProof {
+                project_id: &policy.project_id,
+                policy_id: &policy.policy_id,
+                policy_fingerprint: &policy.policy_id,
+                expected_provider_cost_bound_contract: &policy.provider_cost_bound_contract,
+                source_fingerprint: &scope.source_identity,
+                requested_provider: &policy.provider,
+                requested_model: &policy.primary_model,
+                run_id: None,
+                allowed_operations: &["pilot", AnalysisRunKind::NativeSpeechTranscription.as_str()],
+            },
+        )?;
 
         // Explicitly keep silent/no-audio artifacts request-free and prevent a
         // provider-backed artifact from carrying a fabricated request count.

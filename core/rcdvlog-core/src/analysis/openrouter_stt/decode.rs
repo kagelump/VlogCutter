@@ -10,7 +10,8 @@ const MAX_WORDS_PER_SEGMENT: usize = 10_000;
 
 /// Stable, body-free protocol failure categories. Provider response text is
 /// never interpolated into these values.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum NativeSttProtocolError {
     InvalidJson,
     NotAnObject,

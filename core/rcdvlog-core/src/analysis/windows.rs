@@ -11,11 +11,14 @@
 //! whisper returns are relative to the packed window and are meaningless until
 //! they are translated back to clip time.
 
+use serde::{Deserialize, Serialize};
+
 /// whisper's fixed decode window.
 pub const WINDOW_MS: u32 = 30_000;
 
 /// A span of detected speech in clip time.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SpeechRegion {
     pub start_ms: u32,
     pub end_ms: u32,
@@ -28,7 +31,8 @@ impl SpeechRegion {
 }
 
 /// A speech region placed inside a packed window, retaining its origin.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PackedRegion {
     /// Offset of this region from the start of the packed window.
     pub window_offset_ms: u32,
@@ -38,7 +42,8 @@ pub struct PackedRegion {
 }
 
 /// One 30-second decode unit.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PackedWindow {
     pub regions: Vec<PackedRegion>,
 }

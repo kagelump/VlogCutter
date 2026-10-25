@@ -11,7 +11,7 @@
 //! They are starting constants to revisit against a larger hand-labeled set,
 //! not measured truth.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
 pub mod native_stt;
@@ -25,7 +25,7 @@ const REPETITION_REJECT_RATIO: f32 = 0.3;
 const MIN_MEAN_TOKEN_PROBABILITY: f32 = 0.20;
 
 /// One decoded segment in clip time.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DecodedSegment {
     pub start_ms: u32,

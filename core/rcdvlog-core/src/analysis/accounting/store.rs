@@ -90,7 +90,7 @@ pub(crate) enum PolicyRequestFamily<'a> {
 /// Prove a genuine bounded native window only claims source milliseconds that
 /// exist inside one canonically authorized asset scope. This is pure and runs
 /// inside the same `IMMEDIATE` admission transaction that resolved the scope.
-pub(super) fn validate_native_audio_source_bounds(
+pub(crate) fn validate_native_audio_source_bounds(
     audio: &NativeSttAudioWindow,
     source_duration_ms: u32,
 ) -> Result<()> {
@@ -1382,6 +1382,162 @@ pub(crate) fn load_request(
         )
         .optional()
         .context("read analysis request")
+}
+
+/// Exact identity and settlement expectations for one already paid native
+/// speech result. Callers that own a different artifact (canonical transcript or
+/// bounded pilot evidence) share this proof instead of maintaining separate
+/// financial/ownership SQL.
+pub(crate) struct NativeSettledResultProof<'a> {
+    pub project_id: &'a str,
+    pub policy_id: &'a str,
+    pub policy_fingerprint: &'a str,
+    pub expected_provider_cost_bound_contract: &'a str,
+    pub source_fingerprint: &'a str,
+    pub requested_provider: &'a str,
+    pub requested_model: &'a str,
+    /// `Some` requires the request to belong to this exact run.
+    pub run_id: Option<&'a str>,
+    pub allowed_operations: &'a [&'a str],
+}
+
+/// Reuse the canonical accounting owner to prove that a native result is backed
+/// by one immutable, settled provider request and receipt. This is a financial
+/// and ownership proof, not a quality/capability pass and not permission to
+/// spend; domain owners add their own payload/source mapping checks.
+///
+/// Unknown-cost receipts are accepted only through the durable `uncertain`
+/// lifecycle with its honest unresolved-usage reserve. A caller cannot turn that
+/// lifecycle into a clean financial pass here.
+pub(crate) fn validate_native_settled_result_request(
+    connection: &Connection,
+    request_key: &str,
+    proof: &NativeSettledResultProof<'_>,
+) -> Result<AnalysisRequestRecord> {
+    ensure!(
+        !request_key.trim().is_empty()
+            && !proof.project_id.trim().is_empty()
+            && !proof.policy_id.trim().is_empty()
+            && !proof.policy_fingerprint.trim().is_empty()
+            && !proof
+                .expected_provider_cost_bound_contract
+                .trim()
+                .is_empty()
+            && !proof.source_fingerprint.trim().is_empty()
+            && !proof.requested_provider.trim().is_empty()
+            && !proof.requested_model.trim().is_empty()
+            && !proof.allowed_operations.is_empty()
+            && proof
+                .allowed_operations
+                .iter()
+                .all(|operation| !operation.trim().is_empty()),
+        "native result request proof is incomplete"
+    );
+    let request = load_request(connection, request_key)?
+        .ok_or_else(|| anyhow!("native result accounting request was not found"))?;
+    ensure!(
+        request.project_id == proof.project_id
+            && request.policy_id == proof.policy_id
+            && request.policy_fingerprint == proof.policy_fingerprint,
+        "native result accounting request policy/project ownership changed"
+    );
+    ensure!(
+        proof
+            .allowed_operations
+            .iter()
+            .any(|operation| *operation == request.operation),
+        "native result accounting request is not an allowed distinct speech operation"
+    );
+    ensure!(
+        request.source_fingerprint == proof.source_fingerprint
+            && request.provider == proof.requested_provider
+            && request.requested_model == proof.requested_model,
+        "native result accounting request source/provider/model does not match its owner"
+    );
+    ensure!(
+        !request.payload_fingerprint.trim().is_empty()
+            && !request.request_fingerprint.trim().is_empty()
+            && !request.cost_bound_fingerprint.trim().is_empty(),
+        "native result accounting request identity proof is incomplete"
+    );
+    if let Some(run_id) = proof.run_id {
+        ensure!(
+            !run_id.trim().is_empty() && request.run_id == run_id,
+            "native result accounting request is not owned by the expected run"
+        );
+    }
+    ensure!(
+        !request.run_id.trim().is_empty(),
+        "native result accounting request has no owning accounted run"
+    );
+    ensure!(
+        request.dispatch_at.is_some()
+            && !matches!(
+                request.lifecycle,
+                AnalysisRequestLifecycle::Reserved
+                    | AnalysisRequestLifecycle::Dispatched
+                    | AnalysisRequestLifecycle::Released
+            ),
+        "native result cannot link an undispatched, active or released accounting request"
+    );
+    let receipts = receipts(connection, request_key)?;
+    ensure!(
+        !receipts.is_empty(),
+        "native result accounting request has no immutable provider receipt"
+    );
+    let attempt_history = attempt_history(connection, request_key)?;
+    ensure!(
+        attempt_history
+            .iter()
+            .any(|attempt| attempt.request_key == request.request_key),
+        "native result accounting request is absent from its immutable attempt history"
+    );
+    match request.lifecycle {
+        AnalysisRequestLifecycle::Completed => {
+            ensure!(
+                request.settled_at.is_some()
+                    && request.confirmed_cost_usd.is_finite()
+                    && request.confirmed_cost_usd >= 0.0,
+                "completed native result request is missing its settled receipt boundary"
+            );
+        }
+        AnalysisRequestLifecycle::Uncertain => {
+            ensure!(
+                request.uncertain_usage_reserve_usd.is_finite()
+                    && request.uncertain_usage_reserve_usd > 0.0,
+                "uncertain native result request has no honest unresolved-usage reserve"
+            );
+        }
+        AnalysisRequestLifecycle::Reserved
+        | AnalysisRequestLifecycle::Dispatched
+        | AnalysisRequestLifecycle::Released => unreachable!("rejected above"),
+    }
+    let cost_bound = request
+        .cost_bound
+        .as_ref()
+        .ok_or_else(|| anyhow!("native result accounting request has no cost bound"))?;
+    cost_bound.validate()?;
+    ensure!(
+        cost_bound.audio.is_some()
+            && cost_bound.contract_version == proof.expected_provider_cost_bound_contract,
+        "native result accounting request is not bound to the canonical native audio cost family"
+    );
+    let run: Option<(String, String, String)> = connection
+        .query_row(
+            "SELECT project_id,policy_id,accounting_contract FROM analysis_runs WHERE id=?1",
+            [&request.run_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let (run_project, run_policy, run_contract) =
+        run.ok_or_else(|| anyhow!("native result accounting run does not exist"))?;
+    ensure!(
+        run_project == proof.project_id
+            && run_policy == proof.policy_id
+            && run_contract == ANALYSIS_ACCOUNTING_SCHEMA_VERSION,
+        "native result accounting run ownership or contract does not match the frozen policy"
+    );
+    Ok(request)
 }
 
 /// Unresolved attempts for one exact source/operation. A generated replacement

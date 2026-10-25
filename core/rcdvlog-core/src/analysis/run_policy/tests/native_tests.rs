@@ -1365,3 +1365,7 @@ fn native_header_only_receipt_with_late_cost_reconciles_once_and_conflicts_fail(
 #[cfg(test)]
 #[path = "native_provenance_tests.rs"]
 mod native_provenance_tests;
+
+#[cfg(test)]
+#[path = "native_pilot_evidence_tests.rs"]
+mod native_pilot_evidence_tests;
