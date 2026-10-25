@@ -15,10 +15,16 @@ use crate::analysis::quality::DecodedSegment;
 
 /// Terminal states of a transcription attempt.
 ///
-/// `NoSpeech`, `NoAudio`, `NoAcceptedSpeech`, and `Rejected` are successful,
-/// terminal outcomes. Only `Failed` is retryable by an ordinary batch.
-/// `NoSpeech` means the VAD gate ran and found no speech; it does not mean the
-/// provider happened to return nothing after speech was detected.
+/// `NoSpeech`, `NoAudio`, `NoAcceptedSpeech`, `Rejected`, and
+/// `ReviewRequired` are successful, terminal outcomes. Only `Failed` is
+/// retryable by an ordinary batch. `NoSpeech` means the VAD gate ran and found
+/// no speech; it does not mean the provider happened to return nothing after
+/// speech was detected.
+///
+/// `ReviewRequired` retains timed provider candidate text whose quality
+/// evidence is incomplete. The candidates are explicitly unaccepted: they are
+/// available to a human reviewer but are not accepted speech and must not be
+/// forwarded as AI context.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TranscriptStatus {
@@ -28,6 +34,7 @@ pub enum TranscriptStatus {
     NoAcceptedSpeech,
     Rejected,
     Failed,
+    ReviewRequired,
 }
 
 impl TranscriptStatus {
@@ -39,6 +46,7 @@ impl TranscriptStatus {
             TranscriptStatus::NoAcceptedSpeech => "no_accepted_speech",
             TranscriptStatus::Rejected => "rejected",
             TranscriptStatus::Failed => "failed",
+            TranscriptStatus::ReviewRequired => "review_required",
         }
     }
 
@@ -50,6 +58,7 @@ impl TranscriptStatus {
             "no_accepted_speech" => Ok(TranscriptStatus::NoAcceptedSpeech),
             "rejected" => Ok(TranscriptStatus::Rejected),
             "failed" => Ok(TranscriptStatus::Failed),
+            "review_required" => Ok(TranscriptStatus::ReviewRequired),
             other => bail!("unknown transcript status: {other}"),
         }
     }
@@ -59,9 +68,10 @@ impl TranscriptStatus {
 ///
 /// The status records the broad result while this reason preserves the
 /// distinction between literal silence, absent audio, an empty provider
-/// response, a quality rejection, and a processing failure. `Legacy...` records
-/// are migration-only compatibility evidence: older schemas did not store
-/// enough information to prove literal silence.
+/// response, a quality rejection, a processing failure, and retained candidate
+/// text with incomplete quality evidence. `Legacy...` records are migration-only
+/// compatibility evidence: older schemas did not store enough information to
+/// prove literal silence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TranscriptOutcomeReason {
@@ -72,6 +82,7 @@ pub enum TranscriptOutcomeReason {
     QualityRejected,
     ProcessingFailed,
     LegacyNoSpeechUnverified,
+    QualityEvidenceIncomplete,
 }
 
 impl TranscriptOutcomeReason {
@@ -84,6 +95,7 @@ impl TranscriptOutcomeReason {
             TranscriptOutcomeReason::QualityRejected => "quality_rejected",
             TranscriptOutcomeReason::ProcessingFailed => "processing_failed",
             TranscriptOutcomeReason::LegacyNoSpeechUnverified => "legacy_no_speech_unverified",
+            TranscriptOutcomeReason::QualityEvidenceIncomplete => "quality_evidence_incomplete",
         }
     }
 
@@ -96,6 +108,7 @@ impl TranscriptOutcomeReason {
             "quality_rejected" => Ok(TranscriptOutcomeReason::QualityRejected),
             "processing_failed" => Ok(TranscriptOutcomeReason::ProcessingFailed),
             "legacy_no_speech_unverified" => Ok(TranscriptOutcomeReason::LegacyNoSpeechUnverified),
+            "quality_evidence_incomplete" => Ok(TranscriptOutcomeReason::QualityEvidenceIncomplete),
             other => bail!("unknown transcript outcome reason: {other}"),
         }
     }
@@ -147,13 +160,50 @@ fn validate_probability_evidence(value: Option<f32>, label: &str) -> Result<()> 
     Ok(())
 }
 
+/// Validate the one deliberately new status/reason pairing.
+///
+/// `ReviewRequired` is not accepted speech: it is timed candidate text retained
+/// for a human because a comparable quality metric was absent or incomplete.
+/// The contract is intentionally limited to this new state so legacy and local
+/// transcript fixtures keep their existing shape.
+fn validate_review_required_contract(transcript: &StoredTranscript) -> Result<()> {
+    match (transcript.status, transcript.outcome_reason) {
+        (TranscriptStatus::ReviewRequired, TranscriptOutcomeReason::QualityEvidenceIncomplete) => {
+            if transcript.segments.is_empty() {
+                bail!("review_required transcript must retain at least one candidate segment");
+            }
+            for (index, segment) in transcript.segments.iter().enumerate() {
+                if segment.text.trim().is_empty() {
+                    bail!("review_required segment {index} must contain candidate text");
+                }
+                if segment.start_ms >= segment.end_ms {
+                    bail!("review_required segment {index} must have a positive source-time span");
+                }
+            }
+            Ok(())
+        }
+        (TranscriptStatus::ReviewRequired, reason) => bail!(
+            "review_required transcript must use quality_evidence_incomplete, not {}",
+            reason.as_str()
+        ),
+        (status, TranscriptOutcomeReason::QualityEvidenceIncomplete) => bail!(
+            "quality_evidence_incomplete is only valid for review_required, not {}",
+            status.as_str()
+        ),
+        _ => Ok(()),
+    }
+}
+
 /// Writes a transcript and its segments, replacing any previous result.
 ///
 /// The header row, the removal of the previous segments and the new segments
 /// are one transaction: a failure part-way through would otherwise leave a
 /// header claiming `speech` above a truncated or empty segment list, which is
-/// indistinguishable downstream from a genuinely short transcript.
+/// indistinguishable downstream from a genuinely short transcript. Validation
+/// happens before the transaction, so an invalid review candidate cannot
+/// replace a previously valid transcript.
 pub fn save_transcript(connection: &Connection, transcript: &StoredTranscript) -> Result<()> {
+    validate_review_required_contract(transcript)?;
     validate_probability_evidence(transcript.mean_token_probability, "transcript header mean")?;
     for (index, segment) in transcript.segments.iter().enumerate() {
         validate_probability_evidence(
@@ -375,6 +425,9 @@ mod tests {
                 TranscriptStatus::NoAcceptedSpeech => TranscriptOutcomeReason::EmptyProviderOutput,
                 TranscriptStatus::Rejected => TranscriptOutcomeReason::QualityRejected,
                 TranscriptStatus::Failed => TranscriptOutcomeReason::ProcessingFailed,
+                TranscriptStatus::ReviewRequired => {
+                    TranscriptOutcomeReason::QualityEvidenceIncomplete
+                }
             },
             reject_reason: String::new(),
             primary_language: "ja".to_string(),
@@ -624,6 +677,111 @@ mod tests {
             save_transcript(&connection, &result).unwrap();
             let loaded = load_transcript(&connection, "a1").unwrap().unwrap();
             assert_eq!(loaded, result);
+        }
+    }
+    #[test]
+    fn review_required_candidates_round_trip_as_terminal_unaccepted_evidence() {
+        let connection = catalog();
+        let mut stored = transcript(
+            TranscriptStatus::ReviewRequired,
+            vec![segment("retained candidate")],
+        );
+        stored.segments[0].mean_token_probability = None;
+        stored.reject_reason = "review_missing_quality_evidence".to_string();
+        save_transcript(&connection, &stored).unwrap();
+
+        assert_eq!(
+            serde_json::to_string(&TranscriptStatus::ReviewRequired).unwrap(),
+            "\"review_required\""
+        );
+        assert_eq!(
+            serde_json::to_string(&TranscriptOutcomeReason::QualityEvidenceIncomplete).unwrap(),
+            "\"quality_evidence_incomplete\""
+        );
+        let loaded = load_transcript(&connection, "a1").unwrap().unwrap();
+        assert_eq!(loaded, stored);
+        assert_eq!(loaded.status, TranscriptStatus::ReviewRequired);
+        assert_eq!(
+            loaded.outcome_reason,
+            TranscriptOutcomeReason::QualityEvidenceIncomplete
+        );
+        assert_eq!(loaded.segments[0].text, "retained candidate");
+        assert_eq!(loaded.segments[0].mean_token_probability, None);
+        let segment_probability: Option<f64> = connection
+            .query_row(
+                "SELECT mean_token_probability FROM transcript_segments
+                 WHERE asset_id = 'a1' AND segment_index = 0",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            segment_probability, None,
+            "review candidate evidence must stay SQL NULL, not confidence zero"
+        );
+
+        assert!(
+            is_current(&connection, "a1", "proxy-fp-1").unwrap(),
+            "a terminal review result is reusable under the same recipe/source"
+        );
+        assert!(
+            !is_current(&connection, "a1", "proxy-fp-2").unwrap(),
+            "a changed source still makes retained candidates stale"
+        );
+
+        stored.recipe_key = "stt.changed-recipe.v2".to_string();
+        save_transcript(&connection, &stored).unwrap();
+        assert!(
+            !is_current(&connection, "a1", "proxy-fp-1").unwrap(),
+            "a changed recipe still makes retained candidates stale"
+        );
+    }
+
+    #[test]
+    fn invalid_review_required_replacement_preserves_previous_header_and_segments() {
+        let connection = catalog();
+        let mut previous = transcript(
+            TranscriptStatus::ReviewRequired,
+            vec![segment("previous candidate")],
+        );
+        previous.segments[0].mean_token_probability = None;
+        save_transcript(&connection, &previous).unwrap();
+        let before = load_transcript(&connection, "a1").unwrap().unwrap();
+
+        let mut wrong_reason = transcript(
+            TranscriptStatus::ReviewRequired,
+            vec![segment("bad candidate")],
+        );
+        wrong_reason.outcome_reason = TranscriptOutcomeReason::Accepted;
+
+        let no_segments = transcript(TranscriptStatus::ReviewRequired, vec![]);
+
+        let empty_text = transcript(TranscriptStatus::ReviewRequired, vec![segment("   ")]);
+
+        let mut invalid_span =
+            transcript(TranscriptStatus::ReviewRequired, vec![segment("bad span")]);
+        invalid_span.segments[0].end_ms = invalid_span.segments[0].start_ms;
+
+        let mut reason_on_other_status =
+            transcript(TranscriptStatus::Speech, vec![segment("wrong owner")]);
+        reason_on_other_status.outcome_reason = TranscriptOutcomeReason::QualityEvidenceIncomplete;
+
+        for bad in [
+            wrong_reason,
+            no_segments,
+            empty_text,
+            invalid_span,
+            reason_on_other_status,
+        ] {
+            assert!(
+                save_transcript(&connection, &bad).is_err(),
+                "invalid review replacement must be rejected"
+            );
+            assert_eq!(
+                load_transcript(&connection, "a1").unwrap().unwrap(),
+                before,
+                "a rejected replacement must not alter the prior artifact"
+            );
         }
     }
 }

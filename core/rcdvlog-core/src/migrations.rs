@@ -7,7 +7,7 @@ use thiserror::Error;
 
 use crate::chronology::forward_migrate_project_chronology;
 
-pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 41;
+pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 42;
 
 const MIGRATION_TABLE_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -329,6 +329,12 @@ pub const PROJECT_CATALOG_MIGRATIONS: &[SqliteMigration] = &[
         name: "nullable_transcript_segment_probability",
         source_identity: "project-catalog/0041-nullable-transcript-segment-probability/20261026",
         apply: make_transcript_segment_probability_nullable,
+    },
+    SqliteMigration {
+        id: 42,
+        name: "review_required_transcript_status",
+        source_identity: "project-catalog/0042-review-required-transcript-status/20261027",
+        apply: add_review_required_transcript_status,
     },
 ];
 
@@ -798,6 +804,53 @@ fn make_transcript_segment_probability_nullable(transaction: &Transaction<'_>) -
         ALTER TABLE transcript_segments_v41 RENAME TO transcript_segments;
         CREATE INDEX IF NOT EXISTS transcript_segments_time
             ON transcript_segments(asset_id, start_ms);
+        "#,
+    )?;
+    Ok(())
+}
+
+/// Migration 42. Admit the explicit human-review transcript status.
+///
+/// SQLite cannot alter a CHECK constraint in place, so rebuild the header table
+/// while copying every historical row and column verbatim. Candidate segments
+/// live in a separate table keyed to the asset and are deliberately untouched;
+/// this rebuild does not clear or reinterpret their evidence. The primary key
+/// and asset foreign key/cascade are recreated exactly.
+fn add_review_required_transcript_status(transaction: &Transaction<'_>) -> Result<()> {
+    transaction.execute_batch(
+        r#"
+        CREATE TABLE asset_transcripts_v42 (
+            asset_id TEXT PRIMARY KEY REFERENCES assets(id) ON DELETE CASCADE,
+            recipe_key TEXT NOT NULL,
+            source_kind TEXT NOT NULL DEFAULT 'proxy',
+            source_fingerprint TEXT NOT NULL,
+            status TEXT NOT NULL CHECK(status IN (
+                'speech','no_speech','no_audio','no_accepted_speech','rejected','failed','review_required'
+            )),
+            outcome_reason TEXT NOT NULL DEFAULT '',
+            reject_reason TEXT NOT NULL DEFAULT '',
+            primary_language TEXT NOT NULL DEFAULT '',
+            speech_seconds REAL NOT NULL DEFAULT 0,
+            window_count INTEGER NOT NULL DEFAULT 0,
+            provider_segment_count INTEGER NOT NULL DEFAULT 0,
+            mean_token_probability REAL,
+            repetition_ratio REAL,
+            created_at TEXT NOT NULL
+        );
+
+        INSERT INTO asset_transcripts_v42
+            (asset_id, recipe_key, source_kind, source_fingerprint, status,
+             outcome_reason, reject_reason, primary_language, speech_seconds,
+             window_count, provider_segment_count, mean_token_probability,
+             repetition_ratio, created_at)
+        SELECT asset_id, recipe_key, source_kind, source_fingerprint, status,
+            outcome_reason, reject_reason, primary_language, speech_seconds,
+            window_count, provider_segment_count, mean_token_probability,
+            repetition_ratio, created_at
+        FROM asset_transcripts;
+
+        DROP TABLE asset_transcripts;
+        ALTER TABLE asset_transcripts_v42 RENAME TO asset_transcripts;
         "#,
     )?;
     Ok(())
@@ -2722,6 +2775,407 @@ mod tests {
             })
             .unwrap();
         assert_eq!(remaining, 0, "the rebuilt child FK must still cascade");
+    }
+
+    #[test]
+    fn migration_42_preserves_v41_transcript_history_and_admits_review_required() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch("PRAGMA foreign_keys = ON;")
+            .unwrap();
+        run_sqlite_migrations(&mut connection, migrations_before_id(42)).unwrap();
+        connection
+            .execute_batch(
+                r#"
+                INSERT INTO projects(id, name, created_at)
+                VALUES ('p1', 'p', '2026-01-01T00:00:00Z');
+                INSERT INTO assets(
+                    id, project_id, fingerprint, path, filename, size_bytes,
+                    duration_seconds, created_at
+                ) VALUES
+                    ('a1','p1','f1','/a1.mp4','a1.mp4',1,2.0,'2026-01-01T00:00:00Z'),
+                    ('a2','p1','f2','/a2.mp4','a2.mp4',1,3.0,'2026-01-01T00:00:00Z'),
+                    ('a3','p1','f3','/a3.mp4','a3.mp4',1,4.0,'2026-01-01T00:00:00Z'),
+                    ('a4','p1','f4','/a4.mp4','a4.mp4',1,5.0,'2026-01-01T00:00:00Z'),
+                    ('a5','p1','f5','/a5.mp4','a5.mp4',1,6.0,'2026-01-01T00:00:00Z'),
+                    ('a6','p1','f6','/a6.mp4','a6.mp4',1,7.0,'2026-01-01T00:00:00Z'),
+                    ('a7','p1','f7','/a7.mp4','a7.mp4',1,8.0,'2026-01-01T00:00:00Z');
+                "#,
+            )
+            .unwrap();
+
+        let cases = [
+            (
+                "a1",
+                "speech",
+                "accepted",
+                "",
+                "en",
+                2.0_f64,
+                1_i64,
+                2_i64,
+                Some(0.365_f64),
+                Some(0.0_f64),
+                "2026-01-01T00:00:01Z",
+                "proxy",
+            ),
+            (
+                "a2",
+                "no_speech",
+                "legacy_no_speech_unverified",
+                "legacy",
+                "",
+                0.0,
+                0,
+                0,
+                None,
+                None,
+                "2026-01-01T00:00:02Z",
+                "proxy",
+            ),
+            (
+                "a3",
+                "no_audio",
+                "no_audio_stream",
+                "",
+                "",
+                0.0,
+                0,
+                0,
+                None,
+                None,
+                "2026-01-01T00:00:03Z",
+                "camera_sidecar",
+            ),
+            (
+                "a4",
+                "no_accepted_speech",
+                "empty_provider_output",
+                "",
+                "ja",
+                3.5,
+                2,
+                4,
+                None,
+                Some(0.25),
+                "2026-01-01T00:00:04Z",
+                "proxy",
+            ),
+            (
+                "a5",
+                "rejected",
+                "quality_rejected",
+                "repetition",
+                "en",
+                4.0,
+                1,
+                3,
+                Some(0.91),
+                Some(0.75),
+                "2026-01-01T00:00:05Z",
+                "proxy",
+            ),
+            (
+                "a6",
+                "failed",
+                "processing_failed",
+                "probe failed",
+                "",
+                0.0,
+                0,
+                0,
+                None,
+                None,
+                "2026-01-01T00:00:06Z",
+                "proxy",
+            ),
+        ];
+        for case in cases {
+            connection
+                .execute(
+                    "INSERT INTO asset_transcripts(
+                        asset_id, recipe_key, source_kind, source_fingerprint, status,
+                        outcome_reason, reject_reason, primary_language, speech_seconds,
+                        window_count, provider_segment_count, mean_token_probability,
+                        repetition_ratio, created_at
+                    ) VALUES (?1, 'stt.test.v1', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                    params![
+                        case.0,
+                        case.11,
+                        format!("fingerprint-{}", case.0),
+                        case.1,
+                        case.2,
+                        case.3,
+                        case.4,
+                        case.5,
+                        case.6,
+                        case.7,
+                        case.8,
+                        case.9,
+                        case.10,
+                    ],
+                )
+                .unwrap();
+        }
+        connection
+            .execute_batch(
+                r#"
+                INSERT INTO transcript_segments(
+                    asset_id, segment_index, start_ms, end_ms, language, text,
+                    mean_token_probability
+                ) VALUES
+                    ('a1', 0, 0, 1000, 'en', 'legacy zero', 0.0),
+                    ('a1', 1, 1000, 2000, 'en', 'legacy unknown', NULL),
+                    ('a2', 0, 0, 500, 'en', 'no speech candidate', 0.42);
+                "#,
+            )
+            .unwrap();
+
+        migrate_project_catalog(&mut connection).unwrap();
+        validate_project_catalog_migrations(&connection).unwrap();
+
+        let header_columns: Vec<String> = connection
+            .prepare("SELECT name FROM pragma_table_info('asset_transcripts')")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            header_columns,
+            vec![
+                "asset_id",
+                "recipe_key",
+                "source_kind",
+                "source_fingerprint",
+                "status",
+                "outcome_reason",
+                "reject_reason",
+                "primary_language",
+                "speech_seconds",
+                "window_count",
+                "provider_segment_count",
+                "mean_token_probability",
+                "repetition_ratio",
+                "created_at",
+            ]
+        );
+
+        #[derive(Debug, PartialEq)]
+        struct HeaderRow {
+            asset_id: String,
+            recipe_key: String,
+            source_kind: String,
+            source_fingerprint: String,
+            status: String,
+            outcome_reason: String,
+            reject_reason: String,
+            primary_language: String,
+            speech_seconds: f64,
+            window_count: i64,
+            provider_segment_count: i64,
+            mean_token_probability: Option<f64>,
+            repetition_ratio: Option<f64>,
+            created_at: String,
+        }
+        let preserved: Vec<HeaderRow> = connection
+            .prepare(
+                "SELECT asset_id, recipe_key, source_kind, source_fingerprint, status,
+                        outcome_reason, reject_reason, primary_language, speech_seconds,
+                        window_count, provider_segment_count, mean_token_probability,
+                        repetition_ratio, created_at
+                 FROM asset_transcripts ORDER BY asset_id",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok(HeaderRow {
+                    asset_id: row.get(0)?,
+                    recipe_key: row.get(1)?,
+                    source_kind: row.get(2)?,
+                    source_fingerprint: row.get(3)?,
+                    status: row.get(4)?,
+                    outcome_reason: row.get(5)?,
+                    reject_reason: row.get(6)?,
+                    primary_language: row.get(7)?,
+                    speech_seconds: row.get(8)?,
+                    window_count: row.get(9)?,
+                    provider_segment_count: row.get(10)?,
+                    mean_token_probability: row.get(11)?,
+                    repetition_ratio: row.get(12)?,
+                    created_at: row.get(13)?,
+                })
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        let expected: Vec<HeaderRow> = cases
+            .iter()
+            .map(|case| HeaderRow {
+                asset_id: case.0.to_string(),
+                recipe_key: "stt.test.v1".to_string(),
+                source_kind: case.11.to_string(),
+                source_fingerprint: format!("fingerprint-{}", case.0),
+                status: case.1.to_string(),
+                outcome_reason: case.2.to_string(),
+                reject_reason: case.3.to_string(),
+                primary_language: case.4.to_string(),
+                speech_seconds: case.5,
+                window_count: case.6,
+                provider_segment_count: case.7,
+                mean_token_probability: case.8,
+                repetition_ratio: case.9,
+                created_at: case.10.to_string(),
+            })
+            .collect();
+        assert_eq!(preserved, expected);
+
+        let preserved_segments: Vec<(String, i64, String, Option<f64>)> = connection
+            .prepare(
+                "SELECT asset_id, segment_index, text, mean_token_probability
+                 FROM transcript_segments ORDER BY asset_id, segment_index",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            preserved_segments,
+            vec![
+                ("a1".to_string(), 0, "legacy zero".to_string(), Some(0.0)),
+                ("a1".to_string(), 1, "legacy unknown".to_string(), None),
+                (
+                    "a2".to_string(),
+                    0,
+                    "no speech candidate".to_string(),
+                    Some(0.42)
+                ),
+            ]
+        );
+
+        let primary_key: (i64, String) = connection
+            .query_row(
+                "SELECT pk, name FROM pragma_table_info('asset_transcripts')
+                 WHERE name = 'asset_id'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(primary_key, (1, "asset_id".to_string()));
+        let header_foreign_key: (String, String, String, String) = connection
+            .query_row(
+                "SELECT \"table\", \"from\", \"to\", on_delete
+                 FROM pragma_foreign_key_list('asset_transcripts')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            header_foreign_key,
+            (
+                "assets".to_string(),
+                "asset_id".to_string(),
+                "id".to_string(),
+                "CASCADE".to_string()
+            )
+        );
+        let segment_foreign_key: (String, String, String, String) = connection
+            .query_row(
+                "SELECT \"table\", \"from\", \"to\", on_delete
+                 FROM pragma_foreign_key_list('transcript_segments')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            segment_foreign_key,
+            (
+                "assets".to_string(),
+                "asset_id".to_string(),
+                "id".to_string(),
+                "CASCADE".to_string()
+            )
+        );
+        let index_sql: String = connection
+            .query_row(
+                "SELECT sql FROM sqlite_master
+                 WHERE type = 'index' AND name = 'transcript_segments_time'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(index_sql.contains("ON transcript_segments(asset_id, start_ms)"));
+
+        assert!(
+            connection
+                .execute(
+                    "INSERT INTO asset_transcripts(
+                        asset_id, recipe_key, source_kind, source_fingerprint, status,
+                        outcome_reason, created_at
+                    ) VALUES ('a7','stt.review.v1','proxy','review-source','banana',
+                              'quality_evidence_incomplete','2026-01-01T00:00:07Z')",
+                    [],
+                )
+                .is_err(),
+            "the rebuilt CHECK constraint must reject a bogus status"
+        );
+        connection
+            .execute(
+                "INSERT INTO asset_transcripts(
+                    asset_id, recipe_key, source_kind, source_fingerprint, status,
+                    outcome_reason, primary_language, speech_seconds, window_count,
+                    provider_segment_count, created_at
+                ) VALUES ('a7','stt.review.v1','proxy','review-source','review_required',
+                          'quality_evidence_incomplete','en',2.0,1,2,
+                          '2026-01-01T00:00:07Z')",
+                [],
+            )
+            .unwrap();
+        let review: (String, String) = connection
+            .query_row(
+                "SELECT status, outcome_reason FROM asset_transcripts WHERE asset_id = 'a7'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            review,
+            (
+                "review_required".to_string(),
+                "quality_evidence_incomplete".to_string()
+            )
+        );
+
+        connection
+            .execute("DELETE FROM assets WHERE id = 'a1'", [])
+            .unwrap();
+        let removed_headers: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM asset_transcripts WHERE asset_id = 'a1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let removed_segments: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM transcript_segments WHERE asset_id = 'a1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(removed_headers, 0, "the rebuilt header FK must cascade");
+        assert_eq!(removed_segments, 0, "child segments must still cascade");
+        let remaining_segments: i64 = connection
+            .query_row("SELECT COUNT(*) FROM transcript_segments", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            remaining_segments, 1,
+            "unrelated segment history must remain"
+        );
     }
 
     #[test]

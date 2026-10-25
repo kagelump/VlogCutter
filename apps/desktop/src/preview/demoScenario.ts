@@ -332,3 +332,37 @@ export function scaleScenario(clips: number): ScenarioBuilder {
     state.mediaOrigin = null;
   });
 }
+
+/**
+ * An isolated synthetic scenario for the canonical review-required transcript
+ * display. This is reached only with the explicit `?review=required` preview
+ * switch; it changes no default demo data and proves display only.
+ */
+export function reviewRequiredScenario(): ScenarioBuilder {
+  const assetId = "asset_sony_a7c_ii_001";
+  return desktopScenario({ now: "2026-08-09T12:00:00.000Z" })
+    .project("Synthetic transcript review fixture", {
+      id: "project_transcript_review_fixture",
+      createdAt: "2026-08-01T09:00:00.000Z",
+    })
+    .camera("Sony A7C II", {
+      clips: 1,
+      startAt: "2026-02-08T00:14:08.000Z",
+      durationSeconds: 18.4,
+      withProxy: true,
+    })
+    .withTranscript(assetId, {
+      status: "review_required",
+      outcomeReason: "quality_evidence_incomplete",
+      language: "en",
+      speechSeconds: 6.5,
+      meanTokenProbability: null,
+      repetitionRatio: null,
+      segmentMeanTokenProbability: null,
+      segments: [
+        { startMs: 1_200, text: "Synthetic candidate: the train slows along the platform." },
+        { startMs: 6_500, text: "Synthetic candidate: someone asks where the market is." },
+      ],
+    })
+    .selectedClip(assetId);
+}

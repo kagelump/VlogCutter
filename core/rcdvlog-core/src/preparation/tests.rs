@@ -770,6 +770,81 @@ fn cancellation_resumes_only_missing_transcript_work_and_busy_proxy_is_skipped()
 }
 
 #[test]
+fn review_required_transcript_exposes_safe_quality_evidence_without_candidate_text() {
+    if !media_tools_available() {
+        eprintln!("skipping generated preparation review fixture: ffmpeg/ffprobe unavailable");
+        return;
+    }
+    let (directory, catalog, project_id) = fixture();
+    make_asset(&catalog, &project_id, directory.path(), "review", 2, true);
+    let fingerprint = catalog.proxy_fingerprint("review").unwrap();
+    save_transcript(
+        &catalog.connection().unwrap(),
+        &StoredTranscript {
+            asset_id: "review".into(),
+            recipe_key: crate::STT_RECIPE_KEY.into(),
+            source_fingerprint: fingerprint,
+            status: TranscriptStatus::ReviewRequired,
+            outcome_reason:
+                crate::analysis::store::TranscriptOutcomeReason::QualityEvidenceIncomplete,
+            reject_reason: "review_missing_quality_evidence".into(),
+            primary_language: "en".into(),
+            speech_seconds: 2.0,
+            window_count: 1,
+            provider_segment_count: 2,
+            mean_token_probability: None,
+            repetition_ratio: None,
+            segments: vec![
+                DecodedSegment {
+                    start_ms: 0,
+                    end_ms: 1_000,
+                    language: "en".into(),
+                    text: "REVIEW_CANDIDATE_CANARY_ONE".into(),
+                    mean_token_probability: None,
+                },
+                DecodedSegment {
+                    start_ms: 1_000,
+                    end_ms: 2_000,
+                    language: "en".into(),
+                    text: "REVIEW_CANDIDATE_CANARY_TWO".into(),
+                    mean_token_probability: None,
+                },
+            ],
+        },
+    )
+    .unwrap();
+
+    let manifest = catalog
+        .preparation_preflight(&scope(&project_id, &["review"]), 0, 10)
+        .unwrap();
+    let transcript = &manifest.items[0].transcript;
+    assert_eq!(transcript.status.as_deref(), Some("review_required"));
+    assert_eq!(
+        transcript.outcome_reason.as_deref(),
+        Some("quality_evidence_incomplete")
+    );
+    assert_eq!(
+        transcript.readiness.state,
+        PreparationState::ReviewRequired,
+        "retained review candidates must never be reported as ready/accepted"
+    );
+    assert_eq!(transcript.segment_count, 2);
+    assert_eq!(transcript.speech_seconds, Some(2.0));
+    assert_eq!(transcript.provider_segment_count, Some(2));
+    assert_eq!(transcript.window_count, Some(1));
+    let reason = transcript.readiness.reasons.join(" ");
+    assert!(
+        reason.contains("quality evidence is incomplete"),
+        "{reason}"
+    );
+    assert!(reason.contains("2 timed candidate segments"), "{reason}");
+    assert!(
+        !reason.contains("REVIEW_CANDIDATE_CANARY"),
+        "reason leaked text"
+    );
+}
+
+#[test]
 fn legacy_no_speech_is_review_required_rather_than_verified_silence() {
     if !media_tools_available() {
         eprintln!("skipping generated preparation legacy fixture: ffmpeg/ffprobe unavailable");

@@ -565,6 +565,8 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .shelf-toggle:hover { color: var(--ink); }
 .shelf-pane { height: 246px; padding: 12px; overflow-y: auto; }
 .pane-empty { margin: 0; color: var(--quiet); font-size: 13px; }
+.transcript-review-warning { margin: 0 0 8px; padding: 7px 9px; color: #f0d6a8; background: #2c2418; border-left: 2px solid var(--amber); font-size: 12px; line-height: 17px; }
+.transcript-review-warning strong { color: #ffe4b3; }
 .segment-list { margin: 0; padding: 0; list-style: none; }
 .segment { display: grid; grid-template-columns: 44px minmax(0, 1fr); align-items: baseline; gap: 8px; width: 100%; height: 22px; padding: 0; color: var(--ink); background: transparent; border: 0; cursor: pointer; text-align: left; font-size: 13px; }
 .segment:hover { color: var(--amber); }

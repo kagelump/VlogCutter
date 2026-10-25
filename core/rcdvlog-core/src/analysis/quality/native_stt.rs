@@ -24,10 +24,10 @@
 //!   only missing or partial comparable evidence was supplied, the result is
 //!   [`NativeSttQualityDecision::ReviewRequired`] and remains unaccepted.
 //!
-//! `ReviewRequired` retains candidate text solely so a human can review it in a
-//! future adapter. It is not a canonical transcript status and must not be
-//! persisted or shown as accepted speech until future status/provenance wiring
-//! defines that contract.
+//! `ReviewRequired` retains candidate text solely so a human can review it.
+//! Canonical persistence now has a distinct review-required status contract, but
+//! this pure evaluator still does not write it or enable native execution; the
+//! candidates remain unaccepted and must not be shown as accepted speech.
 
 use crate::analysis::openrouter_stt::{
     NativeSttAudioWindow, NativeSttSegment, NativeSttTranscript,

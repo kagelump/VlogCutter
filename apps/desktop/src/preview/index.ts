@@ -17,7 +17,7 @@
  */
 
 import { DesktopHarness } from "../test/harness/DesktopHarness";
-import { previewScenario, scaleScenario } from "./demoScenario";
+import { previewScenario, reviewRequiredScenario, scaleScenario } from "./demoScenario";
 import { previewConvertFileSrc } from "./previewFrames";
 import { startPreviewJobs } from "./liveJobs";
 
@@ -44,17 +44,27 @@ function requestedClipCount(search: string): number | null {
   return Number.isInteger(clips) && clips > 0 && clips <= 20_000 ? clips : null;
 }
 
+function requestedReviewFixture(search: string): boolean {
+  return new URLSearchParams(search).get("review") === "required";
+}
+
 export function installPreviewBackend(): DesktopHarness {
   const clips = typeof window === "undefined" ? null : requestedClipCount(window.location.search);
-  const scenario = clips === null ? previewScenario() : scaleScenario(clips);
+  const reviewFixture =
+    typeof window !== "undefined" && requestedReviewFixture(window.location.search);
+  const scenario = reviewFixture
+    ? reviewRequiredScenario()
+    : clips === null
+      ? previewScenario()
+      : scaleScenario(clips);
   const harness = scenario.build({ convertFileSrc: previewConvertFileSrc });
   harness.install();
-  // The demo's live jobs are staged against the demo's clips; a scale run is
-  // about mounting cost and would only be measuring the job timer.
-  if (clips === null) startPreviewJobs(harness);
+  // The demo's live jobs are staged against the demo's clips; a scale or
+  // isolated review fixture is about its declared state, not the job timer.
+  if (!reviewFixture && clips === null) startPreviewJobs(harness);
   window.__RCDVLOG_PREVIEW__ = harness;
   return harness;
 }
 
-export { previewScenario, scaleScenario } from "./demoScenario";
-export { requestedClipCount };
+export { previewScenario, reviewRequiredScenario, scaleScenario } from "./demoScenario";
+export { requestedClipCount, requestedReviewFixture };

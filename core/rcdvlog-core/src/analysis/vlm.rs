@@ -387,6 +387,14 @@ mod tests {
     }
 
     #[test]
+    fn a_review_required_transcript_is_never_included() {
+        assert!(
+            !build_prompt(&context(TranscriptStatus::ReviewRequired))
+                .contains("spoken secret phrase")
+        );
+    }
+
+    #[test]
     fn the_existing_vocabulary_is_offered_to_the_model() {
         assert!(build_prompt(&context(TranscriptStatus::NoSpeech)).contains("exhibition"));
     }

@@ -185,7 +185,8 @@ probability gate:
   `avg_logprob`, all segment confidence, or full-transcript confidence) before
   output can be accepted. Missing or partial comparable evidence produces
   `review_required`, retaining mapped candidates for human review only. That
-  decision is **unaccepted** and has no canonical persistence/status wiring yet.
+  decision is **unaccepted**; the canonical status contract below can retain it
+  for a human, but native execution and provider dispatch are not wired.
 
 Provider confidence, word confidence and `avg_logprob` are uncalibrated native
 heuristics, not arithmetic mean token probability. No native value is copied or
@@ -203,6 +204,23 @@ This slice adds no SQLite schema/status/provenance fields, no pilot/bulk/CLI or
 desktop execution, no native accounting/authorization, no VAD readiness or
 credential changes, and no retry/cancellation behavior. Those remain later
 integration work before issue #119 can close.
+
+**C3 canonical review-required transcript status (no native execution).**
+Transcript persistence now has a distinct `ReviewRequired` status serialized as
+`review_required`, paired with `QualityEvidenceIncomplete` serialized as
+`quality_evidence_incomplete`. It means timed provider candidate text was
+retained because comparable quality evidence was absent or incomplete; the
+candidates are unaccepted, are not counted as speech/rejection/silence/failure,
+and are excluded from AI prompt context and run-policy transcript scope. They
+remain visible and seekable in the human review surface. Migration 42 extends
+the existing `asset_transcripts` status CHECK while rebuilding the header table
+transactionally and preserving every historical header, segment, nullable
+probability, key, foreign key and index. The existing atomic replacement and
+source/recipe currentness owners are reused: a terminal review candidate is
+reused under the same source and recipe, changed identity makes it stale, and
+force alone is not paid-retry authorization. This slice still performs no cloud
+call, credential resolution, VAD execution, native accounting, provenance,
+provider/model selection, automatic retry or manual acceptance override.
 
 **Batch estimation, two-phase.** VAD sweeps the whole project first — at RTF
 0.0019 this is effectively free — which yields exact 30-second window counts.

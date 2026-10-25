@@ -16,6 +16,7 @@ export const transcriptStatusLabels: Record<TranscriptStatus, string> = {
   no_accepted_speech: "Speech detected, no accepted transcript",
   rejected: "Discarded as unreliable",
   failed: "Transcription failed",
+  review_required: "Review required — quality evidence incomplete",
 };
 
 export function formatBytes(bytes: number) {
@@ -28,6 +29,10 @@ export function transcriptSummary(transcript: ClipTranscript | null): string {
   if (!transcript) return "Not transcribed";
 
   const label = transcriptStatusLabels[transcript.status];
+  if (transcript.status === "review_required") {
+    const count = transcript.segments.length;
+    return `${label} · ${count} candidate segment${count === 1 ? "" : "s"} retained, not accepted`;
+  }
   if (transcript.status !== "speech") {
     const reason = transcript.rejectReason.trim();
     return reason ? `${label} · ${reason}` : label;

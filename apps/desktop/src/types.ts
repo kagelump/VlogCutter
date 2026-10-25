@@ -184,7 +184,8 @@ export type TranscriptStatus =
   | "no_audio"
   | "no_accepted_speech"
   | "rejected"
-  | "failed";
+  | "failed"
+  | "review_required";
 
 export type TranscriptOutcomeReason =
   | "accepted"
@@ -193,7 +194,8 @@ export type TranscriptOutcomeReason =
   | "empty_provider_output"
   | "quality_rejected"
   | "processing_failed"
-  | "legacy_no_speech_unverified";
+  | "legacy_no_speech_unverified"
+  | "quality_evidence_incomplete";
 
 export type CameraMovement = "static" | "pan" | "tilt" | "handheld" | "tracking" | "zoom" | "other";
 
@@ -220,6 +222,8 @@ export interface ClipTranscript {
    * Terminal outcome. `no_speech` means the VAD gate ran and found no speech;
    * `no_audio` means the media had no audio stream; `no_accepted_speech` means
    * speech was detected but the provider returned no usable output.
+   * `review_required` retains timed candidate text with incomplete quality
+   * evidence for human review only; it is not accepted speech.
    */
   status: TranscriptStatus;
   outcomeReason: TranscriptOutcomeReason;
