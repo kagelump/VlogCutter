@@ -204,7 +204,12 @@ export interface TranscriptSegment {
   endMs: number;
   language: string;
   text: string;
-  meanTokenProbability: number;
+  /**
+   * Observed arithmetic mean token probability from the local decoder, or
+   * `null` when comparable token evidence is absent. `null` is not confidence
+   * zero/one and must not be rendered or compared as one.
+   */
+  meanTokenProbability: number | null;
 }
 
 export interface ClipTranscript {

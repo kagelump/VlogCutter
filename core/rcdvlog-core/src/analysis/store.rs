@@ -126,11 +126,25 @@ pub struct StoredTranscript {
     /// the quality gate. Together with `window_count`, this is the provider
     /// evidence a caller needs to judge whether targeted recovery is useful.
     pub provider_segment_count: u32,
-    /// Quality evidence computed on the candidate segments. `None` means there
-    /// were no candidate segments to measure.
+    /// Quality evidence computed on the candidate segments. `None` means the
+    /// measurement is absent: either there were no candidate segments, or one
+    /// or more candidates lacked comparable token-probability evidence. It is
+    /// never a fabricated zero/one confidence.
     pub mean_token_probability: Option<f32>,
     pub repetition_ratio: Option<f32>,
     pub segments: Vec<DecodedSegment>,
+}
+
+/// Reject malformed confidence evidence before it can be stored as if measured.
+fn validate_probability_evidence(value: Option<f32>, label: &str) -> Result<()> {
+    if let Some(probability) = value
+        && (!probability.is_finite() || !(0.0..=1.0).contains(&probability))
+    {
+        bail!(
+            "{label} token probability must be finite and in [0, 1] when present; got {probability}"
+        );
+    }
+    Ok(())
 }
 
 /// Writes a transcript and its segments, replacing any previous result.
@@ -140,6 +154,14 @@ pub struct StoredTranscript {
 /// header claiming `speech` above a truncated or empty segment list, which is
 /// indistinguishable downstream from a genuinely short transcript.
 pub fn save_transcript(connection: &Connection, transcript: &StoredTranscript) -> Result<()> {
+    validate_probability_evidence(transcript.mean_token_probability, "transcript header mean")?;
+    for (index, segment) in transcript.segments.iter().enumerate() {
+        validate_probability_evidence(
+            segment.mean_token_probability,
+            &format!("segment {index} mean"),
+        )?;
+    }
+
     let now = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
     let transaction = connection.unchecked_transaction()?;
     let connection = &transaction;
@@ -268,7 +290,7 @@ pub fn load_transcript(
                 end_ms: row.get::<_, i64>(1)? as u32,
                 language: row.get(2)?,
                 text: row.get(3)?,
-                mean_token_probability: row.get::<_, f64>(4)? as f32,
+                mean_token_probability: row.get::<_, Option<f64>>(4)?.map(|value| value as f32),
             })
         })?
         .collect::<rusqlite::Result<Vec<DecodedSegment>>>()?;
@@ -371,7 +393,7 @@ mod tests {
             end_ms: 4_000,
             language: "ja".to_string(),
             text: text.to_string(),
-            mean_token_probability: 0.73,
+            mean_token_probability: Some(0.73),
         }
     }
 
@@ -385,7 +407,52 @@ mod tests {
         assert_eq!(loaded.segments.len(), 1);
         assert_eq!(loaded.segments[0].text, "次は新大阪です");
         assert_eq!(loaded.segments[0].start_ms, 1_000);
-        assert!((loaded.segments[0].mean_token_probability - 0.73).abs() < 1e-6);
+        assert_eq!(loaded.segments[0].mean_token_probability, Some(0.73));
+    }
+
+    #[test]
+    fn unknown_segment_probability_round_trips_as_sql_null() {
+        let connection = catalog();
+        let mut stored = transcript(TranscriptStatus::Speech, vec![segment("unknown")]);
+        stored.segments[0].mean_token_probability = None;
+        save_transcript(&connection, &stored).unwrap();
+
+        let loaded = load_transcript(&connection, "a1").unwrap().unwrap();
+        assert_eq!(loaded.segments[0].mean_token_probability, None);
+        let sql_value: Option<f64> = connection
+            .query_row(
+                "SELECT mean_token_probability FROM transcript_segments
+                 WHERE asset_id = 'a1' AND segment_index = 0",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(sql_value, None, "absence must be stored as SQL NULL");
+    }
+
+    #[test]
+    fn invalid_probability_does_not_replace_a_previous_valid_transcript() {
+        let connection = catalog();
+        let mut previous = transcript(TranscriptStatus::Speech, vec![segment("valid")]);
+        previous.mean_token_probability = Some(0.73);
+        save_transcript(&connection, &previous).unwrap();
+        let before = load_transcript(&connection, "a1").unwrap().unwrap();
+
+        for invalid in [f32::NAN, f32::INFINITY, -0.1, 1.1] {
+            let mut bad = transcript(TranscriptStatus::Speech, vec![segment("bad")]);
+            bad.mean_token_probability = Some(0.73);
+            bad.segments[0].mean_token_probability = Some(invalid);
+            assert!(
+                save_transcript(&connection, &bad).is_err(),
+                "segment probability {invalid} must be rejected"
+            );
+            assert_eq!(load_transcript(&connection, "a1").unwrap().unwrap(), before);
+        }
+
+        let mut bad_header = transcript(TranscriptStatus::Speech, vec![segment("bad")]);
+        bad_header.mean_token_probability = Some(1.5);
+        assert!(save_transcript(&connection, &bad_header).is_err());
+        assert_eq!(load_transcript(&connection, "a1").unwrap().unwrap(), before);
     }
 
     #[test]
@@ -472,8 +539,14 @@ mod tests {
     #[test]
     fn a_transcript_from_a_different_proxy_is_stale() {
         let connection = catalog();
-        save_transcript(&connection, &transcript(TranscriptStatus::Speech, vec![])).unwrap();
+        save_transcript(
+            &connection,
+            &transcript(TranscriptStatus::Speech, vec![segment("known")]),
+        )
+        .unwrap();
         assert!(is_current(&connection, "a1", "proxy-fp-1").unwrap());
+        let loaded = load_transcript(&connection, "a1").unwrap().unwrap();
+        assert_eq!(loaded.segments[0].mean_token_probability, Some(0.73));
         // The proxy was regenerated, so its fingerprint changed.
         assert!(!is_current(&connection, "a1", "proxy-fp-2").unwrap());
     }
@@ -502,5 +575,55 @@ mod tests {
         let loaded = load_transcript(&connection, "a1").unwrap().unwrap();
         assert_eq!(loaded.status, TranscriptStatus::Rejected);
         assert_eq!(loaded.reject_reason, "repetition");
+    }
+    #[test]
+    fn malformed_probability_rejections_remain_persistable_terminal_outcomes() {
+        use crate::analysis::engine::SttEngine;
+        use crate::analysis::windows::{PackedWindow, SpeechRegion};
+        struct InvalidProbabilityEngine(f32);
+        impl SttEngine for InvalidProbabilityEngine {
+            fn detect_speech(&self, _pcm: &[f32]) -> Result<Vec<SpeechRegion>> {
+                Ok(vec![SpeechRegion {
+                    start_ms: 0,
+                    end_ms: 1_000,
+                }])
+            }
+            fn decode_window(
+                &self,
+                _pcm: &[f32],
+                _window: &PackedWindow,
+            ) -> Result<Vec<DecodedSegment>> {
+                Ok(vec![DecodedSegment {
+                    start_ms: 0,
+                    end_ms: 1_000,
+                    language: "en".into(),
+                    text: "unusable candidate".into(),
+                    mean_token_probability: Some(self.0),
+                }])
+            }
+        }
+        let connection = catalog();
+        for probability in [f32::NAN, f32::INFINITY, -0.1, 1.1] {
+            let result = crate::analysis::stt::transcribe_pcm(
+                &InvalidProbabilityEngine(probability),
+                "a1",
+                "proxy-fp-invalid",
+                &[],
+            )
+            .unwrap();
+            assert_eq!(result.status, TranscriptStatus::Rejected);
+            assert_eq!(
+                result.outcome_reason,
+                TranscriptOutcomeReason::QualityRejected
+            );
+            assert_eq!(result.reject_reason, "invalid_probability_evidence");
+            assert_eq!(result.mean_token_probability, None);
+            assert_eq!(result.provider_segment_count, 1);
+            assert_eq!(result.speech_seconds, 1.0);
+            assert!(result.segments.is_empty());
+            save_transcript(&connection, &result).unwrap();
+            let loaded = load_transcript(&connection, "a1").unwrap().unwrap();
+            assert_eq!(loaded, result);
+        }
     }
 }

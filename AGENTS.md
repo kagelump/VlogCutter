@@ -669,6 +669,11 @@ touches the network. Design and measurements:
   Quality-gate rejections remain `rejected`; exact proxy fingerprints,
   detected-speech duration, decode-window count, raw provider segment count,
   mean token probability and repetition ratio stay attached to the outcome.
+  Token probability is optional and stored as SQL NULL when a candidate has no
+  comparable measurement; missing evidence is rejected explicitly rather than
+  invented as confidence 0 or 1. Provider confidence and average log
+  probability are different native metrics and must not be relabelled as a
+  mean token probability.
 - **Legacy compatibility is explicit.** Rows written before audio probing and
   provider-output distinctions existed keep status `no_speech` but migrate with
   reason `legacy_no_speech_unverified`. Preparation marks those rows
@@ -679,8 +684,12 @@ touches the network. Design and measurements:
   not reintroduce the PRD's 8–25 second chunking: measured, it ran 30% slower on
   39% less audio.
 - **Do not use `no_speech_probability()`** as a quality gate. Measured median
-  0.000 for good and bad transcripts alike. The gate that works is
-  `repetition_ratio >= 0.3 OR mean_token_probability < 0.20`.
+  0.000 for good and bad transcripts alike. The local gate that works is
+  repetition at `>= 0.3` or a known token-probability mean below `0.20`.
+  Non-empty candidate output with any missing probability evidence is rejected
+  as `missing_probability_evidence`; malformed provided values are rejected as
+  `invalid_probability_evidence`. Unknown evidence must not dilute a known bad
+  mean into a pass.
 - **A batch never downloads a model.** It fails with an actionable error naming
   the file, its size, and where it belongs. Installation is a separate, explicit
   user action: global settings and CLI `models install` share

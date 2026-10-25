@@ -7,7 +7,7 @@ use thiserror::Error;
 
 use crate::chronology::forward_migrate_project_chronology;
 
-pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 40;
+pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 41;
 
 const MIGRATION_TABLE_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -323,6 +323,12 @@ pub const PROJECT_CATALOG_MIGRATIONS: &[SqliteMigration] = &[
         name: "analysis_run_accounting_contract",
         source_identity: "project-catalog/0040-analysis-run-accounting-contract/20261025",
         apply: add_analysis_run_accounting_contract,
+    },
+    SqliteMigration {
+        id: 41,
+        name: "nullable_transcript_segment_probability",
+        source_identity: "project-catalog/0041-nullable-transcript-segment-probability/20261026",
+        apply: make_transcript_segment_probability_nullable,
     },
 ];
 
@@ -758,6 +764,40 @@ fn add_analysis_run_accounting_contract(transaction: &Transaction<'_>) -> Result
         BEGIN
             SELECT RAISE(ABORT, 'analysis untracked usage evidence is append-only');
         END;
+        "#,
+    )?;
+    Ok(())
+}
+
+/// Migration 41. Preserve an absent token-probability measurement as SQL NULL.
+///
+/// SQLite cannot remove a NOT NULL constraint in place, so rebuild the segment
+/// table while copying every row verbatim. Historic numeric values (including
+/// legacy zeroes) remain unchanged; their provenance is not guessed. The child
+/// foreign key, composite primary key, and time index are recreated.
+fn make_transcript_segment_probability_nullable(transaction: &Transaction<'_>) -> Result<()> {
+    transaction.execute_batch(
+        r#"
+        CREATE TABLE transcript_segments_v41 (
+            asset_id TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+            segment_index INTEGER NOT NULL,
+            start_ms INTEGER NOT NULL,
+            end_ms INTEGER NOT NULL,
+            language TEXT NOT NULL DEFAULT '',
+            text TEXT NOT NULL,
+            mean_token_probability REAL,
+            PRIMARY KEY(asset_id, segment_index)
+        );
+
+        INSERT INTO transcript_segments_v41
+            (asset_id, segment_index, start_ms, end_ms, language, text, mean_token_probability)
+        SELECT asset_id, segment_index, start_ms, end_ms, language, text, mean_token_probability
+        FROM transcript_segments;
+
+        DROP TABLE transcript_segments;
+        ALTER TABLE transcript_segments_v41 RENAME TO transcript_segments;
+        CREATE INDEX IF NOT EXISTS transcript_segments_time
+            ON transcript_segments(asset_id, start_ms);
         "#,
     )?;
     Ok(())
@@ -2550,6 +2590,138 @@ mod tests {
             )
             .unwrap();
         assert_eq!(trigger_count, 1);
+    }
+
+    #[test]
+    fn migration_41_preserves_v40_segment_rows_and_makes_probability_nullable() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch("PRAGMA foreign_keys = ON;")
+            .unwrap();
+        run_sqlite_migrations(&mut connection, migrations_before_id(41)).unwrap();
+        connection
+            .execute_batch(
+                r#"
+                INSERT INTO projects(id, name, created_at)
+                VALUES ('p1', 'p', '2026-01-01T00:00:00Z');
+                INSERT INTO assets(
+                    id, project_id, fingerprint, path, filename, size_bytes,
+                    duration_seconds, created_at
+                ) VALUES (
+                    'a1', 'p1', 'fp', '/clip.mp4', 'clip.mp4', 1, 2.0,
+                    '2026-01-01T00:00:00Z'
+                );
+                INSERT INTO asset_transcripts(
+                    asset_id, recipe_key, source_kind, source_fingerprint, status,
+                    outcome_reason, reject_reason, primary_language, speech_seconds,
+                    window_count, provider_segment_count, mean_token_probability,
+                    repetition_ratio, created_at
+                ) VALUES (
+                    'a1', 'stt.test.v1', 'proxy', 'proxy-fp', 'speech', 'accepted',
+                    '', 'en', 2.0, 1, 2, 0.365, 0.0, '2026-01-01T00:00:00Z'
+                );
+                INSERT INTO transcript_segments(
+                    asset_id, segment_index, start_ms, end_ms, language, text,
+                    mean_token_probability
+                ) VALUES
+                    ('a1', 0, 0, 1000, 'en', 'legacy zero', 0.0),
+                    ('a1', 1, 1000, 2000, 'en', 'legacy known', 0.73);
+                "#,
+            )
+            .unwrap();
+
+        migrate_project_catalog(&mut connection).unwrap();
+        validate_project_catalog_migrations(&connection).unwrap();
+
+        let probability_column: (String, i64, Option<String>) = connection
+            .query_row(
+                r#"SELECT name, "notnull", dflt_value
+                   FROM pragma_table_info('transcript_segments')
+                   WHERE name = 'mean_token_probability'"#,
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            probability_column,
+            ("mean_token_probability".to_string(), 0, None)
+        );
+
+        let preserved: Vec<(String, i64, String, Option<f64>)> = connection
+            .prepare(
+                "SELECT asset_id, segment_index, text, mean_token_probability
+                 FROM transcript_segments ORDER BY segment_index",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            preserved,
+            vec![
+                ("a1".to_string(), 0, "legacy zero".to_string(), Some(0.0)),
+                ("a1".to_string(), 1, "legacy known".to_string(), Some(0.73)),
+            ]
+        );
+
+        let foreign_key: (String, String, String, String) = connection
+            .query_row(
+                r#"SELECT "table", "from", "to", on_delete
+                   FROM pragma_foreign_key_list('transcript_segments')"#,
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            foreign_key,
+            (
+                "assets".to_string(),
+                "asset_id".to_string(),
+                "id".to_string(),
+                "CASCADE".to_string()
+            )
+        );
+        let index_sql: String = connection
+            .query_row(
+                "SELECT sql FROM sqlite_master
+                 WHERE type = 'index' AND name = 'transcript_segments_time'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(index_sql.contains("ON transcript_segments(asset_id, start_ms)"));
+
+        connection
+            .execute(
+                "INSERT INTO transcript_segments(
+                    asset_id, segment_index, start_ms, end_ms, language, text,
+                    mean_token_probability
+                ) VALUES ('a1', 2, 2000, 3000, 'en', 'unknown', NULL)",
+                [],
+            )
+            .unwrap();
+        let unknown: Option<f64> = connection
+            .query_row(
+                "SELECT mean_token_probability FROM transcript_segments
+                 WHERE asset_id = 'a1' AND segment_index = 2",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(unknown, None);
+
+        connection
+            .execute("DELETE FROM assets WHERE id = 'a1'", [])
+            .unwrap();
+        let remaining: i64 = connection
+            .query_row("SELECT COUNT(*) FROM transcript_segments", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(remaining, 0, "the rebuilt child FK must still cascade");
     }
 
     #[test]

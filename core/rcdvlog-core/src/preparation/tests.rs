@@ -377,21 +377,21 @@ fn all_asset_and_transcript_pages_are_bounded_and_long_text_is_marked() {
             end_ms: 200,
             language: "ja".into(),
             text: "a".repeat(5_000),
-            mean_token_probability: 0.9,
+            mean_token_probability: Some(0.9),
         },
         DecodedSegment {
             start_ms: 300,
             end_ms: 400,
             language: "ja".into(),
             text: "second".into(),
-            mean_token_probability: 0.9,
+            mean_token_probability: Some(0.9),
         },
         DecodedSegment {
             start_ms: 500,
             end_ms: 600,
             language: "ja".into(),
             text: "third".into(),
-            mean_token_probability: 0.9,
+            mean_token_probability: Some(0.9),
         },
     ];
     save_transcript(
@@ -651,7 +651,7 @@ fn cached_transcript_past_validated_proxy_end_requires_review_without_retranscri
                 end_ms: 2_050,
                 language: "en".into(),
                 text: "beyond validated proxy end".into(),
-                mean_token_probability: 0.9,
+                mean_token_probability: Some(0.9),
             }],
         },
     )
@@ -1056,7 +1056,7 @@ fn changing_only_unsampled_proxy_bytes_invalidates_full_decode_and_transcript_bi
             end_ms: 750,
             language: "ja".into(),
             text: "known transcript for the padded proxy".into(),
-            mean_token_probability: 0.9,
+            mean_token_probability: Some(0.9),
         }],
     };
     save_transcript(&catalog.connection().unwrap(), &transcript).unwrap();
@@ -1270,4 +1270,43 @@ fn unversioned_catalog_replay_preserves_preparation_receipt_rows() {
         .unwrap();
     assert_eq!(count, 1);
     assert_eq!(body, saved_body);
+}
+
+#[test]
+fn known_probability_hash_material_preserves_existing_artifact_fingerprint_inputs() {
+    let old_segment_material = serde_json::to_vec(&(
+        100_u32,
+        200_u32,
+        "ja".to_string(),
+        "known".to_string(),
+        0.73_f64,
+    ))
+    .unwrap();
+    let new_segment_material = serde_json::to_vec(&(
+        100_u32,
+        200_u32,
+        "ja".to_string(),
+        "known".to_string(),
+        Some(0.73_f64),
+    ))
+    .unwrap();
+    assert_eq!(
+        old_segment_material, new_segment_material,
+        "a known numeric measurement must serialize byte-identically so existing bindings stay current"
+    );
+
+    let unknown_segment_material = serde_json::to_vec(&(
+        100_u32,
+        200_u32,
+        "ja".to_string(),
+        "unknown".to_string(),
+        Option::<f64>::None,
+    ))
+    .unwrap();
+    assert!(
+        std::str::from_utf8(&unknown_segment_material)
+            .unwrap()
+            .ends_with("null]"),
+        "an absent measurement must hash distinctly as null"
+    );
 }

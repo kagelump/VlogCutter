@@ -1502,7 +1502,7 @@ mod tests {
             end_ms: start_ms + 100,
             language: "en".into(),
             text: "same hallucinated line".into(),
-            mean_token_probability: 0.7,
+            mean_token_probability: Some(0.7),
         };
         let repeated = (0..6).map(|index| repeat(index * 100)).collect();
         let script = vec![
@@ -1514,14 +1514,14 @@ mod tests {
                 end_ms: 900,
                 language: "en".into(),
                 text: "uncertain".into(),
-                mean_token_probability: 0.1,
+                mean_token_probability: Some(0.1),
             }]),
             ScriptedResponse::Decode(vec![DecodedSegment {
                 start_ms: 0,
                 end_ms: 900,
                 language: "en".into(),
                 text: "accepted speech".into(),
-                mean_token_probability: 0.9,
+                mean_token_probability: Some(0.9),
             }]),
         ];
         let detects = Arc::new(AtomicUsize::new(0));
