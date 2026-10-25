@@ -122,25 +122,48 @@ models; provisioning remains explicit.
 ### Speech model management
 
 ```bash
+# Existing local/offline default: ASR + Silero VAD.
 rcdvlog --catalog /absolute/project/catalog.sqlite3 models status
 rcdvlog --catalog /absolute/project/catalog.sqlite3 models install
+
+# Explicit native backend: only Silero VAD is local. Provider/model are required.
+rcdvlog --catalog /absolute/project/catalog.sqlite3 models status \
+  --backend native-openrouter --provider openrouter --model openai/whisper-1
+rcdvlog --catalog /absolute/project/catalog.sqlite3 models install \
+  --backend native-openrouter --provider openrouter --model openai/whisper-1
 ```
+
+The default backend remains `local-whisper`, so old invocations retain the
+historical two-row status and pair installation behavior.
+`--backend native-openrouter` is an explicit model-readiness operation only: it
+validates the registered provider-qualified audio model in shared Rust code,
+reports only the Silero VAD row, and does not require or inspect the local
+574 MB ASR file.
+It performs no provider request, does not require an API key, and does not load
+an inference engine. Unsupported, chat-model, or unqualified selections fail
+before catalog or model-directory effects. Passing `--provider`/`--model` with
+the local backend is rejected rather than ignored. The executable advertises
+`speech.model-backends.v1` while preserving the leaf command identities
+`models.status` and `models.install`.
 
 `models status` is strictly read-only and offline. For each speech artifact it
 reports a stable `name`/`role`, `present`, `ready`, `installed`, `integrity`
 (`verified`, `present_unverified`, `invalid`, or `missing`), an actionable
-`detail`, the expected `path`, and the catalog-managed `directory`. It never
+`detail`, the expected `path`, and the catalog-managed `directory`. A missing
+native VAD row names the explicit native install command in its `detail`; it
+never directs native users to the generic local pair download. Status never
 creates the model directory, migrates the catalog, downloads a file, or loads an
 inference engine.
 
 `models install` is the separate explicit provisioning operation. It downloads
-only missing or invalid artifacts, emits `models.install.progress` JSON events
-on stderr, and checks for Ctrl-C through the existing bounded-callback path.
-Cancellation is checked before each download and at transfer progress callbacks;
-it removes the partial file and returns a success envelope with `cancelled: true`.
-Earlier completed downloads remain installed. Transcription never calls this
-operation, so a batch with unavailable models fails with
-`speech_models_not_ready` instead of starting a hidden download.
+only missing or invalid artifacts selected by the backend, emits
+`models.install.progress` JSON events on stderr, and checks for Ctrl-C through
+the existing bounded-callback path. Cancellation is checked before each download
+and at transfer progress callbacks; it removes the partial file and returns a
+success envelope with `cancelled: true`. Earlier completed downloads remain
+installed. Transcription never calls this operation, so a batch with unavailable
+models fails with `speech_models_not_ready` instead of starting a hidden
+download.
 
 ### Project-local CLI binding
 

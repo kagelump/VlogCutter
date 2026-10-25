@@ -52,7 +52,7 @@ enum Commands {
         #[command(subcommand)]
         command: agent_commands::WorkspaceCommand,
     },
-    /// Inspect or explicitly install local speech models.
+    /// Inspect or explicitly install local models or a selected native backend's VAD.
     Models {
         #[command(subcommand)]
         command: agent_commands::ModelsCommand,
@@ -2139,6 +2139,48 @@ mod tests {
     #[test]
     fn transcribe_status_requires_a_project() {
         assert!(Cli::try_parse_from(["rcdvlog", "transcribe", "status"]).is_err());
+    }
+
+    #[test]
+    fn speech_model_backend_flags_preserve_default_and_parse_explicit_native_selection() {
+        let local = parse(&["rcdvlog", "models", "status"]);
+        assert_eq!(command_name(&local.command), "models.status");
+        let local_install = parse(&["rcdvlog", "models", "install"]);
+        assert_eq!(command_name(&local_install.command), "models.install");
+
+        let native = parse(&[
+            "rcdvlog",
+            "models",
+            "status",
+            "--backend",
+            "native-openrouter",
+            "--provider",
+            "openrouter",
+            "--model",
+            "openai/whisper-1",
+        ]);
+        assert_eq!(command_name(&native.command), "models.status");
+        let native_install = parse(&[
+            "rcdvlog",
+            "models",
+            "install",
+            "--backend",
+            "native-openrouter",
+            "--provider",
+            "openrouter",
+            "--model",
+            "openai/whisper-1",
+        ]);
+        assert_eq!(command_name(&native_install.command), "models.install");
+
+        let mut command = Cli::command();
+        let models = command.find_subcommand_mut("models").unwrap();
+        let status = models.find_subcommand_mut("status").unwrap();
+        let help = status.render_long_help().to_string();
+        assert!(help.contains("local-whisper"));
+        assert!(help.contains("native-openrouter"));
+        assert!(help.contains("--provider"));
+        assert!(help.contains("--model"));
     }
 
     #[test]

@@ -1,6 +1,10 @@
 //! Read-only agent readiness and an explicit, node-local executable binding.
 //! The binding is configuration, never a projection or alternate catalog.
 
+use crate::analysis::engine::{ModelAsset, VAD_MODEL, WHISPER_MODEL};
+use crate::analysis::openrouter_stt::{
+    ResolvedSpeechBackend, SpeechBackendSelection, resolve_speech_backend,
+};
 use crate::prerequisites::run_bounded_command;
 use crate::{
     MigrationHistoryStatus, ModelInstallProgress, ModelInstallReport, ModelStatus,
@@ -160,13 +164,28 @@ pub fn catalog_readiness(path: Option<&Path>) -> CatalogReadiness {
     result
 }
 
-/// The existing model resolver/policy, usable even before a catalog is opened.
+/// The existing local model resolver/policy, usable even before a catalog is
+/// opened. This wrapper retains the historical two-artifact local default.
 pub fn speech_model_status(catalog_path: &Path) -> Result<Vec<ModelStatus>> {
-    speech_models_in(crate::analysis::engine::model_dir(catalog_path)?)
+    speech_model_status_for(catalog_path, &SpeechBackendSelection::LocalWhisper)
+}
+
+/// Read-only, offline readiness for an explicitly selected speech backend.
+///
+/// Local whisper requires the ASR/VAD pair. Native OpenRouter requires only the
+/// existing Silero VAD artifact; an ASR file is neither inspected nor required.
+/// Validation of the provider/model contract happens before directory
+/// resolution or any filesystem work.
+pub fn speech_model_status_for(
+    catalog_path: &Path,
+    selection: &SpeechBackendSelection,
+) -> Result<Vec<ModelStatus>> {
+    let plan = speech_model_plan(selection)?;
+    let directory = crate::analysis::engine::model_dir_for(catalog_path, &plan.directory_anchor)?;
+    Ok(speech_model_statuses_in(&directory, &plan))
 }
 
 fn speech_models_in(directory: PathBuf) -> Result<Vec<ModelStatus>> {
-    use crate::analysis::engine::{VAD_MODEL, WHISPER_MODEL};
     Ok([
         (WHISPER_MODEL, "speech_to_text"),
         (VAD_MODEL, "voice_activity_detection"),
@@ -176,10 +195,67 @@ fn speech_models_in(directory: PathBuf) -> Result<Vec<ModelStatus>> {
     .collect())
 }
 
-fn model_status_in(
+/// The exact local artifacts one backend needs and the artifact whose location
+/// anchors directory selection.
+struct SpeechModelPlan {
+    models: Vec<ModelAsset>,
+    directory_anchor: ModelAsset,
+    missing_remediation: Option<String>,
+}
+
+fn speech_model_plan(selection: &SpeechBackendSelection) -> Result<SpeechModelPlan> {
+    match resolve_speech_backend(selection)? {
+        ResolvedSpeechBackend::LocalWhisper { .. } => Ok(SpeechModelPlan {
+            models: vec![WHISPER_MODEL, VAD_MODEL],
+            directory_anchor: WHISPER_MODEL,
+            missing_remediation: None,
+        }),
+        ResolvedSpeechBackend::NativeOpenRouter { spec } => Ok(SpeechModelPlan {
+            models: vec![VAD_MODEL],
+            directory_anchor: VAD_MODEL,
+            missing_remediation: Some(format!(
+                "run `rcdvlog models install --backend native-openrouter --provider {} --model {}` explicitly",
+                spec.provider, spec.model
+            )),
+        }),
+    }
+}
+
+fn speech_model_role(model: &ModelAsset) -> &'static str {
+    if model.file_name == WHISPER_MODEL.file_name {
+        "speech_to_text"
+    } else {
+        "voice_activity_detection"
+    }
+}
+
+fn speech_model_statuses_in(directory: &Path, plan: &SpeechModelPlan) -> Vec<ModelStatus> {
+    plan.models
+        .iter()
+        .map(|model| {
+            model_status_with_remediation(
+                directory,
+                model,
+                speech_model_role(model),
+                plan.missing_remediation.as_deref(),
+            )
+        })
+        .collect()
+}
+
+fn model_status_in(directory: &Path, model: &ModelAsset, role: &str) -> ModelStatus {
+    model_status_with_remediation(directory, model, role, None)
+}
+
+/// Builds one status row. `missing_remediation` is optional so the historical
+/// local detail string remains byte-compatible while a backend-qualified native
+/// status can point at the explicit install command rather than the local
+/// 574 MB ASR default.
+fn model_status_with_remediation(
     directory: &Path,
-    model: &crate::analysis::engine::ModelAsset,
+    model: &ModelAsset,
     role: &str,
+    missing_remediation: Option<&str>,
 ) -> ModelStatus {
     let path = directory.join(model.file_name);
     let present = path.is_file();
@@ -189,8 +265,9 @@ fn model_status_in(
             "missing",
             false,
             Some(format!(
-                "not installed; expected at {} (run `rcdvlog models install` explicitly)",
-                path.display()
+                "not installed; expected at {} ({})",
+                path.display(),
+                missing_remediation.unwrap_or("run `rcdvlog models install` explicitly")
             )),
         )
     } else if model.blake3.is_empty() {
@@ -239,9 +316,8 @@ fn model_status_in(
     }
 }
 
-/// Explicitly download missing speech models into the directory this catalog
-/// reads from. This is the only model-fetching path; status and transcription
-/// never call it.
+/// Explicitly download missing local speech models into the directory this
+/// catalog reads from. This historical wrapper retains the local pair default.
 pub fn install_speech_models_with_progress<F>(
     catalog_path: &Path,
     on_progress: F,
@@ -249,15 +325,58 @@ pub fn install_speech_models_with_progress<F>(
 where
     F: FnMut(ModelInstallProgress) -> ControlFlow<()>,
 {
-    use crate::analysis::engine::{VAD_MODEL, WHISPER_MODEL, model_dir};
-    let directory = model_dir(catalog_path)?;
+    install_speech_models_with_progress_for(
+        catalog_path,
+        &SpeechBackendSelection::LocalWhisper,
+        on_progress,
+    )
+}
+
+/// Explicitly download only the artifacts required by the selected backend.
+///
+/// This remains the sole model-fetching path. Status, preflight, transcription
+/// and doctor never call it. Provider/model validation and directory/artifact
+/// selection complete before the first progress callback or transfer.
+pub fn install_speech_models_with_progress_for<F>(
+    catalog_path: &Path,
+    selection: &SpeechBackendSelection,
+    on_progress: F,
+) -> Result<ModelInstallReport>
+where
+    F: FnMut(ModelInstallProgress) -> ControlFlow<()>,
+{
+    let plan = speech_model_plan(selection)?;
+    let directory = crate::analysis::engine::model_dir_for(catalog_path, &plan.directory_anchor)?;
     let (cancelled, installed) =
-        install_models_into(&directory, &[WHISPER_MODEL, VAD_MODEL], on_progress)?;
+        install_backend_models_into(&directory, &plan, &plan.models, on_progress)?;
     Ok(ModelInstallReport {
         cancelled,
         installed,
-        models: speech_model_status(catalog_path)?,
+        models: speech_model_statuses_in(&directory, &plan),
     })
+}
+
+/// Keeps the selected backend plan and the actual transfer list locked together.
+/// Tests use the same boundary with a tiny synthetic VAD asset while production
+/// passes the exact artifact from the backend plan.
+fn install_backend_models_into<F>(
+    directory: &Path,
+    plan: &SpeechModelPlan,
+    models: &[ModelAsset],
+    on_progress: F,
+) -> Result<(bool, usize)>
+where
+    F: FnMut(ModelInstallProgress) -> ControlFlow<()>,
+{
+    anyhow::ensure!(
+        models.len() == plan.models.len()
+            && models
+                .iter()
+                .zip(&plan.models)
+                .all(|(selected, planned)| selected.file_name == planned.file_name),
+        "selected model assets do not match the backend install plan"
+    );
+    install_models_into(directory, models, on_progress)
 }
 
 fn install_models_into<F>(
@@ -440,6 +559,191 @@ mod tests {
         assert_eq!(
             fs::read(directory.path().join(model.file_name)).unwrap(),
             body
+        );
+    }
+
+    fn native_selection() -> SpeechBackendSelection {
+        SpeechBackendSelection::NativeOpenRouter {
+            provider: "openrouter".into(),
+            model: "openai/whisper-1".into(),
+        }
+    }
+
+    fn fake_asset(file_name: &'static str, url: String, body: &[u8], digest: &str) -> ModelAsset {
+        ModelAsset {
+            file_name,
+            url: Box::leak(url.into_boxed_str()),
+            blake3: Box::leak(digest.to_string().into_boxed_str()),
+            bytes: body.len() as u64,
+        }
+    }
+
+    #[test]
+    fn native_status_requires_only_vad_and_reports_explicit_backend_remediation() {
+        let directory = tempdir().unwrap();
+        let native = native_selection();
+        let missing_plan = speech_model_plan(&native).unwrap();
+        assert_eq!(missing_plan.models.len(), 1);
+        assert_eq!(missing_plan.models[0].file_name, VAD_MODEL.file_name);
+        let missing = speech_model_statuses_in(directory.path(), &missing_plan);
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0].role, "voice_activity_detection");
+        assert!(!missing[0].ready);
+        let detail = missing[0].detail.as_deref().unwrap();
+        assert!(
+            detail.contains(
+                "rcdvlog models install --backend native-openrouter --provider openrouter --model openai/whisper-1"
+            ),
+            "{detail}"
+        );
+
+        fs::write(directory.path().join(VAD_MODEL.file_name), b"silero").unwrap();
+        let native_ready = speech_model_statuses_in(directory.path(), &missing_plan);
+        assert_eq!(native_ready.len(), 1);
+        assert!(native_ready[0].ready);
+
+        // The same directory is not a ready local backend: local status still
+        // reports and requires the existing ASR/VAD pair.
+        let local_plan = speech_model_plan(&SpeechBackendSelection::LocalWhisper).unwrap();
+        let local = speech_model_statuses_in(directory.path(), &local_plan);
+        assert_eq!(local.len(), 2);
+        assert!(
+            local
+                .iter()
+                .any(|status| status.role == "speech_to_text" && !status.ready)
+        );
+        assert!(!local.iter().all(|status| status.ready));
+    }
+
+    #[test]
+    fn local_default_missing_detail_remains_byte_compatible() {
+        let directory = tempdir().unwrap();
+        let plan = speech_model_plan(&SpeechBackendSelection::LocalWhisper).unwrap();
+        let statuses = speech_model_statuses_in(directory.path(), &plan);
+        assert_eq!(statuses.len(), 2);
+        assert_eq!(statuses[0].name, WHISPER_MODEL.file_name);
+        assert_eq!(statuses[1].name, VAD_MODEL.file_name);
+        let expected = format!(
+            "not installed; expected at {} (run `rcdvlog models install` explicitly)",
+            directory.path().join(WHISPER_MODEL.file_name).display()
+        );
+        assert_eq!(statuses[0].detail.as_deref(), Some(expected.as_str()));
+    }
+
+    #[test]
+    fn unsupported_or_chat_model_native_selection_fails_before_filesystem_work() {
+        let root = tempdir().unwrap();
+        let catalog = root.path().join("nested/catalog.sqlite3");
+        for (provider, model) in [
+            ("openrouter", "openai/gpt-4o"),
+            ("other", "openai/whisper-1"),
+            ("openrouter", "whisper-1"),
+        ] {
+            let selection = SpeechBackendSelection::NativeOpenRouter {
+                provider: provider.into(),
+                model: model.into(),
+            };
+            let error = speech_model_status_for(&catalog, &selection).unwrap_err();
+            assert!(error.to_string().contains("unsupported"), "{error}");
+        }
+        assert!(
+            !root.path().join("nested").exists(),
+            "validation must happen before resolving or creating model directories"
+        );
+    }
+
+    #[test]
+    fn native_installer_transfers_only_selected_vad_and_reuses_it() {
+        let directory = tempdir().unwrap();
+        let body = b"synthetic silero vad".to_vec();
+        let digest = blake3::hash(&body).to_hex().to_string();
+        let url = serve_body_once(body.clone());
+        let vad = fake_asset(VAD_MODEL.file_name, url, &body, &digest);
+        let plan = speech_model_plan(&native_selection()).unwrap();
+        assert_eq!(plan.models.len(), 1);
+        assert_eq!(plan.models[0].file_name, VAD_MODEL.file_name);
+
+        let progress_calls = Arc::new(AtomicUsize::new(0));
+        let calls = progress_calls.clone();
+        let expected_bytes = body.len() as u64;
+        let (cancelled, installed) =
+            install_backend_models_into(directory.path(), &plan, &[vad], move |progress| {
+                assert_eq!(progress.name, VAD_MODEL.file_name);
+                assert_eq!(progress.total_bytes, expected_bytes);
+                calls.fetch_add(1, Ordering::SeqCst);
+                ControlFlow::Continue(())
+            })
+            .unwrap();
+        assert!(!cancelled);
+        assert_eq!(installed, 1);
+        assert!(progress_calls.load(Ordering::SeqCst) >= 2);
+        assert_eq!(
+            fs::read(directory.path().join(VAD_MODEL.file_name)).unwrap(),
+            body
+        );
+
+        assert_eq!(
+            install_backend_models_into(directory.path(), &plan, &[vad], |_| panic!(
+                "already-ready VAD must be reused without a provider transfer"
+            ))
+            .unwrap(),
+            (false, 0)
+        );
+    }
+
+    #[test]
+    fn native_install_cancellation_removes_partial_vad_and_counts_progress() {
+        let directory = tempdir().unwrap();
+        let body = vec![7_u8; 4 * 1024 * 1024];
+        let url = serve_body_once(body.clone());
+        let vad = fake_asset(VAD_MODEL.file_name, url, &body, "");
+        let plan = speech_model_plan(&native_selection()).unwrap();
+        let progress_calls = Arc::new(AtomicUsize::new(0));
+        let calls = progress_calls.clone();
+
+        let (cancelled, installed) =
+            install_backend_models_into(directory.path(), &plan, &[vad], move |progress| {
+                assert_eq!(progress.name, VAD_MODEL.file_name);
+                calls.fetch_add(1, Ordering::SeqCst);
+                if progress.downloaded_bytes == 0 {
+                    ControlFlow::Continue(())
+                } else {
+                    ControlFlow::Break(())
+                }
+            })
+            .unwrap();
+        assert!(cancelled);
+        assert_eq!(installed, 0);
+        assert_eq!(progress_calls.load(Ordering::SeqCst), 2);
+        assert!(!directory.path().join(VAD_MODEL.file_name).exists());
+        assert!(
+            !directory
+                .path()
+                .join(format!("{}.partial", VAD_MODEL.file_name))
+                .exists()
+        );
+    }
+
+    #[test]
+    fn native_install_digest_failure_cleans_partial_vad() {
+        let directory = tempdir().unwrap();
+        let body = b"corrupt synthetic vad".to_vec();
+        let url = serve_body_once(body.clone());
+        let wrong_digest = "0000000000000000000000000000000000000000000000000000000000000000";
+        let vad = fake_asset(VAD_MODEL.file_name, url, &body, wrong_digest);
+        let plan = speech_model_plan(&native_selection()).unwrap();
+
+        let error = install_backend_models_into(directory.path(), &plan, &[vad], |_| {
+            ControlFlow::Continue(())
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("failed verification"), "{error}");
+        assert!(!directory.path().join(VAD_MODEL.file_name).exists());
+        assert!(
+            !directory
+                .path()
+                .join(format!("{}.partial", VAD_MODEL.file_name))
+                .exists()
         );
     }
 }

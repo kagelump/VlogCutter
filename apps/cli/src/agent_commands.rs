@@ -1,8 +1,8 @@
 use anyhow::{Result, anyhow, ensure};
 use clap::{Args, CommandFactory, Subcommand, ValueEnum};
 use rcdvlog_core::{
-    Catalog, CliBuild, CliExecutable, CliSelection, ReadinessRequirements,
-    install_speech_models_with_progress,
+    Catalog, CliBuild, CliExecutable, CliSelection, ReadinessRequirements, SpeechBackendSelection,
+    install_speech_models_with_progress_for, resolve_speech_backend,
 };
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -108,18 +108,77 @@ pub enum Selection {
     Development,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
+pub enum SpeechBackendArg {
+    /// Existing local/offline whisper.cpp ASR plus Silero VAD.
+    #[default]
+    #[value(name = "local-whisper")]
+    LocalWhisper,
+    /// Explicit native OpenRouter audio transcription; only Silero VAD is local.
+    #[value(name = "native-openrouter")]
+    NativeOpenRouter,
+}
+
+#[derive(Debug, Args)]
+pub struct SpeechBackendArgs {
+    /// Explicit speech backend. Local/offline remains the default; cloud is never implicit.
+    #[arg(long, value_enum, default_value = "local-whisper")]
+    backend: SpeechBackendArg,
+    /// Required with --backend native-openrouter; must name a registered provider.
+    #[arg(long)]
+    provider: Option<String>,
+    /// Required with --backend native-openrouter; must name a registered audio model.
+    #[arg(long)]
+    model: Option<String>,
+}
+
+fn selected_speech_backend(args: &SpeechBackendArgs) -> Result<SpeechBackendSelection> {
+    let selection = match args.backend {
+        SpeechBackendArg::LocalWhisper => {
+            ensure!(
+                args.provider.is_none() && args.model.is_none(),
+                "invalid input: --provider and --model are only valid with --backend native-openrouter"
+            );
+            SpeechBackendSelection::LocalWhisper
+        }
+        SpeechBackendArg::NativeOpenRouter => {
+            let provider = args.provider.clone().ok_or_else(|| {
+                anyhow!(
+                    "invalid input: --backend native-openrouter requires explicit --provider openrouter"
+                )
+            })?;
+            let model = args.model.clone().ok_or_else(|| {
+                anyhow!(
+                    "invalid input: --backend native-openrouter requires explicit --model openai/whisper-1"
+                )
+            })?;
+            SpeechBackendSelection::NativeOpenRouter { provider, model }
+        }
+    };
+    // Provider/model validation lives in the owning Rust contract. It runs
+    // before catalog access, directory resolution, network transfer or progress.
+    resolve_speech_backend(&selection)?;
+    Ok(selection)
+}
+
 #[derive(Debug, Subcommand)]
 pub enum ModelsCommand {
     /// Read-only model identity, integrity, readiness, and managed location.
-    Status,
+    Status {
+        #[command(flatten)]
+        backend: SpeechBackendArgs,
+    },
     /// Explicitly download missing speech models with progress and Ctrl-C cancellation.
-    Install,
+    Install {
+        #[command(flatten)]
+        backend: SpeechBackendArgs,
+    },
 }
 
 pub fn models_command_name(command: &ModelsCommand) -> &'static str {
     match command {
-        ModelsCommand::Status => "models.status",
-        ModelsCommand::Install => "models.install",
+        ModelsCommand::Status { .. } => "models.status",
+        ModelsCommand::Install { .. } => "models.install",
     }
 }
 
@@ -195,6 +254,7 @@ fn executable() -> Result<CliExecutable> {
             ),
             ("speech.local.v1".into(), 1),
             ("speech.models.v1".into(), 1),
+            ("speech.model-backends.v1".into(), 1),
             ("transcribe.selected.v1".into(), 1),
             ("video.validation.v1".into(), 1),
             ("camera-sidecars.mapping.v1".into(), 1),
@@ -255,6 +315,12 @@ pub fn workspace(catalog: Option<&Path>, command: &WorkspaceCommand) -> Result<V
 /// Explicit model management. Status is strictly read-only and offline;
 /// installation is a separate command that never runs implicitly.
 pub fn models(catalog: Option<&Path>, command: &ModelsCommand) -> Result<Value> {
+    let backend = match command {
+        ModelsCommand::Status { backend } | ModelsCommand::Install { backend } => backend,
+    };
+    // The explicit backend/provider/model contract is validated before any
+    // catalog or model-directory access and before install progress begins.
+    let selection = selected_speech_backend(backend)?;
     let catalog_path = catalog.ok_or_else(|| {
         anyhow!("invalid input: model commands require --catalog or RCDVLOG_CATALOG")
     })?;
@@ -264,22 +330,23 @@ pub fn models(catalog: Option<&Path>, command: &ModelsCommand) -> Result<Value> 
         catalog_path.display()
     );
     match command {
-        ModelsCommand::Status => {
+        ModelsCommand::Status { .. } => {
             let catalog = Catalog::open_read_only_existing(catalog_path)?;
-            Ok(serde_json::to_value(catalog.model_status()?)?)
+            Ok(serde_json::to_value(catalog.model_status_for(&selection)?)?)
         }
-        ModelsCommand::Install => {
+        ModelsCommand::Install { .. } => {
             // Validate the catalog without migrating or writing it. Installation
             // only writes managed model files, never catalog state.
             let _catalog = Catalog::open_read_only_existing(catalog_path)?;
             let cancellation = CommandCancellation::arm()?;
-            let report = install_speech_models_with_progress(catalog_path, |progress| {
-                eprintln!(
-                    "{}",
-                    json!({"event": "models.install.progress", "progress": progress})
-                );
-                cancellation.flow()
-            })?;
+            let report =
+                install_speech_models_with_progress_for(catalog_path, &selection, |progress| {
+                    eprintln!(
+                        "{}",
+                        json!({"event": "models.install.progress", "progress": progress})
+                    );
+                    cancellation.flow()
+                })?;
             Ok(serde_json::to_value(report)?)
         }
     }
