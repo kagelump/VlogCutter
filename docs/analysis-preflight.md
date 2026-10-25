@@ -210,7 +210,20 @@ helpers. An offline original with a usable current derived proxy remains valid;
 a missing/stale proxy is blocked. The proposal binds the native endpoint/window/
 rate contract via `native_stt_cost_bound_contract_id()`, the shared Silero
 VAD/packing recipe, fixed protocol version labels, language, data policy, exact
-scope and budget. Its expected cost uses the registered full-window duration
+scope and budget. Its `recipeVersion` comes from the transcript owner's single
+`native_stt_transcript_recipe()` helper for a validated registered request: a
+`native-stt.transcript-recipe.v1:<blake3>` identity over the explicit
+provider/model, language, provider data policy, fixed temperature, registered
+endpoint/response/timestamp/input/window semantics, shared Silero VAD artifact,
+packing algorithm and native quality-recipe version. Budget, tariff and asset
+scope stay in the run-policy identity but not in the transcript cache recipe, so
+budget/scope approval changes do not create a false transcript-cache change.
+Quality or native protocol/config semantic changes do change the recipe and thus
+future approval identity. Invalid or unregistered proposals keep a stable
+`:unregistered` placeholder and their structured blockers; they never acquire a
+valid recipe, authorization or runtime capability. Historical native approval,
+receipt and accounting rows are not reset. Native expected cost uses the
+registered full-window duration
 tariff and the conservative pre-VAD source-duration window upper bound
 `floor(2 * duration_ms / 30_000) + 1`; it never uses the VLM reference clip
 estimate or constructs a fake audio request. The cost basis and warnings state
@@ -247,3 +260,5 @@ observed pilot.
   extraction writes only to the managed project cache.
 
 Native speech cost proposals reserve a conservative pre-VAD upper bound for bulk speech windows plus one separate capability-pilot window. Each window reserves the full registered 30-second duration; pilot and bulk spending use the same eventual policy ceiling. No pilot or bulk call is enabled by a proposal in this slice.
+
+C4A adds only the deterministic native recipe/approval identity above. Native provenance persistence/links, pilot/bulk orchestration, typed retry recovery and CLI/desktop backend selection remain deferred to C4B and later integration slices; no SQLite migration or native execution is enabled by this change.

@@ -16,8 +16,9 @@ use super::{
     RunPolicyParameters, RunPolicyRequest,
 };
 use crate::analysis::openrouter_stt::{
-    OPENROUTER_STT_PROVIDER, resolve_native_stt_model, validate_iso639_1,
+    NativeSttRequest, OPENROUTER_STT_PROVIDER, resolve_native_stt_model, validate_iso639_1,
 };
+use crate::analysis::store::native_stt_transcript_recipe;
 
 /// An explicit native speech kind has one authoritative provider/model pair.
 /// No fallback or extra allowlist is inferred, even before the request is
@@ -253,8 +254,37 @@ pub(super) const NATIVE_STT_TEMPERATURE: f64 = 0.0;
 pub(super) const NATIVE_STT_PROMPT_VERSION: &str = "native-stt.no-chat-prompt.v1";
 pub(super) const NATIVE_STT_OUTPUT_SCHEMA_VERSION: &str =
     "openrouter.audio-transcriptions.verbose-json.segment.v1";
+/// Stable prefix retained only for blocked/unregistered proposal identities.
+/// A valid native proposal uses the transcript owner's semantic digest instead.
 pub(super) const NATIVE_STT_RECIPE_VERSION: &str =
     "native-stt.silero-v5.pack-30s.full-window-reservation.v1";
+
+/// Recipe identity for a native proposal, built only from the validated request
+/// semantics. Invalid/unregistered proposals keep a stable blocked placeholder
+/// and their existing structured blockers; they never acquire a valid recipe or
+/// runtime capability.
+pub(super) fn native_stt_recipe_version(request: &RunPolicyRequest) -> Result<String> {
+    let placeholder = || format!("{NATIVE_STT_RECIPE_VERSION}:unregistered");
+    let RunPolicyParameters::NativeSpeechTranscription {
+        language,
+        provider_policy,
+        ..
+    } = &request.parameters
+    else {
+        return Ok(placeholder());
+    };
+    let native_request = NativeSttRequest::new(
+        request.provider.clone(),
+        request.primary_model.clone(),
+        language.clone(),
+        NATIVE_STT_TEMPERATURE,
+        *provider_policy,
+    );
+    match native_request {
+        Ok(native_request) => native_stt_transcript_recipe(&native_request),
+        Err(_) => Ok(placeholder()),
+    }
+}
 
 /// Explicit warning that the single-window accounted leaf is not a high-level
 /// paid workflow or observed capability pilot.

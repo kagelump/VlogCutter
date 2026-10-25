@@ -39,7 +39,10 @@ use crate::analysis::{VLM_PROMPT_VERSION, framepack, store::TranscriptStatus};
 use crate::{Asset, Catalog, REFERENCE_COST_PER_CLIP_USD};
 
 mod native_stt;
-use native_stt::{canonical_native_models, native_stt_blockers, native_stt_capability_checks};
+use native_stt::{
+    canonical_native_models, native_stt_blockers, native_stt_capability_checks,
+    native_stt_recipe_version,
+};
 
 pub const RUN_POLICY_SCHEMA_VERSION: &str = "analysis.run-policy.v1";
 pub const RUN_AUTHORIZATION_SCHEMA_VERSION: &str = "analysis.run-authorization.v1";
@@ -1204,7 +1207,7 @@ impl Catalog {
             AnalysisRunKind::NativeSpeechTranscription => (
                 native_stt::NATIVE_STT_PROMPT_VERSION.to_string(),
                 native_stt::NATIVE_STT_OUTPUT_SCHEMA_VERSION.to_string(),
-                native_stt::NATIVE_STT_RECIPE_VERSION.to_string(),
+                native_stt_recipe_version(request)?,
             ),
         };
         let context = if native_stt {

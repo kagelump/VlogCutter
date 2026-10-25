@@ -264,6 +264,10 @@ fn native_quote_reserves_full_registered_window_without_fake_chat_components() {
 fn native_cost_contract_identity_tracks_exact_endpoint_window_and_tariff() {
     let stable = native_stt_cost_bound_contract_id();
     assert_eq!(stable, native_stt_cost_bound_contract_id());
+    assert_eq!(
+        stable,
+        "openrouter.native-stt-duration-reservation.v1:b6ffe247928304d02731f3d71490d1e5aaded9eceb98267951e3a8b91f6406b8"
+    );
     assert!(stable.starts_with(NATIVE_STT_COST_BOUND_CONTRACT_VERSION));
 
     let mut changed = NATIVE_STT_MODELS.to_vec();
