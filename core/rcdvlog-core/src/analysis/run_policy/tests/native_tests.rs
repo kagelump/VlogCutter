@@ -153,6 +153,10 @@ fn native_speech_proposal_binds_registered_audio_only_scope_cost_and_stays_block
         check.requirement == "native_stt.accounted_runtime"
             && check.status == CapabilityStatus::Passed
     }));
+    assert!(policy.capability_checks.iter().any(|check| {
+        check.requirement == "native_stt.high_level_pilot"
+            && check.status == CapabilityStatus::Passed
+    }));
     assert!(
         !policy
             .readiness
@@ -161,6 +165,10 @@ fn native_speech_proposal_binds_registered_audio_only_scope_cost_and_stays_block
             .any(|blocker| { blocker.code == "native_accounted_runtime_unavailable" })
     );
     assert!(policy.readiness.ready_for_authorization);
+    // Paid native pilot readiness is transiently false in this fixture because
+    // no VAD artifact or provider credential is present; the static high-level
+    // pilot capability itself is implemented. The all-local no-provider outcome
+    // remains runnable without those prerequisites.
     assert!(!policy.readiness.ready_for_pilot);
     assert!(policy.readiness.capabilities_ready);
     assert!(
@@ -168,7 +176,14 @@ fn native_speech_proposal_binds_registered_audio_only_scope_cost_and_stays_block
             .readiness
             .warnings
             .iter()
-            .any(|warning| warning.contains("ready_for_pilot stays false"))
+            .any(|warning| warning.contains("native STT bounded capability pilot is implemented"))
+    );
+    assert!(
+        policy
+            .readiness
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("models install --backend native-openrouter"))
     );
 
     let spec = resolve_native_stt_model(OPENROUTER_STT_PROVIDER, OPENROUTER_WHISPER_MODEL).unwrap();
@@ -1369,3 +1384,7 @@ mod native_provenance_tests;
 #[cfg(test)]
 #[path = "native_pilot_evidence_tests.rs"]
 mod native_pilot_evidence_tests;
+
+#[cfg(test)]
+#[path = "native_runtime_tests.rs"]
+mod native_runtime_tests;

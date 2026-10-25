@@ -42,7 +42,11 @@ impl PilotAttemptBaseline {
 }
 
 pub(crate) enum PilotSessionStart {
+    /// A terminal cached result that requires no additional provider work.
     AlreadyPassed(Box<RunPilotRecord>),
+    /// A current terminal native result (including all-local no-provider work)
+    /// that must be returned rather than automatically replayed.
+    Cached(Box<RunPilotRecord>),
     Ready(Box<PilotSession>),
 }
 
@@ -63,8 +67,18 @@ pub(crate) fn prepare_pilot_session(
     request: &RunPolicyRequest,
     retry_uncertain: bool,
 ) -> Result<PilotSessionStart> {
-    ensure_vlm_run_kind(request.parameters.kind())?;
-    let policy = catalog.describe_run_policy(request)?;
+    // This owner is shared by VLM and native speech pilots. Public injected VLM
+    // entry points still call `ensure_vlm_run_kind` before reaching here.
+    let kind = request.parameters.kind();
+    ensure!(
+        kind.is_vlm() || kind == AnalysisRunKind::NativeSpeechTranscription,
+        "unsupported analysis pilot kind"
+    );
+    let policy = if kind == AnalysisRunKind::NativeSpeechTranscription {
+        catalog.describe_run_policy_for_local_preparation(request)?
+    } else {
+        catalog.describe_run_policy(request)?
+    };
     ensure!(
         policy.readiness.ready_for_authorization,
         "run policy is not ready for a pilot: {}",
@@ -82,21 +96,59 @@ pub(crate) fn prepare_pilot_session(
     let mut prior_cost_usd = 0.0;
     let mut prior_attempts = 0u32;
     if let Some(existing) = previous_record.as_ref() {
-        if existing.status == "passed" {
-            return Ok(PilotSessionStart::AlreadyPassed(Box::new(existing.clone())));
+        if kind == AnalysisRunKind::NativeSpeechTranscription {
+            // Native pilot results are one-shot capability evidence. A typed
+            // paid sample (pass, reject, review, protocol-unusable or uncertain)
+            // is never automatically replayed, even with retry_uncertain=true.
+            // A receipt-only interrupted attempt has no typed sample and must
+            // remain behind explicit reconciliation/targeted recovery.
+            ensure!(
+                existing.status != "running",
+                "native pilot has interrupted or unknown usage; reconcile its receipt before any retry"
+            );
+            if !existing.usage_complete {
+                return Err(anyhow::anyhow!(
+                    "native pilot has unknown usage; reconcile its canonical receipt before any retry"
+                ));
+            }
+            if existing.status == "passed" || existing.status == "no_provider_required" {
+                return Ok(PilotSessionStart::Cached(Box::new(existing.clone())));
+            }
+            let has_typed_sample = existing
+                .native_evidence
+                .as_ref()
+                .is_some_and(|evidence| evidence.sample.is_some());
+            if has_typed_sample {
+                // A failed/rejected/review-required typed result is truthful
+                // negative capability evidence. Return it unchanged; a future
+                // exact targeted retry owner may create a new epoch explicitly.
+                return Ok(PilotSessionStart::Cached(Box::new(existing.clone())));
+            }
+            ensure!(
+                existing.attempts == 0,
+                "native pilot has accounted provider work without a typed sample; require exact receipt reconciliation and targeted recovery"
+            );
+            ensure!(
+                retry_uncertain,
+                "a prior native pilot failed locally; inspect its receipt before an explicit retry"
+            );
+        } else {
+            if existing.status == "passed" {
+                return Ok(PilotSessionStart::AlreadyPassed(Box::new(existing.clone())));
+            }
+            ensure!(
+                existing.status != "running",
+                "pilot has interrupted or unknown usage; reconcile its receipt before any retry"
+            );
+            ensure!(
+                existing.usage_complete || retry_uncertain,
+                "pilot has interrupted or unknown usage; reconcile its receipt before any retry"
+            );
+            ensure!(
+                retry_uncertain,
+                "a prior pilot failed; inspect its receipt before an explicit retry"
+            );
         }
-        ensure!(
-            existing.status != "running",
-            "pilot has interrupted or unknown usage; reconcile its receipt before any retry"
-        );
-        ensure!(
-            existing.usage_complete || retry_uncertain,
-            "pilot has interrupted or unknown usage; reconcile its receipt before any retry"
-        );
-        ensure!(
-            retry_uncertain,
-            "a prior pilot failed; inspect its receipt before an explicit retry"
-        );
         prior_cost_usd = existing.cost_usd;
         prior_attempts = existing.attempts;
     }
@@ -120,15 +172,24 @@ pub(crate) fn prepare_pilot_session(
 
     let first_scope = first_scope(&policy)?;
     // A force-generated replacement policy must not bypass unresolved paid work.
-    for unresolved in catalog.analysis_requests_needing_reconciliation_for_source(
-        &policy.project_id,
-        "pilot",
-        &first_scope.source_identity,
-    )? {
-        ensure!(
-            unresolved.policy_id == policy.policy_id,
-            "a prior pilot request has unresolved usage; reconcile it and authorize the exact prior request before a replacement policy can retry"
-        );
+    // Native pilots may select many bounded sources and scan past silent assets,
+    // so every frozen scope entry must be fenced, not only the first one.
+    let fence_scopes: &[RunAssetScope] = if kind == AnalysisRunKind::NativeSpeechTranscription {
+        &policy.scope
+    } else {
+        std::slice::from_ref(&first_scope)
+    };
+    for scope in fence_scopes {
+        for unresolved in catalog.analysis_requests_needing_reconciliation_for_source(
+            &policy.project_id,
+            "pilot",
+            &scope.source_identity,
+        )? {
+            ensure!(
+                unresolved.policy_id == policy.policy_id,
+                "a prior pilot request has unresolved usage; reconcile it and authorize the exact prior request before a replacement policy can retry"
+            );
+        }
     }
 
     let baseline = match previous_record.as_ref() {

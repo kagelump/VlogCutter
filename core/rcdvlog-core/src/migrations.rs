@@ -7,7 +7,7 @@ use thiserror::Error;
 
 use crate::chronology::forward_migrate_project_chronology;
 
-pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 43;
+pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 44;
 
 const MIGRATION_TABLE_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -341,6 +341,12 @@ pub const PROJECT_CATALOG_MIGRATIONS: &[SqliteMigration] = &[
         name: "native_transcript_provenance",
         source_identity: "project-catalog/0043-native-transcript-provenance/20261028",
         apply: add_native_transcript_provenance,
+    },
+    SqliteMigration {
+        id: 44,
+        name: "native_no_provider_pilot_status",
+        source_identity: "project-catalog/0044-native-no-provider-pilot-status/20261029",
+        apply: add_native_no_provider_pilot_status,
     },
 ];
 
@@ -914,6 +920,32 @@ fn add_native_transcript_provenance(transaction: &Transaction<'_>) -> Result<()>
         BEGIN
             SELECT RAISE(ABORT, 'native transcript policy and quality recipe must be present together');
         END;
+        "#,
+    )?;
+    Ok(())
+}
+
+/// Migration 44. Preserve every existing pilot row while admitting the explicit
+/// native all-local outcome. `no_provider_required` means no provider request
+/// was made: it is not a capability pass, accepted transcript or bulk permit.
+fn add_native_no_provider_pilot_status(transaction: &Transaction<'_>) -> Result<()> {
+    transaction.execute_batch(
+        r#"
+        CREATE TABLE analysis_run_pilots_v44 (
+            policy_id TEXT PRIMARY KEY REFERENCES analysis_run_authorizations(policy_id) ON DELETE CASCADE,
+            project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            status TEXT NOT NULL CHECK(status IN ('running','passed','failed','uncertain','no_provider_required')),
+            record_json TEXT NOT NULL,
+            started_at TEXT NOT NULL,
+            finished_at TEXT NOT NULL DEFAULT ''
+        );
+        INSERT INTO analysis_run_pilots_v44(policy_id,project_id,status,record_json,started_at,finished_at)
+        SELECT policy_id,project_id,status,record_json,started_at,finished_at
+        FROM analysis_run_pilots;
+        DROP TABLE analysis_run_pilots;
+        ALTER TABLE analysis_run_pilots_v44 RENAME TO analysis_run_pilots;
+        CREATE INDEX IF NOT EXISTS analysis_run_pilots_project
+            ON analysis_run_pilots(project_id, started_at DESC);
         "#,
     )?;
     Ok(())
@@ -3713,8 +3745,9 @@ mod tests {
                 .unwrap()
         };
         assert_eq!(&history_after[..history_before.len()], &history_before[..]);
-        assert_eq!(history_after.len(), history_before.len() + 1);
-        assert_eq!(history_after.last().unwrap().0, 43);
+        assert_eq!(history_after.len(), history_before.len() + 2);
+        assert_eq!(history_after[history_before.len()].0, 43);
+        assert_eq!(history_after.last().unwrap().0, 44);
         let fk_violations: i64 = connection
             .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
                 row.get(0)
@@ -4087,5 +4120,74 @@ mod tests {
             assert!(format!("{error:#}").contains(expected));
             assert!(!table_exists(&connection, "schema_migrations").unwrap());
         }
+    }
+    #[test]
+    fn migration_44_preserves_pilot_rows_and_admits_no_provider_status() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        run_sqlite_migrations(&mut connection, &PROJECT_CATALOG_MIGRATIONS[..43]).unwrap();
+        connection
+            .execute_batch(
+                r#"
+                INSERT INTO projects(id,name,created_at)
+                    VALUES ('p44','project','2026-01-01T00:00:00Z');
+                INSERT INTO analysis_run_authorizations(
+                    policy_id,project_id,policy_json,authorized_at,accounting_contract)
+                    VALUES ('policy44','p44','{}','2026-01-01T00:00:00Z','contract');
+                INSERT INTO analysis_run_pilots(
+                    policy_id,project_id,status,record_json,started_at,finished_at)
+                    VALUES ('policy44','p44','passed','{"legacy":true}',
+                            '2026-01-01T00:00:00Z','2026-01-01T00:01:00Z');
+                "#,
+            )
+            .unwrap();
+        assert!(
+            connection
+                .execute(
+                    "UPDATE analysis_run_pilots SET status='no_provider_required' WHERE policy_id='policy44'",
+                    [],
+                )
+                .is_err(),
+            "the pre-44 schema must reject the new explicit status before migration"
+        );
+
+        migrate_project_catalog(&mut connection).unwrap();
+        let preserved: (String, String, String, String) = connection
+            .query_row(
+                "SELECT project_id,status,record_json,started_at FROM analysis_run_pilots WHERE policy_id='policy44'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            preserved,
+            (
+                "p44".into(),
+                "passed".into(),
+                "{\"legacy\":true}".into(),
+                "2026-01-01T00:00:00Z".into()
+            )
+        );
+        connection
+            .execute(
+                "UPDATE analysis_run_pilots SET status='no_provider_required' WHERE policy_id='policy44'",
+                [],
+            )
+            .unwrap();
+        let status: String = connection
+            .query_row(
+                "SELECT status FROM analysis_run_pilots WHERE policy_id='policy44'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "no_provider_required");
+        assert!(
+            connection
+                .execute(
+                    "UPDATE analysis_run_pilots SET status='invented' WHERE policy_id='policy44'",
+                    [],
+                )
+                .is_err()
+        );
     }
 }

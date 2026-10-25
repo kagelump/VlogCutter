@@ -4,7 +4,9 @@
 //! NativeSpeechTranscription policy, extracts the selected proxy exactly once,
 //! runs standalone Silero VAD, and returns bounded window maps plus exclusive
 //! speech/proxy claims. It never reads credentials, prepares a provider request,
-//! calls a transport, reserves budget, or writes canonical speech state.
+//! calls a transport, reserves budget, or writes canonical speech state; the
+//! bounded native pilot caller owns those accounted/cloud phases while holding
+//! this result's claims and source guard.
 
 use anyhow::{Context, Result, bail, ensure};
 use hound::{SampleFormat, WavReader};
@@ -18,8 +20,8 @@ use crate::analysis::openrouter_stt::{
     plan_native_stt_speech_windows, resolve_speech_backend,
 };
 use crate::analysis::run_policy::{
-    AnalysisPayload, RunAssetScope, RunPolicy, RunPolicyParameters,
-    load_run_authorization_on_connection, source_scope,
+    AnalysisPayload, RunAssetScope, RunPolicy, load_run_authorization_on_connection,
+    native_stt_request_from_policy, source_scope,
 };
 use crate::analysis::silero_vad::{SileroVad, SpeechDetector, validate_vad_threads};
 use crate::analysis::store::native_stt_transcript_recipe;
@@ -55,8 +57,8 @@ pub(crate) struct NativeVadEvidence {
     pub sample_compatibility: String,
 }
 
-/// Exact identities needed by a future accounted native-speech caller. Paths,
-/// raw PCM, WAV bytes and credentials are deliberately absent.
+/// Exact identities needed by the bounded accounted native-speech pilot caller.
+/// Paths, raw PCM, WAV bytes and credentials are deliberately absent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct NativeSpeechPreparationEvidence {
@@ -129,8 +131,8 @@ impl fmt::Debug for NativeSpeechPreparation {
 }
 
 /// One locally prepared native-speech candidate. The result owns both the
-/// selected proxy claim and the per-asset speech claim until the future caller
-/// has finished its cloud work or drops the result.
+/// selected proxy claim and the per-asset speech claim until the bounded native
+/// pilot caller has finished its cloud work or drops the result.
 pub(crate) struct NativeSpeechPreparation {
     evidence: NativeSpeechPreparationEvidence,
     media: NativeSpeechMedia,
@@ -194,7 +196,7 @@ impl NativeSpeechPreparation {
         NativeSttAudioWindow::from_pcm(pcm, window)
     }
 
-    /// Recheck the exact proxy identity before a future caller uploads audio.
+    /// Recheck the exact proxy identity before the native pilot uploads audio.
     /// Claims remain coordination only; this is the independent source proof.
     pub(crate) fn validate_source_current(&self, catalog: &Catalog) -> Result<()> {
         self.source_guard
@@ -237,7 +239,7 @@ impl NativeSpeechPreparation {
     }
 }
 
-type DetectorLoader = Box<dyn FnMut(&Path, usize) -> Result<Box<dyn SpeechDetector>>>;
+pub(crate) type DetectorLoader = Box<dyn FnMut(&Path, usize) -> Result<Box<dyn SpeechDetector>>>;
 
 #[cfg(test)]
 type TestProbeHook = Box<dyn FnMut(&Path) -> Result<bool>>;
@@ -251,9 +253,9 @@ pub(crate) struct NativeSpeechPreparer {
     detector_configuration: Option<(PathBuf, usize)>,
     loader: DetectorLoader,
     #[cfg(test)]
-    probe_hook: Option<TestProbeHook>,
+    pub(crate) probe_hook: Option<TestProbeHook>,
     #[cfg(test)]
-    extract_hook: Option<TestExtractHook>,
+    pub(crate) extract_hook: Option<TestExtractHook>,
 }
 
 impl Default for NativeSpeechPreparer {
@@ -271,6 +273,11 @@ impl Default for NativeSpeechPreparer {
 }
 
 impl NativeSpeechPreparer {
+    #[cfg(test)]
+    pub(crate) fn set_test_loader(&mut self, loader: DetectorLoader) {
+        self.loader = loader;
+    }
+
     pub(crate) fn new() -> Self {
         Self::default()
     }
@@ -512,14 +519,6 @@ fn check_cancelled(is_cancelled: &mut dyn FnMut() -> bool) -> Result<()> {
 
 fn validate_native_policy(policy: &RunPolicy, asset_id: &str) -> Result<NativeSttRequest> {
     ensure!(
-        policy.kind == crate::AnalysisRunKind::NativeSpeechTranscription,
-        "authorized policy is not native speech transcription"
-    );
-    ensure!(
-        policy.payload == AnalysisPayload::Audio,
-        "authorized native speech policy payload is not audio"
-    );
-    ensure!(
         policy
             .scope
             .iter()
@@ -528,46 +527,7 @@ fn validate_native_policy(policy: &RunPolicy, asset_id: &str) -> Result<NativeSt
             == 1,
         "authorized native speech policy must contain exactly one entry for the requested asset"
     );
-    ensure!(
-        !policy.allow_fallback
-            && policy.permitted_fallbacks.is_empty()
-            && policy.allowed_models == vec![policy.primary_model.clone()],
-        "authorized native speech policy must select exactly one model without fallback"
-    );
-    ensure!(
-        policy.readiness.ready_for_authorization && policy.readiness.budget_ready,
-        "authorized native speech policy is not ready"
-    );
-    ensure!(
-        policy.budget_usd.is_finite() && policy.budget_usd > 0.0,
-        "authorized native speech budget is invalid"
-    );
-    ensure!(
-        policy.expected_cost_usd.is_finite()
-            && policy.expected_cost_usd >= 0.0
-            && policy.expected_cost_usd <= policy.budget_usd,
-        "authorized native speech cost exceeds its budget"
-    );
-    ensure!(
-        policy.provider_cost_bound_contract == crate::native_stt_cost_bound_contract_id(),
-        "authorized native speech provider cost contract changed"
-    );
-    let RunPolicyParameters::NativeSpeechTranscription {
-        language,
-        provider_policy,
-        ..
-    } = &policy.parameters
-    else {
-        bail!("authorized policy is missing native speech parameters");
-    };
-    let request = NativeSttRequest::new(
-        policy.provider.clone(),
-        policy.primary_model.clone(),
-        language.clone(),
-        0.0,
-        *provider_policy,
-    )?;
-    Ok(request)
+    native_stt_request_from_policy(policy)
 }
 
 fn validate_asset_scope(catalog: &Catalog, policy: &RunPolicy, asset: &Asset) -> Result<()> {
