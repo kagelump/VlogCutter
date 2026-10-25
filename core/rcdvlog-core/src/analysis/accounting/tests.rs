@@ -4601,6 +4601,10 @@ fn native_payload_fingerprint_is_deterministic_content_free_and_field_sensitive(
     let fingerprint = analysis_native_stt_payload_fingerprint(&request, &audio).unwrap();
     assert_eq!(
         fingerprint,
+        "a70248f1f4b57d703d42c608ae1622b848eb31db2b35e6dcd0b9c722915746d7"
+    );
+    assert_eq!(
+        fingerprint,
         analysis_native_stt_payload_fingerprint(&request, &audio).unwrap()
     );
     assert_eq!(fingerprint.len(), 64);

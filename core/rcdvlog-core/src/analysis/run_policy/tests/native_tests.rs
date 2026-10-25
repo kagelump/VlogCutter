@@ -63,6 +63,30 @@ fn native_request(project: &str, asset: &str, budget: f64) -> RunPolicyRequest {
     )
 }
 
+fn expected_native_recipe(request: &RunPolicyRequest) -> String {
+    let RunPolicyParameters::NativeSpeechTranscription {
+        language,
+        provider_policy,
+        ..
+    } = &request.parameters
+    else {
+        panic!("expected native parameters");
+    };
+    let native_request = NativeSttRequest::new(
+        request.provider.clone(),
+        request.primary_model.clone(),
+        language.clone(),
+        0.0,
+        *provider_policy,
+    )
+    .unwrap();
+    crate::analysis::store::native_stt_transcript_recipe(&native_request).unwrap()
+}
+
+fn blocked_native_recipe() -> String {
+    format!("{}:unregistered", native_stt::NATIVE_STT_RECIPE_VERSION)
+}
+
 fn table_count(catalog: &Catalog, table: &str) -> i64 {
     catalog
         .connection()
@@ -110,7 +134,11 @@ fn native_speech_proposal_binds_registered_audio_only_scope_cost_and_stays_block
         policy.output_schema_version,
         native_stt::NATIVE_STT_OUTPUT_SCHEMA_VERSION
     );
-    assert_eq!(policy.recipe_version, native_stt::NATIVE_STT_RECIPE_VERSION);
+    assert_eq!(policy.recipe_version, expected_native_recipe(&request));
+    assert!(policy.recipe_version.starts_with(
+        crate::analysis::store::native_recipe::NATIVE_STT_TRANSCRIPT_RECIPE_SCHEMA_VERSION
+    ));
+    assert_ne!(policy.recipe_version, crate::analysis::STT_RECIPE_KEY);
     assert_eq!(policy.tool_version, RUN_POLICY_TOOL_VERSION);
     assert!(
         policy
@@ -251,18 +279,42 @@ fn native_speech_rejects_chat_models_routes_fallback_vocab_and_non_audio() {
             .iter()
             .any(|blocker| blocker.code == "unsupported_native_stt_model")
     );
+    assert_eq!(policy.recipe_version, blocked_native_recipe());
+    assert!(!policy.recipe_version.starts_with(
+        crate::analysis::store::native_recipe::NATIVE_STT_TRANSCRIPT_RECIPE_SCHEMA_VERSION
+    ));
 
     let mut unqualified = native_request(&project, &asset, 1.0);
     unqualified.primary_model = "whisper-1".into();
     unqualified.allowed_models = vec!["whisper-1".into()];
+    let unqualified_policy = catalog.describe_run_policy(&unqualified).unwrap();
     assert!(
-        catalog
-            .describe_run_policy(&unqualified)
-            .unwrap()
+        unqualified_policy
             .readiness
             .blockers
             .iter()
             .any(|blocker| blocker.code == "unsupported_native_stt_model")
+    );
+    assert_eq!(unqualified_policy.recipe_version, blocked_native_recipe());
+
+    let mut invalid_language = native_request(&project, &asset, 1.0);
+    if let RunPolicyParameters::NativeSpeechTranscription { language, .. } =
+        &mut invalid_language.parameters
+    {
+        *language = Some("zz".into());
+    }
+    let invalid_language_policy = catalog.describe_run_policy(&invalid_language).unwrap();
+    assert!(!invalid_language_policy.readiness.ready_for_authorization);
+    assert!(
+        invalid_language_policy
+            .readiness
+            .blockers
+            .iter()
+            .any(|blocker| blocker.code == "unsupported_language")
+    );
+    assert_eq!(
+        invalid_language_policy.recipe_version,
+        blocked_native_recipe()
     );
 
     let mut extra_allowlist = native_request(&project, &asset, 1.0);
@@ -347,6 +399,7 @@ fn native_speech_identity_binds_scope_language_policy_budget_and_source_not_tran
     let (directory, catalog, project, asset) = fixture();
     let request = native_request(&project, &asset, 1.0);
     let baseline = catalog.describe_run_policy(&request).unwrap();
+    assert_eq!(baseline.recipe_version, expected_native_recipe(&request));
 
     let mut changed_language = request.clone();
     changed_language.parameters = RunPolicyParameters::NativeSpeechTranscription {
@@ -354,12 +407,11 @@ fn native_speech_identity_binds_scope_language_policy_budget_and_source_not_tran
         provider_policy: NativeSttProviderPolicy::new(true, SttDataCollection::Deny),
         force: false,
     };
+    let changed_language_policy = catalog.describe_run_policy(&changed_language).unwrap();
+    assert_ne!(changed_language_policy.policy_id, baseline.policy_id);
     assert_ne!(
-        catalog
-            .describe_run_policy(&changed_language)
-            .unwrap()
-            .policy_id,
-        baseline.policy_id
+        changed_language_policy.recipe_version,
+        baseline.recipe_version
     );
 
     let mut changed_data_policy = request.clone();
@@ -368,33 +420,27 @@ fn native_speech_identity_binds_scope_language_policy_budget_and_source_not_tran
         provider_policy: NativeSttProviderPolicy::new(true, SttDataCollection::Allow),
         force: false,
     };
-    assert_ne!(
-        catalog
-            .describe_run_policy(&changed_data_policy)
-            .unwrap()
-            .policy_id,
-        baseline.policy_id
-    );
+    let changed_data_policy = catalog.describe_run_policy(&changed_data_policy).unwrap();
+    assert_ne!(changed_data_policy.policy_id, baseline.policy_id);
+    assert_ne!(changed_data_policy.recipe_version, baseline.recipe_version);
 
     let mut changed_budget = request.clone();
     changed_budget.budget_usd = 2.0;
-    assert_ne!(
-        catalog
-            .describe_run_policy(&changed_budget)
-            .unwrap()
-            .policy_id,
-        baseline.policy_id
+    let changed_budget_policy = catalog.describe_run_policy(&changed_budget).unwrap();
+    assert_ne!(changed_budget_policy.policy_id, baseline.policy_id);
+    assert_eq!(
+        changed_budget_policy.recipe_version, baseline.recipe_version,
+        "budget changes must not alter the transcript recipe identity"
     );
 
     let second = generated_asset(&catalog, &project, directory.path(), "clip2", 2);
     let mut changed_scope = request.clone();
     changed_scope.asset_ids.push(second);
-    assert_ne!(
-        catalog
-            .describe_run_policy(&changed_scope)
-            .unwrap()
-            .policy_id,
-        baseline.policy_id
+    let changed_scope_policy = catalog.describe_run_policy(&changed_scope).unwrap();
+    assert_ne!(changed_scope_policy.policy_id, baseline.policy_id);
+    assert_eq!(
+        changed_scope_policy.recipe_version, baseline.recipe_version,
+        "asset scope changes must not alter the transcript recipe identity"
     );
 
     let mut changed_rate_contract = baseline.clone();
@@ -412,6 +458,7 @@ fn native_speech_identity_binds_scope_language_policy_budget_and_source_not_tran
         .unwrap();
     let unchanged = catalog.describe_run_policy(&request).unwrap();
     assert_eq!(unchanged.policy_id, baseline.policy_id);
+    assert_eq!(unchanged.recipe_version, baseline.recipe_version);
     assert!(unchanged.scope[0].transcript_fingerprint.is_none());
     assert_eq!(unchanged.context, RunPolicyContext::default());
 

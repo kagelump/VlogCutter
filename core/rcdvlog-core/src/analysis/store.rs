@@ -13,6 +13,9 @@ use serde::{Deserialize, Serialize};
 use crate::analysis::STT_RECIPE_KEY;
 use crate::analysis::quality::DecodedSegment;
 
+pub(crate) mod native_recipe;
+pub use native_recipe::native_stt_transcript_recipe;
+
 /// Terminal states of a transcription attempt.
 ///
 /// `NoSpeech`, `NoAudio`, `NoAcceptedSpeech`, `Rejected`, and

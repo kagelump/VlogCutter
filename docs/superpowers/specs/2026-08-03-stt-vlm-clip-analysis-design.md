@@ -222,6 +222,27 @@ force alone is not paid-retry authorization. This slice still performs no cloud
 call, credential resolution, VAD execution, native accounting, provenance,
 provider/model selection, automatic retry or manual acceptance override.
 
+**C4A deterministic native transcript recipe (no provenance/runtime change).**
+The transcript owner now exposes one pure
+`native_stt_transcript_recipe(&NativeSttRequest)` helper under
+`analysis/store/native_recipe.rs`. It returns a recognizable
+`native-stt.transcript-recipe.v1:<blake3>` identity over explicit
+provider/model, selected language, supported provider data policy, fixed
+temperature, the registered endpoint/response/timestamp/input/window contract,
+the shared Silero VAD artifact identity, the 30-second greedy packing recipe and
+the C2 native quality recipe version. Raw audio, transcript text, paths,
+credentials, budgets, tariffs and monetary rates cannot enter the digest.
+Native `RunPolicy.recipe_version` uses this same helper for a valid registered
+proposal; invalid or unregistered proposals retain a stable `:unregistered`
+placeholder plus their existing structured blockers. A quality-rule or
+protocol/config semantic change therefore changes the recipe and the derived
+approval identity without resetting historical native accounting. Budget and
+asset-scope changes remain policy-identity inputs but are intentionally absent
+from the transcript cache recipe. Local whisper and VLM recipe identities are
+unchanged. C4B provenance links, persistence metadata, pilot/bulk orchestration
+and CLI/desktop backend selection remain deferred; this slice adds no SQLite
+migration and does not enable native execution.
+
 **Batch estimation, two-phase.** VAD sweeps the whole project first — at RTF
 0.0019 this is effectively free — which yields exact 30-second window counts.
 Transcription then runs with real weights. Weight is **30 s windows**, not
