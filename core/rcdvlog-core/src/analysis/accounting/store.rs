@@ -26,7 +26,12 @@ use super::model::{
 use super::settlement::{
     ExistingReceipt, ReceiptDisposition, classify_receipt, settlement_for_receipt,
 };
+use crate::analysis::openrouter_stt::{
+    NativeSttAudioWindow, NativeSttRequest, native_stt_cost_bound_contract_id,
+    native_stt_request_cost_bound,
+};
 use crate::analysis::provider::AnalysisRequestCostBound;
+use crate::analysis::run_policy::{AnalysisPayload, RunPolicyParameters};
 
 pub(crate) const REQUEST_SELECT: &str = "SELECT request_key,budget_scope_id,project_id,policy_id,run_id,operation,\
  attempt_base_key,attempt_epoch,requested_provider,actual_provider,requested_model,actual_model,\
@@ -62,6 +67,128 @@ struct LedgerTotals {
 impl LedgerTotals {
     fn committed(&self) -> f64 {
         self.confirmed + self.active_reserved + self.uncertain
+    }
+}
+
+/// Typed request-family proof carried into the same IMMEDIATE transaction as
+/// policy/source/model/run/budget validation. It prevents a VLM wrapper from
+/// spending against a native audio contract and vice versa. `Any` is only for
+/// authority initialization, which freezes evidence before a request exists.
+#[derive(Clone, Copy)]
+pub(crate) enum PolicyRequestFamily<'a> {
+    Any,
+    Vlm {
+        cost_bound: &'a AnalysisRequestCostBound,
+    },
+    NativeStt {
+        request: &'a NativeSttRequest,
+        audio: &'a NativeSttAudioWindow,
+        cost_bound: &'a AnalysisRequestCostBound,
+    },
+}
+
+/// Prove a genuine bounded native window only claims source milliseconds that
+/// exist inside one canonically authorized asset scope. This is pure and runs
+/// inside the same `IMMEDIATE` admission transaction that resolved the scope.
+pub(super) fn validate_native_audio_source_bounds(
+    audio: &NativeSttAudioWindow,
+    source_duration_ms: u32,
+) -> Result<()> {
+    for region in &audio.window().regions {
+        let source_end = region
+            .source_start_ms
+            .checked_add(region.duration_ms)
+            .ok_or_else(|| anyhow!("native STT source mapping overflowed"))?;
+        ensure!(
+            source_end <= source_duration_ms,
+            "native STT audio window exceeds the authorized source duration"
+        );
+    }
+    Ok(())
+}
+
+fn validate_policy_request_family(
+    policy: &crate::RunPolicy,
+    model: &str,
+    family: PolicyRequestFamily<'_>,
+) -> Result<()> {
+    match family {
+        PolicyRequestFamily::Any => Ok(()),
+        PolicyRequestFamily::Vlm { cost_bound } => {
+            ensure!(
+                policy.kind.is_vlm(),
+                "VLM accounted wrapper cannot spend against a native speech policy"
+            );
+            ensure!(
+                cost_bound.audio.is_none(),
+                "VLM accounted wrapper cannot use a native audio cost quote"
+            );
+            Ok(())
+        }
+        PolicyRequestFamily::NativeStt {
+            request,
+            audio,
+            cost_bound,
+        } => {
+            ensure!(
+                policy.kind == crate::AnalysisRunKind::NativeSpeechTranscription
+                    && policy.readiness.ready_for_authorization,
+                "native STT account wrapper requires a ready native speech policy"
+            );
+            ensure!(
+                policy.payload == AnalysisPayload::Audio,
+                "native STT policy must be audio-only"
+            );
+            ensure!(
+                policy.provider == request.provider(),
+                "native STT policy provider does not match the request"
+            );
+            ensure!(
+                model == request.model() && policy.primary_model == request.model(),
+                "native STT policy model does not match the request"
+            );
+            ensure!(
+                !policy.allow_fallback
+                    && policy.permitted_fallbacks.is_empty()
+                    && policy.allowed_models == vec![policy.primary_model.clone()],
+                "native STT policy must admit exactly one model with no fallback"
+            );
+            let RunPolicyParameters::NativeSpeechTranscription {
+                language,
+                provider_policy,
+                ..
+            } = &policy.parameters
+            else {
+                bail!("native STT policy is missing native speech parameters");
+            };
+            ensure!(
+                language.as_deref() == request.language(),
+                "native STT request language differs from the frozen policy"
+            );
+            ensure!(
+                *provider_policy == request.provider_policy(),
+                "native STT request data policy differs from the frozen policy"
+            );
+            ensure!(
+                request.temperature().to_bits() == 0.0_f64.to_bits(),
+                "native STT request temperature must be the fixed policy value 0"
+            );
+            ensure!(
+                policy.provider_cost_bound_contract == native_stt_cost_bound_contract_id(),
+                "native STT policy cost-bound contract is not the registered native contract"
+            );
+            let expected_bound = native_stt_request_cost_bound(request, audio)?;
+            ensure!(
+                cost_bound == &expected_bound,
+                "native STT request quote does not match the current registered native cost contract"
+            );
+            ensure!(
+                cost_bound.contract_version == policy.provider_cost_bound_contract
+                    && cost_bound.audio.is_some(),
+                "native STT policy and current quote use different cost contracts"
+            );
+            Ok(())
+        }
     }
 }
 
@@ -176,6 +303,7 @@ struct OwnerIdentity<'a> {
     model: &'a str,
     source_fingerprint: &'a str,
     run_id: &'a str,
+    intended_attempt_key: &'a str,
 }
 
 impl<'a> OwnerIdentity<'a> {
@@ -189,6 +317,7 @@ impl<'a> OwnerIdentity<'a> {
             model,
             source_fingerprint: &context.source_fingerprint,
             run_id: &context.run_id,
+            intended_attempt_key: &context.intended_attempt_key,
         }
     }
 
@@ -206,6 +335,7 @@ impl<'a> OwnerIdentity<'a> {
             model: &prior.requested_model,
             source_fingerprint: &prior.source_fingerprint,
             run_id,
+            intended_attempt_key: "",
         }
     }
 }
@@ -221,6 +351,7 @@ pub(crate) struct TargetedRetryClaim<'a> {
     pub model: &'a str,
     pub payload_fingerprint: &'a str,
     pub cost_bound_fingerprint: &'a str,
+    pub cost_bound: &'a AnalysisRequestCostBound,
 }
 
 fn merged_event_detail(base: Value, extra: Value) -> Value {
@@ -332,6 +463,60 @@ pub(crate) fn reserve(
     payload_fingerprint: &str,
     cost_bound: &AnalysisRequestCostBound,
 ) -> Result<AnalysisRequestRecord> {
+    reserve_with_family(
+        connection,
+        context,
+        model,
+        payload_fingerprint,
+        cost_bound,
+        PolicyRequestFamily::Vlm { cost_bound },
+    )
+}
+
+/// Native-audio admission uses the same canonical transaction but carries a
+/// typed native request/quote proof so chat and native policies cannot cross.
+pub(crate) fn reserve_native_stt(
+    connection: &mut Connection,
+    context: &AnalysisAccountingContext,
+    request: &NativeSttRequest,
+    audio: &NativeSttAudioWindow,
+    payload_fingerprint: &str,
+    cost_bound: &AnalysisRequestCostBound,
+) -> Result<AnalysisRequestRecord> {
+    ensure!(
+        !context.policy_id.trim().is_empty(),
+        "native STT admission requires a non-empty canonical policy identity"
+    );
+    ensure!(
+        !context.run_id.trim().is_empty(),
+        "native STT admission requires a real running accounted run"
+    );
+    ensure!(
+        context.operation == "pilot",
+        "native STT accounted admission is limited to the pilot operation"
+    );
+    reserve_with_family(
+        connection,
+        context,
+        request.model(),
+        payload_fingerprint,
+        cost_bound,
+        PolicyRequestFamily::NativeStt {
+            request,
+            audio,
+            cost_bound,
+        },
+    )
+}
+
+fn reserve_with_family(
+    connection: &mut Connection,
+    context: &AnalysisAccountingContext,
+    model: &str,
+    payload_fingerprint: &str,
+    cost_bound: &AnalysisRequestCostBound,
+    family: PolicyRequestFamily<'_>,
+) -> Result<AnalysisRequestRecord> {
     context.validate_request(model, payload_fingerprint)?;
     cost_bound.validate()?;
     let cost_bound_fingerprint = analysis_request_cost_bound_fingerprint(cost_bound)?;
@@ -352,7 +537,11 @@ pub(crate) fn reserve(
         context.budget_usd,
         &scope,
     )?;
-    validate_owner_identity(&transaction, &OwnerIdentity::from_context(context, model))?;
+    validate_owner_identity(
+        &transaction,
+        &OwnerIdentity::from_context(context, model),
+        family,
+    )?;
     if let Some(stop_reason) =
         persist_untracked_denial_boundary(&transaction, &authority, context.budget_usd)?
     {
@@ -470,6 +659,9 @@ pub(crate) fn validate_targeted_retry_claim(
             claim.run_id.unwrap_or(""),
             authority.budget_usd,
         ),
+        PolicyRequestFamily::Vlm {
+            cost_bound: claim.cost_bound,
+        },
     )?;
     Ok(prior)
 }
@@ -500,6 +692,7 @@ pub(crate) fn reserve_targeted_retry(
             model,
             payload_fingerprint,
             cost_bound_fingerprint: &cost_bound_fingerprint,
+            cost_bound,
         },
     )?;
     let authority = load_authority(&transaction, &prior.budget_scope_id)?;
@@ -1080,23 +1273,26 @@ pub(crate) fn record_receipt(
     let receipt_key = insert_receipt(&transaction, key, evidence, &fingerprint, &now)?;
     stop_on_receipt_overrun(&transaction, &current, evidence, &settlement, &now)?;
     apply_receipt_settlement(&transaction, &current, &settlement, &now)?;
-    append_event(
-        &transaction,
-        key,
-        "receipt",
-        json!({
-            "receiptKey": receipt_key,
-            "receiptFingerprint": fingerprint,
-            "usageComplete": evidence.usage_complete,
-            "reportedCostUsd": evidence.reported_cost_usd,
-            "confirmedCostUsd": settlement.confirmed_cost_usd,
-            "uncertainUsageReserveUsd": settlement.uncertain_usage_reserve_usd,
-            "metadataEnriched": settlement.metadata_enriched,
-            "actualProvider": evidence.provider,
-            "actualModel": evidence.actual_model,
-            "providerGenerationId": evidence.provider_generation_id,
-        }),
-    )?;
+    let mut receipt_event = json!({
+        "receiptKey": receipt_key,
+        "receiptFingerprint": fingerprint,
+        "usageComplete": evidence.usage_complete,
+        "reportedCostUsd": evidence.reported_cost_usd,
+        "confirmedCostUsd": settlement.confirmed_cost_usd,
+        "uncertainUsageReserveUsd": settlement.uncertain_usage_reserve_usd,
+        "metadataEnriched": settlement.metadata_enriched,
+        "actualProvider": evidence.provider,
+        "actualModel": evidence.actual_model,
+        "providerGenerationId": evidence.provider_generation_id,
+    });
+    if let Some(seconds) = evidence.billed_audio_seconds
+        && let Some(object) = receipt_event.as_object_mut()
+    {
+        // Native provider-billed duration is retained separately from the
+        // local input window and the conservative admission reservation.
+        object.insert("billedAudioSeconds".into(), json!(seconds));
+    }
+    append_event(&transaction, key, "receipt", receipt_event)?;
     let record = load_request(&transaction, key)?
         .ok_or_else(|| anyhow!("receipted analysis request disappeared"))?;
     transaction.commit()?;
@@ -1449,6 +1645,7 @@ fn validate_authority_input(
             &context.policy_fingerprint,
             &context.provider,
             context.budget_usd,
+            PolicyRequestFamily::Any,
         )?;
         ensure!(
             policy.policy_id == context.policy_id,
@@ -1463,7 +1660,11 @@ fn validate_authority_input(
 /// retry both call this exact function; an empty run id is only accepted by
 /// lower-level operation callers that do not use the accounted provider
 /// boundary, while a provided run id must be the real accounted running row.
-fn validate_owner_identity(connection: &Connection, identity: &OwnerIdentity<'_>) -> Result<()> {
+fn validate_owner_identity(
+    connection: &Connection,
+    identity: &OwnerIdentity<'_>,
+    family: PolicyRequestFamily<'_>,
+) -> Result<()> {
     if !identity.policy_id.trim().is_empty() {
         let policy = load_authorized_policy(
             connection,
@@ -1472,6 +1673,7 @@ fn validate_owner_identity(connection: &Connection, identity: &OwnerIdentity<'_>
             identity.policy_fingerprint,
             identity.provider,
             identity.budget_usd,
+            family,
         )?;
         ensure!(
             policy
@@ -1481,13 +1683,23 @@ fn validate_owner_identity(connection: &Connection, identity: &OwnerIdentity<'_>
                 || policy.primary_model == identity.model,
             "analysis accounting model is outside the frozen authorized model allowlist"
         );
-        ensure!(
-            policy
-                .scope
-                .iter()
-                .any(|scope| scope.source_identity == identity.source_fingerprint),
-            "analysis accounting source identity is outside the frozen authorized scope"
-        );
+        let authorized_scope = policy
+            .scope
+            .iter()
+            .find(|scope| scope.source_identity == identity.source_fingerprint)
+            .ok_or_else(|| {
+                anyhow!(
+                    "analysis accounting source identity is outside the frozen authorized scope"
+                )
+            })?;
+        if let PolicyRequestFamily::NativeStt { audio, .. } = family {
+            ensure!(
+                identity.intended_attempt_key
+                    == format!("{}:{}", policy.kind.as_str(), authorized_scope.asset_id),
+                "native STT intended request key is not the stable policy/source identity"
+            );
+            validate_native_audio_source_bounds(audio, authorized_scope.source_duration_ms)?;
+        }
     }
     if !identity.run_id.trim().is_empty() {
         let run: Option<(String, String, String, String)> = connection
@@ -1529,6 +1741,7 @@ fn load_authorized_policy(
     policy_fingerprint: &str,
     provider: &str,
     budget_usd: f64,
+    family: PolicyRequestFamily<'_>,
 ) -> Result<crate::RunPolicy> {
     let authorization: Option<(String, String, String)> = connection
         .query_row(
@@ -1558,7 +1771,6 @@ fn load_authorized_policy(
         policy.project_id == project_id,
         "analysis policy authorization belongs to a different project"
     );
-    crate::analysis::run_policy::ensure_vlm_run_kind(policy.kind)?;
     ensure!(
         policy_fingerprint == policy.policy_id,
         "analysis accounting policy fingerprint does not match the frozen authorization"
@@ -1571,6 +1783,7 @@ fn load_authorized_policy(
         (policy.budget_usd - budget_usd).abs() <= 1e-9,
         "analysis accounting budget does not match the frozen authorized ceiling"
     );
+    validate_policy_request_family(&policy, &policy.primary_model, family)?;
     Ok(policy)
 }
 

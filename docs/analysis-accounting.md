@@ -9,6 +9,12 @@ and explicitly authorized targeted retry are now thin adapters over the same
 canonical owner. Process-interruption recovery is verified with synthetic
 transports; no live OpenRouter/native acceptance is claimed by this slice.
 
+B3 additionally exposes one accounted native speech-transcription pilot request
+leaf. The VLM and native adapters share the same private admission -> prepare ->
+domain guard -> dispatch marker -> one send -> receipt lifecycle. High-level
+native pilot/bulk orchestration, VAD extraction, model loading, transcript
+persistence and CLI/desktop native selection remain unwired.
+
 ## Canonical owner
 
 The project SQLite catalog remains the single accounting owner. Migrations 38
@@ -457,7 +463,7 @@ window mapping changes the fingerprint. Production cloud selection, dispatch,
 CLI/desktop wiring and native retry recovery remain intentionally disconnected
 in this slice.
 
-## Native STT policy proposal (B2, proposal only)
+## Native STT policy authorization (B2, superseded runtime blocker)
 
 B2 extends the existing `RunPolicy` owner with the explicit
 `native_speech_transcription` kind. A native proposal binds the exact scoped
@@ -469,11 +475,67 @@ duration rate; before VAD runs, the window count is the conservative source
 duration upper bound `floor(2 * duration_ms / 30_000) + 1`. This estimate is not
 the VLM reference clip cost and is not a provider invoice cap.
 
-No native authorization, reservation, run row or provider call exists in B2.
-The proposal always carries `native_accounted_runtime_unavailable` (and a failed
-`native_stt.accounted_runtime` capability), so authorization is refused before a
-write and the existing VLM pilot/provider/recovery boundaries reject the kind
-before credentials or preparation. The contract ID and registered protocol check
-describe the reviewed native transport only; they are not observed capability.
-A later slice must route native audio through the same canonical reservation,
-dispatch, receipt and unknown-usage owners before relaxing this blocker.
+B2 originally kept the proposal blocked with
+`native_accounted_runtime_unavailable` and a failed
+`native_stt.accounted_runtime` capability. B3 supersedes that fact only because
+the shared accounted native request leaf now exists: real
+`Catalog::authorize_run_policy` can persist the exact native policy, and a
+caller can initialize the existing authority and create a real running
+accounted run before invoking the leaf. High-level native pilot/bulk
+orchestration is still absent, so `ready_for_pilot` remains false and an
+explicit native-pilot-unavailable warning is reported separately from
+provider/model authorization.
+
+## Native STT accounted pilot leaf (B3)
+
+`AccountedNativeSttProvider` owns exactly one explicitly supplied bounded
+`NativeSttAudioWindow` for an authorized native policy. It is restricted to the
+existing `pilot` operation and a stable `native_speech_transcription:<asset>`
+intended-attempt key. The caller initializes the whole-policy authority before
+creating the owned `analysis_runs` row; the adapter does not create budgets,
+runs, scopes, credentials, retries or fallback chains.
+
+The native quote and payload identity are always computed by the existing
+`native_stt_request_cost_bound` and
+`analysis_native_stt_payload_fingerprint` owners. Admission calls the canonical
+SQLite `BEGIN IMMEDIATE` reservation path with a typed native request-family
+proof. Inside that same transaction the owner rechecks the authorized policy,
+current native cost contract, audio-only/fixed-temperature/language/data-policy
+binding, one-model/no-fallback policy, exact project-owned source scope and real
+running accounted run. After resolving the unique canonical scope, that same
+immediate transaction proves every native packed-region source end fits inside
+the authorized asset duration. The strict native WAV constructor also requires
+source regions to be monotonic and non-overlapping; the lenient local decode
+helper is unchanged. A VLM wrapper cannot spend against a native policy or a
+native audio quote, and it rejects a native duration quote even in a lower-level
+non-policy operation context before preparation or ledger admission. A native
+wrapper cannot spend against a VLM policy or token quote.
+
+After the local transport `prepare`, a mandatory pre-dispatch guard reloads the
+canonical authorization, re-materializes the current policy identity, validates
+the exact source scope entry and referenced asset, and rejects changed source or
+policy before the durable marker. The marker is committed immediately before
+the single `NativeSttTransport::transcribe` call. The real
+`OpenRouterSttClient` uses its existing no-cancel send leaf after the marker and
+performs no second cancellation check that could masquerade as local no-upload
+proof.
+
+Returned provider evidence is settled before domain outcome validation.
+Provider/model/generation identity is persisted only when returned; known
+finite non-negative cost produces complete usage, while missing or malformed
+cost remains uncertain even for a structurally valid transcript. Token counts
+are preserved as `None` when absent and are never fabricated or clamped on
+`u64 -> u32` overflow. Optional billed audio seconds are retained separately
+from both the local input window and the admission reservation in immutable
+receipt event evidence; the optional receipt JSON field is omitted when absent
+so historical VLM receipt fingerprints remain byte-identical. A malformed body
+or non-2xx response still returns a typed unusable outcome after its known
+charge is retained. Transport failure after the marker remains uncertain and is
+never automatically retried.
+
+Native targeted retry dispatch remains intentionally unwired in B3. Existing
+generic inspection/reconciliation can inspect and reconcile a native request,
+but the VLM targeted-retry wrapper rejects native policies and no high-level
+native retry parser/permit path exists yet. A default repeat of a completed or
+uncertain native request is fenced by the canonical stable intended-attempt key
+and cannot be forced merely by creating a new run.

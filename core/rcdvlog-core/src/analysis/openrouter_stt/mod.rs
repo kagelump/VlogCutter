@@ -44,9 +44,26 @@ const NATIVE_STT_BILLING_SEMANTICS: &str =
 mod client;
 mod decode;
 #[cfg(test)]
+mod native_packing_tests;
+#[cfg(test)]
 mod tests;
 pub use client::{NativeSttClientError, OpenRouterSttClient};
 pub use decode::*;
+
+/// Narrow transport seam for one native-audio transmission.
+///
+/// Accounting owns the durable phases around this seam. Implementations must
+/// not retry, fall back, read catalogs or perform their own authorization.
+/// `prepare` runs before the durable dispatch marker; `transcribe` is the one
+/// actual send and must not consult cancellation after the marker.
+pub trait NativeSttTransport {
+    fn prepare(&self) -> Result<()>;
+    fn transcribe(
+        &self,
+        request: &NativeSttRequest,
+        audio: &NativeSttAudioWindow,
+    ) -> Result<NativeSttCallResult>;
+}
 
 /// Verified native transcription capability for one provider-qualified model.
 ///

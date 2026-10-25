@@ -9,7 +9,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::analysis::openrouter_stt::{
-    NativeSttAudioWindow, NativeSttRequest, build_native_stt_request_body, resolve_native_stt_model,
+    NativeSttAudioWindow, NativeSttCost, NativeSttReceipt, NativeSttRequest,
+    build_native_stt_request_body, resolve_native_stt_model,
 };
 use crate::analysis::provider::{AnalysisRequestCostBound, VlmRequest, VlmResponse};
 
@@ -498,6 +499,12 @@ pub struct ProviderReceiptEvidence {
     pub completion_tokens: Option<u32>,
     #[serde(default)]
     pub usage_complete: bool,
+    /// Provider-reported billed audio duration for native STT. This is kept
+    /// separate from the local input window and admission reservation. The
+    /// optional field is omitted from JSON so historical VLM receipt
+    /// fingerprints remain byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub billed_audio_seconds: Option<f64>,
 }
 
 impl ProviderReceiptEvidence {
@@ -511,7 +518,36 @@ impl ProviderReceiptEvidence {
             prompt_tokens: Some(response.prompt_tokens),
             completion_tokens: Some(response.completion_tokens),
             usage_complete: response.receipt.usage_complete,
+            billed_audio_seconds: None,
         }
+    }
+
+    /// Map only provider-returned native evidence into the shared receipt
+    /// owner. Requested provider/model are never substituted for missing
+    /// actual identities, and token counts wider than `u32` stay unknown.
+    pub fn from_native_stt_receipt(receipt: &NativeSttReceipt) -> Result<Self> {
+        let reported_cost_usd = match receipt.usage.cost {
+            NativeSttCost::Known(cost) if cost.is_finite() && cost >= 0.0 => Some(cost),
+            _ => None,
+        };
+        let evidence = Self {
+            provider: receipt.actual_provider.clone().unwrap_or_default(),
+            provider_generation_id: receipt.generation_id.clone().unwrap_or_default(),
+            actual_model: receipt.actual_model.clone().unwrap_or_default(),
+            reported_cost_usd,
+            prompt_tokens: receipt
+                .usage
+                .input_tokens
+                .and_then(|value| u32::try_from(value).ok()),
+            completion_tokens: receipt
+                .usage
+                .output_tokens
+                .and_then(|value| u32::try_from(value).ok()),
+            usage_complete: reported_cost_usd.is_some(),
+            billed_audio_seconds: receipt.usage.seconds,
+        };
+        evidence.validate()?;
+        Ok(evidence)
     }
 
     /// Complete usage plus a trustworthy returned cost is required to confirm a
@@ -538,6 +574,12 @@ impl ProviderReceiptEvidence {
             ensure!(
                 cost.is_finite() && cost >= 0.0,
                 "provider receipt cost must be finite and non-negative"
+            );
+        }
+        if let Some(seconds) = self.billed_audio_seconds {
+            ensure!(
+                seconds.is_finite() && seconds >= 0.0,
+                "provider receipt billed audio seconds must be finite and non-negative"
             );
         }
         ensure!(

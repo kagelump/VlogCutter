@@ -29,6 +29,8 @@ use crate::analysis::run_policy::{
 use crate::analysis::windows::{SpeechRegion, pack_windows};
 use crate::{AnalysisRunKind, Catalog};
 
+mod native_boundary_regressions;
+
 fn fixture() -> (tempfile::TempDir, Catalog, String) {
     let directory = tempdir().unwrap();
     let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).unwrap();
@@ -165,6 +167,7 @@ fn receipt(
         prompt_tokens: Some(10),
         completion_tokens: Some(5),
         usage_complete,
+        billed_audio_seconds: None,
     }
 }
 
@@ -2047,6 +2050,7 @@ fn complete_usage_without_cost_stays_unknown_until_matching_cost_receipt() {
         prompt_tokens: Some(10),
         completion_tokens: Some(5),
         usage_complete: true,
+        billed_audio_seconds: None,
     };
     let unknown = catalog
         .record_analysis_request_receipt(&request.request_key, &missing_cost)
@@ -3391,6 +3395,7 @@ fn current_run_provenance_uses_receipt_event_order_not_timestamps() {
         prompt_tokens: None,
         completion_tokens: None,
         usage_complete: false,
+        billed_audio_seconds: None,
     };
     catalog
         .record_analysis_request_receipt(&fallback.request_key, &metadata_only)
@@ -4203,6 +4208,7 @@ fn targeted_retry_claim_uses_the_same_owner_checks_as_initial_admission() {
             DEFAULT_MODEL,
             payload_fingerprint,
             &cost_bound_fingerprint,
+            &cost_bound,
         )
         .unwrap();
 
@@ -4214,6 +4220,7 @@ fn targeted_retry_claim_uses_the_same_owner_checks_as_initial_admission() {
                 DEFAULT_MODEL,
                 payload_fingerprint,
                 &cost_bound_fingerprint,
+                &cost_bound,
             )
             .is_err(),
         "the prior interrupted run cannot be reused as a new retry run"
@@ -4237,6 +4244,7 @@ fn targeted_retry_claim_uses_the_same_owner_checks_as_initial_admission() {
             DEFAULT_MODEL,
             payload_fingerprint,
             &cost_bound_fingerprint,
+            &cost_bound,
         )
         .unwrap_err();
     assert!(
@@ -4261,6 +4269,7 @@ fn targeted_retry_claim_uses_the_same_owner_checks_as_initial_admission() {
             DEFAULT_MODEL,
             payload_fingerprint,
             &cost_bound_fingerprint,
+            &cost_bound,
         )
         .unwrap_err();
     assert!(
@@ -4289,6 +4298,7 @@ fn targeted_retry_claim_uses_the_same_owner_checks_as_initial_admission() {
             DEFAULT_MODEL,
             payload_fingerprint,
             &cost_bound_fingerprint,
+            &cost_bound,
         )
         .unwrap_err();
     assert!(
@@ -4305,6 +4315,7 @@ fn targeted_retry_claim_uses_the_same_owner_checks_as_initial_admission() {
             DEFAULT_MODEL,
             payload_fingerprint,
             &cost_bound_fingerprint,
+            &cost_bound,
         )
         .unwrap_err();
     assert!(
@@ -4332,6 +4343,7 @@ fn targeted_retry_claim_uses_the_same_owner_checks_as_initial_admission() {
             DEFAULT_MODEL,
             payload_fingerprint,
             &cost_bound_fingerprint,
+            &cost_bound,
         )
         .unwrap_err();
     assert!(
@@ -4360,6 +4372,7 @@ fn targeted_retry_claim_uses_the_same_owner_checks_as_initial_admission() {
             DEFAULT_MODEL,
             payload_fingerprint,
             &cost_bound_fingerprint,
+            &cost_bound,
         )
         .unwrap_err();
     assert!(
@@ -4382,6 +4395,7 @@ fn targeted_retry_claim_uses_the_same_owner_checks_as_initial_admission() {
             DEFAULT_MODEL,
             payload_fingerprint,
             &cost_bound_fingerprint,
+            &cost_bound,
         )
         .unwrap_err();
     assert!(

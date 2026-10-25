@@ -1,7 +1,17 @@
 use super::*;
-use crate::analysis::openrouter_stt::{
-    OPENROUTER_STT_PROVIDER, OPENROUTER_WHISPER_MODEL, SttDataCollection,
+use crate::analysis::accounting::{
+    AccountedNativeSttProvider, AnalysisAccountingContext, AnalysisBudgetAuthorityContext,
+    AnalysisRequestLifecycle,
 };
+use crate::analysis::openrouter_stt::{
+    NativeSttAudioWindow, NativeSttCallResult, NativeSttCost, NativeSttOutcome,
+    NativeSttProviderPolicy, NativeSttReceipt, NativeSttRequest, NativeSttTransport,
+    NativeSttUsage, OPENROUTER_STT_PROVIDER, OPENROUTER_WHISPER_MODEL, SttDataCollection,
+    decode_native_stt_body,
+};
+use crate::analysis::windows::{SpeechRegion, pack_windows};
+use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
 
 struct NeverVlmProvider {
     prepare_calls: AtomicUsize,
@@ -113,18 +123,25 @@ fn native_speech_proposal_binds_registered_audio_only_scope_cost_and_stays_block
     );
     assert!(policy.capability_checks.iter().any(|check| {
         check.requirement == "native_stt.accounted_runtime"
-            && check.status == CapabilityStatus::Failed
+            && check.status == CapabilityStatus::Passed
     }));
     assert!(
-        policy
+        !policy
             .readiness
             .blockers
             .iter()
-            .any(|blocker| { blocker.code == native_stt::NATIVE_STT_RUNTIME_UNAVAILABLE })
+            .any(|blocker| { blocker.code == "native_accounted_runtime_unavailable" })
     );
-    assert!(!policy.readiness.ready_for_authorization);
+    assert!(policy.readiness.ready_for_authorization);
     assert!(!policy.readiness.ready_for_pilot);
-    assert!(!policy.readiness.capabilities_ready);
+    assert!(policy.readiness.capabilities_ready);
+    assert!(
+        policy
+            .readiness
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("ready_for_pilot stays false"))
+    );
 
     let spec = resolve_native_stt_model(OPENROUTER_STT_PROVIDER, OPENROUTER_WHISPER_MODEL).unwrap();
     let (expected, basis) = native_stt::expected_cost_usd(&policy.scope, spec).unwrap();
@@ -172,14 +189,14 @@ fn native_speech_proposal_binds_registered_audio_only_scope_cost_and_stays_block
         policy.policy_id
     );
 
-    let auth_rows = table_count(&catalog, "analysis_run_authorizations");
     let run_rows = table_count(&catalog, "analysis_runs");
     let budget_rows = table_count(&catalog, "analysis_budget_authorities");
-    let authorization_error = catalog.authorize_run_policy(&request).unwrap_err();
-    assert!(format!("{authorization_error:#}").contains("proposal-only"));
+    let authorization = catalog.authorize_run_policy(&request).unwrap();
+    assert_eq!(authorization.policy.policy_id, policy.policy_id);
     assert_eq!(
         table_count(&catalog, "analysis_run_authorizations"),
-        auth_rows
+        1,
+        "native policy authorization uses the real existing authorization owner"
     );
     assert_eq!(table_count(&catalog, "analysis_runs"), run_rows);
     assert_eq!(
@@ -200,7 +217,8 @@ fn native_speech_proposal_binds_registered_audio_only_scope_cost_and_stays_block
     assert_eq!(provider.analyze_calls.load(Ordering::SeqCst), 0);
     assert_eq!(
         table_count(&catalog, "analysis_run_authorizations"),
-        auth_rows
+        1,
+        "rejected VLM pilot entry point must not change native authorization"
     );
     assert_eq!(table_count(&catalog, "analysis_runs"), run_rows);
     assert_eq!(
@@ -538,5 +556,761 @@ fn native_speech_budget_and_source_duration_boundaries_fail_closed() {
             .blockers
             .iter()
             .any(|blocker| blocker.code == "source_not_ready")
+    );
+}
+
+#[derive(Clone)]
+enum FakeNativeResponse {
+    Ok(Box<NativeSttCallResult>),
+    TransportError,
+}
+
+struct CountingNativeTransport<'a> {
+    catalog: &'a Catalog,
+    run_id: String,
+    prepare_calls: AtomicUsize,
+    transcribe_calls: AtomicUsize,
+    dispatched_seen_before_call: AtomicUsize,
+    prepared: AtomicBool,
+    fail_prepare: bool,
+    mutate_asset_on_prepare: Option<String>,
+    response: Mutex<FakeNativeResponse>,
+}
+
+impl<'a> CountingNativeTransport<'a> {
+    fn new(
+        catalog: &'a Catalog,
+        run_id: &str,
+        response: FakeNativeResponse,
+    ) -> CountingNativeTransport<'a> {
+        Self {
+            catalog,
+            run_id: run_id.to_string(),
+            prepare_calls: AtomicUsize::new(0),
+            transcribe_calls: AtomicUsize::new(0),
+            dispatched_seen_before_call: AtomicUsize::new(0),
+            prepared: AtomicBool::new(false),
+            fail_prepare: false,
+            mutate_asset_on_prepare: None,
+            response: Mutex::new(response),
+        }
+    }
+
+    fn failing_prepare(mut self) -> Self {
+        self.fail_prepare = true;
+        self
+    }
+
+    fn mutating_asset_on_prepare(mut self, asset_id: &str) -> Self {
+        self.mutate_asset_on_prepare = Some(asset_id.to_string());
+        self
+    }
+
+    fn prepare_seen(&self) -> bool {
+        self.prepared.load(Ordering::SeqCst)
+    }
+}
+
+impl NativeSttTransport for CountingNativeTransport<'_> {
+    fn prepare(&self) -> Result<()> {
+        self.prepare_calls.fetch_add(1, Ordering::SeqCst);
+        if self.fail_prepare {
+            bail!("synthetic native credential/configuration failure");
+        }
+        if let Some(asset_id) = &self.mutate_asset_on_prepare {
+            self.catalog
+                .connection()
+                .unwrap()
+                .execute(
+                    "UPDATE assets SET duration_seconds=duration_seconds+1 WHERE id=?1",
+                    [asset_id],
+                )
+                .unwrap();
+        }
+        self.prepared.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn transcribe(
+        &self,
+        _request: &NativeSttRequest,
+        _audio: &NativeSttAudioWindow,
+    ) -> Result<NativeSttCallResult> {
+        self.transcribe_calls.fetch_add(1, Ordering::SeqCst);
+        let lifecycle: String = self
+            .catalog
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT lifecycle FROM analysis_request_reservations WHERE run_id=?1 ORDER BY created_at DESC LIMIT 1",
+                [&self.run_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            lifecycle, "dispatched",
+            "the durable dispatch marker must exist before the one transport call"
+        );
+        self.dispatched_seen_before_call
+            .fetch_add(1, Ordering::SeqCst);
+        match &*self.response.lock().unwrap() {
+            FakeNativeResponse::Ok(result) => Ok((**result).clone()),
+            FakeNativeResponse::TransportError => bail!("synthetic native transport interrupted"),
+        }
+    }
+}
+
+fn native_audio_window() -> NativeSttAudioWindow {
+    let pcm = vec![0.1_f32; 16_000];
+    let window = pack_windows(&[SpeechRegion {
+        start_ms: 0,
+        end_ms: 1_000,
+    }])
+    .remove(0);
+    NativeSttAudioWindow::from_pcm(&pcm, &window).unwrap()
+}
+
+fn native_policy_request() -> NativeSttRequest {
+    NativeSttRequest::new(
+        OPENROUTER_STT_PROVIDER,
+        OPENROUTER_WHISPER_MODEL,
+        Some("en".into()),
+        0.0,
+        NativeSttProviderPolicy::new(true, SttDataCollection::Deny),
+    )
+    .unwrap()
+}
+
+fn valid_native_call(audio: &NativeSttAudioWindow, include_cost: bool) -> NativeSttCallResult {
+    let mut payload = json!({
+        "text": "Synthetic native transcript",
+        "language": "english",
+        "duration": 1.0,
+        "segments": [{
+            "id": 0,
+            "start": 0.0,
+            "end": 1.0,
+            "text": "Synthetic native transcript"
+        }],
+        "model": OPENROUTER_WHISPER_MODEL,
+        "provider": "openai"
+    });
+    if include_cost {
+        payload["usage"] = json!({
+            "cost": 0.002,
+            "seconds": 1.0,
+            "input_tokens": 12,
+            "output_tokens": 4
+        });
+    }
+    decode_native_stt_body(
+        serde_json::to_vec(&payload).unwrap().as_slice(),
+        audio.duration_ms(),
+        Some("native-generation-1".into()),
+        47,
+    )
+}
+
+fn authorized_native_setup() -> (
+    tempfile::TempDir,
+    Catalog,
+    String,
+    String,
+    RunPolicy,
+    NativeSttRequest,
+    NativeSttAudioWindow,
+    String,
+    AnalysisAccountingContext,
+) {
+    let (directory, catalog, project, asset) = fixture();
+    let policy_request = native_request(&project, &asset, 1.0);
+    let policy = catalog.describe_run_policy(&policy_request).unwrap();
+    assert!(policy.readiness.ready_for_authorization);
+    assert!(!policy.readiness.ready_for_pilot);
+    catalog.authorize_run_policy(&policy_request).unwrap();
+    let authority = AnalysisBudgetAuthorityContext {
+        project_id: policy.project_id.clone(),
+        policy_id: policy.policy_id.clone(),
+        policy_fingerprint: policy.policy_id.clone(),
+        operation: "pilot".into(),
+        provider: policy.provider.clone(),
+        budget_scope_id: String::new(),
+        budget_usd: policy.budget_usd,
+    };
+    catalog
+        .initialize_analysis_accounting_authority(&authority)
+        .unwrap();
+    let run_id = catalog
+        .begin_accounted_analysis_run(&policy.project_id, &policy.policy_id, "pilot")
+        .unwrap();
+    let scope = policy.scope.first().unwrap();
+    let context = AnalysisAccountingContext {
+        project_id: policy.project_id.clone(),
+        policy_id: policy.policy_id.clone(),
+        policy_fingerprint: policy.policy_id.clone(),
+        run_id: run_id.clone(),
+        operation: "pilot".into(),
+        intended_attempt_key: format!("{}:{}", policy.kind.as_str(), scope.asset_id),
+        source_fingerprint: scope.source_identity.clone(),
+        provider: policy.provider.clone(),
+        budget_scope_id: String::new(),
+        budget_usd: policy.budget_usd,
+        explicit_retry: false,
+    };
+    let request = native_policy_request();
+    let audio = native_audio_window();
+    (
+        directory, catalog, project, asset, policy, request, audio, run_id, context,
+    )
+}
+
+#[test]
+fn native_accounted_pilot_marks_before_one_call_and_settles_known_cost() {
+    let (_directory, catalog, _project, _asset, policy, request, audio, run_id, context) =
+        authorized_native_setup();
+    let call = valid_native_call(&audio, true);
+    let transport = CountingNativeTransport::new(
+        &catalog,
+        &run_id,
+        FakeNativeResponse::Ok(Box::new(call.clone())),
+    );
+    let result =
+        AccountedNativeSttProvider::new(&catalog, &policy, context, &request, &audio, &transport)
+            .transmit()
+            .unwrap();
+
+    assert_eq!(transport.prepare_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(transport.transcribe_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        transport.dispatched_seen_before_call.load(Ordering::SeqCst),
+        1
+    );
+    assert_eq!(result.latency_ms(), 47);
+    assert!(matches!(result.outcome(), NativeSttOutcome::Usable(_)));
+
+    let record = catalog
+        .analysis_request(&result.request_key)
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.lifecycle, AnalysisRequestLifecycle::Completed);
+    assert!((record.confirmed_cost_usd - 0.002).abs() < 1e-12);
+    assert_eq!(record.actual_provider.as_deref(), Some("openai"));
+    assert_eq!(
+        record.provider_generation_id.as_deref(),
+        Some("native-generation-1")
+    );
+    let receipts = catalog
+        .analysis_provider_receipts(&result.request_key)
+        .unwrap();
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(receipts[0].prompt_tokens, Some(12));
+    assert_eq!(receipts[0].completion_tokens, Some(4));
+    let events = catalog
+        .analysis_request_events(&result.request_key)
+        .unwrap();
+    let receipt_event = events
+        .iter()
+        .find(|event| event.event_kind == "receipt")
+        .unwrap();
+    assert_eq!(
+        receipt_event.detail["billedAudioSeconds"].as_f64(),
+        Some(1.0)
+    );
+    assert_eq!(
+        receipt_event.detail["reportedCostUsd"].as_f64(),
+        Some(0.002)
+    );
+}
+
+#[test]
+fn native_unusable_payload_retains_returned_charge_and_typed_outcome() {
+    let (_directory, catalog, _project, _asset, policy, request, audio, run_id, context) =
+        authorized_native_setup();
+    let body = serde_json::to_vec(&json!({
+        "usage": {"cost": 0.002, "seconds": 1.0},
+        "model": OPENROUTER_WHISPER_MODEL,
+        "provider": "openai"
+    }))
+    .unwrap();
+    let call = decode_native_stt_body(
+        &body,
+        audio.duration_ms(),
+        Some("native-generation-unusable".into()),
+        13,
+    );
+    assert!(matches!(call.outcome, NativeSttOutcome::Unusable(_)));
+    let transport =
+        CountingNativeTransport::new(&catalog, &run_id, FakeNativeResponse::Ok(Box::new(call)));
+    let result =
+        AccountedNativeSttProvider::new(&catalog, &policy, context, &request, &audio, &transport)
+            .transmit()
+            .unwrap();
+    assert!(matches!(result.outcome(), NativeSttOutcome::Unusable(_)));
+    let record = catalog
+        .analysis_request(&result.request_key)
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.lifecycle, AnalysisRequestLifecycle::Completed);
+    assert!((record.confirmed_cost_usd - 0.002).abs() < 1e-12);
+}
+
+#[test]
+fn native_missing_cost_is_uncertain_and_retains_the_reservation() {
+    let (_directory, catalog, _project, _asset, policy, request, audio, run_id, context) =
+        authorized_native_setup();
+    let call = valid_native_call(&audio, false);
+    let transport =
+        CountingNativeTransport::new(&catalog, &run_id, FakeNativeResponse::Ok(Box::new(call)));
+    let result =
+        AccountedNativeSttProvider::new(&catalog, &policy, context, &request, &audio, &transport)
+            .transmit()
+            .unwrap();
+    let record = catalog
+        .analysis_request(&result.request_key)
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.lifecycle, AnalysisRequestLifecycle::Uncertain);
+    assert_eq!(record.reported_cost_usd, None);
+    assert!(record.uncertain_usage_reserve_usd >= record.reserved_cost_usd);
+    assert_eq!(
+        record.provider_generation_id.as_deref(),
+        Some("native-generation-1")
+    );
+}
+
+#[test]
+fn native_prepare_failure_releases_without_transport() {
+    let (_directory, catalog, _project, _asset, policy, request, audio, run_id, context) =
+        authorized_native_setup();
+    let call = valid_native_call(&audio, false);
+    let transport =
+        CountingNativeTransport::new(&catalog, &run_id, FakeNativeResponse::Ok(Box::new(call)))
+            .failing_prepare();
+    let error =
+        AccountedNativeSttProvider::new(&catalog, &policy, context, &request, &audio, &transport)
+            .transmit()
+            .unwrap_err();
+    assert!(format!("{error:#}").contains("pre_upload_failed"));
+    assert_eq!(transport.transcribe_calls.load(Ordering::SeqCst), 0);
+    let released = catalog
+        .list_analysis_requests(&policy.project_id, Some(&policy.policy_id), 10)
+        .unwrap();
+    assert_eq!(released.len(), 1);
+    assert_eq!(released[0].lifecycle, AnalysisRequestLifecycle::Released);
+    assert!(released[0].dispatch_at.is_none());
+}
+
+#[test]
+fn native_transport_error_after_marker_is_uncertain_not_released() {
+    let (_directory, catalog, _project, _asset, policy, request, audio, run_id, context) =
+        authorized_native_setup();
+    let transport =
+        CountingNativeTransport::new(&catalog, &run_id, FakeNativeResponse::TransportError);
+    let error =
+        AccountedNativeSttProvider::new(&catalog, &policy, context, &request, &audio, &transport)
+            .transmit()
+            .unwrap_err();
+    assert!(format!("{error:#}").contains("transport interrupted"));
+    assert_eq!(transport.transcribe_calls.load(Ordering::SeqCst), 1);
+    let records = catalog
+        .list_analysis_requests(&policy.project_id, Some(&policy.policy_id), 10)
+        .unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].lifecycle, AnalysisRequestLifecycle::Uncertain);
+    assert!(records[0].dispatch_at.is_some());
+}
+
+#[test]
+fn native_adapter_rejects_wrong_operation_and_request_binding_before_provider() {
+    let (_directory, catalog, _project, _asset, policy, request, audio, run_id, context) =
+        authorized_native_setup();
+    let call = valid_native_call(&audio, true);
+    let transport =
+        CountingNativeTransport::new(&catalog, &run_id, FakeNativeResponse::Ok(Box::new(call)));
+
+    let mut wrong_operation = context.clone();
+    wrong_operation.operation = "native_speech_transcription".into();
+    let error = AccountedNativeSttProvider::new(
+        &catalog,
+        &policy,
+        wrong_operation,
+        &request,
+        &audio,
+        &transport,
+    )
+    .transmit()
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("limited to one supplied pilot window"));
+
+    let wrong_language = NativeSttRequest::new(
+        OPENROUTER_STT_PROVIDER,
+        OPENROUTER_WHISPER_MODEL,
+        Some("ja".into()),
+        0.0,
+        NativeSttProviderPolicy::new(true, SttDataCollection::Deny),
+    )
+    .unwrap();
+    let error = AccountedNativeSttProvider::new(
+        &catalog,
+        &policy,
+        context.clone(),
+        &wrong_language,
+        &audio,
+        &transport,
+    )
+    .transmit()
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("language/data-policy/temperature"));
+
+    let wrong_data_policy = NativeSttRequest::new(
+        OPENROUTER_STT_PROVIDER,
+        OPENROUTER_WHISPER_MODEL,
+        Some("en".into()),
+        0.0,
+        NativeSttProviderPolicy::new(true, SttDataCollection::Allow),
+    )
+    .unwrap();
+    let error = AccountedNativeSttProvider::new(
+        &catalog,
+        &policy,
+        context,
+        &wrong_data_policy,
+        &audio,
+        &transport,
+    )
+    .transmit()
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("language/data-policy/temperature"));
+
+    assert_eq!(transport.prepare_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(transport.transcribe_calls.load(Ordering::SeqCst), 0);
+    assert!(
+        catalog
+            .list_analysis_requests(&policy.project_id, Some(&policy.policy_id), 10)
+            .unwrap()
+            .is_empty(),
+        "validation failures must occur before admission"
+    );
+}
+
+#[test]
+fn native_cancel_after_prepare_releases_without_send() {
+    let (_directory, catalog, _project, _asset, policy, request, audio, run_id, context) =
+        authorized_native_setup();
+    let call = valid_native_call(&audio, true);
+    let transport =
+        CountingNativeTransport::new(&catalog, &run_id, FakeNativeResponse::Ok(Box::new(call)));
+    let error =
+        AccountedNativeSttProvider::new(&catalog, &policy, context, &request, &audio, &transport)
+            .transmit_with_cancel(|| transport.prepare_seen())
+            .unwrap_err();
+    assert!(format!("{error:#}").contains("cancelled"));
+    assert_eq!(transport.prepare_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(transport.transcribe_calls.load(Ordering::SeqCst), 0);
+    let records = catalog
+        .list_analysis_requests(&policy.project_id, Some(&policy.policy_id), 10)
+        .unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].lifecycle, AnalysisRequestLifecycle::Released);
+    assert!(records[0].dispatch_at.is_none());
+}
+
+#[test]
+fn native_source_change_during_prepare_releases_without_send() {
+    let (_directory, catalog, _project, asset, policy, request, audio, run_id, context) =
+        authorized_native_setup();
+    let call = valid_native_call(&audio, true);
+    let transport =
+        CountingNativeTransport::new(&catalog, &run_id, FakeNativeResponse::Ok(Box::new(call)))
+            .mutating_asset_on_prepare(&asset);
+    let error =
+        AccountedNativeSttProvider::new(&catalog, &policy, context, &request, &audio, &transport)
+            .transmit()
+            .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("pre_upload_failed"),
+        "unexpected guard error: {error:#}"
+    );
+    assert_eq!(transport.transcribe_calls.load(Ordering::SeqCst), 0);
+    let records = catalog
+        .list_analysis_requests(&policy.project_id, Some(&policy.policy_id), 10)
+        .unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].lifecycle, AnalysisRequestLifecycle::Released);
+}
+
+#[test]
+fn native_duplicate_completed_request_cannot_resend_from_a_new_run() {
+    let (_directory, catalog, _project, _asset, policy, request, audio, run_id, context) =
+        authorized_native_setup();
+    let first = CountingNativeTransport::new(
+        &catalog,
+        &run_id,
+        FakeNativeResponse::Ok(Box::new(valid_native_call(&audio, true))),
+    );
+    AccountedNativeSttProvider::new(&catalog, &policy, context.clone(), &request, &audio, &first)
+        .transmit()
+        .unwrap();
+    assert_eq!(first.transcribe_calls.load(Ordering::SeqCst), 1);
+
+    let new_run = catalog
+        .begin_accounted_analysis_run(&policy.project_id, &policy.policy_id, "pilot")
+        .unwrap();
+    let mut repeat = context;
+    repeat.run_id = new_run.clone();
+    let second = CountingNativeTransport::new(
+        &catalog,
+        &new_run,
+        FakeNativeResponse::Ok(Box::new(valid_native_call(&audio, true))),
+    );
+    let error =
+        AccountedNativeSttProvider::new(&catalog, &policy, repeat, &request, &audio, &second)
+            .transmit()
+            .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("completed provider receipt"),
+        "{error:#}"
+    );
+    assert_eq!(second.prepare_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(second.transcribe_calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn native_store_rejects_vlm_request_family_for_native_policy() {
+    let (_directory, catalog, _project, _asset, policy, _request, _audio, _run_id, context) =
+        authorized_native_setup();
+    let error = catalog
+        .reserve_analysis_request(
+            &context,
+            OPENROUTER_WHISPER_MODEL,
+            "vlm-payload-fingerprint",
+            &AnalysisRequestCostBound::declared_for_synthetic_transport(0.01),
+        )
+        .unwrap_err();
+    assert!(
+        format!("{error:#}")
+            .contains("VLM accounted wrapper cannot spend against a native speech policy"),
+        "{error:#}"
+    );
+    assert!(
+        catalog
+            .list_analysis_requests(&policy.project_id, Some(&policy.policy_id), 10)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn native_vlm_wrapper_rejects_native_audio_policy_before_provider() {
+    let (_directory, catalog, _project, _asset, mut policy, request, audio, run_id, context) =
+        authorized_native_setup();
+    policy.kind = AnalysisRunKind::Observation;
+    let call = valid_native_call(&audio, true);
+    let transport =
+        CountingNativeTransport::new(&catalog, &run_id, FakeNativeResponse::Ok(Box::new(call)));
+    let error =
+        AccountedNativeSttProvider::new(&catalog, &policy, context, &request, &audio, &transport)
+            .transmit()
+            .unwrap_err();
+    assert!(format!("{error:#}").contains("audio-only native speech policy"));
+    assert_eq!(transport.prepare_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(transport.transcribe_calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn old_receipt_json_without_native_billing_field_is_byte_identical() {
+    let evidence = ProviderReceiptEvidence {
+        provider: "openai".into(),
+        provider_generation_id: "generation-old".into(),
+        actual_model: "model-old".into(),
+        reported_cost_usd: Some(0.01),
+        prompt_tokens: Some(3),
+        completion_tokens: Some(2),
+        usage_complete: true,
+        billed_audio_seconds: None,
+    };
+    let encoded = serde_json::to_string(&evidence).unwrap();
+    assert_eq!(
+        encoded,
+        r#"{"provider":"openai","providerGenerationId":"generation-old","actualModel":"model-old","reportedCostUsd":0.01,"promptTokens":3,"completionTokens":2,"usageComplete":true}"#
+    );
+}
+
+#[test]
+fn native_store_rejects_native_request_family_for_vlm_policy() {
+    let (_directory, catalog, project, asset) = fixture();
+    let vlm_request = RunPolicyRequest::observation(
+        &project,
+        vec![asset],
+        DEFAULT_MODEL,
+        vec![DEFAULT_MODEL.to_string()],
+        false,
+        1.0,
+        false,
+    );
+    let vlm_policy = catalog.describe_run_policy(&vlm_request).unwrap();
+    assert!(vlm_policy.readiness.ready_for_authorization);
+    catalog.authorize_run_policy(&vlm_request).unwrap();
+    let authority = AnalysisBudgetAuthorityContext {
+        project_id: vlm_policy.project_id.clone(),
+        policy_id: vlm_policy.policy_id.clone(),
+        policy_fingerprint: vlm_policy.policy_id.clone(),
+        operation: "pilot".into(),
+        provider: vlm_policy.provider.clone(),
+        budget_scope_id: String::new(),
+        budget_usd: vlm_policy.budget_usd,
+    };
+    catalog
+        .initialize_analysis_accounting_authority(&authority)
+        .unwrap();
+    let run_id = catalog
+        .begin_accounted_analysis_run(&vlm_policy.project_id, &vlm_policy.policy_id, "pilot")
+        .unwrap();
+    let scope = vlm_policy.scope.first().unwrap();
+    let context = AnalysisAccountingContext {
+        project_id: vlm_policy.project_id.clone(),
+        policy_id: vlm_policy.policy_id.clone(),
+        policy_fingerprint: vlm_policy.policy_id.clone(),
+        run_id,
+        operation: "pilot".into(),
+        intended_attempt_key: format!("{}:{}", vlm_policy.kind.as_str(), scope.asset_id),
+        source_fingerprint: scope.source_identity.clone(),
+        provider: vlm_policy.provider.clone(),
+        budget_scope_id: String::new(),
+        budget_usd: vlm_policy.budget_usd,
+        explicit_retry: false,
+    };
+    let request = native_policy_request();
+    let audio = native_audio_window();
+    let error = catalog
+        .reserve_analysis_native_stt_request(&context, &request, &audio)
+        .unwrap_err();
+    assert!(
+        format!("{error:#}")
+            .contains("native STT account wrapper requires a ready native speech policy"),
+        "{error:#}"
+    );
+    assert!(
+        catalog
+            .list_analysis_requests(&vlm_policy.project_id, Some(&vlm_policy.policy_id), 10)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn native_catalog_admission_rejects_non_policy_and_non_pilot_shortcuts() {
+    let (_directory, catalog, _project, _asset, _policy, request, audio, _run_id, context) =
+        authorized_native_setup();
+
+    let mut non_policy = context.clone();
+    non_policy.policy_id.clear();
+    let error = catalog
+        .reserve_analysis_native_stt_request(&non_policy, &request, &audio)
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("non-empty canonical policy identity"),
+        "{error:#}"
+    );
+
+    let mut non_pilot = context;
+    non_pilot.operation = "native_speech_transcription".into();
+    let error = catalog
+        .reserve_analysis_native_stt_request(&non_pilot, &request, &audio)
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("limited to the pilot operation"),
+        "{error:#}"
+    );
+}
+
+#[test]
+fn native_receipt_mapping_never_invents_identity_tokens_or_complete_usage() {
+    let receipt = NativeSttReceipt {
+        generation_id: Some("generation-overflow".into()),
+        actual_model: None,
+        actual_provider: None,
+        usage: NativeSttUsage {
+            cost: NativeSttCost::Unknown,
+            seconds: Some(1.25),
+            input_tokens: Some(u64::MAX),
+            output_tokens: None,
+        },
+    };
+    let evidence = ProviderReceiptEvidence::from_native_stt_receipt(&receipt).unwrap();
+    assert!(evidence.provider.is_empty());
+    assert!(evidence.actual_model.is_empty());
+    assert_eq!(
+        evidence.provider_generation_id.as_str(),
+        "generation-overflow"
+    );
+    assert_eq!(evidence.reported_cost_usd, None);
+    assert_eq!(evidence.prompt_tokens, None);
+    assert_eq!(evidence.completion_tokens, None);
+    assert!(!evidence.usage_complete);
+    assert_eq!(evidence.billed_audio_seconds, Some(1.25));
+}
+
+#[test]
+fn native_header_only_receipt_with_late_cost_reconciles_once_and_conflicts_fail() {
+    let (_directory, catalog, _project, _asset, policy, request, audio, run_id, context) =
+        authorized_native_setup();
+    let transport = CountingNativeTransport::new(
+        &catalog,
+        &run_id,
+        FakeNativeResponse::Ok(Box::new(valid_native_call(&audio, false))),
+    );
+    let result =
+        AccountedNativeSttProvider::new(&catalog, &policy, context, &request, &audio, &transport)
+            .transmit()
+            .unwrap();
+    let uncertain = catalog
+        .analysis_request(&result.request_key)
+        .unwrap()
+        .unwrap();
+    assert_eq!(uncertain.lifecycle, AnalysisRequestLifecycle::Uncertain);
+    assert_eq!(
+        uncertain.provider_generation_id.as_deref(),
+        Some("native-generation-1")
+    );
+
+    let late = ProviderReceiptEvidence::from_native_stt_receipt(&NativeSttReceipt {
+        generation_id: Some("native-generation-1".into()),
+        actual_model: Some(OPENROUTER_WHISPER_MODEL.into()),
+        actual_provider: Some("openai".into()),
+        usage: NativeSttUsage {
+            cost: NativeSttCost::Known(0.002),
+            seconds: Some(1.0),
+            input_tokens: Some(12),
+            output_tokens: Some(4),
+        },
+    })
+    .unwrap();
+    let completed = catalog
+        .record_analysis_request_receipt(&result.request_key, &late)
+        .unwrap();
+    assert_eq!(completed.lifecycle, AnalysisRequestLifecycle::Completed);
+    assert!((completed.confirmed_cost_usd - 0.002).abs() < 1e-12);
+    let repeated = catalog
+        .record_analysis_request_receipt(&result.request_key, &late)
+        .unwrap();
+    assert_eq!(repeated, completed);
+
+    let conflicting = ProviderReceiptEvidence::from_native_stt_receipt(&NativeSttReceipt {
+        generation_id: Some("different-native-generation".into()),
+        actual_model: Some(OPENROUTER_WHISPER_MODEL.into()),
+        actual_provider: Some("openai".into()),
+        usage: NativeSttUsage {
+            cost: NativeSttCost::Known(0.002),
+            seconds: Some(1.0),
+            input_tokens: Some(12),
+            output_tokens: Some(4),
+        },
+    })
+    .unwrap();
+    assert!(
+        catalog
+            .record_analysis_request_receipt(&result.request_key, &conflicting)
+            .is_err()
     );
 }

@@ -1,9 +1,11 @@
-//! Proposal-only native speech-transcription policy helpers.
+//! Native speech-transcription policy helpers.
 //!
 //! This leaf has no provider I/O and never loads an ASR or VAD model. It binds
 //! the registered native duration tariff to a conservative pre-VAD window count
-//! so a later accounted runtime can reserve the same full-window units without
-//! inventing a provider charge or constructing a fake audio request.
+//! so the accounted pilot leaf can reserve the same full-window units without
+//! inventing a provider charge or constructing a fake audio request. B3 exposes
+//! one explicit single-window accounted request; high-level native pilot/bulk
+//! orchestration and capability observation remain unwired.
 
 use crate::analysis::openrouter_stt::NativeSttModelSpec;
 use crate::analysis::windows::WINDOW_MS;
@@ -28,8 +30,9 @@ pub(super) fn canonical_native_models(request: &RunPolicyRequest) -> Vec<String>
 }
 
 /// Native protocol capability checks deliberately distinguish the registered
-/// provider contract from an observed pilot/runtime capability. The latter is
-/// always failed in this proposal-only slice.
+/// provider contract from an observed high-level pilot/runtime capability. B3
+/// makes the single-window accounted request leaf real; observed native pilot
+/// and bulk workflow capability remain unavailable.
 fn registered_protocol_checks(request: &RunPolicyRequest) -> Vec<CapabilityCheck> {
     let mut checks = vec![CapabilityCheck {
         requirement: "provider.native_stt".into(),
@@ -161,8 +164,13 @@ pub(super) fn native_stt_capability_checks(
     });
     checks.push(CapabilityCheck {
         requirement: "native_stt.accounted_runtime".into(),
-        status: CapabilityStatus::Failed,
-        detail: "native speech accounting/dispatch runtime is not implemented; proposal remains blocked and authorization is refused".into(),
+        status: CapabilityStatus::Passed,
+        detail: "one supplied bounded native window can cross the shared accounted request leaf with canonical reservation, dispatch marker and receipt settlement".into(),
+    });
+    checks.push(CapabilityCheck {
+        requirement: "native_stt.high_level_pilot".into(),
+        status: CapabilityStatus::NotRequired,
+        detail: "the accounted single-window request leaf exists, but high-level native pilot/bulk orchestration and observed capability remain unavailable".into(),
     });
     checks
 }
@@ -233,11 +241,6 @@ pub(super) fn native_stt_blockers(request: &RunPolicyRequest) -> Vec<RunPolicyBl
             asset_id: None,
         });
     }
-    blockers.push(RunPolicyBlocker {
-        code: NATIVE_STT_RUNTIME_UNAVAILABLE.into(),
-        message: "native speech transcription is proposal-only; the shared accounted native runtime is not implemented, so authorization and paid dispatch remain unavailable".into(),
-        asset_id: None,
-    });
     blockers
 }
 
@@ -253,8 +256,9 @@ pub(super) const NATIVE_STT_OUTPUT_SCHEMA_VERSION: &str =
 pub(super) const NATIVE_STT_RECIPE_VERSION: &str =
     "native-stt.silero-v5.pack-30s.full-window-reservation.v1";
 
-/// Stable machine blocker until the shared accounted native runtime exists.
-pub(super) const NATIVE_STT_RUNTIME_UNAVAILABLE: &str = "native_accounted_runtime_unavailable";
+/// Explicit warning that the single-window accounted leaf is not a high-level
+/// paid workflow or observed capability pilot.
+pub(super) const NATIVE_STT_PILOT_UNAVAILABLE_WARNING: &str = "native STT accounted single-window request leaf is available for explicit orchestration; high-level native pilot/bulk execution, quality/provenance and adapters remain unavailable, so ready_for_pilot stays false";
 
 /// Conservative upper bound on packed speech windows for a positive source
 /// duration. Greedy packing cannot produce more than

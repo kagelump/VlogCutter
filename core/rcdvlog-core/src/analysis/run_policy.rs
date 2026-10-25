@@ -1077,9 +1077,7 @@ impl Catalog {
             warnings.push(
                 "native STT max_price, order, only and ignore routing restrictions are not enforced by the transcription endpoint; the duration tariff is an external reservation assumption, not a hard invoice cap, and receipt settlement retains above-bound or unknown charges".into(),
             );
-            warnings.push(
-                "native STT is proposal-only in this build: accounted pilot/bulk runtime orchestration is unavailable, so readiness remains blocked and authorization is refused".into(),
-            );
+            warnings.push(native_stt::NATIVE_STT_PILOT_UNAVAILABLE_WARNING.into());
             resolve_native_stt_model(&request.provider, &request.primary_model).ok()
         } else {
             None
@@ -1233,7 +1231,8 @@ impl Catalog {
             budget_ready,
             credentials_present,
             ready_for_authorization: capabilities_ready && blockers.is_empty() && budget_ready,
-            ready_for_pilot: capabilities_ready
+            ready_for_pilot: !native_stt
+                && capabilities_ready
                 && blockers.is_empty()
                 && budget_ready
                 && credentials_present,
@@ -1520,7 +1519,8 @@ impl Catalog {
         policy_id: &str,
         request_key: &str,
     ) -> Result<AnalysisRetryAuthorization> {
-        self.load_run_authorization(policy_id)?;
+        let authorization = self.load_run_authorization(policy_id)?;
+        ensure_vlm_run_kind(authorization.policy.kind)?;
         let request = self
             .analysis_request(request_key)?
             .ok_or_else(|| anyhow::anyhow!("analysis request not found"))?;
@@ -1852,6 +1852,7 @@ impl Catalog {
 
 #[cfg(test)]
 mod tests {
+    mod native_boundary_tests;
     mod native_tests;
     use super::*;
     use crate::ProviderReceiptEvidence;
@@ -2667,6 +2668,7 @@ mod tests {
                     prompt_tokens: Some(10),
                     completion_tokens: Some(5),
                     usage_complete: true,
+                    billed_audio_seconds: None,
                 },
             )
             .unwrap();
@@ -3312,6 +3314,7 @@ mod tests {
                     prompt_tokens: Some(10),
                     completion_tokens: Some(5),
                     usage_complete: true,
+                    billed_audio_seconds: None,
                 },
             )
             .unwrap();
@@ -4255,6 +4258,7 @@ mod recovery_tests {
                         prompt_tokens: Some(10),
                         completion_tokens: Some(5),
                         usage_complete: true,
+                        billed_audio_seconds: None,
                     },
                 },
             )
@@ -4904,6 +4908,7 @@ mod recovery_tests {
             prompt_tokens: Some(19),
             completion_tokens: Some(7),
             usage_complete: true,
+            billed_audio_seconds: None,
         };
         let evidence = AnalysisRequestReconciliation::LateReceipt {
             receipt: first_receipt,
