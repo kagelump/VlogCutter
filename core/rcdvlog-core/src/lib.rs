@@ -210,6 +210,13 @@ pub use analysis::moments::{
     MomentPlan, MomentProgress, MomentRunOptions, MomentRunReport, MomentStatus,
 };
 pub use analysis::quality::DecodedSegment;
+pub use analysis::quality::native_stt::{
+    NATIVE_STT_AVG_LOGPROB_LN_0_20_REJECT_THRESHOLD,
+    NATIVE_STT_PROVIDER_CONFIDENCE_REJECT_THRESHOLD, NATIVE_STT_QUALITY_RECIPE_VERSION,
+    NativeSttMetricSummary, NativeSttQualityDecision, NativeSttQualityEvaluation,
+    NativeSttQualityMetrics, NativeSttQualityReason, NativeSttWordConfidenceCoverage,
+    evaluate_native_stt_quality,
+};
 pub use analysis::schema::{
     CameraMovement, ClipObservation, DomainError, UnusableReason, output_schema,
     validate as validate_observation,

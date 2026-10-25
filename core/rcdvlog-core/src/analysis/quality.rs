@@ -14,6 +14,8 @@
 use serde::Serialize;
 use std::collections::HashSet;
 
+pub mod native_stt;
+
 /// Reject a transcript once this fraction of its segments duplicate an earlier
 /// segment. Bad chunks measured a median of 0.929; good chunks measured 0.000.
 const REPETITION_REJECT_RATIO: f32 = 0.3;

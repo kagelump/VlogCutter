@@ -161,6 +161,49 @@ gate stays unchanged and is not duplicated here. Credentials reuse the existing
 `OPENROUTER_API_KEY` / `~/.openrouter.key` convention only when the explicit
 cloud client is constructed. Redirects are disabled: one invocation cannot resend audio to a redirected endpoint. The test endpoint override is unavailable in production builds.
 
+**C2 pure native quality evaluation (not wired or persisted).** The existing
+quality owner now has a pure `analysis/quality/native_stt.rs` evaluator. It
+consumes the decoded native transcript plus the exact validated bounded audio
+window that produced it, revalidates direct DTO shape and provider timestamps,
+and maps accepted or review-only candidates through the existing packed-window
+`translate_span` semantics. It never clamps an out-of-range provider timestamp,
+never fabricates silence/timing/text, and never performs provider I/O, VAD,
+accounting, catalog writes or backend selection. Empty provider output is an
+explicit rejection, not a local `no_speech`/`no_audio` outcome.
+
+The native evidence thresholds are deliberately separate from the local token
+probability gate:
+- repetition uses the existing local `>= 0.30` fraction and rejects regardless
+  of the other evidence;
+- the arithmetic mean of reported segment `avg_logprob` values below
+  `ln(0.20) = -1.6094379124341003` rejects;
+- the arithmetic mean of reported segment confidence values, or a reported
+  full-transcript confidence, below `0.20` rejects;
+- a known low subset rejects even when coverage is incomplete, and a passing
+  alternate metric cannot hide it;
+- at least one complete comparable metric must pass (all segment
+  `avg_logprob`, all segment confidence, or full-transcript confidence) before
+  output can be accepted. Missing or partial comparable evidence produces
+  `review_required`, retaining mapped candidates for human review only. That
+  decision is **unaccepted** and has no canonical persistence/status wiring yet.
+
+Provider confidence, word confidence and `avg_logprob` are uncalibrated native
+heuristics, not arithmetic mean token probability. No native value is copied or
+exponentiated into `DecodedSegment.mean_token_probability`; it stays `None`.
+Word confidence is validated when present but never used as segment confidence
+or a weighted token estimate. Unknown language text is never passed to the
+whisper `get_lang_id` call; known codes/full names are resolved by enumerating
+the existing registry. Invalid supplied values, repetition and low-evidence
+rejections discard candidate text. Metric summaries expose only finite complete
+means plus known/total coverage; an unavailable aggregate or partial mean is
+never presented as complete evidence. The public result carries an explicit
+`native-stt.quality.v1` heuristic recipe identity.
+
+This slice adds no SQLite schema/status/provenance fields, no pilot/bulk/CLI or
+desktop execution, no native accounting/authorization, no VAD readiness or
+credential changes, and no retry/cancellation behavior. Those remain later
+integration work before issue #119 can close.
+
 **Batch estimation, two-phase.** VAD sweeps the whole project first — at RTF
 0.0019 this is effectively free — which yields exact 30-second window counts.
 Transcription then runs with real weights. Weight is **30 s windows**, not
