@@ -260,7 +260,7 @@ impl Catalog {
         )?;
         let mut rows = statement.query([&asset.id])?;
         while let Some(segment) = rows.next()? {
-            let value: (u32, u32, String, String, f64) = (
+            let value: (u32, u32, String, String, Option<f64>) = (
                 segment.get(0)?,
                 segment.get(1)?,
                 segment.get(2)?,

@@ -543,7 +543,12 @@ stream; `no_accepted_speech` means speech was detected but the provider returned
 no accepted text; `rejected` means the quality gate discarded output; and
 `failed` is retryable. The result also retains the exact source fingerprint,
 detected `speechSeconds`, provider `windowCount`/`providerSegmentCount`, and
-quality evidence (`meanTokenProbability`, `repetitionRatio`). `transcribe status`
+quality evidence (`meanTokenProbability`, `repetitionRatio`). Per-segment and
+aggregate `meanTokenProbability` are JSON numbers when local token evidence was
+actually measured and JSON `null` when it was absent; `null` is never confidence
+zero. Non-empty candidate output whose probability coverage is incomplete is
+rejected with `missing_probability_evidence`, and malformed supplied values with
+`invalid_probability_evidence`. `transcribe status`
 reports `noAudio` and `noAcceptedSpeech` in addition to speech, no-speech,
 rejected, failed, and missing coverage. `legacyNoSpeechUnverified` is counted as
 a subset of no-speech coverage. Rows migrated from older catalogs keep

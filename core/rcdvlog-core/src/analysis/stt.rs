@@ -142,8 +142,7 @@ pub fn transcribe_pcm(
     segments.retain(|segment| !segment.text.trim().is_empty());
     segments.sort_by_key(|segment| (segment.start_ms, segment.end_ms));
 
-    let measured_mean_probability =
-        (!segments.is_empty()).then(|| mean_token_probability(&segments));
+    let measured_mean_probability = mean_token_probability(&segments);
     let measured_repetition = (!segments.is_empty()).then(|| repetition_ratio(&segments));
 
     if let Some(reason) = reject_reason(&segments) {
@@ -359,7 +358,7 @@ mod tests {
             end_ms,
             language: "ja".to_string(),
             text: text.to_string(),
-            mean_token_probability: probability,
+            mean_token_probability: Some(probability),
         }
     }
 
@@ -590,6 +589,35 @@ mod tests {
                 .mean_token_probability
                 .is_some_and(|value| value < 0.2)
         );
+    }
+
+    #[test]
+    fn unknown_probability_evidence_is_rejected_without_storing_hallucinated_text() {
+        let engine = FakeEngine::new(
+            vec![SpeechRegion {
+                start_ms: 0,
+                end_ms: 4_000,
+            }],
+            vec![vec![DecodedSegment {
+                start_ms: 0,
+                end_ms: 4_000,
+                language: "ja".to_string(),
+                text: "unmeasured words".to_string(),
+                mean_token_probability: None,
+            }]],
+        );
+        let stored = transcribe_pcm(&engine, "a1", "fp", &[]).unwrap();
+        assert_eq!(stored.status, TranscriptStatus::Rejected);
+        assert_eq!(
+            stored.outcome_reason,
+            TranscriptOutcomeReason::QualityRejected
+        );
+        assert_eq!(stored.reject_reason, "missing_probability_evidence");
+        assert_eq!(stored.window_count, 1);
+        assert_eq!(stored.provider_segment_count, 1);
+        assert!((stored.speech_seconds - 4.0).abs() < 1e-6);
+        assert_eq!(stored.mean_token_probability, None);
+        assert!(stored.segments.is_empty());
     }
 
     #[test]

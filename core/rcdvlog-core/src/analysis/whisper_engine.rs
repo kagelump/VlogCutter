@@ -152,11 +152,7 @@ impl SttEngine for WhisperEngine {
                     counted += 1;
                 }
             }
-            let mean_token_probability = if counted > 0 {
-                probability_total / counted as f32
-            } else {
-                0.0
-            };
+            let mean_token_probability = (counted > 0).then(|| probability_total / counted as f32);
 
             segments.push(DecodedSegment {
                 start_ms: (segment.start_timestamp() * CENTISECONDS_TO_MS).max(0) as u32,

@@ -96,7 +96,7 @@ mod tests {
             end_ms,
             language: "ja".to_string(),
             text: "text".to_string(),
-            mean_token_probability: 0.7,
+            mean_token_probability: Some(0.7),
         }
     }
 

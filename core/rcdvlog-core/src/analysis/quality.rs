@@ -30,7 +30,12 @@ pub struct DecodedSegment {
     pub end_ms: u32,
     pub language: String,
     pub text: String,
-    pub mean_token_probability: f32,
+    /// Arithmetic mean token probability measured by the local decoder.
+    ///
+    /// `None` means this segment has no comparable token-probability evidence.
+    /// It is not a confidence of zero or one, and it must not be synthesized
+    /// from provider confidence or an average log probability.
+    pub mean_token_probability: Option<f32>,
 }
 
 /// Why a transcript was rejected. Recorded on the stored row so a rejection is
@@ -39,6 +44,8 @@ pub struct DecodedSegment {
 pub enum RejectReason {
     Repetition,
     LowTokenProbability,
+    InvalidProbabilityEvidence,
+    MissingProbabilityEvidence,
 }
 
 impl RejectReason {
@@ -46,6 +53,8 @@ impl RejectReason {
         match self {
             RejectReason::Repetition => "repetition",
             RejectReason::LowTokenProbability => "low_token_probability",
+            RejectReason::InvalidProbabilityEvidence => "invalid_probability_evidence",
+            RejectReason::MissingProbabilityEvidence => "missing_probability_evidence",
         }
     }
 }
@@ -87,22 +96,57 @@ pub fn repetition_ratio(segments: &[DecodedSegment]) -> f32 {
     duplicates as f32 / segments.len() as f32
 }
 
-/// Mean of the per-segment mean token probabilities.
-pub fn mean_token_probability(segments: &[DecodedSegment]) -> f32 {
+/// Arithmetic mean of all per-segment mean token probabilities.
+///
+/// Returns `None` when there are no candidate segments or when any candidate
+/// lacks valid token-probability evidence. Incomplete evidence must not be silently
+/// treated as a complete measurement.
+pub fn mean_token_probability(segments: &[DecodedSegment]) -> Option<f32> {
     if segments.is_empty() {
-        return 0.0;
+        return None;
     }
-    let total: f32 = segments
-        .iter()
-        .map(|segment| segment.mean_token_probability)
-        .sum();
-    total / segments.len() as f32
+    let mut total = 0.0_f32;
+    for segment in segments {
+        let probability = segment.mean_token_probability?;
+        if !probability.is_finite() || !(0.0..=1.0).contains(&probability) {
+            return None;
+        }
+        total += probability;
+    }
+    Some(total / segments.len() as f32)
 }
 
-/// The measured gate: reject on repetition, or on very low token probability.
+/// Mean over only the candidates that actually reported token probabilities.
+///
+/// This private helper exists solely for the low-probability gate. Unknown
+/// evidence must not dilute a known bad value into an apparent pass.
+fn known_token_probability_mean(segments: &[DecodedSegment]) -> Option<f32> {
+    let mut total = 0.0_f32;
+    let mut count = 0_usize;
+    for segment in segments {
+        if let Some(probability) = segment.mean_token_probability {
+            total += probability;
+            count += 1;
+        }
+    }
+    (count > 0).then(|| total / count as f32)
+}
+
+fn has_invalid_probability_evidence(segments: &[DecodedSegment]) -> bool {
+    segments.iter().any(|segment| {
+        segment.mean_token_probability.is_some_and(|probability| {
+            !probability.is_finite() || !(0.0..=1.0).contains(&probability)
+        })
+    })
+}
+
+/// The measured gate: reject on repetition, invalid evidence, very low known
+/// token probability, or incomplete probability evidence.
 ///
 /// An empty transcript is not a rejection — that is the VAD gate's business,
-/// and a clip with no speech is a successful `no_speech` result.
+/// and a clip with no speech is a successful `no_speech` result. A non-empty
+/// candidate set without complete probability evidence is distinct from
+/// silence and must be rejected rather than silently accepted.
 pub fn reject_reason(segments: &[DecodedSegment]) -> Option<RejectReason> {
     if segments.is_empty() {
         return None;
@@ -110,8 +154,15 @@ pub fn reject_reason(segments: &[DecodedSegment]) -> Option<RejectReason> {
     if repetition_ratio(segments) >= REPETITION_REJECT_RATIO {
         return Some(RejectReason::Repetition);
     }
-    if mean_token_probability(segments) < MIN_MEAN_TOKEN_PROBABILITY {
+    if has_invalid_probability_evidence(segments) {
+        return Some(RejectReason::InvalidProbabilityEvidence);
+    }
+    if known_token_probability_mean(segments).is_some_and(|mean| mean < MIN_MEAN_TOKEN_PROBABILITY)
+    {
         return Some(RejectReason::LowTokenProbability);
+    }
+    if mean_token_probability(segments).is_none() {
+        return Some(RejectReason::MissingProbabilityEvidence);
     }
     None
 }
@@ -126,7 +177,7 @@ mod tests {
             end_ms: 1_000,
             language: "ja".to_string(),
             text: text.to_string(),
-            mean_token_probability: probability,
+            mean_token_probability: Some(probability),
         }
     }
 
@@ -159,14 +210,14 @@ mod tests {
     #[test]
     fn empty_input_is_not_repetitive_and_is_not_rejected() {
         assert_eq!(repetition_ratio(&[]), 0.0);
-        assert_eq!(mean_token_probability(&[]), 0.0);
+        assert_eq!(mean_token_probability(&[]), None);
         assert!(reject_reason(&[]).is_none());
     }
 
     #[test]
     fn mean_token_probability_averages_across_segments() {
         let segments = vec![segment("a", 0.4), segment("b", 0.6)];
-        assert!((mean_token_probability(&segments) - 0.5).abs() < 1e-6);
+        assert!((mean_token_probability(&segments).unwrap() - 0.5).abs() < 1e-6);
     }
 
     #[test]
@@ -202,5 +253,83 @@ mod tests {
         let segments = vec![segment("hello", 0.8)];
         assert_eq!(repetition_ratio(&segments), 0.0);
         assert!(reject_reason(&segments).is_none());
+    }
+
+    #[test]
+    fn incomplete_probability_evidence_has_no_aggregate_mean() {
+        let segments = vec![segment("known", 0.8), unknown_segment("unknown")];
+        assert_eq!(mean_token_probability(&segments), None);
+        assert_eq!(
+            reject_reason(&segments),
+            Some(RejectReason::MissingProbabilityEvidence)
+        );
+    }
+
+    #[test]
+    fn unknown_evidence_does_not_dilute_a_known_low_probability() {
+        let segments = vec![segment("garbled", 0.1), unknown_segment("unknown")];
+        assert_eq!(
+            reject_reason(&segments),
+            Some(RejectReason::LowTokenProbability)
+        );
+    }
+
+    #[test]
+    fn repetition_still_rejects_when_probability_is_unknown() {
+        let segments = vec![unknown_segment("same line"), unknown_segment("same line")];
+        assert_eq!(reject_reason(&segments), Some(RejectReason::Repetition));
+    }
+
+    #[test]
+    fn invalid_probability_evidence_is_rejected() {
+        for probability in [f32::NAN, f32::INFINITY, -0.1, 1.1] {
+            let segments = vec![segment("measured", probability)];
+            assert_eq!(mean_token_probability(&segments), None);
+            assert_eq!(
+                reject_reason(&segments),
+                Some(RejectReason::InvalidProbabilityEvidence),
+                "probability {probability} must be invalid"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_evidence_is_distinct_from_a_genuine_zero_probability() {
+        let missing = vec![unknown_segment("unknown")];
+        let zero = vec![segment("measured", 0.0)];
+        assert_eq!(
+            reject_reason(&missing),
+            Some(RejectReason::MissingProbabilityEvidence)
+        );
+        assert_eq!(mean_token_probability(&missing), None);
+        assert_eq!(
+            reject_reason(&zero),
+            Some(RejectReason::LowTokenProbability)
+        );
+        assert_eq!(mean_token_probability(&zero), Some(0.0));
+    }
+
+    #[test]
+    fn known_numeric_probability_keeps_the_existing_json_shape() {
+        let known = segment("known", 0.73);
+        assert_eq!(
+            serde_json::to_string(&known).unwrap(),
+            r#"{"startMs":0,"endMs":1000,"language":"ja","text":"known","meanTokenProbability":0.73}"#
+        );
+        let unknown = unknown_segment("unknown");
+        assert_eq!(
+            serde_json::to_string(&unknown).unwrap(),
+            r#"{"startMs":0,"endMs":1000,"language":"ja","text":"unknown","meanTokenProbability":null}"#
+        );
+    }
+
+    fn unknown_segment(text: &str) -> DecodedSegment {
+        DecodedSegment {
+            start_ms: 0,
+            end_ms: 1_000,
+            language: "ja".to_string(),
+            text: text.to_string(),
+            mean_token_probability: None,
+        }
     }
 }

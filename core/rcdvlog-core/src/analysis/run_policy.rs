@@ -2567,7 +2567,7 @@ mod tests {
                     end_ms: 1_600,
                     language: "en".into(),
                     text: "PRIVATE_TRANSCRIPT_CANARY".into(),
-                    mean_token_probability: 0.9,
+                    mean_token_probability: Some(0.9),
                 }],
             },
         )
