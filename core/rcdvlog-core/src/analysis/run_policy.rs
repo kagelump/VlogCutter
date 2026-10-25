@@ -38,7 +38,13 @@ use crate::analysis::provider::{
 use crate::analysis::{VLM_PROMPT_VERSION, framepack, store::TranscriptStatus};
 use crate::{Asset, Catalog, REFERENCE_COST_PER_CLIP_USD};
 
+mod native_pilot_evidence;
 mod native_stt;
+pub use native_pilot_evidence::{
+    MAX_NATIVE_PILOT_LOCAL_OUTCOMES, NATIVE_PILOT_EVIDENCE_SCHEMA_VERSION, NativePilotEvidence,
+    NativePilotLocalOutcome, NativePilotLocalOutcomeFact, NativePilotPaidSample,
+    NativePilotSampleCoverage, NativePilotSampleOutcome,
+};
 use native_stt::{
     canonical_native_models, native_stt_blockers, native_stt_capability_checks,
     native_stt_recipe_version,
@@ -500,6 +506,10 @@ pub struct RunPilotRecord {
     pub validation: PilotValidation,
     pub observed_capabilities: Vec<String>,
     pub warning: String,
+    /// Bounded native capability-pilot facts. Omitted for legacy VLM records so
+    /// their JSON wire shape remains unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_evidence: Option<NativePilotEvidence>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -994,6 +1004,52 @@ fn policy_context(
     })
 }
 
+fn load_run_pilot_on_connection(
+    connection: &rusqlite::Connection,
+    policy_id: &str,
+) -> Result<Option<RunPilotRecord>> {
+    let record: Option<String> = connection
+        .query_row(
+            "SELECT record_json FROM analysis_run_pilots WHERE policy_id=?1",
+            [policy_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    record
+        .map(|record| {
+            let pilot: RunPilotRecord =
+                serde_json::from_str(&record).context("stored pilot record is unreadable")?;
+            ensure!(
+                pilot.policy_id == policy_id,
+                "stored pilot policy id mismatch"
+            );
+            Ok(pilot)
+        })
+        .transpose()
+}
+
+fn save_pilot_on_connection(
+    connection: &rusqlite::Connection,
+    record: &RunPilotRecord,
+) -> Result<()> {
+    let record_json = serde_json::to_string(record)?;
+    connection.execute(
+            "INSERT INTO analysis_run_pilots(policy_id,project_id,status,record_json,started_at,finished_at)
+             VALUES (?1,?2,?3,?4,?5,?6)
+             ON CONFLICT(policy_id) DO UPDATE SET status=excluded.status,record_json=excluded.record_json,
+                started_at=excluded.started_at,finished_at=excluded.finished_at",
+            params![
+                record.policy_id,
+                record.project_id,
+                record.status,
+                record_json,
+                record.started_at,
+                record.finished_at
+            ],
+        )?;
+    Ok(())
+}
+
 impl Catalog {
     /// Recheck only the asset about to be transmitted, avoiding a full scope
     /// scan for every request in a large batch. The caller holds a policy that
@@ -1368,25 +1424,7 @@ impl Catalog {
     }
 
     pub fn load_run_pilot(&self, policy_id: &str) -> Result<Option<RunPilotRecord>> {
-        let record: Option<String> = self
-            .connection()?
-            .query_row(
-                "SELECT record_json FROM analysis_run_pilots WHERE policy_id=?1",
-                [policy_id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        record
-            .map(|record| {
-                let pilot: RunPilotRecord =
-                    serde_json::from_str(&record).context("stored pilot record is unreadable")?;
-                ensure!(
-                    pilot.policy_id == policy_id,
-                    "stored pilot policy id mismatch"
-                );
-                Ok(pilot)
-            })
-            .transpose()
+        load_run_pilot_on_connection(&self.connection()?, policy_id)
     }
 
     /// Execute exactly one bounded capability/schema/editorial-semantic pilot.
@@ -1617,6 +1655,7 @@ impl Catalog {
             },
             observed_capabilities: Vec::new(),
             warning: PILOT_WARNING.into(),
+            native_evidence: None,
         };
         self.save_pilot(&running)?;
         Ok(running)
@@ -1629,12 +1668,25 @@ impl Catalog {
         validation: PilotValidation,
         failure_hint: Option<String>,
     ) -> Result<RunPilotRecord> {
-        let aggregate = self.analysis_accounting_aggregate_for_operation(
+        let mut connection = self.connection()?;
+        let transaction =
+            connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let current = load_run_pilot_on_connection(&transaction, &running.policy_id)?;
+        let native_evidence = match current.as_ref() {
+            Some(current) if current.run_id == running.run_id => current.native_evidence.clone(),
+            _ => running.native_evidence.clone(),
+        };
+        let aggregate = crate::analysis::accounting::store::accounting_aggregate(
+            &transaction,
             &running.policy_id,
-            "pilot",
+            Some("pilot"),
             Some(&running.run_id),
         )?;
-        let ledger = self.analysis_operation_attempt_projection(&running.policy_id, "pilot")?;
+        let ledger = crate::analysis::accounting::store::operation_attempt_projection(
+            &transaction,
+            &running.policy_id,
+            "pilot",
+        )?;
         let mut attempted_models = baseline.attempted_models.clone();
         attempted_models.extend(ledger.attempted_models);
         let attempts = baseline
@@ -1708,8 +1760,17 @@ impl Catalog {
                 observed
             },
             warning,
+            native_evidence,
         };
-        self.save_pilot(&record)?;
+        // A late result may finish its audit run, but cannot replace a newer
+        // pilot projection. The same transaction preserves any attached sample.
+        if current
+            .as_ref()
+            .is_some_and(|current| current.run_id == running.run_id)
+        {
+            save_pilot_on_connection(&transaction, &record)?;
+        }
+        transaction.commit()?;
         self.finish_analysis_run(
             &running.run_id,
             &crate::AnalysisRunOutcome {
@@ -1853,22 +1914,7 @@ impl Catalog {
     }
 
     pub(crate) fn save_pilot(&self, record: &RunPilotRecord) -> Result<()> {
-        let record_json = serde_json::to_string(record)?;
-        self.connection()?.execute(
-            "INSERT INTO analysis_run_pilots(policy_id,project_id,status,record_json,started_at,finished_at)
-             VALUES (?1,?2,?3,?4,?5,?6)
-             ON CONFLICT(policy_id) DO UPDATE SET status=excluded.status,record_json=excluded.record_json,
-                started_at=excluded.started_at,finished_at=excluded.finished_at",
-            params![
-                record.policy_id,
-                record.project_id,
-                record.status,
-                record_json,
-                record.started_at,
-                record.finished_at
-            ],
-        )?;
-        Ok(())
+        save_pilot_on_connection(&self.connection()?, record)
     }
 }
 

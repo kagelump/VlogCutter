@@ -200,6 +200,41 @@ impl NativeSpeechPreparation {
         self.source_guard
             .validate(catalog, &self.evidence.asset_id, &self.evidence.project_id)
     }
+
+    #[cfg(test)]
+    pub(crate) fn test_with_speech(mut self, pcm: Vec<f32>, windows: Vec<PackedWindow>) -> Self {
+        let speech_duration_ms = windows.iter().map(PackedWindow::speech_ms).sum();
+        let region_count = windows.iter().map(|window| window.regions.len()).sum();
+        self.media = NativeSpeechMedia::Speech {
+            pcm,
+            windows,
+            speech_duration_ms,
+            region_count,
+        };
+        self
+    }
+
+    /// Test-only construction for callers that need to exercise a downstream
+    /// boundary without loading Silero/FFmpeg. Production construction remains
+    /// the local preparer above and this method exists only in test builds.
+    #[cfg(test)]
+    pub(crate) fn test_preparation(
+        evidence: NativeSpeechPreparationEvidence,
+        proxy_path: PathBuf,
+        proxy_claim: RepresentationClaim,
+        speech_claim: RepresentationClaim,
+    ) -> Self {
+        Self {
+            evidence: evidence.clone(),
+            media: NativeSpeechMedia::NoSpeech,
+            source_guard: NativeSpeechSourceGuard {
+                proxy_path,
+                approved_scope: evidence.scope,
+            },
+            _proxy_claim: proxy_claim,
+            _speech_claim: speech_claim,
+        }
+    }
 }
 
 type DetectorLoader = Box<dyn FnMut(&Path, usize) -> Result<Box<dyn SpeechDetector>>>;

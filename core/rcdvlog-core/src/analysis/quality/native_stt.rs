@@ -578,6 +578,11 @@ pub(crate) fn recognized_native_stt_reported_language(reported: &str) -> Option<
     normalize_language(reported).map(|language| language.reported)
 }
 
+/// Normalize recorded candidate language through the same registry as evaluation.
+pub(crate) fn normalized_native_stt_language(reported: &str) -> Option<String> {
+    normalize_language(reported).map(|language| language.iso_code)
+}
+
 fn normalize_language(reported: &str) -> Option<RecognizedLanguage> {
     let reported = reported.trim();
     if reported.is_empty() {
