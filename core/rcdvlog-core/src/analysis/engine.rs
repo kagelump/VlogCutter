@@ -82,21 +82,47 @@ pub fn legacy_model_dir(catalog_path: &Path) -> Result<PathBuf> {
     Ok(parent.join("cache").join("models"))
 }
 
+/// Selects the managed directory for a required model artifact.
+///
+/// Shared first and legacy fallback are both based on the artifact the selected
+/// backend actually needs. This matters for native cloud speech: its only local
+/// model is Silero VAD, so a large local ASR file in a different directory must
+/// not choose the wrong location. When the required artifact is absent from
+/// both, the shared directory is the explicit install target.
+fn model_dir_from_shared(
+    catalog_path: &Path,
+    shared: &Path,
+    required: &ModelAsset,
+) -> Result<PathBuf> {
+    if shared.join(required.file_name).is_file() {
+        return Ok(shared.to_path_buf());
+    }
+    // Resolve legacy only if it is needed. A shared model has historically
+    // worked even when a relative catalog filename has no legacy parent.
+    let legacy = legacy_model_dir(catalog_path)?;
+    if legacy.join(required.file_name).is_file() {
+        return Ok(legacy);
+    }
+    Ok(shared.to_path_buf())
+}
+
 /// Resolves the directory a model should be read from for this catalog.
 ///
 /// The shared directory wins, but a project that already holds the file keeps
 /// working: installs made before models were shared must not silently start a
 /// 574 MB re-download.
 pub fn model_dir(catalog_path: &Path) -> Result<PathBuf> {
+    model_dir_for(catalog_path, &WHISPER_MODEL)
+}
+
+/// Resolves the directory for an explicitly required model artifact.
+///
+/// Existing local callers keep using [`model_dir`], whose compatibility anchor
+/// is the ASR file. A backend-qualified status/install operation passes the
+/// artifact it actually requires (Silero VAD for native speech).
+pub fn model_dir_for(catalog_path: &Path, required: &ModelAsset) -> Result<PathBuf> {
     let shared = shared_model_dir()?;
-    if shared.join(WHISPER_MODEL.file_name).is_file() {
-        return Ok(shared);
-    }
-    let legacy = legacy_model_dir(catalog_path)?;
-    if legacy.join(WHISPER_MODEL.file_name).is_file() {
-        return Ok(legacy);
-    }
-    Ok(shared)
+    model_dir_from_shared(catalog_path, &shared, required)
 }
 
 /// Whether a model file is present and, when a digest is published, verifies.
@@ -309,5 +335,68 @@ mod tests {
     fn model_constants_name_the_measured_artifacts() {
         assert_eq!(WHISPER_MODEL.file_name, "ggml-large-v3-turbo-q5_0.bin");
         assert_eq!(VAD_MODEL.file_name, "ggml-silero-v5.1.2.bin");
+    }
+
+    #[test]
+    fn required_artifact_resolution_follows_the_artifact_not_asr_presence() {
+        let root = tempdir().unwrap();
+        let shared = root.path().join("shared");
+        let catalog = root.path().join("project/catalog.sqlite3");
+        let legacy = legacy_model_dir(&catalog).unwrap();
+        fs::create_dir_all(&shared).unwrap();
+        fs::create_dir_all(&legacy).unwrap();
+
+        // A large ASR file in one directory must not determine where native VAD
+        // is read from.
+        fs::write(shared.join(WHISPER_MODEL.file_name), b"asr").unwrap();
+        fs::write(legacy.join(VAD_MODEL.file_name), b"vad").unwrap();
+        assert_eq!(
+            model_dir_from_shared(&catalog, &shared, &WHISPER_MODEL).unwrap(),
+            shared
+        );
+        assert_eq!(
+            model_dir_from_shared(&catalog, &shared, &VAD_MODEL).unwrap(),
+            legacy
+        );
+
+        // A shared copy wins when the required artifact exists in both places.
+        fs::write(shared.join(VAD_MODEL.file_name), b"vad-shared").unwrap();
+        assert_eq!(
+            model_dir_from_shared(&catalog, &shared, &VAD_MODEL).unwrap(),
+            shared
+        );
+
+        let empty_shared = root.path().join("empty-shared");
+        assert_eq!(
+            model_dir_from_shared(&catalog, &empty_shared, &WHISPER_MODEL).unwrap(),
+            empty_shared,
+            "the shared target remains the explicit install location"
+        );
+        fs::remove_file(shared.join(WHISPER_MODEL.file_name)).unwrap();
+        fs::write(legacy.join(WHISPER_MODEL.file_name), b"legacy-asr").unwrap();
+        assert_eq!(
+            model_dir_from_shared(&catalog, &shared, &WHISPER_MODEL).unwrap(),
+            legacy
+        );
+        assert_eq!(
+            model_dir_from_shared(&catalog, &shared, &VAD_MODEL).unwrap(),
+            shared
+        );
+    }
+
+    #[test]
+    fn shared_required_model_does_not_require_a_legacy_catalog_parent() {
+        let root = tempdir().unwrap();
+        fs::write(root.path().join(VAD_MODEL.file_name), b"shared-vad").unwrap();
+        assert_eq!(
+            model_dir_from_shared(Path::new("catalog.sqlite3"), root.path(), &VAD_MODEL).unwrap(),
+            root.path()
+        );
+        fs::write(root.path().join(WHISPER_MODEL.file_name), b"shared-asr").unwrap();
+        assert_eq!(
+            model_dir_from_shared(Path::new("catalog.sqlite3"), root.path(), &WHISPER_MODEL)
+                .unwrap(),
+            root.path()
+        );
     }
 }

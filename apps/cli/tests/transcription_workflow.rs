@@ -180,6 +180,166 @@ fn model_status_is_read_only_and_reports_identity_integrity_and_location() {
 }
 
 #[test]
+fn native_model_status_requires_only_vad_and_names_the_explicit_install_command() {
+    let directory = tempdir().unwrap();
+    let catalog_path = directory.path().join("catalog.sqlite3");
+    let data_home = directory.path().join("data-home");
+    fs::create_dir_all(&data_home).unwrap();
+    create_catalog(&catalog_path);
+    let before = fs::read(&catalog_path).unwrap();
+
+    let output = invoke_with_data_home(
+        &catalog_path,
+        &data_home,
+        [
+            "models",
+            "status",
+            "--backend",
+            "native-openrouter",
+            "--provider",
+            "openrouter",
+            "--model",
+            "openai/whisper-1",
+        ],
+    );
+    let value = success(output);
+    assert_eq!(value["command"], "models.status");
+    let models = value["data"].as_array().unwrap();
+    assert_eq!(models.len(), 1, "{value:#}");
+    assert_eq!(models[0]["role"], "voice_activity_detection");
+    assert!(models[0]["name"].as_str().unwrap().contains("ggml-silero"));
+    assert_eq!(models[0]["installed"], false);
+    assert_eq!(models[0]["ready"], false);
+    assert_eq!(models[0]["integrity"], "missing");
+    let detail = models[0]["detail"].as_str().unwrap();
+    assert!(
+        detail.contains(
+            "rcdvlog models install --backend native-openrouter --provider openrouter --model openai/whisper-1"
+        ),
+        "{detail}"
+    );
+    assert_eq!(
+        fs::read(&catalog_path).unwrap(),
+        before,
+        "native model status must not change catalog bytes"
+    );
+    assert!(
+        !data_home.join("com.rcd.vlogcutter").exists(),
+        "native status must not create managed model directories"
+    );
+}
+
+#[test]
+fn model_backend_invalid_combinations_fail_before_catalog_or_network_effects() {
+    let directory = tempdir().unwrap();
+    let catalog_path = directory.path().join("catalog.sqlite3");
+    let data_home = directory.path().join("data-home");
+    fs::create_dir_all(&data_home).unwrap();
+    create_catalog(&catalog_path);
+    let before = fs::read(&catalog_path).unwrap();
+
+    for (arguments, expected_command, expected_message) in [
+        (
+            vec![
+                "models",
+                "status",
+                "--backend",
+                "local-whisper",
+                "--provider",
+                "openrouter",
+            ],
+            "models.status",
+            "only valid with --backend native-openrouter",
+        ),
+        (
+            vec![
+                "models",
+                "status",
+                "--backend",
+                "native-openrouter",
+                "--model",
+                "openai/whisper-1",
+            ],
+            "models.status",
+            "requires explicit --provider openrouter",
+        ),
+        (
+            vec![
+                "models",
+                "status",
+                "--backend",
+                "native-openrouter",
+                "--provider",
+                "openrouter",
+            ],
+            "models.status",
+            "requires explicit --model openai/whisper-1",
+        ),
+        (
+            vec![
+                "models",
+                "status",
+                "--backend",
+                "native-openrouter",
+                "--provider",
+                "openrouter",
+                "--model",
+                "openai/gpt-4o",
+            ],
+            "models.status",
+            "unsupported native STT provider/model pair",
+        ),
+        (
+            vec![
+                "models",
+                "install",
+                "--backend",
+                "native-openrouter",
+                "--provider",
+                "openrouter",
+                "--model",
+                "openai/gpt-4o",
+            ],
+            "models.install",
+            "unsupported native STT provider/model pair",
+        ),
+        (
+            vec![
+                "models",
+                "install",
+                "--backend",
+                "local-whisper",
+                "--model",
+                "openai/whisper-1",
+            ],
+            "models.install",
+            "only valid with --backend native-openrouter",
+        ),
+    ] {
+        let value = failure(invoke_with_data_home(&catalog_path, &data_home, arguments));
+        assert_eq!(value["command"], expected_command, "{value:#}");
+        assert_eq!(value["error"]["code"], "invalid_input", "{value:#}");
+        assert!(
+            value["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains(expected_message),
+            "{value:#}"
+        );
+    }
+
+    assert_eq!(
+        fs::read(&catalog_path).unwrap(),
+        before,
+        "selection failures must not migrate or change the catalog"
+    );
+    assert!(
+        !data_home.join("com.rcd.vlogcutter").exists(),
+        "selection failures must not create managed model paths"
+    );
+}
+
+#[test]
 fn selected_batch_validates_empty_duplicate_unknown_and_wrong_project_ids_before_media_work() {
     let directory = tempdir().unwrap();
     let catalog_path = directory.path().join("catalog.sqlite3");

@@ -169,7 +169,8 @@ pub use agent::{
     AgentReadinessError, BindingCheck, CatalogReadiness, CliBinding, CliBuild, CliExecutable,
     CliSelection, DoctorReport, ReadinessRequirements, catalog_readiness, check_cli_binding,
     doctor_report, ensure_agent_readiness, install_speech_models_with_progress,
-    refresh_cli_binding, speech_model_status,
+    install_speech_models_with_progress_for, refresh_cli_binding, speech_model_status,
+    speech_model_status_for,
 };
 pub use preflight::{
     Classification, ImportDestination, ImportOutcome, ImportPreflight, ImportProgress,
@@ -2853,6 +2854,12 @@ impl Catalog {
         speech_model_status(&self.database_path)
     }
 
+    /// Reports readiness for an explicit backend selection without opening a
+    /// second catalog, downloading, or loading an inference engine.
+    pub fn model_status_for(&self, selection: &SpeechBackendSelection) -> Result<Vec<ModelStatus>> {
+        speech_model_status_for(&self.database_path, selection)
+    }
+
     /// Downloads whichever speech models are missing.
     ///
     /// This is the only path that fetches a model. It exists so installation is
@@ -2864,6 +2871,26 @@ impl Catalog {
         F: FnMut(ModelInstallProgress) -> ControlFlow<()>,
     {
         let report = install_speech_models_with_progress(&self.database_path, on_progress)?;
+        if report.cancelled {
+            bail!("model download cancelled");
+        }
+        Ok(report.models)
+    }
+
+    /// Explicitly download only the artifacts required by the selected backend.
+    ///
+    /// This is a thin wrapper over the owning core operation, kept alongside the
+    /// historical local-only method for callers that already hold a Catalog.
+    pub fn install_models_with_progress_for<F>(
+        &self,
+        selection: &SpeechBackendSelection,
+        on_progress: F,
+    ) -> Result<Vec<ModelStatus>>
+    where
+        F: FnMut(ModelInstallProgress) -> ControlFlow<()>,
+    {
+        let report =
+            install_speech_models_with_progress_for(&self.database_path, selection, on_progress)?;
         if report.cancelled {
             bail!("model download cancelled");
         }
