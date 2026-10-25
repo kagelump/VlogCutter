@@ -9,7 +9,7 @@ use anyhow::{Context, Result, bail};
 use std::path::Path;
 use std::process::Command;
 
-use crate::{media_tool_failure, run_captured_media_command, tool_command};
+use crate::{media_tool_failure, run_captured_media_command_with_cancellation, tool_command};
 
 /// Extracts 16 kHz mono PCM, the only input format whisper.cpp accepts.
 pub trait AudioExtractor {
@@ -45,14 +45,30 @@ pub fn audio_extract_command(source: &Path, destination: &Path) -> Command {
 
 pub struct FfmpegAudioExtractor;
 
-impl AudioExtractor for FfmpegAudioExtractor {
-    fn extract_pcm16k(&self, source: &Path, destination: &Path) -> Result<()> {
+impl FfmpegAudioExtractor {
+    /// Cancellation-aware extraction for the native speech preparation path.
+    /// The existing trait method remains the behavior-compatible local entry
+    /// point and delegates here with an uncancelled closure.
+    pub(crate) fn extract_pcm16k_cancellable(
+        &self,
+        source: &Path,
+        destination: &Path,
+        is_cancelled: &mut dyn FnMut() -> bool,
+    ) -> Result<()> {
+        if is_cancelled() {
+            bail!("ffmpeg audio extraction canceled before spawn");
+        }
         if !source.is_file() {
             bail!("proxy is offline: {}", source.display());
         }
         let mut command = audio_extract_command(source, destination);
-        let (status, diagnostic) = run_captured_media_command(&mut command, source, destination)
-            .context("spawn ffmpeg audio extraction process")?;
+        let (status, diagnostic) = run_captured_media_command_with_cancellation(
+            &mut command,
+            source,
+            destination,
+            is_cancelled,
+        )
+        .context("spawn ffmpeg audio extraction process")?;
         if !status.success() {
             return Err(media_tool_failure(
                 "ffmpeg audio extraction",
@@ -61,6 +77,12 @@ impl AudioExtractor for FfmpegAudioExtractor {
             ));
         }
         Ok(())
+    }
+}
+
+impl AudioExtractor for FfmpegAudioExtractor {
+    fn extract_pcm16k(&self, source: &Path, destination: &Path) -> Result<()> {
+        self.extract_pcm16k_cancellable(source, destination, &mut || false)
     }
 }
 
@@ -154,6 +176,67 @@ mod tests {
             .extract_pcm16k(&source, &directory.path().join("decoded.wav"))
             .unwrap_err();
         assert!(format!("{error:#}").contains("ffmpeg audio extraction"));
+    }
+
+    #[test]
+    fn early_extraction_cancel_spawns_nothing() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let marker = directory.path().join("spawned");
+        let mut command = Command::new("sh");
+        command.arg("-c").arg("touch \"$1\"").arg("sh").arg(&marker);
+        let error = crate::run_captured_media_command_with_cancellation(
+            &mut command,
+            Path::new("/unused/source.mp4"),
+            Path::new("/unused/output.wav"),
+            &mut || true,
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("canceled before spawn"),
+            "{error}"
+        );
+        assert!(!marker.exists(), "a canceled extraction must not spawn");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extraction_cancel_kills_reaps_and_drains_stderr() {
+        use std::time::{Duration, Instant};
+
+        let directory = tempfile::TempDir::new().unwrap();
+        let pid_file = directory.path().join("child.pid");
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg(
+                "echo $$ > \"$1\"; i=0; while [ \"$i\" -lt 16384 ]; do printf 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx' >&2; i=$((i+1)); done; exec sleep 60",
+            )
+            .arg("sh")
+            .arg(&pid_file);
+        let started = Instant::now();
+        let error = crate::run_captured_media_command_with_cancellation(
+            &mut command,
+            Path::new("/unused/source.mp4"),
+            Path::new("/unused/output.wav"),
+            &mut || pid_file.exists() && started.elapsed() > Duration::from_millis(100),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("canceled"), "{error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "canceled child took too long to kill and reap"
+        );
+        let pid: i32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let alive = unsafe { libc::kill(pid, 0) };
+        assert_eq!(alive, -1, "canceled child {pid} was not reaped");
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
     }
 
     #[test]

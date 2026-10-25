@@ -1687,12 +1687,12 @@ fn eta_from_timing(
     }
 }
 
-fn override_selection(
+/// Validate explicit resource settings without model inspection, catalog writes
+/// or media work, including for no-work/no-audio fast paths.
+pub(crate) fn validate_resource_overrides(
     representation_kind: &str,
-    recipe_key: &str,
     overrides: &ResourceOverrides,
-    history_key: String,
-) -> Result<ResourceSelection> {
+) -> Result<()> {
     if let Some(value) = overrides.worker_count {
         ensure!(
             (1..=MAX_CALIBRATION_WORKERS).contains(&value),
@@ -1739,6 +1739,16 @@ fn override_selection(
             "invalid input: explicit encoder override {encoder:?} is unsupported; only software can be forced (use policy auto for bounded hardware probing)"
         );
     }
+    Ok(())
+}
+
+fn override_selection(
+    representation_kind: &str,
+    recipe_key: &str,
+    overrides: &ResourceOverrides,
+    history_key: String,
+) -> Result<ResourceSelection> {
+    validate_resource_overrides(representation_kind, overrides)?;
     Ok(ResourceSelection {
         representation_kind: representation_kind.into(),
         recipe_key: recipe_key.into(),

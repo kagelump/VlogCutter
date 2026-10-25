@@ -985,6 +985,9 @@ impl Catalog {
         if !self.preparation_asset_active(asset_id, &receipt.project_id)? {
             return Ok(ControlFlow::Continue(changed));
         }
+        // Preparation already owns the proxy claim; the separate speech claim
+        // is the shared write/result boundary with native-cloud preparation.
+        let _speech_claim = self.claim_representation(asset_id, RepresentationKind::Speech)?;
         let proxy_path = Self::require_proxy(&asset)?;
         let source_fingerprint = self.proxy_fingerprint(asset_id)?;
         let audio_present = match self.transcription_audio_present(&proxy_path) {

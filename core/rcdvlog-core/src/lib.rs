@@ -2923,6 +2923,10 @@ impl Catalog {
             overrides,
         )?;
         let asset = self.get_asset(asset_id)?;
+        // One shared speech claim covers the local probe/extract/engine path and
+        // the eventual transcript replacement, so it cannot race a prepared
+        // native request for the same asset.
+        let _speech_claim = self.claim_representation(asset_id, RepresentationKind::Speech)?;
         let proxy_path = Self::require_proxy(&asset)?;
         let source_fingerprint = self.proxy_fingerprint(asset_id)?;
         let audio_present = match self.transcription_audio_present(&proxy_path) {
@@ -3299,6 +3303,29 @@ impl Catalog {
         for item in pending.iter() {
             let remaining = &task_work[audio_processed.min(task_work.len())..];
             let flow;
+            let asset = match item {
+                ProjectPlannedAsset::NoAudio { asset, .. }
+                | ProjectPlannedAsset::ProbeFailed { asset, .. }
+                | ProjectPlannedAsset::Ready { asset, .. } => asset,
+            };
+            let Some(_speech_claim) =
+                self.try_claim_representation(&asset.id, RepresentationKind::Speech)?
+            else {
+                report.failed += 1;
+                report.failures.push(IngestFailure {
+                    path: asset.path.clone(),
+                    error: "speech transcription is already in progress for this asset".into(),
+                });
+                flow = on_progress(TranscribeBatchProgress {
+                    outcome: None,
+                    estimate: estimator.estimate(remaining),
+                });
+                if flow.is_break() {
+                    report.cancelled = true;
+                    break;
+                }
+                continue;
+            };
             match item {
                 ProjectPlannedAsset::NoAudio {
                     asset,
@@ -6248,14 +6275,50 @@ pub(crate) fn run_captured_media_command(
     input: &Path,
     output: &Path,
 ) -> Result<(std::process::ExitStatus, String)> {
+    run_captured_media_command_with_cancellation(command, input, output, &mut || false)
+}
+
+/// Shared captured-child execution with cancellation. The child is killed and
+/// reaped before this returns, and its stderr drain thread is joined so a
+/// canceled FFmpeg cannot leave an orphan or a blocked pipe behind.
+pub(crate) fn run_captured_media_command_with_cancellation(
+    command: &mut Command,
+    input: &Path,
+    output: &Path,
+    is_cancelled: &mut dyn FnMut() -> bool,
+) -> Result<(std::process::ExitStatus, String)> {
+    if is_cancelled() {
+        bail!("media tool process canceled before spawn");
+    }
     command.stdout(Stdio::null()).stderr(Stdio::piped());
     let mut child = command.spawn().context("spawn media tool process")?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| anyhow!("media tool stderr pipe was not available"))?;
+    let stderr = match child.stderr.take() {
+        Some(stderr) => stderr,
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("media tool stderr pipe was not available");
+        }
+    };
     let stderr_reader = drain_child_stderr(stderr);
-    let status = child.wait().context("wait for media tool process")?;
+    let status = loop {
+        if is_cancelled() {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = stderr_reader.join();
+            bail!("media tool process canceled");
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => thread::sleep(crate::stall::POLL_INTERVAL),
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stderr_reader.join();
+                return Err(error).context("wait for media tool process");
+            }
+        }
+    };
     let stderr = stderr_reader.join().unwrap_or_default();
     let stderr = String::from_utf8_lossy(&stderr).into_owned();
     let diagnostic = redact_media_diagnostic(&stderr, input, output);
