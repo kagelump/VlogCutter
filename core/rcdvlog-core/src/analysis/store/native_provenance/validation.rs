@@ -1,8 +1,10 @@
 //! Pure validation for a native transcript artifact and its window evidence.
 
-use anyhow::{Result, bail, ensure};
+use anyhow::{Context, Result, bail, ensure};
 
-use crate::analysis::quality::native_stt::{NativeSttQualityDecision, NativeSttQualityReason};
+use crate::analysis::quality::native_stt::{
+    NativeSttQualityDecision, NativeSttQualityReason, native_stt_repetition_is_safe,
+};
 use crate::analysis::run_policy::{RunAssetScope, RunPolicy, RunPolicyParameters};
 
 use super::super::{StoredTranscript, TranscriptOutcomeReason, TranscriptStatus};
@@ -23,6 +25,11 @@ pub(super) fn validate_transcript_shape(
         transcript.speech_seconds.is_finite() && transcript.speech_seconds >= 0.0,
         "native transcript speech duration must be finite and non-negative"
     );
+    for (index, observation) in observations.iter().enumerate() {
+        observation
+            .validate()
+            .with_context(|| format!("validate native transcript window observation {index}"))?;
+    }
     ensure!(
         transcript.mean_token_probability.is_none(),
         "native transcript header must not claim an unmeasured arithmetic token probability"
@@ -45,6 +52,17 @@ pub(super) fn validate_transcript_shape(
         ensure!(
             ratio.is_finite() && (0.0..=1.0).contains(&ratio),
             "native transcript repetition ratio must be finite and in [0, 1]"
+        );
+    }
+
+    if matches!(
+        transcript.status,
+        TranscriptStatus::Speech | TranscriptStatus::ReviewRequired
+    ) {
+        let measured = crate::analysis::quality::repetition_ratio(&transcript.segments);
+        ensure!(
+            transcript.repetition_ratio == Some(measured),
+            "native transcript whole-clip repetition summary disagrees with retained candidate text"
         );
     }
 
@@ -104,6 +122,12 @@ pub(super) fn validate_transcript_shape(
                                 == NativeSttQualityDecision::Accepted),
                         "accepted native speech requires every provider window to have accepted quality evidence"
                     );
+                    ensure!(
+                        transcript
+                            .repetition_ratio
+                            .is_some_and(native_stt_repetition_is_safe),
+                        "accepted native speech requires a measured safe whole-clip repetition ratio"
+                    );
                 }
                 TranscriptStatus::ReviewRequired => {
                     ensure!(
@@ -129,6 +153,12 @@ pub(super) fn validate_transcript_shape(
                                 != NativeSttQualityDecision::Rejected),
                         "review_required native transcript cannot hide a known-bad provider window"
                     );
+                    ensure!(
+                        transcript
+                            .repetition_ratio
+                            .is_some_and(native_stt_repetition_is_safe),
+                        "review_required native transcript requires a measured safe whole-clip repetition ratio"
+                    );
                 }
                 TranscriptStatus::Rejected => {
                     ensure!(
@@ -139,13 +169,22 @@ pub(super) fn validate_transcript_shape(
                         transcript.segments.is_empty(),
                         "rejected native output must not retain candidate text"
                     );
+                    let has_rejected_window = observations.iter().any(|observation| {
+                        observation.quality.decision == NativeSttQualityDecision::Rejected
+                    });
+                    let unsafe_clip_repetition = transcript
+                        .repetition_ratio
+                        .is_some_and(|ratio| !native_stt_repetition_is_safe(ratio));
                     ensure!(
-                        observations
-                            .iter()
-                            .any(|observation| observation.quality.decision
-                                == NativeSttQualityDecision::Rejected),
-                        "rejected native transcript requires rejected quality evidence"
+                        has_rejected_window || unsafe_clip_repetition,
+                        "rejected native transcript requires rejected window evidence or measured unsafe whole-clip repetition"
                     );
+                    if !has_rejected_window {
+                        ensure!(
+                            transcript.reject_reason == NativeSttQualityReason::Repetition.code(),
+                            "clip-level native repetition rejection must retain its stable body-free reason"
+                        );
+                    }
                 }
                 TranscriptStatus::NoAcceptedSpeech => {
                     ensure!(

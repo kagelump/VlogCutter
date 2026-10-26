@@ -144,7 +144,17 @@ pub(crate) fn load_native_transcript_checkpoint(
                             &provenance.policy,
                             scope,
                         )?;
-                    Some(checkpoint_from_provenance(provenance, plan)?)
+                    if provenance.status != TranscriptStatus::Failed
+                        || provenance.outcome_reason
+                            != TranscriptOutcomeReason::NativeCoverageIncomplete
+                    {
+                        // A terminal artifact may retain the same plan for exact
+                        // currentness/coverage inspection, but this accessor is an
+                        // incomplete-checkpoint projection only.
+                        None
+                    } else {
+                        Some(checkpoint_from_provenance(provenance, plan)?)
+                    }
                 }
                 None => None,
             }

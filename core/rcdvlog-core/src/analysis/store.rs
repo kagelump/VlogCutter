@@ -241,13 +241,39 @@ pub(crate) fn write_transcript_rows(
         native_policy_id.is_some() == native_quality_recipe_version.is_some(),
         "native policy and quality recipe identities must be written together"
     );
-    ensure!(
-        native_window_plan.is_none()
-            || (native_policy_id.is_some()
-                && transcript.status == TranscriptStatus::Failed
-                && transcript.outcome_reason == TranscriptOutcomeReason::NativeCoverageIncomplete),
-        "a native transcript window plan is only valid on an incomplete native checkpoint"
-    );
+    if let Some(plan) = native_window_plan {
+        let valid_incomplete = transcript.status == TranscriptStatus::Failed
+            && transcript.outcome_reason == TranscriptOutcomeReason::NativeCoverageIncomplete;
+        let valid_terminal_native = matches!(
+            (transcript.status, transcript.outcome_reason),
+            (TranscriptStatus::Speech, TranscriptOutcomeReason::Accepted)
+                | (
+                    TranscriptStatus::NoAcceptedSpeech,
+                    TranscriptOutcomeReason::EmptyProviderOutput
+                )
+                | (
+                    TranscriptStatus::Rejected,
+                    TranscriptOutcomeReason::QualityRejected
+                )
+                | (
+                    TranscriptStatus::ReviewRequired,
+                    TranscriptOutcomeReason::QualityEvidenceIncomplete
+                )
+        );
+        ensure!(
+            native_policy_id.is_some() && (valid_incomplete || valid_terminal_native),
+            "a native transcript window plan is only valid on an incomplete native checkpoint or a terminal native output"
+        );
+        if valid_terminal_native {
+            let parsed: crate::analysis::store::NativeTranscriptWindowPlan =
+                serde_json::from_str(plan.plan_json)
+                    .context("parse terminal native transcript window plan")?;
+            ensure!(
+                parsed.windows.len() == transcript.window_count as usize,
+                "terminal native transcript window plan must match the header window count"
+            );
+        }
+    }
     let (plan_json, plan_fingerprint) = native_window_plan
         .map(|plan| (Some(plan.plan_json), Some(plan.fingerprint)))
         .unwrap_or((None, None));
