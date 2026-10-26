@@ -11,7 +11,17 @@ for package in "${packages[@]}"; do
 done
 dpkg-query -W "${packages[@]}" || true
 if ((${#missing[@]})); then
-  options=(-o Acquire::Retries=1 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 -o DPkg::Lock::Timeout=30)
+  # The hosted mirror list selected an Azure HTTP mirror that repeatedly
+  # trickled package downloads. Use Ubuntu's signed HTTPS archives explicitly,
+  # without changing the runner's own sources or involving third-party repos.
+  sources=$(mktemp)
+  trap 'rm -f "$sources"' EXIT
+  cat > "$sources" <<'SOURCES'
+deb [signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] https://archive.ubuntu.com/ubuntu noble main restricted universe multiverse
+deb [signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] https://archive.ubuntu.com/ubuntu noble-updates main restricted universe multiverse
+deb [signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] https://security.ubuntu.com/ubuntu noble-security main restricted universe multiverse
+SOURCES
+  options=(-o "Dir::Etc::sourcelist=$sources" -o Dir::Etc::sourceparts=- -o Acquire::Languages=none -o Acquire::Retries=1 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 -o DPkg::Lock::Timeout=30)
   # A trickling mirror need not trigger socket timeouts: bound total wall time.
   timeout --kill-after=10s 90s sudo apt-get "${options[@]}" update
   timeout --kill-after=10s 180s sudo apt-get "${options[@]}" install -y --no-install-recommends "${missing[@]}"

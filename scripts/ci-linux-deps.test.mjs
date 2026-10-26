@@ -12,7 +12,7 @@ function setup({ installed = false, fail = "" } = {}) {
   fake("dpkg-query", 'if [[ "$*" == *Status* ]]; then [[ "$INSTALLED" == yes ]] && echo "install ok installed"; else echo versions; fi');
   fake("timeout", 'echo "timeout $*" >> "$LOG"; shift 2; "$@"');
   fake("sudo", '"$@"');
-  fake("apt-get", 'echo "apt-get $*" >> "$LOG"; [[ "$*" != *"$FAIL"* ]]');
+  fake("apt-get", 'echo "apt-get $*" >> "$LOG"; for arg in "$@"; do if [[ "$arg" == Dir::Etc::sourcelist=* ]]; then cat "${arg#*=}" >> "$LOG"; fi; done; [[ "$*" != *"$FAIL"* ]]');
   fake("ffmpeg", 'echo ffmpeg');
   fake("ffprobe", 'echo ffprobe');
   fake("pkg-config", 'echo "pkg-config $*" >> "$LOG"; echo versions');
@@ -36,6 +36,11 @@ test("missing dependencies use bounded apt with limited retries and no recommend
   assert.match(result.log, /timeout --kill-after=10s 90s sudo apt-get/);
   assert.match(result.log, /timeout --kill-after=10s 180s sudo apt-get/);
   assert.match(result.log, /Acquire::Retries=1/);
+  assert.match(result.log, /Dir::Etc::sourceparts=-/);
+  assert.match(result.log, /signed-by=\/usr\/share\/keyrings\/ubuntu-archive-keyring.gpg/);
+  assert.match(result.log, /https:\/\/archive.ubuntu.com\/ubuntu noble-updates/);
+  assert.match(result.log, /https:\/\/security.ubuntu.com\/ubuntu noble-security/);
+  assert.doesNotMatch(result.log, /azure.archive/);
   assert.match(result.log, /Acquire::http::Timeout=20/);
   assert.match(result.log, /Acquire::https::Timeout=20/);
   assert.match(result.log, /DPkg::Lock::Timeout=30/);

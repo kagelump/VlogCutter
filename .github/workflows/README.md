@@ -33,7 +33,11 @@ browser container.
 Linux uses `ubuntu-24.04` instead of a moving release alias. The runner image
 still receives updates. `scripts/ci-linux-deps.sh` records installed versions,
 installs only missing FFmpeg/GTK/WebKit/AppIndicator/SVG packages, and uses
-`--no-install-recommends`. Apt has one retry, 20-second socket timeouts and a
+`--no-install-recommends`. A temporary apt source list selects the signed
+Ubuntu HTTPS archive/security endpoints rather than the hosted Azure HTTP
+mirror that repeatedly trickled downloads in measured runs. The runner's own
+sources are untouched; third-party package repositories are excluded from this
+step, and the temporary source list is removed on exit. Apt has one retry, 20-second socket timeouts and a
 30-second lock timeout. Total update/install deadlines are 90/180 seconds,
 with a five-minute step deadline. A trickling download cannot keep the job
 successful after an hour. Failures retain the apt output; they require a new
