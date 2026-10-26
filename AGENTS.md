@@ -1005,9 +1005,10 @@ and Codex session management remain in the external consumer. See
 ## 12. Testing and verification
 
 Run focused local checks for the changed behavior and its dependencies before
-PR, then require passing Ubuntu and macOS CI on the exact candidate head before
-merge. The broader automated checks below are supplied by CI; select additional
-local checks according to the changed boundaries and risk. Manual acceptance
+PR, then require passing Linux and platform-relevant macOS CI on the exact
+candidate head before merge. The conservative skip policy and stable
+`ci-required` aggregate are documented in `.github/workflows/README.md`. The
+broader automated checks below are supplied by CI; select additional local checks according to the changed boundaries and risk. Manual acceptance
 requirements remain explicit.
 
 | Change area | Fast check | Required broader check |
@@ -1041,11 +1042,11 @@ cover the changed behavior and its dependencies, including targeted integration
 checks for migrations, integrity, concurrency, cancellation, or paid accounting
 when those boundaries change. Use the full pre-PR scope only when a specific
 risk or repeated CI failure justifies its broader cost:
-`pnpm gate --scope pre-pr`. It follows all Ubuntu CI checks in
+`pnpm gate --scope pre-pr`. It follows all Linux CI checks in
 `.github/workflows/ci.yml`, prints each command's output and status, and fails
 if any prerequisite or command fails. `pnpm gate --scope fast` remains
-iteration-only. Before merge, completed Ubuntu and macOS CI must pass on the
-exact candidate head; coverage and safety checks remain mandatory. The gate's
+iteration-only. Before merge, completed Linux and platform-relevant macOS CI
+must pass on the exact candidate head; coverage and safety checks remain mandatory. The gate's
 isolated regression suite is `node --test scripts/pre-pr-gate.test.mjs`, and
 `pnpm test:scripts` includes it. Re-run relevant checks after each code change
 and include results or exact-head CI links and failed-step logs in a handoff.
@@ -1073,10 +1074,11 @@ the gate on the repaired code, and push the new commit. Confirm CI passes on
 that exact commit before declaring an issue complete; neither an in-progress
 run nor a green run for an older commit is confirmation.
 
-The CI encoding of this gate table lives in `.github/workflows/ci.yml` (two
-jobs, `ubuntu` and `macos`; runs on every push to `main` and every pull request
-targeting `main`). When adding a new gate command to this table, add a
-corresponding named step to the workflow. When a gate command is removed or
+The CI encoding of this gate table lives in `.github/workflows/ci.yml`: concurrent
+Linux Rust lint/tests, frontend and browser jobs, conditional macOS, and the
+always-reported `ci-required` aggregate. It runs on every main push and PR, merge
+queues, manual dispatch and a weekly unconditional full run. When adding a
+new gate command to this table, add a corresponding named step to the workflow. When a gate command is removed or
 demoted, remove or adjust its CI step. The table and the workflow must not
 drift apart.
 

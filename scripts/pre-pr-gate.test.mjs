@@ -63,7 +63,7 @@ test("clean pass runs every required pre-PR check", () => {
   assert.match(result.output, /RESULT cargo clippy --workspace --all-targets -- -D warnings: PASS/);
   assert.match(result.output, /RESULT cargo test --workspace: PASS/);
   assert.match(result.output, /RESULT pnpm check:frontend: PASS/);
-  assert.match(result.output, /Gate summary \(pre-pr\): 18 passed, 0 failed\./);
+  assert.match(result.output, /Gate summary \(pre-pr\): 15 passed, 0 failed\./);
 });
 
 test("local scope requires and runs structured focused checks after baseline checks", () => {
@@ -119,7 +119,7 @@ test("format failure appears in summary and fails the gate", () => {
   const result = runScenario("format failure", { fail: "format" });
   assert.equal(result.code, 1);
   assert.match(result.output, /RESULT cargo fmt --all -- --check: FAIL \(exit 9\)/);
-  assert.match(result.output, /Gate summary \(pre-pr\): 17 passed, 1 failed\./);
+  assert.match(result.output, /Gate summary \(pre-pr\): 14 passed, 1 failed\./);
 });
 
 test("clippy failure appears in summary and fails the gate", () => {

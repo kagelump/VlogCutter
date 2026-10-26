@@ -68,7 +68,7 @@ exit 0
 test("CLI succeeds when every fake prerequisite and check succeeds", () => {
   const result = runCli("valid CLI pass");
   assert.equal(result.status, 0, JSON.stringify(result));
-  assert.match(result.stdout, /Gate summary \(pre-pr\): 18 passed, 0 failed\./);
+  assert.match(result.stdout, /Gate summary \(pre-pr\): 15 passed, 0 failed\./);
 });
 
 test("CLI defaults to local scope and requires a focused checks plan", () => {
@@ -183,7 +183,7 @@ exit 0
     assert.match(result.stdout, /trailing whitespace/);
     assert.match(result.stdout, /fix the trailing-whitespace lines shown above/);
     assert.doesNotMatch(result.stdout, /git fetch origin main/);
-    assert.match(result.stdout, /Gate summary \(pre-pr\): 17 passed, 1 failed\./);
+    assert.match(result.stdout, /Gate summary \(pre-pr\): 14 passed, 1 failed\./);
   } finally {
     rmSync(temp, { recursive: true, force: true });
   }
