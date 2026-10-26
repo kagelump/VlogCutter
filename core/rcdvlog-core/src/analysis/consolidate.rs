@@ -140,8 +140,15 @@ pub fn run_with_cancel(
 ) -> Result<Vec<LabelMapping>> {
     let first = chain.analyze_with_cancel(provider, request, is_cancelled)?;
     match parse_mapping(&first.response.body, proposals) {
-        Ok(mapping) => Ok(mapping),
+        Ok(mapping) => {
+            provider.record_response_success(&first.response.model)?;
+            Ok(mapping)
+        }
         Err(default_error) if first.response.model == DEFAULT_MODEL => {
+            provider.record_response_rejection(
+                &first.response.model,
+                crate::analysis::provider::ProviderResponseRejection::ContentQuality,
+            )?;
             chain.record_default_failure();
             let fallback_model = chain.fallback_model().ok_or_else(|| {
                 anyhow::anyhow!(
@@ -152,11 +159,31 @@ pub fn run_with_cancel(
                 return Err(ProviderFailure::cancelled().into());
             }
             let fallback = provider.analyze_with_cancel(fallback_model, request, is_cancelled)?;
-            parse_mapping(&fallback.body, proposals).with_context(|| {
-                format!("default mapping was invalid ({default_error:#}); fallback was invalid")
-            })
+            match parse_mapping(&fallback.body, proposals) {
+                Ok(mapping) => {
+                    provider.record_response_success(&fallback.model)?;
+                    Ok(mapping)
+                }
+                Err(error) => {
+                    provider.record_response_rejection(
+                        &fallback.model,
+                        crate::analysis::provider::ProviderResponseRejection::ContentQuality,
+                    )?;
+                    Err(error).with_context(|| {
+                        format!(
+                            "default mapping was invalid ({default_error:#}); fallback was invalid"
+                        )
+                    })
+                }
+            }
         }
-        Err(error) => Err(error).context("validate consolidation mapping"),
+        Err(error) => {
+            provider.record_response_rejection(
+                &first.response.model,
+                crate::analysis::provider::ProviderResponseRejection::ContentQuality,
+            )?;
+            Err(error).context("validate consolidation mapping")
+        }
     }
 }
 

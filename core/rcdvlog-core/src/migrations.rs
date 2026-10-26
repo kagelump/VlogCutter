@@ -7,7 +7,7 @@ use thiserror::Error;
 
 use crate::chronology::forward_migrate_project_chronology;
 
-pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 45;
+pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 46;
 
 const MIGRATION_TABLE_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -354,7 +354,33 @@ pub const PROJECT_CATALOG_MIGRATIONS: &[SqliteMigration] = &[
         source_identity: "project-catalog/0045-native-transcript-window-checkpoint/20261030",
         apply: add_native_transcript_window_checkpoint,
     },
+    SqliteMigration {
+        id: 46,
+        name: "analysis_provider_health_cooldowns",
+        source_identity: "project-catalog/0046-analysis-provider-health-cooldowns/20261027",
+        apply: add_analysis_provider_health_cooldowns,
+    },
 ];
+
+/// Durable provider health shared by concurrent and resumed workers. Policy
+/// identity is stable for the authorized generation; run IDs are attempt evidence.
+fn add_analysis_provider_health_cooldowns(transaction: &Transaction<'_>) -> Result<()> {
+    transaction.execute_batch(
+        r#"CREATE TABLE IF NOT EXISTS analysis_provider_health (
+            project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            budget_scope_id TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            model TEXT NOT NULL,
+            consecutive_failures INTEGER NOT NULL DEFAULT 0 CHECK(consecutive_failures >= 0),
+            cooldown_until INTEGER NOT NULL DEFAULT 0 CHECK(cooldown_until >= 0),
+            last_failure_category TEXT NOT NULL DEFAULT '',
+            updated_at INTEGER NOT NULL,
+            revision INTEGER NOT NULL DEFAULT 0 CHECK(revision >= 0),
+            PRIMARY KEY(project_id, budget_scope_id, provider, model)
+        );"#,
+    )?;
+    Ok(())
+}
 
 /// Migration 36. Separate terminal transcript outcomes that older schemas had
 /// to conflate.
@@ -4428,6 +4454,58 @@ mod tests {
                 )
                 .is_err(),
             "plan JSON and semantic fingerprint must be present together"
+        );
+    }
+
+    #[test]
+    fn migration_46_adds_shared_provider_health_without_changing_accounting_rows() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        run_sqlite_migrations(&mut connection, &PROJECT_CATALOG_MIGRATIONS[..45]).unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO projects(id,name,created_at) VALUES ('p46','project','2026-01-01T00:00:00Z');",
+            )
+            .unwrap();
+        assert!(!table_exists(&connection, "analysis_provider_health").unwrap());
+        migrate_project_catalog(&mut connection).unwrap();
+        assert!(table_exists(&connection, "analysis_provider_health").unwrap());
+        let columns: Vec<String> = connection
+            .prepare("SELECT name FROM pragma_table_info('analysis_provider_health') ORDER BY cid")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            columns,
+            [
+                "project_id",
+                "budget_scope_id",
+                "provider",
+                "model",
+                "consecutive_failures",
+                "cooldown_until",
+                "last_failure_category",
+                "updated_at",
+                "revision"
+            ]
+        );
+        let primary_key_columns: Vec<String> = connection
+            .prepare("SELECT name FROM pragma_table_info('analysis_provider_health') WHERE pk>0 ORDER BY pk")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            primary_key_columns,
+            ["project_id", "budget_scope_id", "provider", "model"]
+        );
+        assert_eq!(
+            inspect_project_catalog_migrations(&connection)
+                .unwrap()
+                .current_version,
+            46
         );
     }
 }

@@ -31,7 +31,7 @@ use crate::{AnalysisRunKind, Catalog};
 
 mod native_boundary_regressions;
 
-fn fixture() -> (tempfile::TempDir, Catalog, String) {
+pub(super) fn fixture() -> (tempfile::TempDir, Catalog, String) {
     let directory = tempdir().unwrap();
     let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).unwrap();
     let project = catalog.create_project("Synthetic accounting").unwrap();

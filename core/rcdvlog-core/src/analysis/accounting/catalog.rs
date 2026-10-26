@@ -148,7 +148,9 @@ impl Catalog {
     ) -> Result<AnalysisRequestRecord> {
         let safe = bounded_failure_code(failure_code);
         ensure!(
-            safe.starts_with("local_") || safe == "provider_configuration",
+            safe.starts_with("local_")
+                || safe == "provider_configuration"
+                || safe == "provider_cooldown",
             "local release requires typed local failure evidence"
         );
         self.release_analysis_request_before_dispatch(request_key, &safe)

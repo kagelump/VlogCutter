@@ -545,6 +545,23 @@ fn reserve_with_family(
     )?;
     let owner = OwnerIdentity::from_context(context, model);
     validate_owner_identity(&transaction, &owner, family)?;
+    if matches!(family, PolicyRequestFamily::Vlm { .. }) && !context.policy_id.is_empty() {
+        // Serialize replacement-policy admission with all prior active or
+        // uncertain attempts for this exact source. Because this check shares
+        // the immediate reservation transaction, either the old attempt or
+        // the replacement wins; the other cannot race past the drain fence.
+        let conflicting_policy: Option<String> = transaction
+            .query_row(
+                "SELECT policy_id FROM analysis_request_reservations WHERE project_id=?1 AND operation IN ('pilot','observation','moment_discovery') AND source_fingerprint=?2 AND policy_id<>?3 AND lifecycle IN ('reserved','dispatched','uncertain') ORDER BY created_at LIMIT 1",
+                params![context.project_id, context.source_fingerprint, context.policy_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        ensure!(
+            conflicting_policy.is_none(),
+            "a prior policy has active or unresolved paid work for this source; drain active requests and reconcile uncertain usage before replacement"
+        );
+    }
     if matches!(family, PolicyRequestFamily::NativeStt { .. }) {
         ensure_no_foreign_native_unresolved_for_source(&transaction, context)?;
     }

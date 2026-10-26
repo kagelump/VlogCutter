@@ -11,6 +11,8 @@
 //! never fabricates an intended-attempt key or a replacement account context.
 
 use anyhow::Result;
+use std::collections::HashMap;
+use std::sync::Mutex;
 
 use super::lifecycle::AccountingBoundary;
 use super::model::{
@@ -45,6 +47,7 @@ pub struct AccountedVlmProvider<'a> {
     catalog: &'a Catalog,
     provider: &'a dyn VlmProvider,
     admission: Admission,
+    health_revisions: Mutex<HashMap<String, i64>>,
     pre_dispatch_check: Option<Box<dyn Fn() -> Result<()> + Send + Sync + 'a>>,
 }
 
@@ -61,6 +64,7 @@ impl<'a> AccountedVlmProvider<'a> {
                 context,
                 explicit_retry: false,
             },
+            health_revisions: Mutex::new(HashMap::new()),
             pre_dispatch_check: None,
         }
     }
@@ -77,6 +81,7 @@ impl<'a> AccountedVlmProvider<'a> {
             catalog,
             provider,
             admission: Admission::TargetedRetry(admission),
+            health_revisions: Mutex::new(HashMap::new()),
             pre_dispatch_check: None,
         }
     }
@@ -110,6 +115,23 @@ impl<'a> AccountedVlmProvider<'a> {
         match &self.admission {
             Admission::Initial { context, .. } => &context.run_id,
             Admission::TargetedRetry(admission) => &admission.run_id,
+        }
+    }
+
+    fn provider_health_scope(&self) -> Result<(String, String, String)> {
+        match &self.admission {
+            Admission::Initial { context, .. } => Ok((
+                context.project_id.clone(),
+                context.resolved_budget_scope_id()?,
+                context.provider.clone(),
+            )),
+            Admission::TargetedRetry(admission) => {
+                let prior = self
+                    .catalog
+                    .analysis_request(&admission.prior_request_key)?
+                    .ok_or_else(ProviderFailure::local_admission)?;
+                Ok((prior.project_id, prior.budget_scope_id, prior.provider))
+            }
         }
     }
 
@@ -190,15 +212,90 @@ impl<'a> AccountedVlmProvider<'a> {
             .pre_dispatch_check
             .as_deref()
             .map(|check| check as &dyn Fn() -> Result<()>);
-        AccountingBoundary::new(self.catalog, self.run_id(), pre_dispatch_check)
+        let (project_id, policy_id, provider) = self.provider_health_scope()?;
+        let health_revision = std::sync::Mutex::new(0_i64);
+        let health_check = || -> Result<()> {
+            let revision = self
+                .catalog
+                .check_provider_health(&project_id, &policy_id, &provider, model)
+                .map_err(|error| {
+                    if error
+                        .downcast_ref::<super::provider_health::ProviderCooldown>()
+                        .is_some()
+                    {
+                        anyhow::Error::from(ProviderFailure::provider_cooldown())
+                    } else {
+                        anyhow::Error::from(ProviderFailure::local_admission())
+                    }
+                })?;
+            *health_revision
+                .lock()
+                .map_err(|_| ProviderFailure::local_admission())? = revision;
+            Ok(())
+        };
+        let combined_check = || {
+            health_check()?;
+            if let Some(check) = pre_dispatch_check {
+                check()?;
+            }
+            Ok(())
+        };
+        let result = AccountingBoundary::new(self.catalog, self.run_id(), Some(&combined_check))
             .execute(
                 is_cancelled,
                 || self.reserve_attempt(model, request),
                 || self.provider.prepare(),
                 || self.provider.analyze(model, request),
                 |response| Ok(ProviderReceiptEvidence::from_response(response)),
-            )
-            .map(|transmission| transmission.value)
+            );
+        match result {
+            Ok(transmission) => {
+                let revision = *health_revision
+                    .lock()
+                    .map_err(|_| ProviderFailure::local_post_dispatch())?;
+                self.health_revisions
+                    .lock()
+                    .map_err(|_| ProviderFailure::local_post_dispatch())?
+                    .insert(model.to_string(), revision);
+                Ok(transmission.value)
+            }
+            Err(error) => {
+                let failure = ProviderFailure::from_anyhow(&error);
+                if matches!(
+                    failure.category,
+                    crate::analysis::provider::ProviderFailureCategory::Transport
+                        | crate::analysis::provider::ProviderFailureCategory::HttpStatus
+                        | crate::analysis::provider::ProviderFailureCategory::InvalidResponse
+                        | crate::analysis::provider::ProviderFailureCategory::Unclassified
+                ) {
+                    let category = match failure.category {
+                        crate::analysis::provider::ProviderFailureCategory::Transport => {
+                            "transport"
+                        }
+                        crate::analysis::provider::ProviderFailureCategory::HttpStatus
+                            if failure.http_status == Some(429) =>
+                        {
+                            "rate_limit"
+                        }
+                        crate::analysis::provider::ProviderFailureCategory::InvalidResponse => {
+                            "schema"
+                        }
+                        _ => "provider",
+                    };
+                    self.catalog
+                        .record_provider_health_failure(
+                            &project_id,
+                            &policy_id,
+                            &provider,
+                            model,
+                            category,
+                            failure.retry_after_seconds,
+                        )
+                        .map_err(|_| ProviderFailure::local_post_dispatch())?;
+                }
+                Err(error)
+            }
+        }
     }
 }
 
@@ -215,6 +312,45 @@ impl VlmProvider for AccountedVlmProvider<'_> {
 
     fn analyze(&self, model: &str, request: &VlmRequest) -> Result<VlmResponse> {
         self.transmit(model, request, &mut || false)
+    }
+
+    fn record_response_rejection(
+        &self,
+        model: &str,
+        kind: crate::analysis::provider::ProviderResponseRejection,
+    ) -> Result<()> {
+        let (project_id, scope_id, provider) = self.provider_health_scope()?;
+        let result = self.catalog.record_provider_health_failure(
+            &project_id,
+            &scope_id,
+            &provider,
+            model,
+            match kind {
+                crate::analysis::provider::ProviderResponseRejection::Schema => "schema",
+                crate::analysis::provider::ProviderResponseRejection::ContentQuality => {
+                    "content_quality"
+                }
+            },
+            None,
+        );
+        self.health_revisions
+            .lock()
+            .map_err(|_| ProviderFailure::local_post_dispatch())?
+            .remove(model);
+        result.map_err(|_| ProviderFailure::local_post_dispatch().into())
+    }
+
+    fn record_response_success(&self, model: &str) -> Result<()> {
+        let (project_id, scope_id, provider) = self.provider_health_scope()?;
+        let revision = self
+            .health_revisions
+            .lock()
+            .map_err(|_| ProviderFailure::local_post_dispatch())?
+            .remove(model)
+            .unwrap_or(0);
+        self.catalog
+            .record_provider_health_success(&project_id, &scope_id, &provider, model, revision)
+            .map_err(|_| ProviderFailure::local_post_dispatch().into())
     }
 
     fn analyze_with_cancel(

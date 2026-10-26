@@ -13,7 +13,9 @@ use crate::analysis::accounting::AccountedVlmProvider;
 use crate::analysis::framepack;
 use crate::analysis::moments::{EditProfile, MomentSpan, moment_output_schema, validate_reply};
 use crate::analysis::openrouter::frame_data_uri;
-use crate::analysis::provider::{ProviderChain, VlmProvider, VlmRequest};
+use crate::analysis::provider::{
+    ProviderChain, ProviderResponseRejection, VlmProvider, VlmRequest,
+};
 use crate::analysis::run_policy::{
     AnalysisRunKind, PilotValidation, RunAssetScope, RunPilotRecord, RunPolicy,
     RunPolicyParameters, RunPolicyRequest, ensure_vlm_run_kind, pilot_accounting_context,
@@ -199,6 +201,16 @@ pub(crate) fn prepare_pilot_session(
                 ensure!(
                     unresolved.policy_id == policy.policy_id,
                     "a prior pilot request has unresolved usage; reconcile it and authorize the exact prior request before a replacement policy can retry"
+                );
+            }
+            for unresolved in catalog.analysis_requests_needing_reconciliation_for_source(
+                &policy.project_id,
+                kind.as_str(),
+                &scope.source_identity,
+            )? {
+                ensure!(
+                    unresolved.policy_id == policy.policy_id,
+                    "a prior bulk analysis request has unresolved usage; reconcile its exact receipt before a replacement policy can retry"
                 );
             }
         }
@@ -458,6 +470,18 @@ pub(crate) fn execute_accounted_pilot_attempts<C: FnMut() -> bool>(
     let mut response = first.response;
     let mut validation = prepared.validate(policy, &response.body);
     if validation.capability_observed {
+        accounted.record_response_success(&response.model)?;
+    } else {
+        accounted.record_response_rejection(
+            &response.model,
+            if validation.structural_schema_valid {
+                ProviderResponseRejection::ContentQuality
+            } else {
+                ProviderResponseRejection::Schema
+            },
+        )?;
+    }
+    if validation.capability_observed {
         return Ok(PilotExecution {
             validation,
             cancelled_before_domain_fallback: false,
@@ -484,6 +508,18 @@ pub(crate) fn execute_accounted_pilot_attempts<C: FnMut() -> bool>(
     chain.record_default_failure();
     response = accounted.analyze_with_cancel(fallback_model, &prepared.request, is_cancelled)?;
     validation = prepared.validate(policy, &response.body);
+    if validation.capability_observed {
+        accounted.record_response_success(&response.model)?;
+    } else {
+        accounted.record_response_rejection(
+            &response.model,
+            if validation.structural_schema_valid {
+                ProviderResponseRejection::ContentQuality
+            } else {
+                ProviderResponseRejection::Schema
+            },
+        )?;
+    }
     Ok(PilotExecution {
         validation,
         cancelled_before_domain_fallback: false,

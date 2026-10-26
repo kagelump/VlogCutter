@@ -705,6 +705,7 @@ fn native_batch_failure(
         ProviderFailureCategory::LocalBudgetExhausted => "native_batch_budget_exhausted",
         ProviderFailureCategory::Cancelled => "native_batch_cancelled",
         ProviderFailureCategory::LocalAdmission => "native_batch_admission_denied",
+        ProviderFailureCategory::ProviderCooldown => "native_batch_provider_cooldown",
         ProviderFailureCategory::LocalPreUpload => "native_batch_pre_upload_failed",
         ProviderFailureCategory::LocalPostDispatch => {
             "native_batch_post_dispatch_persistence_failed"

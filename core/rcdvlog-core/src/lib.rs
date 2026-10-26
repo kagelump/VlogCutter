@@ -121,8 +121,8 @@ pub use analysis::openrouter_stt::{
 pub use analysis::provider::{
     ANALYSIS_COST_BOUND_CONTRACT_VERSION, AnalysisAudioCostBound, AnalysisRequestCostBound,
     ChainOutcome, DEFAULT_MODEL, FALLBACK_MODEL, MODELS, ModelSpec, OPENROUTER_MAX_OUTPUT_TOKENS,
-    ProviderChain, ProviderFailure, ProviderFailureCategory, VlmProvider, VlmReceipt, VlmRequest,
-    VlmResponse, analysis_cost_bound_contract_id, model_spec,
+    ProviderChain, ProviderFailure, ProviderFailureCategory, ProviderResponseRejection,
+    VlmProvider, VlmReceipt, VlmRequest, VlmResponse, analysis_cost_bound_contract_id, model_spec,
 };
 pub use analysis::run_policy::{
     AnalysisPayload, AnalysisRunKind, AuthorizedPolicyState, CapabilityCheck, CapabilityStatus,
@@ -1316,7 +1316,7 @@ impl Catalog {
         &self.database_path
     }
 
-    fn connection(&self) -> Result<Connection> {
+    pub(crate) fn connection(&self) -> Result<Connection> {
         let connection = if self.read_only {
             Connection::open_with_flags(&self.database_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
         } else {
@@ -3879,7 +3879,7 @@ impl Catalog {
             );
             self.require_project(project_id)?;
             let (pending, skipped, force_overwrite_warnings) =
-                self.analysis_pending_assets(project_id, options)?;
+                self.analysis_pending_assets(project_id, options, false)?;
             if pending.is_empty() {
                 return Ok(AnalyzeReport {
                     analyzed: 0,
@@ -4078,6 +4078,7 @@ impl Catalog {
         &self,
         project_id: &str,
         options: &AnalysisRunOptions,
+        allow_rejected_recovery: bool,
     ) -> Result<(Vec<Asset>, usize, usize)> {
         let force = options.force;
         let selected = options.selected_assets.as_ref().map(|ids| {
@@ -4086,6 +4087,24 @@ impl Catalog {
                 .collect::<std::collections::HashSet<_>>()
         });
         let connection = self.connection()?;
+        let recovery_source_by_asset = if allow_rejected_recovery {
+            options
+                .policy_id
+                .as_deref()
+                .map(|policy_id| self.load_run_authorization(policy_id))
+                .transpose()?
+                .map(|authorization| {
+                    authorization
+                        .policy
+                        .scope
+                        .into_iter()
+                        .map(|scope| (scope.asset_id, scope.source_identity))
+                        .collect::<std::collections::HashMap<_, _>>()
+                })
+                .unwrap_or_default()
+        } else {
+            std::collections::HashMap::new()
+        };
         let mut skipped = 0;
         let mut force_overwrite_warnings = 0;
         let mut pending = Vec::new();
@@ -4111,7 +4130,37 @@ impl Catalog {
                 .is_some_and(|fingerprint| {
                     analysis_is_current(&connection, &asset.id, &fingerprint).unwrap_or(false)
                 });
-            if current && !force {
+            // Ordinary Analyze Missing treats every paid result as present,
+            // including rejected responses. Explicit recovery is eligible only
+            // under a changed primary model and a policy/source pair with no
+            // prior dispatched ledger attempt. This also protects fallback
+            // rejections whose stored serving model differs from the primary.
+            let rejected_under_changed_model = allow_rejected_recovery
+                && current
+                && options
+                    .primary_model
+                    .as_deref()
+                    .is_some_and(|requested_model| {
+                        load_analysis(&connection, &asset.id)
+                            .ok()
+                            .flatten()
+                            .is_some_and(|stored| {
+                                stored.status == AnalysisStatus::Rejected
+                                    && stored.model != requested_model
+                                    && recovery_source_by_asset
+                                        .get(&asset.id)
+                                        .is_some_and(|source_identity| {
+                                            !connection
+                                                .query_row(
+                                                    "SELECT EXISTS(SELECT 1 FROM analysis_request_reservations WHERE project_id=?1 AND policy_id=?2 AND operation IN ('observation','moment_discovery') AND source_fingerprint=?3 AND lifecycle IN ('dispatched','completed','uncertain'))",
+                                                    rusqlite::params![project_id, options.policy_id.as_deref().unwrap_or_default(), source_identity],
+                                                    |row| row.get::<_, bool>(0),
+                                                )
+                                                .unwrap_or(true)
+                                        })
+                            })
+                    });
+            if current && !force && !rejected_under_changed_model {
                 skipped += 1;
                 continue;
             }
@@ -4303,7 +4352,7 @@ impl Catalog {
         // transmission. A missing credential therefore causes zero provider calls.
         provider.prepare()?;
         let (pending, skipped, force_overwrite_warnings) =
-            self.analysis_pending_assets(project_id, options)?;
+            self.analysis_pending_assets(project_id, options, true)?;
 
         // Materialize frame packs first so the estimator's remaining weights
         // are exact frame counts, not clip-count or byte-size guesses.

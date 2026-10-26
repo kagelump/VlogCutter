@@ -71,6 +71,23 @@ that digest.
 Old approvals and pilots therefore stop matching and cannot be reused for a
 broader or altered batch.
 
+## Exact failed-asset recovery (#121)
+
+For a completed paid request whose domain response was rejected, recover only
+the exact failed asset by creating a new policy scoped to that asset and an
+explicitly approved healthy primary model/allowlist. Use the same Preflight →
+Authorize → Pilot → Run lifecycle. A same-policy rerun does not resend the
+rejected paid response, and the ordinary Analyze Missing path continues to treat
+that result as present. The authorized runner admits the rejected result as
+pending only when its requested primary model differs from the model that
+produced the rejection; successful observations remain current and are reused.
+
+An old reserved, dispatched, or uncertain request for that source blocks a
+replacement policy. Let dispatched work finish, then reconcile its receipt and
+authorize any exact retry under the existing accounting recovery flow before
+creating the replacement policy. The old policy's confirmed and unknown spend
+remain in its canonical ledger; a changed model allowlist does not clear it.
+
 ## SQLite provenance
 
 Migration 37 adds:
