@@ -23,17 +23,15 @@ use crate::analysis::accounting::NativeSttAccountedResult;
 use crate::analysis::accounting::store::NativeSettledResultProof;
 use crate::analysis::openrouter_stt::{
     NativeSttAudioWindow, NativeSttOutcome, NativeSttProtocolError, NativeSttRequest,
-    validate_iso639_1,
 };
 use crate::analysis::quality::DecodedSegment;
 use crate::analysis::quality::native_stt::{
-    NATIVE_STT_QUALITY_RECIPE_VERSION, NativeSttQualityDecision, NativeSttQualityReason,
-    evaluate_native_stt_quality, normalized_native_stt_language,
+    NATIVE_STT_QUALITY_RECIPE_VERSION, NativeSttQualityDecision, evaluate_native_stt_quality,
 };
 use crate::analysis::store::{
     NativeSttWindowObservation, NativeSttWindowQualityObservation, native_stt_transcript_recipe,
 };
-use crate::analysis::windows::{PackedWindow, WINDOW_MS};
+use crate::analysis::windows::PackedWindow;
 use crate::transcription::{NativeSpeechLocalOutcome, NativeSpeechPreparation};
 
 use super::{
@@ -45,8 +43,6 @@ pub const NATIVE_PILOT_EVIDENCE_SCHEMA_VERSION: &str = "analysis.native-pilot-ev
 /// The selected policy scope is already bounded by `MAX_SCOPE_ASSETS`; local
 /// facts may not exceed that existing bound.
 pub const MAX_NATIVE_PILOT_LOCAL_OUTCOMES: usize = super::MAX_SCOPE_ASSETS;
-const MAX_NATIVE_PILOT_CANDIDATES: usize = 10_000;
-const MAX_NATIVE_PILOT_CANDIDATE_TEXT_BYTES: usize = 64 * 1024;
 const MAX_NATIVE_PILOT_REQUEST_KEY_BYTES: usize = 512;
 
 mod persistence;
@@ -56,3 +52,5 @@ mod validation;
 pub(crate) use persistence::validate_native_no_provider_finalization;
 pub use types::*;
 use validation::*;
+
+pub(crate) use persistence::reusable_native_pilot_sample_on_transaction;

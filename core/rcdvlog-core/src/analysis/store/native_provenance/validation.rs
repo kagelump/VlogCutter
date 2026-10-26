@@ -210,6 +210,10 @@ pub(super) fn validate_native_policy(
     policy: &RunPolicy,
     transcript: &StoredTranscript,
 ) -> Result<()> {
+    validate_native_policy_recipe(policy, &transcript.recipe_key)
+}
+
+pub(super) fn validate_native_policy_recipe(policy: &RunPolicy, recipe_key: &str) -> Result<()> {
     ensure!(
         policy.kind == crate::analysis::run_policy::AnalysisRunKind::NativeSpeechTranscription
             && policy.payload == crate::analysis::run_policy::AnalysisPayload::Audio
@@ -252,7 +256,7 @@ pub(super) fn validate_native_policy(
         "frozen native policy recipe is not the deterministic native transcript recipe"
     );
     ensure!(
-        transcript.recipe_key == expected_recipe,
+        recipe_key == expected_recipe,
         "native transcript header recipe does not match the frozen native policy recipe"
     );
     Ok(())

@@ -1597,6 +1597,42 @@ pub(crate) fn list_requests(
     Ok(records)
 }
 
+/// Find any native request that prevents treating an exact payload as never
+/// attempted. Filter in SQLite without a global inspection-page limit, so old
+/// paid/active work cannot be hidden by unrelated newer requests.
+pub(crate) fn native_request_requiring_result_recovery(
+    connection: &Connection,
+    project_id: &str,
+    policy_id: &str,
+    source_fingerprint: &str,
+    provider: &str,
+    model: &str,
+    payload_fingerprint: &str,
+) -> Result<Option<AnalysisRequestRecord>> {
+    connection
+        .query_row(
+            &format!(
+                "{REQUEST_SELECT} WHERE project_id=?1 AND policy_id=?2
+           AND source_fingerprint=?3 AND requested_provider=?4 AND requested_model=?5
+           AND payload_fingerprint=?6
+           AND operation IN ('pilot','native_speech_transcription')
+           AND (lifecycle!='released' OR dispatch_at IS NOT NULL)
+         ORDER BY created_at ASC, request_key ASC LIMIT 1"
+            ),
+            params![
+                project_id,
+                policy_id,
+                source_fingerprint,
+                provider,
+                model,
+                payload_fingerprint
+            ],
+            row_to_request,
+        )
+        .optional()
+        .context("find native request requiring typed-result recovery")
+}
+
 /// Exact scoped inspection query. It filters in SQLite rather than loading a
 /// global page and discarding non-matching rows.
 #[allow(clippy::too_many_arguments)]

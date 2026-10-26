@@ -155,141 +155,148 @@ impl Catalog {
         request: &NativeSttRequest,
         audio: &NativeSttAudioWindow,
     ) -> Result<Option<NativePilotPaidSample>> {
-        // The existing preparation guard owns filesystem/proxy currentness.
         preparation.validate_source_current(self)?;
-        let preparation_evidence = preparation.evidence();
-        let scope = &preparation_evidence.scope;
-
         let connection = self.connection()?;
         let transaction = connection.unchecked_transaction()?;
-        let (authorization, accounting_contract) =
-            load_run_authorization_on_connection(&transaction, &preparation_evidence.policy_id)?;
-        ensure!(
-            accounting_contract == crate::analysis::accounting::ANALYSIS_ACCOUNTING_SCHEMA_VERSION,
-            "reusable native pilot evidence policy uses a stale accounting contract"
-        );
-        let policy = &authorization.policy;
-        ensure!(
-            policy.policy_id == preparation_evidence.policy_id
-                && policy.project_id == preparation_evidence.project_id
-                && policy.kind == AnalysisRunKind::NativeSpeechTranscription
-                && policy.payload == AnalysisPayload::Audio
-                && policy.provider == preparation_evidence.provider
-                && policy.primary_model == preparation_evidence.model
-                && policy.recipe_version == preparation_evidence.recipe
-                && policy.readiness.ready_for_authorization,
-            "reusable native pilot evidence policy/recipe identity changed"
-        );
-        ensure_provider_request_matches_policy(policy, request)?;
-        ensure!(
-            policy
-                .scope
-                .iter()
-                .filter(|candidate| *candidate == scope)
-                .count()
-                == 1,
-            "reusable native pilot preparation scope is stale or foreign"
-        );
-
-        if preparation.outcome() != NativeSpeechLocalOutcome::PreparedSpeech {
-            transaction.commit()?;
-            return Ok(None);
-        }
-        let window_index = preparation
-            .windows()
-            .iter()
-            .position(|window| window == audio.window())
-            .ok_or_else(|| {
-                anyhow::anyhow!("requested native window is not in the current prepared speech map")
-            })?;
-        let prepared_audio = preparation.materialize_window(window_index)?;
-        let current_payload_fingerprint =
-            crate::analysis::accounting::analysis_native_stt_payload_fingerprint(request, audio)?;
-        ensure!(
-            crate::analysis::accounting::analysis_native_stt_payload_fingerprint(
-                request,
-                &prepared_audio
-            )? == current_payload_fingerprint,
-            "supplied native audio differs from the current prepared samples"
-        );
-
-        let raw: Option<String> = transaction
-            .query_row(
-                "SELECT record_json FROM analysis_run_pilots WHERE policy_id=?1 AND project_id=?2",
-                params![policy.policy_id, policy.project_id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        let Some(raw) = raw else {
-            transaction.commit()?;
-            return Ok(None);
-        };
-        let pilot: RunPilotRecord =
-            serde_json::from_str(&raw).context("parse pilot record for native sample reuse")?;
-        ensure!(
-            pilot.policy_id == policy.policy_id && pilot.project_id == policy.project_id,
-            "reusable native pilot record owner changed"
-        );
-        let Some(evidence) = pilot.native_evidence.as_ref() else {
-            transaction.commit()?;
-            return Ok(None);
-        };
-        evidence.validate()?;
-        let Some(sample) = evidence.sample.as_ref() else {
-            transaction.commit()?;
-            return Ok(None);
-        };
-        ensure!(
-            sample.scope.asset_id == pilot.asset_id && policy.scope.contains(&sample.scope),
-            "reusable native pilot sample is outside its owning frozen scope"
-        );
-        if sample.scope.asset_id != scope.asset_id || sample.window != *audio.window() {
-            transaction.commit()?;
-            return Ok(None);
-        }
-        ensure!(
-            sample.coverage == NativePilotSampleCoverage::PartialWindow
-                && sample.scope == *scope
-                && sample.requested_provider == request.provider()
-                && sample.requested_model == request.model()
-                && sample.recipe_version == policy.recipe_version
-                && sample.quality_recipe_version == NATIVE_STT_QUALITY_RECIPE_VERSION
-                && sample.window == *audio.window(),
-            "reusable native pilot sample coverage/scope/recipe/window changed"
-        );
-        ensure!(
-            sample.payload_fingerprint == current_payload_fingerprint,
-            "reusable native pilot sample payload fingerprint changed"
-        );
-        crate::analysis::accounting::store::validate_native_audio_source_bounds(
-            audio,
-            scope.source_duration_ms,
-        )?;
-
-        let request_record =
-            crate::analysis::accounting::store::validate_native_settled_result_request(
-                &transaction,
-                &sample.request_key,
-                &NativeSettledResultProof {
-                    project_id: &policy.project_id,
-                    policy_id: &policy.policy_id,
-                    policy_fingerprint: &policy.policy_id,
-                    expected_provider_cost_bound_contract: &policy.provider_cost_bound_contract,
-                    source_fingerprint: &scope.source_identity,
-                    requested_provider: &policy.provider,
-                    requested_model: &policy.primary_model,
-                    run_id: Some(&pilot.run_id),
-                    allowed_operations: &["pilot"],
-                },
-            )?;
-        ensure!(
-            request_record.payload_fingerprint == current_payload_fingerprint,
-            "reusable native pilot sample request payload identity changed"
-        );
-        let sample = sample.clone();
+        let sample =
+            reusable_native_pilot_sample_on_transaction(&transaction, preparation, request, audio)?;
         transaction.commit()?;
-        Ok(Some(sample))
+        Ok(sample)
     }
+}
+
+/// Re-prove the canonical cached pilot sample on the caller's snapshot, so
+/// checkpoint seeding does not trust a supplied clone or open another connection.
+pub(crate) fn reusable_native_pilot_sample_on_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    preparation: &NativeSpeechPreparation,
+    request: &NativeSttRequest,
+    audio: &NativeSttAudioWindow,
+) -> Result<Option<NativePilotPaidSample>> {
+    let preparation_evidence = preparation.evidence();
+    let scope = &preparation_evidence.scope;
+
+    let (authorization, accounting_contract) =
+        load_run_authorization_on_connection(transaction, &preparation_evidence.policy_id)?;
+    ensure!(
+        accounting_contract == crate::analysis::accounting::ANALYSIS_ACCOUNTING_SCHEMA_VERSION,
+        "reusable native pilot evidence policy uses a stale accounting contract"
+    );
+    let policy = &authorization.policy;
+    ensure!(
+        policy.policy_id == preparation_evidence.policy_id
+            && policy.project_id == preparation_evidence.project_id
+            && policy.kind == AnalysisRunKind::NativeSpeechTranscription
+            && policy.payload == AnalysisPayload::Audio
+            && policy.provider == preparation_evidence.provider
+            && policy.primary_model == preparation_evidence.model
+            && policy.recipe_version == preparation_evidence.recipe
+            && policy.readiness.ready_for_authorization,
+        "reusable native pilot evidence policy/recipe identity changed"
+    );
+    ensure_provider_request_matches_policy(policy, request)?;
+    ensure!(
+        policy
+            .scope
+            .iter()
+            .filter(|candidate| *candidate == scope)
+            .count()
+            == 1,
+        "reusable native pilot preparation scope is stale or foreign"
+    );
+
+    if preparation.outcome() != NativeSpeechLocalOutcome::PreparedSpeech {
+        return Ok(None);
+    }
+    let window_index = preparation
+        .windows()
+        .iter()
+        .position(|window| window == audio.window())
+        .ok_or_else(|| {
+            anyhow::anyhow!("requested native window is not in the current prepared speech map")
+        })?;
+    let prepared_audio = preparation.materialize_window(window_index)?;
+    let current_payload_fingerprint =
+        crate::analysis::accounting::analysis_native_stt_payload_fingerprint(request, audio)?;
+    ensure!(
+        crate::analysis::accounting::analysis_native_stt_payload_fingerprint(
+            request,
+            &prepared_audio
+        )? == current_payload_fingerprint,
+        "supplied native audio differs from the current prepared samples"
+    );
+
+    let raw: Option<String> = transaction
+        .query_row(
+            "SELECT record_json FROM analysis_run_pilots WHERE policy_id=?1 AND project_id=?2",
+            params![policy.policy_id, policy.project_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let pilot: RunPilotRecord =
+        serde_json::from_str(&raw).context("parse pilot record for native sample reuse")?;
+    ensure!(
+        pilot.policy_id == policy.policy_id && pilot.project_id == policy.project_id,
+        "reusable native pilot record owner changed"
+    );
+    let Some(evidence) = pilot.native_evidence.as_ref() else {
+        return Ok(None);
+    };
+    evidence.validate()?;
+    let Some(sample) = evidence.sample.as_ref() else {
+        return Ok(None);
+    };
+    ensure!(
+        sample.scope.asset_id == pilot.asset_id && policy.scope.contains(&sample.scope),
+        "reusable native pilot sample is outside its owning frozen scope"
+    );
+    if sample.scope.asset_id != scope.asset_id || sample.window != *audio.window() {
+        return Ok(None);
+    }
+    ensure!(
+        sample.coverage == NativePilotSampleCoverage::PartialWindow
+            && sample.scope == *scope
+            && sample.requested_provider == request.provider()
+            && sample.requested_model == request.model()
+            && sample.recipe_version == policy.recipe_version
+            && sample.quality_recipe_version == NATIVE_STT_QUALITY_RECIPE_VERSION
+            && sample.window == *audio.window(),
+        "reusable native pilot sample coverage/scope/recipe/window changed"
+    );
+    ensure!(
+        sample.payload_fingerprint == current_payload_fingerprint,
+        "reusable native pilot sample payload fingerprint changed"
+    );
+    crate::analysis::accounting::store::validate_native_audio_source_bounds(
+        audio,
+        scope.source_duration_ms,
+    )?;
+
+    let request_record =
+        crate::analysis::accounting::store::validate_native_settled_result_request(
+            transaction,
+            &sample.request_key,
+            &NativeSettledResultProof {
+                project_id: &policy.project_id,
+                policy_id: &policy.policy_id,
+                policy_fingerprint: &policy.policy_id,
+                expected_provider_cost_bound_contract: &policy.provider_cost_bound_contract,
+                source_fingerprint: &scope.source_identity,
+                requested_provider: &policy.provider,
+                requested_model: &policy.primary_model,
+                run_id: Some(&pilot.run_id),
+                allowed_operations: &["pilot"],
+            },
+        )?;
+    ensure!(
+        request_record.payload_fingerprint == current_payload_fingerprint,
+        "reusable native pilot sample request payload identity changed"
+    );
+    let sample = sample.clone();
+    Ok(Some(sample))
 }
 
 /// Validate the complete local-only native outcome inside the same transaction

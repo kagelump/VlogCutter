@@ -599,3 +599,31 @@ but the VLM targeted-retry wrapper rejects native policies and no high-level
 native retry parser/permit path exists yet. A default repeat of a completed or
 uncertain native request is fenced by the canonical stable intended-attempt key
 and cannot be forced merely by creating a new run.
+
+## Incomplete native speech checkpoints
+
+Native window recovery extends the existing transcript owner. Migration 45 adds
+an optional versioned window plan and its semantic fingerprint to
+`asset_transcripts`; candidates remain solely in `transcript_segments`, window
+links remain in `native_transcript_windows`, and financial facts remain in the
+shared request/receipt ledger. Historical complete native transcripts without a
+plan remain readable and do not acquire inferred coverage.
+
+The internal checkpoint writer begins a positive prepared-speech plan and
+atomically appends one contiguous quality-evaluated result at a time. It proves
+current preparation/audio/map, frozen authorization, source ownership and settled
+request/receipt identity in the same immediate transaction as canonical row
+replacement. An exact canonical pilot sample can seed the first window without
+another upload. The incomplete header stays `failed` with
+`native_coverage_incomplete`, including after every planned window is retained:
+a later clip assembly step must apply complete-clip quality before acceptance.
+Candidates are explicitly unaccepted, excluded from AI context and seekable for
+human inspection. Provider segment counts survive rejection of candidate text;
+missing token probabilities remain absent.
+
+Historical reads use the recorded policy and structural facts. Current reuse
+separately re-proves every retained window against newly prepared PCM and current
+quality. Missing typed results after an active reservation, dispatch marker or
+settled request require recovery; they are never ordinary cache misses authorizing
+a new upload. This persistence boundary does not enable bulk execution, targeted
+retry or native CLI/desktop selection.

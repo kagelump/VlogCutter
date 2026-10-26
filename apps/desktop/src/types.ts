@@ -195,7 +195,8 @@ export type TranscriptOutcomeReason =
   | "quality_rejected"
   | "processing_failed"
   | "legacy_no_speech_unverified"
-  | "quality_evidence_incomplete";
+  | "quality_evidence_incomplete"
+  | "native_coverage_incomplete";
 
 export type CameraMovement = "static" | "pan" | "tilt" | "handheld" | "tracking" | "zoom" | "other";
 
