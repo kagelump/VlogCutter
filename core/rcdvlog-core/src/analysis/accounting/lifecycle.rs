@@ -73,8 +73,14 @@ impl<'a> AccountingBoundary<'a> {
         if let Some(check) = self.pre_dispatch_check
             && let Err(error) = check()
         {
-            release_no_upload(self.catalog, &reservation.request_key, "local_domain_guard");
-            return Err(local_or_pre_upload(error).into());
+            let failure = local_or_pre_upload(error);
+            let release_code = if failure.category == ProviderFailureCategory::ProviderCooldown {
+                "provider_cooldown"
+            } else {
+                "local_domain_guard"
+            };
+            release_no_upload(self.catalog, &reservation.request_key, release_code);
+            return Err(failure.into());
         }
         if is_cancelled() {
             release_no_upload(
@@ -117,7 +123,9 @@ fn prepare_before_dispatch(
 
 fn local_or_pre_upload(error: anyhow::Error) -> ProviderFailure {
     let observed = ProviderFailure::from_anyhow(&error);
-    if observed.category.is_local() {
+    if observed.category.is_local()
+        || observed.category == ProviderFailureCategory::ProviderCooldown
+    {
         observed
     } else {
         ProviderFailure::local_pre_upload()

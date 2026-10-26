@@ -411,8 +411,15 @@ pub(crate) fn request_suggestion_with_cancel(
         first.attempted_models.clone(),
         first.usage_complete,
     ) {
-        Ok(result) => Ok(result),
+        Ok(result) => {
+            provider.record_response_success(&first.response.model)?;
+            Ok(result)
+        }
         Err(default_error) if first.response.model == DEFAULT_MODEL => {
+            provider.record_response_rejection(
+                &first.response.model,
+                crate::analysis::provider::ProviderResponseRejection::Schema,
+            )?;
             chain.record_default_failure();
             let fallback_model = chain.fallback_model().ok_or_else(|| {
                 anyhow::anyhow!(
@@ -425,20 +432,38 @@ pub(crate) fn request_suggestion_with_cancel(
             let fallback =
                 provider.analyze_with_cancel(fallback_model, &request_payload, is_cancelled)?;
             attempted_models.push(fallback_model.to_string());
-            suggestion_from_response(
+            let validation = suggestion_from_response(
                 &fallback,
                 request,
                 first_attempts + 1,
                 attempted_models,
                 first.usage_complete && fallback.receipt.usage_complete,
-            )
-            .with_context(|| {
-                format!(
-                    "default chronology suggestion was invalid ({default_error:#}); fallback was invalid"
-                )
-            })
+            );
+            match validation {
+                Ok(result) => {
+                    provider.record_response_success(&fallback.model)?;
+                    Ok(result)
+                }
+                Err(error) => {
+                    provider.record_response_rejection(
+                        &fallback.model,
+                        crate::analysis::provider::ProviderResponseRejection::Schema,
+                    )?;
+                    Err(error).with_context(|| {
+                        format!(
+                            "default chronology suggestion was invalid ({default_error:#}); fallback was invalid"
+                        )
+                    })
+                }
+            }
         }
-        Err(error) => Err(error).context("validate chronology suggestion"),
+        Err(error) => {
+            provider.record_response_rejection(
+                &first.response.model,
+                crate::analysis::provider::ProviderResponseRejection::Schema,
+            )?;
+            Err(error).context("validate chronology suggestion")
+        }
     }
 }
 

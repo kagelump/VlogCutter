@@ -390,6 +390,8 @@ pub enum ProviderFailureCategory {
     /// Durable ledger admission rejected the attempt before any transmission
     /// (saturation, duplicate fence, stopped authority, policy/source mismatch).
     LocalAdmission,
+    /// Shared SQLite health gate denied dispatch during provider cooldown.
+    ProviderCooldown,
     /// The complete conservative provider quote did not fit the remaining
     /// whole-policy budget. Distinct from saturation/duplicate denial so runtime
     /// reports can mark the budget as exhausted without parsing error text.
@@ -404,6 +406,12 @@ pub enum ProviderFailureCategory {
     Unclassified,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderResponseRejection {
+    Schema,
+    ContentQuality,
+}
+
 impl ProviderFailureCategory {
     /// Only an actual provider transmission outcome may consume another paid
     /// fallback attempt. Local accounting/configuration/cancellation failures
@@ -411,7 +419,11 @@ impl ProviderFailureCategory {
     pub fn allows_paid_fallback(self) -> bool {
         matches!(
             self,
-            Self::Transport | Self::HttpStatus | Self::InvalidResponse | Self::Unclassified
+            Self::Transport
+                | Self::HttpStatus
+                | Self::InvalidResponse
+                | Self::Unclassified
+                | Self::ProviderCooldown
         )
     }
 
@@ -446,6 +458,7 @@ impl ProviderFailureCategory {
 pub struct ProviderFailure {
     pub category: ProviderFailureCategory,
     pub http_status: Option<u16>,
+    pub retry_after_seconds: Option<i64>,
 }
 
 impl ProviderFailure {
@@ -453,6 +466,7 @@ impl ProviderFailure {
         Self {
             category: ProviderFailureCategory::Transport,
             http_status: None,
+            retry_after_seconds: None,
         }
     }
 
@@ -460,6 +474,15 @@ impl ProviderFailure {
         Self {
             category: ProviderFailureCategory::HttpStatus,
             http_status: Some(status),
+            retry_after_seconds: None,
+        }
+    }
+
+    pub fn http_status_with_retry_after(status: u16, seconds: Option<i64>) -> Self {
+        Self {
+            category: ProviderFailureCategory::HttpStatus,
+            http_status: Some(status),
+            retry_after_seconds: seconds.map(|value| value.clamp(0, 900)),
         }
     }
 
@@ -467,6 +490,7 @@ impl ProviderFailure {
         Self {
             category: ProviderFailureCategory::InvalidResponse,
             http_status: None,
+            retry_after_seconds: None,
         }
     }
 
@@ -474,6 +498,7 @@ impl ProviderFailure {
         Self {
             category: ProviderFailureCategory::Unclassified,
             http_status: None,
+            retry_after_seconds: None,
         }
     }
 
@@ -481,6 +506,15 @@ impl ProviderFailure {
         Self {
             category: ProviderFailureCategory::LocalAdmission,
             http_status: None,
+            retry_after_seconds: None,
+        }
+    }
+
+    pub fn provider_cooldown() -> Self {
+        Self {
+            category: ProviderFailureCategory::ProviderCooldown,
+            http_status: None,
+            retry_after_seconds: None,
         }
     }
 
@@ -488,6 +522,7 @@ impl ProviderFailure {
         Self {
             category: ProviderFailureCategory::LocalBudgetExhausted,
             http_status: None,
+            retry_after_seconds: None,
         }
     }
 
@@ -495,6 +530,7 @@ impl ProviderFailure {
         Self {
             category: ProviderFailureCategory::LocalPreUpload,
             http_status: None,
+            retry_after_seconds: None,
         }
     }
 
@@ -502,6 +538,7 @@ impl ProviderFailure {
         Self {
             category: ProviderFailureCategory::LocalPostDispatch,
             http_status: None,
+            retry_after_seconds: None,
         }
     }
 
@@ -509,6 +546,7 @@ impl ProviderFailure {
         Self {
             category: ProviderFailureCategory::Cancelled,
             http_status: None,
+            retry_after_seconds: None,
         }
     }
 
@@ -516,6 +554,7 @@ impl ProviderFailure {
         Self {
             category: ProviderFailureCategory::Configuration,
             http_status: None,
+            retry_after_seconds: None,
         }
     }
 
@@ -532,6 +571,7 @@ impl ProviderFailure {
                     .map(|chain| Self {
                         category: chain.category,
                         http_status: chain.http_status,
+                        retry_after_seconds: None,
                     })
             })
             .unwrap_or_else(Self::unclassified)
@@ -554,6 +594,9 @@ impl ProviderFailure {
             }
             ProviderFailureCategory::LocalAdmission => {
                 "analysis_accounting:admission_denied; inspect prior requests and reconcile uncertain usage before an explicit retry"
+            }
+            ProviderFailureCategory::ProviderCooldown => {
+                "analysis_accounting:provider_cooldown; request denied before paid dispatch"
             }
             ProviderFailureCategory::LocalBudgetExhausted => {
                 "analysis_accounting:budget_exhausted; the full conservative request bound no longer fits the whole-policy ceiling"
@@ -600,6 +643,24 @@ pub trait VlmProvider: Send + Sync {
     }
 
     fn analyze(&self, model: &str, request: &VlmRequest) -> Result<VlmResponse>;
+
+    /// Record a response rejected by the owning domain schema/quality checks.
+    /// This remains distinct from transport health and may guide only an
+    /// already-allowlisted fallback.
+    fn record_response_rejection(
+        &self,
+        _model: &str,
+        _kind: ProviderResponseRejection,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// A provider response is considered healthy only after the owner has
+    /// accepted its schema/semantics. Raw transport success alone is not a
+    /// health reset.
+    fn record_response_success(&self, _model: &str) -> Result<()> {
+        Ok(())
+    }
 
     /// Cancellation-aware single attempt. The default preserves the historical
     /// raw-provider behavior while giving the accounted boundary a hook to check

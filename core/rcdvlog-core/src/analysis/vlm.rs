@@ -8,7 +8,8 @@ use anyhow::Result;
 use serde::Serialize;
 
 use crate::analysis::provider::{
-    ProviderChain, ProviderChainError, ProviderFailure, VlmProvider, VlmRequest, VlmResponse,
+    ProviderChain, ProviderChainError, ProviderFailure, ProviderResponseRejection, VlmProvider,
+    VlmRequest, VlmResponse,
 };
 use crate::analysis::schema::{ClipObservation, output_schema, validate};
 use crate::analysis::store::TranscriptStatus;
@@ -71,6 +72,17 @@ pub fn build_prompt(context: &PromptContext) -> String {
          bounds must lie inside the clip.{transcript}{trip}",
         context.clip_duration_ms
     )
+}
+
+fn response_rejection_kind(
+    error: &crate::analysis::schema::DomainError,
+) -> ProviderResponseRejection {
+    match error.safe_code() {
+        "malformed_json" | "truncated_json" | "schema_violation" => {
+            ProviderResponseRejection::Schema
+        }
+        _ => ProviderResponseRejection::ContentQuality,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -148,7 +160,9 @@ pub fn analyze_clip_with_cancel(
         Ok(outcome) => outcome,
         Err(error) => {
             let failure = ProviderFailure::from_anyhow(&error);
-            if failure.category.is_local() {
+            if failure.category.is_local()
+                || failure.category == crate::ProviderFailureCategory::ProviderCooldown
+            {
                 return Err(error);
             }
             let Some(chain_failure) = error.downcast_ref::<ProviderChainError>() else {
@@ -174,19 +188,22 @@ pub fn analyze_clip_with_cancel(
         &context.frame_timestamps_ms,
         context.clip_duration_ms,
     ) {
-        Ok(observation) => Ok(AnalysisOutcome {
-            observation: Some(observation),
-            reject_reason: String::new(),
-            model: first.response.model,
-            attempts: first.attempts,
-            fell_back: first.fell_back,
-            prompt_tokens: first.response.prompt_tokens,
-            completion_tokens: first.response.completion_tokens,
-            cost_usd: first.response.cost_usd,
-            latency_ms: first.response.latency_ms,
-            attempted_models: first.attempted_models,
-            usage_complete: first.usage_complete,
-        }),
+        Ok(observation) => {
+            provider.record_response_success(&first.response.model)?;
+            Ok(AnalysisOutcome {
+                observation: Some(observation),
+                reject_reason: String::new(),
+                model: first.response.model,
+                attempts: first.attempts,
+                fell_back: first.fell_back,
+                prompt_tokens: first.response.prompt_tokens,
+                completion_tokens: first.response.completion_tokens,
+                cost_usd: first.response.cost_usd,
+                latency_ms: first.response.latency_ms,
+                attempted_models: first.attempted_models,
+                usage_complete: first.usage_complete,
+            })
+        }
         Err(error)
             if chain.fallback_model().is_some()
                 && chain.fallback_model() != Some(first.response.model.as_str()) =>
@@ -194,6 +211,10 @@ pub fn analyze_clip_with_cancel(
             if is_cancelled() {
                 return Err(ProviderFailure::cancelled().into());
             }
+            provider.record_response_rejection(
+                &first.response.model,
+                response_rejection_kind(&error),
+            )?;
             chain.record_default_failure();
             let fallback_model = chain
                 .fallback_model()
@@ -255,6 +276,7 @@ pub fn analyze_clip_with_cancel(
                 context.clip_duration_ms,
             ) {
                 Ok(observation) => {
+                    provider.record_response_success(&fallback.model)?;
                     let usage = aggregate(&fallback);
                     let usage_complete = first.usage_complete && fallback.receipt.usage_complete;
                     Ok(AnalysisOutcome {
@@ -277,6 +299,10 @@ pub fn analyze_clip_with_cancel(
                     })
                 }
                 Err(fallback_error) => {
+                    provider.record_response_rejection(
+                        &fallback.model,
+                        response_rejection_kind(&fallback_error),
+                    )?;
                     let usage = aggregate(&fallback);
                     let usage_complete = first.usage_complete && fallback.receipt.usage_complete;
                     let mut outcome = rejected(
@@ -304,21 +330,27 @@ pub fn analyze_clip_with_cancel(
                 }
             }
         }
-        Err(error) => Ok(rejected(
-            &first.response,
-            first.attempts,
-            first.fell_back,
-            error.safe_code().to_string(),
-            first.attempted_models,
-            first.usage_complete,
-        )),
+        Err(error) => {
+            provider.record_response_rejection(
+                &first.response.model,
+                response_rejection_kind(&error),
+            )?;
+            Ok(rejected(
+                &first.response,
+                first.attempts,
+                first.fell_back,
+                error.safe_code().to_string(),
+                first.attempted_models,
+                first.usage_complete,
+            ))
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analysis::provider::{DEFAULT_MODEL, FALLBACK_MODEL};
+    use crate::analysis::provider::{DEFAULT_MODEL, FALLBACK_MODEL, ProviderFailureCategory};
     use anyhow::bail;
     use std::sync::Mutex;
 
@@ -372,6 +404,48 @@ mod tests {
                 },
             })
         }
+    }
+
+    struct CoolingFake;
+    impl VlmProvider for CoolingFake {
+        fn analyze(&self, _model: &str, _request: &VlmRequest) -> Result<VlmResponse> {
+            Err(ProviderFailure::provider_cooldown().into())
+        }
+    }
+
+    #[test]
+    fn cooldown_without_an_allowed_alternate_is_not_saved_as_content_rejection() {
+        let allowed = vec![DEFAULT_MODEL.to_string()];
+        let chain = ProviderChain::with_policy(DEFAULT_MODEL, &allowed, false).unwrap();
+        let error = analyze_clip(
+            &CoolingFake,
+            &chain,
+            &context(TranscriptStatus::NoSpeech),
+            vec![],
+        )
+        .unwrap_err();
+        assert_eq!(
+            ProviderFailure::from_anyhow(&error).category,
+            ProviderFailureCategory::ProviderCooldown
+        );
+    }
+
+    #[test]
+    fn response_schema_errors_are_distinct_from_content_quality_rejections() {
+        assert_eq!(
+            response_rejection_kind(&crate::analysis::schema::DomainError::SchemaViolation {
+                first_keyword: "type".into(),
+                count: 1,
+            }),
+            ProviderResponseRejection::Schema
+        );
+        assert_eq!(
+            response_rejection_kind(&crate::analysis::schema::DomainError::UnknownEnum {
+                field: "cameraMovement",
+                value: "synthetic-invalid".into(),
+            }),
+            ProviderResponseRejection::ContentQuality
+        );
     }
 
     #[test]

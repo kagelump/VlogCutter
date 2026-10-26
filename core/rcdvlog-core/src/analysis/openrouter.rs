@@ -251,6 +251,19 @@ pub struct OpenRouterProvider {
     client: reqwest::blocking::Client,
 }
 
+fn retry_after_seconds(header: &str) -> Option<i64> {
+    let header = header.trim();
+    let seconds = header.parse::<i64>().ok().or_else(|| {
+        chrono::DateTime::parse_from_rfc2822(header)
+            .ok()
+            .map(|date| {
+                date.timestamp()
+                    .saturating_sub(chrono::Utc::now().timestamp())
+            })
+    })?;
+    Some(seconds.clamp(0, 900))
+}
+
 impl OpenRouterProvider {
     pub fn new(api_key: String) -> Result<Self> {
         Ok(Self {
@@ -374,7 +387,16 @@ impl VlmProvider for OpenRouterProvider {
         if !status.is_success() {
             // Response bodies can echo prompts, frame payloads or private
             // provider diagnostics. Only the bounded status is retained.
-            return Err(ProviderFailure::http_status(status.as_u16()).into());
+            let retry_after = response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .and_then(retry_after_seconds);
+            return Err(ProviderFailure::http_status_with_retry_after(
+                status.as_u16(),
+                retry_after,
+            )
+            .into());
         }
 
         let payload: Value = response
@@ -416,6 +438,19 @@ fn decode_paid_response(model: &str, payload: &Value, latency_ms: u64) -> VlmRes
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retry_after_accepts_delta_and_http_date_with_a_fifteen_minute_cap() {
+        assert_eq!(retry_after_seconds("45"), Some(45));
+        assert_eq!(retry_after_seconds("9999"), Some(900));
+        assert_eq!(retry_after_seconds("invalid"), None);
+        let future = (chrono::Utc::now() + chrono::Duration::seconds(45)).to_rfc2822();
+        let parsed = retry_after_seconds(&future).unwrap();
+        assert!(
+            (0..=45).contains(&parsed),
+            "parsed HTTP date should become a bounded delta"
+        );
+    }
     use crate::analysis::provider::DEFAULT_MODEL;
     use std::io::Write;
 

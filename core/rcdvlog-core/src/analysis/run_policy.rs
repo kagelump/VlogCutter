@@ -621,6 +621,18 @@ pub(crate) fn verify_bulk_authority(
     catalog: &Catalog,
     policy: &RunPolicy,
 ) -> Result<AnalysisBudgetSnapshot> {
+    for scope in &policy.scope {
+        for unresolved in catalog.analysis_requests_needing_reconciliation_for_source(
+            &policy.project_id,
+            policy.kind.as_str(),
+            &scope.source_identity,
+        )? {
+            ensure!(
+                unresolved.policy_id == policy.policy_id,
+                "a prior bulk analysis request has unresolved usage; reconcile its exact receipt before a replacement policy can run"
+            );
+        }
+    }
     let authority =
         catalog.initialize_analysis_accounting_authority(&pilot_authority_context(policy))?;
     ensure!(
@@ -2293,7 +2305,7 @@ mod tests {
         }
     }
 
-    fn generated_asset(
+    pub(super) fn generated_asset(
         catalog: &Catalog,
         project_id: &str,
         root: &std::path::Path,
@@ -2775,8 +2787,8 @@ mod tests {
         assert_eq!(report.analyzed, 0);
         assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
     }
-    struct CapturingProvider {
-        calls: AtomicUsize,
+    pub(super) struct CapturingProvider {
+        pub(super) calls: AtomicUsize,
         requests: Mutex<Vec<VlmRequest>>,
         body: String,
         fail_message: Option<String>,
@@ -2785,7 +2797,7 @@ mod tests {
     }
 
     impl CapturingProvider {
-        fn observation() -> Self {
+        pub(super) fn observation() -> Self {
             Self {
                 calls: AtomicUsize::new(0),
                 requests: Mutex::new(Vec::new()),
@@ -3521,14 +3533,14 @@ mod tests {
 
     type ProviderScript = Box<dyn Fn(&str, usize) -> Result<VlmResponse> + Send + Sync>;
 
-    struct ModelScriptProvider {
-        calls: AtomicUsize,
+    pub(super) struct ModelScriptProvider {
+        pub(super) calls: AtomicUsize,
         bound_usd: f64,
         script: ProviderScript,
     }
 
     impl ModelScriptProvider {
-        fn new(
+        pub(super) fn new(
             bound_usd: f64,
             script: impl Fn(&str, usize) -> Result<VlmResponse> + Send + Sync + 'static,
         ) -> Self {
@@ -3557,7 +3569,12 @@ mod tests {
         }
     }
 
-    fn scripted_response(model: &str, call: usize, body: String, cost: f64) -> VlmResponse {
+    pub(super) fn scripted_response(
+        model: &str,
+        call: usize,
+        body: String,
+        cost: f64,
+    ) -> VlmResponse {
         VlmResponse {
             model: model.into(),
             body,
@@ -3574,7 +3591,7 @@ mod tests {
         }
     }
 
-    fn valid_observation_body() -> String {
+    pub(super) fn valid_observation_body() -> String {
         serde_json::json!({
             "title": "Synthetic fallback pilot",
             "description": "A bounded synthetic observation.",
@@ -3885,6 +3902,44 @@ mod tests {
         assert_eq!(preserved.attempted_models.len(), 2);
         assert_eq!(preserved.prompt_tokens, 10);
         assert_eq!(preserved.completion_tokens, 5);
+    }
+
+    #[test]
+    fn invalid_no_fallback_pilot_records_schema_health_feedback() {
+        let (_directory, catalog, project, asset) = fixture();
+        let request = RunPolicyRequest::observation(
+            project.clone(),
+            vec![asset],
+            DEFAULT_MODEL,
+            vec![DEFAULT_MODEL.into()],
+            false,
+            1.0,
+            false,
+        );
+        catalog.authorize_run_policy(&request).unwrap();
+        let invalid = ModelScriptProvider::new(0.03, |model, call| {
+            Ok(scripted_response(model, call, "{}".into(), 0.01))
+        });
+        let pilot = catalog
+            .run_run_policy_pilot_with_provider(&request, &invalid, false)
+            .unwrap();
+        assert_eq!(pilot.status, "failed");
+        assert_eq!(invalid.calls.load(Ordering::SeqCst), 1);
+        let category: String = catalog.connection().unwrap().query_row(
+            "SELECT last_failure_category FROM analysis_provider_health WHERE project_id=?1 AND model=?2",
+            params![project, DEFAULT_MODEL],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(category, "schema");
+        let failures: i64 = catalog.connection().unwrap().query_row(
+            "SELECT consecutive_failures FROM analysis_provider_health WHERE project_id=?1 AND model=?2",
+            params![project, DEFAULT_MODEL],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(
+            failures, 1,
+            "a no-fallback pilot must still record validation failure"
+        );
     }
 
     #[test]
@@ -4588,6 +4643,9 @@ mod tests {
 
 #[cfg(test)]
 mod recovery_tests {
+    use super::tests::{
+        CapturingProvider, ModelScriptProvider, scripted_response, valid_observation_body,
+    };
     use super::*;
     use crate::ProviderReceiptEvidence;
     use crate::analysis::provider::{
@@ -4822,6 +4880,274 @@ mod recovery_tests {
         );
         assert!((report.budget.confirmed_cost_usd - 0.03).abs() < 1e-12);
         assert!((report.budget.uncertain_usage_reserve_usd - 0.03).abs() < 1e-12);
+    }
+
+    #[test]
+    fn unresolved_bulk_usage_blocks_replacement_policy_on_exact_source() {
+        let (_directory, catalog, project, asset) = super::tests::fixture();
+        let prior = RunPolicyRequest::observation(
+            project.clone(),
+            vec![asset.clone()],
+            DEFAULT_MODEL,
+            vec![DEFAULT_MODEL.into()],
+            false,
+            1.0,
+            false,
+        );
+        let old_policy = catalog.authorize_run_policy(&prior).unwrap();
+        let pilot = catalog
+            .run_run_policy_pilot_with_provider(&prior, &CapturingProvider::observation(), false)
+            .unwrap();
+        assert_eq!(pilot.status, "passed");
+        let failed = CaptureFailProvider {
+            calls: AtomicUsize::new(0),
+            payload: Mutex::new(None),
+        };
+        let report = catalog
+            .analyze_authorized_with_provider(&old_policy.policy.policy_id, &failed, |_| {
+                std::ops::ControlFlow::Continue(())
+            })
+            .unwrap();
+        assert_eq!(failed.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(report.analyzed, 1);
+        assert!(
+            catalog
+                .list_analysis_requests(&project, Some(&old_policy.policy.policy_id), 20)
+                .unwrap()
+                .iter()
+                .any(|request| request.operation == "observation"
+                    && request.lifecycle == AnalysisRequestLifecycle::Uncertain)
+        );
+
+        let replacement = RunPolicyRequest::observation(
+            project.clone(),
+            vec![asset],
+            FALLBACK_MODEL,
+            vec![FALLBACK_MODEL.into()],
+            false,
+            1.0,
+            false,
+        );
+        let new_policy = catalog.authorize_run_policy(&replacement).unwrap();
+        let provider = CapturingProvider::observation();
+        let error = catalog
+            .run_run_policy_pilot_with_provider(&replacement, &provider, false)
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("prior bulk analysis request has unresolved usage"));
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+        assert_ne!(new_policy.policy.policy_id, old_policy.policy.policy_id);
+    }
+
+    #[test]
+    fn exact_failed_asset_recovers_under_new_allowlisted_policy_and_reuses_saved_result() {
+        let (directory, catalog, project, asset) = super::tests::fixture();
+        let successful_asset = super::tests::generated_asset(
+            &catalog,
+            &project,
+            directory.path(),
+            "clip-recovery-successful",
+            2,
+        );
+        let old_request = RunPolicyRequest::observation(
+            project.clone(),
+            vec![asset.clone(), successful_asset.clone()],
+            DEFAULT_MODEL,
+            vec![DEFAULT_MODEL.into()],
+            false,
+            1.0,
+            false,
+        );
+        let old_policy = catalog.authorize_run_policy(&old_request).unwrap();
+        let pilot = catalog
+            .run_run_policy_pilot_with_provider(
+                &old_request,
+                &CapturingProvider::observation(),
+                false,
+            )
+            .unwrap();
+        assert_eq!(pilot.status, "passed");
+
+        let rejected = ModelScriptProvider::new(0.01, |model, call| {
+            Ok(scripted_response(
+                model,
+                call,
+                if call == 1 {
+                    valid_observation_body()
+                } else {
+                    "not valid observation JSON".into()
+                },
+                0.01,
+            ))
+        });
+        let failed = catalog
+            .analyze_authorized_with_provider(&old_policy.policy.policy_id, &rejected, |_| {
+                std::ops::ControlFlow::Continue(())
+            })
+            .unwrap();
+        assert_eq!(failed.rejected, 1);
+        assert_eq!(failed.analyzed, 2);
+        assert_eq!(rejected.calls.load(Ordering::SeqCst), 2);
+        let (successful_asset_id, failed_asset_id) = {
+            let first = catalog.get_asset(&asset).unwrap();
+            let second = catalog.get_asset(&successful_asset).unwrap();
+            if first.title.is_empty() {
+                (successful_asset.clone(), asset.clone())
+            } else if second.title.is_empty() {
+                (asset.clone(), successful_asset.clone())
+            } else {
+                panic!("synthetic run must have one saved result and one rejected result")
+            }
+        };
+        let successful_title = catalog.get_asset(&successful_asset_id).unwrap().title;
+        let same_policy = ModelScriptProvider::new(0.01, |model, call| {
+            Ok(scripted_response(
+                model,
+                call,
+                valid_observation_body(),
+                0.01,
+            ))
+        });
+        let protected = catalog
+            .analyze_authorized_with_provider(&old_policy.policy.policy_id, &same_policy, |_| {
+                std::ops::ControlFlow::Continue(())
+            })
+            .unwrap();
+        assert_eq!(protected.skipped, 2);
+        assert_eq!(
+            same_policy.calls.load(Ordering::SeqCst),
+            0,
+            "ordinary same-policy reruns must not resend a paid rejection"
+        );
+
+        // The replacement authorization explicitly scopes only the exact failed
+        // asset and permits only the healthy alternate model. The old paid
+        // response remains in the old ledger and is never resent.
+        let replacement = RunPolicyRequest::observation(
+            project.clone(),
+            vec![failed_asset_id.clone()],
+            FALLBACK_MODEL,
+            vec![FALLBACK_MODEL.into()],
+            false,
+            1.0,
+            false,
+        );
+        let new_policy = catalog.authorize_run_policy(&replacement).unwrap();
+        assert_ne!(new_policy.policy.policy_id, old_policy.policy.policy_id);
+        assert_eq!(new_policy.policy.scope.len(), 1);
+        assert_eq!(new_policy.policy.scope[0].asset_id, failed_asset_id);
+        assert!(
+            !new_policy
+                .policy
+                .scope
+                .iter()
+                .any(|scope| scope.asset_id == successful_asset_id)
+        );
+        let new_pilot = catalog
+            .run_run_policy_pilot_with_provider(
+                &replacement,
+                &CapturingProvider::observation(),
+                false,
+            )
+            .unwrap();
+        assert_eq!(new_pilot.status, "passed");
+        let healthy = ModelScriptProvider::new(0.01, |model, call| {
+            Ok(scripted_response(
+                model,
+                call,
+                valid_observation_body(),
+                0.01,
+            ))
+        });
+        let recovered = catalog
+            .analyze_authorized_with_provider(&new_policy.policy.policy_id, &healthy, |_| {
+                std::ops::ControlFlow::Continue(())
+            })
+            .unwrap();
+        assert_eq!(recovered.analyzed, 1);
+        assert_eq!(healthy.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            catalog.get_asset(&successful_asset_id).unwrap().title,
+            successful_title
+        );
+        let repeated = ModelScriptProvider::new(0.01, |model, call| {
+            Ok(scripted_response(
+                model,
+                call,
+                valid_observation_body(),
+                0.01,
+            ))
+        });
+        let reused = catalog
+            .analyze_authorized_with_provider(&new_policy.policy.policy_id, &repeated, |_| {
+                std::ops::ControlFlow::Continue(())
+            })
+            .unwrap();
+        assert_eq!(reused.skipped, 1);
+        assert_eq!(repeated.calls.load(Ordering::SeqCst), 0);
+        let attempts = catalog
+            .list_analysis_requests(&project, Some(&new_policy.policy.policy_id), 20)
+            .unwrap();
+        assert!(
+            attempts
+                .iter()
+                .all(|attempt| attempt.actual_model.as_deref() == Some(FALLBACK_MODEL))
+        );
+    }
+
+    #[test]
+    fn same_policy_fallback_rejection_is_not_replayed() {
+        let (_directory, catalog, project, asset) = super::tests::fixture();
+        let request = RunPolicyRequest::observation(
+            project.clone(),
+            vec![asset],
+            DEFAULT_MODEL,
+            vec![DEFAULT_MODEL.into(), FALLBACK_MODEL.into()],
+            true,
+            1.0,
+            false,
+        );
+        let authorization = catalog.authorize_run_policy(&request).unwrap();
+        catalog
+            .run_run_policy_pilot_with_provider(&request, &CapturingProvider::observation(), false)
+            .unwrap();
+        let provider = ModelScriptProvider::new(0.01, |model, call| {
+            Ok(scripted_response(
+                model,
+                call,
+                "not valid observation JSON".into(),
+                0.01,
+            ))
+        });
+        let failed = catalog
+            .analyze_authorized_with_provider(&authorization.policy.policy_id, &provider, |_| {
+                std::ops::ControlFlow::Continue(())
+            })
+            .unwrap();
+        assert_eq!(failed.rejected, 1);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+        let asset_id = authorization.policy.scope[0].asset_id.clone();
+        let saved =
+            crate::analysis::vlm_store::load_analysis(&catalog.connection().unwrap(), &asset_id)
+                .unwrap()
+                .unwrap();
+        assert_eq!(saved.status, crate::AnalysisStatus::Rejected);
+        assert_eq!(saved.model, FALLBACK_MODEL);
+
+        let repeat = ModelScriptProvider::new(0.01, |model, call| {
+            Ok(scripted_response(
+                model,
+                call,
+                valid_observation_body(),
+                0.01,
+            ))
+        });
+        let report = catalog
+            .analyze_authorized_with_provider(&authorization.policy.policy_id, &repeat, |_| {
+                std::ops::ControlFlow::Continue(())
+            })
+            .unwrap();
+        assert_eq!(report.skipped, 1);
+        assert_eq!(repeat.calls.load(Ordering::SeqCst), 0);
     }
     #[test]
     fn policy_source_or_project_mismatch_denies_targeted_retry_before_any_call() {

@@ -1679,7 +1679,7 @@ impl StepRunner<'_> {
             "moment run cancelled before the next paid transmission"
         );
         let settled_before = self.step_settled_attempts()?;
-        let outcome = match self.state.approved_policy.clone() {
+        let (outcome, accounted) = match self.state.approved_policy.clone() {
             Some(policy) => {
                 let context = bulk_request_accounting_context(
                     &policy,
@@ -1693,15 +1693,17 @@ impl StepRunner<'_> {
                 let cancelled = &mut self.state.cancelled;
                 let spent = self.state.spent;
                 let notify = &mut self.notify;
-                self.chain
+                let outcome = self
+                    .chain
                     .analyze_with_cancel(&accounted, &request, &mut || {
                         if !*cancelled && notify(phase, spent).is_break() {
                             *cancelled = true;
                         }
                         *cancelled
-                    })
+                    });
+                (outcome, Some(accounted))
             }
-            None => self.chain.analyze(self.provider, &request),
+            None => (self.chain.analyze(self.provider, &request), None),
         };
         let outcome = match outcome {
             Ok(outcome) => outcome,
@@ -1774,6 +1776,9 @@ impl StepRunner<'_> {
             });
         match validated {
             Ok(reply) => {
+                if let Some(accounted) = &accounted {
+                    accounted.record_response_success(&response.model)?;
+                }
                 self.save(
                     &step_key,
                     CachedStep {
@@ -1787,6 +1792,16 @@ impl StepRunner<'_> {
                 Ok((reply, evidence))
             }
             Err(error) => {
+                if let Some(accounted) = &accounted {
+                    let category = if error.to_string().to_ascii_lowercase().contains("schema")
+                        || error.to_string().to_ascii_lowercase().contains("json")
+                    {
+                        crate::analysis::provider::ProviderResponseRejection::Schema
+                    } else {
+                        crate::analysis::provider::ProviderResponseRejection::ContentQuality
+                    };
+                    accounted.record_response_rejection(&response.model, category)?;
+                }
                 self.save(
                     &step_key,
                     CachedStep {

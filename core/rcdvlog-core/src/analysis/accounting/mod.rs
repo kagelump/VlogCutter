@@ -17,6 +17,7 @@ mod model;
 mod native_stt;
 mod operation;
 mod provider_boundary;
+mod provider_health;
 mod recovery;
 mod settlement;
 pub(crate) mod store;
