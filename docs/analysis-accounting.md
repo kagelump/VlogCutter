@@ -651,3 +651,23 @@ inspection; legacy complete artifacts remain plan-less and readable, and the
 incomplete-checkpoint accessor returns `None` for terminal output. This does not
 enable native bulk, targeted retry, current terminal reuse or CLI/desktop
 selection.
+
+## Native transcript currentness
+
+Generic missing preparation reuses native terminal evidence only after one
+canonical snapshot proves its frozen recipe, current selected proxy, complete
+window plan, quality and request ownership. Current accepted native Speech is
+selected through the same owner for policy transcript fingerprints and AI prompt
+text. Historical, review-required, rejected, incomplete and malformed native
+candidates remain available for human inspection and outside accepted prompt
+context. Existing evidence reuse uses its recorded financial contract; new
+writes and uploads retain their separate current authorization and budget gates.
+
+Missing-proxy and other unproved native work are visible review/recovery
+exceptions. A generic local missing pass preserves those headers and paid window
+links, including if native work appears after planning and before the speech
+claim. Explicit selected local transcription still uses its local recipe and can
+replace native output through the existing claim and atomic writer. Aggregate
+coverage includes proved native terminal work; its compatibility `recipeKey`
+field describes the local recipe, while each artifact retains its actual recipe
+and provider provenance.

@@ -890,23 +890,28 @@ pub(crate) fn source_scope(
     add_legacy_audio_backend_blocker: bool,
 ) -> (RunAssetScope, Vec<RunPolicyBlocker>, Option<String>) {
     let source_duration_ms = (asset.duration_seconds.max(0.0) * 1_000.0).round() as u32;
-    // A frames-only or audio-only policy must not even bind transcript content
-    // that it is not authorized to transmit. The identity is present only when
-    // the payload actually selects accepted transcript context.
+    let proxy_identity = catalog.analysis_proxy_source(asset);
+    // A frames-only or audio-only policy must not even bind or load transcript
+    // content that it is not authorized to transmit. The identity is present
+    // only when the payload selects current accepted transcript context, and it
+    // reuses the same single analysis_proxy_source result as source identity.
     let transcript_fingerprint = if payload.uses_transcript() {
-        catalog
-            .asset_transcript(&asset.id)
-            .ok()
-            .flatten()
-            .and_then(|transcript| {
-                (transcript.status == TranscriptStatus::Speech && !transcript.segments.is_empty())
-                    .then(|| digest(&transcript).ok())
+        match &proxy_identity {
+            Ok(source) => catalog
+                .current_transcript_state_with_proxy(asset, source)
+                .ok()
+                .and_then(|state| {
+                    let transcript = state.current_transcript()?;
+                    (transcript.status == TranscriptStatus::Speech
+                        && !transcript.segments.is_empty())
+                    .then(|| digest(transcript).ok())
                     .flatten()
-            })
+                }),
+            Err(_) => None,
+        }
     } else {
         None
     };
-    let proxy_identity = catalog.analysis_proxy_source(asset);
     let (representation_fingerprint, sampled_representation_fingerprint, blockers) =
         match proxy_identity {
             Ok(source) => (
@@ -2821,7 +2826,7 @@ mod tests {
             &StoredTranscript {
                 asset_id: asset_id.to_string(),
                 recipe_key: crate::analysis::STT_RECIPE_KEY.to_string(),
-                source_fingerprint: "synthetic-source".into(),
+                source_fingerprint: catalog.proxy_fingerprint(asset_id).unwrap(),
                 status: TranscriptStatus::Speech,
                 outcome_reason: TranscriptOutcomeReason::Accepted,
                 reject_reason: String::new(),
@@ -2849,7 +2854,7 @@ mod tests {
             &StoredTranscript {
                 asset_id: asset_id.to_string(),
                 recipe_key: crate::analysis::STT_RECIPE_KEY.to_string(),
-                source_fingerprint: "synthetic-review-source".into(),
+                source_fingerprint: catalog.proxy_fingerprint(asset_id).unwrap(),
                 status: TranscriptStatus::ReviewRequired,
                 outcome_reason: TranscriptOutcomeReason::QualityEvidenceIncomplete,
                 reject_reason: "review_missing_quality_evidence".into(),
