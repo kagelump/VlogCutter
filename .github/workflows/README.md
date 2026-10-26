@@ -123,7 +123,7 @@ covers the measured roughly 14 GB target tree plus cache/setup overhead.
 
 Workspace tests retain Cargo/libtest with **four test workers** (also in the
 full local gate); there is no nextest, sharding, filtering, retry or assertion
-change. The default two-worker run spent 269 seconds in the 916-test core
+change. A prior libtest-default run spent 269 seconds in the 916-test core
 binary and 210 seconds in the 155-test server core binary. The bounded worker
 increase must pass the same complete suite, including SQLite, file-lock,
 financial and concurrency cases, before merge. Compare executed/ignored counts

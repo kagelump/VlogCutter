@@ -103,7 +103,10 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: cargo test --workspace
         if: ${{ !cancelled() && matrix.gate == 'tests' }}
-        run: /usr/bin/time -v cargo test --workspace -- --test-threads=4
+        run: |
+          nproc
+          lscpu
+          /usr/bin/time -v cargo test --workspace -- --test-threads=4
       - name: pnpm check:openapi
         if: ${{ !cancelled() && matrix.gate == 'tests' }}
         run: pnpm check:openapi
