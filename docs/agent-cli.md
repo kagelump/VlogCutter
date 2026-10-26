@@ -388,6 +388,13 @@ rcdvlog --catalog /absolute/project/catalog.sqlite3 clips update \
 
 `clips refresh-orientation` is the explicit mutating counterpart to diagnosis. It probes the immutable original, marks orientation as known even when the answer is 0°, preserves a user override, and updates only catalog metadata.
 
+`clips orientation-queue` reads a bounded review page. `clips orientation-evidence`
+generates raw-metadata/effective comparison stills from an available proxy or original.
+Use `clips orientation-confirm`, `orientation-unresolved`, or `orientation-confirm-batch`
+with expected revisions to record explicit human decisions; a numeric override alone
+does not establish visual confirmation. The CLI advertises `orientation.review.v1`.
+See [orientation review](orientation-review.md) for batch arguments and preservation rules.
+
 ### Camera clock events
 
 ```bash
