@@ -59,7 +59,7 @@ use analysis::consolidate::{
     proposals as label_proposals,
 };
 use analysis::engine::{SttEngine, VAD_MODEL, WHISPER_MODEL, ensure_model, model_dir};
-use analysis::store::{StoredTranscript, is_current, load_transcript, save_transcript};
+use analysis::store::{StoredTranscript, TranscriptCurrentState, load_transcript, save_transcript};
 use analysis::stt::transcribe_pcm;
 use analysis::stt::{
     failed_transcript, failed_transcript_with_evidence, failure_evidence, no_audio_transcript,
@@ -814,6 +814,11 @@ enum ProjectPlannedAsset {
         source_fingerprint: String,
         reason: String,
     },
+    /// Existing native work cannot be proved current (incomplete paid prefix,
+    /// stale source/recipe/quality, unproved history or foreign ownership).
+    /// Generic missing must surface it for review/recovery and leave every
+    /// canonical header/segment/window/accounting link untouched.
+    NativeReviewRecovery { asset: Asset, reason: String },
     Ready {
         asset: Asset,
         proxy_path: PathBuf,
@@ -2545,7 +2550,10 @@ impl Catalog {
             // the proxy and the later stages will then have work to do.
             match self.proxy_fingerprint(&asset.id) {
                 Ok(fingerprint) => {
-                    if !is_current(&connection, &asset.id, &fingerprint)? {
+                    // Current native terminal evidence is reusable here without
+                    // opening the local engine or contacting a provider. Incomplete
+                    // or unproved native work stays visibly missing/review.
+                    if !self.current_transcript_state(&asset.id)?.is_current() {
                         readiness.missing_transcripts += 1;
                     }
                     if !analysis_is_current(&connection, &asset.id, &fingerprint)? {
@@ -3066,7 +3074,6 @@ impl Catalog {
     /// A stored transcript whose proxy fingerprint no longer matches counts as
     /// `missing`, because that is what a `transcribe missing` run would redo.
     pub fn transcript_coverage(&self, project_id: &str) -> Result<TranscriptCoverage> {
-        let connection = self.connection()?;
         let mut coverage = TranscriptCoverage {
             recipe_key: STT_RECIPE_KEY.to_string(),
             ..TranscriptCoverage::default()
@@ -3076,24 +3083,16 @@ impl Catalog {
                 continue;
             }
             coverage.total += 1;
-            let stored = load_transcript(&connection, &asset.id)?;
-            let matches_source =
-                self.proxy_fingerprint(&asset.id)
-                    .ok()
-                    .is_some_and(|fingerprint| {
-                        stored.as_ref().is_some_and(|row| {
-                            row.recipe_key == STT_RECIPE_KEY
-                                && row.source_fingerprint == fingerprint
-                        })
-                    });
-            if !matches_source {
-                coverage.missing += 1;
-                continue;
-            }
-            // A matching failed attempt is visible as failed coverage, while
-            // is_current still excludes it from automatic reuse.
-            match stored {
-                Some(stored) => match stored.status {
+            match self.current_transcript_state(&asset.id)? {
+                TranscriptCurrentState::Missing
+                | TranscriptCurrentState::ProtectedNative { .. } => {
+                    // Incomplete/unproved native work remains visibly unaccepted
+                    // and outside the analysis-ready set.
+                    coverage.missing += 1;
+                }
+                TranscriptCurrentState::RetryableLocalFailed(_) => coverage.failed += 1,
+                TranscriptCurrentState::CurrentLocal(stored)
+                | TranscriptCurrentState::CurrentNative(stored) => match stored.status {
                     TranscriptStatus::Speech => coverage.speech += 1,
                     TranscriptStatus::NoSpeech => {
                         coverage.no_speech += 1;
@@ -3109,7 +3108,6 @@ impl Catalog {
                     TranscriptStatus::Failed => coverage.failed += 1,
                     TranscriptStatus::ReviewRequired => coverage.review_required += 1,
                 },
-                None => coverage.missing += 1,
             }
         }
         Ok(coverage)
@@ -3185,7 +3183,6 @@ impl Catalog {
         );
         let mut pending: Vec<ProjectPlannedAsset> = Vec::new();
         {
-            let connection = self.connection()?;
             for asset in assets {
                 let mut estimate = probe_estimator.estimate(&[]);
                 estimate.estimated_remaining_seconds = None;
@@ -3209,6 +3206,19 @@ impl Catalog {
                     report.skipped += 1;
                     continue;
                 }
+                match self.current_transcript_state(&asset.id)? {
+                    TranscriptCurrentState::CurrentLocal(_)
+                    | TranscriptCurrentState::CurrentNative(_) => {
+                        report.skipped += 1;
+                        continue;
+                    }
+                    TranscriptCurrentState::ProtectedNative { reason, .. } => {
+                        pending.push(ProjectPlannedAsset::NativeReviewRecovery { asset, reason });
+                        continue;
+                    }
+                    TranscriptCurrentState::Missing
+                    | TranscriptCurrentState::RetryableLocalFailed(_) => {}
+                }
                 let source_fingerprint = match self.proxy_fingerprint(&asset.id) {
                     Ok(fingerprint) => fingerprint,
                     // A clip with no usable proxy cannot be transcribed. It is
@@ -3223,10 +3233,6 @@ impl Catalog {
                         continue;
                     }
                 };
-                if is_current(&connection, &asset.id, &source_fingerprint)? {
-                    report.skipped += 1;
-                    continue;
-                }
                 let proxy_path = match Self::require_proxy(&asset) {
                     Ok(path) => path,
                     Err(error) => {
@@ -3308,8 +3314,25 @@ impl Catalog {
             let asset = match item {
                 ProjectPlannedAsset::NoAudio { asset, .. }
                 | ProjectPlannedAsset::ProbeFailed { asset, .. }
+                | ProjectPlannedAsset::NativeReviewRecovery { asset, .. }
                 | ProjectPlannedAsset::Ready { asset, .. } => asset,
             };
+            if let ProjectPlannedAsset::NativeReviewRecovery { asset, reason } = item {
+                report.skipped += 1;
+                report.failures.push(IngestFailure {
+                    path: asset.path.clone(),
+                    error: format!("native speech review/recovery required: {reason}"),
+                });
+                flow = on_progress(TranscribeBatchProgress {
+                    outcome: None,
+                    estimate: estimator.estimate(remaining),
+                });
+                if flow.is_break() {
+                    report.cancelled = true;
+                    break;
+                }
+                continue;
+            }
             let Some(_speech_claim) =
                 self.try_claim_representation(&asset.id, RepresentationKind::Speech)?
             else {
@@ -3328,6 +3351,52 @@ impl Catalog {
                 }
                 continue;
             };
+            // Another writer may have produced native work after planning but
+            // before this speech claim became available. Recheck under the
+            // existing claim before any local replacement can clear paid links.
+            match self.current_transcript_state(&asset.id)? {
+                TranscriptCurrentState::CurrentNative(_)
+                | TranscriptCurrentState::CurrentLocal(_) => {
+                    report.skipped += 1;
+                    if matches!(item, ProjectPlannedAsset::Ready { .. }) {
+                        audio_processed += 1;
+                    }
+                    if on_progress(TranscribeBatchProgress {
+                        outcome: None,
+                        estimate: estimator
+                            .estimate(&task_work[audio_processed.min(task_work.len())..]),
+                    })
+                    .is_break()
+                    {
+                        report.cancelled = true;
+                        break;
+                    }
+                    continue;
+                }
+                TranscriptCurrentState::ProtectedNative { reason } => {
+                    report.skipped += 1;
+                    if matches!(item, ProjectPlannedAsset::Ready { .. }) {
+                        audio_processed += 1;
+                    }
+                    report.failures.push(IngestFailure {
+                        path: asset.path.clone(),
+                        error: format!("native speech review/recovery required: {reason}"),
+                    });
+                    if on_progress(TranscribeBatchProgress {
+                        outcome: None,
+                        estimate: estimator
+                            .estimate(&task_work[audio_processed.min(task_work.len())..]),
+                    })
+                    .is_break()
+                    {
+                        report.cancelled = true;
+                        break;
+                    }
+                    continue;
+                }
+                TranscriptCurrentState::Missing
+                | TranscriptCurrentState::RetryableLocalFailed(_) => {}
+            }
             match item {
                 ProjectPlannedAsset::NoAudio {
                     asset,
@@ -3360,6 +3429,9 @@ impl Catalog {
                         outcome: None,
                         estimate: estimator.estimate(remaining),
                     });
+                }
+                ProjectPlannedAsset::NativeReviewRecovery { .. } => {
+                    unreachable!("native review/recovery items are handled before claims")
                 }
                 ProjectPlannedAsset::Ready {
                     asset,
@@ -3526,16 +3598,26 @@ impl Catalog {
     }
 
     pub(crate) fn prompt_transcript(&self, asset_id: &str) -> Result<Option<PromptTranscript>> {
-        let Some(transcript) = load_transcript(&self.connection()?, asset_id)? else {
-            return Ok(None);
+        // Prompt context and RunPolicy::source_scope share this exact currentness
+        // owner. Historical rows remain readable through asset_transcript, but
+        // only a currently proved local/native artifact may contribute text.
+        let state = self.current_transcript_state(asset_id)?;
+        let (transcript, native) = match &state {
+            TranscriptCurrentState::CurrentLocal(transcript) => (transcript, false),
+            TranscriptCurrentState::CurrentNative(transcript) => (transcript, true),
+            TranscriptCurrentState::Missing
+            | TranscriptCurrentState::RetryableLocalFailed(_)
+            | TranscriptCurrentState::ProtectedNative { .. } => return Ok(None),
         };
-        // Review candidates and incomplete native checkpoint prefixes are
-        // retained for a human, not accepted speech. Do not gather or return
-        // their raw text to any downstream AI prompt.
-        if matches!(
-            transcript.status,
-            TranscriptStatus::ReviewRequired | TranscriptStatus::Failed
-        ) {
+        // Review/rejected/no-accepted native outcomes are retained for a human,
+        // not accepted speech. Only current accepted native Speech may become
+        // AI context. Local status semantics remain unchanged.
+        if (native && transcript.status != TranscriptStatus::Speech)
+            || matches!(
+                transcript.status,
+                TranscriptStatus::ReviewRequired | TranscriptStatus::Failed
+            )
+        {
             return Ok(None);
         }
         let text = transcript
@@ -7942,6 +8024,39 @@ pub(crate) mod tests {
             Some("review_required")
         );
         assert_eq!(index[0].transcript_text, "REVIEW_CANDIDATE_CANARY");
+
+        // A historical local Speech row from a superseded proxy must not leak
+        // either. The unified currentness owner applies the unchanged local
+        // source/recipe rule before prompt context is gathered.
+        save_transcript(
+            &catalog.connection().unwrap(),
+            &StoredTranscript {
+                asset_id: "a1".to_string(),
+                recipe_key: STT_RECIPE_KEY.to_string(),
+                source_fingerprint: "stale-local-proxy-fingerprint".to_string(),
+                status: TranscriptStatus::Speech,
+                outcome_reason: crate::analysis::store::TranscriptOutcomeReason::Accepted,
+                reject_reason: String::new(),
+                primary_language: "en".to_string(),
+                speech_seconds: 2.0,
+                window_count: 1,
+                provider_segment_count: 1,
+                mean_token_probability: Some(0.8),
+                repetition_ratio: Some(0.0),
+                segments: vec![DecodedSegment {
+                    start_ms: 250,
+                    end_ms: 2_250,
+                    language: "en".to_string(),
+                    text: "STALE_LOCAL_CANARY".to_string(),
+                    mean_token_probability: Some(0.8),
+                }],
+            },
+        )
+        .unwrap();
+        assert!(
+            catalog.prompt_transcript("a1").unwrap().is_none(),
+            "stale local speech must not become AI prompt context"
+        );
 
         save_transcript(
             &catalog.connection().unwrap(),

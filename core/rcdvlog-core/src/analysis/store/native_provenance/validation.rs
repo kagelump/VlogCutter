@@ -252,7 +252,22 @@ pub(super) fn validate_native_policy(
     validate_native_policy_recipe(policy, &transcript.recipe_key)
 }
 
+/// Current persistence additionally requires today's registered cost contract.
+/// Read-only reuse validates the frozen recipe binding without this spending rule.
 pub(super) fn validate_native_policy_recipe(policy: &RunPolicy, recipe_key: &str) -> Result<()> {
+    validate_native_policy_recipe_binding(policy, recipe_key)?;
+    ensure!(
+        policy.provider_cost_bound_contract
+            == crate::analysis::openrouter_stt::native_stt_cost_bound_contract_id(),
+        "native transcript policy is not bound to the registered native cost contract"
+    );
+    Ok(())
+}
+
+pub(super) fn validate_native_policy_recipe_binding(
+    policy: &RunPolicy,
+    recipe_key: &str,
+) -> Result<()> {
     ensure!(
         policy.kind == crate::analysis::run_policy::AnalysisRunKind::NativeSpeechTranscription
             && policy.payload == crate::analysis::run_policy::AnalysisPayload::Audio
@@ -264,11 +279,6 @@ pub(super) fn validate_native_policy_recipe(policy: &RunPolicy, recipe_key: &str
             && !policy.allow_fallback
             && policy.permitted_fallbacks.is_empty(),
         "native transcript policy must select exactly one provider-qualified model with no fallback"
-    );
-    ensure!(
-        policy.provider_cost_bound_contract
-            == crate::analysis::openrouter_stt::native_stt_cost_bound_contract_id(),
-        "native transcript policy is not bound to the registered native cost contract"
     );
     let RunPolicyParameters::NativeSpeechTranscription {
         language,

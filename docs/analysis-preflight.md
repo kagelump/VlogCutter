@@ -312,3 +312,10 @@ from local silence, and retains the exact plan/fingerprint on new terminal
 native artifacts. No provider dispatch, migration, new dependency, bulk
 activation, targeted retry, terminal current-reuse or CLI/desktop selection is
 enabled by this slice.
+
+Native transcript coverage distinguishes current reusable terminal evidence from
+historical or incomplete paid work. Generic missing preparation preserves
+unproved native associations as review/recovery exceptions, and accepted prompt
+context and policy transcript fingerprints share the currentness proof. Explicit
+local selection remains available. This read integration does not enable native
+bulk dispatch, desktop/CLI native selection or targeted retry.

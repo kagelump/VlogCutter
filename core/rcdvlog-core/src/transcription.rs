@@ -6,7 +6,9 @@
 //! transcripts by default, and open the speech engine once for the batch.
 
 use crate::analysis::engine::SttEngine;
-use crate::analysis::store::{StoredTranscript, is_current, load_transcript, save_transcript};
+use crate::analysis::store::{
+    StoredTranscript, is_current_local, load_transcript, save_transcript,
+};
 use crate::analysis::stt::{
     failed_transcript, failed_transcript_with_evidence, failure_evidence, no_audio_transcript,
 };
@@ -408,7 +410,7 @@ impl Catalog {
                     continue;
                 }
             };
-            if !options.force && is_current(&connection, &asset.id, &source_fingerprint)? {
+            if !options.force && is_current_local(&connection, &asset.id, &source_fingerprint)? {
                 let stored = load_transcript(&connection, &asset.id)?
                     .context("current transcript disappeared during selected transcription")?;
                 planned.push(PlannedAsset::Reused(outcome(
@@ -803,7 +805,7 @@ mod tests {
     use super::*;
     use crate::analysis::engine::SttEngine;
     use crate::analysis::quality::DecodedSegment;
-    use crate::analysis::store::TranscriptStatus;
+    use crate::analysis::store::{TranscriptStatus, is_current};
     use crate::analysis::windows::{PackedWindow, SpeechRegion};
     use crate::{AssetPatch, ModelStatus};
     use rusqlite::params;

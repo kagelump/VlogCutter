@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) fn ensure_checkpoint_quality_is_typed(
+pub(crate) fn ensure_checkpoint_quality_is_typed(
     decision: NativeSttQualityDecision,
     reason: NativeSttQualityReason,
 ) -> Result<()> {

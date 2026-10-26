@@ -61,7 +61,10 @@ mod types;
 mod validation;
 mod write;
 
-pub(crate) use assembly::assemble_native_transcript_completion;
+pub(crate) use assembly::{
+    NativeTranscriptAssemblyIdentity, assemble_native_transcript_completion,
+    assemble_native_transcript_completion_for_source,
+};
 pub(crate) use finalize::finalize_native_transcript_checkpoint;
 
 pub(crate) use evaluation::evaluate_native_checkpoint_result;
@@ -120,3 +123,5 @@ impl Catalog {
         probe_native_transcript_checkpoint_for_reuse(self, preparation, request)
     }
 }
+
+pub(super) use validation::ensure_checkpoint_quality_is_typed;

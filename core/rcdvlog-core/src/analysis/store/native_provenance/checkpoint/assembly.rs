@@ -15,6 +15,7 @@ use crate::analysis::quality::native_stt::{
     NativeSttQualityDecision, NativeSttQualityReason, native_stt_repetition_is_safe,
     validate_native_mapped_candidates,
 };
+use crate::analysis::run_policy::RunAssetScope;
 use crate::analysis::store::{StoredTranscript, TranscriptOutcomeReason, TranscriptStatus};
 use crate::analysis::stt::dominant_language;
 use crate::transcription::NativeSpeechPreparationEvidence;
@@ -30,12 +31,44 @@ use crate::analysis::store::native_provenance::types::NativeTranscriptWindowPlan
 /// quality/source-map owners; their recorded decisions and metrics are never
 /// rewritten. Whole-clip repetition is the only new gate and is measured over
 /// the combined source-mapped candidates.
+/// Narrow truthful identity shared by the live finalizer and read-only
+/// currentness proof. This deliberately excludes VAD/model/resource facts that
+/// are irrelevant to assembling already evaluated window evidence.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct NativeTranscriptAssemblyIdentity<'a> {
+    pub asset_id: &'a str,
+    pub recipe: &'a str,
+    pub scope: &'a RunAssetScope,
+}
+
+/// The live finalizer supplies actual preparation evidence. Read-only
+/// currentness supplies the narrower frozen identity below; both paths share
+/// the same pure assembly without fabricating preparation facts.
 pub(crate) fn assemble_native_transcript_completion(
     evidence: &NativeSpeechPreparationEvidence,
     plan: &NativeTranscriptWindowPlan,
     windows: &[NativeTranscriptCheckpointWindow],
 ) -> Result<StoredTranscript> {
-    validate_plan(plan, evidence.source_duration_ms)?;
+    assemble_native_transcript_completion_for_source(
+        NativeTranscriptAssemblyIdentity {
+            asset_id: &evidence.asset_id,
+            recipe: &evidence.recipe,
+            scope: &evidence.scope,
+        },
+        plan,
+        windows,
+    )
+}
+
+/// Pure complete-clip assembly from existing transcript identity plus the exact
+/// frozen source scope. No preparation, model, credential, database or provider
+/// effect is required.
+pub(crate) fn assemble_native_transcript_completion_for_source(
+    identity: NativeTranscriptAssemblyIdentity<'_>,
+    plan: &NativeTranscriptWindowPlan,
+    windows: &[NativeTranscriptCheckpointWindow],
+) -> Result<StoredTranscript> {
+    validate_plan(plan, identity.scope.source_duration_ms)?;
     ensure!(
         windows.len() == plan.windows.len(),
         "native complete-clip assembly requires exactly one result per planned window"
@@ -61,15 +94,15 @@ pub(crate) fn assemble_native_transcript_completion(
     } else {
         Vec::new()
     };
-    let source_fingerprint = evidence
+    let source_fingerprint = identity
         .scope
         .sampled_representation_fingerprint
         .clone()
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| anyhow::anyhow!("native complete-clip source fingerprint is missing"))?;
     Ok(StoredTranscript {
-        asset_id: evidence.asset_id.clone(),
-        recipe_key: evidence.recipe.clone(),
+        asset_id: identity.asset_id.to_string(),
+        recipe_key: identity.recipe.to_string(),
         source_fingerprint,
         status,
         outcome_reason,

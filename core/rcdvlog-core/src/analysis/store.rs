@@ -464,13 +464,120 @@ pub fn load_transcript(
     }))
 }
 
-/// Whether the stored transcript was produced by the current recipe from the
-/// current proxy. Anything else must be regenerated.
+/// Present-time disposition of the canonical transcript row. Current local and
+/// native terminal artifacts are reusable; a stale/incomplete/unproved native
+/// association is explicitly protected for human review/recovery rather than
+/// being silently replaced by an ordinary missing-local pass.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum TranscriptCurrentState {
+    Missing,
+    CurrentLocal(StoredTranscript),
+    CurrentNative(StoredTranscript),
+    /// A current local row from a failed attempt. It is not reusable but its
+    /// failed coverage remains visible and ordinary local retry may replace it.
+    RetryableLocalFailed(StoredTranscript),
+    /// Existing native work whose present proof failed. The canonical header,
+    /// segments and native window links stay untouched.
+    ProtectedNative {
+        reason: String,
+    },
+}
+
+impl TranscriptCurrentState {
+    pub(crate) fn current_transcript(&self) -> Option<&StoredTranscript> {
+        match self {
+            TranscriptCurrentState::CurrentLocal(transcript)
+            | TranscriptCurrentState::CurrentNative(transcript) => Some(transcript),
+            TranscriptCurrentState::Missing
+            | TranscriptCurrentState::RetryableLocalFailed(_)
+            | TranscriptCurrentState::ProtectedNative { .. } => None,
+        }
+    }
+
+    pub(crate) fn is_current(&self) -> bool {
+        self.current_transcript().is_some()
+    }
+}
+
+/// Whether the transcript row carries any native owner identity, plan or linked
+/// provider window. Any one-sided/foreign association is treated as native work
+/// by generic callers rather than as an ordinary local cache miss.
+pub(crate) fn has_native_transcript_association(
+    connection: &Connection,
+    asset_id: &str,
+) -> Result<bool> {
+    let associated: Option<bool> = connection
+        .query_row(
+            "SELECT native_policy_id IS NOT NULL
+                    OR native_quality_recipe_version IS NOT NULL
+                    OR native_window_plan_json IS NOT NULL
+                    OR native_window_plan_fingerprint IS NOT NULL
+                    OR EXISTS(SELECT 1 FROM native_transcript_windows w
+                              WHERE w.asset_id = asset_transcripts.asset_id)
+             FROM asset_transcripts WHERE asset_id=?1",
+            [asset_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(associated.unwrap_or(false))
+}
+
+/// One read-snapshot currentness decision. The caller owns the transaction so
+/// header reads, provenance, window links and accounting receipts cannot tear.
+pub(crate) fn load_transcript_current_state(
+    transaction: &rusqlite::Transaction<'_>,
+    asset_id: &str,
+    selected_source_fingerprint: &str,
+    native_source: Option<&crate::representation::AnalysisProxySource>,
+) -> Result<TranscriptCurrentState> {
+    let associated = has_native_transcript_association(transaction, asset_id)?;
+    let transcript = match load_transcript(transaction, asset_id) {
+        Ok(Some(transcript)) => transcript,
+        Ok(None) => return Ok(TranscriptCurrentState::Missing),
+        Err(error) if associated => {
+            return Ok(TranscriptCurrentState::ProtectedNative {
+                reason: format!("native transcript header requires review/recovery: {error:#}"),
+            });
+        }
+        Err(error) => return Err(error),
+    };
+    if !associated {
+        if transcript.recipe_key == STT_RECIPE_KEY
+            && transcript.source_fingerprint == selected_source_fingerprint
+        {
+            return Ok(if transcript.status == TranscriptStatus::Failed {
+                TranscriptCurrentState::RetryableLocalFailed(transcript)
+            } else {
+                TranscriptCurrentState::CurrentLocal(transcript)
+            });
+        }
+        return Ok(TranscriptCurrentState::Missing);
+    }
+    let Some(source) = native_source else {
+        return Ok(TranscriptCurrentState::ProtectedNative {
+            reason: "current selected derived-source proof is unavailable".into(),
+        });
+    };
+    match native_provenance::prove_current_native_transcript(transaction, &transcript, source) {
+        Ok(()) => Ok(TranscriptCurrentState::CurrentNative(transcript)),
+        Err(error) => Ok(TranscriptCurrentState::ProtectedNative {
+            reason: format!("{error:#}"),
+        }),
+    }
+}
+
+/// The unchanged explicit-local reuse rule. Selected/offline transcription is a
+/// local-recipe operation: a current native artifact must not masquerade as its
+/// cache entry, and an explicit local selection may replace it through the
+/// existing speech claim + atomic local writer.
 pub fn is_current(
     connection: &Connection,
     asset_id: &str,
     source_fingerprint: &str,
 ) -> Result<bool> {
+    if has_native_transcript_association(connection, asset_id)? {
+        return Ok(false);
+    }
     let stored: Option<(String, String, String)> = connection
         .query_row(
             "SELECT recipe_key, source_fingerprint, status FROM asset_transcripts WHERE asset_id = ?1",
@@ -487,6 +594,10 @@ pub fn is_current(
         None => false,
     })
 }
+
+// The named alias makes explicit-local selection distinct from Catalog's
+// full native-aware currentness proof without changing this legacy public API.
+pub(crate) use is_current as is_current_local;
 
 #[cfg(test)]
 mod tests {

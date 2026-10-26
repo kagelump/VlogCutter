@@ -1994,6 +1994,51 @@ fn append_native_window(
         .unwrap()
 }
 
+#[allow(clippy::too_many_arguments)]
+fn finalize_accepted_two_window_native(
+    catalog: &Catalog,
+    policy: &RunPolicy,
+    request: &NativeSttRequest,
+    preparation: &NativeSpeechPreparation,
+    context: &AnalysisAccountingContext,
+    first_text: &str,
+    second_text: &str,
+    include_cost: bool,
+) -> StoredTranscript {
+    catalog
+        .begin_native_transcript_checkpoint(preparation)
+        .unwrap();
+    let first = preparation.materialize_window(0).unwrap();
+    let second = preparation.materialize_window(1).unwrap();
+    let first_result = transmit_configured_window(
+        catalog,
+        policy,
+        request,
+        &first,
+        &context.run_id,
+        context.clone(),
+        first_text,
+        include_cost,
+        Some(0.9),
+    );
+    let second_result = transmit_configured_window(
+        catalog,
+        policy,
+        request,
+        &second,
+        &context.run_id,
+        context.clone(),
+        second_text,
+        include_cost,
+        Some(0.9),
+    );
+    append_native_window(catalog, preparation, request, &first, &first_result);
+    append_native_window(catalog, preparation, request, &second, &second_result);
+    catalog
+        .finalize_native_transcript_checkpoint(preparation, request)
+        .unwrap()
+}
+
 #[test]
 fn native_complete_checkpoint_finalizes_atomically_with_exact_terminal_coverage() {
     let (_directory, catalog, project, asset, policy, _request, _audio, _run_id, context) =
@@ -2674,6 +2719,17 @@ fn terminal_clip_repetition_rejection_discards_text_and_replays_idempotently() {
                 .is_some_and(|candidates| candidates.is_empty())
     }));
     assert_eq!(link_count(&catalog, &asset), 2);
+    assert!(
+        catalog
+            .current_transcript_state(&asset)
+            .unwrap()
+            .is_current(),
+        "a truthful terminal quality rejection is current reusable terminal evidence"
+    );
+    assert!(
+        catalog.prompt_transcript(&asset).unwrap().is_none(),
+        "rejected native text is discarded and never becomes prompt context"
+    );
 
     catalog
         .connection()
@@ -2698,5 +2754,488 @@ fn terminal_clip_repetition_rejection_discards_text_and_replays_idempotently() {
         .unwrap();
     assert_eq!(created_at, "sentinel-rejected");
 }
+#[test]
+fn current_native_speech_is_reused_for_prompt_scope_and_generic_missing_without_local_engine() {
+    let (_directory, catalog, project, asset, policy, _request, _audio, _run_id, context) =
+        authorized_native_setup();
+    let request = native_policy_request();
+    let preparation = two_window_preparation(&catalog, &policy, &asset);
+    let finalized = finalize_accepted_two_window_native(
+        &catalog,
+        &policy,
+        &request,
+        &preparation,
+        &context,
+        "CURRENT_NATIVE_CANARY_ONE",
+        "CURRENT_NATIVE_CANARY_TWO",
+        true,
+    );
+    assert_eq!(finalized.status, TranscriptStatus::Speech);
+    assert_eq!(finalized.segments.len(), 2);
+
+    let state = catalog.current_transcript_state(&asset).unwrap();
+    assert!(
+        matches!(
+            state,
+            crate::analysis::store::TranscriptCurrentState::CurrentNative(_)
+        ),
+        "expected current native state, got {state:?}"
+    );
+    let selected = catalog.proxy_fingerprint(&asset).unwrap();
+    assert!(
+        !crate::analysis::store::is_current(&catalog.connection().unwrap(), &asset, &selected)
+            .unwrap(),
+        "the legacy local-only predicate cannot infer full native currentness from a sampled hash"
+    );
+    assert!(
+        !crate::analysis::store::is_current_local(
+            &catalog.connection().unwrap(),
+            &asset,
+            &selected
+        )
+        .unwrap(),
+        "explicit local selection must retain the unchanged local-recipe rule and not reuse native output"
+    );
+
+    let prompt = catalog.prompt_transcript(&asset).unwrap().unwrap();
+    assert_eq!(prompt.status, TranscriptStatus::Speech);
+    assert_eq!(
+        prompt.text,
+        "CURRENT_NATIVE_CANARY_ONE CURRENT_NATIVE_CANARY_TWO"
+    );
+
+    let (scope, blockers, _) = crate::analysis::run_policy::source_scope(
+        &catalog,
+        &catalog.get_asset(&asset).unwrap(),
+        crate::analysis::run_policy::AnalysisPayload::FramesAndTranscript,
+        false,
+    );
+    assert!(blockers.is_empty());
+    let stored = catalog.asset_transcript(&asset).unwrap().unwrap();
+    assert_eq!(
+        scope.transcript_fingerprint,
+        Some(super::super::digest(&stored).unwrap()),
+        "policy scope and prompt must bind the same accepted native artifact"
+    );
+
+    // No local model is installed in this fixture. Reaching the local engine
+    // would make this fail; current native reuse must skip it entirely.
+    let report = catalog.transcribe_missing(&project).unwrap();
+    assert_eq!(
+        (report.skipped, report.transcribed, report.failed),
+        (1, 0, 0)
+    );
+    assert!(report.outcomes.is_empty());
+    assert!(report.failures.is_empty());
+    assert_eq!(
+        catalog.asset_transcript(&asset).unwrap().unwrap(),
+        finalized,
+        "generic missing must not rewrite current native work"
+    );
+    // A contradictory local recipe label cannot make a native association an
+    // explicit-local cache hit; the canonical owner fields remain decisive.
+    catalog
+        .connection()
+        .unwrap()
+        .execute(
+            "UPDATE asset_transcripts SET recipe_key=?1 WHERE asset_id=?2",
+            rusqlite::params![crate::analysis::STT_RECIPE_KEY, asset],
+        )
+        .unwrap();
+    assert!(
+        !crate::analysis::store::is_current(&catalog.connection().unwrap(), &asset, &selected)
+            .unwrap()
+    );
+    assert!(catalog.prompt_transcript(&asset).unwrap().is_none());
+}
+
+#[test]
+fn incomplete_paid_native_prefix_is_visible_review_recovery_not_a_local_rewrite() {
+    let (_directory, catalog, project, asset, policy, _request, _audio, _run_id, context) =
+        authorized_native_setup();
+    let request = native_policy_request();
+    let preparation = two_window_preparation(&catalog, &policy, &asset);
+    catalog
+        .begin_native_transcript_checkpoint(&preparation)
+        .unwrap();
+    let first = preparation.materialize_window(0).unwrap();
+    let first_result = transmit_configured_window(
+        &catalog,
+        &policy,
+        &request,
+        &first,
+        &context.run_id,
+        context.clone(),
+        "PAID_PREFIX_CANARY",
+        true,
+        Some(0.9),
+    );
+    append_native_window(&catalog, &preparation, &request, &first, &first_result);
+    let before = catalog.asset_transcript(&asset).unwrap().unwrap();
+    let links_before = link_count(&catalog, &asset);
+    let requests_before = catalog
+        .list_analysis_requests(&project, Some(&policy.policy_id), 10)
+        .unwrap()
+        .len();
+
+    assert_eq!(before.status, TranscriptStatus::Failed);
+    assert!(catalog.prompt_transcript(&asset).unwrap().is_none());
+    let state = catalog.current_transcript_state(&asset).unwrap();
+    assert!(
+        matches!(
+            state,
+            crate::analysis::store::TranscriptCurrentState::ProtectedNative { .. }
+        ),
+        "incomplete paid work must be protected, got {state:?}"
+    );
+    assert!(
+        !crate::analysis::store::is_current(
+            &catalog.connection().unwrap(),
+            &asset,
+            &catalog.proxy_fingerprint(&asset).unwrap()
+        )
+        .unwrap()
+    );
+
+    let report = catalog.transcribe_missing(&project).unwrap();
+    assert_eq!(
+        (report.skipped, report.transcribed, report.failed),
+        (1, 0, 0)
+    );
+    assert_eq!(report.failures.len(), 1);
+    assert!(
+        report.failures[0]
+            .error
+            .contains("review/recovery required")
+    );
+    assert_eq!(
+        catalog.asset_transcript(&asset).unwrap().unwrap(),
+        before,
+        "generic missing must leave the incomplete paid header/candidates intact"
+    );
+    assert_eq!(link_count(&catalog, &asset), links_before);
+    assert_eq!(
+        catalog
+            .list_analysis_requests(&project, Some(&policy.policy_id), 10)
+            .unwrap()
+            .len(),
+        requests_before
+    );
+}
+
+#[test]
+fn stale_native_quality_representation_and_legacy_plan_do_not_leak_prompt_text() {
+    let (_directory, catalog, _project, asset, policy, _request, _audio, _run_id, context) =
+        authorized_native_setup();
+    let request = native_policy_request();
+    let preparation = two_window_preparation(&catalog, &policy, &asset);
+    let finalized = finalize_accepted_two_window_native(
+        &catalog,
+        &policy,
+        &request,
+        &preparation,
+        &context,
+        "STALE_NATIVE_CANARY_ONE",
+        "STALE_NATIVE_CANARY_TWO",
+        true,
+    );
+    assert_eq!(
+        catalog.prompt_transcript(&asset).unwrap().unwrap().text,
+        "STALE_NATIVE_CANARY_ONE STALE_NATIVE_CANARY_TWO"
+    );
+
+    let mut stale_representation = catalog
+        .analysis_proxy_source(&catalog.get_asset(&asset).unwrap())
+        .unwrap();
+    stale_representation.fingerprint = "stale-full-representation-fingerprint".into();
+    let stale_state = catalog
+        .current_transcript_state_with_proxy(
+            &catalog.get_asset(&asset).unwrap(),
+            &stale_representation,
+        )
+        .unwrap();
+    assert!(
+        matches!(
+            stale_state,
+            crate::analysis::store::TranscriptCurrentState::ProtectedNative { .. }
+        ),
+        "a changed full derived-representation fingerprint must deny current native reuse"
+    );
+
+    let connection = catalog.connection().unwrap();
+    connection
+        .execute(
+            "UPDATE asset_transcripts SET native_quality_recipe_version='native-stt.quality.historical.v0' WHERE asset_id=?1",
+            [&asset],
+        )
+        .unwrap();
+    assert!(catalog.prompt_transcript(&asset).unwrap().is_none());
+    assert!(
+        catalog
+            .native_transcript_provenance(&asset)
+            .unwrap()
+            .is_some(),
+        "historical provenance stays independently inspectable"
+    );
+    connection
+        .execute(
+            "UPDATE asset_transcripts SET native_quality_recipe_version=?2,
+                    repetition_ratio=0.99 WHERE asset_id=?1",
+            rusqlite::params![
+                asset,
+                crate::analysis::quality::native_stt::NATIVE_STT_QUALITY_RECIPE_VERSION
+            ],
+        )
+        .unwrap();
+    assert!(
+        catalog.prompt_transcript(&asset).unwrap().is_none(),
+        "forged safe whole-clip repetition must not enter prompt context"
+    );
+
+    connection
+        .execute(
+            "UPDATE asset_transcripts SET repetition_ratio=?2,
+                    native_window_plan_json=NULL,
+                    native_window_plan_fingerprint=NULL WHERE asset_id=?1",
+            rusqlite::params![asset, finalized.repetition_ratio],
+        )
+        .unwrap();
+    assert!(
+        catalog.prompt_transcript(&asset).unwrap().is_none(),
+        "legacy provider-backed native history without a plan is readable but not current"
+    );
+    assert!(
+        catalog
+            .native_transcript_provenance(&asset)
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[test]
+fn current_review_required_native_terminal_stays_inspectable_but_never_becomes_prompt_context() {
+    let (_directory, catalog, _project, asset, policy, _request, _audio, _run_id, context) =
+        authorized_native_setup();
+    let request = native_policy_request();
+    let preparation = two_window_preparation(&catalog, &policy, &asset);
+    catalog
+        .begin_native_transcript_checkpoint(&preparation)
+        .unwrap();
+    let first = preparation.materialize_window(0).unwrap();
+    let second = preparation.materialize_window(1).unwrap();
+    let first_result = transmit_configured_window(
+        &catalog,
+        &policy,
+        &request,
+        &first,
+        &context.run_id,
+        context.clone(),
+        "accepted review first",
+        true,
+        Some(0.9),
+    );
+    let second_result = transmit_configured_window(
+        &catalog,
+        &policy,
+        &request,
+        &second,
+        &context.run_id,
+        context.clone(),
+        "REVIEW_TERMINAL_CANARY",
+        true,
+        None,
+    );
+    let first_checkpoint =
+        append_native_window(&catalog, &preparation, &request, &first, &first_result);
+    let second_checkpoint =
+        append_native_window(&catalog, &preparation, &request, &second, &second_result);
+    assert_eq!(
+        first_checkpoint.windows[0].observation.quality.decision,
+        NativeSttQualityDecision::Accepted
+    );
+    assert_eq!(
+        second_checkpoint.windows[1].observation.quality.decision,
+        NativeSttQualityDecision::ReviewRequired
+    );
+
+    let finalized = catalog
+        .finalize_native_transcript_checkpoint(&preparation, &request)
+        .unwrap();
+    assert_eq!(finalized.status, TranscriptStatus::ReviewRequired);
+    assert!(
+        finalized
+            .segments
+            .iter()
+            .any(|segment| segment.text == "REVIEW_TERMINAL_CANARY")
+    );
+    assert!(
+        catalog
+            .current_transcript_state(&asset)
+            .unwrap()
+            .is_current(),
+        "review-required is a truthful current terminal outcome, not a stale cache miss"
+    );
+    assert!(
+        catalog.prompt_transcript(&asset).unwrap().is_none(),
+        "terminal review candidates never become accepted prompt text"
+    );
+    let (scope, blockers, _) = crate::analysis::run_policy::source_scope(
+        &catalog,
+        &catalog.get_asset(&asset).unwrap(),
+        crate::analysis::run_policy::AnalysisPayload::FramesAndTranscript,
+        false,
+    );
+    assert!(blockers.is_empty());
+    assert!(
+        scope.transcript_fingerprint.is_none(),
+        "review candidates are not bound into the transcript digest"
+    );
+}
+
+#[test]
+fn frame_and_audio_only_payloads_do_not_bind_native_transcript_identity() {
+    let (_directory, catalog, _project, asset, policy, _request, _audio, _run_id, context) =
+        authorized_native_setup();
+    let request = native_policy_request();
+    let preparation = two_window_preparation(&catalog, &policy, &asset);
+    let finalized = finalize_accepted_two_window_native(
+        &catalog,
+        &policy,
+        &request,
+        &preparation,
+        &context,
+        "FRAME_ONLY_NO_LEAK_ONE",
+        "FRAME_ONLY_NO_LEAK_TWO",
+        true,
+    );
+    assert_eq!(finalized.status, TranscriptStatus::Speech);
+    let asset_row = catalog.get_asset(&asset).unwrap();
+    for payload in [
+        crate::analysis::run_policy::AnalysisPayload::Frames,
+        crate::analysis::run_policy::AnalysisPayload::Audio,
+    ] {
+        let (scope, blockers, _) =
+            crate::analysis::run_policy::source_scope(&catalog, &asset_row, payload, false);
+        assert!(blockers.is_empty());
+        assert!(
+            scope.transcript_fingerprint.is_none(),
+            "{payload:?} must not load or bind transcript content"
+        );
+    }
+}
+
+#[test]
+fn current_request_free_native_silence_is_terminal_without_provider_identity() {
+    let (_directory, catalog, _project, asset, policy, _request, _audio, _run_id, _context) =
+        authorized_native_setup();
+    let scope = policy.scope.first().unwrap();
+    let no_audio = StoredTranscript {
+        asset_id: asset.clone(),
+        recipe_key: policy.recipe_version.clone(),
+        source_fingerprint: scope.sampled_representation_fingerprint.clone().unwrap(),
+        status: TranscriptStatus::NoAudio,
+        outcome_reason: TranscriptOutcomeReason::NoAudioStream,
+        reject_reason: String::new(),
+        primary_language: String::new(),
+        speech_seconds: 0.0,
+        window_count: 0,
+        provider_segment_count: 0,
+        mean_token_probability: None,
+        repetition_ratio: None,
+        segments: Vec::new(),
+    };
+    let mut connection = catalog.connection().unwrap();
+    save_native_transcript(&mut connection, &policy.policy_id, &no_audio, &[]).unwrap();
+    drop(connection);
+    assert!(
+        catalog
+            .current_transcript_state(&asset)
+            .unwrap()
+            .is_current(),
+        "exact current request-free native silence is reusable terminal evidence"
+    );
+    let (scope, blockers, _) = crate::analysis::run_policy::source_scope(
+        &catalog,
+        &catalog.get_asset(&asset).unwrap(),
+        crate::analysis::run_policy::AnalysisPayload::FramesAndTranscript,
+        false,
+    );
+    assert!(blockers.is_empty());
+    assert!(scope.transcript_fingerprint.is_none());
+    // Simulate an immutable authorization from an earlier native tariff. Reuse
+    // validates its unchanged quality/source recipe; new writes still require
+    // the registered current financial contract.
+    let mut historical = policy.clone();
+    historical.provider_cost_bound_contract = "native.duration.historical.v0".into();
+    historical.policy_id = super::super::run_policy_identity(&historical).unwrap();
+    let mut connection = catalog.connection().unwrap();
+    connection.execute(
+        "INSERT INTO analysis_run_authorizations(policy_id,project_id,policy_json,authorized_at,accounting_contract)
+         VALUES (?1,?2,?3,'historical-authorized',?4)",
+        rusqlite::params![historical.policy_id, historical.project_id,
+            serde_json::to_string(&historical).unwrap(), crate::analysis::accounting::ANALYSIS_ACCOUNTING_SCHEMA_VERSION],
+    ).unwrap();
+    connection
+        .execute(
+            "UPDATE asset_transcripts SET native_policy_id=?1 WHERE asset_id=?2",
+            rusqlite::params![historical.policy_id, asset],
+        )
+        .unwrap();
+    assert!(
+        catalog
+            .current_transcript_state(&asset)
+            .unwrap()
+            .is_current(),
+        "current evidence reuse must not require today's tariff"
+    );
+    let error =
+        save_native_transcript(&mut connection, &historical.policy_id, &no_audio, &[]).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("registered native cost contract"),
+        "{error:#}"
+    );
+}
+
+#[test]
+fn current_unknown_cost_native_speech_remains_reusable_without_fabricating_a_financial_pass() {
+    let (_directory, catalog, _project, asset, policy, _request, _audio, _run_id, context) =
+        authorized_native_setup();
+    let request = native_policy_request();
+    let preparation = two_window_preparation(&catalog, &policy, &asset);
+    let finalized = finalize_accepted_two_window_native(
+        &catalog,
+        &policy,
+        &request,
+        &preparation,
+        &context,
+        "UNKNOWN_COST_CANARY_ONE",
+        "UNKNOWN_COST_CANARY_TWO",
+        false,
+    );
+    assert_eq!(finalized.status, TranscriptStatus::Speech);
+    let provenance = catalog
+        .native_transcript_provenance(&asset)
+        .unwrap()
+        .unwrap();
+    assert!(provenance.windows.iter().all(|window| {
+        window.accounting.request.lifecycle
+            == crate::analysis::accounting::AnalysisRequestLifecycle::Uncertain
+    }));
+    assert!(
+        catalog
+            .current_transcript_state(&asset)
+            .unwrap()
+            .is_current(),
+        "unknown cost is retained as honest uncertainty, not rewritten as a financial pass"
+    );
+    assert_eq!(
+        catalog.prompt_transcript(&asset).unwrap().unwrap().text,
+        "UNKNOWN_COST_CANARY_ONE UNKNOWN_COST_CANARY_TWO"
+    );
+}
+
 #[path = "native_checkpoint_regressions.rs"]
 mod native_checkpoint_regressions;
+
+#[path = "native_currentness_regressions.rs"]
+mod native_currentness_regressions;
