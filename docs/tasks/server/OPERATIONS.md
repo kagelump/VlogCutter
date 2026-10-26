@@ -23,6 +23,7 @@ HLC comparison is `(wallMillis, counter, nodeId, operationId)`. The local clock 
 | `labelRemoved` | `projectAsset` | `normalizedLabel`, `observedAddTags` | Removes only observed tags, so an unobserved concurrent add wins. |
 | `removedSet` | `projectAsset` | `removed` | HLC last-write-wins register. |
 | `rotationSet` | `projectAsset` | `rotationDegrees` | HLC last-write-wins register; only 0, 90, 180, and 270 are valid. |
+| `orientationDecisionSet` | `projectAsset` | `status`, `rotationDegrees` | Revision-guarded explicit visual confirmation (including the current/default value) or an explicit unresolved decision. Confirmation also writes the rotation LWW register; later rotations can make the stored confirmation visibly mismatch. |
 | `clockEventCreated` | `clock` keyed by camera | Event ID, camera, filename boundary, offset seconds, label | Requires the current camera base revision. A stale base records an unresolved conflict and leaves chronology unchanged. |
 
 Payload structs reject unknown fields and any payload version other than 1. Breaking semantics require a new operation type or payload version.

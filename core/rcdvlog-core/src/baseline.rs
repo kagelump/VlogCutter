@@ -1,9 +1,11 @@
 use crate::{Catalog, ClockEvent, ConflictProjection, MediaVerificationState, ProjectOperation};
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
+
+use crate::operations::validate_orientation_decision;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -26,6 +28,8 @@ pub struct PortableAssetBaseline {
     pub metadata_rotation_degrees: u16,
     pub default_rotation_degrees: u16,
     pub orientation_probed: bool,
+    #[serde(default)]
+    pub orientation_decision: Option<crate::OrientationDecision>,
     pub baseline_notes: String,
     pub baseline_labels: Vec<String>,
     pub baseline_removed: bool,
@@ -98,7 +102,7 @@ impl Catalog {
             [project_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
         )?;
         let mut statement = connection.prepare(
-            "SELECT id, fingerprint, filename, size_bytes, duration_seconds, frame_rate, width, height, codec, camera, captured_at_raw, best_time, offset_seconds, metadata_rotation_degrees, default_rotation_degrees, orientation_probed, notes, labels_json, removed, rotation_degrees, media_object_id, media_verification_state, created_at, timestamp_candidates_json FROM assets WHERE project_id=?1 AND COALESCE(membership_removed, 0) = 0 ORDER BY id",
+            "SELECT id, fingerprint, filename, size_bytes, duration_seconds, frame_rate, width, height, codec, camera, captured_at_raw, best_time, offset_seconds, metadata_rotation_degrees, default_rotation_degrees, orientation_probed, notes, labels_json, removed, rotation_degrees, media_object_id, media_verification_state, created_at, timestamp_candidates_json, orientation_decision_json FROM assets WHERE project_id=?1 AND COALESCE(membership_removed, 0) = 0 ORDER BY id",
         )?;
         let rows = statement
             .query_map([project_id], |row| {
@@ -127,6 +131,7 @@ impl Catalog {
                     row.get::<_, String>(21)?,
                     row.get::<_, String>(22)?,
                     row.get::<_, Option<String>>(23)?,
+                    row.get::<_, Option<String>>(24)?,
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -166,6 +171,16 @@ impl Catalog {
                 metadata_rotation_degrees: row.13 as u16,
                 default_rotation_degrees: row.14 as u16,
                 orientation_probed: row.15,
+                orientation_decision: row
+                    .24
+                    .as_deref()
+                    .map(|value| {
+                        let decision: crate::OrientationDecision = serde_json::from_str(value)
+                            .context("decode stored orientation decision")?;
+                        validate_orientation_decision(&decision.status, decision.rotation_degrees)?;
+                        Ok::<_, anyhow::Error>(decision)
+                    })
+                    .transpose()?,
                 baseline_notes,
                 baseline_labels,
                 baseline_removed,
@@ -243,13 +258,21 @@ impl Catalog {
         {
             bail!("baseline contains an empty project or asset ID");
         }
+        for asset in &snapshot.assets {
+            if let Some(decision) = &asset.orientation_decision {
+                validate_orientation_decision(&decision.status, decision.rotation_degrees)
+                    .with_context(|| {
+                        format!("invalid orientation decision for asset {}", asset.id)
+                    })?;
+            }
+        }
         let catalog = Catalog::open(database_path)?;
         catalog.set_local_node_id(local_node_id)?;
         let mut connection = catalog.connection()?;
         let transaction = connection.transaction()?;
         transaction.execute("INSERT INTO projects(id, name, created_at, origin_node_id, paired_server_node_id, paired_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)", params![snapshot.project_id, snapshot.name, snapshot.created_at, snapshot.origin_node_id, snapshot.paired_server_node_id, snapshot.paired_at])?;
         for asset in &snapshot.assets {
-            transaction.execute("INSERT INTO assets(id, project_id, fingerprint, path, filename, size_bytes, duration_seconds, frame_rate, width, height, codec, camera, captured_at_raw, best_time, offset_seconds, metadata_rotation_degrees, default_rotation_degrees, rotation_degrees, orientation_probed, notes, labels_json, removed, media_object_id, media_verification_state, created_at, timestamp_candidates_json) VALUES (?1, ?2, ?3, '', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)", params![asset.id, snapshot.project_id, asset.fingerprint, asset.filename, asset.size_bytes as i64, asset.duration_seconds, asset.frame_rate, asset.width, asset.height, asset.codec, asset.camera, asset.captured_at_raw, asset.best_time, asset.offset_seconds, asset.metadata_rotation_degrees, asset.default_rotation_degrees, asset.baseline_rotation_degrees, asset.orientation_probed, asset.baseline_notes, serde_json::to_string(&asset.baseline_labels)?, asset.baseline_removed, asset.media_object_id, asset.media_verification_state.as_str(), asset.created_at, asset.timestamp_candidates.as_ref().map(serde_json::to_string).transpose()?])?;
+            transaction.execute("INSERT INTO assets(id, project_id, fingerprint, path, filename, size_bytes, duration_seconds, frame_rate, width, height, codec, camera, captured_at_raw, best_time, offset_seconds, metadata_rotation_degrees, default_rotation_degrees, rotation_degrees, orientation_probed, notes, labels_json, removed, media_object_id, media_verification_state, created_at, timestamp_candidates_json, orientation_decision_json) VALUES (?1, ?2, ?3, '', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)", params![asset.id, snapshot.project_id, asset.fingerprint, asset.filename, asset.size_bytes as i64, asset.duration_seconds, asset.frame_rate, asset.width, asset.height, asset.codec, asset.camera, asset.captured_at_raw, asset.best_time, asset.offset_seconds, asset.metadata_rotation_degrees, asset.default_rotation_degrees, asset.baseline_rotation_degrees, asset.orientation_probed, asset.baseline_notes, serde_json::to_string(&asset.baseline_labels)?, asset.baseline_removed, asset.media_object_id, asset.media_verification_state.as_str(), asset.created_at, asset.timestamp_candidates.as_ref().map(serde_json::to_string).transpose()?, asset.orientation_decision.as_ref().map(serde_json::to_string).transpose()?])?;
             let capture_sequence_id = crate::chronology::ensure_capture_sequence_for_camera(
                 &transaction,
                 &snapshot.project_id,

@@ -107,13 +107,8 @@ fn exceptional_asset(asset: &Asset, state: PreparationState, reason: &str) -> Pr
             metadata_rotation_degrees: asset.metadata_rotation_degrees,
             default_rotation_degrees: asset.default_rotation_degrees,
             effective_rotation_degrees: asset.rotation_degrees,
-            confirmation: if asset.rotation_degrees != asset.default_rotation_degrees {
-                "explicit_override"
-            } else {
-                "confirmation_not_tracked"
-            }
-            .into(),
-            review_questions: vec![],
+            confirmation: orientation_confirmation(asset),
+            review_questions: orientation_review_questions(asset),
         },
         technical_range: None,
         range_certification: "no validated range claimed".into(),
@@ -569,21 +564,13 @@ impl Catalog {
             metadata_rotation_degrees: asset.metadata_rotation_degrees,
             default_rotation_degrees: asset.default_rotation_degrees,
             effective_rotation_degrees: asset.rotation_degrees,
-            confirmation: if asset.rotation_degrees != asset.default_rotation_degrees {
-                "explicit_override"
-            } else {
-                "confirmation_not_tracked"
-            }
-            .into(),
-            review_questions: vec![],
+            confirmation: orientation_confirmation(asset),
+            review_questions: orientation_review_questions(asset),
         };
-        if !asset.orientation_probed {
-            orientation.review_questions.push(
-                "orientation metadata has not been probed; preparation never applies a rotation"
-                    .into(),
-            );
-        }
-        if asset.width < asset.height && asset.rotation_degrees == asset.default_rotation_degrees {
+        if asset.width < asset.height
+            && asset.rotation_degrees == asset.default_rotation_degrees
+            && asset.orientation_decision.is_none()
+        {
             orientation.review_questions.push("portrait dimensions use the inferred default; human orientation confirmation is not recorded".into());
         }
         questions.extend(orientation.review_questions.clone());
@@ -1322,4 +1309,42 @@ impl Catalog {
             limit,
         })
     }
+}
+
+pub(super) fn orientation_confirmation(asset: &Asset) -> String {
+    match &asset.orientation_decision {
+        Some(decision) if decision.status == "unresolved" => "explicitly_unresolved".into(),
+        Some(decision)
+            if decision.status == "confirmed"
+                && decision.rotation_degrees == Some(asset.rotation_degrees) =>
+        {
+            "visually_confirmed".into()
+        }
+        Some(decision) if decision.status == "confirmed" => "confirmed_value_mismatch".into(),
+        _ if asset.rotation_degrees != asset.default_rotation_degrees => {
+            "explicit_override_unconfirmed".into()
+        }
+        _ => "confirmation_not_tracked".into(),
+    }
+}
+
+pub(super) fn orientation_review_questions(asset: &Asset) -> Vec<String> {
+    let mut questions = Vec::new();
+    if !asset.orientation_probed {
+        questions.push(
+            "orientation metadata has not been probed; preparation never applies a rotation".into(),
+        );
+    }
+    match orientation_confirmation(asset).as_str() {
+        "explicitly_unresolved" => questions
+            .push("orientation was explicitly left unresolved; review before preparation".into()),
+        "confirmed_value_mismatch" => questions.push(
+            "saved rotation changed since visual confirmation; reconfirm before preparation".into(),
+        ),
+        "explicit_override_unconfirmed" => {
+            questions.push("saved rotation override has not been visually confirmed".into())
+        }
+        _ => {}
+    }
+    questions
 }

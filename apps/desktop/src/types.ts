@@ -152,6 +152,8 @@ export interface Asset {
   defaultRotationDegrees: number;
   rotationDegrees: number;
   orientationProbed: boolean;
+  /** Explicit human decision; absent/null on catalogs without an orientation review yet. */
+  orientationDecision?: OrientationDecision | null;
   originalAvailable: boolean;
   proxyAvailable: boolean;
   /** Verified camera supplied `.LRF` sidecar is available for review. */
@@ -172,6 +174,12 @@ export interface Asset {
   location?: string | null;
   timezone?: string | null;
   storyBeat?: string | null;
+}
+
+export interface OrientationDecision {
+  status: "confirmed" | "unresolved";
+  /** Degrees explicitly confirmed, or null when the reviewer left it unresolved. */
+  rotationDegrees: number | null;
 }
 
 // ── Clip analysis ────────────────────────────────────────────────────

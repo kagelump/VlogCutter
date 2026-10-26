@@ -1302,6 +1302,68 @@ fn proxy_generation_preserves_orientation_annotations_chronology_and_original_by
 }
 
 #[test]
+fn preparation_marks_confirmed_default_and_stale_or_unresolved_decisions_truthfully() {
+    if !media_tools_available() {
+        return;
+    }
+    let (directory, catalog, project_id) = fixture();
+    let media_dir = directory.path().join("media");
+    fs::create_dir_all(&media_dir).unwrap();
+    make_asset(
+        &catalog,
+        &project_id,
+        &media_dir,
+        "orientation_state",
+        1,
+        false,
+    );
+    let asset = catalog.get_asset("orientation_state").unwrap();
+    let confirmed = catalog
+        .decide_orientation(
+            &asset.id,
+            asset.revision,
+            crate::OrientationDecision {
+                status: "confirmed".into(),
+                rotation_degrees: Some(asset.rotation_degrees),
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        super::catalog::orientation_confirmation(&confirmed),
+        "visually_confirmed"
+    );
+    assert!(super::catalog::orientation_review_questions(&confirmed).is_empty());
+
+    let rotated = catalog.set_rotation(&confirmed.id, 90).unwrap();
+    assert_eq!(
+        super::catalog::orientation_confirmation(&rotated),
+        "confirmed_value_mismatch"
+    );
+    assert!(
+        super::catalog::orientation_review_questions(&rotated)
+            .iter()
+            .any(|question| question.contains("reconfirm"))
+    );
+
+    let unresolved = catalog
+        .decide_orientation(
+            &rotated.id,
+            rotated.revision,
+            crate::OrientationDecision {
+                status: "unresolved".into(),
+                rotation_degrees: None,
+            },
+        )
+        .unwrap();
+    assert_eq!(unresolved.rotation_degrees, 90);
+    assert_eq!(
+        super::catalog::orientation_confirmation(&unresolved),
+        "explicitly_unresolved"
+    );
+    assert!(!super::catalog::orientation_review_questions(&unresolved).is_empty());
+}
+
+#[test]
 fn unversioned_catalog_replay_preserves_preparation_receipt_rows() {
     let (directory, catalog, project_id) = fixture();
     let original = directory.path().join("legacy-replay.mp4");
