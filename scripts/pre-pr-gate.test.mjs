@@ -34,6 +34,7 @@ function runScenario(name, { fail, missingCargo = false, emptyTests = false, wro
     }
     if (command === "rustc") return { status: 0, stdout: `rustc ${wrongRust ? "1.85.0" : "1.97.1"} (fake)\n`, stderr: "" };
     if (command === "cargo" && args.includes("test")) {
+      assert.ok(args.includes("--test-threads=4"), "full gate uses the bounded CI libtest policy");
       const summary = emptyTests
         ? "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n"
         : "test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n";
@@ -63,7 +64,7 @@ test("clean pass runs every required pre-PR check", () => {
   assert.match(result.output, /RESULT cargo clippy --workspace --all-targets -- -D warnings: PASS/);
   assert.match(result.output, /RESULT cargo test --workspace: PASS/);
   assert.match(result.output, /RESULT pnpm check:frontend: PASS/);
-  assert.match(result.output, /Gate summary \(pre-pr\): 18 passed, 0 failed\./);
+  assert.match(result.output, /Gate summary \(pre-pr\): 15 passed, 0 failed\./);
 });
 
 test("local scope requires and runs structured focused checks after baseline checks", () => {
@@ -119,7 +120,7 @@ test("format failure appears in summary and fails the gate", () => {
   const result = runScenario("format failure", { fail: "format" });
   assert.equal(result.code, 1);
   assert.match(result.output, /RESULT cargo fmt --all -- --check: FAIL \(exit 9\)/);
-  assert.match(result.output, /Gate summary \(pre-pr\): 17 passed, 1 failed\./);
+  assert.match(result.output, /Gate summary \(pre-pr\): 14 passed, 1 failed\./);
 });
 
 test("clippy failure appears in summary and fails the gate", () => {

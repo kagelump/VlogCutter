@@ -2,181 +2,147 @@
 
 ## `ci.yml`
 
-Runs on every push to `main` and every pull request targeting `main`.
+Runs for every pull request targeting `main`, main push, merge queue,
+manual dispatch, and Monday 03:17 UTC full run. There are no workflow path
+filters. The stable merge gate is **`ci-required`**.
 
-### `ubuntu` job (ubuntu-latest)
+### Concurrent verification
 
-Proves the full headless verification gate passes on Linux. The local
-equivalent is `pnpm gate` from the repository root. The local gate also checks
-committed whitespace with `git diff --check origin/main...HEAD`; fetch `origin
-committed whitespace with `git diff --check origin/main...HEAD`; run
-`git fetch origin main` when that ref is unavailable. Use
-`pnpm gate --scope fast` for quick iteration; only the default pre-PR scope is
-the CI-equivalent gate. The checked-in runner reads Rust 1.97.1 from the
-workflow, fails when a required command is absent, preserves command exit
-codes, and prints a per-check summary after running all checks. The publication
-wrapper prints candidate HEAD before the gate for the handoff receipt. It
-verifies that the workspace test command reports executed tests. Regression coverage
-runs with `node --test scripts/pre-pr-gate.test.mjs` (also part of
-`pnpm test:scripts`).
+| Job | Checks |
+| --- | --- |
+| `linux-rust (lint)` | Pinned Rust formatting and workspace/all-target Clippy with warnings denied |
+| `linux-rust (tests)` | Full workspace tests (including CLI/media integration), OpenAPI freshness |
+| `frontend` | All frontend typechecks, full desktop Vitest with coverage floors (including CUJ), web Vitest, docs, script regressions, deployment invariants |
+| `browser` | Existing desktop Chromium Playwright tier in Microsoft's official image |
+| `macos` | Desktop Rust tests and full native Tauri bundle, when platform-relevant |
+| `changes` | Conservative macOS decision, recorded in its log and step summary |
+| `ci-required` | Always evaluates every required result, including failed/cancelled/missing jobs and justified skips |
 
-For local publication, `pnpm publish:after-gate push` and
-`pnpm publish:after-gate pr` run the gate once at the boundary, then verify
-HEAD and the working-tree content before each external action. The `pr` action
-pushes the current branch and creates the PR, stopping if push fails. The
-wrapper refuses a dirty starting tree. For focused Rust iteration,
-`pnpm test:focused <cargo-package> <exact-test-name>` runs the pinned Cargo
-test with `--exact` and verifies that the requested name executed.
+Steps retain `if: ${{ !cancelled() }}` so a failed gate does not hide later
+failures. Rust matrix fail-fast is disabled. Setup failures still fail the
+job; later gates may report missing prerequisites rather than silently pass.
+No coverage threshold or test exclusion was changed. Full coverage includes
+`src/test/cuj`; `cargo test --workspace` includes `cli_workflow`. The full
+local gate no longer repeats those suites, while focused commands remain.
+`pnpm test:web:e2e` remains a separate local server/process acceptance tier;
+it was not in the previous full CI and is not part of the isolated desktop
+browser container.
 
-- Rust: formatting, clippy (deny warnings), and the full workspace test suite
-- TypeScript: type checking across all frontend packages, the desktop vitest
-  suite (extracted by D01-T003), and the web vitest suite
-- CLI integration: the process-level `cli_workflow` test, which creates a
-  real FFmpeg fixture and validates persistence, WAL reads, ingest, metadata,
-  deduplication, labels/notes/removal, clock correction, thumbnails/proxies,
-  and offline-original review
-- Documentation: OpenAPI spec freshness, link and fence validation in
-  Markdown, and deployment configuration checks
-- Repository tooling: the `node --test` suites under `scripts/`, covering the
-  docs checker and the eval-bridge address resolution that `pnpm eval` and the
-  desktop harness share
-- Desktop coverage: the vitest suite again under v8 instrumentation, against
-  the floor in `apps/desktop/vitest.config.ts`. It exists because coverage was
-  unmeasured until it was added, and the first measurement found whole features
-  — import rollback, project creation, the baseline wizard — with no journey
-  test at all. Raise the thresholds as the suite improves; lowering them to
-  turn a run green defeats the point
+### Bounded Linux setup and browser provisioning
 
-Every gate step after the first carries `if: ${{ !cancelled() }}`. A gate that
-fails still fails the job, but it no longer skips the gates behind it, so one
-run reports every problem instead of the first one. This is not cosmetic: a
-`cargo fmt` nit left `main` red from 2026-08-03 to 2026-08-09 while nine later
-checks — clippy, the whole workspace test suite, both frontend suites, the CLI
-integration test and every docs check — reported nothing at all. Add the guard
-to any gate step added here.
+Linux uses `ubuntu-24.04` instead of a moving release alias. The runner image
+still receives updates. `scripts/ci-linux-deps.sh` records installed versions,
+installs only missing FFmpeg/GTK/WebKit/AppIndicator/SVG packages, and uses
+`--no-install-recommends`. A temporary apt source list selects the signed
+Ubuntu HTTPS archive/security endpoints rather than the hosted Azure HTTP
+mirror that repeatedly trickled downloads in measured runs. The runner's own
+sources are untouched; third-party package repositories are excluded from this
+step, and the temporary source list is removed on exit. Apt has one retry, 20-second socket timeouts and a
+30-second lock timeout. Total update/install deadlines are 90/180 seconds,
+with a five-minute step deadline. A trickling download cannot keep the job
+successful after an hour. Failures retain the apt output; they require a new
+run rather than an unbounded retry loop. `pkg-config`, FFmpeg and ffprobe
+checks make a missing tool fail explicitly instead of skipping media tests.
 
-### Pinning, and why everything here is immutable
+The browser job uses
+`mcr.microsoft.com/playwright:v1.61.1-noble@sha256:cf0daee9b994042e011bc29f20cdff1a9f682a039b43fcd738f7d8a9d3bcd9d6`.
+The registry digest was verified on 2026-10-26. This official image supplies
+browsers and their OS libraries; it does not supply this project's Playwright
+npm dependency. Node/pnpm and frozen-lockfile installation still run. There is
+no runtime `playwright install`, apt or browser-library install in this job.
+`scripts/ci-browser-image.mjs` rejects a lockfile/image version mismatch; update
+the tag and verified digest together when Playwright changes. See
+[Microsoft's Docker guidance](https://playwright.dev/docs/docker).
 
-Two kinds of drift can turn this gate red without anyone changing the code, and
-both are closed.
+A custom Linux Rust container is deferred: it would need separately maintained
+GTK, FFmpeg, Clang and Rust dependencies, image publishing, and pull/cache
+measurement. First measure bounded apt on hosted runners. The official browser
+image can be measured directly through the Actions `Initialize containers`
+step; do not count pull overhead as zero.
 
-**The toolchain.** `dtolnay/rust-toolchain@stable` followed whatever stable
-release existed at run time, so a new `rustfmt` or `clippy` could reject code
-that was fine the day before — which is exactly the six-day breakage above. The
-version is now the `RUST_TOOLCHAIN` env value at the top of `ci.yml`, used by
-both jobs. Raise it deliberately: run the gate locally on the new toolchain
-first, change it in its own commit, and keep `AGENTS.md` §6 in step. The pin
-also makes `components: rustfmt, clippy` load-bearing — the action installs a
-minimal profile, and a pinned version is one the runner image does not already
-carry with those components attached.
+### Conservative macOS policy
 
-The other remedy the D01-T004 review offered for this — a root
-`rust-toolchain.toml` read by the action — was not taken. It would pin every
-contributor's local `cargo` to one version as a side effect of hardening CI,
-which contradicts the `Rust 1.85+` floor in `AGENTS.md` §6 and is a wider
-decision than this gate should make on its own. The env value keeps the pin
-where the drift was.
+Only a nonempty diff consisting entirely of **modified existing** files from
+this exact allowlist may skip macOS:
 
-**The actions.** Every `uses:` is a commit SHA with the human-readable version
-in a trailing comment. A tag is mutable: whoever owns the action's repository
-can repoint `v4` at new code, and a workflow that trusts a tag runs whatever
-that account publishes next, with this repository's checkout in front of it. A
-SHA cannot be repointed. `.github/dependabot.yml` proposes the upgrades so the
-pins do not quietly rot; it rewrites both the SHA and the version comment.
+- `deploy/server/Caddyfile`
+- `deploy/server/compose.yaml`
+- `deploy/server/example.env`
+
+These configure the Linux companion deployment and are not inputs to desktop
+compilation or packaging. All new/deleted/renamed files run macOS, as do the
+Dockerfile, server Rust (shared dependencies/features), shared core, frontend,
+Cargo/npm manifests, tooling, workflows, docs, mixed diffs, and unknown paths.
+There is intentionally no broad `apps/server/**`, `core/**` or docs-only skip.
+
+PRs use the base/head merge-base diff, including forks. Main pushes compare
+before/after. Missing SHAs, missing objects, malformed diffs, initial pushes,
+empty diffs and detector failure run macOS. Manual dispatch, merge groups and
+weekly scheduled runs always run macOS. The decision job logs the skip reason
+and writes it to the summary. Regression coverage is in
+`scripts/ci-policy.test.mjs` and includes aggregate skip/failure combinations.
+
+### Required checks and rollout
+
+On 2026-10-26 the branch-protection endpoint reported `Branch not protected`
+and the repository rulesets endpoint returned an empty list. There is no
+existing required-check configuration to migrate. If branch protection is
+enabled, require **only `ci-required`** (GitHub Actions) rather than the old
+`ubuntu`/`macos` names or optional jobs. Requiring `macos` directly defeats
+conditional skipping. The aggregate explicitly requires detector success,
+all Linux checks, and macOS success unless the detector explicitly permitted
+a skip; an absent output cannot permit one. It runs with `always()` so failed
+or skipped dependencies cannot leave the merge gate Pending. See
+[GitHub workflow syntax](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax).
+
+### Local verification and publication
+
+`pnpm gate --checks /absolute/path/checks.json` runs candidate whitespace,
+the pinned formatter/toolchain, workspace Clippy, frontend typechecking, and
+structured focused commands. Use `pnpm gate --scope fast` only for iteration.
+`pnpm gate --scope pre-pr` runs the full Linux-equivalent coverage sequentially
+on a provisioned local machine; install browser/media prerequisites first.
+Neither scope proves native macOS behavior. Before merge, require all relevant
+exact-head CI results and inspect failures. Run `pnpm publish:after-gate push`
+or `pnpm publish:after-gate pr` with `--checks` to publish a clean, verified
+candidate; the wrapper rechecks identity before external actions.
+
+### Pins, cache and disk
+
+Rust 1.97.1, Node 24.11.0, pnpm 10.17.0 and all action commit pins remain
+explicit. Rust components include rustfmt/Clippy. Keep `AGENTS.md` section 6
+in step with deliberate toolchain updates. `Swatinem/rust-cache` prunes
+workspace artifacts before saving, with `cache-on-failure: true`; plain caches
+of the roughly 14 GB target tree grow without pruning. The Rust matrix uses distinct lint/tests cache keys so the first job to finish
+cannot save a lint-only cache for the test job. Separate Rust jobs increase
+cold build/cache and runner-minute costs; measure them alongside
+wall-clock improvement. Rust workers reclaim unused SDKs before building only if less than 40 GiB is
+free, leaving `/opt/hostedtoolcache` intact. Measured runners already had 86 GiB
+free, while unconditional deletion took 49–111 seconds. The reserve comfortably
+covers the measured roughly 14 GB target tree plus cache/setup overhead.
+
+Workspace tests retain Cargo/libtest with **four test workers** (also in the
+full local gate); there is no nextest, sharding, filtering, retry or assertion
+change. A prior libtest-default run spent 269 seconds in the 916-test core
+binary and 210 seconds in the 155-test server core binary. The bounded worker
+increase must pass the same complete suite, including SQLite, file-lock,
+financial and concurrency cases, before merge. Compare executed/ignored counts
+in the benchmark receipt; do not treat lower counts as a speed improvement.
 
 ### Untrusted pull requests
 
-The repository's destination is public, so anyone can fork it and open a pull
-request, and PR code must be treated as untrusted.
-
-- The trigger stays `pull_request`. It runs fork code with a token scoped to
-  the fork and no access to this repository's secrets. `pull_request_target`
-  runs the same untrusted code with the *base* repository's write-capable
-  token; do not introduce it here for any convenience.
-- `permissions: contents: read` is declared at the workflow level, so the
-  token is read-only even on `main` pushes. Nothing in this gate writes to the
-  repository. A future step that genuinely needs more takes it at the job
-  level, at the smallest scope that works.
-- No step reads a secret, so there is nothing for a fork PR to exfiltrate
-  through a build script or a test.
-- Caches are written by the base repository's runs and are read-only to fork
-  PRs, so a fork cannot poison a cache entry that a later trusted run restores.
-- Artifacts are per-run, and this workflow uploads none.
-
-### Disk
-
-The job reclaims disk before it builds anything, and this is load-bearing rather
-than tidy. A full debug `target/` for this workspace is about 14 GB: whisper.cpp
-through `whisper-rs-sys`, the webkit2gtk bindings, a bundled SQLite, axum and
-reqwest — and several of those are built more than once, because each cargo
-invocation that narrows the package graph (`cargo run -p rcdvlog-server`, as
-`check:openapi` does) resolves features differently from `cargo test
---workspace` and gets its own metadata hash. A local tree carries ten separate
-`whisper-rs-sys` build directories for exactly that reason.
-
-That is close enough to the runner image's free space that a job can finish nine
-gates and then fail on the tenth with `No space left on device` from `ar`, which
-reads as a broken step rather than a full disk. Removing the Android SDK, .NET,
-GHC, Boost and Swift frees roughly 15 GB and is the difference between "barely
-fits" and "comfortable". `/opt/hostedtoolcache` is left alone because Node lives
-there. The step prints `df -h` on both sides so the next disk problem is one
-glance rather than log archaeology.
-
-### The Rust cache
-
-`Cache Rust` is `Swatinem/rust-cache`, not a bare `actions/cache` over
-`target/`, and the difference is that it prunes before it saves.
-
-A plain cache of `target/` only grows. It restores under a `Cargo.lock` hash
-with a broad fallback key, so any lockfile change restores the *previous*
-target directory, builds the new artifacts alongside the old ones, and saves
-both. Nothing ever removes the artifacts of a dependency version no longer in
-the graph, and nothing removes the workspace's own binaries, which are rebuilt
-every run anyway and are the largest single thing in the tree — a local
-`target/debug/deps` holds 5.3 GB of them across 190 files, including three
-separate ~300 MB `rcdvlog_desktop` test binaries left over from earlier builds
-and one 891 MB `librcdvlog_desktop_lib.a`. GitHub caps a repository at 10 GB of
-cache and evicts least-recently-used entries to stay under it, so an
-ever-growing Rust entry does not just waste space, it pushes every other cache
-out and eventually cannot be stored at all.
-
-`rust-cache` cleans the target directory in its post step: it drops workspace
-member artifacts, `examples`, incremental state, and dependency artifacts that
-are no longer in the resolved graph, keeping the expensive external builds —
-`whisper-rs-sys`'s compiled whisper.cpp among them. Its key also includes the
-rustc version, so a toolchain bump gets a fresh entry instead of layering on an
-incompatible one.
-
-`cache-on-failure: true` is set deliberately. Now that every gate runs even
-after one fails, a single red gate would otherwise cost the following run its
-cache as well, turning one failure into two slow runs.
-
-Expect the first run after this change to be slow: it starts from a cold cache
-under a new key. The disk reclaim above stays regardless — the working
-`target/` is still ~14 GB during a run whatever ends up cached.
-
-### `macos` job (macos-latest)
-
-Proves what the `ubuntu` job cannot: that the native macOS desktop bundle
-compiles and that the Tauri-specific Rust crate (`rcdvlog-desktop`) passes its
-own test suite. This job exists because the desktop is the product, and a gate
-that never compiles it is not a gate.
-
-The `cargo test -p rcdvlog-desktop` step runs before `tauri build` so that a
-test failure surfaces faster than waiting through a full native compile.
+Keep `pull_request`, never `pull_request_target`, with workflow-level
+`contents: read`, SHA-pinned actions, and no secrets in steps. Fork PRs cannot
+restore their caches into trusted main runs (GitHub cache scope rules); same
+repository contributors still require review. No job publishes images/packages
+or writes repository state. The container runs only the checkout's local test
+app; it does not browse external untrusted sites. Manual dispatches are full
+runs and must not be used to expose credentials to candidate code.
 
 ### What CI does not prove
 
-These items from `AGENTS.md` §12 ("do not pretend headless tests validate")
-are not and cannot be proven by CI:
-
-- DaVinci Resolve import
-- macOS dialogs and filesystem permission prompts
-- Native media playback in the Tauri webview
-- Sleep/wake or source-volume disconnect/reconnect
-- Expo-scale NAS performance
-- Ubuntu/Compose restart and real NFS/SMB mount behavior
-- LAN Caddy trust, Tailscale Serve/ACLs, and endpoint failover
-- Target-laptop CPU/RSS/thermal behavior
-- Playwright web end-to-end tests (`pnpm test:web:e2e` needs browser downloads
-  and a running server, and stays a local manual check)
+CI does not prove Resolve import, native dialogs/permissions/playback,
+sleep/wake or volume reconnect, NAS scale, real Ubuntu/Compose/NFS/SMB
+restart behavior, LAN Caddy trust or Tailscale topology, signing/notarization,
+or laptop CPU/RSS/thermals. Browser tests prove Chromium behavior against the
+in-memory IPC harness, not native media/persistence. See `AGENTS.md` section 12.

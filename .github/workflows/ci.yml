@@ -1,9 +1,3 @@
-# Every gate step carries `if: ${{ !cancelled() }}` so that one red step
-# reports one failure rather than hiding every later one. Before this, a
-# formatting nit in `cargo fmt` skipped clippy, the whole test suite, both
-# frontend suites and every docs check, and main stayed red for six days
-# looking like a single trivial problem. Keep the guard on any gate added here.
-
 name: ci
 
 on:
@@ -11,9 +5,13 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  merge_group:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 3 * * 1"
 
 # Anyone can fork a public repository and open a pull request, so PR code is
-# untrusted code. `pull_request` runs it with a token scoped to the fork and no
+# untrusted code. `pull_request` runs fork code with a read-only token and no
 # access to this repository's secrets; `pull_request_target` would run the same
 # code against the base repository's write-capable token, which is the one thing
 # this workflow must never do. Keep the trigger, and keep the token read-only —
@@ -30,33 +28,45 @@ env:
   NODE_VERSION: "24.11.0"
   PNPM_VERSION: "10.17.0"
 
+# Required check: ci-required. Never add workflow-level path filters.
 jobs:
-  ubuntu:
-    runs-on: ubuntu-latest
+  changes:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    outputs:
+      macos: ${{ steps.platform.outputs.macos }}
+      reason: ${{ steps.platform.outputs.reason }}
     steps:
-      # Every action below is pinned to an immutable commit rather than a
-      # moving tag: a tag can be repointed at new code by whoever owns it, and
-      # a workflow that trusts one is running whatever that account decides to
-      # publish. The trailing comment is the human-readable version, and is
-      # what Dependabot rewrites when it proposes an upgrade — see
-      # `.github/dependabot.yml`.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - name: Install Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - name: Classify macOS impact (fail closed)
+        id: platform
+        run: node scripts/ci-platform.mjs
 
-      # This workspace's debug `target/` is ~14 GB — whisper.cpp, the webkit2gtk
-      # bindings, a bundled SQLite, axum and reqwest, built once per feature
-      # resolution — which does not comfortably fit in the runner image's free
-      # space. Reclaim the SDKs nothing here uses before anything writes to disk.
-      # `/opt/hostedtoolcache` is deliberately untouched: Node lives there.
+  linux-rust:
+    name: linux-rust (${{ matrix.gate }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        gate: [lint, tests]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Free disk space
         run: |
           df -h /
-          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
-            /usr/local/.ghcup /usr/local/share/boost /usr/share/swift || true
+          available_kb=$(df -Pk / | awk 'NR == 2 {print $4}')
+          if (( available_kb < 40 * 1024 * 1024 )); then
+            sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+              /usr/local/.ghcup /usr/local/share/boost /usr/share/swift
+          fi
           df -h /
-
-      # `components` is explicit because this pin installs a toolchain the
-      # runner image does not already carry, under a minimal profile: without
-      # it the first two gates below fail on a missing rustfmt and clippy.
       - name: Install Rust ${{ env.RUST_TOOLCHAIN }}
         uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
@@ -73,86 +83,67 @@ jobs:
         with:
           version: ${{ env.PNPM_VERSION }}
 
-      - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y ffmpeg libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev
-
-      # Prunes the target directory before saving, which plain `actions/cache`
-      # cannot do — see the workflow README. `cache-on-failure` matters here
-      # because every gate runs now: one red gate should not also cost the next
-      # run its cache. A fork PR reads the base repository's cache and cannot
-      # write to it, so nothing a fork builds is ever restored into a later run.
+      - name: Install system dependencies (bounded)
+        timeout-minutes: 5
+        run: bash scripts/ci-linux-deps.sh
       - name: Cache Rust
         uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
         with:
           cache-on-failure: true
+          # Matrix jobs produce different artifacts; avoid a first-writer cache race.
+          key: ${{ matrix.gate }}
 
       - name: Install JS dependencies
         run: pnpm install --frozen-lockfile
-
       - name: cargo fmt --all -- --check
+        if: ${{ !cancelled() && matrix.gate == 'lint' }}
         run: cargo fmt --all -- --check
-
       - name: cargo clippy --workspace --all-targets -- -D warnings
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && matrix.gate == 'lint' }}
         run: cargo clippy --workspace --all-targets -- -D warnings
-
       - name: cargo test --workspace
-        if: ${{ !cancelled() }}
-        run: cargo test --workspace
+        if: ${{ !cancelled() && matrix.gate == 'tests' }}
+        run: |
+          nproc
+          lscpu
+          /usr/bin/time -v cargo test --workspace -- --test-threads=4
+      - name: pnpm check:openapi
+        if: ${{ !cancelled() && matrix.gate == 'tests' }}
+        run: pnpm check:openapi
 
+  frontend:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - name: Install JS dependencies
+        run: pnpm install --frozen-lockfile
       - name: pnpm check:frontend
         if: ${{ !cancelled() }}
         run: pnpm check:frontend
 
-      - name: pnpm test:desktop
-        if: ${{ !cancelled() }}
-        run: pnpm test:desktop
-
-      # The fast CUJ tier also runs inside `test:desktop` above. It has its own
-      # step so a failure in the full-journey layer is legible at a glance
-      # rather than buried among four hundred unit and component tests.
-      - name: pnpm test:desktop:cuj
-        if: ${{ !cancelled() }}
-        run: pnpm test:desktop:cuj
-
-      # Coverage runs the same vitest suite again with instrumentation and a
-      # floor, so a change that adds an unexercised branch is visible in the
-      # run that introduced it rather than a quarter later. The thresholds live
-      # in `apps/desktop/vitest.config.ts`.
       - name: pnpm test:desktop:coverage
         if: ${{ !cancelled() }}
         run: pnpm test:desktop:coverage
-
-      # The desktop real-browser tier (issue #22) needs a Chromium and its
-      # system libraries; the gate step below drives it through the Vite
-      # preview. Kept as its own install so a browser-download failure is
-      # legible rather than folded into the gate.
-      - name: Install Playwright Chromium (desktop)
-        if: ${{ !cancelled() }}
-        run: pnpm --dir apps/desktop exec playwright install --with-deps chromium
-
-      - name: pnpm test:desktop:browser
-        if: ${{ !cancelled() }}
-        run: pnpm test:desktop:browser
 
       - name: pnpm test:web
         if: ${{ !cancelled() }}
         run: pnpm test:web
 
-      - name: pnpm test:integration
-        if: ${{ !cancelled() }}
-        run: pnpm test:integration
-
-      - name: pnpm check:openapi
-        if: ${{ !cancelled() }}
-        run: pnpm check:openapi
-
       - name: pnpm check:docs
         if: ${{ !cancelled() }}
         run: pnpm check:docs
 
-      # The repository's own tooling — the docs checker and the eval-bridge
-      # address resolution that the desktop harness and `pnpm eval` share.
       - name: pnpm test:scripts
         if: ${{ !cancelled() }}
         run: pnpm test:scripts
@@ -161,11 +152,49 @@ jobs:
         if: ${{ !cancelled() }}
         run: pnpm check:deployment
 
-  macos:
-    runs-on: macos-latest
+  browser:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    container:
+      # Match pnpm-lock.yaml; immutable Microsoft image includes browsers + OS libs.
+      image: mcr.microsoft.com/playwright:v1.61.1-noble@sha256:cf0daee9b994042e011bc29f20cdff1a9f682a039b43fcd738f7d8a9d3bcd9d6
+      options: --ipc=host
+    env:
+      PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
 
+      - name: Install pnpm
+        uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - name: Install JS dependencies
+        run: pnpm install --frozen-lockfile
+      - name: node scripts/ci-browser-image.mjs
+        if: ${{ !cancelled() }}
+        run: node scripts/ci-browser-image.mjs
+
+      - name: pnpm test:desktop:browser
+        if: ${{ !cancelled() }}
+        run: pnpm test:desktop:browser
+
+  macos:
+    needs: changes
+    # A failed detector or absent output must run macOS, not silently skip it.
+    if: ${{ !cancelled() && needs.changes.outputs.macos != 'false' }}
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Platform decision
+        env:
+          REASON: ${{ needs.changes.outputs.reason }}
+        run: echo "${REASON:-Change detection unavailable; running macOS}"
       - name: Install Rust ${{ env.RUST_TOOLCHAIN }}
         uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
@@ -182,8 +211,16 @@ jobs:
         with:
           version: ${{ env.PNPM_VERSION }}
 
-      - name: Install system dependencies
-        run: brew install ffmpeg
+      - name: Install system dependencies (bounded)
+        timeout-minutes: 5
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+        run: |
+          if ! command -v ffmpeg >/dev/null || ! command -v ffprobe >/dev/null; then
+            brew install ffmpeg
+          fi
+          ffmpeg -version | head -n 1
+          ffprobe -version | head -n 1
 
       # Prunes the target directory before saving, which plain `actions/cache`
       # cannot do — see the workflow README. `cache-on-failure` matters here
@@ -203,3 +240,15 @@ jobs:
       - name: pnpm --dir apps/desktop tauri build
         if: ${{ !cancelled() }}
         run: pnpm --dir apps/desktop tauri build
+
+  ci-required:
+    if: ${{ always() }}
+    needs: [changes, linux-rust, frontend, browser, macos]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Verify all required results
+        env:
+          CI_NEEDS: ${{ toJSON(needs) }}
+        run: node scripts/ci-required.mjs
