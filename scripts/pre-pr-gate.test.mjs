@@ -34,6 +34,7 @@ function runScenario(name, { fail, missingCargo = false, emptyTests = false, wro
     }
     if (command === "rustc") return { status: 0, stdout: `rustc ${wrongRust ? "1.85.0" : "1.97.1"} (fake)\n`, stderr: "" };
     if (command === "cargo" && args.includes("test")) {
+      assert.ok(args.includes("--test-threads=4"), "full gate uses the bounded CI libtest policy");
       const summary = emptyTests
         ? "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n"
         : "test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n";

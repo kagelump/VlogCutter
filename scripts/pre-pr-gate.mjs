@@ -81,7 +81,7 @@ export function runGate({ args = process.argv.slice(2), spawn = spawnSync, write
   } else {
     checks.push(
       rust("cargo clippy --workspace --all-targets -- -D warnings", ["clippy", "--workspace", "--all-targets", "--", "-D", "warnings"]),
-      { name: "cargo test --workspace", command: "cargo", args: [`+${rustToolchain}`, "test", "--workspace"], requireTests: true },
+      { name: "cargo test --workspace", command: "cargo", args: [`+${rustToolchain}`, "test", "--workspace", "--", "--test-threads=4"], requireTests: true },
       { name: "pnpm check:frontend", command: "pnpm", args: ["check:frontend"] },
       { name: "pnpm test:desktop:coverage", command: "pnpm", args: ["test:desktop:coverage"] },
       { name: "pnpm test:desktop:browser", command: "pnpm", args: ["test:desktop:browser"] },

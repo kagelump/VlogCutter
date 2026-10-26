@@ -61,8 +61,11 @@ jobs:
       - name: Free disk space
         run: |
           df -h /
-          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
-            /usr/local/.ghcup /usr/local/share/boost /usr/share/swift
+          available_kb=$(df -Pk / | awk 'NR == 2 {print $4}')
+          if (( available_kb < 40 * 1024 * 1024 )); then
+            sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+              /usr/local/.ghcup /usr/local/share/boost /usr/share/swift
+          fi
           df -h /
       - name: Install Rust ${{ env.RUST_TOOLCHAIN }}
         uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
@@ -100,7 +103,7 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: cargo test --workspace
         if: ${{ !cancelled() && matrix.gate == 'tests' }}
-        run: /usr/bin/time -v cargo test --workspace
+        run: /usr/bin/time -v cargo test --workspace -- --test-threads=4
       - name: pnpm check:openapi
         if: ${{ !cancelled() && matrix.gate == 'tests' }}
         run: pnpm check:openapi

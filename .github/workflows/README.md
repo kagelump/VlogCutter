@@ -116,9 +116,18 @@ workspace artifacts before saving, with `cache-on-failure: true`; plain caches
 of the roughly 14 GB target tree grow without pruning. The Rust matrix uses distinct lint/tests cache keys so the first job to finish
 cannot save a lint-only cache for the test job. Separate Rust jobs increase
 cold build/cache and runner-minute costs; measure them alongside
-wall-clock improvement. Rust workers reclaim unused SDKs before building,
-leaving `/opt/hostedtoolcache` intact. No nextest or test-thread policy change
-is made: SQLite/file-lock/concurrency behavior retains Cargo's existing runner.
+wall-clock improvement. Rust workers reclaim unused SDKs before building only if less than 40 GiB is
+free, leaving `/opt/hostedtoolcache` intact. Measured runners already had 86 GiB
+free, while unconditional deletion took 49–111 seconds. The reserve comfortably
+covers the measured roughly 14 GB target tree plus cache/setup overhead.
+
+Workspace tests retain Cargo/libtest with **four test workers** (also in the
+full local gate); there is no nextest, sharding, filtering, retry or assertion
+change. The default two-worker run spent 269 seconds in the 916-test core
+binary and 210 seconds in the 155-test server core binary. The bounded worker
+increase must pass the same complete suite, including SQLite, file-lock,
+financial and concurrency cases, before merge. Compare executed/ignored counts
+in the benchmark receipt; do not treat lower counts as a speed improvement.
 
 ### Untrusted pull requests
 
