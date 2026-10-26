@@ -109,8 +109,9 @@ Rust 1.97.1, Node 24.11.0, pnpm 10.17.0 and all action commit pins remain
 explicit. Rust components include rustfmt/Clippy. Keep `AGENTS.md` section 6
 in step with deliberate toolchain updates. `Swatinem/rust-cache` prunes
 workspace artifacts before saving, with `cache-on-failure: true`; plain caches
-of the roughly 14 GB target tree grow without pruning. Separate Rust jobs
-increase cold build/cache and runner-minute costs; measure them alongside
+of the roughly 14 GB target tree grow without pruning. The Rust matrix uses distinct lint/tests cache keys so the first job to finish
+cannot save a lint-only cache for the test job. Separate Rust jobs increase
+cold build/cache and runner-minute costs; measure them alongside
 wall-clock improvement. Rust workers reclaim unused SDKs before building,
 leaving `/opt/hostedtoolcache` intact. No nextest or test-thread policy change
 is made: SQLite/file-lock/concurrency behavior retains Cargo's existing runner.

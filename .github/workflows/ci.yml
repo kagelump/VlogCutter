@@ -87,6 +87,8 @@ jobs:
         uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
         with:
           cache-on-failure: true
+          # Matrix jobs produce different artifacts; avoid a first-writer cache race.
+          key: ${{ matrix.gate }}
 
       - name: Install JS dependencies
         run: pnpm install --frozen-lockfile
@@ -203,8 +205,16 @@ jobs:
         with:
           version: ${{ env.PNPM_VERSION }}
 
-      - name: Install system dependencies
-        run: brew install ffmpeg
+      - name: Install system dependencies (bounded)
+        timeout-minutes: 5
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+        run: |
+          if ! command -v ffmpeg >/dev/null || ! command -v ffprobe >/dev/null; then
+            brew install ffmpeg
+          fi
+          ffmpeg -version | head -n 1
+          ffprobe -version | head -n 1
 
       # Prunes the target directory before saving, which plain `actions/cache`
       # cannot do — see the workflow README. `cache-on-failure` matters here
