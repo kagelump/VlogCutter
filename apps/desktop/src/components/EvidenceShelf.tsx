@@ -69,6 +69,8 @@ export function EvidenceShelf({
 }: EvidenceShelfProps) {
   const segments = transcript?.segments ?? [];
   const reviewRequired = transcript?.status === "review_required";
+  const nativeCoverageIncomplete =
+    transcript?.outcomeReason === "native_coverage_incomplete";
   const badge = transcriptBadge(transcript);
   const attention = analysisNeedsAttention(observation);
   const activeSegment = activeSegmentIndex(segments, positionSeconds);
@@ -174,6 +176,8 @@ export function EvidenceShelf({
                     "Speech was detected, but the transcriber returned no usable text."
                   ) : transcript.status === "review_required" ? (
                     "This transcript needs review because quality evidence is incomplete; no candidate text was retained."
+                  ) : transcript.outcomeReason === "native_coverage_incomplete" ? (
+                    "Transcription is incomplete; retained candidate text is unaccepted."
                   ) : (
                     transcript.rejectReason || transcriptStatusLabels[transcript.status]
                   )
@@ -191,6 +195,16 @@ export function EvidenceShelf({
                   >
                     <strong>Transcript needs review.</strong> Quality evidence is incomplete.
                     Check these candidate lines against the clip before using them.
+                  </div>
+                )}
+                {nativeCoverageIncomplete && (
+                  <div
+                    className="transcript-review-warning"
+                    role="note"
+                    aria-label="Transcription incomplete"
+                  >
+                    <strong>Transcription is incomplete.</strong> Retained candidate text is
+                    unaccepted and must not be treated as a full transcript.
                   </div>
                 )}
                 {followSuspended && (

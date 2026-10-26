@@ -57,7 +57,7 @@ fn running_pilot(policy: &RunPolicy, run_id: &str, asset_id: &str) -> RunPilotRe
     }
 }
 
-fn install_running_pilot(
+pub(super) fn install_running_pilot(
     catalog: &Catalog,
     policy: &RunPolicy,
     run_id: &str,

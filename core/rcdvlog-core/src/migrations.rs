@@ -7,7 +7,7 @@ use thiserror::Error;
 
 use crate::chronology::forward_migrate_project_chronology;
 
-pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 44;
+pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 45;
 
 const MIGRATION_TABLE_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -347,6 +347,12 @@ pub const PROJECT_CATALOG_MIGRATIONS: &[SqliteMigration] = &[
         name: "native_no_provider_pilot_status",
         source_identity: "project-catalog/0044-native-no-provider-pilot-status/20261029",
         apply: add_native_no_provider_pilot_status,
+    },
+    SqliteMigration {
+        id: 45,
+        name: "native_transcript_window_checkpoint",
+        source_identity: "project-catalog/0045-native-transcript-window-checkpoint/20261030",
+        apply: add_native_transcript_window_checkpoint,
     },
 ];
 
@@ -946,6 +952,88 @@ fn add_native_no_provider_pilot_status(transaction: &Transaction<'_>) -> Result<
         ALTER TABLE analysis_run_pilots_v44 RENAME TO analysis_run_pilots;
         CREATE INDEX IF NOT EXISTS analysis_run_pilots_project
             ON analysis_run_pilots(project_id, started_at DESC);
+        "#,
+    )?;
+    Ok(())
+}
+
+/// Migration 45. Retain an incomplete native speech window plan and its
+/// semantic identity on the existing transcript header.
+///
+/// The two nullable columns are written together by the native checkpoint
+/// owner. The plan JSON is a typed, versioned `Vec<PackedWindow>`; the
+/// fingerprint binds it to the frozen policy/recipe/source identity. Existing
+/// complete native rows without a plan remain readable and are not
+/// reconstructed. No audio, provider body, path or financial value is stored
+/// here, and the existing native child table/FKs/indexes are preserved by the
+/// additive ALTER TABLE.
+fn add_native_transcript_window_checkpoint(transaction: &Transaction<'_>) -> Result<()> {
+    add_column_if_missing(
+        transaction,
+        "asset_transcripts",
+        "native_window_plan_json",
+        "TEXT",
+    )?;
+    add_column_if_missing(
+        transaction,
+        "asset_transcripts",
+        "native_window_plan_fingerprint",
+        "TEXT",
+    )?;
+    transaction.execute_batch(
+        r#"
+        CREATE TRIGGER IF NOT EXISTS asset_transcripts_native_window_plan_pair_insert
+        BEFORE INSERT ON asset_transcripts
+        WHEN (NEW.native_window_plan_json IS NULL) != (NEW.native_window_plan_fingerprint IS NULL)
+          OR (NEW.native_window_plan_json IS NOT NULL AND
+              (NOT json_valid(NEW.native_window_plan_json)
+               OR COALESCE(json_type(NEW.native_window_plan_json, '$.windows'), '') != 'array'
+               OR json_array_length(NEW.native_window_plan_json, '$.windows') = 0
+               OR length(NEW.native_window_plan_fingerprint) != 64
+               OR NEW.native_window_plan_fingerprint GLOB '*[^0-9a-f]*'))
+        BEGIN
+            SELECT RAISE(ABORT, 'native transcript window plan and fingerprint must be present together and well formed');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS asset_transcripts_native_window_plan_pair_update
+        BEFORE UPDATE OF native_window_plan_json, native_window_plan_fingerprint ON asset_transcripts
+        WHEN (NEW.native_window_plan_json IS NULL) != (NEW.native_window_plan_fingerprint IS NULL)
+          OR (NEW.native_window_plan_json IS NOT NULL AND
+              (NOT json_valid(NEW.native_window_plan_json)
+               OR COALESCE(json_type(NEW.native_window_plan_json, '$.windows'), '') != 'array'
+               OR json_array_length(NEW.native_window_plan_json, '$.windows') = 0
+               OR length(NEW.native_window_plan_fingerprint) != 64
+               OR NEW.native_window_plan_fingerprint GLOB '*[^0-9a-f]*'))
+        BEGIN
+            SELECT RAISE(ABORT, 'native transcript window plan and fingerprint must be present together and well formed');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS asset_transcripts_native_coverage_incomplete_insert
+        BEFORE INSERT ON asset_transcripts
+        WHEN NEW.outcome_reason = 'native_coverage_incomplete'
+          AND (NEW.status != 'failed'
+               OR NEW.native_policy_id IS NULL
+               OR NEW.native_quality_recipe_version IS NULL
+               OR NEW.native_window_plan_json IS NULL
+               OR NEW.native_window_plan_fingerprint IS NULL)
+        BEGIN
+            SELECT RAISE(ABORT, 'native coverage incomplete requires the native checkpoint owner and a complete plan');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS asset_transcripts_native_coverage_incomplete_update
+        BEFORE UPDATE OF status, outcome_reason, native_policy_id,
+                          native_quality_recipe_version, native_window_plan_json,
+                          native_window_plan_fingerprint
+        ON asset_transcripts
+        WHEN NEW.outcome_reason = 'native_coverage_incomplete'
+          AND (NEW.status != 'failed'
+               OR NEW.native_policy_id IS NULL
+               OR NEW.native_quality_recipe_version IS NULL
+               OR NEW.native_window_plan_json IS NULL
+               OR NEW.native_window_plan_fingerprint IS NULL)
+        BEGIN
+            SELECT RAISE(ABORT, 'native coverage incomplete requires the native checkpoint owner and a complete plan');
+        END;
         "#,
     )?;
     Ok(())
@@ -3055,6 +3143,8 @@ mod tests {
                 "created_at",
                 "native_policy_id",
                 "native_quality_recipe_version",
+                "native_window_plan_json",
+                "native_window_plan_fingerprint",
             ]
         );
 
@@ -3745,9 +3835,9 @@ mod tests {
                 .unwrap()
         };
         assert_eq!(&history_after[..history_before.len()], &history_before[..]);
-        assert_eq!(history_after.len(), history_before.len() + 2);
+        assert_eq!(history_after.len(), history_before.len() + 3);
         assert_eq!(history_after[history_before.len()].0, 43);
-        assert_eq!(history_after.last().unwrap().0, 44);
+        assert_eq!(history_after.last().unwrap().0, 45);
         let fk_violations: i64 = connection
             .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
                 row.get(0)
@@ -4188,6 +4278,155 @@ mod tests {
                     [],
                 )
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn migration_45_admits_incomplete_native_plan_without_rebuilding_native_children() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        run_sqlite_migrations(&mut connection, &PROJECT_CATALOG_MIGRATIONS[..44]).unwrap();
+        assert!(
+            !column_exists(&connection, "asset_transcripts", "native_window_plan_json").unwrap()
+        );
+        let native_columns_before: Vec<String> = connection
+            .prepare("SELECT name FROM pragma_table_info('native_transcript_windows') ORDER BY cid")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        let native_fk_count_before: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_foreign_key_list('native_transcript_windows')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let native_index_count_before: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_index_list('native_transcript_windows')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        connection
+            .execute_batch(
+                r#"
+                INSERT INTO projects(id,name,created_at) VALUES ('p45','project','2026-01-01T00:00:00Z');
+                INSERT INTO assets(id,project_id,fingerprint,path,filename,size_bytes,duration_seconds,created_at)
+                    VALUES ('a45','p45','source-fp','/clip.mp4','clip.mp4',1,9.0,'2026-01-01T00:00:00Z');
+                INSERT INTO assets(id,project_id,fingerprint,path,filename,size_bytes,duration_seconds,created_at)
+                    VALUES ('a45-complete','p45','source-fp-2','/clip2.mp4','clip2.mp4',1,9.0,'2026-01-01T00:00:00Z');
+                "#,
+            )
+            .unwrap();
+
+        migrate_project_catalog(&mut connection).unwrap();
+        assert!(
+            column_exists(&connection, "asset_transcripts", "native_window_plan_json").unwrap()
+        );
+        assert!(
+            column_exists(
+                &connection,
+                "asset_transcripts",
+                "native_window_plan_fingerprint"
+            )
+            .unwrap()
+        );
+        let native_columns_after: Vec<String> = connection
+            .prepare("SELECT name FROM pragma_table_info('native_transcript_windows') ORDER BY cid")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(native_columns_after, native_columns_before);
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_foreign_key_list('native_transcript_windows')",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            native_fk_count_before
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_index_list('native_transcript_windows')",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            native_index_count_before
+        );
+
+        assert!(
+            connection
+                .execute(
+                    "INSERT INTO asset_transcripts
+                        (asset_id,recipe_key,source_kind,source_fingerprint,status,outcome_reason,
+                         reject_reason,primary_language,speech_seconds,window_count,
+                         provider_segment_count,mean_token_probability,repetition_ratio,created_at,
+                         native_policy_id,native_quality_recipe_version)
+                     VALUES ('a45','native.recipe','proxy','sampled-fp','failed','native_coverage_incomplete',
+                             '','en',1.0,0,0,NULL,NULL,'2026-01-01T00:00:01Z',
+                             'policy45','native-stt.quality.v1')",
+                    [],
+                )
+                .is_err(),
+            "incomplete native coverage cannot be written without a positive plan"
+        );
+        connection
+            .execute(
+                "INSERT INTO asset_transcripts
+                    (asset_id,recipe_key,source_kind,source_fingerprint,status,outcome_reason,
+                     reject_reason,primary_language,speech_seconds,window_count,
+                     provider_segment_count,mean_token_probability,repetition_ratio,created_at,
+                     native_policy_id,native_quality_recipe_version,
+                     native_window_plan_json,native_window_plan_fingerprint)
+                 VALUES ('a45','native.recipe','proxy','sampled-fp','failed','native_coverage_incomplete',
+                         '','en',1.0,0,0,NULL,NULL,'2026-01-01T00:00:01Z',
+                         'policy45','native-stt.quality.v1',?,?)",
+                rusqlite::params![
+                    r#"{"schemaVersion":"analysis.native-transcript-window-plan.v1","windows":[{"regions":[{"windowOffsetMs":0,"sourceStartMs":0,"durationMs":1000}]}]}"#,
+                    "0".repeat(64),
+                ],
+            )
+            .unwrap();
+        // An old complete native-equivalent header without a plan stays valid
+        // and nullable after migration; no plan or candidates are guessed.
+        connection
+            .execute(
+                "INSERT INTO asset_transcripts
+                    (asset_id,recipe_key,source_kind,source_fingerprint,status,outcome_reason,
+                     reject_reason,primary_language,speech_seconds,window_count,
+                     provider_segment_count,mean_token_probability,repetition_ratio,created_at,
+                     native_policy_id,native_quality_recipe_version)
+                 VALUES ('a45-complete','native.recipe','proxy','sampled-fp-2','speech','accepted',
+                         '','en',1.0,0,0,NULL,NULL,'2026-01-01T00:00:01Z',
+                         'policy45','native-stt.quality.v1')",
+                [],
+            )
+            .unwrap();
+        let old_complete_plan: (Option<String>, Option<String>) = connection
+            .query_row(
+                "SELECT native_window_plan_json,native_window_plan_fingerprint
+                 FROM asset_transcripts WHERE asset_id='a45-complete'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(old_complete_plan, (None, None));
+        assert!(
+            connection
+                .execute(
+                    "UPDATE asset_transcripts SET native_window_plan_fingerprint=NULL WHERE asset_id='a45'",
+                    [],
+                )
+                .is_err(),
+            "plan JSON and semantic fingerprint must be present together"
         );
     }
 }

@@ -32,6 +32,10 @@ pub(crate) fn save_native_transcript(
     observations: &[NativeSttWindowObservation],
 ) -> Result<()> {
     super::super::validate_review_required_contract(transcript)?;
+    ensure!(
+        transcript.outcome_reason != TranscriptOutcomeReason::NativeCoverageIncomplete,
+        "native_coverage_incomplete is written only by the checkpoint owner"
+    );
     super::super::validate_probability_evidence(
         transcript.mean_token_probability,
         "native transcript header mean",
@@ -76,30 +80,43 @@ pub(crate) fn save_native_transcript(
         transcript,
         Some(policy_id),
         Some(NATIVE_STT_QUALITY_RECIPE_VERSION),
+        None,
     )?;
     for (index, observation) in observations.iter().enumerate() {
-        let quality_json = observation.quality.encode_json()?;
-        transaction
-            .execute(
-                "INSERT INTO native_transcript_windows
-                    (asset_id, window_index, request_key, latency_ms, reported_language, quality_json)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![
-                    transcript.asset_id,
-                    index as i64,
-                    observation.request_key,
-                    observation.latency_ms as i64,
-                    observation.reported_language,
-                    quality_json,
-                ],
-            )
-            .context("link native transcript window accounting request")?;
+        insert_native_window_observation(&transaction, &transcript.asset_id, index, observation)?;
     }
     transaction.commit()?;
     Ok(())
 }
 
-fn validate_asset_scope<'a>(
+/// Link one exact, already-validated native provider window observation to the
+/// transcript owner. The caller owns the surrounding transaction.
+pub(super) fn insert_native_window_observation(
+    connection: &Connection,
+    asset_id: &str,
+    window_index: usize,
+    observation: &NativeSttWindowObservation,
+) -> Result<()> {
+    let quality_json = observation.quality.encode_json()?;
+    connection
+        .execute(
+            "INSERT INTO native_transcript_windows
+                (asset_id, window_index, request_key, latency_ms, reported_language, quality_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                asset_id,
+                window_index as i64,
+                observation.request_key,
+                observation.latency_ms as i64,
+                observation.reported_language,
+                quality_json,
+            ],
+        )
+        .context("link native transcript window accounting request")?;
+    Ok(())
+}
+
+pub(super) fn validate_asset_scope<'a>(
     connection: &Connection,
     policy: &'a RunPolicy,
     transcript: &StoredTranscript,

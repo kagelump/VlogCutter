@@ -225,10 +225,10 @@ pub use analysis::schema::{
     validate as validate_observation,
 };
 pub use analysis::store::{
-    NATIVE_TRANSCRIPT_PROVENANCE_SCHEMA_VERSION, NativeSttWindowObservation,
-    NativeSttWindowQualityObservation, NativeTranscriptProvenance,
-    NativeTranscriptWindowProvenance, StoredTranscript as ClipTranscript, TranscriptOutcomeReason,
-    TranscriptStatus,
+    NATIVE_TRANSCRIPT_PROVENANCE_SCHEMA_VERSION, NATIVE_TRANSCRIPT_WINDOW_PLAN_SCHEMA_VERSION,
+    NativeSttWindowObservation, NativeSttWindowQualityObservation, NativeTranscriptCoverage,
+    NativeTranscriptProvenance, NativeTranscriptWindowPlan, NativeTranscriptWindowProvenance,
+    StoredTranscript as ClipTranscript, TranscriptOutcomeReason, TranscriptStatus,
 };
 pub use analysis::stt::TranscribeOutcome;
 pub use analysis::vlm::AnalysisOutcome;
@@ -3529,9 +3529,13 @@ impl Catalog {
         let Some(transcript) = load_transcript(&self.connection()?, asset_id)? else {
             return Ok(None);
         };
-        // Review candidates are retained for a human, not accepted speech. Do
-        // not gather or return their raw text to any downstream AI prompt.
-        if transcript.status == TranscriptStatus::ReviewRequired {
+        // Review candidates and incomplete native checkpoint prefixes are
+        // retained for a human, not accepted speech. Do not gather or return
+        // their raw text to any downstream AI prompt.
+        if matches!(
+            transcript.status,
+            TranscriptStatus::ReviewRequired | TranscriptStatus::Failed
+        ) {
             return Ok(None);
         }
         let text = transcript

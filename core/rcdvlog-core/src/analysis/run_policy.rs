@@ -42,6 +42,7 @@ mod native_pilot;
 mod pilot_projection;
 use pilot_projection::{pilot_observed_capabilities, pilot_projection_status};
 mod native_pilot_evidence;
+pub(crate) use native_pilot_evidence::reusable_native_pilot_sample_on_transaction;
 mod native_stt;
 pub use native_pilot_evidence::{
     MAX_NATIVE_PILOT_LOCAL_OUTCOMES, NATIVE_PILOT_EVIDENCE_SCHEMA_VERSION, NativePilotEvidence,

@@ -1213,3 +1213,748 @@ fn historical_native_policy_and_recipe_remain_readable_without_current_tariff_ru
     assert!(provenance.windows.is_empty());
     assert_eq!(provenance.status, TranscriptStatus::NoAudio);
 }
+
+use crate::RepresentationKind;
+use crate::analysis::accounting::NativeSttAccountedResult;
+use crate::analysis::store::native_provenance::{
+    NativeTranscriptCheckpointWindowInput, NativeTranscriptWindowReuse,
+};
+use crate::analysis::windows::{PackedRegion, PackedWindow};
+use crate::transcription::{NativeSpeechPreparation, NativeSpeechPreparationEvidence};
+use std::path::PathBuf;
+
+fn two_window_preparation(
+    catalog: &Catalog,
+    policy: &RunPolicy,
+    asset_id: &str,
+) -> NativeSpeechPreparation {
+    let scope = policy
+        .scope
+        .iter()
+        .find(|scope| scope.asset_id == asset_id)
+        .unwrap()
+        .clone();
+    let asset = catalog.get_asset(asset_id).unwrap();
+    let proxy_path = PathBuf::from(asset.proxy_path.as_deref().unwrap());
+    let proxy_claim = catalog
+        .try_claim_representation(asset_id, RepresentationKind::Proxy)
+        .unwrap()
+        .unwrap();
+    let speech_claim = catalog
+        .try_claim_representation(asset_id, RepresentationKind::Speech)
+        .unwrap()
+        .unwrap();
+    let evidence = NativeSpeechPreparationEvidence {
+        policy_id: policy.policy_id.clone(),
+        project_id: policy.project_id.clone(),
+        asset_id: asset_id.into(),
+        provider: policy.provider.clone(),
+        model: policy.primary_model.clone(),
+        recipe: policy.recipe_version.clone(),
+        scope: scope.clone(),
+        proxy_full_fingerprint: scope.representation_fingerprint.clone().unwrap(),
+        proxy_sampled_fingerprint: scope.sampled_representation_fingerprint.clone().unwrap(),
+        source_duration_ms: scope.source_duration_ms,
+        last_safe_sample_ms: scope.source_duration_ms,
+        vad: None,
+    };
+    let windows = vec![
+        PackedWindow {
+            regions: vec![PackedRegion {
+                window_offset_ms: 0,
+                source_start_ms: 0,
+                duration_ms: 500,
+            }],
+        },
+        PackedWindow {
+            regions: vec![PackedRegion {
+                window_offset_ms: 0,
+                source_start_ms: 1_000,
+                duration_ms: 500,
+            }],
+        },
+    ];
+    NativeSpeechPreparation::test_preparation(evidence, proxy_path, proxy_claim, speech_claim)
+        .test_with_speech(vec![0.1_f32; 32_000], windows)
+}
+
+fn native_call_for_window(
+    audio: &NativeSttAudioWindow,
+    include_cost: bool,
+    text: &str,
+) -> NativeSttCallResult {
+    let seconds = f64::from(audio.duration_ms()) / 1_000.0;
+    let mut payload = json!({
+        "text": text,
+        "language": "english",
+        "duration": seconds,
+        "segments": [{
+            "id": 0,
+            "start": 0.0,
+            "end": seconds,
+            "text": text
+        }],
+        "model": OPENROUTER_WHISPER_MODEL,
+        "provider": "openai"
+    });
+    if include_cost {
+        payload["usage"] = json!({
+            "cost": 0.002,
+            "seconds": seconds,
+            "input_tokens": 12,
+            "output_tokens": 4
+        });
+    }
+    decode_native_stt_body(
+        serde_json::to_vec(&payload).unwrap().as_slice(),
+        audio.duration_ms(),
+        Some(format!(
+            "native-checkpoint-generation-{}",
+            text.replace(' ', "-")
+        )),
+        11,
+    )
+}
+
+fn transmit_window(
+    catalog: &Catalog,
+    policy: &RunPolicy,
+    request: &NativeSttRequest,
+    audio: &NativeSttAudioWindow,
+    run_id: &str,
+    context: AnalysisAccountingContext,
+    text: &str,
+) -> NativeSttAccountedResult {
+    transmit_native(
+        catalog,
+        policy,
+        request,
+        audio,
+        run_id,
+        context,
+        native_call_for_window(audio, true, text),
+    )
+}
+
+#[test]
+fn native_checkpoint_prefix_roundtrip_reuse_and_pilot_seed_without_send() {
+    let (_directory, catalog, _project, asset, policy, _request, _audio, _run_id, context) =
+        authorized_native_setup();
+    let request = native_policy_request();
+    let preparation = two_window_preparation(&catalog, &policy, &asset);
+    let first = preparation.materialize_window(0).unwrap();
+
+    let opened = catalog
+        .begin_native_transcript_checkpoint(&preparation)
+        .unwrap();
+    assert_eq!(opened.coverage.planned_window_count, 2);
+    assert_eq!(opened.coverage.completed_window_count, 0);
+    assert!(opened.windows.is_empty());
+    assert_eq!(opened.status, TranscriptStatus::Failed);
+    assert_eq!(
+        opened.outcome_reason,
+        TranscriptOutcomeReason::NativeCoverageIncomplete
+    );
+    assert!(!opened.outcome_reason.is_terminal());
+    assert!(catalog.prompt_transcript(&asset).unwrap().is_none());
+
+    let first_result = transmit_window(
+        &catalog,
+        &policy,
+        &request,
+        &first,
+        &context.run_id,
+        context.clone(),
+        "first paid window",
+    );
+    // Keep this test focused on direct accounted-result append; the pilot seed
+    // path is exercised by a separate focused test.
+    let first_checkpoint = catalog
+        .append_native_transcript_checkpoint(
+            &preparation,
+            NativeTranscriptCheckpointWindowInput::AccountedResult {
+                request: &request,
+                audio: &first,
+                result: &first_result,
+            },
+        )
+        .unwrap();
+    assert_eq!(first_checkpoint.windows.len(), 1);
+    assert_eq!(first_checkpoint.coverage.remaining_window_count, 1);
+    assert_eq!(
+        first_checkpoint.windows[0].candidates[0].text,
+        "first paid window"
+    );
+    assert!(catalog.prompt_transcript(&asset).unwrap().is_none());
+    assert!(
+        catalog
+            .native_transcript_checkpoint(&asset)
+            .unwrap()
+            .unwrap()
+            .windows
+            .len()
+            == 1
+    );
+
+    // The same request/result is idempotent and does not create another result.
+    let idempotent = catalog
+        .append_native_transcript_checkpoint(
+            &preparation,
+            NativeTranscriptCheckpointWindowInput::AccountedResult {
+                request: &request,
+                audio: &first,
+                result: &first_result,
+            },
+        )
+        .unwrap();
+    assert_eq!(idempotent.windows.len(), 1);
+
+    // A live current probe reuses the first exact payload and reports the second
+    // window as genuinely missing, with no provider side effect.
+    let reuse = catalog
+        .probe_native_transcript_checkpoint_reuse(&preparation, &request)
+        .unwrap();
+    assert!(matches!(
+        reuse.windows[0],
+        NativeTranscriptWindowReuse::Cached(_)
+    ));
+    assert!(matches!(
+        reuse.windows[1],
+        NativeTranscriptWindowReuse::Missing { window_index: 1 }
+    ));
+    assert_eq!(
+        catalog
+            .list_analysis_requests(&policy.project_id, Some(&policy.policy_id), 10)
+            .unwrap()
+            .len(),
+        1,
+        "reuse probe must not issue a request"
+    );
+
+    let second = preparation.materialize_window(1).unwrap();
+    let second_result = transmit_window(
+        &catalog,
+        &policy,
+        &request,
+        &second,
+        &context.run_id,
+        context.clone(),
+        "second paid window",
+    );
+    let complete_prefix = catalog
+        .append_native_transcript_checkpoint(
+            &preparation,
+            NativeTranscriptCheckpointWindowInput::AccountedResult {
+                request: &request,
+                audio: &second,
+                result: &second_result,
+            },
+        )
+        .unwrap();
+    assert_eq!(complete_prefix.coverage.planned_window_count, 2);
+    assert_eq!(complete_prefix.coverage.completed_window_count, 2);
+    assert_eq!(complete_prefix.coverage.remaining_window_count, 0);
+    assert_eq!(
+        complete_prefix.status,
+        TranscriptStatus::Failed,
+        "C9 never finalizes a full Speech artifact"
+    );
+    assert_eq!(
+        complete_prefix.outcome_reason,
+        TranscriptOutcomeReason::NativeCoverageIncomplete
+    );
+    assert_eq!(
+        complete_prefix.windows[1].candidates[0].text,
+        "second paid window"
+    );
+    assert!(
+        catalog.prompt_transcript(&asset).unwrap().is_none(),
+        "incomplete native candidates must never enter AI context"
+    );
+    let all_cached = catalog
+        .probe_native_transcript_checkpoint_reuse(&preparation, &request)
+        .unwrap();
+    assert!(
+        all_cached
+            .windows
+            .iter()
+            .all(|state| matches!(state, NativeTranscriptWindowReuse::Cached(_)))
+    );
+}
+
+#[test]
+fn native_checkpoint_pilot_sample_seeds_without_transport_and_unknown_cost_stays_uncertain() {
+    let (_directory, catalog, _project, asset, policy, _request, _audio, _run_id, context) =
+        authorized_native_setup();
+    let request = native_policy_request();
+    let preparation = two_window_preparation(&catalog, &policy, &asset);
+    let first = preparation.materialize_window(0).unwrap();
+    catalog
+        .begin_native_transcript_checkpoint(&preparation)
+        .unwrap();
+    let call = native_call_for_window(&first, false, "paid but cost unknown");
+    let result = transmit_native(
+        &catalog,
+        &policy,
+        &request,
+        &first,
+        &context.run_id,
+        context.clone(),
+        call,
+    );
+    let record = catalog
+        .analysis_request(&result.request_key)
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.lifecycle, crate::AnalysisRequestLifecycle::Uncertain);
+    assert!(record.uncertain_usage_reserve_usd > 0.0);
+    let scope = preparation.evidence().scope.clone();
+    let sample = crate::NativePilotPaidSample::from_accounted_result(
+        &policy, &scope, &request, &first, &result,
+    )
+    .unwrap();
+    let running = super::native_pilot_evidence_tests::install_running_pilot(
+        &catalog,
+        &policy,
+        &context.run_id,
+        &asset,
+    );
+    catalog
+        .attach_native_pilot_evidence(
+            &running,
+            crate::NativePilotEvidence::with_sample(sample.clone()),
+            Some((&request, &first)),
+        )
+        .unwrap()
+        .unwrap();
+    let mut altered = sample.clone();
+    if let crate::NativePilotSampleOutcome::Evaluated { candidates, .. } = &mut altered.outcome {
+        candidates[0].text = "mutated cached candidate".into();
+    }
+    assert!(
+        catalog
+            .append_native_transcript_checkpoint(
+                &preparation,
+                NativeTranscriptCheckpointWindowInput::PilotSample {
+                    request: &request,
+                    audio: &first,
+                    sample: &altered
+                }
+            )
+            .is_err(),
+        "a supplied clone must equal canonical pilot evidence"
+    );
+    assert!(
+        catalog
+            .native_transcript_checkpoint(&asset)
+            .unwrap()
+            .unwrap()
+            .windows
+            .is_empty()
+    );
+    let before_requests = catalog
+        .list_analysis_requests(&policy.project_id, Some(&policy.policy_id), 10)
+        .unwrap()
+        .len();
+    let checkpoint = catalog
+        .append_native_transcript_checkpoint(
+            &preparation,
+            NativeTranscriptCheckpointWindowInput::PilotSample {
+                request: &request,
+                audio: &first,
+                sample: &sample,
+            },
+        )
+        .unwrap();
+    assert_eq!(checkpoint.windows.len(), 1);
+    assert_eq!(
+        catalog
+            .list_analysis_requests(&policy.project_id, Some(&policy.policy_id), 10)
+            .unwrap()
+            .len(),
+        before_requests,
+        "seeding from the exact C7 sample must not send or reserve"
+    );
+    let provenance = catalog
+        .native_transcript_provenance(&asset)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        provenance.windows[0].accounting.request.lifecycle,
+        crate::AnalysisRequestLifecycle::Uncertain
+    );
+    assert!(
+        provenance.windows[0]
+            .accounting
+            .request
+            .uncertain_usage_reserve_usd
+            > 0.0
+    );
+    assert_eq!(
+        provenance.windows[0].candidates.as_ref().unwrap()[0].text,
+        "paid but cost unknown"
+    );
+}
+
+#[test]
+fn native_checkpoint_paid_marker_without_result_blocks_default_replay() {
+    let (_directory, catalog, _project, asset, policy, _request, _audio, _run_id, context) =
+        authorized_native_setup();
+    let request = native_policy_request();
+    let preparation = two_window_preparation(&catalog, &policy, &asset);
+    let first = preparation.materialize_window(0).unwrap();
+    catalog
+        .begin_native_transcript_checkpoint(&preparation)
+        .unwrap();
+    let result = transmit_window(
+        &catalog,
+        &policy,
+        &request,
+        &first,
+        &context.run_id,
+        context.clone(),
+        "receipt without checkpoint",
+    );
+    let reuse = catalog
+        .probe_native_transcript_checkpoint_reuse(&preparation, &request)
+        .unwrap();
+    match &reuse.windows[0] {
+        NativeTranscriptWindowReuse::RecoveryRequired {
+            window_index,
+            request_key,
+        } => {
+            assert_eq!(*window_index, 0);
+            assert_eq!(request_key.as_deref(), Some(result.request_key.as_str()));
+        }
+        other => panic!("expected recovery-required marker, got {other:?}"),
+    }
+    assert_eq!(
+        catalog
+            .native_transcript_checkpoint(&asset)
+            .unwrap()
+            .unwrap()
+            .windows
+            .len(),
+        0,
+        "a receipt or marker never fabricates candidate text"
+    );
+}
+
+#[test]
+fn native_checkpoint_evaluated_append_is_quality_mapped_and_conflicts_roll_back() {
+    let (_directory, catalog, _project, asset, policy, _request, _audio, _run_id, context) =
+        authorized_native_setup();
+    let request = native_policy_request();
+    let preparation = two_window_preparation(&catalog, &policy, &asset);
+    let first = preparation.materialize_window(0).unwrap();
+    catalog
+        .begin_native_transcript_checkpoint(&preparation)
+        .unwrap();
+    let result = transmit_window(
+        &catalog,
+        &policy,
+        &request,
+        &first,
+        &context.run_id,
+        context.clone(),
+        "evaluated synthetic window",
+    );
+    let evaluation = evaluation_for(&result, &first);
+    let observation = NativeSttWindowObservation {
+        request_key: result.request_key.clone(),
+        latency_ms: result.latency_ms(),
+        reported_language: evaluation.reported_language.clone(),
+        quality: crate::analysis::store::NativeSttWindowQualityObservation::from_evaluation(
+            &evaluation,
+        )
+        .unwrap(),
+    };
+    let checkpoint = catalog
+        .append_native_transcript_checkpoint(
+            &preparation,
+            NativeTranscriptCheckpointWindowInput::Evaluated {
+                request: &request,
+                audio: &first,
+                observation: observation.clone(),
+                candidates: evaluation.segments.clone(),
+            },
+        )
+        .unwrap();
+    assert_eq!(checkpoint.windows.len(), 1);
+
+    let before = catalog
+        .native_transcript_checkpoint(&asset)
+        .unwrap()
+        .unwrap();
+    let mut conflicting = evaluation.segments.clone();
+    conflicting[0].text = "forged candidate".into();
+    let error = catalog
+        .append_native_transcript_checkpoint(
+            &preparation,
+            NativeTranscriptCheckpointWindowInput::Evaluated {
+                request: &request,
+                audio: &first,
+                observation,
+                candidates: conflicting,
+            },
+        )
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("conflicting result"));
+    let after = catalog
+        .native_transcript_checkpoint(&asset)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        after, before,
+        "a conflicting append must not mutate the paid prefix"
+    );
+    assert_eq!(
+        after.windows[0].candidates[0].text,
+        "evaluated synthetic window"
+    );
+}
+
+#[test]
+fn native_checkpoint_local_replacement_clears_plan_and_native_links_atomically() {
+    let (_directory, catalog, _project, asset, policy, _request, _audio, _run_id, context) =
+        authorized_native_setup();
+    let request = native_policy_request();
+    let preparation = two_window_preparation(&catalog, &policy, &asset);
+    let first = preparation.materialize_window(0).unwrap();
+    catalog
+        .begin_native_transcript_checkpoint(&preparation)
+        .unwrap();
+    let result = transmit_window(
+        &catalog,
+        &policy,
+        &request,
+        &first,
+        &context.run_id,
+        context.clone(),
+        "paid prefix before local replacement",
+    );
+    catalog
+        .append_native_transcript_checkpoint(
+            &preparation,
+            NativeTranscriptCheckpointWindowInput::AccountedResult {
+                request: &request,
+                audio: &first,
+                result: &result,
+            },
+        )
+        .unwrap();
+    assert_eq!(link_count(&catalog, &asset), 1);
+
+    let connection = catalog.connection().unwrap();
+    let source_fingerprint: String = connection
+        .query_row(
+            "SELECT source_fingerprint FROM asset_transcripts WHERE asset_id=?1",
+            [&asset],
+            |row| row.get(0),
+        )
+        .unwrap();
+    save_transcript(
+        &connection,
+        &StoredTranscript {
+            asset_id: asset.clone(),
+            recipe_key: crate::STT_RECIPE_KEY.to_string(),
+            source_fingerprint,
+            status: TranscriptStatus::Speech,
+            outcome_reason: TranscriptOutcomeReason::Accepted,
+            reject_reason: String::new(),
+            primary_language: "en".to_string(),
+            speech_seconds: 1.0,
+            window_count: 1,
+            provider_segment_count: 1,
+            mean_token_probability: Some(0.9),
+            repetition_ratio: Some(0.0),
+            segments: vec![crate::DecodedSegment {
+                start_ms: 0,
+                end_ms: 500,
+                language: "en".to_string(),
+                text: "local replacement".to_string(),
+                mean_token_probability: Some(0.9),
+            }],
+        },
+    )
+    .unwrap();
+    let row: (Option<String>, Option<String>, String) = connection
+        .query_row(
+            "SELECT native_window_plan_json,native_window_plan_fingerprint,status
+             FROM asset_transcripts WHERE asset_id=?1",
+            [&asset],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(row, (None, None, "speech".to_string()));
+    assert_eq!(link_count(&catalog, &asset), 0);
+}
+
+#[test]
+fn native_checkpoint_changed_source_rejects_current_reuse_but_history_stays_readable() {
+    let (_directory, catalog, _project, asset, policy, _request, _audio, _run_id, context) =
+        authorized_native_setup();
+    let request = native_policy_request();
+    let preparation = two_window_preparation(&catalog, &policy, &asset);
+    let first = preparation.materialize_window(0).unwrap();
+    catalog
+        .begin_native_transcript_checkpoint(&preparation)
+        .unwrap();
+    let result = transmit_window(
+        &catalog,
+        &policy,
+        &request,
+        &first,
+        &context.run_id,
+        context.clone(),
+        "historical checkpoint",
+    );
+    catalog
+        .append_native_transcript_checkpoint(
+            &preparation,
+            NativeTranscriptCheckpointWindowInput::AccountedResult {
+                request: &request,
+                audio: &first,
+                result: &result,
+            },
+        )
+        .unwrap();
+
+    catalog
+        .connection()
+        .unwrap()
+        .execute(
+            "UPDATE assets SET duration_seconds=duration_seconds+1 WHERE id=?1",
+            [&asset],
+        )
+        .unwrap();
+    let reuse_error = catalog
+        .probe_native_transcript_checkpoint_reuse(&preparation, &request)
+        .unwrap_err();
+    assert!(
+        format!("{reuse_error:#}").contains("source identity changed")
+            || format!("{reuse_error:#}").contains("source"),
+        "changed source must reject current reuse: {reuse_error:#}"
+    );
+    let historical = catalog
+        .native_transcript_checkpoint(&asset)
+        .unwrap()
+        .unwrap();
+    assert_eq!(historical.windows.len(), 1);
+    assert_eq!(
+        historical.windows[0].candidates[0].text,
+        "historical checkpoint"
+    );
+    let provenance = catalog
+        .native_transcript_provenance(&asset)
+        .unwrap()
+        .unwrap();
+    assert_eq!(provenance.coverage.unwrap().planned_window_count, 2);
+}
+
+#[test]
+fn native_checkpoint_invalid_quality_and_sql_failure_never_replaces_paid_prefix() {
+    let (_directory, catalog, _project, asset, policy, _request, _audio, _run_id, context) =
+        authorized_native_setup();
+    let request = native_policy_request();
+    let preparation = two_window_preparation(&catalog, &policy, &asset);
+    let first = preparation.materialize_window(0).unwrap();
+    let second = preparation.materialize_window(1).unwrap();
+    catalog
+        .begin_native_transcript_checkpoint(&preparation)
+        .unwrap();
+    let first_result = transmit_window(
+        &catalog,
+        &policy,
+        &request,
+        &first,
+        &context.run_id,
+        context.clone(),
+        "first stable prefix",
+    );
+    catalog
+        .append_native_transcript_checkpoint(
+            &preparation,
+            NativeTranscriptCheckpointWindowInput::AccountedResult {
+                request: &request,
+                audio: &first,
+                result: &first_result,
+            },
+        )
+        .unwrap();
+    let before = catalog
+        .native_transcript_checkpoint(&asset)
+        .unwrap()
+        .unwrap();
+
+    let second_result = transmit_window(
+        &catalog,
+        &policy,
+        &request,
+        &second,
+        &context.run_id,
+        context.clone(),
+        "trigger-fail second prefix",
+    );
+    let evaluation = evaluation_for(&second_result, &second);
+    let mut invalid_quality =
+        crate::analysis::store::NativeSttWindowQualityObservation::from_evaluation(&evaluation)
+            .unwrap();
+    invalid_quality.decision = NativeSttQualityDecision::Rejected;
+    invalid_quality.reason =
+        crate::analysis::quality::native_stt::NativeSttQualityReason::InvalidTimestamp;
+    let invalid = catalog.append_native_transcript_checkpoint(
+        &preparation,
+        NativeTranscriptCheckpointWindowInput::Evaluated {
+            request: &request,
+            audio: &second,
+            observation: NativeSttWindowObservation {
+                request_key: second_result.request_key.clone(),
+                latency_ms: second_result.latency_ms(),
+                reported_language: evaluation.reported_language.clone(),
+                quality: invalid_quality,
+            },
+            candidates: Vec::new(),
+        },
+    );
+    assert!(invalid.is_err(), "structurally invalid quality must deny");
+    assert_eq!(
+        catalog
+            .native_transcript_checkpoint(&asset)
+            .unwrap()
+            .unwrap(),
+        before
+    );
+
+    catalog
+        .connection()
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER synthetic_checkpoint_abort
+             BEFORE INSERT ON transcript_segments
+             WHEN NEW.text = 'trigger-fail second prefix'
+             BEGIN SELECT RAISE(ABORT, 'synthetic checkpoint persistence failure'); END;",
+        )
+        .unwrap();
+    let append = catalog.append_native_transcript_checkpoint(
+        &preparation,
+        NativeTranscriptCheckpointWindowInput::AccountedResult {
+            request: &request,
+            audio: &second,
+            result: &second_result,
+        },
+    );
+    assert!(append.is_err(), "synthetic SQL failure must surface");
+    assert_eq!(
+        catalog
+            .native_transcript_checkpoint(&asset)
+            .unwrap()
+            .unwrap(),
+        before,
+        "SQL failure must roll back header/segments/window links together"
+    );
+    assert_eq!(link_count(&catalog, &asset), 1);
+}
+
+#[path = "native_checkpoint_regressions.rs"]
+mod native_checkpoint_regressions;

@@ -29,6 +29,7 @@
 //! this pure evaluator still does not write it or enable native execution; the
 //! candidates remain unaccepted and must not be shown as accepted speech.
 
+use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 
 use crate::analysis::openrouter_stt::{
@@ -648,6 +649,169 @@ fn finite_mean(values: &[f64]) -> Option<f64> {
         }
     }
     Some(mean)
+}
+
+/// Upper bounds shared by canonical native checkpoint persistence and the
+/// bounded pilot evidence owner. They are deliberately data limits, not a
+/// second quality recipe.
+pub(crate) const MAX_NATIVE_MAPPED_CANDIDATES: usize = 10_000;
+pub(crate) const MAX_NATIVE_MAPPED_CANDIDATE_TEXT_BYTES: usize = 64 * 1024;
+
+pub(crate) fn source_start_maps_to_window(
+    window: &crate::analysis::windows::PackedWindow,
+    source_ms: u32,
+) -> bool {
+    window.regions.iter().any(|region| {
+        source_ms >= region.source_start_ms
+            && source_ms < region.source_start_ms + region.duration_ms
+    })
+}
+
+pub(crate) fn source_end_maps_to_window(
+    window: &crate::analysis::windows::PackedWindow,
+    source_ms: u32,
+) -> bool {
+    window.regions.iter().any(|region| {
+        source_ms > region.source_start_ms
+            && source_ms <= region.source_start_ms + region.duration_ms
+    })
+}
+
+/// Validate one packed window's internal offsets and source bounds.
+pub(crate) fn validate_native_window_mapping(
+    window: &crate::analysis::windows::PackedWindow,
+    source_duration_ms: u32,
+) -> Result<()> {
+    ensure!(
+        !window.regions.is_empty(),
+        "native mapped window has no speech regions"
+    );
+    let mut next_window_offset = 0_u32;
+    let mut previous_source_end = 0_u32;
+    let mut speech_ms = 0_u32;
+    for (index, region) in window.regions.iter().enumerate() {
+        ensure!(
+            region.duration_ms > 0
+                && region.window_offset_ms == next_window_offset
+                && region.window_offset_ms.saturating_add(region.duration_ms)
+                    <= crate::analysis::windows::WINDOW_MS,
+            "native mapped window region {index} has an invalid packed offset"
+        );
+        let source_end = region
+            .source_start_ms
+            .checked_add(region.duration_ms)
+            .ok_or_else(|| anyhow::anyhow!("native mapped window source time overflowed"))?;
+        ensure!(
+            region.source_start_ms >= previous_source_end && source_end <= source_duration_ms,
+            "native mapped window region {index} exceeds source bounds or overlaps"
+        );
+        next_window_offset = next_window_offset.saturating_add(region.duration_ms);
+        previous_source_end = source_end;
+        speech_ms = speech_ms.saturating_add(region.duration_ms);
+    }
+    ensure!(
+        speech_ms > 0 && speech_ms <= crate::analysis::windows::WINDOW_MS,
+        "native mapped window speech duration is invalid"
+    );
+    Ok(())
+}
+
+/// Validate the mapped candidates retained for one already-evaluated native
+/// window. This is the shared pure part of the C7 pilot sample and canonical
+/// checkpoint contracts: rejected output retains no text, accepted/review
+/// output retains ordered candidates that map back into this exact window.
+pub(crate) fn validate_native_mapped_candidates(
+    decision: NativeSttQualityDecision,
+    reason: NativeSttQualityReason,
+    reported_language: &Option<String>,
+    candidates: &[DecodedSegment],
+    window: &crate::analysis::windows::PackedWindow,
+) -> Result<()> {
+    match decision {
+        NativeSttQualityDecision::Rejected => {
+            ensure!(
+                candidates.is_empty(),
+                "rejected native window result must not retain candidate text"
+            );
+            ensure!(
+                reason != NativeSttQualityReason::AcceptedCompleteEvidence,
+                "rejected native window quality reason is inconsistent"
+            );
+            return Ok(());
+        }
+        NativeSttQualityDecision::Accepted | NativeSttQualityDecision::ReviewRequired => {
+            ensure!(
+                !candidates.is_empty(),
+                "accepted/review native window result must retain mapped candidates"
+            );
+            ensure!(
+                reported_language.is_some(),
+                "accepted/review native window result must retain its recognized reported language"
+            );
+        }
+    }
+    ensure!(
+        candidates.len() <= MAX_NATIVE_MAPPED_CANDIDATES,
+        "native mapped candidate count exceeds the bounded provider segment limit"
+    );
+    let total_text_bytes = candidates.iter().try_fold(0_usize, |total, candidate| {
+        total.checked_add(candidate.text.len())
+    });
+    ensure!(
+        total_text_bytes.is_some_and(
+            |total| total <= crate::analysis::openrouter_stt::MAX_NATIVE_STT_RESPONSE_BYTES
+        ),
+        "native mapped candidate text exceeds the bounded response size"
+    );
+    let expected_language = reported_language
+        .as_deref()
+        .and_then(normalized_native_stt_language)
+        .ok_or_else(|| anyhow::anyhow!("native window reported language is not recognized"))?;
+    ensure!(
+        native_stt_repetition_is_safe(crate::analysis::quality::repetition_ratio(candidates)),
+        "native mapped candidate text fails the repetition gate"
+    );
+    let mut previous_end_ms = 0_u32;
+    let mut candidate_language: Option<&str> = None;
+    for (index, candidate) in candidates.iter().enumerate() {
+        ensure!(
+            candidate.start_ms < candidate.end_ms,
+            "native mapped candidate {index} has an invalid source span"
+        );
+        ensure!(
+            !candidate.text.trim().is_empty()
+                && candidate.text.len() <= MAX_NATIVE_MAPPED_CANDIDATE_TEXT_BYTES,
+            "native mapped candidate {index} text is empty or oversized"
+        );
+        ensure!(
+            candidate.mean_token_probability.is_none(),
+            "native mapped candidate {index} must not claim arithmetic token probability"
+        );
+        crate::analysis::openrouter_stt::validate_iso639_1(&candidate.language)?;
+        ensure!(
+            candidate.language == expected_language,
+            "native mapped candidate language disagrees with its reported language"
+        );
+        if let Some(language) = candidate_language {
+            ensure!(
+                language == candidate.language,
+                "native mapped candidates use inconsistent languages"
+            );
+        } else {
+            candidate_language = Some(&candidate.language);
+        }
+        ensure!(
+            previous_end_ms <= candidate.start_ms,
+            "native mapped candidate {index} overlaps or is out of source order"
+        );
+        ensure!(
+            source_start_maps_to_window(window, candidate.start_ms)
+                && source_end_maps_to_window(window, candidate.end_ms),
+            "native mapped candidate {index} is not mapped by the packed source window"
+        );
+        previous_end_ms = candidate.end_ms;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

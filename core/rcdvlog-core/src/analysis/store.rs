@@ -18,9 +18,9 @@ pub(crate) mod native_recipe;
 #[allow(unused_imports)]
 pub(crate) use native_provenance::save_native_transcript;
 pub use native_provenance::{
-    NATIVE_TRANSCRIPT_PROVENANCE_SCHEMA_VERSION, NativeSttWindowObservation,
-    NativeSttWindowQualityObservation, NativeTranscriptProvenance,
-    NativeTranscriptWindowProvenance,
+    NATIVE_TRANSCRIPT_PROVENANCE_SCHEMA_VERSION, NATIVE_TRANSCRIPT_WINDOW_PLAN_SCHEMA_VERSION,
+    NativeSttWindowObservation, NativeSttWindowQualityObservation, NativeTranscriptCoverage,
+    NativeTranscriptProvenance, NativeTranscriptWindowPlan, NativeTranscriptWindowProvenance,
 };
 pub use native_recipe::native_stt_transcript_recipe;
 
@@ -94,6 +94,11 @@ pub enum TranscriptOutcomeReason {
     ProcessingFailed,
     LegacyNoSpeechUnverified,
     QualityEvidenceIncomplete,
+    /// The native checkpoint owner retained a contiguous, quality-evaluated
+    /// prefix of a paid multi-window speech plan, but the full asset has not
+    /// been finalized. This is nonterminal: candidates are not accepted and no
+    /// generic batch may reuse them as a complete transcript.
+    NativeCoverageIncomplete,
 }
 
 impl TranscriptOutcomeReason {
@@ -107,6 +112,7 @@ impl TranscriptOutcomeReason {
             TranscriptOutcomeReason::ProcessingFailed => "processing_failed",
             TranscriptOutcomeReason::LegacyNoSpeechUnverified => "legacy_no_speech_unverified",
             TranscriptOutcomeReason::QualityEvidenceIncomplete => "quality_evidence_incomplete",
+            TranscriptOutcomeReason::NativeCoverageIncomplete => "native_coverage_incomplete",
         }
     }
 
@@ -120,6 +126,7 @@ impl TranscriptOutcomeReason {
             "processing_failed" => Ok(TranscriptOutcomeReason::ProcessingFailed),
             "legacy_no_speech_unverified" => Ok(TranscriptOutcomeReason::LegacyNoSpeechUnverified),
             "quality_evidence_incomplete" => Ok(TranscriptOutcomeReason::QualityEvidenceIncomplete),
+            "native_coverage_incomplete" => Ok(TranscriptOutcomeReason::NativeCoverageIncomplete),
             other => bail!("unknown transcript outcome reason: {other}"),
         }
     }
@@ -127,7 +134,11 @@ impl TranscriptOutcomeReason {
     /// Terminal outcomes are reusable by background batches. A failed attempt
     /// is deliberately excluded even when its source fingerprint matches.
     pub fn is_terminal(&self) -> bool {
-        !matches!(self, TranscriptOutcomeReason::ProcessingFailed)
+        !matches!(
+            self,
+            TranscriptOutcomeReason::ProcessingFailed
+                | TranscriptOutcomeReason::NativeCoverageIncomplete
+        )
     }
 }
 
@@ -201,8 +212,17 @@ fn validate_review_required_contract(transcript: &StoredTranscript) -> Result<()
             "quality_evidence_incomplete is only valid for review_required, not {}",
             status.as_str()
         ),
+        (_, TranscriptOutcomeReason::NativeCoverageIncomplete) => bail!(
+            "native_coverage_incomplete is owned exclusively by the native transcript checkpoint writer"
+        ),
         _ => Ok(()),
     }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct NativeTranscriptWindowPlanRow<'a> {
+    pub plan_json: &'a str,
+    pub fingerprint: &'a str,
 }
 
 /// Replace the canonical header, segments and any native associations in one
@@ -210,16 +230,27 @@ fn validate_review_required_contract(transcript: &StoredTranscript) -> Result<()
 /// clear stale native provenance when replacing a cloud artifact with local
 /// output. Native callers pass the frozen policy/quality identities and then
 /// insert their exact request links before committing the same transaction.
-fn write_transcript_rows(
+pub(crate) fn write_transcript_rows(
     connection: &Connection,
     transcript: &StoredTranscript,
     native_policy_id: Option<&str>,
     native_quality_recipe_version: Option<&str>,
+    native_window_plan: Option<NativeTranscriptWindowPlanRow<'_>>,
 ) -> Result<()> {
     ensure!(
         native_policy_id.is_some() == native_quality_recipe_version.is_some(),
         "native policy and quality recipe identities must be written together"
     );
+    ensure!(
+        native_window_plan.is_none()
+            || (native_policy_id.is_some()
+                && transcript.status == TranscriptStatus::Failed
+                && transcript.outcome_reason == TranscriptOutcomeReason::NativeCoverageIncomplete),
+        "a native transcript window plan is only valid on an incomplete native checkpoint"
+    );
+    let (plan_json, plan_fingerprint) = native_window_plan
+        .map(|plan| (Some(plan.plan_json), Some(plan.fingerprint)))
+        .unwrap_or((None, None));
     let now = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
     connection
         .execute(
@@ -234,8 +265,9 @@ fn write_transcript_rows(
                 (asset_id, recipe_key, source_kind, source_fingerprint, status, outcome_reason,
                  reject_reason, primary_language, speech_seconds, window_count,
                  provider_segment_count, mean_token_probability, repetition_ratio, created_at,
-                 native_policy_id, native_quality_recipe_version)
-            VALUES (?1, ?2, 'proxy', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+                 native_policy_id, native_quality_recipe_version,
+                 native_window_plan_json, native_window_plan_fingerprint)
+            VALUES (?1, ?2, 'proxy', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
             ON CONFLICT(asset_id) DO UPDATE SET
                 recipe_key = excluded.recipe_key,
                 source_fingerprint = excluded.source_fingerprint,
@@ -250,7 +282,9 @@ fn write_transcript_rows(
                 repetition_ratio = excluded.repetition_ratio,
                 created_at = excluded.created_at,
                 native_policy_id = excluded.native_policy_id,
-                native_quality_recipe_version = excluded.native_quality_recipe_version
+                native_quality_recipe_version = excluded.native_quality_recipe_version,
+                native_window_plan_json = excluded.native_window_plan_json,
+                native_window_plan_fingerprint = excluded.native_window_plan_fingerprint
             "#,
             params![
                 transcript.asset_id,
@@ -268,6 +302,8 @@ fn write_transcript_rows(
                 now,
                 native_policy_id,
                 native_quality_recipe_version,
+                plan_json,
+                plan_fingerprint,
             ],
         )
         .context("save transcript row")?;
@@ -319,7 +355,7 @@ pub fn save_transcript(connection: &Connection, transcript: &StoredTranscript) -
     }
 
     let transaction = connection.unchecked_transaction()?;
-    write_transcript_rows(&transaction, transcript, None, None)?;
+    write_transcript_rows(&transaction, transcript, None, None, None)?;
     transaction.commit()?;
     Ok(())
 }

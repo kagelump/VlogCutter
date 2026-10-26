@@ -4,6 +4,7 @@ use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 
 use crate::analysis::accounting::AnalysisAccountingRequestInspection;
+use crate::analysis::quality::DecodedSegment;
 use crate::analysis::quality::native_stt::{
     NativeSttQualityDecision, NativeSttQualityMetrics, NativeSttQualityReason,
     recognized_native_stt_reported_language,
@@ -11,11 +12,42 @@ use crate::analysis::quality::native_stt::{
 
 use super::super::{TranscriptOutcomeReason, TranscriptStatus};
 use crate::analysis::run_policy::RunPolicy;
+use crate::analysis::windows::PackedWindow;
 
 /// Schema identity for the catalog read projection over native transcript
 /// provenance. The projection has no independent store.
 pub const NATIVE_TRANSCRIPT_PROVENANCE_SCHEMA_VERSION: &str =
     "analysis.native-transcript-provenance.v1";
+
+/// Versioned, body-free window plan retained on an incomplete native transcript
+/// header. The ordered `PackedWindow` map is the only source-time coordination
+/// identity; raw PCM/WAV, paths and provider bodies are never stored.
+pub const NATIVE_TRANSCRIPT_WINDOW_PLAN_SCHEMA_VERSION: &str =
+    "analysis.native-transcript-window-plan.v1";
+
+/// Bounded defensive limit for a retained native window plan. Existing VAD
+/// packing already limits a single window; this caps pathological catalogs.
+pub const MAX_NATIVE_TRANSCRIPT_PLANNED_WINDOWS: usize = 10_000;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NativeTranscriptWindowPlan {
+    pub schema_version: String,
+    pub windows: Vec<PackedWindow>,
+}
+
+/// Read-only coverage facts for one incomplete native checkpoint. Completed
+/// window results and actual attempts/costs remain in their canonical child
+/// rows/accounting ledger; this projection copies neither.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeTranscriptCoverage {
+    pub plan_schema_version: String,
+    pub plan_fingerprint: String,
+    pub planned_window_count: u32,
+    pub completed_window_count: u32,
+    pub remaining_window_count: u32,
+}
 
 /// Bounded, body-free quality evidence retained for one native provider window.
 ///
@@ -260,6 +292,11 @@ pub struct NativeTranscriptWindowProvenance {
     pub reported_language: Option<String>,
     pub quality: NativeSttWindowQualityObservation,
     pub accounting: AnalysisAccountingRequestInspection,
+    /// Reconstructed only for rows that carry an exact versioned window plan.
+    /// Legacy complete native rows without a plan remain `None`: their
+    /// candidates are not guessed from overlapping source ranges.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidates: Option<Vec<DecodedSegment>>,
 }
 
 /// Read-only derived projection over one canonical transcript plus its frozen
@@ -280,4 +317,8 @@ pub struct NativeTranscriptProvenance {
     /// from the frozen canonical authorization row.
     pub policy: RunPolicy,
     pub windows: Vec<NativeTranscriptWindowProvenance>,
+    /// Present only for an incomplete native checkpoint carrying a validated
+    /// versioned plan. Omitted from legacy complete-row wire output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coverage: Option<NativeTranscriptCoverage>,
 }
