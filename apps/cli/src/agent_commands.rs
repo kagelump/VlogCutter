@@ -255,6 +255,7 @@ fn executable() -> Result<CliExecutable> {
             ("speech.local.v1".into(), 1),
             ("speech.models.v1".into(), 1),
             ("speech.model-backends.v1".into(), 1),
+            ("speech.native-batch.v1".into(), 1),
             ("transcribe.selected.v1".into(), 1),
             ("video.validation.v1".into(), 1),
             ("camera-sidecars.mapping.v1".into(), 1),

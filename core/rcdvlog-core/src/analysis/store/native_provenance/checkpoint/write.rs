@@ -8,6 +8,7 @@ use super::*;
 pub(crate) fn begin_native_transcript_checkpoint(
     catalog: &Catalog,
     preparation: &NativeSpeechPreparation,
+    start: NativeTranscriptCheckpointStart,
 ) -> Result<NativeTranscriptCheckpoint> {
     ensure!(
         preparation.outcome() == NativeSpeechLocalOutcome::PreparedSpeech,
@@ -44,13 +45,40 @@ pub(crate) fn begin_native_transcript_checkpoint(
     );
 
     if let Some(existing) = load_transcript_header(&transaction, &evidence.asset_id)? {
-        ensure!(
-            existing.recipe_key == evidence.recipe
-                && existing.source_fingerprint == source_fingerprint
-                && existing.status == TranscriptStatus::Failed
-                && existing.outcome_reason == TranscriptOutcomeReason::NativeCoverageIncomplete,
-            "native checkpoint cannot replace existing local or terminal transcript work"
-        );
+        let native_associated =
+            has_native_transcript_association(&transaction, &evidence.asset_id)?;
+        match start {
+            NativeTranscriptCheckpointStart::ResumeOnly => ensure!(
+                existing.recipe_key == evidence.recipe
+                    && existing.source_fingerprint == source_fingerprint
+                    && existing.status == TranscriptStatus::Failed
+                    && existing.outcome_reason == TranscriptOutcomeReason::NativeCoverageIncomplete
+                    && native_associated,
+                "native checkpoint cannot replace existing local or terminal transcript work"
+            ),
+            NativeTranscriptCheckpointStart::ExplicitNativeSelection => ensure!(
+                !native_associated,
+                "explicit native selection cannot replace prior native policy, quality, plan or paid-window work"
+            ),
+        }
+        if !native_associated {
+            // This is the narrow explicit backend-selection transition: the
+            // caller selected native output over ordinary generated local
+            // transcript rows. Human asset metadata and chronology are not in
+            // this table and are never touched here. Resume-only callers have
+            // already rejected this branch above.
+            replace_checkpoint_rows(
+                &transaction,
+                &policy.policy_id,
+                &header,
+                &plan,
+                &fingerprint,
+                &[],
+            )?;
+            let snapshot = load_checkpoint_snapshot(&transaction, &evidence.asset_id)?;
+            transaction.commit()?;
+            return Ok(snapshot);
+        }
         let (plan_json, existing_fingerprint): (Option<String>, Option<String>) = transaction
             .query_row(
                 "SELECT native_window_plan_json, native_window_plan_fingerprint

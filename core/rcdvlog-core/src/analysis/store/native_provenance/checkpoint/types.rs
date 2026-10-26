@@ -1,5 +1,18 @@
 use super::*;
 
+/// Which existing canonical header a checkpoint start may replace.
+///
+/// The default resume-only intent can only reopen an identical native
+/// checkpoint. The explicit native-selection intent exists solely for an
+/// adapter that explicitly selected this backend over ordinary local derived
+/// output. It may replace free local output but never any native policy, quality,
+/// plan, or paid-window association.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NativeTranscriptCheckpointStart {
+    ResumeOnly,
+    ExplicitNativeSelection,
+}
+
 /// One evaluated provider window retained in the checkpoint projection.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct NativeTranscriptCheckpointWindow {

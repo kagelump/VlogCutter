@@ -34,6 +34,7 @@ use super::{
 mod transport;
 mod validation;
 pub(super) use transport::DeferredEnvironmentNativeSttTransport;
+pub(crate) use validation::native_serving_model_identity_requires_review;
 use validation::validate_native_accounted_result;
 
 #[derive(Debug)]

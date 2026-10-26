@@ -343,10 +343,11 @@ pub(crate) fn native_stt_request_from_policy(policy: &RunPolicy) -> Result<Nativ
     )
 }
 
-/// Native bulk remains a separate future owner. This warning is shown alongside
-/// the now-implemented one-shot pilot so callers cannot infer that bulk or
-/// adapters are available.
-pub(super) const NATIVE_STT_BULK_UNAVAILABLE_WARNING: &str = "native STT bounded capability pilot is implemented, but native bulk execution, targeted retry and CLI/desktop native selection remain unavailable";
+/// Native core bulk and the thin CLI selection path are implemented, while the
+/// desktop adapter and typed native targeted recovery remain separate follow-up
+/// slices. This warning is outside policy identity and does not alter the
+/// registered capability check or pilot record.
+pub(super) const NATIVE_STT_BULK_UNAVAILABLE_WARNING: &str = "native STT core bulk and CLI execution are implemented; desktop native selection and typed native targeted recovery remain unavailable";
 
 /// Conservative upper bound on packed speech windows for a positive source
 /// duration. Greedy packing cannot produce more than

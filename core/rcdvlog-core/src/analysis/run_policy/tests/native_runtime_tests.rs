@@ -329,15 +329,22 @@ fn decoded_call(
     cost: Option<f64>,
 ) -> NativeSttCallResult {
     let end = audio.duration_ms() as f64 / 1_000.0;
+    let source_start_ms = audio
+        .window()
+        .regions
+        .first()
+        .map(|region| region.source_start_ms)
+        .unwrap_or_default();
+    let text = format!("Synthetic bounded native speech from {source_start_ms} ms");
     let mut payload = json!({
-        "text": "Synthetic bounded native speech",
+        "text": text,
         "language": "english",
         "duration": end,
         "segments": [{
             "id": 0,
             "start": 0.0,
             "end": end,
-            "text": "Synthetic bounded native speech",
+            "text": text.clone(),
             "confidence": confidence,
         }],
         "model": OPENROUTER_WHISPER_MODEL,
@@ -351,10 +358,15 @@ fn decoded_call(
             "output_tokens": 4
         });
     }
+    static GENERATION_COUNTER: AtomicUsize = AtomicUsize::new(0);
+    let generation = format!(
+        "native-runtime-generation-{}",
+        GENERATION_COUNTER.fetch_add(1, Ordering::SeqCst)
+    );
     decode_native_stt_body(
         serde_json::to_vec(&payload).unwrap().as_slice(),
         audio.duration_ms(),
-        Some("native-runtime-generation".into()),
+        Some(generation),
         17,
     )
 }
@@ -1411,4 +1423,679 @@ fn existing_vlm_pilot_observed_capability_strings_remain_compatible() {
         ]
     );
     assert!(record.native_evidence.is_none());
+}
+
+fn run_batch_with_preparer<C: FnMut() -> bool>(
+    fixture: &NativeRuntimeFixture,
+    transport: &dyn NativeSttTransport,
+    preparer: &mut NativeSpeechPreparer,
+    is_cancelled: &mut C,
+) -> Result<crate::NativeSpeechBatchReport> {
+    fixture
+        .catalog
+        .transcribe_native_speech_authorized_with_transport_and_preparer(
+            &fixture.policy_id,
+            &crate::ResourceOverrides::default(),
+            transport,
+            preparer,
+            is_cancelled,
+            &mut |_| std::ops::ControlFlow::Continue(()),
+        )
+}
+
+fn long_speech_region() -> SpeechRegion {
+    SpeechRegion {
+        start_ms: 0,
+        end_ms: 65_000,
+    }
+}
+
+#[test]
+fn native_batch_reuses_paid_pilot_transcribes_multiwindow_scope_and_caches_resume() {
+    let fixture = runtime_fixture(&[true, true], 65);
+    install_fake_vad_artifact(&fixture.catalog);
+    let detector_loads = Arc::new(AtomicUsize::new(0));
+    let (mut preparer, detector_calls) = fake_preparer(
+        true,
+        pcm(65),
+        vec![
+            vec![long_speech_region()],
+            vec![long_speech_region()],
+            vec![long_speech_region()],
+        ],
+        Arc::clone(&detector_loads),
+    );
+    let transport = RecordingNativeTransport::new(&fixture.catalog, None, accepted_response());
+
+    // The existing one-window capability pilot pays for the first bounded
+    // window of the first selected speech source.
+    let pilot =
+        run_with_preparer(&fixture, &transport, &mut preparer, false, &mut || false).unwrap();
+    assert_eq!(pilot.status, "passed");
+    assert_eq!(transport.transcribe_calls.load(Ordering::SeqCst), 1);
+
+    let report =
+        run_batch_with_preparer(&fixture, &transport, &mut preparer, &mut || false).unwrap();
+    assert!(!report.cancelled, "{report:?}");
+    assert_eq!(report.assets_total, 2);
+    assert_eq!(report.completed, 2, "{report:#?}");
+    assert_eq!(
+        report
+            .outcomes
+            .iter()
+            .filter(|outcome| outcome.status == "speech")
+            .count(),
+        2
+    );
+    assert_eq!(report.reused, 0);
+    assert_eq!(
+        report
+            .accounting
+            .as_ref()
+            .map_or(0, |accounting| accounting.request_count),
+        5
+    );
+    assert_eq!(transport.prepare_calls.load(Ordering::SeqCst), 6);
+    assert_eq!(transport.transcribe_calls.load(Ordering::SeqCst), 6);
+    assert_eq!(detector_calls.load(Ordering::SeqCst), 3);
+    assert_eq!(report.outcomes.len(), 2);
+    for outcome in &report.outcomes {
+        assert_eq!(outcome.status, "speech");
+        let provenance = fixture
+            .catalog
+            .native_transcript_provenance(&outcome.asset_id)
+            .unwrap()
+            .unwrap();
+        let coverage = provenance.coverage.as_ref().unwrap();
+        assert_eq!(coverage.planned_window_count, 3);
+        assert_eq!(coverage.completed_window_count, 3);
+        for window in &provenance.windows {
+            assert_eq!(
+                window.quality.decision,
+                crate::analysis::quality::native_stt::NativeSttQualityDecision::Accepted
+            );
+            assert_eq!(
+                window.accounting.request.actual_provider.as_deref(),
+                Some("openai")
+            );
+            assert_eq!(
+                window.accounting.request.actual_model.as_deref(),
+                Some(OPENROUTER_WHISPER_MODEL)
+            );
+            assert_eq!(window.latency_ms, 17);
+            assert!((window.accounting.request.confirmed_cost_usd - 0.0001).abs() < 1e-12);
+            assert_eq!(window.accounting.request.uncertain_usage_reserve_usd, 0.0);
+        }
+    }
+    assert!((report.accounting.as_ref().unwrap().confirmed_cost_usd - 0.0005).abs() < 1e-12);
+    assert_eq!(
+        report
+            .accounting
+            .as_ref()
+            .unwrap()
+            .uncertain_usage_reserve_usd,
+        0.0
+    );
+    assert!(!report.accounting.as_ref().unwrap().has_unresolved_usage());
+    assert!(report.run_id.is_some());
+
+    // A second invocation is entirely cached: no local model load, credential
+    // resolution or provider call is required.
+    let (mut cached_preparer, _) =
+        fake_preparer(true, pcm(65), Vec::new(), Arc::new(AtomicUsize::new(0)));
+    let cached =
+        run_batch_with_preparer(&fixture, &transport, &mut cached_preparer, &mut || false).unwrap();
+    assert_eq!(cached.completed, 2);
+    assert_eq!(cached.reused, 2);
+    assert_eq!(
+        cached
+            .accounting
+            .as_ref()
+            .map_or(0, |accounting| accounting.request_count),
+        0
+    );
+    assert!(cached.run_id.is_none());
+    assert!(cached.outcomes.iter().all(|outcome| outcome.reused));
+    assert_eq!(transport.prepare_calls.load(Ordering::SeqCst), 6);
+    assert_eq!(transport.transcribe_calls.load(Ordering::SeqCst), 6);
+    assert_eq!(
+        fixture
+            .catalog
+            .list_analysis_requests(&fixture.project_id, Some(&fixture.policy_id), 100)
+            .unwrap()
+            .len(),
+        6
+    );
+}
+
+#[test]
+fn native_batch_silence_is_provider_free_after_local_pilot() {
+    let fixture = runtime_fixture(&[true, true], 1);
+    install_fake_vad_artifact(&fixture.catalog);
+    let detector_loads = Arc::new(AtomicUsize::new(0));
+    let (mut preparer, _) = fake_preparer(
+        true,
+        pcm(1),
+        vec![Vec::new(), Vec::new(), Vec::new(), Vec::new()],
+        detector_loads,
+    );
+    let transport = RecordingNativeTransport::new(&fixture.catalog, None, accepted_response());
+
+    let pilot =
+        run_with_preparer(&fixture, &transport, &mut preparer, false, &mut || false).unwrap();
+    assert_eq!(pilot.status, "no_provider_required");
+    assert!(!pilot.validation.capability_observed);
+    assert_eq!(transport.prepare_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(transport.transcribe_calls.load(Ordering::SeqCst), 0);
+
+    let report =
+        run_batch_with_preparer(&fixture, &transport, &mut preparer, &mut || false).unwrap();
+    assert_eq!(report.completed, 2);
+    assert_eq!(
+        report
+            .outcomes
+            .iter()
+            .filter(|outcome| outcome.status == "no_speech")
+            .count(),
+        2
+    );
+    assert_eq!(
+        report
+            .accounting
+            .as_ref()
+            .map_or(0, |accounting| accounting.request_count),
+        0
+    );
+    assert!(report.run_id.is_none());
+    assert_eq!(transport.prepare_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(transport.transcribe_calls.load(Ordering::SeqCst), 0);
+    assert!(
+        fixture
+            .catalog
+            .list_analysis_requests(&fixture.project_id, Some(&fixture.policy_id), 100)
+            .unwrap()
+            .is_empty()
+    );
+    for outcome in &report.outcomes {
+        assert_eq!(outcome.status, "no_speech");
+        assert!(
+            fixture
+                .catalog
+                .native_transcript_provenance(&outcome.asset_id)
+                .unwrap()
+                .unwrap()
+                .windows
+                .is_empty()
+        );
+    }
+}
+
+#[test]
+fn native_batch_cancel_after_response_keeps_paid_window_and_resume_sends_only_missing() {
+    let fixture = runtime_fixture(&[true], 65);
+    install_fake_vad_artifact(&fixture.catalog);
+    let detector_loads = Arc::new(AtomicUsize::new(0));
+    let (mut preparer, _) = fake_preparer(
+        true,
+        pcm(65),
+        vec![
+            vec![long_speech_region()],
+            vec![long_speech_region()],
+            vec![long_speech_region()],
+        ],
+        Arc::clone(&detector_loads),
+    );
+    let cancelled_after_bulk_response = Arc::new(AtomicBool::new(false));
+    let response_cancel = Arc::clone(&cancelled_after_bulk_response);
+    let response_counter = Arc::new(AtomicUsize::new(0));
+    let response_calls = Arc::clone(&response_counter);
+    let transport = RecordingNativeTransport::new(&fixture.catalog, None, move |audio| {
+        let call = response_calls.fetch_add(1, Ordering::SeqCst) + 1;
+        let result = decoded_call(audio, Some(0.9), Some(0.0001));
+        if call == 2 {
+            // The second provider response overall is the first bulk window.
+            // Mark cancellation only after this response has been returned; the
+            // batch must still retain its typed checkpoint before stopping.
+            response_cancel.store(true, Ordering::SeqCst);
+        }
+        Ok(result)
+    });
+    let pilot =
+        run_with_preparer(&fixture, &transport, &mut preparer, false, &mut || false).unwrap();
+    assert_eq!(pilot.status, "passed");
+
+    let mut cancellation = || cancelled_after_bulk_response.load(Ordering::SeqCst);
+    let report =
+        run_batch_with_preparer(&fixture, &transport, &mut preparer, &mut cancellation).unwrap();
+    assert!(report.cancelled, "{report:#?}");
+    assert_eq!(
+        report
+            .accounting
+            .as_ref()
+            .map_or(0, |accounting| accounting.request_count),
+        1
+    );
+    assert_eq!(transport.transcribe_calls.load(Ordering::SeqCst), 2);
+    let checkpoint = fixture
+        .catalog
+        .native_transcript_checkpoint(fixture.asset_ids[0].as_str())
+        .unwrap()
+        .expect("partial checkpoint");
+    assert_eq!(checkpoint.windows.len(), 2);
+
+    let resumed =
+        run_batch_with_preparer(&fixture, &transport, &mut preparer, &mut || false).unwrap();
+    assert!(!resumed.cancelled, "{resumed:?}");
+    assert_eq!(resumed.completed, 1);
+    assert_eq!(
+        resumed
+            .accounting
+            .as_ref()
+            .map_or(0, |accounting| accounting.request_count),
+        1
+    );
+    assert_eq!(
+        fixture
+            .catalog
+            .native_transcript_provenance(&fixture.asset_ids[0])
+            .unwrap()
+            .unwrap()
+            .windows
+            .len(),
+        3
+    );
+    assert_eq!(transport.transcribe_calls.load(Ordering::SeqCst), 3);
+}
+
+#[test]
+fn native_batch_protocol_unusable_receipt_blocks_blind_replay() {
+    let fixture = runtime_fixture(&[true], 65);
+    install_fake_vad_artifact(&fixture.catalog);
+    let detector_loads = Arc::new(AtomicUsize::new(0));
+    let (mut preparer, _) = fake_preparer(
+        true,
+        pcm(65),
+        vec![
+            vec![long_speech_region()],
+            vec![long_speech_region()],
+            vec![long_speech_region()],
+        ],
+        Arc::clone(&detector_loads),
+    );
+    let responses = Arc::new(AtomicUsize::new(0));
+    let response_counter = Arc::clone(&responses);
+    let transport = RecordingNativeTransport::new(&fixture.catalog, None, move |audio| {
+        let call = response_counter.fetch_add(1, Ordering::SeqCst) + 1;
+        if call == 1 {
+            return Ok(decoded_call(audio, Some(0.9), Some(0.0001)));
+        }
+        let mut result = decode_native_stt_body(
+            b"PRIVATE_NATIVE_BODY_CANARY",
+            audio.duration_ms(),
+            Some("invalid-native-generation".into()),
+            9,
+        );
+        result.receipt.usage.cost = crate::NativeSttCost::Known(0.0001);
+        result.receipt.usage.seconds = Some(audio.duration_ms() as f64 / 1_000.0);
+        Ok(result)
+    });
+    let pilot =
+        run_with_preparer(&fixture, &transport, &mut preparer, false, &mut || false).unwrap();
+    assert_eq!(pilot.status, "passed");
+
+    let failed =
+        run_batch_with_preparer(&fixture, &transport, &mut preparer, &mut || false).unwrap();
+    assert_eq!(failed.failures.len(), 1);
+    assert!(!failed.failures.is_empty());
+    assert_eq!(transport.transcribe_calls.load(Ordering::SeqCst), 2);
+    let checkpoint = fixture
+        .catalog
+        .native_transcript_checkpoint(fixture.asset_ids[0].as_str())
+        .unwrap()
+        .expect("pilot-seeded checkpoint");
+    assert_eq!(checkpoint.windows.len(), 1);
+
+    let (mut replay_preparer, _) = fake_preparer(
+        true,
+        pcm(65),
+        vec![vec![long_speech_region()]],
+        Arc::new(AtomicUsize::new(0)),
+    );
+    let replay =
+        run_batch_with_preparer(&fixture, &transport, &mut replay_preparer, &mut || false).unwrap();
+    assert_eq!(replay.failures.len(), 1);
+    assert!(
+        replay.failures[0]
+            .detail
+            .contains("requires typed-result recovery"),
+        "{:?}",
+        replay.failures
+    );
+    assert_eq!(transport.transcribe_calls.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn native_batch_persists_quality_rejection_and_discards_candidate_text() {
+    let fixture = runtime_fixture(&[true], 65);
+    install_fake_vad_artifact(&fixture.catalog);
+    let detector_loads = Arc::new(AtomicUsize::new(0));
+    let (mut preparer, _) = fake_preparer(
+        true,
+        pcm(65),
+        vec![
+            vec![long_speech_region()],
+            vec![long_speech_region()],
+            vec![long_speech_region()],
+        ],
+        Arc::clone(&detector_loads),
+    );
+    let responses = Arc::new(AtomicUsize::new(0));
+    let response_counter = Arc::clone(&responses);
+    let transport = RecordingNativeTransport::new(&fixture.catalog, None, move |audio| {
+        let call = response_counter.fetch_add(1, Ordering::SeqCst) + 1;
+        if call == 1 {
+            Ok(decoded_call(audio, Some(0.9), Some(0.0001)))
+        } else {
+            Ok(decoded_call(audio, Some(0.01), Some(0.0001)))
+        }
+    });
+    let pilot =
+        run_with_preparer(&fixture, &transport, &mut preparer, false, &mut || false).unwrap();
+    assert_eq!(pilot.status, "passed");
+
+    let report =
+        run_batch_with_preparer(&fixture, &transport, &mut preparer, &mut || false).unwrap();
+    assert_eq!(report.completed, 1, "{report:#?}");
+    assert_eq!(
+        report
+            .outcomes
+            .iter()
+            .filter(|outcome| outcome.status == "rejected")
+            .count(),
+        1
+    );
+    let outcome = &report.outcomes[0];
+    assert_eq!(outcome.status, "rejected");
+    let provenance = fixture
+        .catalog
+        .native_transcript_provenance(&outcome.asset_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        provenance
+            .windows
+            .iter()
+            .filter(|window| window.quality.decision
+                == crate::analysis::quality::native_stt::NativeSttQualityDecision::Rejected)
+            .count(),
+        2
+    );
+    assert_eq!(
+        provenance
+            .windows
+            .iter()
+            .filter(|window| window.quality.decision
+                == crate::analysis::quality::native_stt::NativeSttQualityDecision::Accepted)
+            .count(),
+        1
+    );
+    let transcript = fixture
+        .catalog
+        .asset_transcript(fixture.asset_ids[0].as_str())
+        .unwrap()
+        .unwrap();
+    assert_eq!(transcript.status, crate::TranscriptStatus::Rejected);
+    assert!(
+        transcript.segments.is_empty(),
+        "rejected text must be discarded"
+    );
+}
+
+#[test]
+fn native_batch_explicit_selection_replaces_ordinary_local_rows_only() {
+    let fixture = runtime_fixture(&[true], 1);
+    install_fake_vad_artifact(&fixture.catalog);
+    let detector_loads = Arc::new(AtomicUsize::new(0));
+    let (mut preparer, _) = fake_preparer(
+        true,
+        pcm(1),
+        vec![
+            vec![SpeechRegion {
+                start_ms: 0,
+                end_ms: 1_000,
+            }],
+            vec![SpeechRegion {
+                start_ms: 0,
+                end_ms: 1_000,
+            }],
+        ],
+        Arc::clone(&detector_loads),
+    );
+    let transport = RecordingNativeTransport::new(&fixture.catalog, None, accepted_response());
+    let pilot =
+        run_with_preparer(&fixture, &transport, &mut preparer, false, &mut || false).unwrap();
+    assert_eq!(pilot.status, "passed");
+
+    let policy = fixture
+        .catalog
+        .load_run_authorization(&fixture.policy_id)
+        .unwrap()
+        .policy;
+    let scope = &policy.scope[0];
+    let local = crate::ClipTranscript {
+        asset_id: scope.asset_id.clone(),
+        recipe_key: crate::STT_RECIPE_KEY.into(),
+        source_fingerprint: scope
+            .sampled_representation_fingerprint
+            .clone()
+            .expect("sampled source fingerprint"),
+        status: crate::TranscriptStatus::NoSpeech,
+        outcome_reason: crate::TranscriptOutcomeReason::NoDetectedSpeech,
+        reject_reason: String::new(),
+        primary_language: String::new(),
+        speech_seconds: 0.0,
+        window_count: 0,
+        provider_segment_count: 0,
+        mean_token_probability: None,
+        repetition_ratio: None,
+        segments: Vec::new(),
+    };
+    crate::analysis::store::save_transcript(&fixture.catalog.connection().unwrap(), &local)
+        .unwrap();
+
+    let report =
+        run_batch_with_preparer(&fixture, &transport, &mut preparer, &mut || false).unwrap();
+    assert_eq!(report.completed, 1);
+    assert_eq!(
+        report
+            .outcomes
+            .iter()
+            .filter(|outcome| outcome.status == "speech")
+            .count(),
+        1
+    );
+    assert_eq!(
+        report
+            .accounting
+            .as_ref()
+            .map_or(0, |accounting| accounting.request_count),
+        0
+    );
+    assert_eq!(transport.transcribe_calls.load(Ordering::SeqCst), 1);
+    let transcript = fixture
+        .catalog
+        .asset_transcript(&scope.asset_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(transcript.status, crate::TranscriptStatus::Speech);
+    assert_ne!(transcript.recipe_key, crate::STT_RECIPE_KEY);
+    assert!(
+        fixture
+            .catalog
+            .native_transcript_provenance(&scope.asset_id)
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[test]
+fn native_batch_unknown_usage_retains_typed_prefix_and_stops_replay() {
+    let fixture = runtime_fixture(&[true], 65);
+    install_fake_vad_artifact(&fixture.catalog);
+    let detector_loads = Arc::new(AtomicUsize::new(0));
+    let (mut preparer, _) = fake_preparer(
+        true,
+        pcm(65),
+        vec![
+            vec![long_speech_region()],
+            vec![long_speech_region()],
+            vec![long_speech_region()],
+        ],
+        Arc::clone(&detector_loads),
+    );
+    let response_calls = Arc::new(AtomicUsize::new(0));
+    let response_counter = Arc::clone(&response_calls);
+    let transport = RecordingNativeTransport::new(&fixture.catalog, None, move |audio| {
+        let call = response_counter.fetch_add(1, Ordering::SeqCst) + 1;
+        if call == 1 {
+            Ok(decoded_call(audio, Some(0.9), Some(0.0001)))
+        } else {
+            Ok(decoded_call(audio, Some(0.9), None))
+        }
+    });
+    let pilot =
+        run_with_preparer(&fixture, &transport, &mut preparer, false, &mut || false).unwrap();
+    assert_eq!(pilot.status, "passed");
+
+    let report =
+        run_batch_with_preparer(&fixture, &transport, &mut preparer, &mut || false).unwrap();
+    assert_eq!(report.failures.len(), 1);
+    assert!(
+        report
+            .accounting
+            .as_ref()
+            .unwrap()
+            .uncertain_usage_reserve_usd
+            > 0.0
+    );
+    assert!(!!report.accounting.as_ref().unwrap().has_unresolved_usage());
+    assert_eq!(transport.transcribe_calls.load(Ordering::SeqCst), 2);
+    let checkpoint = fixture
+        .catalog
+        .native_transcript_checkpoint(fixture.asset_ids[0].as_str())
+        .unwrap()
+        .expect("typed paid prefix");
+    assert_eq!(checkpoint.windows.len(), 2);
+
+    let (mut replay_preparer, _) = fake_preparer(
+        true,
+        pcm(65),
+        vec![vec![long_speech_region()]],
+        Arc::new(AtomicUsize::new(0)),
+    );
+    let replay =
+        run_batch_with_preparer(&fixture, &transport, &mut replay_preparer, &mut || false).unwrap();
+    assert_eq!(replay.failures.len(), 1);
+    assert_eq!(transport.transcribe_calls.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn native_batch_final_window_unknown_or_overrun_retains_prefix_and_reports_failure() {
+    for cost in [None, Some(0.1)] {
+        let fixture = runtime_fixture(&[true, true], 1);
+        install_fake_vad_artifact(&fixture.catalog);
+        let (mut preparer, _) = fake_preparer(
+            true,
+            pcm(1),
+            vec![
+                vec![SpeechRegion {
+                    start_ms: 0,
+                    end_ms: 1_000
+                }];
+                3
+            ],
+            Arc::new(AtomicUsize::new(0)),
+        );
+        let responses = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&responses);
+        let transport = RecordingNativeTransport::new(&fixture.catalog, None, move |audio| {
+            let call = counter.fetch_add(1, Ordering::SeqCst);
+            Ok(decoded_call(
+                audio,
+                Some(0.9),
+                if call == 0 { Some(0.0001) } else { cost },
+            ))
+        });
+        run_with_preparer(&fixture, &transport, &mut preparer, false, &mut || false).unwrap();
+        let report =
+            run_batch_with_preparer(&fixture, &transport, &mut preparer, &mut || false).unwrap();
+        assert_eq!(report.status, "failed", "{report:?}");
+        assert_eq!(report.failures.len(), 1);
+        assert_eq!(transport.transcribe_calls.load(Ordering::SeqCst), 2);
+        let checkpoint = fixture
+            .catalog
+            .native_transcript_checkpoint(&fixture.asset_ids[1])
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            checkpoint.windows.len(),
+            1,
+            "last paid result must survive the stop"
+        );
+        assert_eq!(
+            fixture
+                .catalog
+                .asset_transcript(&fixture.asset_ids[1])
+                .unwrap()
+                .unwrap()
+                .outcome_reason,
+            crate::TranscriptOutcomeReason::NativeCoverageIncomplete
+        );
+    }
+}
+
+#[test]
+fn native_batch_missing_quality_evidence_remains_review_required_and_unaccepted() {
+    let fixture = runtime_fixture(&[true, true], 1);
+    install_fake_vad_artifact(&fixture.catalog);
+    let (mut preparer, _) = fake_preparer(
+        true,
+        pcm(1),
+        vec![
+            vec![SpeechRegion {
+                start_ms: 0,
+                end_ms: 1_000
+            }];
+            3
+        ],
+        Arc::new(AtomicUsize::new(0)),
+    );
+    let responses = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&responses);
+    let transport = RecordingNativeTransport::new(&fixture.catalog, None, move |audio| {
+        let call = counter.fetch_add(1, Ordering::SeqCst);
+        Ok(decoded_call(
+            audio,
+            if call == 0 { Some(0.9) } else { None },
+            Some(0.0001),
+        ))
+    });
+    run_with_preparer(&fixture, &transport, &mut preparer, false, &mut || false).unwrap();
+    let report =
+        run_batch_with_preparer(&fixture, &transport, &mut preparer, &mut || false).unwrap();
+    assert_eq!(report.status, "completed", "{report:?}");
+    let transcript = fixture
+        .catalog
+        .asset_transcript(&fixture.asset_ids[1])
+        .unwrap()
+        .unwrap();
+    assert_eq!(transcript.status, crate::TranscriptStatus::ReviewRequired);
+    assert!(!transcript.segments.is_empty());
+    assert!(
+        fixture
+            .catalog
+            .prompt_transcript(&fixture.asset_ids[1])
+            .unwrap()
+            .is_none()
+    );
 }
