@@ -7,7 +7,7 @@ use thiserror::Error;
 
 use crate::chronology::forward_migrate_project_chronology;
 
-pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 46;
+pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 47;
 
 const MIGRATION_TABLE_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -360,7 +360,18 @@ pub const PROJECT_CATALOG_MIGRATIONS: &[SqliteMigration] = &[
         source_identity: "project-catalog/0046-analysis-provider-health-cooldowns/20261027",
         apply: add_analysis_provider_health_cooldowns,
     },
+    SqliteMigration {
+        id: 47,
+        name: "asset_orientation_decisions",
+        source_identity: "project-catalog/0047-asset-orientation-decisions/20261027",
+        apply: add_asset_orientation_decisions,
+    },
 ];
+
+fn add_asset_orientation_decisions(transaction: &Transaction<'_>) -> Result<()> {
+    add_column_if_missing(transaction, "assets", "orientation_decision_json", "TEXT")?;
+    Ok(())
+}
 
 /// Durable provider health shared by concurrent and resumed workers. Policy
 /// identity is stable for the authorized generation; run IDs are attempt evidence.
@@ -4508,7 +4519,30 @@ mod tests {
             inspect_project_catalog_migrations(&connection)
                 .unwrap()
                 .current_version,
-            46
+            PROJECT_CATALOG_SCHEMA_VERSION
+        );
+    }
+
+    #[test]
+    fn migration_47_adds_nullable_orientation_decision_without_rewriting_assets() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        run_sqlite_migrations(&mut connection, &PROJECT_CATALOG_MIGRATIONS[..46]).unwrap();
+        connection.execute_batch(
+            "INSERT INTO projects(id,name,created_at) VALUES ('p47','project','2026-01-01T00:00:00Z');
+             INSERT INTO assets(id,project_id,fingerprint,path,filename,size_bytes,duration_seconds,created_at)
+             VALUES ('a47','p47','fp','/offline/a.mp4','a.mp4',7,1,'2026-01-01T00:00:00Z');",
+        ).unwrap();
+        assert!(!column_exists(&connection, "assets", "orientation_decision_json").unwrap());
+        migrate_project_catalog(&mut connection).unwrap();
+        assert_eq!(
+            connection.query_row("SELECT fingerprint,rotation_degrees,orientation_decision_json FROM assets WHERE id='a47'", [], |row| Ok((row.get::<_,String>(0)?,row.get::<_,i64>(1)?,row.get::<_,Option<String>>(2)?))).unwrap(),
+            ("fp".to_string(), 0, None),
+        );
+        assert_eq!(
+            inspect_project_catalog_migrations(&connection)
+                .unwrap()
+                .current_version,
+            PROJECT_CATALOG_SCHEMA_VERSION
         );
     }
 }

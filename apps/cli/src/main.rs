@@ -3,8 +3,8 @@ use anyhow::{Context, Result, anyhow, ensure};
 use clap::CommandFactory;
 use clap::{Args, Parser, Subcommand, ValueEnum, error::ErrorKind};
 use rcdvlog_core::{
-    Asset, AssetPatch, Catalog, MediaStreamInfo, ProxyEncoderPolicy, ProxyRepresentation,
-    inspect_catalog, landscape_default_rotation, probe_media_stream,
+    Asset, AssetPatch, Catalog, MediaStreamInfo, OrientationDecision, ProxyEncoderPolicy,
+    ProxyRepresentation, inspect_catalog, landscape_default_rotation, probe_media_stream,
     probe_proxy_encoder_capabilities,
 };
 use serde::{Deserialize, Serialize};
@@ -489,6 +489,43 @@ enum ClipsCommand {
         #[arg(long)]
         asset: String,
     },
+    /// Show a bounded queue of suspicious, unresolved, or mismatched decisions.
+    OrientationQueue {
+        #[arg(long)]
+        project: String,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+    },
+    /// Generate metadata-raw and saved-effective comparison stills.
+    OrientationEvidence {
+        #[arg(long)]
+        asset: String,
+    },
+    /// Record a revision-guarded visual confirmation, including current defaults.
+    OrientationConfirm {
+        #[arg(long)]
+        asset: String,
+        #[arg(long)]
+        expected_revision: u64,
+        #[arg(long)]
+        rotation_degrees: u16,
+    },
+    /// Explicitly leave an orientation unresolved without changing its rotation.
+    OrientationUnresolved {
+        #[arg(long)]
+        asset: String,
+        #[arg(long)]
+        expected_revision: u64,
+    },
+    /// Atomically review several assets; repeat --confirm asset:revision:degrees or --unresolved asset:revision.
+    OrientationConfirmBatch {
+        #[arg(long = "confirm")]
+        confirm: Vec<String>,
+        #[arg(long = "unresolved")]
+        unresolved: Vec<String>,
+    },
     Update {
         #[arg(long)]
         asset: String,
@@ -725,6 +762,11 @@ fn command_name(command: &Commands) -> &'static str {
             ClipsCommand::Diagnose { .. } => "clips.diagnose",
             ClipsCommand::ValidateVideo { .. } => "clips.validate-video",
             ClipsCommand::RefreshOrientation { .. } => "clips.refresh-orientation",
+            ClipsCommand::OrientationQueue { .. } => "clips.orientation-queue",
+            ClipsCommand::OrientationEvidence { .. } => "clips.orientation-evidence",
+            ClipsCommand::OrientationConfirm { .. } => "clips.orientation-confirm",
+            ClipsCommand::OrientationUnresolved { .. } => "clips.orientation-unresolved",
+            ClipsCommand::OrientationConfirmBatch { .. } => "clips.orientation-confirm-batch",
             ClipsCommand::Update { .. } => "clips.update",
         },
         Commands::Clock { .. } => "clock.apply",
@@ -864,7 +906,7 @@ fn execute(cli: &Cli) -> Result<Value> {
             command: ProjectCommand::Diagnose { .. },
         }
         | Commands::Clips {
-            command: ClipsCommand::Diagnose { .. },
+            command: ClipsCommand::Diagnose { .. } | ClipsCommand::OrientationQueue { .. },
         }
         | Commands::Proxy {
             command:
@@ -1056,6 +1098,31 @@ fn execute(cli: &Cli) -> Result<Value> {
             ClipsCommand::RefreshOrientation { asset } => Ok(serde_json::to_value(
                 catalog.refresh_asset_orientation(asset)?,
             )?),
+            ClipsCommand::OrientationQueue { project, limit, offset } => Ok(serde_json::to_value(
+                catalog.orientation_review_queue(project, *limit, *offset)?,
+            )?),
+            ClipsCommand::OrientationEvidence { asset } => Ok(serde_json::to_value(catalog.orientation_evidence(asset)?)?),
+            ClipsCommand::OrientationConfirm { asset, expected_revision, rotation_degrees } => Ok(serde_json::to_value(
+                catalog.decide_orientation(asset, *expected_revision, OrientationDecision { status: "confirmed".into(), rotation_degrees: Some(*rotation_degrees) })?,
+            )?),
+            ClipsCommand::OrientationUnresolved { asset, expected_revision } => Ok(serde_json::to_value(
+                catalog.decide_orientation(asset, *expected_revision, OrientationDecision { status: "unresolved".into(), rotation_degrees: None })?,
+            )?),
+            ClipsCommand::OrientationConfirmBatch { confirm, unresolved } => {
+                ensure!(!confirm.is_empty() || !unresolved.is_empty(), "provide at least one --confirm or --unresolved decision");
+                let mut decisions = confirm.iter().map(|item| {
+                    let mut parts = item.rsplitn(3, ':');
+                    let degrees = parts.next().context("batch confirmation must be asset:revision:degrees")?.parse::<u16>()?;
+                    let revision = parts.next().context("batch confirmation must be asset:revision:degrees")?.parse::<u64>()?;
+                    let asset = parts.next().context("batch confirmation must be asset:revision:degrees")?;
+                    Ok((asset.to_string(), revision, OrientationDecision { status: "confirmed".into(), rotation_degrees: Some(degrees) }))
+                }).collect::<Result<Vec<_>>>()?;
+                decisions.extend(unresolved.iter().map(|item| {
+                    let (asset, revision) = item.rsplit_once(':').context("unresolved decision must be asset:revision")?;
+                    Ok((asset.to_string(), revision.parse::<u64>()?, OrientationDecision { status: "unresolved".into(), rotation_degrees: None }))
+                }).collect::<Result<Vec<_>>>()?);
+                Ok(serde_json::to_value(catalog.decide_orientation_batch(&decisions)?)?)
+            }
             ClipsCommand::Update {
                 asset,
                 notes,

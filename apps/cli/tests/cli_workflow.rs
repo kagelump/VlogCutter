@@ -142,6 +142,34 @@ fn create_project(catalog: &Path, name: &str) -> String {
         .to_string()
 }
 
+fn insert_orientation_asset(
+    catalog: &Path,
+    project: &str,
+    id: &str,
+    width: u32,
+    height: u32,
+    default_degrees: u16,
+    rotation_degrees: u16,
+) {
+    Connection::open(catalog)
+        .unwrap()
+        .execute(
+            "INSERT INTO assets(id,project_id,fingerprint,path,filename,size_bytes,duration_seconds,frame_rate,width,height,codec,camera,captured_at_raw,best_time,metadata_rotation_degrees,default_rotation_degrees,rotation_degrees,orientation_probed,notes,labels_json,removed,created_at) VALUES (?1,?2,?3,?4,?5,100,10,30,?6,?7,'h264','Synthetic camera','2025-12-01T00:00:00Z','2025-12-01T00:00:00Z',0,?8,?9,1,'','[]',0,'2026-01-01T00:00:00Z')",
+            params![
+                id,
+                project,
+                format!("fingerprint-{id}"),
+                format!("/offline/{id}.mp4"),
+                format!("{id}.mp4"),
+                width,
+                height,
+                default_degrees,
+                rotation_degrees,
+            ],
+        )
+        .unwrap();
+}
+
 fn insert_native_no_audio_asset(
     catalog_path: &Path,
     project: &str,
@@ -3139,6 +3167,184 @@ fn a_stale_clip_update_is_refused_with_a_code_the_agent_can_act_on() {
         "decided before the label landed"
     );
     assert_eq!(settled.json["data"]["labels"][0], "market");
+}
+
+#[test]
+fn orientation_queue_is_read_only_and_orientation_decisions_are_revision_guarded() {
+    let directory = tempdir().unwrap();
+    let catalog = directory.path().join("catalog.sqlite3");
+    let project = create_project(&catalog, "Orientation CLI");
+    success(
+        &catalog,
+        ["doctor", "--require-capability", "orientation.review.v1"],
+    );
+    insert_orientation_asset(&catalog, &project, "asset_queue", 1080, 1920, 90, 90);
+    insert_orientation_asset(&catalog, &project, "asset_default", 1080, 1920, 90, 90);
+    insert_orientation_asset(&catalog, &project, "asset_batch_confirm", 1920, 1080, 0, 0);
+    insert_orientation_asset(
+        &catalog,
+        &project,
+        "asset_batch_unresolved",
+        1080,
+        1920,
+        90,
+        90,
+    );
+
+    // Model a catalog stopped one migration behind. The queue must use the
+    // explicit-catalog read-only open path and leave its migration history and
+    // SQLite bytes untouched.
+    Connection::open(&catalog)
+        .unwrap()
+        .execute("DELETE FROM schema_migrations WHERE migration_id=47", [])
+        .unwrap();
+    let before = fs::read(&catalog).unwrap();
+    let queue = success(
+        &catalog,
+        [
+            "clips",
+            "orientation-queue",
+            "--project",
+            &project,
+            "--limit",
+            "3",
+        ],
+    );
+    assert_eq!(queue.json["data"]["total"], 3);
+    assert_eq!(queue.json["data"]["items"].as_array().unwrap().len(), 3);
+    assert_eq!(
+        queue.json["data"]["items"][0]["asset"]["orientationDecision"],
+        Value::Null
+    );
+    assert!(
+        queue.json["data"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["asset"]["id"] == "asset_queue"
+                && item["reviewReasons"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|reason| reason == "portrait_dimensions_need_review"))
+    );
+    assert_eq!(fs::read(&catalog).unwrap(), before);
+    assert_eq!(
+        Connection::open(&catalog)
+            .unwrap()
+            .query_row(
+                "SELECT MAX(migration_id) FROM schema_migrations",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        46
+    );
+
+    // Confirming the current inferred default is an explicit operation even
+    // though no rotation value changes.
+    let default_confirmation = success(
+        &catalog,
+        [
+            "clips",
+            "orientation-confirm",
+            "--asset",
+            "asset_default",
+            "--expected-revision",
+            "0",
+            "--rotation-degrees",
+            "90",
+        ],
+    );
+    assert_eq!(default_confirmation.json["data"]["rotationDegrees"], 90);
+    assert_eq!(
+        default_confirmation.json["data"]["orientationDecision"]["status"],
+        "confirmed"
+    );
+    assert_eq!(
+        default_confirmation.json["data"]["orientationDecision"]["rotationDegrees"],
+        90
+    );
+
+    let stale_confirmation = failure(
+        &catalog,
+        [
+            "clips",
+            "orientation-confirm",
+            "--asset",
+            "asset_default",
+            "--expected-revision",
+            "0",
+            "--rotation-degrees",
+            "180",
+        ],
+    );
+    assert_eq!(stale_confirmation["error"]["code"], "stale_revision");
+    assert_eq!(
+        success(&catalog, ["clips", "get", "--asset", "asset_default"]).json["data"]["rotationDegrees"],
+        90
+    );
+
+    // The mixed batch has one stale member. Neither its valid confirmation
+    // nor unresolved decision may be written.
+    let stale_batch = failure(
+        &catalog,
+        [
+            "clips",
+            "orientation-confirm-batch",
+            "--confirm",
+            "asset_batch_confirm:0:180",
+            "--unresolved",
+            "asset_batch_unresolved:1",
+        ],
+    );
+    assert_eq!(stale_batch["error"]["code"], "stale_revision");
+    for asset in ["asset_batch_confirm", "asset_batch_unresolved"] {
+        let read = success(&catalog, ["clips", "get", "--asset", asset]);
+        assert_eq!(read.json["data"]["revision"], 0);
+        assert_eq!(read.json["data"]["orientationDecision"], Value::Null);
+    }
+    assert_eq!(
+        Connection::open(&catalog)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM project_operations WHERE operation_type='orientationDecisionSet' AND aggregate_id IN ('asset_batch_confirm','asset_batch_unresolved')",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0
+    );
+
+    let batch = success(
+        &catalog,
+        [
+            "clips",
+            "orientation-confirm-batch",
+            "--confirm",
+            "asset_batch_confirm:0:0",
+            "--unresolved",
+            "asset_batch_unresolved:0",
+        ],
+    );
+    let items = batch.json["data"].as_array().expect("batch asset list");
+    let confirmed = items
+        .iter()
+        .find(|asset| asset["id"] == "asset_batch_confirm")
+        .unwrap();
+    let unresolved = items
+        .iter()
+        .find(|asset| asset["id"] == "asset_batch_unresolved")
+        .unwrap();
+    assert_eq!(confirmed["orientationDecision"]["status"], "confirmed");
+    assert_eq!(confirmed["orientationDecision"]["rotationDegrees"], 0);
+    assert_eq!(confirmed["rotationDegrees"], 0);
+    assert_eq!(unresolved["orientationDecision"]["status"], "unresolved");
+    assert_eq!(
+        unresolved["orientationDecision"]["rotationDegrees"],
+        Value::Null
+    );
+    assert_eq!(unresolved["rotationDegrees"], 90);
 }
 
 #[test]

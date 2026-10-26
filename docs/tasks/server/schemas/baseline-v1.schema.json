@@ -132,6 +132,15 @@
         "metadataRotationDegrees": { "type": "integer" },
         "defaultRotationDegrees": { "type": "integer" },
         "orientationProbed": { "type": "boolean" },
+        "orientationDecision": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "required": ["status", "rotationDegrees"],
+          "properties": {
+            "status": { "enum": ["confirmed", "unresolved"] },
+            "rotationDegrees": { "type": ["integer", "null"], "enum": [0, 90, 180, 270, null] }
+          }
+        },
         "baselineNotes": { "type": "string" },
         "baselineLabels": { "type": "array", "items": { "type": "string" } },
         "baselineRemoved": { "type": "boolean" },

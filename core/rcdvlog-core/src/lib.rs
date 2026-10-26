@@ -273,11 +273,11 @@ pub use operations::{
     EDIT_PLAN_EXPORT_RECORDED, EDIT_PLAN_REVISION_ACTIVATED, EDIT_PLAN_REVISION_CREATED,
     EVENT_ORDER_CONSTRAINT_CLEARED, EVENT_ORDER_CONSTRAINT_SET, HybridLogicalTime, LABEL_ADDED,
     LABEL_REMOVED, MAX_REMOTE_HLC_FUTURE_SKEW_MILLIS, NOTE_REVISION_CREATED,
-    NoteRevisionProjection, OperationBatchResult, OperationDiagnostics, PROJECT_ASSET_ADDED,
-    PROJECT_ASSET_MEDIA_LINKED, ProjectAssetAddedPayload, ProjectAssetItem, ProjectAssetPage,
-    ProjectOperation, REMOVED_SET, ROTATION_SET, STALE_ASSET_REVISION, SequenceRecoveryProjection,
-    SequenceRecoveryState, TRIP_PHASE_REMOVED, TRIP_PHASE_SET,
-    operation_affects_chronology_projection,
+    NoteRevisionProjection, ORIENTATION_DECISION_SET, OperationBatchResult, OperationDiagnostics,
+    OrientationDecision, PROJECT_ASSET_ADDED, PROJECT_ASSET_MEDIA_LINKED, ProjectAssetAddedPayload,
+    ProjectAssetItem, ProjectAssetPage, ProjectOperation, REMOVED_SET, ROTATION_SET,
+    STALE_ASSET_REVISION, SequenceRecoveryProjection, SequenceRecoveryState, TRIP_PHASE_REMOVED,
+    TRIP_PHASE_SET, operation_affects_chronology_projection,
 };
 
 pub use baseline::{PortableAssetBaseline, PortableRootMapping, ProjectBaselineSnapshot};
@@ -422,6 +422,9 @@ pub struct Asset {
     pub rotation_degrees: u16,
     /// True when camera rotation metadata has been explicitly probed for this asset.
     pub orientation_probed: bool,
+    /// Explicit visual judgment, independent of inferred defaults and numeric overrides.
+    #[serde(default)]
+    pub orientation_decision: Option<OrientationDecision>,
     pub original_available: bool,
     pub proxy_available: bool,
     pub thumbnail_path: Option<String>,
@@ -1082,6 +1085,163 @@ pub struct MediaStreamInfo {
     pub display_orientation: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrientationEvidence {
+    pub asset_id: String,
+    pub asset_revision: u64,
+    pub source_fingerprint: String,
+    pub representation: String,
+    pub representation_fingerprint: Option<String>,
+    pub original_available: bool,
+    pub raw_frame_path: Option<String>,
+    pub effective_frame_path: Option<String>,
+    pub unavailable_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrientationReviewItem {
+    pub asset: Asset,
+    pub review_reasons: Vec<String>,
+    pub evidence_available: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrientationReviewPage {
+    pub items: Vec<OrientationReviewItem>,
+    pub total: usize,
+    pub offset: usize,
+    pub limit: usize,
+}
+
+fn orientation_review_reasons(asset: &Asset) -> Vec<String> {
+    let decision = asset.orientation_decision.as_ref();
+    if decision.is_some_and(|decision| {
+        decision.status == "confirmed" && decision.rotation_degrees == Some(asset.rotation_degrees)
+    }) {
+        return Vec::new();
+    }
+    let mut reasons = Vec::new();
+    if !asset.orientation_probed {
+        reasons.push("metadata_unprobed".into());
+    }
+    if decision.is_some_and(|decision| decision.status == "unresolved") {
+        reasons.push("explicitly_unresolved".into());
+    }
+    if decision.is_some_and(|decision| {
+        decision.status == "confirmed" && decision.rotation_degrees != Some(asset.rotation_degrees)
+    }) {
+        reasons.push("confirmed_value_mismatch".into());
+    }
+    if asset.width < asset.height {
+        reasons.push("portrait_dimensions_need_review".into());
+    }
+    if asset.default_rotation_degrees != asset.metadata_rotation_degrees {
+        reasons.push("landscape_default_differs_from_metadata".into());
+    }
+    if asset.rotation_degrees != asset.default_rotation_degrees
+        && !decision.is_some_and(|decision| decision.status == "confirmed")
+    {
+        reasons.push("explicit_override_unconfirmed".into());
+    }
+    reasons
+}
+
+fn render_orientation_still(
+    input: &Path,
+    output: &Path,
+    timestamp: &str,
+    rotation: i32,
+) -> Result<()> {
+    let rotation_filter = match rotation {
+        0 => "",
+        90 => "transpose=clock,",
+        180 => "hflip,vflip,",
+        270 => "transpose=cclock,",
+        _ => bail!("unsupported orientation evidence rotation {rotation}"),
+    };
+    let filter = format!(
+        "{rotation_filter}scale='min(960,iw)':'min(960,ih)':force_original_aspect_ratio=decrease"
+    );
+    let mut command = tool_command("ffmpeg");
+    command
+        .args([
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-ss",
+            timestamp,
+            "-noautorotate",
+            "-i",
+        ])
+        .arg(input)
+        .args(["-frames:v", "1", "-vf", &filter])
+        .arg(output);
+    let (status, diagnostic) = run_captured_media_command(&mut command, input, output)
+        .context("start orientation evidence frame extraction")?;
+    if !status.success() {
+        let _ = fs::remove_file(output);
+        return Err(media_tool_failure(
+            "orientation evidence frame extraction",
+            status,
+            diagnostic,
+        ));
+    }
+    ensure!(
+        output.is_file(),
+        "orientation evidence extractor produced no frame"
+    );
+    Ok(())
+}
+
+fn full_media_fingerprint(path: &Path) -> Result<String> {
+    let mut file = File::open(path)
+        .with_context(|| format!("open selected representation {}", path.display()))?;
+    let mut hasher = Hasher::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .with_context(|| format!("read selected representation {}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
+fn decode_orientation_decision(
+    value: Option<String>,
+) -> rusqlite::Result<Option<OrientationDecision>> {
+    value
+        .map(|json| {
+            let decision: OrientationDecision = serde_json::from_str(&json).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    35,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?;
+            operations::validate_orientation_decision(&decision.status, decision.rotation_degrees)
+                .map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        35,
+                        rusqlite::types::Type::Text,
+                        Box::new(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            error.to_string(),
+                        )),
+                    )
+                })?;
+            Ok(decision)
+        })
+        .transpose()
+}
+
 /// Inspects catalog shape and counts without running migrations or opening it writable.
 pub fn inspect_catalog(path: impl AsRef<Path>) -> Result<CatalogInspection> {
     let path = path.as_ref();
@@ -1120,6 +1280,7 @@ pub fn inspect_catalog(path: impl AsRef<Path>) -> Result<CatalogInspection> {
         "default_rotation_degrees",
         "rotation_degrees",
         "orientation_probed",
+        "orientation_decision_json",
         "labels_json",
         "removed",
         "media_object_id",
@@ -1830,6 +1991,12 @@ impl Catalog {
             "a.orientation_probed",
             "0",
         )?;
+        let orientation_decision = asset_column_expression(
+            &connection,
+            "orientation_decision_json",
+            "a.orientation_decision_json",
+            "NULL",
+        )?;
         let labels = asset_column_expression(&connection, "labels_json", "a.labels_json", "'[]'")?;
         let removed = asset_column_expression(&connection, "removed", "a.removed", "0")?;
         let media_object_id =
@@ -1869,7 +2036,7 @@ impl Catalog {
                    a.notes, {labels}, {removed}, {media_object_id},
                    {media_verification_state}, {title}, {description},
                    {location_state}, {location_size}, {location_mtime},
-                   {revision}, {camera_proxy_columns}
+                   {revision}, {camera_proxy_columns}, {orientation_decision}
             FROM assets a
             {thumbnail_join}
             {location_join}
@@ -1919,6 +2086,12 @@ impl Catalog {
             "a.orientation_probed",
             "0",
         )?;
+        let orientation_decision = asset_column_expression(
+            &connection,
+            "orientation_decision_json",
+            "a.orientation_decision_json",
+            "NULL",
+        )?;
         let labels = asset_column_expression(&connection, "labels_json", "a.labels_json", "'[]'")?;
         let removed = asset_column_expression(&connection, "removed", "a.removed", "0")?;
         let media_object_id =
@@ -1958,7 +2131,7 @@ impl Catalog {
                    a.notes, {labels}, {removed}, {media_object_id},
                    {media_verification_state}, {title}, {description},
                    {location_state}, {location_size}, {location_mtime},
-                   {revision}, {camera_proxy_columns}
+                   {revision}, {camera_proxy_columns}, {orientation_decision}
             FROM assets a
             {thumbnail_join}
             {location_join}
@@ -2135,11 +2308,25 @@ impl Catalog {
         let original = self.resolve_original(asset_id)?;
 
         let probe = probe_media(&original)?;
-        let rotation_degrees = if asset.rotation_degrees != asset.default_rotation_degrees {
-            asset.rotation_degrees
-        } else {
-            probe.default_rotation_degrees
-        };
+        let explicit_rotation = self.connection()?.query_row(
+            "SELECT EXISTS(SELECT 1 FROM lww_registers WHERE project_id=?1 AND aggregate_type='projectAsset' AND aggregate_id=?2 AND field_name='rotationDegrees')",
+            params![asset.project_id, asset.id],
+            |row| row.get::<_, bool>(0),
+        )?;
+        let rotation_degrees =
+            if explicit_rotation || asset.rotation_degrees != asset.default_rotation_degrees {
+                asset.rotation_degrees
+            } else if let Some(decision) = asset
+                .orientation_decision
+                .as_ref()
+                .filter(|decision| decision.status == "confirmed")
+            {
+                decision
+                    .rotation_degrees
+                    .unwrap_or(probe.default_rotation_degrees)
+            } else {
+                probe.default_rotation_degrees
+            };
         self.connection()?.execute(
             r#"
                 UPDATE assets
@@ -2155,6 +2342,47 @@ impl Catalog {
             ],
         )?;
         self.get_asset(&asset.id)
+    }
+
+    /// Returns at most 200 suspicious or unresolved orientation rows, newest
+    /// evidence first. It never proposes or applies a visual rotation.
+    pub fn orientation_review_queue(
+        &self,
+        project_id: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<OrientationReviewPage> {
+        ensure!(limit <= 200, "orientation review page limit exceeds 200");
+        let assets = self.list_assets(project_id)?;
+        let mut items = assets
+            .into_iter()
+            .filter_map(|asset| {
+                let reasons = orientation_review_reasons(&asset);
+                (!reasons.is_empty()).then_some(OrientationReviewItem {
+                    evidence_available: asset.original_available || asset.proxy_available,
+                    asset,
+                    review_reasons: reasons,
+                })
+            })
+            .collect::<Vec<_>>();
+        items.sort_by_key(|item| {
+            (
+                item.asset
+                    .orientation_decision
+                    .as_ref()
+                    .is_some_and(|decision| decision.status == "confirmed"),
+                item.asset.orientation_decision.is_some(),
+                item.asset.filename.clone(),
+                item.asset.id.clone(),
+            )
+        });
+        let total = items.len();
+        Ok(OrientationReviewPage {
+            items: items.into_iter().skip(offset).take(limit).collect(),
+            total,
+            offset,
+            limit,
+        })
     }
 
     pub fn generate_proxy(&self, asset_id: &str) -> Result<Asset> {
@@ -5289,6 +5517,185 @@ impl Catalog {
         self.get_asset(asset_id)
     }
 
+    /// Generates bounded raw-metadata and saved-effective stills from an
+    /// available proxy or, when present, the immutable original.
+    pub fn orientation_evidence(&self, asset_id: &str) -> Result<OrientationEvidence> {
+        let asset = self.get_asset(asset_id)?;
+        let proxy_candidate = asset
+            .proxy_path
+            .as_deref()
+            .filter(|path| asset.proxy_available && Path::new(path).is_file());
+        let mut _proxy_claim = None;
+        let (selected, using_proxy) = if let Some(proxy) = proxy_candidate {
+            // The proxy claim is always acquired before the evidence claim.
+            // Proxy replacement holds this same lock while atomically swapping
+            // the registered output.
+            match self.try_claim_representation(asset_id, RepresentationKind::Proxy)? {
+                Some(claim) => {
+                    self.validate_representation_claim(
+                        &claim,
+                        asset_id,
+                        RepresentationKind::Proxy,
+                    )?;
+                    _proxy_claim = Some(claim);
+                    (PathBuf::from(proxy), true)
+                }
+                None if asset.original_available => (self.resolve_original(asset_id)?, false),
+                None => {
+                    return Err(RepresentationBusy {
+                        asset_id: asset_id.to_string(),
+                        kind: RepresentationKind::Proxy,
+                    }
+                    .into());
+                }
+            }
+        } else if asset.original_available {
+            (self.resolve_original(asset_id)?, false)
+        } else {
+            return Ok(OrientationEvidence {
+                asset_id: asset.id,
+                asset_revision: asset.revision,
+                source_fingerprint: asset.fingerprint,
+                representation: "unavailable".into(),
+                representation_fingerprint: None,
+                original_available: false,
+                raw_frame_path: None,
+                effective_frame_path: None,
+                unavailable_reason: Some("no usable proxy or original is available".into()),
+            });
+        };
+        let representation_fingerprint = if using_proxy {
+            Some(full_media_fingerprint(&selected)?)
+        } else {
+            None
+        };
+        let proxy_registration = using_proxy.then(|| {
+            (
+                asset.proxy_path.clone(),
+                asset.proxy_representation,
+                representation_fingerprint.clone(),
+            )
+        });
+        let registration_check = self.get_asset(asset_id)?;
+        ensure!(
+            registration_check.revision == asset.revision
+                && registration_check.fingerprint == asset.fingerprint
+                && registration_check.rotation_degrees == asset.rotation_degrees
+                && registration_check.metadata_rotation_degrees == asset.metadata_rotation_degrees
+                && registration_check.default_rotation_degrees == asset.default_rotation_degrees
+                && registration_check.orientation_probed == asset.orientation_probed
+                && registration_check.orientation_decision == asset.orientation_decision,
+            "orientation changed before evidence generation started"
+        );
+        if let Some((path, representation, _)) = &proxy_registration {
+            ensure!(
+                registration_check.proxy_path == *path
+                    && registration_check.proxy_representation == *representation,
+                "registered proxy changed before evidence generation started"
+            );
+        }
+        let claim = self.claim_representation(asset_id, RepresentationKind::OrientationReview)?;
+        self.validate_representation_claim(
+            &claim,
+            asset_id,
+            RepresentationKind::OrientationReview,
+        )?;
+        let baked_rotation = if using_proxy
+            && asset.proxy_representation == Some(ProxyRepresentation::MetadataBakedV1)
+        {
+            asset.metadata_rotation_degrees
+        } else {
+            0
+        };
+        // RawV3 removes the source display matrix but leaves encoded pixels
+        // untouched, so apply the source metadata rotation for the raw view.
+        let input_rotation = asset.metadata_rotation_degrees;
+        let parent = self
+            .database_path
+            .parent()
+            .ok_or_else(|| anyhow!("catalog has no parent directory"))?;
+        let revision_dir = parent
+            .join("cache")
+            .join("orientation")
+            .join(&asset.id)
+            .join(format!(
+                "r{}-{}-{}-m{}-e{}",
+                asset.revision,
+                asset.fingerprint,
+                representation_fingerprint
+                    .as_deref()
+                    .unwrap_or("source-original"),
+                asset.metadata_rotation_degrees,
+                asset.rotation_degrees
+            ));
+        fs::create_dir_all(&revision_dir)?;
+        // First frame is reliable even for short or low-frame-rate footage,
+        // where a 20% seek can land past the final decoded PTS.
+        let timestamp = "0".to_string();
+        let raw_target = input_rotation;
+        let effective_target = asset.rotation_degrees;
+        let raw_path = revision_dir.join("raw-metadata.png");
+        let effective_path = revision_dir.join("effective.png");
+        let token = Uuid::new_v4().simple().to_string();
+        let raw_temporary = revision_dir.join(format!("raw-metadata.{token}.tmp.png"));
+        let effective_temporary = revision_dir.join(format!("effective.{token}.tmp.png"));
+        for (rotation, output) in [(raw_target, &raw_path), (effective_target, &effective_path)] {
+            let temporary = if output == &raw_path {
+                &raw_temporary
+            } else {
+                &effective_temporary
+            };
+            if let Err(error) = render_orientation_still(
+                &selected,
+                temporary,
+                &timestamp,
+                (rotation as i32 - baked_rotation as i32).rem_euclid(360),
+            ) {
+                let _ = fs::remove_file(&raw_temporary);
+                let _ = fs::remove_file(&effective_temporary);
+                return Err(error);
+            }
+        }
+        let current = self.get_asset(asset_id)?;
+        let orientation_unchanged = current.revision == asset.revision
+            && current.fingerprint == asset.fingerprint
+            && current.rotation_degrees == asset.rotation_degrees
+            && current.metadata_rotation_degrees == asset.metadata_rotation_degrees
+            && current.default_rotation_degrees == asset.default_rotation_degrees
+            && current.orientation_probed == asset.orientation_probed
+            && current.orientation_decision == asset.orientation_decision;
+        let proxy_unchanged = if using_proxy {
+            current.proxy_path == asset.proxy_path
+                && current.proxy_representation == asset.proxy_representation
+                && full_media_fingerprint(&selected)?
+                    == representation_fingerprint.as_deref().unwrap()
+        } else {
+            true
+        };
+        if !orientation_unchanged || !proxy_unchanged {
+            let _ = fs::remove_file(&raw_temporary);
+            let _ = fs::remove_file(&effective_temporary);
+            bail!("orientation evidence became stale while frames were decoded");
+        }
+        fs::rename(&raw_temporary, &raw_path)?;
+        if let Err(error) = fs::rename(&effective_temporary, &effective_path) {
+            let _ = fs::remove_file(&raw_path);
+            let _ = fs::remove_file(&effective_temporary);
+            return Err(error.into());
+        }
+        Ok(OrientationEvidence {
+            asset_id: asset.id,
+            asset_revision: asset.revision,
+            source_fingerprint: asset.fingerprint,
+            representation: if using_proxy { "proxy" } else { "original" }.into(),
+            representation_fingerprint,
+            original_available: asset.original_available,
+            raw_frame_path: Some(raw_path.to_string_lossy().into_owned()),
+            effective_frame_path: Some(effective_path.to_string_lossy().into_owned()),
+            unavailable_reason: None,
+        })
+    }
+
     pub fn generate_missing_thumbnails(
         &self,
         project_id: &str,
@@ -6320,6 +6727,7 @@ fn row_to_asset(row: &rusqlite::Row<'_>) -> rusqlite::Result<Asset> {
         default_rotation_degrees: row.get::<_, i64>(17)? as u16,
         rotation_degrees: row.get::<_, i64>(18)? as u16,
         orientation_probed: row.get::<_, i64>(19)? != 0,
+        orientation_decision: decode_orientation_decision(row.get::<_, Option<String>>(35)?)?,
         original_available,
         proxy_available,
         thumbnail_path: thumbnail_available
@@ -8772,6 +9180,176 @@ pub(crate) mod tests {
                 )
                 .is_err()
         );
+    }
+
+    #[test]
+    fn invalid_orientation_decisions_are_rejected_in_rows_and_baseline_import() {
+        let (_directory, catalog, project) = catalog_fixture();
+        let source_dir = tempfile::tempdir().unwrap();
+        let source = source_dir.path().join("decision-corruption.mp4");
+        std::fs::write(&source, b"synthetic").unwrap();
+        insert_asset_at(&catalog, &project.id, "asset_decision_corruption", &source);
+        let asset = catalog.get_asset("asset_decision_corruption").unwrap();
+        let mut snapshot = catalog.export_project_baseline(&project.id).unwrap();
+        catalog
+            .connection()
+            .unwrap()
+            .execute(
+                "UPDATE assets SET orientation_decision_json=?1 WHERE id=?2",
+                rusqlite::params![r#"{"status":"confirmed","rotationDegrees":45}"#, asset.id],
+            )
+            .unwrap();
+        assert!(catalog.get_asset(&asset.id).is_err());
+        assert!(catalog.export_project_baseline(&project.id).is_err());
+
+        snapshot.assets[0].orientation_decision = Some(OrientationDecision {
+            status: "confirmed".into(),
+            rotation_degrees: Some(45),
+        });
+        let destination = source_dir.path().join("should-not-exist.sqlite3");
+        assert!(
+            Catalog::import_project_baseline(&destination, &snapshot, "node", 1, "digest").is_err()
+        );
+        assert!(!destination.exists());
+    }
+
+    #[test]
+    fn orientation_evidence_decodes_asymmetric_raw_and_effective_pixels() {
+        let (_directory, catalog, project) = catalog_fixture();
+        let source_dir = tempfile::tempdir().unwrap();
+        let source = source_dir.path().join("asymmetric.mp4");
+        let status = Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=yellow:s=64x32:r=1:d=1",
+                "-vf",
+                "drawbox=x=0:y=0:w=16:h=8:color=red:t=fill",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+            ])
+            .arg(&source)
+            .status();
+        let Ok(status) = status else { return };
+        if !status.success() {
+            return;
+        }
+        catalog.ingest_file(&project.id, &source).unwrap();
+        let asset = catalog.list_assets(&project.id).unwrap().remove(0);
+        catalog.connection().unwrap().execute(
+            "UPDATE assets SET metadata_rotation_degrees=90,default_rotation_degrees=90,rotation_degrees=90,orientation_probed=0 WHERE id=?1",
+            [&asset.id],
+        ).unwrap();
+        let asset = catalog
+            .decide_orientation(
+                &asset.id,
+                asset.revision,
+                OrientationDecision {
+                    status: "confirmed".into(),
+                    rotation_degrees: Some(90),
+                },
+            )
+            .unwrap();
+        catalog
+            .connection()
+            .unwrap()
+            .execute(
+                "UPDATE assets SET orientation_probed=0 WHERE id=?1",
+                [&asset.id],
+            )
+            .unwrap();
+        let asset = catalog.refresh_asset_orientation(&asset.id).unwrap();
+        catalog.connection().unwrap().execute(
+            "UPDATE assets SET metadata_rotation_degrees=90,default_rotation_degrees=90,rotation_degrees=90 WHERE id=?1",
+            [&asset.id],
+        ).unwrap();
+        let asset = catalog.get_asset(&asset.id).unwrap();
+        assert_eq!(asset.rotation_degrees, 90);
+        assert_eq!(
+            asset.orientation_decision.unwrap().rotation_degrees,
+            Some(90)
+        );
+        let evidence = catalog.orientation_evidence(&asset.id).unwrap();
+        assert_eq!(evidence.representation, "original");
+        let raw = decode_rgb(evidence.raw_frame_path.as_deref().unwrap());
+        let effective = decode_rgb(evidence.effective_frame_path.as_deref().unwrap());
+        assert_eq!((raw.0, raw.1), (32, 64));
+        assert_eq!((effective.0, effective.1), (32, 64));
+        assert!(is_red(raw.0, &raw.2, 28, 4));
+        assert!(is_red(effective.0, &effective.2, 28, 4));
+        assert!(!is_red(effective.0, &effective.2, 4, 4));
+        catalog.generate_proxy(&asset.id).unwrap();
+        std::fs::rename(&source, source_dir.path().join("original-offline.mp4")).unwrap();
+        let offline_evidence = catalog.orientation_evidence(&asset.id).unwrap();
+        assert_eq!(offline_evidence.representation, "proxy");
+        assert!(!offline_evidence.original_available);
+        let proxy_raw = decode_rgb(offline_evidence.raw_frame_path.as_deref().unwrap());
+        let proxy_effective = decode_rgb(offline_evidence.effective_frame_path.as_deref().unwrap());
+        assert_eq!((proxy_raw.0, proxy_raw.1), (32, 64));
+        assert_eq!((proxy_effective.0, proxy_effective.1), (32, 64));
+        assert!(is_red(proxy_raw.0, &proxy_raw.2, 28, 4));
+        assert_eq!(
+            is_red(proxy_raw.0, &proxy_raw.2, 28, 4),
+            is_red(raw.0, &raw.2, 28, 4)
+        );
+        assert_eq!(
+            is_red(proxy_effective.0, &proxy_effective.2, 28, 4),
+            is_red(effective.0, &effective.2, 28, 4)
+        );
+    }
+
+    fn decode_rgb(path: &str) -> (usize, usize, Vec<u8>) {
+        let dimensions = Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=width,height",
+                "-of",
+                "json",
+            ])
+            .arg(path)
+            .output()
+            .unwrap();
+        assert!(
+            dimensions.status.success(),
+            "{}",
+            String::from_utf8_lossy(&dimensions.stderr)
+        );
+        let dims: Value = serde_json::from_slice(&dimensions.stdout).unwrap();
+        let stream = &dims["streams"][0];
+        let width = stream["width"].as_u64().unwrap() as usize;
+        let height = stream["height"].as_u64().unwrap() as usize;
+        let pixels = Command::new("ffmpeg")
+            .args(["-v", "error", "-i"])
+            .arg(path)
+            .args([
+                "-frames:v",
+                "1",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "rgb24",
+                "pipe:1",
+            ])
+            .output()
+            .unwrap();
+        assert!(pixels.status.success());
+        (width, height, pixels.stdout)
+    }
+
+    fn is_red(width: usize, pixels: &[u8], x: usize, y: usize) -> bool {
+        let index = (y * width + x) * 3;
+        pixels[index] > 180 && pixels[index + 1] < 80 && pixels[index + 2] < 80
     }
 
     #[test]

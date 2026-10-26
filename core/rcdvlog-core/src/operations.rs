@@ -2,7 +2,7 @@ use crate::{
     Asset, AssetPatch, Catalog, ClockEvent, MediaVerificationState, normalize_datetime,
     normalize_labels, now,
 };
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Result, anyhow, bail, ensure};
 use chrono::Utc;
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -15,6 +15,7 @@ pub const LABEL_ADDED: &str = "labelAdded";
 pub const LABEL_REMOVED: &str = "labelRemoved";
 pub const REMOVED_SET: &str = "removedSet";
 pub const ROTATION_SET: &str = "rotationSet";
+pub const ORIENTATION_DECISION_SET: &str = "orientationDecisionSet";
 pub const PROJECT_ASSET_ADDED: &str = "projectAssetAdded";
 pub const PROJECT_ASSET_MEMBERSHIP_SET: &str = "projectAssetMembershipSet";
 pub const PROJECT_ASSET_MEDIA_LINKED: &str = "projectAssetMediaLinked";
@@ -87,6 +88,7 @@ pub(crate) const KNOWN_OPERATION_TYPES: &[&str] = &[
     LABEL_REMOVED,
     REMOVED_SET,
     ROTATION_SET,
+    ORIENTATION_DECISION_SET,
     PROJECT_ASSET_ADDED,
     PROJECT_ASSET_MEMBERSHIP_SET,
     PROJECT_ASSET_MEDIA_LINKED,
@@ -303,6 +305,22 @@ struct RemovedPayload {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct RotationPayload {
     rotation_degrees: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OrientationDecision {
+    /// `confirmed` records an explicit visual judgment; `unresolved` records
+    /// an explicit decision to defer judgment.
+    pub status: String,
+    pub rotation_degrees: Option<u16>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct OrientationDecisionPayload {
+    status: String,
+    rotation_degrees: Option<u16>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -759,6 +777,85 @@ impl Catalog {
             }],
         )?;
         self.get_asset(asset_id)
+    }
+
+    /// Persists an explicit human orientation decision through the same
+    /// revisioned operation stream as other asset judgments.
+    pub fn decide_orientation(
+        &self,
+        asset_id: &str,
+        expected_revision: u64,
+        decision: OrientationDecision,
+    ) -> Result<Asset> {
+        self.decide_orientation_batch(&[(asset_id.to_string(), expected_revision, decision)])?
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("orientation decision returned no asset"))
+    }
+
+    /// Confirms a batch atomically. Every revision is checked under the same
+    /// IMMEDIATE transaction before any operation is appended.
+    pub fn decide_orientation_batch(
+        &self,
+        decisions: &[(String, u64, OrientationDecision)],
+    ) -> Result<Vec<Asset>> {
+        use std::collections::BTreeSet;
+        ensure!(!decisions.is_empty(), "orientation decision batch is empty");
+        ensure!(
+            decisions.len() <= 200,
+            "orientation decision batch exceeds 200 assets"
+        );
+        let mut ids = BTreeSet::new();
+        let mut prepared = Vec::with_capacity(decisions.len());
+        let mut project_id = None;
+        for (asset_id, expected_revision, decision) in decisions {
+            ensure!(
+                ids.insert(asset_id),
+                "duplicate asset in orientation decision batch: {asset_id}"
+            );
+            validate_orientation_decision(&decision.status, decision.rotation_degrees)?;
+            let asset = self.get_asset(asset_id)?;
+            if let Some(expected_project) = project_id.as_deref() {
+                ensure!(
+                    asset.project_id == expected_project,
+                    "orientation decision batch spans projects"
+                );
+            } else {
+                project_id = Some(asset.project_id.clone());
+            }
+            prepared.push((asset_id, *expected_revision, decision));
+        }
+        let project_id = project_id.expect("nonempty decisions");
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for (asset_id, expected, _) in &prepared {
+            let actual = current_revision(&transaction, &project_id, "projectAsset", asset_id)?;
+            ensure!(
+                actual == *expected,
+                "stale asset revision for {asset_id}: expected {expected}, found {actual}"
+            );
+        }
+        let operations = prepared
+            .into_iter()
+            .map(|(asset_id, expected_revision, decision)| {
+                Ok(NewOperation {
+                    aggregate_type: "projectAsset",
+                    aggregate_id: asset_id.clone(),
+                    operation_type: ORIENTATION_DECISION_SET,
+                    base_revision: Some(expected_revision),
+                    payload: serde_json::to_value(OrientationDecisionPayload {
+                        status: decision.status.clone(),
+                        rotation_degrees: decision.rotation_degrees,
+                    })?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        commit_local_in_transaction(&transaction, &project_id, operations)?;
+        transaction.commit()?;
+        decisions
+            .iter()
+            .map(|(asset_id, _, _)| self.get_asset(asset_id))
+            .collect()
     }
 
     /// Compatibility adapter for the desktop's full replacement patch.
@@ -1860,6 +1957,12 @@ pub(crate) fn materialize_operation(
         LABEL_REMOVED => materialize_label_remove(transaction, operation)?,
         REMOVED_SET => materialize_register(transaction, operation, "removed")?,
         ROTATION_SET => materialize_register(transaction, operation, "rotationDegrees")?,
+        ORIENTATION_DECISION_SET => {
+            if !revision_guard_passes(transaction, operation)? {
+                return Ok(ApplyOperationResult::Conflict);
+            }
+            materialize_register(transaction, operation, "orientationDecision")?
+        }
         PROJECT_ASSET_MEMBERSHIP_SET => materialize_membership_set(transaction, operation)?,
         PROJECT_ASSET_ADDED => materialize_asset_add(transaction, operation)?,
         PROJECT_ASSET_MEDIA_LINKED => materialize_media_link(transaction, operation)?,
@@ -2010,6 +2113,14 @@ fn materialize_register(
             }
             serde_json::to_value(rotation)?
         }
+        "orientationDecision" => {
+            let decision = payload::<OrientationDecisionPayload>(operation)?;
+            validate_orientation_decision(&decision.status, decision.rotation_degrees)?;
+            serde_json::to_value(OrientationDecision {
+                status: decision.status,
+                rotation_degrees: decision.rotation_degrees,
+            })?
+        }
         "membershipRemoved" => serde_json::Value::Bool(true),
         "membershipPresent" => {
             serde_json::to_value(payload::<MembershipPayload>(operation)?.present)?
@@ -2039,6 +2150,33 @@ fn materialize_register(
                     "UPDATE assets SET rotation_degrees=?2 WHERE id=?1",
                     params![operation.aggregate_id, value.as_u64().unwrap() as i64],
                 )?;
+            }
+            "orientationDecision" => {
+                let degrees = value
+                    .get("rotationDegrees")
+                    .and_then(serde_json::Value::as_u64)
+                    .map(|degrees| degrees as i64);
+                transaction.execute(
+                    "UPDATE assets SET orientation_decision_json=?2 WHERE id=?1",
+                    params![operation.aggregate_id, value.to_string()],
+                )?;
+                if let Some(degrees) = degrees {
+                    let current = transaction.query_row(
+                        "SELECT hlc_wall_millis,hlc_counter,origin_node_id,COALESCE(operation_id,'') FROM lww_registers WHERE project_id=?1 AND aggregate_type='projectAsset' AND aggregate_id=?2 AND field_name='rotationDegrees'",
+                        params![operation.project_id, operation.aggregate_id],
+                        |row| Ok((row.get::<_,i64>(0)?,row.get::<_,i64>(1)?,row.get::<_,String>(2)?,row.get::<_,String>(3)?)),
+                    ).optional()?;
+                    if current.is_none_or(|current| operation_key(operation) > current) {
+                        transaction.execute(
+                            "INSERT INTO lww_registers(project_id,aggregate_type,aggregate_id,field_name,value_json,operation_id,hlc_wall_millis,hlc_counter,origin_node_id) VALUES (?1,'projectAsset',?2,'rotationDegrees',?3,?4,?5,?6,?7) ON CONFLICT(project_id,aggregate_type,aggregate_id,field_name) DO UPDATE SET value_json=excluded.value_json,operation_id=excluded.operation_id,hlc_wall_millis=excluded.hlc_wall_millis,hlc_counter=excluded.hlc_counter,origin_node_id=excluded.origin_node_id",
+                            params![operation.project_id, operation.aggregate_id, degrees.to_string(), operation.operation_id, operation.logical_time.wall_millis, operation.logical_time.counter as i64, operation.origin_node_id],
+                        )?;
+                        transaction.execute(
+                            "UPDATE assets SET rotation_degrees=?2 WHERE id=?1",
+                            params![operation.aggregate_id, degrees],
+                        )?;
+                    }
+                }
             }
             "membershipRemoved" => {
                 transaction.execute(
@@ -3643,6 +3781,17 @@ fn payload<T: DeserializeOwned>(operation: &ProjectOperation) -> Result<T> {
     Ok(serde_json::from_value(operation.payload.clone())?)
 }
 
+pub(crate) fn validate_orientation_decision(status: &str, degrees: Option<u16>) -> Result<()> {
+    match (status, degrees) {
+        ("confirmed", Some(0 | 90 | 180 | 270)) => Ok(()),
+        ("unresolved", None) => Ok(()),
+        ("confirmed", Some(degrees)) => bail!("invalid confirmed rotation: {degrees}"),
+        _ => bail!(
+            "orientation decision must be confirmed with rotation degrees or unresolved without them"
+        ),
+    }
+}
+
 fn validate_operation(operation: &ProjectOperation) -> Result<()> {
     validate_id("operation ID", &operation.operation_id)?;
     validate_id("project ID", &operation.project_id)?;
@@ -3660,6 +3809,9 @@ fn validate_operation(operation: &ProjectOperation) -> Result<()> {
     }
     if operation.logical_time.wall_millis < 0 {
         bail!("logical wall time cannot be negative");
+    }
+    if operation.operation_type == ORIENTATION_DECISION_SET && operation.base_revision.is_none() {
+        bail!("orientation decision requires a base revision");
     }
     if operation.logical_time.node_id != operation.origin_node_id {
         bail!("logical time node ID must match origin node ID");
@@ -3820,6 +3972,150 @@ mod tests {
         assert_eq!(
             catalog.list_assets("project_test").unwrap()[0].revision,
             after.revision
+        );
+    }
+
+    #[test]
+    fn explicit_orientation_decision_confirms_default_and_later_rotation_is_mismatched() {
+        let (_directory, catalog) = fixture();
+        catalog.connection().unwrap().execute(
+            "UPDATE assets SET width=1080,height=1920,default_rotation_degrees=90,rotation_degrees=90,orientation_probed=1 WHERE id='asset_test'", [],
+        ).unwrap();
+        let revision = catalog.get_asset("asset_test").unwrap().revision;
+        let confirmed = catalog
+            .decide_orientation(
+                "asset_test",
+                revision,
+                OrientationDecision {
+                    status: "confirmed".into(),
+                    rotation_degrees: Some(90),
+                },
+            )
+            .unwrap();
+        assert_eq!(confirmed.rotation_degrees, 90);
+        assert_eq!(
+            confirmed.orientation_decision.unwrap().rotation_degrees,
+            Some(90)
+        );
+        let snapshot = catalog.export_project_baseline("project_test").unwrap();
+        assert_eq!(
+            snapshot.assets[0]
+                .orientation_decision
+                .as_ref()
+                .unwrap()
+                .status,
+            "confirmed"
+        );
+        let restored_dir = tempdir().unwrap();
+        let restored = Catalog::import_project_baseline(
+            restored_dir.path().join("restored.sqlite3"),
+            &snapshot,
+            "node_restored",
+            1,
+            "test-digest",
+        )
+        .unwrap();
+        assert_eq!(
+            restored
+                .get_asset("asset_test")
+                .unwrap()
+                .orientation_decision
+                .unwrap()
+                .rotation_degrees,
+            Some(90)
+        );
+        catalog.set_rotation("asset_test", 180).unwrap();
+        let changed = catalog.get_asset("asset_test").unwrap();
+        assert_eq!(changed.rotation_degrees, 180);
+        assert_eq!(
+            changed.orientation_decision.unwrap().rotation_degrees,
+            Some(90)
+        );
+        let queue = catalog
+            .orientation_review_queue("project_test", 10, 0)
+            .unwrap();
+        assert!(
+            queue.items[0]
+                .review_reasons
+                .contains(&"confirmed_value_mismatch".to_string())
+        );
+    }
+
+    #[test]
+    fn orientation_batch_checks_all_revisions_before_any_decision_write() {
+        let (_directory, catalog) = fixture();
+        catalog.connection().unwrap().execute(
+            "INSERT INTO assets(id,project_id,fingerprint,path,filename,size_bytes,duration_seconds,frame_rate,width,height,codec,camera,notes,labels_json,removed,rotation_degrees,created_at) VALUES('asset_second','project_test','f2','/offline/second.mp4','second.mp4',10,1,30,1920,1080,'h264','DJI','','[]',0,0,'2026-01-01T00:00:00Z')", [],
+        ).unwrap();
+        let before = catalog.get_asset("asset_test").unwrap().revision;
+        let error = catalog
+            .decide_orientation_batch(&[
+                (
+                    "asset_test".into(),
+                    before,
+                    OrientationDecision {
+                        status: "confirmed".into(),
+                        rotation_degrees: Some(0),
+                    },
+                ),
+                (
+                    "asset_second".into(),
+                    1,
+                    OrientationDecision {
+                        status: "unresolved".into(),
+                        rotation_degrees: None,
+                    },
+                ),
+            ])
+            .unwrap_err();
+        assert!(error.to_string().contains("stale asset revision"));
+        assert_eq!(
+            catalog
+                .get_asset("asset_test")
+                .unwrap()
+                .orientation_decision,
+            None
+        );
+        assert_eq!(catalog.get_asset("asset_test").unwrap().revision, before);
+        assert_eq!(catalog.get_asset("asset_second").unwrap().revision, 0);
+        let current = catalog.get_asset("asset_test").unwrap();
+        let unresolved = catalog
+            .decide_orientation(
+                "asset_test",
+                current.revision,
+                OrientationDecision {
+                    status: "unresolved".into(),
+                    rotation_degrees: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(unresolved.rotation_degrees, current.rotation_degrees);
+        assert_eq!(
+            unresolved.orientation_decision.unwrap().status,
+            "unresolved"
+        );
+    }
+
+    #[test]
+    fn suspicious_orientation_queue_is_bounded_and_actionable_without_media() {
+        let (_directory, catalog) = fixture();
+        catalog.connection().unwrap().execute(
+            "UPDATE assets SET width=1080,height=1920,default_rotation_degrees=90,rotation_degrees=90,orientation_probed=1 WHERE id='asset_test'", [],
+        ).unwrap();
+        let page = catalog
+            .orientation_review_queue("project_test", 1, 0)
+            .unwrap();
+        assert_eq!(page.total, 1);
+        assert!(
+            page.items[0]
+                .review_reasons
+                .contains(&"portrait_dimensions_need_review".to_string())
+        );
+        assert!(!page.items[0].evidence_available);
+        assert!(
+            catalog
+                .orientation_review_queue("project_test", 201, 0)
+                .is_err()
         );
     }
 

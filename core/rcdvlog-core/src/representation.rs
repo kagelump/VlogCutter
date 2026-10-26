@@ -24,6 +24,7 @@ const LOCK_DIRECTORY: &str = ".representation-locks";
 pub enum RepresentationKind {
     Proxy,
     Thumbnail,
+    OrientationReview,
     Moments,
     /// Exclusive ownership of one asset's local speech write/result window.
     /// Local transcription and a prepared native-cloud request share this
@@ -36,6 +37,7 @@ impl RepresentationKind {
         match self {
             Self::Proxy => "proxy",
             Self::Thumbnail => "thumbnail",
+            Self::OrientationReview => "orientation-review",
             Self::Moments => "moments",
             Self::Speech => "speech",
         }
