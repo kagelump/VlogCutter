@@ -152,17 +152,47 @@ impl Catalog {
             // Arguments are structured through `Command`, never assembled as a
             // shell string: media paths contain spaces and non-ASCII characters
             // (`AGENTS.md` §15).
+            let canvas_height = request.max_height.max(2) / 2 * 2;
+            let canvas_width = (canvas_height * 16 / 9) / 2 * 2;
+            let rotation = match asset.rotation_degrees % 360 {
+                90 => "transpose=clock,",
+                180 => "hflip,vflip,",
+                270 => "transpose=cclock,",
+                _ => "",
+            };
+            let normalize = format!(
+                "{rotation}scale={canvas_width}:{canvas_height}:force_original_aspect_ratio=decrease,pad={canvas_width}:{canvas_height}:(ow-iw)/2:(oh-ih)/2,fps=30000/1001,setsar=1,setpts=PTS-STARTPTS"
+            );
+            let has_audio = source_has_audio(source)?;
             let mut command = tool_command("ffmpeg");
             command
                 .args(["-y", "-hide_banner", "-loglevel", "error", "-ss"])
                 .arg(format!("{:.3}", operation.source_in_seconds))
                 .arg("-t")
                 .arg(format!("{duration:.3}"))
+                .arg("-noautorotate")
                 .arg("-i")
-                .arg(source)
+                .arg(source);
+            if has_audio {
+                command.args(["-map", "0:v:0", "-map", "0:a:0"]);
+            } else {
+                command.args([
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "anullsrc=channel_layout=stereo:sample_rate=48000",
+                    "-map",
+                    "0:v:0",
+                    "-map",
+                    "1:a:0",
+                ]);
+            }
+            command
+                .arg("-t")
+                .arg(format!("{duration:.3}"))
                 .args([
                     "-vf",
-                    &format!("scale=-2:'min({},ih)'", request.max_height.max(2)),
+                    &normalize,
                     "-c:v",
                     "libx264",
                     "-preset",
@@ -171,10 +201,18 @@ impl Catalog {
                     "28",
                     "-pix_fmt",
                     "yuv420p",
+                    "-video_track_timescale",
+                    "30000",
                     "-c:a",
                     "aac",
                     "-b:a",
                     "96k",
+                    "-ar",
+                    "48000",
+                    "-ac",
+                    "2",
+                    "-af",
+                    "aresample=48000:async=1:first_pts=0,asetpts=PTS-STARTPTS",
                     "-map_metadata",
                     "-1",
                 ])
@@ -291,4 +329,33 @@ impl Catalog {
         fs::create_dir_all(&workspace)?;
         Ok(workspace)
     }
+}
+
+fn source_has_audio(source: &str) -> Result<bool> {
+    let mut command = tool_command("ffprobe");
+    command
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "a:0",
+            "-show_entries",
+            "stream=codec_type",
+            "-of",
+            "json",
+        ])
+        .arg(source);
+    let output = crate::stall::output_with_timeout(
+        &mut command,
+        "ffprobe preview audio stream",
+        crate::stall::io_stall_timeout(),
+    )?;
+    if !output.status.success() {
+        bail!("ffprobe could not inspect preview audio stream");
+    }
+    let document: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .context("parse ffprobe preview audio stream response")?;
+    Ok(document["streams"]
+        .as_array()
+        .is_some_and(|streams| !streams.is_empty()))
 }

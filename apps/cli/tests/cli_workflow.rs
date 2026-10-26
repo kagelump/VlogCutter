@@ -2431,6 +2431,7 @@ fn doctor_process_reports_running_build_and_strict_requirements_without_writes()
     );
     assert!(executable["capabilities"]["agent.readiness.v1"].is_number());
     assert_eq!(data["catalogStatus"]["status"], "catalog_required");
+    assert_eq!(data["pipelineSmoke"]["state"], "unverified");
     assert!(!data["ready"].as_bool().unwrap());
     assert!(!catalog.exists(), "observational doctor created a catalog");
     assert!(!home.join("xdg-data").exists(), "doctor wrote model state");
@@ -3196,7 +3197,10 @@ fn orientation_queue_is_read_only_and_orientation_decisions_are_revision_guarded
     // SQLite bytes untouched.
     Connection::open(&catalog)
         .unwrap()
-        .execute("DELETE FROM schema_migrations WHERE migration_id=47", [])
+        .execute(
+            "DELETE FROM schema_migrations WHERE migration_id=?1",
+            [i64::from(PROJECT_CATALOG_SCHEMA_VERSION)],
+        )
         .unwrap();
     let before = fs::read(&catalog).unwrap();
     let queue = success(
@@ -3238,7 +3242,7 @@ fn orientation_queue_is_read_only_and_orientation_decisions_are_revision_guarded
                 |row| row.get::<_, i64>(0)
             )
             .unwrap(),
-        46
+        i64::from(PROJECT_CATALOG_SCHEMA_VERSION - 1)
     );
 
     // Confirming the current inferred default is an explicit operation even
@@ -3345,6 +3349,113 @@ fn orientation_queue_is_read_only_and_orientation_decisions_are_revision_guarded
         Value::Null
     );
     assert_eq!(unresolved["rotationDegrees"], 90);
+}
+
+#[test]
+fn pipeline_smoke_command_runs_reuses_and_reports_readiness_read_only() {
+    if std::process::Command::new("ffmpeg")
+        .arg("-version")
+        .output()
+        .is_err()
+        || std::process::Command::new("ffprobe")
+            .arg("-version")
+            .output()
+            .is_err()
+    {
+        eprintln!("skipping generated pipeline smoke process test: ffmpeg/ffprobe unavailable");
+        return;
+    }
+    let directory = tempdir().unwrap();
+    let catalog = directory.path().join("catalog.sqlite3");
+    let opened = Catalog::open(&catalog).unwrap();
+    let project_id = opened
+        .create_project("Pipeline smoke CLI fixture")
+        .unwrap()
+        .id;
+    drop(opened);
+
+    let before_preflight = fs::read(&catalog).unwrap();
+    let preflight = success(
+        &catalog,
+        ["calibrate", "status", "--recipe", "pipeline-smoke"],
+    );
+    assert_eq!(preflight.json["data"]["state"], "unverified");
+    assert_eq!(
+        fs::read(&catalog).unwrap(),
+        before_preflight,
+        "missing-receipt preflight must be read-only"
+    );
+    let doctor = failure(&catalog, ["doctor", "--require-pipeline-smoke"]);
+    assert_eq!(doctor["error"]["code"], "pipeline_smoke_unverified");
+    let preparation = success(
+        &catalog,
+        [
+            "prepare",
+            "preflight",
+            "--project",
+            &project_id,
+            "--all",
+            "--limit",
+            "1",
+        ],
+    );
+    assert_eq!(
+        preparation.json["data"]["pipelineSmoke"]["state"],
+        "unverified"
+    );
+
+    let first = success(&catalog, ["calibrate", "run", "--recipe", "pipeline-smoke"]);
+    assert_eq!(first.json["data"]["state"], "passed", "{}", first.json);
+    assert!(
+        first.json["data"]["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|check| check["passed"] == true)
+    );
+    let cached = success(&catalog, ["calibrate", "run", "--recipe", "pipeline-smoke"]);
+    assert_eq!(cached.json["data"]["state"], "passed");
+    assert_eq!(cached.json["data"]["reused"], true);
+
+    let before = fs::read(&catalog).unwrap();
+    let status = success(
+        &catalog,
+        ["calibrate", "status", "--recipe", "pipeline-smoke"],
+    );
+    assert_eq!(status.json["data"]["state"], "passed");
+    assert_eq!(status.json["data"]["reused"], true);
+    assert_eq!(
+        fs::read(&catalog).unwrap(),
+        before,
+        "readiness status must not mutate catalog bytes"
+    );
+    let preparation = success(
+        &catalog,
+        [
+            "prepare",
+            "preflight",
+            "--project",
+            &project_id,
+            "--all",
+            "--limit",
+            "1",
+        ],
+    );
+    assert_eq!(preparation.json["data"]["pipelineSmoke"]["state"], "passed");
+    let doctor = success(&catalog, ["doctor", "--require-pipeline-smoke"]);
+    assert_eq!(doctor.json["data"]["pipelineSmoke"]["state"], "passed");
+    let doctor = success(
+        &catalog,
+        [
+            "doctor",
+            "--require-capability",
+            "prepare.pipeline-smoke.v1",
+        ],
+    );
+    assert_eq!(
+        doctor.json["data"]["executable"]["capabilities"]["prepare.pipeline-smoke.v1"],
+        1
+    );
 }
 
 #[test]

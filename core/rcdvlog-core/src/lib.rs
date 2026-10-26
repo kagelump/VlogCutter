@@ -39,6 +39,7 @@ mod lifecycle;
 mod locations;
 mod migrations;
 mod operations;
+mod pipeline_smoke;
 mod preflight;
 mod preparation;
 mod prerequisites;
@@ -158,6 +159,9 @@ pub use cards::{
     CardCandidate, MountedVolumes, VolumeSource, card_session_slug, detect_cards, inspect_card,
 };
 pub use import_cutoff::ImportCutoff;
+pub use pipeline_smoke::{
+    PIPELINE_SMOKE_RECIPE_VERSION, PipelineSmokeCheck, PipelineSmokeIdentity, PipelineSmokeReport,
+};
 
 pub use import_history::{
     ImportHistoryEntry, ImportRollbackModifiedClip, ImportRollbackPreview, ImportSessionDetail,
