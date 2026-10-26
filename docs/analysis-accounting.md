@@ -627,3 +627,27 @@ quality. Missing typed results after an active reservation, dispatch marker or
 settled request require recovery; they are never ordinary cache misses authorizing
 a new upload. This persistence boundary does not enable bulk execution, targeted
 retry or native CLI/desktop selection.
+
+## Complete native clip assembly (C10 slice)
+
+A fully retained native checkpoint can now be assembled into the existing
+terminal transcript artifact without additional provider dispatch. The internal
+finalizer borrows the live prepared speech and exact native request, re-proves
+the current source, frozen authorization, exact plan/payload for every paid
+window, canonical request/run and settled or honestly uncertain receipt inside
+the same SQLite `IMMEDIATE` transaction, then reuses the canonical transcript
+writer. SQL failure retains the entire completed checkpoint unchanged.
+
+Pure assembly validates every planned index exactly once, mapped candidate
+ordering/language/quality and whole-clip repetition. Per-window quality
+observations are preserved verbatim. Provider segment counts remain the sum of
+recorded metric totals even when candidate text is discarded; local VAD speech
+duration, not provider billed duration, is recorded. Native token probability
+stays absent. All-empty provider output becomes `no_accepted_speech`; any mixed
+empty/rejected window is a body-free quality rejection, never local silence or
+accepted speech. Review-required candidates stay explicitly unaccepted. New
+terminal artifacts retain the same plan/fingerprint for historical coverage
+inspection; legacy complete artifacts remain plan-less and readable, and the
+incomplete-checkpoint accessor returns `None` for terminal output. This does not
+enable native bulk, targeted retry, current terminal reuse or CLI/desktop
+selection.

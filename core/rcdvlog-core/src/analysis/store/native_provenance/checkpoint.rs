@@ -1,10 +1,12 @@
-//! Durable incomplete native speech-window checkpoints.
+//! Durable native speech-window checkpoints and complete-clip finalization.
 //!
 //! This is a persistence boundary, not bulk orchestration. It starts a positive
-//! VAD/packing plan on the existing transcript header and appends one contiguous
-//! quality-evaluated paid window result at a time. Candidate text stays solely
-//! in `transcript_segments`; request/cost/uncertainty truth stays solely in the
-//! accounting ledger. No provider, model, media or credential work happens here.
+//! VAD/packing plan on the existing transcript header, appends one contiguous
+//! quality-evaluated paid window result at a time, and can atomically assemble a
+//! fully retained plan into the existing terminal transcript artifact. Candidate
+//! text stays solely in `transcript_segments`; request/cost/uncertainty truth
+//! stays solely in the accounting ledger. No provider, model, media extraction or
+//! credential work happens here.
 
 // C9 exposes internal persistence/read primitives intentionally; production
 // bulk/adapters are later reviewed slices. Tests exercise this boundary now.
@@ -50,12 +52,17 @@ use crate::analysis::store::{
     NativeTranscriptWindowPlanRow, StoredTranscript, TranscriptOutcomeReason, TranscriptStatus,
 };
 
+mod assembly;
 mod evaluation;
+mod finalize;
 mod read;
 mod reuse;
 mod types;
 mod validation;
 mod write;
+
+pub(crate) use assembly::assemble_native_transcript_completion;
+pub(crate) use finalize::finalize_native_transcript_checkpoint;
 
 pub(crate) use evaluation::evaluate_native_checkpoint_result;
 use evaluation::*;
@@ -83,6 +90,16 @@ impl Catalog {
         input: NativeTranscriptCheckpointWindowInput<'_>,
     ) -> Result<NativeTranscriptCheckpoint> {
         append_native_transcript_checkpoint(self, preparation, input)
+    }
+
+    /// Internal C10 entry point: atomically assemble and persist a fully
+    /// retained paid-window checkpoint. This performs no provider dispatch.
+    pub(crate) fn finalize_native_transcript_checkpoint(
+        &self,
+        preparation: &NativeSpeechPreparation,
+        request: &NativeSttRequest,
+    ) -> Result<StoredTranscript> {
+        finalize_native_transcript_checkpoint(self, preparation, request)
     }
 
     /// Internal C9 read projection. Historical callers do not need today's

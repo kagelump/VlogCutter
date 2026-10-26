@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 
 use anyhow::{Context, Result, ensure};
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
 use crate::analysis::accounting::ANALYSIS_ACCOUNTING_SCHEMA_VERSION;
 use crate::analysis::accounting::store as accounting_store;
@@ -13,7 +13,9 @@ use crate::analysis::run_policy::{
     AnalysisRunKind, RunAssetScope, RunPolicy, load_run_authorization_on_connection,
 };
 
-use super::super::{StoredTranscript, TranscriptOutcomeReason, TranscriptStatus};
+use super::super::{
+    NativeTranscriptWindowPlanRow, StoredTranscript, TranscriptOutcomeReason, TranscriptStatus,
+};
 use super::types::NativeSttWindowObservation;
 use super::validation::{validate_native_policy, validate_scope, validate_transcript_shape};
 
@@ -30,6 +32,25 @@ pub(crate) fn save_native_transcript(
     policy_id: &str,
     transcript: &StoredTranscript,
     observations: &[NativeSttWindowObservation],
+) -> Result<()> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    save_native_transcript_on_transaction(&transaction, policy_id, transcript, observations, None)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+/// Shared native transcript writer for a caller-owned transaction.
+///
+/// The finalizer uses this boundary to keep the C9 checkpoint replacement, the
+/// optional retained plan and the complete-native validation in one existing
+/// SQLite `IMMEDIATE` transaction. This function never opens or commits a
+/// transaction and never performs media/provider work.
+pub(crate) fn save_native_transcript_on_transaction(
+    connection: &Transaction<'_>,
+    policy_id: &str,
+    transcript: &StoredTranscript,
+    observations: &[NativeSttWindowObservation],
+    native_window_plan: Option<NativeTranscriptWindowPlanRow<'_>>,
 ) -> Result<()> {
     super::super::validate_review_required_contract(transcript)?;
     ensure!(
@@ -51,16 +72,9 @@ pub(crate) fn save_native_transcript(
         !policy_id.trim().is_empty() && policy_id.trim() == policy_id,
         "native transcript save requires a canonical non-empty policy identity"
     );
-    for (index, observation) in observations.iter().enumerate() {
-        observation
-            .validate()
-            .with_context(|| format!("validate native window observation {index}"))?;
-    }
-
-    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
     let (authorization, accounting_contract) =
-        load_run_authorization_on_connection(&transaction, policy_id)?;
+        load_run_authorization_on_connection(connection, policy_id)?;
     ensure!(
         accounting_contract == ANALYSIS_ACCOUNTING_SCHEMA_VERSION,
         "native transcript frozen policy was not authorized under the current accounting contract"
@@ -72,20 +86,47 @@ pub(crate) fn save_native_transcript(
     );
     validate_native_policy(policy, transcript)?;
 
-    let scope = validate_asset_scope(&transaction, policy, transcript)?;
-    validate_request_windows(&transaction, policy, scope, transcript, observations)?;
+    let scope = validate_asset_scope(connection, policy, transcript)?;
+    validate_request_windows(connection, policy, scope, transcript, observations)?;
+    if let Some(retained) = native_window_plan {
+        let plan = super::plan::parse_validated_plan(
+            retained.plan_json,
+            retained.fingerprint,
+            policy,
+            scope,
+        )?;
+        ensure!(
+            plan.windows.len() == observations.len(),
+            "terminal native transcript plan must exactly match the retained completed window count"
+        );
+        if matches!(
+            transcript.status,
+            TranscriptStatus::Speech | TranscriptStatus::ReviewRequired
+        ) {
+            let candidates =
+                super::plan::reconstruct_candidates_by_window(&plan, &transcript.segments)?;
+            for (index, observation) in observations.iter().enumerate() {
+                crate::analysis::quality::native_stt::validate_native_mapped_candidates(
+                    observation.quality.decision,
+                    observation.quality.reason,
+                    &observation.reported_language,
+                    &candidates[index],
+                    &plan.windows[index],
+                )?;
+            }
+        }
+    }
 
     super::super::write_transcript_rows(
-        &transaction,
+        connection,
         transcript,
         Some(policy_id),
         Some(NATIVE_STT_QUALITY_RECIPE_VERSION),
-        None,
+        native_window_plan,
     )?;
     for (index, observation) in observations.iter().enumerate() {
-        insert_native_window_observation(&transaction, &transcript.asset_id, index, observation)?;
+        insert_native_window_observation(connection, &transcript.asset_id, index, observation)?;
     }
-    transaction.commit()?;
     Ok(())
 }
 

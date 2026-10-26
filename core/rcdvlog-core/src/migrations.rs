@@ -957,16 +957,17 @@ fn add_native_no_provider_pilot_status(transaction: &Transaction<'_>) -> Result<
     Ok(())
 }
 
-/// Migration 45. Retain an incomplete native speech window plan and its
-/// semantic identity on the existing transcript header.
+/// Migration 45. Retain a native speech window plan and its semantic identity
+/// on the existing transcript header.
 ///
 /// The two nullable columns are written together by the native checkpoint
-/// owner. The plan JSON is a typed, versioned `Vec<PackedWindow>`; the
-/// fingerprint binds it to the frozen policy/recipe/source identity. Existing
-/// complete native rows without a plan remain readable and are not
-/// reconstructed. No audio, provider body, path or financial value is stored
-/// here, and the existing native child table/FKs/indexes are preserved by the
-/// additive ALTER TABLE.
+/// owner. An incomplete row retains a completed prefix; a terminal row written
+/// by complete-clip assembly retains the exact fully completed plan. The plan
+/// JSON is a typed, versioned `Vec<PackedWindow>`; the fingerprint binds it to
+/// the frozen policy/recipe/source identity. Existing complete native rows
+/// without a plan remain readable and are not reconstructed. No audio, provider
+/// body, path or financial value is stored here, and the existing native child
+/// table/FKs/indexes are preserved by the additive ALTER TABLE.
 fn add_native_transcript_window_checkpoint(transaction: &Transaction<'_>) -> Result<()> {
     add_column_if_missing(
         transaction,

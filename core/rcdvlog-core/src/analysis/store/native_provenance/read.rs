@@ -185,14 +185,23 @@ pub(crate) fn load_native_transcript_provenance(
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let completed_window_count = rows.len();
+    let incomplete_checkpoint = status == TranscriptStatus::Failed.as_str()
+        && outcome_reason == TranscriptOutcomeReason::NativeCoverageIncomplete.as_str();
     if let Some(plan) = &plan {
-        ensure!(
-            completed_window_count <= plan.windows.len(),
-            "native transcript checkpoint window rows exceed its plan coverage"
-        );
+        if incomplete_checkpoint {
+            ensure!(
+                completed_window_count <= plan.windows.len(),
+                "native transcript checkpoint window rows exceed its plan coverage"
+            );
+        } else {
+            ensure!(
+                completed_window_count == plan.windows.len(),
+                "terminal native transcript plan requires every planned window to remain linked"
+            );
+        }
         ensure!(
             window_count == completed_window_count as i64,
-            "native transcript checkpoint header window count disagrees with retained window rows"
+            "native transcript window count disagrees with retained window rows"
         );
         ensure!(
             candidates_by_window
@@ -201,7 +210,7 @@ pub(crate) fn load_native_transcript_provenance(
                     .iter()
                     .skip(completed_window_count)
                     .all(Vec::is_empty)),
-            "native transcript checkpoint candidates fall outside its completed prefix"
+            "native transcript candidates fall outside its completed window coverage"
         );
     }
 

@@ -304,3 +304,11 @@ Receipts settle before cached domain results and post-response cancellation.
 Unknown usage remains uncertain; repeated invocation, force or a generic retry
 flag cannot blindly resend prior native paid work. Receipt-only interruptions
 require explicit reconciliation and later targeted recovery support.
+
+C10 adds pure complete-clip assembly and an atomic same-owner finalizer for a
+fully retained C9 plan. It preserves per-window quality facts, applies the
+existing whole-clip repetition threshold, keeps empty provider output distinct
+from local silence, and retains the exact plan/fingerprint on new terminal
+native artifacts. No provider dispatch, migration, new dependency, bulk
+activation, targeted retry, terminal current-reuse or CLI/desktop selection is
+enabled by this slice.

@@ -289,3 +289,107 @@ fn historical_quality_inspection_preserves_recorded_decision_without_current_thr
         "historical observations still require structurally valid finite evidence"
     );
 }
+
+#[test]
+fn whole_clip_repetition_shape_requires_safe_speech_and_allows_only_truthful_clip_rejection() {
+    let mut speech = transcript(TranscriptStatus::Speech, TranscriptOutcomeReason::Accepted);
+    speech.repetition_ratio = Some(0.5);
+    let error = validate_transcript_shape(
+        &speech,
+        &[
+            observation("request-1", accepted_quality()),
+            observation("request-2", accepted_quality()),
+        ],
+    )
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("whole-clip repetition"),
+        "{error}"
+    );
+
+    let mut review = transcript(
+        TranscriptStatus::ReviewRequired,
+        TranscriptOutcomeReason::QualityEvidenceIncomplete,
+    );
+    review.repetition_ratio = Some(0.5);
+    let error = validate_transcript_shape(
+        &review,
+        &[
+            observation("request-1", accepted_quality()),
+            observation("request-2", review_quality()),
+        ],
+    )
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("whole-clip repetition"),
+        "{error}"
+    );
+
+    let mut clip_rejected = transcript(
+        TranscriptStatus::Rejected,
+        TranscriptOutcomeReason::QualityRejected,
+    );
+    clip_rejected.reject_reason = NativeSttQualityReason::Repetition.code().into();
+    clip_rejected.repetition_ratio = Some(0.5);
+    assert!(
+        validate_transcript_shape(
+            &clip_rejected,
+            &[
+                observation("request-1", accepted_quality()),
+                observation("request-2", accepted_quality()),
+            ],
+        )
+        .is_ok(),
+        "a measured unsafe whole-clip ratio can reject without rewriting per-window acceptance"
+    );
+
+    let mut forged = clip_rejected;
+    forged.reject_reason = String::new();
+    assert!(
+        validate_transcript_shape(
+            &forged,
+            &[
+                observation("request-1", accepted_quality()),
+                observation("request-2", accepted_quality()),
+            ],
+        )
+        .is_err(),
+        "clip-level rejection must retain its stable body-free repetition reason"
+    );
+}
+
+#[test]
+fn retained_native_text_cannot_forge_a_safe_whole_clip_repetition_summary() {
+    for status in [TranscriptStatus::Speech, TranscriptStatus::ReviewRequired] {
+        let reason = if status == TranscriptStatus::Speech {
+            TranscriptOutcomeReason::Accepted
+        } else {
+            TranscriptOutcomeReason::QualityEvidenceIncomplete
+        };
+        let mut stored = transcript(status, reason);
+        let mut duplicate = stored.segments[0].clone();
+        duplicate.start_ms = stored.segments[0].end_ms;
+        duplicate.end_ms = duplicate.start_ms + 500;
+        stored.segments.push(duplicate);
+        stored.repetition_ratio = Some(0.0);
+        let last_quality = if status == TranscriptStatus::Speech {
+            accepted_quality()
+        } else {
+            review_quality()
+        };
+        let error = validate_transcript_shape(
+            &stored,
+            &[
+                observation("request-1", accepted_quality()),
+                observation("request-2", last_quality),
+            ],
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("disagrees with retained candidate text"),
+            "{error}"
+        );
+    }
+}

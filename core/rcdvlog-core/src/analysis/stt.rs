@@ -298,7 +298,7 @@ fn to_clip_time(window: &PackedWindow, decoded: &[DecodedSegment]) -> Vec<Decode
 
 /// The language covering the most transcribed time, used as the clip's summary
 /// language. Per-segment languages are retained; this is only a headline.
-fn dominant_language(segments: &[DecodedSegment]) -> String {
+pub(crate) fn dominant_language(segments: &[DecodedSegment]) -> String {
     let mut totals: HashMap<&str, u32> = HashMap::new();
     for segment in segments {
         *totals.entry(segment.language.as_str()).or_default() +=

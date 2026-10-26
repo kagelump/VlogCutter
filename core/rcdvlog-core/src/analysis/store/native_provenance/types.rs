@@ -19,9 +19,10 @@ use crate::analysis::windows::PackedWindow;
 pub const NATIVE_TRANSCRIPT_PROVENANCE_SCHEMA_VERSION: &str =
     "analysis.native-transcript-provenance.v1";
 
-/// Versioned, body-free window plan retained on an incomplete native transcript
-/// header. The ordered `PackedWindow` map is the only source-time coordination
-/// identity; raw PCM/WAV, paths and provider bodies are never stored.
+/// Versioned, body-free window plan retained on an incomplete native checkpoint
+/// or a terminal native transcript assembled from exactly that completed plan.
+/// The ordered `PackedWindow` map is the only source-time coordination identity;
+/// raw PCM/WAV, paths and provider bodies are never stored.
 pub const NATIVE_TRANSCRIPT_WINDOW_PLAN_SCHEMA_VERSION: &str =
     "analysis.native-transcript-window-plan.v1";
 
@@ -36,9 +37,11 @@ pub struct NativeTranscriptWindowPlan {
     pub windows: Vec<PackedWindow>,
 }
 
-/// Read-only coverage facts for one incomplete native checkpoint. Completed
-/// window results and actual attempts/costs remain in their canonical child
-/// rows/accounting ledger; this projection copies neither.
+/// Read-only coverage facts for one retained native plan. An incomplete
+/// checkpoint may expose a completed prefix; a terminal native artifact must
+/// expose every planned window exactly once. Completed window results and actual
+/// attempts/costs remain in their canonical child rows/accounting ledger; this
+/// projection copies neither.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NativeTranscriptCoverage {
@@ -317,8 +320,9 @@ pub struct NativeTranscriptProvenance {
     /// from the frozen canonical authorization row.
     pub policy: RunPolicy,
     pub windows: Vec<NativeTranscriptWindowProvenance>,
-    /// Present only for an incomplete native checkpoint carrying a validated
-    /// versioned plan. Omitted from legacy complete-row wire output.
+    /// Present for an incomplete native checkpoint or a terminal native artifact
+    /// carrying a validated versioned plan. Omitted from legacy complete-row wire
+    /// output.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coverage: Option<NativeTranscriptCoverage>,
 }

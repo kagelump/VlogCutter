@@ -57,17 +57,32 @@ pub(super) fn validate_current_checkpoint_window(
     audio: &NativeSttAudioWindow,
     window: &NativeTranscriptCheckpointWindow,
 ) -> Result<()> {
-    window.observation.validate()?;
-    ensure_checkpoint_quality_is_typed(
-        window.observation.quality.decision,
-        window.observation.quality.reason,
-    )?;
+    validate_current_checkpoint_observation(connection, policy, scope, request, audio, window)?;
     crate::analysis::quality::native_stt::validate_native_mapped_candidates(
         window.observation.quality.decision,
         window.observation.quality.reason,
         &window.observation.reported_language,
         &window.candidates,
         audio.window(),
+    )?;
+    Ok(())
+}
+
+/// Re-prove one retained observation's provider/accounting/payload identity
+/// without requiring the original provider body to be reconstructed. Callers
+/// that own candidate text additionally run the source-mapping helper.
+pub(super) fn validate_current_checkpoint_observation(
+    connection: &Connection,
+    policy: &RunPolicy,
+    scope: &RunAssetScope,
+    request: &NativeSttRequest,
+    audio: &NativeSttAudioWindow,
+    window: &NativeTranscriptCheckpointWindow,
+) -> Result<()> {
+    window.observation.validate()?;
+    ensure_checkpoint_quality_is_typed(
+        window.observation.quality.decision,
+        window.observation.quality.reason,
     )?;
     let recorded = accounting_store::validate_native_settled_result_request(
         connection,

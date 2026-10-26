@@ -24,10 +24,11 @@ pub(crate) use checkpoint::{
     EvaluatedNativeCheckpointWindow, NativeTranscriptCheckpoint, NativeTranscriptCheckpointReuse,
     NativeTranscriptCheckpointWindow, NativeTranscriptCheckpointWindowInput,
     NativeTranscriptWindowReuse, append_native_transcript_checkpoint,
-    begin_native_transcript_checkpoint, evaluate_native_checkpoint_result,
+    assemble_native_transcript_completion, begin_native_transcript_checkpoint,
+    evaluate_native_checkpoint_result, finalize_native_transcript_checkpoint,
     load_native_transcript_checkpoint, probe_native_transcript_checkpoint_for_reuse,
 };
-pub(crate) use write::save_native_transcript;
+pub(crate) use write::{save_native_transcript, save_native_transcript_on_transaction};
 
 #[cfg(test)]
 mod tests;
