@@ -7,7 +7,7 @@ use crate::analysis::openrouter_stt::{
 };
 use crate::prerequisites::run_bounded_command;
 use crate::{
-    MigrationHistoryStatus, ModelInstallProgress, ModelInstallReport, ModelStatus,
+    Catalog, MigrationHistoryStatus, ModelInstallProgress, ModelInstallReport, ModelStatus,
     PROJECT_CATALOG_SCHEMA_VERSION, ToolStatus,
 };
 use anyhow::Result;
@@ -69,6 +69,8 @@ pub struct DoctorReport {
     pub tools: Vec<ToolStatus>,
     pub models: Vec<ModelStatus>,
     pub models_ready: bool,
+    /// Generated preview-toolchain proof for this executable/tool/recipe identity.
+    pub pipeline_smoke: crate::PipelineSmokeReport,
     pub ready: bool,
 }
 
@@ -77,6 +79,7 @@ pub struct ReadinessRequirements {
     pub catalog: bool,
     pub tools: Vec<String>,
     pub models: bool,
+    pub pipeline_smoke: bool,
     pub capabilities: Vec<String>,
     pub revision: Option<String>,
 }
@@ -756,8 +759,17 @@ pub fn doctor_report(executable: CliExecutable, catalog: Option<&Path>) -> Resul
     };
     let models_ready = models.iter().all(|model| model.installed);
     let tools = crate::prerequisite_status();
-    let ready =
-        catalog_status.compatible && models_ready && tools.iter().all(|tool| tool.supported);
+    let smoke_identity = crate::PipelineSmokeIdentity::from_executable(&executable)?;
+    let pipeline_smoke = match catalog.filter(|_| catalog_status.compatible) {
+        Some(path) => {
+            Catalog::open_read_only_existing(path)?.pipeline_smoke_status(smoke_identity)?
+        }
+        None => crate::PipelineSmokeReport::unverified(smoke_identity),
+    };
+    let ready = catalog_status.compatible
+        && models_ready
+        && tools.iter().all(|tool| tool.supported)
+        && pipeline_smoke.state == "passed";
     Ok(DoctorReport {
         schema_version: 1,
         executable,
@@ -766,6 +778,7 @@ pub fn doctor_report(executable: CliExecutable, catalog: Option<&Path>) -> Resul
         tools,
         models,
         models_ready,
+        pipeline_smoke,
         ready,
     })
 }
@@ -857,6 +870,25 @@ pub fn ensure_agent_readiness(
             format!(
                 "Speech models are not installed: {missing}. Install explicitly through Settings, then re-check; readiness never downloads models."
             ),
+            report,
+        ));
+    }
+    if required.pipeline_smoke && report.pipeline_smoke.state != "passed" {
+        let failed = report.pipeline_smoke.state == "failed";
+        return Err(report_failure(
+            if failed {
+                "pipeline_smoke_failed"
+            } else {
+                "pipeline_smoke_unverified"
+            },
+            report
+                .pipeline_smoke
+                .remediation
+                .clone()
+                .unwrap_or_else(|| {
+                    "Run the explicit generated-media pipeline smoke check before expensive work."
+                        .into()
+                }),
             report,
         ));
     }

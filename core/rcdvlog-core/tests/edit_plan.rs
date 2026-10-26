@@ -2,10 +2,11 @@
 //! (D01-T020), and deterministic OTIO export (D01-T022).
 
 use rcdvlog_core::{
-    Catalog, EditPlanError, EditPlanOperation, OtioExportRequest, ProjectAssetAddedPayload,
-    otio_document,
+    Catalog, EditPlanError, EditPlanOperation, OtioExportRequest, PreviewRequest,
+    ProjectAssetAddedPayload, otio_document,
 };
 use std::fs;
+use std::process::Command;
 use tempfile::{TempDir, tempdir};
 
 struct Fixture {
@@ -364,6 +365,266 @@ fn an_offline_original_blocks_the_plan() {
             .errors()
             .any(|finding| finding.code == "edit_plan_original_offline")
     );
+}
+
+/// Preview segments from mixed frame rates and audio layouts must share one
+/// stream format before the concat demuxer joins them.
+#[test]
+fn preview_normalizes_mixed_video_and_audio_streams() {
+    if Command::new("ffmpeg").arg("-version").output().is_err()
+        || Command::new("ffprobe").arg("-version").output().is_err()
+    {
+        eprintln!("skipping preview media regression: ffmpeg/ffprobe unavailable");
+        return;
+    }
+
+    let fixture = fixture(2);
+    let first = fixture.directory.path().join("media/C0000.MP4");
+    let second = fixture.directory.path().join("media/C0001.MP4");
+    for (path, rate, with_audio) in [(&first, "60000/1001", true), (&second, "30000/1001", false)] {
+        let mut command = Command::new("ffmpeg");
+        command.args([
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            &format!("testsrc2=size=640x360:rate={rate}"),
+        ]);
+        if with_audio {
+            command.args(["-f", "lavfi", "-i", "sine=frequency=440:sample_rate=44100"]);
+        }
+        command.args([
+            "-t",
+            "2",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-pix_fmt",
+            "yuv420p",
+        ]);
+        if with_audio {
+            command.args(["-c:a", "aac", "-ar", "44100"]);
+        }
+        let output = command.arg(path).output().unwrap();
+        assert!(
+            output.status.success(),
+            "could not generate mixed-media fixture: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let revision = fixture
+        .catalog
+        .create_edit_plan_revision(
+            &fixture.project_id,
+            &[cut(0, 0.0, 1.7), cut(1, 0.0, 1.7)],
+            None,
+            None,
+        )
+        .unwrap();
+    let result = fixture
+        .catalog
+        .render_preview(
+            &PreviewRequest {
+                revision_id: revision.revision_id,
+                max_height: 720,
+            },
+            &mut |_| {},
+            &|| false,
+        )
+        .unwrap();
+
+    let output = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration:stream=codec_type,width,height,r_frame_rate,time_base,sample_rate,channels",
+            "-of",
+            "json",
+        ])
+        .arg(&result.output_path)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let duration = document["format"]["duration"]
+        .as_str()
+        .unwrap()
+        .parse::<f64>()
+        .unwrap();
+    assert!(
+        (duration - 3.4).abs() < 0.1,
+        "unexpected preview duration: {duration}"
+    );
+    assert!((result.duration_seconds - 3.4).abs() < f64::EPSILON);
+
+    let streams = document["streams"].as_array().unwrap();
+    let video = streams
+        .iter()
+        .find(|stream| stream["codec_type"] == "video")
+        .unwrap();
+    assert_eq!(video["width"], 1280);
+    assert_eq!(video["height"], 720);
+    assert_eq!(video["r_frame_rate"], "30000/1001");
+    assert_eq!(video["time_base"], "1/30000");
+    let audio = streams
+        .iter()
+        .find(|stream| stream["codec_type"] == "audio")
+        .unwrap();
+    assert_eq!(audio["sample_rate"], "48000");
+    assert_eq!(audio["channels"], 2);
+    let tone_rms = decoded_audio_rms(&result.output_path, "0.3");
+    let silent_rms = decoded_audio_rms(&result.output_path, "2.2");
+    assert!(
+        tone_rms > 0.01,
+        "the source tone was replaced or lost: RMS={tone_rms}"
+    );
+    assert!(
+        silent_rms < 0.003,
+        "the silent clip gained audible audio: RMS={silent_rms}"
+    );
+}
+
+fn decoded_audio_rms(path: &str, start_seconds: &str) -> f64 {
+    let output = Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            path,
+            "-ss",
+            start_seconds,
+            "-t",
+            "0.4",
+            "-vn",
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            "-f",
+            "s16le",
+            "pipe:1",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let samples: Vec<i16> = output
+        .stdout
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|bytes| i16::from_le_bytes(*bytes))
+        .collect();
+    assert!(!samples.is_empty());
+    let mean_square = samples
+        .iter()
+        .map(|sample| f64::from(*sample).powi(2))
+        .sum::<f64>()
+        / samples.len() as f64;
+    mean_square.sqrt() / f64::from(i16::MAX)
+}
+
+#[test]
+fn preview_applies_the_effective_asset_rotation_to_raw_media() {
+    if Command::new("ffmpeg").arg("-version").output().is_err()
+        || Command::new("ffprobe").arg("-version").output().is_err()
+    {
+        eprintln!("skipping preview rotation regression: ffmpeg/ffprobe unavailable");
+        return;
+    }
+
+    let fixture = fixture(1);
+    let source = fixture.directory.path().join("media/C0000.MP4");
+    let generated = Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=black:size=640x360:rate=30:duration=1",
+            "-vf",
+            "drawbox=x=0:y=0:w=320:h=180:color=red:t=fill,drawbox=x=320:y=0:w=320:h=180:color=green:t=fill,drawbox=x=0:y=180:w=320:h=180:color=blue:t=fill,drawbox=x=320:y=180:w=320:h=180:color=yellow:t=fill",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-pix_fmt",
+            "yuv420p",
+        ])
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(generated.status.success());
+    rusqlite::Connection::open(fixture.directory.path().join("catalog.sqlite3"))
+        .unwrap()
+        .execute(
+            "UPDATE assets SET rotation_degrees=180 WHERE id='asset_0'",
+            [],
+        )
+        .unwrap();
+
+    let revision = fixture
+        .catalog
+        .create_edit_plan_revision(&fixture.project_id, &[cut(0, 0.0, 0.9)], None, None)
+        .unwrap();
+    let result = fixture
+        .catalog
+        .render_preview(
+            &PreviewRequest {
+                revision_id: revision.revision_id,
+                max_height: 720,
+            },
+            &mut |_| {},
+            &|| false,
+        )
+        .unwrap();
+    let top_left = decoded_rgb_pixel(&result.output_path, 160, 90);
+    let bottom_right = decoded_rgb_pixel(&result.output_path, 1120, 630);
+    assert!(
+        top_left[0] > 150 && top_left[1] > 150 && top_left[2] < 100,
+        "180-degree rotation should move the source's yellow lower-right tile to preview upper-left; got {top_left:?}"
+    );
+    assert!(
+        bottom_right[0] > 150 && bottom_right[1] < 100 && bottom_right[2] < 100,
+        "180-degree rotation should move the source's red upper-left tile to preview lower-right; got {bottom_right:?}"
+    );
+}
+
+fn decoded_rgb_pixel(path: &str, x: u32, y: u32) -> [u8; 3] {
+    let filter = format!("format=rgb24,crop=16:16:{x}:{y},scale=1:1");
+    let output = Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            path,
+            "-ss",
+            "0.5",
+            "-frames:v",
+            "1",
+            "-vf",
+            &filter,
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgb24",
+            "pipe:1",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(output.stdout.len(), 3);
+    [output.stdout[0], output.stdout[1], output.stdout[2]]
 }
 
 /// D01-T022: the document is byte-stable across repeated serialization, and it

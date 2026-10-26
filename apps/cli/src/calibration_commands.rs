@@ -25,6 +25,7 @@ pub enum CalibrationCommand {
 pub enum RecipeArg {
     Proxy,
     Speech,
+    PipelineSmoke,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -108,6 +109,14 @@ pub fn execute(catalog: &rcdvlog_core::Catalog, command: &CalibrationCommand) ->
                     Some(PROXY_REPRESENTATION_KIND),
                 ),
                 Some(RecipeArg::Speech) => (Some(STT_RECIPE_KEY), Some(SPEECH_REPRESENTATION_KIND)),
+                Some(RecipeArg::PipelineSmoke) => {
+                    let executable = super::agent_commands::executable()?;
+                    let identity =
+                        rcdvlog_core::PipelineSmokeIdentity::from_executable(&executable)?;
+                    return Ok(serde_json::to_value(
+                        catalog.pipeline_smoke_status(identity)?,
+                    )?);
+                }
                 None => (None, None),
             };
             Ok(serde_json::to_value(catalog.resource_calibration_status(
@@ -125,6 +134,7 @@ pub fn execute(catalog: &rcdvlog_core::Catalog, command: &CalibrationCommand) ->
                 "representations": [
                     rcdvlog_core::PROXY_REPRESENTATION_KIND,
                     rcdvlog_core::SPEECH_REPRESENTATION_KIND,
+                    "pipeline_smoke",
                 ],
                 "generatedMedia": {
                     "available": ffmpeg.is_file() && ffprobe.is_file(),
@@ -158,6 +168,23 @@ pub fn execute(catalog: &rcdvlog_core::Catalog, command: &CalibrationCommand) ->
             }))
         }
         CalibrationCommand::Run(args) => {
+            if matches!(args.recipe, RecipeArg::PipelineSmoke) {
+                ensure!(
+                    args.media.is_none(),
+                    "pipeline smoke uses generated fixtures only; --media is unsupported"
+                );
+                ensure!(
+                    args.worker_counts.is_empty()
+                        && args.vad_threads.is_empty()
+                        && args.decode_threads.is_empty(),
+                    "pipeline smoke does not accept calibration tuning options"
+                );
+                let executable = super::agent_commands::executable()?;
+                let identity = rcdvlog_core::PipelineSmokeIdentity::from_executable(&executable)?;
+                return Ok(serde_json::to_value(
+                    catalog.run_pipeline_smoke(identity, args.force)?,
+                )?);
+            }
             ensure!(
                 args.trials >= 1,
                 "invalid input: --trials must be at least 1"
@@ -191,6 +218,7 @@ pub fn execute(catalog: &rcdvlog_core::Catalog, command: &CalibrationCommand) ->
                     generated_duration_seconds: args.generated_duration_seconds,
                     force: args.force,
                 })?,
+                RecipeArg::PipelineSmoke => unreachable!("handled above"),
             };
             Ok(serde_json::to_value(report)?)
         }

@@ -7,7 +7,7 @@ use thiserror::Error;
 
 use crate::chronology::forward_migrate_project_chronology;
 
-pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 47;
+pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 48;
 
 const MIGRATION_TABLE_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -366,7 +366,29 @@ pub const PROJECT_CATALOG_MIGRATIONS: &[SqliteMigration] = &[
         source_identity: "project-catalog/0047-asset-orientation-decisions/20261027",
         apply: add_asset_orientation_decisions,
     },
+    SqliteMigration {
+        id: 48,
+        name: "pipeline_smoke_receipts",
+        source_identity: "project-catalog/0048-pipeline-smoke-receipts/20261027",
+        apply: add_pipeline_smoke_receipts,
+    },
 ];
+
+fn add_pipeline_smoke_receipts(transaction: &Transaction<'_>) -> Result<()> {
+    transaction.execute_batch(
+        r#"CREATE TABLE IF NOT EXISTS pipeline_smoke_receipts (
+            cache_key TEXT PRIMARY KEY,
+            identity_json TEXT NOT NULL,
+            report_json TEXT NOT NULL,
+            state TEXT NOT NULL CHECK(state IN ('passed','failed')),
+            created_at TEXT NOT NULL,
+            completed_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS pipeline_smoke_receipts_latest
+            ON pipeline_smoke_receipts(completed_at DESC);"#,
+    )?;
+    Ok(())
+}
 
 fn add_asset_orientation_decisions(transaction: &Transaction<'_>) -> Result<()> {
     add_column_if_missing(transaction, "assets", "orientation_decision_json", "TEXT")?;
@@ -4543,6 +4565,35 @@ mod tests {
                 .unwrap()
                 .current_version,
             PROJECT_CATALOG_SCHEMA_VERSION
+        );
+    }
+
+    #[test]
+    fn migration_48_adds_identity_qualified_pipeline_smoke_receipts() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        run_sqlite_migrations(&mut connection, &PROJECT_CATALOG_MIGRATIONS[..47]).unwrap();
+        migrate_project_catalog(&mut connection).unwrap();
+        connection.execute(
+            "INSERT INTO pipeline_smoke_receipts(cache_key,identity_json,report_json,state,created_at,completed_at) VALUES('key','{}','{}','passed','start','done')",
+            [],
+        ).unwrap();
+        assert_eq!(
+            connection.query_row(
+                "SELECT identity_json,report_json,state FROM pipeline_smoke_receipts WHERE cache_key='key'",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)),
+            ).unwrap(),
+            ("{}".into(), "{}".into(), "passed".into()),
+        );
+        assert!(connection.execute(
+            "INSERT INTO pipeline_smoke_receipts(cache_key,identity_json,report_json,state,created_at,completed_at) VALUES('invalid','{}','{}','running','start','')",
+            [],
+        ).is_err());
+        assert_eq!(
+            inspect_project_catalog_migrations(&connection)
+                .unwrap()
+                .current_version,
+            PROJECT_CATALOG_SCHEMA_VERSION,
         );
     }
 }

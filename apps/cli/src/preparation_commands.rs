@@ -119,11 +119,22 @@ pub fn execute(catalog: &Catalog, command: &PreparationCommand) -> Result<Value>
     match command {
         PreparationCommand::Preflight(args) => {
             validate_page(args.offset, args.limit)?;
-            Ok(serde_json::to_value(catalog.preparation_preflight(
+            let mut report = serde_json::to_value(catalog.preparation_preflight(
                 &scope(&args.scope),
                 args.offset,
                 args.limit,
-            )?)?)
+            )?)?;
+            let executable = super::agent_commands::executable()?;
+            let identity = rcdvlog_core::PipelineSmokeIdentity::from_executable(&executable)?;
+            let pipeline_smoke = catalog.pipeline_smoke_status(identity)?;
+            report
+                .as_object_mut()
+                .expect("preparation manifest serializes as an object")
+                .insert(
+                    "pipelineSmoke".into(),
+                    serde_json::to_value(pipeline_smoke)?,
+                );
+            Ok(report)
         }
         PreparationCommand::Evidence(args) => {
             validate_page(args.offset, args.limit)?;

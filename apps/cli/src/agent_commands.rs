@@ -79,6 +79,9 @@ pub struct ReadinessArgs {
     /// Require locally installed speech models, without downloading them.
     #[arg(long)]
     require_models: bool,
+    /// Require a passed exact-identity generated-media pipeline smoke receipt.
+    #[arg(long)]
+    require_pipeline_smoke: bool,
     /// Require this full source revision, captured at compile time.
     #[arg(long)]
     expect_revision: Option<String>,
@@ -96,6 +99,7 @@ impl ReadinessArgs {
             catalog: self.check,
             tools,
             models: self.check || self.require_models,
+            pipeline_smoke: self.check || self.require_pipeline_smoke,
             capabilities: self.capabilities.clone(),
             revision: self.expect_revision.clone(),
         }
@@ -229,7 +233,7 @@ fn command_paths(command: &clap::Command, prefix: &str, paths: &mut Vec<String>)
     }
 }
 
-fn executable() -> Result<CliExecutable> {
+pub(super) fn executable() -> Result<CliExecutable> {
     let mut commands = Vec::new();
     command_paths(&super::Cli::command(), "", &mut commands);
     commands.sort();
@@ -262,6 +266,7 @@ fn executable() -> Result<CliExecutable> {
             ("camera-sidecars.mapping.v1".into(), 1),
             ("proxy.encoders.v1".into(), 1),
             ("prepare.calibration.v1".into(), 1),
+            ("prepare.pipeline-smoke.v1".into(), 1),
             ("moments.discovery.v1".into(), 1),
             ("prepare.evidence.v1".into(), 1),
             ("analysis.accounting.recovery.v1".into(), 1),

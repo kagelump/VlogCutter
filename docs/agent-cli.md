@@ -101,15 +101,20 @@ rcdvlog doctor
 rcdvlog --catalog /absolute/project/catalog.sqlite3 doctor --check
 rcdvlog --catalog /absolute/project/catalog.sqlite3 doctor \
   --require-tool ffmpeg --require-models
+rcdvlog --catalog /absolute/project/catalog.sqlite3 doctor --require-pipeline-smoke
 ```
 
 `doctor` succeeds as a report even when the selected environment is not ready.
 Its `data.executable` contains the canonical path of the running binary,
 compile-time version/revision/dirty/profile/target/rustc metadata, capabilities,
-and leaf command names. The `tools` and `models` sections report observed
-readiness, while `catalogStatus` is read-only. `--check` is strict: it requires
-a compatible explicit catalog, all three supported media tools, and installed
-speech models. Repeat `--require-tool <name>`, `--require-models`,
+and leaf command names. The `tools`, `models`, and `pipelineSmoke` sections
+report observed readiness, while `catalogStatus` and the smoke receipt lookup
+are read-only. `pipelineSmoke` is `unverified` until an explicit generated-media
+run passes for the exact executable, FFmpeg/FFprobe, and recipe identities;
+`doctor --require-pipeline-smoke` requires that pass. `--check` is strict: it
+requires a compatible explicit catalog, all three supported media tools,
+installed speech models, and a passed pipeline smoke receipt. Repeat
+`--require-tool <name>`, `--require-models`,
 `--require-capability <capability-or-exact-command>`, and
 `--expect-revision <full-revision>` to ask for a narrower explicit contract.
 Strict failures use JSON error codes such as `catalog_missing`,
@@ -489,9 +494,13 @@ rcdvlog --catalog /absolute/project/catalog.sqlite3 calibrate run --recipe speec
   --vad-threads 1,2,4 --decode-threads 4 --trials 1
 rcdvlog --catalog /absolute/project/catalog.sqlite3 calibrate run --recipe proxy \
   --media /absolute/authorized/representative.mp4 --trials 2
+rcdvlog --catalog /absolute/project/catalog.sqlite3 calibrate status --recipe pipeline-smoke
+rcdvlog --catalog /absolute/project/catalog.sqlite3 calibrate run --recipe pipeline-smoke
 ```
 
 `calibrate capabilities` and `calibrate status` are read-only and never benchmark. `calibrate run` is explicit opt-in and bounded: generated synthetic media is the default, and `--media` is the only way to select a representative file. Representative media is rejected before full-file hashing/PCM expansion when it exceeds 30 seconds or the documented byte bound, and candidate/total-trial caps bound the matrix. A completed exact-key result is reused without rerunning the benchmark; `--force` requests an intentional recalibration. It never downloads missing speech models; a speech run without ready models reports `not_ready` and adopts nothing. Results are keyed by host, build, media-tool executable/version, device/model, recipe, representation kind, and candidate configuration. Only a complete matching result can seed a range-bearing ETA. Interrupted, failed, not-ready, stale, and explicit-override states are reported as uncertainty rather than a completion promise. Speech candidates are adopted only after their detected regions exactly match the validated baseline; the tool does not assume one VAD thread is universally optimal. VAD calibration fixes decode threads at the default because it does not measure decode quality; decode tuning is available only as an explicit, uncalibrated override. Proxy candidates retain the existing output validation and render/audio contract checks. Synthetic 320x180 proxy calibration reports `generatedContractOnly` compatibility and a deliberately wider ETA range; it is not presented as representative 4K/HEVC coverage.
+
+`calibrate status --recipe pipeline-smoke` is a read-only readiness check for the exact running CLI executable, FFmpeg, FFprobe, and smoke recipe. A missing or identity-stale receipt reports `unverified`; a failed receipt reports its measured failures and remediation. The same status is included in `doctor` and the read-only `prepare preflight` manifest; `doctor --require-pipeline-smoke` refuses to report the environment ready until it passes. `calibrate run --recipe pipeline-smoke` explicitly generates short mixed-frame-rate, mixed-dimension, tone, no-audio, silent, and rotated fixtures in managed scratch, invokes the production preview renderer, decodes the rendered video and PCM, and stores a machine-readable receipt in the selected catalog. Exact identities reuse their receipt; `--force` reruns it. The check covers only this host's generated preview path and makes no native editor or Resolve compatibility claim.
 
 Explicit runtime overrides are available without calibration:
 
