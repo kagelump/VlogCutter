@@ -212,9 +212,12 @@ impl<'a> AccountedVlmProvider<'a> {
             .pre_dispatch_check
             .as_deref()
             .map(|check| check as &dyn Fn() -> Result<()>);
-        let (project_id, policy_id, provider) = self.provider_health_scope()?;
-        let health_revision = std::sync::Mutex::new(0_i64);
+        let health_context: std::sync::Mutex<Option<(String, String, String, i64)>> =
+            std::sync::Mutex::new(None);
         let health_check = || -> Result<()> {
+            let (project_id, policy_id, provider) = self
+                .provider_health_scope()
+                .map_err(|_| ProviderFailure::local_admission())?;
             let revision = self
                 .catalog
                 .check_provider_health(&project_id, &policy_id, &provider, model)
@@ -228,9 +231,10 @@ impl<'a> AccountedVlmProvider<'a> {
                         anyhow::Error::from(ProviderFailure::local_admission())
                     }
                 })?;
-            *health_revision
+            *health_context
                 .lock()
-                .map_err(|_| ProviderFailure::local_admission())? = revision;
+                .map_err(|_| ProviderFailure::local_admission())? =
+                Some((project_id, policy_id, provider, revision));
             Ok(())
         };
         let combined_check = || {
@@ -250,9 +254,11 @@ impl<'a> AccountedVlmProvider<'a> {
             );
         match result {
             Ok(transmission) => {
-                let revision = *health_revision
+                let (_, _, _, revision) = health_context
                     .lock()
-                    .map_err(|_| ProviderFailure::local_post_dispatch())?;
+                    .map_err(|_| ProviderFailure::local_post_dispatch())?
+                    .take()
+                    .ok_or_else(ProviderFailure::local_post_dispatch)?;
                 self.health_revisions
                     .lock()
                     .map_err(|_| ProviderFailure::local_post_dispatch())?
@@ -268,30 +274,36 @@ impl<'a> AccountedVlmProvider<'a> {
                         | crate::analysis::provider::ProviderFailureCategory::InvalidResponse
                         | crate::analysis::provider::ProviderFailureCategory::Unclassified
                 ) {
-                    let category = match failure.category {
-                        crate::analysis::provider::ProviderFailureCategory::Transport => {
-                            "transport"
-                        }
-                        crate::analysis::provider::ProviderFailureCategory::HttpStatus
-                            if failure.http_status == Some(429) =>
-                        {
-                            "rate_limit"
-                        }
-                        crate::analysis::provider::ProviderFailureCategory::InvalidResponse => {
-                            "schema"
-                        }
-                        _ => "provider",
-                    };
-                    self.catalog
-                        .record_provider_health_failure(
-                            &project_id,
-                            &policy_id,
-                            &provider,
-                            model,
-                            category,
-                            failure.retry_after_seconds,
-                        )
-                        .map_err(|_| ProviderFailure::local_post_dispatch())?;
+                    let health_context = health_context
+                        .lock()
+                        .map_err(|_| ProviderFailure::local_post_dispatch())?
+                        .take();
+                    if let Some((project_id, policy_id, provider, _)) = health_context {
+                        let category = match failure.category {
+                            crate::analysis::provider::ProviderFailureCategory::Transport => {
+                                "transport"
+                            }
+                            crate::analysis::provider::ProviderFailureCategory::HttpStatus
+                                if failure.http_status == Some(429) =>
+                            {
+                                "rate_limit"
+                            }
+                            crate::analysis::provider::ProviderFailureCategory::InvalidResponse => {
+                                "schema"
+                            }
+                            _ => "provider",
+                        };
+                        self.catalog
+                            .record_provider_health_failure(
+                                &project_id,
+                                &policy_id,
+                                &provider,
+                                model,
+                                category,
+                                failure.retry_after_seconds,
+                            )
+                            .map_err(|_| ProviderFailure::local_post_dispatch())?;
+                    }
                 }
                 Err(error)
             }

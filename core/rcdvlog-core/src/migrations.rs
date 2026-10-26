@@ -3862,9 +3862,12 @@ mod tests {
                 .unwrap()
         };
         assert_eq!(&history_after[..history_before.len()], &history_before[..]);
-        assert_eq!(history_after.len(), history_before.len() + 3);
+        assert_eq!(history_after.len(), PROJECT_CATALOG_SCHEMA_VERSION as usize);
         assert_eq!(history_after[history_before.len()].0, 43);
-        assert_eq!(history_after.last().unwrap().0, 45);
+        assert_eq!(
+            history_after.last().unwrap().0,
+            PROJECT_CATALOG_SCHEMA_VERSION
+        );
         let fk_violations: i64 = connection
             .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
                 row.get(0)
