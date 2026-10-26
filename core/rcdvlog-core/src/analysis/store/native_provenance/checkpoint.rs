@@ -50,6 +50,7 @@ use crate::analysis::store::native_provenance::write::{
 };
 use crate::analysis::store::{
     NativeTranscriptWindowPlanRow, StoredTranscript, TranscriptOutcomeReason, TranscriptStatus,
+    has_native_transcript_association,
 };
 
 mod assembly;
@@ -83,7 +84,25 @@ impl Catalog {
         &self,
         preparation: &NativeSpeechPreparation,
     ) -> Result<NativeTranscriptCheckpoint> {
-        begin_native_transcript_checkpoint(self, preparation)
+        begin_native_transcript_checkpoint(
+            self,
+            preparation,
+            NativeTranscriptCheckpointStart::ResumeOnly,
+        )
+    }
+
+    /// Explicit backend selection start. This is deliberately narrow: it can
+    /// replace ordinary local derived output only when the canonical header has
+    /// no native association whatsoever. Generic resume callers never use it.
+    pub(crate) fn begin_native_transcript_checkpoint_for_explicit_selection(
+        &self,
+        preparation: &NativeSpeechPreparation,
+    ) -> Result<NativeTranscriptCheckpoint> {
+        begin_native_transcript_checkpoint(
+            self,
+            preparation,
+            NativeTranscriptCheckpointStart::ExplicitNativeSelection,
+        )
     }
 
     /// Internal C9 entry point: append one exact quality-evaluated paid window.

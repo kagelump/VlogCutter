@@ -98,7 +98,7 @@ fn table_count(catalog: &Catalog, table: &str) -> i64 {
 }
 
 #[test]
-fn native_speech_proposal_binds_registered_audio_only_scope_cost_and_stays_blocked() {
+fn native_speech_proposal_binds_registered_audio_only_scope_cost_and_exposes_working_route() {
     let (directory, catalog, project, asset) = fixture();
     catalog
         .add_label(&asset, "PRIVATE_NATIVE_VOCAB_CANARY")
@@ -176,7 +176,8 @@ fn native_speech_proposal_binds_registered_audio_only_scope_cost_and_stays_block
             .readiness
             .warnings
             .iter()
-            .any(|warning| warning.contains("native STT bounded capability pilot is implemented"))
+            .any(|warning| warning
+                .contains("native STT core bulk and CLI execution are implemented"))
     );
     assert!(
         policy
@@ -1002,7 +1003,11 @@ fn native_adapter_rejects_wrong_operation_and_request_binding_before_provider() 
     )
     .transmit()
     .unwrap_err();
-    assert!(format!("{error:#}").contains("limited to one supplied pilot window"));
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("capability pilot") || message.contains("exact native operation"),
+        "{message}"
+    );
 
     let wrong_language = NativeSttRequest::new(
         OPENROUTER_STT_PROVIDER,
@@ -1281,7 +1286,7 @@ fn native_catalog_admission_rejects_non_policy_and_non_pilot_shortcuts() {
         .reserve_analysis_native_stt_request(&non_pilot, &request, &audio)
         .unwrap_err();
     assert!(
-        format!("{error:#}").contains("limited to the pilot operation"),
+        format!("{error:#}").contains("owned run created for its exact native operation"),
         "{error:#}"
     );
 }

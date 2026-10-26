@@ -243,6 +243,25 @@ impl Catalog {
         )
     }
 
+    /// Prior unresolved native speech work for one exact source. This query
+    /// spans pilot and native bulk operations and every policy identity, so a
+    /// replacement/force policy cannot bypass unknown paid work.
+    pub fn analysis_native_requests_needing_reconciliation_for_source(
+        &self,
+        project_id: &str,
+        source_fingerprint: &str,
+    ) -> Result<Vec<AnalysisRequestRecord>> {
+        ensure!(
+            !project_id.trim().is_empty() && !source_fingerprint.trim().is_empty(),
+            "project and source identity are required"
+        );
+        store::native_unresolved_requests_for_source(
+            &self.connection()?,
+            project_id,
+            source_fingerprint,
+        )
+    }
+
     pub(crate) fn analysis_request_keys_for_run(
         &self,
         project_id: &str,

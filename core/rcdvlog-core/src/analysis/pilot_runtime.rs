@@ -180,15 +180,27 @@ pub(crate) fn prepare_pilot_session(
         std::slice::from_ref(&first_scope)
     };
     for scope in fence_scopes {
-        for unresolved in catalog.analysis_requests_needing_reconciliation_for_source(
-            &policy.project_id,
-            "pilot",
-            &scope.source_identity,
-        )? {
-            ensure!(
-                unresolved.policy_id == policy.policy_id,
-                "a prior pilot request has unresolved usage; reconcile it and authorize the exact prior request before a replacement policy can retry"
-            );
+        if kind == AnalysisRunKind::NativeSpeechTranscription {
+            for unresolved in catalog.analysis_native_requests_needing_reconciliation_for_source(
+                &policy.project_id,
+                &scope.source_identity,
+            )? {
+                ensure!(
+                    unresolved.policy_id == policy.policy_id,
+                    "a prior native request has unresolved usage; reconcile it and authorize the exact prior request before a replacement policy can retry"
+                );
+            }
+        } else {
+            for unresolved in catalog.analysis_requests_needing_reconciliation_for_source(
+                &policy.project_id,
+                "pilot",
+                &scope.source_identity,
+            )? {
+                ensure!(
+                    unresolved.policy_id == policy.policy_id,
+                    "a prior pilot request has unresolved usage; reconcile it and authorize the exact prior request before a replacement policy can retry"
+                );
+            }
         }
     }
 

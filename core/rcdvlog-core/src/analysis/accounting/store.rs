@@ -303,6 +303,7 @@ struct OwnerIdentity<'a> {
     model: &'a str,
     source_fingerprint: &'a str,
     run_id: &'a str,
+    operation: &'a str,
     intended_attempt_key: &'a str,
 }
 
@@ -317,6 +318,7 @@ impl<'a> OwnerIdentity<'a> {
             model,
             source_fingerprint: &context.source_fingerprint,
             run_id: &context.run_id,
+            operation: &context.operation,
             intended_attempt_key: &context.intended_attempt_key,
         }
     }
@@ -335,6 +337,7 @@ impl<'a> OwnerIdentity<'a> {
             model: &prior.requested_model,
             source_fingerprint: &prior.source_fingerprint,
             run_id,
+            operation: "",
             intended_attempt_key: "",
         }
     }
@@ -492,8 +495,11 @@ pub(crate) fn reserve_native_stt(
         "native STT admission requires a real running accounted run"
     );
     ensure!(
-        context.operation == "pilot",
-        "native STT accounted admission is limited to the pilot operation"
+        matches!(
+            context.operation.as_str(),
+            "pilot" | "native_speech_transcription"
+        ),
+        "native STT accounted admission requires the pilot or native speech transcription operation"
     );
     reserve_with_family(
         connection,
@@ -537,11 +543,11 @@ fn reserve_with_family(
         context.budget_usd,
         &scope,
     )?;
-    validate_owner_identity(
-        &transaction,
-        &OwnerIdentity::from_context(context, model),
-        family,
-    )?;
+    let owner = OwnerIdentity::from_context(context, model);
+    validate_owner_identity(&transaction, &owner, family)?;
+    if matches!(family, PolicyRequestFamily::NativeStt { .. }) {
+        ensure_no_foreign_native_unresolved_for_source(&transaction, context)?;
+    }
     if let Some(stop_reason) =
         persist_untracked_denial_boundary(&transaction, &authority, context.budget_usd)?
     {
@@ -1563,6 +1569,27 @@ pub(crate) fn unresolved_requests_for_source(
         .context("list unresolved analysis requests for source")
 }
 
+/// Prior unresolved native speech work for one exact source identity. This
+/// intentionally spans both native operations and every policy identity: a new
+/// force/replacement policy may not convert unknown usage into a fresh miss.
+pub(crate) fn native_unresolved_requests_for_source(
+    connection: &Connection,
+    project_id: &str,
+    source_fingerprint: &str,
+) -> Result<Vec<AnalysisRequestRecord>> {
+    let mut statement = connection.prepare(&format!(
+        "{REQUEST_SELECT}
+         WHERE project_id=?1 AND source_fingerprint=?2
+           AND operation IN ('pilot','native_speech_transcription')
+           AND lifecycle IN ('reserved','dispatched','uncertain')
+         ORDER BY created_at ASC, request_key ASC"
+    ))?;
+    statement
+        .query_map(params![project_id, source_fingerprint], row_to_request)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .context("list unresolved native speech requests for source")
+}
+
 pub(crate) fn request_keys_for_run(
     connection: &Connection,
     project_id: &str,
@@ -1847,6 +1874,28 @@ fn validate_authority_input(
     Ok(())
 }
 
+/// Atomic source fence for every genuinely new native paid window. Native pilot
+/// and bulk requests share a source identity but may be created under different
+/// policy/force identities; unresolved prior native work must remain an explicit
+/// recovery obligation instead of being hidden by a replacement policy.
+fn ensure_no_foreign_native_unresolved_for_source(
+    connection: &Connection,
+    context: &AnalysisAccountingContext,
+) -> Result<()> {
+    let prior = native_unresolved_requests_for_source(
+        connection,
+        &context.project_id,
+        &context.source_fingerprint,
+    )?;
+    for request in prior {
+        ensure!(
+            request.policy_id == context.policy_id,
+            "a prior native speech request has unresolved usage; reconcile it and authorize the exact prior request before a replacement policy can send"
+        );
+    }
+    Ok(())
+}
+
 /// Validate immutable request-owner identities against the canonical project,
 /// active policy authorization and owned run. Fresh admission and targeted
 /// retry both call this exact function; an empty run id is only accepted by
@@ -1894,15 +1943,23 @@ fn validate_owner_identity(
         }
     }
     if !identity.run_id.trim().is_empty() {
-        let run: Option<(String, String, String, String)> = connection
+        let run: Option<(String, String, String, String, String)> = connection
             .query_row(
-                "SELECT project_id,policy_id,accounting_contract,status
+                "SELECT project_id,policy_id,accounting_contract,status,stage_reached
                  FROM analysis_runs WHERE id=?1",
                 [identity.run_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
             )
             .optional()?;
-        let (run_project, run_policy, accounting_contract, status) =
+        let (run_project, run_policy, accounting_contract, status, stage_reached) =
             run.ok_or_else(|| anyhow!("analysis run does not exist"))?;
         ensure!(
             run_project == identity.project_id,
@@ -1922,6 +1979,12 @@ fn validate_owner_identity(
             status == "running",
             "analysis request requires a currently running owned analysis run"
         );
+        if matches!(family, PolicyRequestFamily::NativeStt { .. }) {
+            ensure!(
+                !identity.operation.trim().is_empty() && stage_reached == identity.operation,
+                "native STT request requires an owned run created for its exact native operation"
+            );
+        }
     }
     Ok(())
 }

@@ -1,10 +1,11 @@
-//! Accounted native speech-transcription pilot leaf.
+//! Accounted native speech-transcription leaf.
 //!
-//! B3 wires exactly one supplied bounded speech window through the same
-//! canonical admission, dispatch marker, receipt settlement and uncertainty
-//! owners as VLM work. It intentionally does not implement a high-level native
-//! pilot/bulk workflow, VAD extraction, model loading, transcript persistence,
-//! retry orchestration or CLI/desktop selection.
+//! One supplied bounded speech window crosses the same canonical admission,
+//! dispatch marker, receipt settlement and uncertainty owners as VLM work. Both
+//! the bounded capability pilot (`pilot`) and the authorized native bulk
+//! operation (`native_speech_transcription`) use this exact adapter; local VAD,
+//! transcript persistence, window planning and retry orchestration stay with
+//! their owning modules.
 
 use anyhow::{Result, ensure};
 
@@ -110,8 +111,11 @@ impl<'a> AccountedNativeSttProvider<'a> {
     /// transport preparation. It never trusts a caller-supplied "current" flag.
     fn validate_preconditions(&self) -> Result<()> {
         ensure!(
-            self.context.operation == "pilot",
-            "native STT accounted adapter is limited to one supplied pilot window"
+            matches!(
+                self.context.operation.as_str(),
+                "pilot" | "native_speech_transcription"
+            ),
+            "native STT accounted adapter requires the pilot or native bulk operation"
         );
         ensure!(
             !self.policy.policy_id.trim().is_empty()
@@ -171,11 +175,35 @@ impl<'a> AccountedNativeSttProvider<'a> {
                 && authorization.policy.kind == AnalysisRunKind::NativeSpeechTranscription,
             "native STT canonical authorization changed before dispatch"
         );
-        let current = self.catalog.describe_run_policy(&self.policy.request())?;
+        let current = self
+            .catalog
+            .describe_run_policy_for_local_preparation(&self.policy.request())?;
         ensure!(
             current.policy_id == self.policy.policy_id && current.readiness.ready_for_authorization,
             "native STT canonical policy or source identity changed before dispatch"
         );
+        if self.context.operation == "native_speech_transcription" {
+            let authorized = self.catalog.authorized_policy_for_bulk(
+                &self.policy.policy_id,
+                AnalysisRunKind::NativeSpeechTranscription,
+            )?;
+            ensure!(
+                authorized.authorization.policy.policy_id == self.policy.policy_id,
+                "native STT bulk capability authorization changed before dispatch"
+            );
+            for unresolved in self
+                .catalog
+                .analysis_native_requests_needing_reconciliation_for_source(
+                    &self.policy.project_id,
+                    &self.context.source_fingerprint,
+                )?
+            {
+                ensure!(
+                    unresolved.policy_id == self.policy.policy_id,
+                    "a prior native speech request has unresolved usage; reconcile it before dispatch"
+                );
+            }
+        }
 
         let matching_scopes: Vec<_> = self
             .policy

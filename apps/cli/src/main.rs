@@ -18,6 +18,7 @@ mod analysis_recovery_commands;
 mod calibration_commands;
 mod chronology_commands;
 mod moment_commands;
+mod native_speech_commands;
 mod preparation_commands;
 mod server_commands;
 
@@ -214,6 +215,11 @@ enum TranscribeCommand {
         /// Explicit whisper decode thread override; bounded and provenance-bearing.
         #[arg(long)]
         decode_threads: Option<usize>,
+    },
+    /// Explicitly select cloud transcription and run its policy, pilot and batch.
+    Native {
+        #[command(subcommand)]
+        command: native_speech_commands::NativeSpeechCommand,
     },
     /// Report transcript coverage without transcribing anything.
     Status {
@@ -734,6 +740,7 @@ fn command_name(command: &Commands) -> &'static str {
             TranscribeCommand::Generate { .. } => "transcribe.generate",
             TranscribeCommand::Missing { .. } => "transcribe.missing",
             TranscribeCommand::Batch { .. } => "transcribe.batch",
+            TranscribeCommand::Native { command } => native_speech_commands::command_name(command),
             TranscribeCommand::Status { .. } => "transcribe.status",
         },
         Commands::Analyze { command } => match command {
@@ -850,6 +857,9 @@ fn execute(cli: &Cli) -> Result<Value> {
     }
 
     let read_only = match &cli.command {
+        Commands::Transcribe {
+            command: TranscribeCommand::Native { command },
+        } => native_speech_commands::is_read_only(command),
         Commands::Project {
             command: ProjectCommand::Diagnose { .. },
         }
@@ -1176,6 +1186,9 @@ fn execute(cli: &Cli) -> Result<Value> {
                         cancellation.flow()
                     },
                 )?)?)
+            }
+            TranscribeCommand::Native { command } => {
+                native_speech_commands::execute(&catalog, command)
             }
             TranscribeCommand::Status { project } => {
                 Ok(serde_json::to_value(catalog.transcript_coverage(project)?)?)

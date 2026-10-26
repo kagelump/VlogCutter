@@ -521,6 +521,50 @@ rcdvlog --catalog /absolute/project/catalog.sqlite3 transcribe batch --project <
 rcdvlog --catalog /absolute/project/catalog.sqlite3 transcribe batch --project <project-id> --asset <asset-a> --force
 rcdvlog --catalog /absolute/project/catalog.sqlite3 transcribe status --project <project-id>
 
+```
+
+Explicit native cloud transcription is a separate, provider-qualified backend. Local
+`transcribe generate`/`missing`/`batch` remains the offline default. A native policy
+selects the exact assets, provider, verified audio-transcription model, language,
+provider data policy and whole-policy budget; `audio` is the only supported payload.
+
+```bash
+rcdvlog --catalog /absolute/project/catalog.sqlite3 models install \
+  --backend native-openrouter --provider openrouter --model openai/whisper-1
+
+rcdvlog --catalog /absolute/project/catalog.sqlite3 transcribe native preflight \
+  --project <project-id> --asset <asset-a> --asset <asset-b> \
+  --backend native-openrouter --provider openrouter --primary-model openai/whisper-1 \
+  --language en --zdr true --data-collection deny --budget-usd 1.00
+rcdvlog --catalog /absolute/project/catalog.sqlite3 transcribe native authorize \
+  --project <project-id> --asset <asset-a> --asset <asset-b> \
+  --backend native-openrouter --provider openrouter --primary-model openai/whisper-1 \
+  --language en --zdr true --data-collection deny --budget-usd 1.00
+rcdvlog --catalog /absolute/project/catalog.sqlite3 transcribe native pilot \
+  --project <project-id> --asset <asset-a> --asset <asset-b> \
+  --backend native-openrouter --provider openrouter --primary-model openai/whisper-1 \
+  --language en --zdr true --data-collection deny --budget-usd 1.00
+rcdvlog --catalog /absolute/project/catalog.sqlite3 transcribe native run \
+  --policy-id <policy-id>
+rcdvlog --catalog /absolute/project/catalog.sqlite3 transcribe native status \
+  --project <project-id> --policy-id <policy-id>
+```
+
+The core opens a real accounted `native_speech_transcription` run only when a
+missing bounded window actually needs a provider send. Local Silero VAD runs on
+the approved derived proxy first; NoAudio/NoSpeech and fully cached resumes make
+no provider request and need no credentials. Every paid send uses the same
+whole-policy budget authority and reservation/receipt/recovery lifecycle as
+other analysis work. A paid pilot window is reused through its exact canonical
+request/payload identity before another upload. Dispatched/uncertain/receipt-only
+work stops for inspection and reconciliation rather than blind replay; a rerun
+resumes only missing typed windows. `status` reads the canonical transcript plus
+native provenance, including per-window quality, actual provider/model, latency,
+confirmed cost and separately retained uncertain usage. The native batch path
+does not load the local Whisper ASR model, does not fall back to local ASR, and
+does not silently substitute a chat model for the audio-transcription endpoint.
+
+```bash
 rcdvlog --catalog /absolute/project/catalog.sqlite3 analyze generate --asset <asset-id>
 rcdvlog --catalog /absolute/project/catalog.sqlite3 analyze missing --project <project-id>
 rcdvlog --catalog /absolute/project/catalog.sqlite3 analyze missing --project <project-id> --force

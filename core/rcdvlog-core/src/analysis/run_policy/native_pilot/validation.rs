@@ -1,8 +1,20 @@
-//! Pure native pilot protocol, quality and identity interpretation.
+//! Pure native pilot/bulk protocol, quality and identity interpretation.
 
 use super::*;
 
-pub(super) fn validate_native_accounted_result(
+/// The deliberately narrow native model registry cannot prove that a returned
+/// serving identifier is an alias of the requested model. A missing actual
+/// identity stays honest `None`; any present-and-different identifier requires
+/// human review. Requested and actual namespaces are compared only as exact
+/// registered strings, never by guessing a provider alias.
+pub(crate) fn native_serving_model_identity_requires_review(
+    actual_model: Option<&str>,
+    requested_model: &str,
+) -> bool {
+    actual_model.is_some_and(|actual| actual != requested_model)
+}
+
+pub(crate) fn validate_native_accounted_result(
     request: &NativeSttRequest,
     result: &crate::analysis::accounting::NativeSttAccountedResult,
     sample: &NativePilotPaidSample,
@@ -60,13 +72,10 @@ pub(super) fn validate_native_accounted_result(
     // A different returned identifier is unverified in this deliberately narrow
     // registry. Require review without claiming an alias is a different model;
     // never compare requested broker and upstream provider namespaces.
-    if result
-        .call
-        .receipt
-        .actual_model
-        .as_deref()
-        .is_some_and(|actual| actual != request.model())
-    {
+    if native_serving_model_identity_requires_review(
+        result.call.receipt.actual_model.as_deref(),
+        request.model(),
+    ) {
         capability_observed = false;
         detail = "native_stt_serving_model_identity_requires_review".into();
     }

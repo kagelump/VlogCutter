@@ -126,9 +126,11 @@ pub use analysis::provider::{
 };
 pub use analysis::run_policy::{
     AnalysisPayload, AnalysisRunKind, AuthorizedPolicyState, CapabilityCheck, CapabilityStatus,
-    MAX_NATIVE_PILOT_LOCAL_OUTCOMES, NATIVE_PILOT_EVIDENCE_SCHEMA_VERSION, NativePilotEvidence,
-    NativePilotLocalOutcome, NativePilotLocalOutcomeFact, NativePilotPaidSample,
-    NativePilotSampleCoverage, NativePilotSampleOutcome, PilotValidation,
+    MAX_NATIVE_PILOT_LOCAL_OUTCOMES, NATIVE_PILOT_EVIDENCE_SCHEMA_VERSION,
+    NATIVE_SPEECH_BATCH_SCHEMA_VERSION, NativePilotEvidence, NativePilotLocalOutcome,
+    NativePilotLocalOutcomeFact, NativePilotPaidSample, NativePilotSampleCoverage,
+    NativePilotSampleOutcome, NativeSpeechAssetOutcome, NativeSpeechBatchFailure,
+    NativeSpeechBatchProgress, NativeSpeechBatchReport, PilotValidation,
     RUN_AUTHORIZATION_SCHEMA_VERSION, RUN_PILOT_SCHEMA_VERSION, RUN_POLICY_SCHEMA_VERSION,
     RUN_POLICY_TOOL_VERSION, RunAssetScope, RunAuthorization, RunPilotRecord, RunPolicy,
     RunPolicyBlocker, RunPolicyContext, RunPolicyParameters, RunPolicyReadiness, RunPolicyRequest,

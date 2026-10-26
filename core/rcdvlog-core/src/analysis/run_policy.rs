@@ -38,12 +38,18 @@ use crate::analysis::provider::{
 use crate::analysis::{VLM_PROMPT_VERSION, framepack, store::TranscriptStatus};
 use crate::{Asset, Catalog, REFERENCE_COST_PER_CLIP_USD};
 
+mod native_bulk;
 mod native_pilot;
 mod pilot_projection;
 use pilot_projection::{pilot_observed_capabilities, pilot_projection_status};
 mod native_pilot_evidence;
 pub(crate) use native_pilot_evidence::reusable_native_pilot_sample_on_transaction;
 mod native_stt;
+pub use native_bulk::{
+    NATIVE_SPEECH_BATCH_SCHEMA_VERSION, NativeSpeechAssetOutcome, NativeSpeechBatchFailure,
+    NativeSpeechBatchProgress, NativeSpeechBatchReport,
+};
+pub(crate) use native_pilot::native_serving_model_identity_requires_review;
 pub use native_pilot_evidence::{
     MAX_NATIVE_PILOT_LOCAL_OUTCOMES, NATIVE_PILOT_EVIDENCE_SCHEMA_VERSION, NativePilotEvidence,
     NativePilotLocalOutcome, NativePilotLocalOutcomeFact, NativePilotPaidSample,
@@ -2021,13 +2027,24 @@ impl Catalog {
         expected_kind: AnalysisRunKind,
     ) -> Result<AuthorizedPolicyState> {
         let authorization = self.load_run_authorization(policy_id)?;
-        ensure_vlm_run_kind(authorization.policy.kind)?;
-        ensure_vlm_run_kind(expected_kind)?;
+        let kind = authorization.policy.kind;
         ensure!(
-            authorization.policy.kind == expected_kind,
+            kind.is_vlm() || kind == AnalysisRunKind::NativeSpeechTranscription,
+            "unsupported authorized bulk policy kind"
+        );
+        ensure!(
+            expected_kind.is_vlm() || expected_kind == AnalysisRunKind::NativeSpeechTranscription,
+            "unsupported requested bulk kind"
+        );
+        ensure!(
+            kind == expected_kind,
             "authorized policy kind does not match the requested bulk operation"
         );
-        let current = self.describe_run_policy(&authorization.policy.request())?;
+        let current = if kind == AnalysisRunKind::NativeSpeechTranscription {
+            self.describe_run_policy_for_local_preparation(&authorization.policy.request())?
+        } else {
+            self.describe_run_policy(&authorization.policy.request())?
+        };
         ensure!(
             current.policy_id == policy_id,
             "run policy or source identity changed; the prior authorization is invalid"
@@ -2052,6 +2069,59 @@ impl Catalog {
             pilot.cost_usd.is_finite() && pilot.cost_usd >= 0.0,
             "capability pilot cost is invalid"
         );
+        if kind == AnalysisRunKind::NativeSpeechTranscription {
+            ensure!(
+                pilot.validation.structural_schema_valid
+                    && pilot.validation.source_time_semantics_valid
+                    && pilot.validation.capability_observed,
+                "capability pilot did not observe the native protocol/source contract"
+            );
+            let sample = pilot
+                .native_evidence
+                .as_ref()
+                .and_then(|evidence| evidence.sample.as_ref())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "native paid capability evidence is missing; local/no-provider pilot results cannot authorize an upload"
+                    )
+                })?;
+            ensure!(
+                matches!(sample.outcome, NativePilotSampleOutcome::Evaluated { .. }),
+                "native paid capability evidence is protocol-unusable; targeted recovery is required"
+            );
+            ensure!(
+                sample.requested_provider == current.provider
+                    && sample.requested_model == current.primary_model
+                    && sample.scope.asset_id == pilot.asset_id,
+                "native paid capability evidence does not match the frozen provider/model"
+            );
+            let sample_request = self
+                .analysis_request(&sample.request_key)?
+                .ok_or_else(|| anyhow::anyhow!("native paid capability request is missing"))?;
+            ensure!(
+                sample_request.operation == "pilot"
+                    && sample_request.run_id == pilot.run_id
+                    && sample_request.policy_id == policy_id
+                    && sample_request.project_id == current.project_id
+                    && sample_request.provider == current.provider
+                    && sample_request.requested_model == current.primary_model
+                    && sample_request.lifecycle.is_terminal()
+                    && sample_request
+                        .cost_bound
+                        .as_ref()
+                        .is_some_and(|bound| bound.audio.is_some()),
+                "native paid capability request is not the exact settled pilot audio window"
+            );
+            // This is the same whole-policy authority the pilot froze. A
+            // replacement policy cannot create a fresh remaining-balance
+            // ceiling, and a stopped/overrun authority is never bypassed.
+            let authority = verify_bulk_authority(self, &current)?;
+            ensure!(
+                !authority.dispatch_stopped,
+                "native speech budget authority dispatch is stopped: {}",
+                authority.stop_reason
+            );
+        }
         // Remaining budget is canonical whole-policy exposure, not a separate
         // add-up of pilot summary fields. Active reservations are legitimate
         // concurrent attempts and are accounted by atomic admission; only

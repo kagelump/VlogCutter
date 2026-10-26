@@ -142,6 +142,41 @@ fn create_project(catalog: &Path, name: &str) -> String {
         .to_string()
 }
 
+fn insert_native_no_audio_asset(
+    catalog_path: &Path,
+    project: &str,
+    id: &str,
+    source: &Path,
+    proxy: &Path,
+) {
+    let catalog = Catalog::open(catalog_path).unwrap();
+    drop(catalog);
+    let connection = Connection::open(catalog_path).unwrap();
+    connection
+        .execute(
+            "INSERT INTO assets(id,project_id,fingerprint,path,filename,size_bytes,duration_seconds,created_at)
+             VALUES (?1,?2,?3,?4,?5,24,1,'2026-10-22T00:00:00Z')",
+            params![
+                id,
+                project,
+                format!("fp-{id}"),
+                source.to_string_lossy(),
+                source.file_name().unwrap().to_string_lossy()
+            ],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE assets SET duration_seconds=1,source_out=1,frame_rate=2,width=160,height=90,
+                orientation_probed=1,proxy_path=?2 WHERE id=?1",
+            params![id, proxy.to_string_lossy()],
+        )
+        .unwrap();
+    drop(connection);
+    let catalog = Catalog::open_existing(catalog_path).unwrap();
+    catalog.validate_asset_video(id).unwrap();
+}
+
 fn insert_moment_scope_asset(catalog: &Path, project: &str, id: &str, path: &Path) {
     fs::write(path, b"synthetic clip placeholder").unwrap();
     let connection = Connection::open(catalog).unwrap();
@@ -3637,4 +3672,207 @@ fn analysis_accounting_inspect_is_read_only_and_missing_operations_fail_locally(
         let response = failure(&catalog_path, arguments);
         assert_eq!(response["error"]["code"], "not_found");
     }
+}
+
+#[test]
+fn native_speech_cli_no_audio_round_trip_needs_no_credentials_or_models() {
+    let ffmpeg_available = Command::new("ffmpeg")
+        .arg("-version")
+        .output()
+        .is_ok_and(|output| output.status.success());
+    if !ffmpeg_available {
+        eprintln!("skipping native no-audio CLI test: ffmpeg unavailable");
+        return;
+    }
+
+    let directory = tempdir().unwrap();
+    let catalog_path = directory.path().join("catalog.sqlite3");
+    let project = create_project(&catalog_path, "Native no-audio CLI");
+    let source = directory.path().join("native-no-audio.mp4");
+    let proxy = directory.path().join("native-no-audio.proxy.v3.mp4");
+    let output = Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=black:s=160x90:r=2:d=1",
+            "-an",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+        ])
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "ffmpeg failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    fs::copy(&source, &proxy).unwrap();
+    insert_native_no_audio_asset(
+        &catalog_path,
+        &project,
+        "native-no-audio-asset",
+        &source,
+        &proxy,
+    );
+
+    let policy_arguments = [
+        "transcribe",
+        "native",
+        "preflight",
+        "--project",
+        &project,
+        "--asset",
+        "native-no-audio-asset",
+        "--backend",
+        "native-openrouter",
+        "--provider",
+        "openrouter",
+        "--primary-model",
+        "openai/whisper-1",
+        "--language",
+        "en",
+        "--zdr",
+        "true",
+        "--data-collection",
+        "deny",
+        "--budget-usd",
+        "1.0",
+    ];
+    let preflight = success(&catalog_path, policy_arguments);
+    assert_eq!(
+        preflight.json["data"]["kind"],
+        "native_speech_transcription"
+    );
+    assert_eq!(preflight.json["data"]["payload"], "audio");
+    assert_eq!(
+        preflight.json["data"]["readiness"]["readyForAuthorization"],
+        true
+    );
+
+    let isolated_home = directory.path().join("isolated-home");
+    fs::create_dir(&isolated_home).unwrap();
+    let mut authorize_arguments = policy_arguments.to_vec();
+    authorize_arguments[2] = "authorize";
+    let authorize_output = Command::new(env!("CARGO_BIN_EXE_rcdvlog"))
+        .arg("--catalog")
+        .arg(&catalog_path)
+        .args(authorize_arguments)
+        .env_remove("OPENROUTER_API_KEY")
+        .env("HOME", &isolated_home)
+        .output()
+        .unwrap();
+    assert!(
+        authorize_output.status.success(),
+        "authorize failed: {}",
+        String::from_utf8_lossy(&authorize_output.stderr)
+    );
+    let authorize: Value = serde_json::from_slice(&authorize_output.stdout).unwrap();
+    assert_eq!(authorize["ok"], true);
+    let policy_id = authorize["data"]["policy"]["policyId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let mut pilot_arguments = policy_arguments.to_vec();
+    pilot_arguments[2] = "pilot";
+    let pilot_output = Command::new(env!("CARGO_BIN_EXE_rcdvlog"))
+        .arg("--catalog")
+        .arg(&catalog_path)
+        .args(pilot_arguments)
+        .env_remove("OPENROUTER_API_KEY")
+        .env("HOME", &isolated_home)
+        .output()
+        .unwrap();
+    assert!(
+        pilot_output.status.success(),
+        "no-audio pilot failed: {}",
+        String::from_utf8_lossy(&pilot_output.stderr)
+    );
+    let pilot: Value = serde_json::from_slice(&pilot_output.stdout).unwrap();
+    assert_eq!(pilot["data"]["status"], "no_provider_required");
+    assert_eq!(pilot["data"]["attempts"], 0);
+    assert_eq!(pilot["data"]["usageComplete"], true);
+
+    let run_output = Command::new(env!("CARGO_BIN_EXE_rcdvlog"))
+        .arg("--catalog")
+        .arg(&catalog_path)
+        .args(["transcribe", "native", "run", "--policy-id", &policy_id])
+        .env_remove("OPENROUTER_API_KEY")
+        .env("HOME", &isolated_home)
+        .output()
+        .unwrap();
+    assert!(
+        run_output.status.success(),
+        "no-audio native run failed: {}",
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+    let run: Value = serde_json::from_slice(&run_output.stdout).unwrap();
+    assert_eq!(run["ok"], true);
+    assert_eq!(run["data"]["status"], "completed");
+    assert_eq!(run["data"]["completed"], 1);
+    assert!(run["data"]["accounting"].is_null());
+    assert!(run["data"]["runId"].is_null());
+    assert_eq!(run["data"]["outcomes"][0]["status"], "no_audio");
+
+    let status = success(
+        &catalog_path,
+        [
+            "transcribe",
+            "native",
+            "status",
+            "--project",
+            &project,
+            "--policy-id",
+            &policy_id,
+        ],
+    );
+    assert_eq!(
+        status.json["data"]["assets"][0]["assetId"],
+        "native-no-audio-asset"
+    );
+    assert_eq!(
+        status.json["data"]["assets"][0]["transcript"]["status"],
+        "no_audio"
+    );
+    assert_eq!(
+        status.json["data"]["assets"][0]["nativeProvenance"]["status"],
+        "no_audio"
+    );
+
+    let other_project = create_project(&catalog_path, "Other native project");
+    let foreign = failure(
+        &catalog_path,
+        [
+            "transcribe",
+            "native",
+            "status",
+            "--project",
+            &other_project,
+            "--asset",
+            "native-no-audio-asset",
+        ],
+    );
+    assert!(
+        foreign["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("different project")
+    );
+
+    let catalog = Catalog::open_existing(&catalog_path).unwrap();
+    assert!(
+        catalog
+            .list_analysis_requests(&project, Some(&policy_id), 100)
+            .unwrap()
+            .is_empty(),
+        "no-audio native selection must make no provider request"
+    );
 }
