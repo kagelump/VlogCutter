@@ -683,6 +683,16 @@ positive. Requested provider and the provider actually reported by the selected
 endpoint are recorded separately; missing upstream identity stays missing.
 The artifact also records whether its selected payload included frames alone
 or frames with accepted timed transcript evidence.
+Moment prompt/schema v2 bind every proposed core, payoff, setup and context to
+that request's exact inspected source window, in integer source milliseconds.
+The wire schema and local validator use the same lower and upper bounds. A
+refinement seed carries event/range/reason hints; earlier frame or transcript
+citations are not evidence in the new request. Frames-only prompts prohibit
+speech claims, and only supplied evidence keys may be cited. Rejected replies
+remain rejected with their original provider body retained in local SQLite for
+inspection. Changed versions invalidate previous request/policy/cache identities.
+Sparse inspection still requires playback before accepting final cut boundaries.
+
 The defaults are 96 coarse frames, 384 refinement frames, at most 8
 candidates per asset, and an edit profile of 3–8 seconds for selects and 20–30
 seconds for justified holds. These frame limits are bounded request budgets,
