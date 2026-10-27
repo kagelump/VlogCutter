@@ -1254,5 +1254,10 @@ YouTube errors use the `youtube.*` namespace (including `auth_required`,
 `metadata_conflict`, `outcome_unknown`, and `session_expired`). Progress and
 `youtube.oauth.authorization_required` events appear on stderr before the final
 result. Never parse prose or automatically pass `--restart-upload` after an
-uncertain outcome. This feature does not add scopes for channel reads or
+uncertain outcome. For phone-only consent, `youtube auth login --redirect-uri`
+accepts a registered HTTPS callback with a Web application client and a fixed
+loopback `--port` behind a trusted HTTPS proxy. The authorization event includes
+`callbackMode`, `healthUrl` and `loopbackTarget`; credentials stay on the upload
+host. The mobile success page appears only after token exchange and storage.
+This feature does not add scopes for channel reads or
 processing-status polling.

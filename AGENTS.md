@@ -922,7 +922,11 @@ Upload-only OAuth, persistent node-local credentials and resumable uploads are
 implemented in `core/rcdvlog-core/src/youtube`, with a thin `youtube` CLI adapter.
 Project schema 49 owns the local, unsynced upload ledger. Credentials stay outside
 project catalogs (macOS Keychain or owner-only local file). Scope is exactly
-`youtube.upload`; do not add read/management scopes for convenience. Auth status
+`youtube.upload`; do not add read/management scopes for convenience. Desktop
+loopback and Web client HTTPS callbacks share PKCE, state validation and token
+storage. Web callbacks require an exactly registered HTTPS URI, a fixed loopback
+port and a trusted proxy preserving Host; never enable Funnel or open the raw
+listener on a non-loopback address. Auth status
 is observational. Never silently recreate an expired/uncertain session or log
 tokens, codes, verifiers, or resumable session URLs. See
 [YouTube publishing](docs/youtube-upload.md) for setup, recovery, JSON contracts

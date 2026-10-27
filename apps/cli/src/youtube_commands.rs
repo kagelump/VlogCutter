@@ -56,9 +56,12 @@ enum YoutubeCommand {
 #[derive(Debug, Subcommand)]
 enum AuthCommand {
     Login {
-        /// Downloaded Google OAuth Desktop app client JSON (never a service account).
+        /// Google Desktop or Web application client JSON (never a service account).
         #[arg(long)]
         client_file: PathBuf,
+        /// Registered HTTPS callback for a Web client, behind a trusted loopback proxy.
+        #[arg(long)]
+        redirect_uri: Option<String>,
         /// Explicit loopback port for SSH forwarding; zero selects an ephemeral port.
         #[arg(long, default_value_t = 0)]
         port: u16,
@@ -97,6 +100,7 @@ pub fn execute(catalog_path: Option<&Path>, arguments: &YoutubeArgs) -> Result<V
         YoutubeCommand::Auth { command } => match command {
             AuthCommand::Login {
                 client_file,
+                redirect_uri,
                 port,
                 timeout_seconds,
                 no_browser,
@@ -107,6 +111,7 @@ pub fn execute(catalog_path: Option<&Path>, arguments: &YoutubeArgs) -> Result<V
                     port: *port,
                     timeout_seconds: *timeout_seconds,
                     open_browser: !*no_browser,
+                    redirect_uri: redirect_uri.clone(),
                 },
                 progress,
             )?)?),
