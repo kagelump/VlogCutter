@@ -1239,3 +1239,20 @@ representation PTS requests, mapping precision, sound policy and limitations.
 `edit-plan suggest-trim --input /absolute/trim.json` returns advisory clean/
 utterance ranges without accepting a trim. See [source range decisions](edit-plan-source-ranges.md)
 for the JSON contract, picture/audio scope, authority and stale-evidence rules.
+
+## YouTube publishing
+
+`youtube auth login/status/revoke`, `youtube upload`, and `youtube history` expose
+upload-only Google OAuth and resumable publishing through the same JSON envelope.
+See [YouTube setup and command contracts](youtube-upload.md) for personal-use
+Cloud setup, agent-led/headless consent, private credential storage, upload
+idempotency and recovery. Only upload/history require an explicit catalog and
+project; auth commands never consult the desktop's catalog selection.
+
+YouTube errors use the `youtube.*` namespace (including `auth_required`,
+`auth_expired`, `scope_mismatch`, `credential_busy`, `upload_busy`,
+`metadata_conflict`, `outcome_unknown`, and `session_expired`). Progress and
+`youtube.oauth.authorization_required` events appear on stderr before the final
+result. Never parse prose or automatically pass `--restart-upload` after an
+uncertain outcome. This feature does not add scopes for channel reads or
+processing-status polling.

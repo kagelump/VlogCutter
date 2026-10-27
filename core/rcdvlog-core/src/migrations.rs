@@ -7,7 +7,7 @@ use thiserror::Error;
 
 use crate::chronology::forward_migrate_project_chronology;
 
-pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 62;
+pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 63;
 
 const MIGRATION_TABLE_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -455,6 +455,12 @@ pub const PROJECT_CATALOG_MIGRATIONS: &[SqliteMigration] = &[
         name: "bounded_selected_audio_integrity",
         source_identity: "project-catalog/0062-bounded-selected-audio-integrity/20261029",
         apply: bounded_selected_audio_integrity,
+    },
+    SqliteMigration {
+        id: 63,
+        name: "youtube_upload_ledger",
+        source_identity: "project-catalog/0063-youtube-upload-ledger/20261027",
+        apply: crate::youtube::migrate,
     },
 ];
 

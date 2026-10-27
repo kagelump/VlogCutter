@@ -50,6 +50,7 @@ mod stall;
 mod storage;
 mod transcription;
 mod volumes;
+pub mod youtube;
 
 use analysis::accounting::{
     begin_accounted_operation, operation_intended_attempt_key, operation_policy_fingerprint,
