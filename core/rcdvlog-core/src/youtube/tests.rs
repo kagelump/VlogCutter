@@ -718,3 +718,275 @@ fn exchange_rejects_missing_refresh_token_and_broader_grants() {
     assert_eq!(code(&second), "youtube.scope_mismatch");
     server.join().unwrap();
 }
+
+fn web_client(directory: &TempDir) -> std::path::PathBuf {
+    let path = directory.path().join("web-client.json");
+    std::fs::write(&path, json!({"web":{"client_id":"web-client","client_secret":"fixture-web-secret","redirect_uris":["https://auth.example.com:8444/oauth/callback"],"token_uri":"https://attacker.invalid"}}).to_string()).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    path
+}
+
+fn web_options(directory: &TempDir) -> LoginOptions {
+    let port = TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    LoginOptions {
+        client_file: web_client(directory),
+        port,
+        timeout_seconds: 5,
+        open_browser: false,
+        redirect_uri: Some("https://auth.example.com:8444/oauth/callback".into()),
+    }
+}
+
+fn send_callback(event: &Value) -> TcpStream {
+    let authorization = reqwest::Url::parse(event["authorizationUrl"].as_str().unwrap()).unwrap();
+    let query: BTreeMap<_, _> = authorization.query_pairs().into_owned().collect();
+    assert_eq!(
+        query["redirect_uri"],
+        "https://auth.example.com:8444/oauth/callback"
+    );
+    assert_eq!(query["scope"], UPLOAD_SCOPE);
+    assert_eq!(query["code_challenge_method"], "S256");
+    let port = event["port"].as_u64().unwrap() as u16;
+    let mut stream = TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)).unwrap();
+    write!(stream,"GET /oauth/callback?state={}&code=fixture-authorization-code HTTP/1.1\r\nHost: auth.example.com:8444\r\nX-Forwarded-Host: auth.example.com:8444\r\nX-Forwarded-Proto: https\r\n\r\n",query["state"]).unwrap();
+    stream
+}
+
+#[test]
+fn https_login_confirms_success_on_phone_only_after_token_exchange_and_storage() {
+    use std::sync::mpsc;
+    let directory = tempdir().unwrap();
+    let credentials_path = directory.path().join("private/credentials.json");
+    let options = web_options(&directory);
+    let (token_started_tx, token_started_rx) = mpsc::channel();
+    let (allow_tx, allow_rx) = mpsc::channel();
+    let (endpoints, http, server) = mock(vec![step(
+        200,
+        json!({"access_token":"new-web-access-secret","refresh_token":"new-web-refresh-secret","expires_in":3600,"token_type":"Bearer","scope":UPLOAD_SCOPE}),
+        move |request| {
+            assert_eq!(request.target, "/token");
+            let form: BTreeMap<_, _> = reqwest::Url::parse(&format!(
+                "http://localhost/?{}",
+                String::from_utf8(request.body).unwrap()
+            ))
+            .unwrap()
+            .query_pairs()
+            .into_owned()
+            .collect();
+            assert_eq!(
+                form["redirect_uri"],
+                "https://auth.example.com:8444/oauth/callback"
+            );
+            assert_eq!(form["client_secret"], "fixture-web-secret");
+            assert_eq!(form["code"], "fixture-authorization-code");
+            assert_eq!(form["code_verifier"].len(), 43);
+            token_started_tx.send(()).unwrap();
+            allow_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        },
+    )]);
+    let (event_tx, event_rx) = mpsc::channel();
+    let path = credentials_path.clone();
+    let worker = thread::spawn(move || {
+        oauth::login_with(
+            &CredentialStore::new(Some(&path)).unwrap(),
+            &options,
+            &http,
+            &endpoints,
+            |event| event_tx.send(event).unwrap(),
+        )
+    });
+    let event = event_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(event["callbackMode"], "https_proxy");
+    assert_eq!(event["healthUrl"], "https://auth.example.com:8444/health");
+    assert!(event.get("sshForward").is_none());
+    let mut phone = send_callback(&event);
+    token_started_rx
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap();
+    phone
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .unwrap();
+    let mut byte = [0u8; 1];
+    assert!(
+        phone.read(&mut byte).is_err(),
+        "phone must not see success while token exchange is pending"
+    );
+    assert!(!credentials_path.exists());
+    allow_tx.send(()).unwrap();
+    phone
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut page = String::new();
+    phone.read_to_string(&mut page).unwrap();
+    assert!(page.starts_with("HTTP/1.1 200"));
+    assert!(page.contains("Your upload credential is saved"));
+    assert!(page.contains("Referrer-Policy: no-referrer"));
+    for secret in [
+        "fixture-authorization-code",
+        "new-web-access-secret",
+        "new-web-refresh-secret",
+        "fixture-web-secret",
+    ] {
+        assert!(!page.contains(secret));
+        assert!(!event.to_string().contains(secret));
+    }
+    assert!(worker.join().unwrap().unwrap().authorized);
+    assert_eq!(
+        CredentialStore::new(Some(&credentials_path))
+            .unwrap()
+            .load()
+            .unwrap()
+            .refresh_token,
+        "new-web-refresh-secret"
+    );
+    server.join().unwrap();
+}
+
+#[test]
+fn https_login_failure_never_shows_success_or_replaces_prior_credential() {
+    use std::sync::mpsc;
+    let directory = tempdir().unwrap();
+    let store = store(&directory);
+    let options = web_options(&directory);
+    let (endpoints, http, server) = mock(vec![step(
+        200,
+        json!({"access_token":"overbroad-access-secret","refresh_token":"overbroad-refresh-secret","expires_in":3600,"token_type":"Bearer","scope":format!("{UPLOAD_SCOPE} openid")}),
+        |_| {},
+    )]);
+    let path = directory.path().join("private/credentials.json");
+    let (event_tx, event_rx) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        oauth::login_with(
+            &CredentialStore::new(Some(&path)).unwrap(),
+            &options,
+            &http,
+            &endpoints,
+            |event| event_tx.send(event).unwrap(),
+        )
+    });
+    let event = event_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let mut phone = send_callback(&event);
+    let mut page = String::new();
+    phone.read_to_string(&mut page).unwrap();
+    assert!(page.starts_with("HTTP/1.1 400"));
+    assert!(page.contains("could not finish"));
+    assert!(!page.contains("credential is saved"));
+    assert!(!page.contains("overbroad-access-secret"));
+    assert_eq!(
+        code(&worker.join().unwrap().unwrap_err()),
+        "youtube.scope_mismatch"
+    );
+    assert_eq!(store.load().unwrap().id, "fixture-identity");
+    server.join().unwrap();
+}
+
+#[test]
+fn https_callback_validates_external_host_forwarding_path_and_state() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let receiver = thread::spawn(move || {
+        let route =
+            oauth::CallbackRoute::https("https://auth.example.com:8444/authorize/youtube").unwrap();
+        let mut pending =
+            oauth::receive_callback(&listener, &route, "right", Duration::from_secs(5)).unwrap();
+        pending
+            .stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+            .unwrap();
+        pending.code
+    });
+    for (target, host, extra, status) in [
+        ("/health", "auth.example.com:8444", "", 200),
+        (
+            "/authorize/youtube?state=right&code=bad",
+            "127.0.0.1",
+            "X-Forwarded-Host: auth.example.com:8444\r\nX-Forwarded-Proto: https\r\n",
+            400,
+        ),
+        (
+            "/authorize/youtube?state=right&code=bad",
+            "auth.example.com:8444",
+            "X-Forwarded-Proto: http\r\n",
+            400,
+        ),
+        (
+            "/authorize/youtube?state=right&code=bad",
+            "auth.example.com:8444",
+            "X-Forwarded-Proto: https\r\nX-Forwarded-Proto: https\r\n",
+            400,
+        ),
+        (
+            "/authorize/youtube?state=right&code=bad",
+            "auth.example.com:8444",
+            "X-Forwarded-Host: attacker.invalid\r\n",
+            400,
+        ),
+        (
+            "/oauth/callback?state=right&code=bad",
+            "auth.example.com:8444",
+            "",
+            400,
+        ),
+        (
+            "/authorize/youtube?state=wrong&code=bad",
+            "auth.example.com:8444",
+            "",
+            400,
+        ),
+        (
+            "/authorize/youtube?state=right&code=bad&error=access_denied",
+            "auth.example.com:8444",
+            "",
+            400,
+        ),
+        (
+            "/authorize/youtube?state=right&code=good",
+            "auth.example.com:8444",
+            "X-Forwarded-Proto: https\r\nX-Forwarded-Host: auth.example.com:8444\r\n",
+            200,
+        ),
+    ] {
+        let mut socket = TcpStream::connect(address).unwrap();
+        write!(
+            socket,
+            "GET {target} HTTP/1.1\r\nHost: {host}\r\n{extra}\r\n"
+        )
+        .unwrap();
+        let mut response = String::new();
+        socket.read_to_string(&mut response).unwrap();
+        assert!(response.starts_with(&format!("HTTP/1.1 {status}")));
+        assert!(!response.contains("state=right"));
+    }
+    assert_eq!(receiver.join().unwrap(), "good");
+}
+
+#[test]
+fn https_redirect_rejects_unsafe_or_ambiguous_uris() {
+    for uri in [
+        "http://auth.example.com/oauth/callback",
+        "https://127.0.0.1/oauth/callback",
+        "https://localhost/oauth/callback",
+        "https://auth.localhost/oauth/callback",
+        "https://user:password@auth.example.com/oauth/callback",
+        "https://auth.example.com/oauth/callback?secret=bad",
+        "https://auth.example.com/oauth/callback#bad",
+        "https://auth.example.com/",
+        "https://auth.example.com/a/../oauth/callback",
+        "https://auth.example.com/oauth/%63allback",
+        "https://auth.example.com:443/oauth/callback",
+    ] {
+        assert_eq!(
+            code(&oauth::validate_https_redirect(uri).unwrap_err()),
+            "youtube.invalid_redirect_uri"
+        );
+    }
+    assert!(oauth::validate_https_redirect("https://auth.example.com:8444/oauth/callback").is_ok());
+}

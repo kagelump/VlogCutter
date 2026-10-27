@@ -18,8 +18,9 @@ step; a nonzero render result must prevent that step.
    an immortal token: revocation, inactivity and Google account policies can
    still require reauthorization. Google documents a personal-use exemption from
    OAuth verification; an unverified-app warning may remain.
-5. Create an OAuth client of type **Desktop app**, download its JSON, and keep it
-   outside the project/repository. This is not a service-account credential.
+5. For a desktop browser, create an OAuth client of type **Desktop app**. For
+   phone-only consent, use the **Web application** setup below. Download its JSON
+   outside the project/repository. Neither is a service-account credential.
 6. Run:
 
 ```bash
@@ -68,16 +69,94 @@ The forward and `--port` must match. A busy listener port fails with a bind erro
 there is no fallback port. This flow needs a desktop browser with a reachable
 loopback callback; opening the URL on a phone alone does not forward localhost
 back to the upload host. Google's obsolete out-of-band copy/paste flow is not
-used. A phone-friendly public HTTPS callback would need a separate web-client
-integration and is not implemented.
+used. For phone-only consent, use the HTTPS callback mode below.
 
 After the callback, the command exchanges the code and writes the credential,
-then emits its final stdout result. Browser acknowledgement only confirms receipt
-of the callback; wait for the CLI's final successful result to confirm storage.
+then emits its final stdout result. The browser shows a success page only after
+that token exchange and credential write succeed.
 Login failures preserve the prior credential. Reauthorizing generates a new
 credential identity to avoid resuming a previous channel's upload accidentally.
 History deduplication is scoped to that identity, so inspect history/Studio before
 uploading previously published files after reauthorizing.
+
+### Phone-only consent through private HTTPS
+
+Once a Google **Web application** client is configured, Codex can run the listener,
+show its authorization link in chat, and wait while you approve in your phone's
+browser. Google sends the authorization code directly to the upload host. That
+host exchanges it for tokens and saves them; you never paste a code or token into
+chat. The Google Cloud client setup and your Google consent still require you.
+
+Use a dedicated private HTTPS proxy route reachable from the phone, such as
+Tailscale Serve. The listener remains on `127.0.0.1`; this command does not expose
+it publicly, configure TLS, or change proxy/Serve settings. Your phone must be
+connected to the tailnet and permitted to reach the selected port. Never enable
+Tailscale Funnel. If the upload host already serves other applications, select an
+unused HTTPS port rather than replacing their routes.
+
+For example, on a host with Tailscale configured, this adds a dedicated private
+route. Check `tailscale serve status --json` first to ensure the port is unused:
+
+```bash
+tailscale serve --bg --https 8444 http://127.0.0.1:8765
+```
+
+In Google Cloud Console, create a **Web application** client and register exactly:
+
+```text
+https://your-upload-host.your-tailnet.ts.net:8444/oauth/callback
+```
+
+Download the Web client JSON after registering that redirect URI, save it outside
+the repository, and set its permissions to `0600`. The downloaded JSON must include
+the exact URI in its `web.redirect_uris` array. Then have Codex run:
+
+```bash
+rcdvlog youtube auth login \
+  --client-file /absolute/private/web-client.json \
+  --redirect-uri https://your-upload-host.your-tailnet.ts.net:8444/oauth/callback \
+  --port 8765 --no-browser
+```
+
+`--redirect-uri` requires an HTTPS DNS hostname and a non-root path, without user
+credentials, query, fragment, percent-encoded path or noncanonical URL spelling.
+Use the exact same URI in Google Cloud, the downloaded JSON and the command.
+A Desktop client cannot be used with this option. A Web client requires both
+`--redirect-uri` and an explicit nonzero `--port`, matching the proxy target.
+Downloaded Web client JSON contains a confidential client secret and must be
+owned by the current user with no group/other permissions.
+
+The `youtube.oauth.authorization_required` event has `callbackMode: "https_proxy"`,
+`redirectUri`, `port`, `loopbackTarget`, and `healthUrl`; it has no `sshForward`.
+Open `healthUrl` from the phone to check private reachability while the login
+command is waiting, then open `authorizationUrl`, sign in, select the channel and
+approve. Desktop mode retains `callbackMode: "loopback"` and `sshForward`.
+
+The proxy must preserve the external `Host` header. Caddy does this by default;
+when explicitly configuring forwarding headers, set `X-Forwarded-Host` to that
+same authority and `X-Forwarded-Proto` to `https`. Forwarding headers are optional
+but, if present, must be single-valued and match; they cannot override a wrong
+Host. The callback rejects an `Origin` or RFC `Forwarded` header, duplicate
+Host/forwarding headers, a wrong path, invalid/duplicate state, and ambiguous
+code/error parameters. PKCE and exact upload scope checks apply to both modes.
+
+Keep proxy access logs from recording callback query strings, which carry the
+short-lived authorization code. The listener does not log requests or reflect
+callback parameters, token responses or internal errors into its mobile page.
+Responses disable caching, referrers and framing. The phone sees **YouTube
+connected** only after Google returns an acceptable token response and persistent
+storage succeeds. A failed exchange shows an error page, and prior credentials
+remain intact. The listener exits after the callback or timeout; `/health` is
+available only during that login. A browser disconnect does not undo a successful
+credential write; check the CLI's final result.
+
+To remove only the example dedicated proxy when no longer needed:
+
+```bash
+tailscale serve --https 8444 off
+```
+
+Do not use `tailscale serve reset`, which would also remove unrelated services.
 
 ### Credential storage and revocation
 
@@ -95,7 +174,7 @@ Credential files and their persistent lock files must be owned by the current
 user with no group/other permissions (`0600`). Newly created private credential
 directories use `0700`; existing parent-directory permissions are not changed.
 Symlink credential files are refused. Writes use a same-directory private staging
-file, fsync and atomic rename. Access/refresh tokens, Desktop client credentials
+file, fsync and atomic rename. Access/refresh tokens, OAuth client credentials
 and PKCE verifiers never appear in JSON results or errors. Endpoint URLs in
 client JSON are ignored: production requests use fixed Google endpoints, and
 HTTP redirects are disabled. Refresh responses without a replacement refresh
@@ -202,16 +281,20 @@ fixtures for OAuth/token refresh, callback state/Host/Origin checks, private fil
 storage, revocation, chunked resume after reopening the catalog, lost final
 responses, duplicate avoidance, expired-session recovery and session-origin
 validation. CLI process tests exercise JSON, explicit catalog selection,
-observational status/history and headless authorization timeout. Existing
+observational status/history, HTTPS Web client validation and authorization timeout.
+Phone-flow fixtures verify that the browser receives success only after tokens
+are exchanged and stored, and that failed exchange preserves prior credentials. Existing
 migration tests upgrade catalogs stopped at every previous schema version.
 
 These tests do not establish real Google consent, Brand channel selection,
 macOS Keychain behavior, YouTube processing, or unlisted/public visibility.
-Authorize a real Desktop client, upload a private fixture, inspect Studio and
+Authorize a real Desktop or Web client, upload a private fixture, inspect Studio and
 verify rerun reuse before enabling unattended uploads of real cuts.
 
 References:
 
+- [Google Web application OAuth](https://developers.google.com/identity/protocols/oauth2/web-server)
+- [Private HTTPS with Tailscale Serve](https://tailscale.com/kb/1242/tailscale-serve)
 - [Google desktop OAuth and PKCE](https://developers.google.com/identity/protocols/oauth2/native-app)
 - [Refresh token expiration](https://developers.google.com/identity/protocols/oauth2/)
 - [Personal-use verification exemption](https://support.google.com/cloud/answer/13464323?hl=en)
