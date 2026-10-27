@@ -1,9 +1,8 @@
 //! The edit-plan model and revision semantics (D01-T019).
 //!
-//! The editing scope is exhaustively: one video track, linked source audio,
-//! hard cuts, source in/out ranges, ordered operations. There is no `track`
-//! column, no `transition` table, and no `effect` field — not even as reserved
-//! schema. That absence is a deliverable, not an omission.
+//! One picture track, hard picture cuts, and immutable ordered operations.
+//! Optional versioned source audio extends legacy linked playback with explicit
+//! placement, gain, and short fades; see `audio` for the bounded contract.
 //!
 //! Two invariants are enforced by the database rather than by application
 //! discipline, because discipline is what fails at 2am:
@@ -17,12 +16,15 @@
 //! takes the revision the caller *believed* was active and refuses if that is
 //! no longer true.
 
+pub mod audio;
+mod audio_render;
 pub mod diff;
 pub mod model;
 pub mod otio;
 pub mod preview;
 pub mod validate;
 
+pub use audio::{EditPlanAudio, SourceAudio};
 pub use model::{
     EditPlanError, EditPlanExport, EditPlanOperation, EditPlanRevision, EditPlanStaleness,
 };
@@ -98,6 +100,32 @@ impl Catalog {
                 }
                 .into());
             }
+            if let Some(EditPlanAudio::Source(audio)) = &operation.audio
+                && ![
+                    audio.source_in_seconds,
+                    audio.source_out_seconds,
+                    audio.timeline_start_seconds,
+                    audio.sync_offset_seconds,
+                    audio.gain_db,
+                    audio.fade_in_seconds,
+                    audio.fade_out_seconds,
+                ]
+                .iter()
+                .all(|value| value.is_finite())
+            {
+                return Err(EditPlanError::InvalidPlan {
+                    message: "audio timing and gains must be finite".into(),
+                }
+                .into());
+            }
+            if let Some(EditPlanAudio::Source(audio)) = &operation.audio
+                && self.get_asset(&audio.asset_id)?.project_id != project_id
+            {
+                return Err(EditPlanError::InvalidPlan {
+                    message: "audio asset belongs to another project".into(),
+                }
+                .into());
+            }
             if self.get_asset(&operation.asset_id)?.project_id != project_id {
                 return Err(EditPlanError::InvalidPlan {
                     message: "asset belongs to another project".into(),
@@ -116,18 +144,14 @@ impl Catalog {
             "operations": operations
                 .iter()
                 .enumerate()
-                .map(|(position, operation)| serde_json::json!({
-                    "operationId": if operation.operation_id.is_empty() {
-                        format!("editop_{}", Uuid::new_v4().simple())
-                    } else {
-                        operation.operation_id.clone()
-                    },
-                    "position": position as u32,
-                    "assetId": operation.asset_id,
-                    "sourceInSeconds": operation.source_in_seconds,
-                    "sourceOutSeconds": operation.source_out_seconds,
-                    "rationale": operation.rationale,
-                }))
+                .map(|(position, operation)| {
+                    let mut operation = operation.clone();
+                    operation.position = position as u32;
+                    if operation.operation_id.is_empty() {
+                        operation.operation_id = format!("editop_{}", Uuid::new_v4().simple());
+                    }
+                    serde_json::to_value(operation).expect("finite edit operation serializes")
+                })
                 .collect::<Vec<_>>(),
         });
         let guard = current_revision(&transaction, project_id, "editPlan", project_id)?;
@@ -239,10 +263,18 @@ impl Catalog {
                 revision_id: revision_id.to_string(),
             })?;
 
-        let mut statement = connection.prepare(
-            "SELECT operation_id, position, asset_id, source_in_seconds, source_out_seconds, rationale
+        // Read-only callers must not have to migrate a legacy linked plan.
+        let audio_column =
+            if crate::migrations::column_exists(&connection, "edit_plan_operations", "audio_json")?
+            {
+                "audio_json"
+            } else {
+                "NULL"
+            };
+        let mut statement = connection.prepare(&format!(
+            "SELECT operation_id, position, asset_id, source_in_seconds, source_out_seconds, rationale, {audio_column}
              FROM edit_plan_operations WHERE revision_id=?1 ORDER BY position",
-        )?;
+        ))?;
         let operations = statement
             .query_map([revision_id], |row| {
                 Ok(EditPlanOperation {
@@ -252,6 +284,18 @@ impl Catalog {
                     source_in_seconds: row.get(3)?,
                     source_out_seconds: row.get(4)?,
                     rationale: row.get(5)?,
+                    audio: row
+                        .get::<_, Option<String>>(6)?
+                        .map(|json| {
+                            serde_json::from_str(&json).map_err(|error| {
+                                rusqlite::Error::FromSqlConversionFailure(
+                                    6,
+                                    rusqlite::types::Type::Text,
+                                    Box::new(error),
+                                )
+                            })
+                        })
+                        .transpose()?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -383,8 +427,8 @@ pub(crate) fn insert_revision(
     )?;
     for operation in operations {
         transaction.execute(
-            "INSERT OR IGNORE INTO edit_plan_operations(operation_id, revision_id, position, asset_id, source_in_seconds, source_out_seconds, rationale)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT OR IGNORE INTO edit_plan_operations(operation_id, revision_id, position, asset_id, source_in_seconds, source_out_seconds, rationale, audio_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 operation.operation_id,
                 revision_id,
@@ -393,6 +437,7 @@ pub(crate) fn insert_revision(
                 operation.source_in_seconds,
                 operation.source_out_seconds,
                 operation.rationale,
+                operation.audio.as_ref().map(serde_json::to_string).transpose()?,
             ],
         )?;
     }

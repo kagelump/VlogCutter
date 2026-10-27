@@ -91,7 +91,11 @@ Implemented now:
   its anchor clip when later camera-clock corrections change solved order.
 - Read-only chronology/diagnostics CLI commands and basic desktop chronology
   and edit-plan drawers.
-- Versioned edit-plan persistence and validation, low-resolution preview
+- Versioned edit-plan persistence and validation, explicit source-audio ranges,
+  J/L placement and short audio fades in local previews (legacy omitted audio
+  remains linked), identity-based audio diffs, and an explicit OTIO rejection
+  until finishing can preserve these edits.
+- Low-resolution preview
   generation, and deterministic pure-Rust OTIO writing.
 - Quality-1 thumbnails and 720p H.264/AAC proxies with four concurrent
   VideoToolbox workers on macOS and a one-worker software fallback elsewhere.
@@ -535,7 +539,7 @@ Always pass `--catalog` in agent automation, tests, and temporary workflows. A d
 
 SQLite connections enable foreign keys, WAL journal mode, and a five-second busy timeout. Read operations can continue during an uncommitted writer. Project mutations append typed operations with materialized revisions. Adopted projects synchronize bounded operation pages between independent local catalogs; live SQLite/WAL files are never copied or placed on NAS.
 
-Project catalogs use an explicit `schema_migrations` history and are currently at version 49. The server control catalog is version 11; backup format is version 1. Migration definitions have immutable names/source identities and each migration commits atomically. Migration 18 includes a one-time compatibility reconciliation for catalogs created on the import feature branch before its migration IDs were merged with main. When changing the schema:
+Project catalogs use an explicit `schema_migrations` history and are currently at version 50. The server control catalog is version 11; backup format is version 1. Migration definitions have immutable names/source identities and each migration commits atomically. Migration 18 includes a one-time compatibility reconciliation for catalogs created on the import feature branch before its migration IDs were merged with main. When changing the schema:
 
 - Preserve existing catalogs; never solve migration issues by deleting the database.
 - Add a forward migration and an upgrade test using an older schema fixture.

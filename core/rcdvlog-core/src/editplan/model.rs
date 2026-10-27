@@ -1,10 +1,10 @@
 //! Edit-plan record types, frozen by D01-T019
 //! (`docs/tasks/desktop/EDIT_PLAN_MODEL.md`).
 //!
-//! The editing scope is exhaustively one video track, linked source audio, hard
-//! cuts, source in/out ranges, and ordered operations. There is no track field,
-//! no transition, and no effect — not even reserved. Anything a later feature
-//! would need is a later migration with a later contract.
+//! One picture track and hard picture cuts remain. Omitted audio retains the
+//! legacy linked behavior; versioned source audio can use independent ranges,
+//! placement, gain, and short fades. There is no music/effects or general
+//! multitrack contract.
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -20,6 +20,8 @@ pub struct EditPlanOperation {
     pub source_in_seconds: f64,
     pub source_out_seconds: f64,
     pub rationale: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio: Option<super::audio::EditPlanAudio>,
 }
 
 /// One immutable version of the plan. Revisions are never edited in place and

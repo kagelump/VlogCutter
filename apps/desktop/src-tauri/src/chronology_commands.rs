@@ -17,10 +17,10 @@ use rcdvlog_core::{
     CaptureSequenceReassignmentPreview, CaptureSequenceSplitPreview, ChronologyExplanation,
     ChronologySolution, ClipTimeException, ClockEpoch, ClockEpochClearPreview,
     ClockEpochImpactPreview, ConstraintStrength, Contradiction, Diagnostic, DiagnosticCounts,
-    DiagnosticFilter, DiagnosticSeverity, DisplayMode, EditPlanOperation, EditPlanRevision,
-    EventOrderConstraint, OtioExportRequest, OtioExportResult, PhaseKind, PhaseSplitDirection,
-    PreviewProgress, PreviewRequest, PreviewResult, QueuePosition, TripPhase, ValidationReport,
-    VisualPlacementPreview, VisualPlacementSide, resolve_anchored_phases,
+    DiagnosticFilter, DiagnosticSeverity, DisplayMode, EditPlanAudio, EditPlanOperation,
+    EditPlanRevision, EventOrderConstraint, OtioExportRequest, OtioExportResult, PhaseKind,
+    PhaseSplitDirection, PreviewProgress, PreviewRequest, PreviewResult, QueuePosition, TripPhase,
+    ValidationReport, VisualPlacementPreview, VisualPlacementSide, resolve_anchored_phases,
 };
 use serde::{Deserialize, Serialize};
 use tauri::State;
@@ -761,10 +761,14 @@ pub fn detect_offline_volumes(
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EditPlanOperationInput {
+    #[serde(default)]
+    pub operation_id: Option<String>,
     pub asset_id: String,
     pub source_in_seconds: f64,
     pub source_out_seconds: f64,
     pub rationale: String,
+    #[serde(default)]
+    pub audio: Option<EditPlanAudio>,
 }
 
 #[tauri::command]
@@ -801,12 +805,13 @@ pub fn create_edit_plan_revision(
         .into_iter()
         .enumerate()
         .map(|(position, input)| EditPlanOperation {
-            operation_id: String::new(),
+            operation_id: input.operation_id.unwrap_or_default(),
             position: position as u32,
             asset_id: input.asset_id,
             source_in_seconds: input.source_in_seconds,
             source_out_seconds: input.source_out_seconds,
             rationale: input.rationale,
+            audio: input.audio,
         })
         .collect();
     let revision = state
@@ -823,37 +828,42 @@ pub fn create_edit_plan_revision(
 }
 
 #[tauri::command]
-pub fn activate_edit_plan_revision(
+pub async fn activate_edit_plan_revision(
     project_id: String,
     revision_id: String,
     expected_active_revision_id: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<EditPlanRevision, String> {
     let catalog = state.catalog()?;
-    let candidate = catalog
-        .edit_plan_revision(&revision_id)
-        .map_err(error_message)?;
-    if candidate.project_id != project_id {
-        return Err(format!(
-            "edit plan revision {revision_id} belongs to project {}, not {project_id}",
-            candidate.project_id
-        ));
-    }
-    let revision = catalog
-        .activate_edit_plan_revision(&revision_id, expected_active_revision_id.as_deref())
-        .map_err(error_message)?;
+    let revision = tauri::async_runtime::spawn_blocking(move || {
+        let candidate = catalog
+            .edit_plan_revision(&revision_id)
+            .map_err(error_message)?;
+        if candidate.project_id != project_id {
+            return Err(format!(
+                "edit plan revision {} belongs to project {}, not {project_id}",
+                candidate.revision_id, candidate.project_id
+            ));
+        }
+        catalog
+            .activate_edit_plan_revision(&revision_id, expected_active_revision_id.as_deref())
+            .map_err(error_message)
+    })
+    .await
+    .map_err(error_message)??;
     state.sync_manager.wake_project(&revision.project_id);
     Ok(revision)
 }
 
 #[tauri::command]
-pub fn validate_edit_plan(
+pub async fn validate_edit_plan(
     revision_id: String,
     state: State<'_, AppState>,
 ) -> Result<ValidationReport, String> {
-    state
-        .catalog()?
-        .validate_edit_plan(&revision_id)
+    let catalog = state.catalog()?;
+    tauri::async_runtime::spawn_blocking(move || catalog.validate_edit_plan(&revision_id))
+        .await
+        .map_err(error_message)?
         .map_err(error_message)
 }
 
@@ -862,7 +872,7 @@ pub fn validate_edit_plan(
 /// Progress events go out as they happen rather than as a final summary,
 /// because a render of a long plan is exactly where a silent UI feels broken.
 #[tauri::command]
-pub fn render_edit_plan_preview(
+pub async fn render_edit_plan_preview(
     revision_id: String,
     max_height: Option<u32>,
     app: tauri::AppHandle,
@@ -870,21 +880,24 @@ pub fn render_edit_plan_preview(
 ) -> Result<PreviewResult, String> {
     use tauri::Emitter;
     let catalog = state.catalog()?;
-    let mut emit = |progress: PreviewProgress| {
-        let _ = app.emit("edit-plan-preview-progress", &progress);
-    };
-    catalog
-        .render_preview(
-            &PreviewRequest {
-                revision_id,
-                max_height: max_height.unwrap_or(540),
-            },
-            &mut emit,
-            &|| false,
-        )
-        .map_err(error_message)
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut emit = |progress: PreviewProgress| {
+            let _ = app.emit("edit-plan-preview-progress", &progress);
+        };
+        catalog
+            .render_preview(
+                &PreviewRequest {
+                    revision_id,
+                    max_height: max_height.unwrap_or(540),
+                },
+                &mut emit,
+                &|| false,
+            )
+            .map_err(error_message)
+    })
+    .await
+    .map_err(error_message)?
 }
-
 #[tauri::command]
 pub fn export_edit_plan_otio(
     project_id: String,

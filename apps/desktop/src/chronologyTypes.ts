@@ -257,6 +257,31 @@ export interface EditPlanOperation {
   sourceInSeconds: number;
   sourceOutSeconds: number;
   rationale: string;
+  audio?: EditPlanAudio;
+}
+
+export type EditPlanAudio =
+  | { mode: "silent" }
+  | {
+      mode: "source";
+      version: number;
+      assetId: string;
+      sourceInSeconds: number;
+      sourceOutSeconds: number;
+      timelineStartSeconds: number;
+      syncOffsetSeconds: number;
+      gainDb?: number;
+      fadeInSeconds?: number;
+      fadeOutSeconds?: number;
+    };
+
+export interface EditPlanOperationInput {
+  operationId?: string;
+  assetId: string;
+  sourceInSeconds: number;
+  sourceOutSeconds: number;
+  rationale: string;
+  audio?: EditPlanAudio;
 }
 
 export interface EditPlanRevision {

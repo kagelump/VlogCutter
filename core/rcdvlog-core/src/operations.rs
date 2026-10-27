@@ -1680,12 +1680,16 @@ pub(crate) fn commit_local_in_transaction(
             aggregate_type: new.aggregate_type.to_string(),
             aggregate_id: new.aggregate_id,
             operation_type: new.operation_type.to_string(),
-            payload_version: if new.operation_type == PROJECT_ASSET_ADDED
+            payload_version: if (new.operation_type == PROJECT_ASSET_ADDED
                 && new
                     .payload
                     .get("timestampCandidates")
-                    .is_some_and(|value| value.is_array())
-            {
+                    .is_some_and(|value| value.is_array()))
+                || (new.operation_type == EDIT_PLAN_REVISION_CREATED
+                    && new.payload["operations"].as_array().is_some_and(|cuts| {
+                        cuts.iter()
+                            .any(|cut| cut.get("audio").is_some_and(|audio| !audio.is_null()))
+                    })) {
                 2
             } else {
                 1
@@ -3556,6 +3560,9 @@ fn materialize_edit_plan_revision_created(
     operation: &ProjectOperation,
 ) -> Result<ApplyOperationResult> {
     let payload: EditPlanRevisionCreatedPayload = payload(operation)?;
+    if operation.payload_version == 1 && payload.operations.iter().any(|cut| cut.audio.is_some()) {
+        bail!("independent source audio requires editPlanRevisionCreated payload version 2");
+    }
     require_edit_plan_aggregate(operation)?;
     if !revision_guard_passes(transaction, operation)? {
         return Ok(ApplyOperationResult::Conflict);
@@ -3771,7 +3778,10 @@ fn require_asset(transaction: &Transaction<'_>, operation: &ProjectOperation) ->
 }
 
 fn payload<T: DeserializeOwned>(operation: &ProjectOperation) -> Result<T> {
-    if operation.payload_version != 1 {
+    if operation.payload_version != 1
+        && !(operation.operation_type == EDIT_PLAN_REVISION_CREATED
+            && operation.payload_version == 2)
+    {
         bail!(
             "unsupported payload version {} for {}",
             operation.payload_version,
@@ -3817,7 +3827,10 @@ fn validate_operation(operation: &ProjectOperation) -> Result<()> {
         bail!("logical time node ID must match origin node ID");
     }
     if operation.payload_version != 1
-        && !(operation.operation_type == PROJECT_ASSET_ADDED && operation.payload_version == 2)
+        && !(matches!(
+            operation.operation_type.as_str(),
+            PROJECT_ASSET_ADDED | EDIT_PLAN_REVISION_CREATED
+        ) && operation.payload_version == 2)
         && is_known_operation_type(&operation.operation_type)
     {
         bail!(

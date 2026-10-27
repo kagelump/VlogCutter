@@ -111,6 +111,7 @@ fn a_real_plan_exports_to_a_stable_otio_document() {
             source_in_seconds: 0.0,
             source_out_seconds: 2.0,
             rationale: "acceptance run".to_string(),
+            audio: None,
         })
         .collect();
     assert!(!operations.is_empty());

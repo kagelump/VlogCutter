@@ -7,7 +7,7 @@ use thiserror::Error;
 
 use crate::chronology::forward_migrate_project_chronology;
 
-pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 49;
+pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 50;
 
 const MIGRATION_TABLE_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -378,7 +378,18 @@ pub const PROJECT_CATALOG_MIGRATIONS: &[SqliteMigration] = &[
         source_identity: "project-catalog/0049-revision-scoped-edit-cut-ids/20261028",
         apply: revision_scoped_edit_cut_ids,
     },
+    SqliteMigration {
+        id: 50,
+        name: "independent_source_audio",
+        source_identity: "project-catalog/0050-independent-source-audio/20261028",
+        apply: independent_source_audio,
+    },
 ];
+
+fn independent_source_audio(transaction: &Transaction<'_>) -> Result<()> {
+    transaction.execute_batch("ALTER TABLE edit_plan_operations ADD COLUMN audio_json TEXT;")?;
+    Ok(())
+}
 
 fn revision_scoped_edit_cut_ids(transaction: &Transaction<'_>) -> Result<()> {
     transaction.execute_batch(
@@ -1553,7 +1564,7 @@ fn table_exists(connection: &Connection, table: &str) -> Result<bool> {
     )?)
 }
 
-fn column_exists(connection: &Connection, table: &str, column: &str) -> Result<bool> {
+pub(crate) fn column_exists(connection: &Connection, table: &str, column: &str) -> Result<bool> {
     let sql = format!("SELECT 1 FROM pragma_table_info('{table}') WHERE name = ?1 LIMIT 1");
     Ok(connection
         .query_row(&sql, [column], |_| Ok(()))
@@ -4629,6 +4640,41 @@ mod edit_cut_migration_tests {
     use super::*;
 
     #[test]
+    fn migration_50_preserves_legacy_linked_audio() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("catalog.sqlite3");
+        let mut connection = Connection::open(&path).unwrap();
+        run_sqlite_migrations(&mut connection, &PROJECT_CATALOG_MIGRATIONS[..49]).unwrap();
+        connection.execute_batch(
+            "INSERT INTO projects(id,name,created_at) VALUES('p','fixture','now');
+             INSERT INTO assets(id,project_id,fingerprint,path,filename,size_bytes,duration_seconds,created_at)
+                VALUES('a','p','fp','/offline/a.mp4','a.mp4',1,5,'now');
+             INSERT INTO edit_plan_revisions(revision_id,project_id,active,created_at) VALUES('r','p',1,'now');
+             INSERT INTO edit_plan_operations VALUES('cut','r',0,'a',1,4,'keep');",
+        ).unwrap();
+        let readonly = crate::Catalog::open_read_only_existing(&path).unwrap();
+        assert!(
+            readonly.edit_plan_revision("r").unwrap().operations[0]
+                .audio
+                .is_none()
+        );
+        assert!(!column_exists(&connection, "edit_plan_operations", "audio_json").unwrap());
+        migrate_project_catalog(&mut connection).unwrap();
+        assert_eq!(connection.query_row("SELECT source_in_seconds,source_out_seconds,audio_json FROM edit_plan_operations", [],
+            |row| Ok((row.get::<_,f64>(0)?,row.get::<_,f64>(1)?,row.get::<_,Option<String>>(2)?))).unwrap(),(1.0,4.0,None));
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT active FROM edit_plan_revisions WHERE revision_id='r'",
+                    [],
+                    |row| row.get::<_, i32>(0)
+                )
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
     fn migration_49_preserves_cuts_and_allows_identity_in_another_revision() {
         let mut connection = Connection::open_in_memory().unwrap();
         run_sqlite_migrations(&mut connection, &PROJECT_CATALOG_MIGRATIONS[..48]).unwrap();
@@ -4652,18 +4698,18 @@ mod edit_cut_migration_tests {
         );
         connection
             .execute(
-                "INSERT INTO edit_plan_operations VALUES('cut','r2',0,'a',1,3,'trim')",
+                "INSERT INTO edit_plan_operations(operation_id,revision_id,position,asset_id,source_in_seconds,source_out_seconds,rationale) VALUES('cut','r2',0,'a',1,3,'trim')",
                 [],
             )
             .unwrap();
         assert!(
             connection
                 .execute(
-                    "INSERT INTO edit_plan_operations VALUES('cut','r2',1,'a',1,3,'duplicate')",
+                    "INSERT INTO edit_plan_operations(operation_id,revision_id,position,asset_id,source_in_seconds,source_out_seconds,rationale) VALUES('cut','r2',1,'a',1,3,'duplicate')",
                     []
                 )
                 .is_err()
         );
-        assert!(connection.execute("INSERT INTO edit_plan_operations VALUES('other','r2',0,'a',1,3,'duplicate position')", []).is_err());
+        assert!(connection.execute("INSERT INTO edit_plan_operations(operation_id,revision_id,position,asset_id,source_in_seconds,source_out_seconds,rationale) VALUES('other','r2',0,'a',1,3,'duplicate position')", []).is_err());
     }
 }

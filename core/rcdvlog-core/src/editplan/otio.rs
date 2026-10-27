@@ -59,6 +59,8 @@ pub struct OtioExportResult {
 
 #[derive(Debug, Error)]
 pub enum OtioExportError {
+    #[error("OTIO export does not yet support independent or silent source audio")]
+    UnsupportedAudio,
     #[error("output {path} already exists with digest {actual}")]
     OutputExists { path: String, actual: String },
     #[error("asset {asset_id} has no usable frame rate")]
@@ -68,6 +70,7 @@ pub enum OtioExportError {
 impl OtioExportError {
     pub const fn code(&self) -> &'static str {
         match self {
+            Self::UnsupportedAudio => "otio_unsupported_audio",
             Self::OutputExists { .. } => "otio_output_exists",
             Self::UnusableFrameRate { .. } => "otio_unusable_frame_rate",
         }
@@ -148,6 +151,9 @@ pub fn otio_document(
     assets: &[Asset],
     timeline_name: &str,
 ) -> Result<String> {
+    if plan.operations.iter().any(|cut| cut.audio.is_some()) {
+        return Err(OtioExportError::UnsupportedAudio.into());
+    }
     let mut clips: Vec<Value> = Vec::with_capacity(plan.operations.len());
     // The timeline rate is the first clip's rate, so a single-camera timeline
     // carries its camera's rate rather than an invented global one.

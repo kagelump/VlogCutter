@@ -16,6 +16,7 @@ use std::path::Path;
 #[serde(rename_all = "snake_case")]
 pub enum FindingKind {
     MissingAsset,
+    AudioInvalid,
     OriginalOffline,
     ProxyMissing,
     RangeOutOfBounds,
@@ -38,6 +39,7 @@ impl FindingKind {
     /// The stable code, referenced by the desktop and the CLI.
     pub const fn code(self) -> &'static str {
         match self {
+            Self::AudioInvalid => "edit_plan_audio_invalid",
             Self::MissingAsset => "edit_plan_missing_asset",
             Self::OriginalOffline => "edit_plan_original_offline",
             Self::ProxyMissing => "edit_plan_proxy_missing",
@@ -52,7 +54,8 @@ impl FindingKind {
 
     pub const fn severity(self) -> Severity {
         match self {
-            Self::MissingAsset
+            Self::AudioInvalid
+            | Self::MissingAsset
             | Self::OriginalOffline
             | Self::RangeOutOfBounds
             | Self::RangeInverted
@@ -226,6 +229,17 @@ impl Catalog {
                     ),
                 ));
             }
+        }
+
+        if revision.operations.iter().any(|cut| cut.audio.is_some())
+            && let Err(error) = super::audio::audio_events(&revision, &assets)
+        {
+            findings.push(Finding::new(
+                FindingKind::AudioInvalid,
+                None,
+                None,
+                error.to_string(),
+            ));
         }
 
         // Overlapping source ranges from one asset are legal — reusing a shot
