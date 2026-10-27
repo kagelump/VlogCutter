@@ -21,6 +21,7 @@ mod moment_commands;
 mod native_speech_commands;
 mod preparation_commands;
 mod server_commands;
+mod youtube_commands;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -43,6 +44,8 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    /// Persistent upload-only YouTube authorization and resumable publishing.
+    Youtube(youtube_commands::YoutubeArgs),
     /// Inspect the running build, explicit catalog, tools, and speech readiness.
     Doctor {
         #[command(flatten)]
@@ -726,6 +729,7 @@ fn selected_catalog(cli: &Cli) -> Result<PathBuf> {
 
 fn command_name(command: &Commands) -> &'static str {
     match command {
+        Commands::Youtube(arguments) => youtube_commands::command_name(arguments),
         Commands::Doctor { .. } => "doctor",
         Commands::Workspace { command } => agent_commands::command_name(command),
         Commands::Models { command } => agent_commands::models_command_name(command),
@@ -816,6 +820,9 @@ fn command_name(command: &Commands) -> &'static str {
 }
 
 fn execute(cli: &Cli) -> Result<Value> {
+    if let Commands::Youtube(arguments) = &cli.command {
+        return youtube_commands::execute(cli.catalog.as_deref(), arguments);
+    }
     // Agent readiness never consults the desktop breadcrumb or opens a catalog
     // writable. Dispatch before legacy catalog selection.
     if let Commands::Doctor { readiness } = &cli.command {
@@ -953,7 +960,7 @@ fn execute(cli: &Cli) -> Result<Value> {
         Commands::Doctor { .. } | Commands::Workspace { .. } | Commands::Models { .. } => {
             unreachable!()
         }
-        Commands::Catalog { .. } | Commands::Desktop { .. } => unreachable!(),
+        Commands::Catalog { .. } | Commands::Desktop { .. } | Commands::Youtube(_) => unreachable!(),
         Commands::Chronology { command } => {
             chronology_commands::execute_chronology(&catalog, command)
         }
@@ -1993,7 +2000,10 @@ fn main() -> ExitCode {
                 error.downcast_ref::<rcdvlog_core::TranscriptionReadinessError>();
             let prerequisite_error = error.downcast_ref::<rcdvlog_core::MediaPrerequisiteError>();
             let representation_busy = error.downcast_ref::<rcdvlog_core::RepresentationBusy>();
-            let code = if let Some(job_agent) = job_agent {
+            let youtube_error = error.downcast_ref::<rcdvlog_core::youtube::YoutubeError>();
+            let code = if let Some(youtube_error) = youtube_error {
+                youtube_error.code
+            } else if let Some(job_agent) = job_agent {
                 job_agent.code
             } else if let Some(readiness) = readiness_error {
                 readiness.code

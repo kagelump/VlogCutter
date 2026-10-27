@@ -64,6 +64,9 @@ target/debug/rcdvlog server --endpoint https://<server-host>:8443 status
 
 Commands emit one JSON success envelope on stdout or one JSON error envelope on stderr. Remote server commands use a paired device credential from an owner-only file, `RCDVLOG_SERVER_TOKEN`, or interactive macOS Keychain fallback; tokens never belong in argv. See [docs/agent-cli.md](docs/agent-cli.md).
 
+Optional upload-only YouTube publishing is available through `rcdvlog youtube`.
+See [OAuth setup, headless consent and resumable uploads](docs/youtube-upload.md).
+
 ## Documentation
 
 - [Product scope and decisions](PRD.md)
