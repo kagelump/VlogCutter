@@ -1001,3 +1001,25 @@ prediction for unrelated footage. Runtime ETA starts uncertain until compatible
 sample timing or configuration-matching observations of actual work exist.
 Calibration can still recommend bounded resource settings without inventing a
 corpus completion time.
+
+## YouTube publishing
+
+`youtube auth login/status/revoke`, `youtube upload`, and `youtube history` expose
+upload-only Google OAuth and resumable publishing through the same JSON envelope.
+See [YouTube setup and command contracts](youtube-upload.md) for personal-use
+Cloud setup, agent-led/headless consent, private credential storage, upload
+idempotency and recovery. Only upload/history require an explicit catalog and
+project; auth commands never consult the desktop's catalog selection.
+
+YouTube errors use the `youtube.*` namespace (including `auth_required`,
+`auth_expired`, `scope_mismatch`, `credential_busy`, `upload_busy`,
+`metadata_conflict`, `outcome_unknown`, and `session_expired`). Progress and
+`youtube.oauth.authorization_required` events appear on stderr before the final
+result. Never parse prose or automatically pass `--restart-upload` after an
+uncertain outcome. For phone-only consent, `youtube auth login --redirect-uri`
+accepts a registered HTTPS callback with a Web application client and a fixed
+loopback `--port` behind a trusted HTTPS proxy. The authorization event includes
+`callbackMode`, `healthUrl` and `loopbackTarget`; credentials stay on the upload
+host. The mobile success page appears only after token exchange and storage.
+This feature does not add scopes for channel reads or
+processing-status polling.
