@@ -4656,7 +4656,10 @@ impl Catalog {
                 .map(|(index, (asset, frames))| (index, asset, frames))
                 .collect::<VecDeque<_>>(),
         ));
-        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // Admission/budget exhaustion stops queue claims. Only an explicit
+        // caller cancellation may abandon work that already reserved its cost.
+        let stop_claiming = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let default_allowed = vec![DEFAULT_MODEL.to_string(), FALLBACK_MODEL.to_string()];
         let allowed_models = if options.allowed_models.is_empty() {
             &default_allowed
@@ -4675,13 +4678,14 @@ impl Catalog {
             for _ in 0..worker_count {
                 let catalog = self.clone();
                 let queue = Arc::clone(&queue);
-                let stop = Arc::clone(&stop);
+                let stop_claiming = Arc::clone(&stop_claiming);
+                let cancelled = Arc::clone(&cancelled);
                 let sender = sender.clone();
                 let worker_chain = chain.clone();
                 let approved_vocabulary = &approved_vocabulary;
                 scope.spawn(move || {
                     loop {
-                        if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        if stop_claiming.load(std::sync::atomic::Ordering::Relaxed) {
                             break;
                         }
                         let Some((index, asset, frames)) = queue
@@ -4713,7 +4717,7 @@ impl Catalog {
                                 include_transcript,
                                 approved_vocabulary,
                                 policy,
-                                &mut || stop.load(std::sync::atomic::Ordering::Relaxed),
+                                &mut || cancelled.load(std::sync::atomic::Ordering::Relaxed),
                             )
                         })();
                         if sender
@@ -4759,18 +4763,19 @@ impl Catalog {
                         let failure = ProviderFailure::from_anyhow(&error);
                         if failure.category == crate::ProviderFailureCategory::Cancelled {
                             report.cancelled = true;
-                            stop.store(true, Ordering::Relaxed);
+                            cancelled.store(true, Ordering::Relaxed);
+                            stop_claiming.store(true, Ordering::Relaxed);
                         } else if failure.category
                             == crate::ProviderFailureCategory::LocalBudgetExhausted
                         {
                             report.budget_exhausted = true;
-                            stop.store(true, Ordering::Relaxed);
+                            stop_claiming.store(true, Ordering::Relaxed);
                         } else if failure.category == crate::ProviderFailureCategory::LocalAdmission
                         {
                             // Canonical admission denied this transmission. Stop
                             // claiming new work; the final canonical snapshot
                             // decides whether the denial was budget exhaustion.
-                            stop.store(true, Ordering::Relaxed);
+                            stop_claiming.store(true, Ordering::Relaxed);
                         }
                         report.failures.push(IngestFailure {
                             path: asset.path,
@@ -4785,7 +4790,8 @@ impl Catalog {
                 };
                 if flow.is_break() {
                     report.cancelled = true;
-                    stop.store(true, Ordering::Relaxed);
+                    cancelled.store(true, Ordering::Relaxed);
+                    stop_claiming.store(true, Ordering::Relaxed);
                 }
                 let budget_stop = self
                     .analysis_budget_snapshot(&policy_scope_id)?
@@ -4794,7 +4800,7 @@ impl Catalog {
                     });
                 if budget_stop {
                     report.budget_exhausted = true;
-                    stop.store(true, Ordering::Relaxed);
+                    stop_claiming.store(true, Ordering::Relaxed);
                 }
             }
             Ok(())

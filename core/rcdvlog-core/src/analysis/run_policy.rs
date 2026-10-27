@@ -3983,6 +3983,106 @@ mod tests {
     }
 
     #[test]
+    fn denied_bulk_admission_does_not_cancel_an_already_reserved_request() {
+        struct HeldProvider {
+            inner: FakeProvider,
+            preparations: AtomicUsize,
+            denied: (Mutex<bool>, std::sync::Condvar),
+        }
+        impl VlmProvider for HeldProvider {
+            fn prepare(&self) -> Result<()> {
+                // The first preparation is the batch's credential preflight.
+                // Hold the admitted worker after reservation, before dispatch,
+                // until the coordinator has handled the losing admission.
+                if self.preparations.fetch_add(1, Ordering::SeqCst) > 0 {
+                    let (lock, changed) = &self.denied;
+                    let (denied, _) = changed
+                        .wait_timeout_while(
+                            lock.lock().unwrap(),
+                            std::time::Duration::from_secs(10),
+                            |denied| !*denied,
+                        )
+                        .unwrap();
+                    ensure!(
+                        *denied,
+                        "another worker must report its denial before the admitted worker dispatches"
+                    );
+                }
+                Ok(())
+            }
+            fn analysis_cost_bound(
+                &self,
+                model: &str,
+                request: &VlmRequest,
+            ) -> Result<AnalysisRequestCostBound> {
+                self.inner.analysis_cost_bound(model, request)
+            }
+            fn analyze(&self, model: &str, request: &VlmRequest) -> Result<VlmResponse> {
+                self.inner.analyze(model, request)
+            }
+        }
+        let (directory, catalog, project, first_asset) = fixture();
+        let second = generated_asset(
+            &catalog,
+            &project,
+            directory.path(),
+            "denied-before-send",
+            2,
+        );
+        let request = RunPolicyRequest::observation(
+            project.clone(),
+            vec![first_asset, second],
+            DEFAULT_MODEL,
+            vec![DEFAULT_MODEL.into()],
+            false,
+            0.03,
+            false,
+        );
+        catalog.authorize_run_policy(&request).unwrap();
+        let pilot = catalog
+            .run_run_policy_pilot_with_provider(&request, &FakeProvider::observation(), false)
+            .unwrap();
+        assert_eq!(pilot.status, "passed");
+        let provider = HeldProvider {
+            inner: FakeProvider::observation(),
+            preparations: AtomicUsize::new(0),
+            denied: (Mutex::new(false), std::sync::Condvar::new()),
+        };
+        let report = catalog
+            .analyze_authorized_with_provider_and_workers(
+                &pilot.policy_id,
+                &provider,
+                Some(2),
+                |progress| {
+                    if progress.asset_id.is_some() && progress.outcome.is_none() {
+                        let (lock, changed) = &provider.denied;
+                        *lock.lock().unwrap() = true;
+                        changed.notify_all();
+                    }
+                    std::ops::ControlFlow::Continue(())
+                },
+            )
+            .unwrap();
+        assert!(report.budget_exhausted);
+        assert!(!report.cancelled, "budget denial is not user cancellation");
+        assert_eq!(
+            report.analyzed, 1,
+            "the reserved worker must finish: {report:?}"
+        );
+        assert_eq!(provider.inner.calls.load(Ordering::SeqCst), 1);
+        let aggregate = catalog
+            .analysis_accounting_aggregate(&pilot.policy_id, None)
+            .unwrap();
+        assert_eq!(aggregate.confirmed_cost_usd, 0.02);
+        assert_eq!(aggregate.active_request_count, 0);
+        assert_eq!(aggregate.uncertain_request_count, 0);
+        assert_eq!(
+            aggregate.committed_or_reserved_usd,
+            aggregate.confirmed_cost_usd
+        );
+    }
+
+    #[test]
     fn concurrent_bulk_workers_cannot_oversubscribe_the_whole_policy_budget() {
         let (directory, catalog, project, first_asset) = fixture();
         let second_asset =

@@ -175,6 +175,13 @@ credential/configuration, cancellation, and admission failures happen before a
 dispatch marker and never consume a paid fallback. Cancellation is checked
 again immediately before each primary/fallback transmission.
 
+Budget exhaustion or another local admission denial stops claiming queued work
+without cancelling requests that already reserved their full cost. An explicit
+caller cancellation separately stops queued work and reaches the pre-dispatch
+cancellation checks. This preserves the admitted request when a losing worker's
+denial arrives before it dispatches; the same transactional authority still
+rejects unaffordable requests and settles every completed receipt.
+
 Report `cost_usd` comes from the canonical current-run projection and therefore
 contains confirmed receipts only; provider-returned amounts stay in outcomes,
 and reservations/uncertainty stay separate on the canonical authority. Worker
