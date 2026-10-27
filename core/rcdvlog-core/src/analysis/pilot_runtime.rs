@@ -386,7 +386,14 @@ fn build_pilot_request(
                 .iter()
                 .map(|at| format!("frame:{at}"))
                 .collect::<Vec<_>>();
-            let schema = moment_output_schema(1, first_scope.source_duration_ms, &keys);
+            let schema = moment_output_schema(
+                1,
+                MomentSpan {
+                    start_ms: 0,
+                    end_ms: first_scope.source_duration_ms,
+                },
+                &keys,
+            );
             let evidence = frame_timestamps_ms
                 .iter()
                 .map(|at| json!({"kind":"frame","key":format!("frame:{at}"),"timeMs":at}))

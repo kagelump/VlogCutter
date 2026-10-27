@@ -1383,6 +1383,8 @@ struct CachedStep {
     reply: Option<StepReply>,
     receipt: MomentReceipt,
     error: String,
+    #[serde(default)]
+    raw_output: Option<String>,
 }
 
 impl StepRunner<'_> {
@@ -1452,6 +1454,22 @@ impl StepRunner<'_> {
             });
         }
         let keys = evidence.iter().map(|e| e.key.clone()).collect::<Vec<_>>();
+        let speech_contract = match self.options.payload {
+            MomentPayload::Frames => {
+                "This request contains frames only: do not claim dialogue, words, or spoken-thought boundaries."
+            }
+            MomentPayload::FramesAndTranscript => {
+                "Speech claims require a cited accepted timed utterance; preserve each cited utterance entirely in the core or explicit context. A transcript alone cannot establish a visible payoff."
+            }
+        };
+        let refinement_seed = seed.map(|candidate| {
+            json!({
+                "event": candidate.event,
+                "core": candidate.core,
+                "payoff": candidate.payoff,
+                "reason": candidate.reason,
+            })
+        });
         let mut prior_receipts = Vec::new();
         if let Some(cached) = store::load_step(
             &self.catalog.connection()?,
@@ -1640,13 +1658,14 @@ impl StepRunner<'_> {
             "proxy changed before moment request"
         );
         let prompt = format!(
-            "Discover reusable within-clip moments from ONLY this explicitly scoped evidence. Return bounded JSON; zero moments is valid. Do not force source inclusion or invent events. Inspect every supplied time, including late action. Nearby views of the same payoff are one event; genuinely separate payoffs remain separate. Identify the actual peak and necessary setup, not the first N seconds. Prefer concise cores using the edit profile, with optional context and occasional justified long holds. Sampled frames are not continuous video; set uncertain=true when temporal boundaries or visual content cannot be established. Preserve each cited utterance entirely in the core or explicit context. Use only supplied evidence keys. Role must be action, dialogue, atmosphere, transition or hold. Core/payoff must fit inside inspectedSpan; payoff must fit inside core. Optional setup precedes payoff; optional context contains core. Keep explanations short. Refine-phase evidence is denser than coarse evidence; check setup/payoff, dialogue boundaries and whether the original candidate actually exists. Preserve useful long event context while keeping the selected core concise.\nEVIDENCE={}\n",
-            json!({"phase":phase,"inspectedSpan":span,"sourceDurationMs":self.source.duration_ms,"frameTimesMs":times,"evidence":evidence,"acceptedTimedSpeech":speech,"priorCoarseRange":self.source.coarse_observation,"candidateToRefine":seed,"editProfile":self.options.profile})
+            "Discover reusable within-clip moments from ONLY this explicitly scoped evidence. All times are integer milliseconds on the original source clock; inspectedSpan is the exact allowed interval [startMs,endMs), and every proposed core, payoff, setup, and context must stay within it. Return bounded JSON; zero moments is valid. Do not force source inclusion or invent events. Inspect every supplied time, including late action. Nearby views of the same payoff are one event; genuinely separate payoffs remain separate. Identify the actual peak and necessary setup, not the first N seconds. Prefer concise cores using the edit profile, with optional context and occasional justified long holds. Sampled frames are not continuous video; set uncertain=true when temporal boundaries or visual content cannot be established. {} Use only evidence keys supplied in this request; visual grounding requires a supplied frame near the payoff. Role must be action, dialogue, atmosphere, transition or hold. Payoff must fit inside core. Optional setup precedes payoff; optional context contains core. Keep explanations short. Refine-phase evidence is denser than coarse evidence; check setup/payoff, dialogue boundaries and whether the original candidate actually exists. The refinement seed is only an event/core/payoff/reason hint; its prior evidence is not available for citation. Preserve useful long event context while keeping the selected core concise.\nEVIDENCE={}\n",
+            speech_contract,
+            json!({"phase":phase,"inspectedSpan":span,"sourceDurationMs":self.source.duration_ms,"frameTimesMs":times,"evidence":evidence,"acceptedTimedSpeech":speech,"priorCoarseRange":self.source.coarse_observation,"candidateToRefine":refinement_seed,"editProfile":self.options.profile})
         );
         let request = VlmRequest {
             prompt,
             frames,
-            schema: output_schema(limit, self.source.duration_ms, &keys),
+            schema: output_schema(limit, span, &keys),
         };
         if let Some(policy) = &self.state.approved_policy {
             self.catalog
@@ -1671,6 +1690,7 @@ impl StepRunner<'_> {
                 reply: None,
                 receipt: pending_receipt.clone(),
                 error: String::new(),
+                raw_output: None,
             },
         )?;
         self.state.executed_steps += 1;
@@ -1730,6 +1750,7 @@ impl StepRunner<'_> {
                             reply: None,
                             receipt: pending_receipt,
                             error: failure.safe_detail(),
+                            raw_output: None,
                         },
                     )?;
                     return Err(error);
@@ -1743,6 +1764,7 @@ impl StepRunner<'_> {
                         reply: None,
                         receipt: pending_receipt.clone(),
                         error: format!("{error:#}"),
+                        raw_output: None,
                     },
                 )?;
                 self.receipts.push(pending_receipt);
@@ -1787,6 +1809,7 @@ impl StepRunner<'_> {
                         reply: Some(reply.clone()),
                         receipt,
                         error: String::new(),
+                        raw_output: None,
                     },
                 )?;
                 Ok((reply, evidence))
@@ -1810,6 +1833,7 @@ impl StepRunner<'_> {
                         reply: None,
                         receipt,
                         error: format!("{error:#}"),
+                        raw_output: Some(response.body.clone()),
                     },
                 )?;
                 Err(error)
@@ -1860,6 +1884,27 @@ mod tests {
 
     struct EmptyMomentProvider {
         calls: AtomicUsize,
+    }
+
+    struct InvalidMomentProvider;
+
+    impl VlmProvider for InvalidMomentProvider {
+        fn analyze(&self, model: &str, _request: &VlmRequest) -> Result<VlmResponse> {
+            Ok(VlmResponse {
+                model: model.to_owned(),
+                body: r#"{"moments":[],"uncertain":false,"reason":"bad fixture","unexpected":"retain raw"}"#.into(),
+                prompt_tokens: 1,
+                completion_tokens: 1,
+                cost_usd: 0.0,
+                latency_ms: 1,
+                receipt: VlmReceipt {
+                    actual_model: Some(model.to_owned()),
+                    provider: Some("openrouter".into()),
+                    generation_id: Some("invalid-moment-fixture".into()),
+                    usage_complete: true,
+                },
+            })
+        }
     }
 
     impl VlmProvider for EmptyMomentProvider {
@@ -1914,6 +1959,7 @@ mod tests {
                 .split_once("EVIDENCE=")
                 .and_then(|(_, json)| serde_json::from_str(json).ok())
                 .context("fake event provider did not receive structured evidence")?;
+            let phase = input["phase"].as_str().unwrap();
             let times = input["frameTimesMs"]
                 .as_array()
                 .context("frame times missing")?;
@@ -1927,7 +1973,34 @@ mod tests {
             );
             let start = input["inspectedSpan"]["startMs"].as_u64().unwrap() as u32;
             let end = input["inspectedSpan"]["endMs"].as_u64().unwrap() as u32;
-            let phase = input["phase"].as_str().unwrap();
+            let proposal_schema = &request.schema["properties"]["moments"]["items"]["properties"];
+            for field in ["coreStartMs", "coreEndMs", "payoffStartMs", "payoffEndMs"] {
+                ensure!(
+                    proposal_schema[field]["minimum"] == start
+                        && proposal_schema[field]["maximum"] == end,
+                    "wire schema for {field} must match inspected source window"
+                );
+            }
+            for field in ["setup", "context"] {
+                let bounds = &proposal_schema[field]["anyOf"][1]["properties"];
+                ensure!(
+                    bounds["startMs"]["minimum"] == start
+                        && bounds["startMs"]["maximum"] == end
+                        && bounds["endMs"]["minimum"] == start
+                        && bounds["endMs"]["maximum"] == end,
+                    "wire schema for {field} must match inspected source window"
+                );
+            }
+            let seed = &input["candidateToRefine"];
+            if phase == "refine" {
+                let fields = seed.as_object().context("refinement seed missing")?;
+                ensure!(
+                    fields
+                        .keys()
+                        .all(|key| ["event", "core", "payoff", "reason"].contains(&key.as_str())),
+                    "refinement seed must not include prior evidence citations"
+                );
+            }
             let centers = if phase == "refine" {
                 let seed_event = input["candidateToRefine"]["event"].as_str();
                 self.centers_ms
@@ -2941,6 +3014,7 @@ mod tests {
                     reply: None,
                     receipt: pending,
                     error: String::new(),
+                    raw_output: None,
                 })
                 .unwrap(),
                 cost_usd: 0.0,
@@ -3363,6 +3437,44 @@ mod tests {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
             Err(error) => panic!("could not run {name}: {error}"),
         }
+    }
+
+    #[test]
+    fn rejected_moment_response_retains_raw_provider_body() {
+        if !tool_available("ffmpeg") || !tool_available("ffprobe") {
+            eprintln!("skipping generated rejected-moment fixture: ffmpeg/ffprobe unavailable");
+            return;
+        }
+        let directory = tempdir().unwrap();
+        let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).unwrap();
+        let project = catalog.create_project("Synthetic rejected moment").unwrap();
+        generated_asset(&catalog, &project.id, directory.path(), "rejected", 2);
+        let options = event_options();
+        let _ = catalog.discover_moments_with_provider_for_domain_test(
+            &project.id,
+            &["rejected".into()],
+            &options,
+            &InvalidMomentProvider,
+            |_| ControlFlow::Continue(()),
+        );
+        let body: String = catalog
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT body_json FROM moment_steps WHERE asset_id='rejected' LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let stored: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            stored["body"]["state"], "rejected",
+            "invalid fake-provider response should be stored as rejected"
+        );
+        assert_eq!(
+            stored["body"]["raw_output"],
+            r#"{"moments":[],"uncertain":false,"reason":"bad fixture","unexpected":"retain raw"}"#
+        );
     }
 
     #[test]

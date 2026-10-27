@@ -8,8 +8,8 @@ use serde_json::{Value, json};
 use std::collections::BTreeSet;
 
 pub const RECIPE_VERSION: &str = "moments.full-span.dense-refine.v1";
-pub const PROMPT_VERSION: &str = "moments.discover-refine.v1";
-pub const SCHEMA_VERSION: &str = "moments.evidence.v1";
+pub const PROMPT_VERSION: &str = "moments.discover-refine.v2";
+pub const SCHEMA_VERSION: &str = "moments.evidence.v2";
 pub const TIME_MAPPING: &str = "proxy-v3.source-ms.identity.v1";
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -203,8 +203,8 @@ pub struct StepReply {
     pub reason: String,
 }
 
-pub fn output_schema(max_moments: usize, duration_ms: u32, keys: &[String]) -> Value {
-    let time = json!({"type":"integer","minimum":0,"maximum":duration_ms});
+pub fn output_schema(max_moments: usize, span: MomentSpan, keys: &[String]) -> Value {
+    let time = json!({"type":"integer","minimum":span.start_ms,"maximum":span.end_ms});
     let span = json!({"anyOf":[{"type":"null"},{"type":"object","additionalProperties":false,"properties":{"startMs":time.clone(),"endMs":time.clone()},"required":["startMs","endMs"]}]});
     let text = |n| json!({"type":"string","maxLength":n});
     let props = json!({
@@ -235,7 +235,7 @@ pub fn validate_reply(
 ) -> Result<StepReply> {
     ensure!(body.len() <= 32_768, "moment response exceeds byte limit");
     let json: Value = serde_json::from_str(body)?;
-    let schema = output_schema(limit, span.end_ms, allowed_keys);
+    let schema = output_schema(limit, span, allowed_keys);
     ensure!(
         json["moments"].as_array().is_some_and(|values| values
             .iter()
@@ -607,6 +607,52 @@ mod tests {
         assert!(windows.last().unwrap().0.end_ms == 60_000);
         assert!(windows.last().unwrap().1.iter().any(|time| *time > 50_000));
         assert!(windows.iter().all(|(_, times)| times.len() <= 8));
+    }
+
+    #[test]
+    fn inspected_window_schema_and_reply_reject_stale_bounds_and_citations() {
+        let span = MomentSpan {
+            start_ms: 40_000,
+            end_ms: 48_000,
+        };
+        let keys = vec!["frame:44000".to_owned()];
+        let schema = output_schema(1, span, &keys);
+        let properties = &schema["properties"]["moments"]["items"]["properties"];
+        for field in ["coreStartMs", "coreEndMs", "payoffStartMs", "payoffEndMs"] {
+            assert_eq!(properties[field]["minimum"], 40_000);
+            assert_eq!(properties[field]["maximum"], 48_000);
+        }
+        for field in ["setup", "context"] {
+            let bounds = &properties[field]["anyOf"][1]["properties"];
+            assert_eq!(bounds["startMs"]["minimum"], 40_000);
+            assert_eq!(bounds["endMs"]["maximum"], 48_000);
+        }
+
+        let mut proposal = Proposal {
+            event: "visible payoff".into(),
+            role: "action".into(),
+            reason: "near supplied sample".into(),
+            score: 0.9,
+            core_start_ms: 41_000,
+            core_end_ms: 47_000,
+            payoff_start_ms: 44_000,
+            payoff_end_ms: 45_000,
+            setup: None,
+            context: None,
+            long_hold: false,
+            evidence_keys: keys.clone(),
+            uncertainty: vec![],
+        };
+        let body = |proposal: &Proposal| {
+            json!({"moments":[proposal],"uncertain":false,"reason":"fixture"}).to_string()
+        };
+        assert!(validate_reply(&body(&proposal), span, EditProfile::default(), &keys, 1).is_ok());
+
+        proposal.core_start_ms = 39_000;
+        assert!(validate_reply(&body(&proposal), span, EditProfile::default(), &keys, 1).is_err());
+        proposal.core_start_ms = 41_000;
+        proposal.evidence_keys = vec!["frame:20000".into()];
+        assert!(validate_reply(&body(&proposal), span, EditProfile::default(), &keys, 1).is_err());
     }
 
     #[test]
