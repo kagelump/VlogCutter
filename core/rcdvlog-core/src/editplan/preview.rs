@@ -167,9 +167,9 @@ impl Catalog {
             let mut command = tool_command("ffmpeg");
             command
                 .args(["-y", "-hide_banner", "-loglevel", "error", "-ss"])
-                .arg(format!("{:.3}", operation.source_in_seconds))
+                .arg(operation.source_in_seconds.to_string())
                 .arg("-t")
-                .arg(format!("{duration:.3}"))
+                .arg(duration.to_string())
                 .arg("-noautorotate")
                 .arg("-i")
                 .arg(source);
@@ -189,7 +189,7 @@ impl Catalog {
             }
             command
                 .arg("-t")
-                .arg(format!("{duration:.3}"))
+                .arg(duration.to_string())
                 .args([
                     "-vf",
                     &normalize,
@@ -201,6 +201,8 @@ impl Catalog {
                     "28",
                     "-pix_fmt",
                     "yuv420p",
+                    "-r",
+                    "30000/1001",
                     "-video_track_timescale",
                     "30000",
                     "-c:a",

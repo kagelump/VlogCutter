@@ -17,6 +17,7 @@ mod agent_commands;
 mod analysis_recovery_commands;
 mod calibration_commands;
 mod chronology_commands;
+mod edit_plan_commands;
 mod moment_commands;
 mod native_speech_commands;
 mod preparation_commands;
@@ -157,6 +158,11 @@ enum Commands {
     Moments {
         #[command(subcommand)]
         command: moment_commands::MomentCommand,
+    },
+    /// Inspect, create, compare, validate, activate, or preview immutable edit plans.
+    EditPlan {
+        #[command(subcommand)]
+        command: edit_plan_commands::EditPlanCommand,
     },
     /// Preflight, run, or inspect bounded preparation evidence.
     Prepare {
@@ -799,6 +805,7 @@ fn command_name(command: &Commands) -> &'static str {
             AnalyzeCommand::Status { .. } => "analyze.status",
         },
         Commands::Moments { command } => moment_commands::command_name(command),
+        Commands::EditPlan { command } => edit_plan_commands::command_name(command),
         Commands::Prepare { command } => preparation_commands::command_name(command),
         Commands::Calibrate { command } => calibration_commands::command_name(command),
         Commands::Labels { command } => match command {
@@ -826,6 +833,18 @@ fn execute(cli: &Cli) -> Result<Value> {
     }
     if let Commands::Models { command } = &cli.command {
         return agent_commands::models(cli.catalog.as_deref(), command);
+    }
+    if let Commands::EditPlan { command } = &cli.command {
+        let path = cli.catalog.as_deref().ok_or_else(|| {
+            anyhow!("invalid input: edit-plan commands require --catalog or RCDVLOG_CATALOG")
+        })?;
+        ensure!(path.is_file(), "catalog not found: {}", path.display());
+        let catalog = if edit_plan_commands::is_read_only(command) {
+            Catalog::open_read_only_existing(path)?
+        } else {
+            Catalog::open_existing(path)?
+        };
+        return edit_plan_commands::execute(&catalog, command);
     }
     if let Commands::Prepare { command } = &cli.command {
         let path = cli.catalog.as_deref().ok_or_else(|| {
@@ -958,7 +977,7 @@ fn execute(cli: &Cli) -> Result<Value> {
             chronology_commands::execute_chronology(&catalog, command)
         }
         Commands::Moments { command } => moment_commands::execute(&catalog, command),
-        Commands::Prepare { .. } | Commands::Calibrate { .. } => unreachable!(),
+        Commands::EditPlan { .. } | Commands::Prepare { .. } | Commands::Calibrate { .. } => unreachable!(),
         Commands::Diagnostics { command } => {
             chronology_commands::execute_diagnostics(&catalog, command)
         }
@@ -1993,7 +2012,10 @@ fn main() -> ExitCode {
                 error.downcast_ref::<rcdvlog_core::TranscriptionReadinessError>();
             let prerequisite_error = error.downcast_ref::<rcdvlog_core::MediaPrerequisiteError>();
             let representation_busy = error.downcast_ref::<rcdvlog_core::RepresentationBusy>();
-            let code = if let Some(job_agent) = job_agent {
+            let edit_plan_error = error.downcast_ref::<rcdvlog_core::EditPlanError>();
+            let code = if let Some(plan) = edit_plan_error {
+                plan.code()
+            } else if let Some(job_agent) = job_agent {
                 job_agent.code
             } else if let Some(readiness) = readiness_error {
                 readiness.code

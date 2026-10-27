@@ -204,3 +204,17 @@ and the refusal names the digest found (`otio_output_exists`).
 - The absence of `track`, `transition`, `effect`, `filter`, `opacity`,
   `audio_level`, and `fade` from the schema and the writer.
 - The OTIO determinism rules and the originals-not-proxies rule.
+
+
+### Revision-safe CLI foundation (schema 49)
+
+Migration 49 preserves all existing rows and scopes the operation primary key to
+`(revision_id, operation_id)`. This allows stable cut IDs across immutable drafts;
+`UNIQUE(revision_id, position)` and the single-active-revision index remain.
+Creation and activation check expected active state in the same immediate
+transaction as the operation commit, including an assertion of no active plan.
+Activation additionally refuses blocking validation findings without deleting the
+draft. `create_edit_plan_from_base` permits explicit same-project draft ancestry
+independent of the active-plan guard. See [CLI contract](../../agent-cli.md#immutable-edit-plans)
+for ordered JSON input and cut-identity diffs. Ranges retain source seconds without
+persistence snapping; preview seeks no longer round them to milliseconds.

@@ -177,9 +177,12 @@ impl Catalog {
                 ));
             }
 
-            if asset.duration_seconds > 0.0
-                && (operation.source_in_seconds < 0.0
-                    || operation.source_out_seconds > asset.duration_seconds)
+            if !operation.source_in_seconds.is_finite()
+                || !operation.source_out_seconds.is_finite()
+                || !asset.duration_seconds.is_finite()
+                || asset.duration_seconds <= 0.0
+                || operation.source_in_seconds < 0.0
+                || operation.source_out_seconds > asset.duration_seconds
             {
                 findings.push(Finding::new(
                     FindingKind::RangeOutOfBounds,

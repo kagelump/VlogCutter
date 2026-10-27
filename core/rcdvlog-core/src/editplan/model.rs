@@ -12,7 +12,7 @@ use thiserror::Error;
 /// One clip in the plan: a source range, at a position, with the reason it is
 /// there.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct EditPlanOperation {
     pub operation_id: String,
     pub position: u32,
@@ -78,6 +78,10 @@ pub struct EditPlanExport {
 pub enum EditPlanError {
     #[error("edit plan revision {expected} is no longer active; {actual} superseded it")]
     StaleRevision { expected: String, actual: String },
+    #[error("invalid edit plan: {message}")]
+    InvalidPlan { message: String },
+    #[error("edit plan has blocking validation findings: {codes:?}")]
+    ValidationFailed { codes: Vec<String> },
     #[error("edit plan revision {revision_id} not found")]
     UnknownRevision { revision_id: String },
 }
@@ -87,6 +91,8 @@ impl EditPlanError {
         match self {
             Self::StaleRevision { .. } => "edit_plan_stale_revision",
             Self::UnknownRevision { .. } => "edit_plan_unknown_revision",
+            Self::InvalidPlan { .. } => "edit_plan_invalid_input",
+            Self::ValidationFailed { .. } => "edit_plan_validation_failed",
         }
     }
 }

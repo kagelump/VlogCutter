@@ -17,6 +17,7 @@
 //! takes the revision the caller *believed* was active and refuses if that is
 //! no longer true.
 
+pub mod diff;
 pub mod model;
 pub mod otio;
 pub mod preview;
@@ -33,10 +34,10 @@ use crate::Catalog;
 use crate::now;
 use crate::operations::{
     EDIT_PLAN_EXPORT_RECORDED, EDIT_PLAN_REVISION_ACTIVATED, EDIT_PLAN_REVISION_CREATED,
-    NewOperation, current_revision,
+    NewOperation, commit_local_in_transaction, current_revision,
 };
 use anyhow::{Result, anyhow};
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use uuid::Uuid;
 
 impl Catalog {
@@ -56,31 +57,62 @@ impl Catalog {
         script_revision_id: Option<&str>,
         expected_active_revision_id: Option<&str>,
     ) -> Result<EditPlanRevision> {
-        self.require_project(project_id)?;
-        let active = self.active_edit_plan_revision_id(project_id)?;
-        match (&active, expected_active_revision_id) {
-            (Some(current), Some(expected)) if current != expected => {
-                return Err(EditPlanError::StaleRevision {
-                    expected: expected.to_string(),
-                    actual: current.clone(),
-                }
-                .into());
-            }
-            (Some(current), None) => {
-                return Err(EditPlanError::StaleRevision {
-                    expected: "none".to_string(),
-                    actual: current.clone(),
-                }
-                .into());
-            }
-            _ => {}
-        }
+        self.create_edit_plan_from_base(
+            project_id,
+            operations,
+            script_revision_id,
+            expected_active_revision_id,
+            expected_active_revision_id,
+        )
+    }
 
+    /// Fork any immutable draft while independently guarding the active plan.
+    /// Stable operation IDs identify the same cut across revisions. New/repeated
+    /// cuts must use distinct IDs; empty IDs receive fresh generated identities.
+    pub fn create_edit_plan_from_base(
+        &self,
+        project_id: &str,
+        operations: &[EditPlanOperation],
+        script_revision_id: Option<&str>,
+        base_revision_id: Option<&str>,
+        expected_active_revision_id: Option<&str>,
+    ) -> Result<EditPlanRevision> {
+        self.require_project(project_id)?;
+        if let Some(base) = base_revision_id {
+            let base = self.edit_plan_revision(base)?;
+            if base.project_id != project_id {
+                return Err(EditPlanError::InvalidPlan {
+                    message: "base revision belongs to another project".into(),
+                }
+                .into());
+            }
+        }
+        let mut ids = std::collections::HashSet::new();
+        for operation in operations {
+            if !operation.source_in_seconds.is_finite()
+                || !operation.source_out_seconds.is_finite()
+                || (!operation.operation_id.is_empty() && !ids.insert(&operation.operation_id))
+            {
+                return Err(EditPlanError::InvalidPlan {
+                    message: "ranges must be finite and cut IDs unique within a revision".into(),
+                }
+                .into());
+            }
+            if self.get_asset(&operation.asset_id)?.project_id != project_id {
+                return Err(EditPlanError::InvalidPlan {
+                    message: "asset belongs to another project".into(),
+                }
+                .into());
+            }
+        }
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_active(&transaction, project_id, expected_active_revision_id)?;
         let revision_id = format!("editrev_{}", Uuid::new_v4().simple());
         let payload = serde_json::json!({
             "revisionId": revision_id,
             "scriptRevisionId": script_revision_id,
-            "parentRevisionId": active,
+            "parentRevisionId": base_revision_id,
             "operations": operations
                 .iter()
                 .enumerate()
@@ -98,8 +130,9 @@ impl Catalog {
                 }))
                 .collect::<Vec<_>>(),
         });
-        let guard = current_revision(&self.connection()?, project_id, "editPlan", project_id)?;
-        self.commit_local(
+        let guard = current_revision(&transaction, project_id, "editPlan", project_id)?;
+        commit_local_in_transaction(
+            &transaction,
             project_id,
             vec![NewOperation {
                 aggregate_type: "editPlan",
@@ -109,6 +142,7 @@ impl Catalog {
                 payload,
             }],
         )?;
+        transaction.commit()?;
         self.edit_plan_revision(&revision_id)
     }
 
@@ -124,31 +158,31 @@ impl Catalog {
         expected_active_revision_id: Option<&str>,
     ) -> Result<EditPlanRevision> {
         let revision = self.edit_plan_revision(revision_id)?;
-        let active = self.active_edit_plan_revision_id(&revision.project_id)?;
-        match (&active, expected_active_revision_id) {
-            (Some(current), Some(expected)) if current != expected => {
-                return Err(EditPlanError::StaleRevision {
-                    expected: expected.to_string(),
-                    actual: current.clone(),
-                }
-                .into());
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_active(
+            &transaction,
+            &revision.project_id,
+            expected_active_revision_id,
+        )?;
+        let report = self.validate_edit_plan(revision_id)?;
+        if !report.renderable() {
+            return Err(EditPlanError::ValidationFailed {
+                codes: report
+                    .errors()
+                    .map(|finding| finding.code.to_string())
+                    .collect(),
             }
-            (Some(current), None) => {
-                return Err(EditPlanError::StaleRevision {
-                    expected: "none".to_string(),
-                    actual: current.clone(),
-                }
-                .into());
-            }
-            _ => {}
+            .into());
         }
         let guard = current_revision(
-            &self.connection()?,
+            &transaction,
             &revision.project_id,
             "editPlan",
             &revision.project_id,
         )?;
-        self.commit_local(
+        commit_local_in_transaction(
+            &transaction,
             &revision.project_id,
             vec![NewOperation {
                 aggregate_type: "editPlan",
@@ -158,6 +192,7 @@ impl Catalog {
                 payload: serde_json::json!({ "revisionId": revision_id }),
             }],
         )?;
+        transaction.commit()?;
         self.edit_plan_revision(revision_id)
     }
 
@@ -387,5 +422,28 @@ pub(crate) fn activate_revision(
         "UPDATE edit_plan_revisions SET active=1 WHERE revision_id=?1",
         [revision_id],
     )?;
+    Ok(())
+}
+
+/// The read and the operation commit share one immediate write transaction.
+fn require_active(
+    connection: &rusqlite::Connection,
+    project_id: &str,
+    expected: Option<&str>,
+) -> Result<()> {
+    let actual: Option<String> = connection
+        .query_row(
+            "SELECT revision_id FROM edit_plan_revisions WHERE project_id=?1 AND active=1",
+            [project_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if actual.as_deref() != expected {
+        return Err(EditPlanError::StaleRevision {
+            expected: expected.unwrap_or("none").into(),
+            actual: actual.unwrap_or_else(|| "none".into()),
+        }
+        .into());
+    }
     Ok(())
 }
