@@ -7,7 +7,7 @@ use thiserror::Error;
 
 use crate::chronology::forward_migrate_project_chronology;
 
-pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 48;
+pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 49;
 
 const MIGRATION_TABLE_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -372,7 +372,33 @@ pub const PROJECT_CATALOG_MIGRATIONS: &[SqliteMigration] = &[
         source_identity: "project-catalog/0048-pipeline-smoke-receipts/20261027",
         apply: add_pipeline_smoke_receipts,
     },
+    SqliteMigration {
+        id: 49,
+        name: "revision_scoped_edit_cut_ids",
+        source_identity: "project-catalog/0049-revision-scoped-edit-cut-ids/20261028",
+        apply: revision_scoped_edit_cut_ids,
+    },
 ];
+
+fn revision_scoped_edit_cut_ids(transaction: &Transaction<'_>) -> Result<()> {
+    transaction.execute_batch(
+        "CREATE TABLE edit_plan_operations_v49 (
+            operation_id TEXT NOT NULL,
+            revision_id TEXT NOT NULL REFERENCES edit_plan_revisions(revision_id) ON DELETE CASCADE,
+            position INTEGER NOT NULL,
+            asset_id TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+            source_in_seconds REAL NOT NULL,
+            source_out_seconds REAL NOT NULL,
+            rationale TEXT NOT NULL DEFAULT '',
+            PRIMARY KEY(revision_id, operation_id),
+            UNIQUE(revision_id, position)
+        );
+        INSERT INTO edit_plan_operations_v49 SELECT * FROM edit_plan_operations;
+        DROP TABLE edit_plan_operations;
+        ALTER TABLE edit_plan_operations_v49 RENAME TO edit_plan_operations;",
+    )?;
+    Ok(())
+}
 
 fn add_pipeline_smoke_receipts(transaction: &Transaction<'_>) -> Result<()> {
     transaction.execute_batch(
@@ -4595,5 +4621,49 @@ mod tests {
                 .current_version,
             PROJECT_CATALOG_SCHEMA_VERSION,
         );
+    }
+}
+
+#[cfg(test)]
+mod edit_cut_migration_tests {
+    use super::*;
+
+    #[test]
+    fn migration_49_preserves_cuts_and_allows_identity_in_another_revision() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        run_sqlite_migrations(&mut connection, &PROJECT_CATALOG_MIGRATIONS[..48]).unwrap();
+        connection.execute_batch(
+            "INSERT INTO projects(id,name,created_at) VALUES('p','fixture','now');
+             INSERT INTO assets(id,project_id,fingerprint,path,filename,size_bytes,duration_seconds,created_at)
+                VALUES('a','p','fp','/offline/a.mp4','a.mp4',1,5,'now');
+             INSERT INTO edit_plan_revisions(revision_id,project_id,created_at) VALUES('r1','p','now'),('r2','p','now');
+             INSERT INTO edit_plan_operations VALUES('cut','r1',0,'a',1,4,'keep');",
+        ).unwrap();
+        migrate_project_catalog(&mut connection).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT rationale FROM edit_plan_operations WHERE revision_id='r1'",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            "keep"
+        );
+        connection
+            .execute(
+                "INSERT INTO edit_plan_operations VALUES('cut','r2',0,'a',1,3,'trim')",
+                [],
+            )
+            .unwrap();
+        assert!(
+            connection
+                .execute(
+                    "INSERT INTO edit_plan_operations VALUES('cut','r2',1,'a',1,3,'duplicate')",
+                    []
+                )
+                .is_err()
+        );
+        assert!(connection.execute("INSERT INTO edit_plan_operations VALUES('other','r2',0,'a',1,3,'duplicate position')", []).is_err());
     }
 }

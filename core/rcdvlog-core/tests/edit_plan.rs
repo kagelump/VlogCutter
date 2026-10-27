@@ -798,3 +798,191 @@ fn the_edit_plan_schema_contains_no_track_transition_or_effect_column() {
         );
     }
 }
+
+#[test]
+fn cut_identity_survives_draft_forks_and_diff_tracks_order_and_trim() {
+    let fixture = fixture(2);
+    let a = fixture
+        .catalog
+        .create_edit_plan_revision(
+            &fixture.project_id,
+            &[cut(0, 0.0, 5.0), cut(0, 10.0, 15.0), cut(1, 0.0, 60.0)],
+            None,
+            None,
+        )
+        .unwrap();
+    let mut cuts = a.operations.clone();
+    cuts.swap(0, 2);
+    cuts[0].source_out_seconds = 59.99;
+    let b = fixture
+        .catalog
+        .create_edit_plan_from_base(&fixture.project_id, &cuts, None, Some(&a.revision_id), None)
+        .unwrap();
+    assert_eq!(
+        b.operations.len(),
+        3,
+        "shared IDs must never drop cuts on insertion"
+    );
+    assert_eq!(b.operations[0].operation_id, a.operations[2].operation_id);
+    assert_eq!(
+        b.parent_revision_id.as_deref(),
+        Some(a.revision_id.as_str())
+    );
+    let diff = fixture
+        .catalog
+        .diff_edit_plans(&a.revision_id, &b.revision_id)
+        .unwrap();
+    assert_eq!(diff.changes.len(), 2);
+    assert!(
+        diff.changes
+            .iter()
+            .any(|change| change.changes == ["order", "range"])
+    );
+    assert_eq!(
+        fixture.catalog.edit_plan_revision(&a.revision_id).unwrap(),
+        a
+    );
+    let restored = Catalog::import_project_baseline(
+        fixture.directory.path().join("restored.sqlite3"),
+        &fixture
+            .catalog
+            .export_project_baseline(&fixture.project_id)
+            .unwrap(),
+        "restored-node",
+        1,
+        "test",
+    )
+    .unwrap();
+    assert_eq!(
+        restored
+            .edit_plan_revision(&b.revision_id)
+            .unwrap()
+            .operations,
+        b.operations
+    );
+}
+
+#[test]
+fn initial_revision_guards_are_symmetric_and_invalid_activation_preserves_draft() {
+    let fixture = fixture(1);
+    let a = fixture
+        .catalog
+        .create_edit_plan_revision(&fixture.project_id, &[cut(0, 0.0, 5.0)], None, None)
+        .unwrap();
+    let error = fixture
+        .catalog
+        .activate_edit_plan_revision(&a.revision_id, Some(&a.revision_id))
+        .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<EditPlanError>().unwrap().code(),
+        "edit_plan_stale_revision"
+    );
+    let error = fixture
+        .catalog
+        .create_edit_plan_from_base(
+            &fixture.project_id,
+            &a.operations,
+            None,
+            Some(&a.revision_id),
+            Some(&a.revision_id),
+        )
+        .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<EditPlanError>().unwrap().code(),
+        "edit_plan_stale_revision"
+    );
+    let invalid = fixture
+        .catalog
+        .create_edit_plan_revision(&fixture.project_id, &[cut(0, 50.0, 90.0)], None, None)
+        .unwrap();
+    let error = fixture
+        .catalog
+        .activate_edit_plan_revision(&invalid.revision_id, None)
+        .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<EditPlanError>().unwrap().code(),
+        "edit_plan_validation_failed"
+    );
+    assert_eq!(
+        fixture
+            .catalog
+            .edit_plan_revision(&invalid.revision_id)
+            .unwrap(),
+        invalid
+    );
+    assert!(
+        fixture
+            .catalog
+            .active_edit_plan(&fixture.project_id)
+            .unwrap()
+            .is_none()
+    );
+    for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        assert!(
+            fixture
+                .catalog
+                .create_edit_plan_revision(&fixture.project_id, &[cut(0, 0.0, value)], None, None)
+                .is_err()
+        );
+    }
+    let mut duplicate = a.operations.clone();
+    duplicate.push(duplicate[0].clone());
+    assert!(
+        fixture
+            .catalog
+            .create_edit_plan_from_base(
+                &fixture.project_id,
+                &duplicate,
+                None,
+                Some(&a.revision_id),
+                None
+            )
+            .is_err()
+    );
+}
+
+#[test]
+fn concurrent_initial_activations_have_one_winner() {
+    let fixture = fixture(1);
+    let a = fixture
+        .catalog
+        .create_edit_plan_revision(&fixture.project_id, &[cut(0, 0.0, 5.0)], None, None)
+        .unwrap();
+    let b = fixture
+        .catalog
+        .create_edit_plan_revision(&fixture.project_id, &[cut(0, 5.0, 10.0)], None, None)
+        .unwrap();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let threads: Vec<_> = [a.revision_id, b.revision_id]
+        .into_iter()
+        .map(|revision| {
+            let barrier = barrier.clone();
+            let catalog = Catalog::open_existing(fixture.catalog.database_path()).unwrap();
+            std::thread::spawn(move || {
+                barrier.wait();
+                catalog
+                    .activate_edit_plan_revision(&revision, None)
+                    .map(|_| ())
+                    .map_err(|error| {
+                        error
+                            .downcast_ref::<EditPlanError>()
+                            .unwrap()
+                            .code()
+                            .to_string()
+                    })
+            })
+        })
+        .collect();
+    let results: Vec<_> = threads
+        .into_iter()
+        .map(|thread| thread.join().unwrap())
+        .collect();
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| matches!(result, Err(code) if code == "edit_plan_stale_revision"))
+            .count(),
+        1
+    );
+}

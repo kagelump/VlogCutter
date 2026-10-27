@@ -1001,3 +1001,64 @@ prediction for unrelated footage. Runtime ETA starts uncertain until compatible
 sample timing or configuration-matching observations of actual work exist.
 Calibration can still recommend bounded resource settings without inventing a
 corpus completion time.
+
+
+## Immutable edit plans
+
+Always supply an existing explicit `--catalog`. Read-only commands open without
+migrations and return the ordinary JSON envelope. Commands:
+
+```bash
+rcdvlog --catalog /absolute/project/catalog.sqlite3 edit-plan list --project <project-id>
+rcdvlog --catalog /absolute/project/catalog.sqlite3 edit-plan get --revision <revision-id>
+rcdvlog --catalog /absolute/project/catalog.sqlite3 edit-plan create --project <project-id> --input /absolute/plan.json --expected-base none --expected-active none
+rcdvlog --catalog /absolute/project/catalog.sqlite3 edit-plan diff --base <revision-a> --revision <revision-b>
+rcdvlog --catalog /absolute/project/catalog.sqlite3 edit-plan validate --revision <revision-id>
+rcdvlog --catalog /absolute/project/catalog.sqlite3 edit-plan activate --revision <revision-id> --expected-active none
+rcdvlog --catalog /absolute/project/catalog.sqlite3 edit-plan preview --revision <revision-id> --max-height 360
+```
+
+The complete ordered input is an object (maximum 4 MiB and 10,000 cuts):
+
+```json
+{
+  "operations": [
+    {"operationId": "opening", "position": 0, "assetId": "asset-id", "sourceInSeconds": 0.25, "sourceOutSeconds": 2.0, "rationale": "Establish the journey"}
+  ]
+}
+```
+
+`scriptRevisionId` is optional. Unknown fields are rejected, including unsupported
+audio/track/effect fields. Positions must equal zero-based array indices. Empty
+`operationId` values receive generated IDs. Keep the same ID when trimming or
+reordering a cut; give each new cut, split, or repeated-source use its own ID.
+IDs are unique within each revision and may persist across revisions. A diff
+returns each changed cut's identity, before/after values, and change kinds
+(`added`, `omitted`, `order`, `source`, `range`, `rationale`).
+
+Ranges are finite seconds on the source clock, inclusive in / exclusive out.
+Source reuse and overlapping ranges are legal and reported as advisory warnings.
+No frame snapping occurs at plan persistence: retain exact measured duration for
+an endpoint at source end. Rendering passes decimal seconds without millisecond
+rounding; decoding selects source frames and the preview resamples to its
+30000/1001 frame grid. Its encoded frame/audio packet boundaries are not proof
+that a model's decimal locator is a frame-accurate source boundary.
+
+Creation always saves an inactive immutable draft, including finite invalid
+ranges so the validation report can explain and recover the work. Nonfinite
+ranges and duplicate cut IDs are refused before saving. `validate` returns
+`renderable` and findings; blocking invalid/unknown-duration/out-of-media ranges
+and unavailable originals prevent activation/rendering. A refused activation
+leaves the draft available. Older revisions and desktop drafts are retained.
+
+`--expected-base` selects the immutable parent (any same-project draft), while
+`--expected-active` independently guards the current active plan. Both are
+required for creation; use the literal `none` to assert absence. Activation
+requires `--expected-active` too. Guard checks and writes share one immediate
+SQLite transaction, so concurrent clients cannot silently replace a newer active
+plan. Stale writes report `edit_plan_stale_revision`; failed validation reports
+`edit_plan_validation_failed`. Preview never activates and returns the addressed
+revision ID plus preview metadata. Progress events go to stderr.
+
+Revision-bound review feedback and independent source audio are follow-up slices
+under #112 and #183; this interface does not accept either yet.

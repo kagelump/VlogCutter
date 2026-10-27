@@ -216,7 +216,8 @@ Important gaps; do not accidentally describe these as complete:
   events, and scripts remain unimplemented. Edit-plan revisions, validation,
   preview rendering, and OTIO writing exist, but the desktop edit-plan workflow
   still lacks reordering, trimming, removal, preview playback, export history,
-  and overwrite confirmation; there is no edit-plan CLI yet.
+  and overwrite confirmation. The supported `edit-plan` CLI exposes
+  list/get/create/diff/validate/activate/preview.
 - No materialized project-local agent workspace. The CLI can report its build
   and readiness, and can explicitly bind/check the selected executable and
   catalog in `<project-root>/.vlogcutter/cli-binding.json`. This binding never
@@ -534,7 +535,7 @@ Always pass `--catalog` in agent automation, tests, and temporary workflows. A d
 
 SQLite connections enable foreign keys, WAL journal mode, and a five-second busy timeout. Read operations can continue during an uncommitted writer. Project mutations append typed operations with materialized revisions. Adopted projects synchronize bounded operation pages between independent local catalogs; live SQLite/WAL files are never copied or placed on NAS.
 
-Project catalogs use an explicit `schema_migrations` history and are currently at version 31. The server control catalog is version 11; backup format is version 1. Migration definitions have immutable names/source identities and each migration commits atomically. Migration 18 includes a one-time compatibility reconciliation for catalogs created on the import feature branch before its migration IDs were merged with main. When changing the schema:
+Project catalogs use an explicit `schema_migrations` history and are currently at version 49. The server control catalog is version 11; backup format is version 1. Migration definitions have immutable names/source identities and each migration commits atomically. Migration 18 includes a one-time compatibility reconciliation for catalogs created on the import feature branch before its migration IDs were merged with main. When changing the schema:
 
 - Preserve existing catalogs; never solve migration issues by deleting the database.
 - Add a forward migration and an upgrade test using an older schema fixture.
