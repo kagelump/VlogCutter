@@ -25,6 +25,10 @@ import type {
   ReviewFeedbackView,
   ReviewFeedbackPage,
   ApplyReviewFeedbackResult,
+  SequenceSelectionRequest,
+  SelectionProposal,
+  SelectionDraftResult,
+  SelectionRevisionView,
 } from "../../../chronologyTypes";
 import type { JobBinding } from "../jobs";
 import type { CommandTable, HarnessContext } from "../registry";
@@ -62,6 +66,20 @@ function assertNotStale(expected: unknown, activeId: string | null) {
     `The edit plan changed since you loaded it: expected ${expectation ?? "no active revision"}, ` +
       `but ${activeId ?? "no revision"} is active. Reload and try again.`,
   );
+}
+
+function sequenceSelectionRequestFrom(value: unknown, command: string): SequenceSelectionRequest {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${command} requires a request object`);
+  const request = value as Partial<SequenceSelectionRequest>;
+  if (typeof request.projectId !== "string" || request.projectId.length === 0) throw new Error(`${command} requires request.projectId`);
+  if (!Object.prototype.hasOwnProperty.call(request, "expectedBaseRevisionId") || (request.expectedBaseRevisionId !== null && typeof request.expectedBaseRevisionId !== "string")) {
+    throw new Error(`${command} requires request.expectedBaseRevisionId as a revision id or null`);
+  }
+  if (!Object.prototype.hasOwnProperty.call(request, "expectedActiveRevisionId") || (request.expectedActiveRevisionId !== null && typeof request.expectedActiveRevisionId !== "string")) {
+    throw new Error(`${command} requires request.expectedActiveRevisionId as a revision id or null`);
+  }
+  if (!request.input || typeof request.input !== "object" || Array.isArray(request.input)) throw new Error(`${command} requires request.input`);
+  return request as SequenceSelectionRequest;
 }
 
 export interface PreviewStep {
@@ -263,6 +281,31 @@ function trimRequestFrom(value: unknown): SourceTrimRequest {
 }
 
 export const editPlanCommands: CommandTable = {
+  preview_sequence_selection: (args, { state }): SelectionProposal => {
+    const request = sequenceSelectionRequestFrom(args.request, "preview_sequence_selection");
+    const key = `${request.projectId}:${request.expectedBaseRevisionId ?? "none"}`;
+    const response = state.editPlans.selectionPreviews[key];
+    if (!response) throw new Error(`Scenario did not declare selection preview for ${key}`);
+    return response;
+  },
+  create_sequence_selection: (args, { state }): SelectionDraftResult => {
+    const request = sequenceSelectionRequestFrom(args.request, "create_sequence_selection");
+    const key = `${request.projectId}:${request.expectedBaseRevisionId ?? "none"}`;
+    const response = state.editPlans.selectionCreates[key];
+    if (!response) throw new Error(`Scenario did not declare selection draft for ${key}`);
+    if (response.revision.projectId !== request.projectId) throw new Error("selection draft belongs to another project");
+    return response;
+  },
+  edit_plan_selection: (args, { state }): SelectionRevisionView => {
+    const projectId = requireString(args, "projectId");
+    const revisionId = requireString(args, "revisionId");
+    const response = state.editPlans.selectionViews[revisionId];
+    if (!response) throw new Error(`Scenario did not declare selection view for ${revisionId}`);
+    const revision = state.editPlans.revisions.find((candidate) => candidate.revisionId === revisionId);
+    if (!revision) throw new Error(`Unknown edit plan revision: ${revisionId}`);
+    if (revision.projectId !== projectId) throw new Error("edit plan revision belongs to another project");
+    return response;
+  },
   record_review_note: (args, { state }): ReviewFeedbackView => {
     const request = args.request as Record<string, unknown> | undefined;
     if (!request || typeof request.projectId !== "string" || typeof request.revisionId !== "string" || typeof request.operationId !== "string") throw new Error("record_review_note requires request.projectId, request.revisionId, and request.operationId");

@@ -14,7 +14,7 @@
 import { describe, expect, it } from "vitest";
 import { desktopScenario } from "../harness";
 import { chronologyApi } from "../../chronologyApi";
-import type { ApplyReviewFeedbackResult, ReviewFeedbackPage, ReviewFeedbackView } from "../../chronologyTypes";
+import type { ApplyReviewFeedbackResult, ReviewFeedbackPage, ReviewFeedbackView, SelectionProposal } from "../../chronologyTypes";
 import {
   CHRONOLOGY_COMMANDS_SOURCE,
   CHRONOLOGY_TYPES_SOURCE,
@@ -342,6 +342,24 @@ describe("the harness's own guarantees", () => {
     for (const entry of contractExemptions) {
       expect(entry.command, "an exemption needs a command").toBeTruthy();
       expect(entry.reason.trim().length, `exemption for ${entry.command} has no reason`).toBeGreaterThan(20);
+    }
+  });
+
+  it("serves declared sequence-selection replies through the registered harness command", async () => {
+    const harness = desktopScenario().project("Selection project", { id: "project_selection" }).build().install();
+    try {
+      const proposal = { operations: [], metadata: {}, report: { limitations: ["fixture"] } } as unknown as SelectionProposal;
+      harness.state.editPlans.selectionPreviews["project_selection:none"] = proposal;
+      await expect(window.__TAURI_INTERNALS__!.invoke("preview_sequence_selection", {
+        request: {
+          projectId: "project_selection",
+          expectedBaseRevisionId: null,
+          expectedActiveRevisionId: null,
+          input: { version: 1, decisionOwner: "human", goal: "test", sequences: [], minimumScore: 0, repetitionPenalty: 0, coverageBonus: 0 },
+        },
+      })).resolves.toEqual(proposal);
+    } finally {
+      harness.uninstall();
     }
   });
 });

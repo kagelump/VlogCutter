@@ -2017,8 +2017,12 @@ fn main() -> ExitCode {
             let source_range_error = error.downcast_ref::<rcdvlog_core::SourceRangeError>();
             let preview_artifact_error = error.downcast_ref::<rcdvlog_core::PreviewArtifactError>();
             let review_feedback_error = error.downcast_ref::<rcdvlog_core::ReviewFeedbackError>();
+            let sequence_selection_error =
+                error.downcast_ref::<rcdvlog_core::SequenceSelectionError>();
             let code = if let Some(plan) = edit_plan_error {
                 plan.code()
+            } else if let Some(selection) = sequence_selection_error {
+                selection.code()
             } else if let Some(inspection) = inspection_error {
                 inspection.code()
             } else if let Some(ranges) = source_range_error {

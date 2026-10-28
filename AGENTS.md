@@ -101,6 +101,9 @@ Implemented now:
   segment receipts, bounded progress/status reads, explicit cancellation, and
   opt-in byte/input verification. They are derived evidence, not synchronized
   decisions; see `docs/edit-plan-preview-artifacts.md`.
+- Schema 56 adds optional immutable chapter selection intent, pacing profiles,
+  evidence identities and reports. Selection reuses local moments, preserves human
+  constraints and creates inactive normal plans; see `docs/edit-plan-selection.md`.
 - Schema 55 adds portable revision-bound edit-review notes, proposals, human
   decisions and target mappings. Only an explicit accepted proposal can be
   applied, producing a normal inactive edit-plan draft; feedback does not
@@ -224,8 +227,8 @@ Important gaps; do not accidentally describe these as complete:
   merged, or deleted: `apps/desktop/src/review/labelVocabulary.ts` is a
   read-only view over the labels already written.
 - Sparse suggested key moments and a bounded preparation evidence CLI now exist;
-  they do not certify arbitrary cut ranges or replace human review. Chapters,
-  events, and scripts remain unimplemented. Edit-plan revisions, validation,
+  they do not certify arbitrary cut ranges or replace human review. Separate chapter/event/script entities remain unimplemented; optional sequence
+  intent is stored with immutable edit-plan revisions. Edit-plan revisions, validation,
   preview rendering, and OTIO writing exist, but the desktop edit-plan workflow
   still lacks reordering, trimming, removal, preview playback, export history,
   and overwrite confirmation. The supported `edit-plan` CLI exposes
@@ -553,7 +556,7 @@ Always pass `--catalog` in agent automation, tests, and temporary workflows. A d
 
 SQLite connections enable foreign keys, WAL journal mode, and a five-second busy timeout. Read operations can continue during an uncommitted writer. Project mutations append typed operations with materialized revisions. Adopted projects synchronize bounded operation pages between independent local catalogs; live SQLite/WAL files are never copied or placed on NAS.
 
-Project catalogs use an explicit `schema_migrations` history and are currently at version 55. The server control catalog is version 11; backup format is version 1. Migration definitions have immutable names/source identities and each migration commits atomically. Migration 18 includes a one-time compatibility reconciliation for catalogs created on the import feature branch before its migration IDs were merged with main. When changing the schema:
+Project catalogs use an explicit `schema_migrations` history and are currently at version 56. The server control catalog is version 11; backup format is version 1. Migration definitions have immutable names/source identities and each migration commits atomically. Migration 18 includes a one-time compatibility reconciliation for catalogs created on the import feature branch before its migration IDs were merged with main. When changing the schema:
 
 - Preserve existing catalogs; never solve migration issues by deleting the database.
 - Add a forward migration and an upgrade test using an older schema fixture.

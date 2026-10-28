@@ -895,3 +895,226 @@ fn feedback_review_revision_workflow(
         false
     );
 }
+
+#[test]
+fn generated_media_sequence_selection_cli_preview_create_get_and_bounds() {
+    for tool in ["ffmpeg", "ffprobe"] {
+        assert!(
+            Command::new(tool)
+                .arg("-version")
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+    }
+    let dir = tempdir().unwrap();
+    let catalog = dir.path().join("catalog.sqlite3");
+    let media = dir.path().join("declared selection media");
+    fs::create_dir(&media).unwrap();
+    let source = media.join("synthetic clip.mp4");
+    let output = Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=160x90:rate=30:duration=3",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-an",
+        ])
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let project = success(
+        &catalog,
+        &["project", "create", "--name", "Selection CLI fixture"],
+    );
+    let project = project["id"].as_str().unwrap().to_string();
+    success(
+        &catalog,
+        &[
+            "ingest",
+            "--project",
+            &project,
+            "--folder",
+            media.to_str().unwrap(),
+        ],
+    );
+    let assets = success(&catalog, &["clips", "list", "--project", &project]);
+    let asset = assets
+        .as_array()
+        .or_else(|| assets["items"].as_array())
+        .unwrap()[0]
+        .clone();
+    let asset_id = asset["id"].as_str().unwrap();
+
+    let input_value = |inverted: bool| {
+        let (core_start, core_end) = if inverted { (1200, 500) } else { (500, 1500) };
+        json!({
+            "version": 1,
+            "decisionOwner": "human",
+            "goal": "Show the declared synthetic moment",
+            "sequences": [{
+                "sequenceId": "synthetic_sequence",
+                "goal": "Establish the generated clip",
+                "pacing": { "preset": "natural", "preferredMinSeconds": 0.5, "preferredMaxSeconds": 2.0, "longReviewSeconds": 2.0, "preferredUpperSeconds": 3.0, "preferredLongHolds": 1, "allowMontageFragments": false },
+                "sources": [{
+                    "kind": "declared", "assetId": asset_id,
+                    "expectedSourceFingerprint": asset["fingerprint"],
+                    "rationale": "Generated public media fixture",
+                    "candidates": [{
+                        "id": "declared_moment", "rank": 1, "score": 0.9,
+                        "core": { "startMs": core_start, "endMs": core_end },
+                        "payoff": { "startMs": 700, "endMs": 1200 },
+                        "setup": null, "context": null,
+                        "allowedRange": { "startMs": 500, "endMs": 1500 },
+                        "reason": "Synthetic declared locator", "event": "test pattern", "role": "action",
+                        "evidence": [], "uncertainty": [], "dialogueBoundaries": [], "refined": false
+                    }]
+                }],
+                "budgetSeconds": null, "placeContext": null
+            }],
+            "budgetSeconds": null, "minimumScore": 0.0, "repetitionPenalty": 0.0, "coverageBonus": 0.0
+        })
+    };
+    let input = dir.path().join("selection.json");
+    fs::write(&input, serde_json::to_vec(&input_value(false)).unwrap()).unwrap();
+    let args = |verb: &str, path: &Path, active: &str| {
+        vec![
+            "edit-plan".to_string(),
+            "selection".to_string(),
+            verb.to_string(),
+            "--project".to_string(),
+            project.clone(),
+            "--input".to_string(),
+            path.to_str().unwrap().to_string(),
+            "--expected-base".to_string(),
+            "none".to_string(),
+            "--expected-active".to_string(),
+            active.to_string(),
+        ]
+    };
+    let before_preview = fs::read(&catalog).unwrap();
+    let preview_args = args("preview", &input, "none");
+    let preview_args_ref = preview_args.iter().map(String::as_str).collect::<Vec<_>>();
+    let preview = success(&catalog, &preview_args_ref);
+    assert_eq!(preview["operations"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        fs::read(&catalog).unwrap(),
+        before_preview,
+        "preview must not write a selection cache or revision"
+    );
+
+    // Scope flags are mandatory even when there is no base or active plan.
+    failure(
+        &catalog,
+        &[
+            "edit-plan",
+            "selection",
+            "preview",
+            "--project",
+            &project,
+            "--input",
+            input.to_str().unwrap(),
+        ],
+        "invalid_input",
+    );
+    let created_args = args("create", &input, "none");
+    let created_args_ref = created_args.iter().map(String::as_str).collect::<Vec<_>>();
+    let created = success(&catalog, &created_args_ref);
+    let revision = created["revision"]["revisionId"].as_str().unwrap();
+    assert_eq!(
+        created["revision"]["active"], false,
+        "selection creates a draft only"
+    );
+    let get_args = [
+        "edit-plan",
+        "selection",
+        "get",
+        "--project",
+        &project,
+        "--revision",
+        revision,
+    ];
+    let before_get = fs::read(&catalog).unwrap();
+    let first_get = success(&catalog, &get_args);
+    let second_get = success(&catalog, &get_args);
+    assert_eq!(first_get, second_get, "get must produce stable JSON");
+    assert_eq!(first_get["schemaReady"], true);
+    assert!(first_get["metadata"].is_object());
+    assert_eq!(
+        fs::read(&catalog).unwrap(),
+        before_get,
+        "get must remain read-only"
+    );
+    failure(
+        &catalog,
+        &[
+            "edit-plan",
+            "activate",
+            "--revision",
+            revision,
+            "--expected-active",
+            "stale_revision",
+        ],
+        "edit_plan_stale_revision",
+    );
+
+    fs::write(&input, serde_json::to_vec(&input_value(true)).unwrap()).unwrap();
+    let inverted_args = args("preview", &input, "none");
+    failure(
+        &catalog,
+        &inverted_args.iter().map(String::as_str).collect::<Vec<_>>(),
+        "invalid_input",
+    );
+
+    let mut unavailable = input_value(false);
+    unavailable["sequences"][0]["sources"][0] = json!({
+        "kind": "current", "assetId": asset_id,
+        "expectedMomentIdentity": "missing-generated-moment-evidence", "candidateIds": []
+    });
+    fs::write(&input, serde_json::to_vec(&unavailable).unwrap()).unwrap();
+    let unavailable_args = args("preview", &input, "none");
+    failure(
+        &catalog,
+        &unavailable_args
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        "selection_evidence_unavailable",
+    );
+
+    let mut stale = input_value(false);
+    stale["sequences"][0]["sources"][0]["expectedSourceFingerprint"] =
+        json!("changed-source-fingerprint");
+    fs::write(&input, serde_json::to_vec(&stale).unwrap()).unwrap();
+    let stale_args = args("preview", &input, "none");
+    failure(
+        &catalog,
+        &stale_args.iter().map(String::as_str).collect::<Vec<_>>(),
+        "selection_stale_evidence",
+    );
+
+    let oversized = dir.path().join("oversized-selection.json");
+    fs::write(&oversized, vec![b' '; 8 * 1024 * 1024 + 1]).unwrap();
+    let oversized_args = args("preview", &oversized, "none");
+    failure(
+        &catalog,
+        &oversized_args
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        "invalid_input",
+    );
+}

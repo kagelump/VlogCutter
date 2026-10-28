@@ -47,6 +47,7 @@ import type {
   RecordReviewNoteRequest, ReviewFeedbackView, ReviewFeedbackPage,
   ProposeReviewChangeRequest, DecideReviewFeedbackRequest, MapReviewTargetRequest,
   ApplyReviewFeedbackRequest, ApplyReviewFeedbackResult,
+  SequenceSelectionRequest, SelectionProposal, SelectionDraftResult, SelectionRevisionView,
 } from "./chronologyTypes";
 
 const inTauri = () => "__TAURI_INTERNALS__" in window;
@@ -360,6 +361,18 @@ export const chronologyApi = {
       scriptRevisionId: null,
       expectedActiveRevisionId,
     });
+  },
+
+  async previewSequenceSelection(request: SequenceSelectionRequest): Promise<SelectionProposal> {
+    return invoke<SelectionProposal>("preview_sequence_selection", { request });
+  },
+
+  async createSequenceSelection(request: SequenceSelectionRequest): Promise<SelectionDraftResult> {
+    return invoke<SelectionDraftResult>("create_sequence_selection", { request });
+  },
+
+  async editPlanSelection(projectId: string, revisionId: string): Promise<SelectionRevisionView> {
+    return invoke<SelectionRevisionView>("edit_plan_selection", { projectId, revisionId });
   },
 
   async activateEditPlanRevision(

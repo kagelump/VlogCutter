@@ -324,6 +324,29 @@ export interface EditPlanChange { operationId: string; changes: string[]; before
 export interface EditPlanDiff { baseRevisionId: string; revisionId: string; changes: EditPlanChange[] }
 export interface ApplyReviewFeedbackResult { revision: EditPlanRevision; diff: EditPlanDiff; validation: ValidationReport; addressedNoteIds: string[] }
 
+export type SelectionActivity = "active" | "passive" | "movement" | "dialogue" | "uncertain";
+export type SelectionMomentSource =
+  | { kind: "current"; assetId: string; expectedMomentIdentity: string; candidateIds?: string[] }
+  | { kind: "declared"; assetId: string; expectedSourceFingerprint: string; rationale: string; candidates: MomentCandidate[] };
+export interface MomentSpan { startMs: number; endMs: number }
+export interface MomentCandidate { id: string; rank: number; score: number; core: MomentSpan; payoff: MomentSpan; setup: MomentSpan | null; context: MomentSpan | null; allowedRange: MomentSpan; reason: string; event: string; role: string; evidence: Array<{ kind: string; key: string; span: MomentSpan | null }>; uncertainty: string[]; dialogueBoundaries: MomentSpan[]; refined: boolean; longHold?: boolean }
+export interface SelectionCandidateKey { sequenceId: string; assetId: string; candidateId: string }
+export interface SequencePacingProfile { preset: "natural" | "rapidMovement" | "custom"; preferredMinSeconds: number; preferredMaxSeconds: number; longReviewSeconds: number; preferredUpperSeconds: number; preferredLongHolds: number; allowMontageFragments: boolean }
+export interface SequenceIntent { sequenceId: string; goal: string; pacing: SequencePacingProfile; sources: SelectionMomentSource[]; roleClaims?: Array<{ key: SelectionCandidateKey; role: string; activity: SelectionActivity; rationale: string }>; retainedChoices?: Array<{ noteId: string; role: string; activity: SelectionActivity; rationale: string }>; heroCandidates?: SelectionCandidateKey[]; budgetSeconds: number | null; hardBudget?: boolean; majorPlaceChange?: boolean; placeContext: { kind: "visual" | "spoken" | "humanSupplied"; description: string; establishingCandidate: SelectionCandidateKey; decisionOwner: "human" } | null }
+export interface SequenceSelectionInput { version: number; decisionOwner: "human"; goal: string; sequences: SequenceIntent[]; include?: SelectionCandidateKey[]; exclude?: SelectionCandidateKey[]; counts?: Array<{ sequenceId: string | null; role: string; minimum: number; maximum: number; hard: boolean; rationale: string }>; relationships?: Array<{ before: SelectionCandidateKey; after: SelectionCandidateKey; keepTogether: boolean; hard: boolean; rationale: string }>; budgetSeconds: number | null; hardBudget?: boolean; minimumScore: number; repetitionPenalty: number; coverageBonus: number }
+export interface SequenceSelectionRequest { projectId: string; expectedBaseRevisionId: string | null; expectedActiveRevisionId: string | null; input: SequenceSelectionInput }
+export interface SelectionEvidenceIdentity { sourceFingerprint: string; momentIdentity: string; candidateFingerprint: string; origin: string; provider: string | null; requestedModel: string | null; actualModel: string | null; promptVersion: string | null; schemaVersion: string | null; recipeVersion: string; policyFingerprint: string; representationFingerprint: string | null; samplingLimits: string[] }
+export interface SelectedMomentAssignment { operationId: string; sequenceId: string; candidate: SelectionCandidateKey | null; retainedNoteId: string | null; assetId: string; role: string; activity: SelectionActivity; event: string; coverageBucket: number; originalCore: MomentSpan; completeSpan: MomentSpan; chosenSourceInSeconds: number; chosenSourceOutSeconds: number; montageFragment: boolean; rationale: string; evidence: SelectionEvidenceIdentity; uncertainty: string[] }
+export interface SelectionConflict { candidate: SelectionCandidateKey | null; assetId: string | null; code: string; blocking: boolean; sequenceId: string | null; operationId: string | null; message: string }
+export interface SelectionMetadata { version: number; recipe: string; inputIdentity: string; input: SequenceSelectionInput; assignments: SelectedMomentAssignment[]; constraintsKey: string; planningConflicts: SelectionConflict[] }
+export interface SelectionRoleDistribution { role: string; count: number; durationSeconds: number; shortestSeconds: number; longestSeconds: number; medianSeconds: number }
+export interface SelectionSequenceSummary { sequenceId: string; goal: string; earnedSeconds: number; preferredBudgetSeconds: number | null; unfilledSeconds: number | null; activeSeconds: number; passiveSeconds: number; uncertainSeconds: number; earlyCount: number; middleCount: number; lateCount: number; roles: SelectionRoleDistribution[] }
+export interface SelectionReviewItem { operationId: string; sequenceId: string; durationSeconds: number; reason: string; alternatives: SelectionCandidateKey[] }
+export interface SelectionReport { durationBasis: string; recipe: string; inputIdentity: string; reused: boolean; earnedSeconds: number; preferredBudgetSeconds: number | null; unfilledSeconds: number | null; sequences: SelectionSequenceSummary[]; conflicts: SelectionConflict[]; longTakeReview: SelectionReviewItem[]; deferredCandidates: SelectionCandidateKey[]; limitations: string[] }
+export interface SelectionProposal { operations: Array<EditPlanOperationInput & { position: number }>; metadata: SelectionMetadata; report: SelectionReport }
+export interface SelectionDraftResult { revision: EditPlanRevision; report: SelectionReport; validation: ValidationReport }
+export interface SelectionRevisionView { schemaReady: boolean; revisionId: string; metadata: SelectionMetadata | null; report: SelectionReport | null }
+
 export type InspectionRepresentation = "original" | "generatedProxy" | "cameraProxy";
 export type InspectionPurpose = "locator" | "proposedBoundary" | "inspectedBoundary";
 

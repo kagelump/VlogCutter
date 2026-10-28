@@ -2793,6 +2793,9 @@ pub fn run() {
             // D01-T023: edit plan and export
             chronology_commands::active_edit_plan,
             chronology_commands::edit_plan_revisions,
+            chronology_commands::preview_sequence_selection,
+            chronology_commands::create_sequence_selection,
+            chronology_commands::edit_plan_selection,
             chronology_commands::create_edit_plan_revision,
             chronology_commands::activate_edit_plan_revision,
             chronology_commands::record_review_note,

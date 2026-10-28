@@ -25,6 +25,8 @@ pub enum FindingKind {
     SourceRangeOverlap,
     ConfirmedRangeViolation,
     HumanChoiceViolation,
+    SelectionConflict,
+    SelectionReview,
     StaleScriptRevision,
     StaleRevision,
 }
@@ -41,6 +43,8 @@ impl FindingKind {
     /// The stable code, referenced by the desktop and the CLI.
     pub const fn code(self) -> &'static str {
         match self {
+            Self::SelectionConflict => "edit_plan_selection_conflict",
+            Self::SelectionReview => "edit_plan_selection_review",
             Self::HumanChoiceViolation => "edit_plan_human_choice_violation",
             Self::AudioInvalid => "edit_plan_audio_invalid",
             Self::MissingAsset => "edit_plan_missing_asset",
@@ -59,6 +63,7 @@ impl FindingKind {
     pub const fn severity(self) -> Severity {
         match self {
             Self::AudioInvalid
+            | Self::SelectionConflict
             | Self::HumanChoiceViolation
             | Self::ConfirmedRangeViolation
             | Self::MissingAsset
@@ -66,7 +71,8 @@ impl FindingKind {
             | Self::RangeOutOfBounds
             | Self::RangeInverted
             | Self::RangeZeroLength => Severity::Error,
-            Self::ProxyMissing
+            Self::SelectionReview
+            | Self::ProxyMissing
             | Self::SourceRangeOverlap
             | Self::StaleScriptRevision
             | Self::StaleRevision => Severity::Warning,
@@ -182,6 +188,24 @@ impl Catalog {
             if pending {
                 findings.push(Finding::new(FindingKind::HumanChoiceViolation, None, None,
                 "Retained human feedback requires an explicit writable catalog upgrade before validation.".into()));
+            }
+        }
+        if let Some(metadata) = super::selection::load_metadata(&self.connection()?, revision_id)? {
+            for conflict in super::selection_report::report(&revision, &metadata).conflicts {
+                findings.push(Finding::new(
+                    if conflict.blocking {
+                        FindingKind::SelectionConflict
+                    } else {
+                        FindingKind::SelectionReview
+                    },
+                    conflict
+                        .operation_id
+                        .as_ref()
+                        .and_then(|id| revision.operations.iter().find(|c| &c.operation_id == id))
+                        .map(|c| c.position),
+                    conflict.asset_id,
+                    format!("{}: {}", conflict.code, conflict.message),
+                ));
             }
         }
         for cut in &revision.operations {

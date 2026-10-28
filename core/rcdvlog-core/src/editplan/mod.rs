@@ -33,6 +33,11 @@ mod preview_media;
 mod preview_segments;
 mod range_model;
 pub mod ranges;
+pub mod selection;
+mod selection_logic;
+mod selection_model;
+mod selection_report;
+mod selection_source;
 pub mod validate;
 
 pub use audio::{EditPlanAudio, SourceAudio};
@@ -437,7 +442,10 @@ fn require_active(
     Ok(())
 }
 
-fn read_revision(connection: &rusqlite::Connection, revision_id: &str) -> Result<EditPlanRevision> {
+pub(crate) fn read_revision(
+    connection: &rusqlite::Connection,
+    revision_id: &str,
+) -> Result<EditPlanRevision> {
     let (project_id, script_revision_id, parent_revision_id, active, created_at) = connection
         .query_row(
             "SELECT project_id, script_revision_id, parent_revision_id, active, created_at
@@ -513,8 +521,30 @@ fn revision_operation(
     script_revision_id: Option<&str>,
     base_revision_id: Option<&str>,
 ) -> Result<(String, NewOperation)> {
+    let inherited = base_revision_id
+        .map(|base| selection::load_metadata(connection, base))
+        .transpose()?
+        .flatten();
+    revision_operation_with_selection(
+        connection,
+        project_id,
+        operations,
+        script_revision_id,
+        base_revision_id,
+        inherited.as_ref(),
+    )
+}
+
+fn revision_operation_with_selection(
+    connection: &rusqlite::Connection,
+    project_id: &str,
+    operations: &[EditPlanOperation],
+    script_revision_id: Option<&str>,
+    base_revision_id: Option<&str>,
+    selection: Option<&selection_model::SelectionMetadata>,
+) -> Result<(String, NewOperation)> {
     let revision_id = format!("editrev_{}", Uuid::new_v4().simple());
-    let payload = serde_json::json!({
+    let mut payload = serde_json::json!({
         "revisionId": revision_id,
         "scriptRevisionId": script_revision_id,
         "parentRevisionId": base_revision_id,
@@ -531,6 +561,9 @@ fn revision_operation(
             })
             .collect::<Vec<_>>(),
     });
+    if let Some(metadata) = selection {
+        payload["selection"] = serde_json::to_value(metadata)?;
+    }
     let guard = current_revision(connection, project_id, "editPlan", project_id)?;
     Ok((
         revision_id,

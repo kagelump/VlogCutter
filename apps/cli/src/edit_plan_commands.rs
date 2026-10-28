@@ -4,11 +4,12 @@ use clap::{Args, Subcommand};
 use rcdvlog_core::{
     AcceptedReviewReference, ApplyReviewFeedbackRequest, Catalog, ConfirmSourceRangeRequest,
     DecideReviewFeedbackRequest, EditPlanOperation, MapReviewTargetRequest, PreviewRequest,
-    ProposeReviewChangeRequest, RecordReviewNoteRequest, SourceInspectionRequest,
-    SourceTrimRequest,
+    ProposeReviewChangeRequest, RecordReviewNoteRequest, SequenceSelectionInput,
+    SequenceSelectionRequest, SourceInspectionRequest, SourceTrimRequest,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::io::Read;
 use std::path::PathBuf;
 
 #[derive(Debug, Subcommand)]
@@ -108,6 +109,41 @@ pub enum EditPlanCommand {
         #[command(subcommand)]
         command: ReviewFeedbackCommand,
     },
+    /// Preview, create, or read versioned sequence selections.
+    Selection {
+        #[command(subcommand)]
+        command: SelectionCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SelectionCommand {
+    /// Propose sequence selections without changing the catalog.
+    Preview(SelectionScopeArgs),
+    /// Create an inactive edit-plan draft from sequence selections.
+    Create(SelectionScopeArgs),
+    /// Read selection metadata and report for one revision.
+    Get {
+        #[arg(long)]
+        project: String,
+        #[arg(long)]
+        revision: String,
+    },
+}
+
+#[derive(Debug, Args)]
+pub struct SelectionScopeArgs {
+    #[arg(long)]
+    project: String,
+    /// JSON file containing SequenceSelectionInput.
+    #[arg(long)]
+    input: PathBuf,
+    /// Immutable base revision id, or literal 'none'.
+    #[arg(long)]
+    expected_base: String,
+    /// Expected active revision id, or literal 'none'.
+    #[arg(long)]
+    expected_active: String,
 }
 
 #[derive(Debug, Subcommand)]
@@ -231,6 +267,11 @@ pub fn command_name(command: &EditPlanCommand) -> &'static str {
             ReviewFeedbackCommand::Report { .. } => "edit-plan.feedback.report",
             ReviewFeedbackCommand::Apply { .. } => "edit-plan.feedback.apply",
         },
+        EditPlanCommand::Selection { command } => match command {
+            SelectionCommand::Preview(_) => "edit-plan.selection.preview",
+            SelectionCommand::Create(_) => "edit-plan.selection.create",
+            SelectionCommand::Get { .. } => "edit-plan.selection.get",
+        },
     }
 }
 
@@ -249,6 +290,9 @@ pub fn is_read_only(command: &EditPlanCommand) -> bool {
             | EditPlanCommand::Validate(_)
             | EditPlanCommand::Feedback {
                 command: ReviewFeedbackCommand::Get { .. } | ReviewFeedbackCommand::Report { .. },
+            }
+            | EditPlanCommand::Selection {
+                command: SelectionCommand::Preview(_) | SelectionCommand::Get { .. },
             }
     )
 }
@@ -453,7 +497,57 @@ pub fn execute(catalog: &Catalog, command: &EditPlanCommand) -> Result<Value> {
                 )?)?)
             }
         },
+        EditPlanCommand::Selection { command } => match command {
+            SelectionCommand::Preview(args) => {
+                let request = selection_request(args, read_selection_input(&args.input)?);
+                Ok(serde_json::to_value(
+                    catalog.preview_sequence_selection(&request)?,
+                )?)
+            }
+            SelectionCommand::Create(args) => {
+                let request = selection_request(args, read_selection_input(&args.input)?);
+                Ok(serde_json::to_value(
+                    catalog.create_sequence_selection(&request)?,
+                )?)
+            }
+            SelectionCommand::Get { project, revision } => {
+                let revision_view = catalog.edit_plan_revision(revision)?;
+                ensure!(
+                    revision_view.project_id == *project,
+                    "edit plan revision belongs to another project"
+                );
+                Ok(serde_json::to_value(
+                    catalog.edit_plan_selection(revision)?,
+                )?)
+            }
+        },
     }
+}
+
+fn selection_request(
+    args: &SelectionScopeArgs,
+    input: SequenceSelectionInput,
+) -> SequenceSelectionRequest {
+    SequenceSelectionRequest {
+        project_id: args.project.clone(),
+        expected_base_revision_id: expected(&args.expected_base).map(str::to_owned),
+        expected_active_revision_id: expected(&args.expected_active).map(str::to_owned),
+        input,
+    }
+}
+
+fn read_selection_input(input: &PathBuf) -> Result<SequenceSelectionInput> {
+    let mut bytes = Vec::new();
+    std::fs::File::open(input)
+        .context("invalid input: open sequence selection JSON")?
+        .take(8 * 1024 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .context("invalid input: read sequence selection JSON")?;
+    ensure!(
+        bytes.len() <= 8 * 1024 * 1024,
+        "invalid input: sequence selection JSON exceeds 8 MiB"
+    );
+    serde_json::from_slice(&bytes).context("invalid input: parse sequence selection JSON")
 }
 
 fn read_review_input<T: serde::de::DeserializeOwned>(input: &PathBuf) -> Result<T> {
