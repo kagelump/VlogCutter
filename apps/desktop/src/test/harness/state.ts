@@ -55,6 +55,10 @@ import type {
   ReviewFeedbackPage,
   ApplyReviewFeedbackResult,
   VisualPlacementPreview,
+  SequenceSelectionRequest,
+  SelectionProposal,
+  SelectionDraftResult,
+  SelectionRevisionView,
 } from "../../chronologyTypes";
 import { HarnessClock } from "./clock";
 
@@ -108,6 +112,10 @@ export interface EditPlanScenarioState {
   feedbackResponses: Record<string, ReviewFeedbackView>;
   feedbackReports: Record<string, ReviewFeedbackPage>;
   feedbackApplyResults: Record<string, ApplyReviewFeedbackResult>;
+  /** Selection replies are complete scenario declarations keyed by project/base. */
+  selectionPreviews: Record<string, SelectionProposal>;
+  selectionCreates: Record<string, SelectionDraftResult>;
+  selectionViews: Record<string, SelectionRevisionView>;
 }
 
 export interface PairingScenarioState {
@@ -330,6 +338,9 @@ export function createInitialState(clock: HarnessClock): DesktopHarnessState {
       feedbackResponses: {},
       feedbackReports: {},
       feedbackApplyResults: {},
+      selectionPreviews: {},
+      selectionCreates: {},
+      selectionViews: {},
     },
     sourceRanges: {},
     sourceTrimSuggestions: {},

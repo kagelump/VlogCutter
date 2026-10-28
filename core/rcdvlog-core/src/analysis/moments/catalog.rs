@@ -736,7 +736,20 @@ impl Catalog {
     }
 
     fn moment_source(&self, asset: &Asset, include_transcript: bool) -> Result<SourceContext> {
-        let source = self.analysis_proxy_source(asset)?;
+        self.moment_source_mode(asset, include_transcript, false)
+    }
+
+    fn moment_source_mode(
+        &self,
+        asset: &Asset,
+        include_transcript: bool,
+        explicit_review: bool,
+    ) -> Result<SourceContext> {
+        let source = if explicit_review {
+            self.validated_review_proxy_source(asset, &|| false)?
+        } else {
+            self.analysis_proxy_source(asset)?
+        };
         let proxy = source.proxy;
         let duration_ms = source.duration_ms;
         let last_safe_sample_ms = source.last_safe_sample_ms;
@@ -1235,6 +1248,15 @@ impl Catalog {
     }
 
     fn moment_artifact_current(&self, asset: &Asset, artifact: &MomentArtifact) -> bool {
+        self.moment_artifact_current_mode(asset, artifact, false)
+    }
+
+    fn moment_artifact_current_mode(
+        &self,
+        asset: &Asset,
+        artifact: &MomentArtifact,
+        explicit_review: bool,
+    ) -> bool {
         if artifact.provenance.recipe_version != RECIPE_VERSION
             || artifact.provenance.prompt_version != PROMPT_VERSION
             || artifact.provenance.schema_version != SCHEMA_VERSION
@@ -1242,9 +1264,10 @@ impl Catalog {
         {
             return false;
         }
-        self.moment_source(
+        self.moment_source_mode(
             asset,
             artifact.provenance.payload == MomentPayload::FramesAndTranscript,
+            explicit_review,
         )
         .is_ok_and(|source| {
             source.fingerprint == artifact.provenance.representation_fingerprint
@@ -1252,6 +1275,46 @@ impl Catalog {
                 && source.transcript_fingerprint == artifact.provenance.transcript_fingerprint
                 && source.observation_fingerprint == artifact.provenance.observation_fingerprint
         })
+    }
+
+    /// One immutable row observation for explicit local selection. A full-row
+    /// digest catches force-replacement under the same configuration identity;
+    /// paging could otherwise splice two generations. No paid preparation runs.
+    pub(crate) fn selection_moment_artifact(
+        &self,
+        asset_id: &str,
+        identity: &str,
+    ) -> Result<Option<(MomentArtifact, bool, String)>> {
+        let asset = self.get_asset(asset_id)?;
+        let connection = self.connection()?;
+        if !crate::table_exists(&connection, "moment_artifacts")? {
+            return Ok(None);
+        }
+        let body: Option<String> = connection
+            .query_row(
+                "SELECT body_json FROM moment_artifacts WHERE asset_id=?1 AND identity=?2 AND length(body_json)<=8388608",
+                params![asset_id, identity],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(body) = body else {
+            return Ok(None);
+        };
+        ensure!(
+            body.len() <= 8 * 1024 * 1024,
+            "moment evidence exceeds selection input bound"
+        );
+        let artifact: MomentArtifact = serde_json::from_str(&body)?;
+        ensure!(
+            artifact.asset_id == asset_id && artifact.identity == identity,
+            "moment evidence identity does not match its canonical row"
+        );
+        let current = self.moment_artifact_current_mode(&asset, &artifact, true);
+        Ok(Some((
+            artifact,
+            current,
+            blake3::hash(body.as_bytes()).to_hex().to_string(),
+        )))
     }
 
     pub fn moment_evidence_page(

@@ -22,13 +22,22 @@ use rcdvlog_core::{
     EventOrderConstraint, MapReviewTargetRequest, OtioExportRequest, OtioExportResult, PhaseKind,
     PhaseSplitDirection, PreviewArtifactPage, PreviewArtifactStatus, PreviewProgress,
     PreviewRequest, PreviewResult, ProposeReviewChangeRequest, QueuePosition,
-    RecordReviewNoteRequest, ReviewFeedbackPage, ReviewFeedbackView, SourceInspectionRequest,
+    RecordReviewNoteRequest, ReviewFeedbackPage, ReviewFeedbackView, SelectionDraftResult,
+    SelectionProposal, SelectionRevisionView, SequenceSelectionRequest, SourceInspectionRequest,
     SourceInspectionResult, SourceRangeConstraints, SourceTrimRequest, SourceTrimSuggestion,
     TripPhase, ValidationReport, VisualPlacementPreview, VisualPlacementSide,
     resolve_anchored_phases,
 };
 use serde::{Deserialize, Serialize};
 use tauri::State;
+
+fn sequence_selection_error_message(error: anyhow::Error) -> String {
+    if let Some(selection) = error.downcast_ref::<rcdvlog_core::SequenceSelectionError>() {
+        format!("{}: {}", selection.code(), error)
+    } else {
+        error.to_string()
+    }
+}
 
 /// Everything the calibration surface reads in one round trip.
 ///
@@ -796,6 +805,64 @@ pub fn edit_plan_revisions(
         .catalog()?
         .edit_plan_revisions(&project_id)
         .map_err(error_message)
+}
+
+#[tauri::command]
+pub async fn preview_sequence_selection(
+    request: SequenceSelectionRequest,
+    state: State<'_, AppState>,
+) -> Result<SelectionProposal, String> {
+    let catalog = state.catalog()?;
+    tauri::async_runtime::spawn_blocking(move || {
+        catalog
+            .preview_sequence_selection(&request)
+            .map_err(sequence_selection_error_message)
+    })
+    .await
+    .map_err(error_message)?
+}
+
+#[tauri::command]
+pub async fn create_sequence_selection(
+    request: SequenceSelectionRequest,
+    state: State<'_, AppState>,
+) -> Result<SelectionDraftResult, String> {
+    let project_id = request.project_id.clone();
+    let catalog = state.catalog()?;
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        catalog
+            .create_sequence_selection(&request)
+            .map_err(sequence_selection_error_message)
+    })
+    .await
+    .map_err(error_message)??;
+    state.sync_manager.wake_project(&project_id);
+    Ok(result)
+}
+
+#[tauri::command]
+pub async fn edit_plan_selection(
+    project_id: String,
+    revision_id: String,
+    state: State<'_, AppState>,
+) -> Result<SelectionRevisionView, String> {
+    let catalog = state.catalog()?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let revision = catalog
+            .edit_plan_revision(&revision_id)
+            .map_err(error_message)?;
+        if revision.project_id != project_id {
+            return Err(format!(
+                "edit plan revision {} belongs to project {}, not {project_id}",
+                revision.revision_id, revision.project_id
+            ));
+        }
+        catalog
+            .edit_plan_selection(&revision_id)
+            .map_err(error_message)
+    })
+    .await
+    .map_err(error_message)?
 }
 
 #[tauri::command]

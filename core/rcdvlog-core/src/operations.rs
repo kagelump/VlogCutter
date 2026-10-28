@@ -1693,7 +1693,11 @@ pub(crate) fn commit_local_in_transaction(
             aggregate_type: new.aggregate_type.to_string(),
             aggregate_id: new.aggregate_id,
             operation_type: new.operation_type.to_string(),
-            payload_version: if (new.operation_type == PROJECT_ASSET_ADDED
+            payload_version: if new.operation_type == EDIT_PLAN_REVISION_CREATED
+                && new.payload.get("selection").is_some_and(|v| !v.is_null())
+            {
+                3
+            } else if (new.operation_type == PROJECT_ASSET_ADDED
                 && new
                     .payload
                     .get("timestampCandidates")
@@ -1702,7 +1706,8 @@ pub(crate) fn commit_local_in_transaction(
                     && new.payload["operations"].as_array().is_some_and(|cuts| {
                         cuts.iter()
                             .any(|cut| cut.get("audio").is_some_and(|audio| !audio.is_null()))
-                    })) {
+                    }))
+            {
                 2
             } else {
                 1
@@ -3546,6 +3551,8 @@ pub(crate) struct EditPlanRevisionCreatedPayload {
     pub(crate) script_revision_id: Option<String>,
     pub(crate) parent_revision_id: Option<String>,
     pub(crate) operations: Vec<crate::editplan::EditPlanOperation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) selection: Option<crate::SelectionMetadata>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -3574,7 +3581,7 @@ fn require_edit_plan_aggregate(operation: &ProjectOperation) -> Result<()> {
     Ok(())
 }
 
-fn materialize_edit_plan_revision_created(
+pub(crate) fn materialize_edit_plan_revision_created(
     transaction: &Transaction<'_>,
     operation: &ProjectOperation,
 ) -> Result<ApplyOperationResult> {
@@ -3582,9 +3589,31 @@ fn materialize_edit_plan_revision_created(
     if operation.payload_version == 1 && payload.operations.iter().any(|cut| cut.audio.is_some()) {
         bail!("independent source audio requires editPlanRevisionCreated payload version 2");
     }
+    if (operation.payload_version < 3 && payload.selection.is_some())
+        || (operation.payload_version == 3 && payload.selection.is_none())
+    {
+        bail!("sequence selection metadata requires editPlanRevisionCreated payload version 3");
+    }
     require_edit_plan_aggregate(operation)?;
     if !revision_guard_passes(transaction, operation)? {
         return Ok(ApplyOperationResult::Conflict);
+    }
+    let exists: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM edit_plan_revisions WHERE revision_id=?1)",
+        [&payload.revision_id],
+        |r| r.get(0),
+    )?;
+    if exists {
+        let existing = crate::editplan::read_revision(transaction, &payload.revision_id)?;
+        ensure!(
+            existing.project_id == operation.project_id
+                && existing.parent_revision_id == payload.parent_revision_id
+                && existing.script_revision_id == payload.script_revision_id
+                && existing.operations == payload.operations
+                && crate::editplan::selection::load_metadata(transaction, &payload.revision_id)?
+                    == payload.selection,
+            "immutable edit revision identity was reused with different content"
+        );
     }
     // `INSERT OR IGNORE` throughout, so applying the same operation id twice
     // materializes exactly once.
@@ -3597,6 +3626,14 @@ fn materialize_edit_plan_revision_created(
         &now(),
         &payload.operations,
     )?;
+    if let Some(metadata) = &payload.selection {
+        crate::editplan::selection::materialize_metadata(
+            transaction,
+            &operation.project_id,
+            &payload.revision_id,
+            metadata,
+        )?;
+    }
     advance_revision(transaction, operation)?;
     Ok(ApplyOperationResult::Applied)
 }
@@ -3802,7 +3839,7 @@ fn require_asset(transaction: &Transaction<'_>, operation: &ProjectOperation) ->
 fn payload<T: DeserializeOwned>(operation: &ProjectOperation) -> Result<T> {
     if operation.payload_version != 1
         && !(operation.operation_type == EDIT_PLAN_REVISION_CREATED
-            && operation.payload_version == 2)
+            && matches!(operation.payload_version, 2 | 3))
     {
         bail!(
             "unsupported payload version {} for {}",
@@ -3853,6 +3890,8 @@ fn validate_operation(operation: &ProjectOperation) -> Result<()> {
             operation.operation_type.as_str(),
             PROJECT_ASSET_ADDED | EDIT_PLAN_REVISION_CREATED
         ) && operation.payload_version == 2)
+        && !(operation.operation_type == EDIT_PLAN_REVISION_CREATED
+            && operation.payload_version == 3)
         && is_known_operation_type(&operation.operation_type)
     {
         bail!(

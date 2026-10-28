@@ -7,7 +7,7 @@ use thiserror::Error;
 
 use crate::chronology::forward_migrate_project_chronology;
 
-pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 55;
+pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 56;
 
 const MIGRATION_TABLE_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -414,7 +414,25 @@ pub const PROJECT_CATALOG_MIGRATIONS: &[SqliteMigration] = &[
         source_identity: "project-catalog/0055-revision-bound-edit-feedback/20261028",
         apply: revision_bound_edit_feedback,
     },
+    SqliteMigration {
+        id: 56,
+        name: "versioned_sequence_selection_inputs",
+        source_identity: "project-catalog/0056-versioned-sequence-selection-inputs/20261028",
+        apply: versioned_sequence_selection_inputs,
+    },
 ];
+
+fn versioned_sequence_selection_inputs(transaction: &Transaction<'_>) -> Result<()> {
+    add_column_if_missing(transaction, "edit_plan_revisions", "selection_json", "TEXT")?;
+    transaction.execute_batch(
+        "CREATE TABLE IF NOT EXISTS edit_selection_cache (
+        input_identity TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        body_json TEXT NOT NULL
+    );",
+    )?;
+    Ok(())
+}
 
 fn revision_bound_edit_feedback(transaction: &Transaction<'_>) -> Result<()> {
     transaction.execute_batch("CREATE TABLE IF NOT EXISTS edit_feedback_facts (

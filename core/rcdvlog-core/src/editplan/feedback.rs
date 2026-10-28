@@ -245,6 +245,20 @@ fn status(target: &ReviewTarget, plan: &EditPlanRevision) -> ReviewTargetStatus 
         candidates_truncated: truncated,
     }
 }
+fn scoped_status(
+    connection: &Connection,
+    target: &ReviewTarget,
+    plan: &EditPlanRevision,
+) -> Result<ReviewTargetStatus> {
+    let mut result = status(target, plan);
+    if super::selection::metadata_fingerprint(connection, &target.revision_id)?
+        != super::selection::metadata_fingerprint(connection, &plan.revision_id)?
+    {
+        result.flags.push("editorial_intent_changed".into());
+        result.requires_mapping = true;
+    }
+    Ok(result)
+}
 fn fact_parts(fact: &ReviewFeedbackFact) -> (&'static str, &str, &str) {
     match fact {
         ReviewFeedbackFact::Note(n) => ("note", &n.note_id, &n.note_id),
@@ -864,7 +878,7 @@ impl Catalog {
             );
             let target = effective_target(&transaction, &note, Some(&proposed))?;
             ensure!(
-                !status(&target, &base).requires_mapping,
+                !scoped_status(&transaction, &target, &base)?.requires_mapping,
                 ReviewFeedbackError::ChangedTarget
             );
             ensure!(
@@ -956,9 +970,12 @@ fn view(
     let proposal_target_status = decided_proposal
         .as_ref()
         .or(latest_proposal.as_ref())
-        .map(|p| self::effective_target(connection, &note, Some(p)).map(|t| status(&t, plan)))
+        .map(|p| {
+            self::effective_target(connection, &note, Some(p))
+                .and_then(|t| scoped_status(connection, &t, plan))
+        })
         .transpose()?;
-    let target_status = status(&effective_target, plan);
+    let target_status = scoped_status(connection, &effective_target, plan)?;
     let accepted_target_changed = if latest_decision
         .as_ref()
         .is_some_and(|d| d.proposal_id.is_some())
@@ -1227,7 +1244,7 @@ pub(crate) fn materialize(
                     )?;
                     let target = effective_target(transaction, &note, Some(&proposed))?;
                     ensure!(
-                        !status(&target, &parent).requires_mapping
+                        !scoped_status(transaction, &target, &parent)?.requires_mapping
                             && change_satisfied(&applied, &target, &proposed.change)?,
                         "applied review receipt does not match the accepted target/change"
                     );

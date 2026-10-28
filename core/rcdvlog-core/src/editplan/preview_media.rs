@@ -193,8 +193,16 @@ pub(super) fn prepare(
         });
         paths.insert(id.into(), path);
     }
-    let plan_digest=blake3::hash(&serde_json::to_vec(&json!({"revisionId":plan.revision_id,"projectId":plan.project_id,
-        "parentRevisionId":plan.parent_revision_id,"scriptRevisionId":plan.script_revision_id,"operations":plan.operations}))?).to_hex().to_string();
+    let mut plan_identity = json!({"revisionId":plan.revision_id,"projectId":plan.project_id,
+        "parentRevisionId":plan.parent_revision_id,"scriptRevisionId":plan.script_revision_id,"operations":plan.operations});
+    if let Some(selection) =
+        super::selection::metadata_fingerprint(&catalog.connection()?, &plan.revision_id)?
+    {
+        plan_identity["selection"] = json!(selection);
+    }
+    let plan_digest = blake3::hash(&serde_json::to_vec(&plan_identity)?)
+        .to_hex()
+        .to_string();
     let tools = tool_identities();
     let mut tool_content_fingerprints = Vec::new();
     for name in ["ffmpeg", "ffprobe"] {

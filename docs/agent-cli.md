@@ -1040,6 +1040,22 @@ rcdvlog --catalog /absolute/project/catalog.sqlite3 edit-plan feedback apply --p
 Feedback command JSON shapes, revision semantics, and safety limits are
 documented in [revision-bound edit-plan feedback](edit-plan-feedback.md).
 
+Optional chapter-wide intent and pacing selection (schema 56):
+
+```sh
+rcdvlog --catalog /absolute/project/catalog.sqlite3 edit-plan selection preview --project <project-id> --input /absolute/selection.json --expected-base none --expected-active none
+rcdvlog --catalog /absolute/project/catalog.sqlite3 edit-plan selection create --project <project-id> --input /absolute/selection.json --expected-base <revision-id-or-none> --expected-active <revision-id-or-none>
+rcdvlog --catalog /absolute/project/catalog.sqlite3 edit-plan selection get --project <project-id> --revision <revision-id>
+```
+
+Preview/get are read-only; create records an inactive, normally validated draft.
+Input accepts current canonical moments or explicitly authored locators, bounded
+to 8 MiB. Complete beats, explicit movement fragments, human constraints,
+earned-runtime reports, place context and evidence cache identity are documented
+in [chapter-wide sequence selection](edit-plan-selection.md). Selection never
+calls a provider or certifies speech/pacing quality.
+
+
 The complete ordered input is an object (maximum 4 MiB and 10,000 cuts):
 
 ```json
