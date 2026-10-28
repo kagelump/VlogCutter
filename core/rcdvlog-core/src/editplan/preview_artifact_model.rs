@@ -88,6 +88,8 @@ pub struct PreviewInputIdentity {
     pub tools: Vec<CalibrationToolIdentity>,
     #[serde(default)]
     pub tool_content_fingerprints: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub excerpt: Option<super::PreviewExcerptScope>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -134,8 +136,10 @@ pub struct PreviewArtifact {
     pub revision_id: String,
     pub generation: u64,
     pub request: PreviewRequest,
-    /// fullPreview now; future excerpts must carry a distinct declared scope.
+    /// fullPreview or cutNeighborhood; the latter always carries excerpt scope.
     pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub excerpt: Option<super::PreviewExcerptScope>,
     pub state: PreviewArtifactState,
     pub sequence: u64,
     pub stage: String,
@@ -196,6 +200,8 @@ pub struct PreviewArtifactSummary {
     pub artifact_id: String,
     pub revision_id: String,
     pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub excerpt: Option<super::PreviewExcerptScope>,
     pub generation: u64,
     pub sequence: u64,
     pub state: PreviewArtifactState,

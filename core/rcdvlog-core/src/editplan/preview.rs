@@ -96,6 +96,7 @@ struct RenderAttempt<'a, 'b> {
     plan: &'a super::EditPlanRevision,
     attempt: &'a super::preview_artifacts::PreviewAttempt<'b>,
     heavy: Option<&'a crate::LocalHeavyLease>,
+    excerpt: Option<&'a super::PreviewExcerptScope>,
 }
 
 impl Catalog {
@@ -112,7 +113,7 @@ impl Catalog {
         progress: &mut dyn FnMut(PreviewProgress),
         cancel: &dyn Fn() -> bool,
     ) -> Result<PreviewResult> {
-        self.render_preview_internal(request, progress, cancel, None)
+        self.render_preview_scoped(request, None, progress, cancel, None)
     }
 
     /// An enclosing domain pipeline already owns the host's heavy-work lease.
@@ -123,12 +124,13 @@ impl Catalog {
         cancel: &dyn Fn() -> bool,
         heavy: &crate::LocalHeavyLease,
     ) -> Result<PreviewResult> {
-        self.render_preview_internal(request, progress, cancel, Some(heavy))
+        self.render_preview_scoped(request, None, progress, cancel, Some(heavy))
     }
 
-    fn render_preview_internal(
+    pub(super) fn render_preview_scoped(
         &self,
         request: &PreviewRequest,
+        excerpt: Option<&super::PreviewExcerptScope>,
         progress: &mut dyn FnMut(PreviewProgress),
         cancel: &dyn Fn() -> bool,
         heavy: Option<&crate::LocalHeavyLease>,
@@ -138,15 +140,19 @@ impl Catalog {
             (144..=1080).contains(&request.max_height),
             "invalid input: preview height must be 144-1080"
         );
+        if let Some(scope) = excerpt {
+            super::preview_excerpt::resolve(&plan, scope)?;
+        }
         let claim = super::preview_artifacts::claim(self, &plan)?;
         let attempt =
-            super::preview_artifacts::PreviewAttempt::begin(self, &plan, request, &claim)?;
+            super::preview_artifacts::PreviewAttempt::begin(self, &plan, request, &claim, excerpt)?;
         let cancelled = || cancel() || attempt.is_cancelled();
         let context = RenderAttempt {
             request,
             plan: &plan,
             attempt: &attempt,
             heavy,
+            excerpt,
         };
         let result = self.render_preview_attempt(&context, progress, &cancelled);
         match result {
@@ -187,8 +193,19 @@ impl Catalog {
                 && plan.duration_seconds() <= 21600.0,
             "invalid input: preview duration must be positive and no longer than six hours"
         );
+        let window = context
+            .excerpt
+            .map(|scope| super::preview_excerpt::resolve(plan, scope))
+            .transpose()?;
+        let operations = if let Some(w) = &window {
+            &plan.operations[w.first..=w.last]
+        } else {
+            &plan.operations[..]
+        };
+        let audio_window = window.as_ref().map(|w| (w.in_seconds(), w.out_seconds()));
         let constraints_key = super::ranges::constraints_key(&self.connection()?, plan)?;
-        let report = self.validate_edit_plan_cancellable(&request.revision_id, cancel)?;
+        let report =
+            self.validate_edit_plan_audio_window(&request.revision_id, cancel, audio_window)?;
         if !report.renderable() {
             let blocking: Vec<&str> = report.errors().map(|finding| finding.code).collect();
             bail!(
@@ -197,20 +214,22 @@ impl Catalog {
                 blocking.join(", ")
             );
         }
-
         let assets = self.list_assets(&plan.project_id)?;
-        let split_audio = plan.operations.iter().any(|cut| cut.audio.is_some());
+        let split_audio = window.is_some() || plan.operations.iter().any(|cut| cut.audio.is_some());
         let audio_events = if split_audio {
-            super::audio::audio_events_cancellable(plan, &assets, cancel)?
+            super::audio::audio_events_cancellable_window(plan, &assets, cancel, audio_window)?
         } else {
             Vec::new()
         };
+        let rendered_duration = window
+            .as_ref()
+            .map_or_else(|| plan.duration_seconds(), |w| w.duration());
         let workspace = attempt.directory.clone();
         let sequence = attempt.stage("waitingForResource")?;
         progress(PreviewProgress::Started {
             artifact_id: Some(attempt.artifact_id.clone()),
             sequence: Some(sequence),
-            clip_count: plan.operations.len() as u32,
+            clip_count: operations.len() as u32,
             worker_count: 1,
         });
         let _heavy = if context.heavy.is_some() {
@@ -219,7 +238,8 @@ impl Catalog {
             Some(self.acquire_local_heavy_cancellable(cancel)?)
         };
         attempt.stage("identifyingSources")?;
-        let prepared = super::preview_media::prepare(self, plan, request, &assets, cancel)?;
+        let prepared =
+            super::preview_media::prepare(self, plan, request, &assets, cancel, context.excerpt)?;
         attempt.identity(&prepared.identity)?;
         let segments_dir = workspace.join("segments");
         fs::create_dir(&segments_dir)?;
@@ -228,10 +248,10 @@ impl Catalog {
         let mut segment_frames = Vec::new();
         let mut segment_counts = super::PreviewSegmentCounts::default();
         let started = std::time::Instant::now();
-        let mut picture_frames = 0_u64;
-        let mut requested_picture_end = 0.0;
+        let mut picture_frames = window.as_ref().map_or(0, |w| w.first_frame);
+        let mut requested_picture_end = window.as_ref().map_or(0.0, |w| w.prefix_seconds);
 
-        for (index, operation) in plan.operations.iter().enumerate() {
+        for (index, operation) in operations.iter().enumerate() {
             if cancel() {
                 // Leave nothing that could be presented as a complete preview.
                 return Err(anyhow!("preview render cancelled"));
@@ -461,9 +481,8 @@ impl Catalog {
                 sequence: Some(sequence),
                 position: operation.position,
                 elapsed_seconds: elapsed,
-                estimate_remaining_seconds: (completed > 0).then(|| {
-                    elapsed / completed as f64 * (plan.operations.len() - completed) as f64
-                }),
+                estimate_remaining_seconds: (completed > 0)
+                    .then(|| elapsed / completed as f64 * (operations.len() - completed) as f64),
             });
         }
 
@@ -523,16 +542,28 @@ impl Catalog {
         }
         if split_audio {
             ensure!(!cancel(), "preview render cancelled before audio mix");
-            let mix = super::audio_render::render_mix(
-                &workspace,
-                &audio_events,
-                plan.duration_seconds(),
-                cancel,
-            )?;
+            let mix = if let Some(w) = &window {
+                super::audio_render::render_mix_window(
+                    &workspace,
+                    &audio_events,
+                    super::audio_render::AudioMixWindow {
+                        in_samples: (w.in_seconds() * 48000.0).round() as u64,
+                        out_samples: (w.out_seconds() * 48000.0).round() as u64,
+                    },
+                    cancel,
+                )?
+            } else {
+                super::audio_render::render_mix(
+                    &workspace,
+                    &audio_events,
+                    rendered_duration,
+                    cancel,
+                )?
+            };
             let muxed = workspace.join("preview.audio.tmp.mp4");
             let rendered_seconds = super::audio_render::mux_mix(&temporary, &mix, &muxed, cancel)?;
             ensure!(
-                (rendered_seconds - plan.duration_seconds()).abs() <= 0.1,
+                (rendered_seconds - rendered_duration).abs() <= 0.1,
                 "split audio preview duration differs from planned duration"
             );
             ensure!(!cancel(), "preview render cancelled before publication");
@@ -547,6 +578,7 @@ impl Catalog {
             request,
             &segment_frames,
             cancel,
+            context.excerpt,
         )?;
         let current = super::preview_media::prepare(
             self,
@@ -554,6 +586,7 @@ impl Catalog {
             request,
             &self.list_assets(&plan.project_id)?,
             cancel,
+            context.excerpt,
         )?;
         ensure!(
             current.identity.sources == prepared.identity.sources

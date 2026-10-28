@@ -63,10 +63,11 @@ pub(super) fn review_source(asset: &Asset) -> &str {
         .unwrap_or(&asset.path)
 }
 
-pub(super) fn audio_events_cancellable(
+pub(super) fn audio_events_cancellable_window(
     plan: &EditPlanRevision,
     assets: &[Asset],
     cancel: &dyn Fn() -> bool,
+    window: Option<(f64, f64)>,
 ) -> Result<Vec<AudioEvent>> {
     let rate = f64::from(AUDIO_SAMPLE_RATE);
     let movie_duration = plan.duration_seconds();
@@ -152,6 +153,11 @@ pub(super) fn audio_events_cancellable(
             "cut {}: all audio timing and gain values must be finite",
             cut.operation_id
         );
+        if let Some((start, end)) = window
+            && (placement >= end || placement + source_out - source_in <= start)
+        {
+            continue;
+        }
         let asset = assets
             .iter()
             .find(|asset| &asset.id == asset_id)

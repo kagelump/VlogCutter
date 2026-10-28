@@ -251,6 +251,24 @@ fn scoped_status(
     plan: &EditPlanRevision,
 ) -> Result<ReviewTargetStatus> {
     let mut result = status(target, plan);
+    if let Some(movie) = &target.viewed_movie {
+        for source in &movie.source_fingerprints {
+            let now: Option<(String, u16)> = connection
+                .query_row(
+                    "SELECT fingerprint,rotation_degrees FROM assets WHERE id=?1 AND project_id=?2",
+                    params![source.asset_id, plan.project_id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            if now.as_ref().is_none_or(|(fp, rotation)| {
+                fp != &source.source_fingerprint || *rotation != source.rotation_degrees
+            }) {
+                result.flags.push("source_media_metadata_changed".into());
+                result.requires_mapping = true;
+                break;
+            }
+        }
+    }
     if super::selection::metadata_fingerprint(connection, &target.revision_id)?
         != super::selection::metadata_fingerprint(connection, &plan.revision_id)?
     {
@@ -392,7 +410,7 @@ fn validate_target(connection: &Connection, project: &str, reviewed: &ReviewTarg
                 .requested_movie_seconds
                 .is_none_or(|v| v.is_finite() && v >= 0.0 && v <= movie.movie_duration_seconds)
                 && movie.timestamp_mapping == timestamp_mapping
-                && movie.source_fingerprints.len() <= 6
+                && movie.source_fingerprints.len() <= 64
                 && movie
                     .source_fingerprints
                     .iter()
@@ -631,7 +649,7 @@ impl Catalog {
                 movie_time_base_numerator:qa.movie_time_base_numerator,movie_time_base_denominator:qa.movie_time_base_denominator,
                 movie_duration_seconds:qa.duration_seconds,requested_movie_seconds:request.movie_time_seconds,
                 timestamp_mapping:if request.movie_time_seconds.is_some(){"declaredPlaybackSeconds"}else{"none"}.into(),picture_mapping:mapping,
-                source_fingerprints:identity.sources.into_iter().filter(|s|source_ids.contains(&s.asset_id.as_str())).map(|s|ReviewSourceReference{
+                source_fingerprints:identity.sources.into_iter().filter(|s|receipt.kind=="cutNeighborhood" || source_ids.contains(&s.asset_id.as_str())).map(|s|ReviewSourceReference{
                     asset_id:s.asset_id,source_fingerprint:s.source_fingerprint,representation_fingerprint:s.representation_fingerprint,rotation_degrees:s.rotation_degrees}).collect(),
                 limitations:vec!["The output fingerprint identifies the recorded completed movie. Recording a note does not freshly verify source/output bytes or assert human listening.".into(),
                     "Entered playback seconds are a declared locator, not a verified frame/source boundary; edits require explicit inspected source ranges.".into()]});

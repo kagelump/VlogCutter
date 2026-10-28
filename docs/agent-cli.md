@@ -14,6 +14,14 @@ source-inspection and trim-suggestion tools. It performs no provider calls and
 cannot record human decisions; see [source inspection](edit-plan-inspection.md)
 for input shapes, bounds, and freshness behavior.
 
+### Assembled context review
+
+Use `edit-plan excerpt` to render a contiguous whole-cut neighborhood, then
+`edit-plan context create|get|note` to assemble verified evidence, read it, and
+record an explicitly authored note. Context handles remain separate source
+inspections; notes flow through revision-bound feedback. See
+[whole-cut context excerpts and assembled review](edit-plan-context-review.md).
+
 ### Native video review
 
 Use `native-video preflight|authorize|pilot|prepare|windows|run|status|wait|cancel|result|evidence-list|run-windows` for explicit bounded direct video review. Policy and window inputs are typed capped JSON files; local preparation and read-only planning are separate from provider execution. See [native video review](native-video-review.md) for the full contract and examples.

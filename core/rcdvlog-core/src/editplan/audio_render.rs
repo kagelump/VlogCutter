@@ -10,12 +10,45 @@ use std::{
     path::{Path, PathBuf},
 };
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct AudioMixWindow {
+    pub(super) in_samples: u64,
+    pub(super) out_samples: u64,
+}
+
 pub(super) fn render_mix(
     workspace: &Path,
     events: &[AudioEvent],
     movie_seconds: f64,
     cancel: &dyn Fn() -> bool,
 ) -> Result<PathBuf> {
+    ensure!(
+        movie_seconds.is_finite() && movie_seconds >= 0.0,
+        "invalid input: audio mix duration"
+    );
+    let total_samples = (movie_seconds * f64::from(AUDIO_SAMPLE_RATE)).ceil() as u64;
+    render_mix_window(
+        workspace,
+        events,
+        AudioMixWindow {
+            in_samples: 0,
+            out_samples: total_samples,
+        },
+        cancel,
+    )
+}
+
+pub(super) fn render_mix_window(
+    workspace: &Path,
+    events: &[AudioEvent],
+    window: AudioMixWindow,
+    cancel: &dyn Fn() -> bool,
+) -> Result<PathBuf> {
+    ensure!(
+        window.out_samples > window.in_samples
+            && window.out_samples - window.in_samples <= 6 * 3600 * u64::from(AUDIO_SAMPLE_RATE),
+        "invalid input: audio mix window must be positive and no longer than six hours"
+    );
     let mix_path = workspace.join("source-audio.f32le");
     let mut mix = OpenOptions::new()
         .create(true)
@@ -23,21 +56,29 @@ pub(super) fn render_mix(
         .read(true)
         .write(true)
         .open(&mix_path)?;
-    let total_samples = (movie_seconds * f64::from(AUDIO_SAMPLE_RATE)).ceil() as u64;
+    let total_samples = window.out_samples - window.in_samples;
     mix.set_len(
         total_samples
             .checked_mul(8)
             .context("audio mix length overflow")?,
     )?;
     for (index, event) in events.iter().enumerate() {
+        let event_end = event.timeline_start_samples + event.sample_count();
+        let crop_start = event.timeline_start_samples.max(window.in_samples);
+        let crop_end = event_end.min(window.out_samples);
+        if crop_start >= crop_end {
+            continue;
+        }
         ensure!(!cancel(), "preview render cancelled during source audio");
         let decoded_path = workspace.join(format!("source-audio-{index:05}.f32le"));
+        let crop_before = crop_start - event.timeline_start_samples;
+        let source_in_samples = event.source_in_samples + crop_before;
+        let sample_count = crop_end - crop_start;
         // Seek on a whole-second native sample boundary, retaining at least a
         // second of decoder/resampler history. Final trimming stays on the
         // source-derived 48 kHz grid instead of rounding a seek to microseconds.
-        let seek_seconds =
-            (event.source_in_samples / u64::from(AUDIO_SAMPLE_RATE)).saturating_sub(1);
-        let trim_in = event.source_in_samples - seek_seconds * u64::from(AUDIO_SAMPLE_RATE);
+        let seek_seconds = (source_in_samples / u64::from(AUDIO_SAMPLE_RATE)).saturating_sub(1);
+        let trim_in = source_in_samples - seek_seconds * u64::from(AUDIO_SAMPLE_RATE);
         let mut command = tool_command("ffmpeg");
         command
             .args(["-y", "-hide_banner", "-loglevel", "error", "-ss"])
@@ -47,7 +88,7 @@ pub(super) fn render_mix(
             .args(["-map", "0:a:0", "-vn", "-sn", "-dn", "-af"])
             .arg(format!(
                 "aresample=48000:async=1:first_pts=0,atrim=start_sample={trim_in}:end_sample={},asetpts=PTS-STARTPTS",
-                trim_in + event.sample_count()
+                trim_in + sample_count
             ))
             .args([
                 "-ar",
@@ -73,7 +114,7 @@ pub(super) fn render_mix(
                 diagnostic,
             ));
         }
-        let expected_bytes = event.sample_count() * 8;
+        let expected_bytes = sample_count * 8;
         ensure!(
             decoded_path.metadata()?.len() == expected_bytes,
             "source audio did not provide the complete requested sample range; refusing a truncated preview"
@@ -83,12 +124,12 @@ pub(super) fn render_mix(
         let mut mixed_bytes = vec![0_u8; 4096 * 8];
         let gain = 10.0_f64.powf(event.gain_db / 20.0) as f32;
         let mut offset_samples = 0;
-        while offset_samples < event.sample_count() {
+        while offset_samples < sample_count {
             ensure!(!cancel(), "preview render cancelled during audio mixing");
-            let count = (event.sample_count() - offset_samples).min(4096) as usize;
+            let count = (sample_count - offset_samples).min(4096) as usize;
             let bytes = count * 8;
             decoded.read_exact(&mut source_bytes[..bytes])?;
-            let destination = (event.timeline_start_samples + offset_samples) * 8;
+            let destination = (crop_start - window.in_samples + offset_samples) * 8;
             ensure!(
                 destination + bytes as u64 <= total_samples * 8,
                 "audio placement exceeds movie sample bounds"
@@ -96,7 +137,7 @@ pub(super) fn render_mix(
             mix.seek(SeekFrom::Start(destination))?;
             mix.read_exact(&mut mixed_bytes[..bytes])?;
             for sample in 0..count {
-                let at = offset_samples + sample as u64;
+                let at = crop_before + offset_samples + sample as u64;
                 let attack = if event.fade_in_samples > 0 {
                     (at as f32 / event.fade_in_samples as f32).min(1.0)
                 } else {
@@ -209,3 +250,7 @@ pub(super) fn mux_mix(
         .parse()
         .context("invalid preview duration")
 }
+
+#[cfg(test)]
+#[path = "audio_render_window_tests.rs"]
+mod window_tests;

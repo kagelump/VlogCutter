@@ -18,6 +18,7 @@
 
 pub mod audio;
 mod audio_render;
+pub mod context_review;
 pub mod diff;
 pub mod feedback;
 mod feedback_model;
@@ -30,6 +31,7 @@ pub mod otio;
 pub mod preview;
 mod preview_artifact_model;
 pub mod preview_artifacts;
+mod preview_excerpt;
 mod preview_media;
 mod preview_segments;
 mod range_model;
@@ -49,6 +51,7 @@ pub use model::{
 pub use otio::{OtioExportError, OtioExportRequest, OtioExportResult, otio_document};
 pub use preview::{PreviewFailure, PreviewProgress, PreviewRequest, PreviewResult};
 pub use preview_artifact_model::*;
+pub use preview_excerpt::{PreviewExcerptRequest, PreviewExcerptScope};
 pub use range_model::*;
 pub use validate::{Finding, FindingKind, Severity, ValidationReport};
 

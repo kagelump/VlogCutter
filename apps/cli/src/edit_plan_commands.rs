@@ -2,10 +2,11 @@
 use anyhow::{Context, Result, ensure};
 use clap::{Args, Subcommand};
 use rcdvlog_core::{
-    AcceptedReviewReference, ApplyReviewFeedbackRequest, Catalog, ConfirmSourceRangeRequest,
-    DecideReviewFeedbackRequest, EditPlanOperation, MapReviewTargetRequest, PreviewRequest,
-    ProposeReviewChangeRequest, RecordReviewNoteRequest, SequenceSelectionInput,
-    SequenceSelectionRequest, SourceInspectionRequest, SourceTrimRequest,
+    AcceptedReviewReference, ApplyReviewFeedbackRequest, AssembledContextRequest, Catalog,
+    ConfirmSourceRangeRequest, DecideReviewFeedbackRequest, EditPlanOperation,
+    MapReviewTargetRequest, PreviewExcerptRequest, PreviewRequest, ProposeReviewChangeRequest,
+    RecordReviewNoteRequest, SequenceSelectionInput, SequenceSelectionRequest,
+    SourceInspectionRequest, SourceTrimRequest,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -57,6 +58,17 @@ pub enum EditPlanCommand {
         revision: String,
         #[arg(long, default_value_t = 360, value_parser = clap::value_parser!(u32).range(144..=1080))]
         max_height: u32,
+    },
+    /// Render a bounded whole-cut excerpt for context review; never edits a plan.
+    Excerpt {
+        /// PreviewExcerptRequest JSON, capped at 64 KiB.
+        #[arg(long)]
+        input: PathBuf,
+    },
+    /// Assemble verified excerpt evidence and separately playable source handles.
+    Context {
+        #[command(subcommand)]
+        command: AssembledContextCommand,
     },
     /// Read one immutable preview attempt; --verify explicitly checks current media bytes.
     PreviewStatus {
@@ -156,6 +168,27 @@ pub enum InspectionReviewCommand {
     Finish {
         #[arg(long)]
         session: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AssembledContextCommand {
+    /// Create revision-bound review evidence from a verified excerpt.
+    Create {
+        #[arg(long)]
+        input: PathBuf,
+    },
+    /// Read historical assembled evidence without certifying current media.
+    Get {
+        #[arg(long)]
+        evidence: String,
+    },
+    /// Record a human note scoped to the viewed assembled context.
+    Note {
+        #[arg(long)]
+        evidence: String,
+        #[arg(long)]
+        input: PathBuf,
     },
 }
 
@@ -290,6 +323,12 @@ pub fn command_name(command: &EditPlanCommand) -> &'static str {
         EditPlanCommand::Validate(_) => "edit-plan.validate",
         EditPlanCommand::Activate { .. } => "edit-plan.activate",
         EditPlanCommand::Preview { .. } => "edit-plan.preview",
+        EditPlanCommand::Excerpt { .. } => "edit-plan.excerpt",
+        EditPlanCommand::Context { command } => match command {
+            AssembledContextCommand::Create { .. } => "edit-plan.context.create",
+            AssembledContextCommand::Get { .. } => "edit-plan.context.get",
+            AssembledContextCommand::Note { .. } => "edit-plan.context.note",
+        },
         EditPlanCommand::PreviewStatus { .. } => "edit-plan.preview-status",
         EditPlanCommand::PreviewList { .. } => "edit-plan.preview-list",
         EditPlanCommand::PreviewCancel { .. } => "edit-plan.preview-cancel",
@@ -348,6 +387,9 @@ pub fn is_read_only(command: &EditPlanCommand) -> bool {
             | EditPlanCommand::ReviewSession {
                 command: InspectionReviewCommand::Status { .. }
                     | InspectionReviewCommand::Steps { .. },
+            }
+            | EditPlanCommand::Context {
+                command: AssembledContextCommand::Get { .. }
             }
     )
 }
@@ -427,6 +469,31 @@ pub fn execute(catalog: &Catalog, command: &EditPlanCommand) -> Result<Value> {
             )?;
             Ok(json!({ "revisionId": revision, "preview": result }))
         }
+        EditPlanCommand::Excerpt { input } => {
+            let request: PreviewExcerptRequest = read_review_input(input)?;
+            Ok(serde_json::to_value(catalog.render_preview_excerpt(
+                &request,
+                &mut |event| eprintln!("{}", json!({ "event": "preview-progress", "data": event })),
+                &|| false,
+            )?)?)
+        }
+        EditPlanCommand::Context { command } => match command {
+            AssembledContextCommand::Create { input } => {
+                let request: AssembledContextRequest = read_review_input(input)?;
+                Ok(serde_json::to_value(
+                    catalog.assembled_review_context(&request, &|| false)?,
+                )?)
+            }
+            AssembledContextCommand::Get { evidence } => Ok(serde_json::to_value(
+                catalog.assembled_review_evidence(evidence)?,
+            )?),
+            AssembledContextCommand::Note { evidence, input } => {
+                let request: RecordReviewNoteRequest = read_review_input(input)?;
+                Ok(serde_json::to_value(
+                    catalog.record_assembled_review_note(evidence, &request)?,
+                )?)
+            }
+        },
         EditPlanCommand::PreviewStatus { artifact, verify } => Ok(serde_json::to_value(
             catalog.preview_artifact_status(artifact, *verify)?,
         )?),
