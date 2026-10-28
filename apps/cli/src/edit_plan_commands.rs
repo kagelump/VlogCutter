@@ -55,6 +55,36 @@ pub enum EditPlanCommand {
         #[arg(long, default_value_t = 360, value_parser = clap::value_parser!(u32).range(144..=1080))]
         max_height: u32,
     },
+    /// Read one immutable preview attempt; --verify explicitly checks current media bytes.
+    PreviewStatus {
+        #[arg(long)]
+        artifact: String,
+        #[arg(long)]
+        verify: bool,
+    },
+    /// List bounded preview attempt summaries for an immutable revision.
+    PreviewList {
+        #[arg(long)]
+        revision: String,
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+    /// Cooperatively stop one owning preview attempt and reap its media children.
+    PreviewCancel {
+        #[arg(long)]
+        artifact: String,
+    },
+    /// Quiet observation; timing out never cancels or replaces the original render.
+    PreviewWait {
+        #[arg(long)]
+        artifact: String,
+        #[arg(long, default_value_t = 600)]
+        timeout_seconds: u64,
+        #[arg(long)]
+        verify: bool,
+    },
     /// Inspect oriented actual frames and optional audio in a bounded source window.
     Inspect {
         /// SourceInspectionRequest JSON; never chooses a fallback representation.
@@ -122,6 +152,10 @@ pub fn command_name(command: &EditPlanCommand) -> &'static str {
         EditPlanCommand::Validate(_) => "edit-plan.validate",
         EditPlanCommand::Activate { .. } => "edit-plan.activate",
         EditPlanCommand::Preview { .. } => "edit-plan.preview",
+        EditPlanCommand::PreviewStatus { .. } => "edit-plan.preview-status",
+        EditPlanCommand::PreviewList { .. } => "edit-plan.preview-list",
+        EditPlanCommand::PreviewCancel { .. } => "edit-plan.preview-cancel",
+        EditPlanCommand::PreviewWait { .. } => "edit-plan.preview-wait",
         EditPlanCommand::Inspect { .. } => "edit-plan.inspect",
         EditPlanCommand::Ranges { command } => match command {
             SourceRangeCommand::List { .. } => "edit-plan.ranges.list",
@@ -136,6 +170,9 @@ pub fn is_read_only(command: &EditPlanCommand) -> bool {
     matches!(
         command,
         EditPlanCommand::List { .. }
+            | EditPlanCommand::PreviewStatus { verify: false, .. }
+            | EditPlanCommand::PreviewList { .. }
+            | EditPlanCommand::PreviewWait { verify: false, .. }
             | EditPlanCommand::Ranges {
                 command: SourceRangeCommand::List { .. }
             }
@@ -219,6 +256,34 @@ pub fn execute(catalog: &Catalog, command: &EditPlanCommand) -> Result<Value> {
                 &|| false,
             )?;
             Ok(json!({ "revisionId": revision, "preview": result }))
+        }
+        EditPlanCommand::PreviewStatus { artifact, verify } => Ok(serde_json::to_value(
+            catalog.preview_artifact_status(artifact, *verify)?,
+        )?),
+        EditPlanCommand::PreviewList {
+            revision,
+            offset,
+            limit,
+        } => Ok(serde_json::to_value(
+            catalog.preview_artifacts(revision, *offset, *limit)?,
+        )?),
+        EditPlanCommand::PreviewCancel { artifact } => Ok(serde_json::to_value(
+            catalog.cancel_preview_artifact(artifact)?,
+        )?),
+        EditPlanCommand::PreviewWait {
+            artifact,
+            timeout_seconds,
+            verify,
+        } => {
+            let observed = catalog.wait_preview_artifact(
+                artifact,
+                std::time::Duration::from_secs(*timeout_seconds),
+            )?;
+            Ok(serde_json::to_value(if *verify {
+                catalog.preview_artifact_status(artifact, true)?
+            } else {
+                observed
+            })?)
         }
         EditPlanCommand::Inspect { input } => {
             let bytes = std::fs::read(input).context("invalid input: read inspection JSON")?;

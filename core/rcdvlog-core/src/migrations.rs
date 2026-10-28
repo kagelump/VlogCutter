@@ -7,7 +7,7 @@ use thiserror::Error;
 
 use crate::chronology::forward_migrate_project_chronology;
 
-pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 52;
+pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 53;
 
 const MIGRATION_TABLE_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -396,7 +396,42 @@ pub const PROJECT_CATALOG_MIGRATIONS: &[SqliteMigration] = &[
         source_identity: "project-catalog/0052-confirmed-source-ranges/20261028",
         apply: confirmed_source_ranges,
     },
+    SqliteMigration {
+        id: 53,
+        name: "preview_artifact_receipts",
+        source_identity: "project-catalog/0053-preview-artifact-receipts/20261028",
+        apply: preview_artifact_receipts,
+    },
 ];
+
+fn preview_artifact_receipts(transaction: &Transaction<'_>) -> Result<()> {
+    transaction.execute_batch(
+        "CREATE TABLE IF NOT EXISTS preview_artifacts (
+            generation INTEGER PRIMARY KEY AUTOINCREMENT,
+            artifact_id TEXT NOT NULL UNIQUE,
+            project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            revision_id TEXT NOT NULL REFERENCES edit_plan_revisions(revision_id) ON DELETE CASCADE,
+            request_key TEXT NOT NULL,
+            state TEXT NOT NULL CHECK(state IN ('running','complete','cancelled','failed','interrupted')),
+            sequence INTEGER NOT NULL CHECK(sequence>0),
+            cancel_requested INTEGER NOT NULL DEFAULT 0 CHECK(cancel_requested IN (0,1)),
+            body_json TEXT NOT NULL,
+            identity_json TEXT,
+            result_json TEXT,
+            validation_json TEXT,
+            started_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS preview_artifacts_revision ON preview_artifacts(revision_id,started_at DESC);
+        CREATE INDEX IF NOT EXISTS preview_artifacts_latest ON preview_artifacts(request_key,generation DESC);
+        CREATE TABLE IF NOT EXISTS preview_cut_outcomes (
+            artifact_id TEXT NOT NULL REFERENCES preview_artifacts(artifact_id) ON DELETE CASCADE,
+            position INTEGER NOT NULL CHECK(position>=0),
+            body_json TEXT NOT NULL,
+            PRIMARY KEY(artifact_id,position)
+        );"
+    )?;
+    Ok(())
+}
 
 fn confirmed_source_ranges(transaction: &Transaction<'_>) -> Result<()> {
     transaction.execute_batch(

@@ -462,7 +462,7 @@ fn preview_normalizes_mixed_video_and_audio_streams() {
         (duration - 3.4).abs() < 0.1,
         "unexpected preview duration: {duration}"
     );
-    assert!((result.duration_seconds - 3.4).abs() < f64::EPSILON);
+    assert!((result.duration_seconds - duration).abs() < f64::EPSILON);
 
     let streams = document["streams"].as_array().unwrap();
     let video = streams

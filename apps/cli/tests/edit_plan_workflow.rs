@@ -341,6 +341,66 @@ fn generated_media_plan_create_fork_diff_validate_activate_and_preview() {
             .status
             .success()
     );
+    let artifact = preview["preview"]["artifactId"].as_str().unwrap();
+    let stored = success(
+        &catalog,
+        &["edit-plan", "preview-status", "--artifact", artifact],
+    );
+    assert_eq!(stored["artifact"]["state"], "complete");
+    assert!(stored["currentForRequest"].is_null());
+    assert_eq!(
+        stored["activeRevisionId"], a_id,
+        "rendering a draft never activates it"
+    );
+    let verified = success(
+        &catalog,
+        &[
+            "edit-plan",
+            "preview-status",
+            "--artifact",
+            artifact,
+            "--verify",
+        ],
+    );
+    assert_eq!(verified["currentForRequest"], true);
+    assert_eq!(verified["artifact"]["validation"]["fullyDecoded"], true);
+    let page = success(
+        &catalog,
+        &[
+            "edit-plan",
+            "preview-list",
+            "--revision",
+            b_id,
+            "--limit",
+            "1",
+        ],
+    );
+    assert_eq!(page["total"], 1);
+    assert_eq!(page["items"][0]["artifactId"], artifact);
+    let waited = success(
+        &catalog,
+        &[
+            "edit-plan",
+            "preview-wait",
+            "--artifact",
+            artifact,
+            "--timeout-seconds",
+            "0",
+        ],
+    );
+    assert_eq!(waited["observedState"], "complete");
+    failure(
+        &catalog,
+        &["edit-plan", "preview-cancel", "--artifact", artifact],
+        "preview_artifact_terminal",
+    );
+    failure(
+        &catalog,
+        &["edit-plan", "preview-status", "--artifact", "missing"],
+        "not_found",
+    );
+    #[cfg(unix)]
+    cancel_live_preview_child(&catalog, b_id, dir.path());
     success(
         &catalog,
         &[
@@ -430,4 +490,124 @@ fn generated_media_plan_create_fork_diff_validate_activate_and_preview() {
         success(&catalog, &["edit-plan", "list", "--project", project])["activeRevisionId"],
         b_id
     );
+}
+
+/// Exercise cancellation of a live media child in a separate CLI process,
+/// without process-global tool overrides or races with other Rust tests.
+#[cfg(unix)]
+fn cancel_live_preview_child(catalog: &Path, revision: &str, parent: &Path) {
+    use std::{
+        os::unix::fs::PermissionsExt,
+        process::Stdio,
+        time::{Duration, Instant},
+    };
+    let tools = parent.join("controlled-preview-tools");
+    fs::create_dir(&tools).unwrap();
+    let wrapper = tools.join("ffmpeg");
+    let marker = parent.join("controlled-preview-child.pid");
+    fs::write(&wrapper, "#!/bin/sh\nif [ \"$1\" = \"-version\" ]; then exec \"$RCDVLOG_TEST_REAL_FFMPEG\" \"$@\"; fi\necho $$ > \"$RCDVLOG_TEST_PID_FILE\"\nexec sleep 120\n").unwrap();
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700)).unwrap();
+    let real_ffmpeg = rcdvlog_core::resolve_tool_path("ffmpeg");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rcdvlog"))
+        .arg("--catalog")
+        .arg(catalog)
+        .args([
+            "edit-plan",
+            "preview",
+            "--revision",
+            revision,
+            "--max-height",
+            "144",
+        ])
+        .env(
+            "PATH",
+            std::env::join_paths(
+                std::iter::once(tools)
+                    .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+            )
+            .unwrap(),
+        )
+        .env("RCDVLOG_TEST_REAL_FFMPEG", real_ffmpeg)
+        .env("RCDVLOG_TEST_PID_FILE", &marker)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let started = Instant::now();
+    while !marker.exists() {
+        if let Some(status) = child.try_wait().unwrap() {
+            panic!("controlled preview exited before child started: {status}");
+        }
+        if started.elapsed() > Duration::from_secs(20) {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("controlled child never started");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let page = success(
+        catalog,
+        &[
+            "edit-plan",
+            "preview-list",
+            "--revision",
+            revision,
+            "--limit",
+            "1",
+        ],
+    );
+    let id = page["items"][0]["artifactId"].as_str().unwrap();
+    assert_eq!(page["items"][0]["observedState"], "running");
+    failure(
+        catalog,
+        &[
+            "edit-plan",
+            "preview-wait",
+            "--artifact",
+            id,
+            "--timeout-seconds",
+            "0",
+        ],
+        "preview_wait_timeout",
+    );
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "observation timeout cancelled the original child"
+    );
+    let cancelled = success(catalog, &["edit-plan", "preview-cancel", "--artifact", id]);
+    assert_eq!(cancelled["artifact"]["cancelRequested"], true);
+    let deadline = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(!status.success());
+            break;
+        }
+        if deadline.elapsed() > Duration::from_secs(10) {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("cancel did not reap the original render process");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let terminal = success(
+        catalog,
+        &[
+            "edit-plan",
+            "preview-wait",
+            "--artifact",
+            id,
+            "--timeout-seconds",
+            "1",
+        ],
+    );
+    assert_eq!(terminal["observedState"], "cancelled");
+    assert!(terminal["artifact"]["result"].is_null());
+    let pid = fs::read_to_string(&marker).unwrap();
+    let alive = Command::new("kill")
+        .args(["-0", pid.trim()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(!alive.success(), "cancelled media child was left alive");
 }

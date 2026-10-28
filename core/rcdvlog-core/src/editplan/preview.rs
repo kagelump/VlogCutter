@@ -1,11 +1,8 @@
 //! Low-resolution preview render (D01-T021).
 //!
-//! Renders the plan from *review proxies*, not originals. This is a preview:
-//! `PRD.md` §23 Milestone 6 asks for low resolution, and rendering from camera
-//! masters would be slow and would touch source media for no benefit.
-//!
-//! The preview is not an export and is never handed to a finishing editor. It
-//! carries no determinism requirement — D01-T022 owns that.
+//! Renders from the selected review proxy when available, otherwise the original.
+//! Each local attempt owns an immutable receipt and unique derived output;
+//! completed files are retained for revision-bound review and comparison.
 //!
 //! Picture uses hard cuts on a common preview canvas. Legacy plans retain their
 //! linked-source recipe. Explicit source audio is mixed on a separate 48 kHz
@@ -30,7 +27,7 @@ pub struct PreviewRequest {
 }
 
 /// One clip that could not be rendered. Per-clip failures never abort the batch
-/// silently (`AGENTS.md` §15): the render continues and names what it dropped.
+/// silently (`AGENTS.md` §15): outcomes name failures and block publication.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PreviewFailure {
@@ -42,6 +39,8 @@ pub struct PreviewFailure {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PreviewResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_id: Option<String>,
     pub output_path: String,
     pub duration_seconds: f64,
     pub clip_count: u32,
@@ -49,38 +48,58 @@ pub struct PreviewResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", tag = "type")]
+#[serde(
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    tag = "type"
+)]
 pub enum PreviewProgress {
     Started {
+        artifact_id: Option<String>,
+        sequence: Option<u64>,
         clip_count: u32,
         worker_count: u32,
     },
     ClipCompleted {
+        artifact_id: Option<String>,
+        sequence: Option<u64>,
         position: u32,
         elapsed_seconds: f64,
         estimate_remaining_seconds: Option<f64>,
     },
     ClipFailed {
+        artifact_id: Option<String>,
+        sequence: Option<u64>,
         position: u32,
         message: String,
     },
     Finished {
+        artifact_id: Option<String>,
+        sequence: Option<u64>,
         output_path: String,
         duration_seconds: f64,
     },
-    Cancelled,
+    Cancelled {
+        artifact_id: Option<String>,
+        sequence: Option<u64>,
+    },
+}
+
+struct RenderAttempt<'a, 'b> {
+    request: &'a PreviewRequest,
+    plan: &'a super::EditPlanRevision,
+    attempt: &'a super::preview_artifacts::PreviewAttempt<'b>,
+    heavy: Option<&'a crate::LocalHeavyLease>,
 }
 
 impl Catalog {
     /// Renders a low-resolution preview of a plan.
     ///
     /// Validation runs first: a plan that is not `renderable()` is refused
-    /// before FFmpeg is ever invoked, and that refusal is a refusal — not a
-    /// render failure.
+    /// before encoding. A durable failed attempt records a validation refusal.
     ///
-    /// `cancel` is polled between clips, which is the granularity at which a
-    /// concat render can stop cleanly. A cancelled render leaves nothing that
-    /// could be mistaken for a finished preview.
+    /// Caller and database cancellation are polled during metadata, resource
+    /// waits, hashing and media children. No cancelled output is published.
     pub fn render_preview(
         &self,
         request: &PreviewRequest,
@@ -109,8 +128,61 @@ impl Catalog {
         heavy: Option<&crate::LocalHeavyLease>,
     ) -> Result<PreviewResult> {
         let plan = self.edit_plan_revision(&request.revision_id)?;
-        let constraints_key = super::ranges::constraints_key(&self.connection()?, &plan)?;
-        let report = self.validate_edit_plan(&request.revision_id)?;
+        ensure!(
+            (144..=1080).contains(&request.max_height),
+            "invalid input: preview height must be 144-1080"
+        );
+        let claim = super::preview_artifacts::claim(self, &plan)?;
+        let attempt =
+            super::preview_artifacts::PreviewAttempt::begin(self, &plan, request, &claim)?;
+        let cancelled = || cancel() || attempt.is_cancelled();
+        let context = RenderAttempt {
+            request,
+            plan: &plan,
+            attempt: &attempt,
+            heavy,
+        };
+        let result = self.render_preview_attempt(&context, progress, &cancelled);
+        match result {
+            Ok(result) => Ok(result),
+            Err(error) => {
+                let was_cancelled = cancel() || attempt.cancellation_requested_now();
+                let error = if was_cancelled {
+                    error.context(super::PreviewArtifactError::Cancelled {
+                        artifact_id: attempt.artifact_id.clone(),
+                    })
+                } else {
+                    error
+                };
+                let sequence = attempt.finish_error(&error, was_cancelled)?;
+                if was_cancelled {
+                    progress(PreviewProgress::Cancelled {
+                        artifact_id: Some(attempt.artifact_id.clone()),
+                        sequence: Some(sequence),
+                    });
+                }
+                Err(error)
+            }
+        }
+    }
+
+    fn render_preview_attempt(
+        &self,
+        context: &RenderAttempt<'_, '_>,
+        progress: &mut dyn FnMut(PreviewProgress),
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<PreviewResult> {
+        let request = context.request;
+        let plan = context.plan;
+        let attempt = context.attempt;
+        ensure!(
+            plan.duration_seconds().is_finite()
+                && plan.duration_seconds() > 0.0
+                && plan.duration_seconds() <= 21600.0,
+            "invalid input: preview duration must be positive and no longer than six hours"
+        );
+        let constraints_key = super::ranges::constraints_key(&self.connection()?, plan)?;
+        let report = self.validate_edit_plan_cancellable(&request.revision_id, cancel)?;
         if !report.renderable() {
             let blocking: Vec<&str> = report.errors().map(|finding| finding.code).collect();
             bail!(
@@ -123,40 +195,31 @@ impl Catalog {
         let assets = self.list_assets(&plan.project_id)?;
         let split_audio = plan.operations.iter().any(|cut| cut.audio.is_some());
         let audio_events = if split_audio {
-            super::audio::audio_events(&plan, &assets)?
+            super::audio::audio_events_cancellable(plan, &assets, cancel)?
         } else {
             Vec::new()
         };
-        let workspace = self.preview_workspace(&plan.project_id, &plan.revision_id)?;
-        let render_lock = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(workspace.join(".render.lock"))?;
-        fs2::FileExt::try_lock_exclusive(&render_lock)
-            .context("preview render is already in progress for this revision")?;
-        let _heavy = if heavy.is_some() {
+        let workspace = attempt.directory.clone();
+        let sequence = attempt.stage("waitingForResource")?;
+        progress(PreviewProgress::Started {
+            artifact_id: Some(attempt.artifact_id.clone()),
+            sequence: Some(sequence),
+            clip_count: plan.operations.len() as u32,
+            worker_count: 1,
+        });
+        let _heavy = if context.heavy.is_some() {
             None
         } else {
             Some(self.acquire_local_heavy_cancellable(cancel)?)
         };
-        // A previous attempt's segments must never be concatenated into this
-        // one, so the workspace starts empty every time.
+        attempt.stage("identifyingSources")?;
+        let prepared = super::preview_media::prepare(self, plan, request, &assets, cancel)?;
+        attempt.identity(&prepared.identity)?;
         let segments_dir = workspace.join("segments");
-        if segments_dir.exists() {
-            fs::remove_dir_all(&segments_dir)?;
-        }
-        fs::create_dir_all(&segments_dir)?;
-
-        progress(PreviewProgress::Started {
-            clip_count: plan.operations.len() as u32,
-            worker_count: 1,
-        });
-
+        fs::create_dir(&segments_dir)?;
         let mut segments: Vec<PathBuf> = Vec::new();
         let mut failures: Vec<PreviewFailure> = Vec::new();
-        let mut rendered_seconds = 0.0f64;
+        let mut segment_frames = Vec::new();
         let started = std::time::Instant::now();
         let mut picture_frames = 0_u64;
         let mut requested_picture_end = 0.0;
@@ -164,8 +227,6 @@ impl Catalog {
         for (index, operation) in plan.operations.iter().enumerate() {
             if cancel() {
                 // Leave nothing that could be presented as a complete preview.
-                let _ = fs::remove_dir_all(&segments_dir);
-                progress(PreviewProgress::Cancelled);
                 return Err(anyhow!("preview render cancelled"));
             }
 
@@ -175,6 +236,8 @@ impl Catalog {
             else {
                 let message = format!("clip {} is not in this project", operation.asset_id);
                 progress(PreviewProgress::ClipFailed {
+                    artifact_id: Some(attempt.artifact_id.clone()),
+                    sequence: Some(attempt.stage("segmentFailed")?),
                     position: operation.position,
                     message: message.clone(),
                 });
@@ -186,14 +249,11 @@ impl Catalog {
                 continue;
             };
 
-            // Proxy first; the original is the fallback so a project without
-            // proxies still previews rather than failing outright.
-            let source = asset
-                .proxy_path
-                .as_deref()
-                .filter(|proxy| std::path::Path::new(proxy).is_file())
-                .unwrap_or(asset.path.as_str());
-
+            let source = prepared
+                .paths
+                .get(&asset.id)
+                .and_then(|p| p.to_str())
+                .context("preview selected source unavailable")?;
             let segment = segments_dir.join(format!("{:05}.mp4", operation.position));
             let duration = (operation.source_out_seconds - operation.source_in_seconds).max(0.0);
             // Arguments are structured through `Command`, never assembled as a
@@ -210,6 +270,7 @@ impl Catalog {
             let mut normalize = format!(
                 "{rotation}scale={canvas_width}:{canvas_height}:force_original_aspect_ratio=decrease,pad={canvas_width}:{canvas_height}:(ow-iw)/2:(oh-ih)/2,fps=30000/1001,setsar=1,setpts=PTS-STARTPTS"
             );
+            let mut expected_frames = None;
             let segment_duration = if split_audio {
                 requested_picture_end += duration;
                 let end_frame = (requested_picture_end * 30000.0 / 1001.0).round() as u64;
@@ -220,12 +281,13 @@ impl Catalog {
                     operation.operation_id
                 );
                 picture_frames = end_frame;
+                expected_frames = Some(frames);
                 normalize.push_str(",tpad=stop_mode=clone:stop_duration=0.1");
                 frames as f64 * 1001.0 / 30000.0
             } else {
                 duration
             };
-            let has_audio = !split_audio && source_has_audio(source)?;
+            let has_audio = !split_audio && source_has_audio(source, cancel)?;
             let mut command = tool_command("ffmpeg");
             command
                 .args(["-y", "-hide_banner", "-loglevel", "error", "-ss"])
@@ -291,27 +353,70 @@ impl Catalog {
             )
             .context("start ffmpeg preview segment process")?;
 
-            if !status.success() {
-                let message =
-                    media_tool_failure("ffmpeg preview segment", status, diagnostic).to_string();
-                progress(PreviewProgress::ClipFailed {
-                    position: operation.position,
-                    message: message.clone(),
-                });
-                failures.push(PreviewFailure {
-                    position: operation.position,
-                    asset_id: operation.asset_id.clone(),
-                    message,
-                });
-                let _ = fs::remove_file(&segment);
-                continue;
-            }
-
+            let checked = if status.success() {
+                super::preview_media::segment_frame_count(
+                    &segment,
+                    &workspace,
+                    &super::preview_media::SegmentExpectation {
+                        width: canvas_width,
+                        height: canvas_height,
+                        seconds: segment_duration,
+                        frames: expected_frames,
+                        audio: !split_audio,
+                    },
+                    cancel,
+                )
+            } else {
+                Err(media_tool_failure(
+                    "ffmpeg preview segment",
+                    status,
+                    diagnostic,
+                ))
+            };
+            let count = match checked {
+                Ok(count) => count,
+                Err(error) => {
+                    let message = error.to_string();
+                    let sequence = attempt.outcome(&super::PreviewCutOutcome {
+                        operation_id: operation.operation_id.clone(),
+                        position: operation.position,
+                        asset_id: operation.asset_id.clone(),
+                        state: "failed".into(),
+                        reused: false,
+                        cache_key: None,
+                        failure: Some(message.clone()),
+                    })?;
+                    progress(PreviewProgress::ClipFailed {
+                        artifact_id: Some(attempt.artifact_id.clone()),
+                        sequence: Some(sequence),
+                        position: operation.position,
+                        message: message.clone(),
+                    });
+                    failures.push(PreviewFailure {
+                        position: operation.position,
+                        asset_id: operation.asset_id.clone(),
+                        message,
+                    });
+                    let _ = fs::remove_file(&segment);
+                    continue;
+                }
+            };
+            segment_frames.push(count);
+            let sequence = attempt.outcome(&super::PreviewCutOutcome {
+                operation_id: operation.operation_id.clone(),
+                position: operation.position,
+                asset_id: operation.asset_id.clone(),
+                state: "encoded".into(),
+                reused: false,
+                cache_key: None,
+                failure: None,
+            })?;
             segments.push(segment);
-            rendered_seconds += duration;
             let elapsed = started.elapsed().as_secs_f64();
             let completed = index + 1;
             progress(PreviewProgress::ClipCompleted {
+                artifact_id: Some(attempt.artifact_id.clone()),
+                sequence: Some(sequence),
                 position: operation.position,
                 elapsed_seconds: elapsed,
                 estimate_remaining_seconds: (completed > 0).then(|| {
@@ -383,7 +488,7 @@ impl Catalog {
                 cancel,
             )?;
             let muxed = workspace.join("preview.audio.tmp.mp4");
-            rendered_seconds = super::audio_render::mux_mix(&temporary, &mix, &muxed, cancel)?;
+            let rendered_seconds = super::audio_render::mux_mix(&temporary, &mix, &muxed, cancel)?;
             ensure!(
                 (rendered_seconds - plan.duration_seconds()).abs() <= 0.1,
                 "split audio preview duration differs from planned duration"
@@ -392,51 +497,60 @@ impl Catalog {
             fs::rename(&muxed, &temporary)?;
             fs::remove_file(mix)?;
         }
-        // Renamed only once complete, so a crash mid-render never leaves a
-        // truncated file sitting at the preview's path.
+        attempt.stage("validatingOutput")?;
+        let validation = super::preview_media::validate_movie(
+            &temporary,
+            &workspace,
+            plan,
+            request,
+            &segment_frames,
+            cancel,
+        )?;
+        let current = super::preview_media::prepare(
+            self,
+            plan,
+            request,
+            &self.list_assets(&plan.project_id)?,
+            cancel,
+        )?;
+        ensure!(
+            current.identity.sources == prepared.identity.sources
+                && current.identity.tools == prepared.identity.tools
+                && current.identity.plan_digest == prepared.identity.plan_digest,
+            "preview source media or rendering recipe changed during the attempt"
+        );
+        let result = PreviewResult {
+            artifact_id: Some(attempt.artifact_id.clone()),
+            output_path: output.to_string_lossy().into_owned(),
+            duration_seconds: validation.duration_seconds,
+            clip_count: segments.len() as u32,
+            failures,
+        };
+        ensure!(!cancel(), "preview render cancelled before publication");
         // Only the short publication window excludes concurrent human writes;
         // media rendering never holds SQLite's write lock.
         let mut publication_connection = self.connection()?;
         let publication = publication_connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         ensure!(
-            super::ranges::constraints_key(&publication, &plan)? == constraints_key,
+            super::ranges::constraints_key(&publication, plan)? == constraints_key,
             "human source constraints changed during rendering; review this revision before publishing another preview"
         );
+        let sequence = attempt.complete(&publication, &result, &validation)?;
         fs::rename(&temporary, &output).context("commit rendered preview")?;
         publication.commit()?;
 
         progress(PreviewProgress::Finished {
+            artifact_id: Some(attempt.artifact_id.clone()),
+            sequence: Some(sequence),
             output_path: output.to_string_lossy().into_owned(),
-            duration_seconds: rendered_seconds,
+            duration_seconds: validation.duration_seconds,
         });
-        Ok(PreviewResult {
-            output_path: output.to_string_lossy().into_owned(),
-            duration_seconds: rendered_seconds,
-            clip_count: segments.len() as u32,
-            failures,
-        })
-    }
-
-    /// The cache directory for one plan revision's preview, keyed by revision
-    /// id so one revision's preview is never confused with another's.
-    fn preview_workspace(&self, project_id: &str, revision_id: &str) -> Result<PathBuf> {
-        let parent = self
-            .database_path()
-            .parent()
-            .ok_or_else(|| anyhow!("catalog has no parent directory"))?
-            .to_path_buf();
-        let workspace = parent
-            .join("cache")
-            .join("previews")
-            .join(project_id)
-            .join(revision_id);
-        fs::create_dir_all(&workspace)?;
-        Ok(workspace)
+        Ok(result)
     }
 }
 
-pub(super) fn source_has_audio(source: &str) -> Result<bool> {
+pub(super) fn source_has_audio(source: &str, cancel: &dyn Fn() -> bool) -> Result<bool> {
     let mut command = tool_command("ffprobe");
     command
         .args([
@@ -450,10 +564,11 @@ pub(super) fn source_has_audio(source: &str) -> Result<bool> {
             "json",
         ])
         .arg(source);
-    let output = crate::stall::output_with_timeout(
+    let output = crate::stall::output_with_timeout_and_cancellation(
         &mut command,
         "ffprobe preview audio stream",
         crate::stall::io_stall_timeout(),
+        &cancel,
     )?;
     if !output.status.success() {
         bail!("ffprobe could not inspect preview audio stream");

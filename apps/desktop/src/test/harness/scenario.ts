@@ -53,7 +53,7 @@ import type {
   VisualPlacementPreview,
 } from "../../chronologyTypes";
 import type { Asset, CacheKind, DesktopSettings, SyncStatus } from "../../types";
-import type { SourceRangeConstraints, SourceTrimSuggestion } from "../../chronologyTypes";
+import type { PreviewArtifactPage, PreviewArtifactStatus, SourceRangeConstraints, SourceTrimSuggestion } from "../../chronologyTypes";
 
 export interface ScenarioOptions {
   /** The instant the scenario starts at. Every fake timestamp derives from it. */
@@ -389,6 +389,16 @@ export class ScenarioBuilder {
   /** Declare a trim suggestion by inspection id and media scope. */
   sourceTrimSuggestion(suggestion: SourceTrimSuggestion): this {
     this.state.sourceTrimSuggestions[`${suggestion.inspectedEvidenceId}:${suggestion.media}`] = suggestion;
+    return this;
+  }
+
+  previewArtifactPage(page: PreviewArtifactPage): this {
+    this.state.previewArtifactPages[page.revisionId] = page;
+    return this;
+  }
+
+  previewArtifactStatus(status: PreviewArtifactStatus): this {
+    this.state.previewArtifactStatuses[status.artifact.artifactId] = status;
     return this;
   }
 
