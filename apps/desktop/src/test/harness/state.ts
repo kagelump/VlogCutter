@@ -51,6 +51,9 @@ import type {
   SourceRangeConstraints,
   SourceTrimSuggestion,
   ValidationReport,
+  ReviewFeedbackView,
+  ReviewFeedbackPage,
+  ApplyReviewFeedbackResult,
   VisualPlacementPreview,
 } from "../../chronologyTypes";
 import { HarnessClock } from "./clock";
@@ -101,6 +104,10 @@ export interface EditPlanScenarioState {
   exportResult: OtioExportResult | null;
   /** Set when the scenario wants the next write to hit a revision conflict. */
   conflictMessage: string | null;
+  /** Exact portable review responses declared by the scenario; never derived. */
+  feedbackResponses: Record<string, ReviewFeedbackView>;
+  feedbackReports: Record<string, ReviewFeedbackPage>;
+  feedbackApplyResults: Record<string, ApplyReviewFeedbackResult>;
 }
 
 export interface PairingScenarioState {
@@ -320,6 +327,9 @@ export function createInitialState(clock: HarnessClock): DesktopHarnessState {
       validation: {},
       exportResult: null,
       conflictMessage: null,
+      feedbackResponses: {},
+      feedbackReports: {},
+      feedbackApplyResults: {},
     },
     sourceRanges: {},
     sourceTrimSuggestions: {},

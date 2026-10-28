@@ -19,6 +19,8 @@
 pub mod audio;
 mod audio_render;
 pub mod diff;
+pub mod feedback;
+mod feedback_model;
 pub mod inspection;
 mod inspection_media;
 mod inspection_model;
@@ -91,6 +93,32 @@ impl Catalog {
         base_revision_id: Option<&str>,
         expected_active_revision_id: Option<&str>,
     ) -> Result<EditPlanRevision> {
+        self.check_revision_inputs(project_id, operations, base_revision_id)?;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_active(&transaction, project_id, expected_active_revision_id)?;
+        let (revision_id, operation) = revision_operation(
+            &transaction,
+            project_id,
+            operations,
+            script_revision_id,
+            base_revision_id,
+        )?;
+        commit_local_in_transaction(&transaction, project_id, vec![operation])?;
+        transaction.commit()?;
+        self.edit_plan_revision(&revision_id)
+    }
+
+    fn check_revision_inputs(
+        &self,
+        project_id: &str,
+        operations: &[EditPlanOperation],
+        base_revision_id: Option<&str>,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            operations.len() <= 10_000,
+            "invalid input: maximum 10000 cuts"
+        );
         self.require_project(project_id)?;
         if let Some(base) = base_revision_id {
             let base = self.edit_plan_revision(base)?;
@@ -145,41 +173,7 @@ impl Catalog {
                 .into());
             }
         }
-        let mut connection = self.connection()?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        require_active(&transaction, project_id, expected_active_revision_id)?;
-        let revision_id = format!("editrev_{}", Uuid::new_v4().simple());
-        let payload = serde_json::json!({
-            "revisionId": revision_id,
-            "scriptRevisionId": script_revision_id,
-            "parentRevisionId": base_revision_id,
-            "operations": operations
-                .iter()
-                .enumerate()
-                .map(|(position, operation)| {
-                    let mut operation = operation.clone();
-                    operation.position = position as u32;
-                    if operation.operation_id.is_empty() {
-                        operation.operation_id = format!("editop_{}", Uuid::new_v4().simple());
-                    }
-                    serde_json::to_value(operation).expect("finite edit operation serializes")
-                })
-                .collect::<Vec<_>>(),
-        });
-        let guard = current_revision(&transaction, project_id, "editPlan", project_id)?;
-        commit_local_in_transaction(
-            &transaction,
-            project_id,
-            vec![NewOperation {
-                aggregate_type: "editPlan",
-                aggregate_id: project_id.to_string(),
-                operation_type: EDIT_PLAN_REVISION_CREATED,
-                base_revision: Some(guard),
-                payload,
-            }],
-        )?;
-        transaction.commit()?;
-        self.edit_plan_revision(&revision_id)
+        Ok(())
     }
 
     /// Makes a revision the active plan.
@@ -255,72 +249,10 @@ impl Catalog {
     /// One revision with its operations, in position order.
     pub fn edit_plan_revision(&self, revision_id: &str) -> Result<EditPlanRevision> {
         let connection = self.connection()?;
-        let (project_id, script_revision_id, parent_revision_id, active, created_at) = connection
-            .query_row(
-                "SELECT project_id, script_revision_id, parent_revision_id, active, created_at
-                 FROM edit_plan_revisions WHERE revision_id=?1",
-                [revision_id],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, Option<String>>(1)?,
-                        row.get::<_, Option<String>>(2)?,
-                        row.get::<_, i64>(3)? != 0,
-                        row.get::<_, String>(4)?,
-                    ))
-                },
-            )
-            .optional()?
-            .ok_or_else(|| EditPlanError::UnknownRevision {
-                revision_id: revision_id.to_string(),
-            })?;
-
-        // Read-only callers must not have to migrate a legacy linked plan.
-        let audio_column =
-            if crate::migrations::column_exists(&connection, "edit_plan_operations", "audio_json")?
-            {
-                "audio_json"
-            } else {
-                "NULL"
-            };
-        let mut statement = connection.prepare(&format!(
-            "SELECT operation_id, position, asset_id, source_in_seconds, source_out_seconds, rationale, {audio_column}
-             FROM edit_plan_operations WHERE revision_id=?1 ORDER BY position",
-        ))?;
-        let operations = statement
-            .query_map([revision_id], |row| {
-                Ok(EditPlanOperation {
-                    operation_id: row.get(0)?,
-                    position: row.get::<_, i64>(1)? as u32,
-                    asset_id: row.get(2)?,
-                    source_in_seconds: row.get(3)?,
-                    source_out_seconds: row.get(4)?,
-                    rationale: row.get(5)?,
-                    audio: row
-                        .get::<_, Option<String>>(6)?
-                        .map(|json| {
-                            serde_json::from_str(&json).map_err(|error| {
-                                rusqlite::Error::FromSqlConversionFailure(
-                                    6,
-                                    rusqlite::types::Type::Text,
-                                    Box::new(error),
-                                )
-                            })
-                        })
-                        .transpose()?,
-                })
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-
-        Ok(EditPlanRevision {
-            revision_id: revision_id.to_string(),
-            project_id,
-            script_revision_id,
-            parent_revision_id,
-            active,
-            operations,
-            created_at,
-        })
+        let transaction = connection.unchecked_transaction()?;
+        let revision = read_revision(&transaction, revision_id)?;
+        transaction.commit()?;
+        Ok(revision)
     }
 
     /// Whether a revision was derived from a script revision that is no longer
@@ -503,4 +435,111 @@ fn require_active(
         .into());
     }
     Ok(())
+}
+
+fn read_revision(connection: &rusqlite::Connection, revision_id: &str) -> Result<EditPlanRevision> {
+    let (project_id, script_revision_id, parent_revision_id, active, created_at) = connection
+        .query_row(
+            "SELECT project_id, script_revision_id, parent_revision_id, active, created_at
+                 FROM edit_plan_revisions WHERE revision_id=?1",
+            [revision_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, i64>(3)? != 0,
+                    row.get::<_, String>(4)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or_else(|| EditPlanError::UnknownRevision {
+            revision_id: revision_id.to_string(),
+        })?;
+
+    // Read-only callers must not have to migrate a legacy linked plan.
+    let audio_column =
+        if crate::migrations::column_exists(connection, "edit_plan_operations", "audio_json")? {
+            "audio_json"
+        } else {
+            "NULL"
+        };
+    let mut statement = connection.prepare(&format!(
+            "SELECT operation_id, position, asset_id, source_in_seconds, source_out_seconds, rationale, {audio_column}
+             FROM edit_plan_operations WHERE revision_id=?1 ORDER BY position",
+        ))?;
+    let operations = statement
+        .query_map([revision_id], |row| {
+            Ok(EditPlanOperation {
+                operation_id: row.get(0)?,
+                position: row.get::<_, i64>(1)? as u32,
+                asset_id: row.get(2)?,
+                source_in_seconds: row.get(3)?,
+                source_out_seconds: row.get(4)?,
+                rationale: row.get(5)?,
+                audio: row
+                    .get::<_, Option<String>>(6)?
+                    .map(|json| {
+                        serde_json::from_str(&json).map_err(|error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                6,
+                                rusqlite::types::Type::Text,
+                                Box::new(error),
+                            )
+                        })
+                    })
+                    .transpose()?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    Ok(EditPlanRevision {
+        revision_id: revision_id.to_string(),
+        project_id,
+        script_revision_id,
+        parent_revision_id,
+        active,
+        operations,
+        created_at,
+    })
+}
+
+/// Shared by ordinary drafts and atomic accepted-feedback revisions.
+fn revision_operation(
+    connection: &rusqlite::Connection,
+    project_id: &str,
+    operations: &[EditPlanOperation],
+    script_revision_id: Option<&str>,
+    base_revision_id: Option<&str>,
+) -> Result<(String, NewOperation)> {
+    let revision_id = format!("editrev_{}", Uuid::new_v4().simple());
+    let payload = serde_json::json!({
+        "revisionId": revision_id,
+        "scriptRevisionId": script_revision_id,
+        "parentRevisionId": base_revision_id,
+        "operations": operations
+            .iter()
+            .enumerate()
+            .map(|(position, operation)| {
+                let mut operation = operation.clone();
+                operation.position = position as u32;
+                if operation.operation_id.is_empty() {
+                    operation.operation_id = format!("editop_{}", Uuid::new_v4().simple());
+                }
+                serde_json::to_value(operation).expect("finite edit operation serializes")
+            })
+            .collect::<Vec<_>>(),
+    });
+    let guard = current_revision(connection, project_id, "editPlan", project_id)?;
+    Ok((
+        revision_id,
+        NewOperation {
+            aggregate_type: "editPlan",
+            aggregate_id: project_id.into(),
+            operation_type: EDIT_PLAN_REVISION_CREATED,
+            base_revision: Some(guard),
+            payload,
+        },
+    ))
 }

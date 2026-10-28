@@ -44,6 +44,9 @@ import type {
   TripPhase,
   ValidationReport,
   VisualPlacementPreview,
+  RecordReviewNoteRequest, ReviewFeedbackView, ReviewFeedbackPage,
+  ProposeReviewChangeRequest, DecideReviewFeedbackRequest, MapReviewTargetRequest,
+  ApplyReviewFeedbackRequest, ApplyReviewFeedbackResult,
 } from "./chronologyTypes";
 
 const inTauri = () => "__TAURI_INTERNALS__" in window;
@@ -373,6 +376,28 @@ export const chronologyApi = {
 
   async validateEditPlan(revisionId: string): Promise<ValidationReport> {
     return invoke<ValidationReport>("validate_edit_plan", { revisionId });
+  },
+
+  async recordReviewNote(request: RecordReviewNoteRequest): Promise<ReviewFeedbackView> {
+    return invoke<ReviewFeedbackView>("record_review_note", { request });
+  },
+  async proposeReviewChange(projectId: string, request: ProposeReviewChangeRequest): Promise<ReviewFeedbackView> {
+    return invoke<ReviewFeedbackView>("propose_review_change", { projectId, request });
+  },
+  async decideReviewFeedback(projectId: string, request: DecideReviewFeedbackRequest): Promise<ReviewFeedbackView> {
+    return invoke<ReviewFeedbackView>("decide_review_feedback", { projectId, request });
+  },
+  async mapReviewTarget(projectId: string, request: MapReviewTargetRequest): Promise<ReviewFeedbackView> {
+    return invoke<ReviewFeedbackView>("map_review_target", { projectId, request });
+  },
+  async reviewFeedback(projectId: string, noteId: string, revisionId: string): Promise<ReviewFeedbackView> {
+    return invoke<ReviewFeedbackView>("review_feedback", { projectId, noteId, revisionId });
+  },
+  async reviewFeedbackReport(projectId: string, revisionId: string, offset?: number, limit?: number): Promise<ReviewFeedbackPage> {
+    return invoke<ReviewFeedbackPage>("review_feedback_report", { projectId, revisionId, offset, limit });
+  },
+  async applyReviewFeedback(request: ApplyReviewFeedbackRequest): Promise<ApplyReviewFeedbackResult> {
+    return invoke<ApplyReviewFeedbackResult>("apply_review_feedback", { request });
   },
 
   async inspectSourceWindow(

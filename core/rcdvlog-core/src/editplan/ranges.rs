@@ -365,9 +365,19 @@ pub(crate) fn constraints_key(
         .into_iter()
         .filter(|r| assets.contains(r.0.as_str()))
         .collect();
-    Ok(blake3::hash(&serde_json::to_vec(&rows)?)
+    let ranges_key = blake3::hash(&serde_json::to_vec(&rows)?)
         .to_hex()
-        .to_string())
+        .to_string();
+    Ok(
+        if let Some(hard_choices) = super::feedback::hard_choice_key(connection, &plan.project_id)?
+        {
+            blake3::hash(&serde_json::to_vec(&(ranges_key, hard_choices))?)
+                .to_hex()
+                .to_string()
+        } else {
+            ranges_key
+        },
+    )
 }
 fn load_one(connection: &Connection, id: &str) -> Result<Option<ConfirmedSourceRange>> {
     let body: Option<String> = connection

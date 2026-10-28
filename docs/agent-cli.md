@@ -1028,7 +1028,17 @@ rcdvlog --catalog /absolute/project/catalog.sqlite3 edit-plan preview-status --a
 rcdvlog --catalog /absolute/project/catalog.sqlite3 edit-plan preview-status --artifact <artifact-id> --verify
 rcdvlog --catalog /absolute/project/catalog.sqlite3 edit-plan preview-wait --artifact <artifact-id> --timeout-seconds 600
 rcdvlog --catalog /absolute/project/catalog.sqlite3 edit-plan preview-cancel --artifact <artifact-id>
+rcdvlog --catalog /absolute/project/catalog.sqlite3 edit-plan feedback record --input /absolute/note.json
+rcdvlog --catalog /absolute/project/catalog.sqlite3 edit-plan feedback propose --input /absolute/proposal.json
+rcdvlog --catalog /absolute/project/catalog.sqlite3 edit-plan feedback decide --input /absolute/decision.json
+rcdvlog --catalog /absolute/project/catalog.sqlite3 edit-plan feedback map --input /absolute/mapping.json
+rcdvlog --catalog /absolute/project/catalog.sqlite3 edit-plan feedback get --note <note-id> --revision <revision-id>
+rcdvlog --catalog /absolute/project/catalog.sqlite3 edit-plan feedback report --project <project-id> --revision <revision-id> --offset 0 --limit 20
+rcdvlog --catalog /absolute/project/catalog.sqlite3 edit-plan feedback apply --project <project-id> --expected-base <revision-id> --expected-active <revision-id-or-none> --input /absolute/accepted.json
 ```
+
+Feedback command JSON shapes, revision semantics, and safety limits are
+documented in [revision-bound edit-plan feedback](edit-plan-feedback.md).
 
 The complete ordered input is an object (maximum 4 MiB and 10,000 cuts):
 
@@ -1104,7 +1114,9 @@ The managed segment store has no implicit cleanup or deletion API.
 See [preview artifacts](edit-plan-preview-artifacts.md) for the receipt fields,
 clock semantics, verification boundary, and interpretation limits.
 
-Revision-bound review feedback remains a follow-up slice under #112.
+Revision-bound review feedback is implemented in schema 55. See
+[revision-bound edit-plan feedback](edit-plan-feedback.md) for the portable
+operation model and apply/retention rules.
 
 ### Independent source audio
 

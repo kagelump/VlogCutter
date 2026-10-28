@@ -13,16 +13,19 @@
 
 use crate::{AppState, error_message};
 use rcdvlog_core::{
-    AssetChronology, CaptureSequence, CaptureSequenceMergePreview,
-    CaptureSequenceReassignmentPreview, CaptureSequenceSplitPreview, ChronologyExplanation,
-    ChronologySolution, ClipTimeException, ClockEpoch, ClockEpochClearPreview,
-    ClockEpochImpactPreview, ConfirmSourceRangeRequest, ConstraintStrength, Contradiction,
-    Diagnostic, DiagnosticCounts, DiagnosticFilter, DiagnosticSeverity, DisplayMode, EditPlanAudio,
-    EditPlanOperation, EditPlanRevision, EventOrderConstraint, OtioExportRequest, OtioExportResult,
-    PhaseKind, PhaseSplitDirection, PreviewArtifactPage, PreviewArtifactStatus, PreviewProgress,
-    PreviewRequest, PreviewResult, QueuePosition, SourceInspectionRequest, SourceInspectionResult,
-    SourceRangeConstraints, SourceTrimRequest, SourceTrimSuggestion, TripPhase, ValidationReport,
-    VisualPlacementPreview, VisualPlacementSide, resolve_anchored_phases,
+    ApplyReviewFeedbackRequest, ApplyReviewFeedbackResult, AssetChronology, CaptureSequence,
+    CaptureSequenceMergePreview, CaptureSequenceReassignmentPreview, CaptureSequenceSplitPreview,
+    ChronologyExplanation, ChronologySolution, ClipTimeException, ClockEpoch,
+    ClockEpochClearPreview, ClockEpochImpactPreview, ConfirmSourceRangeRequest, ConstraintStrength,
+    Contradiction, DecideReviewFeedbackRequest, Diagnostic, DiagnosticCounts, DiagnosticFilter,
+    DiagnosticSeverity, DisplayMode, EditPlanAudio, EditPlanOperation, EditPlanRevision,
+    EventOrderConstraint, MapReviewTargetRequest, OtioExportRequest, OtioExportResult, PhaseKind,
+    PhaseSplitDirection, PreviewArtifactPage, PreviewArtifactStatus, PreviewProgress,
+    PreviewRequest, PreviewResult, ProposeReviewChangeRequest, QueuePosition,
+    RecordReviewNoteRequest, ReviewFeedbackPage, ReviewFeedbackView, SourceInspectionRequest,
+    SourceInspectionResult, SourceRangeConstraints, SourceTrimRequest, SourceTrimSuggestion,
+    TripPhase, ValidationReport, VisualPlacementPreview, VisualPlacementSide,
+    resolve_anchored_phases,
 };
 use serde::{Deserialize, Serialize};
 use tauri::State;
@@ -855,6 +858,189 @@ pub async fn activate_edit_plan_revision(
     .map_err(error_message)??;
     state.sync_manager.wake_project(&revision.project_id);
     Ok(revision)
+}
+
+// Revision feedback is portable project data. Ownership is checked before
+// each core operation so a caller cannot use a note id to cross project scope.
+#[tauri::command]
+pub async fn record_review_note(
+    request: RecordReviewNoteRequest,
+    state: State<'_, AppState>,
+) -> Result<ReviewFeedbackView, String> {
+    let catalog = state.catalog()?;
+    let project_id = request.project_id.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let revision = catalog
+            .edit_plan_revision(&request.revision_id)
+            .map_err(error_message)?;
+        if revision.project_id != request.project_id {
+            return Err("edit plan revision belongs to another project".into());
+        }
+        catalog.record_review_note(&request).map_err(error_message)
+    })
+    .await
+    .map_err(error_message)??;
+    state.sync_manager.wake_project(&project_id);
+    Ok(result)
+}
+
+#[tauri::command]
+pub async fn propose_review_change(
+    project_id: String,
+    request: ProposeReviewChangeRequest,
+    state: State<'_, AppState>,
+) -> Result<ReviewFeedbackView, String> {
+    let catalog = state.catalog()?;
+    let note_id = request.note_id.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let note = catalog.review_note(&note_id).map_err(error_message)?;
+        if note.project_id != project_id {
+            return Err("review note belongs to another project".into());
+        }
+        let project_id = note.project_id.clone();
+        let result = catalog
+            .propose_review_change(&request)
+            .map_err(error_message)?;
+        Ok::<_, String>((project_id, result))
+    })
+    .await
+    .map_err(error_message)??;
+    state.sync_manager.wake_project(&result.0);
+    Ok(result.1)
+}
+
+#[tauri::command]
+pub async fn decide_review_feedback(
+    project_id: String,
+    request: DecideReviewFeedbackRequest,
+    state: State<'_, AppState>,
+) -> Result<ReviewFeedbackView, String> {
+    let catalog = state.catalog()?;
+    let note_id = request.note_id.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let note = catalog.review_note(&note_id).map_err(error_message)?;
+        if note.project_id != project_id {
+            return Err("review note belongs to another project".into());
+        }
+        let project_id = note.project_id.clone();
+        let result = catalog
+            .decide_review_feedback(&request)
+            .map_err(error_message)?;
+        Ok::<_, String>((project_id, result))
+    })
+    .await
+    .map_err(error_message)??;
+    state.sync_manager.wake_project(&result.0);
+    Ok(result.1)
+}
+
+#[tauri::command]
+pub async fn map_review_target(
+    project_id: String,
+    request: MapReviewTargetRequest,
+    state: State<'_, AppState>,
+) -> Result<ReviewFeedbackView, String> {
+    let catalog = state.catalog()?;
+    let note_id = request.note_id.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let note = catalog.review_note(&note_id).map_err(error_message)?;
+        if note.project_id != project_id {
+            return Err("review note belongs to another project".into());
+        }
+        let revision = catalog
+            .edit_plan_revision(&request.revision_id)
+            .map_err(error_message)?;
+        if revision.project_id != note.project_id {
+            return Err("mapped revision belongs to another project".into());
+        }
+        let project_id = note.project_id.clone();
+        let result = catalog.map_review_target(&request).map_err(error_message)?;
+        Ok::<_, String>((project_id, result))
+    })
+    .await
+    .map_err(error_message)??;
+    state.sync_manager.wake_project(&result.0);
+    Ok(result.1)
+}
+
+#[tauri::command]
+pub async fn review_feedback(
+    project_id: String,
+    note_id: String,
+    revision_id: String,
+    state: State<'_, AppState>,
+) -> Result<ReviewFeedbackView, String> {
+    let catalog = state.catalog()?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let note = catalog.review_note(&note_id).map_err(error_message)?;
+        if note.project_id != project_id {
+            return Err("review note belongs to another project".into());
+        }
+        let revision = catalog
+            .edit_plan_revision(&revision_id)
+            .map_err(error_message)?;
+        if revision.project_id != project_id {
+            return Err("edit plan revision belongs to another project".into());
+        }
+        catalog
+            .review_feedback(&note_id, &revision_id)
+            .map_err(error_message)
+    })
+    .await
+    .map_err(error_message)?
+}
+
+#[tauri::command]
+pub async fn review_feedback_report(
+    project_id: String,
+    revision_id: String,
+    offset: Option<usize>,
+    limit: Option<usize>,
+    state: State<'_, AppState>,
+) -> Result<ReviewFeedbackPage, String> {
+    let catalog = state.catalog()?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let revision = catalog
+            .edit_plan_revision(&revision_id)
+            .map_err(error_message)?;
+        if revision.project_id != project_id {
+            return Err("edit plan revision belongs to another project".into());
+        }
+        catalog
+            .review_feedback_report(
+                &project_id,
+                &revision_id,
+                offset.unwrap_or(0),
+                limit.unwrap_or(100),
+            )
+            .map_err(error_message)
+    })
+    .await
+    .map_err(error_message)?
+}
+
+#[tauri::command]
+pub async fn apply_review_feedback(
+    request: ApplyReviewFeedbackRequest,
+    state: State<'_, AppState>,
+) -> Result<ApplyReviewFeedbackResult, String> {
+    let catalog = state.catalog()?;
+    let project_id = request.project_id.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let revision = catalog
+            .edit_plan_revision(&request.base_revision_id)
+            .map_err(error_message)?;
+        if revision.project_id != request.project_id {
+            return Err("base revision belongs to another project".into());
+        }
+        catalog
+            .apply_review_feedback(&request)
+            .map_err(error_message)
+    })
+    .await
+    .map_err(error_message)??;
+    state.sync_manager.wake_project(&project_id);
+    Ok(result)
 }
 
 #[tauri::command]

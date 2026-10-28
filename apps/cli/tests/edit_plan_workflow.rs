@@ -494,6 +494,7 @@ fn generated_media_plan_create_fork_diff_validate_activate_and_preview() {
         success(&catalog, &["edit-plan", "list", "--project", project])["activeRevisionId"],
         b_id
     );
+    feedback_review_revision_workflow(&catalog, project, &b, &preview, dir.path());
 }
 
 /// Exercise cancellation of a live media child in a separate CLI process,
@@ -674,4 +675,223 @@ fn tool_content_changes_invalidate_cached_segments(catalog: &Path, revision: &st
             "{document}"
         );
     }
+}
+
+fn feedback_review_revision_workflow(
+    catalog: &Path,
+    project: &str,
+    base: &Value,
+    movie: &Value,
+    parent: &Path,
+) {
+    let input = parent.join("review-feedback.json");
+    let request = |verb: &str, value: Value| {
+        fs::write(&input, serde_json::to_vec(&value).unwrap()).unwrap();
+        success(
+            catalog,
+            &[
+                "edit-plan",
+                "feedback",
+                verb,
+                "--input",
+                input.to_str().unwrap(),
+            ],
+        )
+    };
+    let base_id = base["revisionId"].as_str().unwrap();
+    let cut = base["operations"][0]["operationId"].as_str().unwrap();
+    let source_in = base["operations"][0]["sourceInSeconds"].as_f64().unwrap() + 0.1;
+    let source_out = base["operations"][0]["sourceOutSeconds"].as_f64().unwrap();
+    let recorded = request(
+        "record",
+        json!({"projectId":project,"revisionId":base_id,"operationId":cut,"author":"human","category":"endpoint",
+        "observation":"Synthetic human asks for a cleaner opening; this is not editorial listening acceptance.","viewedArtifactId":movie["preview"]["artifactId"],"movieTimeSeconds":0.2}),
+    );
+    let note = recorded["note"]["noteId"].as_str().unwrap();
+    assert_eq!(recorded["revision"], 1);
+    assert_eq!(recorded["note"]["target"]["revisionId"], base_id);
+    assert_eq!(
+        recorded["note"]["target"]["viewedMovie"]["timestampMapping"],
+        "declaredPlaybackSeconds"
+    );
+    let proposed = request(
+        "propose",
+        json!({"noteId":note,"expectedRevision":1,"author":"reviewer","change":{"kind":"trim","sourceInSeconds":source_in,"sourceOutSeconds":source_out},"rationale":"Generated bounded trim proposal."}),
+    );
+    let proposal = proposed["latestProposal"]["proposalId"].as_str().unwrap();
+    let accepted_input =
+        json!({"accepted":[{"noteId":note,"expectedRevision":2,"proposalId":proposal}]});
+    fs::write(&input, serde_json::to_vec(&accepted_input).unwrap()).unwrap();
+    let apply_args = [
+        "edit-plan",
+        "feedback",
+        "apply",
+        "--project",
+        project,
+        "--expected-base",
+        base_id,
+        "--expected-active",
+        base_id,
+        "--input",
+        input.to_str().unwrap(),
+    ];
+    failure(catalog, &apply_args, "review_feedback_not_accepted");
+    request(
+        "decide",
+        json!({"noteId":note,"expectedRevision":2,"proposalId":proposal,"decisionOwner":"human","action":"accepted","rationale":"Synthetic explicit human acceptance."}),
+    );
+    fs::write(
+        &input,
+        serde_json::to_vec(
+            &json!({"accepted":[{"noteId":note,"expectedRevision":3,"proposalId":proposal}]}),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let mut stale = apply_args;
+    stale[8] = "none";
+    failure(catalog, &stale, "edit_plan_stale_revision");
+    let applied = success(catalog, &apply_args);
+    let changed = applied["revision"]["revisionId"].as_str().unwrap();
+    assert_eq!(applied["revision"]["parentRevisionId"], base_id);
+    assert_eq!(
+        applied["validation"]["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|f| f["severity"] == "error")
+            .count(),
+        0
+    );
+    assert_eq!(
+        success(catalog, &["edit-plan", "list", "--project", project])["activeRevisionId"],
+        base_id
+    );
+    let before = fs::read(catalog).unwrap();
+    let read = success(
+        catalog,
+        &[
+            "edit-plan",
+            "feedback",
+            "get",
+            "--note",
+            note,
+            "--revision",
+            changed,
+        ],
+    );
+    assert_eq!(read["currentRevisionId"], changed);
+    assert_eq!(read["note"]["target"]["revisionId"], base_id);
+    assert_eq!(read["resolution"], "addressed");
+    assert_eq!(read["targetStatus"]["requiresMapping"], true);
+    let report = success(
+        catalog,
+        &[
+            "edit-plan",
+            "feedback",
+            "report",
+            "--project",
+            project,
+            "--revision",
+            changed,
+            "--limit",
+            "1",
+        ],
+    );
+    assert_eq!(report["total"], 1);
+    assert_eq!(report["items"][0]["note"]["noteId"], note);
+    assert_eq!(
+        fs::read(catalog).unwrap(),
+        before,
+        "feedback reads must not migrate/write"
+    );
+    request(
+        "map",
+        json!({"noteId":note,"expectedRevision":4,"proposalId":null,"revisionId":changed,"operationId":cut,"decisionOwner":"human","rationale":"Synthetic explicit mapping for a later sound proposal."}),
+    );
+    request(
+        "decide",
+        json!({"noteId":note,"expectedRevision":5,"proposalId":null,"decisionOwner":"human","action":"deferred","rationale":"Synthetic deferral remains distinct from acceptance."}),
+    );
+    let audio = request(
+        "propose",
+        json!({"noteId":note,"expectedRevision":6,"author":"reviewer","change":{"kind":"audio","audio":{"mode":"silent"}},"rationale":"Synthetic explicit deliberate silence."}),
+    );
+    let audio_proposal = audio["latestProposal"]["proposalId"].as_str().unwrap();
+    request(
+        "decide",
+        json!({"noteId":note,"expectedRevision":7,"proposalId":audio_proposal,"decisionOwner":"human","action":"accepted","rationale":"Synthetic acceptance of deliberate silence."}),
+    );
+    fs::write(
+        &input,
+        serde_json::to_vec(
+            &json!({"accepted":[{"noteId":note,"expectedRevision":8,"proposalId":audio_proposal}]}),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let audio_apply = [
+        "edit-plan",
+        "feedback",
+        "apply",
+        "--project",
+        project,
+        "--expected-base",
+        changed,
+        "--expected-active",
+        base_id,
+        "--input",
+        input.to_str().unwrap(),
+    ];
+    let audio_revision = success(catalog, &audio_apply);
+    let audio_id = audio_revision["revision"]["revisionId"].as_str().unwrap();
+    assert!(
+        audio_revision["diff"]["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["changes"].as_array().unwrap().contains(&json!("audio")))
+    );
+    let preview = success(
+        catalog,
+        &[
+            "edit-plan",
+            "preview",
+            "--revision",
+            audio_id,
+            "--max-height",
+            "144",
+        ],
+    );
+    assert_eq!(preview["preview"]["clipCount"], 2);
+    success(
+        catalog,
+        &[
+            "edit-plan",
+            "activate",
+            "--revision",
+            audio_id,
+            "--expected-active",
+            base_id,
+        ],
+    );
+    failure(
+        catalog,
+        &[
+            "edit-plan",
+            "activate",
+            "--revision",
+            changed,
+            "--expected-active",
+            base_id,
+        ],
+        "edit_plan_stale_revision",
+    );
+    let mut stale_note = audio_apply;
+    stale_note[8] = audio_id;
+    failure(catalog, &stale_note, "review_feedback_stale_revision");
+    assert_eq!(
+        success(catalog, &["edit-plan", "get", "--revision", changed])["active"],
+        false
+    );
 }

@@ -264,6 +264,7 @@ pub use diagnostics::{
     Diagnostic, DiagnosticCounts, DiagnosticFilter, DiagnosticRecord, DiagnosticSeverity,
     DiagnosticSubject,
 };
+pub use editplan::feedback::*;
 pub use editplan::{
     ConfirmSourceRangeRequest, ConfirmedRangeInspection, ConfirmedSourceRange, EditPlanAudio,
     EditPlanError, EditPlanExport, EditPlanOperation, EditPlanRevision, EditPlanStaleness, Finding,
@@ -1445,6 +1446,7 @@ impl Catalog {
         // `open_read_only_existing` must stay side-effect free.
         catalog.redispatch_chronology_operations()?;
         editplan::ranges::redispatch(&mut catalog.connection()?)?;
+        editplan::feedback::redispatch(&mut catalog.connection()?)?;
         Ok(catalog)
     }
 
