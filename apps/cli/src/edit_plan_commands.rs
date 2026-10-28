@@ -1,7 +1,7 @@
 //! Thin supported adapter for immutable edit plans. Core owns all plan writes.
 use anyhow::{Context, Result, ensure};
 use clap::{Args, Subcommand};
-use rcdvlog_core::{Catalog, EditPlanOperation, PreviewRequest};
+use rcdvlog_core::{Catalog, EditPlanOperation, PreviewRequest, SourceInspectionRequest};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::path::PathBuf;
@@ -52,6 +52,12 @@ pub enum EditPlanCommand {
         #[arg(long, default_value_t = 360, value_parser = clap::value_parser!(u32).range(144..=1080))]
         max_height: u32,
     },
+    /// Inspect oriented actual frames and optional audio in a bounded source window.
+    Inspect {
+        /// SourceInspectionRequest JSON; never chooses a fallback representation.
+        #[arg(long)]
+        input: PathBuf,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -77,6 +83,7 @@ pub fn command_name(command: &EditPlanCommand) -> &'static str {
         EditPlanCommand::Validate(_) => "edit-plan.validate",
         EditPlanCommand::Activate { .. } => "edit-plan.activate",
         EditPlanCommand::Preview { .. } => "edit-plan.preview",
+        EditPlanCommand::Inspect { .. } => "edit-plan.inspect",
     }
 }
 
@@ -164,6 +171,18 @@ pub fn execute(catalog: &Catalog, command: &EditPlanCommand) -> Result<Value> {
                 &|| false,
             )?;
             Ok(json!({ "revisionId": revision, "preview": result }))
+        }
+        EditPlanCommand::Inspect { input } => {
+            let bytes = std::fs::read(input).context("invalid input: read inspection JSON")?;
+            ensure!(
+                bytes.len() <= 64 * 1024,
+                "invalid input: inspection JSON exceeds 64 KiB"
+            );
+            let request: SourceInspectionRequest = serde_json::from_slice(&bytes)
+                .context("invalid input: parse source inspection JSON")?;
+            Ok(serde_json::to_value(
+                catalog.inspect_source_window(&request, &|| false)?,
+            )?)
         }
     }
 }

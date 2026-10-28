@@ -144,6 +144,49 @@ fn generated_media_plan_create_fork_diff_validate_activate_and_preview() {
         .or_else(|| listed["items"].as_array())
         .unwrap();
     let asset = assets[0]["id"].as_str().unwrap();
+    let inspection_input = dir.path().join("inspection.json");
+    let mut inspection_request = json!({
+        "assetId":asset,"representation":"original","purpose":"proposedBoundary",
+        "sourceInSeconds":0.5,"sourceOutSeconds":1.5,"beforeSeconds":0.25,"afterSeconds":0.25,
+        "sampleCount":3,"maxWidth":160,"includeAudio":true
+    });
+    fs::write(
+        &inspection_input,
+        serde_json::to_vec(&inspection_request).unwrap(),
+    )
+    .unwrap();
+    let inspect_args = [
+        "edit-plan",
+        "inspect",
+        "--input",
+        inspection_input.to_str().unwrap(),
+    ];
+    let inspected = success(&catalog, &inspect_args);
+    assert_eq!(
+        inspected["inspection"]["frames"].as_array().unwrap().len(),
+        3
+    );
+    assert_eq!(inspected["inspection"]["audio"]["state"], "complete");
+    assert_eq!(
+        inspected["inspection"]["mapping"]["precision"],
+        "actualSourcePts"
+    );
+    assert_eq!(success(&catalog, &inspect_args)["reused"], true);
+    inspection_request["expectedRepresentationFingerprint"] = json!("stale");
+    fs::write(
+        &inspection_input,
+        serde_json::to_vec(&inspection_request).unwrap(),
+    )
+    .unwrap();
+    failure(&catalog, &inspect_args, "stale_evidence");
+    inspection_request["expectedRepresentationFingerprint"] = Value::Null;
+    inspection_request["sampleCount"] = json!(65);
+    fs::write(
+        &inspection_input,
+        serde_json::to_vec(&inspection_request).unwrap(),
+    )
+    .unwrap();
+    failure(&catalog, &inspect_args, "invalid_input");
     let exact_end = assets[0]["durationSeconds"].as_f64().unwrap();
     let input = dir.path().join("plan.json");
     fs::write(&input, serde_json::to_vec(&json!({"operations": [

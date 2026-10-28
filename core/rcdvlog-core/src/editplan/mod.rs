@@ -19,12 +19,16 @@
 pub mod audio;
 mod audio_render;
 pub mod diff;
+pub mod inspection;
+mod inspection_media;
+mod inspection_model;
 pub mod model;
 pub mod otio;
 pub mod preview;
 pub mod validate;
 
 pub use audio::{EditPlanAudio, SourceAudio};
+pub use inspection_model::*;
 pub use model::{
     EditPlanError, EditPlanExport, EditPlanOperation, EditPlanRevision, EditPlanStaleness,
 };

@@ -294,6 +294,108 @@ export interface EditPlanRevision {
   createdAt: string;
 }
 
+export type InspectionRepresentation = "original" | "generatedProxy" | "cameraProxy";
+export type InspectionPurpose = "locator" | "proposedBoundary" | "inspectedBoundary";
+
+/** Input for one bounded source-window evidence request. Fields with defaults
+ * in Rust may be omitted by callers. */
+export interface SourceInspectionRequest {
+  assetId: string;
+  representation: InspectionRepresentation;
+  purpose: InspectionPurpose;
+  sourceInSeconds: number;
+  sourceOutSeconds: number;
+  beforeSeconds?: number;
+  afterSeconds?: number;
+  sampleCount: number;
+  maxWidth: number;
+  sourceTimesSeconds?: number[];
+  exactRepresentationPts?: number[];
+  expectedRepresentationFingerprint?: string | null;
+  includeAudio?: boolean;
+  includeTranscript?: boolean;
+}
+
+export interface InspectionFile {
+  path: string;
+  blake3: string;
+  byteLength: number;
+}
+
+export interface InspectionTimeMapping {
+  timeBaseNumerator: number;
+  timeBaseDenominator: number;
+  representationOriginPts: number;
+  sourceOffsetSeconds: number;
+  representationOffsetSeconds: number;
+  secondsScale: number;
+  precision: string;
+  sourceFrameReduction: number | null;
+}
+
+export interface InspectedFrame {
+  evidenceId: string;
+  representationPts: number;
+  sourceSeconds: number;
+  excerptSeconds: number;
+  image: InspectionFile;
+}
+
+export interface InspectionWaveformBin {
+  excerptStartSeconds: number;
+  excerptEndSeconds: number;
+  peak: number;
+  rms: number;
+  lowEnergy: boolean;
+}
+
+export interface InspectedAudio {
+  state: string;
+  playable: InspectionFile | null;
+  sampleRate: number;
+  channels: number;
+  sourceInSamples: number;
+  sourceOutSamples: number;
+  streamSourceInSeconds: number | null;
+  leadingGapSeconds: number;
+  waveform: InspectionWaveformBin[];
+}
+
+export interface InspectedUtterance {
+  sourceInSeconds: number;
+  sourceOutSeconds: number;
+  excerptInSeconds: number;
+  excerptOutSeconds: number;
+  text: string;
+  clippedByWindow: boolean;
+}
+
+export interface SourceInspection {
+  evidenceId: string;
+  recipe: string;
+  request: SourceInspectionRequest;
+  sourceFingerprint: string;
+  representationFingerprint: string;
+  rotationDegrees: number;
+  mapping: InspectionTimeMapping;
+  windowInSeconds: number;
+  windowOutSeconds: number;
+  frames: InspectedFrame[];
+  audio: InspectedAudio | null;
+  utterances: InspectedUtterance[];
+  availableFrameCount: number;
+  minAvailableFrameIntervalSeconds: number | null;
+  maxAvailableFrameIntervalSeconds: number | null;
+  maxUnsampledGapSeconds: number;
+  limitations: string[];
+  createdAt: string;
+}
+
+export interface SourceInspectionResult {
+  inspection: SourceInspection;
+  reused: boolean;
+}
+
 export type FindingSeverity = "error" | "warning";
 
 export interface Finding {

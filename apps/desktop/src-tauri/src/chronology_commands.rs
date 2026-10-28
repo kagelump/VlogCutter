@@ -19,8 +19,9 @@ use rcdvlog_core::{
     ClockEpochImpactPreview, ConstraintStrength, Contradiction, Diagnostic, DiagnosticCounts,
     DiagnosticFilter, DiagnosticSeverity, DisplayMode, EditPlanAudio, EditPlanOperation,
     EditPlanRevision, EventOrderConstraint, OtioExportRequest, OtioExportResult, PhaseKind,
-    PhaseSplitDirection, PreviewProgress, PreviewRequest, PreviewResult, QueuePosition, TripPhase,
-    ValidationReport, VisualPlacementPreview, VisualPlacementSide, resolve_anchored_phases,
+    PhaseSplitDirection, PreviewProgress, PreviewRequest, PreviewResult, QueuePosition,
+    SourceInspectionRequest, SourceInspectionResult, TripPhase, ValidationReport,
+    VisualPlacementPreview, VisualPlacementSide, resolve_anchored_phases,
 };
 use serde::{Deserialize, Serialize};
 use tauri::State;
@@ -865,6 +866,21 @@ pub async fn validate_edit_plan(
         .await
         .map_err(error_message)?
         .map_err(error_message)
+}
+
+#[tauri::command]
+pub async fn inspect_source_window(
+    request: SourceInspectionRequest,
+    state: State<'_, AppState>,
+) -> Result<SourceInspectionResult, String> {
+    let catalog = state.catalog()?;
+    tauri::async_runtime::spawn_blocking(move || {
+        catalog
+            .inspect_source_window(&request, &|| false)
+            .map_err(error_message)
+    })
+    .await
+    .map_err(error_message)?
 }
 
 /// Renders a low-resolution preview, emitting progress to the front end.

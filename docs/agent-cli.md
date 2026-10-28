@@ -900,13 +900,10 @@ remaps only labels whose local authorship record says analysis created them; it
 never changes human-only labels.
 
 Rough-cut selection and source ranges remain separate from the labeling phase.
-The core and desktop now have an initial edit-plan/preview/OTIO path, but the
-CLI does not yet expose edit-plan revision, validation, preview, export, or
-history commands. That missing machine-readable surface is tracked by D01-T030
-and by issue #48, which pairs it with the project-local agent workspace. When
-those commands land they are the supported way for an agent to create or
-activate an edit-plan revision; editing a projected `edit-plan.json` by hand is
-not.
+The supported immutable edit-plan commands below create, compare, validate,
+activate, preview and inspect plans/source windows. Export/history CLI and the
+project-local agent workspace remain follow-up work under #48. Editing a
+projected `edit-plan.json` by hand does not mutate a catalog.
 
 ## Companion-server commands
 
@@ -1044,7 +1041,7 @@ track/effect fields. Positions must equal zero-based array indices. Empty
 reordering a cut; give each new cut, split, or repeated-source use its own ID.
 IDs are unique within each revision and may persist across revisions. A diff
 returns each changed cut's identity, before/after values, and change kinds
-(`added`, `omitted`, `order`, `source`, `range`, `rationale`).
+(`added`, `omitted`, `order`, `source`, `range`, `rationale`, `audio`).
 
 Ranges are finite seconds on the source clock, inclusive in / exclusive out.
 Source reuse and overlapping ranges are legal and reported as advisory warnings.
@@ -1127,3 +1124,10 @@ render claim prevents concurrent writers, and failed/cancelled attempts never
 replace a completed preview. OTIO export refuses any explicit audio mode with
 `otio_unsupported_audio` before creating an output or export record; finishing
 acceptance under #128 is separate.
+
+### Bounded source inspection
+
+`edit-plan inspect --input /absolute/inspection.json` explicitly generates or
+reuses local source-window evidence without activating or changing a plan.
+See [source inspection](edit-plan-inspection.md) for the JSON contract, exact
+representation PTS requests, mapping precision, sound policy and limitations.

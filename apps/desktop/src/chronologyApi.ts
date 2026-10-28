@@ -33,6 +33,8 @@ import type {
   PreviewResult,
   PhaseSplitDirection,
   QueuePosition,
+  SourceInspectionRequest,
+  SourceInspectionResult,
   TripPhase,
   ValidationReport,
   VisualPlacementPreview,
@@ -365,6 +367,12 @@ export const chronologyApi = {
 
   async validateEditPlan(revisionId: string): Promise<ValidationReport> {
     return invoke<ValidationReport>("validate_edit_plan", { revisionId });
+  },
+
+  async inspectSourceWindow(
+    request: SourceInspectionRequest,
+  ): Promise<SourceInspectionResult> {
+    return invoke<SourceInspectionResult>("inspect_source_window", { request });
   },
 
   async renderPreview(revisionId: string, maxHeight?: number): Promise<PreviewResult | null> {

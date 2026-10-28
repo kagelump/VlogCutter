@@ -266,9 +266,12 @@ pub use diagnostics::{
 };
 pub use editplan::{
     EditPlanAudio, EditPlanError, EditPlanExport, EditPlanOperation, EditPlanRevision,
-    EditPlanStaleness, Finding, FindingKind, OtioExportError, OtioExportRequest, OtioExportResult,
-    PreviewFailure, PreviewProgress, PreviewRequest, PreviewResult, Severity, SourceAudio,
-    ValidationReport, otio_document,
+    EditPlanStaleness, Finding, FindingKind, InspectedAudio, InspectedFrame, InspectedUtterance,
+    InspectionFile, InspectionPurpose, InspectionRepresentation, InspectionTimeMapping,
+    InspectionWaveformBin, OtioExportError, OtioExportRequest, OtioExportResult, PreviewFailure,
+    PreviewProgress, PreviewRequest, PreviewResult, Severity, SourceAudio, SourceInspection,
+    SourceInspectionError, SourceInspectionRequest, SourceInspectionResult, ValidationReport,
+    otio_document,
 };
 pub use operations::{
     ApplyOperationResult, AssetRevisionDiagnostics, CAPTURE_SEQUENCE_DECLARED,
