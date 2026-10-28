@@ -7,7 +7,7 @@ use thiserror::Error;
 
 use crate::chronology::forward_migrate_project_chronology;
 
-pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 49;
+pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 50;
 
 const MIGRATION_TABLE_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -378,9 +378,37 @@ pub const PROJECT_CATALOG_MIGRATIONS: &[SqliteMigration] = &[
         source_identity: "project-catalog/0049-revision-scoped-edit-cut-ids/20261028",
         apply: revision_scoped_edit_cut_ids,
     },
+    SqliteMigration {
+        id: 50,
+        name: "independent_source_audio",
+        source_identity: "project-catalog/0050-independent-source-audio/20261028",
+        apply: independent_source_audio,
+    },
 ];
 
+fn independent_source_audio(transaction: &Transaction<'_>) -> Result<()> {
+    add_column_if_missing(transaction, "edit_plan_operations", "audio_json", "TEXT")?;
+    Ok(())
+}
+
 fn revision_scoped_edit_cut_ids(transaction: &Transaction<'_>) -> Result<()> {
+    // Unversioned catalog adoption replays the migration list over an already
+    // current physical schema. Preserve both the composite identity and any
+    // later columns instead of rebuilding an old seven-column projection.
+    let already_scoped: bool = transaction.query_row(
+        "SELECT COUNT(*)=2 AND SUM(CASE WHEN (name='revision_id' AND pk=1)
+            OR (name='operation_id' AND pk=2) THEN 1 ELSE 0 END)=2
+         FROM pragma_table_info('edit_plan_operations') WHERE pk>0",
+        [],
+        |row| row.get(0),
+    )?;
+    if already_scoped {
+        return Ok(());
+    }
+    anyhow::ensure!(
+        !column_exists(transaction, "edit_plan_operations", "audio_json")?,
+        "incompatible edit-plan schema: independent audio without revision-scoped cut identities"
+    );
     transaction.execute_batch(
         "CREATE TABLE edit_plan_operations_v49 (
             operation_id TEXT NOT NULL,
@@ -393,7 +421,9 @@ fn revision_scoped_edit_cut_ids(transaction: &Transaction<'_>) -> Result<()> {
             PRIMARY KEY(revision_id, operation_id),
             UNIQUE(revision_id, position)
         );
-        INSERT INTO edit_plan_operations_v49 SELECT * FROM edit_plan_operations;
+        INSERT INTO edit_plan_operations_v49
+            SELECT operation_id,revision_id,position,asset_id,source_in_seconds,source_out_seconds,rationale
+            FROM edit_plan_operations;
         DROP TABLE edit_plan_operations;
         ALTER TABLE edit_plan_operations_v49 RENAME TO edit_plan_operations;",
     )?;
@@ -1553,7 +1583,7 @@ fn table_exists(connection: &Connection, table: &str) -> Result<bool> {
     )?)
 }
 
-fn column_exists(connection: &Connection, table: &str, column: &str) -> Result<bool> {
+pub(crate) fn column_exists(connection: &Connection, table: &str, column: &str) -> Result<bool> {
     let sql = format!("SELECT 1 FROM pragma_table_info('{table}') WHERE name = ?1 LIMIT 1");
     Ok(connection
         .query_row(&sql, [column], |_| Ok(()))
@@ -4629,6 +4659,82 @@ mod edit_cut_migration_tests {
     use super::*;
 
     #[test]
+    fn unversioned_replay_preserves_revision_scoped_cuts_and_source_audio() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        migrate_project_catalog(&mut connection).unwrap();
+        connection.execute_batch(
+            "INSERT INTO projects(id,name,created_at) VALUES('p','fixture','now');
+             INSERT INTO assets(id,project_id,fingerprint,path,filename,size_bytes,duration_seconds,created_at)
+                VALUES('a','p','fp','/offline/a.mp4','a.mp4',1,5,'now');
+             INSERT INTO edit_plan_revisions(revision_id,project_id,created_at) VALUES('r1','p','now'),('r2','p','now');
+             INSERT INTO edit_plan_operations VALUES('cut','r1',0,'a',1,4,'keep','{\"mode\":\"silent\"}');
+             INSERT INTO edit_plan_operations VALUES('cut','r2',0,'a',2,4,'trim',NULL);
+             DROP TABLE schema_migrations;",
+        ).unwrap();
+        migrate_project_catalog(&mut connection).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT audio_json FROM edit_plan_operations WHERE revision_id='r1'",
+                    [],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+            "{\"mode\":\"silent\"}"
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM edit_plan_operations", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        assert!(connection.execute("INSERT INTO edit_plan_operations VALUES('cut','r2',1,'a',0,1,'duplicate',NULL)", []).is_err());
+        migrate_project_catalog(&mut connection).unwrap();
+        assert_eq!(
+            inspect_project_catalog_migrations(&connection)
+                .unwrap()
+                .current_version,
+            PROJECT_CATALOG_SCHEMA_VERSION
+        );
+    }
+
+    #[test]
+    fn migration_50_preserves_legacy_linked_audio() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("catalog.sqlite3");
+        let mut connection = Connection::open(&path).unwrap();
+        run_sqlite_migrations(&mut connection, &PROJECT_CATALOG_MIGRATIONS[..49]).unwrap();
+        connection.execute_batch(
+            "INSERT INTO projects(id,name,created_at) VALUES('p','fixture','now');
+             INSERT INTO assets(id,project_id,fingerprint,path,filename,size_bytes,duration_seconds,created_at)
+                VALUES('a','p','fp','/offline/a.mp4','a.mp4',1,5,'now');
+             INSERT INTO edit_plan_revisions(revision_id,project_id,active,created_at) VALUES('r','p',1,'now');
+             INSERT INTO edit_plan_operations VALUES('cut','r',0,'a',1,4,'keep');",
+        ).unwrap();
+        let readonly = crate::Catalog::open_read_only_existing(&path).unwrap();
+        assert!(
+            readonly.edit_plan_revision("r").unwrap().operations[0]
+                .audio
+                .is_none()
+        );
+        assert!(!column_exists(&connection, "edit_plan_operations", "audio_json").unwrap());
+        migrate_project_catalog(&mut connection).unwrap();
+        assert_eq!(connection.query_row("SELECT source_in_seconds,source_out_seconds,audio_json FROM edit_plan_operations", [],
+            |row| Ok((row.get::<_,f64>(0)?,row.get::<_,f64>(1)?,row.get::<_,Option<String>>(2)?))).unwrap(),(1.0,4.0,None));
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT active FROM edit_plan_revisions WHERE revision_id='r'",
+                    [],
+                    |row| row.get::<_, i32>(0)
+                )
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
     fn migration_49_preserves_cuts_and_allows_identity_in_another_revision() {
         let mut connection = Connection::open_in_memory().unwrap();
         run_sqlite_migrations(&mut connection, &PROJECT_CATALOG_MIGRATIONS[..48]).unwrap();
@@ -4652,18 +4758,18 @@ mod edit_cut_migration_tests {
         );
         connection
             .execute(
-                "INSERT INTO edit_plan_operations VALUES('cut','r2',0,'a',1,3,'trim')",
+                "INSERT INTO edit_plan_operations(operation_id,revision_id,position,asset_id,source_in_seconds,source_out_seconds,rationale) VALUES('cut','r2',0,'a',1,3,'trim')",
                 [],
             )
             .unwrap();
         assert!(
             connection
                 .execute(
-                    "INSERT INTO edit_plan_operations VALUES('cut','r2',1,'a',1,3,'duplicate')",
+                    "INSERT INTO edit_plan_operations(operation_id,revision_id,position,asset_id,source_in_seconds,source_out_seconds,rationale) VALUES('cut','r2',1,'a',1,3,'duplicate')",
                     []
                 )
                 .is_err()
         );
-        assert!(connection.execute("INSERT INTO edit_plan_operations VALUES('other','r2',0,'a',1,3,'duplicate position')", []).is_err());
+        assert!(connection.execute("INSERT INTO edit_plan_operations(operation_id,revision_id,position,asset_id,source_in_seconds,source_out_seconds,rationale) VALUES('other','r2',0,'a',1,3,'duplicate position')", []).is_err());
     }
 }

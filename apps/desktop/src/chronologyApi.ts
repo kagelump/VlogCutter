@@ -25,6 +25,7 @@ import type {
   Contradiction,
   Diagnostic,
   DiagnosticsView,
+  EditPlanOperationInput,
   EditPlanRevision,
   EventOrderConstraint,
   OtioExportResult,
@@ -339,12 +340,7 @@ export const chronologyApi = {
 
   async createEditPlanRevision(
     projectId: string,
-    operations: {
-      assetId: string;
-      sourceInSeconds: number;
-      sourceOutSeconds: number;
-      rationale: string;
-    }[],
+    operations: EditPlanOperationInput[],
     expectedActiveRevisionId: string | null,
   ): Promise<EditPlanRevision | null> {
     return invoke<EditPlanRevision>("create_edit_plan_revision", {

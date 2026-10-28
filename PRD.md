@@ -1283,7 +1283,7 @@ The following decisions were accepted for the MVP on 2026-07-18.
 
 7. **Chronology corrections:** fixed offsets plus explicit clip exceptions are sufficient. Clock drift is out of scope. The principal boundaries are camera clock changes and timezone-change events.
 
-8. **Edit plan:** one video track, linked source audio where available, and hard cuts only.
+8. **Edit plan:** one picture track and hard picture cuts. Legacy plans retain linked source audio where available. The explicit rough-cut extension accepted under #183 supports versioned independent source-audio ranges and movie placement, at most two overlapping source intervals, explicit gain, and short audio fades in local previews. General multitrack editing, music and effects remain outside this scope. Export must preserve these edits or reject them explicitly; see [the audio contract](docs/agent-cli.md#independent-source-audio).
 
 9. **Persistence:** use one portable SQLite catalog per project. New projects default to `~/Movies/VideoProjects/<project name>/`, with the parent folder configurable and laptop-local proxies stored beside the catalog.
 

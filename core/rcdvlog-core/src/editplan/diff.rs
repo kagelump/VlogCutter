@@ -58,6 +58,9 @@ impl Catalog {
                     {
                         kinds.push("range");
                     }
+                    if left.audio != right.audio {
+                        kinds.push("audio");
+                    }
                     if left.rationale != right.rationale {
                         kinds.push("rationale");
                     }

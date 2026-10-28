@@ -74,6 +74,7 @@ fn cut(asset_index: usize, from: f64, to: f64) -> EditPlanOperation {
         source_in_seconds: from,
         source_out_seconds: to,
         rationale: format!("shot {asset_index}"),
+        audio: None,
     }
 }
 

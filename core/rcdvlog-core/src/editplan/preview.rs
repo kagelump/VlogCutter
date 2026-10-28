@@ -7,13 +7,17 @@
 //! The preview is not an export and is never handed to a finishing editor. It
 //! carries no determinism requirement — D01-T022 owns that.
 //!
-//! Hard cuts only. No transition, no crossfade, no audio ramp, including none
-//! introduced incidentally by an FFmpeg filter default: each segment is cut
-//! with a stream copy and the segments are concatenated, so there is no filter
-//! graph that could add one.
+//! Picture uses hard cuts on a common preview canvas. Legacy plans retain their
+//! linked-source recipe. Explicit source audio is mixed on a separate 48 kHz
+//! clock with only the requested gains and short fades, then muxed and decoded
+//! before publication. No failed segment is silently omitted from a complete
+//! preview.
 
-use crate::{Catalog, media_tool_failure, run_captured_media_command, tool_command};
-use anyhow::{Context, Result, anyhow, bail};
+use crate::{
+    Catalog, media_tool_failure, run_captured_media_command_with_cancellation as run_media,
+    tool_command,
+};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
@@ -83,6 +87,27 @@ impl Catalog {
         progress: &mut dyn FnMut(PreviewProgress),
         cancel: &dyn Fn() -> bool,
     ) -> Result<PreviewResult> {
+        self.render_preview_internal(request, progress, cancel, None)
+    }
+
+    /// An enclosing domain pipeline already owns the host's heavy-work lease.
+    pub(crate) fn render_preview_with_heavy_lease(
+        &self,
+        request: &PreviewRequest,
+        progress: &mut dyn FnMut(PreviewProgress),
+        cancel: &dyn Fn() -> bool,
+        heavy: &crate::LocalHeavyLease,
+    ) -> Result<PreviewResult> {
+        self.render_preview_internal(request, progress, cancel, Some(heavy))
+    }
+
+    fn render_preview_internal(
+        &self,
+        request: &PreviewRequest,
+        progress: &mut dyn FnMut(PreviewProgress),
+        cancel: &dyn Fn() -> bool,
+        heavy: Option<&crate::LocalHeavyLease>,
+    ) -> Result<PreviewResult> {
         let plan = self.edit_plan_revision(&request.revision_id)?;
         let report = self.validate_edit_plan(&request.revision_id)?;
         if !report.renderable() {
@@ -95,7 +120,26 @@ impl Catalog {
         }
 
         let assets = self.list_assets(&plan.project_id)?;
+        let split_audio = plan.operations.iter().any(|cut| cut.audio.is_some());
+        let audio_events = if split_audio {
+            super::audio::audio_events(&plan, &assets)?
+        } else {
+            Vec::new()
+        };
         let workspace = self.preview_workspace(&plan.project_id, &plan.revision_id)?;
+        let render_lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(workspace.join(".render.lock"))?;
+        fs2::FileExt::try_lock_exclusive(&render_lock)
+            .context("preview render is already in progress for this revision")?;
+        let _heavy = if heavy.is_some() {
+            None
+        } else {
+            Some(self.acquire_local_heavy_cancellable(cancel)?)
+        };
         // A previous attempt's segments must never be concatenated into this
         // one, so the workspace starts empty every time.
         let segments_dir = workspace.join("segments");
@@ -113,6 +157,8 @@ impl Catalog {
         let mut failures: Vec<PreviewFailure> = Vec::new();
         let mut rendered_seconds = 0.0f64;
         let started = std::time::Instant::now();
+        let mut picture_frames = 0_u64;
+        let mut requested_picture_end = 0.0;
 
         for (index, operation) in plan.operations.iter().enumerate() {
             if cancel() {
@@ -160,10 +206,25 @@ impl Catalog {
                 270 => "transpose=cclock,",
                 _ => "",
             };
-            let normalize = format!(
+            let mut normalize = format!(
                 "{rotation}scale={canvas_width}:{canvas_height}:force_original_aspect_ratio=decrease,pad={canvas_width}:{canvas_height}:(ow-iw)/2:(oh-ih)/2,fps=30000/1001,setsar=1,setpts=PTS-STARTPTS"
             );
-            let has_audio = source_has_audio(source)?;
+            let segment_duration = if split_audio {
+                requested_picture_end += duration;
+                let end_frame = (requested_picture_end * 30000.0 / 1001.0).round() as u64;
+                let frames = end_frame.saturating_sub(picture_frames);
+                ensure!(
+                    frames > 0,
+                    "cut {} is shorter than a preview frame",
+                    operation.operation_id
+                );
+                picture_frames = end_frame;
+                normalize.push_str(",tpad=stop_mode=clone:stop_duration=0.1");
+                frames as f64 * 1001.0 / 30000.0
+            } else {
+                duration
+            };
+            let has_audio = !split_audio && source_has_audio(source)?;
             let mut command = tool_command("ffmpeg");
             command
                 .args(["-y", "-hide_banner", "-loglevel", "error", "-ss"])
@@ -173,7 +234,9 @@ impl Catalog {
                 .arg("-noautorotate")
                 .arg("-i")
                 .arg(source);
-            if has_audio {
+            if split_audio {
+                command.args(["-map", "0:v:0", "-an"]);
+            } else if has_audio {
                 command.args(["-map", "0:v:0", "-map", "0:a:0"]);
             } else {
                 command.args([
@@ -189,7 +252,7 @@ impl Catalog {
             }
             command
                 .arg("-t")
-                .arg(duration.to_string())
+                .arg(segment_duration.to_string())
                 .args([
                     "-vf",
                     &normalize,
@@ -219,9 +282,13 @@ impl Catalog {
                     "-1",
                 ])
                 .arg(&segment);
-            let (status, diagnostic) =
-                run_captured_media_command(&mut command, std::path::Path::new(source), &segment)
-                    .context("start ffmpeg preview segment process")?;
+            let (status, diagnostic) = run_media(
+                &mut command,
+                std::path::Path::new(source),
+                &segment,
+                &mut || cancel(),
+            )
+            .context("start ffmpeg preview segment process")?;
 
             if !status.success() {
                 let message =
@@ -252,6 +319,12 @@ impl Catalog {
             });
         }
 
+        if !failures.is_empty() {
+            bail!(
+                "preview incomplete: {} source segments failed; no completed preview was published",
+                failures.len()
+            );
+        }
         if segments.is_empty() {
             bail!(
                 "preview produced no segments; {} clips failed",
@@ -289,8 +362,9 @@ impl Catalog {
             .arg(&list_path)
             .args(["-c", "copy", "-movflags", "+faststart"])
             .arg(&temporary);
-        let (status, diagnostic) = run_captured_media_command(&mut command, &list_path, &temporary)
-            .context("start ffmpeg preview concat process")?;
+        let (status, diagnostic) =
+            run_media(&mut command, &list_path, &temporary, &mut || cancel())
+                .context("start ffmpeg preview concat process")?;
         if !status.success() {
             let _ = fs::remove_file(&temporary);
             return Err(media_tool_failure(
@@ -298,6 +372,24 @@ impl Catalog {
                 status,
                 diagnostic,
             ));
+        }
+        if split_audio {
+            ensure!(!cancel(), "preview render cancelled before audio mix");
+            let mix = super::audio_render::render_mix(
+                &workspace,
+                &audio_events,
+                plan.duration_seconds(),
+                cancel,
+            )?;
+            let muxed = workspace.join("preview.audio.tmp.mp4");
+            rendered_seconds = super::audio_render::mux_mix(&temporary, &mix, &muxed, cancel)?;
+            ensure!(
+                (rendered_seconds - plan.duration_seconds()).abs() <= 0.1,
+                "split audio preview duration differs from planned duration"
+            );
+            ensure!(!cancel(), "preview render cancelled before publication");
+            fs::rename(&muxed, &temporary)?;
+            fs::remove_file(mix)?;
         }
         // Renamed only once complete, so a crash mid-render never leaves a
         // truncated file sitting at the preview's path.
@@ -333,7 +425,7 @@ impl Catalog {
     }
 }
 
-fn source_has_audio(source: &str) -> Result<bool> {
+pub(super) fn source_has_audio(source: &str) -> Result<bool> {
     let mut command = tool_command("ffprobe");
     command
         .args([

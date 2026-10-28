@@ -1039,7 +1039,7 @@ The complete ordered input is an object (maximum 4 MiB and 10,000 cuts):
 ```
 
 `scriptRevisionId` is optional. Unknown fields are rejected, including unsupported
-audio/track/effect fields. Positions must equal zero-based array indices. Empty
+track/effect fields. Positions must equal zero-based array indices. Empty
 `operationId` values receive generated IDs. Keep the same ID when trimming or
 reordering a cut; give each new cut, split, or repeated-source use its own ID.
 IDs are unique within each revision and may persist across revisions. A diff
@@ -1070,5 +1070,60 @@ plan. Stale writes report `edit_plan_stale_revision`; failed validation reports
 `edit_plan_validation_failed`. Preview never activates and returns the addressed
 revision ID plus preview metadata. Progress events go to stderr.
 
-Revision-bound review feedback and independent source audio are follow-up slices
-under #112 and #183; this interface does not accept either yet.
+Revision-bound review feedback remains a follow-up slice under #112.
+
+### Independent source audio
+
+An omitted `audio` field preserves legacy linked source sound. An explicit
+`{"mode":"silent"}` suppresses that picture cut's linked audio, for example on
+B-roll covering retained dialogue. To give source sound independent handles:
+
+```json
+{
+  "mode": "source",
+  "version": 1,
+  "assetId": "audio-source-asset-id",
+  "sourceInSeconds": 0.5,
+  "sourceOutSeconds": 2.5,
+  "timelineStartSeconds": 0.5,
+  "syncOffsetSeconds": 0,
+  "gainDb": -6,
+  "fadeInSeconds": 0,
+  "fadeOutSeconds": 0.05
+}
+```
+
+Place this object in a cut's `audio` field. Picture positions still define one
+contiguous hard-cut track. Audio placement uses movie seconds from zero and
+must stay inside that track's requested duration. Audio may start before its
+picture (J cut), end after it (L cut), or cover other silent imagery. Its source
+must be a clip in the same project with sufficient verified audio-stream handles
+in the chosen review representation; unknown audio duration requires review.
+
+During coincident imagery from that source, `syncOffsetSeconds` is the audio
+source clock minus the picture source clock. Zero keeps sync; a nonzero offset
+must match the explicitly requested placement. Incompatible repeated-source
+mappings are rejected. Version, finite intervals, source handles, stream presence,
+placement, sync, gain and fade limits are checked before activation or rendering.
+
+At most two audible source intervals may overlap. Mixing is a deterministic sum
+at the explicit gains, with no normalization or ducking; choose sufficient gain
+headroom to avoid clipping. Gains default to 0 dB and must be -60..=0. Fades
+default to zero, must be at most 250 ms each, and must fit the interval. They do
+not silently expand to cover speech. Explicit-audio previews are bounded to six
+hours, use stereo 48 kHz samples, and decode the full result before publication.
+Every picture cut must occupy at least one preview frame.
+Source in points round inward up to a whole 48 kHz sample; out points round
+inward down, and movie placement rounds to the nearest sample. Preview picture
+boundaries round on the cumulative 30000/1001 frame grid, avoiding per-cut drift;
+output resampling may hold the last accepted source frame for the fractional
+frame boundary. This creates no additional source-frame evidence.
+
+The immutable operation uses `editPlanRevisionCreated` payload version 2 whenever
+any cut declares audio; older clients refuse that version. Schema 50 preserves
+legacy rows with absent audio. Audio-only changes appear as `audio` in the normal
+revision diff. Creating or previewing the draft never activates it. A per-revision
+render claim prevents concurrent writers, and failed/cancelled attempts never
+replace a completed preview. OTIO export refuses any explicit audio mode with
+`otio_unsupported_audio` before creating an output or export record; finishing
+acceptance under #128 is separate.

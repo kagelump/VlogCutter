@@ -228,7 +228,7 @@ impl Catalog {
         run: F,
     ) -> Result<PipelineSmokeReport>
     where
-        F: FnOnce(&Path) -> Result<Vec<PipelineSmokeCheck>>,
+        F: FnOnce(&Path, &crate::LocalHeavyLease) -> Result<Vec<PipelineSmokeCheck>>,
     {
         ensure!(
             !self.read_only,
@@ -241,7 +241,7 @@ impl Catalog {
                 return Ok(current);
             }
         }
-        let _heavy = self.acquire_local_heavy()?;
+        let heavy = self.acquire_local_heavy()?;
         let started_at = Utc::now().to_rfc3339();
         let root = self
             .database_path()
@@ -251,7 +251,7 @@ impl Catalog {
             .join("pipeline-smoke")
             .join(Uuid::new_v4().simple().to_string());
         fs::create_dir_all(&root).context("create managed pipeline-smoke workspace")?;
-        let report = match run(&root) {
+        let report = match run(&root, &heavy) {
             Ok(checks) => {
                 let passed = checks.iter().all(|check| check.passed);
                 PipelineSmokeReport {
@@ -306,8 +306,11 @@ impl Catalog {
     }
 }
 
-fn run_generated_preview(root: &Path) -> Result<Vec<PipelineSmokeCheck>> {
-    run_generated_preview_with_fault(root, None)
+fn run_generated_preview(
+    root: &Path,
+    heavy: &crate::LocalHeavyLease,
+) -> Result<Vec<PipelineSmokeCheck>> {
+    run_generated_preview_with_fault(root, None, heavy)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -322,6 +325,7 @@ enum SmokeFault {
 fn run_generated_preview_with_fault(
     root: &Path,
     fault: Option<SmokeFault>,
+    heavy: &crate::LocalHeavyLease,
 ) -> Result<Vec<PipelineSmokeCheck>> {
     let media = root.join("fixtures");
     fs::create_dir_all(&media)?;
@@ -388,18 +392,20 @@ fn run_generated_preview_with_fault(
                 FIXTURE_SECONDS
             },
             rationale: "generated pipeline smoke".into(),
+            audio: None,
         })
         .collect();
     let plan = temp_catalog.create_edit_plan_revision(&project.id, &operations, None, None)?;
     let plan = temp_catalog.activate_edit_plan_revision(&plan.revision_id, None)?;
     let mut progress = |_| {};
-    let preview = temp_catalog.render_preview(
+    let preview = temp_catalog.render_preview_with_heavy_lease(
         &PreviewRequest {
             revision_id: plan.revision_id,
             max_height: 180,
         },
         &mut progress,
         &|| false,
+        heavy,
     )?;
     ensure!(
         preview.failures.is_empty(),
@@ -977,8 +983,8 @@ mod tests {
             let catalog = Catalog::open(directory.path().join("catalog.sqlite3")).unwrap();
             let identity = smoke_identity();
             let report = catalog
-                .run_pipeline_smoke_using(identity.clone(), true, |root| {
-                    run_generated_preview_with_fault(root, Some(fault))
+                .run_pipeline_smoke_using(identity.clone(), true, |root, heavy| {
+                    run_generated_preview_with_fault(root, Some(fault), heavy)
                 })
                 .unwrap();
             let checks = report.checks;
@@ -1019,7 +1025,7 @@ mod tests {
         assert_eq!(tampered.state, "unverified");
         assert!(tampered.remediation.unwrap().contains("inconsistent"));
         let repaired = catalog
-            .run_pipeline_smoke_using(identity.clone(), true, |_| {
+            .run_pipeline_smoke_using(identity.clone(), true, |_, _| {
                 let mut checks = evaluate_measurements(good_measurements());
                 checks.push(check(
                     "generated-fixture-diversity",

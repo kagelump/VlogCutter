@@ -218,3 +218,21 @@ draft. `create_edit_plan_from_base` permits explicit same-project draft ancestry
 independent of the active-plan guard. See [CLI contract](../../agent-cli.md#immutable-edit-plans)
 for ordered JSON input and cut-identity diffs. Ranges retain source seconds without
 persistence snapping; preview seeks no longer round them to milliseconds.
+
+
+### Independent source audio (schema 50)
+
+The optional `audio` JSON field extends each cut with explicit silence or a
+version-1 source-audio interval and movie placement. Migration 50 adds nullable
+`audio_json`; null preserves every legacy range, active revision, and linked
+playback behavior. Extended revision operations use payload version 2 so older
+clients refuse incompatible replay. The operation log and baseline retain the
+whole audio contract; stable cut diffs include audio-only edits. See the
+[CLI audio contract](../../agent-cli.md#independent-source-audio) for validation,
+sample/frame rounding, deterministic two-source mixing, and short fade limits.
+
+Local rendering separates picture from source sound only when an explicit audio
+mode is present. It serializes same-revision writers, rejects incomplete output,
+mixes in bounded memory, validates full decode, and publishes atomically. The
+OTIO writer explicitly refuses the new audio modes until it can preserve them;
+it cannot silently relink audio to picture ranges.

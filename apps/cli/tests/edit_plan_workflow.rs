@@ -259,6 +259,40 @@ fn generated_media_plan_create_fork_diff_validate_activate_and_preview() {
         success(&catalog, &["edit-plan", "get", "--revision", a_id])["operations"],
         a["operations"]
     );
+    cuts[0]["audio"] = json!({"mode":"source", "version":1, "assetId":asset,
+        "sourceInSeconds":2.0,"sourceOutSeconds":2.5,"timelineStartSeconds":0.0,
+        "syncOffsetSeconds":0.0,"gainDb":-6.0,"fadeInSeconds":0.02,"fadeOutSeconds":0.02});
+    fs::write(
+        &input,
+        serde_json::to_vec(&json!({"operations":cuts})).unwrap(),
+    )
+    .unwrap();
+    let audio = create(&catalog, project, &input, b_id, b_id);
+    let audio_id = audio["revisionId"].as_str().unwrap();
+    assert_eq!(audio["operations"][0]["audio"]["version"], 1);
+    let diff = success(
+        &catalog,
+        &["edit-plan", "diff", "--base", b_id, "--revision", audio_id],
+    );
+    assert_eq!(diff["changes"][0]["changes"], json!(["audio"]));
+    let audio_preview = success(
+        &catalog,
+        &[
+            "edit-plan",
+            "preview",
+            "--revision",
+            audio_id,
+            "--max-height",
+            "144",
+        ],
+    );
+    assert_eq!(audio_preview["revisionId"], audio_id);
+    assert_eq!(audio_preview["preview"]["clipCount"], 2);
+    assert_eq!(
+        success(&catalog, &["edit-plan", "list", "--project", project])["activeRevisionId"],
+        b_id
+    );
+    cuts[0].as_object_mut().unwrap().remove("audio");
     cuts[0]["sourceOutSeconds"] = json!(exact_end + 1.0);
     fs::write(
         &input,

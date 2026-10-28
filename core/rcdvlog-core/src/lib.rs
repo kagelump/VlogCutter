@@ -265,9 +265,10 @@ pub use diagnostics::{
     DiagnosticSubject,
 };
 pub use editplan::{
-    EditPlanError, EditPlanExport, EditPlanOperation, EditPlanRevision, EditPlanStaleness, Finding,
-    FindingKind, OtioExportError, OtioExportRequest, OtioExportResult, PreviewFailure,
-    PreviewProgress, PreviewRequest, PreviewResult, Severity, ValidationReport, otio_document,
+    EditPlanAudio, EditPlanError, EditPlanExport, EditPlanOperation, EditPlanRevision,
+    EditPlanStaleness, Finding, FindingKind, OtioExportError, OtioExportRequest, OtioExportResult,
+    PreviewFailure, PreviewProgress, PreviewRequest, PreviewResult, Severity, SourceAudio,
+    ValidationReport, otio_document,
 };
 pub use operations::{
     ApplyOperationResult, AssetRevisionDiagnostics, CAPTURE_SEQUENCE_DECLARED,
