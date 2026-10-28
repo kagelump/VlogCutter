@@ -1131,3 +1131,13 @@ acceptance under #128 is separate.
 reuses local source-window evidence without activating or changing a plan.
 See [source inspection](edit-plan-inspection.md) for the JSON contract, exact
 representation PTS requests, mapping precision, sound policy and limitations.
+
+### Confirmed human source ranges and trim suggestions
+
+`edit-plan ranges list --asset <id>` reads a bounded page without migrations.
+`edit-plan ranges confirm --input /absolute/range.json` and
+`edit-plan ranges revoke --asset <id> --constraint <id> --expected-revision <n>
+--rationale "human reason"` make explicit, revision-guarded human decisions.
+`edit-plan suggest-trim --input /absolute/trim.json` returns advisory clean/
+utterance ranges without accepting a trim. See [source range decisions](edit-plan-source-ranges.md)
+for the JSON contract, picture/audio scope, authority and stale-evidence rules.

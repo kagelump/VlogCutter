@@ -46,6 +46,8 @@ import type {
   EditPlanRevision,
   OtioExportResult,
   QueuePosition,
+  SourceRangeConstraints,
+  SourceTrimSuggestion,
   ValidationReport,
   VisualPlacementPreview,
 } from "../../chronologyTypes";
@@ -180,6 +182,10 @@ export interface DesktopHarnessState {
   diagnostics: Diagnostic[];
   acknowledgedDiagnostics: string[];
   editPlans: EditPlanScenarioState;
+  /** Declared per-asset human source-range projection for edit-plan command CUJs. */
+  sourceRanges: Record<string, SourceRangeConstraints>;
+  /** Declared advisory trim suggestions, keyed by inspection id and media. */
+  sourceTrimSuggestions: Record<string, SourceTrimSuggestion>;
 
   archiveRoots: ArchiveRoot[];
   /**
@@ -311,6 +317,8 @@ export function createInitialState(clock: HarnessClock): DesktopHarnessState {
       exportResult: null,
       conflictMessage: null,
     },
+    sourceRanges: {},
+    sourceTrimSuggestions: {},
 
     archiveRoots: [],
     mountedVolumeIds: {},

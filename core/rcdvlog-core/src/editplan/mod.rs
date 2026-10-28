@@ -25,6 +25,8 @@ mod inspection_model;
 pub mod model;
 pub mod otio;
 pub mod preview;
+mod range_model;
+pub mod ranges;
 pub mod validate;
 
 pub use audio::{EditPlanAudio, SourceAudio};
@@ -34,6 +36,7 @@ pub use model::{
 };
 pub use otio::{OtioExportError, OtioExportRequest, OtioExportResult, otio_document};
 pub use preview::{PreviewFailure, PreviewProgress, PreviewRequest, PreviewResult};
+pub use range_model::*;
 pub use validate::{Finding, FindingKind, Severity, ValidationReport};
 
 use crate::Catalog;

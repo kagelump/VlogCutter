@@ -23,6 +23,7 @@ pub enum FindingKind {
     RangeInverted,
     RangeZeroLength,
     SourceRangeOverlap,
+    ConfirmedRangeViolation,
     StaleScriptRevision,
     StaleRevision,
 }
@@ -47,6 +48,7 @@ impl FindingKind {
             Self::RangeInverted => "edit_plan_range_inverted",
             Self::RangeZeroLength => "edit_plan_range_zero_length",
             Self::SourceRangeOverlap => "edit_plan_source_range_overlap",
+            Self::ConfirmedRangeViolation => "edit_plan_confirmed_range_violation",
             Self::StaleScriptRevision => "edit_plan_stale_script_revision",
             Self::StaleRevision => "edit_plan_stale_revision_warning",
         }
@@ -55,6 +57,7 @@ impl FindingKind {
     pub const fn severity(self) -> Severity {
         match self {
             Self::AudioInvalid
+            | Self::ConfirmedRangeViolation
             | Self::MissingAsset
             | Self::OriginalOffline
             | Self::RangeOutOfBounds
@@ -138,6 +141,81 @@ impl Catalog {
         let revision = self.edit_plan_revision(revision_id)?;
         let assets = self.list_assets(&revision.project_id)?;
         let mut findings: Vec<Finding> = Vec::new();
+        let constraints =
+            super::ranges::load_for_project(&self.connection()?, &revision.project_id)?;
+        if !crate::table_exists(&self.connection()?, "confirmed_source_ranges")? {
+            let pending:bool=self.connection()?.query_row(
+                "SELECT EXISTS(SELECT 1 FROM project_operations WHERE project_id=?1 AND operation_type IN ('sourceRangeConfirmed','sourceRangeRevoked'))",
+                [&revision.project_id],|r|r.get(0))?;
+            if pending {
+                findings.push(Finding::new(FindingKind::ConfirmedRangeViolation,None,None,
+                "Human range decisions require an explicit writable catalog upgrade before this plan can be validated.".into()));
+            }
+        }
+        for cut in &revision.operations {
+            if let Some(asset) = assets.iter().find(|a| a.id == cut.asset_id)
+                && let Some(records) = constraints.get(&asset.id)
+            {
+                check_confirmed_range(
+                    &mut findings,
+                    cut.position,
+                    asset,
+                    records,
+                    cut.source_in_seconds,
+                    cut.source_out_seconds,
+                    super::TrimMedia::Picture,
+                );
+            }
+            let audio = match &cut.audio {
+                Some(super::EditPlanAudio::Silent) => None,
+                Some(super::EditPlanAudio::Source(audio)) => Some((
+                    audio.asset_id.as_str(),
+                    audio.source_in_seconds,
+                    audio.source_out_seconds,
+                )),
+                None => Some((
+                    cut.asset_id.as_str(),
+                    cut.source_in_seconds,
+                    cut.source_out_seconds,
+                )),
+            };
+            if let Some((id, start, end)) = audio
+                && let Some(asset) = assets.iter().find(|a| a.id == id)
+                && let Some(records) = constraints.get(id)
+                && records
+                    .iter()
+                    .any(|r| matches!(r.media, super::RangeMedia::Audio | super::RangeMedia::Both))
+            {
+                let has_audio = if cut.audio.is_some() {
+                    true
+                } else {
+                    let path = asset
+                        .proxy_path
+                        .as_deref()
+                        .filter(|p| Path::new(p).is_file())
+                        .unwrap_or(&asset.path);
+                    match super::preview::source_has_audio(path) {
+                        Ok(present) => present,
+                        Err(_) => {
+                            findings.push(Finding::new(FindingKind::ConfirmedRangeViolation,Some(cut.position),Some(asset.id.clone()),
+                                "Selected linked-audio presence is unchecked; source constraints cannot be verified until media is available.".into()));
+                            false
+                        }
+                    }
+                };
+                if has_audio {
+                    check_confirmed_range(
+                        &mut findings,
+                        cut.position,
+                        asset,
+                        records,
+                        start,
+                        end,
+                        super::TrimMedia::Audio,
+                    );
+                }
+            }
+        }
 
         for operation in &revision.operations {
             let position = Some(operation.position);
@@ -292,5 +370,42 @@ impl Catalog {
                 .then_with(|| left.code.cmp(right.code))
         });
         Ok(ValidationReport { findings })
+    }
+}
+
+fn check_confirmed_range(
+    findings: &mut Vec<Finding>,
+    position: u32,
+    asset: &crate::Asset,
+    records: &[super::ConfirmedSourceRange],
+    start: f64,
+    end: f64,
+    media: super::TrimMedia,
+) {
+    if !start.is_finite() || !end.is_finite() || end <= start {
+        return;
+    }
+    let (allowed, conflicts) =
+        super::ranges::feasible_ranges(records, &asset.fingerprint, asset.duration_seconds, media);
+    if !conflicts.is_empty()
+        || !allowed.iter().any(|r| {
+            super::ranges::contains(
+                *r,
+                super::SourceTimeRange {
+                    source_in_seconds: start,
+                    source_out_seconds: end,
+                },
+            )
+        })
+    {
+        findings.push(Finding::new(
+            FindingKind::ConfirmedRangeViolation,
+            Some(position),
+            Some(asset.id.clone()),
+            format!(
+                "{media:?} range {start:.9}–{end:.9}s violates confirmed human source ranges. {}",
+                conflicts.join(" ")
+            ),
+        ));
     }
 }

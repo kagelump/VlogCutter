@@ -16,12 +16,13 @@ use rcdvlog_core::{
     AssetChronology, CaptureSequence, CaptureSequenceMergePreview,
     CaptureSequenceReassignmentPreview, CaptureSequenceSplitPreview, ChronologyExplanation,
     ChronologySolution, ClipTimeException, ClockEpoch, ClockEpochClearPreview,
-    ClockEpochImpactPreview, ConstraintStrength, Contradiction, Diagnostic, DiagnosticCounts,
-    DiagnosticFilter, DiagnosticSeverity, DisplayMode, EditPlanAudio, EditPlanOperation,
-    EditPlanRevision, EventOrderConstraint, OtioExportRequest, OtioExportResult, PhaseKind,
-    PhaseSplitDirection, PreviewProgress, PreviewRequest, PreviewResult, QueuePosition,
-    SourceInspectionRequest, SourceInspectionResult, TripPhase, ValidationReport,
-    VisualPlacementPreview, VisualPlacementSide, resolve_anchored_phases,
+    ClockEpochImpactPreview, ConfirmSourceRangeRequest, ConstraintStrength, Contradiction,
+    Diagnostic, DiagnosticCounts, DiagnosticFilter, DiagnosticSeverity, DisplayMode, EditPlanAudio,
+    EditPlanOperation, EditPlanRevision, EventOrderConstraint, OtioExportRequest, OtioExportResult,
+    PhaseKind, PhaseSplitDirection, PreviewProgress, PreviewRequest, PreviewResult, QueuePosition,
+    SourceInspectionRequest, SourceInspectionResult, SourceRangeConstraints, SourceTrimRequest,
+    SourceTrimSuggestion, TripPhase, ValidationReport, VisualPlacementPreview, VisualPlacementSide,
+    resolve_anchored_phases,
 };
 use serde::{Deserialize, Serialize};
 use tauri::State;
@@ -878,6 +879,89 @@ pub async fn inspect_source_window(
         catalog
             .inspect_source_window(&request, &|| false)
             .map_err(error_message)
+    })
+    .await
+    .map_err(error_message)?
+}
+
+#[tauri::command]
+pub fn source_range_constraints(
+    asset_id: String,
+    offset: Option<usize>,
+    limit: Option<usize>,
+    state: State<'_, AppState>,
+) -> Result<SourceRangeConstraints, String> {
+    let catalog = state.catalog()?;
+    catalog
+        .source_range_constraints(&asset_id, offset.unwrap_or(0), limit.unwrap_or(100))
+        .map_err(error_message)
+}
+
+#[tauri::command]
+pub async fn confirm_source_range(
+    project_id: String,
+    request: ConfirmSourceRangeRequest,
+    state: State<'_, AppState>,
+) -> Result<SourceRangeConstraints, String> {
+    let catalog = state.catalog()?;
+    let owner_project_id = project_id.clone();
+    let constraints = tauri::async_runtime::spawn_blocking(move || {
+        let asset = catalog
+            .get_asset(&request.asset_id)
+            .map_err(error_message)?;
+        if asset.project_id != owner_project_id {
+            return Err(format!(
+                "asset {} belongs to project {}, not {owner_project_id}",
+                asset.id, asset.project_id
+            ));
+        }
+        catalog
+            .confirm_source_range(&request)
+            .map_err(error_message)
+    })
+    .await
+    .map_err(error_message)??;
+    state.sync_manager.wake_project(&project_id);
+    Ok(constraints)
+}
+
+#[tauri::command]
+pub async fn revoke_source_range(
+    project_id: String,
+    asset_id: String,
+    constraint_id: String,
+    expected_revision: u64,
+    rationale: String,
+    state: State<'_, AppState>,
+) -> Result<SourceRangeConstraints, String> {
+    let catalog = state.catalog()?;
+    let owner_project_id = project_id.clone();
+    let constraints = tauri::async_runtime::spawn_blocking(move || {
+        let asset = catalog.get_asset(&asset_id).map_err(error_message)?;
+        if asset.project_id != owner_project_id {
+            return Err(format!(
+                "asset {} belongs to project {}, not {owner_project_id}",
+                asset.id, asset.project_id
+            ));
+        }
+        catalog
+            .revoke_source_range(&asset_id, &constraint_id, expected_revision, &rationale)
+            .map_err(error_message)
+    })
+    .await
+    .map_err(error_message)??;
+    state.sync_manager.wake_project(&project_id);
+    Ok(constraints)
+}
+
+#[tauri::command]
+pub async fn suggest_source_trim(
+    request: SourceTrimRequest,
+    state: State<'_, AppState>,
+) -> Result<SourceTrimSuggestion, String> {
+    let catalog = state.catalog()?;
+    tauri::async_runtime::spawn_blocking(move || {
+        catalog.suggest_source_trim(&request).map_err(error_message)
     })
     .await
     .map_err(error_message)?

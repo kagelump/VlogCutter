@@ -2014,10 +2014,13 @@ fn main() -> ExitCode {
             let representation_busy = error.downcast_ref::<rcdvlog_core::RepresentationBusy>();
             let edit_plan_error = error.downcast_ref::<rcdvlog_core::EditPlanError>();
             let inspection_error = error.downcast_ref::<rcdvlog_core::SourceInspectionError>();
+            let source_range_error = error.downcast_ref::<rcdvlog_core::SourceRangeError>();
             let code = if let Some(plan) = edit_plan_error {
                 plan.code()
             } else if let Some(inspection) = inspection_error {
                 inspection.code()
+            } else if let Some(ranges) = source_range_error {
+                ranges.code()
             } else if let Some(job_agent) = job_agent {
                 job_agent.code
             } else if let Some(readiness) = readiness_error {

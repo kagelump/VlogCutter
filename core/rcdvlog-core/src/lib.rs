@@ -265,13 +265,15 @@ pub use diagnostics::{
     DiagnosticSubject,
 };
 pub use editplan::{
-    EditPlanAudio, EditPlanError, EditPlanExport, EditPlanOperation, EditPlanRevision,
-    EditPlanStaleness, Finding, FindingKind, InspectedAudio, InspectedFrame, InspectedUtterance,
-    InspectionFile, InspectionPurpose, InspectionRepresentation, InspectionTimeMapping,
-    InspectionWaveformBin, OtioExportError, OtioExportRequest, OtioExportResult, PreviewFailure,
-    PreviewProgress, PreviewRequest, PreviewResult, Severity, SourceAudio, SourceInspection,
-    SourceInspectionError, SourceInspectionRequest, SourceInspectionResult, ValidationReport,
-    otio_document,
+    ConfirmSourceRangeRequest, ConfirmedRangeInspection, ConfirmedSourceRange, EditPlanAudio,
+    EditPlanError, EditPlanExport, EditPlanOperation, EditPlanRevision, EditPlanStaleness, Finding,
+    FindingKind, InspectedAudio, InspectedFrame, InspectedUtterance, InspectionFile,
+    InspectionPurpose, InspectionRepresentation, InspectionTimeMapping, InspectionWaveformBin,
+    OtioExportError, OtioExportRequest, OtioExportResult, PreviewFailure, PreviewProgress,
+    PreviewRequest, PreviewResult, RangeDecision, RangeDecisionOwner, RangeMedia, Severity,
+    SourceAudio, SourceInspection, SourceInspectionError, SourceInspectionRequest,
+    SourceInspectionResult, SourceRangeConstraints, SourceRangeError, SourceTimeRange,
+    SourceTrimRequest, SourceTrimSuggestion, TrimMedia, ValidationReport, otio_document,
 };
 pub use operations::{
     ApplyOperationResult, AssetRevisionDiagnostics, CAPTURE_SEQUENCE_DECLARED,
@@ -1439,6 +1441,7 @@ impl Catalog {
         // from the log by a build that knows their type. Writable open only —
         // `open_read_only_existing` must stay side-effect free.
         catalog.redispatch_chronology_operations()?;
+        editplan::ranges::redispatch(&mut catalog.connection()?)?;
         Ok(catalog)
     }
 

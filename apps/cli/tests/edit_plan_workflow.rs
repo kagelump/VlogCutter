@@ -172,6 +172,72 @@ fn generated_media_plan_create_fork_diff_validate_activate_and_preview() {
         "actualSourcePts"
     );
     assert_eq!(success(&catalog, &inspect_args)["reused"], true);
+    let ranges_args = ["edit-plan", "ranges", "list", "--asset", asset];
+    assert_eq!(
+        success(&catalog, &ranges_args)["revision"],
+        0,
+        "inspection never confirms a human constraint"
+    );
+    let range_input = dir.path().join("human-range.json");
+    fs::write(&range_input,serde_json::to_vec(&json!({"assetId":asset,"expectedRevision":0,
+        "expectedSourceFingerprint":assets[0]["fingerprint"],"decision":"exclude","media":"picture","decisionOwner":"human",
+        "sourceInSeconds":0.5,"sourceOutSeconds":0.6,"rationale":"Explicit generated human review",
+        "inspectedEvidenceId":inspected["inspection"]["evidenceId"],"overridesEvidenceIds":["review_false_positive_override"]})).unwrap()).unwrap();
+    let confirm_args = [
+        "edit-plan",
+        "ranges",
+        "confirm",
+        "--input",
+        range_input.to_str().unwrap(),
+    ];
+    let confirmed = success(&catalog, &confirm_args);
+    assert_eq!(confirmed["revision"], 1);
+    let bytes = fs::read(&catalog).unwrap();
+    assert_eq!(success(&catalog, &ranges_args), confirmed);
+    assert_eq!(fs::read(&catalog).unwrap(), bytes);
+    failure(&catalog, &confirm_args, "source_ranges_stale_revision");
+    let trim_input = dir.path().join("trim.json");
+    fs::write(
+        &trim_input,
+        serde_json::to_vec(
+            &json!({"assetId":asset,"inspectedEvidenceId":inspected["inspection"]["evidenceId"],
+        "media":"picture","sourceInSeconds":0.4,"sourceOutSeconds":0.8,"preferUtterances":false}),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let suggested = success(
+        &catalog,
+        &[
+            "edit-plan",
+            "suggest-trim",
+            "--input",
+            trim_input.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(suggested["constraintsRevision"], 1);
+    assert_eq!(suggested["proposedRanges"].as_array().unwrap().len(), 2);
+    assert_eq!(suggested["proposedRanges"][0]["sourceOutSeconds"], 0.5);
+    assert_eq!(suggested["proposedRanges"][1]["sourceInSeconds"], 0.6);
+    let constraint = confirmed["items"][0]["constraintId"].as_str().unwrap();
+    let revoked = success(
+        &catalog,
+        &[
+            "edit-plan",
+            "ranges",
+            "revoke",
+            "--asset",
+            asset,
+            "--constraint",
+            constraint,
+            "--expected-revision",
+            "1",
+            "--rationale",
+            "Human withdraws temporary fixture exclusion",
+        ],
+    );
+    assert_eq!(revoked["revision"], 2);
+    assert_eq!(revoked["items"][0]["active"], false);
     inspection_request["expectedRepresentationFingerprint"] = json!("stale");
     fs::write(
         &inspection_input,

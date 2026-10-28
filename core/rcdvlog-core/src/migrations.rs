@@ -7,7 +7,7 @@ use thiserror::Error;
 
 use crate::chronology::forward_migrate_project_chronology;
 
-pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 51;
+pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 52;
 
 const MIGRATION_TABLE_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -390,7 +390,28 @@ pub const PROJECT_CATALOG_MIGRATIONS: &[SqliteMigration] = &[
         source_identity: "project-catalog/0051-source-inspection-evidence/20261028",
         apply: source_inspection_evidence,
     },
+    SqliteMigration {
+        id: 52,
+        name: "confirmed_source_ranges",
+        source_identity: "project-catalog/0052-confirmed-source-ranges/20261028",
+        apply: confirmed_source_ranges,
+    },
 ];
+
+fn confirmed_source_ranges(transaction: &Transaction<'_>) -> Result<()> {
+    transaction.execute_batch(
+        "CREATE TABLE IF NOT EXISTS confirmed_source_ranges (
+            constraint_id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            asset_id TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+            body_json TEXT NOT NULL,
+            active INTEGER NOT NULL CHECK(active IN (0,1))
+        );
+        CREATE INDEX IF NOT EXISTS confirmed_source_ranges_asset
+            ON confirmed_source_ranges(project_id,asset_id,active);",
+    )?;
+    Ok(())
+}
 
 fn source_inspection_evidence(transaction: &Transaction<'_>) -> Result<()> {
     transaction.execute_batch(

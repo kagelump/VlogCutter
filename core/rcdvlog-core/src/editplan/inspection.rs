@@ -63,18 +63,7 @@ impl Catalog {
             representation_start >= 0.0 && representation_end <= stream.duration + 1e-7,
             "invalid input: requested handles exceed selected representation"
         );
-        let transcript = if request.include_transcript
-            && request.representation == InspectionRepresentation::GeneratedProxy
-        {
-            let current = self.proxy_fingerprint(&asset.id)?;
-            self.asset_transcript(&asset.id)?.filter(|t| {
-                t.recipe_key == STT_RECIPE_KEY
-                    && t.source_fingerprint == current
-                    && t.status == TranscriptStatus::Speech
-            })
-        } else {
-            None
-        };
+        let transcript = self.inspection_transcript(&asset, request)?;
         let tools = media::tool_identity();
         let identity = json!({
             "recipe": SOURCE_INSPECTION_RECIPE, "request": request,
@@ -257,6 +246,92 @@ impl Catalog {
         })
     }
 
+    fn inspection_transcript(
+        &self,
+        asset: &Asset,
+        request: &SourceInspectionRequest,
+    ) -> Result<Option<crate::ClipTranscript>> {
+        if !request.include_audio
+            || !request.include_transcript
+            || request.representation != InspectionRepresentation::GeneratedProxy
+        {
+            return Ok(None);
+        }
+        let current = self.proxy_fingerprint(&asset.id)?;
+        Ok(self.asset_transcript(&asset.id)?.filter(|t| {
+            t.recipe_key == STT_RECIPE_KEY
+                && t.source_fingerprint == current
+                && t.status == TranscriptStatus::Speech
+        }))
+    }
+
+    /// Strict verification for a new human decision. Never rebuild or replace
+    /// what the human saw; stale/missing/corrupt evidence needs explicit review.
+    pub(crate) fn require_current_source_inspection(
+        &self,
+        evidence_id: &str,
+        asset_id: &str,
+    ) -> Result<SourceInspection> {
+        ensure!(
+            evidence_id
+                .strip_prefix("inspect_")
+                .is_some_and(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())),
+            "invalid input: malformed inspection evidence ID"
+        );
+        let _heavy = self.acquire_local_heavy()?;
+        let row: Option<(String,String)> = self.connection()?.query_row(
+            "SELECT identity_json,report_json FROM source_inspections WHERE evidence_id=?1 AND asset_id=?2",
+            params![evidence_id,asset_id],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+        let (identity_json, body) = row.context("source inspection evidence not found")?;
+        let identity: Value = serde_json::from_str(&identity_json)?;
+        let report: SourceInspection = serde_json::from_str(&body)?;
+        let asset = self.get_asset(asset_id)?;
+        let source = self.inspection_source(&asset, report.request.representation, &|| false)?;
+        let stream = media::probe(&source.path, report.request.include_audio, &|| false)?;
+        let mapping = InspectionTimeMapping {
+            time_base_numerator: stream.numerator,
+            time_base_denominator: stream.denominator,
+            representation_origin_pts: stream.origin,
+            source_offset_seconds: source.source_offset,
+            representation_offset_seconds: source.representation_offset,
+            seconds_scale: source.scale,
+            precision: source.precision.into(),
+            source_frame_reduction: source.reduction,
+        };
+        let expected = json!({"recipe":SOURCE_INSPECTION_RECIPE,"request":report.request,"sourceFingerprint":asset.fingerprint,
+            "representationFingerprint":source.fingerprint,"provenance":source.provenance,"mapping":mapping,"rotation":asset.rotation_degrees,
+            "orientationDecision":asset.orientation_decision,"transcript":self.inspection_transcript(&asset,&report.request)?,"tools":media::tool_identity()});
+        let root = self
+            .database_path()
+            .parent()
+            .context("catalog has no parent")?
+            .join("cache")
+            .join("source-inspections")
+            .join(evidence_id);
+        if identity != expected
+            || format!(
+                "inspect_{}",
+                blake3::hash(identity_json.as_bytes()).to_hex()
+            ) != evidence_id
+            || report.evidence_id != evidence_id
+            || report.request.asset_id != asset_id
+            || report.source_fingerprint != asset.fingerprint
+            || report.representation_fingerprint != source.fingerprint
+            || report.mapping != mapping
+            || report.rotation_degrees != asset.rotation_degrees
+            || report.recipe != SOURCE_INSPECTION_RECIPE
+            || report.window_in_seconds
+                != report.request.source_in_seconds - report.request.before_seconds
+            || report.window_out_seconds
+                != report.request.source_out_seconds + report.request.after_seconds
+            || !root.is_dir()
+            || !media::files_current(&report, &root, &|| false)?
+        {
+            return Err(SourceInspectionError::StaleEvidence.into());
+        }
+        Ok(report)
+    }
+
     fn inspection_source(
         &self,
         asset: &Asset,
@@ -281,7 +356,7 @@ impl Catalog {
                 }
             }
             InspectionRepresentation::GeneratedProxy => {
-                let proxy = self.analysis_proxy_source_with_cancellation(asset, cancel)?;
+                let proxy = self.validated_review_proxy_source(asset, cancel)?;
                 SelectedSource {
                     path: proxy.proxy,
                     fingerprint: proxy.fingerprint,
@@ -447,4 +522,4 @@ fn select_pts(
 
 #[cfg(test)]
 #[path = "inspection_tests.rs"]
-mod tests;
+pub(crate) mod tests;

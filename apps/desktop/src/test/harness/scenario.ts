@@ -53,6 +53,7 @@ import type {
   VisualPlacementPreview,
 } from "../../chronologyTypes";
 import type { Asset, CacheKind, DesktopSettings, SyncStatus } from "../../types";
+import type { SourceRangeConstraints, SourceTrimSuggestion } from "../../chronologyTypes";
 
 export interface ScenarioOptions {
   /** The instant the scenario starts at. Every fake timestamp derives from it. */
@@ -372,6 +373,22 @@ export class ScenarioBuilder {
   /** Findings validation returns for a revision. An undeclared one is clean. */
   editPlanValidation(revisionId: string, report: ValidationReport): this {
     this.state.editPlans.validation[revisionId] = report;
+    return this;
+  }
+
+  /** Declare the source-range projection returned for one asset. */
+  sourceRangeConstraints(assetId: string, constraints: SourceRangeConstraints): this {
+    this.requireAsset(assetId);
+    if (constraints.assetId !== assetId) {
+      throw new Error(`Source-range fixture asset ${constraints.assetId} does not match ${assetId}`);
+    }
+    this.state.sourceRanges[assetId] = constraints;
+    return this;
+  }
+
+  /** Declare a trim suggestion by inspection id and media scope. */
+  sourceTrimSuggestion(suggestion: SourceTrimSuggestion): this {
+    this.state.sourceTrimSuggestions[`${suggestion.inspectedEvidenceId}:${suggestion.media}`] = suggestion;
     return this;
   }
 

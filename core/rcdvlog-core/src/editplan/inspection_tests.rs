@@ -11,7 +11,7 @@ use std::{
 };
 use tempfile::{TempDir, tempdir};
 
-fn fixture() -> (TempDir, Catalog, String) {
+pub(crate) fn fixture() -> (TempDir, Catalog, String) {
     let dir = tempdir().unwrap();
     let media = dir.path().join("original sources 日本語");
     fs::create_dir(&media).unwrap();
