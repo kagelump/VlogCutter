@@ -27,6 +27,8 @@ impl PreviewArtifactState {
 
 #[derive(Debug, thiserror::Error)]
 pub enum PreviewArtifactError {
+    #[error("preview render cancelled: {artifact_id}")]
+    Cancelled { artifact_id: String },
     #[error("preview wait timed out for {artifact_id}; the original attempt continues running")]
     ObservationTimedOut { artifact_id: String },
     #[error("preview rendering is already in progress for revision {revision_id}")]
@@ -43,6 +45,7 @@ pub enum PreviewArtifactError {
 impl PreviewArtifactError {
     pub fn code(&self) -> &'static str {
         match self {
+            Self::Cancelled { .. } => "cancelled",
             Self::ObservationTimedOut { .. } => "preview_wait_timeout",
             Self::Busy { .. } => "representation_busy",
             Self::NotFound { .. } => "not_found",

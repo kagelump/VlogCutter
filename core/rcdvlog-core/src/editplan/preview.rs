@@ -147,6 +147,13 @@ impl Catalog {
             Ok(result) => Ok(result),
             Err(error) => {
                 let was_cancelled = cancel() || attempt.cancellation_requested_now();
+                let error = if was_cancelled {
+                    error.context(super::PreviewArtifactError::Cancelled {
+                        artifact_id: attempt.artifact_id.clone(),
+                    })
+                } else {
+                    error
+                };
                 let sequence = attempt.finish_error(&error, was_cancelled)?;
                 if was_cancelled {
                     progress(PreviewProgress::Cancelled {
