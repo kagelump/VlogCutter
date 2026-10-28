@@ -442,7 +442,7 @@ pub const PROJECT_CATALOG_MIGRATIONS: &[SqliteMigration] = &[
 
 fn bounded_inspection_review(transaction: &Transaction<'_>) -> Result<()> {
     transaction.execute_batch(
-        "CREATE TABLE inspection_review_sessions(
+        "CREATE TABLE IF NOT EXISTS inspection_review_sessions(
         id TEXT PRIMARY KEY,
         project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
         asset_id TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
@@ -454,7 +454,7 @@ fn bounded_inspection_review(transaction: &Transaction<'_>) -> Result<()> {
         media_seconds_reserved REAL NOT NULL DEFAULT 0,
         updated_at TEXT NOT NULL
     );
-    CREATE TABLE inspection_review_steps(
+    CREATE TABLE IF NOT EXISTS inspection_review_steps(
         session_id TEXT NOT NULL REFERENCES inspection_review_sessions(id) ON DELETE CASCADE,
         step_index INTEGER NOT NULL,
         request_json TEXT NOT NULL,
