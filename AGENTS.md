@@ -112,6 +112,11 @@ Implemented now:
   permitted. Local media preparation is not an upload permit. See
   `docs/native-video-review.md`; fake protocol tests do not establish live
   provider capability or human listening/pacing acceptance.
+- Schema 59 adds canonical bounded local inspection-review sessions and step
+  receipts over the existing source-inspection and trim-suggestion owners.
+  Sessions freeze source/representation identity and human-range revision,
+  consume durable local step/frame/media limits, and cannot write human facts,
+  plans, or provider accounting. See `docs/edit-plan-inspection.md`.
 - Schema 56 adds optional immutable chapter selection intent, pacing profiles,
   evidence identities and reports. Selection reuses local moments, preserves human
   constraints and creates inactive normal plans; see `docs/edit-plan-selection.md`.

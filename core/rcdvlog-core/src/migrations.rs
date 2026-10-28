@@ -7,7 +7,7 @@ use thiserror::Error;
 
 use crate::chronology::forward_migrate_project_chronology;
 
-pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 58;
+pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 59;
 
 const MIGRATION_TABLE_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -432,7 +432,39 @@ pub const PROJECT_CATALOG_MIGRATIONS: &[SqliteMigration] = &[
         source_identity: "project-catalog/0058-bounded-native-video-evidence/20261028",
         apply: bounded_native_video_evidence,
     },
+    SqliteMigration {
+        id: 59,
+        name: "bounded_inspection_review",
+        source_identity: "project-catalog/0059-bounded-inspection-review/20261029",
+        apply: bounded_inspection_review,
+    },
 ];
+
+fn bounded_inspection_review(transaction: &Transaction<'_>) -> Result<()> {
+    transaction.execute_batch(
+        "CREATE TABLE inspection_review_sessions(
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        asset_id TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+        body_json TEXT NOT NULL,
+        state TEXT NOT NULL DEFAULT 'open',
+        cancel_requested INTEGER NOT NULL DEFAULT 0,
+        next_step INTEGER NOT NULL DEFAULT 0,
+        frames_reserved INTEGER NOT NULL DEFAULT 0,
+        media_seconds_reserved REAL NOT NULL DEFAULT 0,
+        updated_at TEXT NOT NULL
+    );
+    CREATE TABLE inspection_review_steps(
+        session_id TEXT NOT NULL REFERENCES inspection_review_sessions(id) ON DELETE CASCADE,
+        step_index INTEGER NOT NULL,
+        request_json TEXT NOT NULL,
+        state TEXT NOT NULL,
+        result_json TEXT,
+        PRIMARY KEY(session_id,step_index)
+    );",
+    )?;
+    Ok(())
+}
 
 fn bounded_native_video_evidence(transaction: &Transaction<'_>) -> Result<()> {
     transaction.execute_batch("CREATE TABLE IF NOT EXISTS native_video_media(

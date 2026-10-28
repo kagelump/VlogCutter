@@ -265,6 +265,7 @@ pub use diagnostics::{
     DiagnosticSubject,
 };
 pub use editplan::feedback::*;
+pub use editplan::inspection_review::*;
 pub use editplan::selection::*;
 pub use editplan::{
     ConfirmSourceRangeRequest, ConfirmedRangeInspection, ConfirmedSourceRange, EditPlanAudio,
