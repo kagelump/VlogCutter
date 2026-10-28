@@ -9,15 +9,16 @@ use std::{fs, path::PathBuf};
 
 pub const SOURCE_INSPECTION_RECIPE: &str = "source-inspection.actual-pts.oriented-jpeg.pcm48.v1";
 
-struct SelectedSource {
-    path: PathBuf,
-    fingerprint: String,
-    provenance: Value,
-    source_offset: f64,
-    representation_offset: f64,
-    scale: u32,
-    precision: &'static str,
-    reduction: Option<u32>,
+#[derive(Clone)]
+pub(crate) struct SelectedSource {
+    pub(crate) path: PathBuf,
+    pub(crate) fingerprint: String,
+    pub(crate) provenance: Value,
+    pub(crate) source_offset: f64,
+    pub(crate) representation_offset: f64,
+    pub(crate) scale: u32,
+    pub(crate) precision: &'static str,
+    pub(crate) reduction: Option<u32>,
 }
 
 impl Catalog {
@@ -246,7 +247,7 @@ impl Catalog {
         })
     }
 
-    fn inspection_transcript(
+    pub(crate) fn inspection_transcript(
         &self,
         asset: &Asset,
         request: &SourceInspectionRequest,
@@ -332,7 +333,7 @@ impl Catalog {
         Ok(report)
     }
 
-    fn inspection_source(
+    pub(crate) fn inspection_source(
         &self,
         asset: &Asset,
         choice: InspectionRepresentation,
@@ -406,7 +407,7 @@ impl Catalog {
         Ok(source)
     }
 
-    fn require_inspection_source_current(
+    pub(crate) fn require_inspection_source_current(
         &self,
         previous: &Asset,
         source: &SelectedSource,

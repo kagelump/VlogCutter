@@ -75,6 +75,9 @@ fn artifact(catalog: &Catalog, asset_id: &str, identity: &str) -> MomentArtifact
             cost_usd: 0.0,
             usage_complete: false,
             receipts: vec![],
+            estimated_cost_usd: None,
+            cost_basis: None,
+            native_source: None,
         },
         review_questions: vec![],
     }

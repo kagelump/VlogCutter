@@ -12,7 +12,7 @@ use std::{
     time::Duration,
 };
 
-pub(super) struct Stream {
+pub(crate) struct Stream {
     pub numerator: i64,
     pub denominator: i64,
     pub origin: i64,
@@ -20,7 +20,7 @@ pub(super) struct Stream {
     pub audio_start_seconds: Option<f64>,
 }
 
-pub(super) fn tool_identity() -> Value {
+pub(crate) fn tool_identity() -> Value {
     serde_json::json!([
         calibration_tool_identity_for_path(
             "source_inspection_decode",
@@ -53,7 +53,7 @@ fn output(command: &mut Command, cancel: &dyn Fn() -> bool) -> Result<std::proce
     Ok(output)
 }
 
-pub(super) fn probe(path: &Path, include_audio: bool, cancel: &dyn Fn() -> bool) -> Result<Stream> {
+pub(crate) fn probe(path: &Path, include_audio: bool, cancel: &dyn Fn() -> bool) -> Result<Stream> {
     let mut command = tool_command("ffprobe");
     command
         .args([
@@ -133,7 +133,7 @@ pub(super) fn probe(path: &Path, include_audio: bool, cancel: &dyn Fn() -> bool)
     })
 }
 
-pub(super) fn frame_pts(
+pub(crate) fn frame_pts(
     path: &Path,
     mapping: &InspectionTimeMapping,
     start: f64,
@@ -243,7 +243,7 @@ pub(super) fn encode_frames(
     Ok(files)
 }
 
-pub(super) fn audio_context(
+pub(crate) fn audio_context(
     path: &Path,
     workspace: &Path,
     audio_start: Option<f64>,

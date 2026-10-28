@@ -12329,3 +12329,5 @@ pub(crate) mod tests {
         drop(lease);
     }
 }
+
+pub use analysis::native_video::*;

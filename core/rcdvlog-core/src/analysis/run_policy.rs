@@ -75,6 +75,7 @@ pub enum AnalysisRunKind {
     Observation,
     MomentDiscovery,
     NativeSpeechTranscription,
+    NativeVideoReview,
 }
 
 impl AnalysisRunKind {
@@ -83,6 +84,7 @@ impl AnalysisRunKind {
             Self::Observation => "observation",
             Self::MomentDiscovery => "moment_discovery",
             Self::NativeSpeechTranscription => "native_speech_transcription",
+            Self::NativeVideoReview => "native_video_review",
         }
     }
 
@@ -106,6 +108,10 @@ pub enum AnalysisPayload {
     Audio,
     AudioAndTranscript,
     Transcript,
+    Video,
+    VideoAndAudio,
+    VideoAndTranscript,
+    VideoAndAudioAndTranscript,
 }
 
 impl AnalysisPayload {
@@ -116,6 +122,10 @@ impl AnalysisPayload {
             Self::Audio => "audio",
             Self::AudioAndTranscript => "audio-and-transcript",
             Self::Transcript => "transcript",
+            Self::Video => "video",
+            Self::VideoAndAudio => "video-and-audio",
+            Self::VideoAndTranscript => "video-and-transcript",
+            Self::VideoAndAudioAndTranscript => "video-and-audio-and-transcript",
         }
     }
 
@@ -126,6 +136,12 @@ impl AnalysisPayload {
             "audio" => Some(Self::Audio),
             "audio-and-transcript" | "audio_and_transcript" => Some(Self::AudioAndTranscript),
             "transcript" => Some(Self::Transcript),
+            "video" => Some(Self::Video),
+            "video-and-audio" | "video_and_audio" => Some(Self::VideoAndAudio),
+            "video-and-transcript" | "video_and_transcript" => Some(Self::VideoAndTranscript),
+            "video-and-audio-and-transcript" | "video_and_audio_and_transcript" => {
+                Some(Self::VideoAndAudioAndTranscript)
+            }
             _ => None,
         }
     }
@@ -135,13 +151,33 @@ impl AnalysisPayload {
     }
 
     pub fn uses_audio(self) -> bool {
-        matches!(self, Self::Audio | Self::AudioAndTranscript)
+        matches!(
+            self,
+            Self::Audio
+                | Self::AudioAndTranscript
+                | Self::VideoAndAudio
+                | Self::VideoAndAudioAndTranscript
+        )
     }
 
     pub fn uses_transcript(self) -> bool {
         matches!(
             self,
-            Self::FramesAndTranscript | Self::AudioAndTranscript | Self::Transcript
+            Self::FramesAndTranscript
+                | Self::AudioAndTranscript
+                | Self::Transcript
+                | Self::VideoAndTranscript
+                | Self::VideoAndAudioAndTranscript
+        )
+    }
+
+    pub fn uses_video(self) -> bool {
+        matches!(
+            self,
+            Self::Video
+                | Self::VideoAndAudio
+                | Self::VideoAndTranscript
+                | Self::VideoAndAudioAndTranscript
         )
     }
 
@@ -167,7 +203,7 @@ pub struct RunPolicyContext {
     pub trip_context_fingerprint: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RunPolicyParameters {
     Observation {
@@ -186,6 +222,9 @@ pub enum RunPolicyParameters {
         provider_policy: NativeSttProviderPolicy,
         force: bool,
     },
+    NativeVideoReview {
+        options: crate::NativeVideoOptions,
+    },
 }
 
 impl RunPolicyParameters {
@@ -194,6 +233,7 @@ impl RunPolicyParameters {
             Self::Observation { .. } => AnalysisRunKind::Observation,
             Self::MomentDiscovery { .. } => AnalysisRunKind::MomentDiscovery,
             Self::NativeSpeechTranscription { .. } => AnalysisRunKind::NativeSpeechTranscription,
+            Self::NativeVideoReview { .. } => AnalysisRunKind::NativeVideoReview,
         }
     }
 
@@ -202,6 +242,7 @@ impl RunPolicyParameters {
             Self::Observation { force }
             | Self::MomentDiscovery { force, .. }
             | Self::NativeSpeechTranscription { force, .. } => *force,
+            Self::NativeVideoReview { .. } => false,
         }
     }
 }
@@ -524,6 +565,10 @@ pub struct RunPilotRecord {
     /// their JSON wire shape remains unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_evidence: Option<NativePilotEvidence>,
+    /// Exact locally persisted native-video capability response, possibly
+    /// reused from a prior identical payload; never a new paid observation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_video_evidence_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1013,7 +1058,7 @@ struct PolicyIdentity<'a> {
     capability_checks: &'a [CapabilityCheck],
 }
 
-fn run_policy_identity(policy: &RunPolicy) -> Result<String> {
+pub(crate) fn run_policy_identity(policy: &RunPolicy) -> Result<String> {
     digest(&PolicyIdentity {
         schema_version: &policy.schema_version,
         project_id: &policy.project_id,
@@ -1121,6 +1166,9 @@ impl Catalog {
         policy: &RunPolicy,
         asset_id: &str,
     ) -> Result<()> {
+        if policy.kind == AnalysisRunKind::NativeVideoReview {
+            return native_video::validate_asset(self, policy, asset_id, &|| false);
+        }
         let asset = self.get_asset(asset_id)?;
         ensure!(
             asset.project_id == policy.project_id && !asset.removed,
@@ -1188,6 +1236,7 @@ impl Catalog {
             !request.asset_ids.is_empty() && request.asset_ids.len() <= MAX_SCOPE_ASSETS,
             "run scope must explicitly select 1..={MAX_SCOPE_ASSETS} asset ids"
         );
+        let kind = request.parameters.kind();
         let mut seen = HashSet::new();
         let mut assets = Vec::new();
         for asset_id in &request.asset_ids {
@@ -1201,13 +1250,16 @@ impl Catalog {
                 "asset {asset_id} is outside the authorized project scope"
             );
             ensure!(
-                !asset.removed,
+                !asset.removed
+                    || matches!(&request.parameters,RunPolicyParameters::NativeVideoReview { options } if options.purpose==crate::NativeVideoPurpose::EndpointReview),
                 "asset {asset_id} is excluded from analysis scope"
             );
             assets.push(asset);
         }
 
-        let kind = request.parameters.kind();
+        if kind == AnalysisRunKind::NativeVideoReview {
+            return native_video::describe(self, request, &assets);
+        }
         let native_stt = kind == AnalysisRunKind::NativeSpeechTranscription;
         // Native speech is always represented as audio-only even when a
         // malformed caller selected another payload. The request is still
@@ -1424,6 +1476,9 @@ impl Catalog {
                 native_stt::NATIVE_STT_OUTPUT_SCHEMA_VERSION.to_string(),
                 native_stt_recipe_version(request)?,
             ),
+            AnalysisRunKind::NativeVideoReview => {
+                unreachable!("native video has its explicit descriptor")
+            }
         };
         let context = if native_stt {
             RunPolicyContext::default()
@@ -1771,6 +1826,7 @@ impl Catalog {
             observed_capabilities: Vec::new(),
             warning: PILOT_WARNING.into(),
             native_evidence: None,
+            native_video_evidence_id: None,
         };
         self.save_pilot(&running)?;
         Ok(running)
@@ -1832,6 +1888,11 @@ impl Catalog {
             Some(current) if current.run_id == running.run_id => current.native_evidence.clone(),
             _ => running.native_evidence.clone(),
         };
+        let native_video_evidence_id = current
+            .as_ref()
+            .filter(|c| c.run_id == running.run_id)
+            .and_then(|c| c.native_video_evidence_id.clone())
+            .or_else(|| running.native_video_evidence_id.clone());
         let aggregate = crate::analysis::accounting::store::accounting_aggregate(
             &transaction,
             &running.policy_id,
@@ -1910,6 +1971,7 @@ impl Catalog {
             observed_capabilities,
             warning,
             native_evidence,
+            native_video_evidence_id,
         };
         // A late result may finish its audit run, but cannot replace a newer
         // pilot projection. The same transaction preserves any attached sample.
@@ -2025,6 +2087,13 @@ impl Catalog {
         request: &RunPolicyRequest,
         retry_uncertain: bool,
     ) -> Result<RunPilotRecord> {
+        if request.parameters.kind() == AnalysisRunKind::NativeVideoReview {
+            ensure!(
+                !retry_uncertain,
+                "native video does not support implicit pilot retry; inspect/reconcile the exact prior request"
+            );
+            return self.run_native_video_pilot(request, &|| false);
+        }
         if request.parameters.kind() == AnalysisRunKind::NativeSpeechTranscription {
             return self.run_native_speech_pilot(request, retry_uncertain);
         }
@@ -2046,18 +2115,29 @@ impl Catalog {
         let authorization = self.load_run_authorization(policy_id)?;
         let kind = authorization.policy.kind;
         ensure!(
-            kind.is_vlm() || kind == AnalysisRunKind::NativeSpeechTranscription,
+            kind.is_vlm()
+                || matches!(
+                    kind,
+                    AnalysisRunKind::NativeSpeechTranscription | AnalysisRunKind::NativeVideoReview
+                ),
             "unsupported authorized bulk policy kind"
         );
         ensure!(
-            expected_kind.is_vlm() || expected_kind == AnalysisRunKind::NativeSpeechTranscription,
+            expected_kind.is_vlm()
+                || matches!(
+                    expected_kind,
+                    AnalysisRunKind::NativeSpeechTranscription | AnalysisRunKind::NativeVideoReview
+                ),
             "unsupported requested bulk kind"
         );
         ensure!(
             kind == expected_kind,
             "authorized policy kind does not match the requested bulk operation"
         );
-        let current = if kind == AnalysisRunKind::NativeSpeechTranscription {
+        let current = if matches!(
+            kind,
+            AnalysisRunKind::NativeSpeechTranscription | AnalysisRunKind::NativeVideoReview
+        ) {
             self.describe_run_policy_for_local_preparation(&authorization.policy.request())?
         } else {
             self.describe_run_policy(&authorization.policy.request())?
@@ -2082,6 +2162,10 @@ impl Catalog {
             "capability pilot has not passed for this policy"
         );
         ensure!(pilot.usage_complete, "capability pilot usage is incomplete");
+        if kind == AnalysisRunKind::NativeVideoReview {
+            self.require_native_video_pilot(&current)?;
+            verify_bulk_authority(self, &current)?;
+        }
         ensure!(
             pilot.cost_usd.is_finite() && pilot.cost_usd >= 0.0,
             "capability pilot cost is invalid"
@@ -2144,6 +2228,12 @@ impl Catalog {
         // concurrent attempts and are accounted by atomic admission; only
         // unknown/interrupted usage blocks a new bulk run before it starts.
         let aggregate = self.analysis_accounting_aggregate(policy_id, Some(&pilot.run_id))?;
+        if kind == AnalysisRunKind::NativeVideoReview {
+            ensure!(
+                aggregate.active_request_count == 0,
+                "a prior native video operation still has active or interrupted requests; inspect/reconcile them before a new run"
+            );
+        }
         ensure!(
             !aggregate.has_unknown_usage(),
             "canonical analysis usage is unknown or interrupted; reconcile request evidence before bulk work"
@@ -5823,3 +5913,9 @@ mod recovery_tests {
 fn pilot_estimate_is_zero(value: &f64) -> bool {
     *value == 0.0
 }
+
+mod native_video;
+
+pub(crate) use native_video::accepted_transcript as accepted_native_video_transcript;
+pub(crate) use native_video::validate_asset as validate_native_video_asset;
+pub(crate) use native_video::validate_asset_mode as validate_native_video_asset_mode;

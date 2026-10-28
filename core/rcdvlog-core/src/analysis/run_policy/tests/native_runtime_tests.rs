@@ -1102,6 +1102,7 @@ fn stale_auth_budget_source_and_receipt_only_work_fail_closed() {
         observed_capabilities: Vec::new(),
         warning: PILOT_WARNING.into(),
         native_evidence: None,
+        native_video_evidence_id: None,
     };
     receipt_only.catalog.save_pilot(&running).unwrap();
     let loads = Arc::new(AtomicUsize::new(0));

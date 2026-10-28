@@ -104,6 +104,14 @@ Implemented now:
 - Schema 57 adds separately labeled published token estimates to shared analysis
   accounting; estimates consume the same budget without becoming provider-reported
   charges. Existing transports retain their admission rules. See `docs/analysis-accounting.md`.
+- Schema 58 adds node-local native-video carriers, request evidence and run/window
+  details. The explicit direct Gemini route shares canonical policy approval,
+  bounded capability pilots, reservation/dispatch/receipt accounting and the
+  existing moment artifact owner. Source scopes and video/audio/transcript
+  payloads are explicit; no provider/model/tier fallback or automatic resend is
+  permitted. Local media preparation is not an upload permit. See
+  `docs/native-video-review.md`; fake protocol tests do not establish live
+  provider capability or human listening/pacing acceptance.
 - Schema 56 adds optional immutable chapter selection intent, pacing profiles,
   evidence identities and reports. Selection reuses local moments, preserves human
   constraints and creates inactive normal plans; see `docs/edit-plan-selection.md`.

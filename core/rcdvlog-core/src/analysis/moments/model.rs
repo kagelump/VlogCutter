@@ -20,6 +20,12 @@ pub struct MomentReceipt {
     pub cost_usd: Option<f64>,
     pub usage_complete: bool,
     pub reused: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_cost_usd: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_basis: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_usage: Option<Box<crate::analysis::accounting::usage_pricing::UsagePricedReceipt>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -124,6 +130,19 @@ pub struct MomentProvenance {
     pub usage_complete: bool,
     #[serde(default)]
     pub receipts: Vec<MomentReceipt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_cost_usd: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_basis: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_source: Option<NativeMomentSource>,
+}
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeMomentSource {
+    pub policy_id: String,
+    pub source_identity: String,
+    pub evidence_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

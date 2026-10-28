@@ -102,6 +102,11 @@ pub(crate) enum PolicyRequestFamily<'a> {
         audio: &'a NativeSttAudioWindow,
         cost_bound: &'a AnalysisRequestCostBound,
     },
+    NativeVideo {
+        media: &'a crate::NativeVideoMedia,
+        evidence_id: &'a str,
+        cost_bound: &'a AnalysisRequestCostBound,
+    },
 }
 
 /// Prove a genuine bounded native window only claims source milliseconds that
@@ -131,6 +136,18 @@ fn validate_policy_request_family(
 ) -> Result<()> {
     match family {
         PolicyRequestFamily::Any => Ok(()),
+        PolicyRequestFamily::NativeVideo { cost_bound, .. } => {
+            let RunPolicyParameters::NativeVideoReview { options } = &policy.parameters else {
+                bail!("native video parameters missing");
+            };
+            ensure!(
+                policy.kind == crate::AnalysisRunKind::NativeVideoReview
+                    && model == crate::analysis::native_video::NATIVE_VIDEO_MODEL
+                    && cost_bound == &crate::analysis::native_video::cost_bound(options)?,
+                "native video admission quote/model mismatch"
+            );
+            Ok(())
+        }
         PolicyRequestFamily::Vlm { cost_bound } => {
             ensure!(
                 policy.kind.is_vlm(),
@@ -536,6 +553,34 @@ pub(crate) fn reserve_native_stt(
     )
 }
 
+pub(crate) fn reserve_native_video(
+    connection: &mut Connection,
+    context: &AnalysisAccountingContext,
+    media: &crate::NativeVideoMedia,
+    evidence_id: &str,
+    payload_fingerprint: &str,
+    cost_bound: &AnalysisRequestCostBound,
+) -> Result<AnalysisRequestRecord> {
+    ensure!(
+        !context.policy_id.is_empty()
+            && !context.run_id.is_empty()
+            && matches!(context.operation.as_str(), "pilot" | "native_video_review"),
+        "native video requires canonical authorization and a real owned native run"
+    );
+    reserve_with_family(
+        connection,
+        context,
+        crate::analysis::native_video::NATIVE_VIDEO_MODEL,
+        payload_fingerprint,
+        cost_bound,
+        PolicyRequestFamily::NativeVideo {
+            media,
+            evidence_id,
+            cost_bound,
+        },
+    )
+}
+
 fn reserve_with_family(
     connection: &mut Connection,
     context: &AnalysisAccountingContext,
@@ -586,6 +631,51 @@ fn reserve_with_family(
     if matches!(family, PolicyRequestFamily::NativeStt { .. }) {
         ensure_no_foreign_native_unresolved_for_source(&transaction, context)?;
     }
+    if matches!(family, PolicyRequestFamily::NativeVideo { .. }) {
+        let conflicting: bool=transaction.query_row("SELECT EXISTS(SELECT 1 FROM analysis_request_reservations WHERE project_id=?1 AND source_fingerprint=?2 AND policy_id<>?3 AND lifecycle IN ('reserved','dispatched','uncertain'))",
+            params![context.project_id,context.source_fingerprint,context.policy_id],|r|r.get(0))?;
+        ensure!(
+            !conflicting,
+            "a prior policy has active or unresolved native video usage for this source"
+        );
+    }
+    if let PolicyRequestFamily::NativeVideo {
+        media, evidence_id, ..
+    } = family
+    {
+        // A replacement media/tool recipe changes the full source identity.
+        // The stable asset fence still retains prior native uncertainty, so
+        // those changes cannot turn an interrupted request into a fresh send.
+        let prior_asset_work:bool=transaction.query_row("SELECT EXISTS(SELECT 1 FROM native_video_calls c JOIN analysis_request_reservations r ON r.request_key=c.request_key WHERE c.project_id=?1 AND c.asset_id=?2 AND c.policy_id<>?3 AND r.lifecycle IN ('reserved','dispatched','uncertain'))",params![context.project_id,media.view().asset_id,context.policy_id],|r|r.get(0))?;
+        ensure!(
+            !prior_asset_work,
+            "prior native video asset work is active or unresolved; reconcile its canonical receipt before a replacement policy"
+        );
+        let (run,policy_id,asset,state,request_json):(String,String,String,String,String)=transaction.query_row("SELECT run_id,policy_id,asset_id,state,request_json FROM native_video_calls WHERE evidence_id=?1 AND project_id=?2",params![evidence_id,context.project_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))?;
+        ensure!(
+            run == context.run_id
+                && policy_id == context.policy_id
+                && asset == media.view().asset_id
+                && state == "prepared"
+                && request_json == serde_json::to_string(media.request())?,
+            "native request does not own its exact durable window"
+        );
+        let (policy, _) = crate::analysis::run_policy::load_run_authorization_on_connection(
+            &transaction,
+            &context.policy_id,
+        )?;
+        let RunPolicyParameters::NativeVideoReview { options } = &policy.policy.parameters else {
+            bail!("native parameters missing");
+        };
+        let (prior_requests, prior_seconds):(u32,f64)=transaction.query_row("SELECT COUNT(*),COALESCE(SUM(json_extract(c.request_json,'$.sourceOutSeconds')-json_extract(c.request_json,'$.sourceInSeconds')),0) FROM native_video_calls c JOIN analysis_request_reservations r ON r.request_key=c.request_key WHERE c.project_id=?1 AND c.policy_id=?2 AND r.lifecycle<>'released'",params![context.project_id,context.policy_id],|r|Ok((r.get(0)?,r.get(1)?)))?;
+        ensure!(
+            prior_requests < options.max_requests
+                && prior_seconds + media.request().source_out_seconds
+                    - media.request().source_in_seconds
+                    <= f64::from(options.max_media_seconds) + 1e-7,
+            "native request/media limit reached"
+        );
+    }
     if let Some(stop_reason) =
         persist_untracked_denial_boundary(&transaction, &authority, context.budget_usd)?
     {
@@ -626,6 +716,13 @@ fn reserve_with_family(
         cost_bound,
         json!({}),
     )?;
+    if let PolicyRequestFamily::NativeVideo { evidence_id, .. } = family {
+        let linked=transaction.execute("UPDATE native_video_calls SET request_key=?3,state='reserved',updated_at=?4 WHERE evidence_id=?1 AND run_id=?2 AND state='prepared' AND request_key IS NULL",params![evidence_id,context.run_id,record.request_key,crate::now()])?;
+        ensure!(
+            linked == 1,
+            "native reservation lost durable call ownership"
+        );
+    }
     transaction.commit()?;
     Ok(record)
 }
@@ -2009,6 +2106,13 @@ fn validate_owner_identity(
             );
             validate_native_audio_source_bounds(audio, authorized_scope.source_duration_ms)?;
         }
+        if let PolicyRequestFamily::NativeVideo { media, .. } = family {
+            media.validate_policy_binding(
+                &policy,
+                identity.source_fingerprint,
+                identity.intended_attempt_key,
+            )?;
+        }
     }
     if !identity.run_id.trim().is_empty() {
         let run: Option<(String, String, String, String, String)> = connection
@@ -2047,7 +2151,10 @@ fn validate_owner_identity(
             status == "running",
             "analysis request requires a currently running owned analysis run"
         );
-        if matches!(family, PolicyRequestFamily::NativeStt { .. }) {
+        if matches!(
+            family,
+            PolicyRequestFamily::NativeStt { .. } | PolicyRequestFamily::NativeVideo { .. }
+        ) {
             ensure!(
                 !identity.operation.trim().is_empty() && stage_reached == identity.operation,
                 "native STT request requires an owned run created for its exact native operation"

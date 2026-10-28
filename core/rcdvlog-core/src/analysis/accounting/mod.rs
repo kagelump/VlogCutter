@@ -15,6 +15,7 @@ mod legacy;
 mod lifecycle;
 mod model;
 mod native_stt;
+pub(crate) mod native_video;
 mod operation;
 mod provider_boundary;
 mod provider_health;

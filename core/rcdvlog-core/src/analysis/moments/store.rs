@@ -141,6 +141,9 @@ mod tests {
                 cost_usd: 0.01,
                 usage_complete: true,
                 receipts: vec![],
+                estimated_cost_usd: None,
+                cost_basis: None,
+                native_source: None,
             },
             review_questions: vec!["Was the action visible?".into()],
         }
