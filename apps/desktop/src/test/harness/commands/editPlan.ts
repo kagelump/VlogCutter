@@ -9,16 +9,22 @@
  */
 
 import type {
+  ConfirmSourceRangeRequest,
+  ConfirmedSourceRange,
   EditPlanRevision,
   OtioExportResult,
   PreviewResult,
+  SourceRangeConstraints,
   SourceInspectionRequest,
   SourceInspectionResult,
+  SourceTrimRequest,
+  SourceTrimSuggestion,
   ValidationReport,
 } from "../../../chronologyTypes";
 import type { JobBinding } from "../jobs";
 import type { CommandTable, HarnessContext } from "../registry";
-import { requireString } from "../registry";
+import { requireNumber, requireString } from "../registry";
+import type { DesktopHarnessState } from "../state";
 
 interface OperationInput {
   assetId: string;
@@ -144,6 +150,113 @@ function declaredInspectionFixture(request: SourceInspectionRequest): SourceInsp
   };
 }
 
+function constraintsForAsset(state: DesktopHarnessState, assetId: string): SourceRangeConstraints {
+  const asset = state.assets[assetId];
+  if (!asset) throw new Error(`Unknown asset: ${assetId}`);
+  const declared = state.sourceRanges[assetId];
+  if (declared) return declared;
+  const empty: SourceRangeConstraints = {
+    schemaReady: true,
+    assetId,
+    sourceFingerprint: asset.fingerprint,
+    revision: 0,
+    items: [],
+    totalItems: 0,
+    nextOffset: null,
+    // The harness intentionally declares no clean ranges and performs no
+    // feasibility calculation. Scenarios can provide the projection they need.
+    feasiblePictureRanges: [],
+    feasibleAudioRanges: [],
+    pictureConflicts: [],
+    audioConflicts: [],
+  };
+  state.sourceRanges[assetId] = empty;
+  return empty;
+}
+
+function rangePage(
+  constraints: SourceRangeConstraints,
+  offset: number,
+  limit: number,
+): SourceRangeConstraints {
+  if (!Number.isSafeInteger(offset) || offset < 0) throw new Error("offset must be a nonnegative integer");
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 200) throw new Error("limit must be an integer from 1 to 200");
+  const items = constraints.items.slice(offset, offset + limit);
+  return {
+    ...constraints,
+    items,
+    totalItems: constraints.items.length,
+    nextOffset: offset + items.length < constraints.items.length ? offset + items.length : null,
+  };
+}
+
+function ownedAsset(state: DesktopHarnessState, projectId: string, assetId: string) {
+  const asset = state.assets[assetId];
+  if (!asset) throw new Error(`Unknown asset: ${assetId}`);
+  if (asset.projectId !== projectId) {
+    throw new Error(`asset ${assetId} belongs to project ${asset.projectId}, not ${projectId}`);
+  }
+  return asset;
+}
+
+function sourceRangeRequest(value: unknown): ConfirmSourceRangeRequest {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("confirm_source_range requires a request object");
+  }
+  const request = value as Partial<ConfirmSourceRangeRequest>;
+  if (typeof request.assetId !== "string") throw new Error("request.assetId must be a string");
+  if (typeof request.expectedRevision !== "number" || !Number.isSafeInteger(request.expectedRevision)) {
+    throw new Error("request.expectedRevision must be an integer");
+  }
+  if (typeof request.expectedSourceFingerprint !== "string") {
+    throw new Error("request.expectedSourceFingerprint must be a string");
+  }
+  if (request.decision !== "allow" && request.decision !== "exclude") {
+    throw new Error("request.decision must be allow or exclude");
+  }
+  if (request.media !== "picture" && request.media !== "audio" && request.media !== "both") {
+    throw new Error("request.media must be picture, audio, or both");
+  }
+  if (request.decisionOwner !== "human") throw new Error("request.decisionOwner must be human");
+  for (const field of ["sourceInSeconds", "sourceOutSeconds"] as const) {
+    if (typeof request[field] !== "number" || !Number.isFinite(request[field])) {
+      throw new Error(`request.${field} must be a finite number`);
+    }
+  }
+  if (typeof request.rationale !== "string" || !request.rationale.trim()) {
+    throw new Error("request.rationale must be a nonempty string");
+  }
+  if (request.overridesEvidenceIds !== undefined &&
+      (!Array.isArray(request.overridesEvidenceIds) || request.overridesEvidenceIds.some((id) => typeof id !== "string"))) {
+    throw new Error("request.overridesEvidenceIds must be an array of strings");
+  }
+  if (request.inspectedEvidenceId) {
+    throw new Error("The desktop harness cannot verify inspected media evidence; declare a media-free human decision.");
+  }
+  return request as ConfirmSourceRangeRequest;
+}
+
+function trimRequestFrom(value: unknown): SourceTrimRequest {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("suggest_source_trim requires a request object");
+  }
+  const request = value as Partial<SourceTrimRequest>;
+  if (typeof request.assetId !== "string") throw new Error("request.assetId must be a string");
+  if (typeof request.inspectedEvidenceId !== "string") throw new Error("request.inspectedEvidenceId must be a string");
+  if (request.media !== "picture" && request.media !== "audio") {
+    throw new Error("request.media must be picture or audio");
+  }
+  for (const field of ["sourceInSeconds", "sourceOutSeconds"] as const) {
+    if (typeof request[field] !== "number" || !Number.isFinite(request[field])) {
+      throw new Error(`request.${field} must be a finite number`);
+    }
+  }
+  if (request.preferUtterances !== undefined && typeof request.preferUtterances !== "boolean") {
+    throw new Error("request.preferUtterances must be a boolean");
+  }
+  return request as SourceTrimRequest;
+}
+
 export const editPlanCommands: CommandTable = {
   active_edit_plan: (args, { state }) => {
     requireString(args, "projectId");
@@ -200,6 +313,110 @@ export const editPlanCommands: CommandTable = {
   inspect_source_window: (args): SourceInspectionResult => {
     const request = inspectionRequestFrom(args.request);
     return declaredInspectionFixture(request);
+  },
+
+  source_range_constraints: (args, { state }): SourceRangeConstraints => {
+    const assetId = requireString(args, "assetId");
+    const current = constraintsForAsset(state, assetId);
+    const offset = args.offset === undefined ? 0 : requireNumber(args, "offset");
+    const limit = args.limit === undefined ? 100 : requireNumber(args, "limit");
+    return rangePage(current, offset, limit);
+  },
+
+  confirm_source_range: (args, { state, clock }): SourceRangeConstraints => {
+    const projectId = requireString(args, "projectId");
+    const request = sourceRangeRequest(args.request);
+    const asset = ownedAsset(state, projectId, request.assetId);
+    const current = constraintsForAsset(state, request.assetId);
+    if (request.expectedRevision !== current.revision) {
+      throw new Error(`source range constraints changed: expected revision ${request.expectedRevision}, found ${current.revision}`);
+    }
+    if (request.expectedSourceFingerprint !== asset.fingerprint || current.sourceFingerprint !== asset.fingerprint) {
+      throw new Error("source range constraint source identity changed");
+    }
+
+    const constraintId = request.constraintId || `range_harness_${current.revision + 1}`;
+    const prior = current.items.find((item) => item.constraintId === constraintId);
+    if (prior && (prior.assetId !== request.assetId || prior.projectId !== projectId)) {
+      throw new Error("constraint identity cannot be moved to another source/project");
+    }
+    const record: ConfirmedSourceRange = {
+      constraintId,
+      projectId,
+      assetId: request.assetId,
+      sourceFingerprint: asset.fingerprint,
+      decision: request.decision,
+      media: request.media,
+      decisionOwner: "human",
+      sourceInSeconds: request.sourceInSeconds,
+      sourceOutSeconds: request.sourceOutSeconds,
+      rationale: request.rationale,
+      inspection: null,
+      overridesEvidenceIds: request.overridesEvidenceIds ?? [],
+      active: true,
+      lastOperationId: `harness_source_range_operation_${current.revision + 1}`,
+      updatedAtMillis: Date.parse(clock.iso()),
+    };
+    const items = prior
+      ? current.items.map((item) => item.constraintId === constraintId ? record : item)
+      : [...current.items, record];
+    const updated: SourceRangeConstraints = {
+      ...current,
+      revision: current.revision + 1,
+      items,
+      totalItems: items.length,
+      nextOffset: null,
+    };
+    state.sourceRanges[request.assetId] = updated;
+    // Feasible ranges/conflicts remain scenario-declared. This adapter only
+    // models operation lifecycle and never implements media-range math.
+    return rangePage(updated, 0, 100);
+  },
+
+  revoke_source_range: (args, { state, clock }): SourceRangeConstraints => {
+    const projectId = requireString(args, "projectId");
+    const assetId = requireString(args, "assetId");
+    ownedAsset(state, projectId, assetId);
+    const constraintId = requireString(args, "constraintId");
+    const expectedRevision = requireNumber(args, "expectedRevision");
+    const rationale = requireString(args, "rationale");
+    const current = constraintsForAsset(state, assetId);
+    if (!Number.isSafeInteger(expectedRevision) || expectedRevision !== current.revision) {
+      throw new Error(`source range constraints changed: expected revision ${expectedRevision}, found ${current.revision}`);
+    }
+    if (!rationale.trim()) throw new Error("rationale must be nonempty");
+    const existing = current.items.find((item) => item.constraintId === constraintId);
+    if (!existing) throw new Error(`source range constraint not found: ${constraintId}`);
+    if (existing.projectId !== projectId || existing.assetId !== assetId) {
+      throw new Error("constraint belongs to another source/project");
+    }
+    const items = current.items.map((item) => item.constraintId === constraintId
+      ? {
+          ...item,
+          active: false,
+          rationale,
+          lastOperationId: `harness_source_range_operation_${current.revision + 1}`,
+          updatedAtMillis: Date.parse(clock.iso()),
+        }
+      : item);
+    const updated: SourceRangeConstraints = {
+      ...current,
+      revision: current.revision + 1,
+      items,
+      totalItems: items.length,
+      nextOffset: null,
+    };
+    state.sourceRanges[assetId] = updated;
+    return rangePage(updated, 0, 100);
+  },
+
+  suggest_source_trim: (args, { state }): SourceTrimSuggestion => {
+    const request = trimRequestFrom(args.request);
+    if (!state.assets[request.assetId]) throw new Error(`Unknown asset: ${request.assetId}`);
+    const key = `${request.inspectedEvidenceId}:${request.media}`;
+    const suggestion = state.sourceTrimSuggestions[key];
+    if (!suggestion) throw new Error(`Scenario did not declare a source trim suggestion for ${key}`);
+    return suggestion;
   },
 
   render_edit_plan_preview: (args, context: HarnessContext) => {

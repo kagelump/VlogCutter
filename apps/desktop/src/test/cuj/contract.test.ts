@@ -134,6 +134,101 @@ describe("the harness's own guarantees", () => {
     }
   });
 
+  it("handles human source-range commands with per-scenario revision state", async () => {
+    const trimSuggestion: import("../../chronologyTypes").SourceTrimSuggestion = {
+      inspectedEvidenceId: "inspect_declared_harness_trim",
+      media: "audio",
+      constraintsRevision: 0,
+      cleanRanges: [],
+      proposedRanges: [],
+      conflicts: ["Declared harness fixture; no trim algorithm was run."],
+      limitations: ["No source media, audio, or utterances were inspected."],
+      listeningRequired: true,
+    };
+    const harness = desktopScenario()
+      .project("Source range test", { id: "project_ranges" })
+      .camera("Camera A", { clips: 1 })
+      .sourceTrimSuggestion(trimSuggestion)
+      .build()
+      .install();
+    const assetId = harness.state.assetOrder[0];
+    const request = {
+      assetId,
+      expectedRevision: 0,
+      expectedSourceFingerprint: harness.state.assets[assetId].fingerprint,
+      decision: "exclude",
+      media: "picture",
+      decisionOwner: "human",
+      sourceInSeconds: 0,
+      sourceOutSeconds: 0.5,
+      rationale: "Human-confirmed synthetic harness decision",
+    };
+    try {
+      const before = (await window.__TAURI_INTERNALS__!.invoke("source_range_constraints", {
+        assetId,
+      })) as { revision: number; schemaReady: boolean; items: unknown[] };
+      expect(before).toMatchObject({ revision: 0, schemaReady: true, items: [] });
+
+      const confirmed = (await window.__TAURI_INTERNALS__!.invoke("confirm_source_range", {
+        projectId: "project_ranges",
+        request,
+      })) as {
+        revision: number;
+        items: Array<{ constraintId: string; decisionOwner: string; active: boolean }>;
+      };
+      expect(confirmed.revision).toBe(1);
+      expect(confirmed.items[0]).toMatchObject({ decisionOwner: "human", active: true });
+
+      await expect(
+        window.__TAURI_INTERNALS__!.invoke("confirm_source_range", {
+          projectId: "project_ranges",
+          request: { ...request, expectedRevision: 1, decisionOwner: "model" },
+        }),
+      ).rejects.toThrow(/request\.decisionOwner must be human/);
+      await expect(
+        window.__TAURI_INTERNALS__!.invoke("confirm_source_range", {
+          projectId: "another_project",
+          request: { ...request, expectedRevision: 1 },
+        }),
+      ).rejects.toThrow(/belongs to project project_ranges/);
+
+      const revoked = (await window.__TAURI_INTERNALS__!.invoke("revoke_source_range", {
+        projectId: "project_ranges",
+        assetId,
+        constraintId: confirmed.items[0].constraintId,
+        expectedRevision: 1,
+        rationale: "Human withdrew the synthetic decision",
+      })) as { revision: number; items: Array<{ active: boolean }> };
+      expect(revoked.revision).toBe(2);
+      expect(revoked.items[0].active).toBe(false);
+
+      const suggestion = await window.__TAURI_INTERNALS__!.invoke("suggest_source_trim", {
+        request: {
+          assetId,
+          inspectedEvidenceId: trimSuggestion.inspectedEvidenceId,
+          media: "audio",
+          sourceInSeconds: 0.1,
+          sourceOutSeconds: 0.2,
+          preferUtterances: true,
+        },
+      });
+      expect(suggestion).toEqual(trimSuggestion);
+      await expect(
+        window.__TAURI_INTERNALS__!.invoke("suggest_source_trim", {
+          request: {
+            asset_id: assetId,
+            inspected_evidence_id: trimSuggestion.inspectedEvidenceId,
+            media: "audio",
+            source_in_seconds: 0.1,
+            source_out_seconds: 0.2,
+          },
+        }),
+      ).rejects.toThrow(/request\.assetId must be a string/);
+    } finally {
+      harness.uninstall();
+    }
+  });
+
   it("serves bounded chronology suggestions locally without mutating canonical chronology", async () => {
     const harness = desktopScenario()
       .project("Synthetic chronology test", { id: "project_test" })
