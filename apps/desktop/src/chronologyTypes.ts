@@ -505,6 +505,7 @@ export interface ValidationReport {
 
 export interface PreviewResult {
   artifactId?: string;
+  segmentCounts?: PreviewSegmentCounts;
   outputPath: string;
   durationSeconds: number;
   clipCount: number;
@@ -515,6 +516,7 @@ export type PreviewProgress =
   | { type: "started"; artifactId?: string | null; sequence?: number | null; clipCount: number; workerCount: number }
   | {
       type: "clipCompleted";
+      segmentCounts?: PreviewSegmentCounts;
       artifactId?: string | null;
       sequence?: number | null;
       position: number;
@@ -522,13 +524,14 @@ export type PreviewProgress =
       estimateRemainingSeconds: number | null;
     }
   | { type: "clipFailed"; artifactId?: string | null; sequence?: number | null; position: number; message: string }
-  | { type: "finished"; artifactId?: string | null; sequence?: number | null; outputPath: string; durationSeconds: number }
+  | { type: "finished"; artifactId?: string | null; sequence?: number | null; segmentCounts?: PreviewSegmentCounts; outputPath: string; durationSeconds: number }
   | { type: "cancelled"; artifactId?: string | null; sequence?: number | null };
 
 export type PreviewArtifactState = "running" | "complete" | "cancelled" | "failed" | "interrupted";
+export interface PreviewSegmentCounts { encoded: number; reused: number; invalidated: number }
 export interface CalibrationToolIdentity { role: string; name: string; version: string; executableKey: string }
 export interface PreviewSourceIdentity { assetId: string; sourceFingerprint: string; representation: string; representationFingerprint: string; rotationDegrees: number; clocks: unknown }
-export interface PreviewInputIdentity { recipe: string; revisionId: string; planDigest: string; maxHeight: number; constraintsKey: string; sources: PreviewSourceIdentity[]; tools: CalibrationToolIdentity[] }
+export interface PreviewInputIdentity { recipe: string; revisionId: string; planDigest: string; maxHeight: number; constraintsKey: string; sources: PreviewSourceIdentity[]; tools: CalibrationToolIdentity[]; toolContentFingerprints?: string[] }
 export interface PreviewCutMapping { operationId: string; assetId: string; sourceInSeconds: number; sourceOutSeconds: number; movieInPts: number; movieOutPts: number; outputFrameCount: number }
 export interface PreviewMediaValidation { outputFingerprint: string; byteLength: number; durationSeconds: number; videoFrameCount: number; videoTimeBaseNumerator: number; videoTimeBaseDenominator: number; videoOriginPts: number; movieTimeBaseNumerator: number; movieTimeBaseDenominator: number; movieOriginPts: number; width: number; height: number; audioSampleRate: number; audioChannels: number; fullyDecoded: boolean; cuts: PreviewCutMapping[]; limitations: string[] }
 export interface PreviewCutOutcome { operationId: string; position: number; assetId: string; state: string; reused: boolean; cacheKey: string | null; failure: string | null }

@@ -151,15 +151,26 @@ describe("the harness's own guarantees", () => {
         items: [],
       };
       const status = {
-        artifact: { artifactId, projectId: "project_preview" },
+        artifact: {
+          artifactId,
+          projectId: "project_preview",
+          identity: { toolContentFingerprints: ["tool-content-sha256:fixture"] },
+          result: { outputPath: "/preview.mp4", durationSeconds: 0, clipCount: 0, failures: [], segmentCounts: { encoded: 0, reused: 2, invalidated: 1 } },
+        },
         observedState: "running",
         latestAttempt: true,
         activeRevisionId: null,
         filePresent: false,
         currentForRequest: null,
         verification: null,
-      } as import("../../chronologyTypes").PreviewArtifactStatus;
+      } as unknown as import("../../chronologyTypes").PreviewArtifactStatus;
       harness.state.previewArtifactStatuses[artifactId] = status;
+
+      await expect(window.__TAURI_INTERNALS__!.invoke("render_edit_plan_preview", {
+        revisionId: revision.revisionId,
+      })).resolves.toMatchObject({ segmentCounts: { encoded: 0, reused: 0, invalidated: 0 } });
+      expect(status.artifact.identity?.toolContentFingerprints).toEqual(["tool-content-sha256:fixture"]);
+      expect(status.artifact.result?.segmentCounts).toEqual({ encoded: 0, reused: 2, invalidated: 1 });
 
       await expect(window.__TAURI_INTERNALS__!.invoke("preview_artifacts", {
         projectId: "project_preview",

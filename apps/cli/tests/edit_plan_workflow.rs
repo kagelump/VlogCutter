@@ -325,6 +325,8 @@ fn generated_media_plan_create_fork_diff_validate_activate_and_preview() {
         ],
     );
     assert_eq!(preview["preview"]["clipCount"], 2);
+    assert_eq!(preview["preview"]["segmentCounts"]["encoded"], 2);
+    assert_eq!(preview["preview"]["segmentCounts"]["reused"], 0);
     assert!(
         preview["preview"]["failures"]
             .as_array()
@@ -401,6 +403,8 @@ fn generated_media_plan_create_fork_diff_validate_activate_and_preview() {
     );
     #[cfg(unix)]
     cancel_live_preview_child(&catalog, b_id, dir.path());
+    #[cfg(unix)]
+    tool_content_changes_invalidate_cached_segments(&catalog, b_id, dir.path());
     success(
         &catalog,
         &[
@@ -610,4 +614,64 @@ fn cancel_live_preview_child(catalog: &Path, revision: &str, parent: &Path) {
         .status()
         .unwrap();
     assert!(!alive.success(), "cancelled media child was left alive");
+}
+
+#[cfg(unix)]
+fn tool_content_changes_invalidate_cached_segments(catalog: &Path, revision: &str, parent: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let tools = parent.join("content-key-tools");
+    fs::create_dir(&tools).unwrap();
+    let wrapper = tools.join("ffmpeg");
+    let real = rcdvlog_core::resolve_tool_path("ffmpeg");
+    let path = std::env::join_paths(
+        std::iter::once(tools).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+    )
+    .unwrap();
+    for (generation, comment) in [
+        "first executable bytes",
+        "different bytes same version",
+        "different bytes same version",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        fs::write(
+            &wrapper,
+            format!("#!/bin/sh\n# {comment}\nexec \"$RCDVLOG_TEST_REAL_FFMPEG\" \"$@\"\n"),
+        )
+        .unwrap();
+        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700)).unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_rcdvlog"))
+            .arg("--catalog")
+            .arg(catalog)
+            .args([
+                "edit-plan",
+                "preview",
+                "--revision",
+                revision,
+                "--max-height",
+                "144",
+            ])
+            .env("PATH", &path)
+            .env("RCDVLOG_TEST_REAL_FFMPEG", &real)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let document: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let counts = &document["data"]["preview"]["segmentCounts"];
+        assert_eq!(
+            counts["encoded"],
+            if generation < 2 { 2 } else { 0 },
+            "{document}"
+        );
+        assert_eq!(
+            counts["reused"],
+            if generation < 2 { 0 } else { 2 },
+            "{document}"
+        );
+    }
 }

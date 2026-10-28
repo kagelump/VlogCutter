@@ -30,9 +30,37 @@ process disappears, a running receipt with no live render claim is observed as
 
 Each attempt owns a separate output directory under the project cache. A later
 generation never overwrites a completed preview, so prior output paths remain
-available for comparison until manually removed. There is no automatic receipt
-or output cleanup. Per-cut outcome records describe render outcomes; segment
-reuse across attempts is not implemented.
+available for comparison until manually removed. Per-cut outcome records
+describe render outcomes. Compatible encoded picture segments can be reused
+between attempts from the project-local `cache/preview-segments/<project>/<digest>/objects`
+store, owned by the core SQLite catalog at schema 54. There is no implicit
+cleanup or segment-deletion command. Any future managed-cache pruning must
+honor active segment claims and preserve completed preview artifacts, human
+data, source media, and other cache categories.
+
+The segment key covers the full selected-representation identity and content
+hash, exact source interval, operation's expected picture mapping and cumulative
+frame-grid allocation where applicable, orientation, canvas dimensions,
+frame-rate recipe, audio mode, preview recipe, and media-tool version and actual
+executable-content hashes. It excludes operation position, revision ID, and
+editorial rationale. Therefore moving or renaming an otherwise identical cut
+does not by itself defeat reuse, while a changed frame allocation invalidates
+the affected segment. A change to split audio can reuse compatible picture-only
+segments while creating a fresh sound mix; linked source-audio segments include
+their audio mode in the key.
+
+Reuse is based on immutable encoded bytes whose full-file hash, byte length,
+expected media metadata, and prior full-decode receipt are checked. A matching
+entry that is missing, damaged, or has an invalid receipt is counted as
+`invalidated` and repaired; a new input key is an ordinary cache miss, not an
+invalidation. Per-result and progress `segmentCounts` report `encoded`,
+`reused`, and `invalidated`. Per-key process claims coordinate concurrent
+renderers and observe cancellation while waiting or verifying. Interrupted or
+cancelled work cannot publish a partial receipt. Repaired segments use unique
+objects and do not remove earlier completed movies. Every attempt still checks
+source/tool identity and full content hashes, assembles a fresh movie, and
+performs final full-movie decode and coverage validation. Reuse does not skip
+the fresh audio mix or final validation.
 
 ## What the receipt measures
 

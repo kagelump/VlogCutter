@@ -496,3 +496,109 @@ fn render_claim_and_cancellation_preserve_the_prior_complete_preview() {
         "cancelled writer must release its render claim"
     );
 }
+
+#[test]
+fn audio_only_revisions_reuse_picture_but_remix_the_actual_source_sound() {
+    let (_dir, catalog, project, ids) = generated_fixture();
+    let first = plan(&catalog, &project, &ids);
+    let request = |revision: &EditPlanRevision| PreviewRequest {
+        revision_id: revision.revision_id.clone(),
+        max_height: 180,
+    };
+    let original = catalog
+        .render_preview(&request(&first), &mut |_| {}, &|| false)
+        .unwrap();
+    assert_eq!(original.segment_counts.as_ref().unwrap().encoded, 3);
+    let mut changed = first.operations.clone();
+    let Some(EditPlanAudio::Source(audio)) = &mut changed[0].audio else {
+        panic!("source audio fixture")
+    };
+    audio.gain_db = -12.0;
+    let next = catalog
+        .create_edit_plan_from_base(&project, &changed, None, Some(&first.revision_id), None)
+        .unwrap();
+    let remixed = catalog
+        .render_preview(&request(&next), &mut |_| {}, &|| false)
+        .unwrap();
+    let counts = remixed.segment_counts.as_ref().unwrap();
+    assert_eq!(
+        (counts.encoded, counts.reused, counts.invalidated),
+        (0, 3, 0)
+    );
+    let before = amplitude(&samples(Path::new(&original.output_path), 0.2, 0.15), 440.0);
+    let after = amplitude(&samples(Path::new(&remixed.output_path), 0.2, 0.15), 440.0);
+    assert!(
+        (after / before - 0.5).abs() < 0.08,
+        "cached picture improperly reused stale sound: before={before} after={after}"
+    );
+    assert_eq!(
+        pixel(Path::new(&original.output_path), 1.2, 160, 90),
+        pixel(Path::new(&remixed.output_path), 1.2, 160, 90)
+    );
+    assert_ne!(original.artifact_id, remixed.artifact_id);
+    let verified = catalog
+        .preview_artifact_status(remixed.artifact_id.as_deref().unwrap(), true)
+        .unwrap();
+    assert_eq!(verified.current_for_request, Some(true));
+}
+
+#[test]
+fn verified_reuse_keeps_silent_first_mixed_rate_rotated_linked_audio_behavior() {
+    let (_dir, catalog, project, ids) = generated_fixture();
+    let asset = catalog.get_asset(&ids[1]).unwrap();
+    catalog
+        .update_asset(
+            &asset.id,
+            &rcdvlog_core::AssetPatch {
+                notes: asset.notes,
+                labels: asset.labels,
+                removed: asset.removed,
+                rotation_degrees: 90,
+                expected_revision: Some(asset.revision),
+            },
+        )
+        .unwrap();
+    let operations = [&ids[2], &ids[0], &ids[1]]
+        .into_iter()
+        .enumerate()
+        .map(|(index, id)| EditPlanOperation {
+            operation_id: format!("linked-{index}"),
+            position: index as u32,
+            asset_id: id.clone(),
+            source_in_seconds: 0.5,
+            source_out_seconds: 1.5,
+            rationale: "Generated mixed cadence/silence/rotation cache coverage".into(),
+            audio: None,
+        })
+        .collect::<Vec<_>>();
+    let plan = catalog
+        .create_edit_plan_from_base(&project, &operations, None, None, None)
+        .unwrap();
+    let request = PreviewRequest {
+        revision_id: plan.revision_id,
+        max_height: 180,
+    };
+    let first = catalog
+        .render_preview(&request, &mut |_| {}, &|| false)
+        .unwrap();
+    let second = catalog
+        .render_preview(&request, &mut |_| {}, &|| false)
+        .unwrap();
+    assert_eq!(first.segment_counts.as_ref().unwrap().encoded, 3);
+    assert_eq!(second.segment_counts.as_ref().unwrap().reused, 3);
+    let quiet = samples(Path::new(&second.output_path), 0.2, 0.15);
+    assert!(quiet.iter().map(|s| s * s).sum::<f64>() / (quiet.len() as f64) < 1e-6);
+    assert!(amplitude(&samples(Path::new(&second.output_path), 1.2, 0.15), 440.0) > 0.06);
+    assert!(amplitude(&samples(Path::new(&second.output_path), 2.2, 0.15), 660.0) > 0.06);
+    for at in [0.2, 1.2, 2.2] {
+        assert_eq!(
+            pixel(Path::new(&first.output_path), at, 160, 90),
+            pixel(Path::new(&second.output_path), at, 160, 90)
+        );
+    }
+    let rotation_marker = pixel(Path::new(&second.output_path), 2.2, 200, 10);
+    assert!(
+        (rotation_marker[0] as i32 - rotation_marker[2] as i32).abs() < 15,
+        "rotated counter marker was not retained: {rotation_marker:?}"
+    );
+}
