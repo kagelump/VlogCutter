@@ -3174,7 +3174,24 @@ fn a_stale_clip_update_is_refused_with_a_code_the_agent_can_act_on() {
 fn orientation_queue_is_read_only_and_orientation_decisions_are_revision_guarded() {
     let directory = tempdir().unwrap();
     let catalog = directory.path().join("catalog.sqlite3");
-    let project = create_project(&catalog, "Orientation CLI");
+    // Build an actual old schema, including its physical tables. Removing a
+    // current migration's history alone leaves its changes installed and can
+    // make the later writable command apply that migration twice. Pin the
+    // compatibility fixture so future migrations do not change its meaning.
+    let project = "project_orientation_cli".to_string();
+    let mut connection = Connection::open(&catalog).unwrap();
+    rcdvlog_core::run_sqlite_migrations(
+        &mut connection,
+        &rcdvlog_core::PROJECT_CATALOG_MIGRATIONS[..49],
+    )
+    .unwrap();
+    connection
+        .execute(
+            "INSERT INTO projects(id,name,created_at) VALUES (?1,'Orientation CLI','now')",
+            [&project],
+        )
+        .unwrap();
+    drop(connection);
     success(
         &catalog,
         ["doctor", "--require-capability", "orientation.review.v1"],
@@ -3192,16 +3209,9 @@ fn orientation_queue_is_read_only_and_orientation_decisions_are_revision_guarded
         90,
     );
 
-    // Model a catalog stopped one migration behind. The queue must use the
+    // The queue must use the
     // explicit-catalog read-only open path and leave its migration history and
     // SQLite bytes untouched.
-    Connection::open(&catalog)
-        .unwrap()
-        .execute(
-            "DELETE FROM schema_migrations WHERE migration_id=?1",
-            [i64::from(PROJECT_CATALOG_SCHEMA_VERSION)],
-        )
-        .unwrap();
     let before = fs::read(&catalog).unwrap();
     let queue = success(
         &catalog,
@@ -3242,7 +3252,7 @@ fn orientation_queue_is_read_only_and_orientation_decisions_are_revision_guarded
                 |row| row.get::<_, i64>(0)
             )
             .unwrap(),
-        i64::from(PROJECT_CATALOG_SCHEMA_VERSION - 1)
+        49
     );
 
     // Confirming the current inferred default is an explicit operation even
@@ -3261,6 +3271,18 @@ fn orientation_queue_is_read_only_and_orientation_decisions_are_revision_guarded
         ],
     );
     assert_eq!(default_confirmation.json["data"]["rotationDegrees"], 90);
+    assert_eq!(
+        Connection::open(&catalog)
+            .unwrap()
+            .query_row(
+                "SELECT MAX(migration_id) FROM schema_migrations",
+                [],
+                |row| { row.get::<_, u32>(0) }
+            )
+            .unwrap(),
+        PROJECT_CATALOG_SCHEMA_VERSION,
+        "the explicit write upgrades the real legacy schema"
+    );
     assert_eq!(
         default_confirmation.json["data"]["orientationDecision"]["status"],
         "confirmed"
