@@ -55,6 +55,15 @@ impl PreviewArtifactError {
     }
 }
 
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PreviewSegmentCounts {
+    pub encoded: u32,
+    pub reused: u32,
+    /// Matching receipts rejected for damaged/missing output or invalid metadata.
+    pub invalidated: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PreviewSourceIdentity {
@@ -77,6 +86,8 @@ pub struct PreviewInputIdentity {
     pub constraints_key: String,
     pub sources: Vec<PreviewSourceIdentity>,
     pub tools: Vec<CalibrationToolIdentity>,
+    #[serde(default)]
+    pub tool_content_fingerprints: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

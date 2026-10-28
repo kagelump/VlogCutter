@@ -28,6 +28,7 @@ pub mod preview;
 mod preview_artifact_model;
 pub mod preview_artifacts;
 mod preview_media;
+mod preview_segments;
 mod range_model;
 pub mod ranges;
 pub mod validate;

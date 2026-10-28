@@ -1088,10 +1088,18 @@ cannot be resumed; submit a new `preview` request for another attempt.
 Completed artifacts and their output paths are immutable historical attempts.
 A newer generation never overwrites an older completed output. An interrupted
 attempt is recorded as `interrupted` when its render claim is gone; it is not
-resumable. Receipts are local derived evidence in catalog schema 53, not synced
-human decisions. Listing before that migration reports `schemaReady: false`;
-the read-only listing does not migrate a catalog. There is no cross-attempt
-segment reuse yet and no automatic receipt/output cleanup.
+resumable. Receipts and encoded-segment receipts are local derived evidence in
+catalog schema 54, not synced human decisions. Listing before that migration
+reports `schemaReady: false`; the read-only listing does not migrate a catalog.
+Preview renders may reuse verified encoded segments across attempts when the
+selected representation, exact interval, frame mapping/allocation, orientation,
+canvas, frame grid, audio mode, recipes, and media-tool version/content hashes
+match. Keys omit revision, operation position, and editorial rationale. Segment
+reuse is counted as `encoded`, `reused`, and `invalidated`; invalidated counts
+refer only to damaged or invalid matching receipts, while new input keys are
+cache misses. Each attempt still verifies current sources/tools, makes a fresh
+sound mix when needed, and decodes and validates the complete assembled movie.
+The managed segment store has no implicit cleanup or deletion API.
 
 See [preview artifacts](edit-plan-preview-artifacts.md) for the receipt fields,
 clock semantics, verification boundary, and interpretation limits.

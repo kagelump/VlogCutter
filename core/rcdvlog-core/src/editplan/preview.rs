@@ -41,6 +41,8 @@ pub struct PreviewFailure {
 pub struct PreviewResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub segment_counts: Option<super::PreviewSegmentCounts>,
     pub output_path: String,
     pub duration_seconds: f64,
     pub clip_count: u32,
@@ -61,6 +63,8 @@ pub enum PreviewProgress {
         worker_count: u32,
     },
     ClipCompleted {
+        #[serde(default)]
+        segment_counts: Option<super::PreviewSegmentCounts>,
         artifact_id: Option<String>,
         sequence: Option<u64>,
         position: u32,
@@ -74,6 +78,8 @@ pub enum PreviewProgress {
         message: String,
     },
     Finished {
+        #[serde(default)]
+        segment_counts: Option<super::PreviewSegmentCounts>,
         artifact_id: Option<String>,
         sequence: Option<u64>,
         output_path: String,
@@ -220,6 +226,7 @@ impl Catalog {
         let mut segments: Vec<PathBuf> = Vec::new();
         let mut failures: Vec<PreviewFailure> = Vec::new();
         let mut segment_frames = Vec::new();
+        let mut segment_counts = super::PreviewSegmentCounts::default();
         let started = std::time::Instant::now();
         let mut picture_frames = 0_u64;
         let mut requested_picture_end = 0.0;
@@ -287,134 +294,169 @@ impl Catalog {
             } else {
                 duration
             };
-            let has_audio = !split_audio && source_has_audio(source, cancel)?;
-            let mut command = tool_command("ffmpeg");
-            command
-                .args(["-y", "-hide_banner", "-loglevel", "error", "-ss"])
-                .arg(operation.source_in_seconds.to_string())
-                .arg("-t")
-                .arg(duration.to_string())
-                .arg("-noautorotate")
-                .arg("-i")
-                .arg(source);
-            if split_audio {
-                command.args(["-map", "0:v:0", "-an"]);
-            } else if has_audio {
-                command.args(["-map", "0:v:0", "-map", "0:a:0"]);
-            } else {
-                command.args([
-                    "-f",
-                    "lavfi",
-                    "-i",
-                    "anullsrc=channel_layout=stereo:sample_rate=48000",
-                    "-map",
-                    "0:v:0",
-                    "-map",
-                    "1:a:0",
-                ]);
+            let expected = super::preview_media::SegmentExpectation {
+                width: canvas_width,
+                height: canvas_height,
+                seconds: segment_duration,
+                frames: expected_frames,
+                audio: !split_audio,
+            };
+            let cache_key = super::preview_segments::key(
+                &plan.project_id,
+                &prepared.identity,
+                operation,
+                &expected,
+            )?;
+            let mut cache = super::preview_segments::SegmentClaim::acquire(
+                self,
+                &plan.project_id,
+                cache_key.clone(),
+                expected,
+                cancel,
+            )?;
+            if cache.invalidated {
+                segment_counts.invalidated += 1;
             }
-            command
-                .arg("-t")
-                .arg(segment_duration.to_string())
-                .args([
-                    "-vf",
-                    &normalize,
-                    "-c:v",
-                    "libx264",
-                    "-preset",
-                    "veryfast",
-                    "-crf",
-                    "28",
-                    "-pix_fmt",
-                    "yuv420p",
-                    "-r",
-                    "30000/1001",
-                    "-video_track_timescale",
-                    "30000",
-                    "-c:a",
-                    "aac",
-                    "-b:a",
-                    "96k",
-                    "-ar",
-                    "48000",
-                    "-ac",
-                    "2",
-                    "-af",
-                    "aresample=48000:async=1:first_pts=0,asetpts=PTS-STARTPTS",
-                    "-map_metadata",
-                    "-1",
-                ])
-                .arg(&segment);
-            let (status, diagnostic) = run_media(
-                &mut command,
-                std::path::Path::new(source),
-                &segment,
-                &mut || cancel(),
-            )
-            .context("start ffmpeg preview segment process")?;
-
-            let checked = if status.success() {
-                super::preview_media::segment_frame_count(
-                    &segment,
-                    &workspace,
-                    &super::preview_media::SegmentExpectation {
-                        width: canvas_width,
-                        height: canvas_height,
-                        seconds: segment_duration,
-                        frames: expected_frames,
-                        audio: !split_audio,
-                    },
-                    cancel,
-                )
+            prepared.require_unchanged()?;
+            let reused = cache.cached.is_some();
+            let cached = if let Some(cached) = cache.cached.take() {
+                segment_counts.reused += 1;
+                cached
             } else {
-                Err(media_tool_failure(
-                    "ffmpeg preview segment",
-                    status,
-                    diagnostic,
-                ))
-            };
-            let count = match checked {
-                Ok(count) => count,
-                Err(error) => {
-                    let message = error.to_string();
-                    let sequence = attempt.outcome(&super::PreviewCutOutcome {
-                        operation_id: operation.operation_id.clone(),
-                        position: operation.position,
-                        asset_id: operation.asset_id.clone(),
-                        state: "failed".into(),
-                        reused: false,
-                        cache_key: None,
-                        failure: Some(message.clone()),
-                    })?;
-                    progress(PreviewProgress::ClipFailed {
-                        artifact_id: Some(attempt.artifact_id.clone()),
-                        sequence: Some(sequence),
-                        position: operation.position,
-                        message: message.clone(),
-                    });
-                    failures.push(PreviewFailure {
-                        position: operation.position,
-                        asset_id: operation.asset_id.clone(),
-                        message,
-                    });
-                    let _ = fs::remove_file(&segment);
-                    continue;
+                let has_audio = !split_audio && source_has_audio(source, cancel)?;
+                let mut command = tool_command("ffmpeg");
+                command
+                    .args(["-y", "-hide_banner", "-loglevel", "error", "-ss"])
+                    .arg(operation.source_in_seconds.to_string())
+                    .arg("-t")
+                    .arg(duration.to_string())
+                    .arg("-noautorotate")
+                    .arg("-i")
+                    .arg(source);
+                if split_audio {
+                    command.args(["-map", "0:v:0", "-an"]);
+                } else if has_audio {
+                    command.args(["-map", "0:v:0", "-map", "0:a:0"]);
+                } else {
+                    command.args([
+                        "-f",
+                        "lavfi",
+                        "-i",
+                        "anullsrc=channel_layout=stereo:sample_rate=48000",
+                        "-map",
+                        "0:v:0",
+                        "-map",
+                        "1:a:0",
+                    ]);
                 }
+                command
+                    .arg("-t")
+                    .arg(segment_duration.to_string())
+                    .args([
+                        "-vf",
+                        &normalize,
+                        "-c:v",
+                        "libx264",
+                        "-preset",
+                        "veryfast",
+                        "-crf",
+                        "28",
+                        "-pix_fmt",
+                        "yuv420p",
+                        "-r",
+                        "30000/1001",
+                        "-video_track_timescale",
+                        "30000",
+                        "-c:a",
+                        "aac",
+                        "-b:a",
+                        "96k",
+                        "-ar",
+                        "48000",
+                        "-ac",
+                        "2",
+                        "-af",
+                        "aresample=48000:async=1:first_pts=0,asetpts=PTS-STARTPTS",
+                        "-map_metadata",
+                        "-1",
+                    ])
+                    .arg(&segment);
+                let (status, diagnostic) = run_media(
+                    &mut command,
+                    std::path::Path::new(source),
+                    &segment,
+                    &mut || cancel(),
+                )
+                .context("start ffmpeg preview segment process")?;
+
+                let checked = if status.success() {
+                    super::preview_media::segment_frame_count(
+                        &segment,
+                        &workspace,
+                        &super::preview_media::SegmentExpectation {
+                            width: canvas_width,
+                            height: canvas_height,
+                            seconds: segment_duration,
+                            frames: expected_frames,
+                            audio: !split_audio,
+                        },
+                        cancel,
+                    )
+                } else {
+                    Err(media_tool_failure(
+                        "ffmpeg preview segment",
+                        status,
+                        diagnostic,
+                    ))
+                };
+                let count = match checked {
+                    Ok(count) => count,
+                    Err(error) => {
+                        let message = error.to_string();
+                        let sequence = attempt.outcome(&super::PreviewCutOutcome {
+                            operation_id: operation.operation_id.clone(),
+                            position: operation.position,
+                            asset_id: operation.asset_id.clone(),
+                            state: "failed".into(),
+                            reused: false,
+                            cache_key: Some(cache_key.clone()),
+                            failure: Some(message.clone()),
+                        })?;
+                        progress(PreviewProgress::ClipFailed {
+                            artifact_id: Some(attempt.artifact_id.clone()),
+                            sequence: Some(sequence),
+                            position: operation.position,
+                            message: message.clone(),
+                        });
+                        failures.push(PreviewFailure {
+                            position: operation.position,
+                            asset_id: operation.asset_id.clone(),
+                            message,
+                        });
+                        let _ = fs::remove_file(&segment);
+                        continue;
+                    }
+                };
+                prepared.require_unchanged()?;
+                let published = cache.publish(self, &segment, count, cancel)?;
+                segment_counts.encoded += 1;
+                published
             };
-            segment_frames.push(count);
+            segment_frames.push(cached.frame_count);
             let sequence = attempt.outcome(&super::PreviewCutOutcome {
                 operation_id: operation.operation_id.clone(),
                 position: operation.position,
                 asset_id: operation.asset_id.clone(),
-                state: "encoded".into(),
-                reused: false,
-                cache_key: None,
+                state: if reused { "reused" } else { "encoded" }.into(),
+                reused,
+                cache_key: Some(cache_key),
                 failure: None,
             })?;
-            segments.push(segment);
+            segments.push(cached.path);
             let elapsed = started.elapsed().as_secs_f64();
             let completed = index + 1;
             progress(PreviewProgress::ClipCompleted {
+                segment_counts: Some(segment_counts.clone()),
                 artifact_id: Some(attempt.artifact_id.clone()),
                 sequence: Some(sequence),
                 position: operation.position,
@@ -516,11 +558,14 @@ impl Catalog {
         ensure!(
             current.identity.sources == prepared.identity.sources
                 && current.identity.tools == prepared.identity.tools
-                && current.identity.plan_digest == prepared.identity.plan_digest,
+                && current.identity.plan_digest == prepared.identity.plan_digest
+                && current.identity.tool_content_fingerprints
+                    == prepared.identity.tool_content_fingerprints,
             "preview source media or rendering recipe changed during the attempt"
         );
         let result = PreviewResult {
             artifact_id: Some(attempt.artifact_id.clone()),
+            segment_counts: Some(segment_counts.clone()),
             output_path: output.to_string_lossy().into_owned(),
             duration_seconds: validation.duration_seconds,
             clip_count: segments.len() as u32,
@@ -541,6 +586,7 @@ impl Catalog {
         publication.commit()?;
 
         progress(PreviewProgress::Finished {
+            segment_counts: Some(segment_counts),
             artifact_id: Some(attempt.artifact_id.clone()),
             sequence: Some(sequence),
             output_path: output.to_string_lossy().into_owned(),

@@ -273,10 +273,10 @@ pub use editplan::{
     PreviewArtifactPage, PreviewArtifactState, PreviewArtifactStatus, PreviewArtifactSummary,
     PreviewArtifactVerification, PreviewCutMapping, PreviewCutOutcome, PreviewFailure,
     PreviewInputIdentity, PreviewMediaValidation, PreviewProgress, PreviewRequest, PreviewResult,
-    PreviewSourceIdentity, RangeDecision, RangeDecisionOwner, RangeMedia, Severity, SourceAudio,
-    SourceInspection, SourceInspectionError, SourceInspectionRequest, SourceInspectionResult,
-    SourceRangeConstraints, SourceRangeError, SourceTimeRange, SourceTrimRequest,
-    SourceTrimSuggestion, TrimMedia, ValidationReport, otio_document,
+    PreviewSegmentCounts, PreviewSourceIdentity, RangeDecision, RangeDecisionOwner, RangeMedia,
+    Severity, SourceAudio, SourceInspection, SourceInspectionError, SourceInspectionRequest,
+    SourceInspectionResult, SourceRangeConstraints, SourceRangeError, SourceTimeRange,
+    SourceTrimRequest, SourceTrimSuggestion, TrimMedia, ValidationReport, otio_document,
 };
 pub use operations::{
     ApplyOperationResult, AssetRevisionDiagnostics, CAPTURE_SEQUENCE_DECLARED,

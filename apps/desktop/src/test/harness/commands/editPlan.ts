@@ -427,6 +427,7 @@ export const editPlanCommands: CommandTable = {
     if (!revision) throw new Error(`Unknown edit plan revision: ${revisionId}`);
 
     const result = (failures: PreviewResult["failures"]): PreviewResult => ({
+      segmentCounts: { encoded: revision.operations.length, reused: 0, invalidated: 0 },
       outputPath: `/Users/harness/Movies/previews/${revisionId}.mp4`,
       durationSeconds: revision.operations.reduce(
         (total, operation) => total + (operation.sourceOutSeconds - operation.sourceInSeconds),
@@ -451,6 +452,7 @@ export const editPlanCommands: CommandTable = {
         }
         return {
           type: "clipCompleted",
+          segmentCounts: { encoded: step.position + 1, reused: 0, invalidated: 0 },
           position: step.position,
           elapsedSeconds: step.position,
           estimateRemainingSeconds: Math.max(0, revision.operations.length - step.position),

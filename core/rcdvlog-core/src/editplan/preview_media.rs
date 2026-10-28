@@ -32,6 +32,50 @@ const MAX_METADATA_BYTES: u64 = 256 * 1024 * 1024;
 pub(super) struct PreparedSources {
     pub identity: PreviewInputIdentity,
     pub paths: HashMap<String, PathBuf>,
+    stamps: HashMap<PathBuf, FileStamp>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct FileStamp {
+    length: u64,
+    modified: Option<std::time::SystemTime>,
+    #[cfg(unix)]
+    file_id: (u64, u64),
+}
+impl FileStamp {
+    fn read(path: &Path) -> Result<Self> {
+        let metadata = fs::metadata(path)?;
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+        Ok(Self {
+            length: metadata.len(),
+            modified: metadata.modified().ok(),
+            #[cfg(unix)]
+            file_id: (metadata.dev(), metadata.ino()),
+        })
+    }
+}
+impl PreparedSources {
+    // Originals are immutable by contract. Detect ordinary in-place writes and
+    // atomic representation/tool replacement before publishing reusable work.
+    pub fn require_unchanged(&self) -> Result<()> {
+        for (path, stamp) in &self.stamps {
+            ensure!(
+                &FileStamp::read(path)? == stamp,
+                "preview source or tool changed during segment rendering"
+            );
+        }
+        Ok(())
+    }
+}
+fn stable_hash(path: &Path, cancel: &dyn Fn() -> bool) -> Result<(String, FileStamp)> {
+    let before = FileStamp::read(path)?;
+    let hash = full_file_blake3(path, cancel)?.hex_digest;
+    ensure!(
+        FileStamp::read(path)? == before,
+        "preview input changed while hashing"
+    );
+    Ok((hash, before))
 }
 fn tool_identities() -> Vec<crate::CalibrationToolIdentity> {
     vec![
@@ -98,7 +142,8 @@ pub(super) fn prepare(
         .collect();
     let mut sources = Vec::new();
     let mut paths = HashMap::new();
-    let mut hashes = HashMap::new();
+    let mut hashes = HashMap::<PathBuf, (String, FileStamp)>::new();
+    let mut stamps = HashMap::new();
     for id in ids {
         ensure!(!cancel(), "preview cancelled while identifying media");
         let asset = assets_by_id
@@ -117,13 +162,18 @@ pub(super) fn prepare(
             "media offline: preview selected source is unavailable"
         );
         let canonical = fs::canonicalize(&path)?;
-        let fingerprint = if let Some(hash) = hashes.get(&canonical) {
-            String::clone(hash)
+        let (fingerprint, stamp) = if let Some((hash, stamp)) = hashes.get(&canonical) {
+            ensure!(
+                FileStamp::read(&path)? == *stamp,
+                "preview selected input changed during preparation"
+            );
+            (hash.clone(), stamp.clone())
         } else {
-            let hash = full_file_blake3(&path, cancel)?.hex_digest;
-            hashes.insert(canonical, hash.clone());
-            hash
+            let result = stable_hash(&path, cancel)?;
+            hashes.insert(canonical, result.clone());
+            result
         };
+        stamps.insert(path.clone(), stamp);
         let representation = if proxy.is_some() {
             format!("generatedProxy:{:?}", asset.proxy_representation)
         } else {
@@ -145,6 +195,14 @@ pub(super) fn prepare(
     }
     let plan_digest=blake3::hash(&serde_json::to_vec(&json!({"revisionId":plan.revision_id,"projectId":plan.project_id,
         "parentRevisionId":plan.parent_revision_id,"scriptRevisionId":plan.script_revision_id,"operations":plan.operations}))?).to_hex().to_string();
+    let tools = tool_identities();
+    let mut tool_content_fingerprints = Vec::new();
+    for name in ["ffmpeg", "ffprobe"] {
+        let path = resolve_tool_path(name);
+        let (hash, stamp) = stable_hash(&path, cancel)?;
+        tool_content_fingerprints.push(hash);
+        stamps.insert(path, stamp);
+    }
     Ok(PreparedSources {
         identity: PreviewInputIdentity {
             recipe: RECIPE.into(),
@@ -153,9 +211,11 @@ pub(super) fn prepare(
             max_height: request.max_height,
             constraints_key: super::ranges::constraints_key(&catalog.connection()?, plan)?,
             sources,
-            tools: tool_identities(),
+            tools,
+            tool_content_fingerprints,
         },
         paths,
+        stamps,
     })
 }
 
@@ -372,6 +432,8 @@ fn video_shape(decoded: &Decoded, width: u32, height: u32) -> Result<(i64, i64)>
     );
     rational(&video["time_base"])
 }
+#[derive(Debug, Clone, PartialEq, serde::Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub(super) struct SegmentExpectation {
     pub width: u32,
     pub height: u32,

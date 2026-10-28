@@ -7,7 +7,7 @@ use thiserror::Error;
 
 use crate::chronology::forward_migrate_project_chronology;
 
-pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 53;
+pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 54;
 
 const MIGRATION_TABLE_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -402,7 +402,24 @@ pub const PROJECT_CATALOG_MIGRATIONS: &[SqliteMigration] = &[
         source_identity: "project-catalog/0053-preview-artifact-receipts/20261028",
         apply: preview_artifact_receipts,
     },
+    SqliteMigration {
+        id: 54,
+        name: "verified_preview_segment_cache",
+        source_identity: "project-catalog/0054-verified-preview-segment-cache/20261028",
+        apply: verified_preview_segment_cache,
+    },
 ];
+
+fn verified_preview_segment_cache(transaction: &Transaction<'_>) -> Result<()> {
+    transaction.execute_batch(
+        "CREATE TABLE IF NOT EXISTS preview_segments (
+        segment_key TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        body_json TEXT NOT NULL
+    ); CREATE INDEX IF NOT EXISTS preview_segments_project ON preview_segments(project_id);",
+    )?;
+    Ok(())
+}
 
 fn preview_artifact_receipts(transaction: &Transaction<'_>) -> Result<()> {
     transaction.execute_batch(

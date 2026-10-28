@@ -31,7 +31,7 @@ fn component(value: &str) -> Result<()> {
     );
     Ok(())
 }
-fn project_directory(catalog: &Catalog) -> Result<PathBuf> {
+pub(super) fn project_directory(catalog: &Catalog) -> Result<PathBuf> {
     let parent = catalog
         .database_path()
         .parent()
@@ -39,7 +39,7 @@ fn project_directory(catalog: &Catalog) -> Result<PathBuf> {
         .unwrap_or(Path::new("."));
     fs::canonicalize(parent).context("resolve project catalog directory")
 }
-fn managed_child(parent: &Path, name: &str) -> Result<PathBuf> {
+pub(super) fn managed_child(parent: &Path, name: &str) -> Result<PathBuf> {
     component(name)?;
     let path = parent.join(name);
     match fs::create_dir(&path) {
