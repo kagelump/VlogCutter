@@ -14,6 +14,8 @@ import type {
   EditPlanRevision,
   OtioExportResult,
   PreviewResult,
+  PreviewArtifactPage,
+  PreviewArtifactStatus,
   SourceRangeConstraints,
   SourceInspectionRequest,
   SourceInspectionResult,
@@ -457,6 +459,54 @@ export const editPlanCommands: CommandTable = {
       result: (outcome) => result(outcome?.failures ?? failures),
     };
     return controller.bind(binding);
+  },
+
+  preview_artifacts: (args, { state }): PreviewArtifactPage => {
+    const projectId = requireString(args, "projectId");
+    const revisionId = requireString(args, "revisionId");
+    const revision = state.editPlans.revisions.find((item) => item.revisionId === revisionId);
+    if (!revision) throw new Error(`Unknown edit plan revision: ${revisionId}`);
+    if (revision.projectId !== projectId) throw new Error("edit plan revision belongs to another project");
+    if (args.offset !== undefined && (!Number.isSafeInteger(args.offset) || (args.offset as number) < 0)) {
+      throw new Error("offset must be a nonnegative integer");
+    }
+    if (args.limit !== undefined && (!Number.isSafeInteger(args.limit) || (args.limit as number) < 1 || (args.limit as number) > 100)) {
+      throw new Error("limit must be an integer from 1 to 100");
+    }
+    const page = state.previewArtifactPages[revisionId];
+    if (!page) throw new Error(`Scenario did not declare a preview artifact page for ${revisionId}`);
+    return page;
+  },
+
+  preview_artifact_status: (args, { state }): PreviewArtifactStatus => {
+    requireString(args, "projectId");
+    const artifactId = requireString(args, "artifactId");
+    if (args.verify !== undefined && typeof args.verify !== "boolean") throw new Error("verify must be a boolean");
+    const status = state.previewArtifactStatuses[artifactId];
+    if (!status) throw new Error(`Scenario did not declare preview artifact status for ${artifactId}`);
+    if (status.artifact.projectId !== args.projectId) throw new Error("preview artifact belongs to another project");
+    return status;
+  },
+
+  cancel_preview_artifact: (args, { state }): PreviewArtifactStatus => {
+    requireString(args, "projectId");
+    const artifactId = requireString(args, "artifactId");
+    const status = state.previewArtifactStatuses[artifactId];
+    if (!status) throw new Error(`Scenario did not declare preview artifact status for ${artifactId}`);
+    if (status.artifact.projectId !== args.projectId) throw new Error("preview artifact belongs to another project");
+    return status;
+  },
+
+  wait_preview_artifact: (args, { state }): PreviewArtifactStatus => {
+    requireString(args, "projectId");
+    const artifactId = requireString(args, "artifactId");
+    if (args.timeoutSeconds !== undefined && (!Number.isSafeInteger(args.timeoutSeconds) || (args.timeoutSeconds as number) < 0)) {
+      throw new Error("timeoutSeconds must be a nonnegative integer");
+    }
+    const status = state.previewArtifactStatuses[artifactId];
+    if (!status) throw new Error(`Scenario did not declare preview artifact status for ${artifactId}`);
+    if (status.artifact.projectId !== args.projectId) throw new Error("preview artifact belongs to another project");
+    return status;
   },
 
   export_edit_plan_otio: (args, { state }): OtioExportResult => {

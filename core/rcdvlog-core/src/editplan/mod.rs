@@ -25,6 +25,9 @@ mod inspection_model;
 pub mod model;
 pub mod otio;
 pub mod preview;
+mod preview_artifact_model;
+pub mod preview_artifacts;
+mod preview_media;
 mod range_model;
 pub mod ranges;
 pub mod validate;
@@ -36,6 +39,7 @@ pub use model::{
 };
 pub use otio::{OtioExportError, OtioExportRequest, OtioExportResult, otio_document};
 pub use preview::{PreviewFailure, PreviewProgress, PreviewRequest, PreviewResult};
+pub use preview_artifact_model::*;
 pub use range_model::*;
 pub use validate::{Finding, FindingKind, Severity, ValidationReport};
 

@@ -19,10 +19,10 @@ use rcdvlog_core::{
     ClockEpochImpactPreview, ConfirmSourceRangeRequest, ConstraintStrength, Contradiction,
     Diagnostic, DiagnosticCounts, DiagnosticFilter, DiagnosticSeverity, DisplayMode, EditPlanAudio,
     EditPlanOperation, EditPlanRevision, EventOrderConstraint, OtioExportRequest, OtioExportResult,
-    PhaseKind, PhaseSplitDirection, PreviewProgress, PreviewRequest, PreviewResult, QueuePosition,
-    SourceInspectionRequest, SourceInspectionResult, SourceRangeConstraints, SourceTrimRequest,
-    SourceTrimSuggestion, TripPhase, ValidationReport, VisualPlacementPreview, VisualPlacementSide,
-    resolve_anchored_phases,
+    PhaseKind, PhaseSplitDirection, PreviewArtifactPage, PreviewArtifactStatus, PreviewProgress,
+    PreviewRequest, PreviewResult, QueuePosition, SourceInspectionRequest, SourceInspectionResult,
+    SourceRangeConstraints, SourceTrimRequest, SourceTrimSuggestion, TripPhase, ValidationReport,
+    VisualPlacementPreview, VisualPlacementSide, resolve_anchored_phases,
 };
 use serde::{Deserialize, Serialize};
 use tauri::State;
@@ -992,6 +992,105 @@ pub async fn render_edit_plan_preview(
                 },
                 &mut emit,
                 &|| false,
+            )
+            .map_err(error_message)
+    })
+    .await
+    .map_err(error_message)?
+}
+
+#[tauri::command]
+pub async fn preview_artifacts(
+    project_id: String,
+    revision_id: String,
+    offset: Option<usize>,
+    limit: Option<usize>,
+    state: State<'_, AppState>,
+) -> Result<PreviewArtifactPage, String> {
+    let catalog = state.catalog()?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let revision = catalog
+            .edit_plan_revision(&revision_id)
+            .map_err(error_message)?;
+        if revision.project_id != project_id {
+            return Err("edit plan revision belongs to another project".to_string());
+        }
+        catalog
+            .preview_artifacts(&revision_id, offset.unwrap_or(0), limit.unwrap_or(100))
+            .map_err(error_message)
+    })
+    .await
+    .map_err(error_message)?
+}
+
+#[tauri::command]
+pub async fn preview_artifact_status(
+    project_id: String,
+    artifact_id: String,
+    verify: Option<bool>,
+    state: State<'_, AppState>,
+) -> Result<PreviewArtifactStatus, String> {
+    let catalog = state.catalog()?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let status = catalog
+            .preview_artifact_status(&artifact_id, false)
+            .map_err(error_message)?;
+        if status.artifact.project_id != project_id {
+            return Err("preview artifact belongs to another project".to_string());
+        }
+        if verify.unwrap_or(false) {
+            catalog
+                .preview_artifact_status(&artifact_id, true)
+                .map_err(error_message)
+        } else {
+            Ok(status)
+        }
+    })
+    .await
+    .map_err(error_message)?
+}
+
+#[tauri::command]
+pub async fn cancel_preview_artifact(
+    project_id: String,
+    artifact_id: String,
+    state: State<'_, AppState>,
+) -> Result<PreviewArtifactStatus, String> {
+    let catalog = state.catalog()?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let before = catalog
+            .preview_artifact_status(&artifact_id, false)
+            .map_err(error_message)?;
+        if before.artifact.project_id != project_id {
+            return Err("preview artifact belongs to another project".to_string());
+        }
+        catalog
+            .cancel_preview_artifact(&artifact_id)
+            .map_err(error_message)
+    })
+    .await
+    .map_err(error_message)?
+}
+
+#[tauri::command]
+pub async fn wait_preview_artifact(
+    project_id: String,
+    artifact_id: String,
+    timeout_seconds: Option<u64>,
+    state: State<'_, AppState>,
+) -> Result<PreviewArtifactStatus, String> {
+    let catalog = state.catalog()?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let before = catalog
+            .preview_artifact_status(&artifact_id, false)
+            .map_err(error_message)?;
+        if before.artifact.project_id != project_id {
+            return Err("preview artifact belongs to another project".to_string());
+        }
+        catalog
+            .wait_preview_artifact(
+                &artifact_id,
+                std::time::Duration::from_secs(timeout_seconds.unwrap_or(600)),
             )
             .map_err(error_message)
     })

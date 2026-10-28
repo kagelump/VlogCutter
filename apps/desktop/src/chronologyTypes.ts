@@ -504,6 +504,7 @@ export interface ValidationReport {
 }
 
 export interface PreviewResult {
+  artifactId?: string;
   outputPath: string;
   durationSeconds: number;
   clipCount: number;
@@ -511,16 +512,31 @@ export interface PreviewResult {
 }
 
 export type PreviewProgress =
-  | { type: "started"; clipCount: number; workerCount: number }
+  | { type: "started"; artifactId?: string | null; sequence?: number | null; clipCount: number; workerCount: number }
   | {
       type: "clipCompleted";
+      artifactId?: string | null;
+      sequence?: number | null;
       position: number;
       elapsedSeconds: number;
       estimateRemainingSeconds: number | null;
     }
-  | { type: "clipFailed"; position: number; message: string }
-  | { type: "finished"; outputPath: string; durationSeconds: number }
-  | { type: "cancelled" };
+  | { type: "clipFailed"; artifactId?: string | null; sequence?: number | null; position: number; message: string }
+  | { type: "finished"; artifactId?: string | null; sequence?: number | null; outputPath: string; durationSeconds: number }
+  | { type: "cancelled"; artifactId?: string | null; sequence?: number | null };
+
+export type PreviewArtifactState = "running" | "complete" | "cancelled" | "failed" | "interrupted";
+export interface CalibrationToolIdentity { role: string; name: string; version: string; executableKey: string }
+export interface PreviewSourceIdentity { assetId: string; sourceFingerprint: string; representation: string; representationFingerprint: string; rotationDegrees: number; clocks: unknown }
+export interface PreviewInputIdentity { recipe: string; revisionId: string; planDigest: string; maxHeight: number; constraintsKey: string; sources: PreviewSourceIdentity[]; tools: CalibrationToolIdentity[] }
+export interface PreviewCutMapping { operationId: string; assetId: string; sourceInSeconds: number; sourceOutSeconds: number; movieInPts: number; movieOutPts: number; outputFrameCount: number }
+export interface PreviewMediaValidation { outputFingerprint: string; byteLength: number; durationSeconds: number; videoFrameCount: number; videoTimeBaseNumerator: number; videoTimeBaseDenominator: number; videoOriginPts: number; movieTimeBaseNumerator: number; movieTimeBaseDenominator: number; movieOriginPts: number; width: number; height: number; audioSampleRate: number; audioChannels: number; fullyDecoded: boolean; cuts: PreviewCutMapping[]; limitations: string[] }
+export interface PreviewCutOutcome { operationId: string; position: number; assetId: string; state: string; reused: boolean; cacheKey: string | null; failure: string | null }
+export interface PreviewArtifact { artifactId: string; projectId: string; revisionId: string; generation: number; request: { revisionId: string; maxHeight: number }; kind: string; state: PreviewArtifactState; sequence: number; stage: string; cancelRequested: boolean; identity: PreviewInputIdentity | null; result: PreviewResult | null; validation: PreviewMediaValidation | null; outputRelativePath: string | null; failure: string | null; startedAt: string; completedAt: string | null; cutOutcomes: PreviewCutOutcome[]; outcomeTotal: number; outcomesTruncated: boolean }
+export interface PreviewArtifactVerification { verifiedAt: string; outputMatches: boolean; inputsMatch: boolean; constraintsMatch: boolean; planRenderable: boolean; limitations: string[] }
+export interface PreviewArtifactStatus { artifact: PreviewArtifact; observedState: PreviewArtifactState; latestAttempt: boolean; activeRevisionId: string | null; filePresent: boolean; currentForRequest: boolean | null; verification: PreviewArtifactVerification | null }
+export interface PreviewArtifactSummary { artifactId: string; revisionId: string; kind: string; generation: number; sequence: number; state: PreviewArtifactState; observedState: PreviewArtifactState; stage: string; cancelRequested: boolean; maxHeight: number; startedAt: string; completedAt: string | null; outputPath: string | null; durationSeconds: number | null; clipCount: number | null }
+export interface PreviewArtifactPage { schemaReady: boolean; revisionId: string; total: number; nextOffset: number | null; items: PreviewArtifactSummary[] }
 
 export interface OtioExportResult {
   outputPath: string;

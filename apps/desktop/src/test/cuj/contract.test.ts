@@ -134,6 +134,57 @@ describe("the harness's own guarantees", () => {
     }
   });
 
+  it("handles preview artifact reads and controls from declared project-owned fixtures", async () => {
+    const harness = desktopScenario().project("Preview artifacts", { id: "project_preview" }).build().install();
+    try {
+      const revision = (await window.__TAURI_INTERNALS__!.invoke("create_edit_plan_revision", {
+        projectId: "project_preview",
+        expectedActiveRevisionId: null,
+        operations: [],
+      })) as { revisionId: string; projectId: string };
+      const artifactId = "preview_fixture_1";
+      harness.state.previewArtifactPages[revision.revisionId] = {
+        schemaReady: true,
+        revisionId: revision.revisionId,
+        total: 1,
+        nextOffset: null,
+        items: [],
+      };
+      const status = {
+        artifact: { artifactId, projectId: "project_preview" },
+        observedState: "running",
+        latestAttempt: true,
+        activeRevisionId: null,
+        filePresent: false,
+        currentForRequest: null,
+        verification: null,
+      } as import("../../chronologyTypes").PreviewArtifactStatus;
+      harness.state.previewArtifactStatuses[artifactId] = status;
+
+      await expect(window.__TAURI_INTERNALS__!.invoke("preview_artifacts", {
+        projectId: "project_preview",
+        revisionId: revision.revisionId,
+      })).resolves.toMatchObject({ schemaReady: true, revisionId: revision.revisionId });
+      await expect(window.__TAURI_INTERNALS__!.invoke("preview_artifact_status", {
+        projectId: "project_preview", artifactId, verify: true,
+      })).resolves.toBe(status);
+      await expect(window.__TAURI_INTERNALS__!.invoke("cancel_preview_artifact", {
+        projectId: "project_preview", artifactId,
+      })).resolves.toBe(status);
+      await expect(window.__TAURI_INTERNALS__!.invoke("wait_preview_artifact", {
+        projectId: "project_preview", artifactId, timeoutSeconds: 1,
+      })).resolves.toBe(status);
+      await expect(window.__TAURI_INTERNALS__!.invoke("preview_artifact_status", {
+        projectId: "other_project", artifactId,
+      })).rejects.toThrow(/belongs to another project/);
+      await expect(window.__TAURI_INTERNALS__!.invoke("preview_artifact_status", {
+        project_id: "project_preview", artifact_id: artifactId,
+      })).rejects.toThrow(/projectId.*received undefined/);
+    } finally {
+      harness.uninstall();
+    }
+  });
+
   it("handles human source-range commands with per-scenario revision state", async () => {
     const trimSuggestion: import("../../chronologyTypes").SourceTrimSuggestion = {
       inspectedEvidenceId: "inspect_declared_harness_trim",

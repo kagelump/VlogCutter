@@ -45,6 +45,8 @@ import type {
   Diagnostic,
   EditPlanRevision,
   OtioExportResult,
+  PreviewArtifactPage,
+  PreviewArtifactStatus,
   QueuePosition,
   SourceRangeConstraints,
   SourceTrimSuggestion,
@@ -186,6 +188,8 @@ export interface DesktopHarnessState {
   sourceRanges: Record<string, SourceRangeConstraints>;
   /** Declared advisory trim suggestions, keyed by inspection id and media. */
   sourceTrimSuggestions: Record<string, SourceTrimSuggestion>;
+  previewArtifactPages: Record<string, PreviewArtifactPage>;
+  previewArtifactStatuses: Record<string, PreviewArtifactStatus>;
 
   archiveRoots: ArchiveRoot[];
   /**
@@ -319,6 +323,8 @@ export function createInitialState(clock: HarnessClock): DesktopHarnessState {
     },
     sourceRanges: {},
     sourceTrimSuggestions: {},
+    previewArtifactPages: {},
+    previewArtifactStatuses: {},
 
     archiveRoots: [],
     mountedVolumeIds: {},

@@ -1023,6 +1023,11 @@ rcdvlog --catalog /absolute/project/catalog.sqlite3 edit-plan diff --base <revis
 rcdvlog --catalog /absolute/project/catalog.sqlite3 edit-plan validate --revision <revision-id>
 rcdvlog --catalog /absolute/project/catalog.sqlite3 edit-plan activate --revision <revision-id> --expected-active none
 rcdvlog --catalog /absolute/project/catalog.sqlite3 edit-plan preview --revision <revision-id> --max-height 360
+rcdvlog --catalog /absolute/project/catalog.sqlite3 edit-plan preview-list --revision <revision-id> --limit 20
+rcdvlog --catalog /absolute/project/catalog.sqlite3 edit-plan preview-status --artifact <artifact-id>
+rcdvlog --catalog /absolute/project/catalog.sqlite3 edit-plan preview-status --artifact <artifact-id> --verify
+rcdvlog --catalog /absolute/project/catalog.sqlite3 edit-plan preview-wait --artifact <artifact-id> --timeout-seconds 600
+rcdvlog --catalog /absolute/project/catalog.sqlite3 edit-plan preview-cancel --artifact <artifact-id>
 ```
 
 The complete ordered input is an object (maximum 4 MiB and 10,000 cuts):
@@ -1066,6 +1071,30 @@ SQLite transaction, so concurrent clients cannot silently replace a newer active
 plan. Stale writes report `edit_plan_stale_revision`; failed validation reports
 `edit_plan_validation_failed`. Preview never activates and returns the addressed
 revision ID plus preview metadata. Progress events go to stderr.
+
+Every render has a unique `artifactId` and a monotonically increasing generation
+for that exact preview request. Save the ID from the result or the first
+`preview-progress` event; progress events include it and a sequence number so
+consumers can ignore stale updates. `preview-list` returns at most 100 summaries
+per page (`--limit` defaults to 20); `preview-status` returns the full receipt
+and at most 100 cut outcomes. `preview-status`, `preview-list`, and `preview-wait`
+are observational unless `--verify` is supplied to status or wait. `preview-wait`
+defaults to 600 seconds and observes for at most 24 hours. A timeout reports that
+the same attempt continues; it does not cancel, restart, or replace it. Use
+`preview-cancel` to explicitly request cooperative cancellation from the owning
+process. Cancellation is checked between media work, and a terminal attempt
+cannot be resumed; submit a new `preview` request for another attempt.
+
+Completed artifacts and their output paths are immutable historical attempts.
+A newer generation never overwrites an older completed output. An interrupted
+attempt is recorded as `interrupted` when its render claim is gone; it is not
+resumable. Receipts are local derived evidence in catalog schema 53, not synced
+human decisions. Listing before that migration reports `schemaReady: false`;
+the read-only listing does not migrate a catalog. There is no cross-attempt
+segment reuse yet and no automatic receipt/output cleanup.
+
+See [preview artifacts](edit-plan-preview-artifacts.md) for the receipt fields,
+clock semantics, verification boundary, and interpretation limits.
 
 Revision-bound review feedback remains a follow-up slice under #112.
 

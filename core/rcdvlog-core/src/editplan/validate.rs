@@ -138,6 +138,15 @@ impl ValidationReport {
 impl Catalog {
     /// Checks whether a plan can be rendered and exported.
     pub fn validate_edit_plan(&self, revision_id: &str) -> Result<ValidationReport> {
+        self.validate_edit_plan_cancellable(revision_id, &|| false)
+    }
+
+    pub(super) fn validate_edit_plan_cancellable(
+        &self,
+        revision_id: &str,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<ValidationReport> {
+        anyhow::ensure!(!cancel(), "preview cancelled during validation");
         let revision = self.edit_plan_revision(revision_id)?;
         let assets = self.list_assets(&revision.project_id)?;
         let mut findings: Vec<Finding> = Vec::new();
@@ -153,6 +162,7 @@ impl Catalog {
             }
         }
         for cut in &revision.operations {
+            anyhow::ensure!(!cancel(), "preview cancelled during validation");
             if let Some(asset) = assets.iter().find(|a| a.id == cut.asset_id)
                 && let Some(records) = constraints.get(&asset.id)
             {
@@ -194,7 +204,7 @@ impl Catalog {
                         .as_deref()
                         .filter(|p| Path::new(p).is_file())
                         .unwrap_or(&asset.path);
-                    match super::preview::source_has_audio(path) {
+                    match super::preview::source_has_audio(path, cancel) {
                         Ok(present) => present,
                         Err(_) => {
                             findings.push(Finding::new(FindingKind::ConfirmedRangeViolation,Some(cut.position),Some(asset.id.clone()),
@@ -218,6 +228,7 @@ impl Catalog {
         }
 
         for operation in &revision.operations {
+            anyhow::ensure!(!cancel(), "preview cancelled during validation");
             let position = Some(operation.position);
             let asset_id = Some(operation.asset_id.clone());
             let Some(asset) = assets.iter().find(|asset| asset.id == operation.asset_id) else {
@@ -310,7 +321,7 @@ impl Catalog {
         }
 
         if revision.operations.iter().any(|cut| cut.audio.is_some())
-            && let Err(error) = super::audio::audio_events(&revision, &assets)
+            && let Err(error) = super::audio::audio_events_cancellable(&revision, &assets, cancel)
         {
             findings.push(Finding::new(
                 FindingKind::AudioInvalid,
@@ -320,9 +331,11 @@ impl Catalog {
             ));
         }
 
+        anyhow::ensure!(!cancel(), "preview cancelled during validation");
         // Overlapping source ranges from one asset are legal — reusing a shot
         // is a real edit — but usually accidental, so they warn.
         for (index, left) in revision.operations.iter().enumerate() {
+            anyhow::ensure!(!cancel(), "preview cancelled during validation");
             for right in revision.operations.iter().skip(index + 1) {
                 if left.asset_id != right.asset_id {
                     continue;

@@ -32,6 +32,8 @@ import type {
   OtioExportResult,
   PreviewProgress,
   PreviewResult,
+  PreviewArtifactPage,
+  PreviewArtifactStatus,
   PhaseSplitDirection,
   QueuePosition,
   SourceRangeConstraints,
@@ -423,6 +425,22 @@ export const chronologyApi = {
       revisionId,
       maxHeight: maxHeight ?? 540,
     });
+  },
+
+  async previewArtifacts(projectId: string, revisionId: string, offset = 0, limit = 100): Promise<PreviewArtifactPage> {
+    return invoke<PreviewArtifactPage>("preview_artifacts", { projectId, revisionId, offset, limit });
+  },
+
+  async previewArtifactStatus(projectId: string, artifactId: string, verify = false): Promise<PreviewArtifactStatus> {
+    return invoke<PreviewArtifactStatus>("preview_artifact_status", { projectId, artifactId, verify });
+  },
+
+  async cancelPreviewArtifact(projectId: string, artifactId: string): Promise<PreviewArtifactStatus> {
+    return invoke<PreviewArtifactStatus>("cancel_preview_artifact", { projectId, artifactId });
+  },
+
+  async waitPreviewArtifact(projectId: string, artifactId: string, timeoutSeconds = 600): Promise<PreviewArtifactStatus> {
+    return invoke<PreviewArtifactStatus>("wait_preview_artifact", { projectId, artifactId, timeoutSeconds });
   },
 
   async onPreviewProgress(

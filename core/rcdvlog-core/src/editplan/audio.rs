@@ -63,7 +63,11 @@ pub(super) fn review_source(asset: &Asset) -> &str {
         .unwrap_or(&asset.path)
 }
 
-pub(super) fn audio_events(plan: &EditPlanRevision, assets: &[Asset]) -> Result<Vec<AudioEvent>> {
+pub(super) fn audio_events_cancellable(
+    plan: &EditPlanRevision,
+    assets: &[Asset],
+    cancel: &dyn Fn() -> bool,
+) -> Result<Vec<AudioEvent>> {
     let rate = f64::from(AUDIO_SAMPLE_RATE);
     let movie_duration = plan.duration_seconds();
     ensure!(
@@ -74,6 +78,7 @@ pub(super) fn audio_events(plan: &EditPlanRevision, assets: &[Asset]) -> Result<
     let mut cursor = 0.0;
     let mut picture_frames = 0_u64;
     for cut in &plan.operations {
+        ensure!(!cancel(), "preview cancelled while validating audio");
         let end = cursor + cut.source_out_seconds - cut.source_in_seconds;
         let end_frame = (end * 30000.0 / 1001.0).round() as u64;
         ensure!(
@@ -88,6 +93,7 @@ pub(super) fn audio_events(plan: &EditPlanRevision, assets: &[Asset]) -> Result<
     let mut events = Vec::new();
     let mut audio_bounds = std::collections::HashMap::new();
     for (cut, start, _) in &picture {
+        ensure!(!cancel(), "preview cancelled while validating audio");
         let (
             asset_id,
             source_in,
@@ -199,7 +205,7 @@ pub(super) fn audio_events(plan: &EditPlanRevision, assets: &[Asset]) -> Result<
             cut.operation_id
         );
         if !audio_bounds.contains_key(source) {
-            audio_bounds.insert(source.to_string(), probe_audio_bounds(source)?);
+            audio_bounds.insert(source.to_string(), probe_audio_bounds(source, cancel)?);
         }
         let bounds = audio_bounds
             .get(source)
@@ -270,7 +276,7 @@ struct AudioBounds {
     range: Option<(f64, f64)>,
 }
 
-fn probe_audio_bounds(source: &str) -> Result<AudioBounds> {
+fn probe_audio_bounds(source: &str, cancel: &dyn Fn() -> bool) -> Result<AudioBounds> {
     let mut command = crate::tool_command("ffprobe");
     command
         .args([
@@ -284,10 +290,11 @@ fn probe_audio_bounds(source: &str) -> Result<AudioBounds> {
             "json",
         ])
         .arg(source);
-    let output = crate::stall::output_with_timeout(
+    let output = crate::stall::output_with_timeout_and_cancellation(
         &mut command,
         "verify source audio handles",
         crate::stall::io_stall_timeout(),
+        &cancel,
     )?;
     ensure!(
         output.status.success(),
