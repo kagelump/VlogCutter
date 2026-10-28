@@ -7,7 +7,7 @@ use thiserror::Error;
 
 use crate::chronology::forward_migrate_project_chronology;
 
-pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 50;
+pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 51;
 
 const MIGRATION_TABLE_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -384,7 +384,27 @@ pub const PROJECT_CATALOG_MIGRATIONS: &[SqliteMigration] = &[
         source_identity: "project-catalog/0050-independent-source-audio/20261028",
         apply: independent_source_audio,
     },
+    SqliteMigration {
+        id: 51,
+        name: "source_inspection_evidence",
+        source_identity: "project-catalog/0051-source-inspection-evidence/20261028",
+        apply: source_inspection_evidence,
+    },
 ];
+
+fn source_inspection_evidence(transaction: &Transaction<'_>) -> Result<()> {
+    transaction.execute_batch(
+        "CREATE TABLE IF NOT EXISTS source_inspections (
+            evidence_id TEXT PRIMARY KEY,
+            asset_id TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+            identity_json TEXT NOT NULL,
+            report_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS source_inspections_asset ON source_inspections(asset_id,created_at);",
+    )?;
+    Ok(())
+}
 
 fn independent_source_audio(transaction: &Transaction<'_>) -> Result<()> {
     add_column_if_missing(transaction, "edit_plan_operations", "audio_json", "TEXT")?;
@@ -4657,6 +4677,29 @@ mod tests {
 #[cfg(test)]
 mod edit_cut_migration_tests {
     use super::*;
+
+    #[test]
+    fn inspection_migration_and_unversioned_replay_preserve_local_receipts() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        run_sqlite_migrations(&mut connection, &PROJECT_CATALOG_MIGRATIONS[..50]).unwrap();
+        connection.execute_batch(
+            "INSERT INTO projects(id,name,created_at) VALUES('p','fixture','now');
+             INSERT INTO assets(id,project_id,fingerprint,path,filename,size_bytes,duration_seconds,created_at)
+                VALUES('a','p','fp','/offline/a.mp4','a.mp4',1,5,'now');"
+        ).unwrap();
+        migrate_project_catalog(&mut connection).unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO source_inspections VALUES('evidence','a','identity','report','now');
+             DROP TABLE schema_migrations;",
+            )
+            .unwrap();
+        migrate_project_catalog(&mut connection).unwrap();
+        let row: (String,String,String) = connection.query_row(
+            "SELECT identity_json,report_json,created_at FROM source_inspections WHERE evidence_id='evidence'", [],
+            |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+        assert_eq!(row, ("identity".into(), "report".into(), "now".into()));
+    }
 
     #[test]
     fn unversioned_replay_preserves_revision_scoped_cuts_and_source_audio() {

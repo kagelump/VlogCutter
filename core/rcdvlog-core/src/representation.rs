@@ -166,6 +166,14 @@ impl Catalog {
     /// Validate the accepted analysis proxy and return its time mapping and
     /// fingerprints for consumers that need identical source acceptance.
     pub(crate) fn analysis_proxy_source(&self, asset: &Asset) -> Result<AnalysisProxySource> {
+        self.analysis_proxy_source_with_cancellation(asset, &|| false)
+    }
+
+    pub(crate) fn analysis_proxy_source_with_cancellation(
+        &self,
+        asset: &Asset,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<AnalysisProxySource> {
         ensure!(
             asset.duration_seconds.is_finite() && asset.duration_seconds > 0.0,
             "source has no finite positive duration"
@@ -219,7 +227,7 @@ impl Catalog {
             .filter(|rate| rate.is_finite() && *rate > 0.0)
             .ok_or_else(|| anyhow!("proxy has no finite positive frame rate"))?;
         let tail_ms = ((1000.0 / frame_rate).ceil().min(u32::MAX as f64) as u32).saturating_add(1);
-        let fingerprint = crate::full_file_blake3(&proxy, &|| false)?.hex_digest;
+        let fingerprint = crate::full_file_blake3(&proxy, cancel)?.hex_digest;
         let sampled_fingerprint = self.proxy_fingerprint(&asset.id)?;
         Ok(AnalysisProxySource {
             proxy,

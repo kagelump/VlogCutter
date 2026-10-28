@@ -2796,6 +2796,7 @@ pub fn run() {
             chronology_commands::create_edit_plan_revision,
             chronology_commands::activate_edit_plan_revision,
             chronology_commands::validate_edit_plan,
+            chronology_commands::inspect_source_window,
             chronology_commands::render_edit_plan_preview,
             chronology_commands::export_edit_plan_otio,
             prerequisite_status,
