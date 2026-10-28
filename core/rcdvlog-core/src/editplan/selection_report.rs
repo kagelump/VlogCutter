@@ -254,17 +254,17 @@ pub(super) fn report(plan: &EditPlanRevision, metadata: &SelectionMetadata) -> S
             conflicts.push(conflict("long_hold_count_above_preference",false,Some(&seq.sequence_id),None,None,format!("{} takes exceed the long-review threshold; preferred occasional long holds: {}.",long_holds,seq.pacing.preferred_long_holds)));
         }
         let budget = seq.budget_seconds;
-        if let Some(max) = budget {
-            if earned > max + 1e-9 {
-                conflicts.push(conflict(
-                    "sequence_budget_exceeded",
-                    seq.hard_budget,
-                    Some(&seq.sequence_id),
-                    None,
-                    None,
-                    format!("Current sequence duration {earned:.3}s exceeds {max:.3}s."),
-                ));
-            }
+        if let Some(max) = budget
+            && earned > max + 1e-9
+        {
+            conflicts.push(conflict(
+                "sequence_budget_exceeded",
+                seq.hard_budget,
+                Some(&seq.sequence_id),
+                None,
+                None,
+                format!("Current sequence duration {earned:.3}s exceeds {max:.3}s."),
+            ));
         }
         let mut distributions = roles
             .into_iter()
@@ -331,18 +331,36 @@ pub(super) fn report(plan: &EditPlanRevision, metadata: &SelectionMetadata) -> S
             ));
         }
     }
-    if let Some(budget) = input.budget_seconds {
-        if total > budget + 1e-9 {
-            conflicts.push(conflict(
-                "total_budget_exceeded",
-                input.hard_budget,
-                None,
-                None,
-                None,
-                format!("Current total duration {total:.3}s exceeds {budget:.3}s."),
-            ));
-        }
+    if let Some(budget) = input.budget_seconds
+        && total > budget + 1e-9
+    {
+        conflicts.push(conflict(
+            "total_budget_exceeded",
+            input.hard_budget,
+            None,
+            None,
+            None,
+            format!("Current total duration {total:.3}s exceeds {budget:.3}s."),
+        ));
     }
     let preferred = input.budget_seconds;
-    SelectionReport{duration_basis:"requestedSourceRanges".into(),recipe:metadata.recipe.clone(),input_identity:metadata.input_identity.clone(),reused:false,earned_seconds:total,preferred_budget_seconds:preferred,unfilled_seconds:preferred.map(|b|(b-total).max(0.0)),sequences,conflicts,long_take_review,deferred_candidates:Vec::new(),limitations:vec!["Durations are computed from current requested source ranges; they do not measure preview playback.".into(),"Candidate and utterance timings remain locator evidence; inspect picture and listen to audio before acceptance.".into(),"No filler or weak material is added to meet a preferred runtime.".into()]}
+    SelectionReport {
+        duration_basis: "requestedSourceRanges".into(),
+        recipe: metadata.recipe.clone(),
+        input_identity: metadata.input_identity.clone(),
+        reused: false,
+        earned_seconds: total,
+        preferred_budget_seconds: preferred,
+        unfilled_seconds: preferred.map(|b|(b-total).max(0.0)),
+        sequences,
+        conflicts,
+        long_take_review,
+        deferred_candidates: Vec::new(),
+        limitations: vec![
+            "Durations are computed from current requested source ranges; they do not measure preview playback.".into(),
+            "Candidate and utterance timings remain locator evidence; inspect picture and listen to audio before acceptance.".into(),
+            "No filler or weak material is added to meet a preferred runtime.".into(),
+            "Place descriptions identify authored context; they do not render captions or prove the viewer knows the location. Review the actual establishing picture and speech.".into(),
+        ],
+    }
 }

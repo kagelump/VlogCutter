@@ -1028,7 +1028,7 @@ fn generated_media_sequence_selection_cli_preview_create_get_and_bounds() {
             "--input",
             input.to_str().unwrap(),
         ],
-        "invalid_input",
+        "invalid_arguments",
     );
     let created_args = args("create", &input, "none");
     let created_args_ref = created_args.iter().map(String::as_str).collect::<Vec<_>>();
