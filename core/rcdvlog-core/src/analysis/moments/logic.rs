@@ -18,6 +18,10 @@ pub enum MomentPayload {
     #[default]
     Frames,
     FramesAndTranscript,
+    Video,
+    VideoAndAudio,
+    VideoAndTranscript,
+    VideoAndAudioAndTranscript,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -47,6 +51,13 @@ fn default_allow_fallback() -> bool {
 
 impl MomentRunOptions {
     pub fn validate(&self) -> Result<()> {
+        ensure!(
+            matches!(
+                self.payload,
+                MomentPayload::Frames | MomentPayload::FramesAndTranscript
+            ),
+            "native video moments require their explicitly authorized native runtime"
+        );
         ensure!(
             self.provider == "openrouter",
             "moments provider must be explicitly selected as openrouter"

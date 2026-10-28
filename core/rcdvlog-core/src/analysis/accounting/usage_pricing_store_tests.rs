@@ -91,6 +91,8 @@ fn usage(bound: &AnalysisRequestCostBound) -> ProviderReceiptEvidence {
                 .fingerprint()
                 .unwrap(),
             reported_tier: Some("flex".into()),
+            reported_tier_body: None,
+            reported_tier_header: None,
             prompt_tokens: Some(1000),
             cached_prompt_tokens: Some(800),
             candidate_tokens: Some(200),
@@ -98,6 +100,7 @@ fn usage(bound: &AnalysisRequestCostBound) -> ProviderReceiptEvidence {
             tool_prompt_tokens: Some(0),
             total_tokens: Some(1300),
             latency_ms: 321,
+            conservative_derivation: None,
         })),
     }
 }

@@ -21,5 +21,6 @@ pub(crate) use logic::{
 pub use model::{
     CoverageLevel, CoverageSegment, EditProfile, MomentArtifact, MomentCandidate,
     MomentEvidenceRef, MomentProvenance, MomentReceipt, MomentSpan, MomentStatus,
+    NativeMomentSource,
 };
 pub use store::MomentStep;

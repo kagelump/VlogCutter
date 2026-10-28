@@ -104,6 +104,10 @@ impl PublishedTokenTariff {
 pub struct UsagePricedReceipt {
     pub tariff_fingerprint: String,
     pub reported_tier: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reported_tier_body: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reported_tier_header: Option<String>,
     pub prompt_tokens: Option<u64>,
     pub cached_prompt_tokens: Option<u64>,
     pub candidate_tokens: Option<u64>,
@@ -111,6 +115,16 @@ pub struct UsagePricedReceipt {
     pub tool_prompt_tokens: Option<u64>,
     pub total_tokens: Option<u64>,
     pub latency_ms: u64,
+    /// Raw missing counters above remain unknown. This registered derivation
+    /// permits zero *billable auxiliary* tokens only when returned total equals
+    /// all known nonnegative components. Missing cache counts earn no discount.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conservative_derivation: Option<UsageConservativeDerivation>,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum UsageConservativeDerivation {
+    GeminiGenerateContentV1BetaConservedAuxiliaryCountersV1,
 }
 impl UsagePricedReceipt {
     pub(crate) fn validate(&self) -> Result<()> {
@@ -125,23 +139,50 @@ impl UsagePricedReceipt {
         ensure!(
             self.reported_tier
                 .as_ref()
-                .is_none_or(|s| s.len() <= 64 && s == s.trim()),
+                .is_none_or(|s| s.len() <= 64 && s == s.trim())
+                && [&self.reported_tier_body, &self.reported_tier_header]
+                    .iter()
+                    .all(|tier| tier.as_ref().is_none_or(|s| s.len() <= 64)),
             "reported service tier is invalid"
         );
         Ok(())
     }
     pub(crate) fn accepts_partial_metadata(&self, newer: &Self) -> bool {
+        let same_or_new_tier = |known: &Option<String>, incoming: &Option<String>| {
+            incoming.as_ref().is_none_or(|value| {
+                known.as_ref().map_or_else(
+                    || Some(value) == self.reported_tier.as_ref(),
+                    |prior| prior == value,
+                )
+            })
+        };
+        let derived_zero = |known: Option<u64>, incoming: Option<u64>| {
+            incoming.is_none_or(|value| {
+                Some(value) == known
+                    || (known.is_none() && self.conservative_derivation.is_some() && value == 0)
+            })
+        };
         self.tariff_fingerprint == newer.tariff_fingerprint
+            && same_or_new_tier(&self.reported_tier_body, &newer.reported_tier_body)
+            && same_or_new_tier(&self.reported_tier_header, &newer.reported_tier_header)
+            && derived_zero(self.thinking_tokens, newer.thinking_tokens)
+            && derived_zero(self.tool_prompt_tokens, newer.tool_prompt_tokens)
+            && newer.cached_prompt_tokens.is_none_or(|value| {
+                Some(value) == self.cached_prompt_tokens
+                    || (self.cached_prompt_tokens.is_none()
+                        && self.conservative_derivation.is_some()
+                        && self.prompt_tokens.is_some_and(|prompt| value <= prompt))
+            })
+            && newer
+                .conservative_derivation
+                .is_none_or(|proof| Some(proof) == self.conservative_derivation)
             && newer
                 .reported_tier
                 .as_ref()
                 .is_none_or(|tier| Some(tier) == self.reported_tier.as_ref())
             && [
                 (self.prompt_tokens, newer.prompt_tokens),
-                (self.cached_prompt_tokens, newer.cached_prompt_tokens),
                 (self.candidate_tokens, newer.candidate_tokens),
-                (self.thinking_tokens, newer.thinking_tokens),
-                (self.tool_prompt_tokens, newer.tool_prompt_tokens),
                 (self.total_tokens, newer.total_tokens),
             ]
             .iter()
@@ -167,15 +208,28 @@ impl UsagePricedReceipt {
             || actual_model != tariff.model
             || self.tariff_fingerprint != tariff.fingerprint()?
             || self.reported_tier.as_deref() != Some(tariff.tier.as_str())
+            || [&self.reported_tier_body, &self.reported_tier_header]
+                .iter()
+                .any(|raw| raw.as_deref().is_some_and(|v| v != tariff.tier.as_str()))
         {
             return Ok(None);
         }
+        // Google GenerateContent's documented total is prompt + tool prompt +
+        // thoughts + candidates. If known components already equal total, any
+        // omitted nonnegative tool/thought component is necessarily zero. This
+        // is a versioned conservation proof, not an assertion of raw presence.
+        // Unknown cache usage is priced without a credit (conservative).
+        let derived = self.conservative_derivation.is_some()
+            && bound
+                .contract_version
+                .starts_with("gemini-direct.native-video.token-bound.v1:");
+        let auxiliary = |raw: Option<u64>| raw.or(if derived { Some(0) } else { None });
         let (Some(prompt), Some(cached), Some(candidate), Some(thinking), Some(tool), Some(total)) = (
             self.prompt_tokens,
-            self.cached_prompt_tokens,
+            auxiliary(self.cached_prompt_tokens),
             self.candidate_tokens,
-            self.thinking_tokens,
-            self.tool_prompt_tokens,
+            auxiliary(self.thinking_tokens),
+            auxiliary(self.tool_prompt_tokens),
             self.total_tokens,
         ) else {
             return Ok(None);

@@ -22,6 +22,8 @@ rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+tempfile = "3.24"
+tokio.workspace = true
 tracing.workspace = true
 unicode-normalization.workspace = true
 uuid.workspace = true
@@ -30,4 +32,3 @@ whisper-rs = { version = "0.16", default-features = false }
 
 [dev-dependencies]
 proptest = "1.7"
-tempfile = "3.24"

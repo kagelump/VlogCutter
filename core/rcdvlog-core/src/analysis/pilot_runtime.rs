@@ -73,10 +73,17 @@ pub(crate) fn prepare_pilot_session(
     // entry points still call `ensure_vlm_run_kind` before reaching here.
     let kind = request.parameters.kind();
     ensure!(
-        kind.is_vlm() || kind == AnalysisRunKind::NativeSpeechTranscription,
+        kind.is_vlm()
+            || matches!(
+                kind,
+                AnalysisRunKind::NativeSpeechTranscription | AnalysisRunKind::NativeVideoReview
+            ),
         "unsupported analysis pilot kind"
     );
-    let policy = if kind == AnalysisRunKind::NativeSpeechTranscription {
+    let policy = if matches!(
+        kind,
+        AnalysisRunKind::NativeSpeechTranscription | AnalysisRunKind::NativeVideoReview
+    ) {
         catalog.describe_run_policy_for_local_preparation(request)?
     } else {
         catalog.describe_run_policy(request)?
@@ -98,7 +105,19 @@ pub(crate) fn prepare_pilot_session(
     let mut prior_cost_usd = 0.0;
     let mut prior_attempts = 0u32;
     if let Some(existing) = previous_record.as_ref() {
-        if kind == AnalysisRunKind::NativeSpeechTranscription {
+        if kind == AnalysisRunKind::NativeVideoReview {
+            ensure!(
+                existing.status != "running" && existing.usage_complete,
+                "native video pilot has interrupted or unknown usage; reconcile its exact receipt before recovery"
+            );
+            if existing.attempts > 0 || existing.status == "passed" {
+                return Ok(PilotSessionStart::Cached(Box::new(existing.clone())));
+            }
+            ensure!(
+                retry_uncertain,
+                "prior native video pilot failed locally; explicit recovery is required"
+            );
+        } else if kind == AnalysisRunKind::NativeSpeechTranscription {
             // Native pilot results are one-shot capability evidence. A typed
             // paid sample (pass, reject, review, protocol-unusable or uncertain)
             // is never automatically replayed, even with retry_uncertain=true.
@@ -425,6 +444,9 @@ fn build_pilot_request(
                                 "native speech transcription cannot be prepared as a VLM moment request"
                             ));
                         }
+                        RunPolicyParameters::NativeVideoReview { .. } => {
+                            bail!("native video cannot be prepared as a frame-pack VLM request");
+                        }
                     }
                 })
             );
@@ -439,6 +461,9 @@ fn build_pilot_request(
         }
         AnalysisRunKind::NativeSpeechTranscription => {
             bail!("native speech transcription cannot be prepared as a VLM request")
+        }
+        AnalysisRunKind::NativeVideoReview => {
+            bail!("native video requires its explicitly scoped native transport")
         }
     }
 }
@@ -576,6 +601,14 @@ fn validate_pilot_response(
                         source_time_semantics_valid: false,
                         capability_observed: false,
                         detail: "native_speech_transcription_is_not_a_vlm_pilot".into(),
+                    };
+                }
+                RunPolicyParameters::NativeVideoReview { .. } => {
+                    return PilotValidation {
+                        structural_schema_valid,
+                        source_time_semantics_valid: false,
+                        capability_observed: false,
+                        detail: "native_video_is_not_a_frame_pack_pilot".into(),
                     };
                 }
             };

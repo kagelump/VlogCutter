@@ -55,6 +55,7 @@ fn running_pilot(policy: &RunPolicy, run_id: &str, asset_id: &str) -> RunPilotRe
         observed_capabilities: Vec::new(),
         warning: PILOT_WARNING.into(),
         native_evidence: None,
+        native_video_evidence_id: None,
     }
 }
 

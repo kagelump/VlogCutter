@@ -20,6 +20,7 @@ mod chronology_commands;
 mod edit_plan_commands;
 mod moment_commands;
 mod native_speech_commands;
+mod native_video_commands;
 mod preparation_commands;
 mod server_commands;
 
@@ -148,6 +149,11 @@ enum Commands {
     Transcribe {
         #[command(subcommand)]
         command: TranscribeCommand,
+    },
+    /// Review bounded native video through the explicitly authorized provider.
+    NativeVideo {
+        #[command(subcommand)]
+        command: native_video_commands::NativeVideoCommand,
     },
     /// Analyze clips with bounded cloud vision through OpenRouter.
     Analyze {
@@ -819,6 +825,7 @@ fn command_name(command: &Commands) -> &'static str {
         Commands::Chronology { command } => chronology_commands::chronology_command_name(command),
         Commands::Diagnostics { command } => chronology_commands::diagnostics_command_name(command),
         Commands::Server { command, .. } => server_commands::command_name(command),
+        Commands::NativeVideo { command } => native_video_commands::command_name(command),
     }
 }
 
@@ -888,6 +895,22 @@ fn execute(cli: &Cli) -> Result<Value> {
             (*policy).into(),
         ))?);
     }
+    if let Commands::NativeVideo { command } = &cli.command {
+        let path = cli.catalog.as_deref().ok_or_else(|| {
+            anyhow!("invalid input: native-video commands require --catalog or RCDVLOG_CATALOG")
+        })?;
+        ensure!(
+            path.is_file(),
+            "catalog not found: native-video commands require an existing catalog at {}",
+            path.display()
+        );
+        let catalog = if native_video_commands::is_read_only(command) {
+            Catalog::open_read_only_existing(path)?
+        } else {
+            Catalog::open_existing(path)?
+        };
+        return native_video_commands::execute(&catalog, command);
+    }
     let catalog_path = selected_catalog(cli)?;
     if let Commands::Server {
         connection,
@@ -921,6 +944,7 @@ fn execute(cli: &Cli) -> Result<Value> {
         Commands::Transcribe {
             command: TranscribeCommand::Native { command },
         } => native_speech_commands::is_read_only(command),
+        Commands::NativeVideo { command } => native_video_commands::is_read_only(command),
         Commands::Project {
             command: ProjectCommand::Diagnose { .. },
         }
@@ -973,6 +997,7 @@ fn execute(cli: &Cli) -> Result<Value> {
             unreachable!()
         }
         Commands::Catalog { .. } | Commands::Desktop { .. } => unreachable!(),
+        Commands::NativeVideo { .. } => unreachable!(),
         Commands::Chronology { command } => {
             chronology_commands::execute_chronology(&catalog, command)
         }

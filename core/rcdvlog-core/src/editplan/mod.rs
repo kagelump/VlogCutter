@@ -22,7 +22,7 @@ pub mod diff;
 pub mod feedback;
 mod feedback_model;
 pub mod inspection;
-mod inspection_media;
+pub(crate) mod inspection_media;
 mod inspection_model;
 pub mod model;
 pub mod otio;

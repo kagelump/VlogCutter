@@ -384,7 +384,7 @@ impl Catalog {
         self.authorize_analysis_request_retry(request_key)
     }
 
-    fn refresh_pilot_projection_after_reconciliation(
+    pub(crate) fn refresh_pilot_projection_after_reconciliation(
         &self,
         reconciled: &AnalysisRequestRecord,
     ) -> Result<Option<RunPilotRecord>> {
@@ -495,7 +495,8 @@ impl Catalog {
             (Some(run), Some(current)) => {
                 run.0 != desired_run_status
                     || run.1.is_none()
-                    || (run.2 - current.confirmed_cost_usd).abs() > 1e-12
+                    || (run.2 - current.confirmed_cost_usd - current.estimated_cost_usd).abs()
+                        > 1e-12
             }
             _ => false,
         };
@@ -516,11 +517,11 @@ impl Catalog {
                 &crate::AnalysisRunOutcome {
                     status: desired_run_status.into(),
                     stage_reached: "pilot".into(),
-                    // Historical run cost is exactly this run's confirmed
-                    // projection; the whole-pilot total lives on the pilot DTO.
+                    // This run's charges and published estimates; the
+                    // whole-pilot total lives on the pilot DTO.
                     cost_usd: current_run
                         .as_ref()
-                        .map_or(0.0, |run| run.confirmed_cost_usd),
+                        .map_or(0.0, |run| run.confirmed_cost_usd + run.estimated_cost_usd),
                     error: if record.status == "passed" {
                         String::new()
                     } else if record.status == "uncertain" {

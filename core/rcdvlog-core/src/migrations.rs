@@ -7,7 +7,7 @@ use thiserror::Error;
 
 use crate::chronology::forward_migrate_project_chronology;
 
-pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 57;
+pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 58;
 
 const MIGRATION_TABLE_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -426,7 +426,66 @@ pub const PROJECT_CATALOG_MIGRATIONS: &[SqliteMigration] = &[
         source_identity: "project-catalog/0057-usage-priced-analysis-estimates/20261028",
         apply: usage_priced_analysis_estimates,
     },
+    SqliteMigration {
+        id: 58,
+        name: "bounded_native_video_evidence",
+        source_identity: "project-catalog/0058-bounded-native-video-evidence/20261028",
+        apply: bounded_native_video_evidence,
+    },
 ];
+
+fn bounded_native_video_evidence(transaction: &Transaction<'_>) -> Result<()> {
+    transaction.execute_batch("CREATE TABLE IF NOT EXISTS native_video_media(
+        identity TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        asset_id TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+        identity_json TEXT NOT NULL,
+        report_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS native_video_calls(
+        evidence_id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        policy_id TEXT NOT NULL,
+        asset_id TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+        input_identity TEXT NOT NULL,
+        semantic_identity TEXT NOT NULL,
+        run_id TEXT NOT NULL,
+        request_key TEXT,
+        state TEXT NOT NULL,
+        cancel_requested INTEGER NOT NULL DEFAULT 0,
+        request_json TEXT NOT NULL,
+        provenance_json TEXT NOT NULL,
+        raw_response TEXT,
+        result_json TEXT,
+        failure_code TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE(project_id,input_identity)
+    );
+    CREATE INDEX IF NOT EXISTS native_video_calls_policy ON native_video_calls(project_id,policy_id,created_at,evidence_id);
+    CREATE INDEX IF NOT EXISTS native_video_calls_semantic ON native_video_calls(project_id,semantic_identity);
+    CREATE INDEX IF NOT EXISTS native_video_calls_asset ON native_video_calls(project_id,asset_id,state);
+    CREATE TABLE IF NOT EXISTS native_video_run_details(
+        run_id TEXT PRIMARY KEY REFERENCES analysis_runs(id) ON DELETE CASCADE,
+        policy_id TEXT NOT NULL,
+        cancel_requested INTEGER NOT NULL DEFAULT 0,
+        progress_json TEXT NOT NULL,
+        report_json TEXT,
+        updated_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS native_video_run_windows(
+        run_id TEXT NOT NULL REFERENCES native_video_run_details(run_id) ON DELETE CASCADE,
+        window_index INTEGER NOT NULL,
+        request_json TEXT NOT NULL,
+        evidence_id TEXT,
+        state TEXT NOT NULL DEFAULT 'pending',
+        reused INTEGER NOT NULL DEFAULT 0,
+        failure_code TEXT,
+        PRIMARY KEY(run_id,window_index)
+    );")?;
+    Ok(())
+}
 
 fn usage_priced_analysis_estimates(transaction: &Transaction<'_>) -> Result<()> {
     add_column_if_missing(

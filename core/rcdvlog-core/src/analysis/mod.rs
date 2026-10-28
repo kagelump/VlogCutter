@@ -17,6 +17,7 @@ pub mod engine;
 pub mod framepack;
 pub mod frames;
 pub mod moments;
+pub mod native_video;
 pub mod openrouter;
 pub mod openrouter_stt;
 pub mod pilot_runtime;

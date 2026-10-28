@@ -122,6 +122,19 @@ within the admitted caps. The actual provider/model/tier must match the frozen
 contract. Thinking is billed with output; cached tokens receive only the returned
 cache credit. A repeated request never proves a cache hit.
 
+The typed native-video route also registers the optional
+`conservativeDerivation=geminiGenerateContentV1BetaConservedAuxiliaryCountersV1`.
+Raw absent counters remain `null`/unknown in the receipt. For this route only,
+prompt, candidate and total counts must be reported. If their checked sum plus
+all known nonnegative thinking/tool counts equals the reported total, omitted
+thinking/tool counts contribute zero to the estimate by conservation. Missing
+cache counts receive **no discount**. Malformed counters, missing primary counts,
+a nonzero unexplained remainder, or model/tier contradictions keep uncertainty.
+This follows the [GenerateContent usage total](https://ai.google.dev/api/generate-content#UsageMetadata)
+and accounts for [ProtoJSON omission of default scalar values](https://protobuf.dev/programming-guides/json/#presence-and-default-values)
+without claiming an observed zero or cache miss. Older receipts without this
+versioned derivation retain the strict complete-counter rule.
+
 A usable priced receipt completes the request with `estimatedCostUsd`, while
 `reportedCostUsd` stays absent and `confirmedCostUsd` stays zero. Requested/actual
 identity and all usage evidence remain in immutable receipt events. Unknown or

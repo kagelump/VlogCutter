@@ -217,6 +217,7 @@ impl Catalog {
             match options.payload {
                 MomentPayload::Frames => crate::AnalysisPayload::Frames,
                 MomentPayload::FramesAndTranscript => crate::AnalysisPayload::FramesAndTranscript,
+                _ => bail!("native video requires its explicitly authorized native runtime"),
             },
             options.budget_usd,
             options.coarse_frames,
@@ -312,6 +313,7 @@ impl Catalog {
             match options.payload {
                 MomentPayload::Frames => crate::AnalysisPayload::Frames,
                 MomentPayload::FramesAndTranscript => crate::AnalysisPayload::FramesAndTranscript,
+                _ => bail!("native video requires its explicitly authorized native runtime"),
             },
             options.budget_usd,
             options.coarse_frames,
@@ -1145,6 +1147,9 @@ impl Catalog {
                 cost_usd: receipts.iter().filter_map(|r| r.cost_usd).sum(),
                 usage_complete: receipts.iter().all(|r| r.usage_complete),
                 receipts,
+                estimated_cost_usd: None,
+                cost_basis: None,
+                native_source: None,
             },
             review_questions: questions,
         };
@@ -1201,6 +1206,9 @@ impl Catalog {
                 cost_usd: 0.0,
                 usage_complete: true,
                 receipts: vec![],
+                estimated_cost_usd: None,
+                cost_basis: None,
+                native_source: None,
             },
             review_questions: vec![reason],
         };
@@ -1257,6 +1265,9 @@ impl Catalog {
         artifact: &MomentArtifact,
         explicit_review: bool,
     ) -> bool {
+        if artifact.provenance.native_source.is_some() {
+            return self.native_video_moment_current(asset, artifact, explicit_review);
+        }
         if artifact.provenance.recipe_version != RECIPE_VERSION
             || artifact.provenance.prompt_version != PROMPT_VERSION
             || artifact.provenance.schema_version != SCHEMA_VERSION
@@ -1524,6 +1535,7 @@ impl StepRunner<'_> {
             MomentPayload::FramesAndTranscript => {
                 "Speech claims require a cited accepted timed utterance; preserve each cited utterance entirely in the core or explicit context. A transcript alone cannot establish a visible payoff."
             }
+            _ => bail!("native video cannot enter the frame-payload provider path"),
         };
         let refinement_seed = seed.map(|candidate| {
             json!({
@@ -1744,6 +1756,9 @@ impl StepRunner<'_> {
             cost_usd: None,
             usage_complete: false,
             reused: false,
+            estimated_cost_usd: None,
+            cost_basis: None,
+            native_usage: None,
         };
         self.save(
             &step_key,
@@ -1847,6 +1862,9 @@ impl StepRunner<'_> {
             cost_usd: complete.then_some(response.cost_usd),
             usage_complete: complete,
             reused: false,
+            estimated_cost_usd: None,
+            cost_basis: None,
+            native_usage: None,
         };
         if complete {
             self.state.spent += response.cost_usd;
@@ -3063,6 +3081,9 @@ mod tests {
             cost_usd: None,
             usage_complete: false,
             reused: false,
+            estimated_cost_usd: None,
+            cost_basis: None,
+            native_usage: None,
         };
         store::save_step(
             &catalog.connection().unwrap(),
