@@ -91,8 +91,9 @@ establish complete words; listen before accepting speech trims.
 All results say what was inspected and what remains uncertain. They never become
 an accepted human constraint or confirmed covered/dark/unusable interval by
 being cached. Maps, meaningful dark scenes, hands and close-ups require context
-and human judgment. Confirmed constraints and bounded provider navigation are
-separate consumers of this foundation, tracked by #124 and #176.
+and human judgment. [Confirmed human range decisions](edit-plan-source-ranges.md) consume this
+evidence through strict freshness checks. Bounded provider navigation is a
+separate consumer tracked by #124 and #176.
 
 Completed receipts live in canonical SQLite `source_inspections`; files live
 under the catalog's managed `cache/source-inspections`. Reuse requires identical

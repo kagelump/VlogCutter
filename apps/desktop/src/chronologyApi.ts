@@ -15,6 +15,7 @@ import type {
   CaptureSequenceMergePreview,
   CaptureSequenceReassignmentPreview,
   CaptureSequenceSplitPreview,
+  ConfirmSourceRangeRequest,
   ChronologyExplanation,
   ChronologyImpact,
   ChronologyOverview,
@@ -33,8 +34,11 @@ import type {
   PreviewResult,
   PhaseSplitDirection,
   QueuePosition,
+  SourceRangeConstraints,
   SourceInspectionRequest,
   SourceInspectionResult,
+  SourceTrimRequest,
+  SourceTrimSuggestion,
   TripPhase,
   ValidationReport,
   VisualPlacementPreview,
@@ -373,6 +377,45 @@ export const chronologyApi = {
     request: SourceInspectionRequest,
   ): Promise<SourceInspectionResult> {
     return invoke<SourceInspectionResult>("inspect_source_window", { request });
+  },
+
+  async sourceRangeConstraints(
+    assetId: string,
+    offset = 0,
+    limit = 100,
+  ): Promise<SourceRangeConstraints> {
+    return invoke<SourceRangeConstraints>("source_range_constraints", {
+      assetId,
+      offset,
+      limit,
+    });
+  },
+
+  async confirmSourceRange(
+    projectId: string,
+    request: ConfirmSourceRangeRequest,
+  ): Promise<SourceRangeConstraints> {
+    return invoke<SourceRangeConstraints>("confirm_source_range", { projectId, request });
+  },
+
+  async revokeSourceRange(
+    projectId: string,
+    assetId: string,
+    constraintId: string,
+    expectedRevision: number,
+    rationale: string,
+  ): Promise<SourceRangeConstraints> {
+    return invoke<SourceRangeConstraints>("revoke_source_range", {
+      projectId,
+      assetId,
+      constraintId,
+      expectedRevision,
+      rationale,
+    });
+  },
+
+  async suggestSourceTrim(request: SourceTrimRequest): Promise<SourceTrimSuggestion> {
+    return invoke<SourceTrimSuggestion>("suggest_source_trim", { request });
   },
 
   async renderPreview(revisionId: string, maxHeight?: number): Promise<PreviewResult | null> {

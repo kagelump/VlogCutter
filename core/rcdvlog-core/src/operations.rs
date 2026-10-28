@@ -42,6 +42,8 @@ pub const EVENT_ORDER_CONSTRAINT_CLEARED: &str = "eventOrderConstraintCleared";
 pub const EDIT_PLAN_REVISION_CREATED: &str = "editPlanRevisionCreated";
 pub const EDIT_PLAN_REVISION_ACTIVATED: &str = "editPlanRevisionActivated";
 pub const EDIT_PLAN_EXPORT_RECORDED: &str = "editPlanExportRecorded";
+pub const SOURCE_RANGE_CONFIRMED: &str = "sourceRangeConfirmed";
+pub const SOURCE_RANGE_REVOKED: &str = "sourceRangeRevoked";
 pub const MAX_REMOTE_HLC_FUTURE_SKEW_MILLIS: i64 = 5 * 60 * 1000;
 
 /// The chronology operation types known to the re-dispatch seam. The seam
@@ -115,6 +117,8 @@ pub(crate) const KNOWN_OPERATION_TYPES: &[&str] = &[
     EDIT_PLAN_REVISION_CREATED,
     EDIT_PLAN_REVISION_ACTIVATED,
     EDIT_PLAN_EXPORT_RECORDED,
+    SOURCE_RANGE_CONFIRMED,
+    SOURCE_RANGE_REVOKED,
 ];
 
 pub(crate) fn is_known_operation_type(value: &str) -> bool {
@@ -2029,6 +2033,9 @@ pub(crate) fn materialize_operation(
         EDIT_PLAN_EXPORT_RECORDED => {
             return materialize_edit_plan_export_recorded(transaction, operation);
         }
+        SOURCE_RANGE_CONFIRMED | SOURCE_RANGE_REVOKED => {
+            return crate::editplan::ranges::materialize_range_decision(transaction, operation);
+        }
         _ => {
             // Unknown operation type: quarantine policy (D01-T007 decision 4).
             // The operation row is already persisted (by the caller's insert
@@ -2707,7 +2714,7 @@ pub(crate) fn revision_guard_passes_without_recording(
 /// and the operation is refused without overwriting. An operation without a
 /// declared base revision passes, matching the existing non-chronology
 /// operations.
-fn revision_guard_passes(
+pub(crate) fn revision_guard_passes(
     transaction: &Transaction<'_>,
     operation: &ProjectOperation,
 ) -> Result<bool> {
@@ -3741,7 +3748,10 @@ fn active_label_tags(
         .collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
-fn advance_revision(transaction: &Transaction<'_>, operation: &ProjectOperation) -> Result<()> {
+pub(crate) fn advance_revision(
+    transaction: &Transaction<'_>,
+    operation: &ProjectOperation,
+) -> Result<()> {
     transaction.execute(
         "INSERT INTO materialized_revisions(project_id, aggregate_type, aggregate_id, revision, last_operation_id) VALUES (?1, ?2, ?3, 1, ?4) ON CONFLICT(project_id, aggregate_type, aggregate_id) DO UPDATE SET revision=revision+1, last_operation_id=excluded.last_operation_id",
         params![operation.project_id, operation.aggregate_type, operation.aggregate_id, operation.operation_id],

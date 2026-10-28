@@ -1,7 +1,10 @@
 //! Thin supported adapter for immutable edit plans. Core owns all plan writes.
 use anyhow::{Context, Result, ensure};
 use clap::{Args, Subcommand};
-use rcdvlog_core::{Catalog, EditPlanOperation, PreviewRequest, SourceInspectionRequest};
+use rcdvlog_core::{
+    Catalog, ConfirmSourceRangeRequest, EditPlanOperation, PreviewRequest, SourceInspectionRequest,
+    SourceTrimRequest,
+};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::path::PathBuf;
@@ -58,6 +61,42 @@ pub enum EditPlanCommand {
         #[arg(long)]
         input: PathBuf,
     },
+    /// Read or explicitly confirm/revoke human-owned source constraints.
+    Ranges {
+        #[command(subcommand)]
+        command: SourceRangeCommand,
+    },
+    /// Suggest a clean/utterance trim using current inspection and human constraints.
+    SuggestTrim {
+        #[arg(long)]
+        input: PathBuf,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SourceRangeCommand {
+    List {
+        #[arg(long)]
+        asset: String,
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+    },
+    Confirm {
+        #[arg(long)]
+        input: PathBuf,
+    },
+    Revoke {
+        #[arg(long)]
+        asset: String,
+        #[arg(long)]
+        constraint: String,
+        #[arg(long)]
+        expected_revision: u64,
+        #[arg(long)]
+        rationale: String,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -84,6 +123,12 @@ pub fn command_name(command: &EditPlanCommand) -> &'static str {
         EditPlanCommand::Activate { .. } => "edit-plan.activate",
         EditPlanCommand::Preview { .. } => "edit-plan.preview",
         EditPlanCommand::Inspect { .. } => "edit-plan.inspect",
+        EditPlanCommand::Ranges { command } => match command {
+            SourceRangeCommand::List { .. } => "edit-plan.ranges.list",
+            SourceRangeCommand::Confirm { .. } => "edit-plan.ranges.confirm",
+            SourceRangeCommand::Revoke { .. } => "edit-plan.ranges.revoke",
+        },
+        EditPlanCommand::SuggestTrim { .. } => "edit-plan.suggest-trim",
     }
 }
 
@@ -91,6 +136,9 @@ pub fn is_read_only(command: &EditPlanCommand) -> bool {
     matches!(
         command,
         EditPlanCommand::List { .. }
+            | EditPlanCommand::Ranges {
+                command: SourceRangeCommand::List { .. }
+            }
             | EditPlanCommand::Get(_)
             | EditPlanCommand::Diff { .. }
             | EditPlanCommand::Validate(_)
@@ -184,5 +232,46 @@ pub fn execute(catalog: &Catalog, command: &EditPlanCommand) -> Result<Value> {
                 catalog.inspect_source_window(&request, &|| false)?,
             )?)
         }
+        EditPlanCommand::Ranges { command } => match command {
+            SourceRangeCommand::List {
+                asset,
+                offset,
+                limit,
+            } => Ok(serde_json::to_value(
+                catalog.source_range_constraints(asset, *offset, *limit)?,
+            )?),
+            SourceRangeCommand::Confirm { input } => {
+                let request: ConfirmSourceRangeRequest = read_review_input(input)?;
+                Ok(serde_json::to_value(
+                    catalog.confirm_source_range(&request)?,
+                )?)
+            }
+            SourceRangeCommand::Revoke {
+                asset,
+                constraint,
+                expected_revision,
+                rationale,
+            } => Ok(serde_json::to_value(catalog.revoke_source_range(
+                asset,
+                constraint,
+                *expected_revision,
+                rationale,
+            )?)?),
+        },
+        EditPlanCommand::SuggestTrim { input } => {
+            let request: SourceTrimRequest = read_review_input(input)?;
+            Ok(serde_json::to_value(
+                catalog.suggest_source_trim(&request)?,
+            )?)
+        }
     }
+}
+
+fn read_review_input<T: serde::de::DeserializeOwned>(input: &PathBuf) -> Result<T> {
+    let bytes = std::fs::read(input).context("invalid input: read review JSON")?;
+    ensure!(
+        bytes.len() <= 64 * 1024,
+        "invalid input: review JSON exceeds 64 KiB"
+    );
+    serde_json::from_slice(&bytes).context("invalid input: parse review JSON")
 }

@@ -175,12 +175,22 @@ impl Catalog {
         cancel: &dyn Fn() -> bool,
     ) -> Result<AnalysisProxySource> {
         ensure!(
-            asset.duration_seconds.is_finite() && asset.duration_seconds > 0.0,
-            "source has no finite positive duration"
-        );
-        ensure!(
             !asset.removed,
             "asset is explicitly excluded from preparation"
+        );
+        self.validated_review_proxy_source(asset, cancel)
+    }
+
+    /// Explicit editing/review may address a source hidden from labeling.
+    /// Keep preparation's removed filter separate from representation safety.
+    pub(crate) fn validated_review_proxy_source(
+        &self,
+        asset: &Asset,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<AnalysisProxySource> {
+        ensure!(
+            asset.duration_seconds.is_finite() && asset.duration_seconds > 0.0,
+            "source has no finite positive duration"
         );
         ensure!(
             self.asset_video_validation(&asset.id)?.status

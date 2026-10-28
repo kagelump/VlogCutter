@@ -109,6 +109,7 @@ impl Catalog {
         heavy: Option<&crate::LocalHeavyLease>,
     ) -> Result<PreviewResult> {
         let plan = self.edit_plan_revision(&request.revision_id)?;
+        let constraints_key = super::ranges::constraints_key(&self.connection()?, &plan)?;
         let report = self.validate_edit_plan(&request.revision_id)?;
         if !report.renderable() {
             let blocking: Vec<&str> = report.errors().map(|finding| finding.code).collect();
@@ -393,7 +394,17 @@ impl Catalog {
         }
         // Renamed only once complete, so a crash mid-render never leaves a
         // truncated file sitting at the preview's path.
+        // Only the short publication window excludes concurrent human writes;
+        // media rendering never holds SQLite's write lock.
+        let mut publication_connection = self.connection()?;
+        let publication = publication_connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        ensure!(
+            super::ranges::constraints_key(&publication, &plan)? == constraints_key,
+            "human source constraints changed during rendering; review this revision before publishing another preview"
+        );
         fs::rename(&temporary, &output).context("commit rendered preview")?;
+        publication.commit()?;
 
         progress(PreviewProgress::Finished {
             output_path: output.to_string_lossy().into_owned(),

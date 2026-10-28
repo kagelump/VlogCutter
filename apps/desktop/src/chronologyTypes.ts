@@ -396,6 +396,98 @@ export interface SourceInspectionResult {
   reused: boolean;
 }
 
+export type RangeDecision = "allow" | "exclude";
+export type RangeDecisionOwner = "human";
+export type RangeMedia = "picture" | "audio" | "both";
+export type TrimMedia = "picture" | "audio";
+
+export interface SourceTimeRange {
+  sourceInSeconds: number;
+  sourceOutSeconds: number;
+}
+
+export interface ConfirmSourceRangeRequest {
+  assetId: string;
+  expectedRevision: number;
+  expectedSourceFingerprint: string;
+  constraintId?: string | null;
+  decision: RangeDecision;
+  media: RangeMedia;
+  decisionOwner: RangeDecisionOwner;
+  sourceInSeconds: number;
+  sourceOutSeconds: number;
+  rationale: string;
+  inspectedEvidenceId?: string | null;
+  overridesEvidenceIds?: string[];
+}
+
+export interface ConfirmedRangeInspection {
+  evidenceId: string;
+  representationFingerprint: string;
+  recipe: string;
+  purpose: InspectionPurpose;
+  includedAudio: boolean;
+  includedTranscript: boolean;
+  rotationDegrees: number;
+  mapping: InspectionTimeMapping;
+  windowInSeconds: number;
+  windowOutSeconds: number;
+  sampleCount: number;
+  maxUnsampledGapSeconds: number;
+}
+
+export interface ConfirmedSourceRange {
+  constraintId: string;
+  projectId: string;
+  assetId: string;
+  sourceFingerprint: string;
+  decision: RangeDecision;
+  media: RangeMedia;
+  decisionOwner: RangeDecisionOwner;
+  sourceInSeconds: number;
+  sourceOutSeconds: number;
+  rationale: string;
+  inspection: ConfirmedRangeInspection | null;
+  overridesEvidenceIds: string[];
+  active: boolean;
+  lastOperationId: string;
+  updatedAtMillis: number;
+}
+
+export interface SourceRangeConstraints {
+  schemaReady: boolean;
+  assetId: string;
+  sourceFingerprint: string;
+  revision: number;
+  items: ConfirmedSourceRange[];
+  totalItems: number;
+  nextOffset: number | null;
+  feasiblePictureRanges: SourceTimeRange[];
+  feasibleAudioRanges: SourceTimeRange[];
+  pictureConflicts: string[];
+  audioConflicts: string[];
+}
+
+export interface SourceTrimRequest {
+  assetId: string;
+  inspectedEvidenceId: string;
+  media: TrimMedia;
+  sourceInSeconds: number;
+  sourceOutSeconds: number;
+  preferUtterances?: boolean;
+}
+
+export interface SourceTrimSuggestion {
+  inspectedEvidenceId: string;
+  media: TrimMedia;
+  constraintsRevision: number;
+  cleanRanges: SourceTimeRange[];
+  proposedRanges: SourceTimeRange[];
+  conflicts: string[];
+  limitations: string[];
+  listeningRequired: boolean;
+}
+
 export type FindingSeverity = "error" | "warning";
 
 export interface Finding {
