@@ -273,13 +273,22 @@ impl Catalog {
         evidence_id: &str,
         asset_id: &str,
     ) -> Result<SourceInspection> {
+        self.require_current_source_inspection_cancellable(evidence_id, asset_id, &|| false)
+    }
+
+    pub(crate) fn require_current_source_inspection_cancellable(
+        &self,
+        evidence_id: &str,
+        asset_id: &str,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<SourceInspection> {
         ensure!(
             evidence_id
                 .strip_prefix("inspect_")
                 .is_some_and(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())),
             "invalid input: malformed inspection evidence ID"
         );
-        let _heavy = self.acquire_local_heavy()?;
+        let _heavy = self.acquire_local_heavy_cancellable(cancel)?;
         let row: Option<(String,String)> = self.connection()?.query_row(
             "SELECT identity_json,report_json FROM source_inspections WHERE evidence_id=?1 AND asset_id=?2",
             params![evidence_id,asset_id],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
@@ -287,8 +296,8 @@ impl Catalog {
         let identity: Value = serde_json::from_str(&identity_json)?;
         let report: SourceInspection = serde_json::from_str(&body)?;
         let asset = self.get_asset(asset_id)?;
-        let source = self.inspection_source(&asset, report.request.representation, &|| false)?;
-        let stream = media::probe(&source.path, report.request.include_audio, &|| false)?;
+        let source = self.inspection_source(&asset, report.request.representation, cancel)?;
+        let stream = media::probe(&source.path, report.request.include_audio, cancel)?;
         let mapping = InspectionTimeMapping {
             time_base_numerator: stream.numerator,
             time_base_denominator: stream.denominator,
@@ -326,7 +335,7 @@ impl Catalog {
             || report.window_out_seconds
                 != report.request.source_out_seconds + report.request.after_seconds
             || !root.is_dir()
-            || !media::files_current(&report, &root, &|| false)?
+            || !media::files_current(&report, &root, cancel)?
         {
             return Err(SourceInspectionError::StaleEvidence.into());
         }

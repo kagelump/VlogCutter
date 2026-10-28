@@ -24,6 +24,7 @@ mod feedback_model;
 pub mod inspection;
 pub(crate) mod inspection_media;
 mod inspection_model;
+pub mod inspection_review;
 pub mod model;
 pub mod otio;
 pub mod preview;

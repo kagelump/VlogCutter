@@ -177,9 +177,20 @@ impl Catalog {
     /// Segment timing is advisory. Expansion to complete utterances is allowed
     /// only inside both confirmed clean ranges and the actually inspected window.
     pub fn suggest_source_trim(&self, request: &SourceTrimRequest) -> Result<SourceTrimSuggestion> {
+        self.suggest_source_trim_cancellable(request, &|| false)
+    }
+
+    pub(crate) fn suggest_source_trim_cancellable(
+        &self,
+        request: &SourceTrimRequest,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<SourceTrimSuggestion> {
         validate_span(request.source_in_seconds, request.source_out_seconds)?;
-        let report = self
-            .require_current_source_inspection(&request.inspected_evidence_id, &request.asset_id)?;
+        let report = self.require_current_source_inspection_cancellable(
+            &request.inspected_evidence_id,
+            &request.asset_id,
+            cancel,
+        )?;
         ensure!(
             request.source_in_seconds >= report.window_in_seconds
                 && request.source_out_seconds <= report.window_out_seconds,

@@ -104,6 +104,11 @@ pub enum EditPlanCommand {
         #[arg(long)]
         input: PathBuf,
     },
+    /// Create and operate a bounded local reviewer-requested inspection session.
+    ReviewSession {
+        #[command(subcommand)]
+        command: InspectionReviewCommand,
+    },
     /// Record and apply explicit, revision-bound human review feedback.
     Feedback {
         #[command(subcommand)]
@@ -113,6 +118,44 @@ pub enum EditPlanCommand {
     Selection {
         #[command(subcommand)]
         command: SelectionCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum InspectionReviewCommand {
+    /// Bind a bounded session to one current source-inspection receipt.
+    Create {
+        #[arg(long)]
+        input: PathBuf,
+    },
+    /// Run one typed inspection, trim suggestion, or advisory observation step.
+    Step {
+        #[arg(long)]
+        input: PathBuf,
+    },
+    /// Read current session state without repairing or verifying media.
+    Status {
+        #[arg(long)]
+        session: String,
+    },
+    /// Read a bounded page of durable session steps.
+    Steps {
+        #[arg(long)]
+        session: String,
+        #[arg(long)]
+        after: Option<u32>,
+        #[arg(long, default_value_t = 32)]
+        limit: u32,
+    },
+    /// Stop a still-open session.
+    Cancel {
+        #[arg(long)]
+        session: String,
+    },
+    /// Finish a still-open session after freshness checks.
+    Finish {
+        #[arg(long)]
+        session: String,
     },
 }
 
@@ -258,6 +301,14 @@ pub fn command_name(command: &EditPlanCommand) -> &'static str {
             SourceRangeCommand::Revoke { .. } => "edit-plan.ranges.revoke",
         },
         EditPlanCommand::SuggestTrim { .. } => "edit-plan.suggest-trim",
+        EditPlanCommand::ReviewSession { command } => match command {
+            InspectionReviewCommand::Create { .. } => "edit-plan.review-session.create",
+            InspectionReviewCommand::Step { .. } => "edit-plan.review-session.step",
+            InspectionReviewCommand::Status { .. } => "edit-plan.review-session.status",
+            InspectionReviewCommand::Steps { .. } => "edit-plan.review-session.steps",
+            InspectionReviewCommand::Cancel { .. } => "edit-plan.review-session.cancel",
+            InspectionReviewCommand::Finish { .. } => "edit-plan.review-session.finish",
+        },
         EditPlanCommand::Feedback { command } => match command {
             ReviewFeedbackCommand::Record { .. } => "edit-plan.feedback.record",
             ReviewFeedbackCommand::Propose { .. } => "edit-plan.feedback.propose",
@@ -293,6 +344,10 @@ pub fn is_read_only(command: &EditPlanCommand) -> bool {
             }
             | EditPlanCommand::Selection {
                 command: SelectionCommand::Preview(_) | SelectionCommand::Get { .. },
+            }
+            | EditPlanCommand::ReviewSession {
+                command: InspectionReviewCommand::Status { .. }
+                    | InspectionReviewCommand::Steps { .. },
             }
     )
 }
@@ -401,13 +456,7 @@ pub fn execute(catalog: &Catalog, command: &EditPlanCommand) -> Result<Value> {
             })?)
         }
         EditPlanCommand::Inspect { input } => {
-            let bytes = std::fs::read(input).context("invalid input: read inspection JSON")?;
-            ensure!(
-                bytes.len() <= 64 * 1024,
-                "invalid input: inspection JSON exceeds 64 KiB"
-            );
-            let request: SourceInspectionRequest = serde_json::from_slice(&bytes)
-                .context("invalid input: parse source inspection JSON")?;
+            let request: SourceInspectionRequest = read_review_input(input)?;
             Ok(serde_json::to_value(
                 catalog.inspect_source_window(&request, &|| false)?,
             )?)
@@ -444,6 +493,36 @@ pub fn execute(catalog: &Catalog, command: &EditPlanCommand) -> Result<Value> {
                 catalog.suggest_source_trim(&request)?,
             )?)
         }
+        EditPlanCommand::ReviewSession { command } => match command {
+            InspectionReviewCommand::Create { input } => {
+                let request = read_review_input(input)?;
+                Ok(serde_json::to_value(
+                    catalog.create_inspection_review(&request)?,
+                )?)
+            }
+            InspectionReviewCommand::Step { input } => {
+                let request = read_review_input(input)?;
+                Ok(serde_json::to_value(
+                    catalog.inspection_review_step(&request, &|| false)?,
+                )?)
+            }
+            InspectionReviewCommand::Status { session } => Ok(serde_json::to_value(
+                catalog.inspection_review_status(session)?,
+            )?),
+            InspectionReviewCommand::Steps {
+                session,
+                after,
+                limit,
+            } => Ok(serde_json::to_value(
+                catalog.inspection_review_steps(session, *after, *limit)?,
+            )?),
+            InspectionReviewCommand::Cancel { session } => Ok(serde_json::to_value(
+                catalog.cancel_inspection_review(session)?,
+            )?),
+            InspectionReviewCommand::Finish { session } => Ok(serde_json::to_value(
+                catalog.finish_inspection_review(session)?,
+            )?),
+        },
         EditPlanCommand::Feedback { command } => match command {
             ReviewFeedbackCommand::Record { input } => {
                 let request: RecordReviewNoteRequest = read_review_input(input)?;

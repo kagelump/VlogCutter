@@ -108,6 +108,43 @@ current CLI/desktop adapters do not expose a cancellation control; the domain
 callback is available to an owning run controller. Local receipts are derived,
 node-local evidence and do not add human facts to the sync operation stream.
 
+## Bounded reviewer-requested inspection session
+
+An external host or reviewer can request more local evidence through a
+canonical, bounded session. The CLI only runs the typed local tools; it does
+not run a model, contact a provider, admit paid work, or write human decisions.
+Create requires a current seed inspection and freezes its asset, source and
+representation fingerprints, inspected window, mapping, and current human
+constraint revision:
+
+```bash
+rcdvlog --catalog catalog.sqlite edit-plan review-session create --input session.json
+rcdvlog --catalog catalog.sqlite edit-plan review-session step --input step.json
+rcdvlog --catalog catalog.sqlite edit-plan review-session status --session SESSION_ID
+rcdvlog --catalog catalog.sqlite edit-plan review-session steps --session SESSION_ID --limit 32
+rcdvlog --catalog catalog.sqlite edit-plan review-session finish --session SESSION_ID
+```
+
+`session.json` contains `seedEvidenceId`, `assetId`, `maxSteps` (1–32),
+`maxTotalFrames` (1–512), `maxMediaSeconds` (at most 600, including handles
+and failed attempts), `maxWidth` (160–1280), and explicit `allowAudio` and
+`allowTranscript` booleans. Each step JSON contains `sessionId`, sequential
+`stepIndex`, `caller` (`host` or `reviewer`), and a tagged request, for example
+`{"tool":"inspect","input":{"assetId":"...","representation":"original","purpose":"locator","sourceInSeconds":1.0,"sourceOutSeconds":2.0,"sampleCount":4,"maxWidth":640}}`.
+Other tools are `suggestTrim` and `observe`; observations require cited
+inspection evidence, bounded text, uncertainty, and a source interval. Steps
+are atomically admitted and durably charged against session limits before local
+work; identical completed steps can be read again, while failed/interrupted
+attempts consume their slot. `status` and paged `steps` are read-only. `cancel`
+may be issued from another process while a step is running; `finish` rechecks
+source and constraint freshness. Stale source or constraints stop the session.
+
+Reviewer observations and trim suggestions remain advisory. No session step can
+confirm a source range, classify a defect as fact, or change a plan. Human
+decisions continue through the revision-bound range commands above. Sessions
+reuse canonical inspection artifacts and SQLite receipts; they are not a
+provider-accounting ledger or a general agent runtime.
+
 Generated numbered-frame/tone tests verify mechanics and mappings. They do not
 establish natural speech, visual defect classification, editorial timing or
 story quality. Record a separate listening/playback review for those judgments.

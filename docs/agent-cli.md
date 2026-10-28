@@ -6,6 +6,14 @@
 
 This document describes the CLI as implemented today.
 
+### Bounded inspection review sessions
+
+Use `edit-plan review-session create|step|status|steps|cancel|finish` for a
+durable, locally bounded reviewer-requested inspection loop over existing
+source-inspection and trim-suggestion tools. It performs no provider calls and
+cannot record human decisions; see [source inspection](edit-plan-inspection.md)
+for input shapes, bounds, and freshness behavior.
+
 ### Native video review
 
 Use `native-video preflight|authorize|pilot|prepare|windows|run|status|wait|cancel|result|evidence-list|run-windows` for explicit bounded direct video review. Policy and window inputs are typed capped JSON files; local preparation and read-only planning are separate from provider execution. See [native video review](native-video-review.md) for the full contract and examples.
