@@ -83,7 +83,7 @@ fn usage(bound: &AnalysisRequestCostBound) -> ProviderReceiptEvidence {
         completion_tokens: Some(300),
         usage_complete: true,
         billed_audio_seconds: None,
-        usage_pricing: Some(UsagePricedReceipt {
+        usage_pricing: Some(Box::new(UsagePricedReceipt {
             tariff_fingerprint: bound
                 .published_token_tariff
                 .as_ref()
@@ -98,7 +98,7 @@ fn usage(bound: &AnalysisRequestCostBound) -> ProviderReceiptEvidence {
             tool_prompt_tokens: Some(0),
             total_tokens: Some(1300),
             latency_ms: 321,
-        }),
+        })),
     }
 }
 #[test]
@@ -389,4 +389,33 @@ fn old_schema_accounting_reads_are_observational_and_estimates_survive_reopen() 
     assert_eq!(observed.reported_cost_usd, None);
     drop(readonly);
     assert_eq!(std::fs::read(&path).unwrap(), before);
+}
+
+#[test]
+fn partial_token_metadata_preserves_known_billing_facts_and_conflicts_restore_uncertainty() {
+    let (_dir, catalog, context, bound) = fixture();
+    let request = reserve_fixture(&catalog, &context, &bound);
+    let mut connection = catalog.connection().unwrap();
+    mark_dispatched(&mut connection, &request.request_key).unwrap();
+    let mut evidence = usage(&bound);
+    let priced = record_receipt(&mut connection, &request.request_key, &evidence).unwrap();
+    evidence.usage_complete = false;
+    let partial = evidence.usage_pricing.as_mut().unwrap();
+    partial.thinking_tokens = None;
+    partial.cached_prompt_tokens = None;
+    partial.total_tokens = None;
+    partial.latency_ms += 1;
+    let enriched = record_receipt(&mut connection, &request.request_key, &evidence).unwrap();
+    assert_eq!(enriched.estimated_cost_usd, priced.estimated_cost_usd);
+    assert_eq!(enriched.lifecycle, AnalysisRequestLifecycle::Completed);
+    // A different known value is a contradiction, not missing metadata.
+    evidence.usage_pricing.as_mut().unwrap().thinking_tokens = Some(900);
+    let conflicted = record_receipt(&mut connection, &request.request_key, &evidence).unwrap();
+    assert_eq!(conflicted.estimated_cost_usd, None);
+    assert_eq!(conflicted.lifecycle, AnalysisRequestLifecycle::Uncertain);
+    assert!(conflicted.uncertain_usage_reserve_usd >= priced.estimated_cost_usd.unwrap());
+    assert_eq!(
+        conflicted.uncertain_usage_reserve_usd,
+        bound.maximum_cost_usd
+    );
 }

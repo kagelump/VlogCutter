@@ -523,7 +523,7 @@ pub struct ProviderReceiptEvidence {
     pub billed_audio_seconds: Option<f64>,
     /// Complete token/tier facts may support a separately labeled estimate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub usage_pricing: Option<super::usage_pricing::UsagePricedReceipt>,
+    pub usage_pricing: Option<Box<super::usage_pricing::UsagePricedReceipt>>,
 }
 
 impl ProviderReceiptEvidence {

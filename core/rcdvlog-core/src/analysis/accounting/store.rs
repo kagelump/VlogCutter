@@ -1107,8 +1107,12 @@ pub(crate) fn associate_cache_result(
 fn load_existing_receipts(connection: &Connection, key: &str) -> Result<Vec<ExistingReceipt>> {
     let mut statement = connection.prepare(
         "SELECT receipt_fingerprint,provider,provider_generation_id,actual_model,
-                reported_cost_usd,usage_complete
-         FROM analysis_provider_receipts WHERE request_key=?1
+                reported_cost_usd,usage_complete,
+                (SELECT json_extract(e.detail_json,'$.usagePricing') FROM analysis_request_events e
+                 WHERE e.request_key=receipts.request_key AND e.event_kind='receipt'
+                   AND json_extract(e.detail_json,'$.receiptKey')=receipts.receipt_key
+                 ORDER BY e.event_id DESC LIMIT 1)
+         FROM analysis_provider_receipts receipts WHERE request_key=?1
          ORDER BY created_at ASC, receipt_key ASC",
     )?;
     let receipts = statement
@@ -1120,6 +1124,18 @@ fn load_existing_receipts(connection: &Connection, key: &str) -> Result<Vec<Exis
                 actual_model: row.get(3)?,
                 reported_cost_usd: row.get(4)?,
                 usage_complete: row.get::<_, i64>(5)? != 0,
+                usage_pricing: row
+                    .get::<_, Option<String>>(6)?
+                    .map(|raw| {
+                        serde_json::from_str(&raw).map_err(|error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                6,
+                                rusqlite::types::Type::Text,
+                                Box::new(error),
+                            )
+                        })
+                    })
+                    .transpose()?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1313,7 +1329,7 @@ pub(crate) fn record_receipt(
         &current.provider,
         &evidence.provider_generation_id,
     )?;
-    let settlement = settlement_for_receipt(&current, evidence)?;
+    let settlement = settlement_for_receipt(&current, &existing, evidence)?;
     let now = crate::now();
     let receipt_key = insert_receipt(&transaction, key, evidence, &fingerprint, &now)?;
     stop_on_receipt_overrun(&transaction, &current, evidence, &settlement, &now)?;

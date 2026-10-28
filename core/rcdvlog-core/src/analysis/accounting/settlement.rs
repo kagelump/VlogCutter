@@ -18,6 +18,7 @@ pub(crate) struct ExistingReceipt {
     pub actual_model: String,
     pub reported_cost_usd: Option<f64>,
     pub usage_complete: bool,
+    pub usage_pricing: Option<Box<super::usage_pricing::UsagePricedReceipt>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -174,6 +175,7 @@ pub(crate) fn classify_receipt(
 /// validated evidence implies.
 pub(crate) fn settlement_for_receipt(
     current: &AnalysisRequestRecord,
+    existing: &[ExistingReceipt],
     evidence: &ProviderReceiptEvidence,
 ) -> Result<ReceiptSettlement> {
     let merged = merged_identity(current, evidence)?;
@@ -213,10 +215,44 @@ pub(crate) fn settlement_for_receipt(
             .estimated_cost_usd
             .is_none_or(|previous| (previous - *estimate).abs() <= AMOUNT_EPSILON)
     });
+    let partial_metadata_compatible = existing.iter().any(|prior| {
+        let (Some(usage), Some(bound), Some(previous)) = (
+            &prior.usage_pricing,
+            &current.cost_bound,
+            current.estimated_cost_usd,
+        ) else {
+            return false;
+        };
+        prior.usage_complete
+            && usage
+                .estimate(
+                    bound,
+                    &prior.provider,
+                    &current.requested_model,
+                    &prior.actual_model,
+                )
+                .ok()
+                .flatten()
+                .is_some_and(|cost| (cost - previous).abs() <= AMOUNT_EPSILON)
+            && evidence
+                .usage_pricing
+                .as_ref()
+                .is_none_or(|newer| usage.accepts_partial_metadata(newer))
+            && evidence
+                .prompt_tokens
+                .is_none_or(|count| usage.prompt_tokens == Some(u64::from(count)))
+            && evidence.completion_tokens.is_none_or(|count| {
+                usage
+                    .candidate_tokens
+                    .zip(usage.thinking_tokens)
+                    .and_then(|(a, b)| a.checked_add(b))
+                    == Some(u64::from(count))
+            })
+    });
     if current.lifecycle == AnalysisRequestLifecycle::Completed
         && (current.estimated_cost_usd.is_none()
             || (!evidence.is_complete_charge()
-                && evidence.usage_pricing.is_none()
+                && partial_metadata_compatible
                 && evidence.reported_cost_usd.is_none_or(|cost| {
                     cost <= current.estimated_cost_usd.unwrap_or(0.0) + AMOUNT_EPSILON
                 })))
@@ -275,6 +311,8 @@ pub(crate) fn settlement_for_receipt(
     let uncertain = current
         .uncertain_usage_reserve_usd
         .max(current.reserved_cost_usd)
+        .max(current.estimated_cost_usd.unwrap_or(0.0))
+        .max(current.reported_cost_usd.unwrap_or(0.0))
         .max(evidence.reported_cost_usd.unwrap_or(0.0));
     let failure_code = if evidence.usage_complete {
         "usage_cost_missing"

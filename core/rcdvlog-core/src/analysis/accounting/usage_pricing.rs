@@ -130,6 +130,24 @@ impl UsagePricedReceipt {
         );
         Ok(())
     }
+    pub(crate) fn accepts_partial_metadata(&self, newer: &Self) -> bool {
+        self.tariff_fingerprint == newer.tariff_fingerprint
+            && newer
+                .reported_tier
+                .as_ref()
+                .is_none_or(|tier| Some(tier) == self.reported_tier.as_ref())
+            && [
+                (self.prompt_tokens, newer.prompt_tokens),
+                (self.cached_prompt_tokens, newer.cached_prompt_tokens),
+                (self.candidate_tokens, newer.candidate_tokens),
+                (self.thinking_tokens, newer.thinking_tokens),
+                (self.tool_prompt_tokens, newer.tool_prompt_tokens),
+                (self.total_tokens, newer.total_tokens),
+            ]
+            .iter()
+            .all(|(known, incoming)| incoming.is_none_or(|value| Some(value) == *known))
+    }
+
     /// A usable estimate requires exact quote provenance and every billing
     /// component. Contradictory/over-limit facts remain uncertain evidence.
     pub(crate) fn estimate(
