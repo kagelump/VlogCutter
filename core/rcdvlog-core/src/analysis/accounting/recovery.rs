@@ -466,6 +466,7 @@ impl Catalog {
             completion_tokens: existing.completion_tokens.max(ledger.completion_tokens),
             cost_usd: aggregate.committed_or_reserved_usd,
             confirmed_cost_usd: aggregate.confirmed_cost_usd,
+            estimated_cost_usd: aggregate.estimated_cost_usd,
             uncertain_usage_reserve_usd: aggregate.uncertain_usage_reserve_usd,
             active_reserved_cost_usd: aggregate.active_reserved_cost_usd,
             usage_complete: !unresolved,

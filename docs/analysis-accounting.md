@@ -98,6 +98,49 @@ There is no JSON ledger, second database, scheduler or competing paid balance.
 Existing run and pilot summaries remain historical evidence or projections, not
 independent live ceilings.
 
+## Published token estimates (schema 57)
+
+The ledger can retain an explicitly registered published token tariff separately
+from a provider-reported charge. This is the accounting prerequisite for the
+direct-video transport in issue 176; it does not itself enable a native upload or
+a new authorization path. Existing VLM and native-speech adapters keep their
+original receipt rules and reject a published token quote at their boundary.
+
+`AnalysisRequestCostBound.publishedTokenTariff`, when present, binds the exact
+version, provider, model, service tier, published input/cache/output rates and
+price source into the cost-bound fingerprint. Registered versions are immutable;
+add a new version when rates change, preserving historical definitions. The first
+registration is direct Gemini 3.5 Flash-Lite Standard/Flex using Google's
+[published pricing](https://ai.google.dev/gemini-api/docs/pricing) verified on
+2026-10-28. Those rates are external assumptions, not a wire-enforced invoice cap.
+
+A receipt's optional `usagePricing` carries reported prompt, cached-prompt,
+candidate, thinking, tool-prompt and total token counts, reported tier, latency and
+tariff fingerprint. Every required count must be present and consistent, with
+cached input no greater than prompt input, checked integer sums, and input/output
+within the admitted caps. The actual provider/model/tier must match the frozen
+contract. Thinking is billed with output; cached tokens receive only the returned
+cache credit. A repeated request never proves a cache hit.
+
+A usable priced receipt completes the request with `estimatedCostUsd`, while
+`reportedCostUsd` stays absent and `confirmedCostUsd` stays zero. Requested/actual
+identity and all usage evidence remain in immutable receipt events. Unknown or
+contradictory usage keeps the full unresolved reservation. The amount is a
+published-rate estimate, never a provider invoice or a listening-quality result.
+
+Admission, snapshots, operation/pilot projections and aggregate totals include
+estimated spend exactly once alongside confirmed charges, active reservations
+and uncertainty. A later complete provider-reported charge replaces the current
+estimate; immutable earlier receipt events retain the old estimate. The resulting
+charge can exceed its admission bound, stop dispatch and exhaust the budget.
+Once an actual charge is confirmed, conflicting replacement charges are refused.
+Metadata-only enrichment cannot erase an estimate or a prior reported cost floor.
+
+Historical quotes/receipts omit the optional new fields, preserving their existing
+fingerprints. Zero estimate totals are omitted from old projection JSON. Read-only
+schema-56 diagnostics use an absent estimate projection without migrating, while
+writable upgrades preserve existing accounting rows.
+
 ## Required C call ordering
 
 Before runtime creates the analysis run or pilot rows for a new attempt, C must

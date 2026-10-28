@@ -168,6 +168,7 @@ fn receipt(
         completion_tokens: Some(5),
         usage_complete,
         billed_audio_seconds: None,
+        usage_pricing: None,
     }
 }
 
@@ -2051,6 +2052,7 @@ fn complete_usage_without_cost_stays_unknown_until_matching_cost_receipt() {
         completion_tokens: Some(5),
         usage_complete: true,
         billed_audio_seconds: None,
+        usage_pricing: None,
     };
     let unknown = catalog
         .record_analysis_request_receipt(&request.request_key, &missing_cost)
@@ -3396,6 +3398,7 @@ fn current_run_provenance_uses_receipt_event_order_not_timestamps() {
         completion_tokens: None,
         usage_complete: false,
         billed_audio_seconds: None,
+        usage_pricing: None,
     };
     catalog
         .record_analysis_request_receipt(&fallback.request_key, &metadata_only)

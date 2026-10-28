@@ -1086,6 +1086,7 @@ fn stale_auth_budget_source_and_receipt_only_work_fail_closed() {
         completion_tokens: 0,
         cost_usd: 0.0,
         confirmed_cost_usd: 0.0,
+        estimated_cost_usd: 0.0,
         uncertain_usage_reserve_usd: 0.0,
         active_reserved_cost_usd: 0.0,
         usage_complete: true,

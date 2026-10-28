@@ -279,6 +279,10 @@ pub struct AnalysisOperationAccountingSummary {
     pub active_request_count: usize,
     pub uncertain_request_count: usize,
     pub confirmed_cost_usd: f64,
+    /// Published-rate estimate; never a provider-reported charge.
+    #[serde(default, skip_serializing_if = "cost_is_zero")]
+    pub estimated_cost_usd: f64,
+
     pub active_reserved_cost_usd: f64,
     pub uncertain_usage_reserve_usd: f64,
     pub committed_or_reserved_usd: f64,
@@ -325,6 +329,10 @@ pub struct AnalysisRequestRecord {
     pub reported_cost_usd: Option<f64>,
     /// Confirmed only by complete provider receipt evidence.
     pub confirmed_cost_usd: f64,
+    /// Published-rate estimate; never a provider-reported charge.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_cost_usd: Option<f64>,
+
     /// Unresolved usage reserve, kept separate from confirmed spend.
     pub uncertain_usage_reserve_usd: f64,
     pub failure_code: String,
@@ -387,6 +395,10 @@ pub struct AnalysisBudgetSnapshot {
     pub legacy_confirmed_cost_usd: f64,
     pub legacy_uncertain_usage_reserve_usd: f64,
     pub confirmed_cost_usd: f64,
+    /// Published-rate estimate; never a provider-reported charge.
+    #[serde(default, skip_serializing_if = "cost_is_zero")]
+    pub estimated_cost_usd: f64,
+
     pub active_reserved_cost_usd: f64,
     pub uncertain_usage_reserve_usd: f64,
     pub committed_or_reserved_usd: f64,
@@ -433,6 +445,10 @@ pub struct AnalysisAccountingAggregate {
     pub uncertain_request_count: usize,
     pub released_request_count: usize,
     pub confirmed_cost_usd: f64,
+    /// Published-rate estimate; never a provider-reported charge.
+    #[serde(default, skip_serializing_if = "cost_is_zero")]
+    pub estimated_cost_usd: f64,
+
     pub active_reserved_cost_usd: f64,
     pub uncertain_usage_reserve_usd: f64,
     /// Frozen evidence is included once for the whole policy, or filtered to
@@ -505,6 +521,9 @@ pub struct ProviderReceiptEvidence {
     /// fingerprints remain byte-identical.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub billed_audio_seconds: Option<f64>,
+    /// Complete token/tier facts may support a separately labeled estimate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_pricing: Option<Box<super::usage_pricing::UsagePricedReceipt>>,
 }
 
 impl ProviderReceiptEvidence {
@@ -519,6 +538,7 @@ impl ProviderReceiptEvidence {
             completion_tokens: Some(response.completion_tokens),
             usage_complete: response.receipt.usage_complete,
             billed_audio_seconds: None,
+            usage_pricing: None,
         }
     }
 
@@ -545,6 +565,7 @@ impl ProviderReceiptEvidence {
                 .and_then(|value| u32::try_from(value).ok()),
             usage_complete: reported_cost_usd.is_some(),
             billed_audio_seconds: receipt.usage.seconds,
+            usage_pricing: None,
         };
         evidence.validate()?;
         Ok(evidence)
@@ -560,6 +581,9 @@ impl ProviderReceiptEvidence {
     }
 
     pub fn validate(&self) -> Result<()> {
+        if let Some(usage) = &self.usage_pricing {
+            usage.validate()?;
+        }
         for identity in [
             &self.provider,
             &self.provider_generation_id,
@@ -775,4 +799,8 @@ pub(crate) fn attempt_base_key(
 
 pub(crate) fn request_key(base: &str, epoch: u32) -> String {
     digest_bytes(&[base.as_bytes(), &epoch.to_le_bytes()])
+}
+
+fn cost_is_zero(value: &f64) -> bool {
+    *value == 0.0
 }

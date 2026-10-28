@@ -502,6 +502,9 @@ pub struct RunPilotRecord {
     pub cost_usd: f64,
     #[serde(default)]
     pub confirmed_cost_usd: f64,
+    #[serde(default, skip_serializing_if = "pilot_estimate_is_zero")]
+    pub estimated_cost_usd: f64,
+
     #[serde(default)]
     pub uncertain_usage_reserve_usd: f64,
     #[serde(default)]
@@ -1752,6 +1755,7 @@ impl Catalog {
                 .saturating_add(ledger.completion_tokens),
             cost_usd: initial.committed_or_reserved_usd,
             confirmed_cost_usd: initial.confirmed_cost_usd,
+            estimated_cost_usd: initial.estimated_cost_usd,
             uncertain_usage_reserve_usd: initial.uncertain_usage_reserve_usd,
             active_reserved_cost_usd: initial.active_reserved_cost_usd,
             usage_complete: !initial.has_unresolved_usage(),
@@ -1895,6 +1899,7 @@ impl Catalog {
             completion_tokens,
             cost_usd: aggregate.committed_or_reserved_usd,
             confirmed_cost_usd: aggregate.confirmed_cost_usd,
+            estimated_cost_usd: aggregate.estimated_cost_usd,
             uncertain_usage_reserve_usd: aggregate.uncertain_usage_reserve_usd,
             active_reserved_cost_usd: aggregate.active_reserved_cost_usd,
             usage_complete,
@@ -3091,6 +3096,7 @@ mod tests {
                     completion_tokens: Some(5),
                     usage_complete: true,
                     billed_audio_seconds: None,
+                    usage_pricing: None,
                 },
             )
             .unwrap();
@@ -3742,6 +3748,7 @@ mod tests {
                     completion_tokens: Some(5),
                     usage_complete: true,
                     billed_audio_seconds: None,
+                    usage_pricing: None,
                 },
             )
             .unwrap();
@@ -4827,6 +4834,7 @@ mod recovery_tests {
                         completion_tokens: Some(5),
                         usage_complete: true,
                         billed_audio_seconds: None,
+                        usage_pricing: None,
                     },
                 },
             )
@@ -5745,6 +5753,7 @@ mod recovery_tests {
             completion_tokens: Some(7),
             usage_complete: true,
             billed_audio_seconds: None,
+            usage_pricing: None,
         };
         let evidence = AnalysisRequestReconciliation::LateReceipt {
             receipt: first_receipt,
@@ -5809,4 +5818,8 @@ mod recovery_tests {
             1
         );
     }
+}
+
+fn pilot_estimate_is_zero(value: &f64) -> bool {
+    *value == 0.0
 }
