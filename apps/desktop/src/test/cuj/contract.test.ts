@@ -94,6 +94,46 @@ describe("the harness's own guarantees", () => {
     }
   });
 
+  it("handles source inspection with a declared fixture and camelCase request", async () => {
+    const harness = desktopScenario().build().install();
+    const request = {
+      assetId: "asset_harness",
+      representation: "original",
+      purpose: "locator",
+      sourceInSeconds: 1,
+      sourceOutSeconds: 2,
+      sampleCount: 1,
+      maxWidth: 160,
+    };
+    try {
+      const result = (await window.__TAURI_INTERNALS__!.invoke("inspect_source_window", {
+        request,
+      })) as {
+        inspection: { evidenceId: string; limitations: string[] };
+        reused: boolean;
+      };
+      expect(result.reused).toBe(false);
+      expect(result.inspection.evidenceId).toBe("inspect_harness_fixture");
+      expect(result.inspection.limitations.join(" ")).toContain("no media was probed");
+
+      await expect(
+        window.__TAURI_INTERNALS__!.invoke("inspect_source_window", {
+          request: {
+            asset_id: "asset_harness",
+            representation: "original",
+            purpose: "locator",
+            source_in_seconds: 1,
+            source_out_seconds: 2,
+            sample_count: 1,
+            max_width: 160,
+          },
+        }),
+      ).rejects.toThrow(/request\.assetId must be a string/);
+    } finally {
+      harness.uninstall();
+    }
+  });
+
   it("serves bounded chronology suggestions locally without mutating canonical chronology", async () => {
     const harness = desktopScenario()
       .project("Synthetic chronology test", { id: "project_test" })

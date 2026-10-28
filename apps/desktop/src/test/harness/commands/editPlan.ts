@@ -8,7 +8,14 @@
  * refusal is a frontend-visible contract, not a domain rule.
  */
 
-import type { EditPlanRevision, OtioExportResult, PreviewResult, ValidationReport } from "../../../chronologyTypes";
+import type {
+  EditPlanRevision,
+  OtioExportResult,
+  PreviewResult,
+  SourceInspectionRequest,
+  SourceInspectionResult,
+  ValidationReport,
+} from "../../../chronologyTypes";
 import type { JobBinding } from "../jobs";
 import type { CommandTable, HarnessContext } from "../registry";
 import { requireString } from "../registry";
@@ -49,6 +56,92 @@ function assertNotStale(expected: unknown, activeId: string | null) {
 export interface PreviewStep {
   position: number;
   failed?: string;
+}
+
+function inspectionRequestFrom(value: unknown): SourceInspectionRequest {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("inspect_source_window requires a request object");
+  }
+  const request = value as Partial<SourceInspectionRequest>;
+  if (typeof request.assetId !== "string") throw new Error("request.assetId must be a string");
+  if (request.representation !== "original" && request.representation !== "generatedProxy" && request.representation !== "cameraProxy") {
+    throw new Error("request.representation must be a declared representation");
+  }
+  if (request.purpose !== "locator" && request.purpose !== "proposedBoundary" && request.purpose !== "inspectedBoundary") {
+    throw new Error("request.purpose must be a declared inspection purpose");
+  }
+  for (const field of ["sourceInSeconds", "sourceOutSeconds", "sampleCount", "maxWidth"] as const) {
+    if (typeof request[field] !== "number" || !Number.isFinite(request[field])) {
+      throw new Error(`request.${field} must be a finite number`);
+    }
+  }
+
+  // This is a deterministic transport fixture only. It deliberately does not
+  // inspect media, decode requested PTS, read audio/transcripts, or implement
+  // the production sampling/mapping algorithm.
+  return request as SourceInspectionRequest;
+}
+
+function declaredInspectionFixture(request: SourceInspectionRequest): SourceInspectionResult {
+  const before = request.beforeSeconds ?? 0;
+  const start = request.sourceInSeconds - before;
+  return {
+    inspection: {
+      evidenceId: "inspect_harness_fixture",
+      recipe: "source-inspection.harness-fixture.v1",
+      request,
+      sourceFingerprint: "harness-source-fingerprint",
+      representationFingerprint: "harness-representation-fingerprint",
+      rotationDegrees: 0,
+      mapping: {
+        timeBaseNumerator: 1,
+        timeBaseDenominator: 1,
+        representationOriginPts: 0,
+        sourceOffsetSeconds: request.sourceInSeconds,
+        representationOffsetSeconds: 0,
+        secondsScale: 1,
+        precision: "harnessFixture",
+        sourceFrameReduction: null,
+      },
+      windowInSeconds: start,
+      windowOutSeconds: request.sourceOutSeconds + (request.afterSeconds ?? 0),
+      frames: [{
+        evidenceId: "inspect_harness_fixture:frame:0",
+        representationPts: 0,
+        sourceSeconds: request.sourceInSeconds,
+        excerptSeconds: before,
+        image: {
+          path: "/harness/inspection/frame.jpg",
+          blake3: "harness-fixture-only",
+          byteLength: 1,
+        },
+      }],
+      audio: request.includeAudio
+        ? {
+            state: "noAudioStream",
+            playable: null,
+            sampleRate: 48000,
+            channels: 2,
+            sourceInSamples: 0,
+            sourceOutSamples: 0,
+            streamSourceInSeconds: null,
+            leadingGapSeconds: 0,
+            waveform: [],
+          }
+        : null,
+      utterances: [],
+      availableFrameCount: 1,
+      minAvailableFrameIntervalSeconds: null,
+      maxAvailableFrameIntervalSeconds: null,
+      maxUnsampledGapSeconds: Math.max(before, request.sourceOutSeconds + (request.afterSeconds ?? 0) - request.sourceInSeconds),
+      limitations: [
+        "Deterministic desktop harness fixture only; no media was probed or inspected.",
+        "Frame, mapping, audio, and transcript fields are not source evidence and must not be used as media truth.",
+      ],
+      createdAt: "2000-01-01T00:00:00Z",
+    },
+    reused: false,
+  };
 }
 
 export const editPlanCommands: CommandTable = {
@@ -103,6 +196,11 @@ export const editPlanCommands: CommandTable = {
   /** Findings are declared per revision; an undeclared revision validates clean. */
   validate_edit_plan: (args, { state }): ValidationReport =>
     state.editPlans.validation[requireString(args, "revisionId")] ?? { findings: [] },
+
+  inspect_source_window: (args): SourceInspectionResult => {
+    const request = inspectionRequestFrom(args.request);
+    return declaredInspectionFixture(request);
+  },
 
   render_edit_plan_preview: (args, context: HarnessContext) => {
     const revisionId = requireString(args, "revisionId");
