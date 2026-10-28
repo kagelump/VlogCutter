@@ -7,7 +7,7 @@ use thiserror::Error;
 
 use crate::chronology::forward_migrate_project_chronology;
 
-pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 56;
+pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 57;
 
 const MIGRATION_TABLE_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -420,7 +420,23 @@ pub const PROJECT_CATALOG_MIGRATIONS: &[SqliteMigration] = &[
         source_identity: "project-catalog/0056-versioned-sequence-selection-inputs/20261028",
         apply: versioned_sequence_selection_inputs,
     },
+    SqliteMigration {
+        id: 57,
+        name: "usage_priced_analysis_estimates",
+        source_identity: "project-catalog/0057-usage-priced-analysis-estimates/20261028",
+        apply: usage_priced_analysis_estimates,
+    },
 ];
+
+fn usage_priced_analysis_estimates(transaction: &Transaction<'_>) -> Result<()> {
+    add_column_if_missing(
+        transaction,
+        "analysis_request_reservations",
+        "estimated_cost_usd",
+        "REAL CHECK(estimated_cost_usd IS NULL OR estimated_cost_usd>=0.0)",
+    )?;
+    Ok(())
+}
 
 fn versioned_sequence_selection_inputs(transaction: &Transaction<'_>) -> Result<()> {
     add_column_if_missing(transaction, "edit_plan_revisions", "selection_json", "TEXT")?;

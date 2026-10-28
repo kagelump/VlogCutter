@@ -1195,6 +1195,7 @@ fn old_receipt_json_without_native_billing_field_is_byte_identical() {
         completion_tokens: Some(2),
         usage_complete: true,
         billed_audio_seconds: None,
+        usage_pricing: None,
     };
     let encoded = serde_json::to_string(&evidence).unwrap();
     assert_eq!(

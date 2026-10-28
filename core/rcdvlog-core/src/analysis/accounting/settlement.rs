@@ -32,6 +32,7 @@ pub(crate) enum ReceiptDisposition {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ReceiptSettlement {
     pub confirmed_cost_usd: f64,
+    pub estimated_cost_usd: Option<f64>,
     pub uncertain_usage_reserve_usd: f64,
     pub reported_cost_usd: Option<f64>,
     pub actual_provider: Option<String>,
@@ -147,7 +148,9 @@ pub(crate) fn classify_receipt(
         "a provider receipt cannot settle a request without a durable dispatch marker"
     );
     enforce_identity(current, existing, evidence)?;
-    if current.lifecycle == AnalysisRequestLifecycle::Completed {
+    if current.lifecycle == AnalysisRequestLifecycle::Completed
+        && current.estimated_cost_usd.is_none()
+    {
         if let Some(cost) = evidence.reported_cost_usd {
             ensure!(
                 (cost - current.confirmed_cost_usd).abs() <= AMOUNT_EPSILON,
@@ -176,9 +179,51 @@ pub(crate) fn settlement_for_receipt(
     let merged = merged_identity(current, evidence)?;
     let observed_cost_exceeded_bound = observed_exceeds_bound(current, evidence);
 
-    if current.lifecycle == AnalysisRequestLifecycle::Completed {
+    let estimate = match (&evidence.usage_pricing, &current.cost_bound) {
+        (Some(usage), Some(bound))
+            if evidence.usage_complete
+                && evidence.provider == current.provider
+                && evidence
+                    .prompt_tokens
+                    .is_none_or(|count| usage.prompt_tokens == Some(u64::from(count)))
+                && evidence.completion_tokens.is_none_or(|count| {
+                    usage
+                        .candidate_tokens
+                        .zip(usage.thinking_tokens)
+                        .and_then(|(a, b)| a.checked_add(b))
+                        == Some(u64::from(count))
+                }) =>
+        {
+            usage.estimate(
+                bound,
+                &evidence.provider,
+                &current.requested_model,
+                &evidence.actual_model,
+            )?
+        }
+        _ => None,
+    }
+    .filter(|estimate| {
+        current
+            .reported_cost_usd
+            .is_none_or(|floor| floor <= *estimate + AMOUNT_EPSILON)
+    })
+    .filter(|estimate| {
+        current
+            .estimated_cost_usd
+            .is_none_or(|previous| (previous - *estimate).abs() <= AMOUNT_EPSILON)
+    });
+    if current.lifecycle == AnalysisRequestLifecycle::Completed
+        && (current.estimated_cost_usd.is_none()
+            || (!evidence.is_complete_charge()
+                && evidence.usage_pricing.is_none()
+                && evidence.reported_cost_usd.is_none_or(|cost| {
+                    cost <= current.estimated_cost_usd.unwrap_or(0.0) + AMOUNT_EPSILON
+                })))
+    {
         return Ok(ReceiptSettlement {
             confirmed_cost_usd: current.confirmed_cost_usd,
+            estimated_cost_usd: current.estimated_cost_usd,
             uncertain_usage_reserve_usd: 0.0,
             reported_cost_usd: current.reported_cost_usd.or(evidence.reported_cost_usd),
             actual_provider: merged.actual_provider,
@@ -195,6 +240,7 @@ pub(crate) fn settlement_for_receipt(
         let confirmed = evidence.reported_cost_usd.unwrap_or(0.0);
         return Ok(ReceiptSettlement {
             confirmed_cost_usd: confirmed,
+            estimated_cost_usd: None,
             uncertain_usage_reserve_usd: 0.0,
             reported_cost_usd: Some(confirmed),
             actual_provider: merged.actual_provider,
@@ -204,6 +250,22 @@ pub(crate) fn settlement_for_receipt(
             failure_code: String::new(),
             metadata_enriched: merged.enriched,
             observed_cost_exceeded_bound,
+        });
+    }
+
+    if let Some(estimated) = estimate {
+        return Ok(ReceiptSettlement {
+            confirmed_cost_usd: 0.0,
+            estimated_cost_usd: Some(estimated),
+            uncertain_usage_reserve_usd: 0.0,
+            reported_cost_usd: current.reported_cost_usd,
+            actual_provider: merged.actual_provider,
+            actual_model: merged.actual_model,
+            provider_generation_id: merged.provider_generation_id,
+            lifecycle: AnalysisRequestLifecycle::Completed,
+            failure_code: String::new(),
+            metadata_enriched: merged.enriched,
+            observed_cost_exceeded_bound: estimated > current.reserved_cost_usd + AMOUNT_EPSILON,
         });
     }
 
@@ -221,6 +283,7 @@ pub(crate) fn settlement_for_receipt(
     };
     Ok(ReceiptSettlement {
         confirmed_cost_usd: 0.0,
+        estimated_cost_usd: None,
         uncertain_usage_reserve_usd: uncertain,
         reported_cost_usd: merge_observed_cost(
             current.reported_cost_usd,

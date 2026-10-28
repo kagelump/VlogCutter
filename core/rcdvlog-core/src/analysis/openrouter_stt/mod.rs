@@ -517,6 +517,7 @@ pub fn native_stt_request_cost_bound(
             "the native STT endpoint does not enforce provider.max_price, order, only or ignore; this reservation is not a provider invoice cap".into(),
             "an external invoice above this reservation and unknown usage remain explicit external facts for existing receipt settlement and authority stopping".into(),
         ],
+        published_token_tariff: None,
     };
     bound.maximum_cost_usd = bound.computed_maximum_cost_usd()?;
     bound.validate()?;

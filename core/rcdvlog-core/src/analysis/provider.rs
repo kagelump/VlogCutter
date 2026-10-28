@@ -117,6 +117,10 @@ pub struct AnalysisRequestCostBound {
     /// quote so prior serialized bounds and fingerprints remain byte-identical.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio: Option<AnalysisAudioCostBound>,
+    /// Explicit published token pricing. Omitted for historical transports.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub published_token_tariff:
+        Option<crate::analysis::accounting::usage_pricing::PublishedTokenTariff>,
     pub assumptions: Vec<String>,
 }
 
@@ -136,6 +140,7 @@ impl AnalysisRequestCostBound {
             image_price_usd_each: 0.0,
             request_price_usd_each: maximum_cost_usd,
             audio: None,
+            published_token_tariff: None,
             assumptions: vec![
                 "synthetic transport declares a deterministic test-only bound".into(),
             ],
@@ -176,6 +181,9 @@ impl AnalysisRequestCostBound {
             !self.contract_version.trim().is_empty(),
             "analysis request cost bound contract version is required"
         );
+        if let Some(tariff) = &self.published_token_tariff {
+            tariff.validate_bound(self)?;
+        }
         if let Some(audio) = &self.audio {
             return self.validate_audio_bound(audio);
         }
@@ -1222,6 +1230,7 @@ mod tests {
                 billable_seconds_max,
                 duration_price_usd_per_second,
             }),
+            published_token_tariff: None,
             assumptions: vec!["native audio external-tariff reservation".into()],
         };
         if let Ok(computed) = bound.computed_maximum_cost_usd() {

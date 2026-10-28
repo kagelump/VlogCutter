@@ -33,12 +33,28 @@ use crate::analysis::openrouter_stt::{
 use crate::analysis::provider::AnalysisRequestCostBound;
 use crate::analysis::run_policy::{AnalysisPayload, RunPolicyParameters};
 
-pub(crate) const REQUEST_SELECT: &str = "SELECT request_key,budget_scope_id,project_id,policy_id,run_id,operation,\
+const REQUEST_SELECT: &str = "SELECT request_key,budget_scope_id,project_id,policy_id,run_id,operation,\
  attempt_base_key,attempt_epoch,requested_provider,actual_provider,requested_model,actual_model,\
  provider_generation_id,policy_fingerprint,payload_fingerprint,source_fingerprint,request_fingerprint,\
  cost_bound_fingerprint,cost_bound_json,lifecycle,reserved_cost_usd,reported_cost_usd,\
  confirmed_cost_usd,uncertain_cost_usd,failure_code,dispatch_at,settled_at,created_at,updated_at \
  FROM analysis_request_reservations";
+
+fn request_select(connection: &Connection) -> Result<String> {
+    let estimated = if crate::migrations::column_exists(
+        connection,
+        "analysis_request_reservations",
+        "estimated_cost_usd",
+    )? {
+        "estimated_cost_usd"
+    } else {
+        "NULL"
+    };
+    Ok(REQUEST_SELECT.replace(
+        " FROM analysis_request_reservations",
+        &format!(",{estimated} FROM analysis_request_reservations"),
+    ))
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct Authority {
@@ -59,6 +75,7 @@ pub(crate) struct Authority {
 #[derive(Debug, Clone, Default)]
 struct LedgerTotals {
     confirmed: f64,
+    estimated: f64,
     active_reserved: f64,
     uncertain: f64,
     active_requests: usize,
@@ -66,7 +83,7 @@ struct LedgerTotals {
 
 impl LedgerTotals {
     fn committed(&self) -> f64 {
-        self.confirmed + self.active_reserved + self.uncertain
+        self.confirmed + self.estimated + self.active_reserved + self.uncertain
     }
 }
 
@@ -120,7 +137,7 @@ fn validate_policy_request_family(
                 "VLM accounted wrapper cannot spend against a native speech policy"
             );
             ensure!(
-                cost_bound.audio.is_none(),
+                cost_bound.audio.is_none() && cost_bound.published_token_tariff.is_none(),
                 "VLM accounted wrapper cannot use a native audio cost quote"
             );
             Ok(())
@@ -466,6 +483,10 @@ pub(crate) fn reserve(
     payload_fingerprint: &str,
     cost_bound: &AnalysisRequestCostBound,
 ) -> Result<AnalysisRequestRecord> {
+    ensure!(
+        cost_bound.published_token_tariff.is_none(),
+        "published token pricing requires its explicit typed transport admission"
+    );
     reserve_with_family(
         connection,
         context,
@@ -1008,7 +1029,7 @@ pub(crate) fn mark_uncertain(
     let now = crate::now();
     transaction.execute(
         "UPDATE analysis_request_reservations
-         SET lifecycle='uncertain',confirmed_cost_usd=0.0,uncertain_cost_usd=?2,
+         SET lifecycle='uncertain',confirmed_cost_usd=0.0,estimated_cost_usd=NULL,uncertain_cost_usd=?2,
              failure_code=?3,settled_at=?4,updated_at=?4
          WHERE request_key=?1",
         params![key, uncertain, safe_failure, now],
@@ -1213,7 +1234,7 @@ fn apply_receipt_settlement(
         "UPDATE analysis_request_reservations
          SET lifecycle=?2,actual_provider=?3,actual_model=?4,provider_generation_id=?5,
              reported_cost_usd=?6,confirmed_cost_usd=?7,uncertain_cost_usd=?8,
-             failure_code=?9,settled_at=?10,updated_at=?10
+             failure_code=?9,settled_at=?10,updated_at=?10,estimated_cost_usd=?11
          WHERE request_key=?1",
         params![
             current.request_key,
@@ -1226,6 +1247,7 @@ fn apply_receipt_settlement(
             settlement.uncertain_usage_reserve_usd,
             settlement.failure_code,
             now,
+            settlement.estimated_cost_usd,
         ],
     )?;
     Ok(())
@@ -1315,6 +1337,13 @@ pub(crate) fn record_receipt(
         // local input window and the conservative admission reservation.
         object.insert("billedAudioSeconds".into(), json!(seconds));
     }
+    if let Some(usage) = &evidence.usage_pricing {
+        receipt_event["usagePricing"] = serde_json::to_value(usage)?;
+    }
+    if let Some(estimated) = settlement.estimated_cost_usd {
+        receipt_event["estimatedCostUsd"] = json!(estimated);
+        receipt_event["costBasis"] = json!("published_rate_estimate");
+    }
     append_event(&transaction, key, "receipt", receipt_event)?;
     let record = load_request(&transaction, key)?
         .ok_or_else(|| anyhow!("receipted analysis request disappeared"))?;
@@ -1397,9 +1426,10 @@ pub(crate) fn load_request(
     connection: &Connection,
     key: &str,
 ) -> Result<Option<AnalysisRequestRecord>> {
+    let request_select = request_select(connection)?;
     connection
         .query_row(
-            &format!("{REQUEST_SELECT} WHERE request_key=?1"),
+            &format!("{request_select} WHERE request_key=?1"),
             [key],
             row_to_request,
         )
@@ -1571,8 +1601,9 @@ pub(crate) fn unresolved_requests_for_source(
     operation: &str,
     source_fingerprint: &str,
 ) -> Result<Vec<AnalysisRequestRecord>> {
+    let request_select = request_select(connection)?;
     let mut statement = connection.prepare(&format!(
-        "{REQUEST_SELECT}
+        "{request_select}
          WHERE project_id=?1 AND operation=?2 AND source_fingerprint=?3
            AND lifecycle IN ('reserved','dispatched','uncertain')
          ORDER BY created_at ASC, request_key ASC"
@@ -1594,8 +1625,9 @@ pub(crate) fn native_unresolved_requests_for_source(
     project_id: &str,
     source_fingerprint: &str,
 ) -> Result<Vec<AnalysisRequestRecord>> {
+    let request_select = request_select(connection)?;
     let mut statement = connection.prepare(&format!(
-        "{REQUEST_SELECT}
+        "{request_select}
          WHERE project_id=?1 AND source_fingerprint=?2
            AND operation IN ('pilot','native_speech_transcription')
            AND lifecycle IN ('reserved','dispatched','uncertain')
@@ -1628,8 +1660,9 @@ pub(crate) fn list_requests(
     policy_id: Option<&str>,
     limit: usize,
 ) -> Result<Vec<AnalysisRequestRecord>> {
+    let request_select = request_select(connection)?;
     let mut statement = connection.prepare(&format!(
-        "{REQUEST_SELECT} WHERE project_id=?1 AND (?2='' OR policy_id=?2)
+        "{request_select} WHERE project_id=?1 AND (?2='' OR policy_id=?2)
          ORDER BY created_at DESC, request_key DESC LIMIT ?3"
     ))?;
     let records = statement
@@ -1653,10 +1686,11 @@ pub(crate) fn native_request_requiring_result_recovery(
     model: &str,
     payload_fingerprint: &str,
 ) -> Result<Option<AnalysisRequestRecord>> {
+    let request_select = request_select(connection)?;
     connection
         .query_row(
             &format!(
-                "{REQUEST_SELECT} WHERE project_id=?1 AND policy_id=?2
+                "{request_select} WHERE project_id=?1 AND policy_id=?2
            AND source_fingerprint=?3 AND requested_provider=?4 AND requested_model=?5
            AND payload_fingerprint=?6
            AND operation IN ('pilot','native_speech_transcription')
@@ -1690,8 +1724,9 @@ pub(crate) fn scoped_requests(
     limit: usize,
     offset: usize,
 ) -> Result<Vec<AnalysisRequestRecord>> {
+    let request_select = request_select(connection)?;
     let mut statement = connection.prepare(&format!(
-        "{REQUEST_SELECT}
+        "{request_select}
          WHERE project_id=?1
            AND (?2='' OR policy_id=?2)
            AND (?3='' OR operation=?3)
@@ -2090,8 +2125,9 @@ fn verify_authority(
 }
 
 fn load_attempts(connection: &Connection, base: &str) -> Result<Vec<AnalysisRequestRecord>> {
+    let request_select = request_select(connection)?;
     let mut statement = connection.prepare(&format!(
-        "{REQUEST_SELECT} WHERE attempt_base_key=?1 ORDER BY attempt_epoch ASC"
+        "{request_select} WHERE attempt_base_key=?1 ORDER BY attempt_epoch ASC"
     ))?;
     let records = statement
         .query_map([base], row_to_request)?
@@ -2136,17 +2172,28 @@ pub(super) fn load_authority(connection: &Connection, scope: &str) -> Result<Aut
 }
 
 fn totals_for_scope(connection: &Connection, scope: &str) -> Result<LedgerTotals> {
+    let estimated = if crate::migrations::column_exists(
+        connection,
+        "analysis_request_reservations",
+        "estimated_cost_usd",
+    )? {
+        "COALESCE(SUM(estimated_cost_usd),0.0)"
+    } else {
+        "0.0"
+    };
     connection
         .query_row(
-            "SELECT
+            &format!(
+                "SELECT
                 COALESCE(SUM(confirmed_cost_usd),0.0),
                 COALESCE(SUM(CASE WHEN lifecycle IN ('reserved','dispatched')
                     THEN reserved_cost_usd ELSE 0.0 END),0.0),
                 COALESCE(SUM(CASE WHEN lifecycle='uncertain'
                     THEN uncertain_cost_usd ELSE 0.0 END),0.0),
                 COALESCE(SUM(CASE WHEN lifecycle IN ('reserved','dispatched')
-                    THEN 1 ELSE 0 END),0)
-             FROM analysis_request_reservations WHERE budget_scope_id=?1",
+                    THEN 1 ELSE 0 END),0), {estimated}
+             FROM analysis_request_reservations WHERE budget_scope_id=?1"
+            ),
             [scope],
             |row| {
                 Ok(LedgerTotals {
@@ -2154,6 +2201,7 @@ fn totals_for_scope(connection: &Connection, scope: &str) -> Result<LedgerTotals
                     active_reserved: row.get(1)?,
                     uncertain: row.get(2)?,
                     active_requests: row.get::<_, i64>(3)? as usize,
+                    estimated: row.get(4)?,
                 })
             },
         )
@@ -2169,7 +2217,7 @@ fn snapshot_from_authority(
     let confirmed = authority.legacy_confirmed_cost_usd + totals.confirmed;
     let uncertain =
         authority.legacy_uncertain_usage_reserve_usd + totals.uncertain + untracked.reserve;
-    let committed = confirmed + totals.active_reserved + uncertain;
+    let committed = confirmed + totals.estimated + totals.active_reserved + uncertain;
     Ok(AnalysisBudgetSnapshot {
         budget_scope_id: authority.budget_scope_id.clone(),
         project_id: authority.project_id.clone(),
@@ -2179,6 +2227,7 @@ fn snapshot_from_authority(
         legacy_confirmed_cost_usd: authority.legacy_confirmed_cost_usd,
         legacy_uncertain_usage_reserve_usd: authority.legacy_uncertain_usage_reserve_usd,
         confirmed_cost_usd: confirmed,
+        estimated_cost_usd: totals.estimated,
         active_reserved_cost_usd: totals.active_reserved,
         uncertain_usage_reserve_usd: uncertain,
         post_initialization_untracked_usage_reserve_usd: untracked.reserve,
@@ -2718,11 +2767,12 @@ fn accounting_aggregate_matching(
     run_id_filter: Option<&str>,
     include_authority_evidence: bool,
 ) -> Result<AnalysisAccountingAggregate> {
+    let request_select = request_select(connection)?;
     let requests = match scope {
         AggregateScope::Policy(policy_id) => {
             if let Some(run_id) = run_id_filter {
                 let mut statement = connection.prepare(&format!(
-                    "{REQUEST_SELECT} WHERE policy_id=?1 AND (?2 IS NULL OR operation=?2) AND run_id=?3
+                    "{request_select} WHERE policy_id=?1 AND (?2 IS NULL OR operation=?2) AND run_id=?3
                      ORDER BY created_at ASC, request_key ASC"
                 ))?;
                 statement
@@ -2730,7 +2780,7 @@ fn accounting_aggregate_matching(
                     .collect::<rusqlite::Result<Vec<_>>>()?
             } else {
                 let mut statement = connection.prepare(&format!(
-                    "{REQUEST_SELECT} WHERE policy_id=?1 AND (?2 IS NULL OR operation=?2)
+                    "{request_select} WHERE policy_id=?1 AND (?2 IS NULL OR operation=?2)
                      ORDER BY created_at ASC, request_key ASC"
                 ))?;
                 statement
@@ -2746,7 +2796,7 @@ fn accounting_aggregate_matching(
                 super::model::analysis_operation_budget_scope_id(project_id, scoped_operation);
             if let Some(run_id) = run_id_filter {
                 let mut statement = connection.prepare(&format!(
-                    "{REQUEST_SELECT} WHERE budget_scope_id=?1 AND operation=?2 AND run_id=?3
+                    "{request_select} WHERE budget_scope_id=?1 AND operation=?2 AND run_id=?3
                      ORDER BY created_at ASC, request_key ASC"
                 ))?;
                 statement
@@ -2757,7 +2807,7 @@ fn accounting_aggregate_matching(
                     .collect::<rusqlite::Result<Vec<_>>>()?
             } else {
                 let mut statement = connection.prepare(&format!(
-                    "{REQUEST_SELECT} WHERE budget_scope_id=?1 AND operation=?2
+                    "{request_select} WHERE budget_scope_id=?1 AND operation=?2
                      ORDER BY created_at ASC, request_key ASC"
                 ))?;
                 statement
@@ -2819,6 +2869,7 @@ fn accounting_aggregate_matching(
         uncertain_request_count: 0,
         released_request_count: 0,
         confirmed_cost_usd: 0.0,
+        estimated_cost_usd: 0.0,
         active_reserved_cost_usd: 0.0,
         uncertain_usage_reserve_usd: 0.0,
         legacy_included,
@@ -2836,6 +2887,7 @@ fn accounting_aggregate_matching(
     };
     for request in requests {
         aggregate.confirmed_cost_usd += request.confirmed_cost_usd;
+        aggregate.estimated_cost_usd += request.estimated_cost_usd.unwrap_or(0.0);
         match request.lifecycle {
             AnalysisRequestLifecycle::Completed => aggregate.completed_request_count += 1,
             AnalysisRequestLifecycle::Reserved | AnalysisRequestLifecycle::Dispatched => {
@@ -2864,6 +2916,7 @@ fn accounting_aggregate_matching(
     }
     aggregate.uncertain_usage_reserve_usd += untracked.reserve;
     aggregate.committed_or_reserved_usd = aggregate.confirmed_cost_usd
+        + aggregate.estimated_cost_usd
         + aggregate.active_reserved_cost_usd
         + aggregate.uncertain_usage_reserve_usd;
     let relevant_evidence_exists = aggregate.request_count > 0
@@ -3104,6 +3157,7 @@ pub(crate) fn row_to_request(row: &Row<'_>) -> rusqlite::Result<AnalysisRequestR
         reserved_cost_usd: row.get(20)?,
         reported_cost_usd: row.get(21)?,
         confirmed_cost_usd: row.get(22)?,
+        estimated_cost_usd: row.get(29)?,
         uncertain_usage_reserve_usd: row.get(23)?,
         failure_code: row.get(24)?,
         dispatch_at: row.get(25)?,
@@ -3112,3 +3166,7 @@ pub(crate) fn row_to_request(row: &Row<'_>) -> rusqlite::Result<AnalysisRequestR
         updated_at: row.get(28)?,
     })
 }
+
+#[cfg(test)]
+#[path = "usage_pricing_store_tests.rs"]
+mod usage_pricing_tests;

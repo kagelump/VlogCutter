@@ -39,6 +39,7 @@ fn running_pilot(policy: &RunPolicy, run_id: &str, asset_id: &str) -> RunPilotRe
         completion_tokens: 0,
         cost_usd: 0.0,
         confirmed_cost_usd: 0.0,
+        estimated_cost_usd: 0.0,
         uncertain_usage_reserve_usd: 0.0,
         active_reserved_cost_usd: 0.0,
         usage_complete: true,

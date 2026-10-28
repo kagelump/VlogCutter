@@ -29,7 +29,7 @@ use crate::analysis::provider::{
 /// contracts. A lower-level non-policy operation context still must never let a
 /// provider smuggle a native duration quote into a VLM dispatch.
 fn ensure_vlm_cost_bound(cost_bound: &AnalysisRequestCostBound) -> Result<()> {
-    if cost_bound.audio.is_some() {
+    if cost_bound.audio.is_some() || cost_bound.published_token_tariff.is_some() {
         return Err(ProviderFailure::local_admission().into());
     }
     Ok(())

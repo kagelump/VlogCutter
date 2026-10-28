@@ -3010,6 +3010,7 @@ impl Catalog {
             active_request_count: projection.active_request_count,
             uncertain_request_count: projection.uncertain_request_count,
             confirmed_cost_usd: projection.confirmed_cost_usd,
+            estimated_cost_usd: projection.estimated_cost_usd,
             active_reserved_cost_usd: projection.active_reserved_cost_usd,
             uncertain_usage_reserve_usd: projection.uncertain_usage_reserve_usd,
             committed_or_reserved_usd: projection.committed_or_reserved_usd,
@@ -11232,6 +11233,7 @@ pub(crate) mod tests {
                     completion_tokens: Some(1),
                     usage_complete: true,
                     billed_audio_seconds: None,
+                    usage_pricing: None,
                 },
             )
             .unwrap();
@@ -12227,6 +12229,7 @@ pub(crate) mod tests {
                     completion_tokens: Some(1),
                     usage_complete: true,
                     billed_audio_seconds: None,
+                    usage_pricing: None,
                 },
             )
             .unwrap();

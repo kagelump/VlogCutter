@@ -143,6 +143,7 @@ pub fn openrouter_request_cost_bound(
             "max_price.request is one per-request fee, not a cap on total request cost".into(),
             "unmodelled provider fees or a returned charge above this bound are external provider facts; this bound is never a confirmed charge".into(),
         ],
+        published_token_tariff: None,
     };
     bound.maximum_cost_usd = bound.computed_maximum_cost_usd()?;
     bound.validate()?;
