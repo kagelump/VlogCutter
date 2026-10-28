@@ -22,6 +22,9 @@ import type {
   SourceTrimRequest,
   SourceTrimSuggestion,
   ValidationReport,
+  ReviewFeedbackView,
+  ReviewFeedbackPage,
+  ApplyReviewFeedbackResult,
 } from "../../../chronologyTypes";
 import type { JobBinding } from "../jobs";
 import type { CommandTable, HarnessContext } from "../registry";
@@ -260,6 +263,50 @@ function trimRequestFrom(value: unknown): SourceTrimRequest {
 }
 
 export const editPlanCommands: CommandTable = {
+  record_review_note: (args, { state }): ReviewFeedbackView => {
+    const request = args.request as Record<string, unknown> | undefined;
+    if (!request || typeof request.projectId !== "string" || typeof request.revisionId !== "string" || typeof request.operationId !== "string") throw new Error("record_review_note requires request.projectId, request.revisionId, and request.operationId");
+    const response = state.editPlans.feedbackResponses[`record_review_note:${request.operationId}`];
+    if (!response) throw new Error(`Scenario did not declare review feedback response for ${request.operationId}`);
+    if (response.note.projectId !== request.projectId) throw new Error("review note belongs to another project");
+    if (response.note.target.revisionId !== request.revisionId) throw new Error("review note target belongs to another revision");
+    return response;
+  },
+  propose_review_change: (args, { state }): ReviewFeedbackView => declaredFeedback(args, state, "propose_review_change"),
+  decide_review_feedback: (args, { state }): ReviewFeedbackView => declaredFeedback(args, state, "decide_review_feedback"),
+  map_review_target: (args, { state }): ReviewFeedbackView => declaredFeedback(args, state, "map_review_target"),
+  review_feedback: (args, { state }): ReviewFeedbackView => {
+    const projectId = requireString(args, "projectId");
+    const noteId = requireString(args, "noteId");
+    const revisionId = requireString(args, "revisionId");
+    const response = state.editPlans.feedbackResponses[`review_feedback:${noteId}`];
+    if (!response) throw new Error(`Scenario did not declare review feedback response for ${noteId}`);
+    if (response.note.projectId !== projectId || response.currentRevisionId !== revisionId) throw new Error("review feedback belongs to another project or revision");
+    return response;
+  },
+  review_feedback_report: (args, { state }): ReviewFeedbackPage => {
+    const projectId = requireString(args, "projectId");
+    const revisionId = requireString(args, "revisionId");
+    const response = state.editPlans.feedbackReports[revisionId];
+    if (!response) throw new Error(`Scenario did not declare review feedback report for ${revisionId}`);
+    if (response.projectId !== projectId) throw new Error("review feedback report belongs to another project");
+    if (response.revisionId !== revisionId) throw new Error("review feedback report belongs to another revision");
+    if (args.offset !== undefined && (!Number.isSafeInteger(args.offset) || (args.offset as number) < 0)) throw new Error("offset must be a nonnegative integer");
+    if (args.limit !== undefined && (!Number.isSafeInteger(args.limit) || (args.limit as number) < 1 || (args.limit as number) > 100)) throw new Error("limit must be an integer from 1 to 100");
+    return response;
+  },
+  apply_review_feedback: (args, { state }): ApplyReviewFeedbackResult => {
+    const request = args.request as Record<string, unknown> | undefined;
+    if (!request || typeof request.projectId !== "string" || typeof request.baseRevisionId !== "string") throw new Error("apply_review_feedback requires request.projectId and request.baseRevisionId");
+    const response = state.editPlans.feedbackApplyResults[request.baseRevisionId];
+    if (!response) throw new Error(`Scenario did not declare applied review feedback for ${request.baseRevisionId}`);
+    if (response.revision.projectId !== request.projectId) throw new Error("applied review feedback belongs to another project");
+    if (!Array.isArray(request.accepted) || request.accepted.length === 0) throw new Error("request.accepted must contain accepted review references");
+    for (const [index, accepted] of request.accepted.entries()) {
+      if (!accepted || typeof accepted !== "object" || typeof (accepted as Record<string, unknown>).noteId !== "string" || typeof (accepted as Record<string, unknown>).proposalId !== "string" || typeof (accepted as Record<string, unknown>).expectedRevision !== "number") throw new Error(`request.accepted[${index}] requires noteId, proposalId, and expectedRevision`);
+    }
+    return response;
+  },
   active_edit_plan: (args, { state }) => {
     requireString(args, "projectId");
     return state.editPlans.active;
@@ -536,3 +583,13 @@ export const editPlanCommands: CommandTable = {
     return result;
   },
 };
+
+function declaredFeedback(args: Record<string, unknown>, state: DesktopHarnessState, command: string): ReviewFeedbackView {
+  const projectId = requireString(args, "projectId");
+  const request = args.request as Record<string, unknown> | undefined;
+  if (!request || typeof request.noteId !== "string") throw new Error(`${command} requires request.noteId`);
+  const response = state.editPlans.feedbackResponses[`${command}:${request.noteId}`];
+  if (!response) throw new Error(`Scenario did not declare review feedback response for ${request.noteId}`);
+  if (response.note.projectId !== projectId) throw new Error("review note belongs to another project");
+  return response;
+}

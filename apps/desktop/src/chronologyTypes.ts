@@ -294,6 +294,36 @@ export interface EditPlanRevision {
   createdAt: string;
 }
 
+export type ReviewAuthor = "human" | "reviewer";
+export type ReviewCategory = "endpoint" | "order" | "duration" | "featuredShot" | "soundContinuity" | "intent" | "preference";
+export interface ReviewCutSnapshot { operationId: string; position: number; assetId: string; sourceInSeconds: number; sourceOutSeconds: number; audio: EditPlanAudio | null }
+export interface ReviewSourceReference { assetId: string; sourceFingerprint: string; representationFingerprint: string; rotationDegrees: number }
+export interface ReviewMovieEvidence { artifactId: string; outputFingerprint: string; movieTimeBaseNumerator: number; movieTimeBaseDenominator: number; movieDurationSeconds: number; requestedMovieSeconds: number | null; timestampMapping: string; pictureMapping: PreviewCutMapping; sourceFingerprints: ReviewSourceReference[]; limitations: string[] }
+export interface ReviewTarget { revisionId: string; cut: ReviewCutSnapshot; previousCut: ReviewCutSnapshot | null; nextCut: ReviewCutSnapshot | null; sourceOccurrences: number; contextAudioDigest: string; contextAudioPrecision: string; contextAudioEventCount: number; viewedMovie: ReviewMovieEvidence | null }
+export interface RecordReviewNoteRequest { projectId: string; revisionId: string; operationId: string; author: ReviewAuthor; category: ReviewCategory; observation: string; viewedArtifactId?: string | null; movieTimeSeconds?: number | null; evidenceRefs?: string[] }
+export interface ReviewNote { noteId: string; projectId: string; author: ReviewAuthor; category: ReviewCategory; observation: string; target: ReviewTarget; evidenceRefs: string[] }
+export type ReviewChange = { kind: "trim"; sourceInSeconds: number; sourceOutSeconds: number } | { kind: "replace"; assetId: string; sourceInSeconds: number; sourceOutSeconds: number; audio: EditPlanAudio | null } | { kind: "reorder"; beforeOperationId: string | null } | { kind: "omit" } | { kind: "audio"; audio: EditPlanAudio | null };
+export interface ProposeReviewChangeRequest { noteId: string; expectedRevision: number; author: ReviewAuthor; change: ReviewChange; rationale: string }
+export interface ReviewProposal { proposalId: string; noteId: string; author: ReviewAuthor; target: ReviewTarget; change: ReviewChange; rationale: string }
+export type ReviewDecisionAction = "accepted" | "deferred" | "superseded" | "addressed";
+export type ReviewDecisionState = ReviewDecisionAction | "applied";
+export type ReviewDecisionOrigin = "human" | "host";
+export type ReviewHardChoice = "keepPicture" | "keepPictureAndAudio";
+export interface DecideReviewFeedbackRequest { noteId: string; expectedRevision: number; proposalId: string | null; decisionOwner: RangeDecisionOwner; action: ReviewDecisionAction; rationale: string; hardChoice: ReviewHardChoice | null }
+export interface ReviewDecision { decisionOrigin: ReviewDecisionOrigin; decisionId: string; noteId: string; proposalId: string | null; state: ReviewDecisionState; rationale: string; hardChoice: ReviewHardChoice | null; retainedTarget: ReviewTarget | null; appliedRevisionId: string | null; acceptedDecisionId: string | null }
+export interface MapReviewTargetRequest { noteId: string; expectedRevision: number; proposalId: string | null; revisionId: string; operationId: string; decisionOwner: RangeDecisionOwner; rationale: string }
+export interface ReviewTargetMapping { decisionOwner: RangeDecisionOwner; mappingId: string; noteId: string; proposalId: string | null; target: ReviewTarget; rationale: string }
+export type ReviewFeedbackFact = ({ kind: "note" } & ReviewNote) | ({ kind: "proposal" } & ReviewProposal) | ({ kind: "decision" } & ReviewDecision) | ({ kind: "mapping" } & ReviewTargetMapping);
+export interface ReviewFeedbackHistoryItem { operationId: string; noteRevision: number; recordedAtMillis: number; fact: ReviewFeedbackFact }
+export interface ReviewTargetStatus { flags: string[]; candidateOperationIds: string[]; candidatesTruncated: boolean; requiresMapping: boolean }
+export interface ReviewFeedbackView { note: ReviewNote; revision: number; currentRevisionId: string; effectiveTarget: ReviewTarget; targetStatus: ReviewTargetStatus; latestProposal: ReviewProposal | null; latestDecision: ReviewDecision | null; decidedProposal: ReviewProposal | null; proposalTargetStatus: ReviewTargetStatus | null; resolution: string; history: ReviewFeedbackHistoryItem[]; historyTotal: number; historyTruncated: boolean }
+export interface ReviewFeedbackPage { schemaReady: boolean; projectId: string; revisionId: string; total: number; nextOffset: number | null; items: ReviewFeedbackView[] }
+export interface AcceptedReviewReference { noteId: string; expectedRevision: number; proposalId: string }
+export interface ApplyReviewFeedbackRequest { projectId: string; baseRevisionId: string; expectedActiveRevisionId: string | null; accepted: AcceptedReviewReference[] }
+export interface EditPlanChange { operationId: string; changes: string[]; before: EditPlanOperation | null; after: EditPlanOperation | null }
+export interface EditPlanDiff { baseRevisionId: string; revisionId: string; changes: EditPlanChange[] }
+export interface ApplyReviewFeedbackResult { revision: EditPlanRevision; diff: EditPlanDiff; validation: ValidationReport; addressedNoteIds: string[] }
+
 export type InspectionRepresentation = "original" | "generatedProxy" | "cameraProxy";
 export type InspectionPurpose = "locator" | "proposedBoundary" | "inspectedBoundary";
 

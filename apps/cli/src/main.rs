@@ -2016,6 +2016,7 @@ fn main() -> ExitCode {
             let inspection_error = error.downcast_ref::<rcdvlog_core::SourceInspectionError>();
             let source_range_error = error.downcast_ref::<rcdvlog_core::SourceRangeError>();
             let preview_artifact_error = error.downcast_ref::<rcdvlog_core::PreviewArtifactError>();
+            let review_feedback_error = error.downcast_ref::<rcdvlog_core::ReviewFeedbackError>();
             let code = if let Some(plan) = edit_plan_error {
                 plan.code()
             } else if let Some(inspection) = inspection_error {
@@ -2024,6 +2025,8 @@ fn main() -> ExitCode {
                 ranges.code()
             } else if let Some(artifact) = preview_artifact_error {
                 artifact.code()
+            } else if let Some(feedback) = review_feedback_error {
+                feedback.code()
             } else if let Some(job_agent) = job_agent {
                 job_agent.code
             } else if let Some(readiness) = readiness_error {

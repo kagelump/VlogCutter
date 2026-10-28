@@ -24,6 +24,7 @@ pub enum FindingKind {
     RangeZeroLength,
     SourceRangeOverlap,
     ConfirmedRangeViolation,
+    HumanChoiceViolation,
     StaleScriptRevision,
     StaleRevision,
 }
@@ -40,6 +41,7 @@ impl FindingKind {
     /// The stable code, referenced by the desktop and the CLI.
     pub const fn code(self) -> &'static str {
         match self {
+            Self::HumanChoiceViolation => "edit_plan_human_choice_violation",
             Self::AudioInvalid => "edit_plan_audio_invalid",
             Self::MissingAsset => "edit_plan_missing_asset",
             Self::OriginalOffline => "edit_plan_original_offline",
@@ -57,6 +59,7 @@ impl FindingKind {
     pub const fn severity(self) -> Severity {
         match self {
             Self::AudioInvalid
+            | Self::HumanChoiceViolation
             | Self::ConfirmedRangeViolation
             | Self::MissingAsset
             | Self::OriginalOffline
@@ -159,6 +162,26 @@ impl Catalog {
             if pending {
                 findings.push(Finding::new(FindingKind::ConfirmedRangeViolation,None,None,
                 "Human range decisions require an explicit writable catalog upgrade before this plan can be validated.".into()));
+            }
+        }
+        for (asset_id, message) in
+            super::feedback::retained_choice_violations(&self.connection()?, &revision)?
+        {
+            findings.push(Finding::new(
+                FindingKind::HumanChoiceViolation,
+                None,
+                Some(asset_id),
+                message,
+            ));
+        }
+        if !crate::table_exists(&self.connection()?, "edit_feedback_note_heads")? {
+            let pending: bool = self.connection()?.query_row(
+                "SELECT EXISTS(SELECT 1 FROM project_operations WHERE project_id=?1 AND operation_type='editReviewDecisionRecorded'
+                    AND json_extract(payload_json,'$.fact.state')='accepted' AND json_extract(payload_json,'$.fact.hardChoice') IS NOT NULL)",
+                [&revision.project_id], |r|r.get(0))?;
+            if pending {
+                findings.push(Finding::new(FindingKind::HumanChoiceViolation, None, None,
+                "Retained human feedback requires an explicit writable catalog upgrade before validation.".into()));
             }
         }
         for cut in &revision.operations {

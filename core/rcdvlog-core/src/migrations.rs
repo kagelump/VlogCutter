@@ -7,7 +7,7 @@ use thiserror::Error;
 
 use crate::chronology::forward_migrate_project_chronology;
 
-pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 54;
+pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 55;
 
 const MIGRATION_TABLE_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -408,7 +408,37 @@ pub const PROJECT_CATALOG_MIGRATIONS: &[SqliteMigration] = &[
         source_identity: "project-catalog/0054-verified-preview-segment-cache/20261028",
         apply: verified_preview_segment_cache,
     },
+    SqliteMigration {
+        id: 55,
+        name: "revision_bound_edit_feedback",
+        source_identity: "project-catalog/0055-revision-bound-edit-feedback/20261028",
+        apply: revision_bound_edit_feedback,
+    },
 ];
+
+fn revision_bound_edit_feedback(transaction: &Transaction<'_>) -> Result<()> {
+    transaction.execute_batch("CREATE TABLE IF NOT EXISTS edit_feedback_facts (
+        operation_id TEXT PRIMARY KEY,
+        entity_id TEXT NOT NULL UNIQUE,
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        note_id TEXT NOT NULL,
+        kind TEXT NOT NULL CHECK(kind IN ('note','proposal','decision','mapping')),
+        note_revision INTEGER NOT NULL CHECK(note_revision>0),
+        recorded_at_millis INTEGER NOT NULL,
+        body_json TEXT NOT NULL,
+        UNIQUE(note_id,note_revision)
+    );
+    CREATE INDEX IF NOT EXISTS edit_feedback_project ON edit_feedback_facts(project_id,kind,note_id);
+    CREATE INDEX IF NOT EXISTS edit_feedback_note ON edit_feedback_facts(note_id,kind,note_revision DESC);
+    CREATE TABLE IF NOT EXISTS edit_feedback_note_heads (
+        note_id TEXT PRIMARY KEY REFERENCES edit_feedback_facts(entity_id),
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        latest_decision_id TEXT REFERENCES edit_feedback_facts(entity_id),
+        hard_choice INTEGER NOT NULL DEFAULT 0 CHECK(hard_choice IN (0,1))
+    );
+    CREATE INDEX IF NOT EXISTS edit_feedback_hard_choices ON edit_feedback_note_heads(project_id,hard_choice,note_id);")?;
+    Ok(())
+}
 
 fn verified_preview_segment_cache(transaction: &Transaction<'_>) -> Result<()> {
     transaction.execute_batch(

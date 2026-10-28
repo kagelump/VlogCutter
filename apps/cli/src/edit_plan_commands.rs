@@ -2,7 +2,9 @@
 use anyhow::{Context, Result, ensure};
 use clap::{Args, Subcommand};
 use rcdvlog_core::{
-    Catalog, ConfirmSourceRangeRequest, EditPlanOperation, PreviewRequest, SourceInspectionRequest,
+    AcceptedReviewReference, ApplyReviewFeedbackRequest, Catalog, ConfirmSourceRangeRequest,
+    DecideReviewFeedbackRequest, EditPlanOperation, MapReviewTargetRequest, PreviewRequest,
+    ProposeReviewChangeRequest, RecordReviewNoteRequest, SourceInspectionRequest,
     SourceTrimRequest,
 };
 use serde::Deserialize;
@@ -101,6 +103,57 @@ pub enum EditPlanCommand {
         #[arg(long)]
         input: PathBuf,
     },
+    /// Record and apply explicit, revision-bound human review feedback.
+    Feedback {
+        #[command(subcommand)]
+        command: ReviewFeedbackCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ReviewFeedbackCommand {
+    Record {
+        #[arg(long)]
+        input: PathBuf,
+    },
+    Propose {
+        #[arg(long)]
+        input: PathBuf,
+    },
+    Decide {
+        #[arg(long)]
+        input: PathBuf,
+    },
+    Map {
+        #[arg(long)]
+        input: PathBuf,
+    },
+    Get {
+        #[arg(long)]
+        note: String,
+        #[arg(long)]
+        revision: String,
+    },
+    Report {
+        #[arg(long)]
+        project: String,
+        #[arg(long)]
+        revision: String,
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+    Apply {
+        #[arg(long)]
+        project: String,
+        #[arg(long)]
+        expected_base: String,
+        #[arg(long)]
+        expected_active: String,
+        #[arg(long)]
+        input: PathBuf,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -143,6 +196,12 @@ struct PlanInput {
     script_revision_id: Option<String>,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ApplyReviewFeedbackInput {
+    accepted: Vec<AcceptedReviewReference>,
+}
+
 pub fn command_name(command: &EditPlanCommand) -> &'static str {
     match command {
         EditPlanCommand::List { .. } => "edit-plan.list",
@@ -163,6 +222,15 @@ pub fn command_name(command: &EditPlanCommand) -> &'static str {
             SourceRangeCommand::Revoke { .. } => "edit-plan.ranges.revoke",
         },
         EditPlanCommand::SuggestTrim { .. } => "edit-plan.suggest-trim",
+        EditPlanCommand::Feedback { command } => match command {
+            ReviewFeedbackCommand::Record { .. } => "edit-plan.feedback.record",
+            ReviewFeedbackCommand::Propose { .. } => "edit-plan.feedback.propose",
+            ReviewFeedbackCommand::Decide { .. } => "edit-plan.feedback.decide",
+            ReviewFeedbackCommand::Map { .. } => "edit-plan.feedback.map",
+            ReviewFeedbackCommand::Get { .. } => "edit-plan.feedback.get",
+            ReviewFeedbackCommand::Report { .. } => "edit-plan.feedback.report",
+            ReviewFeedbackCommand::Apply { .. } => "edit-plan.feedback.apply",
+        },
     }
 }
 
@@ -179,6 +247,9 @@ pub fn is_read_only(command: &EditPlanCommand) -> bool {
             | EditPlanCommand::Get(_)
             | EditPlanCommand::Diff { .. }
             | EditPlanCommand::Validate(_)
+            | EditPlanCommand::Feedback {
+                command: ReviewFeedbackCommand::Get { .. } | ReviewFeedbackCommand::Report { .. },
+            }
     )
 }
 
@@ -329,11 +400,70 @@ pub fn execute(catalog: &Catalog, command: &EditPlanCommand) -> Result<Value> {
                 catalog.suggest_source_trim(&request)?,
             )?)
         }
+        EditPlanCommand::Feedback { command } => match command {
+            ReviewFeedbackCommand::Record { input } => {
+                let request: RecordReviewNoteRequest = read_review_input(input)?;
+                Ok(serde_json::to_value(catalog.record_review_note(&request)?)?)
+            }
+            ReviewFeedbackCommand::Propose { input } => {
+                let request: ProposeReviewChangeRequest = read_review_input(input)?;
+                Ok(serde_json::to_value(
+                    catalog.propose_review_change(&request)?,
+                )?)
+            }
+            ReviewFeedbackCommand::Decide { input } => {
+                let request: DecideReviewFeedbackRequest = read_review_input(input)?;
+                Ok(serde_json::to_value(
+                    catalog.decide_review_feedback(&request)?,
+                )?)
+            }
+            ReviewFeedbackCommand::Map { input } => {
+                let request: MapReviewTargetRequest = read_review_input(input)?;
+                Ok(serde_json::to_value(catalog.map_review_target(&request)?)?)
+            }
+            ReviewFeedbackCommand::Get { note, revision } => Ok(serde_json::to_value(
+                catalog.review_feedback(note, revision)?,
+            )?),
+            ReviewFeedbackCommand::Report {
+                project,
+                revision,
+                offset,
+                limit,
+            } => Ok(serde_json::to_value(
+                catalog.review_feedback_report(project, revision, *offset, *limit)?,
+            )?),
+            ReviewFeedbackCommand::Apply {
+                project,
+                expected_base,
+                expected_active,
+                input,
+            } => {
+                ensure!(
+                    !expected_base.trim().is_empty() && expected_base != "none",
+                    "invalid input: feedback application requires an existing --expected-base revision"
+                );
+                let parsed: ApplyReviewFeedbackInput = read_review_input(input)?;
+                Ok(serde_json::to_value(catalog.apply_review_feedback(
+                    &ApplyReviewFeedbackRequest {
+                        project_id: project.clone(),
+                        base_revision_id: expected_base.clone(),
+                        expected_active_revision_id: expected(expected_active).map(str::to_owned),
+                        accepted: parsed.accepted,
+                    },
+                )?)?)
+            }
+        },
     }
 }
 
 fn read_review_input<T: serde::de::DeserializeOwned>(input: &PathBuf) -> Result<T> {
-    let bytes = std::fs::read(input).context("invalid input: read review JSON")?;
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    std::fs::File::open(input)
+        .context("invalid input: open review JSON")?
+        .take(64 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .context("invalid input: read review JSON")?;
     ensure!(
         bytes.len() <= 64 * 1024,
         "invalid input: review JSON exceeds 64 KiB"

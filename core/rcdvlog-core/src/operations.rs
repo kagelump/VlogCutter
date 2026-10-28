@@ -10,6 +10,11 @@ use serde_json::Value;
 use std::collections::BTreeSet;
 use uuid::Uuid;
 
+use crate::editplan::feedback::{
+    DECISION as EDIT_REVIEW_DECISION, MAPPING as EDIT_REVIEW_MAPPING, NOTE as EDIT_REVIEW_NOTE,
+    PROPOSAL as EDIT_REVIEW_PROPOSAL,
+};
+
 pub const NOTE_REVISION_CREATED: &str = "noteRevisionCreated";
 pub const LABEL_ADDED: &str = "labelAdded";
 pub const LABEL_REMOVED: &str = "labelRemoved";
@@ -119,6 +124,10 @@ pub(crate) const KNOWN_OPERATION_TYPES: &[&str] = &[
     EDIT_PLAN_EXPORT_RECORDED,
     SOURCE_RANGE_CONFIRMED,
     SOURCE_RANGE_REVOKED,
+    EDIT_REVIEW_NOTE,
+    EDIT_REVIEW_PROPOSAL,
+    EDIT_REVIEW_DECISION,
+    EDIT_REVIEW_MAPPING,
 ];
 
 pub(crate) fn is_known_operation_type(value: &str) -> bool {
@@ -2032,6 +2041,9 @@ pub(crate) fn materialize_operation(
         }
         EDIT_PLAN_EXPORT_RECORDED => {
             return materialize_edit_plan_export_recorded(transaction, operation);
+        }
+        EDIT_REVIEW_NOTE | EDIT_REVIEW_PROPOSAL | EDIT_REVIEW_DECISION | EDIT_REVIEW_MAPPING => {
+            return crate::editplan::feedback::materialize(transaction, operation);
         }
         SOURCE_RANGE_CONFIRMED | SOURCE_RANGE_REVOKED => {
             return crate::editplan::ranges::materialize_range_decision(transaction, operation);

@@ -13,6 +13,8 @@
 
 import { describe, expect, it } from "vitest";
 import { desktopScenario } from "../harness";
+import { chronologyApi } from "../../chronologyApi";
+import type { ApplyReviewFeedbackResult, ReviewFeedbackPage, ReviewFeedbackView } from "../../chronologyTypes";
 import {
   CHRONOLOGY_COMMANDS_SOURCE,
   CHRONOLOGY_TYPES_SOURCE,
@@ -340,6 +342,67 @@ describe("the harness's own guarantees", () => {
     for (const entry of contractExemptions) {
       expect(entry.command, "an exemption needs a command").toBeTruthy();
       expect(entry.reason.trim().length, `exemption for ${entry.command} has no reason`).toBeGreaterThan(20);
+    }
+  });
+});
+
+describe("review feedback command contract", () => {
+  it("calls all seven APIs with camelCase DTOs and preserves the reviewed target across revisions", async () => {
+    const harness = desktopScenario().project("Feedback project", { id: "project_feedback" }).build().install();
+    const target = { revisionId: "revision_a", cut: { operationId: "operation_a", position: 0, assetId: "asset_a", sourceInSeconds: 1, sourceOutSeconds: 4, audio: null }, previousCut: null, nextCut: null, sourceOccurrences: 1, contextAudioDigest: "digest_fixture", contextAudioPrecision: "declaredTimeline48k", contextAudioEventCount: 1, viewedMovie: null };
+    const view: ReviewFeedbackView = {
+      note: { noteId: "note_a", projectId: "project_feedback", author: "human", category: "endpoint", observation: "trim ending", target, evidenceRefs: [] },
+      revision: 3, currentRevisionId: "revision_b", effectiveTarget: target,
+      targetStatus: { flags: ["source_range_changed"], candidateOperationIds: [], candidatesTruncated: false, requiresMapping: true },
+      latestProposal: null, latestDecision: null, decidedProposal: null, proposalTargetStatus: null,
+      resolution: "unresolved", history: [], historyTotal: 1, historyTruncated: false,
+    };
+    harness.state.editPlans.feedbackResponses = {
+      "record_review_note:operation_a": view,
+      "propose_review_change:note_a": view,
+      "decide_review_feedback:note_a": view,
+      "map_review_target:note_a": view,
+      "review_feedback:note_a": view,
+    };
+    const page: ReviewFeedbackPage = { schemaReady: true, projectId: "project_feedback", revisionId: "revision_b", total: 1, nextOffset: null, items: [view] };
+    harness.state.editPlans.feedbackReports.revision_b = page;
+    const result: ApplyReviewFeedbackResult = {
+      revision: { revisionId: "revision_c", projectId: "project_feedback", scriptRevisionId: null, parentRevisionId: "revision_b", active: false, operations: [], createdAt: "2000-01-01T00:00:00Z" },
+      diff: { baseRevisionId: "revision_b", revisionId: "revision_c", changes: [] }, validation: { findings: [] }, addressedNoteIds: ["note_a"],
+    };
+    harness.state.editPlans.feedbackApplyResults.revision_b = result;
+    const noteRequest = { projectId: "project_feedback", revisionId: "revision_a", operationId: "operation_a", author: "human" as const, category: "endpoint" as const, observation: "trim ending" };
+    const changeRequest = { noteId: "note_a", expectedRevision: 2, author: "human" as const, change: { kind: "trim" as const, sourceInSeconds: 1, sourceOutSeconds: 3 }, rationale: "clean end" };
+    const decisionRequest = { noteId: "note_a", expectedRevision: 3, proposalId: "proposal_a", decisionOwner: "human" as const, action: "accepted" as const, rationale: "yes", hardChoice: null };
+    const mapRequest = { noteId: "note_a", expectedRevision: 3, proposalId: null, revisionId: "revision_b", operationId: "operation_a", decisionOwner: "human" as const, rationale: "inspect current cut" };
+    const applyRequest = { projectId: "project_feedback", baseRevisionId: "revision_b", expectedActiveRevisionId: null, accepted: [{ noteId: "note_a", expectedRevision: 3, proposalId: "proposal_a" }] };
+    try {
+      expect((await chronologyApi.recordReviewNote(noteRequest)).note.noteId).toBe("note_a");
+      expect((await chronologyApi.proposeReviewChange("project_feedback", changeRequest)).note.noteId).toBe("note_a");
+      expect((await chronologyApi.decideReviewFeedback("project_feedback", decisionRequest)).note.noteId).toBe("note_a");
+      expect((await chronologyApi.mapReviewTarget("project_feedback", mapRequest)).note.noteId).toBe("note_a");
+      const loaded = await chronologyApi.reviewFeedback("project_feedback", "note_a", "revision_b");
+      expect(loaded.currentRevisionId).toBe("revision_b");
+      expect(loaded.effectiveTarget.revisionId).toBe("revision_a");
+      expect(loaded.effectiveTarget.contextAudioDigest).toBe("digest_fixture");
+      expect(loaded.targetStatus.requiresMapping).toBe(true);
+      expect((await chronologyApi.reviewFeedbackReport("project_feedback", "revision_b")).items).toHaveLength(1);
+      expect((await chronologyApi.applyReviewFeedback(applyRequest)).addressedNoteIds).toEqual(["note_a"]);
+      await expect(chronologyApi.proposeReviewChange("project_other", changeRequest)).rejects.toThrow(/another project/);
+      await expect(chronologyApi.decideReviewFeedback("project_other", decisionRequest)).rejects.toThrow(/another project/);
+      await expect(chronologyApi.mapReviewTarget("project_other", mapRequest)).rejects.toThrow(/another project/);
+      await expect(window.__TAURI_INTERNALS__!.invoke("record_review_note", {})).rejects.toThrow(/request.projectId/);
+      await expect(window.__TAURI_INTERNALS__!.invoke("propose_review_change", { projectId: "project_feedback" })).rejects.toThrow(/request.noteId/);
+      await expect(window.__TAURI_INTERNALS__!.invoke("decide_review_feedback", { projectId: "project_feedback" })).rejects.toThrow(/request.noteId/);
+      await expect(window.__TAURI_INTERNALS__!.invoke("map_review_target", { projectId: "project_feedback" })).rejects.toThrow(/request.noteId/);
+      await expect(window.__TAURI_INTERNALS__!.invoke("review_feedback", {})).rejects.toThrow(/projectId/);
+      await expect(window.__TAURI_INTERNALS__!.invoke("review_feedback_report", { projectId: "project_feedback" })).rejects.toThrow(/revisionId/);
+      await expect(window.__TAURI_INTERNALS__!.invoke("apply_review_feedback", {})).rejects.toThrow(/request.projectId/);
+      const log = harness.commandLog();
+      expect(log.map((entry) => entry.command)).toEqual(expect.arrayContaining(["record_review_note", "propose_review_change", "decide_review_feedback", "map_review_target", "review_feedback", "review_feedback_report", "apply_review_feedback"]));
+      expect(log.find((entry) => entry.command === "propose_review_change")?.args).toHaveProperty("projectId", "project_feedback");
+    } finally {
+      harness.uninstall();
     }
   });
 });
