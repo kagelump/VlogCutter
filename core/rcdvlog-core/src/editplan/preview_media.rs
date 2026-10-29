@@ -298,7 +298,7 @@ pub(super) fn verify_artifact(
         .as_ref()
         .map(|scope| super::preview_excerpt::resolve(&plan, scope))
         .transpose()?
-        .map(|w| (w.in_seconds(), w.out_seconds()));
+        .map(|w| (w.in_seconds(), w.audio_end_seconds));
     let plan_renderable = catalog
         .validate_edit_plan_audio_window(&artifact.revision_id, cancel, audio_window)
         .is_ok_and(|r| r.renderable());

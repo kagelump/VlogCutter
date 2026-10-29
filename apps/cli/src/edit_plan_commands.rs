@@ -3,10 +3,10 @@ use anyhow::{Context, Result, ensure};
 use clap::{Args, Subcommand};
 use rcdvlog_core::{
     AcceptedReviewReference, ApplyReviewFeedbackRequest, AssembledContextRequest, Catalog,
-    ConfirmSourceRangeRequest, DecideReviewFeedbackRequest, EditPlanOperation,
-    MapReviewTargetRequest, PreviewExcerptRequest, PreviewRequest, ProposeReviewChangeRequest,
-    RecordReviewNoteRequest, SequenceSelectionInput, SequenceSelectionRequest,
-    SourceInspectionRequest, SourceTrimRequest,
+    ComparisonPreferenceRequest, ConfirmSourceRangeRequest, DecideReviewFeedbackRequest,
+    EditPlanOperation, MapReviewTargetRequest, PreviewExcerptRequest, PreviewRequest,
+    ProposeReviewChangeRequest, RecordReviewNoteRequest, SequenceSelectionInput,
+    SequenceSelectionRequest, ShortComparisonRequest, SourceInspectionRequest, SourceTrimRequest,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -130,6 +130,49 @@ pub enum EditPlanCommand {
     Selection {
         #[command(subcommand)]
         command: SelectionCommand,
+    },
+    /// Render and compare bounded local variants; preference is an explicit human action.
+    Compare {
+        #[command(subcommand)]
+        command: ShortComparisonCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ShortComparisonCommand {
+    /// Render 2-4 scoped variants and create a local sequential player.
+    Create {
+        #[arg(long)]
+        input: PathBuf,
+    },
+    /// Read comparison state; --verify checks current media and player bytes.
+    Status {
+        #[arg(long)]
+        comparison: String,
+        #[arg(long)]
+        verify: bool,
+    },
+    /// Cooperatively stop an active comparison render.
+    Cancel {
+        #[arg(long)]
+        comparison: String,
+    },
+    /// Record an explicit human preference and optional retained cuts.
+    Prefer {
+        #[arg(long)]
+        input: PathBuf,
+    },
+    /// Read a durable preference and draft receipt.
+    Choice {
+        #[arg(long)]
+        choice: String,
+    },
+    /// Create/retrieve the inactive draft linked to a preference choice.
+    Apply {
+        #[arg(long)]
+        choice: String,
+        #[arg(long)]
+        expected_active: String,
     },
 }
 
@@ -362,6 +405,14 @@ pub fn command_name(command: &EditPlanCommand) -> &'static str {
             SelectionCommand::Create(_) => "edit-plan.selection.create",
             SelectionCommand::Get { .. } => "edit-plan.selection.get",
         },
+        EditPlanCommand::Compare { command } => match command {
+            ShortComparisonCommand::Create { .. } => "edit-plan.compare.create",
+            ShortComparisonCommand::Status { .. } => "edit-plan.compare.status",
+            ShortComparisonCommand::Cancel { .. } => "edit-plan.compare.cancel",
+            ShortComparisonCommand::Prefer { .. } => "edit-plan.compare.prefer",
+            ShortComparisonCommand::Choice { .. } => "edit-plan.compare.choice",
+            ShortComparisonCommand::Apply { .. } => "edit-plan.compare.apply",
+        },
     }
 }
 
@@ -390,6 +441,10 @@ pub fn is_read_only(command: &EditPlanCommand) -> bool {
             }
             | EditPlanCommand::Context {
                 command: AssembledContextCommand::Get { .. }
+            }
+            | EditPlanCommand::Compare {
+                command: ShortComparisonCommand::Status { verify: false, .. }
+                    | ShortComparisonCommand::Choice { .. }
             }
     )
 }
@@ -667,6 +722,41 @@ pub fn execute(catalog: &Catalog, command: &EditPlanCommand) -> Result<Value> {
                 )?)
             }
         },
+        EditPlanCommand::Compare { command } => {
+            match command {
+                ShortComparisonCommand::Create { input } => {
+                    let request: ShortComparisonRequest = read_review_input(input)?;
+                    Ok(serde_json::to_value(catalog.create_short_comparison(
+                    &request,
+                    &|| false,
+                    &mut |variant, event| eprintln!("{}", json!({
+                        "event": "comparison-progress", "variant": variant, "data": event
+                    })),
+                )?)?)
+                }
+                ShortComparisonCommand::Status { comparison, verify } => Ok(serde_json::to_value(
+                    catalog.short_comparison_status(comparison, *verify)?,
+                )?),
+                ShortComparisonCommand::Cancel { comparison } => Ok(serde_json::to_value(
+                    catalog.cancel_short_comparison(comparison)?,
+                )?),
+                ShortComparisonCommand::Prefer { input } => {
+                    let request: ComparisonPreferenceRequest = read_review_input(input)?;
+                    Ok(serde_json::to_value(
+                        catalog.prefer_short_comparison(&request)?,
+                    )?)
+                }
+                ShortComparisonCommand::Choice { choice } => {
+                    Ok(serde_json::to_value(catalog.comparison_choice(choice)?)?)
+                }
+                ShortComparisonCommand::Apply {
+                    choice,
+                    expected_active,
+                } => Ok(serde_json::to_value(
+                    catalog.apply_comparison_choice(choice, expected_active)?,
+                )?),
+            }
+        }
     }
 }
 

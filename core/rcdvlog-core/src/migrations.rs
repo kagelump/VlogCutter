@@ -7,7 +7,7 @@ use thiserror::Error;
 
 use crate::chronology::forward_migrate_project_chronology;
 
-pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 60;
+pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 61;
 
 const MIGRATION_TABLE_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -444,7 +444,35 @@ pub const PROJECT_CATALOG_MIGRATIONS: &[SqliteMigration] = &[
         source_identity: "project-catalog/0060-assembled-preview-context/20261029",
         apply: assembled_preview_context,
     },
+    SqliteMigration {
+        id: 61,
+        name: "short_preview_comparisons",
+        source_identity: "project-catalog/0061-short-preview-comparisons/20261029",
+        apply: short_preview_comparisons,
+    },
 ];
+
+fn short_preview_comparisons(transaction: &Transaction<'_>) -> Result<()> {
+    transaction.execute_batch(
+        "CREATE TABLE IF NOT EXISTS preview_comparisons(
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        state TEXT NOT NULL,
+        cancel_requested INTEGER NOT NULL DEFAULT 0,
+        active_artifact_id TEXT,
+        body_json TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS preview_comparison_choices(
+        id TEXT PRIMARY KEY,
+        comparison_id TEXT NOT NULL REFERENCES preview_comparisons(id) ON DELETE CASCADE,
+        body_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );",
+    )?;
+    Ok(())
+}
 
 fn assembled_preview_context(transaction: &Transaction<'_>) -> Result<()> {
     transaction.execute_batch(
