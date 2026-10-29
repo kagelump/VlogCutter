@@ -264,6 +264,7 @@ pub use diagnostics::{
     Diagnostic, DiagnosticCounts, DiagnosticFilter, DiagnosticRecord, DiagnosticSeverity,
     DiagnosticSubject,
 };
+pub use editplan::context_review::*;
 pub use editplan::feedback::*;
 pub use editplan::inspection_review::*;
 pub use editplan::selection::*;
@@ -274,12 +275,13 @@ pub use editplan::{
     InspectionPurpose, InspectionRepresentation, InspectionTimeMapping, InspectionWaveformBin,
     OtioExportError, OtioExportRequest, OtioExportResult, PreviewArtifact, PreviewArtifactError,
     PreviewArtifactPage, PreviewArtifactState, PreviewArtifactStatus, PreviewArtifactSummary,
-    PreviewArtifactVerification, PreviewCutMapping, PreviewCutOutcome, PreviewFailure,
-    PreviewInputIdentity, PreviewMediaValidation, PreviewProgress, PreviewRequest, PreviewResult,
-    PreviewSegmentCounts, PreviewSourceIdentity, RangeDecision, RangeDecisionOwner, RangeMedia,
-    Severity, SourceAudio, SourceInspection, SourceInspectionError, SourceInspectionRequest,
-    SourceInspectionResult, SourceRangeConstraints, SourceRangeError, SourceTimeRange,
-    SourceTrimRequest, SourceTrimSuggestion, TrimMedia, ValidationReport, otio_document,
+    PreviewArtifactVerification, PreviewCutMapping, PreviewCutOutcome, PreviewExcerptRequest,
+    PreviewExcerptScope, PreviewFailure, PreviewInputIdentity, PreviewMediaValidation,
+    PreviewProgress, PreviewRequest, PreviewResult, PreviewSegmentCounts, PreviewSourceIdentity,
+    RangeDecision, RangeDecisionOwner, RangeMedia, Severity, SourceAudio, SourceInspection,
+    SourceInspectionError, SourceInspectionRequest, SourceInspectionResult, SourceRangeConstraints,
+    SourceRangeError, SourceTimeRange, SourceTrimRequest, SourceTrimSuggestion, TrimMedia,
+    ValidationReport, otio_document,
 };
 pub use operations::{
     ApplyOperationResult, AssetRevisionDiagnostics, CAPTURE_SEQUENCE_DECLARED,

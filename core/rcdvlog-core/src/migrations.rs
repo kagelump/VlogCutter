@@ -7,7 +7,7 @@ use thiserror::Error;
 
 use crate::chronology::forward_migrate_project_chronology;
 
-pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 59;
+pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 60;
 
 const MIGRATION_TABLE_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -438,7 +438,27 @@ pub const PROJECT_CATALOG_MIGRATIONS: &[SqliteMigration] = &[
         source_identity: "project-catalog/0059-bounded-inspection-review/20261029",
         apply: bounded_inspection_review,
     },
+    SqliteMigration {
+        id: 60,
+        name: "assembled_preview_context",
+        source_identity: "project-catalog/0060-assembled-preview-context/20261029",
+        apply: assembled_preview_context,
+    },
 ];
+
+fn assembled_preview_context(transaction: &Transaction<'_>) -> Result<()> {
+    transaction.execute_batch(
+        "CREATE TABLE IF NOT EXISTS assembled_review_contexts(
+        evidence_id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        revision_id TEXT NOT NULL,
+        artifact_id TEXT NOT NULL REFERENCES preview_artifacts(artifact_id) ON DELETE CASCADE,
+        body_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    );",
+    )?;
+    Ok(())
+}
 
 fn bounded_inspection_review(transaction: &Transaction<'_>) -> Result<()> {
     transaction.execute_batch(

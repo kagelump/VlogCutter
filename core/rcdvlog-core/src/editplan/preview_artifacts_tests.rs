@@ -248,7 +248,7 @@ fn wait_timeout_keeps_the_original_claim_and_lost_writer_is_explicit() {
     let plan = plan(&catalog, &asset);
     let request = request(&plan);
     let owner = claim(&catalog, &plan).unwrap();
-    let attempt = PreviewAttempt::begin(&catalog, &plan, &request, &owner).unwrap();
+    let attempt = PreviewAttempt::begin(&catalog, &plan, &request, &owner, None).unwrap();
     let id = attempt.artifact_id.clone();
     assert!(matches!(
         catalog
@@ -281,7 +281,7 @@ fn wait_timeout_keeps_the_original_claim_and_lost_writer_is_explicit() {
         PreviewArtifactState::Interrupted
     );
     let owner = claim(&catalog, &plan).unwrap();
-    let next = PreviewAttempt::begin(&catalog, &plan, &request, &owner).unwrap();
+    let next = PreviewAttempt::begin(&catalog, &plan, &request, &owner, None).unwrap();
     let old = catalog.preview_artifact_status(&id, false).unwrap();
     assert_eq!(old.artifact.state, PreviewArtifactState::Interrupted);
     assert!(!old.latest_attempt);
@@ -295,7 +295,7 @@ fn progress_pages_are_bounded_without_rewriting_the_input_manifest() {
     let (_dir, catalog, asset) = fixture();
     let plan = plan(&catalog, &asset);
     let owner = claim(&catalog, &plan).unwrap();
-    let attempt = PreviewAttempt::begin(&catalog, &plan, &request(&plan), &owner).unwrap();
+    let attempt = PreviewAttempt::begin(&catalog, &plan, &request(&plan), &owner, None).unwrap();
     let large_manifest = "x".repeat(100_000);
     catalog
         .connection()
@@ -450,7 +450,7 @@ fn old_schema_preview_diagnosis_is_readonly_and_unversioned_receipts_survive_rep
     let catalog = Catalog::open(&path).unwrap();
     let plan = catalog.edit_plan_revision("revision").unwrap();
     let owner = claim(&catalog, &plan).unwrap();
-    let attempt = PreviewAttempt::begin(&catalog, &plan, &request(&plan), &owner).unwrap();
+    let attempt = PreviewAttempt::begin(&catalog, &plan, &request(&plan), &owner, None).unwrap();
     attempt
         .finish_error(&anyhow::anyhow!("fixture failed before rendering"), false)
         .unwrap();

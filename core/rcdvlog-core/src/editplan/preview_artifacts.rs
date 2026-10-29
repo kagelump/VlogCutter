@@ -130,6 +130,18 @@ fn load_base(connection: &Connection, id: &str) -> Result<PreviewArtifact> {
     let mut artifact: PreviewArtifact =
         serde_json::from_str(&row.0).context("decode preview receipt")?;
     ensure!(
+        (artifact.kind == "fullPreview" && artifact.excerpt.is_none())
+            || (artifact.kind == "cutNeighborhood" && artifact.excerpt.is_some()),
+        PreviewArtifactError::InvalidReceipt
+    );
+    ensure!(
+        artifact
+            .identity
+            .as_ref()
+            .is_none_or(|identity| identity.excerpt == artifact.excerpt),
+        PreviewArtifactError::InvalidReceipt
+    );
+    ensure!(
         artifact.artifact_id == id
             && artifact.project_id == row.5
             && artifact.revision_id == row.6
@@ -298,14 +310,18 @@ impl<'a> PreviewAttempt<'a> {
         plan: &EditPlanRevision,
         request: &PreviewRequest,
         claim: &PreviewRenderClaim,
+        excerpt: Option<&super::PreviewExcerptScope>,
     ) -> Result<Self> {
         let artifacts = managed_child(&claim.workspace, "artifacts")?;
         component(&claim.artifact_id)?;
         let directory = artifacts.join(&claim.artifact_id);
         fs::create_dir(&directory).context("create unique preview attempt workspace")?;
-        let request_key = blake3::hash(&serde_json::to_vec(&("fullPreview", request))?)
-            .to_hex()
-            .to_string();
+        let request_body = if let Some(scope) = excerpt {
+            serde_json::to_vec(&(super::preview_excerpt::EXCERPT_RECIPE, request, scope))?
+        } else {
+            serde_json::to_vec(&("fullPreview", request))?
+        };
+        let request_key = blake3::hash(&request_body).to_hex().to_string();
         let mut connection = catalog.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut statement = transaction.prepare(
@@ -330,7 +346,13 @@ impl<'a> PreviewAttempt<'a> {
             revision_id: plan.revision_id.clone(),
             generation: 0,
             request: request.clone(),
-            kind: "fullPreview".into(),
+            kind: if excerpt.is_some() {
+                "cutNeighborhood"
+            } else {
+                "fullPreview"
+            }
+            .into(),
+            excerpt: excerpt.cloned(),
             state: PreviewArtifactState::Running,
             sequence: 1,
             stage: "validating".into(),
@@ -531,6 +553,7 @@ impl Catalog {
                 artifact_id: record.artifact_id,
                 revision_id: record.revision_id,
                 kind: record.kind,
+                excerpt: record.excerpt,
                 generation: record.generation,
                 sequence: record.sequence,
                 state: record.state,
@@ -594,6 +617,15 @@ impl Catalog {
         artifact_id: &str,
         verify: bool,
     ) -> Result<PreviewArtifactStatus> {
+        self.preview_artifact_status_cancellable(artifact_id, verify, &|| false)
+    }
+
+    pub(crate) fn preview_artifact_status_cancellable(
+        &self,
+        artifact_id: &str,
+        verify: bool,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<PreviewArtifactStatus> {
         let connection = self.connection()?;
         if !crate::table_exists(&connection, "preview_artifacts")? {
             return Err(PreviewArtifactError::NotFound {
@@ -651,8 +683,8 @@ impl Catalog {
             verification: None,
         };
         if verify && observed == PreviewArtifactState::Complete {
-            let _heavy = self.acquire_local_heavy()?;
-            let verification = super::preview_media::verify_artifact(self, &artifact)?;
+            let _heavy = self.acquire_local_heavy_cancellable(cancel)?;
+            let verification = super::preview_media::verify_artifact(self, &artifact, cancel)?;
             // Verification may outlast a newly requested render generation.
             status.latest_attempt = latest(&self.connection()?, artifact_id)?;
             status.active_revision_id = self.active_edit_plan_revision_id(&artifact.project_id)?;

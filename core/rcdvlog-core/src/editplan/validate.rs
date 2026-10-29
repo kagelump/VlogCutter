@@ -155,6 +155,15 @@ impl Catalog {
         revision_id: &str,
         cancel: &dyn Fn() -> bool,
     ) -> Result<ValidationReport> {
+        self.validate_edit_plan_audio_window(revision_id, cancel, None)
+    }
+
+    pub(super) fn validate_edit_plan_audio_window(
+        &self,
+        revision_id: &str,
+        cancel: &dyn Fn() -> bool,
+        audio_window: Option<(f64, f64)>,
+    ) -> Result<ValidationReport> {
         anyhow::ensure!(!cancel(), "preview cancelled during validation");
         let revision = self.edit_plan_revision(revision_id)?;
         let assets = self.list_assets(&revision.project_id)?;
@@ -368,7 +377,12 @@ impl Catalog {
         }
 
         if revision.operations.iter().any(|cut| cut.audio.is_some())
-            && let Err(error) = super::audio::audio_events_cancellable(&revision, &assets, cancel)
+            && let Err(error) = super::audio::audio_events_cancellable_window(
+                &revision,
+                &assets,
+                cancel,
+                audio_window,
+            )
         {
             findings.push(Finding::new(
                 FindingKind::AudioInvalid,

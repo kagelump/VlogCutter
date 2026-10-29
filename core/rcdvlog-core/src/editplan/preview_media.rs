@@ -128,14 +128,26 @@ pub(super) fn prepare(
     request: &PreviewRequest,
     assets: &[Asset],
     cancel: &dyn Fn() -> bool,
+    excerpt: Option<&super::PreviewExcerptScope>,
 ) -> Result<PreparedSources> {
     let mut ids = BTreeSet::new();
-    for cut in &plan.operations {
-        ids.insert(cut.asset_id.as_str());
-        if let Some(super::EditPlanAudio::Source(audio)) = &cut.audio {
-            ids.insert(audio.asset_id.as_str());
+    if let Some(scope) = excerpt {
+        ids = super::preview_excerpt::relevant_assets(
+            plan,
+            &super::preview_excerpt::resolve(plan, scope)?,
+        );
+    } else {
+        for cut in &plan.operations {
+            ids.insert(cut.asset_id.as_str());
+            if let Some(super::EditPlanAudio::Source(audio)) = &cut.audio {
+                ids.insert(audio.asset_id.as_str());
+            }
         }
     }
+    ensure!(
+        excerpt.is_none() || ids.len() <= 64,
+        "invalid input: excerpt exceeds 64 contributing source assets"
+    );
     let assets_by_id: HashMap<_, _> = assets
         .iter()
         .map(|asset| (asset.id.as_str(), asset))
@@ -200,6 +212,9 @@ pub(super) fn prepare(
     {
         plan_identity["selection"] = json!(selection);
     }
+    if excerpt.is_some() {
+        plan_identity["excerptRecipe"] = json!(super::preview_excerpt::EXCERPT_RECIPE);
+    }
     let plan_digest = blake3::hash(&serde_json::to_vec(&plan_identity)?)
         .to_hex()
         .to_string();
@@ -221,6 +236,7 @@ pub(super) fn prepare(
             sources,
             tools,
             tool_content_fingerprints,
+            excerpt: excerpt.cloned(),
         },
         paths,
         stamps,
@@ -230,13 +246,14 @@ pub(super) fn prepare(
 pub(super) fn verify_artifact(
     catalog: &Catalog,
     artifact: &PreviewArtifact,
+    cancel: &dyn Fn() -> bool,
 ) -> Result<PreviewArtifactVerification> {
     let mut limitations = Vec::new();
     let output_matches =
         if let (Some(result), Some(validation)) = (&artifact.result, &artifact.validation) {
             let path = Path::new(&result.output_path);
             if super::preview_artifacts::output_is_owned_file(catalog, artifact) {
-                full_file_blake3(path, &|| false).is_ok_and(|h| {
+                full_file_blake3(path, cancel).is_ok_and(|h| {
                     h.hex_digest == validation.output_fingerprint
                         && h.byte_count == validation.byte_length
                         && validation.fully_decoded
@@ -263,7 +280,8 @@ pub(super) fn verify_artifact(
         &plan,
         &artifact.request,
         &catalog.list_assets(&artifact.project_id)?,
-        &|| false,
+        cancel,
+        artifact.excerpt.as_ref(),
     );
     let inputs_match = match current {
         Ok(current) => artifact
@@ -275,8 +293,14 @@ pub(super) fn verify_artifact(
             false
         }
     };
+    let audio_window = artifact
+        .excerpt
+        .as_ref()
+        .map(|scope| super::preview_excerpt::resolve(&plan, scope))
+        .transpose()?
+        .map(|w| (w.in_seconds(), w.out_seconds()));
     let plan_renderable = catalog
-        .validate_edit_plan(&artifact.revision_id)
+        .validate_edit_plan_audio_window(&artifact.revision_id, cancel, audio_window)
         .is_ok_and(|r| r.renderable());
     constraints_match &=
         super::ranges::constraints_key(&catalog.connection()?, &plan)? == constraint_key;
@@ -502,13 +526,26 @@ pub(super) fn validate_movie(
     request: &PreviewRequest,
     segment_frames: &[u64],
     cancel: &dyn Fn() -> bool,
+    excerpt: Option<&super::PreviewExcerptScope>,
 ) -> Result<PreviewMediaValidation> {
+    let window = excerpt
+        .map(|scope| super::preview_excerpt::resolve(plan, scope))
+        .transpose()?;
+    let operations = if let Some(window) = &window {
+        ensure!(
+            segment_frames == window.frame_counts,
+            "excerpt frames differ from the full-revision frame allocation"
+        );
+        &plan.operations[window.first..=window.last]
+    } else {
+        &plan.operations[..]
+    };
     let decoded = decoded(path, workspace, cancel)?;
     let height = request.max_height / 2 * 2;
     let width = (height * 16 / 9) / 2 * 2;
     let (n, d) = video_shape(&decoded, width, height)?;
     ensure!(
-        segment_frames.len() == plan.operations.len()
+        segment_frames.len() == operations.len()
             && segment_frames.iter().sum::<u64>() == decoded.frames.video_pts.len() as u64,
         "preview is incomplete: decoded movie frame count differs from all validated segments"
     );
@@ -544,7 +581,7 @@ pub(super) fn validate_movie(
     )?;
     let mut cuts = Vec::new();
     let mut at = 0;
-    for (operation, &count) in plan.operations.iter().zip(segment_frames) {
+    for (operation, &count) in operations.iter().zip(segment_frames) {
         let end = at + count as usize;
         let start = ticks(decoded.frames.video_pts[at], n, d)?;
         let out = if end < decoded.frames.video_pts.len() {

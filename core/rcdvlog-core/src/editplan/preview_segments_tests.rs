@@ -200,6 +200,7 @@ fn cache_keys_cover_content_exact_intervals_mapping_recipe_tools_and_frame_alloc
         },
         &catalog.list_assets(&plan.project_id).unwrap(),
         &|| false,
+        None,
     )
     .unwrap();
     let expected = SegmentExpectation {
