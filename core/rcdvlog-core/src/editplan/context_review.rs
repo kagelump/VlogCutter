@@ -105,7 +105,7 @@ impl Catalog {
         let origin = window.as_ref().map_or(0.0, |w| w.in_seconds());
         let end = window
             .as_ref()
-            .map_or_else(|| plan.duration_seconds(), |w| w.out_seconds());
+            .map_or_else(|| plan.duration_seconds(), |w| w.audio_end_seconds);
         let mut mappings = Vec::new();
         let mut at = 0.0;
         for cut in &plan.operations {

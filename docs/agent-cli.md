@@ -22,6 +22,15 @@ record an explicitly authored note. Context handles remain separate source
 inspections; notes flow through revision-bound feedback. See
 [whole-cut context excerpts and assembled review](edit-plan-context-review.md).
 
+### Short local comparisons
+
+Use `edit-plan compare create|status|cancel|prefer|choice|apply` for two to four
+named, bounded variants from the same project. Creation renders each whole-cut
+excerpt and writes a local sequential player; preference and optional draft
+application remain explicit human operations. See
+[short comparisons](edit-plan-comparisons.md) for scope, verification, receipts,
+and revision guards.
+
 ### Native video review
 
 Use `native-video preflight|authorize|pilot|prepare|windows|run|status|wait|cancel|result|evidence-list|run-windows` for explicit bounded direct video review. Policy and window inputs are typed capped JSON files; local preparation and read-only planning are separate from provider execution. See [native video review](native-video-review.md) for the full contract and examples.

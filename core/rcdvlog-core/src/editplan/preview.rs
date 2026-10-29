@@ -202,7 +202,9 @@ impl Catalog {
         } else {
             &plan.operations[..]
         };
-        let audio_window = window.as_ref().map(|w| (w.in_seconds(), w.out_seconds()));
+        let audio_window = window
+            .as_ref()
+            .map(|w| (w.in_seconds(), w.audio_end_seconds));
         let constraints_key = super::ranges::constraints_key(&self.connection()?, plan)?;
         let report =
             self.validate_edit_plan_audio_window(&request.revision_id, cancel, audio_window)?;
@@ -548,7 +550,7 @@ impl Catalog {
                     &audio_events,
                     super::audio_render::AudioMixWindow {
                         in_samples: (w.in_seconds() * 48000.0).round() as u64,
-                        out_samples: (w.out_seconds() * 48000.0).round() as u64,
+                        out_samples: (w.audio_end_seconds * 48000.0).round() as u64,
                     },
                     cancel,
                 )?

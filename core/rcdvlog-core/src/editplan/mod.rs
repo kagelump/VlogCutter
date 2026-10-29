@@ -18,6 +18,8 @@
 
 pub mod audio;
 mod audio_render;
+pub mod comparison;
+mod comparison_player;
 pub mod context_review;
 pub mod diff;
 pub mod feedback;

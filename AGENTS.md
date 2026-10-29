@@ -122,6 +122,11 @@ Implemented now:
   handles. Explicit human notes flow through the existing feedback owner; this
   does not invoke a provider, make decisions, or activate plans. See
   `docs/edit-plan-context-review.md` and `docs/agent-cli.md`.
+- Schema 61 adds bounded local short comparisons over two to four named whole-cut
+  excerpts, with a standalone sequential player and explicit byte verification.
+  Only an explicit human preference records feedback; optional retention and
+  inactive draft application use the existing feedback and revision guards. See
+  `docs/edit-plan-comparisons.md` and `docs/agent-cli.md`.
 - Schema 56 adds optional immutable chapter selection intent, pacing profiles,
   evidence identities and reports. Selection reuses local moments, preserves human
   constraints and creates inactive normal plans; see `docs/edit-plan-selection.md`.

@@ -3,7 +3,8 @@ use super::{EditPlanAudio, EditPlanRevision, PreviewRequest};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
-pub(super) const EXCERPT_RECIPE: &str = "cutNeighborhood.absolute-audio-crop.v1";
+pub(super) const EXCERPT_RECIPE: &str =
+    "cutNeighborhood.absolute-audio-crop.preserve-final-sound.v2";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -27,6 +28,7 @@ pub(super) struct ExcerptWindow {
     pub prefix_seconds: f64,
     pub first_frame: u64,
     pub end_frame: u64,
+    pub audio_end_seconds: f64,
     pub frame_counts: Vec<u64>,
 }
 impl ExcerptWindow {
@@ -95,6 +97,11 @@ pub(super) fn resolve(
         prefix_seconds: prefix,
         first_frame,
         end_frame: previous,
+        audio_end_seconds: if last + 1 == plan.operations.len() {
+            seconds.max(previous as f64 * 1001.0 / 30000.0)
+        } else {
+            previous as f64 * 1001.0 / 30000.0
+        },
         frame_counts: counts,
     };
     ensure!(
@@ -125,7 +132,7 @@ pub(super) fn relevant_assets<'a>(
             None => Some((cut.asset_id.as_str(), at, duration)),
         };
         if let Some((id, start, len)) = audio
-            && start < window.out_seconds()
+            && start < window.audio_end_seconds
             && start + len > window.in_seconds()
         {
             ids.insert(id);
