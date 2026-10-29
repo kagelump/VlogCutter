@@ -17,6 +17,7 @@
 //! no longer true.
 
 pub mod audio;
+pub mod audio_integrity;
 mod audio_render;
 pub mod comparison;
 mod comparison_player;

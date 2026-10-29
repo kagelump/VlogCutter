@@ -264,6 +264,7 @@ pub use diagnostics::{
     Diagnostic, DiagnosticCounts, DiagnosticFilter, DiagnosticRecord, DiagnosticSeverity,
     DiagnosticSubject,
 };
+pub use editplan::audio_integrity::*;
 pub use editplan::comparison::*;
 pub use editplan::context_review::*;
 pub use editplan::feedback::*;

@@ -122,6 +122,27 @@ fn clocks(path: &Path, cancel: &dyn Fn() -> bool) -> Result<Value> {
     serde_json::from_slice(&command_output(&mut command, cancel)?.stdout)
         .context("parse preview media clocks")
 }
+pub(super) fn plan_digest(
+    catalog: &Catalog,
+    plan: &EditPlanRevision,
+    excerpt: Option<&super::PreviewExcerptScope>,
+) -> Result<String> {
+    let mut plan_identity = json!({"revisionId":plan.revision_id,"projectId":plan.project_id,
+        "parentRevisionId":plan.parent_revision_id,"scriptRevisionId":plan.script_revision_id,"operations":plan.operations});
+    if let Some(selection) =
+        super::selection::metadata_fingerprint(&catalog.connection()?, &plan.revision_id)?
+    {
+        plan_identity["selection"] = json!(selection);
+    }
+    if excerpt.is_some() {
+        plan_identity["excerptRecipe"] = json!(super::preview_excerpt::EXCERPT_RECIPE);
+    }
+    let plan_digest = blake3::hash(&serde_json::to_vec(&plan_identity)?)
+        .to_hex()
+        .to_string();
+    Ok(plan_digest)
+}
+
 pub(super) fn prepare(
     catalog: &Catalog,
     plan: &EditPlanRevision,
@@ -205,19 +226,7 @@ pub(super) fn prepare(
         });
         paths.insert(id.into(), path);
     }
-    let mut plan_identity = json!({"revisionId":plan.revision_id,"projectId":plan.project_id,
-        "parentRevisionId":plan.parent_revision_id,"scriptRevisionId":plan.script_revision_id,"operations":plan.operations});
-    if let Some(selection) =
-        super::selection::metadata_fingerprint(&catalog.connection()?, &plan.revision_id)?
-    {
-        plan_identity["selection"] = json!(selection);
-    }
-    if excerpt.is_some() {
-        plan_identity["excerptRecipe"] = json!(super::preview_excerpt::EXCERPT_RECIPE);
-    }
-    let plan_digest = blake3::hash(&serde_json::to_vec(&plan_identity)?)
-        .to_hex()
-        .to_string();
+    let plan_digest = plan_digest(catalog, plan, excerpt)?;
     let tools = tool_identities();
     let mut tool_content_fingerprints = Vec::new();
     for name in ["ffmpeg", "ffprobe"] {

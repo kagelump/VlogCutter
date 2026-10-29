@@ -31,6 +31,10 @@ application remain explicit human operations. See
 [short comparisons](edit-plan-comparisons.md) for scope, verification, receipts,
 and revision guards.
 
+### Selected audio integrity
+
+Use `edit-plan audio-audit create|get` for a bounded, local audit of original and renderer-selected audio presence plus sampled master/selected/rendered energy. A source-only presence audit explicitly uses `artifactId: null` and no samples; preview-backed samples require an artifact matching the same revision and exact excerpt scope. The report exposes whether rendered inputs still match. It is technical evidence, not human listening or editorial acceptance. See [selected audio integrity](selected-audio-integrity.md) for bounds and interpretation.
+
 ### Native video review
 
 Use `native-video preflight|authorize|pilot|prepare|windows|run|status|wait|cancel|result|evidence-list|run-windows` for explicit bounded direct video review. Policy and window inputs are typed capped JSON files; local preparation and read-only planning are separate from provider execution. See [native video review](native-video-review.md) for the full contract and examples.

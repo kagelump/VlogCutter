@@ -173,14 +173,7 @@ impl SegmentClaim {
         Ok(claim)
     }
     fn object_path(&self, name: &str) -> Result<PathBuf> {
-        ensure!(
-            name.starts_with("segment_")
-                && name.ends_with(".mp4")
-                && name.len() == 44
-                && name[8..40].bytes().all(|c| c.is_ascii_hexdigit()),
-            "invalid preview cache object locator"
-        );
-        Ok(self.directory.join("objects").join(name))
+        segment_object_path(&self.directory, name)
     }
     /// Called only after the renderer's actual stream/duration/decode checks.
     pub fn publish(
@@ -222,6 +215,115 @@ impl SegmentClaim {
             frame_count: frames,
         })
     }
+}
+
+fn segment_object_path(directory: &Path, name: &str) -> Result<PathBuf> {
+    ensure!(
+        name.starts_with("segment_")
+            && name.ends_with(".mp4")
+            && name.len() == 44
+            && name.as_bytes()[8..40].iter().all(|c| c.is_ascii_hexdigit()),
+        "invalid preview cache object locator"
+    );
+    Ok(directory.join("objects").join(name))
+}
+
+/// Read-only audit of one existing segment's expected and decoded audio state.
+pub(super) fn inspect_audio_contract(
+    catalog: &Catalog,
+    project: &str,
+    key: &str,
+    cancel: &dyn Fn() -> bool,
+) -> Result<serde_json::Value> {
+    ensure!(
+        !project.is_empty()
+            && project.len() <= 255
+            && project != "."
+            && project != ".."
+            && !project.contains(['/', '\\'])
+            && !project.chars().any(char::is_control),
+        "invalid project cache component"
+    );
+    ensure!(
+        key.len() == 64 && key.bytes().all(|c| c.is_ascii_hexdigit()),
+        "invalid preview segment key"
+    );
+    ensure!(!cancel(), "segment audio inspection cancelled");
+    let (body, body_len): (String, i64) = catalog.connection()?.query_row(
+        "SELECT substr(body_json,1,16385),length(body_json) FROM preview_segments WHERE segment_key=?1 AND project_id=?2",
+        params![key, project],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    ensure!(
+        body_len > 0 && body_len <= 16_384,
+        "preview segment receipt is oversized"
+    );
+    let receipt: Receipt = serde_json::from_str(&body)?;
+    ensure!(
+        receipt.version == 1
+            && receipt.project_id == project
+            && receipt.segment_key == key
+            && receipt.fully_decoded
+            && receipt.frame_count > 0
+            && receipt.frame_count <= 1_800_000,
+        "preview segment receipt identity or coverage mismatch"
+    );
+    if let Some(frames) = receipt.expectation.frames {
+        ensure!(
+            receipt.frame_count == frames,
+            "preview segment frame count changed"
+        );
+    }
+
+    let mut directory = super::preview_artifacts::project_directory(catalog)?;
+    for component in ["cache", "preview-segments", project, key, "objects"] {
+        directory.push(component);
+        let meta = fs::symlink_metadata(&directory)?;
+        ensure!(
+            meta.is_dir()
+                && !meta.file_type().is_symlink()
+                && fs::canonicalize(&directory)? == directory,
+            "preview segment directory is not an owned canonical directory"
+        );
+    }
+    let key_directory = directory
+        .parent()
+        .context("preview segment key directory missing")?;
+    let path = segment_object_path(key_directory, &receipt.object_name)?;
+    let meta = fs::symlink_metadata(&path)?;
+    ensure!(
+        meta.is_file() && !meta.file_type().is_symlink() && fs::canonicalize(&path)? == path,
+        "preview segment object is not an owned regular file"
+    );
+    ensure!(
+        meta.len() == receipt.byte_length,
+        "preview segment object size changed"
+    );
+    let hash = crate::full_file_blake3(&path, cancel)?;
+    ensure!(
+        hash.hex_digest == receipt.fingerprint && hash.byte_count == receipt.byte_length,
+        "preview segment object fingerprint changed"
+    );
+    let audio = super::audio::probe_audio_bounds(
+        path.to_str().context("preview segment path is not UTF-8")?,
+        cancel,
+    )?;
+    let expected_audio = receipt.expectation.audio;
+    let state = if audio.present == expected_audio {
+        "matching"
+    } else {
+        "mismatch"
+    };
+    Ok(serde_json::json!({
+        "projectId": project,
+        "segmentKey": key,
+        "expectedAudio": expected_audio,
+        "audioPresent": audio.present,
+        "audioRangeSeconds": audio.range,
+        "fingerprint": receipt.fingerprint,
+        "state": state,
+        "role": if expected_audio { "linkedSegment" } else { "pictureOnly" },
+    }))
 }
 
 #[cfg(test)]
