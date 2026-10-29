@@ -277,12 +277,12 @@ pub(super) fn audio_events_cancellable_window(
     Ok(events)
 }
 
-struct AudioBounds {
-    present: bool,
-    range: Option<(f64, f64)>,
+pub(super) struct AudioBounds {
+    pub present: bool,
+    pub range: Option<(f64, f64)>,
 }
 
-fn probe_audio_bounds(source: &str, cancel: &dyn Fn() -> bool) -> Result<AudioBounds> {
+pub(super) fn probe_audio_bounds(source: &str, cancel: &dyn Fn() -> bool) -> Result<AudioBounds> {
     let mut command = crate::tool_command("ffprobe");
     command
         .args([

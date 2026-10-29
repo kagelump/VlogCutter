@@ -2,10 +2,10 @@
 use anyhow::{Context, Result, ensure};
 use clap::{Args, Subcommand};
 use rcdvlog_core::{
-    AcceptedReviewReference, ApplyReviewFeedbackRequest, AssembledContextRequest, Catalog,
-    ComparisonPreferenceRequest, ConfirmSourceRangeRequest, DecideReviewFeedbackRequest,
-    EditPlanOperation, MapReviewTargetRequest, PreviewExcerptRequest, PreviewRequest,
-    ProposeReviewChangeRequest, RecordReviewNoteRequest, SequenceSelectionInput,
+    AcceptedReviewReference, ApplyReviewFeedbackRequest, AssembledContextRequest,
+    AudioIntegrityRequest, Catalog, ComparisonPreferenceRequest, ConfirmSourceRangeRequest,
+    DecideReviewFeedbackRequest, EditPlanOperation, MapReviewTargetRequest, PreviewExcerptRequest,
+    PreviewRequest, ProposeReviewChangeRequest, RecordReviewNoteRequest, SequenceSelectionInput,
     SequenceSelectionRequest, ShortComparisonRequest, SourceInspectionRequest, SourceTrimRequest,
 };
 use serde::Deserialize;
@@ -135,6 +135,26 @@ pub enum EditPlanCommand {
     Compare {
         #[command(subcommand)]
         command: ShortComparisonCommand,
+    },
+    /// Audit bounded source and rendered audio presence/energy without making editorial decisions.
+    AudioAudit {
+        #[command(subcommand)]
+        command: AudioAuditCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AudioAuditCommand {
+    /// Create or reuse bounded selected-audio evidence for a revision scope.
+    Create {
+        /// AudioIntegrityRequest JSON, capped at 64 KiB.
+        #[arg(long)]
+        input: PathBuf,
+    },
+    /// Read historical audio evidence without rechecking current media.
+    Get {
+        #[arg(long)]
+        evidence: String,
     },
 }
 
@@ -413,6 +433,10 @@ pub fn command_name(command: &EditPlanCommand) -> &'static str {
             ShortComparisonCommand::Choice { .. } => "edit-plan.compare.choice",
             ShortComparisonCommand::Apply { .. } => "edit-plan.compare.apply",
         },
+        EditPlanCommand::AudioAudit { command } => match command {
+            AudioAuditCommand::Create { .. } => "edit-plan.audio-audit.create",
+            AudioAuditCommand::Get { .. } => "edit-plan.audio-audit.get",
+        },
     }
 }
 
@@ -445,6 +469,9 @@ pub fn is_read_only(command: &EditPlanCommand) -> bool {
             | EditPlanCommand::Compare {
                 command: ShortComparisonCommand::Status { verify: false, .. }
                     | ShortComparisonCommand::Choice { .. }
+            }
+            | EditPlanCommand::AudioAudit {
+                command: AudioAuditCommand::Get { .. }
             }
     )
 }
@@ -757,6 +784,26 @@ pub fn execute(catalog: &Catalog, command: &EditPlanCommand) -> Result<Value> {
                 )?),
             }
         }
+        EditPlanCommand::AudioAudit { command } => match command {
+            AudioAuditCommand::Create { input } => {
+                let request: AudioIntegrityRequest = read_review_input(input)?;
+                Ok(serde_json::to_value(
+                    catalog.audit_selected_audio_with_progress(
+                        &request,
+                        &|| false,
+                        &mut |event| {
+                            eprintln!(
+                                "{}",
+                                json!({ "event": "audio-audit-progress", "data": event })
+                            )
+                        },
+                    )?,
+                )?)
+            }
+            AudioAuditCommand::Get { evidence } => Ok(serde_json::to_value(
+                catalog.audio_integrity_evidence(evidence)?,
+            )?),
+        },
     }
 }
 

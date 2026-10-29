@@ -7,7 +7,7 @@ use thiserror::Error;
 
 use crate::chronology::forward_migrate_project_chronology;
 
-pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 61;
+pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 62;
 
 const MIGRATION_TABLE_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -450,7 +450,28 @@ pub const PROJECT_CATALOG_MIGRATIONS: &[SqliteMigration] = &[
         source_identity: "project-catalog/0061-short-preview-comparisons/20261029",
         apply: short_preview_comparisons,
     },
+    SqliteMigration {
+        id: 62,
+        name: "bounded_selected_audio_integrity",
+        source_identity: "project-catalog/0062-bounded-selected-audio-integrity/20261029",
+        apply: bounded_selected_audio_integrity,
+    },
 ];
+
+fn bounded_selected_audio_integrity(transaction: &Transaction<'_>) -> Result<()> {
+    transaction.execute_batch(
+        "CREATE TABLE IF NOT EXISTS audio_integrity_audits(
+        evidence_id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        revision_id TEXT NOT NULL,
+        identity_json TEXT NOT NULL,
+        report_json TEXT NOT NULL,
+        report_fingerprint TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    );",
+    )?;
+    Ok(())
+}
 
 fn short_preview_comparisons(transaction: &Transaction<'_>) -> Result<()> {
     transaction.execute_batch(

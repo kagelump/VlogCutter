@@ -127,6 +127,7 @@ Implemented now:
   Only an explicit human preference records feedback; optional retention and
   inactive draft application use the existing feedback and revision guards. See
   `docs/edit-plan-comparisons.md` and `docs/agent-cli.md`.
+- Schema 62 adds bounded selected-audio integrity evidence for original and renderer-selected sound, known silent preview segments, and requested master/selected/rendered energy samples. It is local technical evidence only; it does not infer master silence from derivatives or certify speech/editorial quality. See `docs/selected-audio-integrity.md` and `docs/agent-cli.md`.
 - Schema 56 adds optional immutable chapter selection intent, pacing profiles,
   evidence identities and reports. Selection reuses local moments, preserves human
   constraints and creates inactive normal plans; see `docs/edit-plan-selection.md`.
@@ -582,7 +583,7 @@ Always pass `--catalog` in agent automation, tests, and temporary workflows. A d
 
 SQLite connections enable foreign keys, WAL journal mode, and a five-second busy timeout. Read operations can continue during an uncommitted writer. Project mutations append typed operations with materialized revisions. Adopted projects synchronize bounded operation pages between independent local catalogs; live SQLite/WAL files are never copied or placed on NAS.
 
-Project catalogs use an explicit `schema_migrations` history and are currently at version 57. The server control catalog is version 11; backup format is version 1. Migration definitions have immutable names/source identities and each migration commits atomically. Migration 18 includes a one-time compatibility reconciliation for catalogs created on the import feature branch before its migration IDs were merged with main. When changing the schema:
+Project catalogs use an explicit `schema_migrations` history and are currently at version 62. The server control catalog is version 11; backup format is version 1. Migration definitions have immutable names/source identities and each migration commits atomically. Migration 18 includes a one-time compatibility reconciliation for catalogs created on the import feature branch before its migration IDs were merged with main. When changing the schema:
 
 - Preserve existing catalogs; never solve migration issues by deleting the database.
 - Add a forward migration and an upgrade test using an older schema fixture.
