@@ -274,7 +274,7 @@ fn short_comparison_cli_verifies_prefers_and_applies_an_inactive_draft() {
     );
 
     fs::write(
-        &variants[0]["preview"]["outputPath"].as_str().unwrap(),
+        variants[0]["preview"]["outputPath"].as_str().unwrap(),
         b"damaged preview",
     )
     .unwrap();
