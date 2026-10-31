@@ -636,7 +636,7 @@ pub fn execute(catalog: &Catalog, command: &EditPlanCommand) -> Result<Value> {
             } => {
                 let group = group_input
                     .as_ref()
-                    .map(|p| read_workflow_input::<rcdvlog_core::PictureCoverageGroup>(p))
+                    .map(read_workflow_input::<rcdvlog_core::PictureCoverageGroup>)
                     .transpose()?;
                 catalog.unused_picture_sources(
                     revision,
