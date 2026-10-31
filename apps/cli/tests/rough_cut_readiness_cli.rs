@@ -1,22 +1,26 @@
 //! Complete supported local editing/review/delivery loop; generated sources only.
 use serde_json::{Value, json};
 use std::{
+    env,
+    ffi::{OsStr, OsString},
     fs,
+    os::unix::fs::PermissionsExt,
     path::Path,
     process::{Command, Output},
 };
 use tempfile::tempdir;
 
-fn invoke(catalog: &Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_rcdvlog"))
-        .arg("--catalog")
-        .arg(catalog)
-        .args(args)
-        .output()
-        .unwrap()
+fn invoke_with_path(catalog: &Path, args: &[&str], path: Option<&OsStr>) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_rcdvlog"));
+    command.arg("--catalog").arg(catalog).args(args);
+    if let Some(path) = path {
+        command.env("PATH", path);
+    }
+    command.output().unwrap()
 }
-fn ok(catalog: &Path, args: &[&str]) -> Value {
-    let output = invoke(catalog, args);
+
+fn ok_with_path(catalog: &Path, args: &[&str], path: Option<&OsStr>) -> Value {
+    let output = invoke_with_path(catalog, args, path);
     assert!(
         output.status.success(),
         "args={args:?}\nstdout={}\nstderr={}",
@@ -26,6 +30,38 @@ fn ok(catalog: &Path, args: &[&str]) -> Value {
     let envelope: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(envelope["ok"], true);
     envelope["data"].clone()
+}
+
+fn ok(catalog: &Path, args: &[&str]) -> Value {
+    ok_with_path(catalog, args, None)
+}
+
+fn supported_tool_path(dir: &Path) -> OsString {
+    let tools = dir.join("supported media tools");
+    fs::create_dir(&tools).unwrap();
+    for (name, arg, version) in [
+        ("ffmpeg", "-version", "ffmpeg version 7.1.5"),
+        ("ffprobe", "-version", "ffprobe version 7.1.5"),
+        ("exiftool", "-ver", "13.36"),
+    ] {
+        let path = tools.join(name);
+        fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\nif [ \"${{1:-}}\" = \"{arg}\" ]; then\n  printf '%s\\n' '{version}'\n  exit 0\nfi\nexit 2\n"
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&path, permissions).unwrap();
+    }
+
+    let mut paths = vec![tools];
+    if let Some(current) = env::var_os("PATH") {
+        paths.extend(env::split_paths(&current));
+    }
+    env::join_paths(paths).unwrap()
 }
 fn input(dir: &Path, name: &str, value: &Value) -> String {
     let p = dir.join(name);
@@ -96,7 +132,15 @@ fn supported_cli_reuses_one_catalog_for_sparse_edits_review_and_delivery() {
         .unwrap();
     let a = assets[0]["id"].as_str().unwrap();
     let b = assets[1]["id"].as_str().unwrap();
-    let ready = ok(&catalog, &["doctor", "--workflow", "delivery"]);
+    // The host toolchain is used for real generated-media work below. Keep the
+    // workflow preflight deterministic across Linux distributions whose bundled
+    // FFmpeg may be older than the supported minimum.
+    let supported_path = supported_tool_path(dir.path());
+    let ready = ok_with_path(
+        &catalog,
+        &["doctor", "--workflow", "delivery"],
+        Some(&supported_path),
+    );
     assert_eq!(ready["catalogStatus"]["compatible"], true);
     let plan = input(
         dir.path(),
