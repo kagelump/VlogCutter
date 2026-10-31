@@ -240,11 +240,13 @@ impl Catalog {
         let images = media::encode_frames(
             &source.path,
             &workspace,
-            asset.rotation_degrees,
-            request.max_width,
-            representation_start,
-            &selected,
-            request.decode_timeout_seconds,
+            media::FrameDecodeConfig {
+                rotation: asset.rotation_degrees,
+                width: request.max_width,
+                start_seconds: representation_start,
+                pts: &selected,
+                timeout_seconds: request.decode_timeout_seconds,
+            },
             cancel,
         )?;
         write_attempt_checkpoint(&workspace, &id, "framesDecoded", selected.len(), 0)?;

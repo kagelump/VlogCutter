@@ -222,14 +222,17 @@ pub(crate) fn output_with_timeout_cancellation_and_limit(
                 }
             }
         }
-        if status.is_some() && stdout_reader.is_finished() && stderr_reader.is_finished() {
+        if let Some(status) = status
+            && stdout_reader.is_finished()
+            && stderr_reader.is_finished()
+        {
             let stdout = stdout_reader.join().unwrap_or_default();
             let stderr = stderr_reader.join().unwrap_or_default();
             if output_exceeded.load(std::sync::atomic::Ordering::Relaxed) {
                 bail!("{what} exceeded its {max_output_bytes}-byte output limit");
             }
             return Ok(std::process::Output {
-                status: status.expect("child exited"),
+                status,
                 stdout,
                 stderr,
             });

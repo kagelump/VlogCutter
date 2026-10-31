@@ -258,16 +258,27 @@ pub(crate) fn frame_pts(
     Ok(pts)
 }
 
+pub(super) struct FrameDecodeConfig<'a> {
+    pub rotation: u16,
+    pub width: u32,
+    pub start_seconds: f64,
+    pub pts: &'a [i64],
+    pub timeout_seconds: u32,
+}
+
 pub(super) fn encode_frames(
     path: &Path,
     workspace: &Path,
-    rotation: u16,
-    width: u32,
-    start: f64,
-    pts: &[i64],
-    timeout_seconds: u32,
+    config: FrameDecodeConfig<'_>,
     cancel: &dyn Fn() -> bool,
 ) -> Result<Vec<InspectionFile>> {
+    let FrameDecodeConfig {
+        rotation,
+        width,
+        start_seconds,
+        pts,
+        timeout_seconds,
+    } = config;
     let turn = match rotation {
         0 => "",
         90 => "transpose=clock,",
@@ -283,7 +294,7 @@ pub(super) fn encode_frames(
     let filter = format!(
         "select={select},{turn}scale='min({width},iw)':'min({width},ih)':force_original_aspect_ratio=decrease"
     );
-    let seek = (start - 1.0).max(0.0).floor();
+    let seek = (start_seconds - 1.0).max(0.0).floor();
     let mut command = tool_command("ffmpeg");
     command
         .args(["-y", "-v", "error", "-copyts", "-ss"])

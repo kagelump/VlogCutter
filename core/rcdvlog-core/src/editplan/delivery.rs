@@ -56,6 +56,20 @@ fn safe_name(name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
+fn safe_contact_id_prefix(operation_id: &str) -> String {
+    operation_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(32)
+        .collect()
+}
+
 fn digest_file(path: &Path, cancel: &dyn Fn() -> bool) -> Result<(String, u64)> {
     let mut file = File::open(path).with_context(|| format!("open {}", path.display()))?;
     let mut hasher = Hasher::new();
@@ -330,17 +344,30 @@ fn measured_movie_mapping(
     })
 }
 
-fn bundle_html(
-    title: &str,
-    manifest_name: &str,
-    cuts: &[PreviewCutMapping],
-    context: Option<&Value>,
-    contacts: &[Value],
-    handles: &[Value],
+struct BundleHtmlView<'a> {
+    title: &'a str,
+    manifest_name: &'a str,
+    cuts: &'a [PreviewCutMapping],
+    context: Option<&'a Value>,
+    contacts: &'a [Value],
+    handles: &'a [Value],
     movie_time_base_numerator: i64,
     movie_time_base_denominator: i64,
     movie_origin_pts: i64,
-) -> String {
+}
+
+fn bundle_html(view: BundleHtmlView<'_>) -> String {
+    let BundleHtmlView {
+        title,
+        manifest_name,
+        cuts,
+        context,
+        contacts,
+        handles,
+        movie_time_base_numerator,
+        movie_time_base_denominator,
+        movie_origin_pts,
+    } = view;
     let rows = cuts
         .iter()
         .map(|cut| {
@@ -683,17 +710,7 @@ impl Catalog {
         ]);
         if request.contact_sheet && artifact.kind == "cutNeighborhood" {
             for (index, cut) in validation.cuts.iter().enumerate() {
-                let safe_id: String = cut
-                    .operation_id
-                    .chars()
-                    .map(|c| {
-                        if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                            c
-                        } else {
-                            '_'
-                        }
-                    })
-                    .collect();
+                let safe_id = safe_contact_id_prefix(&cut.operation_id);
                 for label in ["start", "middle", "end"] {
                     expected_files.insert(format!("frame-{index:04}-{safe_id}-{label}.jpg"));
                 }
@@ -775,17 +792,7 @@ impl Catalog {
                     ("middle", (start + end) / 2.0),
                     ("end", last_frame_start.max(start)),
                 ] {
-                    let safe_id: String = cut
-                        .operation_id
-                        .chars()
-                        .map(|c| {
-                            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                                c
-                            } else {
-                                '_'
-                            }
-                        })
-                        .collect();
+                    let safe_id = safe_contact_id_prefix(&cut.operation_id);
                     let filename = format!("frame-{index:04}-{safe_id}-{label}.jpg");
                     let dest = bundle.join(&filename);
                     let (hash, len) = render_frame_or_verify(&movie, &dest, seconds, cancel)?;
@@ -1002,17 +1009,17 @@ impl Catalog {
                 &serde_json::to_vec_pretty(&contact_doc)?,
             )?);
         }
-        let html = bundle_html(
-            &request.name,
-            "manifest.json",
-            &validation.cuts,
-            context_value.as_ref(),
-            &contact_records,
-            &handle_records,
-            validation.movie_time_base_numerator,
-            validation.movie_time_base_denominator,
-            validation.movie_origin_pts,
-        );
+        let html = bundle_html(BundleHtmlView {
+            title: &request.name,
+            manifest_name: "manifest.json",
+            cuts: &validation.cuts,
+            context: context_value.as_ref(),
+            contacts: &contact_records,
+            handles: &handle_records,
+            movie_time_base_numerator: validation.movie_time_base_numerator,
+            movie_time_base_denominator: validation.movie_time_base_denominator,
+            movie_origin_pts: validation.movie_origin_pts,
+        });
         files.push(write_or_verify(
             &bundle.join("index.html"),
             html.as_bytes(),

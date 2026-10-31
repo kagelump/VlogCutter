@@ -9,12 +9,13 @@ use std::fs;
 #[test]
 fn verified_render_exports_stable_create_only_bundle_and_reuses_verified_files() {
     let (temp, catalog, asset_id) = fixture();
+    let long_operation_id = "a".repeat(255);
     let project_id = catalog.get_asset(&asset_id).unwrap().project_id;
     let plan = catalog
         .create_edit_plan_from_base(
             &project_id,
             &[EditPlanOperation {
-                operation_id: "delivery-cut-1".into(),
+                operation_id: long_operation_id.clone(),
                 position: 0,
                 asset_id: asset_id.clone(),
                 source_in_seconds: 0.5,
@@ -33,8 +34,8 @@ fn verified_render_exports_stable_create_only_bundle_and_reuses_verified_files()
                 revision_id: plan.revision_id.clone(),
                 max_height: 144,
                 scope: PreviewExcerptScope {
-                    first_operation_id: "delivery-cut-1".into(),
-                    last_operation_id: "delivery-cut-1".into(),
+                    first_operation_id: long_operation_id.clone(),
+                    last_operation_id: long_operation_id.clone(),
                 },
             },
             &mut |_| {},
@@ -92,15 +93,15 @@ fn verified_render_exports_stable_create_only_bundle_and_reuses_verified_files()
     let mapping: Value =
         serde_json::from_slice(&fs::read(first.bundle_directory.join("mapping.json")).unwrap())
             .unwrap();
-    assert_eq!(mapping["cuts"][0]["operationId"], "delivery-cut-1");
+    assert_eq!(mapping["cuts"][0]["operationId"], long_operation_id);
     assert_eq!(
         mapping["cuts"][0]["movieMapping"]["mapping"]["outputFrameCount"],
         validation_frame_count(&catalog, &artifact_id)
     );
     let html = fs::read_to_string(first.bundle_directory.join("index.html")).unwrap();
     assert!(html.contains("<video controls"));
-    assert!(html.contains("delivery-cut-1"));
-    assert!(html.contains("frame-0000-delivery-cut-1-start.jpg"));
+    assert!(html.contains(&long_operation_id));
+    assert!(html.contains("frame-0000-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-start.jpg"));
     assert!(html.contains("<audio controls"));
     let contact_frames = first
         .files
@@ -111,7 +112,7 @@ fn verified_render_exports_stable_create_only_bundle_and_reuses_verified_files()
     assert!(
         contact_frames
             .iter()
-            .all(|file| first.bundle_directory.join(&file.path).is_file())
+            .all(|file| file.path.len() < 255 && first.bundle_directory.join(&file.path).is_file())
     );
     assert!(
         first
@@ -132,7 +133,7 @@ fn verified_render_exports_stable_create_only_bundle_and_reuses_verified_files()
         resumed.reused,
         "owned pre-manifest outputs should resume after interruption"
     );
-    fs::write(&first.bundle_directory.join("movie.mp4"), b"damaged").unwrap();
+    fs::write(first.bundle_directory.join("movie.mp4"), b"damaged").unwrap();
     assert!(
         catalog
             .export_edit_plan_bundle(&request, &|| false)

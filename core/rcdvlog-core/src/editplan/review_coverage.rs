@@ -388,8 +388,22 @@ fn planned_preview_bounds(plan: &EditPlanRevision) -> Vec<(f64, f64)> {
         .collect()
 }
 
+type CoverageHeaderRow = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    i64,
+    String,
+    String,
+    String,
+    Option<String>,
+);
+
 fn load_record(connection: &Connection, record_id: &str) -> Result<ReviewCoverageRecord> {
-    let row: (String,String,String,String,String,String,i64,String,String,String,Option<String>) = connection.query_row(
+    let row: CoverageHeaderRow = connection.query_row(
         "SELECT project_id,revision_id,operation_id,artifact_id,actor,method,explicit_human_playback,recorded_at,dependency_key,evidence_json,uncertainty FROM edit_review_coverage WHERE record_id=?1", [record_id],
         |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?,r.get(9)?,r.get(10)?)))
         .context("read review coverage")?;
@@ -631,12 +645,11 @@ impl Catalog {
             if item.observed_state != PreviewArtifactState::Complete {
                 continue;
             }
-            if let Ok(status) = self.preview_artifact_status(&item.artifact_id, verify) {
-                if status.observed_state == PreviewArtifactState::Complete
-                    && (!verify || status.current_for_request == Some(true))
-                {
-                    current_artifacts.push(status.artifact);
-                }
+            if let Ok(status) = self.preview_artifact_status(&item.artifact_id, verify)
+                && status.observed_state == PreviewArtifactState::Complete
+                && (!verify || status.current_for_request == Some(true))
+            {
+                current_artifacts.push(status.artifact);
             }
         }
         let connection = self.connection()?;
@@ -872,11 +885,11 @@ fn merge_ranges(ranges: &[(f64, f64)], start: f64, end: f64) -> Vec<(f64, f64)> 
         if b <= a {
             continue;
         }
-        if let Some(last) = merged.last_mut() {
-            if a <= last.1 + 1e-7 {
-                last.1 = last.1.max(b);
-                continue;
-            }
+        if let Some(last) = merged.last_mut()
+            && a <= last.1 + 1e-7
+        {
+            last.1 = last.1.max(b);
+            continue;
         }
         merged.push((a, b));
     }

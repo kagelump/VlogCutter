@@ -3919,7 +3919,7 @@ fn require_asset(transaction: &Transaction<'_>, operation: &ProjectOperation) ->
 fn payload<T: DeserializeOwned>(operation: &ProjectOperation) -> Result<T> {
     if operation.payload_version != 1
         && !(operation.operation_type == EDIT_PLAN_REVISION_CREATED
-            && matches!(operation.payload_version, 2 | 3 | 4))
+            && matches!(operation.payload_version, 2..=4))
     {
         bail!(
             "unsupported payload version {} for {}",

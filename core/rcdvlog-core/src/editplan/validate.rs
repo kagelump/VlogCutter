@@ -190,7 +190,7 @@ impl Catalog {
             }
         }
         for (asset_id, message) in
-            super::feedback::retained_choice_violations(&self.connection()?, &revision)?
+            super::feedback::retained_choice_violations(&self.connection()?, revision)?
         {
             findings.push(Finding::new(
                 FindingKind::HumanChoiceViolation,
@@ -210,7 +210,7 @@ impl Catalog {
             }
         }
         if let Some(metadata) = super::selection::load_metadata(&self.connection()?, revision_id)? {
-            for conflict in super::selection_report::report(&revision, &metadata).conflicts {
+            for conflict in super::selection_report::report(revision, &metadata).conflicts {
                 findings.push(Finding::new(
                     if conflict.blocking {
                         FindingKind::SelectionConflict
