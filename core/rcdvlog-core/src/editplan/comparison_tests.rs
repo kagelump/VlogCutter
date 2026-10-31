@@ -45,11 +45,12 @@ fn request(a: &EditPlanRevision, b: &EditPlanRevision) -> ShortComparisonRequest
 }
 fn preference(comparison: &ShortComparison, b: &EditPlanRevision) -> ComparisonPreferenceRequest {
     ComparisonPreferenceRequest {
+        provenance: None,
         comparison_id: comparison.id.clone(),
         preferred_variant: "B".into(),
         expected_preferred_revision_id: b.revision_id.clone(),
         expected_active_revision_id: "none".into(),
-        decision_owner: RangeDecisionOwner::Human,
+        decision_owner: Some(RangeDecisionOwner::Human),
         rationale: "Explicit synthetic human-input fixture, not a real listening acceptance".into(),
         retain_operation_ids: vec!["cut-1".into()],
         create_draft: true,

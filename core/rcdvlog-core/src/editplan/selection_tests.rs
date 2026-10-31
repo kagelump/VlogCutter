@@ -523,10 +523,11 @@ fn retained_human_choices_and_canonical_exclusions_survive_reselection_without_d
         .unwrap();
     catalog
         .decide_review_feedback(&DecideReviewFeedbackRequest {
+            provenance: None,
             note_id: note.note.note_id.clone(),
             expected_revision: note.revision,
             proposal_id: None,
-            decision_owner: RangeDecisionOwner::Human,
+            decision_owner: Some(RangeDecisionOwner::Human),
             action: ReviewDecisionAction::Accepted,
             rationale: "Synthetic owner keeps this exact source interval".into(),
             hard_choice: Some(ReviewHardChoice::KeepPictureAndAudio),

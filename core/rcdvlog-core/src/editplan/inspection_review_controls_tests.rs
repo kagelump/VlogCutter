@@ -116,6 +116,9 @@ fn generated_map_dark_and_hand_false_flags_remain_advisory() {
                     expected_representation_fingerprint: None,
                     include_audio: false,
                     include_transcript: false,
+                    io_timeout_seconds: 180,
+                    probe_timeout_seconds: 180,
+                    decode_timeout_seconds: 180,
                 },
                 &|| false,
             )

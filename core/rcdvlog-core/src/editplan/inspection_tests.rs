@@ -1,7 +1,7 @@
 //! Generated numbered/time-coded pictures and sound prove inspection evidence.
 use crate::{
-    Catalog, InspectionPurpose, InspectionRepresentation, SourceInspectionError,
-    SourceInspectionRequest,
+    Catalog, InspectSourceWithPolicyRequest, InspectionPurpose, InspectionRepresentation,
+    SourceInspectionError, SourceInspectionRequest,
 };
 use std::{
     fs,
@@ -99,6 +99,9 @@ fn request(asset: &str) -> SourceInspectionRequest {
         expected_representation_fingerprint: None,
         include_audio: false,
         include_transcript: false,
+        io_timeout_seconds: 180,
+        probe_timeout_seconds: 180,
+        decode_timeout_seconds: 180,
     }
 }
 fn gray(path: &str) -> u8 {
@@ -136,6 +139,10 @@ fn actual_frame_pts_handles_exact_requests_audio_context_and_verified_reuse() {
     assert_eq!(evidence.window_in_seconds, 0.75);
     assert_eq!(evidence.window_out_seconds, 2.25);
     assert_eq!(evidence.mapping.precision, "actualSourcePts");
+    assert_eq!(
+        evidence.actual_representation,
+        Some(InspectionRepresentation::Original)
+    );
     assert_eq!(evidence.frames.len(), 5);
     for frame in &evidence.frames {
         let tick = frame.representation_pts as f64 * evidence.mapping.time_base_numerator as f64
@@ -179,6 +186,12 @@ fn actual_frame_pts_handles_exact_requests_audio_context_and_verified_reuse() {
             .inspection,
         *evidence
     );
+    let attempt = std::path::Path::new(&evidence.frames[0].image.path)
+        .parent()
+        .unwrap()
+        .join("attempt.json");
+    let progress: serde_json::Value = serde_json::from_slice(&fs::read(attempt).unwrap()).unwrap();
+    assert_eq!(progress["state"], "completed");
     assert!(catalog.inspect_source_window(&r, &|| false).unwrap().reused);
     // Request exactly a previously decoded frame. It stays on its rational
     // representation clock and is bound to that exact representation hash.
@@ -435,6 +448,38 @@ fn reduced_rate_proxy_never_claims_missing_source_frames_and_transcript_is_expli
             .utterances
             .is_empty()
     );
+    // A missing original takes the explicitly authorized single proxy
+    // fallback; the evidence names its actual representation and weaker clock.
+    let original_path = std::path::PathBuf::from(&asset.path);
+    let offline_path = original_path.with_extension("offline.mp4");
+    fs::rename(&original_path, &offline_path).unwrap();
+    let mut original_request = r.clone();
+    original_request.include_audio = false;
+    original_request.include_transcript = false;
+    original_request.representation = InspectionRepresentation::Original;
+    original_request.sample_count = 4;
+    let policy = InspectSourceWithPolicyRequest {
+        request: original_request,
+        fallback_representation: Some(InspectionRepresentation::GeneratedProxy),
+    };
+    let fallback = catalog
+        .inspect_source_window_with_policy(&policy, &|| false)
+        .unwrap();
+    assert_eq!(fallback.attempts.len(), 2);
+    assert_eq!(fallback.attempts[0].outcome, "unavailable");
+    let selected = &fallback.inspection.unwrap().inspection;
+    assert_eq!(
+        selected.actual_representation,
+        Some(InspectionRepresentation::GeneratedProxy)
+    );
+    assert_eq!(selected.mapping.precision, "secondsCorrespondence");
+    assert!(
+        selected
+            .limitations
+            .iter()
+            .any(|line| line.contains("not a measured original-frame PTS map"))
+    );
+    fs::rename(&offline_path, original_path).unwrap();
 }
 
 #[test]

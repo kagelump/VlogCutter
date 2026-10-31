@@ -191,7 +191,71 @@ pub enum ReviewDecisionState {
 #[serde(rename_all = "camelCase")]
 pub enum ReviewDecisionOrigin {
     Human,
+    Agent,
     Host,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ReviewDecisionActor {
+    Human,
+    Agent,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ReviewDecisionAuthority {
+    ExplicitHumanChoice,
+    DelegatedEditing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ReviewDecisionConfidence {
+    Confirmed,
+    Provisional,
+}
+
+/// Missing on historical facts: authorship cannot be reconstructed from a rationale.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReviewDecisionProvenance {
+    pub actor: ReviewDecisionActor,
+    pub authority: ReviewDecisionAuthority,
+    pub confidence: ReviewDecisionConfidence,
+}
+
+impl ReviewDecisionProvenance {
+    pub fn human() -> Self {
+        Self {
+            actor: ReviewDecisionActor::Human,
+            authority: ReviewDecisionAuthority::ExplicitHumanChoice,
+            confidence: ReviewDecisionConfidence::Confirmed,
+        }
+    }
+    pub fn agent() -> Self {
+        Self {
+            actor: ReviewDecisionActor::Agent,
+            authority: ReviewDecisionAuthority::DelegatedEditing,
+            confidence: ReviewDecisionConfidence::Provisional,
+        }
+    }
+    pub(super) fn origin(&self) -> anyhow::Result<ReviewDecisionOrigin> {
+        match (self.actor, self.authority, self.confidence) {
+            (
+                ReviewDecisionActor::Human,
+                ReviewDecisionAuthority::ExplicitHumanChoice,
+                ReviewDecisionConfidence::Confirmed,
+            ) => Ok(ReviewDecisionOrigin::Human),
+            (
+                ReviewDecisionActor::Agent,
+                ReviewDecisionAuthority::DelegatedEditing,
+                ReviewDecisionConfidence::Provisional,
+            ) => Ok(ReviewDecisionOrigin::Agent),
+            _ => anyhow::bail!("invalid input: decision actor, authority and confidence disagree"),
+        }
+    }
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -202,10 +266,14 @@ pub enum ReviewHardChoice {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DecideReviewFeedbackRequest {
+    /// Omitted retains the legacy explicit decisionOwner=human assertion.
+    #[serde(default)]
+    pub provenance: Option<ReviewDecisionProvenance>,
     pub note_id: String,
     pub expected_revision: u64,
     pub proposal_id: Option<String>,
-    pub decision_owner: RangeDecisionOwner,
+    #[serde(default)]
+    pub decision_owner: Option<RangeDecisionOwner>,
     pub action: ReviewDecisionAction,
     pub rationale: String,
     /// Explicit retention of an existing cut; proposals are not permanent locks.
@@ -214,6 +282,8 @@ pub struct DecideReviewFeedbackRequest {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ReviewDecision {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<ReviewDecisionProvenance>,
     pub decision_origin: ReviewDecisionOrigin,
     pub decision_id: String,
     pub note_id: String,

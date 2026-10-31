@@ -672,10 +672,7 @@ impl Catalog {
             latest_attempt: is_latest,
             active_revision_id,
             file_present,
-            current_for_request: if observed != PreviewArtifactState::Complete
-                || !file_present
-                || !is_latest
-            {
+            current_for_request: if observed != PreviewArtifactState::Complete || !file_present {
                 Some(false)
             } else {
                 None
@@ -690,8 +687,7 @@ impl Catalog {
             status.active_revision_id = self.active_edit_plan_revision_id(&artifact.project_id)?;
             status.file_present = output_is_owned_file(self, &artifact);
             status.current_for_request = Some(
-                status.latest_attempt
-                    && status.file_present
+                status.file_present
                     && verification.output_matches
                     && verification.inputs_match
                     && verification.constraints_match

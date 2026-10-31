@@ -1261,3 +1261,11 @@ loopback `--port` behind a trusted HTTPS proxy. The authorization event includes
 host. The mobile success page appears only after token exchange and storage.
 This feature does not add scopes for channel reads or
 processing-status polling.
+
+## Rough-cut readiness commands
+
+See [rough-cut readiness](rough-cut-readiness.md) for `doctor --workflow`, atomic
+`edit-plan patch`, `coverage report/unused`, provenance on decisions/preferences,
+`inspect-with-policy`, `review-coverage record/report/list`, `audio-audit plan`,
+phase-aware preview progress, and `edit-plan bundle`. These use the same explicit
+catalog and immutable revision guards as the existing commands.

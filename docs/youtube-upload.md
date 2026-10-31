@@ -232,7 +232,7 @@ throttling. The saved session is queried before continuing, including after a lo
 final response. A refreshed token is retried after a 401. Production session URLs
 must have the exact Google upload origin and path before any token is sent.
 
-Catalog schema 49 adds the **local, unsynced** `youtube_uploads` ledger. It records
+Catalog schema 63 adds the **local, unsynced** `youtube_uploads` ledger. It records
 project/credential identity, file hash/size/path, metadata, revision label, accepted
 bytes, session state, video/channel IDs and timestamps. It stores no OAuth token.
 The resumable session URI is retained only while transferring and omitted from
@@ -268,7 +268,7 @@ rcdvlog --catalog /absolute/project/catalog.sqlite3 youtube history \
 ```
 
 History is read-only, needs no credentials, and never contacts Google. It requires
-a catalog already migrated to schema 49. To automate after a render, invoke upload
+a catalog migrated to the current supported schema. To automate after a render, invoke upload
 only after the renderer and its output checks succeed. CLI success is one JSON
 envelope on stdout; progress is newline-delimited JSON on stderr. Failure keeps
 stdout empty and ends stderr with one JSON error envelope (possibly after progress
@@ -301,3 +301,5 @@ References:
 - [YouTube videos.insert](https://developers.google.com/youtube/v3/docs/videos/insert)
 - [Resumable upload protocol](https://developers.google.com/youtube/v3/guides/using_resumable_upload_protocol)
 - [Visibility documentation clarification](https://issuetracker.google.com/issues/572863050)
+
+The historical upload-only branch allocated schema 49 before editing migrations were merged. The supported build now uses the same current catalog for editing and upload; see [rough-cut readiness](rough-cut-readiness.md) for the lossless compatibility upgrade and workflow preflight.

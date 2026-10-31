@@ -78,6 +78,7 @@ impl NativeVideoMedia {
             &self.asset,
             &self.selected,
             options.representation,
+            180,
             cancel,
         )?;
         ensure!(
@@ -252,8 +253,9 @@ impl Catalog {
             explicit_review,
             cancel,
         )?;
-        let selected = self.inspection_source(&asset, options.representation, cancel)?;
-        let stream = inspection_media::probe(&selected.path, policy.payload.uses_audio(), cancel)?;
+        let selected = self.inspection_source(&asset, options.representation, 180, cancel)?;
+        let stream =
+            inspection_media::probe(&selected.path, policy.payload.uses_audio(), 180, cancel)?;
         let mapping = InspectionTimeMapping {
             time_base_numerator: stream.numerator,
             time_base_denominator: stream.denominator,
@@ -272,7 +274,8 @@ impl Catalog {
             start >= 0.0 && end <= stream.duration + 1e-7,
             "native source scope exceeds selected representation"
         );
-        let available = inspection_media::frame_pts(&selected.path, &mapping, start, end, cancel)?;
+        let available =
+            inspection_media::frame_pts(&selected.path, &mapping, start, end, 180, cancel)?;
         let first = available[0];
         let actual_source_start = mapping.source_seconds(first);
         let actual_representation_start =
@@ -373,6 +376,7 @@ impl Catalog {
                     stream.audio_start_seconds,
                     actual_representation_start,
                     end,
+                    180,
                     cancel,
                 )?)
             } else {
@@ -473,6 +477,7 @@ impl Catalog {
                 &asset,
                 &selected,
                 options.representation,
+                180,
                 cancel,
             )?;
             ensure!(
@@ -482,7 +487,13 @@ impl Catalog {
             self.connection()?.execute("INSERT INTO native_video_media(identity,project_id,asset_id,identity_json,report_json,created_at) VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(identity) DO UPDATE SET report_json=excluded.report_json",params![identity,policy.project_id,asset.id,identity_json,serde_json::to_string(&view)?,crate::now()])?;
             view
         };
-        self.require_inspection_source_current(&asset, &selected, options.representation, cancel)?;
+        self.require_inspection_source_current(
+            &asset,
+            &selected,
+            options.representation,
+            180,
+            cancel,
+        )?;
         let mut bytes = Vec::new();
         fs::File::open(owned_media_path(parent, &view.output_relative_path)?)?
             .take(MAX_MEDIA_BYTES + 1)

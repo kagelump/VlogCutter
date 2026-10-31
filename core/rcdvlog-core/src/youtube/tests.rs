@@ -650,14 +650,14 @@ fn upload_refreshes_after_401_and_probes_before_resending_bytes() {
 }
 
 #[test]
-fn migration_49_upgrades_v48_and_unversioned_replay_preserves_upload_history() {
+fn migration_63_upgrades_v62_and_unversioned_replay_preserves_upload_history() {
     let (directory, catalog, store, options) = fixture(100);
     // Simulate a genuine pre-feature schema, retaining existing project operations.
     catalog
         .connection()
         .unwrap()
         .execute_batch(
-            "DROP TABLE youtube_uploads; DELETE FROM schema_migrations WHERE migration_id=49;",
+            "DROP TABLE youtube_uploads; DELETE FROM schema_migrations WHERE migration_id>=63;",
         )
         .unwrap();
     let readonly =

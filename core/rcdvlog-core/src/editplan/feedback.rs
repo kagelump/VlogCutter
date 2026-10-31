@@ -57,6 +57,26 @@ fn snapshot(cut: &EditPlanOperation) -> ReviewCutSnapshot {
     }
 }
 fn audio_context(plan: &EditPlanRevision, at: usize) -> Result<(String, String, u32)> {
+    let (digest, precision, count, _) = audio_context_with_sources(plan, at)?;
+    Ok((digest, precision, count))
+}
+
+pub(super) fn audio_context_sources(
+    plan: &EditPlanRevision,
+    operation_id: &str,
+) -> Result<std::collections::BTreeSet<String>> {
+    let at = plan
+        .operations
+        .iter()
+        .position(|o| o.operation_id == operation_id)
+        .context("invalid input: audio-context cut not found")?;
+    Ok(audio_context_with_sources(plan, at)?.3)
+}
+
+fn audio_context_with_sources(
+    plan: &EditPlanRevision,
+    at: usize,
+) -> Result<(String, String, u32, std::collections::BTreeSet<String>)> {
     let mut starts = Vec::with_capacity(plan.operations.len());
     let mut cursor = 0.0_f64;
     let mut valid = true;
@@ -131,6 +151,7 @@ fn audio_context(plan: &EditPlanRevision, at: usize) -> Result<(String, String, 
                 .to_string(),
             "unavailableInvalidTiming".into(),
             0,
+            std::collections::BTreeSet::new(),
         ));
     }
     events.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
@@ -139,6 +160,10 @@ fn audio_context(plan: &EditPlanRevision, at: usize) -> Result<(String, String, 
         .into_iter()
         .map(|(_, _, value)| value)
         .collect::<Vec<_>>();
+    let sources = values
+        .iter()
+        .filter_map(|v| v["assetId"].as_str().map(str::to_owned))
+        .collect();
     Ok((
         blake3::hash(&serde_json::to_vec(&(
             "declared-audio-context.48k-neighbors-100ms.v1",
@@ -148,10 +173,11 @@ fn audio_context(plan: &EditPlanRevision, at: usize) -> Result<(String, String, 
         .to_string(),
         "declaredTimeline48k".into(),
         count,
+        sources,
     ))
 }
 
-fn target(plan: &EditPlanRevision, operation: &str) -> Result<ReviewTarget> {
+pub(super) fn target(plan: &EditPlanRevision, operation: &str) -> Result<ReviewTarget> {
     let at = plan
         .operations
         .iter()
@@ -178,7 +204,7 @@ fn target(plan: &EditPlanRevision, operation: &str) -> Result<ReviewTarget> {
         viewed_movie: None,
     })
 }
-fn same_target(left: &ReviewTarget, right: &ReviewTarget) -> bool {
+pub(super) fn same_target(left: &ReviewTarget, right: &ReviewTarget) -> bool {
     left.cut == right.cut
         && left.previous_cut == right.previous_cut
         && left.next_cut == right.next_cut
@@ -714,8 +740,19 @@ impl Catalog {
         request: &DecideReviewFeedbackRequest,
     ) -> Result<ReviewFeedbackView> {
         text(&request.rationale)?;
-        // This is an explicit caller assertion of a human decision. Bounded
-        // reviewer tools have no access to this mutation.
+        ensure!(
+            request.provenance.is_some() || request.decision_owner.is_some(),
+            "invalid input: assert decision provenance or an explicit legacy human decision"
+        );
+        let provenance = request
+            .provenance
+            .clone()
+            .unwrap_or_else(ReviewDecisionProvenance::human);
+        let origin = provenance.origin()?;
+        ensure!(
+            origin == ReviewDecisionOrigin::Human || request.hard_choice.is_none(),
+            "invalid input: agent decisions cannot create authoritative human retention locks"
+        );
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let note = load_note(&transaction, &request.note_id)?;
@@ -728,7 +765,8 @@ impl Catalog {
         };
         let target = effective_target(&transaction, &note, None)?;
         let decision = ReviewDecision {
-            decision_origin: ReviewDecisionOrigin::Human,
+            provenance: Some(provenance),
+            decision_origin: origin,
             decision_id: id("reviewdecision"),
             note_id: note.note_id.clone(),
             proposal_id: request.proposal_id.clone(),
@@ -891,7 +929,10 @@ impl Catalog {
             ensure!(
                 decision.state == ReviewDecisionState::Accepted
                     && decision.proposal_id.as_deref() == Some(&accepted.proposal_id)
-                    && decision.decision_origin == ReviewDecisionOrigin::Human,
+                    && matches!(
+                        decision.decision_origin,
+                        ReviewDecisionOrigin::Human | ReviewDecisionOrigin::Agent
+                    ),
                 ReviewFeedbackError::NotAccepted
             );
             let target = effective_target(&transaction, &note, Some(&proposed))?;
@@ -935,6 +976,7 @@ impl Catalog {
                 ReviewFeedbackError::ConflictingChanges
             );
             let applied = ReviewDecision {
+                provenance: decision.provenance.clone(),
                 decision_origin: ReviewDecisionOrigin::Host,
                 decision_id: id("reviewdecision"),
                 note_id: accepted.note_id.clone(),
@@ -1213,7 +1255,8 @@ pub(crate) fn materialize(
                     && prior.hard_choice.is_some()
                 {
                     ensure!(
-                        decision.state == ReviewDecisionState::Superseded
+                        (decision.state == ReviewDecisionState::Superseded
+                            && decision.decision_origin == ReviewDecisionOrigin::Human)
                             || (decision.state == ReviewDecisionState::Accepted
                                 && decision.hard_choice.is_some()),
                         "explicitly supersede the retained human choice before deferring, addressing or replacing its decision"
@@ -1235,7 +1278,11 @@ pub(crate) fn materialize(
                         .ok_or(ReviewFeedbackError::NotAccepted)?;
                     ensure!(
                         accepted.state == ReviewDecisionState::Accepted
-                            && accepted.decision_origin == ReviewDecisionOrigin::Human
+                            && matches!(
+                                accepted.decision_origin,
+                                ReviewDecisionOrigin::Human | ReviewDecisionOrigin::Agent
+                            )
+                            && decision.provenance == accepted.provenance
                             && decision.accepted_decision_id.as_deref()
                                 == Some(&accepted.decision_id)
                             && decision.proposal_id == accepted.proposal_id,
@@ -1268,12 +1315,29 @@ pub(crate) fn materialize(
                     );
                 } else {
                     ensure!(
-                        decision.decision_origin == ReviewDecisionOrigin::Human
-                            && decision.applied_revision_id.is_none()
+                        matches!(
+                            decision.decision_origin,
+                            ReviewDecisionOrigin::Human | ReviewDecisionOrigin::Agent
+                        ) && decision.applied_revision_id.is_none()
                             && decision.accepted_decision_id.is_none(),
-                        "review acceptance/deferral requires a human decision"
+                        "review acceptance/deferral requires an explicit human or delegated agent decision"
                     );
+                    if let Some(provenance) = &decision.provenance {
+                        ensure!(
+                            provenance.origin()? == decision.decision_origin,
+                            "invalid input: decision provenance differs from origin"
+                        );
+                    } else {
+                        ensure!(
+                            decision.decision_origin == ReviewDecisionOrigin::Human,
+                            "invalid input: agent decisions require explicit provenance"
+                        );
+                    }
                     if let Some(_policy) = decision.hard_choice {
+                        ensure!(
+                            decision.decision_origin == ReviewDecisionOrigin::Human,
+                            "invalid input: only explicit human choices may retain cuts"
+                        );
                         ensure!(
                             decision.state == ReviewDecisionState::Accepted && proposed.is_none(),
                             "retention applies to an existing reviewed cut; accepted proposals do not silently become permanent locks"

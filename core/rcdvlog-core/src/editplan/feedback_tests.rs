@@ -63,6 +63,7 @@ fn accept(
 ) -> ReviewFeedbackView {
     catalog
         .decide_review_feedback(&DecideReviewFeedbackRequest {
+            provenance: None,
             note_id: view.note.note_id.clone(),
             expected_revision: view.revision,
             proposal_id: if hard.is_none() {
@@ -70,7 +71,7 @@ fn accept(
             } else {
                 None
             },
-            decision_owner: RangeDecisionOwner::Human,
+            decision_owner: Some(RangeDecisionOwner::Human),
             action: ReviewDecisionAction::Accepted,
             rationale: "Synthetic human decision for test mechanics.".into(),
             hard_choice: hard,
@@ -421,10 +422,11 @@ fn explicit_human_hero_retention_survives_reselection_and_unaccepted_suggestions
             .renderable()
     );
     let mut request = DecideReviewFeedbackRequest {
+        provenance: None,
         note_id: retained.note.note_id.clone(),
         expected_revision: suggested.revision,
         proposal_id: None,
-        decision_owner: RangeDecisionOwner::Human,
+        decision_owner: Some(RangeDecisionOwner::Human),
         action: ReviewDecisionAction::Deferred,
         rationale: "Synthetic deferral must not withdraw a retained hero.".into(),
         hard_choice: None,
@@ -560,10 +562,11 @@ fn concurrent_feedback_decisions_have_one_cas_winner_and_no_extra_fact() {
         let run = |catalog: Catalog, action| {
             barrier.wait();
             catalog.decide_review_feedback(&DecideReviewFeedbackRequest {
+                provenance: None,
                 note_id: observed.note.note_id.clone(),
                 expected_revision: 1,
                 proposal_id: None,
-                decision_owner: RangeDecisionOwner::Human,
+                decision_owner: Some(RangeDecisionOwner::Human),
                 action,
                 rationale: "Synthetic concurrent human decision.".into(),
                 hard_choice: None,
@@ -688,10 +691,11 @@ fn bounded_history_always_reserves_space_to_withdraw_a_retained_human_choice() {
     );
     let released = catalog
         .decide_review_feedback(&DecideReviewFeedbackRequest {
+            provenance: None,
             note_id: retained.note.note_id.clone(),
             expected_revision: 254,
             proposal_id: None,
-            decision_owner: RangeDecisionOwner::Human,
+            decision_owner: Some(RangeDecisionOwner::Human),
             action: ReviewDecisionAction::Superseded,
             rationale: "Synthetic explicit withdrawal remains possible after history fills.".into(),
             hard_choice: None,
@@ -954,5 +958,56 @@ fn sound_owned_by_a_distant_cut_invalidates_feedback_when_it_overlaps_the_review
             .unwrap()
             .target_status
             .requires_mapping
+    );
+}
+
+#[test]
+fn delegated_agent_decisions_apply_without_becoming_authoritative_human_choices() {
+    let (_dir, catalog, asset) = fixture();
+    let base = plan(&catalog, &asset);
+    let note = note(&catalog, &base);
+    let proposal = propose(
+        &catalog,
+        &note,
+        ReviewChange::Trim {
+            source_in_seconds: 0.6,
+            source_out_seconds: 1.4,
+        },
+    );
+    let mut request = DecideReviewFeedbackRequest {
+        provenance: Some(ReviewDecisionProvenance::agent()),
+        note_id: note.note.note_id.clone(),
+        expected_revision: proposal.revision,
+        proposal_id: proposal
+            .latest_proposal
+            .as_ref()
+            .map(|p| p.proposal_id.clone()),
+        decision_owner: Some(RangeDecisionOwner::Human),
+        action: ReviewDecisionAction::Accepted,
+        rationale: "Autonomous provisional edit under delegated authority".into(),
+        hard_choice: None,
+    };
+    let accepted = catalog.decide_review_feedback(&request).unwrap();
+    assert_eq!(
+        accepted.latest_decision.as_ref().unwrap().decision_origin,
+        ReviewDecisionOrigin::Agent
+    );
+    let applied = apply(&catalog, &base, &accepted).unwrap();
+    assert!(!applied.revision.active);
+    assert_eq!(applied.revision.operations[0].source_in_seconds, 0.6);
+    assert!(
+        hard_choices(&catalog.connection().unwrap(), &base.project_id)
+            .unwrap()
+            .is_empty()
+    );
+    request.expected_revision = accepted.revision;
+    request.proposal_id = None;
+    request.hard_choice = Some(ReviewHardChoice::KeepPictureAndAudio);
+    assert!(
+        catalog
+            .decide_review_feedback(&request)
+            .unwrap_err()
+            .to_string()
+            .contains("agent decisions")
     );
 }

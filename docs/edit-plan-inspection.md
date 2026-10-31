@@ -45,6 +45,22 @@ discarded frames. `availableFrameCount`, measured minimum/maximum available
 frame intervals, returned distinct frames, and maximum unsampled gap expose
 these limits; no sparse pack certifies intervening frames.
 
+`ioTimeoutSeconds`, `probeTimeoutSeconds`, and `decodeTimeoutSeconds` are
+optional request fields (default 180 seconds each; accepted range 1–600). They
+bound selected-representation hashing, each ffprobe process, and each ffmpeg
+process. A timeout returns a stable inspection-timeout outcome, kills a stuck
+media child, and retains an `attempt.json` checkpoint beside any completed
+partial artifacts. A checkpoint is progress evidence, never a completed
+inspection receipt. The original is never swapped silently. A caller may use
+`Catalog::inspect_source_window_with_policy` with one explicit fallback
+representation; only an unavailable or timed-out first representation is
+eligible, and proxy requests cannot fall back to originals. Exact-PTS and
+fingerprint-bound requests cannot fall back because those identities belong to
+the selected representation. The policy result lists each attempted
+representation and outcome, and successful evidence states
+`actualRepresentation` and its mapping precision. Invalid, stale, insufficient,
+or cancelled requests do not trigger fallback.
+
 The result contains `inspection` and `reused`. An inspection binds the complete
 selected-representation BLAKE3, indexed source identity, mapping/provenance,
 effective orientation, request, media-tool identities and recipe. Frame evidence

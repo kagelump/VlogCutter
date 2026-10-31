@@ -16,9 +16,14 @@
 //! takes the revision the caller *believed* was active and refuses if that is
 //! no longer true.
 
+pub mod coverage;
+pub mod delivery;
+pub mod review_coverage;
+pub use feedback_model::*;
 pub mod audio;
 pub mod audio_integrity;
 mod audio_render;
+pub mod audio_sample_plan;
 pub mod comparison;
 mod comparison_player;
 pub mod context_review;
@@ -31,6 +36,7 @@ mod inspection_model;
 pub mod inspection_review;
 pub mod model;
 pub mod otio;
+pub mod patch;
 pub mod preview;
 mod preview_artifact_model;
 pub mod preview_artifacts;
@@ -583,3 +589,6 @@ fn revision_operation_with_selection(
         },
     ))
 }
+
+#[cfg(test)]
+mod readiness_tests;

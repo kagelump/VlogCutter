@@ -76,3 +76,5 @@ See [OAuth setup, headless consent and resumable uploads](docs/youtube-upload.md
 - [Integration and manual acceptance boundaries](docs/integration-testing.md)
 
 Originals are immutable. Never move, rename, rewrite, or delete source media. The removable-card workflow only creates new verified archive copies and never overwrites them. Never copy live SQLite/WAL files between nodes.
+
+For the supported local edit/review/delivery path, see [rough-cut readiness](docs/rough-cut-readiness.md).

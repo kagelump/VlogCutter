@@ -109,7 +109,7 @@ fn completed_previews_keep_unique_bytes_and_actual_decoded_picture_clocks() {
     assert_eq!(fs::read(&first.output_path).unwrap(), bytes);
     let old = catalog.preview_artifact_status(id, true).unwrap();
     assert!(!old.latest_attempt);
-    assert_eq!(old.current_for_request, Some(false));
+    assert_eq!(old.current_for_request, Some(true));
     assert!(old.verification.unwrap().output_matches);
     let page = catalog.preview_artifacts(&plan.revision_id, 0, 1).unwrap();
     assert_eq!(page.total, 2);

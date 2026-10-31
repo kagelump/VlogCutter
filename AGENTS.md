@@ -56,6 +56,14 @@ The implemented slice is intentionally smaller than the launch-critical list in 
 
 Implemented now:
 
+- One supported CLI now includes editing, review and upload against schema 65,
+  with observational `doctor --workflow rough-cut|delivery` preflight. Sparse
+  stable-ID patches, explicit source-inventory picture-usage reports and unused
+  candidate retrieval, agent/human decision provenance, historical-preview
+  verification, audiovisual review coverage and measured local delivery bundles
+  are described in `docs/rough-cut-readiness.md`. Existing source inspection
+  supports bounded local deadlines and explicitly requested proxy fallback.
+
 - One portable SQLite catalog per newly created desktop project.
 - Configurable projects root, defaulting to `~/Movies/VideoProjects`.
 - Project library discovery and loading an existing catalog.
@@ -583,7 +591,7 @@ Always pass `--catalog` in agent automation, tests, and temporary workflows. A d
 
 SQLite connections enable foreign keys, WAL journal mode, and a five-second busy timeout. Read operations can continue during an uncommitted writer. Project mutations append typed operations with materialized revisions. Adopted projects synchronize bounded operation pages between independent local catalogs; live SQLite/WAL files are never copied or placed on NAS.
 
-Project catalogs use an explicit `schema_migrations` history and are currently at version 63. The server control catalog is version 11; backup format is version 1. Migration definitions have immutable names/source identities and each migration commits atomically. Migration 18 includes a one-time compatibility reconciliation for catalogs created on the import feature branch before its migration IDs were merged with main. When changing the schema:
+Project catalogs use an explicit `schema_migrations` history and are currently at version 65. The server control catalog is version 11; backup format is version 1. Migration definitions have immutable names/source identities and each migration commits atomically. Migration 18 includes a one-time compatibility reconciliation for catalogs created on the import feature branch before its migration IDs were merged with main. When changing the schema:
 
 - Preserve existing catalogs; never solve migration issues by deleting the database.
 - Add a forward migration and an upgrade test using an older schema fixture.

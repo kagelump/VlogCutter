@@ -7,6 +7,10 @@ pub enum SourceInspectionError {
     StaleEvidence,
     #[error("source inspection is already in progress")]
     Busy,
+    #[error("source inspection timed out while reading or processing the selected representation")]
+    Timeout,
+    #[error("source inspection exceeded its bounded media evidence output")]
+    Insufficient,
 }
 
 impl SourceInspectionError {
@@ -14,13 +18,16 @@ impl SourceInspectionError {
         match self {
             Self::StaleEvidence => "stale_evidence",
             Self::Busy => "representation_busy",
+            Self::Timeout => "inspection_timeout",
+            Self::Insufficient => "inspection_insufficient",
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum InspectionRepresentation {
+    #[default]
     Original,
     GeneratedProxy,
     CameraProxy,
@@ -63,6 +70,19 @@ pub struct SourceInspectionRequest {
     pub include_audio: bool,
     #[serde(default)]
     pub include_transcript: bool,
+    /// Maximum wall time for hashing one selected representation.
+    #[serde(default = "default_inspection_timeout")]
+    pub io_timeout_seconds: u32,
+    /// Maximum wall time for each ffprobe child.
+    #[serde(default = "default_inspection_timeout")]
+    pub probe_timeout_seconds: u32,
+    /// Maximum wall time for each ffmpeg child.
+    #[serde(default = "default_inspection_timeout")]
+    pub decode_timeout_seconds: u32,
+}
+
+fn default_inspection_timeout() -> u32 {
+    180
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -149,6 +169,10 @@ pub struct SourceInspection {
     pub evidence_id: String,
     pub recipe: String,
     pub request: SourceInspectionRequest,
+    /// Representation actually opened. It is explicit even when it matches
+    /// the request so consumers cannot infer fallback from source metadata.
+    #[serde(default)]
+    pub actual_representation: Option<InspectionRepresentation>,
     pub source_fingerprint: String,
     pub representation_fingerprint: String,
     pub rotation_degrees: u16,
@@ -171,4 +195,31 @@ pub struct SourceInspection {
 pub struct SourceInspectionResult {
     pub inspection: SourceInspection,
     pub reused: bool,
+}
+
+/// A caller may authorize one bounded second attempt on a specific proxy.
+/// It is never inferred, chained, or used to retry an invalid/insufficient
+/// request.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct InspectSourceWithPolicyRequest {
+    pub request: SourceInspectionRequest,
+    #[serde(default)]
+    pub fallback_representation: Option<InspectionRepresentation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InspectionAttempt {
+    pub representation: InspectionRepresentation,
+    /// completed, unavailable, timeout, invalid, insufficient, cancelled, failed
+    pub outcome: String,
+    pub error_code: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InspectSourceWithPolicyResult {
+    pub inspection: Option<SourceInspectionResult>,
+    pub attempts: Vec<InspectionAttempt>,
 }

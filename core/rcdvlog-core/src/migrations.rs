@@ -7,7 +7,7 @@ use thiserror::Error;
 
 use crate::chronology::forward_migrate_project_chronology;
 
-pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 63;
+pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 65;
 
 const MIGRATION_TABLE_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -462,7 +462,24 @@ pub const PROJECT_CATALOG_MIGRATIONS: &[SqliteMigration] = &[
         source_identity: "project-catalog/0063-youtube-upload-ledger/20261027",
         apply: crate::youtube::migrate,
     },
+    SqliteMigration {
+        id: 64,
+        name: "revision_bound_review_coverage",
+        source_identity: "project-catalog/0064-revision-bound-review-coverage/20261031",
+        apply: crate::editplan::review_coverage::migrate,
+    },
+    SqliteMigration {
+        id: 65,
+        name: "sparse_edit_revision_lineage",
+        source_identity: "project-catalog/0065-sparse-edit-revision-lineage/20261031",
+        apply: sparse_edit_revision_lineage,
+    },
 ];
+
+fn sparse_edit_revision_lineage(tx: &Transaction<'_>) -> Result<()> {
+    add_column_if_missing(tx, "edit_plan_revisions", "patch_json", "TEXT")?;
+    Ok(())
+}
 
 fn bounded_selected_audio_integrity(transaction: &Transaction<'_>) -> Result<()> {
     transaction.execute_batch(
@@ -1584,6 +1601,7 @@ fn add_asset_timestamp_candidates(transaction: &Transaction<'_>) -> Result<()> {
 
 pub fn migrate_project_catalog(connection: &mut Connection) -> Result<()> {
     reconcile_divergent_import_migration_history(connection)?;
+    reconcile_youtube_branch_history(connection)?;
     run_sqlite_migrations(connection, PROJECT_CATALOG_MIGRATIONS)
 }
 
@@ -1665,10 +1683,77 @@ fn reconcile_divergent_import_migration_history(connection: &mut Connection) -> 
     Ok(())
 }
 
+/// Recognize only the exact released upload-branch history, never arbitrary drift.
+fn youtube_branch_history(connection: &Connection) -> Result<Option<SchemaMigrationRecord>> {
+    if !table_exists(connection, "schema_migrations")? {
+        return Ok(None);
+    }
+    let history = load_applied_migrations(connection)?;
+    if history.len() != 49
+        || history[..48]
+            .iter()
+            .zip(&PROJECT_CATALOG_MIGRATIONS[..48])
+            .any(|(a, b)| {
+                a.id != b.id || a.name != b.name || a.source_identity != b.source_identity
+            })
+    {
+        return Ok(None);
+    }
+    let last = &history[48];
+    Ok((last.id == 49
+        && last.name == "youtube_upload_ledger"
+        && last.source_identity == "project-catalog/0049-youtube-upload-ledger/20261027")
+        .then(|| last.clone()))
+}
+
+fn reconcile_youtube_branch_history(connection: &mut Connection) -> Result<()> {
+    let Some(original) = youtube_branch_history(connection)? else {
+        return Ok(());
+    };
+    let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    // Retain the original identity verbatim, then install the merged history in
+    // one transaction. All edit revisions and upload rows remain in place.
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS catalog_migration_reconciliations(
+        original_id INTEGER NOT NULL, name TEXT NOT NULL, source_identity TEXT NOT NULL,
+        applied_at TEXT NOT NULL, replacement_id INTEGER NOT NULL,
+        PRIMARY KEY(original_id, source_identity));",
+    )?;
+    tx.execute(
+        "INSERT OR IGNORE INTO catalog_migration_reconciliations VALUES(?1,?2,?3,?4,63)",
+        params![
+            original.id,
+            original.name,
+            original.source_identity,
+            original.applied_at
+        ],
+    )?;
+    tx.execute("DELETE FROM schema_migrations WHERE migration_id=49", [])?;
+    for migration in &PROJECT_CATALOG_MIGRATIONS[48..63] {
+        (migration.apply)(&tx)?;
+        tx.execute("INSERT INTO schema_migrations(migration_id,name,source_identity,applied_at) VALUES(?1,?2,?3,?4)",
+            params![migration.id, migration.name, migration.source_identity, original.applied_at])?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 pub fn inspect_project_catalog_migrations(
     connection: &Connection,
 ) -> Result<MigrationHistoryInspection> {
-    inspect_sqlite_migrations(connection, PROJECT_CATALOG_MIGRATIONS)
+    let mut inspection = inspect_sqlite_migrations(connection, PROJECT_CATALOG_MIGRATIONS)?;
+    if youtube_branch_history(connection)?.is_some() {
+        inspection.status = MigrationHistoryStatus::UpgradeAvailable;
+        inspection.pending_migrations = PROJECT_CATALOG_MIGRATIONS[48..]
+            .iter()
+            .map(|m| PendingMigration {
+                id: m.id,
+                name: m.name.into(),
+                source_identity: m.source_identity.into(),
+            })
+            .collect();
+    }
+    Ok(inspection)
 }
 
 pub fn validate_project_catalog_migrations(connection: &Connection) -> Result<()> {
@@ -5117,5 +5202,68 @@ mod edit_cut_migration_tests {
                 .is_err()
         );
         assert!(connection.execute("INSERT INTO edit_plan_operations(operation_id,revision_id,position,asset_id,source_in_seconds,source_out_seconds,rationale) VALUES('other','r2',0,'a',1,3,'duplicate position')", []).is_err());
+    }
+    #[test]
+    fn youtube_branch_schema49_merges_atomically_preserving_upload_history() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        run_sqlite_migrations(&mut connection, &PROJECT_CATALOG_MIGRATIONS[..48]).unwrap();
+        let tx = connection.transaction().unwrap();
+        crate::youtube::migrate(&tx).unwrap();
+        tx.execute("INSERT INTO schema_migrations VALUES(49,'youtube_upload_ledger','project-catalog/0049-youtube-upload-ledger/20261027','fixture-time')",[]).unwrap();
+        tx.execute(
+            "INSERT INTO projects(id,name,created_at) VALUES('project','fixture','fixture-time')",
+            [],
+        )
+        .unwrap();
+        tx.execute("INSERT INTO youtube_uploads(id,project_id,credential_id,file_sha256,file_path,file_size,metadata_json,state,created_at,updated_at) VALUES('upload','project','credential','fixturehash','fixture.mp4',1,'{}','complete',1,1)",[]).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(
+            inspect_project_catalog_migrations(&connection)
+                .unwrap()
+                .status,
+            MigrationHistoryStatus::UpgradeAvailable
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT MAX(migration_id) FROM schema_migrations", [], |r| r
+                    .get::<_, u32>(0))
+                .unwrap(),
+            49
+        );
+        migrate_project_catalog(&mut connection).unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT id FROM youtube_uploads", [], |r| r
+                    .get::<_, String>(0))
+                .unwrap(),
+            "upload"
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT source_identity FROM catalog_migration_reconciliations",
+                    [],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+            "project-catalog/0049-youtube-upload-ledger/20261027"
+        );
+        assert_eq!(
+            inspect_project_catalog_migrations(&connection)
+                .unwrap()
+                .status,
+            MigrationHistoryStatus::Current
+        );
+        migrate_project_catalog(&mut connection).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM catalog_migration_reconciliations",
+                    [],
+                    |r| r.get::<_, u32>(0)
+                )
+                .unwrap(),
+            1
+        );
     }
 }
