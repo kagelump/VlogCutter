@@ -15,6 +15,32 @@ use std::path::PathBuf;
 
 #[derive(Debug, Subcommand)]
 pub enum EditPlanCommand {
+    /// Apply an atomic sparse patch to an explicit immutable base, without activation.
+    Patch {
+        #[arg(long)]
+        project: String,
+        #[arg(long)]
+        expected_base: String,
+        #[arg(long)]
+        expected_active: String,
+        #[arg(long)]
+        input: PathBuf,
+    },
+    /// Inventory-based unique picture usage and bounded unused-source discovery.
+    Coverage {
+        #[command(subcommand)]
+        command: PictureCoverageCommand,
+    },
+    /// Export a verified measured movie and local review artifacts as one bundle.
+    Bundle {
+        #[arg(long)]
+        input: PathBuf,
+    },
+    /// Record explicit review evidence and report separate picture/listening gaps.
+    ReviewCoverage {
+        #[command(subcommand)]
+        command: ReviewCoverageCommand,
+    },
     /// List immutable revisions and the active revision.
     List {
         #[arg(long)]
@@ -106,6 +132,11 @@ pub enum EditPlanCommand {
         #[arg(long)]
         input: PathBuf,
     },
+    /// Inspect with at most one explicit proxy fallback and bounded local deadlines.
+    InspectWithPolicy {
+        #[arg(long)]
+        input: PathBuf,
+    },
     /// Read or explicitly confirm/revoke human-owned source constraints.
     Ranges {
         #[command(subcommand)]
@@ -144,7 +175,54 @@ pub enum EditPlanCommand {
 }
 
 #[derive(Debug, Subcommand)]
+pub enum ReviewCoverageCommand {
+    Record {
+        #[arg(long)]
+        input: PathBuf,
+    },
+    Report {
+        #[arg(long)]
+        revision: String,
+        #[arg(long)]
+        verify: bool,
+    },
+    List {
+        #[arg(long)]
+        revision: String,
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum PictureCoverageCommand {
+    Report {
+        #[arg(long)]
+        input: PathBuf,
+    },
+    Unused {
+        #[arg(long)]
+        revision: String,
+        #[arg(long)]
+        group_input: Option<PathBuf>,
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        #[arg(long)]
+        include_excluded: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 pub enum AudioAuditCommand {
+    /// Plan valid bounded join/source-audio samples from a completed excerpt.
+    Plan {
+        #[arg(long)]
+        input: PathBuf,
+    },
     /// Create or reuse bounded selected-audio evidence for a revision scope.
     Create {
         /// AudioIntegrityRequest JSON, capped at 64 KiB.
@@ -379,6 +457,17 @@ struct ApplyReviewFeedbackInput {
 
 pub fn command_name(command: &EditPlanCommand) -> &'static str {
     match command {
+        EditPlanCommand::Bundle { .. } => "edit-plan.bundle",
+        EditPlanCommand::ReviewCoverage { command } => match command {
+            ReviewCoverageCommand::Record { .. } => "edit-plan.review-coverage.record",
+            ReviewCoverageCommand::Report { .. } => "edit-plan.review-coverage.report",
+            ReviewCoverageCommand::List { .. } => "edit-plan.review-coverage.list",
+        },
+        EditPlanCommand::Patch { .. } => "edit-plan.patch",
+        EditPlanCommand::Coverage { command } => match command {
+            PictureCoverageCommand::Report { .. } => "edit-plan.coverage.report",
+            PictureCoverageCommand::Unused { .. } => "edit-plan.coverage.unused",
+        },
         EditPlanCommand::List { .. } => "edit-plan.list",
         EditPlanCommand::Get(_) => "edit-plan.get",
         EditPlanCommand::Create { .. } => "edit-plan.create",
@@ -397,6 +486,7 @@ pub fn command_name(command: &EditPlanCommand) -> &'static str {
         EditPlanCommand::PreviewCancel { .. } => "edit-plan.preview-cancel",
         EditPlanCommand::PreviewWait { .. } => "edit-plan.preview-wait",
         EditPlanCommand::Inspect { .. } => "edit-plan.inspect",
+        EditPlanCommand::InspectWithPolicy { .. } => "edit-plan.inspect-with-policy",
         EditPlanCommand::Ranges { command } => match command {
             SourceRangeCommand::List { .. } => "edit-plan.ranges.list",
             SourceRangeCommand::Confirm { .. } => "edit-plan.ranges.confirm",
@@ -434,6 +524,7 @@ pub fn command_name(command: &EditPlanCommand) -> &'static str {
             ShortComparisonCommand::Apply { .. } => "edit-plan.compare.apply",
         },
         EditPlanCommand::AudioAudit { command } => match command {
+            AudioAuditCommand::Plan { .. } => "edit-plan.audio-audit.plan",
             AudioAuditCommand::Create { .. } => "edit-plan.audio-audit.create",
             AudioAuditCommand::Get { .. } => "edit-plan.audio-audit.get",
         },
@@ -441,9 +532,20 @@ pub fn command_name(command: &EditPlanCommand) -> &'static str {
 }
 
 pub fn is_read_only(command: &EditPlanCommand) -> bool {
+    if matches!(
+        command,
+        EditPlanCommand::AudioAudit {
+            command: AudioAuditCommand::Plan { .. }
+        }
+    ) {
+        return true;
+    }
     matches!(
         command,
-        EditPlanCommand::List { .. }
+        EditPlanCommand::ReviewCoverage {
+            command: ReviewCoverageCommand::Report { .. } | ReviewCoverageCommand::List { .. }
+        } | EditPlanCommand::Coverage { .. }
+            | EditPlanCommand::List { .. }
             | EditPlanCommand::PreviewStatus { verify: false, .. }
             | EditPlanCommand::PreviewList { .. }
             | EditPlanCommand::PreviewWait { verify: false, .. }
@@ -482,13 +584,80 @@ fn expected(value: &str) -> Option<&str> {
 
 pub fn execute(catalog: &Catalog, command: &EditPlanCommand) -> Result<Value> {
     match command {
+        EditPlanCommand::Bundle { input } => {
+            let request: rcdvlog_core::EditPlanBundleRequest = read_workflow_input(input)?;
+            Ok(serde_json::to_value(
+                catalog.export_edit_plan_bundle(&request, &|| false)?,
+            )?)
+        }
+        EditPlanCommand::ReviewCoverage { command } => match command {
+            ReviewCoverageCommand::Record { input } => {
+                let request: rcdvlog_core::RecordReviewCoverageRequest = read_review_input(input)?;
+                Ok(serde_json::to_value(
+                    catalog.record_review_coverage(&request)?,
+                )?)
+            }
+            ReviewCoverageCommand::Report { revision, verify } => Ok(serde_json::to_value(
+                catalog.review_coverage_report(revision, *verify)?,
+            )?),
+            ReviewCoverageCommand::List {
+                revision,
+                offset,
+                limit,
+            } => Ok(serde_json::to_value(
+                catalog.review_coverage_records(revision, *offset, *limit)?,
+            )?),
+        },
+        EditPlanCommand::Patch {
+            project,
+            expected_base,
+            expected_active,
+            input,
+        } => {
+            let input: rcdvlog_core::EditPlanPatchInput = read_workflow_input(input)?;
+            Ok(serde_json::to_value(catalog.patch_edit_plan(
+                project,
+                expected_base,
+                expected(expected_active),
+                &input,
+            )?)?)
+        }
+        EditPlanCommand::Coverage { command } => match command {
+            PictureCoverageCommand::Report { input } => {
+                let request: rcdvlog_core::PictureCoverageRequest = read_workflow_input(input)?;
+                catalog.picture_coverage(&request)
+            }
+            PictureCoverageCommand::Unused {
+                revision,
+                group_input,
+                offset,
+                limit,
+                include_excluded,
+            } => {
+                let group = group_input
+                    .as_ref()
+                    .map(read_workflow_input::<rcdvlog_core::PictureCoverageGroup>)
+                    .transpose()?;
+                catalog.unused_picture_sources(
+                    revision,
+                    group.as_ref(),
+                    *offset,
+                    *limit,
+                    *include_excluded,
+                )
+            }
+        },
         EditPlanCommand::List { project } => Ok(json!({
             "activeRevisionId": catalog.active_edit_plan(project)?.map(|plan| plan.revision_id),
             "revisions": catalog.edit_plan_revisions(project)?,
         })),
-        EditPlanCommand::Get(args) => Ok(serde_json::to_value(
-            catalog.edit_plan_revision(&args.revision)?,
-        )?),
+        EditPlanCommand::Get(args) => {
+            let mut value = serde_json::to_value(catalog.edit_plan_revision(&args.revision)?)?;
+            if let Some(metadata) = catalog.edit_plan_patch_metadata(&args.revision)? {
+                value["patchMetadata"] = metadata;
+            }
+            Ok(value)
+        }
         EditPlanCommand::Create {
             project,
             input,
@@ -603,6 +772,15 @@ pub fn execute(catalog: &Catalog, command: &EditPlanCommand) -> Result<Value> {
             } else {
                 observed
             })?)
+        }
+        EditPlanCommand::InspectWithPolicy { input } => {
+            let request: rcdvlog_core::InspectSourceWithPolicyRequest = read_review_input(input)?;
+            let cancellation = crate::agent_commands::CommandCancellation::arm()?;
+            Ok(serde_json::to_value(
+                catalog.inspect_source_window_with_policy(&request, &|| {
+                    cancellation.flow().is_break()
+                })?,
+            )?)
         }
         EditPlanCommand::Inspect { input } => {
             let request: SourceInspectionRequest = read_review_input(input)?;
@@ -785,6 +963,12 @@ pub fn execute(catalog: &Catalog, command: &EditPlanCommand) -> Result<Value> {
             }
         }
         EditPlanCommand::AudioAudit { command } => match command {
+            AudioAuditCommand::Plan { input } => {
+                let request: rcdvlog_core::AudioSamplePlanRequest = read_review_input(input)?;
+                Ok(serde_json::to_value(
+                    catalog.plan_audio_integrity_samples(&request)?,
+                )?)
+            }
             AudioAuditCommand::Create { input } => {
                 let request: AudioIntegrityRequest = read_review_input(input)?;
                 Ok(serde_json::to_value(
@@ -846,4 +1030,17 @@ fn read_review_input<T: serde::de::DeserializeOwned>(input: &PathBuf) -> Result<
         "invalid input: review JSON exceeds 64 KiB"
     );
     serde_json::from_slice(&bytes).context("invalid input: parse review JSON")
+}
+
+fn read_workflow_input<T: serde::de::DeserializeOwned>(input: &PathBuf) -> Result<T> {
+    let mut bytes = Vec::new();
+    std::fs::File::open(input)
+        .context("invalid input: open workflow JSON")?
+        .take(8 * 1024 * 1024 + 1)
+        .read_to_end(&mut bytes)?;
+    ensure!(
+        bytes.len() <= 8 * 1024 * 1024,
+        "invalid input: workflow JSON exceeds 8 MiB"
+    );
+    serde_json::from_slice(&bytes).context("invalid input: parse workflow JSON")
 }

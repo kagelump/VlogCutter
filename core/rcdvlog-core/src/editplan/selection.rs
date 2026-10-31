@@ -244,7 +244,7 @@ impl Catalog {
 pub(crate) fn redispatch(connection: &mut Connection) -> Result<()> {
     let mut statement=connection.prepare("SELECT operation_id,project_id,origin_node_id,origin_sequence,hlc_wall_millis,hlc_counter,
         aggregate_type,aggregate_id,operation_type,payload_version,base_revision,payload_json FROM project_operations
-        WHERE operation_type='editPlanRevisionCreated' AND payload_version=3
+        WHERE operation_type='editPlanRevisionCreated' AND payload_version IN (3,4)
         AND base_revision IS NOT NULL AND base_revision>=COALESCE((SELECT revision FROM materialized_revisions mr
             WHERE mr.project_id=project_operations.project_id AND mr.aggregate_type=project_operations.aggregate_type AND mr.aggregate_id=project_operations.aggregate_id),0)
         AND NOT EXISTS(SELECT 1 FROM operation_conflicts c WHERE c.incoming_operation_id=project_operations.operation_id)

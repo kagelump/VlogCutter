@@ -22,6 +22,91 @@ pub(crate) struct SelectedSource {
 }
 
 impl Catalog {
+    /// Run the requested representation and, only when explicitly authorized,
+    /// one bounded fallback attempt for unavailable media or a deadline.
+    /// Invalid, insufficient, stale, and cancelled requests are never retried.
+    pub fn inspect_source_window_with_policy(
+        &self,
+        policy: &InspectSourceWithPolicyRequest,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<InspectSourceWithPolicyResult> {
+        let requested = policy.request.representation;
+        match self.inspect_source_window(&policy.request, cancel) {
+            Ok(inspection) => Ok(InspectSourceWithPolicyResult {
+                inspection: Some(inspection),
+                attempts: vec![InspectionAttempt {
+                    representation: requested,
+                    outcome: "completed".into(),
+                    error_code: None,
+                }],
+            }),
+            Err(error) => {
+                let Some((outcome, error_code)) = fallback_classification(&error) else {
+                    return Err(error);
+                };
+                let mut attempts = vec![InspectionAttempt {
+                    representation: requested,
+                    outcome: outcome.into(),
+                    error_code: Some(error_code.into()),
+                }];
+                let Some(fallback) = policy.fallback_representation else {
+                    return Ok(InspectSourceWithPolicyResult {
+                        inspection: None,
+                        attempts,
+                    });
+                };
+                ensure!(
+                    fallback != requested,
+                    "invalid input: fallback representation must differ from requested representation"
+                );
+                ensure!(
+                    requested == InspectionRepresentation::Original
+                        || fallback != InspectionRepresentation::Original,
+                    "invalid input: proxy inspections cannot fall back to original media"
+                );
+                ensure!(
+                    policy.request.exact_representation_pts.is_empty()
+                        && policy.request.expected_representation_fingerprint.is_none(),
+                    "invalid input: exact PTS or fingerprint-bound requests cannot use representation fallback"
+                );
+                if cancel() {
+                    return Err(anyhow::anyhow!(
+                        "source inspection cancelled before fallback"
+                    ));
+                }
+                let mut retry = policy.request.clone();
+                retry.representation = fallback;
+                match self.inspect_source_window(&retry, cancel) {
+                    Ok(inspection) => {
+                        attempts.push(InspectionAttempt {
+                            representation: fallback,
+                            outcome: "completed".into(),
+                            error_code: None,
+                        });
+                        Ok(InspectSourceWithPolicyResult {
+                            inspection: Some(inspection),
+                            attempts,
+                        })
+                    }
+                    Err(error) if cancel() || error.to_string().contains("cancelled") => Err(error),
+                    Err(error) => {
+                        let (outcome, code) = fallback_classification(&error)
+                            .unwrap_or(("failed", "inspection_failed"));
+                        attempts.push(InspectionAttempt {
+                            representation: fallback,
+                            outcome: outcome.into(),
+                            error_code: Some(code.into()),
+                        });
+                        Ok(InspectSourceWithPolicyResult {
+                            inspection: None,
+                            attempts,
+                        })
+                    }
+                }
+            }
+        }
+    }
+
     /// Explicitly inspect a bounded window. Never selects a different source,
     /// transcribes, calls a provider, accepts a trim, or changes orientation.
     pub fn inspect_source_window(
@@ -32,8 +117,14 @@ impl Catalog {
         validate_request(request)?;
         ensure!(!cancel(), "source inspection cancelled");
         let _heavy = self.acquire_local_heavy_cancellable(cancel)?;
-        let asset = self.get_asset(&request.asset_id)?;
-        let source = self.inspection_source(&asset, request.representation, cancel)?;
+        let asset =
+            self.inspection_get_asset(&request.asset_id, request.io_timeout_seconds, cancel)?;
+        let source = self.inspection_source(
+            &asset,
+            request.representation,
+            request.io_timeout_seconds,
+            cancel,
+        )?;
         if let Some(expected) = &request.expected_representation_fingerprint
             && expected != &source.fingerprint
         {
@@ -45,7 +136,12 @@ impl Catalog {
             start >= 0.0 && end <= asset.duration_seconds + 1e-7,
             "invalid input: requested handles exceed source duration"
         );
-        let stream = media::probe(&source.path, request.include_audio, cancel)?;
+        let stream = media::probe(
+            &source.path,
+            request.include_audio,
+            request.probe_timeout_seconds,
+            cancel,
+        )?;
         let mapping = InspectionTimeMapping {
             time_base_numerator: stream.numerator,
             time_base_denominator: stream.denominator,
@@ -120,6 +216,7 @@ impl Catalog {
                 &asset,
                 &source,
                 request.representation,
+                request.io_timeout_seconds,
                 cancel,
             )?;
             return Ok(SourceInspectionResult {
@@ -129,23 +226,30 @@ impl Catalog {
         }
         let workspace = root.join(uuid::Uuid::new_v4().simple().to_string());
         fs::create_dir(&workspace)?;
+        write_attempt_checkpoint(&workspace, &id, "probing", 0, 0)?;
         let available = media::frame_pts(
             &source.path,
             &mapping,
             representation_start,
             representation_end,
+            request.probe_timeout_seconds,
             cancel,
         )?;
+        write_attempt_checkpoint(&workspace, &id, "framesLocated", 0, 0)?;
         let selected = select_pts(request, &mapping, start, end, &available)?;
         let images = media::encode_frames(
             &source.path,
             &workspace,
-            asset.rotation_degrees,
-            request.max_width,
-            representation_start,
-            &selected,
+            media::FrameDecodeConfig {
+                rotation: asset.rotation_degrees,
+                width: request.max_width,
+                start_seconds: representation_start,
+                pts: &selected,
+                timeout_seconds: request.decode_timeout_seconds,
+            },
             cancel,
         )?;
+        write_attempt_checkpoint(&workspace, &id, "framesDecoded", selected.len(), 0)?;
         let frames: Vec<_> = selected
             .iter()
             .zip(images)
@@ -158,14 +262,23 @@ impl Catalog {
             })
             .collect();
         let audio = if request.include_audio {
-            Some(media::audio_context(
+            let audio = media::audio_context(
                 &source.path,
                 &workspace,
                 stream.audio_start_seconds,
                 representation_start,
                 representation_end,
+                request.decode_timeout_seconds,
                 cancel,
-            )?)
+            )?;
+            write_attempt_checkpoint(
+                &workspace,
+                &id,
+                "audioDecoded",
+                selected.len(),
+                audio.waveform.len(),
+            )?;
+            Some(audio)
         } else {
             None
         };
@@ -218,6 +331,7 @@ impl Catalog {
             evidence_id: id.clone(),
             recipe: SOURCE_INSPECTION_RECIPE.into(),
             request: request.clone(),
+            actual_representation: Some(request.representation),
             source_fingerprint: asset.fingerprint.clone(),
             representation_fingerprint: source.fingerprint.clone(),
             rotation_degrees: asset.rotation_degrees,
@@ -234,13 +348,33 @@ impl Catalog {
             limitations,
             created_at: crate::now(),
         };
-        self.require_inspection_source_current(&asset, &source, request.representation, cancel)?;
+        self.require_inspection_source_current(
+            &asset,
+            &source,
+            request.representation,
+            request.io_timeout_seconds,
+            cancel,
+        )?;
         ensure!(!cancel(), "source inspection cancelled before publication");
+        write_attempt_checkpoint(
+            &workspace,
+            &id,
+            "artifactsReady",
+            report.frames.len(),
+            report.audio.as_ref().map_or(0, |a| a.waveform.len()),
+        )?;
         self.connection()?.execute(
             "INSERT INTO source_inspections(evidence_id,asset_id,identity_json,report_json,created_at) VALUES(?1,?2,?3,?4,?5)
              ON CONFLICT(evidence_id) DO UPDATE SET identity_json=excluded.identity_json,report_json=excluded.report_json,created_at=excluded.created_at",
             params![id, asset.id, identity_json, serde_json::to_string(&report)?, report.created_at],
         )?;
+        let _ = write_attempt_checkpoint(
+            &workspace,
+            &id,
+            "completed",
+            report.frames.len(),
+            report.audio.as_ref().map_or(0, |a| a.waveform.len()),
+        );
         Ok(SourceInspectionResult {
             inspection: report,
             reused: false,
@@ -295,9 +429,20 @@ impl Catalog {
         let (identity_json, body) = row.context("source inspection evidence not found")?;
         let identity: Value = serde_json::from_str(&identity_json)?;
         let report: SourceInspection = serde_json::from_str(&body)?;
-        let asset = self.get_asset(asset_id)?;
-        let source = self.inspection_source(&asset, report.request.representation, cancel)?;
-        let stream = media::probe(&source.path, report.request.include_audio, cancel)?;
+        let asset =
+            self.inspection_get_asset(asset_id, report.request.io_timeout_seconds, cancel)?;
+        let source = self.inspection_source(
+            &asset,
+            report.request.representation,
+            report.request.io_timeout_seconds,
+            cancel,
+        )?;
+        let stream = media::probe(
+            &source.path,
+            report.request.include_audio,
+            report.request.probe_timeout_seconds,
+            cancel,
+        )?;
         let mapping = InspectionTimeMapping {
             time_base_numerator: stream.numerator,
             time_base_denominator: stream.denominator,
@@ -346,6 +491,28 @@ impl Catalog {
         &self,
         asset: &Asset,
         choice: InspectionRepresentation,
+        io_timeout_seconds: u32,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<SelectedSource> {
+        let database_path = self.database_path().to_owned();
+        let asset = asset.clone();
+        crate::stall::abandonable_io_with_timeout(
+            "inspection representation lookup",
+            std::time::Duration::from_secs(io_timeout_seconds.into()),
+            cancel,
+            move |stop| {
+                let readonly = Catalog::open_read_only_existing(database_path)?;
+                let cancelled = || stop.load(std::sync::atomic::Ordering::Relaxed);
+                readonly.inspection_source_inner(&asset, choice, io_timeout_seconds, &cancelled)
+            },
+        )
+    }
+
+    fn inspection_source_inner(
+        &self,
+        asset: &Asset,
+        choice: InspectionRepresentation,
+        io_timeout_seconds: u32,
         cancel: &dyn Fn() -> bool,
     ) -> Result<SelectedSource> {
         let mut source = match choice {
@@ -411,7 +578,7 @@ impl Catalog {
             }
         };
         if source.fingerprint.is_empty() {
-            source.fingerprint = crate::full_file_blake3(&source.path, cancel)?.hex_digest;
+            source.fingerprint = media::fingerprint(&source.path, io_timeout_seconds, cancel)?;
         }
         Ok(source)
     }
@@ -421,16 +588,17 @@ impl Catalog {
         previous: &Asset,
         source: &SelectedSource,
         choice: InspectionRepresentation,
+        io_timeout_seconds: u32,
         cancel: &dyn Fn() -> bool,
     ) -> Result<()> {
-        let current = self.get_asset(&previous.id)?;
+        let current = self.inspection_get_asset(&previous.id, io_timeout_seconds, cancel)?;
         if !(current.fingerprint == previous.fingerprint
             && current.rotation_degrees == previous.rotation_degrees
             && current.orientation_decision == previous.orientation_decision)
         {
             return Err(SourceInspectionError::StaleEvidence.into());
         }
-        let selected = self.inspection_source(&current, choice, cancel)?;
+        let selected = self.inspection_source(&current, choice, io_timeout_seconds, cancel)?;
         if !(selected.path == source.path
             && selected.fingerprint == source.fingerprint
             && selected.provenance == source.provenance)
@@ -439,9 +607,63 @@ impl Catalog {
         }
         Ok(())
     }
+
+    fn inspection_get_asset(
+        &self,
+        asset_id: &str,
+        timeout_seconds: u32,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<Asset> {
+        let database_path = self.database_path().to_owned();
+        let asset_id = asset_id.to_owned();
+        crate::stall::abandonable_io_with_timeout(
+            "inspection source availability lookup",
+            std::time::Duration::from_secs(timeout_seconds.into()),
+            cancel,
+            move |stop| {
+                let readonly = Catalog::open_read_only_existing(database_path)?;
+                let asset = readonly.get_asset(&asset_id)?;
+                anyhow::ensure!(
+                    !stop.load(std::sync::atomic::Ordering::Relaxed),
+                    "inspection source lookup cancelled"
+                );
+                Ok(asset)
+            },
+        )
+    }
+}
+
+/// Keep a small durable progress receipt beside attempt artifacts. If the
+/// process exits or a later stage fails, successful earlier work is still
+/// discoverable and cannot be mistaken for a completed inspection.
+fn write_attempt_checkpoint(
+    workspace: &std::path::Path,
+    evidence_id: &str,
+    stage: &str,
+    decoded_frames: usize,
+    waveform_bins: usize,
+) -> Result<()> {
+    let checkpoint = json!({
+        "evidenceId": evidence_id,
+        "state": if stage == "completed" { "completed" } else { "partial" },
+        "stage": stage,
+        "decodedFrames": decoded_frames,
+        "waveformBins": waveform_bins,
+        "updatedAt": crate::now(),
+    });
+    let temporary = workspace.join("attempt.json.tmp");
+    fs::write(&temporary, serde_json::to_vec(&checkpoint)?)?;
+    fs::rename(temporary, workspace.join("attempt.json"))?;
+    Ok(())
 }
 
 fn validate_request(r: &SourceInspectionRequest) -> Result<()> {
+    ensure!(
+        (1..=600).contains(&r.io_timeout_seconds)
+            && (1..=600).contains(&r.probe_timeout_seconds)
+            && (1..=600).contains(&r.decode_timeout_seconds),
+        "invalid input: I/O, probe, and decode timeouts must be 1-600 seconds"
+    );
     ensure!(
         [
             r.source_in_seconds,
@@ -483,6 +705,20 @@ fn validate_request(r: &SourceInspectionRequest) -> Result<()> {
         "invalid input: transcript requires explicit audio inclusion"
     );
     Ok(())
+}
+
+fn fallback_classification(error: &anyhow::Error) -> Option<(&'static str, &'static str)> {
+    let message = error.to_string().to_ascii_lowercase();
+    if message.contains("cancelled") || message.contains("canceled") {
+        return None;
+    }
+    if message.contains("stopped answering after") || message.contains("timed out") {
+        return Some(("timeout", "inspection_timeout"));
+    }
+    if message.contains("media offline") || message.contains("unavailable") {
+        return Some(("unavailable", "representation_unavailable"));
+    }
+    None
 }
 
 fn select_pts(

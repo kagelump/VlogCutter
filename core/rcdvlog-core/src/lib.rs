@@ -50,6 +50,7 @@ mod stall;
 mod storage;
 mod transcription;
 mod volumes;
+pub mod youtube;
 
 use analysis::accounting::{
     begin_accounted_operation, operation_intended_attempt_key, operation_policy_fingerprint,
@@ -265,17 +266,23 @@ pub use diagnostics::{
     DiagnosticSubject,
 };
 pub use editplan::audio_integrity::*;
+pub use editplan::audio_sample_plan::*;
 pub use editplan::comparison::*;
 pub use editplan::context_review::*;
+pub use editplan::coverage::*;
+pub use editplan::delivery::*;
 pub use editplan::feedback::*;
 pub use editplan::inspection_review::*;
+pub use editplan::patch::*;
+pub use editplan::review_coverage::*;
 pub use editplan::selection::*;
 pub use editplan::{
     ConfirmSourceRangeRequest, ConfirmedRangeInspection, ConfirmedSourceRange, EditPlanAudio,
     EditPlanError, EditPlanExport, EditPlanOperation, EditPlanRevision, EditPlanStaleness, Finding,
-    FindingKind, InspectedAudio, InspectedFrame, InspectedUtterance, InspectionFile,
-    InspectionPurpose, InspectionRepresentation, InspectionTimeMapping, InspectionWaveformBin,
-    OtioExportError, OtioExportRequest, OtioExportResult, PreviewArtifact, PreviewArtifactError,
+    FindingKind, InspectSourceWithPolicyRequest, InspectSourceWithPolicyResult, InspectedAudio,
+    InspectedFrame, InspectedUtterance, InspectionAttempt, InspectionFile, InspectionPurpose,
+    InspectionRepresentation, InspectionTimeMapping, InspectionWaveformBin, OtioExportError,
+    OtioExportRequest, OtioExportResult, PreviewArtifact, PreviewArtifactError,
     PreviewArtifactPage, PreviewArtifactState, PreviewArtifactStatus, PreviewArtifactSummary,
     PreviewArtifactVerification, PreviewCutMapping, PreviewCutOutcome, PreviewExcerptRequest,
     PreviewExcerptScope, PreviewFailure, PreviewInputIdentity, PreviewMediaValidation,

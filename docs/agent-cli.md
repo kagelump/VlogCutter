@@ -1239,3 +1239,33 @@ representation PTS requests, mapping precision, sound policy and limitations.
 `edit-plan suggest-trim --input /absolute/trim.json` returns advisory clean/
 utterance ranges without accepting a trim. See [source range decisions](edit-plan-source-ranges.md)
 for the JSON contract, picture/audio scope, authority and stale-evidence rules.
+
+## YouTube publishing
+
+`youtube auth login/status/revoke`, `youtube upload`, and `youtube history` expose
+upload-only Google OAuth and resumable publishing through the same JSON envelope.
+See [YouTube setup and command contracts](youtube-upload.md) for personal-use
+Cloud setup, agent-led/headless consent, private credential storage, upload
+idempotency and recovery. Only upload/history require an explicit catalog and
+project; auth commands never consult the desktop's catalog selection.
+
+YouTube errors use the `youtube.*` namespace (including `auth_required`,
+`auth_expired`, `scope_mismatch`, `credential_busy`, `upload_busy`,
+`metadata_conflict`, `outcome_unknown`, and `session_expired`). Progress and
+`youtube.oauth.authorization_required` events appear on stderr before the final
+result. Never parse prose or automatically pass `--restart-upload` after an
+uncertain outcome. For phone-only consent, `youtube auth login --redirect-uri`
+accepts a registered HTTPS callback with a Web application client and a fixed
+loopback `--port` behind a trusted HTTPS proxy. The authorization event includes
+`callbackMode`, `healthUrl` and `loopbackTarget`; credentials stay on the upload
+host. The mobile success page appears only after token exchange and storage.
+This feature does not add scopes for channel reads or
+processing-status polling.
+
+## Rough-cut readiness commands
+
+See [rough-cut readiness](rough-cut-readiness.md) for `doctor --workflow`, atomic
+`edit-plan patch`, `coverage report/unused`, provenance on decisions/preferences,
+`inspect-with-policy`, `review-coverage record/report/list`, `audio-audit plan`,
+phase-aware preview progress, and `edit-plan bundle`. These use the same explicit
+catalog and immutable revision guards as the existing commands.

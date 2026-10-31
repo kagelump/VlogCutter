@@ -191,8 +191,8 @@ pub(super) fn audio_events_cancellable_window(
         );
         for (other, video_start, video_end) in &picture {
             if &other.asset_id == asset_id
-                && placement < *video_end
-                && *video_start < placement + source_out - source_in
+                && placement < *video_end - 1e-9
+                && *video_start < placement + (source_out - source_in) - 1e-9
             {
                 let actual_offset =
                     (source_in - placement) - (other.source_in_seconds - video_start);

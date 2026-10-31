@@ -9,8 +9,56 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Command,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     time::Duration,
 };
+
+/// Hashing an original can otherwise park the inspection thread indefinitely
+/// when a mounted volume stops answering. Bound the whole read, and let the
+/// worker observe cancellation between chunks. A blocked kernel read cannot
+/// be interrupted safely, so it is abandoned after the deadline, like the
+/// import-path stall guard.
+pub(crate) fn fingerprint(
+    path: &Path,
+    timeout_seconds: u32,
+    cancel: &dyn Fn() -> bool,
+) -> Result<String> {
+    fingerprint_with_limit(path, cancel, Duration::from_secs(timeout_seconds.into()))
+}
+
+fn fingerprint_with_limit(
+    path: &Path,
+    cancel: &dyn Fn() -> bool,
+    limit: Duration,
+) -> Result<String> {
+    let path = path.to_owned();
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
+    let worker_stop = stop.clone();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let result = full_file_blake3(&path, &|| worker_stop.load(Ordering::Relaxed))
+            .map(|hash| hash.hex_digest);
+        let _ = tx.send(result);
+    });
+    let started = std::time::Instant::now();
+    loop {
+        if cancel() {
+            stop.store(true, Ordering::Relaxed);
+            anyhow::bail!("source inspection cancelled while hashing selected representation");
+        }
+        if let Ok(result) = rx.try_recv() {
+            return result;
+        }
+        if started.elapsed() >= limit {
+            stop.store(true, Ordering::Relaxed);
+            return Err(SourceInspectionError::Timeout.into());
+        }
+        std::thread::sleep(crate::stall::POLL_INTERVAL);
+    }
+}
 
 pub(crate) struct Stream {
     pub numerator: i64,
@@ -35,13 +83,28 @@ pub(crate) fn tool_identity() -> Value {
     ])
 }
 
-fn output(command: &mut Command, cancel: &dyn Fn() -> bool) -> Result<std::process::Output> {
-    let output = crate::stall::output_with_timeout_and_cancellation(
+fn output(
+    command: &mut Command,
+    timeout_seconds: u32,
+    output_limit: usize,
+    cancel: &dyn Fn() -> bool,
+) -> Result<std::process::Output> {
+    let output = match crate::stall::output_with_timeout_cancellation_and_limit(
         command,
         "source inspection media",
-        Duration::from_secs(180),
+        Duration::from_secs(timeout_seconds.into()),
         &|| cancel(),
-    )?;
+        output_limit,
+    ) {
+        Ok(output) => output,
+        Err(error) if error.to_string().contains("stopped answering after") => {
+            return Err(SourceInspectionError::Timeout.into());
+        }
+        Err(error) if error.to_string().contains("output limit") => {
+            return Err(SourceInspectionError::Insufficient.into());
+        }
+        Err(error) => return Err(error),
+    };
     // Keep raw provider/media output local; errors never expose source paths.
     if !output.status.success() {
         return Err(crate::media_tool_failure(
@@ -53,7 +116,12 @@ fn output(command: &mut Command, cancel: &dyn Fn() -> bool) -> Result<std::proce
     Ok(output)
 }
 
-pub(crate) fn probe(path: &Path, include_audio: bool, cancel: &dyn Fn() -> bool) -> Result<Stream> {
+pub(crate) fn probe(
+    path: &Path,
+    include_audio: bool,
+    timeout_seconds: u32,
+    cancel: &dyn Fn() -> bool,
+) -> Result<Stream> {
     let mut command = tool_command("ffprobe");
     command
         .args([
@@ -65,7 +133,9 @@ pub(crate) fn probe(path: &Path, include_audio: bool, cancel: &dyn Fn() -> bool)
             "json",
         ])
         .arg(path);
-    let document: Value = serde_json::from_slice(&output(&mut command, cancel)?.stdout)?;
+    let document: Value = serde_json::from_slice(
+        &output(&mut command, timeout_seconds, 1024 * 1024, cancel)?.stdout,
+    )?;
     let streams = document["streams"]
         .as_array()
         .context("selected representation has no streams")?;
@@ -138,6 +208,7 @@ pub(crate) fn frame_pts(
     mapping: &InspectionTimeMapping,
     start: f64,
     end: f64,
+    timeout_seconds: u32,
     cancel: &dyn Fn() -> bool,
 ) -> Result<Vec<i64>> {
     let origin = mapping.representation_origin_pts as f64 * mapping.time_base_numerator as f64
@@ -154,7 +225,7 @@ pub(crate) fn frame_pts(
             "json",
         ])
         .arg(path);
-    let bytes = output(&mut command, cancel)?.stdout;
+    let bytes = output(&mut command, timeout_seconds, 16 * 1024 * 1024, cancel)?.stdout;
     ensure!(
         bytes.len() <= 16 * 1024 * 1024,
         "source frame metadata exceeds inspection bound"
@@ -187,15 +258,27 @@ pub(crate) fn frame_pts(
     Ok(pts)
 }
 
+pub(super) struct FrameDecodeConfig<'a> {
+    pub rotation: u16,
+    pub width: u32,
+    pub start_seconds: f64,
+    pub pts: &'a [i64],
+    pub timeout_seconds: u32,
+}
+
 pub(super) fn encode_frames(
     path: &Path,
     workspace: &Path,
-    rotation: u16,
-    width: u32,
-    start: f64,
-    pts: &[i64],
+    config: FrameDecodeConfig<'_>,
     cancel: &dyn Fn() -> bool,
 ) -> Result<Vec<InspectionFile>> {
+    let FrameDecodeConfig {
+        rotation,
+        width,
+        start_seconds,
+        pts,
+        timeout_seconds,
+    } = config;
     let turn = match rotation {
         0 => "",
         90 => "transpose=clock,",
@@ -211,7 +294,7 @@ pub(super) fn encode_frames(
     let filter = format!(
         "select={select},{turn}scale='min({width},iw)':'min({width},ih)':force_original_aspect_ratio=decrease"
     );
-    let seek = (start - 1.0).max(0.0).floor();
+    let seek = (start_seconds - 1.0).max(0.0).floor();
     let mut command = tool_command("ffmpeg");
     command
         .args(["-y", "-v", "error", "-copyts", "-ss"])
@@ -231,7 +314,7 @@ pub(super) fn encode_frames(
             "0",
         ])
         .arg(workspace.join("frame-%04d.jpg"));
-    output(&mut command, cancel)?;
+    output(&mut command, timeout_seconds, 1024 * 1024, cancel)?;
     let mut files = Vec::new();
     for i in 0..pts.len() {
         files.push(file(&workspace.join(format!("frame-{i:04}.jpg")), cancel)?);
@@ -249,6 +332,7 @@ pub(crate) fn audio_context(
     audio_start: Option<f64>,
     start: f64,
     end: f64,
+    timeout_seconds: u32,
     cancel: &dyn Fn() -> bool,
 ) -> Result<InspectedAudio> {
     let first = (start * 48000.0).ceil() as u64;
@@ -288,7 +372,7 @@ pub(crate) fn audio_context(
         .args(["-map","0:a:0","-vn","-sn","-dn","-af"])
         .arg(format!("aresample=48000:async=1:first_pts=0,atrim=start_sample={trim}:end_sample={},asetpts=PTS-STARTPTS",trim+last-first))
         .args(["-ar","48000","-ac","2","-c:a","pcm_s16le","-f","s16le"]).arg(&raw);
-    output(&mut command, cancel)?;
+    output(&mut command, timeout_seconds, 1024 * 1024, cancel)?;
     ensure!(
         fs::metadata(&raw)?.len() == (last - first) * 4,
         "selected audio did not cover all requested samples; narrow the window or inspect original explicitly"
@@ -323,7 +407,7 @@ pub(crate) fn audio_context(
         .arg(raw)
         .args(["-c:a", "copy"])
         .arg(&wav);
-    output(&mut command, cancel)?;
+    output(&mut command, timeout_seconds, 1024 * 1024, cancel)?;
     audio.playable = Some(file(&wav, cancel)?);
     Ok(audio)
 }
@@ -371,4 +455,47 @@ pub(super) fn files_current(
         }
     }
     Ok(!report.frames.is_empty())
+}
+
+#[cfg(test)]
+mod bounded_media_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[cfg(unix)]
+    #[test]
+    fn blocked_original_reader_times_out_and_media_process_is_cancellable() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("blocked-original");
+        assert!(
+            Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let started = std::time::Instant::now();
+        let error = fingerprint_with_limit(&fifo, &|| false, Duration::from_millis(150))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("source inspection timed out"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(3));
+        // Let the abandonable open/read finish after proving the caller has
+        // returned, so the fixture itself does not strand a worker thread.
+        drop(std::fs::OpenOptions::new().write(true).open(&fifo).unwrap());
+
+        let cancelled = AtomicBool::new(false);
+        let timer = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                std::thread::sleep(Duration::from_millis(150));
+                cancelled.store(true, Ordering::Relaxed);
+            });
+            let mut child = Command::new("sleep");
+            child.arg("30");
+            output(&mut child, 30, 1024, &|| cancelled.load(Ordering::Relaxed))
+                .unwrap_err()
+                .to_string()
+        });
+        assert!(timer.contains("canceled"), "{timer}");
+    }
 }

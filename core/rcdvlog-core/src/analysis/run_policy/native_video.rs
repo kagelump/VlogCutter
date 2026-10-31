@@ -88,23 +88,24 @@ pub(super) fn describe(
     };
     let mut scope = Vec::new();
     for asset in assets {
-        let selected = match catalog.inspection_source(asset, options.representation, &|| false) {
-            Ok(selected) => Some(selected),
-            Err(error) => {
-                blockers.push(RunPolicyBlocker {
-                    code: "source_not_ready".into(),
-                    message: format!(
-                        "Selected native source representation is not ready: {}",
-                        source_failure_code(&error)
-                    ),
-                    asset_id: Some(asset.id.clone()),
-                });
-                None
-            }
-        };
+        let selected =
+            match catalog.inspection_source(asset, options.representation, 180, &|| false) {
+                Ok(selected) => Some(selected),
+                Err(error) => {
+                    blockers.push(RunPolicyBlocker {
+                        code: "source_not_ready".into(),
+                        message: format!(
+                            "Selected native source representation is not ready: {}",
+                            source_failure_code(&error)
+                        ),
+                        asset_id: Some(asset.id.clone()),
+                    });
+                    None
+                }
+            };
         if request.payload.uses_audio() {
             let audible = selected.as_ref().is_some_and(|source| {
-                crate::editplan::inspection_media::probe(&source.path, true, &|| false)
+                crate::editplan::inspection_media::probe(&source.path, true, 180, &|| false)
                     .is_ok_and(|stream| stream.audio_start_seconds.is_some())
             });
             checks.push(CapabilityCheck{requirement:format!("native_video.source_audio.{}",asset.id),status:if audible{CapabilityStatus::Passed}else{CapabilityStatus::Failed},
@@ -220,6 +221,9 @@ pub(crate) fn accepted_transcript(
     catalog.inspection_transcript(
         asset,
         &crate::SourceInspectionRequest {
+            io_timeout_seconds: 180,
+            probe_timeout_seconds: 180,
+            decode_timeout_seconds: 180,
             asset_id: asset.id.clone(),
             representation: options.representation,
             purpose: crate::InspectionPurpose::ProposedBoundary,
@@ -296,7 +300,7 @@ pub(crate) fn validate_asset_mode(
                 || options.purpose == crate::NativeVideoPurpose::EndpointReview),
         "native asset membership or review scope changed"
     );
-    let selected = catalog.inspection_source(&asset, options.representation, cancel)?;
+    let selected = catalog.inspection_source(&asset, options.representation, 180, cancel)?;
     let transcript = if policy.payload.uses_transcript() {
         accepted_transcript(catalog, &asset, options)?
     } else {

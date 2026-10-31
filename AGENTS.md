@@ -56,6 +56,14 @@ The implemented slice is intentionally smaller than the launch-critical list in 
 
 Implemented now:
 
+- One supported CLI now includes editing, review and upload against schema 65,
+  with observational `doctor --workflow rough-cut|delivery` preflight. Sparse
+  stable-ID patches, explicit source-inventory picture-usage reports and unused
+  candidate retrieval, agent/human decision provenance, historical-preview
+  verification, audiovisual review coverage and measured local delivery bundles
+  are described in `docs/rough-cut-readiness.md`. Existing source inspection
+  supports bounded local deadlines and explicitly requested proxy fallback.
+
 - One portable SQLite catalog per newly created desktop project.
 - Configurable projects root, defaulting to `~/Movies/VideoProjects`.
 - Project library discovery and loading an existing catalog.
@@ -583,7 +591,7 @@ Always pass `--catalog` in agent automation, tests, and temporary workflows. A d
 
 SQLite connections enable foreign keys, WAL journal mode, and a five-second busy timeout. Read operations can continue during an uncommitted writer. Project mutations append typed operations with materialized revisions. Adopted projects synchronize bounded operation pages between independent local catalogs; live SQLite/WAL files are never copied or placed on NAS.
 
-Project catalogs use an explicit `schema_migrations` history and are currently at version 62. The server control catalog is version 11; backup format is version 1. Migration definitions have immutable names/source identities and each migration commits atomically. Migration 18 includes a one-time compatibility reconciliation for catalogs created on the import feature branch before its migration IDs were merged with main. When changing the schema:
+Project catalogs use an explicit `schema_migrations` history and are currently at version 65. The server control catalog is version 11; backup format is version 1. Migration definitions have immutable names/source identities and each migration commits atomically. Migration 18 includes a one-time compatibility reconciliation for catalogs created on the import feature branch before its migration IDs were merged with main. When changing the schema:
 
 - Preserve existing catalogs; never solve migration issues by deleting the database.
 - Add a forward migration and an upgrade test using an older schema fixture.
@@ -915,6 +923,23 @@ The server persists histories in its control catalog scoped to its stable node a
 One progress/eta range rule applies: a single timing sample widens the reported range rather than pretending a point estimate is precise. Speech calibration compares finite, non-overlapping, in-range detected regions against the baseline before adopting a faster VAD thread setting; it never assumes one thread is universally optimal. Proxy calibration uses the existing output validation/render/audio contract and records the actual selected encoder. Explicit encoder/worker/VAD/decode overrides are validated, carry explicit provenance, and use settings-qualified history keys when they differ from the defaults.
 
 The accepted #53 resource model is one shared local-heavy slot across proxy/transcode, full-hash, speech, and future local VLM/analysis work. The server scheduler claims the union of heavy classes from one durable eligible-work queue (newest explicit heavy work first, intentional LIFO), and lightweight work may overlap under its own cap. Proxy, transcription, preparation, and calibration entrypoints take one advisory same-host/same-user filesystem lease; batch internals must not nested-acquire it. This lock coordinates processes on one host only and is not a distributed cluster scheduler. Existing per-asset representation claims remain separate integrity locks.
+
+### YouTube publishing
+
+Upload-only OAuth, persistent node-local credentials and resumable uploads are
+implemented in `core/rcdvlog-core/src/youtube`, with a thin `youtube` CLI adapter.
+Project schema 49 owns the local, unsynced upload ledger. Credentials stay outside
+project catalogs (macOS Keychain or owner-only local file). Scope is exactly
+`youtube.upload`; do not add read/management scopes for convenience. Desktop
+loopback and Web client HTTPS callbacks share PKCE, state validation and token
+storage. Web callbacks require an exactly registered HTTPS URI, a fixed loopback
+port and a trusted proxy preserving Host; never enable Funnel or open the raw
+listener on a non-loopback address. Auth status
+is observational. Never silently recreate an expired/uncertain session or log
+tokens, codes, verifiers, or resumable session URLs. See
+[YouTube publishing](docs/youtube-upload.md) for setup, recovery, JSON contracts
+and outstanding real-Google/Keychain acceptance. Render scheduling is not
+implemented; a caller explicitly invokes upload after a successful render.
 
 ### Edit planning and export
 

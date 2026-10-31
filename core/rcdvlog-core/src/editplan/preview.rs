@@ -56,6 +56,15 @@ pub struct PreviewResult {
     tag = "type"
 )]
 pub enum PreviewProgress {
+    /// Remaining time is unknown until a phase has measured evidence. Clip ETA
+    /// describes encoding only and must not be shown as whole-render completion.
+    Phase {
+        artifact_id: String,
+        sequence: u64,
+        stage: String,
+        elapsed_seconds: f64,
+        estimate_remaining_seconds: Option<f64>,
+    },
     Started {
         artifact_id: Option<String>,
         sequence: Option<u64>,
@@ -239,9 +248,9 @@ impl Catalog {
         } else {
             Some(self.acquire_local_heavy_cancellable(cancel)?)
         };
-        attempt.stage("identifyingSources")?;
-        let prepared =
-            super::preview_media::prepare(self, plan, request, &assets, cancel, context.excerpt)?;
+        let prepared = phase(attempt, "identifyingSources", progress, cancel, |poll| {
+            super::preview_media::prepare(self, plan, request, &assets, poll, context.excerpt)
+        })?;
         attempt.identity(&prepared.identity)?;
         let segments_dir = workspace.join("segments");
         fs::create_dir(&segments_dir)?;
@@ -483,7 +492,7 @@ impl Catalog {
                 sequence: Some(sequence),
                 position: operation.position,
                 elapsed_seconds: elapsed,
-                estimate_remaining_seconds: (completed > 0)
+                estimate_remaining_seconds: (completed > 0 && completed < operations.len())
                     .then(|| elapsed / completed as f64 * (operations.len() - completed) as f64),
             });
         }
@@ -531,9 +540,10 @@ impl Catalog {
             .arg(&list_path)
             .args(["-c", "copy", "-movflags", "+faststart"])
             .arg(&temporary);
-        let (status, diagnostic) =
-            run_media(&mut command, &list_path, &temporary, &mut || cancel())
-                .context("start ffmpeg preview concat process")?;
+        let (status, diagnostic) = phase(attempt, "assembling", progress, cancel, |poll| {
+            run_media(&mut command, &list_path, &temporary, &mut || poll())
+                .context("start ffmpeg preview concat process")
+        })?;
         if !status.success() {
             let _ = fs::remove_file(&temporary);
             return Err(media_tool_failure(
@@ -544,26 +554,30 @@ impl Catalog {
         }
         if split_audio {
             ensure!(!cancel(), "preview render cancelled before audio mix");
-            let mix = if let Some(w) = &window {
-                super::audio_render::render_mix_window(
-                    &workspace,
-                    &audio_events,
-                    super::audio_render::AudioMixWindow {
-                        in_samples: (w.in_seconds() * 48000.0).round() as u64,
-                        out_samples: (w.audio_end_seconds * 48000.0).round() as u64,
-                    },
-                    cancel,
-                )?
-            } else {
-                super::audio_render::render_mix(
-                    &workspace,
-                    &audio_events,
-                    rendered_duration,
-                    cancel,
-                )?
-            };
+            let mix = phase(attempt, "mixingAudio", progress, cancel, |poll| {
+                if let Some(w) = &window {
+                    super::audio_render::render_mix_window(
+                        &workspace,
+                        &audio_events,
+                        super::audio_render::AudioMixWindow {
+                            in_samples: (w.in_seconds() * 48000.0).round() as u64,
+                            out_samples: (w.audio_end_seconds * 48000.0).round() as u64,
+                        },
+                        poll,
+                    )
+                } else {
+                    super::audio_render::render_mix(
+                        &workspace,
+                        &audio_events,
+                        rendered_duration,
+                        poll,
+                    )
+                }
+            })?;
             let muxed = workspace.join("preview.audio.tmp.mp4");
-            let rendered_seconds = super::audio_render::mux_mix(&temporary, &mix, &muxed, cancel)?;
+            let rendered_seconds = phase(attempt, "muxingAudio", progress, cancel, |poll| {
+                super::audio_render::mux_mix(&temporary, &mix, &muxed, poll)
+            })?;
             ensure!(
                 (rendered_seconds - rendered_duration).abs() <= 0.1,
                 "split audio preview duration differs from planned duration"
@@ -572,24 +586,33 @@ impl Catalog {
             fs::rename(&muxed, &temporary)?;
             fs::remove_file(mix)?;
         }
-        attempt.stage("validatingOutput")?;
-        let validation = super::preview_media::validate_movie(
-            &temporary,
-            &workspace,
-            plan,
-            request,
-            &segment_frames,
+        let validation = phase(
+            attempt,
+            "decodingAndValidatingOutput",
+            progress,
             cancel,
-            context.excerpt,
+            |poll| {
+                super::preview_media::validate_movie(
+                    &temporary,
+                    &workspace,
+                    plan,
+                    request,
+                    &segment_frames,
+                    poll,
+                    context.excerpt,
+                )
+            },
         )?;
-        let current = super::preview_media::prepare(
-            self,
-            plan,
-            request,
-            &self.list_assets(&plan.project_id)?,
-            cancel,
-            context.excerpt,
-        )?;
+        let current = phase(attempt, "verifyingInputs", progress, cancel, |poll| {
+            super::preview_media::prepare(
+                self,
+                plan,
+                request,
+                &self.list_assets(&plan.project_id)?,
+                poll,
+                context.excerpt,
+            )
+        })?;
         ensure!(
             current.identity.sources == prepared.identity.sources
                 && current.identity.tools == prepared.identity.tools
@@ -609,6 +632,14 @@ impl Catalog {
         ensure!(!cancel(), "preview render cancelled before publication");
         // Only the short publication window excludes concurrent human writes;
         // media rendering never holds SQLite's write lock.
+        let sequence = attempt.stage("publishing")?;
+        progress(PreviewProgress::Phase {
+            artifact_id: attempt.artifact_id.clone(),
+            sequence,
+            stage: "publishing".into(),
+            elapsed_seconds: 0.0,
+            estimate_remaining_seconds: None,
+        });
         let mut publication_connection = self.connection()?;
         let publication = publication_connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -629,6 +660,51 @@ impl Catalog {
         });
         Ok(result)
     }
+}
+
+/// Media owners already call their cancellation callback while doing work. Use
+/// that same observation boundary for bounded durable heartbeat updates.
+fn phase<T>(
+    attempt: &super::preview_artifacts::PreviewAttempt<'_>,
+    stage: &str,
+    progress: &mut dyn FnMut(PreviewProgress),
+    cancel: &dyn Fn() -> bool,
+    work: impl FnOnce(&dyn Fn() -> bool) -> Result<T>,
+) -> Result<T> {
+    use std::{
+        cell::{Cell, RefCell},
+        time::{Duration, Instant},
+    };
+    let started = Instant::now();
+    let last = Cell::new(started);
+    let progress = RefCell::new(progress);
+    let error = RefCell::new(None);
+    let emit = || -> Result<()> {
+        let sequence = attempt.stage(stage)?;
+        progress.borrow_mut()(PreviewProgress::Phase {
+            artifact_id: attempt.artifact_id.clone(),
+            sequence,
+            stage: stage.into(),
+            elapsed_seconds: started.elapsed().as_secs_f64(),
+            estimate_remaining_seconds: None,
+        });
+        Ok(())
+    };
+    emit()?;
+    let poll = || {
+        if last.get().elapsed() >= Duration::from_secs(5) {
+            last.set(Instant::now());
+            if let Err(e) = emit() {
+                *error.borrow_mut() = Some(e);
+            }
+        }
+        cancel() || error.borrow().is_some()
+    };
+    let result = work(&poll);
+    if let Some(error) = error.into_inner() {
+        return Err(error);
+    }
+    result
 }
 
 pub(super) fn source_has_audio(source: &str, cancel: &dyn Fn() -> bool) -> Result<bool> {

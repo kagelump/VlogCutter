@@ -34,6 +34,9 @@ fn inspect(catalog: &Catalog, id: &str, audio: bool, transcript: bool) -> crate:
     catalog
         .inspect_source_window(
             &SourceInspectionRequest {
+                io_timeout_seconds: 180,
+                probe_timeout_seconds: 180,
+                decode_timeout_seconds: 180,
                 asset_id: id.into(),
                 representation: InspectionRepresentation::Original,
                 purpose: InspectionPurpose::InspectedBoundary,
@@ -383,6 +386,9 @@ fn trim_suggestions_never_extend_a_whole_utterance_into_exclusions() {
     };
     save_transcript(&catalog.connection().unwrap(), &transcript).unwrap();
     let mut request = SourceInspectionRequest {
+        io_timeout_seconds: 180,
+        probe_timeout_seconds: 180,
+        decode_timeout_seconds: 180,
         asset_id: id.clone(),
         representation: InspectionRepresentation::GeneratedProxy,
         purpose: InspectionPurpose::InspectedBoundary,
@@ -668,6 +674,9 @@ fn labeling_visibility_does_not_change_explicit_inspection_or_human_range_decisi
     let report = catalog
         .inspect_source_window(
             &SourceInspectionRequest {
+                io_timeout_seconds: 180,
+                probe_timeout_seconds: 180,
+                decode_timeout_seconds: 180,
                 asset_id: id.clone(),
                 representation: InspectionRepresentation::GeneratedProxy,
                 purpose: InspectionPurpose::InspectedBoundary,

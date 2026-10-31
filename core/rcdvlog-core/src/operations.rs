@@ -2,7 +2,7 @@ use crate::{
     Asset, AssetPatch, Catalog, ClockEvent, MediaVerificationState, normalize_datetime,
     normalize_labels, now,
 };
-use anyhow::{Result, anyhow, bail, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use chrono::Utc;
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -1694,6 +1694,13 @@ pub(crate) fn commit_local_in_transaction(
             aggregate_id: new.aggregate_id,
             operation_type: new.operation_type.to_string(),
             payload_version: if new.operation_type == EDIT_PLAN_REVISION_CREATED
+                && new
+                    .payload
+                    .get("patchLineage")
+                    .is_some_and(|v| !v.is_null())
+            {
+                4
+            } else if new.operation_type == EDIT_PLAN_REVISION_CREATED
                 && new.payload.get("selection").is_some_and(|v| !v.is_null())
             {
                 3
@@ -3553,6 +3560,10 @@ pub(crate) struct EditPlanRevisionCreatedPayload {
     pub(crate) operations: Vec<crate::editplan::EditPlanOperation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) selection: Option<crate::SelectionMetadata>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) patch_lineage: Option<Vec<crate::PatchLineage>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) variant_name: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -3594,10 +3605,71 @@ pub(crate) fn materialize_edit_plan_revision_created(
     {
         bail!("sequence selection metadata requires editPlanRevisionCreated payload version 3");
     }
+    if operation.payload_version == 4
+        && !crate::migrations::column_exists(transaction, "edit_plan_revisions", "patch_json")?
+    {
+        return Ok(ApplyOperationResult::Quarantined);
+    }
     require_edit_plan_aggregate(operation)?;
     if !revision_guard_passes(transaction, operation)? {
         return Ok(ApplyOperationResult::Conflict);
     }
+    let patch_metadata = match (&payload.patch_lineage, &payload.variant_name) {
+        (None, None) => {
+            ensure!(
+                operation.payload_version != 4,
+                "patch payload version 4 requires lineage and variant name"
+            );
+            None
+        }
+        (Some(lineage), Some(name)) => {
+            ensure!(
+                operation.payload_version == 4
+                    && !name.trim().is_empty()
+                    && name.len() <= 255
+                    && lineage.len() <= 2000,
+                "invalid sparse patch metadata/version"
+            );
+            let parent = crate::editplan::read_revision(
+                transaction,
+                payload
+                    .parent_revision_id
+                    .as_deref()
+                    .context("patch requires an immutable base")?,
+            )?;
+            ensure!(
+                parent.project_id == operation.project_id,
+                "patch parent belongs to another project"
+            );
+            let mut ids = BTreeSet::new();
+            for item in lineage {
+                ensure!(
+                    ids.insert(&item.operation_id)
+                        && payload
+                            .operations
+                            .iter()
+                            .any(|cut| cut.operation_id == item.operation_id)
+                        && match item.kind.as_str() {
+                            "insert" =>
+                                item.parent_operation_id.is_none()
+                                    && !parent
+                                        .operations
+                                        .iter()
+                                        .any(|cut| cut.operation_id == item.operation_id),
+                            "split" | "replace" =>
+                                item.parent_operation_id.as_ref().is_some_and(|id| parent
+                                    .operations
+                                    .iter()
+                                    .any(|cut| &cut.operation_id == id)),
+                            _ => false,
+                        },
+                    "invalid sparse patch lineage identity"
+                );
+            }
+            Some(serde_json::json!({"name":name,"lineage":lineage}))
+        }
+        _ => bail!("patch lineage and variant name must be supplied together"),
+    };
     let exists: bool = transaction.query_row(
         "SELECT EXISTS(SELECT 1 FROM edit_plan_revisions WHERE revision_id=?1)",
         [&payload.revision_id],
@@ -3611,7 +3683,9 @@ pub(crate) fn materialize_edit_plan_revision_created(
                 && existing.script_revision_id == payload.script_revision_id
                 && existing.operations == payload.operations
                 && crate::editplan::selection::load_metadata(transaction, &payload.revision_id)?
-                    == payload.selection,
+                    == payload.selection
+                && crate::editplan::patch::load_patch_metadata(transaction, &payload.revision_id)?
+                    == patch_metadata,
             "immutable edit revision identity was reused with different content"
         );
     }
@@ -3626,6 +3700,12 @@ pub(crate) fn materialize_edit_plan_revision_created(
         &now(),
         &payload.operations,
     )?;
+    if let Some(metadata) = patch_metadata {
+        transaction.execute(
+            "UPDATE edit_plan_revisions SET patch_json=?2 WHERE revision_id=?1",
+            params![payload.revision_id, serde_json::to_string(&metadata)?],
+        )?;
+    }
     if let Some(metadata) = &payload.selection {
         crate::editplan::selection::materialize_metadata(
             transaction,
@@ -3839,7 +3919,7 @@ fn require_asset(transaction: &Transaction<'_>, operation: &ProjectOperation) ->
 fn payload<T: DeserializeOwned>(operation: &ProjectOperation) -> Result<T> {
     if operation.payload_version != 1
         && !(operation.operation_type == EDIT_PLAN_REVISION_CREATED
-            && matches!(operation.payload_version, 2 | 3))
+            && matches!(operation.payload_version, 2..=4))
     {
         bail!(
             "unsupported payload version {} for {}",
@@ -3891,7 +3971,7 @@ fn validate_operation(operation: &ProjectOperation) -> Result<()> {
             PROJECT_ASSET_ADDED | EDIT_PLAN_REVISION_CREATED
         ) && operation.payload_version == 2)
         && !(operation.operation_type == EDIT_PLAN_REVISION_CREATED
-            && operation.payload_version == 3)
+            && matches!(operation.payload_version, 3 | 4))
         && is_known_operation_type(&operation.operation_type)
     {
         bail!(

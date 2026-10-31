@@ -65,12 +65,15 @@ pub struct ShortComparisonStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ComparisonPreferenceRequest {
+    #[serde(default)]
+    pub provenance: Option<super::feedback::ReviewDecisionProvenance>,
     pub comparison_id: String,
     pub preferred_variant: String,
     pub expected_preferred_revision_id: String,
     /// The literal "none" explicitly guards an unactivated project.
     pub expected_active_revision_id: String,
-    pub decision_owner: super::RangeDecisionOwner,
+    #[serde(default)]
+    pub decision_owner: Option<super::RangeDecisionOwner>,
     pub rationale: String,
     /// Explicit retention only; choosing a variant never invents hard locks.
     pub retain_operation_ids: Vec<String>,
@@ -79,6 +82,8 @@ pub struct ComparisonPreferenceRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ComparisonChoice {
+    #[serde(default)]
+    pub provenance: Option<super::feedback::ReviewDecisionProvenance>,
     pub choice_id: String,
     pub comparison_id: String,
     pub preferred_revision_id: String,
@@ -444,6 +449,20 @@ impl Catalog {
                 && request.retain_operation_ids.len() <= 12,
             "invalid input: preference rationale or retention bounds"
         );
+        ensure!(
+            request.provenance.is_some() || request.decision_owner.is_some(),
+            "invalid input: assert preference provenance or an explicit legacy human decision"
+        );
+        let provenance = request
+            .provenance
+            .clone()
+            .unwrap_or_else(super::feedback::ReviewDecisionProvenance::human);
+        let origin = provenance.origin()?;
+        ensure!(
+            origin == super::feedback::ReviewDecisionOrigin::Human
+                || request.retain_operation_ids.is_empty(),
+            "invalid input: agent preferences cannot create authoritative human locks"
+        );
         let status = self.short_comparison_status(&request.comparison_id, true)?;
         ensure!(
             status.current_for_request == Some(true),
@@ -495,7 +514,11 @@ impl Catalog {
                     project_id: comparison.request.project_id.clone(),
                     revision_id: winner.revision_id.clone(),
                     operation_id: operation_id.clone(),
-                    author: super::feedback::ReviewAuthor::Human,
+                    author: if origin == super::feedback::ReviewDecisionOrigin::Human {
+                        super::feedback::ReviewAuthor::Human
+                    } else {
+                        super::feedback::ReviewAuthor::Reviewer
+                    },
                     category: super::feedback::ReviewCategory::Preference,
                     observation: format!(
                         "Preferred variant {}. {}",
@@ -508,6 +531,7 @@ impl Catalog {
             )?;
             if retained.contains(&operation_id) {
                 decisions.push(super::feedback::DecideReviewFeedbackRequest {
+                    provenance: Some(provenance.clone()),
                     note_id: note.note.note_id.clone(),
                     expected_revision: note.revision,
                     proposal_id: None,
@@ -523,6 +547,7 @@ impl Catalog {
             self.decide_review_feedback(&decision)?;
         }
         let mut choice = ComparisonChoice {
+            provenance: Some(provenance),
             choice_id: format!("compare_choice_{}", uuid::Uuid::new_v4().simple()),
             comparison_id: comparison.id,
             preferred_revision_id: winner.revision_id.clone(),
@@ -604,7 +629,6 @@ impl Catalog {
         ensure!(
             status.comparison.state == "complete"
                 && status.comparison.recipe == RECIPE
-                && verified.latest_attempt
                 && verified.file_present
                 && facts.output_matches
                 && facts.plan_renderable

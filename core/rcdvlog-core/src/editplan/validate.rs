@@ -166,6 +166,16 @@ impl Catalog {
     ) -> Result<ValidationReport> {
         anyhow::ensure!(!cancel(), "preview cancelled during validation");
         let revision = self.edit_plan_revision(revision_id)?;
+        self.validate_edit_plan_snapshot(&revision, cancel, audio_window)
+    }
+
+    pub(super) fn validate_edit_plan_snapshot(
+        &self,
+        revision: &super::EditPlanRevision,
+        cancel: &dyn Fn() -> bool,
+        audio_window: Option<(f64, f64)>,
+    ) -> Result<ValidationReport> {
+        let revision_id = &revision.revision_id;
         let assets = self.list_assets(&revision.project_id)?;
         let mut findings: Vec<Finding> = Vec::new();
         let constraints =
@@ -180,7 +190,7 @@ impl Catalog {
             }
         }
         for (asset_id, message) in
-            super::feedback::retained_choice_violations(&self.connection()?, &revision)?
+            super::feedback::retained_choice_violations(&self.connection()?, revision)?
         {
             findings.push(Finding::new(
                 FindingKind::HumanChoiceViolation,
@@ -200,7 +210,7 @@ impl Catalog {
             }
         }
         if let Some(metadata) = super::selection::load_metadata(&self.connection()?, revision_id)? {
-            for conflict in super::selection_report::report(&revision, &metadata).conflicts {
+            for conflict in super::selection_report::report(revision, &metadata).conflicts {
                 findings.push(Finding::new(
                     if conflict.blocking {
                         FindingKind::SelectionConflict
@@ -378,7 +388,7 @@ impl Catalog {
 
         if revision.operations.iter().any(|cut| cut.audio.is_some())
             && let Err(error) = super::audio::audio_events_cancellable_window(
-                &revision,
+                revision,
                 &assets,
                 cancel,
                 audio_window,

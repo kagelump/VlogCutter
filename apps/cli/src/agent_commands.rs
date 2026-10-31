@@ -70,6 +70,9 @@ pub struct ReadinessArgs {
     /// Require a compatible catalog, all media tools and installed speech models.
     #[arg(long)]
     check: bool,
+    /// Preflight a supported end-to-end workflow without media or network mutations.
+    #[arg(long, value_parser = ["rough-cut", "delivery"])]
+    workflow: Option<String>,
     /// Require an exact command name or versioned schema capability (repeatable).
     #[arg(long = "require-capability")]
     capabilities: Vec<String>,
@@ -95,12 +98,32 @@ impl ReadinessArgs {
         }
         tools.sort();
         tools.dedup();
+        let mut capabilities = self.capabilities.clone();
+        if let Some(workflow) = &self.workflow {
+            tools.extend(["ffmpeg".into(), "ffprobe".into()]);
+            capabilities.extend(
+                [
+                    "edit-plan.create",
+                    "edit-plan.patch",
+                    "edit-plan.preview",
+                    "edit-plan.context.create",
+                    "edit-plan.feedback.decide",
+                    "edit-plan.coverage.report",
+                    "edit-plan.review-coverage.report",
+                    "edit-plan.bundle",
+                ]
+                .map(str::to_owned),
+            );
+            if workflow == "delivery" {
+                capabilities.extend(["youtube.upload".into(), "youtube.history".into()]);
+            }
+        }
         ReadinessRequirements {
-            catalog: self.check,
+            catalog: self.check || self.workflow.is_some(),
             tools,
             models: self.check || self.require_models,
             pipeline_smoke: self.check || self.require_pipeline_smoke,
-            capabilities: self.capabilities.clone(),
+            capabilities,
             revision: self.expect_revision.clone(),
         }
     }
@@ -250,6 +273,10 @@ pub(super) fn executable() -> Result<CliExecutable> {
         },
         capabilities: BTreeMap::from([
             ("cli.envelope.v1".into(), 1),
+            ("edit-plan.patch.v1".into(), 1),
+            ("edit-plan.picture-coverage.v1".into(), 1),
+            ("edit-plan.review-coverage.v1".into(), 1),
+            ("youtube.upload.v1".into(), 1),
             ("agent.readiness.v1".into(), 1),
             ("agent.binding.v1".into(), 1),
             (

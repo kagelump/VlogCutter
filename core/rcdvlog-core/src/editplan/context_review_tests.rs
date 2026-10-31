@@ -120,6 +120,9 @@ fn assembled_context_has_separate_source_handles_audio_mapping_and_revision_boun
         .render_preview_excerpt(&request(&plan), &mut |_| {}, &|| false)
         .unwrap();
     let handle = SourceInspectionRequest {
+        io_timeout_seconds: 180,
+        probe_timeout_seconds: 180,
+        decode_timeout_seconds: 180,
         asset_id: asset.clone(),
         representation: InspectionRepresentation::Original,
         purpose: InspectionPurpose::ProposedBoundary,
