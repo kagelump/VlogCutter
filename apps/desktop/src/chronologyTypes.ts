@@ -291,6 +291,8 @@ export interface EditPlanRevision {
   parentRevisionId: string | null;
   active: boolean;
   operations: EditPlanOperation[];
+  /** Revision-local exact story decisions; rendered by the core, not the UI. */
+  storyPolicy?: unknown | null;
   createdAt: string;
 }
 

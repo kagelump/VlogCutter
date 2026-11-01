@@ -379,14 +379,19 @@ pub(crate) fn constraints_key(
     let ranges_key = blake3::hash(&serde_json::to_vec(&rows)?)
         .to_hex()
         .to_string();
+    let story_key = blake3::hash(&serde_json::to_vec(&plan.story_policy)?)
+        .to_hex()
+        .to_string();
     Ok(
         if let Some(hard_choices) = super::feedback::hard_choice_key(connection, &plan.project_id)?
         {
-            blake3::hash(&serde_json::to_vec(&(ranges_key, hard_choices))?)
+            blake3::hash(&serde_json::to_vec(&(ranges_key, story_key, hard_choices))?)
                 .to_hex()
                 .to_string()
         } else {
-            ranges_key
+            blake3::hash(&serde_json::to_vec(&(ranges_key, story_key))?)
+                .to_hex()
+                .to_string()
         },
     )
 }

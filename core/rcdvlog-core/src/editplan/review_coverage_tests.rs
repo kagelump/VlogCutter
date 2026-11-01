@@ -228,6 +228,7 @@ fn normalized_dependency_allows_a_prefix_shift_but_rejects_neighbor_change() {
         parent_revision_id: None,
         active: false,
         operations,
+        story_policy: None,
         created_at: "now".into(),
     };
     // Review C well inside the sequence so the 100 ms audio-context window

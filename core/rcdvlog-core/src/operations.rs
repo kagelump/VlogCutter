@@ -1694,6 +1694,10 @@ pub(crate) fn commit_local_in_transaction(
             aggregate_id: new.aggregate_id,
             operation_type: new.operation_type.to_string(),
             payload_version: if new.operation_type == EDIT_PLAN_REVISION_CREATED
+                && new.payload.get("storyPolicy").is_some_and(|v| !v.is_null())
+            {
+                5
+            } else if new.operation_type == EDIT_PLAN_REVISION_CREATED
                 && new
                     .payload
                     .get("patchLineage")
@@ -3564,6 +3568,8 @@ pub(crate) struct EditPlanRevisionCreatedPayload {
     pub(crate) patch_lineage: Option<Vec<crate::PatchLineage>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) variant_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) story_policy: Option<crate::editplan::EditPlanStoryPolicy>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -3600,13 +3606,37 @@ pub(crate) fn materialize_edit_plan_revision_created(
     if operation.payload_version == 1 && payload.operations.iter().any(|cut| cut.audio.is_some()) {
         bail!("independent source audio requires editPlanRevisionCreated payload version 2");
     }
-    if (operation.payload_version < 3 && payload.selection.is_some())
-        || (operation.payload_version == 3 && payload.selection.is_none())
-    {
+    if payload.selection.is_some() && !matches!(operation.payload_version, 3..=5) {
+        bail!(
+            "sequence selection metadata requires editPlanRevisionCreated payload version 3 or newer"
+        );
+    }
+    if operation.payload_version == 3 && payload.selection.is_none() {
         bail!("sequence selection metadata requires editPlanRevisionCreated payload version 3");
+    }
+    if payload.patch_lineage.is_some() && !matches!(operation.payload_version, 4 | 5) {
+        bail!("patch lineage requires editPlanRevisionCreated payload version 4 or newer");
+    }
+    if operation.payload_version == 4 && payload.patch_lineage.is_none() {
+        bail!("patch payload version 4 requires lineage and variant name");
+    }
+    if payload.story_policy.is_some() && operation.payload_version != 5 {
+        bail!("story policy requires editPlanRevisionCreated payload version 5");
+    }
+    if operation.payload_version == 5 && payload.story_policy.is_none() {
+        bail!("story policy payload version 5 requires storyPolicy");
     }
     if operation.payload_version == 4
         && !crate::migrations::column_exists(transaction, "edit_plan_revisions", "patch_json")?
+    {
+        return Ok(ApplyOperationResult::Quarantined);
+    }
+    if operation.payload_version == 5
+        && !crate::migrations::column_exists(
+            transaction,
+            "edit_plan_revisions",
+            "story_policy_json",
+        )?
     {
         return Ok(ApplyOperationResult::Quarantined);
     }
@@ -3617,14 +3647,15 @@ pub(crate) fn materialize_edit_plan_revision_created(
     let patch_metadata = match (&payload.patch_lineage, &payload.variant_name) {
         (None, None) => {
             ensure!(
-                operation.payload_version != 4,
-                "patch payload version 4 requires lineage and variant name"
+                operation.payload_version < 4
+                    || (operation.payload_version == 5 && payload.story_policy.is_some()),
+                "patch payload versions 4 and 5 require lineage and variant name"
             );
             None
         }
         (Some(lineage), Some(name)) => {
             ensure!(
-                operation.payload_version == 4
+                matches!(operation.payload_version, 4 | 5)
                     && !name.trim().is_empty()
                     && name.len() <= 255
                     && lineage.len() <= 2000,
@@ -3685,7 +3716,9 @@ pub(crate) fn materialize_edit_plan_revision_created(
                 && crate::editplan::selection::load_metadata(transaction, &payload.revision_id)?
                     == payload.selection
                 && crate::editplan::patch::load_patch_metadata(transaction, &payload.revision_id)?
-                    == patch_metadata,
+                    == patch_metadata
+                && crate::editplan::load_story_policy(transaction, &payload.revision_id)?
+                    == payload.story_policy,
             "immutable edit revision identity was reused with different content"
         );
     }
@@ -3693,12 +3726,15 @@ pub(crate) fn materialize_edit_plan_revision_created(
     // materializes exactly once.
     crate::editplan::insert_revision(
         transaction,
-        &operation.project_id,
-        &payload.revision_id,
-        payload.script_revision_id.as_deref(),
-        payload.parent_revision_id.as_deref(),
-        &now(),
-        &payload.operations,
+        crate::editplan::RevisionInsert {
+            project_id: &operation.project_id,
+            revision_id: &payload.revision_id,
+            script_revision_id: payload.script_revision_id.as_deref(),
+            parent_revision_id: payload.parent_revision_id.as_deref(),
+            created_at: &now(),
+            operations: &payload.operations,
+            story_policy: payload.story_policy.as_ref(),
+        },
     )?;
     if let Some(metadata) = patch_metadata {
         transaction.execute(
@@ -3919,7 +3955,7 @@ fn require_asset(transaction: &Transaction<'_>, operation: &ProjectOperation) ->
 fn payload<T: DeserializeOwned>(operation: &ProjectOperation) -> Result<T> {
     if operation.payload_version != 1
         && !(operation.operation_type == EDIT_PLAN_REVISION_CREATED
-            && matches!(operation.payload_version, 2..=4))
+            && matches!(operation.payload_version, 2..=5))
     {
         bail!(
             "unsupported payload version {} for {}",
@@ -3971,7 +4007,7 @@ fn validate_operation(operation: &ProjectOperation) -> Result<()> {
             PROJECT_ASSET_ADDED | EDIT_PLAN_REVISION_CREATED
         ) && operation.payload_version == 2)
         && !(operation.operation_type == EDIT_PLAN_REVISION_CREATED
-            && matches!(operation.payload_version, 3 | 4))
+            && matches!(operation.payload_version, 3..=5))
         && is_known_operation_type(&operation.operation_type)
     {
         bail!(

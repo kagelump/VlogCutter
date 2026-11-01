@@ -7,7 +7,7 @@ use thiserror::Error;
 
 use crate::chronology::forward_migrate_project_chronology;
 
-pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 65;
+pub const PROJECT_CATALOG_SCHEMA_VERSION: u32 = 66;
 
 const MIGRATION_TABLE_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -474,7 +474,18 @@ pub const PROJECT_CATALOG_MIGRATIONS: &[SqliteMigration] = &[
         source_identity: "project-catalog/0065-sparse-edit-revision-lineage/20261031",
         apply: sparse_edit_revision_lineage,
     },
+    SqliteMigration {
+        id: 66,
+        name: "edit_plan_story_policy",
+        source_identity: "project-catalog/0066-edit-plan-story-policy/20261101",
+        apply: edit_plan_story_policy,
+    },
 ];
+
+fn edit_plan_story_policy(tx: &Transaction<'_>) -> Result<()> {
+    add_column_if_missing(tx, "edit_plan_revisions", "story_policy_json", "TEXT")?;
+    Ok(())
+}
 
 fn sparse_edit_revision_lineage(tx: &Transaction<'_>) -> Result<()> {
     add_column_if_missing(tx, "edit_plan_revisions", "patch_json", "TEXT")?;
@@ -5163,6 +5174,36 @@ mod edit_cut_migration_tests {
                 .unwrap(),
             1
         );
+    }
+
+    #[test]
+    fn migration_66_adds_nullable_story_policy_without_approving_legacy_revisions() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        run_sqlite_migrations(&mut connection, &PROJECT_CATALOG_MIGRATIONS[..65]).unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO projects(id,name,created_at) VALUES('p','fixture','now');
+                 INSERT INTO edit_plan_revisions(revision_id,project_id,created_at)
+                    VALUES('legacy_revision','p','now');",
+            )
+            .unwrap();
+        migrate_project_catalog(&mut connection).unwrap();
+        let columns: Vec<String> = connection
+            .prepare("SELECT name FROM pragma_table_info('edit_plan_revisions')")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<String>>>()
+            .unwrap();
+        assert!(columns.contains(&"story_policy_json".to_string()));
+        let policy: Option<String> = connection
+            .query_row(
+                "SELECT story_policy_json FROM edit_plan_revisions WHERE revision_id='legacy_revision'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(policy.is_none(), "legacy history is not silently approved");
     }
 
     #[test]

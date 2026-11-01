@@ -975,6 +975,7 @@ pub(super) fn choose(
         parent_revision_id: request.expected_base_revision_id.clone(),
         active: false,
         operations: operations.clone(),
+        story_policy: None,
         created_at: String::new(),
     };
     let mut report = super::selection_report::report(&plan, &metadata);

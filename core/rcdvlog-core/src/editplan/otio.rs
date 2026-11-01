@@ -239,6 +239,10 @@ impl Catalog {
     /// with the digest actually found.
     pub fn export_otio(&self, request: &OtioExportRequest) -> Result<OtioExportResult> {
         let plan = self.edit_plan_revision(&request.revision_id)?;
+        let validation = self.validate_edit_plan(&request.revision_id)?;
+        if !validation.renderable() {
+            return Err(super::validate::validation_error(&validation).into());
+        }
         let assets = self.list_assets(&plan.project_id)?;
         let document = otio_document(&plan, &assets, &request.timeline_name)?;
         let digest = blake3::hash(document.as_bytes()).to_hex().to_string();

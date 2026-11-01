@@ -29,6 +29,12 @@ pub enum FindingKind {
     SelectionReview,
     StaleScriptRevision,
     StaleRevision,
+    ChronologyViolation,
+    ChronologyAmbiguous,
+    ChronologyUnresolved,
+    StoryPolicyInvalid,
+    StoryGroupViolation,
+    StoryScopeStale,
 }
 
 /// Errors block render and export; warnings do not.
@@ -57,6 +63,12 @@ impl FindingKind {
             Self::ConfirmedRangeViolation => "edit_plan_confirmed_range_violation",
             Self::StaleScriptRevision => "edit_plan_stale_script_revision",
             Self::StaleRevision => "edit_plan_stale_revision_warning",
+            Self::ChronologyViolation => "edit_plan_chronology_conflict",
+            Self::ChronologyAmbiguous => "edit_plan_chronology_ambiguous",
+            Self::ChronologyUnresolved => "edit_plan_chronology_unresolved",
+            Self::StoryPolicyInvalid => "edit_plan_story_policy_invalid",
+            Self::StoryGroupViolation => "edit_plan_story_group_violation",
+            Self::StoryScopeStale => "edit_plan_story_scope_stale",
         }
     }
 
@@ -70,12 +82,18 @@ impl FindingKind {
             | Self::OriginalOffline
             | Self::RangeOutOfBounds
             | Self::RangeInverted
-            | Self::RangeZeroLength => Severity::Error,
+            | Self::RangeZeroLength
+            | Self::ChronologyViolation
+            | Self::StoryPolicyInvalid
+            | Self::StoryGroupViolation
+            | Self::StoryScopeStale => Severity::Error,
             Self::SelectionReview
             | Self::ProxyMissing
             | Self::SourceRangeOverlap
             | Self::StaleScriptRevision
-            | Self::StaleRevision => Severity::Warning,
+            | Self::StaleRevision
+            | Self::ChronologyAmbiguous
+            | Self::ChronologyUnresolved => Severity::Warning,
         }
     }
 }
@@ -97,7 +115,7 @@ pub struct Finding {
 }
 
 impl Finding {
-    fn new(
+    pub(crate) fn new(
         kind: FindingKind,
         position: Option<u32>,
         asset_id: Option<String>,
@@ -120,6 +138,35 @@ impl Finding {
 #[serde(rename_all = "camelCase")]
 pub struct ValidationReport {
     pub findings: Vec<Finding>,
+}
+
+/// Convert a blocking report into the most specific stable core error. This
+/// keeps CLI/API failures actionable without adapters parsing English.
+pub(crate) fn validation_error(report: &ValidationReport) -> crate::EditPlanError {
+    let message = report
+        .errors()
+        .map(|finding| finding.message.clone())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let has = |kind: FindingKind| report.errors().any(|finding| finding.kind == kind);
+    if has(FindingKind::StoryScopeStale) {
+        crate::EditPlanError::StaleStoryScope { message }
+    } else if has(FindingKind::StoryPolicyInvalid) || has(FindingKind::StoryGroupViolation) {
+        crate::EditPlanError::StoryPolicyInvalid { message }
+    } else if has(FindingKind::ChronologyViolation) {
+        crate::EditPlanError::ChronologyConflict { message }
+    } else if has(FindingKind::ChronologyAmbiguous) {
+        crate::EditPlanError::ChronologyAmbiguous { message }
+    } else if has(FindingKind::ChronologyUnresolved) {
+        crate::EditPlanError::ChronologyUnresolved { message }
+    } else {
+        crate::EditPlanError::ValidationFailed {
+            codes: report
+                .errors()
+                .map(|finding| finding.code.to_string())
+                .collect(),
+        }
+    }
 }
 
 impl ValidationReport {
@@ -169,11 +216,32 @@ impl Catalog {
         self.validate_edit_plan_snapshot(&revision, cancel, audio_window)
     }
 
+    /// Validate an in-memory candidate with the same chronology, group, range
+    /// and audio owners used by persisted revisions. Persisted-state warnings
+    /// (active/stale revision) are intentionally skipped for a candidate.
+    pub(crate) fn validate_edit_plan_candidate(
+        &self,
+        revision: &super::EditPlanRevision,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<ValidationReport> {
+        self.validate_edit_plan_snapshot_inner(revision, cancel, None, false)
+    }
+
     pub(super) fn validate_edit_plan_snapshot(
         &self,
         revision: &super::EditPlanRevision,
         cancel: &dyn Fn() -> bool,
         audio_window: Option<(f64, f64)>,
+    ) -> Result<ValidationReport> {
+        self.validate_edit_plan_snapshot_inner(revision, cancel, audio_window, true)
+    }
+
+    fn validate_edit_plan_snapshot_inner(
+        &self,
+        revision: &super::EditPlanRevision,
+        cancel: &dyn Fn() -> bool,
+        audio_window: Option<(f64, f64)>,
+        check_persisted_state: bool,
     ) -> Result<ValidationReport> {
         let revision_id = &revision.revision_id;
         let assets = self.list_assets(&revision.project_id)?;
@@ -427,23 +495,56 @@ impl Catalog {
             }
         }
 
-        let staleness = self.edit_plan_staleness(revision_id)?;
-        if staleness.stale {
-            findings.push(Finding::new(
-                FindingKind::StaleScriptRevision,
-                None,
-                None,
-                "This plan was built from an older version of the script.".to_string(),
-            ));
+        if check_persisted_state {
+            let staleness = self.edit_plan_staleness(revision_id)?;
+            if staleness.stale {
+                findings.push(Finding::new(
+                    FindingKind::StaleScriptRevision,
+                    None,
+                    None,
+                    "This plan was built from an older version of the script.".to_string(),
+                ));
+            }
+            if !revision.active
+                && let Some(active) = self.active_edit_plan_revision_id(&revision.project_id)?
+            {
+                findings.push(Finding::new(
+                    FindingKind::StaleRevision,
+                    None,
+                    None,
+                    format!("Revision {active} is the active plan; this one is not."),
+                ));
+            }
         }
-        if !revision.active
-            && let Some(active) = self.active_edit_plan_revision_id(&revision.project_id)?
-        {
+
+        // Chronology and revision-local story policy are the last shared gate:
+        // preview, activation, OTIO export and delivery all reach this one
+        // report rather than implementing adapter-specific order checks.
+        anyhow::ensure!(!cancel(), "preview cancelled during validation");
+        let facts = self.chronology_facts(&revision.project_id)?;
+        let solution = crate::chronology::solve(&facts);
+        for issue in super::story::validate_revision_chronology(revision, &facts, &solution) {
+            let kind = match issue.kind {
+                super::story::StoryIssueKind::PolicyInvalid => FindingKind::StoryPolicyInvalid,
+                super::story::StoryIssueKind::StaleScope => FindingKind::StoryScopeStale,
+                super::story::StoryIssueKind::ProtectedGroupViolation => {
+                    FindingKind::StoryGroupViolation
+                }
+                super::story::StoryIssueKind::ChronologyViolation => {
+                    FindingKind::ChronologyViolation
+                }
+                super::story::StoryIssueKind::ChronologyAmbiguous => {
+                    FindingKind::ChronologyAmbiguous
+                }
+                super::story::StoryIssueKind::ChronologyUnresolved => {
+                    FindingKind::ChronologyUnresolved
+                }
+            };
             findings.push(Finding::new(
-                FindingKind::StaleRevision,
-                None,
-                None,
-                format!("Revision {active} is the active plan; this one is not."),
+                kind,
+                issue.position,
+                issue.asset_id,
+                issue.message,
             ));
         }
 

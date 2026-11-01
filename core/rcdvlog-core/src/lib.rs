@@ -277,20 +277,24 @@ pub use editplan::patch::*;
 pub use editplan::review_coverage::*;
 pub use editplan::selection::*;
 pub use editplan::{
-    ConfirmSourceRangeRequest, ConfirmedRangeInspection, ConfirmedSourceRange, EditPlanAudio,
-    EditPlanError, EditPlanExport, EditPlanOperation, EditPlanRevision, EditPlanStaleness, Finding,
-    FindingKind, InspectSourceWithPolicyRequest, InspectSourceWithPolicyResult, InspectedAudio,
-    InspectedFrame, InspectedUtterance, InspectionAttempt, InspectionFile, InspectionPurpose,
-    InspectionRepresentation, InspectionTimeMapping, InspectionWaveformBin, OtioExportError,
+    ChronologyException, ChronologyPolicy, ConfirmSourceRangeRequest, ConfirmedRangeInspection,
+    ConfirmedSourceRange, CutIdentity, EditPlanAudio, EditPlanChronologyPolicy, EditPlanError,
+    EditPlanExport, EditPlanOperation, EditPlanRevision, EditPlanStaleness, EditPlanStoryPolicy,
+    ExceptionScope, Finding, FindingKind, InspectSourceWithPolicyRequest,
+    InspectSourceWithPolicyResult, InspectedAudio, InspectedFrame, InspectedUtterance,
+    InspectionAttempt, InspectionFile, InspectionPurpose, InspectionRepresentation,
+    InspectionTimeMapping, InspectionWaveformBin, OpeningTeaser, OtioExportError,
     OtioExportRequest, OtioExportResult, PreviewArtifact, PreviewArtifactError,
     PreviewArtifactPage, PreviewArtifactState, PreviewArtifactStatus, PreviewArtifactSummary,
     PreviewArtifactVerification, PreviewCutMapping, PreviewCutOutcome, PreviewExcerptRequest,
     PreviewExcerptScope, PreviewFailure, PreviewInputIdentity, PreviewMediaValidation,
     PreviewProgress, PreviewRequest, PreviewResult, PreviewSegmentCounts, PreviewSourceIdentity,
-    RangeDecision, RangeDecisionOwner, RangeMedia, Severity, SourceAudio, SourceInspection,
-    SourceInspectionError, SourceInspectionRequest, SourceInspectionResult, SourceRangeConstraints,
-    SourceRangeError, SourceTimeRange, SourceTrimRequest, SourceTrimSuggestion, TrimMedia,
-    ValidationReport, otio_document,
+    ProtectedGroup, ProtectedStoryGroup, RangeDecision, RangeDecisionOwner, RangeMedia,
+    ScopedChronologyException, Severity, SourceAudio, SourceInspection, SourceInspectionError,
+    SourceInspectionRequest, SourceInspectionResult, SourceRangeConstraints, SourceRangeError,
+    SourceTimeRange, SourceTrimRequest, SourceTrimSuggestion, StoryChronologyException,
+    StoryCutIdentity, StoryDecision, StoryDecisionActor, StoryExceptionScope, StoryOpeningTeaser,
+    StoryOrderEdge, StoryPolicy, StoryTeaser, TrimMedia, ValidationReport, otio_document,
 };
 pub use operations::{
     ApplyOperationResult, AssetRevisionDiagnostics, CAPTURE_SEQUENCE_DECLARED,

@@ -336,6 +336,7 @@ pub(super) fn prepare(catalog: &Catalog, request: &SequenceSelectionRequest) -> 
                 audio: None,
             })
             .collect(),
+        story_policy: None,
         created_at: String::new(),
     };
     // Retained choices can reference audio from another asset; use their full

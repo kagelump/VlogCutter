@@ -1089,15 +1089,28 @@ in [chapter-wide sequence selection](edit-plan-selection.md). Selection never
 calls a provider or certifies speech/pacing quality.
 
 
-The complete ordered input is an object (maximum 4 MiB and 10,000 cuts):
+The complete ordered input is an object (maximum 4 MiB and 10,000 cuts), with
+an optional revision-local `storyPolicy` for exact opening teasers, protected
+ordered groups and scoped chronology exceptions:
 
 ```json
 {
   "operations": [
     {"operationId": "opening", "position": 0, "assetId": "asset-id", "sourceInSeconds": 0.25, "sourceOutSeconds": 2.0, "rationale": "Establish the journey"}
-  ]
+  ],
+  "storyPolicy": {
+    "version": 1,
+    "openingTeasers": [],
+    "protectedGroups": [],
+    "exceptions": []
+  }
 }
 ```
+
+Ordinary sparse insertion omits `anchor` and is placed by corrected source
+chronology. Explicit anchors and policy scopes remain checked by the same core
+validator used for activation, preview and delivery. See
+[chronology-safe edit-plan placement](edit-plan-chronology.md).
 
 `scriptRevisionId` is optional. Unknown fields are rejected, including unsupported
 track/effect fields. Positions must equal zero-based array indices. Empty

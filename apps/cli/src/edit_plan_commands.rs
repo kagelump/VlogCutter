@@ -447,6 +447,8 @@ struct PlanInput {
     operations: Vec<EditPlanOperation>,
     #[serde(default)]
     script_revision_id: Option<String>,
+    #[serde(default)]
+    story_policy: Option<rcdvlog_core::EditPlanStoryPolicy>,
 }
 
 #[derive(Deserialize)]
@@ -682,13 +684,16 @@ pub fn execute(catalog: &Catalog, command: &EditPlanCommand) -> Result<Value> {
                     .all(|(i, cut)| cut.position as usize == i),
                 "invalid input: positions must equal ordered zero-based array indices"
             );
-            Ok(serde_json::to_value(catalog.create_edit_plan_from_base(
-                project,
-                &plan.operations,
-                plan.script_revision_id.as_deref(),
-                expected(expected_base),
-                expected(expected_active),
-            )?)?)
+            Ok(serde_json::to_value(
+                catalog.create_edit_plan_from_base_with_story_policy(
+                    project,
+                    &plan.operations,
+                    plan.script_revision_id.as_deref(),
+                    expected(expected_base),
+                    expected(expected_active),
+                    plan.story_policy.as_ref(),
+                )?,
+            )?)
         }
         EditPlanCommand::Diff { base, revision } => Ok(serde_json::to_value(
             catalog.diff_edit_plans(base, revision)?,

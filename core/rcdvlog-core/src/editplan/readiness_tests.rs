@@ -44,6 +44,7 @@ fn patch(edits: Vec<EditPlanPatch>) -> EditPlanPatchInput {
         version: 1,
         name: "generated alternative".into(),
         edits,
+        story_policy: None,
     }
 }
 
@@ -81,9 +82,9 @@ fn sparse_patch_is_atomic_preserves_identity_and_retimes_retained_audio() {
             None,
             &patch(vec![
                 EditPlanPatch::Insert {
-                    anchor: PatchAnchor::Before {
+                    anchor: Some(PatchAnchor::Before {
                         operation_id: "first".into(),
-                    },
+                    }),
                     operation: inserted,
                 },
                 EditPlanPatch::Trim {

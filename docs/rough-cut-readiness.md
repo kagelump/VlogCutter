@@ -21,7 +21,7 @@ historical upload-branch schema 49 is recognized as upgradeable. Its original
 migration identity is retained in `catalog_migration_reconciliations`; upgrading
 installs the merged history atomically and preserves upload records. Unrecognized
 divergent histories are refused. Back up before explicitly opening a catalog
-writable to upgrade. Schema 64 adds local review-coverage evidence. Schema 65 adds the immutable patch-lineage projection, with version-4 creation operations for lossless sync/replay.
+writable to upgrade. Schema 64 adds local review-coverage evidence. Schema 65 adds the immutable patch-lineage projection, with version-4 creation operations for lossless sync/replay. Schema 66 adds revision-local exact story policy and version-5 creation operations; ordinary patch insertion defaults to corrected chronology unless an explicit checked anchor is supplied.
 
 ## Count source use and find unused material
 
@@ -72,10 +72,9 @@ rcdvlog --catalog /absolute/catalog.sqlite3 edit-plan patch \
 ```json
 {
   "version": 1,
-  "name": "Quicker arrival",
+  "name": "Chronological additions",
   "edits": [{
     "kind": "insert",
-    "anchor": {"kind": "before", "operationId": "CUT_ARRIVAL"},
     "operation": {
       "operationId": "NEW_TRANSFER_VIEW",
       "position": 0,
@@ -89,15 +88,26 @@ rcdvlog --catalog /absolute/catalog.sqlite3 edit-plan patch \
 }
 ```
 
-Supported kinds are `trim`, `replace`, `insert`, `reorder`, `omit`, `audio` and
-`split`. Anchors are `before`/`after` with `operationId`, or `end`. Changes use
-explicit source seconds; split supplies `sourceSplitSeconds`, `newOperationId`
-and rationale. Input array order defines batch evaluation. A target may appear
-once per batch; missing/duplicate/reused identities and removed anchors are refused.
-Inserted `position` is recomputed from its explicit anchor.
+Omitted `anchor` is the safe default: automatic placement in the project's
+existing solved/corrected chronology. Automatic additions are sorted as a batch
+and do not depend on incoming JSON enumeration order. Explicit `before`, `after`
+and `end` anchors remain supported but are checked placements, not chronology
+exemptions: a wrong anchor fails atomically. Missing, contradictory or genuinely
+tied chronology is an actionable conflict, never a filename/rank guess or an
+automatic clock correction. Protected teaser groups, ordered story groups and
+narrowly scoped decisions are supplied through the revision-local
+`storyPolicy`; see [chronology-safe edit-plan placement](edit-plan-chronology.md).
 
-The command validates the complete candidate before committing one normal inactive
-revision. Failure leaves no partial revision. Existing human constraints and the
+Supported kinds are `trim`, `replace`, `insert`, `reorder`, `omit`, `audio` and
+`split`. Changes use explicit source seconds; split supplies
+`sourceSplitSeconds`, `newOperationId` and rationale. A target may appear once
+per batch; missing/duplicate/reused identities and removed anchors are refused.
+Inserted `position` is recomputed from automatic chronology or its explicit
+anchor.
+
+The command runs the same complete-plan chronology, protected-group, source-range
+and audio validator used by activation, preview, export and delivery. A refused
+patch leaves no partial revision. Existing human constraints and the
 expected active revision remain authoritative. Unchanged IDs survive; inserted,
 split and replacement lineage is retained in the creation operation and result.
 Named alternatives use the existing [comparison commands](edit-plan-comparisons.md).
