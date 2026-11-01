@@ -50,6 +50,7 @@ mod selection_logic;
 mod selection_model;
 mod selection_report;
 mod selection_source;
+pub mod story;
 pub mod validate;
 
 pub use audio::{EditPlanAudio, SourceAudio};
@@ -62,6 +63,10 @@ pub use preview::{PreviewFailure, PreviewProgress, PreviewRequest, PreviewResult
 pub use preview_artifact_model::*;
 pub use preview_excerpt::{PreviewExcerptRequest, PreviewExcerptScope};
 pub use range_model::*;
+pub use story::{
+    EditPlanStoryPolicy, ProtectedStoryGroup, StoryChronologyException, StoryCutIdentity,
+    StoryDecision, StoryDecisionActor, StoryExceptionScope, StoryOpeningTeaser, StoryOrderEdge,
+};
 pub use validate::{Finding, FindingKind, Severity, ValidationReport};
 
 use crate::Catalog;
@@ -100,6 +105,26 @@ impl Catalog {
         )
     }
 
+    /// Create a whole plan with an explicit immutable story policy. This is the
+    /// same validation owner used by sparse patches and finishing paths.
+    pub fn create_edit_plan_revision_with_story_policy(
+        &self,
+        project_id: &str,
+        operations: &[EditPlanOperation],
+        script_revision_id: Option<&str>,
+        expected_active_revision_id: Option<&str>,
+        story_policy: Option<&EditPlanStoryPolicy>,
+    ) -> Result<EditPlanRevision> {
+        self.create_edit_plan_from_base_with_story_policy(
+            project_id,
+            operations,
+            script_revision_id,
+            expected_active_revision_id,
+            expected_active_revision_id,
+            story_policy,
+        )
+    }
+
     /// Fork any immutable draft while independently guarding the active plan.
     /// Stable operation IDs identify the same cut across revisions. New/repeated
     /// cuts must use distinct IDs; empty IDs receive fresh generated identities.
@@ -111,16 +136,132 @@ impl Catalog {
         base_revision_id: Option<&str>,
         expected_active_revision_id: Option<&str>,
     ) -> Result<EditPlanRevision> {
-        self.check_revision_inputs(project_id, operations, base_revision_id)?;
-        let mut connection = self.connection()?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        require_active(&transaction, project_id, expected_active_revision_id)?;
-        let (revision_id, operation) = revision_operation(
-            &transaction,
+        self.create_edit_plan_from_base_with_story_policy(
             project_id,
             operations,
             script_revision_id,
             base_revision_id,
+            expected_active_revision_id,
+            None,
+        )
+    }
+
+    /// Whole-plan creation/reordering with exact policy inheritance. Passing
+    /// `None` inherits the immutable base policy verbatim; callers that change a
+    /// protected identity must supply an explicit replacement policy.
+    pub fn create_edit_plan_from_base_with_story_policy(
+        &self,
+        project_id: &str,
+        operations: &[EditPlanOperation],
+        script_revision_id: Option<&str>,
+        base_revision_id: Option<&str>,
+        expected_active_revision_id: Option<&str>,
+        story_policy: Option<&EditPlanStoryPolicy>,
+    ) -> Result<EditPlanRevision> {
+        self.check_revision_inputs(project_id, operations, base_revision_id)?;
+        let mut normalized_operations = operations.to_vec();
+        let mut seen = std::collections::BTreeSet::new();
+        for (position, operation) in normalized_operations.iter_mut().enumerate() {
+            operation.position = position as u32;
+            if operation.operation_id.is_empty() {
+                operation.operation_id = format!("editop_{}", Uuid::new_v4().simple());
+            }
+            anyhow::ensure!(
+                seen.insert(operation.operation_id.clone()),
+                "invalid input: cut IDs must be unique within a revision"
+            );
+        }
+        let base_policy = match base_revision_id {
+            Some(base) => self.edit_plan_revision(base)?.story_policy,
+            None => None,
+        };
+        if let Some(policy) = story_policy {
+            story::validate_policy_replacement(base_policy.as_ref(), policy).map_err(|error| {
+                EditPlanError::StoryPolicyInvalid {
+                    message: error.to_string(),
+                }
+            })?;
+        }
+        let mut candidate = EditPlanRevision {
+            revision_id: format!("editrev_candidate_{}", Uuid::new_v4().simple()),
+            project_id: project_id.to_string(),
+            script_revision_id: script_revision_id.map(str::to_string),
+            parent_revision_id: base_revision_id.map(str::to_string),
+            active: false,
+            operations: normalized_operations,
+            story_policy: story_policy.cloned().or(base_policy),
+            created_at: now(),
+        };
+        let facts = self.chronology_facts(project_id)?;
+        let input_chronology_key = story::chronology_dependency_token(
+            &facts,
+            candidate.operations.iter().map(|cut| cut.asset_id.clone()),
+        )?;
+        if let Some(policy) = &mut candidate.story_policy
+            && let Err(error) = story::stamp_policy_dependencies(policy, &facts)
+        {
+            return Err(EditPlanError::StoryPolicyInvalid {
+                message: error.to_string(),
+            }
+            .into());
+        }
+        // Run the same validator used by activation/preview/export/delivery.
+        // An invalid whole-plan draft remains inspectable; every finishing or
+        // activation path re-runs this report and refuses it. A policy-bound
+        // candidate is additionally rechecked under the write reservation
+        // below because exact scope and chronology dependencies are immutable
+        // story decisions, not just advisory findings.
+        let _validation = self.validate_edit_plan_candidate(&candidate, &|| false)?;
+
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_active(&transaction, project_id, expected_active_revision_id)?;
+        // Recheck the exact policy dependency and chronology-owned invariants
+        // while holding the write reservation, not merely before acquiring it.
+        let facts = crate::chronology::load_chronology_facts(&transaction, project_id)?;
+        anyhow::ensure!(input_chronology_key == story::chronology_dependency_token(&facts,
+            candidate.operations.iter().map(|cut| cut.asset_id.clone()))?,
+            EditPlanError::StaleStoryScope { message: "source chronology changed while creating the draft; retry against current facts".into() });
+        let solution = crate::chronology::solve(&facts);
+        if candidate.story_policy.is_some() {
+            if let Err(error) = story::validate_policy_exactness(&candidate, &facts) {
+                return Err(EditPlanError::StaleStoryScope {
+                    message: error.to_string(),
+                }
+                .into());
+            }
+            let issues = story::validate_revision_chronology(&candidate, &facts, &solution);
+            if issues
+                .iter()
+                .any(|finding| finding.kind == story::StoryIssueKind::StaleScope)
+            {
+                return Err(EditPlanError::StaleStoryScope {
+                    message:
+                        "story scope or chronology dependency changed while creating the revision"
+                            .into(),
+                }
+                .into());
+            }
+            if issues.iter().any(|finding| finding.kind.is_error()) {
+                return Err(EditPlanError::StoryPolicyInvalid {
+                    message: "story policy or chronology changed while creating the revision"
+                        .into(),
+                }
+                .into());
+            }
+        } else if !solution.contradictions.is_empty() {
+            return Err(EditPlanError::ChronologyConflict {
+                message: "project chronology has blocking contradictions".into(),
+            }
+            .into());
+        }
+        let (revision_id, operation) = revision_operation_with_story_policy(
+            &transaction,
+            project_id,
+            &candidate.operations,
+            script_revision_id,
+            base_revision_id,
+            candidate.story_policy.as_ref(),
         )?;
         commit_local_in_transaction(&transaction, project_id, vec![operation])?;
         transaction.commit()?;
@@ -215,11 +356,34 @@ impl Catalog {
         )?;
         let report = self.validate_edit_plan(revision_id)?;
         if !report.renderable() {
-            return Err(EditPlanError::ValidationFailed {
-                codes: report
-                    .errors()
-                    .map(|finding| finding.code.to_string())
-                    .collect(),
+            return Err(validate::validation_error(&report).into());
+        }
+        // Validation opened read snapshots. Recheck the chronology/policy
+        // dependency and all chronology-owned findings while the activation
+        // write reservation is held, so a concurrent clock or group edit cannot
+        // squeeze between validation and activation.
+        let facts = crate::chronology::load_chronology_facts(&transaction, &revision.project_id)?;
+        let solution = crate::chronology::solve(&facts);
+        if let Err(error) = story::validate_policy_exactness(&revision, &facts) {
+            return Err(EditPlanError::StaleStoryScope {
+                message: error.to_string(),
+            }
+            .into());
+        }
+        let issues = story::validate_revision_chronology(&revision, &facts, &solution);
+        if issues
+            .iter()
+            .any(|issue| issue.kind == story::StoryIssueKind::StaleScope)
+        {
+            return Err(EditPlanError::StaleStoryScope {
+                message: "story scope or chronology dependency changed while activating".into(),
+            }
+            .into());
+        }
+        if issues.iter().any(|issue| issue.kind.is_error()) {
+            return Err(EditPlanError::StoryPolicyInvalid {
+                message: "story policy or chronology changed while activation was validating"
+                    .into(),
             }
             .into());
         }
@@ -372,28 +536,36 @@ impl Catalog {
     }
 }
 
+/// Materialization inputs kept together so callers cannot accidentally omit
+/// the immutable story-policy identity when replaying a creation operation.
+pub(crate) struct RevisionInsert<'a> {
+    pub(crate) project_id: &'a str,
+    pub(crate) revision_id: &'a str,
+    pub(crate) script_revision_id: Option<&'a str>,
+    pub(crate) parent_revision_id: Option<&'a str>,
+    pub(crate) created_at: &'a str,
+    pub(crate) operations: &'a [EditPlanOperation],
+    pub(crate) story_policy: Option<&'a EditPlanStoryPolicy>,
+}
+
 /// Shared by the materializers: writes a revision and its operations.
 pub(crate) fn insert_revision(
     transaction: &rusqlite::Transaction<'_>,
-    project_id: &str,
-    revision_id: &str,
-    script_revision_id: Option<&str>,
-    parent_revision_id: Option<&str>,
-    created_at: &str,
-    operations: &[EditPlanOperation],
+    insert: RevisionInsert<'_>,
 ) -> Result<()> {
+    let story_policy_json = insert.story_policy.map(serde_json::to_string).transpose()?;
     transaction.execute(
-        "INSERT OR IGNORE INTO edit_plan_revisions(revision_id, project_id, script_revision_id, parent_revision_id, active, created_at)
-         VALUES (?1, ?2, ?3, ?4, 0, ?5)",
-        params![revision_id, project_id, script_revision_id, parent_revision_id, created_at],
+        "INSERT OR IGNORE INTO edit_plan_revisions(revision_id, project_id, script_revision_id, parent_revision_id, active, created_at, story_policy_json)
+         VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6)",
+        params![insert.revision_id, insert.project_id, insert.script_revision_id, insert.parent_revision_id, insert.created_at, story_policy_json],
     )?;
-    for operation in operations {
+    for operation in insert.operations {
         transaction.execute(
             "INSERT OR IGNORE INTO edit_plan_operations(operation_id, revision_id, position, asset_id, source_in_seconds, source_out_seconds, rationale, audio_json)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 operation.operation_id,
-                revision_id,
+                insert.revision_id,
                 operation.position as i64,
                 operation.asset_id,
                 operation.source_in_seconds,
@@ -486,6 +658,24 @@ pub(crate) fn read_revision(
         } else {
             "NULL"
         };
+    let story_policy_column = if crate::migrations::column_exists(
+        connection,
+        "edit_plan_revisions",
+        "story_policy_json",
+    )? {
+        "story_policy_json"
+    } else {
+        "NULL"
+    };
+    let story_policy: Option<String> = connection.query_row(
+        &format!("SELECT {story_policy_column} FROM edit_plan_revisions WHERE revision_id=?1"),
+        [revision_id],
+        |row| row.get(0),
+    )?;
+    let story_policy = story_policy
+        .map(|json| serde_json::from_str(&json))
+        .transpose()
+        .map_err(|error| anyhow!("invalid persisted edit-plan story policy: {error}"))?;
     let mut statement = connection.prepare(&format!(
             "SELECT operation_id, position, asset_id, source_in_seconds, source_out_seconds, rationale, {audio_column}
              FROM edit_plan_operations WHERE revision_id=?1 ORDER BY position",
@@ -522,6 +712,7 @@ pub(crate) fn read_revision(
         parent_revision_id,
         active,
         operations,
+        story_policy,
         created_at,
     })
 }
@@ -534,17 +725,22 @@ fn revision_operation(
     script_revision_id: Option<&str>,
     base_revision_id: Option<&str>,
 ) -> Result<(String, NewOperation)> {
-    let inherited = base_revision_id
+    let inherited_selection = base_revision_id
         .map(|base| selection::load_metadata(connection, base))
         .transpose()?
         .flatten();
-    revision_operation_with_selection(
+    let inherited_policy = base_revision_id
+        .map(|base| load_story_policy(connection, base))
+        .transpose()?
+        .flatten();
+    revision_operation_with_selection_and_story_policy(
         connection,
         project_id,
         operations,
         script_revision_id,
         base_revision_id,
-        inherited.as_ref(),
+        inherited_selection.as_ref(),
+        inherited_policy.as_ref(),
     )
 }
 
@@ -555,6 +751,53 @@ fn revision_operation_with_selection(
     script_revision_id: Option<&str>,
     base_revision_id: Option<&str>,
     selection: Option<&selection_model::SelectionMetadata>,
+) -> Result<(String, NewOperation)> {
+    let inherited_policy = base_revision_id
+        .map(|base| load_story_policy(connection, base))
+        .transpose()?
+        .flatten();
+    revision_operation_with_selection_and_story_policy(
+        connection,
+        project_id,
+        operations,
+        script_revision_id,
+        base_revision_id,
+        selection,
+        inherited_policy.as_ref(),
+    )
+}
+
+fn revision_operation_with_story_policy(
+    connection: &rusqlite::Connection,
+    project_id: &str,
+    operations: &[EditPlanOperation],
+    script_revision_id: Option<&str>,
+    base_revision_id: Option<&str>,
+    story_policy: Option<&EditPlanStoryPolicy>,
+) -> Result<(String, NewOperation)> {
+    let inherited_selection = base_revision_id
+        .map(|base| selection::load_metadata(connection, base))
+        .transpose()?
+        .flatten();
+    revision_operation_with_selection_and_story_policy(
+        connection,
+        project_id,
+        operations,
+        script_revision_id,
+        base_revision_id,
+        inherited_selection.as_ref(),
+        story_policy,
+    )
+}
+
+fn revision_operation_with_selection_and_story_policy(
+    connection: &rusqlite::Connection,
+    project_id: &str,
+    operations: &[EditPlanOperation],
+    script_revision_id: Option<&str>,
+    base_revision_id: Option<&str>,
+    selection: Option<&selection_model::SelectionMetadata>,
+    story_policy: Option<&EditPlanStoryPolicy>,
 ) -> Result<(String, NewOperation)> {
     let revision_id = format!("editrev_{}", Uuid::new_v4().simple());
     let mut payload = serde_json::json!({
@@ -577,6 +820,9 @@ fn revision_operation_with_selection(
     if let Some(metadata) = selection {
         payload["selection"] = serde_json::to_value(metadata)?;
     }
+    if let Some(policy) = story_policy {
+        payload["storyPolicy"] = serde_json::to_value(policy)?;
+    }
     let guard = current_revision(connection, project_id, "editPlan", project_id)?;
     Ok((
         revision_id,
@@ -588,6 +834,36 @@ fn revision_operation_with_selection(
             payload,
         },
     ))
+}
+
+/// Read the revision-local story policy without requiring the latest catalog
+/// schema. Legacy revisions read as `None`.
+pub(crate) fn load_story_policy(
+    connection: &rusqlite::Connection,
+    revision_id: &str,
+) -> Result<Option<EditPlanStoryPolicy>> {
+    if !crate::migrations::column_exists(connection, "edit_plan_revisions", "story_policy_json")? {
+        return Ok(None);
+    }
+    let raw: Option<String> = connection
+        .query_row(
+            "SELECT story_policy_json FROM edit_plan_revisions WHERE revision_id=?1",
+            [revision_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+    raw.map(|json| serde_json::from_str(&json))
+        .transpose()
+        .map_err(|error| anyhow!("invalid persisted edit-plan story policy: {error}"))
+}
+
+impl Catalog {
+    /// Public read for adapter and diagnostic surfaces.
+    pub fn edit_plan_story_policy(&self, revision_id: &str) -> Result<Option<EditPlanStoryPolicy>> {
+        self.edit_plan_revision(revision_id)?;
+        load_story_policy(&self.connection()?, revision_id)
+    }
 }
 
 #[cfg(test)]

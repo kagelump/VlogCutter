@@ -294,7 +294,17 @@ fn replacement_order_and_split_audio_variants_have_distinct_actual_context() {
     reordered[1].source_in_seconds = 0.0;
     reordered[1].source_out_seconds = 1.0;
     let d = catalog
-        .create_edit_plan_from_base(&a.project_id, &reordered, None, Some(&a.revision_id), None)
+        .create_edit_plan_from_base_with_story_policy(
+            &a.project_id,
+            &reordered,
+            None,
+            Some(&a.revision_id),
+            None,
+            Some(&super::super::story::test_policy(
+                &reordered,
+                &[("cut-2", "cut-1"), ("cut-1", "cut-0")],
+            )),
+        )
         .unwrap();
     let mut req = request(&a, &b);
     req.variants.push(ComparisonVariantRequest {

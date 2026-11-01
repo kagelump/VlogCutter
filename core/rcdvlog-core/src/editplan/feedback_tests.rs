@@ -360,12 +360,16 @@ fn explicit_human_hero_retention_survives_reselection_and_unaccepted_suggestions
     let mut reordered = base.operations.clone();
     reordered.reverse();
     let reordered = catalog
-        .create_edit_plan_from_base(
+        .create_edit_plan_from_base_with_story_policy(
             &base.project_id,
             &reordered,
             None,
             Some(&base.revision_id),
             None,
+            Some(&super::super::story::test_policy(
+                &reordered,
+                &[("cut-1", "cut-0")],
+            )),
         )
         .unwrap();
     assert!(
@@ -381,12 +385,16 @@ fn explicit_human_hero_retention_survives_reselection_and_unaccepted_suggestions
         .unwrap()
         .source_in_seconds = 0.6;
     let trimmed = catalog
-        .create_edit_plan_from_base(
+        .create_edit_plan_from_base_with_story_policy(
             &base.project_id,
             &trimmed,
             None,
             Some(&reordered.revision_id),
             None,
+            Some(&super::super::story::test_policy(
+                &trimmed,
+                &[("cut-1", "cut-0")],
+            )),
         )
         .unwrap();
     assert!(

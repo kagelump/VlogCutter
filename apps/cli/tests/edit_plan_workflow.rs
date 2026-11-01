@@ -302,7 +302,16 @@ fn generated_media_plan_create_fork_diff_validate_activate_and_preview() {
     cuts[1]["sourceInSeconds"] = json!(0.25);
     fs::write(
         &input,
-        serde_json::to_vec(&json!({"operations":cuts})).unwrap(),
+        serde_json::to_vec(&json!({"operations":cuts, "storyPolicy": {
+            "version":1, "exceptions":[{
+                "exceptionId":"generated-reverse", "rationale":"Deliberate reversed excerpts to exercise diff and preview",
+                "decision":{"actor":"agent","rationale":"Synthetic explicit story decision"},
+                "scope":{"cuts":[
+                    {"operationId":"repeat","assetId":asset,"sourceInSeconds":2.0,"sourceOutSeconds":exact_end},
+                    {"operationId":"first","assetId":asset,"sourceInSeconds":0.25,"sourceOutSeconds":1.0}
+                ], "edges":[{"earlierOperationId":"repeat","laterOperationId":"first"}]}
+            }]
+        }})).unwrap(),
     )
     .unwrap();
     let b = create(&catalog, project, &input, a_id, a_id);
@@ -467,9 +476,14 @@ fn generated_media_plan_create_fork_diff_validate_activate_and_preview() {
     );
     cuts[0].as_object_mut().unwrap().remove("audio");
     cuts[0]["sourceOutSeconds"] = json!(exact_end + 1.0);
+    // This control tests invalid ranges independently of the prior intentional
+    // reversal. Restore chronological order and explicitly retire its exception.
+    cuts.swap(0, 1);
+    cuts[0]["position"] = json!(0);
+    cuts[1]["position"] = json!(1);
     fs::write(
         &input,
-        serde_json::to_vec(&json!({"operations":cuts})).unwrap(),
+        serde_json::to_vec(&json!({"operations":cuts,"storyPolicy":{"version":1,"revisionDecision":{"actor":"agent","rationale":"Retire the intentional reversal and restore chronological order for the invalid-range control"}}})).unwrap(),
     )
     .unwrap();
     let invalid = create(&catalog, project, &input, b_id, b_id);
@@ -494,7 +508,42 @@ fn generated_media_plan_create_fork_diff_validate_activate_and_preview() {
         success(&catalog, &["edit-plan", "list", "--project", project])["activeRevisionId"],
         b_id
     );
-    feedback_review_revision_workflow(&catalog, project, &b, &preview, dir.path());
+    // Endpoint-feedback mechanics use a chronological baseline. The preceding
+    // reversed variation explicitly bound its old ranges and cannot silently
+    // carry that review across later endpoint edits.
+    fs::write(&input, serde_json::to_vec(&json!({"operations":a["operations"],
+        "storyPolicy":{"version":1,"revisionDecision":{"actor":"agent","rationale":"Return to the chronological variant for endpoint feedback"}}})).unwrap()).unwrap();
+    let feedback_base = create(&catalog, project, &input, b_id, b_id);
+    let feedback_id = feedback_base["revisionId"].as_str().unwrap();
+    success(
+        &catalog,
+        &[
+            "edit-plan",
+            "activate",
+            "--revision",
+            feedback_id,
+            "--expected-active",
+            b_id,
+        ],
+    );
+    let feedback_movie = success(
+        &catalog,
+        &[
+            "edit-plan",
+            "preview",
+            "--revision",
+            feedback_id,
+            "--max-height",
+            "144",
+        ],
+    );
+    feedback_review_revision_workflow(
+        &catalog,
+        project,
+        &feedback_base,
+        &feedback_movie,
+        dir.path(),
+    );
 }
 
 /// Exercise cancellation of a live media child in a separate CLI process,

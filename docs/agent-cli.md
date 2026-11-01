@@ -1089,15 +1089,28 @@ in [chapter-wide sequence selection](edit-plan-selection.md). Selection never
 calls a provider or certifies speech/pacing quality.
 
 
-The complete ordered input is an object (maximum 4 MiB and 10,000 cuts):
+The complete ordered input is an object (maximum 4 MiB and 10,000 cuts), with
+an optional revision-local `storyPolicy` for exact opening teasers, protected
+ordered groups and scoped chronology exceptions:
 
 ```json
 {
   "operations": [
     {"operationId": "opening", "position": 0, "assetId": "asset-id", "sourceInSeconds": 0.25, "sourceOutSeconds": 2.0, "rationale": "Establish the journey"}
-  ]
+  ],
+  "storyPolicy": {
+    "version": 1,
+    "openingTeasers": [],
+    "protectedGroups": [],
+    "exceptions": []
+  }
 }
 ```
+
+Ordinary sparse insertion omits `anchor` and is placed by corrected source
+chronology. Explicit anchors and policy scopes remain checked by the same core
+validator used for activation, preview and delivery. See
+[chronology-safe edit-plan placement](edit-plan-chronology.md).
 
 `scriptRevisionId` is optional. Unknown fields are rejected, including unsupported
 track/effect fields. Positions must equal zero-based array indices. Empty
@@ -1108,7 +1121,7 @@ returns each changed cut's identity, before/after values, and change kinds
 (`added`, `omitted`, `order`, `source`, `range`, `rationale`, `audio`).
 
 Ranges are finite seconds on the source clock, inclusive in / exclusive out.
-Source reuse and overlapping ranges are legal and reported as advisory warnings.
+Source reuse and overlapping ranges remain representable. Teaser reuse and ambiguous inline overlaps require an exact story policy decision; source-overlap diagnostics remain visible.
 No frame snapping occurs at plan persistence: retain exact measured duration for
 an endpoint at source end. Rendering passes decimal seconds without millisecond
 rounding; decoding selects source frames and the preview resamples to its

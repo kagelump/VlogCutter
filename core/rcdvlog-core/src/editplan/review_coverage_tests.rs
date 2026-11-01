@@ -228,6 +228,7 @@ fn normalized_dependency_allows_a_prefix_shift_but_rejects_neighbor_change() {
         parent_revision_id: None,
         active: false,
         operations,
+        story_policy: None,
         created_at: "now".into(),
     };
     // Review C well inside the sequence so the 100 ms audio-context window
@@ -387,7 +388,17 @@ fn coverage_carries_after_different_source_prefix_with_stable_context() {
         op("after", 3, &source_b, 1.8, 2.2),
     ];
     let original = catalog
-        .create_edit_plan_from_base(&project, &original_ops, None, None, None)
+        .create_edit_plan_from_base_with_story_policy(
+            &project,
+            &original_ops,
+            None,
+            None,
+            None,
+            Some(&super::super::story::test_policy(
+                &original_ops,
+                &[("before", "middle"), ("middle", "after")],
+            )),
+        )
         .unwrap();
     let viewed = catalog
         .render_preview(
@@ -452,7 +463,21 @@ fn coverage_carries_after_different_source_prefix_with_stable_context() {
             }),
     );
     let revision = catalog
-        .create_edit_plan_from_base(&project, &prefixed, None, Some(&original.revision_id), None)
+        .create_edit_plan_from_base_with_story_policy(
+            &project,
+            &prefixed,
+            None,
+            Some(&original.revision_id),
+            None,
+            Some(&super::super::story::test_policy(
+                &prefixed,
+                &[
+                    ("prefix", "lead"),
+                    ("before", "middle"),
+                    ("middle", "after"),
+                ],
+            )),
+        )
         .unwrap();
     catalog
         .render_preview(

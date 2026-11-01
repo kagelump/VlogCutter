@@ -379,14 +379,24 @@ pub(crate) fn constraints_key(
     let ranges_key = blake3::hash(&serde_json::to_vec(&rows)?)
         .to_hex()
         .to_string();
+    let facts = crate::chronology::load_chronology_facts(connection, &plan.project_id)?;
+    let chronology_key = super::story::chronology_dependency_token(
+        &facts,
+        plan.operations.iter().map(|cut| cut.asset_id.clone()),
+    )?;
+    let story_key = blake3::hash(&serde_json::to_vec(&(&plan.story_policy, chronology_key))?)
+        .to_hex()
+        .to_string();
     Ok(
         if let Some(hard_choices) = super::feedback::hard_choice_key(connection, &plan.project_id)?
         {
-            blake3::hash(&serde_json::to_vec(&(ranges_key, hard_choices))?)
+            blake3::hash(&serde_json::to_vec(&(ranges_key, story_key, hard_choices))?)
                 .to_hex()
                 .to_string()
         } else {
-            ranges_key
+            blake3::hash(&serde_json::to_vec(&(ranges_key, story_key))?)
+                .to_hex()
+                .to_string()
         },
     )
 }

@@ -35,6 +35,10 @@ pub struct EditPlanRevision {
     pub parent_revision_id: Option<String>,
     pub active: bool,
     pub operations: Vec<EditPlanOperation>,
+    /// Revision-local intentional story structure. `None` is legacy/omitted
+    /// policy, never an implicit approval of backward edits.
+    #[serde(default)]
+    pub story_policy: Option<super::story::EditPlanStoryPolicy>,
     pub created_at: String,
 }
 
@@ -86,6 +90,16 @@ pub enum EditPlanError {
     ValidationFailed { codes: Vec<String> },
     #[error("edit plan revision {revision_id} not found")]
     UnknownRevision { revision_id: String },
+    #[error("edit plan chronology conflict: {message}")]
+    ChronologyConflict { message: String },
+    #[error("edit plan chronology is ambiguous: {message}")]
+    ChronologyAmbiguous { message: String },
+    #[error("edit plan chronology is unresolved: {message}")]
+    ChronologyUnresolved { message: String },
+    #[error("edit plan story policy is invalid: {message}")]
+    StoryPolicyInvalid { message: String },
+    #[error("edit plan story scope is stale or mismatched: {message}")]
+    StaleStoryScope { message: String },
 }
 
 impl EditPlanError {
@@ -95,6 +109,11 @@ impl EditPlanError {
             Self::UnknownRevision { .. } => "edit_plan_unknown_revision",
             Self::InvalidPlan { .. } => "edit_plan_invalid_input",
             Self::ValidationFailed { .. } => "edit_plan_validation_failed",
+            Self::ChronologyConflict { .. } => "edit_plan_chronology_conflict",
+            Self::ChronologyAmbiguous { .. } => "edit_plan_chronology_ambiguous",
+            Self::ChronologyUnresolved { .. } => "edit_plan_chronology_unresolved",
+            Self::StoryPolicyInvalid { .. } => "edit_plan_story_policy_invalid",
+            Self::StaleStoryScope { .. } => "edit_plan_story_scope_stale",
         }
     }
 }

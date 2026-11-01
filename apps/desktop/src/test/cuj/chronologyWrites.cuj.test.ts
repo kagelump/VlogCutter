@@ -356,3 +356,19 @@ describe("the desktop predicate", () => {
     expect(chronologyApi.isDesktop()).toBe(false);
   });
 });
+
+
+describe("story policy adapter", () => {
+  it("passes an explicit agent story decision to the native command without rewriting its provenance", async () => {
+    const harness = trip();
+    const policy = { version: 1 as const, protectedGroups: [{
+      groupId: "setup-payoff",
+      cuts: [{ operationId: "setup", assetId: sony[0], sourceInSeconds: 0, sourceOutSeconds: 1 }],
+      rationale: "Keep the scene together",
+      decision: { actor: "agent" as const, rationale: "Provisional editorial choice" },
+    }] };
+    await chronologyApi.createEditPlanRevision(PROJECT,
+      [{ operationId: "setup", assetId: sony[0], sourceInSeconds: 0, sourceOutSeconds: 1, rationale: "setup" }], null, policy);
+    expect(onlyCall(harness, "create_edit_plan_revision")).toMatchObject({ storyPolicy: policy });
+  });
+});

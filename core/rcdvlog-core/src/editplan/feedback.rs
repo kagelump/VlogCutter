@@ -967,6 +967,7 @@ impl Catalog {
             parent_revision_id: Some(base.revision_id.clone()),
             active: false,
             operations,
+            story_policy: base.story_policy.clone(),
             created_at: String::new(),
         };
         let mut mutations = vec![creation];

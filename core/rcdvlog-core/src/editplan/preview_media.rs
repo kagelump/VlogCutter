@@ -128,7 +128,8 @@ pub(super) fn plan_digest(
     excerpt: Option<&super::PreviewExcerptScope>,
 ) -> Result<String> {
     let mut plan_identity = json!({"revisionId":plan.revision_id,"projectId":plan.project_id,
-        "parentRevisionId":plan.parent_revision_id,"scriptRevisionId":plan.script_revision_id,"operations":plan.operations});
+        "parentRevisionId":plan.parent_revision_id,"scriptRevisionId":plan.script_revision_id,
+        "operations":plan.operations,"storyPolicy":plan.story_policy});
     if let Some(selection) =
         super::selection::metadata_fingerprint(&catalog.connection()?, &plan.revision_id)?
     {

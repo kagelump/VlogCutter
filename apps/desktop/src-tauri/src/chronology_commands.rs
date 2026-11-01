@@ -871,6 +871,7 @@ pub fn create_edit_plan_revision(
     operations: Vec<EditPlanOperationInput>,
     script_revision_id: Option<String>,
     expected_active_revision_id: Option<String>,
+    story_policy: Option<rcdvlog_core::EditPlanStoryPolicy>,
     state: State<'_, AppState>,
 ) -> Result<EditPlanRevision, String> {
     let operations: Vec<EditPlanOperation> = operations
@@ -888,11 +889,12 @@ pub fn create_edit_plan_revision(
         .collect();
     let revision = state
         .catalog()?
-        .create_edit_plan_revision(
+        .create_edit_plan_revision_with_story_policy(
             &project_id,
             &operations,
             script_revision_id.as_deref(),
             expected_active_revision_id.as_deref(),
+            story_policy.as_ref(),
         )
         .map_err(error_message)?;
     state.sync_manager.wake_project(&project_id);

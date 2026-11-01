@@ -41,7 +41,10 @@ pub enum EditPlanPatch {
         rationale: String,
     },
     Insert {
-        anchor: PatchAnchor,
+        /// Omitted anchor means automatic chronological placement. Explicit
+        /// anchors are checked placements, not chronology exemptions.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        anchor: Option<PatchAnchor>,
         operation: EditPlanOperation,
     },
     Reorder {
@@ -70,6 +73,10 @@ pub struct EditPlanPatchInput {
     pub version: u32,
     pub name: String,
     pub edits: Vec<EditPlanPatch>,
+    /// New immutable policy for the resulting revision. Omitted inherits the
+    /// exact compatible base policy; `Some(empty)` explicitly clears it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub story_policy: Option<super::EditPlanStoryPolicy>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -113,6 +120,236 @@ fn starts(cuts: &[EditPlanOperation]) -> BTreeMap<String, f64> {
         .collect()
 }
 
+#[derive(Debug)]
+struct PlacementUnit {
+    start: usize,
+    min_millis: i64,
+    max_millis: i64,
+    cuts: Vec<EditPlanOperation>,
+}
+
+fn placement_error(code: &'static str, message: String) -> anyhow::Error {
+    match code {
+        "edit_plan_chronology_ambiguous" => super::EditPlanError::ChronologyAmbiguous { message },
+        "edit_plan_chronology_unresolved" => super::EditPlanError::ChronologyUnresolved { message },
+        "edit_plan_story_policy_invalid" => super::EditPlanError::StoryPolicyInvalid { message },
+        _ => super::EditPlanError::ChronologyConflict { message },
+    }
+    .into()
+}
+
+fn placement_units(
+    cuts: &[EditPlanOperation],
+    policy: Option<&super::EditPlanStoryPolicy>,
+    chronology: &BTreeMap<String, super::story::ChronologyPlacement>,
+) -> Result<Vec<PlacementUnit>> {
+    let mut teaser_end = 0usize;
+    if let Some(policy) = policy {
+        for (index, teaser) in policy.opening_teasers.iter().enumerate() {
+            let Some(operation) = cuts.get(index) else {
+                return Err(placement_error(
+                    "edit_plan_story_policy_invalid",
+                    format!(
+                        "opening teaser {} is not at the operation prefix",
+                        teaser.operation_id
+                    ),
+                ));
+            };
+            if operation.operation_id != teaser.operation_id || !teaser.cut().matches(operation) {
+                return Err(placement_error(
+                    "edit_plan_story_policy_invalid",
+                    format!(
+                        "opening teaser {} no longer matches the exact operation prefix",
+                        teaser.operation_id
+                    ),
+                ));
+            }
+            teaser_end = index + 1;
+        }
+    }
+
+    let by_id: BTreeMap<&str, usize> = cuts
+        .iter()
+        .enumerate()
+        .map(|(position, cut)| (cut.operation_id.as_str(), position))
+        .collect();
+    let mut groups_by_start: BTreeMap<usize, Vec<EditPlanOperation>> = BTreeMap::new();
+    if let Some(policy) = policy {
+        for group in &policy.protected_groups {
+            let mut positions = Vec::with_capacity(group.cuts.len());
+            let mut operations = Vec::with_capacity(group.cuts.len());
+            for cut in &group.cuts {
+                let Some(position) = by_id.get(cut.operation_id.as_str()).copied() else {
+                    return Err(placement_error(
+                        "edit_plan_story_policy_invalid",
+                        format!(
+                            "protected group {} refers to missing cut {}",
+                            group.group_id, cut.operation_id
+                        ),
+                    ));
+                };
+                if !cut.matches(&cuts[position]) {
+                    return Err(placement_error(
+                        "edit_plan_story_policy_invalid",
+                        format!(
+                            "protected group {} no longer matches cut {}'s exact source range",
+                            group.group_id, cut.operation_id
+                        ),
+                    ));
+                }
+                positions.push(position);
+                operations.push(cuts[position].clone());
+            }
+            if positions.windows(2).any(|pair| pair[1] != pair[0] + 1) {
+                return Err(placement_error(
+                    "edit_plan_story_policy_invalid",
+                    format!(
+                        "protected group {} is no longer contiguous; automatic insertion is refused",
+                        group.group_id
+                    ),
+                ));
+            }
+            if let Some(start) = positions.first().copied() {
+                if start < teaser_end {
+                    return Err(placement_error(
+                        "edit_plan_story_policy_invalid",
+                        format!(
+                            "protected group {} overlaps the opening teaser prefix",
+                            group.group_id
+                        ),
+                    ));
+                }
+                groups_by_start.insert(start, operations);
+            }
+        }
+    }
+
+    let mut units = Vec::new();
+    let mut index = teaser_end;
+    while index < cuts.len() {
+        let operations = if let Some(group) = groups_by_start.get(&index) {
+            group.clone()
+        } else {
+            vec![cuts[index].clone()]
+        };
+        let end = index + operations.len();
+        let mut min_millis = i64::MAX;
+        let mut max_millis = i64::MIN;
+        for operation in &operations {
+            let Some(placement) = chronology.get(&operation.asset_id) else {
+                return Err(placement_error(
+                    "edit_plan_chronology_unresolved",
+                    format!(
+                        "cut {} has no solved source chronology",
+                        operation.operation_id
+                    ),
+                ));
+            };
+            let Some(millis) = placement.trip_time_millis else {
+                return Err(placement_error(
+                    "edit_plan_chronology_unresolved",
+                    format!(
+                        "cut {} has no solved trip time; automatic insertion cannot guess story order",
+                        operation.operation_id
+                    ),
+                ));
+            };
+            min_millis = min_millis.min(millis);
+            max_millis = max_millis.max(millis);
+        }
+        units.push(PlacementUnit {
+            start: index,
+            min_millis,
+            max_millis,
+            cuts: operations,
+        });
+        index = end;
+    }
+    Ok(units)
+}
+
+fn automatic_insert_slot(
+    cuts: &[EditPlanOperation],
+    policy: Option<&super::EditPlanStoryPolicy>,
+    chronology: &BTreeMap<String, super::story::ChronologyPlacement>,
+    operation: &EditPlanOperation,
+) -> Result<usize> {
+    let Some(placement) = chronology.get(&operation.asset_id) else {
+        return Err(placement_error(
+            "edit_plan_chronology_unresolved",
+            format!(
+                "cut {} has no solved source chronology",
+                operation.operation_id
+            ),
+        ));
+    };
+    let Some(new_millis) = placement.trip_time_millis else {
+        return Err(placement_error(
+            "edit_plan_chronology_unresolved",
+            format!(
+                "cut {} has no solved trip time; automatic insertion cannot infer filenames or retrieval rank as story order",
+                operation.operation_id
+            ),
+        ));
+    };
+    let units = placement_units(cuts, policy, chronology)?;
+    let exact_edges = super::story::allowed_exception_edges(policy);
+    let mut slots = Vec::new();
+    let mut tie = false;
+    for boundary in 0..=units.len() {
+        let previous = boundary.checked_sub(1).and_then(|index| units.get(index));
+        let next = units.get(boundary);
+        // A rearranged group is an atomic chronology envelope. Checking only
+        // its first/last shot would admit an insert inside its event span.
+        if previous.is_some_and(|unit| unit.max_millis > new_millis)
+            || next.is_some_and(|unit| unit.min_millis < new_millis)
+        {
+            continue;
+        }
+        let left = previous.and_then(|unit| unit.cuts.last());
+        let right = next.and_then(|unit| unit.cuts.first());
+        if left.zip(right).is_some_and(|(left, right)| {
+            exact_edges.contains(&(left.operation_id.clone(), right.operation_id.clone()))
+        }) {
+            // Ordinary placement must not silently break an existing exact
+            // exceptional adjacency either. It requires a revised decision.
+            continue;
+        }
+        let left_issue =
+            left.and_then(|cut| super::story::edge_issue_kind(cut, operation, chronology));
+        let right_issue =
+            right.and_then(|cut| super::story::edge_issue_kind(operation, cut, chronology));
+        tie |= left_issue == Some(super::story::StoryIssueKind::ChronologyAmbiguous)
+            || right_issue == Some(super::story::StoryIssueKind::ChronologyAmbiguous);
+        if left_issue.is_some() || right_issue.is_some() {
+            continue;
+        }
+        slots.push(next.map_or(cuts.len(), |unit| unit.start));
+    }
+    match slots.as_slice() {
+        [slot] => Ok(*slot),
+        [] => Err(placement_error(
+            if tie {
+                "edit_plan_chronology_ambiguous"
+            } else {
+                "edit_plan_chronology_conflict"
+            },
+            format!(
+                "Cut {} has no safe chronological slot outside the teaser and protected sequences. Choose an explicit scoped placement or revise the affected sequence decision.",
+                operation.operation_id
+            ),
+        )),
+        _ => Err(placement_error(
+            "edit_plan_chronology_ambiguous",
+            format!(
+                "Cut {} has multiple valid story placements at positions {:?}; chronology alone cannot choose between them. Supply an explicit checked anchor.",
+                operation.operation_id,
+                slots.iter().take(16).collect::<Vec<_>>()
+            ),
+        )),
+    }
+}
+
 impl Catalog {
     pub fn patch_edit_plan(
         &self,
@@ -134,12 +371,25 @@ impl Catalog {
             base.project_id == project,
             "invalid input: patch base belongs to another project"
         );
+        if let Some(policy) = &input.story_policy {
+            super::story::validate_policy_replacement(base.story_policy.as_ref(), policy).map_err(
+                |error| super::EditPlanError::StoryPolicyInvalid {
+                    message: error.to_string(),
+                },
+            )?;
+        }
+        let initial_facts = self.chronology_facts(project)?;
         let mut candidate = base.clone();
         candidate.active = false;
+        candidate.story_policy = input
+            .story_policy
+            .clone()
+            .or_else(|| base.story_policy.clone());
         let cuts = &mut candidate.operations;
         let mut touched = BTreeSet::new();
         let mut explicit_audio = BTreeSet::new();
         let mut lineage = Vec::new();
+        let mut automatic: Vec<EditPlanOperation> = Vec::new();
         let base_ids: BTreeSet<_> = cuts.iter().map(|c| c.operation_id.clone()).collect();
         let mut new_ids = base_ids.clone();
         for edit in &input.edits {
@@ -165,14 +415,19 @@ impl Catalog {
                         new_ids.insert(id.clone()),
                         "invalid input: inserted cut ID already exists"
                     );
-                    let at = anchor(cuts, a)?;
-                    cuts.insert(at, operation.clone());
                     explicit_audio.insert(id.clone());
-                    lineage.push(PatchLineage {
-                        operation_id: id.clone(),
-                        parent_operation_id: None,
-                        kind: "insert".into(),
-                    });
+                    match a {
+                        Some(a) => {
+                            let at = anchor(cuts, a)?;
+                            cuts.insert(at, operation.clone());
+                            lineage.push(PatchLineage {
+                                operation_id: id.clone(),
+                                parent_operation_id: None,
+                                kind: "insert".into(),
+                            });
+                        }
+                        None => automatic.push(operation.clone()),
+                    }
                 }
                 EditPlanPatch::Reorder { anchor: a, .. } => {
                     let at = target(cuts, id)?;
@@ -258,6 +513,64 @@ impl Catalog {
                 }
             }
         }
+
+        if !automatic.is_empty() {
+            let solution = crate::chronology::solve(&initial_facts);
+            let chronology = super::story::placement_index(&solution);
+            // Batch additions are one deterministic group. Incoming
+            // enumeration order is not story order.
+            automatic.sort_by(|left, right| {
+                let left_time = chronology
+                    .get(&left.asset_id)
+                    .and_then(|placement| placement.trip_time_millis)
+                    .unwrap_or(i64::MAX);
+                let right_time = chronology
+                    .get(&right.asset_id)
+                    .and_then(|placement| placement.trip_time_millis)
+                    .unwrap_or(i64::MAX);
+                left_time
+                    .cmp(&right_time)
+                    .then_with(|| left.asset_id.cmp(&right.asset_id))
+                    .then_with(|| left.source_in_seconds.total_cmp(&right.source_in_seconds))
+                    .then_with(|| left.source_out_seconds.total_cmp(&right.source_out_seconds))
+                    .then_with(|| left.operation_id.cmp(&right.operation_id))
+            });
+            for pair in automatic.windows(2) {
+                let left = chronology
+                    .get(&pair[0].asset_id)
+                    .and_then(|placement| placement.trip_time_millis);
+                let right = chronology
+                    .get(&pair[1].asset_id)
+                    .and_then(|placement| placement.trip_time_millis);
+                if let (Some(left), Some(right)) = (left, right)
+                    && left == right
+                    && pair[0].asset_id != pair[1].asset_id
+                {
+                    return Err(placement_error(
+                        "edit_plan_chronology_ambiguous",
+                        format!(
+                            "Incoming cuts {} and {} have the same corrected source time. A batch cannot guess their story order from enumeration order.",
+                            pair[0].operation_id, pair[1].operation_id
+                        ),
+                    ));
+                }
+            }
+            for operation in automatic {
+                let at = automatic_insert_slot(
+                    cuts,
+                    candidate.story_policy.as_ref(),
+                    &chronology,
+                    &operation,
+                )?;
+                cuts.insert(at, operation.clone());
+                lineage.push(PatchLineage {
+                    operation_id: operation.operation_id,
+                    parent_operation_id: None,
+                    kind: "insert".into(),
+                });
+            }
+        }
+
         let old_starts = starts(&base.operations);
         let new_starts = starts(cuts);
         for (i, cut) in cuts.iter_mut().enumerate() {
@@ -279,15 +592,38 @@ impl Catalog {
                     new_starts[&cut.operation_id] - old_starts[&cut.operation_id] - source_shift;
             }
         }
+        // Canonical lineage order follows final immutable sequence position.
+        let positions: BTreeMap<_, _> = cuts
+            .iter()
+            .enumerate()
+            .map(|(position, cut)| (cut.operation_id.clone(), position))
+            .collect();
+        lineage.sort_by_key(|item| {
+            positions
+                .get(&item.operation_id)
+                .copied()
+                .unwrap_or(usize::MAX)
+        });
+
         self.check_revision_inputs(project, cuts, Some(base_id))?;
-        let key = super::ranges::constraints_key(&self.connection()?, &candidate)?;
-        let validation = self.validate_edit_plan_snapshot(&candidate, &|| false, None)?;
-        ensure!(
-            validation.renderable(),
-            super::EditPlanError::ValidationFailed {
-                codes: validation.errors().map(|f| f.code.to_owned()).collect()
+        if let Some(policy) = &mut candidate.story_policy {
+            let facts = self.chronology_facts(project)?;
+            if let Err(error) = super::story::stamp_policy_dependencies(policy, &facts) {
+                return Err(super::EditPlanError::StaleStoryScope {
+                    message: error.to_string(),
+                }
+                .into());
             }
-        );
+        }
+        let validation = self.validate_edit_plan_candidate(&candidate, &|| false)?;
+        if !validation.renderable() {
+            return Err(super::validate::validation_error(&validation).into());
+        }
+        let input_chronology_key = super::story::chronology_dependency_token(
+            &initial_facts,
+            candidate.operations.iter().map(|cut| cut.asset_id.clone()),
+        )?;
+        let key = super::ranges::constraints_key(&self.connection()?, &candidate)?;
         let mut connection = self.connection()?;
         let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         super::require_active(&tx, project, expected_active)?;
@@ -295,12 +631,55 @@ impl Catalog {
             super::ranges::constraints_key(&tx, &candidate)? == key,
             "stale evidence: constraints changed while validating patch"
         );
-        let (id, mut operation) = super::revision_operation(
+        // Recheck chronology and exact scope under the write reservation.
+        let facts = crate::chronology::load_chronology_facts(&tx, project)?;
+        ensure!(
+            input_chronology_key
+                == super::story::chronology_dependency_token(
+                    &facts,
+                    candidate.operations.iter().map(|cut| cut.asset_id.clone())
+                )?,
+            super::EditPlanError::StaleStoryScope {
+                message: "source chronology changed during placement; retry against current facts"
+                    .into()
+            }
+        );
+        let solution = crate::chronology::solve(&facts);
+        if let Some(policy) = candidate.story_policy.as_mut()
+            && let Err(error) = super::story::stamp_policy_dependencies(policy, &facts)
+        {
+            return Err(super::EditPlanError::StaleStoryScope {
+                message: error.to_string(),
+            }
+            .into());
+        }
+        {
+            let issues = super::story::validate_revision_chronology(&candidate, &facts, &solution);
+            if issues.iter().any(|issue| issue.kind.is_error()) {
+                return Err(super::EditPlanError::StoryPolicyInvalid {
+                    message: "story policy or chronology changed while patch was validating".into(),
+                }
+                .into());
+            }
+            if candidate
+                .story_policy
+                .as_ref()
+                .is_some_and(|policy| policy.is_empty())
+                && !solution.contradictions.is_empty()
+            {
+                return Err(super::EditPlanError::ChronologyConflict {
+                    message: "project chronology changed while patch was validating".into(),
+                }
+                .into());
+            }
+        }
+        let (id, mut operation) = super::revision_operation_with_story_policy(
             &tx,
             project,
             &candidate.operations,
             base.script_revision_id.as_deref(),
             Some(base_id),
+            candidate.story_policy.as_ref(),
         )?;
         operation.payload["patchLineage"] = serde_json::to_value(&lineage)?;
         operation.payload["variantName"] = serde_json::json!(input.name);

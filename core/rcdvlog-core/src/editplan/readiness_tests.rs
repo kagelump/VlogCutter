@@ -44,6 +44,7 @@ fn patch(edits: Vec<EditPlanPatch>) -> EditPlanPatchInput {
         version: 1,
         name: "generated alternative".into(),
         edits,
+        story_policy: None,
     }
 }
 
@@ -74,25 +75,32 @@ fn sparse_patch_is_atomic_preserves_identity_and_retimes_retained_audio() {
     );
     let mut inserted = cut("inserted", &asset, 2.5, 3.2);
     inserted.audio = Some(EditPlanAudio::Silent);
+    let policy = super::story::test_policy(
+        &[inserted.clone(), cut("first", &asset, 0.5, 1.2)],
+        &[("inserted", "first")],
+    );
     let result = catalog
         .patch_edit_plan(
             &base.project_id,
             &base.revision_id,
             None,
-            &patch(vec![
-                EditPlanPatch::Insert {
-                    anchor: PatchAnchor::Before {
-                        operation_id: "first".into(),
+            &EditPlanPatchInput {
+                story_policy: Some(policy),
+                ..patch(vec![
+                    EditPlanPatch::Insert {
+                        anchor: Some(PatchAnchor::Before {
+                            operation_id: "first".into(),
+                        }),
+                        operation: inserted,
                     },
-                    operation: inserted,
-                },
-                EditPlanPatch::Trim {
-                    operation_id: "first".into(),
-                    source_in_seconds: 0.5,
-                    source_out_seconds: 1.2,
-                    rationale: "quicker connection".into(),
-                },
-            ]),
+                    EditPlanPatch::Trim {
+                        operation_id: "first".into(),
+                        source_in_seconds: 0.5,
+                        source_out_seconds: 1.2,
+                        rationale: "quicker connection".into(),
+                    },
+                ])
+            },
         )
         .unwrap();
     assert!(!result.revision.active);
