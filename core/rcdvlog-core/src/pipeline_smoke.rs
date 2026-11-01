@@ -17,7 +17,7 @@ use std::path::Path;
 use std::process::Command;
 use uuid::Uuid;
 
-pub const PIPELINE_SMOKE_RECIPE_VERSION: &str = "preview-generated-media-smoke.v1";
+pub const PIPELINE_SMOKE_RECIPE_VERSION: &str = "preview-generated-media-smoke.v2";
 const MAX_EXECUTABLE_BYTES: u64 = 512 * 1024 * 1024;
 const FIXTURE_SECONDS: f64 = 0.8;
 const REQUIRED_CHECKS: [&str; 5] = [
@@ -503,6 +503,16 @@ fn generate_fixture(path: &Path, fixture: Fixture) -> Result<()> {
             command.args(["-f", "lavfi", "-i", "color=red:size=160x90:rate=20", "-vf", "drawbox=x=80:y=0:w=80:h=45:color=blue:t=fill,drawbox=x=0:y=45:w=80:h=45:color=green:t=fill,drawbox=x=80:y=45:w=80:h=45:color=yellow:t=fill", "-t", "0.8", "-metadata:s:v:0", "rotate=90", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-an"]);
         }
     }
+    // These are authored synthetic sources in a known sequence. Persist that
+    // chronology in their media metadata so the smoke workflow exercises the
+    // same safe default as real editing, without an ordering exemption.
+    let capture_time = match fixture {
+        Fixture::Tone { .. } => "2026-01-01T00:01:00Z",
+        Fixture::NoAudio => "2026-01-01T00:02:00Z",
+        Fixture::Silent { .. } => "2026-01-01T00:03:00Z",
+        Fixture::Rotated => "2026-01-01T00:04:00Z",
+    };
+    command.args(["-metadata", &format!("creation_time={capture_time}")]);
     command.arg(path);
     let output = crate::stall::output_with_timeout(
         &mut command,
