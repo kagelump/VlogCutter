@@ -99,6 +99,10 @@ fn supported_cli_reuses_one_catalog_for_sparse_edits_review_and_delivery() {
                 "aac",
                 "-shortest",
             ])
+            .args([
+                "-metadata",
+                &format!("creation_time=2026-01-01T00:{i:02}:00Z"),
+            ])
             .arg(sources.join(format!("{i}.mp4")))
             .output()
             .unwrap();
@@ -130,8 +134,10 @@ fn supported_cli_reuses_one_catalog_for_sparse_edits_review_and_delivery() {
         .as_array()
         .or_else(|| listed["items"].as_array())
         .unwrap();
-    let a = assets[0]["id"].as_str().unwrap();
-    let b = assets[1]["id"].as_str().unwrap();
+    // The distinct inserted view is an earlier source. Its explicit prefix
+    // placement should satisfy the same chronology as automatic insertion.
+    let a = assets[1]["id"].as_str().unwrap();
+    let b = assets[0]["id"].as_str().unwrap();
     // The host toolchain is used for real generated-media work below. Keep the
     // workflow preflight deterministic across Linux distributions whose bundled
     // FFmpeg may be older than the supported minimum.
