@@ -98,6 +98,7 @@ fn decision(actor: StoryDecisionActor, rationale: &str) -> StoryDecision {
 fn teaser_policy(operation_id: &str, asset_id: &str) -> EditPlanStoryPolicy {
     EditPlanStoryPolicy {
         version: 1,
+        revision_decision: None,
         opening_teasers: vec![StoryOpeningTeaser {
             operation_id: operation_id.into(),
             asset_id: asset_id.into(),
@@ -371,6 +372,7 @@ fn wrong_anchor_is_atomic_and_a_narrow_agent_exception_is_inspectable() {
 
     let policy = EditPlanStoryPolicy {
         version: 1,
+        revision_decision: None,
         opening_teasers: vec![],
         protected_groups: vec![],
         exceptions: vec![story_exception(
@@ -417,6 +419,7 @@ fn wrong_anchor_is_atomic_and_a_narrow_agent_exception_is_inspectable() {
     let before = revision_count(&fixture);
     let bad_scope = EditPlanStoryPolicy {
         version: 1,
+        revision_decision: None,
         opening_teasers: vec![],
         protected_groups: vec![],
         exceptions: vec![story_exception(
@@ -463,6 +466,7 @@ fn changed_clock_facts_invalidate_an_existing_exception() {
     ]);
     let policy = EditPlanStoryPolicy {
         version: 1,
+        revision_decision: None,
         opening_teasers: vec![],
         protected_groups: vec![],
         exceptions: vec![story_exception(
@@ -518,6 +522,7 @@ fn protected_groups_cannot_be_split_and_stale_group_identity_is_refused() {
     ]);
     let policy = EditPlanStoryPolicy {
         version: 1,
+        revision_decision: None,
         opening_teasers: vec![],
         protected_groups: vec![ProtectedStoryGroup {
             group_id: "setup-payoff".into(),
@@ -936,6 +941,32 @@ fn generated_media_preview_uses_safe_automatic_order_and_stays_synchronized() {
         .parse()
         .unwrap();
     assert!((duration - 4.0).abs() < 0.1);
+    let artifact = preview
+        .artifact_id
+        .as_deref()
+        .expect("managed preview identity");
+    let before = fixture
+        .catalog
+        .preview_artifact_status(artifact, true)
+        .unwrap();
+    assert!(before.verification.unwrap().constraints_match);
+    rusqlite::Connection::open(fixture.directory.path().join("catalog.sqlite3"))
+        .unwrap()
+        .execute(
+            "UPDATE assets SET captured_at_raw='2026-11-01T03:00:00Z' WHERE id='later'",
+            [],
+        )
+        .unwrap();
+    let after = fixture
+        .catalog
+        .preview_artifact_status(artifact, true)
+        .unwrap();
+    let verification = after.verification.unwrap();
+    assert!(verification.plan_renderable);
+    assert!(
+        !verification.constraints_match,
+        "changed source clocks must invalidate an old finishing receipt even when order remains forward"
+    );
 }
 
 #[test]
@@ -946,6 +977,7 @@ fn repeated_teaser_footage_is_declared_exactly_and_a_trim_invalidates_its_scope(
     ]);
     let policy = EditPlanStoryPolicy {
         version: 1,
+        revision_decision: None,
         opening_teasers: vec![StoryOpeningTeaser {
             operation_id: "teaser".into(),
             asset_id: "reused".into(),
@@ -1018,6 +1050,7 @@ fn a_reviewed_rearranged_group_keeps_its_documented_internal_order_and_remains_a
     ]);
     let policy = EditPlanStoryPolicy {
         version: 1,
+        revision_decision: None,
         opening_teasers: vec![],
         protected_groups: vec![ProtectedStoryGroup {
             group_id: "reviewed-camera-choice".into(),
@@ -1086,6 +1119,7 @@ fn story_policy_survives_baseline_roundtrip_and_legacy_revision_reads_are_unappr
     ]);
     let policy = EditPlanStoryPolicy {
         version: 1,
+        revision_decision: None,
         opening_teasers: vec![],
         protected_groups: vec![],
         exceptions: vec![story_exception(
@@ -1141,4 +1175,283 @@ fn story_policy_survives_baseline_roundtrip_and_legacy_revision_reads_are_unappr
         .edit_plan_revision(&revision.revision_id)
         .unwrap();
     assert!(legacy.story_policy.is_none());
+}
+
+#[test]
+fn forward_journey_has_no_spurious_tied_time_findings() {
+    let f = fixture(&[
+        ("early", Some("2026-11-01T01:00:00Z")),
+        ("late", Some("2026-11-01T02:00:00Z")),
+    ]);
+    let plan = f
+        .catalog
+        .create_edit_plan_revision(
+            &f.project_id,
+            &[
+                operation("early", "early", 0.0, 2.0),
+                operation("late", "late", 0.0, 2.0),
+            ],
+            None,
+            None,
+        )
+        .unwrap();
+    let report = f.catalog.validate_edit_plan(&plan.revision_id).unwrap();
+    assert!(
+        report
+            .findings
+            .iter()
+            .all(|finding| !finding.code.starts_with("edit_plan_chronology")),
+        "{report:?}"
+    );
+}
+
+#[test]
+fn retiring_a_protected_group_requires_a_recorded_revision_decision() {
+    let f = fixture(&[
+        ("first", Some("2026-11-01T01:00:00Z")),
+        ("insert", Some("2026-11-01T02:00:00Z")),
+        ("last", Some("2026-11-01T03:00:00Z")),
+    ]);
+    let operations = [
+        operation("first", "first", 0.0, 2.0),
+        operation("last", "last", 0.0, 2.0),
+    ];
+    let policy = EditPlanStoryPolicy {
+        protected_groups: vec![ProtectedStoryGroup {
+            group_id: "two-shot-scene".into(),
+            cuts: operations
+                .iter()
+                .map(StoryCutIdentity::from_operation)
+                .collect(),
+            rationale: "Preserve this scene".into(),
+            decision: decision(StoryDecisionActor::Agent, "Provisional scene order"),
+            chronology_dependency: String::new(),
+        }],
+        ..EditPlanStoryPolicy::default()
+    };
+    let base = f
+        .catalog
+        .create_edit_plan_revision_with_story_policy(
+            &f.project_id,
+            &operations,
+            None,
+            None,
+            Some(&policy),
+        )
+        .unwrap();
+    let edit = EditPlanPatch::Insert {
+        anchor: Some(PatchAnchor::After {
+            operation_id: "first".into(),
+        }),
+        operation: operation("insert", "insert", 0.0, 2.0),
+    };
+    let count = revision_count(&f);
+    assert!(
+        f.catalog
+            .patch_edit_plan(
+                &f.project_id,
+                &base.revision_id,
+                None,
+                &patch(vec![edit.clone()], Some(EditPlanStoryPolicy::default()))
+            )
+            .is_err()
+    );
+    assert_eq!(revision_count(&f), count);
+    let replacement = EditPlanStoryPolicy {
+        revision_decision: Some(decision(
+            StoryDecisionActor::Agent,
+            "Replace the two-shot scene with this explicit three-shot progression",
+        )),
+        ..EditPlanStoryPolicy::default()
+    };
+    let result = f
+        .catalog
+        .patch_edit_plan(
+            &f.project_id,
+            &base.revision_id,
+            None,
+            &patch(vec![edit], Some(replacement)),
+        )
+        .unwrap();
+    assert_eq!(result.revision.operations[1].operation_id, "insert");
+    assert_eq!(
+        result
+            .revision
+            .story_policy
+            .unwrap()
+            .revision_decision
+            .unwrap()
+            .actor,
+        StoryDecisionActor::Agent
+    );
+}
+
+#[test]
+fn chronology_is_enforced_between_separate_protected_groups() {
+    let f = fixture(&[
+        ("early", Some("2026-11-01T01:00:00Z")),
+        ("late", Some("2026-11-01T02:00:00Z")),
+    ]);
+    let policy = EditPlanStoryPolicy {
+        protected_groups: ["late", "early"]
+            .map(|name| ProtectedStoryGroup {
+                group_id: name.into(),
+                cuts: vec![cut(name, name, 0.0, 2.0)],
+                rationale: "Protect this individual shot".into(),
+                decision: decision(
+                    StoryDecisionActor::Agent,
+                    "Protect only this group's internal order",
+                ),
+                chronology_dependency: String::new(),
+            })
+            .to_vec(),
+        ..EditPlanStoryPolicy::default()
+    };
+    let result = f.catalog.create_edit_plan_revision_with_story_policy(
+        &f.project_id,
+        &[
+            operation("late", "late", 0.0, 2.0),
+            operation("early", "early", 0.0, 2.0),
+        ],
+        None,
+        None,
+        Some(&policy),
+    );
+    assert!(
+        result.is_err(),
+        "protecting separate shots must not exempt the edge between them"
+    );
+}
+
+#[test]
+fn explicit_unknown_and_tied_anchors_require_scoped_decisions_too() {
+    for unknown_time in [None, Some("2026-11-01T01:00:00Z")] {
+        let f = fixture(&[
+            ("known", Some("2026-11-01T01:00:00Z")),
+            ("uncertain", unknown_time),
+        ]);
+        let base = f
+            .catalog
+            .create_edit_plan_revision(
+                &f.project_id,
+                &[operation("known", "known", 0.0, 2.0)],
+                None,
+                None,
+            )
+            .unwrap();
+        let count = revision_count(&f);
+        let result = f.catalog.patch_edit_plan(
+            &f.project_id,
+            &base.revision_id,
+            None,
+            &patch(
+                vec![EditPlanPatch::Insert {
+                    anchor: Some(PatchAnchor::End),
+                    operation: operation("uncertain", "uncertain", 0.0, 2.0),
+                }],
+                None,
+            ),
+        );
+        assert!(
+            result.is_err(),
+            "explicit anchors cannot bypass uncertainty: {result:?}"
+        );
+        assert_eq!(revision_count(&f), count);
+        let draft = f
+            .catalog
+            .create_edit_plan_revision(
+                &f.project_id,
+                &[
+                    operation("known", "known", 0.0, 2.0),
+                    operation("uncertain", "uncertain", 0.0, 2.0),
+                ],
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(
+            !f.catalog
+                .validate_edit_plan(&draft.revision_id)
+                .unwrap()
+                .renderable()
+        );
+        assert!(
+            f.catalog
+                .activate_edit_plan_revision(&draft.revision_id, None)
+                .is_err()
+        );
+    }
+}
+
+#[test]
+fn multiple_valid_slots_around_an_exception_require_an_explicit_choice() {
+    let f = fixture(&[
+        ("early", Some("2026-11-01T01:00:00Z")),
+        ("middle", Some("2026-11-01T02:00:00Z")),
+        ("late", Some("2026-11-01T03:00:00Z")),
+    ]);
+    let policy = EditPlanStoryPolicy {
+        exceptions: vec![story_exception(
+            "reverse",
+            vec![
+                cut("late", "late", 0.0, 2.0),
+                cut("early", "early", 0.0, 2.0),
+            ],
+            vec![("late", "early")],
+        )],
+        ..EditPlanStoryPolicy::default()
+    };
+    let base = f
+        .catalog
+        .create_edit_plan_revision_with_story_policy(
+            &f.project_id,
+            &[
+                operation("late", "late", 0.0, 2.0),
+                operation("early", "early", 0.0, 2.0),
+            ],
+            None,
+            None,
+            Some(&policy),
+        )
+        .unwrap();
+    let error = f
+        .catalog
+        .patch_edit_plan(
+            &f.project_id,
+            &base.revision_id,
+            None,
+            &patch(
+                vec![EditPlanPatch::Insert {
+                    anchor: None,
+                    operation: operation("middle", "middle", 0.0, 2.0),
+                }],
+                None,
+            ),
+        )
+        .unwrap_err();
+    assert_eq!(
+        error
+            .downcast_ref::<rcdvlog_core::EditPlanError>()
+            .unwrap()
+            .code(),
+        "edit_plan_chronology_ambiguous"
+    );
+    let explicit = f
+        .catalog
+        .patch_edit_plan(
+            &f.project_id,
+            &base.revision_id,
+            None,
+            &patch(
+                vec![EditPlanPatch::Insert {
+                    anchor: Some(PatchAnchor::Before {
+                        operation_id: "late".into(),
+                    }),
+                    operation: operation("middle", "middle", 0.0, 2.0),
+                }],
+                None,
+            ),
+        )
+        .unwrap();
+    assert_eq!(explicit.revision.operations[0].operation_id, "middle");
 }

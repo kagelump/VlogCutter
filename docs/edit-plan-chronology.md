@@ -81,8 +81,8 @@ base policy is inherited):
     "chronologyDependency": ""
   }],
   "exceptions": [{
-    "exceptionId": "terminal-before-boarding",
-    "rationale": "Opening terminal shot deliberately precedes boarding",
+    "exceptionId": "boarding-to-terminal-flashback",
+    "rationale": "Deliberately return to the terminal after showing boarding",
     "decision": { "actor": "agent", "rationale": "Scoped editorial rearrangement" },
     "scope": {
       "cuts": [{
@@ -97,8 +97,8 @@ base policy is inherited):
         "sourceOutSeconds": 2.0
       }],
       "edges": [{
-        "earlierOperationId": "terminal",
-        "laterOperationId": "boarding"
+        "earlierOperationId": "boarding",
+        "laterOperationId": "terminal"
       }],
       "chronologyDependency": ""
     }
@@ -128,8 +128,9 @@ list`. Creation and patch results also include it in the immutable revision.
   is supplied.
 - Automatic additions are sorted as a batch by corrected source chronology,
   independent of incoming JSON enumeration order. They are placed into the
-  retained main journey only at a slot that introduces no uncovered backward
-  edge and does not split a protected group. If chronology places a new cut
+  retained main journey only at a slot that satisfies both neighbors and does
+  not split a protected group or an existing exact exception edge. Multiple safe
+  slots return a bounded conflict requiring an explicit checked anchor. If chronology places a new cut
   inside a protected group's time envelope, the bounded result is a conflict.
 - Explicit anchors remain checked placements. A backward explicit join is an
   atomic validation failure unless an exact scoped exception covers the
@@ -139,8 +140,12 @@ list`. Creation and patch results also include it in the immutable revision.
   tie requires an exact scoped decision rather than an inferred order.
 - Missing chronology is not guessed. Automatic insertion of an asset without a
   solved trip time fails. So does a genuine tie between different assets.
-  Existing inspectable plans may carry an unresolved warning, but a new
-  automatic placement cannot use that uncertainty as permission.
+  Unresolved or tied cross-source order blocks sparse edits and finishing until
+  an exact scoped decision is recorded, including when an explicit anchor is
+  supplied. Full-plan drafts remain inspectable with these blocking findings.
+  Forward excerpts of the same take are comparable without a wall clock.
+- Group exemptions cover only internal edges of that exact group. The edge
+  between two separate groups remains chronological unless explicitly excepted.
 - Solver contradictions are blocking validation errors. Changed chronology
   facts invalidate exact policy dependencies even when the retained main order
   is still monotonic.
@@ -160,3 +165,19 @@ Legacy revisions load with `storyPolicy: null`; migration never treats an old
 backward edit as approved. New creation operations carry `storyPolicy` in a
 payload version 5 while versions 1-4 remain replayable. Baseline export/import
 and operation replay preserve the policy. SQLite remains canonical.
+
+Preview, inspection and delivery constraint identities include current chronology
+facts for the selected picture sources, even when a plan has no exceptional
+policy. A later correction invalidates an old verification receipt even if the
+new times remain monotonic. Sparse placement and whole-plan creation also recheck
+those dependencies while holding the write transaction.
+
+The desktop typed API accepts the same optional policy when creating a revision;
+no ordering logic is duplicated in TypeScript or Tauri. This change does not add
+an interactive policy editor to the desktop workbench.
+
+Replacing an existing nonempty policy requires `revisionDecision` with an explicit
+`actor` and nonempty `rationale` on the replacement policy. This also applies to
+an empty replacement that retires a teaser, protected group or exception. The
+change decision is stored on the new immutable revision; omitting `storyPolicy`
+continues to inherit the previous contract without changing it.

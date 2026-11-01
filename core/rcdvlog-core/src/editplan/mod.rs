@@ -64,11 +64,8 @@ pub use preview_artifact_model::*;
 pub use preview_excerpt::{PreviewExcerptRequest, PreviewExcerptScope};
 pub use range_model::*;
 pub use story::{
-    ChronologyException, ChronologyPolicy, CutIdentity, EditPlanChronologyPolicy,
-    EditPlanStoryPolicy, ExceptionScope, OpeningTeaser, ProtectedGroup, ProtectedStoryGroup,
-    ScopedChronologyException, StoryChronologyException, StoryCutIdentity, StoryDecision,
-    StoryDecisionActor, StoryExceptionScope, StoryOpeningTeaser, StoryOrderEdge, StoryPolicy,
-    StoryTeaser,
+    EditPlanStoryPolicy, ProtectedStoryGroup, StoryChronologyException, StoryCutIdentity,
+    StoryDecision, StoryDecisionActor, StoryExceptionScope, StoryOpeningTeaser, StoryOrderEdge,
 };
 pub use validate::{Finding, FindingKind, Severity, ValidationReport};
 
@@ -178,6 +175,13 @@ impl Catalog {
             Some(base) => self.edit_plan_revision(base)?.story_policy,
             None => None,
         };
+        if let Some(policy) = story_policy {
+            story::validate_policy_replacement(base_policy.as_ref(), policy).map_err(|error| {
+                EditPlanError::StoryPolicyInvalid {
+                    message: error.to_string(),
+                }
+            })?;
+        }
         let mut candidate = EditPlanRevision {
             revision_id: format!("editrev_candidate_{}", Uuid::new_v4().simple()),
             project_id: project_id.to_string(),
@@ -189,6 +193,10 @@ impl Catalog {
             created_at: now(),
         };
         let facts = self.chronology_facts(project_id)?;
+        let input_chronology_key = story::chronology_dependency_token(
+            &facts,
+            candidate.operations.iter().map(|cut| cut.asset_id.clone()),
+        )?;
         if let Some(policy) = &mut candidate.story_policy
             && let Err(error) = story::stamp_policy_dependencies(policy, &facts)
         {
@@ -211,6 +219,9 @@ impl Catalog {
         // Recheck the exact policy dependency and chronology-owned invariants
         // while holding the write reservation, not merely before acquiring it.
         let facts = crate::chronology::load_chronology_facts(&transaction, project_id)?;
+        anyhow::ensure!(input_chronology_key == story::chronology_dependency_token(&facts,
+            candidate.operations.iter().map(|cut| cut.asset_id.clone()))?,
+            EditPlanError::StaleStoryScope { message: "source chronology changed while creating the draft; retry against current facts".into() });
         let solution = crate::chronology::solve(&facts);
         if candidate.story_policy.is_some() {
             if let Err(error) = story::validate_policy_exactness(&candidate, &facts) {

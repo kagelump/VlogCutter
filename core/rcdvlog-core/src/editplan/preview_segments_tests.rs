@@ -98,12 +98,16 @@ fn interrupted_work_reuses_verified_segments_and_a_reorder_or_single_trim_is_sco
         cut.position = position as u32;
     }
     let reordered = catalog
-        .create_edit_plan_from_base(
+        .create_edit_plan_from_base_with_story_policy(
             &plan.project_id,
             &reversed,
             None,
             Some(&plan.revision_id),
             None,
+            Some(&super::super::story::test_policy(
+                &reversed,
+                &[("cut-1", "cut-0")],
+            )),
         )
         .unwrap();
     let reused = render(&catalog, &reordered);
@@ -124,12 +128,16 @@ fn interrupted_work_reuses_verified_segments_and_a_reorder_or_single_trim_is_sco
     );
     reversed[0].source_in_seconds += 0.2;
     let trimmed = catalog
-        .create_edit_plan_from_base(
+        .create_edit_plan_from_base_with_story_policy(
             &plan.project_id,
             &reversed,
             None,
             Some(&reordered.revision_id),
             None,
+            Some(&super::super::story::test_policy(
+                &reversed,
+                &[("cut-1", "cut-0")],
+            )),
         )
         .unwrap();
     counts(&render(&catalog, &trimmed), 1, 1, 0);

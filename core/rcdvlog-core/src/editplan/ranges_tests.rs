@@ -263,8 +263,19 @@ fn picture_exclusion_can_preserve_covered_dialogue_but_audio_exclusion_blocks_it
     b.operation_id = "cover".into();
     b.position = 1;
     b.audio = Some(EditPlanAudio::Silent);
+    let operations = [a, b];
     let plan = catalog
-        .create_edit_plan_from_base(&asset.project_id, &[a, b], None, None, None)
+        .create_edit_plan_from_base_with_story_policy(
+            &asset.project_id,
+            &operations,
+            None,
+            None,
+            None,
+            Some(&super::super::story::test_policy(
+                &operations,
+                &[("stable-cut", "cover")],
+            )),
+        )
         .unwrap();
     assert!(
         catalog

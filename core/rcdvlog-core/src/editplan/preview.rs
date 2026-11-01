@@ -218,12 +218,7 @@ impl Catalog {
         let report =
             self.validate_edit_plan_audio_window(&request.revision_id, cancel, audio_window)?;
         if !report.renderable() {
-            let blocking: Vec<&str> = report.errors().map(|finding| finding.code).collect();
-            bail!(
-                "edit plan {} cannot be rendered: {}",
-                request.revision_id,
-                blocking.join(", ")
-            );
+            return Err(super::validate::validation_error(&report).into());
         }
         let assets = self.list_assets(&plan.project_id)?;
         let split_audio = window.is_some() || plan.operations.iter().any(|cut| cut.audio.is_some());

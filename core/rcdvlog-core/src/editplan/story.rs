@@ -145,6 +145,10 @@ pub struct StoryChronologyException {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct EditPlanStoryPolicy {
     pub version: u32,
+    /// A deliberate replacement of an existing policy must explain the change,
+    /// including retiring protections or exceptions instead of silently dropping them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision_decision: Option<StoryDecision>,
     #[serde(default)]
     pub opening_teasers: Vec<StoryOpeningTeaser>,
     #[serde(default)]
@@ -157,6 +161,7 @@ impl Default for EditPlanStoryPolicy {
     fn default() -> Self {
         Self {
             version: EDIT_PLAN_STORY_POLICY_VERSION,
+            revision_decision: None,
             opening_teasers: Vec::new(),
             protected_groups: Vec::new(),
             exceptions: Vec::new(),
@@ -187,6 +192,9 @@ impl EditPlanStoryPolicy {
                 && self.exceptions.len() <= 2_000,
             "edit-plan story policy exceeds its bounded collection limits"
         );
+        if let Some(decision) = &self.revision_decision {
+            validate_decision("policy revision", &decision.rationale, decision)?;
+        }
         let mut cut_ids = BTreeSet::new();
         for teaser in &self.opening_teasers {
             validate_decision("opening teaser", &teaser.rationale, &teaser.decision)?;
@@ -302,8 +310,6 @@ fn validate_decision(subject: &str, rationale: &str, decision: &StoryDecision) -
 pub(crate) struct ChronologyPlacement {
     pub trip_time_millis: Option<i64>,
     pub trip_time: Option<String>,
-    pub confidence: f32,
-    pub uncertainty_seconds: u32,
 }
 
 pub(crate) fn placement_index(
@@ -323,8 +329,6 @@ pub(crate) fn placement_index(
                 ChronologyPlacement {
                     trip_time_millis,
                     trip_time: asset.trip_time.clone(),
-                    confidence: asset.confidence,
-                    uncertainty_seconds: asset.uncertainty_seconds,
                 },
             )
         })
@@ -396,7 +400,7 @@ pub(crate) enum StoryIssueKind {
 
 impl StoryIssueKind {
     pub(crate) fn is_error(self) -> bool {
-        !matches!(self, Self::ChronologyAmbiguous | Self::ChronologyUnresolved)
+        true
     }
 }
 
@@ -473,9 +477,8 @@ pub(crate) fn validate_revision_chronology(
     let placement = placement_index(solution);
 
     let mut teaser_ids = BTreeSet::new();
-    let mut protected_ids = BTreeSet::new();
+    let mut protected_edges = BTreeSet::new();
     let mut valid_exception_edges = BTreeSet::new();
-    let mut exception_edge_evidence: Vec<(&StoryOrderEdge, String)> = Vec::new();
 
     if let Some(policy) = &revision.story_policy {
         for (index, teaser) in policy.opening_teasers.iter().enumerate() {
@@ -539,6 +542,12 @@ pub(crate) fn validate_revision_chronology(
         }
 
         for group in &policy.protected_groups {
+            protected_edges.extend(
+                group
+                    .cuts
+                    .windows(2)
+                    .map(|pair| (pair[0].operation_id.clone(), pair[1].operation_id.clone())),
+            );
             let mut positions = Vec::new();
             for cut in &group.cuts {
                 let Some(operation) = by_id.get(cut.operation_id.as_str()) else {
@@ -566,7 +575,6 @@ pub(crate) fn validate_revision_chronology(
                     continue;
                 }
                 positions.push(operation.position as usize);
-                protected_ids.insert(cut.operation_id.clone());
             }
             if positions.len() == group.cuts.len()
                 && positions.windows(2).any(|pair| pair[1] != pair[0] + 1)
@@ -656,7 +664,6 @@ pub(crate) fn validate_revision_chronology(
                         ),
                     ));
                 }
-                exception_edge_evidence.push((edge, exception.exception_id.clone()));
             }
             match chronology_dependency_token(facts, assets) {
                 Ok(token) if token != exception.scope.chronology_dependency => {
@@ -694,124 +701,28 @@ pub(crate) fn validate_revision_chronology(
     for pair in revision.operations.windows(2) {
         let earlier = &pair[0];
         let later = &pair[1];
-        if teaser_ids.contains(&earlier.operation_id) {
-            continue;
-        }
-        if protected_ids.contains(&earlier.operation_id)
-            && protected_ids.contains(&later.operation_id)
-        {
-            continue;
-        }
         let edge = (earlier.operation_id.clone(), later.operation_id.clone());
-        let Some(earlier_time) = placement.get(&earlier.asset_id) else {
-            needs_exception_edges.insert(edge.clone());
-            if !valid_exception_edges.contains(&edge) {
-                issues.push(issue(
-                    StoryIssueKind::ChronologyUnresolved,
-                    Some(later.position),
-                    Some(&later.asset_id),
-                    format!(
-                        "Cut {} has no solved source chronology. Use a narrowly scoped story exception to choose an explicit placement.",
-                        earlier.asset_id
-                    ),
-                ));
-            }
+        if teaser_ids.contains(&earlier.operation_id) || protected_edges.contains(&edge) {
             continue;
-        };
-        let Some(later_time) = placement.get(&later.asset_id) else {
-            needs_exception_edges.insert(edge.clone());
-            if !valid_exception_edges.contains(&edge) {
-                issues.push(issue(
-                    StoryIssueKind::ChronologyUnresolved,
-                    Some(later.position),
-                    Some(&later.asset_id),
-                    format!(
-                        "Cut {} has no solved source chronology. Use a narrowly scoped story exception to choose an explicit placement.",
-                        later.asset_id
-                    ),
-                ));
-            }
-            continue;
-        };
-        match (earlier_time.trip_time_millis, later_time.trip_time_millis) {
-            (Some(earlier_millis), Some(later_millis)) if earlier_millis > later_millis => {
-                needs_exception_edges.insert(edge.clone());
-                if !valid_exception_edges.contains(&edge) {
-                    issues.push(issue(
-                        StoryIssueKind::ChronologyViolation,
-                        Some(later.position),
-                        Some(&later.asset_id),
-                        format!(
-                            "Position {} ({}) is corrected source time {} with solver confidence {:.2} and {:.0}s uncertainty, but position {} ({}) is earlier at {}. Supply a narrowly scoped story exception or move the cut; filenames and retrieval rank are not story order.",
-                            earlier.position,
-                            earlier.asset_id,
-                            earlier_time.trip_time.as_deref().unwrap_or("unknown"),
-                            earlier_time.confidence,
-                            earlier_time.uncertainty_seconds,
-                            later.position,
-                            later.asset_id,
-                            later_time.trip_time.as_deref().unwrap_or("unknown")
-                        ),
-                    ));
-                }
-            }
-            (Some(_), Some(_)) => {
-                if earlier.asset_id != later.asset_id {
-                    needs_exception_edges.insert(edge.clone());
-                    if !valid_exception_edges.contains(&edge) {
-                        issues.push(issue(
-                            StoryIssueKind::ChronologyAmbiguous,
-                            Some(later.position),
-                            Some(&later.asset_id),
-                            format!(
-                                "Positions {} and {} have the same corrected source time. An exact scoped story decision is required for different-source ties.",
-                                earlier.position, later.position
-                            ),
-                        ));
-                    }
-                } else if earlier.source_in_seconds >= later.source_out_seconds - 1e-9 {
-                    needs_exception_edges.insert(edge.clone());
-                    if !valid_exception_edges.contains(&edge) {
-                        issues.push(issue(
-                            StoryIssueKind::ChronologyViolation,
-                            Some(later.position),
-                            Some(&later.asset_id),
-                            format!(
-                                "Positions {} and {} run backward through the same source range at the same corrected time. Use forward source ranges or an exact scoped story exception.",
-                                earlier.position, later.position
-                            ),
-                        ));
-                    }
-                } else if earlier.source_out_seconds > later.source_in_seconds + 1e-9 {
-                    needs_exception_edges.insert(edge.clone());
-                    if !valid_exception_edges.contains(&edge) {
-                        issues.push(issue(
-                            StoryIssueKind::ChronologyAmbiguous,
-                            Some(later.position),
-                            Some(&later.asset_id),
-                            format!(
-                                "Positions {} and {} reuse overlapping source ranges at the same corrected time; the inline order is ambiguous.",
-                                earlier.position, later.position
-                            ),
-                        ));
-                    }
-                }
-            }
-            _ => {
-                needs_exception_edges.insert(edge.clone());
-                if !valid_exception_edges.contains(&edge) {
-                    issues.push(issue(
-                        StoryIssueKind::ChronologyUnresolved,
-                        Some(later.position),
-                        Some(&later.asset_id),
-                        format!(
-                            "Positions {} and {} cannot be compared because a solved source time is missing. Use an exact scoped story exception to choose the placement.",
-                            earlier.position, later.position
-                        ),
-                    ));
-                }
-            }
         }
+        let Some(kind) = edge_issue_kind(earlier, later, &placement) else {
+            continue;
+        };
+        needs_exception_edges.insert(edge.clone());
+        if valid_exception_edges.contains(&edge) {
+            continue;
+        }
+        let describe = |cut: &EditPlanOperation| {
+            placement
+                .get(&cut.asset_id)
+                .and_then(|time| time.trip_time.as_deref())
+                .unwrap_or("unknown")
+        };
+        issues.push(issue(kind, Some(later.position), Some(&later.asset_id), format!(
+            "Cut {} at position {} (corrected capture {}, source {:.6}..{:.6}) -> cut {} at position {} (corrected capture {}, source {:.6}..{:.6}) has {:?}. Move the cut or record an exact scoped story decision; an explicit anchor alone does not resolve it.",
+            earlier.operation_id, earlier.position, describe(earlier), earlier.source_in_seconds, earlier.source_out_seconds,
+            later.operation_id, later.position, describe(later), later.source_in_seconds, later.source_out_seconds, kind
+        )));
     }
 
     // An exception that no longer suppresses a real chronology ambiguity is
@@ -854,49 +765,37 @@ pub(crate) fn allowed_exception_edges(
         .unwrap_or_default()
 }
 
-/// Strict backward edges only. Equal-source ties and unknown times are handled
-/// separately by automatic placement and remain visible as warnings in a
-/// persisted plan.
-pub(crate) fn backward_edge_count(
-    operations: &[EditPlanOperation],
+/// Compare actual source ranges for the same take, and existing solved capture
+/// times across takes. Uncertain cross-source order needs an explicit decision.
+/// A source's own ordered excerpts do not need a wall clock to be comparable.
+pub(crate) fn edge_issue_kind(
+    earlier: &EditPlanOperation,
+    later: &EditPlanOperation,
     placement: &BTreeMap<String, ChronologyPlacement>,
-    policy: Option<&EditPlanStoryPolicy>,
-) -> usize {
-    let teasers: BTreeSet<&str> = policy
-        .into_iter()
-        .flat_map(|policy| policy.opening_teasers.iter())
-        .map(|teaser| teaser.operation_id.as_str())
-        .collect();
-    let protected: BTreeSet<&str> = policy
-        .into_iter()
-        .flat_map(|policy| policy.protected_groups.iter())
-        .flat_map(|group| group.cuts.iter())
-        .map(|cut| cut.operation_id.as_str())
-        .collect();
-    let allowed = allowed_exception_edges(policy);
-    operations
-        .windows(2)
-        .filter(|pair| {
-            !teasers.contains(pair[0].operation_id.as_str())
-                && !(protected.contains(pair[0].operation_id.as_str())
-                    && protected.contains(pair[1].operation_id.as_str()))
-                && !allowed.contains(&(pair[0].operation_id.clone(), pair[1].operation_id.clone()))
-        })
-        .filter(|pair| {
-            match (
-                placement.get(&pair[0].asset_id),
-                placement.get(&pair[1].asset_id),
-            ) {
-                (Some(left), Some(right)) => {
-                    match (left.trip_time_millis, right.trip_time_millis) {
-                        (Some(left), Some(right)) => left > right,
-                        _ => false,
-                    }
-                }
-                _ => false,
-            }
-        })
-        .count()
+) -> Option<StoryIssueKind> {
+    if earlier.asset_id == later.asset_id {
+        return if earlier.source_out_seconds <= later.source_in_seconds + 1e-9 {
+            None
+        } else if earlier.source_in_seconds >= later.source_out_seconds - 1e-9 {
+            Some(StoryIssueKind::ChronologyViolation)
+        } else {
+            Some(StoryIssueKind::ChronologyAmbiguous)
+        };
+    }
+    let times = placement
+        .get(&earlier.asset_id)
+        .and_then(|time| time.trip_time_millis)
+        .zip(
+            placement
+                .get(&later.asset_id)
+                .and_then(|time| time.trip_time_millis),
+        );
+    match times {
+        Some((left, right)) if left < right => None,
+        Some((left, right)) if left > right => Some(StoryIssueKind::ChronologyViolation),
+        Some(_) => Some(StoryIssueKind::ChronologyAmbiguous),
+        None => Some(StoryIssueKind::ChronologyUnresolved),
+    }
 }
 
 pub(crate) fn validate_policy_exactness(
@@ -1021,14 +920,69 @@ pub(crate) fn stamp_policy_dependencies(
     Ok(())
 }
 
-// Stable descriptive aliases for adapter and integration callers.
-pub type StoryPolicy = EditPlanStoryPolicy;
-pub type ChronologyPolicy = EditPlanStoryPolicy;
-pub type EditPlanChronologyPolicy = EditPlanStoryPolicy;
-pub type OpeningTeaser = StoryOpeningTeaser;
-pub type StoryTeaser = StoryOpeningTeaser;
-pub type ProtectedGroup = ProtectedStoryGroup;
-pub type ChronologyException = StoryChronologyException;
-pub type ScopedChronologyException = StoryChronologyException;
-pub type ExceptionScope = StoryExceptionScope;
-pub type CutIdentity = StoryCutIdentity;
+/// Explicit synthetic editorial choices for tests of reuse/reordering mechanics.
+/// Callers must name each intended exceptional edge; no wildcard inference.
+#[cfg(test)]
+pub(crate) fn test_policy(
+    cuts: &[EditPlanOperation],
+    pairs: &[(&str, &str)],
+) -> EditPlanStoryPolicy {
+    EditPlanStoryPolicy {
+        revision_decision: Some(StoryDecision {
+            actor: StoryDecisionActor::Agent,
+            rationale: "Re-author only the exact synthetic fixture edges for this variant".into(),
+            decision_id: None,
+        }),
+        exceptions: pairs
+            .iter()
+            .enumerate()
+            .map(|(index, (left, right))| StoryChronologyException {
+                exception_id: format!("generated-edge-{index}"),
+                rationale: "Exact generated fixture order for testing other editing mechanics"
+                    .into(),
+                decision: StoryDecision {
+                    actor: StoryDecisionActor::Agent,
+                    rationale: "Synthetic explicit editorial exception; not a human approval"
+                        .into(),
+                    decision_id: None,
+                },
+                scope: StoryExceptionScope {
+                    cuts: [left, right]
+                        .map(|id| {
+                            StoryCutIdentity::from_operation(
+                                cuts.iter()
+                                    .find(|cut| cut.operation_id == **id)
+                                    .expect("exact fixture cut"),
+                            )
+                        })
+                        .to_vec(),
+                    edges: vec![StoryOrderEdge {
+                        earlier_operation_id: (*left).into(),
+                        later_operation_id: (*right).into(),
+                    }],
+                    chronology_dependency: String::new(),
+                },
+            })
+            .collect(),
+        ..EditPlanStoryPolicy::default()
+    }
+}
+
+/// Replacing a protected story contract is an editorial decision too. In
+/// particular an empty policy must not silently erase an inherited group.
+pub(crate) fn validate_policy_replacement(
+    base: Option<&EditPlanStoryPolicy>,
+    next: &EditPlanStoryPolicy,
+) -> Result<()> {
+    next.validate_shape()?;
+    if let Some(base) = base
+        && !base.is_empty()
+        && base != next
+    {
+        ensure!(
+            next.revision_decision.is_some(),
+            "replacing or retiring an existing story policy requires revisionDecision with an actor and rationale"
+        );
+    }
+    Ok(())
+}

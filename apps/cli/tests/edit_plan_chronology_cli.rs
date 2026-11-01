@@ -31,6 +31,10 @@ fn success(path: &Path, args: &[&str]) -> Value {
 fn failure(path: &Path, args: &[&str], code: &str) -> Value {
     let output = invoke(path, args);
     assert!(!output.status.success());
+    assert!(
+        output.stdout.is_empty(),
+        "failed commands must keep stdout empty"
+    );
     let envelope: Value = serde_json::from_slice(&output.stderr).unwrap();
     assert_eq!(envelope["ok"], false);
     assert_eq!(envelope["error"]["code"], code, "{envelope}");

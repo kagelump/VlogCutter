@@ -1121,7 +1121,7 @@ returns each changed cut's identity, before/after values, and change kinds
 (`added`, `omitted`, `order`, `source`, `range`, `rationale`, `audio`).
 
 Ranges are finite seconds on the source clock, inclusive in / exclusive out.
-Source reuse and overlapping ranges are legal and reported as advisory warnings.
+Source reuse and overlapping ranges remain representable. Teaser reuse and ambiguous inline overlaps require an exact story policy decision; source-overlap diagnostics remain visible.
 No frame snapping occurs at plan persistence: retain exact measured duration for
 an endpoint at source end. Rendering passes decimal seconds without millisecond
 rounding; decoding selects source frames and the preview resamples to its

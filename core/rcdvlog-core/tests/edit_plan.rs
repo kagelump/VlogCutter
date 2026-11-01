@@ -40,7 +40,7 @@ fn fixture(count: usize) -> Fixture {
                     height: 1080,
                     codec: "h264".to_string(),
                     camera: "SonyA7C".to_string(),
-                    captured_at_raw: Some("2026-01-01T00:00:00Z".to_string()),
+                    captured_at_raw: Some(format!("2026-01-01T00:{index:02}:00Z")),
                     timestamp_candidates: None,
                     best_time: None,
                     metadata_rotation_degrees: 0,

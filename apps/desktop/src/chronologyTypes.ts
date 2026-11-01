@@ -284,6 +284,51 @@ export interface EditPlanOperationInput {
   audio?: EditPlanAudio;
 }
 
+export interface StoryDecision {
+  actor: "agent" | "human";
+  rationale: string;
+  decisionId?: string | null;
+}
+export interface StoryCutIdentity {
+  operationId: string;
+  assetId: string;
+  sourceInSeconds: number;
+  sourceOutSeconds: number;
+}
+export interface StoryOpeningTeaser extends StoryCutIdentity {
+  rationale: string;
+  decision: StoryDecision;
+  chronologyDependency?: string;
+}
+export interface ProtectedStoryGroup {
+  groupId: string;
+  cuts: StoryCutIdentity[];
+  rationale: string;
+  decision: StoryDecision;
+  chronologyDependency?: string;
+}
+export interface StoryOrderEdge {
+  earlierOperationId: string;
+  laterOperationId: string;
+}
+export interface StoryChronologyException {
+  exceptionId: string;
+  rationale: string;
+  decision: StoryDecision;
+  scope: {
+    cuts: StoryCutIdentity[];
+    edges: StoryOrderEdge[];
+    chronologyDependency?: string;
+  };
+}
+export interface EditPlanStoryPolicy {
+  version: 1;
+  revisionDecision?: StoryDecision | null;
+  openingTeasers?: StoryOpeningTeaser[];
+  protectedGroups?: ProtectedStoryGroup[];
+  exceptions?: StoryChronologyException[];
+}
+
 export interface EditPlanRevision {
   revisionId: string;
   projectId: string;
@@ -292,7 +337,7 @@ export interface EditPlanRevision {
   active: boolean;
   operations: EditPlanOperation[];
   /** Revision-local exact story decisions; rendered by the core, not the UI. */
-  storyPolicy?: unknown | null;
+  storyPolicy?: EditPlanStoryPolicy | null;
   createdAt: string;
 }
 

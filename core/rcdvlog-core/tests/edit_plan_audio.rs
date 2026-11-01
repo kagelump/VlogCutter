@@ -60,6 +60,10 @@ fn generated_fixture() -> (TempDir, Catalog, String, Vec<String>) {
             .args([
                 "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-t", "4",
             ])
+            .args([
+                "-metadata",
+                &format!("creation_time=2026-01-01T00:{index:02}:00Z"),
+            ])
             .arg(media.join(format!("source-{index}.mp4")));
         let output = command.output().unwrap();
         assert!(
@@ -571,8 +575,27 @@ fn verified_reuse_keeps_silent_first_mixed_rate_rotated_linked_audio_behavior() 
             audio: None,
         })
         .collect::<Vec<_>>();
+    // This media-format test deliberately puts the later silent source first.
+    // Declare only that exact reverse edge rather than relaxing chronology.
+    let policy = serde_json::from_value(serde_json::json!({
+        "version":1,"exceptions":[{
+            "exceptionId":"generated-silent-first", "rationale":"Explicit silent-first format/reuse comparison",
+            "decision":{"actor":"agent","rationale":"Synthetic three-source media test"},
+            "scope":{"cuts":[
+                {"operationId":"linked-0","assetId":ids[2],"sourceInSeconds":0.5,"sourceOutSeconds":1.5},
+                {"operationId":"linked-1","assetId":ids[0],"sourceInSeconds":0.5,"sourceOutSeconds":1.5}
+            ],"edges":[{"earlierOperationId":"linked-0","laterOperationId":"linked-1"}]}
+        }]
+    })).unwrap();
     let plan = catalog
-        .create_edit_plan_from_base(&project, &operations, None, None, None)
+        .create_edit_plan_from_base_with_story_policy(
+            &project,
+            &operations,
+            None,
+            None,
+            None,
+            Some(&policy),
+        )
         .unwrap();
     let request = PreviewRequest {
         revision_id: plan.revision_id,

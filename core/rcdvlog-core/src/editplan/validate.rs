@@ -84,6 +84,8 @@ impl FindingKind {
             | Self::RangeInverted
             | Self::RangeZeroLength
             | Self::ChronologyViolation
+            | Self::ChronologyAmbiguous
+            | Self::ChronologyUnresolved
             | Self::StoryPolicyInvalid
             | Self::StoryGroupViolation
             | Self::StoryScopeStale => Severity::Error,
@@ -91,9 +93,7 @@ impl FindingKind {
             | Self::ProxyMissing
             | Self::SourceRangeOverlap
             | Self::StaleScriptRevision
-            | Self::StaleRevision
-            | Self::ChronologyAmbiguous
-            | Self::ChronologyUnresolved => Severity::Warning,
+            | Self::StaleRevision => Severity::Warning,
         }
     }
 }

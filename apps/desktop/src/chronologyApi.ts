@@ -28,6 +28,7 @@ import type {
   DiagnosticsView,
   EditPlanOperationInput,
   EditPlanRevision,
+  EditPlanStoryPolicy,
   EventOrderConstraint,
   OtioExportResult,
   PreviewProgress,
@@ -354,12 +355,14 @@ export const chronologyApi = {
     projectId: string,
     operations: EditPlanOperationInput[],
     expectedActiveRevisionId: string | null,
+    storyPolicy?: EditPlanStoryPolicy,
   ): Promise<EditPlanRevision | null> {
     return invoke<EditPlanRevision>("create_edit_plan_revision", {
       projectId,
       operations,
       scriptRevisionId: null,
       expectedActiveRevisionId,
+      ...(storyPolicy === undefined ? {} : { storyPolicy }),
     });
   },
 
