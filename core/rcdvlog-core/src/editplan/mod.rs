@@ -19,6 +19,7 @@
 pub mod coverage;
 pub mod delivery;
 pub mod review_coverage;
+pub mod review_target;
 pub use feedback_model::*;
 pub mod audio;
 pub mod audio_integrity;

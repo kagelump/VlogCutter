@@ -60,3 +60,8 @@ the already-recorded context evidence. The movie's actual audio is preserved
 and playable. `coverage.json` carries the local review coverage report and its
 limitations. Coverage and technical verification are evidence, not human
 approval, word-completeness, continuity, or pacing certification.
+
+For a metadata-only web/TV review handoff, use
+[`edit-plan review-target-export`](tv-review-handoff.md). It exports a versioned
+allowlist after fresh verification; it does not send the local bundle's movie,
+source provenance or paths to a server.

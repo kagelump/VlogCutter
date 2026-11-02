@@ -1282,3 +1282,13 @@ See [rough-cut readiness](rough-cut-readiness.md) for `doctor --workflow`, atomi
 `inspect-with-policy`, `review-coverage record/report/list`, `audio-audit plan`,
 phase-aware preview progress, and `edit-plan bundle`. These use the same explicit
 catalog and immutable revision guards as the existing commands.
+
+## TV review target handoff
+
+`edit-plan review-target-export --artifact <id> [--youtube-video-id <11-character-id>]`
+requires an existing explicit catalog and uses the writable verification/host-lease path. It freshly verifies
+the complete full-preview artifact and returns a version-1 path-free metadata
+handoff in the normal success envelope, command `edit-plan.review-target-export`.
+It copies/uploads no media and writes no edit-plan or feedback operation.
+See [TV review handoff v1](tv-review-handoff.md) for the fixture, clock precision,
+import trust/freshness boundary and canonical feedback reconciliation.

@@ -31,6 +31,13 @@ pub enum EditPlanCommand {
         #[command(subcommand)]
         command: PictureCoverageCommand,
     },
+    /// Export a path-free versioned TV review target after fresh local verification.
+    ReviewTargetExport {
+        #[arg(long)]
+        artifact: String,
+        #[arg(long)]
+        youtube_video_id: Option<String>,
+    },
     /// Export a verified measured movie and local review artifacts as one bundle.
     Bundle {
         #[arg(long)]
@@ -459,6 +466,7 @@ struct ApplyReviewFeedbackInput {
 
 pub fn command_name(command: &EditPlanCommand) -> &'static str {
     match command {
+        EditPlanCommand::ReviewTargetExport { .. } => "edit-plan.review-target-export",
         EditPlanCommand::Bundle { .. } => "edit-plan.bundle",
         EditPlanCommand::ReviewCoverage { command } => match command {
             ReviewCoverageCommand::Record { .. } => "edit-plan.review-coverage.record",
@@ -586,6 +594,14 @@ fn expected(value: &str) -> Option<&str> {
 
 pub fn execute(catalog: &Catalog, command: &EditPlanCommand) -> Result<Value> {
     match command {
+        EditPlanCommand::ReviewTargetExport {
+            artifact,
+            youtube_video_id,
+        } => Ok(serde_json::to_value(catalog.export_review_target(
+            artifact,
+            youtube_video_id.clone(),
+            &|| false,
+        )?)?),
         EditPlanCommand::Bundle { input } => {
             let request: rcdvlog_core::EditPlanBundleRequest = read_workflow_input(input)?;
             Ok(serde_json::to_value(

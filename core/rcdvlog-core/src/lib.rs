@@ -275,6 +275,7 @@ pub use editplan::feedback::*;
 pub use editplan::inspection_review::*;
 pub use editplan::patch::*;
 pub use editplan::review_coverage::*;
+pub use editplan::review_target::*;
 pub use editplan::selection::*;
 pub use editplan::{
     ConfirmSourceRangeRequest, ConfirmedRangeInspection, ConfirmedSourceRange, EditPlanAudio,

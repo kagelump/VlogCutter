@@ -2049,6 +2049,7 @@ fn main() -> ExitCode {
             let source_range_error = error.downcast_ref::<rcdvlog_core::SourceRangeError>();
             let preview_artifact_error = error.downcast_ref::<rcdvlog_core::PreviewArtifactError>();
             let review_feedback_error = error.downcast_ref::<rcdvlog_core::ReviewFeedbackError>();
+            let review_target_error = error.downcast_ref::<rcdvlog_core::ReviewTargetError>();
             let sequence_selection_error =
                 error.downcast_ref::<rcdvlog_core::SequenceSelectionError>();
             let youtube_error = error.downcast_ref::<rcdvlog_core::youtube::YoutubeError>();
@@ -2064,6 +2065,8 @@ fn main() -> ExitCode {
                 ranges.code()
             } else if let Some(artifact) = preview_artifact_error {
                 artifact.code()
+            } else if let Some(target) = review_target_error {
+                target.code()
             } else if let Some(feedback) = review_feedback_error {
                 feedback.code()
             } else if let Some(job_agent) = job_agent {
