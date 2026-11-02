@@ -18,7 +18,13 @@ class PcmCaptureProcessor extends AudioWorkletProcessor {
     this.stopped = false;
     this.port.onmessage = (event) => {
       if (event.data?.type === "flush") this.flush();
-      if (event.data?.type === "stop") { this.flush(); this.stopped = true; }
+      if (event.data?.type === "stop") {
+        // Deliver the partial batch, then acknowledge the frame after the last
+        // one delivered so the main thread can drain exactly to that point.
+        this.flush();
+        this.stopped = true;
+        this.port.postMessage({ type: "stopped", frame: this.expected });
+      }
     };
   }
 

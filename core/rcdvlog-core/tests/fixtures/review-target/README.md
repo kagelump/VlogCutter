@@ -19,3 +19,8 @@ of a real renderer, room recording or soundtrack matcher.
 Use this fixture for web selection, preflight, candidate-cut displays and
 negative mutations. Every session must retain its immutable target snapshot.
 See [the versioned contract](../../../../../docs/tv-review-handoff.md).
+
+`historical-v1.json` reuses the invented target in the separate historical review
+contract. It makes no current-source, constraint or renderability assertion.
+The [historical schema](../../../../../docs/contracts/historical-review-v1.schema.json)
+uses an explicit purpose discriminator; the strict v1 parser rejects it.

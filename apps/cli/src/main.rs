@@ -22,7 +22,9 @@ mod moment_commands;
 mod native_speech_commands;
 mod native_video_commands;
 mod preparation_commands;
+mod review_marker_commands;
 mod server_commands;
+mod tv_review_commands;
 mod youtube_commands;
 
 #[derive(Debug, Parser)]
@@ -46,6 +48,11 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    /// Read-only recording-clock synchronization diagnostics.
+    TvReview {
+        #[command(subcommand)]
+        command: tv_review_commands::TvReviewCommand,
+    },
     /// Persistent upload-only YouTube authorization and resumable publishing.
     Youtube(youtube_commands::YoutubeArgs),
     /// Inspect the running build, explicit catalog, tools, and speech readiness.
@@ -172,6 +179,11 @@ enum Commands {
     EditPlan {
         #[command(subcommand)]
         command: edit_plan_commands::EditPlanCommand,
+    },
+    /// Acoustic movie-time markers for separate TV review copies (no catalog).
+    ReviewMarkers {
+        #[command(subcommand)]
+        command: review_marker_commands::ReviewMarkersCommand,
     },
     /// Preflight, run, or inspect bounded preparation evidence.
     Prepare {
@@ -741,6 +753,7 @@ fn selected_catalog(cli: &Cli) -> Result<PathBuf> {
 
 fn command_name(command: &Commands) -> &'static str {
     match command {
+        Commands::TvReview { command } => tv_review_commands::command_name(command),
         Commands::Youtube(arguments) => youtube_commands::command_name(arguments),
         Commands::Doctor { .. } => "doctor",
         Commands::Workspace { command } => agent_commands::command_name(command),
@@ -816,6 +829,7 @@ fn command_name(command: &Commands) -> &'static str {
         },
         Commands::Moments { command } => moment_commands::command_name(command),
         Commands::EditPlan { command } => edit_plan_commands::command_name(command),
+        Commands::ReviewMarkers { command } => review_marker_commands::command_name(command),
         Commands::Prepare { command } => preparation_commands::command_name(command),
         Commands::Calibrate { command } => calibration_commands::command_name(command),
         Commands::Labels { command } => match command {
@@ -834,6 +848,9 @@ fn command_name(command: &Commands) -> &'static str {
 }
 
 fn execute(cli: &Cli) -> Result<Value> {
+    if let Commands::TvReview { command } = &cli.command {
+        return tv_review_commands::execute(command);
+    }
     if let Commands::Youtube(arguments) = &cli.command {
         return youtube_commands::execute(cli.catalog.as_deref(), arguments);
     }
@@ -847,6 +864,9 @@ fn execute(cli: &Cli) -> Result<Value> {
     }
     if let Commands::Models { command } = &cli.command {
         return agent_commands::models(cli.catalog.as_deref(), command);
+    }
+    if let Commands::ReviewMarkers { command } = &cli.command {
+        return review_marker_commands::execute(command);
     }
     if let Commands::EditPlan { command } = &cli.command {
         let path = cli.catalog.as_deref().ok_or_else(|| {
@@ -1003,13 +1023,13 @@ fn execute(cli: &Cli) -> Result<Value> {
         Commands::Doctor { .. } | Commands::Workspace { .. } | Commands::Models { .. } => {
             unreachable!()
         }
-        Commands::Catalog { .. } | Commands::Desktop { .. } | Commands::Youtube(_) => unreachable!(),
+        Commands::TvReview { .. } | Commands::Catalog { .. } | Commands::Desktop { .. } | Commands::Youtube(_) => unreachable!(),
         Commands::NativeVideo { .. } => unreachable!(),
         Commands::Chronology { command } => {
             chronology_commands::execute_chronology(&catalog, command)
         }
         Commands::Moments { command } => moment_commands::execute(&catalog, command),
-        Commands::EditPlan { .. } | Commands::Prepare { .. } | Commands::Calibrate { .. } => unreachable!(),
+        Commands::EditPlan { .. } | Commands::ReviewMarkers { .. } | Commands::Prepare { .. } | Commands::Calibrate { .. } => unreachable!(),
         Commands::Diagnostics { command } => {
             chronology_commands::execute_diagnostics(&catalog, command)
         }

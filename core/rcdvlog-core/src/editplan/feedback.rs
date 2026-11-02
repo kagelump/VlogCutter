@@ -46,6 +46,40 @@ fn text(value: &str) -> Result<()> {
     );
     Ok(())
 }
+fn imported_note(
+    connection: &Connection,
+    id: &str,
+    request: &RecordReviewNoteRequest,
+) -> Result<bool> {
+    let present: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM edit_feedback_facts WHERE note_id=?1 AND kind='note')",
+        [id],
+        |r| r.get(0),
+    )?;
+    if !present {
+        return Ok(false);
+    }
+    let note = load_note(connection, id)?;
+    ensure!(
+        note.project_id == request.project_id
+            && note.author == request.author
+            && note.category == request.category
+            && note.observation == request.observation
+            && note.evidence_refs == request.evidence_refs
+            && note.target.revision_id == request.revision_id
+            && note.target.cut.operation_id == request.operation_id
+            && note.target.viewed_movie.as_ref().map(|m| &m.artifact_id)
+                == request.viewed_artifact_id.as_ref()
+            && note
+                .target
+                .viewed_movie
+                .as_ref()
+                .and_then(|m| m.requested_movie_seconds)
+                == request.movie_time_seconds,
+        ReviewFeedbackError::ImportConflict
+    );
+    Ok(true)
+}
 fn snapshot(cut: &EditPlanOperation) -> ReviewCutSnapshot {
     ReviewCutSnapshot {
         operation_id: cut.operation_id.clone(),
@@ -617,6 +651,36 @@ impl Catalog {
         &self,
         request: &RecordReviewNoteRequest,
     ) -> Result<ReviewFeedbackView> {
+        Ok(self
+            .record_review_note_internal(request, id("reviewnote"), false)?
+            .0)
+    }
+    pub fn record_review_note_once(
+        &self,
+        request: &RecordReviewNoteOnceRequest,
+    ) -> Result<RecordReviewNoteOnceResult> {
+        bounded_id(&request.import_id)?;
+        let identity = serde_json::to_vec(&(
+            "vlogcutter.review-note-import.v1",
+            &request.record.project_id,
+            &request.import_id,
+        ))?;
+        let note_id = format!("reviewnote_import_{}", blake3::hash(&identity).to_hex());
+        let (feedback, duplicate) =
+            self.record_review_note_internal(&request.record, note_id.clone(), true)?;
+        Ok(RecordReviewNoteOnceResult {
+            import_id: request.import_id.clone(),
+            note_id,
+            duplicate,
+            feedback,
+        })
+    }
+    fn record_review_note_internal(
+        &self,
+        request: &RecordReviewNoteRequest,
+        note_id: String,
+        allow_existing: bool,
+    ) -> Result<(ReviewFeedbackView, bool)> {
         text(&request.observation)?;
         ensure!(
             request.category != ReviewCategory::Intent || request.author == ReviewAuthor::Human,
@@ -628,6 +692,15 @@ impl Catalog {
         );
         for value in &request.evidence_refs {
             bounded_id(value)?;
+        }
+        // Retry can recover an already committed note while originals/the
+        // viewed movie are offline. Compare the entire original request.
+        if allow_existing {
+            let connection = self.connection()?;
+            if imported_note(&connection, &note_id, request)? {
+                drop(connection);
+                return Ok((self.review_feedback(&note_id, &request.revision_id)?, true));
+            }
         }
         let plan = self.edit_plan_revision(&request.revision_id)?;
         ensure!(
@@ -686,7 +759,7 @@ impl Catalog {
             );
         }
         let note = ReviewNote {
-            note_id: id("reviewnote"),
+            note_id,
             project_id: request.project_id.clone(),
             author: request.author,
             category: request.category,
@@ -697,13 +770,18 @@ impl Catalog {
         let note_id = note.note_id.clone();
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if allow_existing && imported_note(&transaction, &note_id, request)? {
+            transaction.rollback()?;
+            drop(connection);
+            return Ok((self.review_feedback(&note_id, &request.revision_id)?, true));
+        }
         commit_local_in_transaction(
             &transaction,
             &request.project_id,
             vec![operation(ReviewFeedbackFact::Note(note), 0)?],
         )?;
         transaction.commit()?;
-        self.review_feedback(&note_id, &request.revision_id)
+        Ok((self.review_feedback(&note_id, &request.revision_id)?, false))
     }
     pub fn propose_review_change(
         &self,

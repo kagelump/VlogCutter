@@ -18,6 +18,7 @@
 
 pub mod coverage;
 pub mod delivery;
+pub mod historical_review;
 pub mod review_coverage;
 pub mod review_target;
 pub use feedback_model::*;
