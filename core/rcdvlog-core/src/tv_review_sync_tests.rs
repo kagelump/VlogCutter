@@ -296,3 +296,55 @@ fn synthetic_affine_error_stays_inside_reported_bounds_across_sample_rates() {
         "max injected-affine error {max_error_ticks} ticks"
     );
 }
+
+#[test]
+fn overlapping_alternative_queries_cannot_amplify_unbounded_reports() {
+    let mut r = fixture();
+    for second in [1.0, 5.0, 10.0] {
+        for n in 0..8 {
+            let id = format!("evidence_{}_{}", second as u32, n);
+            r.anchors.push(anchor(
+                &r,
+                &id,
+                second,
+                second,
+                SyncAnchorSource::PassiveSoundtrack,
+            ));
+        }
+    }
+    let err = r.map(&vec![q(2.0, 9.0); 256], &|| false).unwrap_err();
+    assert!(err.to_string().contains("candidate budget"));
+}
+
+#[test]
+fn broad_uncertainty_cannot_amplify_movie_operation_responses() {
+    let mut target: ReviewTargetHandoff =
+        serde_json::from_str(include_str!("../tests/fixtures/review-target/v1.json")).unwrap();
+    let original = target.target.cuts.clone();
+    target.target.cuts.clear();
+    for i in 0..12 {
+        for cut in &original {
+            let mut c = cut.clone();
+            c.operation_id = format!("{}_copy_{}", c.operation_id, i);
+            c.position = target.target.cuts.len() as u32;
+            c.movie_in_pts += i * 540000;
+            c.movie_out_pts += i * 540000;
+            target.target.cuts.push(c);
+        }
+    }
+    target.target.movie.duration_seconds = 72.02;
+    target.target.movie.video_frame_count = 2160;
+    target.target_digest = ReviewTargetHandoff::snapshot_digest(&target.target).unwrap();
+    target.validate().unwrap();
+    let mut r = fixture();
+    r.target_digest = target.target_digest.clone();
+    r.movie.movie_digest = target.target.movie.blake3.clone();
+    r.movie.duration_pts = (72.02 * 90000.0) as u64;
+    let mut a = anchor(&r, "broad_manual", 1.0, 2.0, SyncAnchorSource::ManualCue);
+    a.movie_uncertainty_ticks = r.movie.duration_pts;
+    r.anchors.push(a);
+    let err = r
+        .map_to_cuts(&vec![q(1.0, 1.0); 256], &target, &|| false)
+        .unwrap_err();
+    assert!(err.to_string().contains("operation budget"));
+}
