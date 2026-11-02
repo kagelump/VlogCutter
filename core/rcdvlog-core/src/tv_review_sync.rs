@@ -1,6 +1,6 @@
 //! Versioned evidence-only microphone sample clock -> exact movie clock mapper.
 //! Stateless/retryable; never owns a recording, timeline, transcript or decision.
-use crate::ReviewTargetHandoff;
+use crate::{ReviewTargetHandoff, tv_soundtrack_consensus::ConsensusSegment};
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
@@ -122,11 +122,15 @@ pub struct SyncRequest {
     pub anchors: Vec<SyncAnchor>,
     pub boundaries: Vec<SyncBoundary>,
     pub policy: SyncPolicy,
+    /// Copied from consensus output; the mapper never infers them (§9).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub consensus_segments: Vec<ConsensusSegment>,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum SyncState {
     Anchored,
+    ConsensusInterpolated,
     Estimated,
     Conflicting,
     Unknown,

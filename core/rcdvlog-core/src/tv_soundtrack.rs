@@ -60,6 +60,9 @@ impl SoundtrackMovie {
 }
 
 pub const SOUNDTRACK_RECIPE: &str = "soundtrack.log-band-delta.fft512-hop128.smooth3-lag6.pcm8k.v1";
+/// Weighted, robust-feature recipe (ARCHITECTURE §7). Opt-in; None means v1.
+pub const SOUNDTRACK_RECIPE_V2: &str =
+    "soundtrack.log-band-delta.fft512-hop128.smooth3-lag6.pcm8k.wtd-robust.v2";
 pub const PCM_RATE: u32 = 8000;
 const FFT: usize = 512;
 const HOP: usize = 128;
@@ -76,6 +79,8 @@ pub struct SoundtrackReferenceSpec {
     pub movie: SyncMovieClock,
     pub start_seconds: f64,
     pub duration_seconds: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recipe: Option<String>,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -87,6 +92,9 @@ pub struct SoundtrackIndex {
     pub index_digest: String,
     pub sample_count: usize,
     pub features: Vec<[f32; BANDS]>,
+    /// Broadband log energy per frame (v2 recipe only).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub frame_energy: Vec<f32>,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -106,6 +114,31 @@ pub struct SoundtrackPolicy {
     pub minimum_subwindow_similarity: f64,
     pub uncertainty_seconds: f64,
     pub maximum_candidates: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub distinctive: Option<DistinctivePolicy>,
+}
+/// Opt-in acceptance of a distinctive low-similarity peak (ARCHITECTURE §4).
+/// Recommended values are 0.5 / 0.25 / 6.0; they are never serde defaults.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DistinctivePolicy {
+    pub minimum_similarity: f64,
+    pub minimum_margin: f64,
+    pub minimum_z_score: f64,
+}
+impl DistinctivePolicy {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.minimum_similarity.is_finite()
+                && (0.3..=1.0).contains(&self.minimum_similarity)
+                && self.minimum_margin.is_finite()
+                && (0.1..=0.8).contains(&self.minimum_margin)
+                && self.minimum_z_score.is_finite()
+                && (3.0..=20.0).contains(&self.minimum_z_score),
+            "invalid input: distinctive soundtrack policy"
+        );
+        Ok(())
+    }
 }
 impl Default for SoundtrackPolicy {
     fn default() -> Self {
@@ -115,6 +148,7 @@ impl Default for SoundtrackPolicy {
             minimum_subwindow_similarity: 0.3,
             uncertainty_seconds: 0.08,
             maximum_candidates: 4,
+            distinctive: None,
         }
     }
 }
@@ -132,6 +166,9 @@ impl SoundtrackPolicy {
                 && (2..=8).contains(&self.maximum_candidates),
             "invalid input: soundtrack matching policy"
         );
+        if let Some(d) = &self.distinctive {
+            d.validate()?;
+        }
         Ok(())
     }
 }
@@ -170,6 +207,24 @@ pub struct SoundtrackMatchReport {
     pub grid_seconds: f64,
     pub best_similarity: Option<f64>,
     pub runner_up_similarity: Option<f64>,
+    /// Best peaks of the searched reference, best first, at most 4 (§3).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub best_peaks: Vec<SoundtrackPeak>,
+    /// Robust z-score of the best coarse score (§4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub distinctiveness: Option<f64>,
+    /// BLAKE3 of the per-frame weight bytes when a mask was applied (§6).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mask_digest: Option<String>,
+}
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SoundtrackPeak {
+    pub similarity: f64,
+    pub reference_offset_frames: usize,
+    /// reference.start_seconds + (offset*HOP + query_len_samples/2) / PCM_RATE
+    pub movie_seconds: f64,
+    pub subwindow_similarities: [f64; 3],
 }
 fn valid_digest(s: &str) -> bool {
     s.len() == 64
@@ -249,6 +304,7 @@ impl SoundtrackIndex {
             index_digest: String::new(),
             sample_count: pcm.len(),
             features: features(pcm, cancel)?,
+            frame_energy: vec![],
         };
         index.index_digest = index.digest()?;
         Ok(index)
@@ -396,6 +452,9 @@ impl SoundtrackIndex {
             grid_seconds: HOP as f64 / PCM_RATE as f64,
             best_similarity: None,
             runner_up_similarity: None,
+            best_peaks: vec![],
+            distinctiveness: None,
+            mask_digest: None,
         };
         ensure!(!cancel(), "soundtrack match cancelled");
         let rms =

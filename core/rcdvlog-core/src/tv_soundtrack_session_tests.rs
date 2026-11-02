@@ -73,6 +73,7 @@ fn fixture(
             anchors: vec![],
             boundaries: vec![],
             policy: SyncPolicy::default(),
+            consensus_segments: vec![],
         },
         segments: vec![SessionAudioSegment {
             segment_id: "native".into(),
@@ -85,6 +86,8 @@ fn fixture(
         query_seconds: 6,
         query_step_seconds: 6,
         match_policy: SoundtrackPolicy::default(),
+        speech_mask: vec![],
+        recipe: None,
     })
     .unwrap();
     (

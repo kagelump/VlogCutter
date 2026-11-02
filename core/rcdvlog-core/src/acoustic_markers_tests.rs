@@ -450,6 +450,7 @@ fn detections_feed_the_shared_mapper_and_a_rewatch_is_not_interpolated() {
         anchors: anchors.clone(),
         boundaries: vec![],
         policy,
+        consensus_segments: vec![],
     };
     let at = |seconds: f64| SyncQuery {
         clock_id: "mic".into(),

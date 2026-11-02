@@ -28,6 +28,7 @@ fn spec(n: usize) -> SoundtrackReferenceSpec {
         },
         start_seconds: 0.0,
         duration_seconds: n as f64,
+        recipe: None,
     }
 }
 fn capture() -> SoundtrackCapture {
@@ -171,6 +172,7 @@ fn passive_anchors_integrate_with_shared_mapper_and_manual_conflicts_stay_visibl
         anchors: vec![anchor.clone()],
         boundaries: vec![],
         policy: SyncPolicy::default(),
+        consensus_segments: vec![],
     };
     let q = SyncQuery {
         clock_id: "mic".into(),
@@ -351,6 +353,7 @@ fn repeated_positions_in_separate_reference_windows_keep_unique_evidence_and_one
         anchors: vec![x, y],
         boundaries: vec![],
         policy: SyncPolicy::default(),
+        consensus_segments: vec![],
     };
     let q = SyncQuery {
         clock_id: "mic".into(),
