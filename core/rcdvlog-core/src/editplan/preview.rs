@@ -301,7 +301,7 @@ impl Catalog {
                 _ => "",
             };
             let mut normalize = format!(
-                "{rotation}scale={canvas_width}:{canvas_height}:force_original_aspect_ratio=decrease,pad={canvas_width}:{canvas_height}:(ow-iw)/2:(oh-ih)/2,fps=30000/1001,setsar=1,setpts=PTS-STARTPTS"
+                "{rotation}scale={canvas_width}:{canvas_height}:force_original_aspect_ratio=decrease:out_range=tv,pad={canvas_width}:{canvas_height}:(ow-iw)/2:(oh-ih)/2,fps=30000/1001,setsar=1,setpts=PTS-STARTPTS"
             );
             let mut expected_frames = None;
             let segment_duration = if split_audio {

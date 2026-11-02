@@ -24,7 +24,7 @@ use std::{
 };
 
 pub(super) const RECIPE: &str =
-    "preview.immutable-receipt.h264-30000-1001.stereo48.actual-clock.v1";
+    "preview.immutable-receipt.h264-30000-1001.stereo48.actual-clock.tv-range.v2";
 const MOVIE_TICKS: i64 = 240000;
 const MAX_FRAMES: usize = 1_800_000;
 const MAX_METADATA_BYTES: u64 = 256 * 1024 * 1024;
