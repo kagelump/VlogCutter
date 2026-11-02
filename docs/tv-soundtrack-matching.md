@@ -53,12 +53,16 @@ movie ticks, similarity as component confidence, movie uncertainty, capture
 uncertainty and candidate group. The report retains query/reference PCM digests,
 index identity, scores, peak margin, grid, reasons and deterministic work counts.
 
-Scores are not calibrated probabilities. A `matched` result contributes a
+Scores are not calibrated probabilities. A dominant competing playback from
+another location in the reference can produce strong evidence for the wrong TV
+position; audio alone cannot identify which physical source is the television.
+Hybrid manual/marker consistency remains necessary in that case. A `matched` result contributes a
 candidate anchor, never a confirmed edit/trim. Multiple `ambiguous` candidates
 share a candidate group and must all be retained by #223; never pick just the
 highest score. `unmatched` contributes no movie locator. The mapper's confidence
-threshold is an explicit caller policy; its default may reject a soundtrack
-candidate that cleared this matcher's lower threshold. Strong manual/marker
+threshold is an explicit caller policy. Both defaults require similarity/confidence
+of at least 0.8; the report records the exact matcher policy. Lower custom thresholds
+can admit wrong candidates, especially when competing reference audio is louder. Strong manual/marker
 conflicts remain visible and require review.
 
 ## Local CLI and bounds

@@ -59,7 +59,7 @@ pub struct SoundtrackPolicy {
 impl Default for SoundtrackPolicy {
     fn default() -> Self {
         Self {
-            minimum_similarity: 0.65,
+            minimum_similarity: 0.8,
             minimum_peak_margin: 0.08,
             minimum_subwindow_similarity: 0.3,
             uncertainty_seconds: 0.08,
@@ -92,6 +92,7 @@ pub struct SoundtrackMatchReport {
     pub reference_index_digest: String,
     pub query_pcm_digest: String,
     pub capture: SoundtrackCapture,
+    pub policy: SoundtrackPolicy,
     pub query_sample_count: usize,
     pub state: SoundtrackMatchState,
     pub reason: String,
@@ -322,6 +323,7 @@ impl SoundtrackIndex {
             reference_index_digest: self.index_digest.clone(),
             query_pcm_digest: pcm_digest(pcm),
             capture: capture.clone(),
+            policy: policy.clone(),
             query_sample_count: pcm.len(),
             state: SoundtrackMatchState::Unmatched,
             reason: "weak_or_non_distinctive".into(),
