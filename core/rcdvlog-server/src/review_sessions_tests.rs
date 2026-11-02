@@ -501,3 +501,114 @@ fn an_unfinalized_session_past_its_lifetime_is_reported_abandoned_but_finalizabl
         .unwrap();
     handoff.validate().unwrap();
 }
+
+#[test]
+fn event_replay_compares_the_full_payload_and_clock_samples_declare_epoch_and_bound() {
+    let f = fixture();
+    let id = f
+        .sessions
+        .create(
+            PROJECT,
+            &create_request(&f.target_id, "key_events"),
+            &actor(),
+            now(),
+        )
+        .unwrap()
+        .summary
+        .session_id;
+    let cue = ReviewSessionEventRequest {
+        event_id: "cue_replay".into(),
+        kind: ReviewSessionEventKind::ManualSyncCue,
+        audio_frame: 4800,
+        performance_ms: Some(2500.5),
+        declared_movie_seconds: Some(0.0),
+        detail: Some(serde_json::json!({"clockEpoch": 0, "method": "audioContextCurrentTime"})),
+    };
+    let first = f.sessions.record_event(PROJECT, &id, &cue, now()).unwrap();
+    // An identical retry (e.g. after a lost response) returns the stored event.
+    let replay = f.sessions.record_event(PROJECT, &id, &cue, now()).unwrap();
+    assert_eq!(first.event_id, replay.event_id);
+    // The same id with a different declared movie time, reading or detail conflicts.
+    for changed in [
+        ReviewSessionEventRequest {
+            declared_movie_seconds: Some(12.0),
+            ..cue.clone()
+        },
+        ReviewSessionEventRequest {
+            performance_ms: Some(2600.0),
+            ..cue.clone()
+        },
+        ReviewSessionEventRequest {
+            detail: Some(serde_json::json!({"clockEpoch": 1})),
+            ..cue.clone()
+        },
+        ReviewSessionEventRequest {
+            detail: None,
+            ..cue.clone()
+        },
+    ] {
+        assert!(matches!(
+            f.sessions.record_event(PROJECT, &id, &changed, now()),
+            Err(ReviewSessionError::IdempotencyConflict)
+        ));
+    }
+
+    let sample = ReviewSessionEventRequest {
+        event_id: "clock_1".into(),
+        kind: ReviewSessionEventKind::ClockSample,
+        audio_frame: 9600,
+        performance_ms: Some(3000.25),
+        declared_movie_seconds: None,
+        detail: Some(
+            serde_json::json!({"clockEpoch": 0, "uncertaintyMs": 2.6667, "method": "getOutputTimestamp"}),
+        ),
+    };
+    f.sessions
+        .record_event(PROJECT, &id, &sample, now())
+        .unwrap();
+    for (event_id, performance_ms, detail) in [
+        (
+            "clock_no_epoch",
+            Some(1.0),
+            serde_json::json!({"uncertaintyMs": 1.0}),
+        ),
+        (
+            "clock_no_bound",
+            Some(1.0),
+            serde_json::json!({"clockEpoch": 0}),
+        ),
+        (
+            "clock_negative",
+            Some(1.0),
+            serde_json::json!({"clockEpoch": 0, "uncertaintyMs": -1.0}),
+        ),
+        (
+            "clock_no_reading",
+            None,
+            serde_json::json!({"clockEpoch": 0, "uncertaintyMs": 1.0}),
+        ),
+    ] {
+        let bad = ReviewSessionEventRequest {
+            event_id: event_id.into(),
+            performance_ms,
+            detail: Some(detail),
+            ..sample.clone()
+        };
+        assert!(matches!(
+            f.sessions.record_event(PROJECT, &id, &bad, now()),
+            Err(ReviewSessionError::InvalidInput(_))
+        ));
+    }
+    // An epoch boundary marker carries no pairing.
+    let boundary = ReviewSessionEventRequest {
+        event_id: "clock_suspended".into(),
+        performance_ms: None,
+        detail: Some(
+            serde_json::json!({"clockEpoch": 0, "transition": "suspended", "uncertaintyMs": null}),
+        ),
+        ..sample.clone()
+    };
+    f.sessions
+        .record_event(PROJECT, &id, &boundary, now())
+        .unwrap();
+}

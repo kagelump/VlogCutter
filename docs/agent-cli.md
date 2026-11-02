@@ -1292,3 +1292,38 @@ handoff in the normal success envelope, command `edit-plan.review-target-export`
 It copies/uploads no media and writes no edit-plan or feedback operation.
 See [TV review handoff v1](tv-review-handoff.md) for the fixture, clock precision,
 import trust/freshness boundary and canonical feedback reconciliation.
+
+`review-markers plan|export|detect` (no catalog) handles acoustic movie-time
+markers for separate TV review copies. `plan --handoff <file>` lists marker
+times. `export --handoff <file> --movie <abs> --output <abs.mp4>` checks that
+the master's BLAKE3 and length match the handoff, then writes a create-only
+marked copy (video stream copy, AAC soundtrack with markers) and a path-free
+`<output>.markers.json` lineage manifest. It decodes its own output and
+refuses to publish a copy whose markers or picture stream do not verify.
+`detect --handoff <file> --recording <wav>` returns `detection` (recording-clock/
+movie-time anchors plus rejected candidates) and the same evidence as shared
+`syncAnchors` (`acousticTimecode`) with their `movieClock` and `captureClock`,
+ready for `tv-review sync-preview`. Commands: `review-markers.plan`,
+`review-markers.export`, `review-markers.detect`. See
+[acoustic markers](tv-review-acoustic-markers.md).
+
+Historical movie review: `edit-plan historical-review-target-export --artifact
+<id>` opens the explicit existing catalog read-only and returns the separate
+`HistoricalRenderedArtifactReview` v1 DTO. It checks fresh movie bytes and stored
+mapping/revision integrity; current source/constraint/renderability checks remain
+explicitly unresolved. See [historical review policy](tv-review-handoff.md#historical-rendered-artifact-review-separate-contract).
+
+`edit-plan feedback record-once --input <JSON>` safely imports a stable external
+review item after a lost response; identical retries return the same canonical
+note, while changed content under that identity is a conflict. See
+[feedback import](edit-plan-feedback.md). Proposal, decision and apply remain
+separate explicit operations.
+
+`tv-review sync-preview --input <file>` performs bounded catalog-free recording-clock mapping without writes. See [shared timing contract](tv-review-sync.md).
+
+`tv-review soundtrack-reference` and `tv-review soundtrack-match` are bounded local final-mix diagnostics. See [soundtrack matching](tv-soundtrack-matching.md).
+
+`tv-review soundtrack-session-plan|soundtrack-session-run|soundtrack-session-evidence|soundtrack-session-sync`
+plans complete-reference searches, runs bounded resumable local batches and maps
+native utterance frames through the shared engine. Media/path bindings stay on
+the local media host. See [local session workflow](tv-review-local-session.md).

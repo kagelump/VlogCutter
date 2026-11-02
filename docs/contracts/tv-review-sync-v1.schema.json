@@ -1,0 +1,345 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TV review synchronization request v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "sessionId",
+    "targetDigest",
+    "movie",
+    "captureClocks",
+    "anchors",
+    "boundaries",
+    "policy"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": 1
+    },
+    "sessionId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 255,
+      "pattern": "^[A-Za-z0-9_-]+$"
+    },
+    "targetDigest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "movie": {
+      "$ref": "#/$defs/movie"
+    },
+    "captureClocks": {
+      "type": "array",
+      "maxItems": 64,
+      "items": {
+        "$ref": "#/$defs/captureClock"
+      }
+    },
+    "anchors": {
+      "type": "array",
+      "maxItems": 4096,
+      "items": {
+        "$ref": "#/$defs/anchor"
+      }
+    },
+    "boundaries": {
+      "type": "array",
+      "maxItems": 4096,
+      "items": {
+        "$ref": "#/$defs/boundary"
+      }
+    },
+    "policy": {
+      "$ref": "#/$defs/policy"
+    }
+  },
+  "$defs": {
+    "movie": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "movieDigest",
+        "timeBaseNumerator",
+        "timeBaseDenominator",
+        "originPts",
+        "durationPts"
+      ],
+      "properties": {
+        "movieDigest": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "timeBaseNumerator": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295
+        },
+        "timeBaseDenominator": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295
+        },
+        "originPts": {
+          "type": "integer",
+          "minimum": -9007199254740991,
+          "maximum": 9007199254740991
+        },
+        "durationPts": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        }
+      }
+    },
+    "captureClock": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "clockId",
+        "sampleRate",
+        "firstSample",
+        "lastSample",
+        "monotonicOriginNs",
+        "monotonicToleranceNs"
+      ],
+      "properties": {
+        "clockId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 255,
+          "pattern": "^[A-Za-z0-9_-]+$"
+        },
+        "sampleRate": {
+          "type": "integer",
+          "minimum": 8000,
+          "maximum": 192000
+        },
+        "firstSample": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "lastSample": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "monotonicOriginNs": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "monotonicToleranceNs": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000000000
+        }
+      }
+    },
+    "capturePosition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "clockId",
+        "sampleIndex",
+        "monotonicNs"
+      ],
+      "properties": {
+        "clockId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 255,
+          "pattern": "^[A-Za-z0-9_-]+$"
+        },
+        "sampleIndex": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "monotonicNs": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        }
+      }
+    },
+    "anchor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "evidenceId",
+        "capture",
+        "moviePts",
+        "source",
+        "confidence",
+        "movieUncertaintyTicks",
+        "captureUncertaintySamples",
+        "candidateGroupId"
+      ],
+      "properties": {
+        "evidenceId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 255,
+          "pattern": "^[A-Za-z0-9_-]+$"
+        },
+        "capture": {
+          "$ref": "#/$defs/capturePosition"
+        },
+        "moviePts": {
+          "type": "integer",
+          "minimum": -9007199254740991,
+          "maximum": 9007199254740991
+        },
+        "source": {
+          "enum": [
+            "manualCue",
+            "acousticTimecode",
+            "passiveSoundtrack"
+          ]
+        },
+        "confidence": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "movieUncertaintyTicks": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "captureUncertaintySamples": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1920000
+        },
+        "candidateGroupId": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 255,
+              "pattern": "^[A-Za-z0-9_-]+$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "boundary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "evidenceId",
+        "clockId",
+        "sampleIndex",
+        "kind"
+      ],
+      "properties": {
+        "evidenceId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 255,
+          "pattern": "^[A-Za-z0-9_-]+$"
+        },
+        "clockId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 255,
+          "pattern": "^[A-Za-z0-9_-]+$"
+        },
+        "sampleIndex": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "kind": {
+          "enum": [
+            "pause",
+            "buffering",
+            "seek",
+            "rewind",
+            "resume",
+            "resync",
+            "captureInterrupted"
+          ]
+        }
+      }
+    },
+    "policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "minimumConfidence",
+        "maxAnchorGapSeconds",
+        "maxExtrapolationSeconds",
+        "maxDriftPpm",
+        "residualToleranceSeconds",
+        "unobservedUncertaintyPpm"
+      ],
+      "properties": {
+        "minimumConfidence": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "maxAnchorGapSeconds": {
+          "type": "number",
+          "minimum": 0.1,
+          "maximum": 120
+        },
+        "maxExtrapolationSeconds": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 30
+        },
+        "maxDriftPpm": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 500000
+        },
+        "residualToleranceSeconds": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 2
+        },
+        "unobservedUncertaintyPpm": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 100000
+        }
+      }
+    },
+    "query": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "clockId",
+        "startSample",
+        "endSample"
+      ],
+      "properties": {
+        "clockId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 255,
+          "pattern": "^[A-Za-z0-9_-]+$"
+        },
+        "startSample": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "endSample": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        }
+      }
+    }
+  }
+}

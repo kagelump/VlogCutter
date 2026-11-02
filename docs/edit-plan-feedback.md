@@ -9,10 +9,30 @@ that proposal (or retains an existing cut). A decision in the `applied` state
 records a host receipt of a prior human acceptance. A target **mapping** is an
 explicit human fact; it does not rewrite the note or proposal.
 
-All seven CLI commands require an existing explicit catalog. `record`,
+All feedback CLI commands require an existing explicit catalog. `record`, `record-once`,
 `propose`, `decide`, `map`, and `apply` are writes; `get` and `report` open the
 catalog read-only and do not migrate it. JSON inputs are bounded to 64 KiB and
 reject unknown fields.
+
+For an external review item, use `edit-plan feedback record-once --input
+/absolute/import.json` with `{ "importId": "issuer/session/discussion/item",
+"record": <RecordReviewNoteRequest> }`. Retain the same namespaced stable item
+identity through retries. The canonical note ID is derived from that identity
+and project ID; the normal portable note fact is committed atomically, without
+a second receipt store or schema migration. The result contains `importId`,
+`noteId`, `duplicate` and the current `feedback` view. After a lost response,
+retrying returns the original note, including its original viewed-movie evidence,
+even while that media is offline. Concurrent retries create one note fact.
+
+Reusing an import identity with any changed request content returns
+`review_feedback_import_conflict`. Do not key imports by mutable text or list
+position. An explicitly revised external item needs its own immutable identity
+and reconciliation decision; no retry overwrites a canonical note, proposal or
+human decision. A first import keeps all existing target/revision/receipt guards.
+The existing `record` command continues to create a new note each time.
+Neither command proposes, accepts, applies or activates an edit. Return the
+committed `noteId` to the external item's reconciliation endpoint only after
+the CLI succeeds; a lost reconciliation response can safely retry both steps.
 
 ```bash
 rcdvlog --catalog /absolute/project/catalog.sqlite3 edit-plan feedback record --input /absolute/note.json

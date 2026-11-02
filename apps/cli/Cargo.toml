@@ -24,5 +24,6 @@ thiserror.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+hound = "3.5"
 rusqlite.workspace = true
 tempfile = "3.24"

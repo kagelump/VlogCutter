@@ -1,6 +1,8 @@
 import { ProjectClientError, type BrowserProjectClient } from "@rcdvlog/project-client";
 import { PcmChunker, chunkFramesFor, floatToInt16, sha256Hex, type PcmChunk } from "./chunker";
-import { MemoryOutbox, OutboxFullError, type OutboxSession } from "./outbox";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
+import { MemoryOutbox, OutboxFullError, type OutboxEvent, type OutboxSession } from "./outbox";
 import { ChunkUploader, isPermanentUploadError } from "./uploader";
 import { finalizeWhenDrained } from "./recorder";
 
@@ -129,4 +131,63 @@ test("recovery never finalizes while audio is still buffered", async () => {
   expect(await finalizeWhenDrained(client, outbox, meta)).toBeNull();
   expect(client.finalizeReviewSession).not.toHaveBeenCalled();
   expect((await outbox.sessions()).length).toBe(1);
+});
+
+function cueEvent(eventId: string, order: number): OutboxEvent {
+  return { sessionId: "s", eventId, order, kind: "manualSyncCue", audioFrame: 4800, performanceMs: 1500, declaredMovieSeconds: 0, detail: { clockEpoch: 0 } };
+}
+
+test("queued events are retried with their stable id until the server acknowledges them", async () => {
+  const outbox = new MemoryOutbox();
+  await outbox.putEvent(cueEvent("evt_b", 1));
+  await outbox.putEvent(cueEvent("evt_a", 0));
+  const posted: string[] = [];
+  let calls = 0;
+  const record = vi.fn(async (_p: string, _s: string, event: { eventId: string }) => {
+    calls += 1;
+    if (calls === 1) throw new ProjectClientError("server_unavailable", "offline", "server_unavailable");
+    posted.push(event.eventId);
+    return event;
+  });
+  const client = { ...uploadClient(vi.fn()), recordReviewSessionEvent: record } as unknown as BrowserProjectClient;
+  const sleeps: number[] = [];
+  const uploader = new ChunkUploader(client, outbox, "p", "s", undefined, async (ms) => { sleeps.push(ms); });
+  await uploader.kick();
+  // The failed post kept the event; the retry reused the same id, in creation order.
+  expect(posted).toEqual(["evt_a", "evt_b"]);
+  expect(record.mock.calls[0][2]).toMatchObject({ eventId: "evt_a", declaredMovieSeconds: 0, performanceMs: 1500, detail: { clockEpoch: 0 } });
+  expect(sleeps).toEqual([500]);
+  expect(await outbox.events("s")).toEqual([]);
+  expect(uploader.status.pendingEvents).toBe(0);
+});
+
+test("a session is never finalized while an event is still queued", async () => {
+  const outbox = new MemoryOutbox();
+  const meta: OutboxSession = { sessionId: "s", projectId: "p", reviewTargetId: "t", capturedFrames: 0, ended: true, endReason: "stopped", updatedAt: "now" };
+  await outbox.putSession(meta);
+  await outbox.putEvent(cueEvent("evt_conflict", 0));
+  const client = { ...uploadClient(vi.fn()), recordReviewSessionEvent: vi.fn().mockRejectedValue(new ProjectClientError("server_error", "x", "idempotency_conflict", null, 409)) } as unknown as BrowserProjectClient;
+  expect(await finalizeWhenDrained(client, outbox, meta)).toBeNull();
+  expect(client.finalizeReviewSession).not.toHaveBeenCalled();
+  expect((await outbox.events("s")).length).toBe(1);
+  await outbox.deleteSession("s");
+  expect(await outbox.events("s")).toEqual([]);
+});
+
+test("the capture worklet delivers its partial batch before acknowledging the final frame", () => {
+  const source = readFileSync(resolve(__dirname, "../../../public/pcm-capture-worklet.js"), "utf8");
+  let Processor: new (options: unknown) => { port: { onmessage: (e: { data: unknown }) => void }; process: (inputs: Float32Array[][]) => boolean } = null as never;
+  const sent: Array<{ type: string; frame?: number; frames?: number }> = [];
+  class FakeProcessor { port = { onmessage: (_e: { data: unknown }) => undefined, postMessage: (m: { type: string }) => sent.push(m) }; }
+  const scope = { AudioWorkletProcessor: FakeProcessor, registerProcessor: (_n: string, c: typeof Processor) => { Processor = c; }, currentFrame: 1000 };
+  new Function("AudioWorkletProcessor", "registerProcessor", "scope", source.replace(/currentFrame/g, "scope.currentFrame"))(scope.AudioWorkletProcessor, scope.registerProcessor, scope);
+  const node = new Processor({ processorOptions: { channels: 1 } });
+  node.process([[new Float32Array(128)]]);
+  scope.currentFrame = 1128;
+  node.process([[new Float32Array(128)]]);
+  node.port.onmessage({ data: { type: "stop" } });
+  expect(sent.map((m) => m.type)).toEqual(["audio", "stopped"]);
+  expect(sent[0]).toMatchObject({ frame: 1000, frames: 256 });
+  expect(sent[1]).toMatchObject({ frame: 1256 });
+  expect(node.process([[new Float32Array(128)]])).toBe(false);
 });

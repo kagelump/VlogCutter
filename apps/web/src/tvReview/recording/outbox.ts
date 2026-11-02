@@ -24,8 +24,28 @@ export interface OutboxSession {
   updatedAt: string;
 }
 
+/**
+ * A capture event (cue, discontinuity, clock sample...) queued with its stable
+ * id before any post, so a failed or interrupted post is retried with the
+ * audio rather than lost. The server replays an identical id idempotently.
+ */
+export interface OutboxEvent {
+  sessionId: string;
+  eventId: string;
+  /** Local creation order, so events drain in the order they happened. */
+  order: number;
+  kind: "manualSyncCue" | "captureDiscontinuity" | "localBufferOverflow" | "deviceLost" | "pageInterrupted" | "clockSample";
+  audioFrame: number;
+  performanceMs: number | null;
+  declaredMovieSeconds: number | null;
+  detail: Record<string, unknown>;
+}
+
 export interface ChunkOutbox {
   putChunk(chunk: OutboxChunk): Promise<void>;
+  putEvent(event: OutboxEvent): Promise<void>;
+  events(sessionId: string): Promise<OutboxEvent[]>;
+  deleteEvent(sessionId: string, eventId: string): Promise<void>;
   chunks(sessionId: string): Promise<OutboxChunk[]>;
   deleteChunk(sessionId: string, sequence: number): Promise<void>;
   putSession(session: OutboxSession): Promise<void>;
@@ -43,7 +63,11 @@ export const OUTBOX_MAX_BYTES = 256 * 1024 * 1024;
 export class MemoryOutbox implements ChunkOutbox {
   private readonly chunkMap = new Map<string, OutboxChunk>();
   private readonly sessionMap = new Map<string, OutboxSession>();
+  private readonly eventMap = new Map<string, OutboxEvent>();
   constructor(private readonly maxBytes = OUTBOX_MAX_BYTES) {}
+  async putEvent(event: OutboxEvent) { this.eventMap.set(`${event.sessionId}:${event.eventId}`, { ...event }); }
+  async events(sessionId: string) { return [...this.eventMap.values()].filter((e) => e.sessionId === sessionId).sort((a, b) => a.order - b.order); }
+  async deleteEvent(sessionId: string, eventId: string) { this.eventMap.delete(`${sessionId}:${eventId}`); }
   async putChunk(chunk: OutboxChunk) {
     if ((await this.pendingBytes()) + chunk.bytes.byteLength > this.maxBytes) throw new OutboxFullError();
     this.chunkMap.set(`${chunk.sessionId}:${chunk.sequence}`, chunk);
@@ -52,7 +76,10 @@ export class MemoryOutbox implements ChunkOutbox {
   async deleteChunk(sessionId: string, sequence: number) { this.chunkMap.delete(`${sessionId}:${sequence}`); }
   async putSession(session: OutboxSession) { this.sessionMap.set(session.sessionId, { ...session }); }
   async sessions() { return [...this.sessionMap.values()]; }
-  async deleteSession(sessionId: string) { this.sessionMap.delete(sessionId); }
+  async deleteSession(sessionId: string) {
+    this.sessionMap.delete(sessionId);
+    for (const [key, event] of this.eventMap) if (event.sessionId === sessionId) this.eventMap.delete(key);
+  }
   async pendingBytes() { let total = 0; for (const c of this.chunkMap.values()) total += c.bytes.byteLength; return total; }
 }
 
@@ -79,12 +106,18 @@ export class IndexedDbOutbox implements ChunkOutbox {
 
   private open(): Promise<IDBDatabase> {
     this.db ??= new Promise((resolve, reject) => {
-      const request = indexedDB.open(DB_NAME, 1);
-      request.onupgradeneeded = () => {
+      const request = indexedDB.open(DB_NAME, 2);
+      request.onupgradeneeded = (event) => {
         const db = request.result;
-        const chunks = db.createObjectStore("chunks", { keyPath: ["sessionId", "sequence"] });
-        chunks.createIndex("bySession", "sessionId");
-        db.createObjectStore("sessions", { keyPath: "sessionId" });
+        if (event.oldVersion < 1) {
+          const chunks = db.createObjectStore("chunks", { keyPath: ["sessionId", "sequence"] });
+          chunks.createIndex("bySession", "sessionId");
+          db.createObjectStore("sessions", { keyPath: "sessionId" });
+        }
+        if (event.oldVersion < 2) {
+          const events = db.createObjectStore("events", { keyPath: ["sessionId", "eventId"] });
+          events.createIndex("bySession", "sessionId");
+        }
       };
       request.onsuccess = () => resolve(request.result);
       request.onerror = () => reject(request.error);
@@ -93,13 +126,13 @@ export class IndexedDbOutbox implements ChunkOutbox {
   }
 
   private async transaction(mode: IDBTransactionMode) {
-    const tx = (await this.open()).transaction(["chunks", "sessions"], mode);
+    const tx = (await this.open()).transaction(["chunks", "sessions", "events"], mode);
     const done = new Promise<void>((resolve, reject) => {
       tx.oncomplete = () => resolve();
       tx.onabort = () => reject(tx.error);
       tx.onerror = () => reject(tx.error);
     });
-    return { chunks: tx.objectStore("chunks"), sessions: tx.objectStore("sessions"), done };
+    return { chunks: tx.objectStore("chunks"), sessions: tx.objectStore("sessions"), events: tx.objectStore("events"), done };
   }
 
   async putChunk(chunk: OutboxChunk) {
@@ -122,6 +155,24 @@ export class IndexedDbOutbox implements ChunkOutbox {
       if (isQuotaError(error)) throw new OutboxFullError();
       throw error;
     }
+  }
+
+  async putEvent(event: OutboxEvent) {
+    const tx = await this.transaction("readwrite");
+    tx.events.put(event);
+    await tx.done;
+  }
+
+  async events(sessionId: string) {
+    const tx = await this.transaction("readonly");
+    const rows = await promisify(tx.events.index("bySession").getAll(IDBKeyRange.only(sessionId))) as OutboxEvent[];
+    return rows.sort((a, b) => a.order - b.order);
+  }
+
+  async deleteEvent(sessionId: string, eventId: string) {
+    const tx = await this.transaction("readwrite");
+    tx.events.delete([sessionId, eventId]);
+    await tx.done;
   }
 
   async chunks(sessionId: string) {
@@ -158,6 +209,10 @@ export class IndexedDbOutbox implements ChunkOutbox {
     tx.chunks.index("bySession").openKeyCursor(IDBKeyRange.only(sessionId)).onsuccess = (event) => {
       const cursor = (event.target as IDBRequest<IDBCursor | null>).result;
       if (cursor) { tx.chunks.delete(cursor.primaryKey); cursor.continue(); }
+    };
+    tx.events.index("bySession").openKeyCursor(IDBKeyRange.only(sessionId)).onsuccess = (event) => {
+      const cursor = (event.target as IDBRequest<IDBCursor | null>).result;
+      if (cursor) { tx.events.delete(cursor.primaryKey); cursor.continue(); }
     };
     await tx.done;
   }
