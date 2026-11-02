@@ -193,7 +193,8 @@ then #227 final-mix matching. Do not duplicate the cloud web recorder or ASR.
 ## Historical rendered-artifact review (separate contract)
 
 `edit-plan historical-review-target-export --artifact <id>` opens the catalog
-read-only and emits `HistoricalRenderedArtifactReview` version 1. It freshly
+read-only and emits `HistoricalRenderedArtifactReview` version 1. Hashing uses
+the shared host scheduling lease without a catalog write. It freshly
 hashes the owned completed movie, binds it to its prior fully decoded receipt,
 checks every measured cut against the immutable revision, and runs the same
 snapshot structure/digest validation as the strict exporter. It does not decode

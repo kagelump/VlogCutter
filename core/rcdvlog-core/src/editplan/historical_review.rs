@@ -69,6 +69,10 @@ impl Catalog {
         cancel: &dyn Fn() -> bool,
     ) -> Result<HistoricalRenderedArtifactReview> {
         ensure!(!cancel(), "historical review cancelled");
+        // Read-only catalog access still coordinates expensive hashing through
+        // the same host scheduling lease; no catalog write/migration is needed.
+        let _heavy =
+            crate::acquire_local_heavy_at_cancellable(&self.local_heavy_lock_path(), cancel)?;
         let status = self.preview_artifact_status_cancellable(artifact_id, false, cancel)?;
         ensure!(
             status.observed_state == PreviewArtifactState::Complete && status.file_present,
