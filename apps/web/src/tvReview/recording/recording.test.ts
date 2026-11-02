@@ -3,7 +3,7 @@ import { PcmChunker, chunkFramesFor, floatToInt16, sha256Hex, type PcmChunk } fr
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { MemoryOutbox, OutboxFullError, type OutboxEvent, type OutboxSession } from "./outbox";
-import { ChunkUploader, isPermanentUploadError } from "./uploader";
+import { ChunkUploader, canonicalJson, isPermanentUploadError, sameEvent } from "./uploader";
 import { finalizeWhenDrained } from "./recorder";
 
 function ramp(frames: number, offset = 0): Float32Array {
@@ -266,4 +266,15 @@ test("failed event storage cannot be finalized as a complete capture", async () 
   expect(await finalizeWhenDrained(client, outbox, meta)).toBeNull();
   expect(client.finalizeReviewSession).not.toHaveBeenCalled();
   expect((await outbox.sessions()).length).toBe(1);
+});
+
+test("an event receipt with the server's sorted detail keys is the same event, a changed value is not", () => {
+  const event: OutboxEvent = { sessionId: "s", eventId: "evt_cal", order: 0, kind: "clockSample", audioFrame: 48000, performanceMs: 1000, declaredMovieSeconds: null,
+    detail: { schema: "review-capture-calibration.v1", clockId: "mic_epoch_0", sampleRate: 48000, nested: { z: 1, a: [2, { y: 3, b: 4 }] }, clockEpoch: 0 } };
+  // serde_json without preserve_order returns object keys sorted.
+  const sorted = JSON.parse(JSON.stringify({ clockEpoch: 0, clockId: "mic_epoch_0", nested: { a: [2, { b: 4, y: 3 }], z: 1 }, sampleRate: 48000, schema: "review-capture-calibration.v1" }));
+  const receipt = { eventId: "evt_cal", kind: "clockSample" as const, audioFrame: 48000, audioSeconds: 1, performanceMs: 1000, declaredMovieSeconds: null, serverReceivedAt: "t", detail: sorted };
+  expect(sameEvent(event, receipt)).toBe(true);
+  expect(sameEvent(event, { ...receipt, detail: { ...sorted, clockEpoch: 1 } })).toBe(false);
+  expect(canonicalJson({ b: 1, a: undefined })).toBe(canonicalJson({ b: 1 }));
 });
