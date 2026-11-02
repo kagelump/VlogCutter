@@ -293,6 +293,16 @@ impl ReviewTargetHandoff {
     /// Candidates are picture locators only; never source trims or audio ownership.
     pub fn picture_candidates(&self, start_seconds: f64, end_seconds: f64) -> Result<Vec<String>> {
         self.validate()?;
+        self.picture_candidates_validated(start_seconds, end_seconds)
+    }
+
+    /// Core batch callers must validate this immutable handoff once before
+    /// querying. Avoid rehashing an entire target for every utterance slice.
+    pub(crate) fn picture_candidates_validated(
+        &self,
+        start_seconds: f64,
+        end_seconds: f64,
+    ) -> Result<Vec<String>> {
         ensure!(
             start_seconds.is_finite()
                 && end_seconds.is_finite()
@@ -306,17 +316,17 @@ impl ReviewTargetHandoff {
             (pts as f64 - m.origin_pts as f64) * m.time_base_numerator as f64
                 / m.time_base_denominator as f64
         };
-        Ok(self
+        let first = self
             .target
             .cuts
+            .partition_point(|cut| seconds(cut.movie_out_pts) <= start_seconds);
+        Ok(self.target.cuts[first..]
             .iter()
-            .filter(|cut| {
-                let a = seconds(cut.movie_in_pts);
-                let b = seconds(cut.movie_out_pts);
+            .take_while(|cut| {
                 if start_seconds == end_seconds {
-                    a <= start_seconds && start_seconds < b
+                    seconds(cut.movie_in_pts) <= start_seconds
                 } else {
-                    a < end_seconds && start_seconds < b
+                    seconds(cut.movie_in_pts) < end_seconds
                 }
             })
             .map(|c| c.operation_id.clone())

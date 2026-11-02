@@ -296,3 +296,22 @@ fn synthetic_affine_error_stays_inside_reported_bounds_across_sample_rates() {
         "max injected-affine error {max_error_ticks} ticks"
     );
 }
+
+#[test]
+fn overlapping_alternative_queries_cannot_amplify_unbounded_reports() {
+    let mut r = fixture();
+    for second in [1.0, 5.0, 10.0] {
+        for n in 0..8 {
+            let id = format!("evidence_{}_{}", second as u32, n);
+            r.anchors.push(anchor(
+                &r,
+                &id,
+                second,
+                second,
+                SyncAnchorSource::PassiveSoundtrack,
+            ));
+        }
+    }
+    let err = r.map(&vec![q(2.0, 9.0); 256], &|| false).unwrap_err();
+    assert!(err.to_string().contains("candidate budget"));
+}

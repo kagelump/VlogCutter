@@ -326,6 +326,7 @@ impl SyncRequest {
             .map(|a| a.evidence_id.clone())
             .collect();
         let mut slices = Vec::new();
+        let mut estimate_count = 0usize;
         for q in queries {
             let c = self.clock(&q.clock_id)?;
             ensure!(
@@ -364,14 +365,20 @@ impl SyncRequest {
             );
             for (start, end) in intervals {
                 ensure!(!cancel(), "synchronization cancelled");
-                slices.push(self.map_slice(
+                let slice = self.map_slice(
                     c,
                     SyncQuery {
                         clock_id: q.clock_id.clone(),
                         start_sample: start,
                         end_sample: end,
                     },
-                ));
+                );
+                estimate_count += slice.candidates.len();
+                ensure!(
+                    estimate_count <= 8192,
+                    "invalid input: sync result exceeds candidate budget; narrow the query/evidence scope"
+                );
+                slices.push(slice);
             }
         }
         Ok(SyncReport {
@@ -601,18 +608,25 @@ impl SyncRequest {
             "invalid input: synchronization target/movie clock mismatch"
         );
         let mut report = self.map(queries, cancel)?;
+        let mut operation_count = 0usize;
         for s in &mut report.slices {
             if matches!(s.state, SyncState::Anchored | SyncState::Estimated) {
                 for e in &s.candidates {
                     let seconds =
                         |p: i64| (p - self.movie.origin_pts) as f64 / self.movie.ticks_per_second();
-                    s.candidate_operation_ids.extend(target.picture_candidates(
-                        seconds(e.lower_pts),
-                        seconds(e.upper_pts).min(m.duration_seconds),
-                    )?);
+                    s.candidate_operation_ids
+                        .extend(target.picture_candidates_validated(
+                            seconds(e.lower_pts),
+                            seconds(e.upper_pts).min(m.duration_seconds),
+                        )?);
                 }
                 s.candidate_operation_ids.sort();
                 s.candidate_operation_ids.dedup();
+                operation_count += s.candidate_operation_ids.len();
+                ensure!(
+                    operation_count <= 8192,
+                    "invalid input: sync result exceeds operation budget; narrow the query scope"
+                );
             }
         }
         Ok(report)

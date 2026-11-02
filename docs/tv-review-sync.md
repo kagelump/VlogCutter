@@ -69,7 +69,10 @@ feedback reconciliation remain separate. Reports retain the original anchor
 array, rejected IDs, alternative estimates, evidence IDs and diagnostics.
 
 Limits: 64 capture clocks, 4096 anchors/boundaries each, 256 queries, 8192 output
-slices, and 64 pair combinations per slice. Large ambiguous groups remain
+slices, 8192 estimates/operation IDs across a response, and 64 pair combinations
+per slice. Oversized result requests fail with a scope-narrowing diagnostic.
+Movie candidate queries validate the immutable target once and use its ordered
+intervals; they do not repeatedly hash the entire target for each slice. Large ambiguous groups remain
 unknown. Component processing and storage cancellation belong to their owners;
 mapper cancellation aborts without side effects. This implementation is a
 conservative local piecewise affine model, not a statistical global optimizer.
