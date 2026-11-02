@@ -612,6 +612,7 @@ impl SyncRequest {
         for s in &mut report.slices {
             if matches!(s.state, SyncState::Anchored | SyncState::Estimated) {
                 for e in &s.candidates {
+                    ensure!(!cancel(), "synchronization cancelled");
                     let seconds =
                         |p: i64| (p - self.movie.origin_pts) as f64 / self.movie.ticks_per_second();
                     s.candidate_operation_ids
@@ -619,9 +620,13 @@ impl SyncRequest {
                             seconds(e.lower_pts),
                             seconds(e.upper_pts).min(m.duration_seconds),
                         )?);
+                    s.candidate_operation_ids.sort();
+                    s.candidate_operation_ids.dedup();
+                    ensure!(
+                        operation_count + s.candidate_operation_ids.len() <= 8192,
+                        "invalid input: sync result exceeds operation budget; narrow the query scope"
+                    );
                 }
-                s.candidate_operation_ids.sort();
-                s.candidate_operation_ids.dedup();
                 operation_count += s.candidate_operation_ids.len();
                 ensure!(
                     operation_count <= 8192,
