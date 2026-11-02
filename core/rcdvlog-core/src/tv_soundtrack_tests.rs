@@ -1,0 +1,305 @@
+use super::*;
+fn signal(seconds: usize, seed: u64) -> Vec<f32> {
+    let mut state = seed;
+    let mut out = Vec::new();
+    for i in 0..seconds * PCM_RATE as usize {
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+        let noise = ((state >> 32) as u32 as f64 / u32::MAX as f64 - 0.5) * 0.06;
+        let t = i as f64 / PCM_RATE as f64;
+        let shift = seed as f64 * 0.001;
+        let envelope =
+            (0.6 + 0.3 * (t * 3.7 + shift).sin()) * (0.7 + 0.25 * (t * 8.3 + shift).sin());
+        let tone = (std::f64::consts::TAU * (t * 173.0 + 19.0 * (t * 0.9 + shift).sin())).sin()
+            + 0.7 * (std::f64::consts::TAU * (t * 613.0 + 31.0 * (t * 0.57 + shift).cos())).sin()
+            + 0.4 * (std::f64::consts::TAU * (t * 1411.0 + 13.0 * (t * 1.37 + shift).sin())).sin();
+        out.push((envelope * tone * 0.2 + noise) as f32);
+    }
+    out
+}
+fn spec(n: usize) -> SoundtrackReferenceSpec {
+    SoundtrackReferenceSpec {
+        schema_version: 1,
+        movie: SyncMovieClock {
+            movie_digest: "a".repeat(64),
+            time_base_numerator: 1,
+            time_base_denominator: 90000,
+            origin_pts: 90000,
+            duration_pts: n as u64 * 90000,
+        },
+        start_seconds: 0.0,
+        duration_seconds: n as f64,
+    }
+}
+fn capture() -> SoundtrackCapture {
+    SoundtrackCapture {
+        evidence_id: "synthetic_query".into(),
+        clock_id: "mic".into(),
+        sample_rate: 48000,
+        first_sample: 96000,
+        monotonic_origin_ns: 1000000000,
+    }
+}
+fn center_error(report: &SoundtrackMatchReport, start: f64, seconds: f64) -> f64 {
+    let truth = 90000.0 + (start + seconds / 2.0) * 90000.0;
+    (report.candidates[0].anchor.movie_pts as f64 - truth).abs() / 90000.0
+}
+#[test]
+fn distinctive_gain_room_and_conversation_are_bounded_or_remain_unmatched() {
+    let source = signal(36, 37);
+    let index = SoundtrackIndex::from_pcm(spec(36), &source, &|| false).unwrap();
+    let start = 8.32;
+    let query = source[(start * 8000.0) as usize..(start * 8000.0) as usize + 6 * 8000].to_vec();
+    let other = signal(6, 987);
+    let mut filtered = 0.0f32;
+    for mode in 0..4 {
+        let mut transformed = query.clone();
+        for i in 0..query.len() {
+            transformed[i] = match mode {
+                0 => query[i],
+                1 => query[i] * 0.12,
+                2 => {
+                    filtered = 0.7 * filtered + 0.3 * query[i];
+                    filtered + if i >= 240 { query[i - 240] * 0.25 } else { 0.0 }
+                }
+                _ => query[i] * 0.8 + other[i] * 0.25,
+            };
+        }
+        let r = index
+            .match_pcm(
+                &transformed,
+                capture(),
+                &SoundtrackPolicy::default(),
+                &|| false,
+            )
+            .unwrap();
+        if mode < 2 {
+            assert_eq!(r.state, SoundtrackMatchState::Matched, "mode {mode}: {r:?}");
+        }
+        if r.state == SoundtrackMatchState::Matched {
+            assert!(center_error(&r, start, 6.0) <= 0.1, "mode {mode}: {r:?}");
+        }
+        assert!(r.comparison_products <= MAX_PRODUCTS);
+    }
+    let r = index
+        .match_pcm(&query, capture(), &SoundtrackPolicy::default(), &|| false)
+        .unwrap();
+    let json = serde_json::to_vec(&index).unwrap();
+    assert_eq!(SoundtrackIndex::from_json(&json).unwrap(), index);
+    assert_eq!(
+        r,
+        index
+            .match_pcm(&query, capture(), &SoundtrackPolicy::default(), &|| false)
+            .unwrap()
+    );
+    assert!(
+        index
+            .match_pcm(&query, capture(), &SoundtrackPolicy::default(), &|| true)
+            .is_err()
+    );
+}
+#[test]
+fn repeats_silence_and_unrelated_audio_do_not_force_unique_positions() {
+    let block = signal(12, 91);
+    let mut source = block.clone();
+    source.extend(&block);
+    let index = SoundtrackIndex::from_pcm(spec(24), &source, &|| false).unwrap();
+    let query = &source[2 * 8000..8 * 8000];
+    let r = index
+        .match_pcm(query, capture(), &SoundtrackPolicy::default(), &|| false)
+        .unwrap();
+    assert_eq!(r.state, SoundtrackMatchState::Ambiguous, "{r:?}");
+    assert!(r.candidates.len() >= 2);
+    let zero = vec![0.0; 6 * 8000];
+    assert_eq!(
+        index
+            .match_pcm(&zero, capture(), &SoundtrackPolicy::default(), &|| false)
+            .unwrap()
+            .state,
+        SoundtrackMatchState::Unmatched
+    );
+    let unrelated = signal(6, 878123);
+    let r = index
+        .match_pcm(&unrelated, capture(), &SoundtrackPolicy::default(), &|| {
+            false
+        })
+        .unwrap();
+    assert_ne!(
+        r.state,
+        SoundtrackMatchState::Matched,
+        "unrelated signal: {r:?}"
+    );
+    let mut corrupt = index.clone();
+    corrupt.features[10][0] += 0.1;
+    assert!(corrupt.validate().is_err());
+}
+#[test]
+fn passive_anchors_integrate_with_shared_mapper_and_manual_conflicts_stay_visible() {
+    use crate::tv_review_sync::*;
+    let source = signal(24, 29);
+    let index = SoundtrackIndex::from_pcm(spec(24), &source, &|| false).unwrap();
+    let r = index
+        .match_pcm(
+            &source[4 * 8000..10 * 8000],
+            capture(),
+            &SoundtrackPolicy::default(),
+            &|| false,
+        )
+        .unwrap();
+    assert_eq!(r.state, SoundtrackMatchState::Matched);
+    let anchor = r.candidates[0].anchor.clone();
+    let sample = anchor.capture.sample_index;
+    let mut request = SyncRequest {
+        schema_version: 1,
+        session_id: "session_synthetic".into(),
+        target_digest: "b".repeat(64),
+        movie: spec(24).movie,
+        capture_clocks: vec![CaptureClock {
+            clock_id: "mic".into(),
+            sample_rate: 48000,
+            first_sample: 0,
+            last_sample: 48000 * 30,
+            monotonic_origin_ns: 1000000000,
+            monotonic_tolerance_ns: 2000000,
+        }],
+        anchors: vec![anchor.clone()],
+        boundaries: vec![],
+        policy: SyncPolicy::default(),
+    };
+    let q = SyncQuery {
+        clock_id: "mic".into(),
+        start_sample: sample,
+        end_sample: sample,
+    };
+    assert_eq!(
+        request
+            .map(std::slice::from_ref(&q), &|| false)
+            .unwrap()
+            .slices[0]
+            .state,
+        SyncState::Anchored
+    );
+    let mut manual = anchor;
+    manual.source = SyncAnchorSource::ManualCue;
+    manual.evidence_id = "manual_conflict".into();
+    manual.candidate_group_id = None;
+    manual.movie_pts += 90000 * 10;
+    request.anchors.push(manual);
+    assert_eq!(
+        request.map(&[q], &|| false).unwrap().slices[0].state,
+        SyncState::Conflicting
+    );
+}
+#[test]
+fn actual_generated_codec_resampling_remains_evidence_not_hardware_acceptance() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = signal(24, 47);
+    let index = SoundtrackIndex::from_pcm(spec(24), &source, &|| false).unwrap();
+    let path = dir.path().join("query.wav");
+    let mut wav = hound::WavWriter::create(
+        &path,
+        hound::WavSpec {
+            channels: 1,
+            sample_rate: 8000,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        },
+    )
+    .unwrap();
+    for x in &source[6 * 8000..12 * 8000] {
+        wav.write_sample(*x).unwrap();
+    }
+    wav.finalize().unwrap();
+    let encoded = dir.path().join("query.m4a");
+    let decoded = dir.path().join("resampled.wav");
+    let out = std::process::Command::new("ffmpeg")
+        .args(["-v", "error", "-nostdin", "-i"])
+        .arg(&path)
+        .args(["-ac", "2", "-ar", "44100", "-c:a", "aac", "-b:a", "96k"])
+        .arg(&encoded)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let out = std::process::Command::new("ffmpeg")
+        .args(["-v", "error", "-nostdin", "-i"])
+        .arg(encoded)
+        .args(["-ac", "1", "-ar", "8000", "-c:a", "pcm_f32le"])
+        .arg(&decoded)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let pcm = read_pcm8k_wav(&decoded).unwrap();
+    let r = index
+        .match_pcm(&pcm, capture(), &SoundtrackPolicy::default(), &|| false)
+        .unwrap();
+    assert_eq!(r.state, SoundtrackMatchState::Matched, "{r:?}");
+    assert!(center_error(&r, 6.0, pcm.len() as f64 / 8000.0) < 0.1);
+}
+
+#[test]
+fn final_movie_decoder_checks_bytes_and_retains_reference_window_offset() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = signal(20, 63);
+    let wav_path = dir.path().join("mixed.wav");
+    let mut wav = hound::WavWriter::create(
+        &wav_path,
+        hound::WavSpec {
+            channels: 2,
+            sample_rate: 8000,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        },
+    )
+    .unwrap();
+    for x in &source {
+        wav.write_sample(*x).unwrap();
+        wav.write_sample(*x * 0.8).unwrap();
+    }
+    wav.finalize().unwrap();
+    let movie = dir.path().join("final.mp4");
+    let out = std::process::Command::new("ffmpeg")
+        .args([
+            "-v",
+            "error",
+            "-nostdin",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=blue:s=160x90:r=30:d=20",
+            "-i",
+        ])
+        .arg(wav_path)
+        .args([
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-ar",
+            "48000",
+            "-ac",
+            "2",
+            "-shortest",
+        ])
+        .arg(&movie)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let mut reference = spec(20);
+    reference.movie.movie_digest = full_file_blake3(&movie, &|| false).unwrap().hex_digest;
+    reference.start_seconds = 4.0;
+    reference.duration_seconds = 12.0;
+    let index = SoundtrackIndex::from_movie(reference.clone(), &movie, &|| false).unwrap();
+    let report = index
+        .match_pcm(
+            &source[8 * 8000..14 * 8000],
+            capture(),
+            &SoundtrackPolicy::default(),
+            &|| false,
+        )
+        .unwrap();
+    assert_eq!(report.state, SoundtrackMatchState::Matched, "{report:?}");
+    assert!(center_error(&report, 8.0, 6.0) < 0.1);
+    reference.movie.movie_digest = "f".repeat(64);
+    assert!(SoundtrackIndex::from_movie(reference, &movie, &|| false).is_err());
+}
