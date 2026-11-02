@@ -71,6 +71,10 @@ const BANDS: usize = 16;
 const MAX_SAMPLES: usize = 600 * PCM_RATE as usize;
 const MAX_INDEX_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PRODUCTS: u64 = 50_000_000;
+/// Peaks reported per report and per merged session query (ARCHITECTURE §3).
+pub const MAX_BEST_PEAKS: usize = 4;
+/// Peaks closer than 16 hops in movie time are one observation (ARCHITECTURE §3).
+pub const PEAK_MERGE_SECONDS: f64 = 16.0 * HOP as f64 / PCM_RATE as f64;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -513,6 +517,28 @@ impl SoundtrackIndex {
             }
         }
         peaks.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+        // §3: diagnostics for every searched report, including unmatched and
+        // ambiguous ones. Filled before any early return below.
+        for &(score, offset) in peaks.iter().take(MAX_BEST_PEAKS) {
+            let mut subwindow_similarities = [0.0; 3];
+            for (part, slot) in subwindow_similarities.iter_mut().enumerate() {
+                let a = part * query.len() / 3;
+                let b = (part + 1) * query.len() / 3;
+                *slot = similarity(
+                    &query[a..b],
+                    &self.features[offset + a..offset + b],
+                    1,
+                    &mut report.comparison_products,
+                )?;
+            }
+            report.best_peaks.push(SoundtrackPeak {
+                similarity: score,
+                reference_offset_frames: offset,
+                movie_seconds: self.reference.start_seconds
+                    + (offset * HOP + pcm.len() / 2) as f64 / PCM_RATE as f64,
+                subwindow_similarities,
+            });
+        }
         report.best_similarity = peaks.first().map(|p| p.0);
         report.runner_up_similarity = peaks.get(1).map(|p| p.0);
         if peaks.is_empty() || peaks[0].0 < policy.minimum_similarity {

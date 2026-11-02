@@ -365,3 +365,92 @@ fn repeated_positions_in_separate_reference_windows_keep_unique_evidence_and_one
         SyncState::Conflicting
     );
 }
+#[test]
+fn unmatched_buried_excerpt_reports_its_true_position_as_best_peak() {
+    let source = signal(36, 37);
+    let index = SoundtrackIndex::from_pcm(spec(36), &source, &|| false).unwrap();
+    let start = 8.32;
+    let at = (start * 8000.0) as usize;
+    let clean = source[at..at + 6 * 8000].to_vec();
+    let noise = signal(6, 987);
+    let query: Vec<f32> = clean.iter().zip(&noise).map(|(q, n)| q + n).collect();
+    let r = index
+        .match_pcm(&query, capture(), &SoundtrackPolicy::default(), &|| false)
+        .unwrap();
+    assert_eq!(r.state, SoundtrackMatchState::Unmatched, "{r:?}");
+    assert!(r.candidates.is_empty());
+    assert!(!r.best_peaks.is_empty() && r.best_peaks.len() <= MAX_BEST_PEAKS);
+    let top = &r.best_peaks[0];
+    // Query centre is start + 3 s; the search grid is one hop (16 ms).
+    assert!(
+        (top.movie_seconds - (start + 3.0)).abs() <= 0.016,
+        "{top:?}"
+    );
+    assert_eq!(top.reference_offset_frames, 520);
+    assert_eq!(Some(top.similarity), r.best_similarity);
+    assert!(
+        top.subwindow_similarities
+            .iter()
+            .all(|s| (-1.0..=1.0).contains(s))
+    );
+    for pair in r.best_peaks.windows(2) {
+        assert!(pair[0].similarity >= pair[1].similarity);
+        assert_ne!(
+            pair[0].reference_offset_frames,
+            pair[1].reference_offset_frames
+        );
+    }
+    // Reports are deterministic, including the new diagnostics.
+    assert_eq!(
+        r,
+        index
+            .match_pcm(&query, capture(), &SoundtrackPolicy::default(), &|| false)
+            .unwrap()
+    );
+}
+#[test]
+fn matched_query_best_peak_is_the_top_candidate() {
+    let source = signal(36, 37);
+    let index = SoundtrackIndex::from_pcm(spec(36), &source, &|| false).unwrap();
+    let start = 8.32;
+    let at = (start * 8000.0) as usize;
+    let query = source[at..at + 6 * 8000].to_vec();
+    let r = index
+        .match_pcm(&query, capture(), &SoundtrackPolicy::default(), &|| false)
+        .unwrap();
+    assert_eq!(r.state, SoundtrackMatchState::Matched, "{r:?}");
+    let candidate = &r.candidates[0];
+    let top = &r.best_peaks[0];
+    assert_eq!(
+        top.reference_offset_frames,
+        candidate.reference_offset_frames
+    );
+    assert_eq!(top.similarity, candidate.similarity);
+    // §3 movie_seconds is the query centre, identical to the candidate anchor.
+    let tps = spec(36).movie.ticks_per_second();
+    let anchor_seconds = (candidate.anchor.movie_pts - spec(36).movie.origin_pts) as f64 / tps;
+    assert!((top.movie_seconds - anchor_seconds).abs() <= 1.0 / tps);
+    assert!((top.movie_seconds - (start + 3.0)).abs() <= 0.016);
+}
+#[test]
+fn quiet_and_flat_queries_leave_best_peaks_empty() {
+    let source = signal(36, 37);
+    let index = SoundtrackIndex::from_pcm(spec(36), &source, &|| false).unwrap();
+    let quiet = vec![0.0; 6 * 8000];
+    let r = index
+        .match_pcm(&quiet, capture(), &SoundtrackPolicy::default(), &|| false)
+        .unwrap();
+    assert_eq!(r.reason, "quiet_query");
+    assert!(r.best_peaks.is_empty());
+    let flat = vec![0.05f32; 6 * 8000];
+    let r = index
+        .match_pcm(&flat, capture(), &SoundtrackPolicy::default(), &|| false)
+        .unwrap();
+    assert_eq!(r.reason, "insufficient_spectral_variation", "{r:?}");
+    assert!(r.best_peaks.is_empty());
+    let json = serde_json::to_value(&r).unwrap();
+    assert!(
+        json.get("bestPeaks").is_none(),
+        "empty peaks must be omitted"
+    );
+}
