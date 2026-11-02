@@ -59,7 +59,11 @@ Implemented now:
 - Version-1 path-free TV review target export freshly verifies a full preview,
   preserves measured movie PTS and declared independent audio, and supplies a
   synthetic cloud fixture. Server import/UI and synchronization remain separate
-  work; see `docs/tv-review-handoff.md`.
+  work; see `docs/tv-review-handoff.md`. `review-markers` (no catalog) writes a
+  separate, create-only, self-verified marked review copy of the BLAKE3-matched
+  master with audible chirp-BFSK movie-time markers (video stream copy) and
+  detects CRC/export-key-checked anchors in recordings for #223; see
+  `docs/tv-review-acoustic-markers.md`.
 
 - One supported CLI now includes editing, review and upload against schema 66,
   with observational `doctor --workflow rough-cut|delivery` preflight. Sparse
