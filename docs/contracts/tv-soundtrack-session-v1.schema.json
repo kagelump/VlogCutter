@@ -1,0 +1,124 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Local TV soundtrack session specification v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "sync",
+    "segments",
+    "referenceSeconds",
+    "querySeconds",
+    "queryStepSeconds",
+    "matchPolicy"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": 1
+    },
+    "sync": {
+      "$ref": "tv-review-sync-v1.schema.json"
+    },
+    "segments": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 512,
+      "items": {
+        "$ref": "#/$defs/segment"
+      }
+    },
+    "referenceSeconds": {
+      "type": "integer",
+      "minimum": 5,
+      "maximum": 120
+    },
+    "querySeconds": {
+      "type": "integer",
+      "minimum": 4,
+      "maximum": 20
+    },
+    "queryStepSeconds": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 20
+    },
+    "matchPolicy": {
+      "$ref": "#/$defs/matchPolicy"
+    }
+  },
+  "$defs": {
+    "segment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "segmentId",
+        "clockId",
+        "firstSample",
+        "frameCount",
+        "wavBlake3"
+      ],
+      "properties": {
+        "segmentId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]{1,128}$"
+        },
+        "clockId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]{1,255}$"
+        },
+        "firstSample": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "frameCount": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295
+        },
+        "wavBlake3": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      }
+    },
+    "matchPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "minimumSimilarity",
+        "minimumPeakMargin",
+        "minimumSubwindowSimilarity",
+        "uncertaintySeconds",
+        "maximumCandidates"
+      ],
+      "properties": {
+        "minimumSimilarity": {
+          "type": "number",
+          "minimum": 0.4,
+          "maximum": 1
+        },
+        "minimumPeakMargin": {
+          "type": "number",
+          "minimum": 0.01,
+          "maximum": 0.5
+        },
+        "minimumSubwindowSimilarity": {
+          "type": "number",
+          "minimum": 0.3,
+          "maximum": 1
+        },
+        "uncertaintySeconds": {
+          "type": "number",
+          "minimum": 0.032,
+          "maximum": 2
+        },
+        "maximumCandidates": {
+          "type": "integer",
+          "minimum": 2,
+          "maximum": 8
+        }
+      }
+    }
+  }
+}

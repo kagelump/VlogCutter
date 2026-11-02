@@ -187,24 +187,33 @@ impl ReviewTargetHandoff {
         start_seconds: f64,
         end_seconds: f64,
     ) -> Result<Vec<String>> {
+        self.target
+            .picture_candidates_validated(start_seconds, end_seconds)
+    }
+}
+impl ReviewTargetSnapshot {
+    pub(crate) fn picture_candidates_validated(
+        &self,
+        start_seconds: f64,
+        end_seconds: f64,
+    ) -> Result<Vec<String>> {
         ensure!(
             start_seconds.is_finite()
                 && end_seconds.is_finite()
                 && start_seconds >= 0.0
                 && end_seconds >= start_seconds
-                && end_seconds <= self.target.movie.duration_seconds,
+                && end_seconds <= self.movie.duration_seconds,
             "invalid input: movie query outside artifact duration"
         );
-        let m = &self.target.movie;
+        let m = &self.movie;
         let seconds = |pts: i64| {
             (pts as f64 - m.origin_pts as f64) * m.time_base_numerator as f64
                 / m.time_base_denominator as f64
         };
         let first = self
-            .target
             .cuts
             .partition_point(|cut| seconds(cut.movie_out_pts) <= start_seconds);
-        Ok(self.target.cuts[first..]
+        Ok(self.cuts[first..]
             .iter()
             .take_while(|cut| {
                 if start_seconds == end_seconds {
