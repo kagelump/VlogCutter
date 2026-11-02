@@ -134,11 +134,35 @@ pub fn execute(command: &ReviewMarkersCommand) -> Result<Value> {
             let handoff = read_handoff(handoff)?;
             let (pcm, rate) = read_wav_mono(recording)
                 .context("invalid input: recording must be a readable WAV")?;
-            Ok(serde_json::to_value(detect_markers(
-                &pcm,
-                rate,
-                export_key_for(&handoff.target_digest),
-            )?)?)
+            let detection = detect_markers(&pcm, rate, export_key_for(&handoff.target_digest))?;
+            // The same detections as shared-mapper (#223) anchors on a clock
+            // whose sample 0 is the WAV's first sample.
+            let movie = &handoff.target.movie;
+            let clock = rcdvlog_core::tv_review_sync::SyncMovieClock {
+                movie_digest: movie.blake3.clone(),
+                time_base_numerator: u32::try_from(movie.time_base_numerator)?,
+                time_base_denominator: u32::try_from(movie.time_base_denominator)?,
+                origin_pts: movie.origin_pts,
+                duration_pts: (movie.duration_seconds * movie.time_base_denominator as f64
+                    / movie.time_base_numerator as f64)
+                    .round() as u64,
+            };
+            let capture = rcdvlog_core::tv_review_sync::CaptureClock {
+                clock_id: "recording".into(),
+                sample_rate: rate,
+                first_sample: 0,
+                last_sample: pcm.len() as u64,
+                monotonic_origin_ns: 0,
+                monotonic_tolerance_ns: 0,
+            };
+            let anchors =
+                rcdvlog_core::acoustic_markers::to_sync_anchors(&detection, &capture, &clock)?;
+            Ok(serde_json::json!({
+                "detection": detection,
+                "movieClock": clock,
+                "captureClock": capture,
+                "syncAnchors": anchors,
+            }))
         }
     }
 }

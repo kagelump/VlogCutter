@@ -640,6 +640,72 @@ pub fn resample(input: &[f32], from: u32, to: u32) -> Vec<f32> {
         .collect()
 }
 
+// ── Shared synchronizer input (#223) ───────────────────────────────────
+
+/// Systematic offset allowed between a marker's encoded movie time and the
+/// played picture (AAC priming, mixing, platform re-encode). Measured synthetic
+/// AAC priming stays well inside it; real YouTube/TV playback is unmeasured.
+pub const MARKER_MOVIE_UNCERTAINTY_SECONDS: f64 = 0.05;
+
+/// Convert accepted detections into `acousticTimecode` anchors for the shared
+/// mapper. `pcm[0]` of the detected recording must be `capture.first_sample`
+/// at `capture.sample_rate`. Only CRC/version/key-checked anchors exist in the
+/// report, so their component confidence is high; it is not a calibrated
+/// probability, and a weak symbol margin lowers it below the default threshold.
+pub fn to_sync_anchors(
+    report: &MarkerDetectionReport,
+    capture: &crate::tv_review_sync::CaptureClock,
+    movie: &crate::tv_review_sync::SyncMovieClock,
+) -> Result<Vec<crate::tv_review_sync::SyncAnchor>> {
+    use crate::tv_review_sync::{CapturePosition, SyncAnchor, SyncAnchorSource};
+    let tps = movie.ticks_per_second();
+    let mut anchors = Vec::with_capacity(report.anchors.len());
+    for anchor in &report.anchors {
+        let sample = capture.first_sample
+            + (anchor.recording_seconds * f64::from(capture.sample_rate)).round() as u64;
+        ensure!(
+            sample <= capture.last_sample,
+            "invalid input: detection lies outside the capture clock"
+        );
+        let monotonic_ns = u128::from(capture.monotonic_origin_ns)
+            + u128::from(sample) * 1_000_000_000 / u128::from(capture.sample_rate);
+        ensure!(
+            sample <= 9_007_199_254_740_991 && monotonic_ns <= 9_007_199_254_740_991,
+            "invalid input: resulting capture clock exceeds v1 bounds"
+        );
+        let movie_pts = movie.origin_pts + (anchor.movie_seconds * tps).round() as i64;
+        let identity = serde_json::to_vec(&(
+            "vlogcutter.acoustic-anchor.v1",
+            ACOUSTIC_MARKER_RECIPE,
+            &capture.clock_id,
+            sample,
+            movie_pts,
+            report.expected_export_key,
+        ))?;
+        anchors.push(SyncAnchor {
+            evidence_id: format!("acoustic_{}", blake3::hash(&identity).to_hex()),
+            capture: CapturePosition {
+                clock_id: capture.clock_id.clone(),
+                sample_index: sample,
+                monotonic_ns: monotonic_ns as u64,
+            },
+            movie_pts,
+            source: SyncAnchorSource::AcousticTimecode,
+            confidence: if anchor.min_bit_confidence >= 0.05 {
+                0.99
+            } else {
+                0.6
+            },
+            movie_uncertainty_ticks: (MARKER_MOVIE_UNCERTAINTY_SECONDS * tps).ceil() as u64,
+            capture_uncertainty_samples: (anchor.uncertainty_seconds
+                * f64::from(capture.sample_rate))
+            .ceil() as u32,
+            candidate_group_id: None,
+        });
+    }
+    Ok(anchors)
+}
+
 // ── Marked review copy ─────────────────────────────────────────────────
 
 pub const MARKED_REVIEW_COPY_SCHEMA: &str = "marked-review-copy.v1";

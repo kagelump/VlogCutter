@@ -402,3 +402,82 @@ fn marked_copy_preserves_the_master_and_picture_and_verifies_its_own_markers() {
     );
     assert!(!other.exists());
 }
+
+#[test]
+fn detections_feed_the_shared_mapper_and_a_rewatch_is_not_interpolated() {
+    use crate::tv_review_sync::*;
+    let (movie, plan) = mixed_movie(95.0, IDENTITY);
+    // Watch 0–40 s, seek back to 25 s, watch to the end; mic starts 1 s early.
+    let mut played = movie[..(40.0 * 48_000.0) as usize].to_vec();
+    played.extend_from_slice(&movie[(25.0 * 48_000.0) as usize..]);
+    let heard = recording(&played, 1.0, 0.5, 0.1);
+    let report = detect_markers(&heard, 16_000, plan.export_key).unwrap();
+    let capture = CaptureClock {
+        clock_id: "mic".into(),
+        sample_rate: 16_000,
+        first_sample: 0,
+        last_sample: heard.len() as u64,
+        monotonic_origin_ns: 1_000_000_000,
+        monotonic_tolerance_ns: 2_000_000,
+    };
+    let clock = SyncMovieClock {
+        movie_digest: "c".repeat(64),
+        time_base_numerator: 1,
+        time_base_denominator: 90_000,
+        origin_pts: 90_000,
+        duration_pts: 95 * 90_000,
+    };
+    let anchors = to_sync_anchors(&report, &capture, &clock).unwrap();
+    assert_eq!(anchors.len(), 5);
+    assert!(
+        anchors
+            .iter()
+            .all(|a| a.source == SyncAnchorSource::AcousticTimecode)
+    );
+    assert_eq!(anchors[0].movie_pts, 90_000 + 2 * 90_000);
+    // Distinct evidence even for the same movie time seen twice.
+    assert_ne!(anchors[1].evidence_id, anchors[2].evidence_id);
+    let policy = SyncPolicy {
+        max_anchor_gap_seconds: 31.0,
+        ..Default::default()
+    };
+    let request = SyncRequest {
+        schema_version: 1,
+        session_id: "session_synthetic".into(),
+        target_digest: "b".repeat(64),
+        movie: clock,
+        capture_clocks: vec![capture],
+        anchors: anchors.clone(),
+        boundaries: vec![],
+        policy,
+    };
+    let at = |seconds: f64| SyncQuery {
+        clock_id: "mic".into(),
+        start_sample: (seconds * 16_000.0) as u64,
+        end_sample: (seconds * 16_000.0) as u64,
+    };
+    let first = anchors[0].capture.sample_index as f64 / 16_000.0;
+    let mapped = request
+        .map(&[at(18.0), at(36.0), at(first)], &|| false)
+        .unwrap();
+    // Before the seek: estimated between consistent markers (3 s and 33 s).
+    assert_eq!(
+        mapped.slices[0].state,
+        SyncState::Estimated,
+        "{:?}",
+        mapped.slices[0]
+    );
+    assert_eq!(mapped.slices.last().unwrap().state, SyncState::Anchored);
+    let estimate = &mapped.slices[0].candidates[0];
+    let movie_seconds = (estimate.start_pts - 90_000.0) / 90_000.0;
+    assert!((movie_seconds - 17.0).abs() < 0.01, "{movie_seconds}");
+    // Spanning the seek (33 s → 48 s shows movie 32 s twice): never a 1x estimate.
+    assert!(
+        matches!(
+            mapped.slices[1].state,
+            SyncState::Conflicting | SyncState::Unknown
+        ),
+        "{:?}",
+        mapped.slices[1]
+    );
+}

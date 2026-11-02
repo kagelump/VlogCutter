@@ -140,5 +140,11 @@ The following is local acceptance, not cloud work:
 - Measured alignment error after #223
 
 The synthetic interference is a stand-in for speech, not a speech corpus.
-Server-side detection on stored session audio, and feeding anchors into the
-#225 workspace, are waiting for the shared #223 interface.
+`to_sync_anchors` converts accepted detections into the shared synchronizer's
+`SyncAnchor` (`acousticTimecode`, [shared timing contract](tv-review-sync.md)):
+exact marker movie PTS, ±50 ms movie uncertainty for encoder priming and
+platform re-encode, capture uncertainty from detection timing, and a
+per-detection evidence ID. `review-markers detect` returns them as
+`syncAnchors`. A test maps a rewatch through `tv_review_sync`: the interval
+between consistent markers is `estimated`, and the seek is never interpolated.
+Server-side detection on stored session audio is not wired yet.

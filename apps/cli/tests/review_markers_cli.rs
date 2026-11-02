@@ -167,7 +167,13 @@ fn plan_export_and_detect_round_trip_through_the_cli() {
         wav.to_str().unwrap(),
     ]);
     assert!(ok);
-    let anchors = detection["data"]["anchors"].as_array().unwrap();
+    let sync = detection["data"]["syncAnchors"].as_array().unwrap();
+    assert_eq!(sync.len(), 3);
+    assert!(sync.iter().all(|a| a["source"] == "acousticTimecode"));
+    assert_eq!(sync[1]["moviePts"], 300);
+    let anchors = detection["data"]["detection"]["anchors"]
+        .as_array()
+        .unwrap();
     assert_eq!(
         anchors
             .iter()

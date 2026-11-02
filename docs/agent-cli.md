@@ -1300,7 +1300,13 @@ the master's BLAKE3 and length match the handoff, then writes a create-only
 marked copy (video stream copy, AAC soundtrack with markers) and a path-free
 `<output>.markers.json` lineage manifest. It decodes its own output and
 refuses to publish a copy whose markers or picture stream do not verify.
-`detect --handoff <file> --recording <wav>` returns recording-clock/movie-time
-anchors plus rejected candidates. Commands: `review-markers.plan`,
+`detect --handoff <file> --recording <wav>` returns `detection` (recording-clock/
+movie-time anchors plus rejected candidates) and the same evidence as shared
+`syncAnchors` (`acousticTimecode`) with their `movieClock` and `captureClock`,
+ready for `tv-review sync-preview`. Commands: `review-markers.plan`,
 `review-markers.export`, `review-markers.detect`. See
 [acoustic markers](tv-review-acoustic-markers.md).
+
+`tv-review sync-preview --input <file>` performs bounded catalog-free recording-clock mapping without writes. See [shared timing contract](tv-review-sync.md).
+
+`tv-review soundtrack-reference` and `tv-review soundtrack-match` are bounded local final-mix diagnostics. See [soundtrack matching](tv-soundtrack-matching.md).
