@@ -223,7 +223,7 @@ pub(super) fn validate_snapshot(t: &ReviewTargetSnapshot, target_digest: &str) -
             t.movie.blake3.as_str()
         ]
         .into_iter()
-        .all(|v| digest(v)),
+        .all(digest),
         "invalid input: full BLAKE3 digests required"
     );
     if let Some(id) = &t.youtube_video_id {
