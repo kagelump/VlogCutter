@@ -1064,6 +1064,18 @@ impl ReviewTargets {
         load_detail(&connection, project_id, review_target_id, now)
     }
 
+    /// Read a target inside a caller's transaction (used by the session owner
+    /// so readiness and session creation are evaluated atomically).
+    pub(crate) fn get_in(
+        &self,
+        connection: &Connection,
+        project_id: &str,
+        review_target_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<ReviewTargetDetail, ReviewTargetServiceError> {
+        load_detail(connection, project_id, review_target_id, now)
+    }
+
     /// The stored snapshot as a handoff carrying its latest receipt. Used by
     /// later session/sync owners; it is never re-digested or rewritten.
     pub fn handoff(
@@ -1417,4 +1429,4 @@ pub(crate) fn migrate(tx: &Transaction<'_>) -> anyhow::Result<()> {
 
 #[cfg(test)]
 #[path = "review_targets_tests.rs"]
-mod tests;
+pub(crate) mod tests;

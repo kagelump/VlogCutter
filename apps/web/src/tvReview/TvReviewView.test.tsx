@@ -2,6 +2,12 @@ import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { ProjectClientError, type BrowserProjectClient, type ReviewTargetDetail, type ReviewTargetPreflight } from "@rcdvlog/project-client";
 import { TvReviewView, formatSeconds } from "./TvReviewView";
+import { MemoryOutbox } from "./recording/outbox";
+import type { VoiceDeps } from "./VoiceReview";
+
+function memoryVoice(): VoiceDeps {
+  return { outbox: new MemoryOutbox(), getUserMedia: vi.fn(), listMicrophones: vi.fn(), startRecording: vi.fn() };
+}
 
 const detail: ReviewTargetDetail = {
   reviewTargetId: "rtarget_one",
@@ -38,6 +44,7 @@ function client(overrides: Partial<BrowserProjectClient> = {}): BrowserProjectCl
     getReviewTarget: vi.fn().mockResolvedValue(detail),
     declareReviewTargetYoutube: vi.fn(),
     getReviewTargetCandidates: vi.fn(),
+    listReviewSessions: vi.fn().mockResolvedValue({ items: [], nextBefore: null }),
     ...overrides,
   } as unknown as BrowserProjectClient;
 }
@@ -114,7 +121,7 @@ test("detail shows revision, digest, duration and mapping, and declares a parsed
   const mock = client({
     declareReviewTargetYoutube: vi.fn().mockResolvedValue({ outcome: "created", reviewTarget: { ...detail, reviewTargetId: "rtarget_two" } }),
   });
-  render(<TvReviewView client={mock} path="/tv-review/project_fixture/rtarget_one" navigate={navigate} />);
+  render(<TvReviewView client={mock} path="/tv-review/project_fixture/rtarget_one" navigate={navigate} voice={memoryVoice()} />);
   expect(await screen.findByRole("heading", { name: "Revision editrev_synthetic" })).toBeVisible();
   expect(screen.getByText("Verified measured mapping", { exact: false })).toBeVisible();
   expect(screen.getByText("dddddddddddd…")).toBeVisible();
@@ -133,7 +140,8 @@ test("detail shows revision, digest, duration and mapping, and declares a parsed
 
 test("a stale target blocks new sessions while keeping the snapshot visible", async () => {
   const stale = { ...detail, readiness: { ...detail.readiness, ready: false, freshness: "expired" as const, blockers: ["review_target_verification_expired"] } };
-  render(<TvReviewView client={client({ getReviewTarget: vi.fn().mockResolvedValue(stale) })} path="/tv-review/project_fixture/rtarget_one" navigate={vi.fn()} />);
+  render(<TvReviewView client={client({ getReviewTarget: vi.fn().mockResolvedValue(stale) })} path="/tv-review/project_fixture/rtarget_one" navigate={vi.fn()} voice={memoryVoice()} />);
+  expect(await screen.findByRole("button", { name: "Start voice review" })).toBeDisabled();
   expect(await screen.findByText(/New recording sessions are blocked/)).toBeVisible();
   expect(screen.getByText("Verification expired")).toBeVisible();
   expect(screen.getByRole("heading", { name: "Revision editrev_synthetic" })).toBeVisible();

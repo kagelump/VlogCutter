@@ -12,6 +12,7 @@ pub mod library_query;
 mod media_facts;
 mod replicas;
 mod representations;
+mod review_sessions;
 mod review_targets;
 mod scan;
 pub mod scan_handler;
@@ -90,6 +91,15 @@ pub use representations::{
     PROXY_RECIPE_KEY, Representation, RepresentationError, RepresentationJobHandler,
     RepresentationKind, RepresentationNeed, RepresentationRequest, RepresentationRequestResult,
     RepresentationService, RepresentationState, ServerJobHandler, THUMBNAIL_RECIPE_KEY,
+};
+pub use review_sessions::{
+    ChunkReceipt, ChunkUpload, CreateReviewSessionRequest, FinalizeReviewSessionRequest,
+    FrameRange, REVIEW_SESSION_LIST_MAX_LIMIT, REVIEW_SESSION_MAX_ACTIVE, REVIEW_SESSION_MAX_BYTES,
+    REVIEW_SESSION_MAX_CHUNK_BYTES, RecordingAudioFormat, RecordingCaptureSettings,
+    RecordingConsent, RecordingEndReason, ReviewSessionAudio, ReviewSessionCoverage,
+    ReviewSessionDetail, ReviewSessionError, ReviewSessionEvent, ReviewSessionEventKind,
+    ReviewSessionEventRequest, ReviewSessionPage, ReviewSessionState, ReviewSessionSummary,
+    ReviewSessions, wav_header,
 };
 pub use review_targets::{
     ArtifactAvailabilityAssertion, ArtifactAvailabilityState, ImportOutcome, PreflightOutcome,

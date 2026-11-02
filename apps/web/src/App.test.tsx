@@ -86,6 +86,14 @@ function client(session: SessionState): BrowserProjectClient {
     getReviewTarget: vi.fn(),
     declareReviewTargetYoutube: vi.fn(),
     getReviewTargetCandidates: vi.fn(),
+    listReviewSessions: vi.fn().mockResolvedValue({ items: [], nextBefore: null }),
+    createReviewSession: vi.fn(),
+    getReviewSession: vi.fn(),
+    putReviewSessionChunk: vi.fn(),
+    recordReviewSessionEvent: vi.fn(),
+    finalizeReviewSession: vi.fn(),
+    deleteReviewSession: vi.fn(),
+    reviewSessionAudioUrl: vi.fn().mockReturnValue("/audio.wav"),
   };
 }
 

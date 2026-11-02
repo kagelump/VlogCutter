@@ -19,6 +19,14 @@ import {
   type ProjectPage,
   type ProjectSyncOverview,
   type RepresentationBatchResult,
+  type CreateReviewSessionRequest,
+  type RecordingEndReason,
+  type ReviewSessionChunkReceipt,
+  type ReviewSessionChunkUpload,
+  type ReviewSessionDetail,
+  type ReviewSessionEvent,
+  type ReviewSessionEventRequest,
+  type ReviewSessionPage,
   type ReviewTargetCandidates,
   type ReviewTargetDetail,
   type ReviewTargetImportRequest,
@@ -200,6 +208,18 @@ export class HttpProjectClient implements BrowserProjectClient {
   async getReviewTarget(projectId: string, reviewTargetId: string): Promise<ReviewTargetDetail> { return this.request(reviewTargetPath(API_PATHS.reviewTarget, projectId, reviewTargetId)); }
   async declareReviewTargetYoutube(projectId: string, reviewTargetId: string, youtubeVideoId: string | null): Promise<ReviewTargetImportResult> { return this.request(reviewTargetPath(API_PATHS.reviewTargetYoutube, projectId, reviewTargetId), jsonPost({ youtubeVideoId })); }
   async getReviewTargetCandidates(projectId: string, reviewTargetId: string, startSeconds: number, endSeconds: number): Promise<ReviewTargetCandidates> { return this.request(`${reviewTargetPath(API_PATHS.reviewTargetCandidates, projectId, reviewTargetId)}${queryString({ startSeconds, endSeconds })}`); }
+  async listReviewSessions(projectId: string, reviewTargetId?: string, limit = 50, before?: number): Promise<ReviewSessionPage> { return this.request(`${pathParam(API_PATHS.reviewSessions, "projectId", projectId)}${queryString({ reviewTargetId, limit, before })}`); }
+  async createReviewSession(projectId: string, request: CreateReviewSessionRequest): Promise<ReviewSessionDetail> { return this.request(pathParam(API_PATHS.reviewSessions, "projectId", projectId), jsonPost(request)); }
+  async getReviewSession(projectId: string, sessionId: string): Promise<ReviewSessionDetail> { return this.request(sessionPath(API_PATHS.reviewSession, projectId, sessionId)); }
+  async putReviewSessionChunk(projectId: string, sessionId: string, chunk: ReviewSessionChunkUpload, bytes: Uint8Array): Promise<ReviewSessionChunkReceipt> {
+    const path = pathParam(sessionPath(API_PATHS.reviewSessionChunk, projectId, sessionId), "sequence", String(chunk.sequence));
+    const query = queryString({ startFrame: chunk.startFrame, frameCount: chunk.frameCount, sha256: chunk.sha256, captureEndMs: chunk.captureEndMs ?? undefined });
+    return this.request(`${path}${query}`, { method: "PUT", headers: { "content-type": "application/octet-stream" }, body: bytes as unknown as BodyInit });
+  }
+  async recordReviewSessionEvent(projectId: string, sessionId: string, event: ReviewSessionEventRequest): Promise<ReviewSessionEvent> { return this.request(sessionPath(API_PATHS.reviewSessionEvents, projectId, sessionId), jsonPost(event)); }
+  async finalizeReviewSession(projectId: string, sessionId: string, request: { finalFrameCount: number; endReason: RecordingEndReason }): Promise<ReviewSessionDetail> { return this.request(sessionPath(API_PATHS.reviewSessionFinalize, projectId, sessionId), jsonPost(request)); }
+  async deleteReviewSession(projectId: string, sessionId: string): Promise<ReviewSessionDetail> { return this.request(sessionPath(API_PATHS.reviewSession, projectId, sessionId), { method: "DELETE" }); }
+  reviewSessionAudioUrl(projectId: string, sessionId: string): string { return `${this.baseUrl}${sessionPath(API_PATHS.reviewSessionAudio, projectId, sessionId)}`; }
   async revokeSession(sessionId: string): Promise<void> { await this.request(pathParam(API_PATHS.revokeSession, "sessionId", sessionId), { method: "DELETE" }); }
 
   private async request<T>(
@@ -250,6 +270,10 @@ function reviewPath(template: string, projectId: string, assetId: string): strin
 
 function reviewTargetPath(template: string, projectId: string, reviewTargetId: string): string {
   return pathParam(pathParam(template, "projectId", projectId), "reviewTargetId", reviewTargetId);
+}
+
+function sessionPath(template: string, projectId: string, sessionId: string): string {
+  return pathParam(pathParam(template, "projectId", projectId), "sessionId", sessionId);
 }
 
 function queryString(values: object): string {

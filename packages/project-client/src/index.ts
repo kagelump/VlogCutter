@@ -336,6 +336,109 @@ export interface ReviewTargetPage { items: ReviewTargetSummary[]; nextBefore: nu
 export interface ReviewTargetImportResult { outcome: "created" | "reused" | "refreshed"; reviewTarget: ReviewTargetDetail }
 export interface ReviewTargetCandidates { reviewTargetId: string; startSeconds: number; endSeconds: number; operationIds: string[] }
 
+// TV voice-review recording sessions (#222). Mirrors rcdvlog-server-core::review_sessions.
+export type ReviewSessionState = "recording" | "completed" | "incomplete" | "corrupt" | "deleted";
+export type RecordingEndReason = "stopped" | "deviceLost" | "interrupted" | "cancelled";
+export type ReviewSessionEventKind = "manualSyncCue" | "captureDiscontinuity" | "localBufferOverflow" | "deviceLost" | "pageInterrupted" | "clockSample";
+
+export interface CreateReviewSessionRequest {
+  reviewTargetId: string;
+  clientSessionKey: string;
+  consent: { allPresentAcknowledged: boolean; additionalSpeakersDisclosed: boolean };
+  audio: { sampleRate: number; channels: number; encoding: "pcm_s16le" };
+  capture: {
+    echoCancellation: boolean | null;
+    noiseSuppression: boolean | null;
+    autoGainControl: boolean | null;
+    clock: string;
+    baseLatencySeconds: number | null;
+    userAgentFamily: string | null;
+  };
+  clientStartedPerformanceMs: number | null;
+}
+
+export interface ReviewSessionChunkUpload {
+  sequence: number;
+  startFrame: number;
+  frameCount: number;
+  sha256: string;
+  captureEndMs?: number | null;
+}
+
+export interface ReviewSessionChunkReceipt {
+  sessionId: string;
+  sequence: number;
+  startFrame: number;
+  frameCount: number;
+  sha256: string;
+  receivedAt: string;
+  duplicate: boolean;
+}
+
+export interface ReviewSessionEventRequest {
+  eventId: string;
+  kind: ReviewSessionEventKind;
+  audioFrame: number;
+  performanceMs?: number | null;
+  declaredMovieSeconds?: number | null;
+  detail?: Record<string, unknown> | null;
+}
+
+export interface ReviewSessionEvent {
+  eventId: string;
+  kind: ReviewSessionEventKind;
+  audioFrame: number;
+  audioSeconds: number;
+  performanceMs: number | null;
+  declaredMovieSeconds: number | null;
+  serverReceivedAt: string;
+  detail: Record<string, unknown> | null;
+}
+
+export interface ReviewSessionSummary {
+  sessionId: string;
+  projectId: string;
+  reviewTargetId: string;
+  targetDigest: string;
+  revisionId: string;
+  viewedArtifactId: string;
+  state: ReviewSessionState;
+  abandoned: boolean;
+  endReason: RecordingEndReason | null;
+  sampleRate: number;
+  channels: number;
+  encoding: string;
+  createdAt: string;
+  finalizedAt: string | null;
+  deletedAt: string | null;
+  receivedSeconds: number;
+  manualCueCount: number;
+}
+
+export interface ReviewSessionDetail extends ReviewSessionSummary {
+  consent: { allPresentAcknowledged: boolean; additionalSpeakersDisclosed: boolean };
+  capture: CreateReviewSessionRequest["capture"];
+  createdBy: ReviewTargetActor;
+  clientStartedPerformanceMs: number | null;
+  recordingExpiresAt: string;
+  coverage: {
+    receivedFrames: number;
+    receivedBytes: number;
+    chunkCount: number;
+    highestSequence: number | null;
+    missingSequences: number[];
+    gaps: Array<{ startFrame: number; endFrame: number }>;
+    finalFrameCount: number | null;
+    receivedSeconds: number;
+  };
+  chunks: Array<{ sequence: number; startFrame: number; frameCount: number; byteLength: number; sha256: string; receivedAt: string; captureEndPerformanceMs: number | null }>;
+  events: ReviewSessionEvent[];
+  limits: { maxChunkBytes: number; maxSessionBytes: number; recordingLifetimeHours: number };
+  storage: { location: string; retention: string; backup: string };
+}
+
+export interface ReviewSessionPage { items: ReviewSessionSummary[]; nextBefore: number | null }
+
 export interface BrowserProjectClient extends ProjectClient {
   getSession(): Promise<SessionState>;
   loginWithBootstrapCode(code: string, hostname?: string): Promise<LoginResult>;
@@ -380,6 +483,14 @@ export interface BrowserProjectClient extends ProjectClient {
   getReviewTarget(projectId: string, reviewTargetId: string): Promise<ReviewTargetDetail>;
   declareReviewTargetYoutube(projectId: string, reviewTargetId: string, youtubeVideoId: string | null): Promise<ReviewTargetImportResult>;
   getReviewTargetCandidates(projectId: string, reviewTargetId: string, startSeconds: number, endSeconds: number): Promise<ReviewTargetCandidates>;
+  listReviewSessions(projectId: string, reviewTargetId?: string, limit?: number, before?: number): Promise<ReviewSessionPage>;
+  createReviewSession(projectId: string, request: CreateReviewSessionRequest): Promise<ReviewSessionDetail>;
+  getReviewSession(projectId: string, sessionId: string): Promise<ReviewSessionDetail>;
+  putReviewSessionChunk(projectId: string, sessionId: string, chunk: ReviewSessionChunkUpload, bytes: Uint8Array): Promise<ReviewSessionChunkReceipt>;
+  recordReviewSessionEvent(projectId: string, sessionId: string, event: ReviewSessionEventRequest): Promise<ReviewSessionEvent>;
+  finalizeReviewSession(projectId: string, sessionId: string, request: { finalFrameCount: number; endReason: RecordingEndReason }): Promise<ReviewSessionDetail>;
+  deleteReviewSession(projectId: string, sessionId: string): Promise<ReviewSessionDetail>;
+  reviewSessionAudioUrl(projectId: string, sessionId: string): string;
 }
 
 export function assertProtocolCompatible(version: ServerVersion): void {

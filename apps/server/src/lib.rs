@@ -1,6 +1,7 @@
 #![recursion_limit = "256"]
 
 mod job_callback_http;
+mod review_session_http;
 mod review_target_http;
 
 use anyhow::{Context, Result, anyhow};
@@ -611,7 +612,9 @@ async fn security_headers(request: Request<Body>, next: Next) -> Response {
     );
     headers.insert(
         header::HeaderName::from_static("permissions-policy"),
-        HeaderValue::from_static("camera=(), microphone=(), geolocation=()"),
+        // Microphone is allowed for this origin only: TV voice review (#222)
+        // records from Chrome. Camera and geolocation stay disabled.
+        HeaderValue::from_static("camera=(), microphone=(self), geolocation=()"),
     );
     response
 }
@@ -887,6 +890,7 @@ pub fn router(state: HttpState) -> Router {
         .merge(auth_session)
         .merge(internal)
         .merge(review_targets)
+        .merge(review_session_http::routes(&state))
         .fallback(web_or_not_found)
         .with_state(state.clone())
         .layer(DefaultBodyLimit::max(MAX_HTTP_BODY_BYTES))
@@ -901,6 +905,7 @@ pub fn router(state: HttpState) -> Router {
 pub fn openapi_document() -> serde_json::Value {
     let mut document = base_openapi_document();
     review_target_http::openapi_extend(&mut document);
+    review_session_http::openapi_extend(&mut document);
     document
 }
 
@@ -6071,5 +6076,267 @@ mod tests {
                 .iter()
                 .any(|e| e.action == "review_target.youtube_declared")
         );
+    }
+
+    #[tokio::test]
+    async fn review_session_routes_record_hashed_chunks_finalize_and_delete_privately() {
+        use sha2::Digest;
+        let fixture = Fixture::new(false);
+        let source = TempDir::new().unwrap();
+        let envelope = baseline_envelope(&source);
+        let project_id = envelope.payload.project.project_id.clone();
+        fixture
+            .foundation
+            .catalog()
+            .project_replicas()
+            .import_baseline(&envelope)
+            .unwrap();
+        let (session_id, session_token, csrf) = browser_auth(&fixture);
+        let cookie = format!("rcdvlog_session={session_id}:{session_token}");
+        let target = fixture
+            .foundation
+            .catalog()
+            .review_targets()
+            .import(
+                &project_id,
+                &rcdvlog_server_core::ReviewTargetImportRequest {
+                    handoff: review_target_handoff(&project_id, None),
+                    declared_issuer: None,
+                    availability: None,
+                    max_verification_age_seconds: None,
+                },
+                &rcdvlog_server_core::ReviewTargetActor::new(
+                    AuditActorType::BrowserSession,
+                    &session_id,
+                ),
+                chrono::Utc::now(),
+            )
+            .unwrap()
+            .review_target
+            .summary
+            .review_target_id;
+        let base = format!("/api/v1/projects/{project_id}/review-sessions");
+        let send =
+            |method: Method, uri: String, content_type: &str, body: Vec<u8>, csrf: Option<&str>| {
+                let mut builder = Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header(header::CONTENT_TYPE, content_type)
+                    .header(header::COOKIE, &cookie);
+                if let Some(csrf) = csrf {
+                    builder = builder.header("x-csrf-token", csrf);
+                }
+                builder.body(Body::from(body)).unwrap()
+            };
+        let create = serde_json::json!({
+            "reviewTargetId": target,
+            "clientSessionKey": "browser_key_1",
+            "consent": {"allPresentAcknowledged": true, "additionalSpeakersDisclosed": true},
+            "audio": {"sampleRate": 48000, "channels": 1, "encoding": "pcm_s16le"},
+            "capture": {"echoCancellation": false, "noiseSuppression": false, "autoGainControl": false,
+                        "clock": "audioWorkletCurrentFrame", "baseLatencySeconds": null, "userAgentFamily": "chromium"},
+            "clientStartedPerformanceMs": 10.0
+        });
+        let created = fixture
+            .app()
+            .oneshot(send(
+                Method::POST,
+                base.clone(),
+                "application/json",
+                serde_json::to_vec(&create).unwrap(),
+                Some(&csrf),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::OK);
+        assert_eq!(
+            created.headers().get("permissions-policy").unwrap(),
+            "camera=(), microphone=(self), geolocation=()"
+        );
+        let created = json(created).await;
+        let id = created["sessionId"].as_str().unwrap().to_string();
+        assert_eq!(created["state"], "recording");
+        assert!(
+            !serde_json::to_string(&created)
+                .unwrap()
+                .contains("review-evidence")
+        );
+
+        let pcm: Vec<u8> = (0..4800_i16).flat_map(|v| v.to_le_bytes()).collect();
+        let sha: String = sha2::Sha256::digest(&pcm)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let chunk_uri = format!(
+            "{base}/{id}/chunks/0?startFrame=0&frameCount=4800&sha256={sha}&captureEndMs=110.5"
+        );
+        let no_csrf = fixture
+            .app()
+            .oneshot(send(
+                Method::PUT,
+                chunk_uri.clone(),
+                "application/octet-stream",
+                pcm.clone(),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(no_csrf.status(), StatusCode::FORBIDDEN);
+        let stored = fixture
+            .app()
+            .oneshot(send(
+                Method::PUT,
+                chunk_uri.clone(),
+                "application/octet-stream",
+                pcm.clone(),
+                Some(&csrf),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(stored.status(), StatusCode::OK);
+        assert_eq!(json(stored).await["duplicate"], false);
+        let retry = fixture
+            .app()
+            .oneshot(send(
+                Method::PUT,
+                chunk_uri,
+                "application/octet-stream",
+                pcm.clone(),
+                Some(&csrf),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(json(retry).await["duplicate"], true);
+        let corrupt = fixture
+            .app()
+            .oneshot(send(
+                Method::PUT,
+                format!("{base}/{id}/chunks/1?startFrame=4800&frameCount=4800&sha256={sha}"),
+                "application/octet-stream",
+                vec![1; 9600],
+                Some(&csrf),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(corrupt.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(json(corrupt).await["code"], "review_session_chunk_corrupt");
+
+        let cue = fixture
+            .app()
+            .oneshot(send(
+                Method::POST,
+                format!("{base}/{id}/events"),
+                "application/json",
+                serde_json::to_vec(&serde_json::json!({"eventId":"cue_1","kind":"manualSyncCue","audioFrame":2400,"performanceMs":60.0,"declaredMovieSeconds":0.0})).unwrap(),
+                Some(&csrf),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(cue.status(), StatusCode::OK);
+
+        let early_audio = fixture
+            .app()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("{base}/{id}/audio.wav"))
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(early_audio.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            json(early_audio).await["code"],
+            "review_session_audio_unavailable"
+        );
+
+        let finalized = fixture
+            .app()
+            .oneshot(send(
+                Method::POST,
+                format!("{base}/{id}/finalize"),
+                "application/json",
+                serde_json::to_vec(
+                    &serde_json::json!({"finalFrameCount":4800,"endReason":"stopped"}),
+                )
+                .unwrap(),
+                Some(&csrf),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(finalized.status(), StatusCode::OK);
+        let finalized = json(finalized).await;
+        assert_eq!(finalized["state"], "completed");
+        assert_eq!(finalized["manualCueCount"], 1);
+
+        let audio = fixture
+            .app()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("{base}/{id}/audio.wav"))
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(audio.status(), StatusCode::OK);
+        assert_eq!(
+            audio.headers().get(header::CONTENT_TYPE).unwrap(),
+            "audio/wav"
+        );
+        let wav = axum::body::to_bytes(audio.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&wav[0..4], b"RIFF");
+        assert_eq!(&wav[44..], pcm.as_slice());
+
+        let deleted = fixture
+            .app()
+            .oneshot(send(
+                Method::DELETE,
+                format!("{base}/{id}"),
+                "application/json",
+                vec![],
+                Some(&csrf),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(json(deleted).await["state"], "deleted");
+        let gone = fixture
+            .app()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("{base}/{id}/audio.wav"))
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(gone.status(), StatusCode::CONFLICT);
+        let anonymous = fixture
+            .app()
+            .oneshot(Request::builder().uri(&base).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+        let events = fixture
+            .foundation
+            .catalog()
+            .audit_log()
+            .list(20, None)
+            .unwrap();
+        for action in [
+            "review_session.started",
+            "review_session.finalized",
+            "review_session.deleted",
+        ] {
+            assert!(
+                events.iter().any(|e| e.action == action),
+                "missing {action}"
+            );
+        }
     }
 }

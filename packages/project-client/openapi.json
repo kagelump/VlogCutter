@@ -381,6 +381,113 @@
         ],
         "type": "object"
       },
+      "CreateReviewSessionRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "audio": {
+            "additionalProperties": false,
+            "properties": {
+              "channels": {
+                "maximum": 2,
+                "minimum": 1,
+                "type": "integer"
+              },
+              "encoding": {
+                "const": "pcm_s16le"
+              },
+              "sampleRate": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "sampleRate",
+              "channels",
+              "encoding"
+            ],
+            "type": "object"
+          },
+          "capture": {
+            "additionalProperties": false,
+            "properties": {
+              "autoGainControl": {
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "baseLatencySeconds": {
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "clock": {
+                "type": "string"
+              },
+              "echoCancellation": {
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "noiseSuppression": {
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "userAgentFamily": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "clock"
+            ],
+            "type": "object"
+          },
+          "clientSessionKey": {
+            "pattern": "^[A-Za-z0-9_-]{1,64}$",
+            "type": "string"
+          },
+          "clientStartedPerformanceMs": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "consent": {
+            "additionalProperties": false,
+            "properties": {
+              "additionalSpeakersDisclosed": {
+                "type": "boolean"
+              },
+              "allPresentAcknowledged": {
+                "const": true,
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "allPresentAcknowledged",
+              "additionalSpeakersDisclosed"
+            ],
+            "type": "object"
+          },
+          "reviewTargetId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "reviewTargetId",
+          "clientSessionKey",
+          "consent",
+          "audio",
+          "capture"
+        ],
+        "type": "object"
+      },
       "Error": {
         "properties": {
           "code": {
@@ -393,6 +500,29 @@
         "required": [
           "requestId",
           "code"
+        ],
+        "type": "object"
+      },
+      "FinalizeReviewSessionRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "endReason": {
+            "enum": [
+              "stopped",
+              "deviceLost",
+              "interrupted",
+              "cancelled"
+            ],
+            "type": "string"
+          },
+          "finalFrameCount": {
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "finalFrameCount",
+          "endReason"
         ],
         "type": "object"
       },
@@ -992,6 +1122,86 @@
           "representationId",
           "state",
           "availableOnServer"
+        ],
+        "type": "object"
+      },
+      "ReviewSessionChunkReceipt": {
+        "additionalProperties": true,
+        "type": "object"
+      },
+      "ReviewSessionDetail": {
+        "additionalProperties": true,
+        "type": "object"
+      },
+      "ReviewSessionEvent": {
+        "additionalProperties": true,
+        "type": "object"
+      },
+      "ReviewSessionEventRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "audioFrame": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "declaredMovieSeconds": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "detail": {
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "eventId": {
+            "type": "string"
+          },
+          "kind": {
+            "enum": [
+              "manualSyncCue",
+              "captureDiscontinuity",
+              "localBufferOverflow",
+              "deviceLost",
+              "pageInterrupted",
+              "clockSample"
+            ],
+            "type": "string"
+          },
+          "performanceMs": {
+            "type": [
+              "number",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "eventId",
+          "kind",
+          "audioFrame"
+        ],
+        "type": "object"
+      },
+      "ReviewSessionPage": {
+        "properties": {
+          "items": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "nextBefore": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "items"
         ],
         "type": "object"
       },
@@ -2517,6 +2727,495 @@
             "$ref": "#/components/responses/Error"
           },
           "401": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/v1/projects/{projectId}/review-sessions": {
+      "get": {
+        "operationId": "listReviewSessions",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "projectId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "reviewTargetId",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "schema": {
+              "maximum": 200,
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "before",
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReviewSessionPage"
+                }
+              }
+            },
+            "description": "ReviewSessionPage"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "post": {
+        "description": "Start a private recording session bound to a ready, imported review target. Idempotent by clientSessionKey.",
+        "operationId": "createReviewSession",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "projectId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateReviewSessionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReviewSessionDetail"
+                }
+              }
+            },
+            "description": "ReviewSessionDetail"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/v1/projects/{projectId}/review-sessions/{sessionId}": {
+      "delete": {
+        "description": "Permanently delete the recorded audio; a metadata tombstone remains.",
+        "operationId": "deleteReviewSession",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "projectId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "sessionId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReviewSessionDetail"
+                }
+              }
+            },
+            "description": "ReviewSessionDetail"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "get": {
+        "operationId": "getReviewSession",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "projectId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "sessionId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReviewSessionDetail"
+                }
+              }
+            },
+            "description": "ReviewSessionDetail"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/v1/projects/{projectId}/review-sessions/{sessionId}/audio.wav": {
+      "get": {
+        "description": "WAV of a completed session only. Incomplete audio is never padded.",
+        "operationId": "getReviewSessionAudio",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "projectId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "sessionId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "audio/wav": {
+                "schema": {
+                  "format": "binary",
+                  "type": "string"
+                }
+              }
+            },
+            "description": "WAV audio"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/v1/projects/{projectId}/review-sessions/{sessionId}/chunks/{sequence}": {
+      "get": {
+        "operationId": "getReviewSessionChunk",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "projectId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "sessionId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "sequence",
+            "required": true,
+            "schema": {
+              "minimum": 0,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/octet-stream": {
+                "schema": {
+                  "format": "binary",
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Stored chunk bytes"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "put": {
+        "description": "Upload one pcm_s16le chunk. Idempotent for identical content; conflicting or overlapping chunks return 409.",
+        "operationId": "putReviewSessionChunk",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "projectId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "sessionId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "sequence",
+            "required": true,
+            "schema": {
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "startFrame",
+            "required": true,
+            "schema": {
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "frameCount",
+            "required": true,
+            "schema": {
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "sha256",
+            "required": true,
+            "schema": {
+              "pattern": "^[0-9a-fA-F]{64}$",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "captureEndMs",
+            "schema": {
+              "minimum": 0,
+              "type": "number"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/octet-stream": {
+              "schema": {
+                "format": "binary",
+                "maxLength": 2097152,
+                "type": "string"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReviewSessionChunkReceipt"
+                }
+              }
+            },
+            "description": "ReviewSessionChunkReceipt"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "413": {
+            "$ref": "#/components/responses/Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error"
+          },
+          "507": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/v1/projects/{projectId}/review-sessions/{sessionId}/events": {
+      "post": {
+        "operationId": "recordReviewSessionEvent",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "projectId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "sessionId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReviewSessionEventRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReviewSessionEvent"
+                }
+              }
+            },
+            "description": "ReviewSessionEvent"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/v1/projects/{projectId}/review-sessions/{sessionId}/finalize": {
+      "post": {
+        "operationId": "finalizeReviewSession",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "projectId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "sessionId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FinalizeReviewSessionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReviewSessionDetail"
+                }
+              }
+            },
+            "description": "ReviewSessionDetail"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
             "$ref": "#/components/responses/Error"
           }
         }

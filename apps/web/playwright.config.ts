@@ -32,7 +32,14 @@ export default defineConfig({
   use: {
     baseURL,
     ...devices["Desktop Chrome"],
-    launchOptions: executablePath ? { executablePath } : undefined,
+    // TV voice review (#222) records from a synthetic microphone in CI: Chrome's
+    // fake capture device produces a deterministic tone, and the permission is
+    // granted up front. Real-device capture is a separate manual acceptance.
+    permissions: ["microphone"],
+    launchOptions: {
+      ...(executablePath ? { executablePath } : {}),
+      args: ["--use-fake-ui-for-media-stream", "--use-fake-device-for-media-stream"],
+    },
   },
   webServer: external ? undefined : {
     command: "node ../../scripts/start-web-e2e-server.mjs",

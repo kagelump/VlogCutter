@@ -66,6 +66,12 @@ export const API_PATHS = {
   reviewTarget: "/api/v1/projects/{projectId}/review-targets/{reviewTargetId}",
   reviewTargetYoutube: "/api/v1/projects/{projectId}/review-targets/{reviewTargetId}/youtube",
   reviewTargetCandidates: "/api/v1/projects/{projectId}/review-targets/{reviewTargetId}/candidates",
+  reviewSessions: "/api/v1/projects/{projectId}/review-sessions",
+  reviewSession: "/api/v1/projects/{projectId}/review-sessions/{sessionId}",
+  reviewSessionChunk: "/api/v1/projects/{projectId}/review-sessions/{sessionId}/chunks/{sequence}",
+  reviewSessionEvents: "/api/v1/projects/{projectId}/review-sessions/{sessionId}/events",
+  reviewSessionFinalize: "/api/v1/projects/{projectId}/review-sessions/{sessionId}/finalize",
+  reviewSessionAudio: "/api/v1/projects/{projectId}/review-sessions/{sessionId}/audio.wav",
 } as const;
 `;
 const schemaPath = resolve(root, "packages/project-client/openapi.json");

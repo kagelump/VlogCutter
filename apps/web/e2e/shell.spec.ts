@@ -140,3 +140,107 @@ test("Chrome imports a verified TV review target through the real server and dec
   await page.getByRole("button", { name: "Check handoff" }).click();
   await expect(page.getByText("Identical target already imported.")).toBeVisible();
 });
+
+async function openSeededTarget(page: import("@playwright/test").Page, code: string) {
+  const baseURL = process.env.RCDVLOG_WEB_E2E_BASE_URL;
+  if (!baseURL) throw new Error("web e2e: no RCDVLOG_WEB_E2E_BASE_URL");
+  const handoff = readFileSync(reviewTargetHandoffPath(baseURL), "utf8");
+  await page.goto("/");
+  await page.getByLabel("Bootstrap code").fill(code);
+  await page.getByRole("button", { name: "Open review desk" }).click();
+  await page.getByRole("link", { name: "TV review" }).click();
+  await page.locator(".project-list button").first().click();
+  await page.getByLabel("Handoff JSON").fill(handoff);
+  await page.getByRole("button", { name: "Check handoff" }).click();
+  await page.getByRole("button", { name: /Import target|Open existing target/ }).click();
+  await expect(page.getByRole("heading", { name: "Revision editrev_synthetic" })).toBeVisible();
+}
+
+async function startRecording(page: import("@playwright/test").Page) {
+  await page.getByRole("button", { name: "Start voice review" }).click();
+  await expect(page.getByRole("heading", { name: "Record a TV review" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "● Record" })).toBeDisabled();
+  await page.getByRole("button", { name: "Allow microphone" }).click();
+  await expect(page.getByLabel("Input device")).toBeVisible();
+  await page.getByLabel(/Everyone present knows/).check();
+  await page.getByRole("button", { name: "● Record" }).click();
+  await expect(page.locator(".tv-recording-indicator")).toBeVisible();
+}
+
+test("Chrome records a fake-microphone voice review with a manual cue and reopens it", async ({ page }) => {
+  // Includes real-time capture, authenticated requests, recovery and deletion.
+  test.setTimeout(60_000);
+  await openSeededTarget(page, bootstrapCode(5));
+  await startRecording(page);
+  await page.waitForTimeout(1_500);
+  await page.keyboard.press("m");
+  await page.waitForTimeout(3_000);
+  await expect(page.locator(".tv-recorder-facts")).toContainText(/Uploaded\s*[1-9]/);
+  await page.getByRole("button", { name: "■ Stop" }).click();
+  await expect(page.getByRole("heading", { name: "Voice review session" })).toBeVisible({ timeout: 30_000 });
+  await expect(page.getByText("Completed", { exact: true })).toBeVisible();
+  await expect(page.getByText(/reviewer declaration, not measured sync/)).toBeVisible();
+  await expect(page.getByText(/echo cancellation false/)).toBeVisible();
+  // Sample-clock / performance-clock pairs were queued, posted and kept.
+  await expect(page.getByText(/sample\/performance clock pairs across 1 clock epoch$/)).toBeVisible();
+
+  const href = await page.getByRole("link", { name: "Download WAV" }).getAttribute("href");
+  // Fetch from the page so the browser's own session cookie is used.
+  const download = (url: string) => page.evaluate(async (target) => {
+    const response = await fetch(target);
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    return { status: response.status, length: bytes.length, magic: String.fromCharCode(...bytes.subarray(0, 4)) };
+  }, url);
+  const wav = await download(href!);
+  expect(wav.status).toBe(200);
+  expect(wav.magic).toBe("RIFF");
+  const sessionApi=href!.replace(/\/audio\.wav$/,"");
+  const evidence=await page.evaluate(async(url)=>{const response=await fetch(url);return response.json();},sessionApi);
+  const detail=evidence;
+  const calibrations=detail.events.filter((e:{kind:string})=>e.kind==="clockSample");
+  expect(calibrations.length).toBeGreaterThan(0);
+  expect(calibrations[0].detail).toMatchObject({schema:"review-capture-calibration.v1",method:"workletProbeBracket",clockId:"mic_epoch_0",sampleRate:48000,firstSample:0});
+  expect(calibrations[0].detail.monotonicToleranceNs).toBeLessThan(1_000_000_000);
+  expect(calibrations[0].detail.probeSentNs).toBeLessThanOrEqual(calibrations[0].detail.probeReceivedNs);
+  expect(detail.coverage.finalFrameCount*detail.channels*2).toBe(wav.length-44);
+
+  // Native 48 kHz PCM16: more than four seconds of audio, preserving channels.
+  expect(wav.length - 44).toBeGreaterThan(4 * 48_000 * 2 * 0.9);
+
+  // Reopen from the target's session list.
+  await page.getByRole("button", { name: "Back to target" }).click();
+  await page.locator(".tv-voice-start .project-list button").first().click();
+  await expect(page.getByText("Completed", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Delete recording…" }).click();
+  await page.getByRole("button", { name: "Delete audio permanently" }).click();
+  await expect(page.getByText(/Audio deleted/)).toBeVisible();
+  expect((await download(href!)).status).toBe(409);
+});
+
+test("Chrome recovers a recording interrupted by a page reload and finalizes it honestly", async ({ page }) => {
+  // Includes real-time capture, authenticated requests, recovery and deletion.
+  test.setTimeout(60_000);
+  await openSeededTarget(page, bootstrapCode(6));
+  const targetUrl = page.url();
+  await startRecording(page);
+  await page.waitForTimeout(2_500);
+  // Audio remains online while event posts fail. The saved cue must survive
+  // page replacement in the real IndexedDB outbox before recovery retries it.
+  await page.route("**/review-sessions/*/events",route=>route.abort("failed"));
+  await page.keyboard.press("m");
+  await expect(page.locator(".tv-recorder-facts")).toContainText(/Cues\s*1/);
+  await page.waitForTimeout(500);
+  await page.reload();
+  await page.goto(targetUrl);
+  const recovery = page.getByRole("region", { name: "Unfinished recordings" });
+  await expect(recovery).toBeVisible();
+  await page.unroute("**/review-sessions/*/events");
+  await recovery.getByRole("button", { name: "Resume upload and finalize" }).click();
+  await expect(page.getByText("Buffered recordings uploaded and finalized.")).toBeVisible({ timeout: 30_000 });
+  await page.reload();
+  await page.locator(".tv-voice-start .project-list button").first().click();
+  await expect(page.getByRole("heading", { name: "Voice review session" })).toBeVisible();
+  await expect(page.getByText(/^interrupted/)).toBeVisible();
+  await expect(page.getByText("Incomplete",{exact:true})).toBeVisible();
+  await expect(page.getByText(/reviewer declaration, not measured sync/)).toBeVisible();
+});
