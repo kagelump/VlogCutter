@@ -32,7 +32,8 @@ verified target (or separately authorized historical review policy). It is a
 caller assertion; the matcher cannot authenticate the issuer or validate an
 edit plan. `SoundtrackIndex::from_movie` freshly hashes that entire local movie
 and checks the declared digest before decoding only its final mixed first audio
-stream. It retains the reference window offset on the movie clock.
+stream with FFmpeg restricted to local file/pipe protocols; playlists cannot
+fetch network media. Inputs must be regular local files. It retains the reference window offset on the movie clock.
 `from_pcm` is a low-level controlled-fixture/decoder adapter and does not
 independently verify movie bytes. Do not label arbitrary PCM as a verified movie.
 

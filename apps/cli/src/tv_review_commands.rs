@@ -47,6 +47,11 @@ struct PreviewInput {
     target: Option<ReviewTargetHandoff>,
 }
 fn read_bytes(path: &Path, limit: usize) -> Result<Vec<u8>> {
+    let metadata = std::fs::metadata(path)?;
+    ensure!(
+        metadata.is_file() && metadata.len() <= limit as u64,
+        "invalid input: TV review JSON must be a bounded regular file"
+    );
     let mut bytes = Vec::new();
     std::fs::File::open(path)?
         .take((limit + 1) as u64)

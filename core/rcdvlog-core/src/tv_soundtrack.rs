@@ -194,6 +194,10 @@ impl SoundtrackIndex {
     ) -> Result<Self> {
         reference.validate()?;
         let before = std::fs::metadata(path)?;
+        ensure!(
+            before.is_file(),
+            "invalid input: reference must be a regular local movie"
+        );
         let observed = full_file_blake3(path, cancel)?;
         ensure!(
             observed.hex_digest == reference.movie.movie_digest,
@@ -201,7 +205,14 @@ impl SoundtrackIndex {
         );
         let mut command = crate::tool_command("ffmpeg");
         command
-            .args(["-v", "error", "-nostdin", "-ss"])
+            .args([
+                "-v",
+                "error",
+                "-nostdin",
+                "-protocol_whitelist",
+                "file,pipe",
+                "-ss",
+            ])
             .arg(format!("{:.9}", reference.start_seconds))
             .arg("-i")
             .arg(path)
@@ -597,8 +608,9 @@ fn fft(real: &mut [f64; FFT], imag: &mut [f64; FFT]) {
 /// Local fixture/capture adapter: mono PCM WAV only. Decode/resample through the
 /// capture owner beforehand, retaining its original sample-clock calibration.
 pub fn read_pcm8k_wav(path: &Path) -> Result<Vec<f32>> {
+    let metadata = std::fs::metadata(path)?;
     ensure!(
-        std::fs::metadata(path)?.len() <= MAX_SAMPLES as u64 * 4 + 4096,
+        metadata.is_file() && metadata.len() <= MAX_SAMPLES as u64 * 4 + 4096,
         "invalid input: WAV exceeds bound"
     );
     let mut reader = hound::WavReader::open(path)?;
