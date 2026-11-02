@@ -332,6 +332,12 @@ fn a_retracted_suggestion_is_kept_but_never_accepted_and_acceptances_stay_consis
     // The exported request is exactly the core type the owning catalog accepts.
     let request: rcdvlog_core::RecordReviewNoteRequest =
         serde_json::from_value(accepted[0]["record"].clone()).unwrap();
+    // The record-once input carries a stable id-only import identity.
+    let once: rcdvlog_core::RecordReviewNoteOnceRequest =
+        serde_json::from_value(accepted[0]["recordOnce"].clone()).unwrap();
+    assert!(once.import_id.starts_with("rcdvlog-server/review/"));
+    assert_eq!(once.import_id, accepted[0]["importId"]);
+    assert!(!once.import_id.chars().any(char::is_whitespace));
     assert_eq!(request.operation_id, "editop_split_a");
     assert_eq!(request.revision_id, "editrev_synthetic");
     assert_eq!(

@@ -102,6 +102,9 @@ collects its speakers, languages and the union of its candidates.
     It carries `viewedArtifactId`, `movieTimeSeconds` (a declared locator),
     and at most 16 evidence refs naming the session, run, discussion, item
     and utterances.
+  - `importId` (`rcdvlog-server/review/{sessionId}/{discussionId}/{itemId}`,
+    built from immutable ids only) and `recordOnce`, the exact
+    `{ importId, record }` input of `edit-plan feedback record-once`
   - `proposeChange`
   - `humanAccepted`
   - `canonicalNoteId`
@@ -109,12 +112,15 @@ collects its speakers, languages and the union of its candidates.
 
 **Handoff to the owning catalog** (Mac, CLI):
 
-1. Feed each `record` to `edit-plan feedback record --input`.
+1. Feed each `recordOnce` to `edit-plan feedback record-once --input`. The
+   owning catalog derives the note ID from `importId`, so a retry after a lost
+   response returns the original note instead of creating a second one, and a
+   changed request under the same `importId` is
+   `review_feedback_import_conflict`.
 2. POST the returned note ID to
    `…/review-discussion-items/{itemId}/reconciliation`. That receipt is single.
    Repeating the same ID is fine; a different ID is 409
-   `review_reconciliation_conflict`. This prevents duplicate notes after a lost
-   response, because `record` itself has no idempotency key.
+   `review_reconciliation_conflict`. Both steps are therefore safe to retry.
 3. Run `propose` and `decide` only for `humanAccepted` items, under the
    existing guards.
 4. Stale revisions are handled with the existing `map` there.

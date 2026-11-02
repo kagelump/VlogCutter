@@ -21,7 +21,10 @@ use crate::{
 };
 use anyhow::Context;
 use chrono::{SecondsFormat, Utc};
-use rcdvlog_core::{RecordReviewNoteRequest, ReviewAuthor, ReviewCategory, ReviewChange};
+use rcdvlog_core::{
+    RecordReviewNoteOnceRequest, RecordReviewNoteRequest, ReviewAuthor, ReviewCategory,
+    ReviewChange,
+};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -1127,8 +1130,20 @@ impl ReviewDiscussions {
                         && d.refers_to_item_id.as_deref() == Some(&item.item_id)
                         && d.decision == Some(DecisionAction::Accepted)
                 });
+                // Stable, namespaced and immutable per item, so the owning
+                // catalog's `record-once` never creates a second note after a
+                // lost response (derived from ids only, never mutable text).
+                let import_id = format!(
+                    "rcdvlog-server/review/{}/{}/{}",
+                    workspace.session_id, discussion.discussion_id, item.item_id
+                );
+                let record_once = RecordReviewNoteOnceRequest {
+                    import_id: import_id.clone(),
+                    record: request.clone(),
+                };
                 feedback.push(serde_json::json!({
                     "itemId": item.item_id,
+                    "importId": import_id,
                     "discussionId": discussion.discussion_id,
                     "status": item.status,
                     "provisional": item.provisional,
@@ -1136,8 +1151,9 @@ impl ReviewDiscussions {
                     "movieTimePrecision": movie_time.as_ref().map(|m| m.source.clone()),
                     "canonicalNoteId": item.canonical_note_id,
                     "record": request,
+                    "recordOnce": record_once,
                     "proposeChange": item.change,
-                    "next": if item.canonical_note_id.is_some() { "reconciled" } else { "run `edit-plan feedback record` on the owning catalog, then POST the returned note ID as this item's reconciliation receipt; propose/decide only after a human acceptance" },
+                    "next": if item.canonical_note_id.is_some() { "reconciled" } else { "run `edit-plan feedback record-once --input` with `recordOnce` on the owning catalog, then POST the returned note ID as this item's reconciliation receipt; propose/decide only after a human acceptance" },
                 }));
             }
             discussions.push(serde_json::json!({
