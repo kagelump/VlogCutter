@@ -4,8 +4,9 @@ use crate::{
     full_file_blake3,
     tv_review_sync::{SyncAnchor, SyncBoundary, SyncBoundaryKind, SyncQuery, SyncRequest},
     tv_soundtrack::{
-        PCM_RATE, SoundtrackCapture, SoundtrackIndex, SoundtrackMatchReport, SoundtrackMovie,
-        SoundtrackPeak, SoundtrackPolicy, SoundtrackReferenceSpec,
+        MAX_BEST_PEAKS, PCM_RATE, PEAK_MERGE_SECONDS, SoundtrackCapture, SoundtrackIndex,
+        SoundtrackMatchReport, SoundtrackMovie, SoundtrackPeak, SoundtrackPolicy,
+        SoundtrackReferenceSpec,
     },
 };
 use anyhow::{Context, Result, ensure};
@@ -138,6 +139,30 @@ pub struct SessionSyncEvidence {
     pub relevant_queries: Vec<SessionQueryEvidence>,
     pub search_complete: bool,
     pub sync: SyncRequest,
+}
+/// ARCHITECTURE §3: keep the highest-scoring peak within each 0.256 s movie
+/// neighbourhood, sorted by similarity descending then movie time ascending.
+fn merge_best_peaks(mut pool: Vec<SoundtrackPeak>) -> Vec<SoundtrackPeak> {
+    pool.sort_by(|a, b| {
+        b.similarity
+            .total_cmp(&a.similarity)
+            .then(a.movie_seconds.total_cmp(&b.movie_seconds))
+    });
+    let mut merged: Vec<SoundtrackPeak> = Vec::new();
+    for peak in pool {
+        // Strictly closer than the merge distance; exactly 16 hops stays distinct.
+        if merged
+            .iter()
+            .any(|m| (m.movie_seconds - peak.movie_seconds).abs() < PEAK_MERGE_SECONDS - 1e-9)
+        {
+            continue;
+        }
+        merged.push(peak);
+        if merged.len() == MAX_BEST_PEAKS {
+            break;
+        }
+    }
+    merged
 }
 fn digest<T: Serialize>(v: &T) -> Result<String> {
     Ok(blake3::hash(&serde_json::to_vec(v)?).to_hex().to_string())
@@ -617,14 +642,17 @@ impl SoundtrackSessionPlan {
                 best_peaks: vec![],
             };
             let mut candidates = Vec::new();
+            let mut peak_pool = Vec::new();
             for ri in 0..self.references.len() {
                 ensure!(!cancel(), "session evidence cancelled");
                 if let Some(receipt) = self.receipt(cache, qi * self.references.len() + ri)? {
                     evidence.completed_references += 1;
                     evidence.report_digests.push(receipt.report_digest);
+                    peak_pool.extend(receipt.report.best_peaks.iter().cloned());
                     candidates.extend(receipt.report.candidates.into_iter().map(|c| c.anchor));
                 }
             }
+            evidence.best_peaks = merge_best_peaks(peak_pool);
             if evidence.completed_references == evidence.total_references {
                 candidates.sort_by_key(|a| a.movie_pts);
                 // Only coalesce observations at the same search-grid location.
