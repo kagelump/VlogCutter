@@ -1,6 +1,7 @@
 #![recursion_limit = "256"]
 
 mod job_callback_http;
+mod review_target_http;
 
 use anyhow::{Context, Result, anyhow};
 use axum::body::Body;
@@ -836,6 +837,42 @@ pub fn router(state: HttpState) -> Router {
             auth_middleware,
         ));
 
+    // TV review targets (#221): same auth/CSRF guards, with a body limit sized
+    // to the handoff validator's 16 MiB cap rather than the media default.
+    let review_targets = Router::new()
+        .route(
+            "/api/v1/projects/{project_id}/review-targets",
+            get(review_target_http::list),
+        )
+        .route(
+            "/api/v1/projects/{project_id}/review-targets/preflight",
+            post(review_target_http::preflight),
+        )
+        .route(
+            "/api/v1/projects/{project_id}/review-targets/import",
+            post(review_target_http::import),
+        )
+        .route(
+            "/api/v1/projects/{project_id}/review-targets/{review_target_id}",
+            get(review_target_http::get),
+        )
+        .route(
+            "/api/v1/projects/{project_id}/review-targets/{review_target_id}/youtube",
+            post(review_target_http::rebind_youtube),
+        )
+        .route(
+            "/api/v1/projects/{project_id}/review-targets/{review_target_id}/candidates",
+            get(review_target_http::candidates),
+        )
+        .layer(DefaultBodyLimit::max(
+            review_target_http::MAX_REVIEW_TARGET_BODY_BYTES,
+        ))
+        .layer(middleware::from_fn_with_state(state.clone(), require_csrf))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ));
+
     // Public routes (no auth)
     let public = Router::new()
         .route("/api/v1", get(root))
@@ -849,6 +886,7 @@ pub fn router(state: HttpState) -> Router {
         .merge(auth_open)
         .merge(auth_session)
         .merge(internal)
+        .merge(review_targets)
         .fallback(web_or_not_found)
         .with_state(state.clone())
         .layer(DefaultBodyLimit::max(MAX_HTTP_BODY_BYTES))
@@ -861,6 +899,12 @@ pub fn router(state: HttpState) -> Router {
 }
 
 pub fn openapi_document() -> serde_json::Value {
+    let mut document = base_openapi_document();
+    review_target_http::openapi_extend(&mut document);
+    document
+}
+
+fn base_openapi_document() -> serde_json::Value {
     serde_json::json!({
         "openapi": "3.1.0",
         "info": {
@@ -5813,6 +5857,219 @@ mod tests {
             events
                 .iter()
                 .any(|event| { event.action == "session.revoked" && event.actor_id == session_id })
+        );
+    }
+
+    fn review_target_handoff(project_id: &str, youtube: Option<&str>) -> Value {
+        let mut handoff: rcdvlog_server_core::ReviewTargetHandoff = serde_json::from_str(
+            include_str!("../../../core/rcdvlog-core/tests/fixtures/review-target/v1.json"),
+        )
+        .unwrap();
+        handoff.target.project_id = project_id.to_string();
+        handoff.target.youtube_video_id = youtube.map(str::to_string);
+        handoff.target_digest =
+            rcdvlog_server_core::ReviewTargetHandoff::snapshot_digest(&handoff.target).unwrap();
+        handoff.verification.verified_at =
+            chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        serde_json::to_value(handoff).unwrap()
+    }
+
+    #[tokio::test]
+    async fn review_target_routes_are_authenticated_csrf_guarded_and_never_overwrite() {
+        let fixture = Fixture::new(false);
+        let source = TempDir::new().unwrap();
+        let envelope = baseline_envelope(&source);
+        let project_id = envelope.payload.project.project_id.clone();
+        fixture
+            .foundation
+            .catalog()
+            .project_replicas()
+            .import_baseline(&envelope)
+            .unwrap();
+        let (session_id, session_token, csrf) = browser_auth(&fixture);
+        let cookie = format!("rcdvlog_session={session_id}:{session_token}");
+        let base = format!("/api/v1/projects/{project_id}/review-targets");
+        let post = |uri: String, body: Value, csrf: Option<&str>| {
+            let mut builder = Request::builder()
+                .method(Method::POST)
+                .uri(uri)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::COOKIE, &cookie);
+            if let Some(csrf) = csrf {
+                builder = builder.header("x-csrf-token", csrf);
+            }
+            builder
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap()
+        };
+        let request = serde_json::json!({
+            "handoff": review_target_handoff(&project_id, None),
+            "declaredIssuer": "Synthetic laptop"
+        });
+
+        let anonymous = fixture
+            .app()
+            .oneshot(Request::builder().uri(&base).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+        let no_csrf = fixture
+            .app()
+            .oneshot(post(format!("{base}/import"), request.clone(), None))
+            .await
+            .unwrap();
+        assert_eq!(no_csrf.status(), StatusCode::FORBIDDEN);
+
+        let preflight = fixture
+            .app()
+            .oneshot(post(
+                format!("{base}/preflight"),
+                request.clone(),
+                Some(&csrf),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(preflight.status(), StatusCode::OK);
+        let preflight = json(preflight).await;
+        assert_eq!(preflight["outcome"], "new");
+        assert_eq!(preflight["importable"], true);
+
+        let imported = fixture
+            .app()
+            .oneshot(post(format!("{base}/import"), request.clone(), Some(&csrf)))
+            .await
+            .unwrap();
+        assert_eq!(imported.status(), StatusCode::OK);
+        let imported = json(imported).await;
+        assert_eq!(imported["outcome"], "created");
+        let target = &imported["reviewTarget"];
+        let id = target["reviewTargetId"].as_str().unwrap().to_string();
+        assert_eq!(target["revisionId"], "editrev_synthetic");
+        assert_eq!(target["youtube"]["identityStatus"], "absent");
+        assert_eq!(target["mapping"]["status"], "measuredComplete");
+        assert_eq!(target["readiness"]["ready"], true);
+        assert_eq!(target["provenance"]["importer"]["actorId"], session_id);
+        assert!(!serde_json::to_string(target).unwrap().contains("/Volumes"));
+
+        let again = fixture
+            .app()
+            .oneshot(post(format!("{base}/import"), request.clone(), Some(&csrf)))
+            .await
+            .unwrap();
+        assert_eq!(json(again).await["outcome"], "reused");
+
+        let mut conflicting = request.clone();
+        conflicting["handoff"]["target"]["movie"]["blake3"] = Value::String("d".repeat(64));
+        let mut typed: rcdvlog_server_core::ReviewTargetSnapshot =
+            serde_json::from_value(conflicting["handoff"]["target"].clone()).unwrap();
+        typed.movie.blake3 = "d".repeat(64);
+        conflicting["handoff"]["targetDigest"] = Value::String(
+            rcdvlog_server_core::ReviewTargetHandoff::snapshot_digest(&typed).unwrap(),
+        );
+        let conflict = fixture
+            .app()
+            .oneshot(post(format!("{base}/import"), conflicting, Some(&csrf)))
+            .await
+            .unwrap();
+        assert_eq!(conflict.status(), StatusCode::CONFLICT);
+        assert_eq!(json(conflict).await["code"], "review_target_conflict");
+
+        let mut tampered = request.clone();
+        tampered["handoff"]["target"]["cuts"][0]["sourceInSeconds"] = serde_json::json!(1.25);
+        let tampered = fixture
+            .app()
+            .oneshot(post(format!("{base}/import"), tampered, Some(&csrf)))
+            .await
+            .unwrap();
+        assert_eq!(tampered.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            json(tampered).await["code"],
+            "review_target_digest_mismatch"
+        );
+
+        let rebound = fixture
+            .app()
+            .oneshot(post(
+                format!("{base}/{id}/youtube"),
+                serde_json::json!({"youtubeVideoId": "synthetic01"}),
+                Some(&csrf),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(rebound.status(), StatusCode::OK);
+        let rebound = json(rebound).await;
+        assert_eq!(
+            rebound["reviewTarget"]["youtube"]["identityStatus"],
+            "declaredUnverified"
+        );
+        assert_eq!(
+            rebound["reviewTarget"]["provenance"]["derivedFromReviewTargetId"],
+            id
+        );
+
+        let candidates = fixture
+            .app()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "{base}/{id}/candidates?startSeconds=1.5&endSeconds=2.5"
+                    ))
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(candidates.status(), StatusCode::OK);
+        assert_eq!(
+            json(candidates).await["operationIds"],
+            serde_json::json!(["editop_split_a", "editop_split_b"])
+        );
+
+        let listed = fixture
+            .app()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("{base}?limit=10"))
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(json(listed).await["items"].as_array().unwrap().len(), 2);
+
+        let missing = fixture
+            .app()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/projects/project_absent/review-targets")
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        assert_eq!(json(missing).await["code"], "project_replica_not_found");
+
+        let events = fixture
+            .foundation
+            .catalog()
+            .audit_log()
+            .list(20, None)
+            .unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e.action == "review_target.imported")
+                .count(),
+            1
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| e.action == "review_target.youtube_declared")
         );
     }
 }

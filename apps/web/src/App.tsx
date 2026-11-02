@@ -22,6 +22,8 @@ import {
   type StorageRoot,
 } from "@rcdvlog/project-client";
 import { StatePanel, StatusBadge } from "@rcdvlog/review-ui";
+import { InlineError, normalizeError } from "./errors";
+import { TvReviewView } from "./tvReview/TvReviewView";
 
 const PROJECT_REFRESH_INTERVAL_MS = 5_000;
 
@@ -127,6 +129,7 @@ function AuthenticatedShell({ client, status, session }: { client: BrowserProjec
     { path: "/", label: "Overview" },
     { path: "/library", label: "Library" },
     { path: "/projects", label: "Projects" },
+    { path: "/tv-review", label: "TV review" },
     { path: "/admin", label: "Administration" },
   ];
 
@@ -153,7 +156,7 @@ function AuthenticatedShell({ client, status, session }: { client: BrowserProjec
           <a
             key={route.path}
             href={route.path}
-            aria-current={path === route.path ? "page" : undefined}
+            aria-current={path === route.path || (route.path === "/tv-review" && path.startsWith("/tv-review/")) ? "page" : undefined}
             onClick={(event) => { event.preventDefault(); navigate(route.path); }}
           >
             {route.label}
@@ -161,7 +164,9 @@ function AuthenticatedShell({ client, status, session }: { client: BrowserProjec
         ))}
       </nav>
       <main className="shell-content">
-        {path === "/library" ? (
+        {path === "/tv-review" || path.startsWith("/tv-review/") ? (
+          <TvReviewView client={client} path={path} navigate={navigate} />
+        ) : path === "/library" ? (
           <LibraryView client={client} url={url} navigate={navigate} />
         ) : path.startsWith("/projects/") ? (
           <ProjectAssetsView client={client} projectId={decodeURIComponent(path.slice("/projects/".length))} />
@@ -658,14 +663,4 @@ function ErrorScreen({ error, retry }: { error: ProjectClientError; retry: () =>
       </StatePanel>
     </main>
   );
-}
-
-function InlineError({ error }: { error: ProjectClientError }) {
-  return <p className="inline-error" role="alert">{error.message}{error.requestId ? ` Request ID: ${error.requestId}` : ""}</p>;
-}
-
-function normalizeError(error: unknown): ProjectClientError {
-  return error instanceof ProjectClientError
-    ? error
-    : new ProjectClientError("server_error", "The application could not complete the request.", "unexpected_error");
 }

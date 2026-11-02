@@ -12,6 +12,7 @@ pub mod library_query;
 mod media_facts;
 mod replicas;
 mod representations;
+mod review_targets;
 mod scan;
 pub mod scan_handler;
 mod search_index;
@@ -21,9 +22,9 @@ pub use rcdvlog_core::{
     BindingVerificationStatus, Catalog, CatalogSchemaError, GlobalMediaVerificationState, JobId,
     MediaObjectId, NodeAvailabilityState, NodeId, PROJECT_CATALOG_SCHEMA_VERSION,
     ProjectAssetAddedPayload, ProjectAssetItem, ProjectAssetPage, ProjectId, RepresentationId,
-    RootAssociationConfirmation, RootAssociationConfirmationStatus, RootAssociationEvidence,
-    RootRelativePath, StorageObjectId, StorageProtocol, StorageRootId,
-    default_local_heavy_lock_path,
+    ReviewTargetHandoff, ReviewTargetSnapshot, RootAssociationConfirmation,
+    RootAssociationConfirmationStatus, RootAssociationEvidence, RootRelativePath, StorageObjectId,
+    StorageProtocol, StorageRootId, default_local_heavy_lock_path,
 };
 pub use rcdvlog_sync::{
     BASELINE_VERSION, BaselineEnvelope, BaselinePayload, BaselinePreview, NodeTargetedJob,
@@ -89,6 +90,15 @@ pub use representations::{
     PROXY_RECIPE_KEY, Representation, RepresentationError, RepresentationJobHandler,
     RepresentationKind, RepresentationNeed, RepresentationRequest, RepresentationRequestResult,
     RepresentationService, RepresentationState, ServerJobHandler, THUMBNAIL_RECIPE_KEY,
+};
+pub use review_targets::{
+    ArtifactAvailabilityAssertion, ArtifactAvailabilityState, ImportOutcome, PreflightOutcome,
+    REVIEW_TARGET_LIMITATIONS, REVIEW_TARGET_LIST_MAX_LIMIT,
+    REVIEW_TARGET_SERVER_MAX_VERIFICATION_AGE_SECONDS, ReviewTargetActor, ReviewTargetCandidates,
+    ReviewTargetCheck, ReviewTargetCheckStatus, ReviewTargetCutView, ReviewTargetDetail,
+    ReviewTargetImportRequest, ReviewTargetImportResult, ReviewTargetObservation, ReviewTargetPage,
+    ReviewTargetPreflight, ReviewTargetPreview, ReviewTargetReadiness, ReviewTargetServiceError,
+    ReviewTargetSummary, ReviewTargets, VerificationFreshness,
 };
 pub use scan::{
     NewScanSchedule, RecoveryReport, ScanRun, ScanSchedule, ScanScheduleUpdate, ScanService,

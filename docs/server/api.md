@@ -11,7 +11,7 @@ The Rust server owns the OpenAPI document at `GET /api/openapi.json`; [`packages
 - `/api/v1/ws/events` requires authentication and a same-origin WebSocket handshake. Events are invalidation hints, not canonical state.
 - `/api/v1/media/{representationId}/content` serves only derived representations through opaque IDs and authenticated full/single-range `GET`/`HEAD`; originals are never served.
 
-Resource groups are auth, projects/project assets, library, representations/media, internal baseline/reconcile, and admin storage/scans/schedules/jobs/sync/backups/audit. The checked OpenAPI document is the exhaustive route/method/schema source.
+Resource groups are auth, projects/project assets, project TV review targets (see [the handoff contract](../tv-review-handoff.md#server-import-implemented)), library, representations/media, internal baseline/reconcile, and admin storage/scans/schedules/jobs/sync/backups/audit. The checked OpenAPI document is the exhaustive route/method/schema source.
 
 ## Contract rules
 

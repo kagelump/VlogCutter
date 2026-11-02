@@ -60,6 +60,12 @@ export const API_PATHS = {
   adminJobCallbackSettle: "/api/v1/admin/job-callbacks/{deliveryId}/settle",
   adminSync: "/api/v1/admin/sync",
   adminRepresentationBatch: "/api/v1/admin/representations/batch",
+  reviewTargets: "/api/v1/projects/{projectId}/review-targets",
+  reviewTargetPreflight: "/api/v1/projects/{projectId}/review-targets/preflight",
+  reviewTargetImport: "/api/v1/projects/{projectId}/review-targets/import",
+  reviewTarget: "/api/v1/projects/{projectId}/review-targets/{reviewTargetId}",
+  reviewTargetYoutube: "/api/v1/projects/{projectId}/review-targets/{reviewTargetId}/youtube",
+  reviewTargetCandidates: "/api/v1/projects/{projectId}/review-targets/{reviewTargetId}/candidates",
 } as const;
 `;
 const schemaPath = resolve(root, "packages/project-client/openapi.json");
