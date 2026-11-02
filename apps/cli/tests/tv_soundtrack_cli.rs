@@ -15,6 +15,7 @@ fn passive_cli_reuses_a_bounded_private_index_and_silence_stays_unmatched() {
         },
         start_seconds: 0.0,
         duration_seconds: 12.0,
+        recipe: None,
     };
     let pcm: Vec<f32> = (0..12 * 8000)
         .map(|i| (i as f32 * 0.17).sin() * 0.1)
