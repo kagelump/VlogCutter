@@ -27,6 +27,9 @@ import {
   type ReviewSessionEvent,
   type ReviewSessionEventRequest,
   type ReviewSessionPage,
+  type DiscussionItem,
+  type NewDiscussionItem,
+  type ReviewWorkspace,
   type ReviewTargetCandidates,
   type ReviewTranscriptionPreflight,
   type ReviewTranscriptionRequest,
@@ -228,6 +231,15 @@ export class HttpProjectClient implements BrowserProjectClient {
   async listReviewTranscriptions(projectId: string, sessionId: string): Promise<{ items: ReviewTranscriptionRun[] }> { return this.request(sessionPath(API_PATHS.reviewTranscriptions, projectId, sessionId)); }
   async getReviewTranscription(projectId: string, runId: string): Promise<ReviewTranscriptionRun> { return this.request(pathParam(pathParam(API_PATHS.reviewTranscription, "projectId", projectId), "runId", runId)); }
   async cancelReviewTranscription(projectId: string, runId: string): Promise<ReviewTranscriptionRun> { return this.request(pathParam(pathParam(API_PATHS.reviewTranscriptionCancel, "projectId", projectId), "runId", runId), jsonPost({})); }
+  async getReviewWorkspace(projectId: string, runId: string): Promise<ReviewWorkspace> { return this.request(runPath(API_PATHS.reviewWorkspace, projectId, runId)); }
+  async getReviewReport(projectId: string, runId: string): Promise<Record<string, unknown>> { return this.request(runPath(API_PATHS.reviewReport, projectId, runId)); }
+  reviewReportUrl(projectId: string, runId: string): string { return `${this.baseUrl}${runPath(API_PATHS.reviewReport, projectId, runId)}`; }
+  async proposeReviewDiscussions(projectId: string, runId: string): Promise<ReviewWorkspace> { return this.request(runPath(API_PATHS.reviewDiscussionsPropose, projectId, runId), jsonPost({})); }
+  async createReviewDiscussion(projectId: string, runId: string, title: string, utteranceIds: string[]): Promise<ReviewWorkspace> { return this.request(runPath(API_PATHS.reviewDiscussions, projectId, runId), jsonPost({ title, utteranceIds })); }
+  async correctReviewUtterance(projectId: string, runId: string, utteranceId: string, field: string, value: unknown, reason?: string | null): Promise<ReviewWorkspace> { return this.request(pathParam(runPath(API_PATHS.reviewUtteranceCorrections, projectId, runId), "utteranceId", utteranceId), jsonPost({ field, value, reason: reason ?? null })); }
+  async updateReviewDiscussion(projectId: string, discussionId: string, update: Record<string, unknown>): Promise<ReviewWorkspace> { return this.request(pathParam(pathParam(API_PATHS.reviewDiscussion, "projectId", projectId), "discussionId", discussionId), jsonRequest("PATCH", update)); }
+  async addReviewDiscussionItem(projectId: string, discussionId: string, item: NewDiscussionItem): Promise<ReviewWorkspace> { return this.request(pathParam(pathParam(API_PATHS.reviewDiscussionItems, "projectId", projectId), "discussionId", discussionId), jsonPost(item)); }
+  async reconcileReviewDiscussionItem(projectId: string, itemId: string, canonicalNoteId: string): Promise<DiscussionItem> { return this.request(pathParam(pathParam(API_PATHS.reviewItemReconciliation, "projectId", projectId), "itemId", itemId), jsonPost({ canonicalNoteId })); }
   async revokeSession(sessionId: string): Promise<void> { await this.request(pathParam(API_PATHS.revokeSession, "sessionId", sessionId), { method: "DELETE" }); }
 
   private async request<T>(
@@ -282,6 +294,10 @@ function reviewTargetPath(template: string, projectId: string, reviewTargetId: s
 
 function sessionPath(template: string, projectId: string, sessionId: string): string {
   return pathParam(pathParam(template, "projectId", projectId), "sessionId", sessionId);
+}
+
+function runPath(template: string, projectId: string, runId: string): string {
+  return pathParam(pathParam(template, "projectId", projectId), "runId", runId);
 }
 
 function queryString(values: object): string {

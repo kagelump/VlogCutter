@@ -13,7 +13,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
 import { allocateLoopbackAddress } from "./lib/loopback-port.mjs";
-import { bootstrapCodePath, reviewTargetHandoffPath } from "./lib/web-e2e-fixture.mjs";
+import { bootstrapCodePath, reviewRunPath, reviewTargetHandoffPath } from "./lib/web-e2e-fixture.mjs";
 
 const repository = resolve(import.meta.dirname, "..");
 const listenAddress = process.env.RCDVLOG_LISTEN_ADDR || (await allocateLoopbackAddress());
@@ -42,17 +42,19 @@ const runtimeEnvironment = {
 };
 
 const reviewTargetFile = reviewTargetHandoffPath(listenAddress);
+const reviewRunFile = reviewRunPath(listenAddress);
 rmSync(reviewTargetFile, { force: true });
+rmSync(reviewRunFile, { force: true });
 const seed = spawnSync(
   "cargo",
   ["run", "--quiet", "-p", "rcdvlog-server", "--example", "web_e2e_seed"],
-  { cwd: repository, env: { ...runtimeEnvironment, RCDVLOG_E2E_REVIEW_TARGET_FILE: reviewTargetFile }, encoding: "utf8" },
+  { cwd: repository, env: { ...runtimeEnvironment, RCDVLOG_E2E_REVIEW_TARGET_FILE: reviewTargetFile, RCDVLOG_E2E_REVIEW_RUN_FILE: reviewRunFile }, encoding: "utf8" },
 );
 if (seed.status !== 0) {
   throw new Error(`seed real web project fixture: ${seed.stderr}`);
 }
 
-const bootstrapFiles = [1, 2, 3, 4, 5, 6].map((index) => bootstrapCodePath(listenAddress, index));
+const bootstrapFiles = [1, 2, 3, 4, 5, 6, 7].map((index) => bootstrapCodePath(listenAddress, index));
 for (const bootstrapFile of bootstrapFiles) {
   rmSync(bootstrapFile, { force: true });
   const bootstrap = spawnSync(
@@ -79,6 +81,7 @@ function stop(signal = "SIGTERM") {
   if (!server.killed) server.kill(signal);
   for (const bootstrapFile of bootstrapFiles) rmSync(bootstrapFile, { force: true });
   rmSync(reviewTargetFile, { force: true });
+  rmSync(reviewRunFile, { force: true });
 }
 
 for (const signal of ["SIGINT", "SIGTERM"]) {
@@ -88,6 +91,7 @@ for (const signal of ["SIGINT", "SIGTERM"]) {
 server.on("exit", (code) => {
   for (const bootstrapFile of bootstrapFiles) rmSync(bootstrapFile, { force: true });
   rmSync(reviewTargetFile, { force: true });
+  rmSync(reviewRunFile, { force: true });
   rmSync(fixture, { recursive: true, force: true });
   process.exit(code ?? 0);
 });

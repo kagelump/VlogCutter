@@ -12,6 +12,7 @@ pub mod library_query;
 mod media_facts;
 mod replicas;
 mod representations;
+mod review_discussions;
 mod review_sessions;
 mod review_targets;
 mod review_transcripts;
@@ -20,6 +21,7 @@ pub mod scan_handler;
 mod search_index;
 mod storage_path;
 
+pub use rcdvlog_core::review_speech;
 pub use rcdvlog_core::{
     BindingVerificationStatus, Catalog, CatalogSchemaError, GlobalMediaVerificationState, JobId,
     MediaObjectId, NodeAvailabilityState, NodeId, PROJECT_CATALOG_SCHEMA_VERSION,
@@ -92,6 +94,11 @@ pub use representations::{
     PROXY_RECIPE_KEY, Representation, RepresentationError, RepresentationJobHandler,
     RepresentationKind, RepresentationNeed, RepresentationRequest, RepresentationRequestResult,
     RepresentationService, RepresentationState, ServerJobHandler, THUMBNAIL_RECIPE_KEY,
+};
+pub use review_discussions::{
+    AuthorKind, DecisionAction, Discussion, DiscussionItem, ItemKind, ManualCueMapping,
+    MovieTimeEstimate, NewDiscussionItem, REVIEW_REPORT_SCHEMA, ReviewActor, ReviewDiscussionError,
+    ReviewDiscussions, ReviewWorkspace, SessionClockMapping, WorkspaceUtterance,
 };
 pub use review_sessions::{
     ChunkReceipt, ChunkUpload, CreateReviewSessionRequest, FinalizeReviewSessionRequest,

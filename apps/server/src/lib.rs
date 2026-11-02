@@ -1,6 +1,7 @@
 #![recursion_limit = "256"]
 
 mod job_callback_http;
+mod review_discussion_http;
 mod review_session_http;
 mod review_target_http;
 mod review_transcript_http;
@@ -893,6 +894,7 @@ pub fn router(state: HttpState) -> Router {
         .merge(review_targets)
         .merge(review_session_http::routes(&state))
         .merge(review_transcript_http::routes(&state))
+        .merge(review_discussion_http::routes(&state))
         .fallback(web_or_not_found)
         .with_state(state.clone())
         .layer(DefaultBodyLimit::max(MAX_HTTP_BODY_BYTES))
@@ -909,6 +911,7 @@ pub fn openapi_document() -> serde_json::Value {
     review_target_http::openapi_extend(&mut document);
     review_session_http::openapi_extend(&mut document);
     review_transcript_http::openapi_extend(&mut document);
+    review_discussion_http::openapi_extend(&mut document);
     document
 }
 

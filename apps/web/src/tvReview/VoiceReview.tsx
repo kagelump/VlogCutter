@@ -295,7 +295,7 @@ export function SessionDetailView({ client, projectId, targetId, sessionId, navi
         <h2 className="tv-section-title">Manual cues</h2>
         {cues.length ? <ul className="tv-limitations">{cues.map((cue) => <li key={cue.eventId}>{formatClock(cue.audioSeconds)} on the recording clock — declared movie {cue.declaredMovieSeconds ?? "?"} s (reviewer declaration, not measured sync)</li>)}</ul> : <p className="help">No manual cue. Automatic synchronization may still align this recording later.</p>}
         {health.length ? <><h2 className="tv-section-title">Capture events</h2><ul className="tv-limitations">{health.map((event) => <li key={event.eventId}>{formatClock(event.audioSeconds)} · {event.kind}</li>)}</ul></> : null}
-        {session.state !== "deleted" ? <TranscriptPanel client={client} projectId={projectId} sessionId={sessionId} sessionState={session.state} /> : null}
+        {session.state !== "deleted" ? <TranscriptPanel client={client} projectId={projectId} sessionId={sessionId} sessionState={session.state} onOpenReview={(runId) => navigate(`${sessionPath(projectId, targetId, sessionId)}/review/${encodeURIComponent(runId)}`)} /> : null}
       </div>
       <aside className="tv-import" aria-label="Evidence">
         <p className="card-index">Private evidence</p>

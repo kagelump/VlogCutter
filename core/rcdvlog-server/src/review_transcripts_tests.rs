@@ -117,7 +117,7 @@ impl NativeSttTransport for FakeTransport {
     }
 }
 
-struct FakeRuntime {
+pub(crate) struct FakeRuntime {
     models: bool,
     credentials: bool,
     calls: Arc<AtomicUsize>,
@@ -125,7 +125,7 @@ struct FakeRuntime {
 }
 
 impl FakeRuntime {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             models: true,
             credentials: true,
@@ -179,14 +179,14 @@ fn tone(seconds: f64, speech: &[(f64, f64)]) -> Vec<i16> {
         .collect()
 }
 
-struct Fixture {
-    _root: TempDir,
-    catalog: ControlCatalog,
-    session_id: String,
+pub(crate) struct Fixture {
+    pub(crate) _root: TempDir,
+    pub(crate) catalog: ControlCatalog,
+    pub(crate) session_id: String,
 }
 
 /// 20 s recording: speech 1–4 s, 6–9 s, 12–15 s. `drop_second_chunk` loses 10–20 s.
-fn fixture(drop_second_chunk: bool, finalize: bool) -> Fixture {
+pub(crate) fn fixture(drop_second_chunk: bool, finalize: bool) -> Fixture {
     let root = TempDir::new().unwrap();
     let catalog = catalog(&root);
     let target_id = catalog
@@ -269,7 +269,7 @@ fn fixture(drop_second_chunk: bool, finalize: bool) -> Fixture {
     }
 }
 
-fn local() -> ReviewTranscriptionRequest {
+pub(crate) fn local() -> ReviewTranscriptionRequest {
     ReviewTranscriptionRequest {
         backend: ReviewTranscriptionBackend::Local,
         model: None,
@@ -291,7 +291,7 @@ fn cloud(cap: f64) -> ReviewTranscriptionRequest {
     }
 }
 
-fn run(
+pub(crate) fn run(
     f: &Fixture,
     request: &ReviewTranscriptionRequest,
     runtime: &FakeRuntime,

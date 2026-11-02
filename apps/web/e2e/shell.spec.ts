@@ -1,7 +1,7 @@
 import { expect, test } from "@playwright/test";
 import { readFileSync } from "node:fs";
 
-import { bootstrapCodePath, reviewTargetHandoffPath } from "../../../scripts/lib/web-e2e-fixture.mjs";
+import { bootstrapCodePath, reviewRunPath, reviewTargetHandoffPath } from "../../../scripts/lib/web-e2e-fixture.mjs";
 
 function bootstrapCode(index: number): string {
   const configured = process.env.RCDVLOG_E2E_BOOTSTRAP_CODES?.split(",")[index - 1]?.trim();
@@ -106,7 +106,9 @@ test("Chrome imports a verified TV review target through the real server and dec
   await page.getByRole("link", { name: "TV review" }).click();
   await expect(page.getByRole("heading", { name: "TV review targets" })).toBeVisible();
   await page.locator(".project-list button").first().click();
-  await expect(page.getByText("No review targets yet")).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Review targets" })).toBeVisible();
+  // The fixture seeds one voice-reviewed target with a different YouTube link.
+  await expect(page.locator(".tv-review-columns .project-list button")).toHaveCount(1);
 
   // A tampered copy is refused by the shared Rust digest before anything is stored.
   const tampered = JSON.parse(handoff);
@@ -135,7 +137,7 @@ test("Chrome imports a verified TV review target through the real server and dec
 
   // Re-importing the identical handoff reuses the original target rather than adding one.
   await page.getByRole("button", { name: "All targets" }).click();
-  await expect(page.locator(".project-list button")).toHaveCount(2);
+  await expect(page.locator(".project-list button")).toHaveCount(3);
   await page.getByLabel("Handoff JSON").fill(handoff);
   await page.getByRole("button", { name: "Check handoff" }).click();
   await expect(page.getByText("Identical target already imported.")).toBeVisible();
@@ -227,4 +229,62 @@ test("Chrome recovers a recording interrupted by a page reload and finalizes it 
   await page.locator(".tv-voice-start .project-list button").first().click();
   await expect(page.getByRole("heading", { name: "Voice review session" })).toBeVisible();
   await expect(page.getByText(/^interrupted/)).toBeVisible();
+});
+
+
+test("Chrome turns a two-reviewer transcript into grouped discussions with a retraction and one human-accepted edit", async ({ page }) => {
+  const baseURL = process.env.RCDVLOG_WEB_E2E_BASE_URL;
+  if (!baseURL) throw new Error("web e2e: no RCDVLOG_WEB_E2E_BASE_URL");
+  const reviewPath = readFileSync(reviewRunPath(baseURL), "utf8").trim();
+  await page.goto("/");
+  await page.getByLabel("Bootstrap code").fill(bootstrapCode(7));
+  await page.getByRole("button", { name: "Open review desk" }).click();
+  await expect(page.getByRole("heading", { name: "Review desk ready" })).toBeVisible();
+  await page.goto(reviewPath);
+  await expect(page.getByRole("heading", { name: "Editorial review" })).toBeVisible();
+  await expect(page.getByText("Movie time: manual cue")).toBeVisible();
+  // Raw Simplified text is preserved; Traditional is the display projection.
+  await expect(page.getByText("不要，長度不變，換個轉場。")).toBeVisible();
+  await expect(page.getByText(/raw: 不要，长度不变，换个转场。/)).toBeVisible();
+
+  const ids = await page.locator("select[aria-label^='Speaker for']").evaluateAll((nodes) => nodes.map((n) => n.getAttribute("aria-label")!));
+  await page.getByLabel(ids[0]).selectOption("A");
+  await page.getByLabel(ids[1]).selectOption("B");
+  await expect(page.getByLabel(ids[1])).toHaveValue("B");
+
+  await page.getByRole("button", { name: "Group into discussions" }).click();
+  const card = page.locator(".tv-discussion").first();
+  await expect(card).toBeVisible();
+
+  async function add(kind: string, speaker: string, text: string, refers?: string, decision?: string) {
+    await card.getByLabel("Item kind").selectOption(kind);
+    await card.getByLabel("Said by").selectOption(speaker);
+    if (refers) await card.getByLabel("Refers to").selectOption({ label: refers });
+    if (decision) await card.getByLabel("Decision").selectOption(decision);
+    await card.getByLabel("Item text").fill(text);
+    await card.getByRole("button", { name: "Add" }).click();
+  }
+  await add("candidateEdit", "A", "Keep this shot longer.");
+  await expect(card.getByText("Speaker A: Keep this shot longer.")).toBeVisible();
+  await add("retraction", "B", "No, keep the duration; change the transition.", "Candidate edit: Keep this shot longer.");
+  await add("candidateEdit", "B", "Change the transition, keep the duration.");
+  await expect(card.locator(".tv-item-retracted")).toHaveCount(1);
+
+  await add("decision", "unknown", "accept the retracted one", "Candidate edit: Keep this shot longer.", "accepted");
+  await expect(page.getByText(/was retracted in the conversation/)).toBeVisible();
+  await add("decision", "unknown", "accept transition", "Candidate edit: Change the transition, keep the duration", "accepted");
+  await expect(page.getByText(/Confirm which cut this discussion is about/)).toBeVisible();
+  await card.getByLabel("Target cut").selectOption("editop_split_a");
+  await add("decision", "unknown", "We agree on the transition.", "Candidate edit: Change the transition, keep the duration", "accepted");
+  await expect(card.locator(".tv-item-accepted")).toHaveCount(1);
+
+  const href = await page.getByRole("link", { name: "Agent report (JSON)" }).getAttribute("href");
+  const report = await page.evaluate(async (url) => (await fetch(url!)).json(), href);
+  expect(report.schema).toBe("review-report.v1");
+  const accepted = report.feedback.filter((f: { humanAccepted: boolean }) => f.humanAccepted);
+  expect(accepted).toHaveLength(1);
+  expect(accepted[0].record.operationId).toBe("editop_split_a");
+  expect(accepted[0].record.author).toBe("human");
+  expect(report.feedback.some((f: { record: { observation: string } }) => f.record.observation === "Keep this shot longer.")).toBe(false);
+  expect(report.coverage.audiovisualReviewAttested).toBe(false);
 });

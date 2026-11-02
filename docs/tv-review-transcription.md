@@ -4,7 +4,8 @@ This page covers transcribing a finalized [voice review recording](tv-voice-revi
 into **timed utterances on the recording clock**. The results are stored in
 their own tables in the companion server's control catalog. They are never
 written into source-asset transcripts, project annotations, edit plans or
-canonical feedback. Movie time comes later, from the shared synchronizer (#223).
+canonical feedback. Movie time comes later, from the shared synchronizer (#223);
+editing and export happen in [editorial discussions](tv-review-discussions.md).
 
 | | |
 | --- | --- |
