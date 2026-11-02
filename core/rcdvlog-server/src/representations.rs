@@ -1055,6 +1055,7 @@ pub struct ServerJobHandler {
     scan: crate::ScanJobHandler,
     representations: RepresentationJobHandler,
     backups: crate::BackupJobHandler,
+    review_transcription: Option<crate::ReviewTranscriptionJobHandler>,
 }
 
 impl ServerJobHandler {
@@ -1067,7 +1068,17 @@ impl ServerJobHandler {
             scan,
             representations,
             backups,
+            review_transcription: None,
         }
+    }
+
+    /// Route `review_session.transcribe.v1` jobs (#224) to their handler.
+    pub fn with_review_transcription(
+        mut self,
+        handler: crate::ReviewTranscriptionJobHandler,
+    ) -> Self {
+        self.review_transcription = Some(handler);
+        self
     }
 }
 
@@ -1077,7 +1088,16 @@ impl JobHandler for ServerJobHandler {
         job: ClaimedJob,
         cancellation: CancellationToken,
     ) -> Result<JobResultCommit, JobHandlerFailure> {
-        if job.job.job_type == crate::BACKUP_JOB_TYPE {
+        if job.job.job_type == crate::REVIEW_TRANSCRIBE_JOB_TYPE {
+            match &self.review_transcription {
+                Some(handler) => handler.run(job, cancellation),
+                None => Err(JobHandlerFailure {
+                    kind: crate::FailureKind::Terminal,
+                    code: "review_transcription_not_ready".into(),
+                    details: serde_json::json!({}),
+                }),
+            }
+        } else if job.job.job_type == crate::BACKUP_JOB_TYPE {
             self.backups.run(job, cancellation)
         } else if job.job.job_type == REPRESENTATION_JOB_TYPE {
             self.representations.run(job, cancellation)
@@ -1092,7 +1112,9 @@ impl JobHandler for ServerJobHandler {
         job: &ClaimedJob,
         result: &JobResultCommit,
     ) -> Result<(), JobEngineError> {
-        if job.job.job_type == crate::BACKUP_JOB_TYPE {
+        if job.job.job_type == crate::REVIEW_TRANSCRIBE_JOB_TYPE {
+            Ok(())
+        } else if job.job.job_type == crate::BACKUP_JOB_TYPE {
             self.backups.commit_result(tx, job, result)
         } else if job.job.job_type == REPRESENTATION_JOB_TYPE {
             self.representations.commit_result(tx, job, result)

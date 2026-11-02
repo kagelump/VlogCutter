@@ -94,6 +94,11 @@ function client(session: SessionState): BrowserProjectClient {
     finalizeReviewSession: vi.fn(),
     deleteReviewSession: vi.fn(),
     reviewSessionAudioUrl: vi.fn().mockReturnValue("/audio.wav"),
+    preflightReviewTranscription: vi.fn(),
+    startReviewTranscription: vi.fn(),
+    listReviewTranscriptions: vi.fn().mockResolvedValue({ items: [] }),
+    getReviewTranscription: vi.fn(),
+    cancelReviewTranscription: vi.fn(),
   };
 }
 

@@ -28,6 +28,9 @@ import {
   type ReviewSessionEventRequest,
   type ReviewSessionPage,
   type ReviewTargetCandidates,
+  type ReviewTranscriptionPreflight,
+  type ReviewTranscriptionRequest,
+  type ReviewTranscriptionRun,
   type ReviewTargetDetail,
   type ReviewTargetImportRequest,
   type ReviewTargetImportResult,
@@ -220,6 +223,11 @@ export class HttpProjectClient implements BrowserProjectClient {
   async finalizeReviewSession(projectId: string, sessionId: string, request: { finalFrameCount: number; endReason: RecordingEndReason }): Promise<ReviewSessionDetail> { return this.request(sessionPath(API_PATHS.reviewSessionFinalize, projectId, sessionId), jsonPost(request)); }
   async deleteReviewSession(projectId: string, sessionId: string): Promise<ReviewSessionDetail> { return this.request(sessionPath(API_PATHS.reviewSession, projectId, sessionId), { method: "DELETE" }); }
   reviewSessionAudioUrl(projectId: string, sessionId: string): string { return `${this.baseUrl}${sessionPath(API_PATHS.reviewSessionAudio, projectId, sessionId)}`; }
+  async preflightReviewTranscription(projectId: string, sessionId: string, request: ReviewTranscriptionRequest): Promise<ReviewTranscriptionPreflight> { return this.request(sessionPath(API_PATHS.reviewTranscriptionPreflight, projectId, sessionId), jsonPost(request)); }
+  async startReviewTranscription(projectId: string, sessionId: string, request: ReviewTranscriptionRequest): Promise<ReviewTranscriptionRun> { return this.request(sessionPath(API_PATHS.reviewTranscriptions, projectId, sessionId), jsonPost(request)); }
+  async listReviewTranscriptions(projectId: string, sessionId: string): Promise<{ items: ReviewTranscriptionRun[] }> { return this.request(sessionPath(API_PATHS.reviewTranscriptions, projectId, sessionId)); }
+  async getReviewTranscription(projectId: string, runId: string): Promise<ReviewTranscriptionRun> { return this.request(pathParam(pathParam(API_PATHS.reviewTranscription, "projectId", projectId), "runId", runId)); }
+  async cancelReviewTranscription(projectId: string, runId: string): Promise<ReviewTranscriptionRun> { return this.request(pathParam(pathParam(API_PATHS.reviewTranscriptionCancel, "projectId", projectId), "runId", runId), jsonPost({})); }
   async revokeSession(sessionId: string): Promise<void> { await this.request(pathParam(API_PATHS.revokeSession, "sessionId", sessionId), { method: "DELETE" }); }
 
   private async request<T>(

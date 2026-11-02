@@ -1428,6 +1428,72 @@
         ],
         "type": "object"
       },
+      "ReviewTranscriptionList": {
+        "properties": {
+          "items": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "type": "object"
+      },
+      "ReviewTranscriptionPreflight": {
+        "additionalProperties": true,
+        "type": "object"
+      },
+      "ReviewTranscriptionRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "authorizedMaxCostUsd": {
+            "exclusiveMinimum": 0,
+            "maximum": 100,
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "backend": {
+            "enum": [
+              "local",
+              "openrouter"
+            ],
+            "type": "string"
+          },
+          "cloudUploadAcknowledged": {
+            "type": "boolean"
+          },
+          "languageHint": {
+            "pattern": "^[a-z]{2}$",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "zeroDataRetention": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "backend"
+        ],
+        "type": "object"
+      },
+      "ReviewTranscriptionRun": {
+        "additionalProperties": true,
+        "type": "object"
+      },
       "RotationMutationRequest": {
         "properties": {
           "baseRevision": {
@@ -3221,6 +3287,149 @@
         }
       }
     },
+    "/api/v1/projects/{projectId}/review-sessions/{sessionId}/transcriptions": {
+      "get": {
+        "operationId": "listReviewTranscriptions",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "projectId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "sessionId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReviewTranscriptionList"
+                }
+              }
+            },
+            "description": "ReviewTranscriptionList"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "post": {
+        "description": "Create or reuse (by audio/provider/settings fingerprint) a durable transcription run. Cloud runs require explicit upload acknowledgement and a hard USD ceiling; no fallback.",
+        "operationId": "startReviewTranscription",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "projectId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "sessionId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReviewTranscriptionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReviewTranscriptionRun"
+                }
+              }
+            },
+            "description": "ReviewTranscriptionRun"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/v1/projects/{projectId}/review-sessions/{sessionId}/transcriptions/preflight": {
+      "post": {
+        "description": "Readiness and worst-case cost; never sends audio or loads a model.",
+        "operationId": "preflightReviewTranscription",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "projectId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "sessionId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReviewTranscriptionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReviewTranscriptionPreflight"
+                }
+              }
+            },
+            "description": "ReviewTranscriptionPreflight"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
     "/api/v1/projects/{projectId}/review-targets": {
       "get": {
         "operationId": "listReviewTargets",
@@ -3522,6 +3731,82 @@
           },
           "401": {
             "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/v1/projects/{projectId}/review-transcriptions/{runId}": {
+      "get": {
+        "operationId": "getReviewTranscription",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "projectId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "runId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReviewTranscriptionRun"
+                }
+              }
+            },
+            "description": "ReviewTranscriptionRun"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/v1/projects/{projectId}/review-transcriptions/{runId}/cancel": {
+      "post": {
+        "operationId": "cancelReviewTranscription",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "projectId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "runId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReviewTranscriptionRun"
+                }
+              }
+            },
+            "description": "ReviewTranscriptionRun"
           },
           "404": {
             "$ref": "#/components/responses/Error"

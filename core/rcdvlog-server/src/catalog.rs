@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 use crate::ConfigDiagnostics;
 
-pub const CONTROL_CATALOG_SCHEMA_VERSION: u32 = 14;
+pub const CONTROL_CATALOG_SCHEMA_VERSION: u32 = 15;
 pub const CONTROL_DATABASE_FILENAME: &str = "control.sqlite3";
 pub const INSTANCE_LOCK_FILENAME: &str = "server.lock";
 
@@ -105,6 +105,12 @@ pub const CONTROL_CATALOG_MIGRATIONS: &[SqliteMigration] = &[
         name: "tv_review_sessions",
         source_identity: "server-control/0014-tv-review-sessions/20261102",
         apply: crate::review_sessions::migrate,
+    },
+    SqliteMigration {
+        id: 15,
+        name: "tv_review_transcription",
+        source_identity: "server-control/0015-tv-review-transcription/20261102",
+        apply: crate::review_transcripts::migrate,
     },
 ];
 
@@ -276,6 +282,11 @@ impl ControlCatalog {
     /// `<data dir>/review-evidence`, never in the derived/media root.
     pub fn review_sessions(&self, minimum_free_bytes: u64) -> crate::ReviewSessions {
         crate::ReviewSessions::new(self.database_path.clone(), minimum_free_bytes)
+    }
+
+    /// Review-session transcription runs (#224); never source-asset transcripts.
+    pub fn review_transcripts(&self) -> crate::ReviewTranscripts {
+        crate::ReviewTranscripts::new(self.database_path.clone())
     }
 
     pub fn project_replicas(&self) -> crate::ProjectReplicaManager {

@@ -14,6 +14,7 @@ mod replicas;
 mod representations;
 mod review_sessions;
 mod review_targets;
+mod review_transcripts;
 mod scan;
 pub mod scan_handler;
 mod search_index;
@@ -109,6 +110,13 @@ pub use review_targets::{
     ReviewTargetImportRequest, ReviewTargetImportResult, ReviewTargetObservation, ReviewTargetPage,
     ReviewTargetPreflight, ReviewTargetPreview, ReviewTargetReadiness, ReviewTargetServiceError,
     ReviewTargetSummary, ReviewTargets, VerificationFreshness,
+};
+pub use review_transcripts::{
+    ModelDirSpeechRuntime, REVIEW_TRANSCRIBE_JOB_TYPE, REVIEW_TRANSCRIPT_SCHEMA,
+    ReviewSpeechRuntime, ReviewTranscriptError, ReviewTranscriptionBackend,
+    ReviewTranscriptionJobHandler, ReviewTranscriptionPreflight, ReviewTranscriptionRequest,
+    ReviewTranscriptionRun, ReviewTranscriptionState, ReviewTranscripts, ReviewUtterance,
+    resample_to, script_and_display,
 };
 pub use scan::{
     NewScanSchedule, RecoveryReport, ScanRun, ScanSchedule, ScanScheduleUpdate, ScanService,

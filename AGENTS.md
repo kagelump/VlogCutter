@@ -67,8 +67,15 @@ Implemented now:
   captures untouched PCM through an AudioWorklet on the microphone sample
   clock, buffers it in IndexedDB, uploads hashed sequenced chunks, records
   manual cues, and has the server compute coverage and gaps at finalization.
-  ASR, sync and feedback reconciliation remain separate work; see
-  `docs/tv-review-handoff.md` and `docs/tv-voice-review-recording.md`.
+  Review-session ASR (control schema 15, `review_transcripts`, job
+  `review_session.transcribe.v1`) reuses the shared speech pipeline through
+  the `rcdvlog_core::review_speech` facade: local whisper or an explicitly
+  authorized, ledger-capped native OpenRouter model, per-window caching that
+  never rebills, recording-clock utterances with raw text plus an OpenCC s2tw
+  display projection. Speaker diarization is reported as unavailable, never
+  inferred. Sync and feedback reconciliation remain separate work; see
+  `docs/tv-review-handoff.md`, `docs/tv-voice-review-recording.md` and
+  `docs/tv-review-transcription.md`.
 
 - One supported CLI now includes editing, review and upload against schema 66,
   with observational `doctor --workflow rough-cut|delivery` preflight. Sparse
@@ -216,7 +223,7 @@ Implemented now:
 - A non-interactive JSON CLI for catalog, clip annotation, chronology, and media operations.
 - Immutable typed project operations for asset membership, notes, labels, removal, rotation, and fixed clock events, with deterministic materialized views and conflict diagnostics.
 - Read-only catalog/project/clip/proxy diagnostics, including the desktop's persisted last-selected catalog, project, and asset breadcrumb.
-- Optional Ubuntu companion runtime with a local-SSD control catalog (schema 14), local project replicas, logical storage roots/node bindings, a global verified-content library, and scoped availability observations.
+- Optional Ubuntu companion runtime with a local-SSD control catalog (schema 15), local project replicas, logical storage roots/node bindings, a global verified-content library, and scoped availability observations.
 - Durable leased jobs, cancellation/retry/restart recovery, scans/schedules, full hashing, shared proxy/thumbnail generation, node-scoped ETA history, and authenticated byte-range streaming.
 - Baseline format 1 and sync protocol 1.0 with bounded operation pages, per-origin cursors/acknowledgements, deterministic conflict handling, WebSocket hints, and polling recovery.
 - Browser bootstrap/session auth, revocable desktop credentials, Keychain storage, CSRF/Host/Origin/proxy validation, LAN Caddy and Tailscale Serve deployment assets.
@@ -605,7 +612,7 @@ Always pass `--catalog` in agent automation, tests, and temporary workflows. A d
 
 SQLite connections enable foreign keys, WAL journal mode, and a five-second busy timeout. Read operations can continue during an uncommitted writer. Project mutations append typed operations with materialized revisions. Adopted projects synchronize bounded operation pages between independent local catalogs; live SQLite/WAL files are never copied or placed on NAS.
 
-Project catalogs use an explicit `schema_migrations` history and are currently at version 66. The server control catalog is version 14; backup format is version 1. Migration definitions have immutable names/source identities and each migration commits atomically. Migration 18 includes a one-time compatibility reconciliation for catalogs created on the import feature branch before its migration IDs were merged with main. When changing the schema:
+Project catalogs use an explicit `schema_migrations` history and are currently at version 66. The server control catalog is version 15; backup format is version 1. Migration definitions have immutable names/source identities and each migration commits atomically. Migration 18 includes a one-time compatibility reconciliation for catalogs created on the import feature branch before its migration IDs were merged with main. When changing the schema:
 
 - Preserve existing catalogs; never solve migration issues by deleting the database.
 - Add a forward migration and an upgrade test using an older schema fixture.
