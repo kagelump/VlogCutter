@@ -270,6 +270,9 @@ impl SoundtrackIndex {
                 && valid_digest(&self.index_digest)
                 && self.sample_count >= FFT + 3 * HOP
                 && self.sample_count <= MAX_SAMPLES
+                && (self.sample_count as f64 / PCM_RATE as f64 - self.reference.duration_seconds)
+                    .abs()
+                    <= 0.05
                 && self.features.len() == (self.sample_count - FFT) / HOP + 1
                 && self
                     .features

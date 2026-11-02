@@ -128,6 +128,13 @@ fn repeats_silence_and_unrelated_audio_do_not_force_unique_positions() {
         SoundtrackMatchState::Matched,
         "unrelated signal: {r:?}"
     );
+    let mut inconsistent = index.clone();
+    inconsistent.reference.duration_seconds -= 1.0;
+    inconsistent.index_digest = inconsistent.digest().unwrap();
+    assert!(
+        inconsistent.validate().is_err(),
+        "a resealed index cannot misstate its PCM duration"
+    );
     let mut corrupt = index.clone();
     corrupt.features[10][0] += 0.1;
     assert!(corrupt.validate().is_err());
