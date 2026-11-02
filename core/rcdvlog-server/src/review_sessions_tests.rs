@@ -501,3 +501,105 @@ fn an_unfinalized_session_past_its_lifetime_is_reported_abandoned_but_finalizabl
         .unwrap();
     handoff.validate().unwrap();
 }
+
+#[test]
+fn event_retries_bind_the_entire_payload_and_native_frame_bounds() {
+    let f = fixture();
+    let id = f
+        .sessions
+        .create(
+            PROJECT,
+            &create_request(&f.target_id, "event_retry"),
+            &actor(),
+            now(),
+        )
+        .unwrap()
+        .summary
+        .session_id;
+    let event = ReviewSessionEventRequest {
+        event_id: "stable_cue".into(),
+        kind: ReviewSessionEventKind::ManualSyncCue,
+        audio_frame: 2400,
+        performance_ms: Some(1500.0),
+        declared_movie_seconds: Some(0.0),
+        detail: Some(serde_json::json!({"clockId":"mic_epoch_0"})),
+    };
+    let first = f
+        .sessions
+        .record_event(PROJECT, &id, &event, now())
+        .unwrap();
+    assert_eq!(
+        f.sessions
+            .record_event(PROJECT, &id, &event, now())
+            .unwrap(),
+        first
+    );
+    for change in 0..3 {
+        let mut changed = ReviewSessionEventRequest {
+            event_id: event.event_id.clone(),
+            kind: event.kind,
+            audio_frame: event.audio_frame,
+            performance_ms: event.performance_ms,
+            declared_movie_seconds: event.declared_movie_seconds,
+            detail: event.detail.clone(),
+        };
+        match change {
+            0 => changed.declared_movie_seconds = Some(5.0),
+            1 => changed.performance_ms = Some(1501.0),
+            _ => changed.detail = Some(serde_json::json!({"clockId":"other_epoch"})),
+        };
+        assert!(matches!(
+            f.sessions.record_event(PROJECT, &id, &changed, now()),
+            Err(ReviewSessionError::IdempotencyConflict)
+        ));
+    }
+    let oversized = ReviewSessionEventRequest {
+        event_id: "too_far".into(),
+        audio_frame: u64::MAX,
+        ..event
+    };
+    assert!(
+        f.sessions
+            .record_event(PROJECT, &id, &oversized, now())
+            .is_err()
+    );
+}
+
+#[test]
+fn unacknowledged_capture_tail_remains_incomplete_while_uploaded_bytes_are_usable() {
+    let f = fixture();
+    let id = f
+        .sessions
+        .create(
+            PROJECT,
+            &create_request(&f.target_id, "tail_unknown"),
+            &actor(),
+            now(),
+        )
+        .unwrap()
+        .summary
+        .session_id;
+    upload(&f, &id, 0, 0, 4800).unwrap();
+    f.sessions
+        .record_event(
+            PROJECT,
+            &id,
+            &ReviewSessionEventRequest {
+                event_id: "tail".into(),
+                kind: ReviewSessionEventKind::PageInterrupted,
+                audio_frame: 4800,
+                performance_ms: None,
+                declared_movie_seconds: None,
+                detail: Some(serde_json::json!({"captureTailStatus":"unknown"})),
+            },
+            now(),
+        )
+        .unwrap();
+    let done = finalize(&f, &id, 4800, RecordingEndReason::Interrupted).unwrap();
+    assert_eq!(done.summary.state, ReviewSessionState::Incomplete);
+    assert_eq!(
+        f.sessions.chunk_bytes(PROJECT, &id, 0).unwrap(),
+        pcm(0, 4800)
+    );
+    assert!(f.sessions.audio(PROJECT, &id).is_err());
+}

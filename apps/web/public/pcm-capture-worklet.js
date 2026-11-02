@@ -16,9 +16,16 @@ class PcmCaptureProcessor extends AudioWorkletProcessor {
     this.batchStart = null;
     this.expected = null;
     this.stopped = false;
+    this.firstFrame = null;
+    this.probe = null;
     this.port.onmessage = (event) => {
       if (event.data?.type === "flush") this.flush();
-      if (event.data?.type === "stop") { this.flush(); this.stopped = true; }
+      if (event.data?.type === "clockProbe") this.probe = event.data.probeId;
+      if (event.data?.type === "stop") {
+        this.flush(); this.stopped = true;
+        // Same-port FIFO: every final audio batch precedes this acknowledgment.
+        this.port.postMessage({type:"stopped",firstFrame:this.firstFrame,finalFrame:this.expected});
+      }
     };
   }
 
@@ -43,6 +50,11 @@ class PcmCaptureProcessor extends AudioWorkletProcessor {
     if (!input || input.length === 0 || input[0].length === 0) return true;
     const frame = currentFrame;
     const length = input[0].length;
+    if (this.firstFrame === null) this.firstFrame = frame;
+    if (this.probe !== null) {
+      this.port.postMessage({type:"clockSample",probeId:this.probe,frame,firstFrame:this.firstFrame});
+      this.probe = null;
+    }
     if (this.expected !== null && frame !== this.expected) {
       this.flush();
       this.port.postMessage({ type: "discontinuity", expectedFrame: this.expected, actualFrame: frame });

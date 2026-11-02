@@ -8,6 +8,7 @@ import type { ChunkOutbox } from "./outbox";
 
 export interface UploadStatus {
   pendingChunks: number;
+  pendingEvents: number;
   uploadedChunks: number;
   lastReceiptAt: string | null;
   retrying: boolean;
@@ -20,6 +21,7 @@ const PERMANENT = new Set([
   "review_session_chunk_corrupt",
   "review_session_limit_exceeded",
   "review_session_not_recording",
+  "idempotency_conflict",
   "not_found",
   "project_replica_not_found",
   "invalid_input",
@@ -35,7 +37,7 @@ export function isPermanentUploadError(error: unknown): boolean {
 export class ChunkUploader {
   private running: Promise<void> | null = null;
   private stopped = false;
-  status: UploadStatus = { pendingChunks: 0, uploadedChunks: 0, lastReceiptAt: null, retrying: false, blockedCode: null };
+  status: UploadStatus = { pendingChunks: 0, pendingEvents: 0, uploadedChunks: 0, lastReceiptAt: null, retrying: false, blockedCode: null };
 
   constructor(
     private readonly client: BrowserProjectClient,
@@ -64,7 +66,24 @@ export class ChunkUploader {
     for (;;) {
       if (this.stopped || this.status.blockedCode) return;
       const pending = await this.outbox.chunks(this.sessionId);
-      this.update({ pendingChunks: pending.length });
+      const events = await this.outbox.events(this.sessionId);
+      this.update({ pendingChunks: pending.length, pendingEvents:events.length });
+      if (events.length) {
+        const event = events[0].event;
+        try {
+          const receipt = await this.client.recordReviewSessionEvent(this.projectId,this.sessionId,event);
+          if (receipt.eventId!==event.eventId || receipt.kind!==event.kind || receipt.audioFrame!==event.audioFrame || receipt.declaredMovieSeconds!==(event.declaredMovieSeconds??null)) {
+            this.update({blockedCode:"review_session_receipt_mismatch"}); return;
+          }
+          await this.outbox.deleteEvent(this.sessionId,event.eventId);
+          this.update({pendingEvents:events.length-1,retrying:false});
+          delay=500;
+        } catch (error) {
+          if (isPermanentUploadError(error)) { this.update({blockedCode:error instanceof ProjectClientError?error.code:"unexpected_error",retrying:false}); return; }
+          this.update({retrying:true}); await this.sleep(delay); delay=Math.min(delay*2,10_000);
+        }
+        continue;
+      }
       if (!pending.length) { this.update({ retrying: false }); return; }
       const chunk = pending[0];
       try {

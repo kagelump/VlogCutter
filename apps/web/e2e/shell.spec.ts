@@ -168,6 +168,8 @@ async function startRecording(page: import("@playwright/test").Page) {
 }
 
 test("Chrome records a fake-microphone voice review with a manual cue and reopens it", async ({ page }) => {
+  // Includes real-time capture, authenticated requests, recovery and deletion.
+  test.setTimeout(60_000);
   await openSeededTarget(page, bootstrapCode(5));
   await startRecording(page);
   await page.waitForTimeout(1_500);
@@ -190,7 +192,17 @@ test("Chrome records a fake-microphone voice review with a manual cue and reopen
   const wav = await download(href!);
   expect(wav.status).toBe(200);
   expect(wav.magic).toBe("RIFF");
-  // 48 kHz mono PCM16: more than four seconds of audio.
+  const sessionApi=href!.replace(/\/audio\.wav$/,"");
+  const evidence=await page.evaluate(async(url)=>{const response=await fetch(url);return response.json();},sessionApi);
+  const detail=evidence;
+  const calibrations=detail.events.filter((e:{kind:string})=>e.kind==="clockSample");
+  expect(calibrations.length).toBeGreaterThan(0);
+  expect(calibrations[0].detail).toMatchObject({schema:"review-capture-calibration.v1",method:"workletProbeBracket",clockId:"mic_epoch_0",sampleRate:48000,firstSample:0});
+  expect(calibrations[0].detail.monotonicToleranceNs).toBeLessThan(1_000_000_000);
+  expect(calibrations[0].detail.probeSentNs).toBeLessThanOrEqual(calibrations[0].detail.probeReceivedNs);
+  expect(detail.coverage.finalFrameCount*detail.channels*2).toBe(wav.length-44);
+
+  // Native 48 kHz PCM16: more than four seconds of audio, preserving channels.
   expect(wav.length - 44).toBeGreaterThan(4 * 48_000 * 2 * 0.9);
 
   // Reopen from the target's session list.
@@ -204,18 +216,29 @@ test("Chrome records a fake-microphone voice review with a manual cue and reopen
 });
 
 test("Chrome recovers a recording interrupted by a page reload and finalizes it honestly", async ({ page }) => {
+  // Includes real-time capture, authenticated requests, recovery and deletion.
+  test.setTimeout(60_000);
   await openSeededTarget(page, bootstrapCode(6));
   const targetUrl = page.url();
   await startRecording(page);
-  await page.waitForTimeout(4_500);
+  await page.waitForTimeout(2_500);
+  // Audio remains online while event posts fail. The saved cue must survive
+  // page replacement in the real IndexedDB outbox before recovery retries it.
+  await page.route("**/review-sessions/*/events",route=>route.abort("failed"));
+  await page.keyboard.press("m");
+  await expect(page.locator(".tv-recorder-facts")).toContainText(/Cues\s*1/);
+  await page.waitForTimeout(500);
   await page.reload();
   await page.goto(targetUrl);
   const recovery = page.getByRole("region", { name: "Unfinished recordings" });
   await expect(recovery).toBeVisible();
+  await page.unroute("**/review-sessions/*/events");
   await recovery.getByRole("button", { name: "Resume upload and finalize" }).click();
   await expect(page.getByText("Buffered recordings uploaded and finalized.")).toBeVisible({ timeout: 30_000 });
   await page.reload();
   await page.locator(".tv-voice-start .project-list button").first().click();
   await expect(page.getByRole("heading", { name: "Voice review session" })).toBeVisible();
   await expect(page.getByText(/^interrupted/)).toBeVisible();
+  await expect(page.getByText("Incomplete",{exact:true})).toBeVisible();
+  await expect(page.getByText(/reviewer declaration, not measured sync/)).toBeVisible();
 });

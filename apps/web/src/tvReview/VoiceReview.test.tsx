@@ -95,7 +95,7 @@ test("incomplete sessions show their gaps and offer no padded download", async (
     reviewSessionAudioUrl: vi.fn().mockReturnValue("/audio.wav"),
   } as unknown as BrowserProjectClient;
   render(<SessionDetailView client={sessionClient} projectId="p" targetId="rtarget_one" sessionId="rsession_1" navigate={vi.fn()} />);
-  expect(await screen.findByText("Incomplete · gaps recorded")).toBeVisible();
+  expect(await screen.findByText("Incomplete",{exact:true})).toBeVisible();
   expect(screen.getByText(/0:02–0:04 \(no audio exists/)).toBeVisible();
   expect(screen.getByText(/reviewer declaration, not measured sync/)).toBeVisible();
   expect(screen.queryByRole("link", { name: "Download WAV" })).toBeNull();

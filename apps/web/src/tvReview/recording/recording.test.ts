@@ -67,6 +67,7 @@ function uploadClient(put: BrowserProjectClient["putReviewSessionChunk"]): Brows
     putReviewSessionChunk: put,
     finalizeReviewSession: vi.fn().mockResolvedValue({ sessionId: "s", state: "completed" }),
     getReviewSession: vi.fn(),
+    recordReviewSessionEvent:vi.fn(async (_p:string,_s:string,event:Record<string,unknown>)=>({...event,serverReceivedAt:"t"})),
   } as unknown as BrowserProjectClient;
 }
 
@@ -129,4 +130,37 @@ test("recovery never finalizes while audio is still buffered", async () => {
   expect(await finalizeWhenDrained(client, outbox, meta)).toBeNull();
   expect(client.finalizeReviewSession).not.toHaveBeenCalled();
   expect((await outbox.sessions()).length).toBe(1);
+});
+
+test("cue and calibration events survive lost responses and reload recovery before finalize", async () => {
+  const outbox=new MemoryOutbox();
+  const meta: OutboxSession={sessionId:"s",projectId:"p",reviewTargetId:"t",capturedFrames:2,ended:true,endReason:"stopped",updatedAt:"now"};
+  await outbox.putSession(meta);
+  await seed(outbox,1);
+  const event={eventId:"stable-cue",kind:"manualSyncCue" as const,audioFrame:1,performanceMs:10,declaredMovieSeconds:0,detail:{clockId:"mic_epoch_0"}};
+  await outbox.putEvent({sessionId:"s",event});
+  const post=vi.fn().mockRejectedValueOnce(new ProjectClientError("server_unavailable","lost committed response","server_unavailable")).mockResolvedValue({...event,audioSeconds:1/48000,serverReceivedAt:"t"});
+  const put=vi.fn(async (_p:string,_s:string,c:{sequence:number;sha256:string})=>({sessionId:"s",sequence:c.sequence,sha256:c.sha256,receivedAt:"t"}));
+  const client={...uploadClient(put as never),recordReviewSessionEvent:post} as unknown as BrowserProjectClient;
+  const uploader=new ChunkUploader(client,outbox,"p","s",undefined,async()=>undefined);
+  await uploader.kick();
+  expect(post).toHaveBeenCalledTimes(2);
+  expect(post.mock.calls[0][2]).toEqual(post.mock.calls[1][2]);
+  expect(await outbox.events("s")).toEqual([]);
+  expect(post.mock.invocationCallOrder[1]).toBeLessThan(put.mock.invocationCallOrder[0]);
+  expect(await finalizeWhenDrained(client,outbox,meta)).not.toBeNull();
+});
+
+test("a conflicting event or failed event storage cannot be finalized as complete", async () => {
+  const outbox=new MemoryOutbox();
+  const meta: OutboxSession={sessionId:"s",projectId:"p",reviewTargetId:"t",capturedFrames:0,ended:true,endReason:"stopped",updatedAt:"now"};
+  await outbox.putSession(meta);
+  await outbox.putEvent({sessionId:"s",event:{eventId:"cue",kind:"manualSyncCue",audioFrame:0,declaredMovieSeconds:0}});
+  const client={...uploadClient(vi.fn()),recordReviewSessionEvent:vi.fn().mockRejectedValue(new ProjectClientError("server_error","conflict","idempotency_conflict",null,409))} as unknown as BrowserProjectClient;
+  expect(await finalizeWhenDrained(client,outbox,meta)).toBeNull();
+  expect(client.finalizeReviewSession).not.toHaveBeenCalled();
+  expect(await outbox.events("s")).toHaveLength(1);
+  await outbox.deleteEvent("s","cue");
+  expect(await finalizeWhenDrained(client,outbox,{...meta,eventStorageFailed:true})).toBeNull();
+  expect(client.finalizeReviewSession).not.toHaveBeenCalled();
 });

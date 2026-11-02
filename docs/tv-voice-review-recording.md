@@ -47,7 +47,7 @@ exact target.
 - Samples are stored as interleaved `pcm_s16le` at the context rate (48 kHz
   requested). The float → int16 quantization is the only transformation.
 - Timing that is not on the recording clock is correlation data only:
-  - each chunk's `performance.now()` at capture end
+  - each chunk's main-thread `performance.now()` on delivery (not its sample-zero origin)
   - each event's `performance.now()`
   - the server's receive time for every chunk and event
 
@@ -55,6 +55,27 @@ exact target.
 - A manual cue is stored on the recording clock (`AudioContext.currentTime`
   rebased to frame 0, with `outputLatency` in its detail), together with the
   declared movie second (0 = first frame).
+
+A versioned `clockSample.detail` (`schema: review-capture-calibration.v1`)
+retains the sample/performance pairing. The main thread sends a probe with its
+monotonic send time; the worklet answers on a processing quantum with the native
+frame and first captured frame; receipt time closes the causal bracket. Detail
+keeps the original performance epoch/send/receive values, session-relative
+`probeSentNs`/`probeReceivedNs`, `sampleIndex`, `sampleRate`, `firstSample`,
+`clockId`, estimated `monotonicOriginNs` and `monotonicToleranceNs`. The bound
+includes half the roundtrip plus one rendering quantum. It is render-thread
+calibration, not a measured ADC/acoustic delay. Slow (>500 ms), negative or
+invalid observations stay uncalibrated. Probes repeat every 30 s; suspend/resume
+records a discontinuity and starts a new clock identity. A consumer must retain
+these observations and reject incompatible epochs rather than reconstructing
+sample zero from request-start or packet arrival. TV alignment remains #223's
+job and has its own uncertainty.
+
+Stop waits for a same-port worklet acknowledgment containing its final frame,
+with all tail audio delivered first. It then drains storage and upload before
+finalizing. A timeout records `captureTailStatus: unknown`, ends as interrupted,
+and keeps the session incomplete; an arbitrary timer cannot certify the tail.
+Concurrent stop calls share the same completion.
 
 ## Durability
 
@@ -78,13 +99,21 @@ If the outbox or the browser quota is full, that chunk's frames are reported as
 a `localBufferOverflow` event and become a gap. They are never dropped silently.
 
 After a reload, tab close or lost network, the target and record pages show
-**Resume upload and finalize**. Recovery uploads the buffered chunks and then
-finalizes the session as `interrupted`, using the last chunk end the outbox
-recorded. Up to one unflushed chunk (≤2 s) can be lost on an abrupt tab close.
-Those frames were never on disk, and the session does not claim them.
+**Resume upload and finalize**. Recovery uploads buffered chunks and durable events, then finalizes as
+`interrupted`. It records an unknown-tail event because the restarted page
+cannot know the worklet's last frame. The last stored prefix does not become
+an acknowledged complete recording. Unflushed samples may be absent; their
+length is unknown, and no silence or frame count is invented. Uploaded chunks
+remain retrievable for later processing.
 
-A session is never finalized while audio for it is still buffered in the
-browser.
+Manual cues, calibration and health events are written to an IndexedDB v2
+event outbox before upload, with stable event IDs and retryable payloads (up to
+10,000 events, 4 KiB per local event; server detail remains 2 KiB). Cues count
+as saved only after local durable acceptance. Event and audio queues must both
+drain before finalization. Local event-storage failure is retained in recovery
+metadata and blocks false completion. Server event replay compares kind, frame,
+monotonic value, declared movie time and detail; reusing an ID with any changed
+payload is a conflict.
 
 ## Server owner and API
 
@@ -109,7 +138,7 @@ States are:
 
 - `recording`
 - `completed`: contiguous coverage of the whole declared length
-- `incomplete`: one or more gaps, each listed
+- `incomplete`: listed gaps or an explicitly unknown capture tail
 - `corrupt`: a stored file is missing or its hash changed
 - `deleted`
 
@@ -133,7 +162,7 @@ never touched.
   - conflicting, overlapping, corrupt and oversized chunks
   - a stored chunk modified after upload (marked corrupt)
   - consent and readiness and the concurrency limit
-  - idempotency conflict
+  - full event-payload idempotency, frame limits and unknown-tail evidence
   - deletion tombstone
   - abandoned-but-finalizable sessions
 - **HTTP**: auth, CSRF, the Permissions-Policy header, duplicate and corrupt

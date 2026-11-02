@@ -44,6 +44,7 @@ export const SESSION_CODE_COPY: Record<string, string> = {
   review_session_chunk_conflict: "A chunk conflicts with audio the server already holds. The local copy is kept; nothing was overwritten.",
   review_session_chunk_corrupt: "A chunk failed its integrity check. The local copy is kept.",
   review_session_limit_exceeded: "This session reached its size or duration limit.",
+  review_session_event_storage_failed: "Some review evidence could not be saved locally. Keep this recording for recovery; it will not be finalized automatically.",
   review_session_audio_unavailable: "Audio download is only offered for a completed session; incomplete audio is never padded.",
   review_target_verification_expired: "The review target's verification has expired. Re-export it on the owning Mac before recording.",
   review_target_artifact_unavailable: "The review target's movie is not known to be present on its owning host.",
@@ -63,7 +64,7 @@ function sessionPath(projectId: string, targetId: string, sessionId?: string) {
 function stateBadge(session: ReviewSessionSummary) {
   if (session.state === "completed") return <StatusBadge label="Completed" tone="positive" />;
   if (session.state === "recording") return <StatusBadge label={session.abandoned ? "Recording · abandoned" : "Recording / uploading"} tone="warning" />;
-  if (session.state === "incomplete") return <StatusBadge label="Incomplete · gaps recorded" tone="warning" />;
+  if (session.state === "incomplete") return <StatusBadge label="Incomplete" tone="warning" />;
   if (session.state === "corrupt") return <StatusBadge label="Corrupt evidence" tone="critical" />;
   return <StatusBadge label="Deleted" tone="neutral" />;
 }
@@ -252,7 +253,7 @@ export function RecordView({ client, projectId, targetId, navigate, deps = brows
         </div>
         {status ? <dl className="tv-facts tv-recorder-facts">
           <dt>Elapsed</dt><dd>{formatClock(status.elapsedSeconds)}</dd>
-          <dt>Uploaded</dt><dd>{status.upload.uploadedChunks} chunks{status.upload.pendingChunks ? ` · ${status.upload.pendingChunks} buffered` : ""}{status.upload.retrying ? " · retrying" : ""}</dd>
+          <dt>Uploaded</dt><dd>{status.upload.uploadedChunks} chunks{status.upload.pendingChunks ? ` · ${status.upload.pendingChunks} buffered` : ""}{status.upload.pendingEvents ? ` · ${status.upload.pendingEvents} review events buffered` : ""}{status.upload.retrying ? " · retrying" : ""}</dd>
           <dt>Cues</dt><dd>{status.cues}</dd>
           {status.lostFrames ? <><dt>Lost</dt><dd>{(status.lostFrames / status.sampleRate).toFixed(1)} s could not be buffered (recorded as a gap)</dd></> : null}
           {status.discontinuities ? <><dt>Glitches</dt><dd>{status.discontinuities} capture discontinuities recorded</dd></> : null}
@@ -290,6 +291,7 @@ export function SessionDetailView({ client, projectId, targetId, sessionId, navi
           <dt>Consent</dt><dd>everyone present acknowledged{session.consent.additionalSpeakersDisclosed ? " · second speaker disclosed" : " · single speaker declared"}</dd>
           <dt>Processing</dt><dd>echo cancellation {String(session.capture.echoCancellation)} · noise suppression {String(session.capture.noiseSuppression)} · auto gain {String(session.capture.autoGainControl)}</dd>
           <dt>Gaps</dt><dd>{session.coverage.gaps.length ? session.coverage.gaps.map((gap) => `${formatClock(gap.startFrame / rate)}–${formatClock(gap.endFrame / rate)}`).join(", ") + " (no audio exists for these spans)" : session.state === "recording" ? "not computed until finalized" : "none"}</dd>
+          {session.events.some((event)=>event.kind==="pageInterrupted"&&event.detail?.captureTailStatus==="unknown") ? <><dt>Capture end</dt><dd>The final sample count was not acknowledged. Uploaded audio is retained; the tail length is unknown.</dd></> : null}
         </dl>
         <h2 className="tv-section-title">Manual cues</h2>
         {cues.length ? <ul className="tv-limitations">{cues.map((cue) => <li key={cue.eventId}>{formatClock(cue.audioSeconds)} on the recording clock — declared movie {cue.declaredMovieSeconds ?? "?"} s (reviewer declaration, not measured sync)</li>)}</ul> : <p className="help">No manual cue. Automatic synchronization may still align this recording later.</p>}
