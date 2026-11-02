@@ -27,6 +27,8 @@ function client(overrides: Partial<BrowserProjectClient> = {}) {
     updateReviewDiscussion: vi.fn().mockResolvedValue(workspace),
     addReviewDiscussionItem: vi.fn(),
     proposeReviewDiscussions: vi.fn(),
+    getReviewSession: vi.fn().mockResolvedValue({ state: "incomplete", sampleRate: 48000, coverage: { storedRanges: [{ startFrame: 0, endFrame: 480000 }] } }),
+    reviewSessionSnippetUrl: vi.fn((_p: string, _s: string, a: number, b: number) => `/snippet.wav?startFrame=${a}&endFrame=${b}`),
     ...overrides,
   } as unknown as BrowserProjectClient;
 }
@@ -53,4 +55,19 @@ test("a refused acceptance is explained by its stable code", async () => {
   await userEvent.click(screen.getByRole("button", { name: "Add" }));
   expect(await screen.findByText(/Confirm which cut this discussion is about/)).toBeVisible();
   expect(vi.mocked(mock.addReviewDiscussionItem).mock.calls[0][2]).toMatchObject({ kind: "decision", authorKind: "human", decision: "accepted", refersToItemId: "i1" });
+});
+
+test("each stored utterance can be heard in a bounded snippet with a little context", async () => {
+  const mock = client();
+  render(<ReviewWorkspaceView client={mock} projectId="p" targetId="t" sessionId="s" runId="r" navigate={vi.fn()} />);
+  await userEvent.click(await screen.findByRole("button", { name: "Listen to utterance at 0:01.0" }));
+  expect(screen.getByLabelText("Recording utterance at 0:01.0")).toHaveAttribute("src", "/snippet.wav?startFrame=24000&endFrame=120000");
+});
+
+test("an utterance whose audio was never stored offers nothing to play", async () => {
+  const mock = client({ getReviewSession: vi.fn().mockResolvedValue({ state: "incomplete", sampleRate: 48000, coverage: { storedRanges: [{ startFrame: 200000, endFrame: 480000 }] } }) });
+  render(<ReviewWorkspaceView client={mock} projectId="p" targetId="t" sessionId="s" runId="r" navigate={vi.fn()} />);
+  expect(await screen.findByRole("heading", { name: "Editorial review" })).toBeVisible();
+  await waitFor(() => expect(mock.getReviewSession).toHaveBeenCalled());
+  expect(screen.queryByRole("button", { name: /Listen to utterance/ })).toBeNull();
 });

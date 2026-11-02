@@ -57,6 +57,9 @@ pub enum ReviewSessionError {
     LowDiskSpace,
     #[error("session audio is not available for download")]
     AudioUnavailable,
+    /// The requested snippet touches audio the server never received.
+    #[error("requested audio range is not fully stored; gaps are never padded")]
+    AudioGap,
     #[error("idempotency key reused for a different session request")]
     IdempotencyConflict,
     #[error(transparent)]
@@ -84,6 +87,7 @@ impl ReviewSessionError {
             Self::LimitExceeded => "review_session_limit_exceeded",
             Self::LowDiskSpace => "low_disk_space",
             Self::AudioUnavailable => "review_session_audio_unavailable",
+            Self::AudioGap => "review_session_audio_gap",
             Self::IdempotencyConflict => "idempotency_conflict",
             Self::Infrastructure(_) | Self::Database(_) | Self::Io(_) => "internal_error",
         }
@@ -254,6 +258,10 @@ pub struct ReviewSessionCoverage {
     pub missing_sequences: Vec<u32>,
     /// Frame ranges inside `[0, finalFrameCount)` with no stored audio.
     pub gaps: Vec<FrameRange>,
+    /// Maximal contiguous stored ranges: what can be listened to, in any
+    /// state but deleted, including the recoverable parts of an incomplete
+    /// session. Independent of finalization.
+    pub stored_ranges: Vec<FrameRange>,
     pub final_frame_count: Option<u64>,
     pub received_seconds: f64,
 }
@@ -351,6 +359,20 @@ const STORAGE: ReviewSessionStorage = ReviewSessionStorage {
 pub struct ReviewSessionPage {
     pub items: Vec<ReviewSessionSummary>,
     pub next_before: Option<i64>,
+}
+
+/// Longest snippet a reviewer can request at once. Snippets are for checking
+/// what was said around an utterance or a recoverable span, not for export.
+pub const REVIEW_SNIPPET_MAX_SECONDS: u64 = 30;
+
+/// Bounded, re-verified PCM for one listening snippet.
+#[derive(Debug, Clone)]
+pub struct ReviewSessionSnippet {
+    pub sample_rate: u32,
+    pub channels: u32,
+    pub start_frame: u64,
+    pub end_frame: u64,
+    pub pcm: Vec<u8>,
 }
 
 /// Contiguous stored audio for a completed session, for streaming as WAV.
@@ -1073,6 +1095,68 @@ impl ReviewSessions {
         })
     }
 
+    /// Bounded PCM of `[start_frame, end_frame)` from any non-deleted session,
+    /// including the recoverable portions of incomplete, corrupt or still
+    /// recording ones. The range must lie entirely inside stored, re-verified
+    /// audio: a gap is refused rather than padded, so silence is never
+    /// synthesized and a listener never mistakes missing audio for quiet.
+    pub fn snippet(
+        &self,
+        project_id: &str,
+        session_id: &str,
+        start_frame: u64,
+        end_frame: u64,
+    ) -> Result<ReviewSessionSnippet, ReviewSessionError> {
+        let connection = open_read_only_connection(&self.database_path)?;
+        Self::project_registered(&connection, project_id)?;
+        let session = load_session_row(&connection, project_id, session_id)?;
+        if session.state == ReviewSessionState::Deleted {
+            return Err(ReviewSessionError::AudioUnavailable);
+        }
+        let max = u64::from(session.sample_rate) * REVIEW_SNIPPET_MAX_SECONDS;
+        if end_frame <= start_frame || end_frame - start_frame > max {
+            return Err(ReviewSessionError::InvalidInput(format!(
+                "snippet must be 1 frame to {REVIEW_SNIPPET_MAX_SECONDS} seconds"
+            )));
+        }
+        let mut chunks = load_chunks(&connection, session_id)?;
+        chunks.sort_by_key(|c| c.start_frame);
+        let frame_bytes = u64::from(session.channels) * 2;
+        let mut pcm = Vec::with_capacity(((end_frame - start_frame) * frame_bytes) as usize);
+        let mut cursor = start_frame;
+        for chunk in &chunks {
+            let chunk_end = chunk.start_frame + u64::from(chunk.frame_count);
+            if chunk_end <= cursor || chunk.start_frame >= end_frame {
+                continue;
+            }
+            if chunk.start_frame > cursor {
+                break;
+            }
+            let bytes = fs::read(self.chunk_path(session_id, chunk.sequence))
+                .map_err(|_| ReviewSessionError::AudioUnavailable)?;
+            if sha256_hex(&bytes) != chunk.sha256 {
+                return Err(ReviewSessionError::AudioUnavailable);
+            }
+            let from = ((cursor - chunk.start_frame) * frame_bytes) as usize;
+            let to = ((end_frame.min(chunk_end) - chunk.start_frame) * frame_bytes) as usize;
+            pcm.extend_from_slice(&bytes[from..to]);
+            cursor = end_frame.min(chunk_end);
+            if cursor == end_frame {
+                break;
+            }
+        }
+        if cursor != end_frame {
+            return Err(ReviewSessionError::AudioGap);
+        }
+        Ok(ReviewSessionSnippet {
+            sample_rate: session.sample_rate,
+            channels: session.channels,
+            start_frame,
+            end_frame,
+            pcm,
+        })
+    }
+
     /// Exact stored bytes of one chunk (any non-deleted state), re-verified.
     pub fn chunk_bytes(
         &self,
@@ -1314,6 +1398,16 @@ fn coverage(
             });
         }
     }
+    let mut stored_ranges: Vec<FrameRange> = Vec::new();
+    for (start, end) in &ranges {
+        match stored_ranges.last_mut() {
+            Some(last) if *start <= last.end_frame => last.end_frame = last.end_frame.max(*end),
+            _ => stored_ranges.push(FrameRange {
+                start_frame: *start,
+                end_frame: *end,
+            }),
+        }
+    }
     let highest_sequence = chunks.iter().map(|c| c.sequence).max();
     let present: std::collections::HashSet<u32> = chunks.iter().map(|c| c.sequence).collect();
     let missing_sequences = highest_sequence
@@ -1326,6 +1420,7 @@ fn coverage(
         highest_sequence,
         missing_sequences,
         gaps,
+        stored_ranges,
         final_frame_count,
         received_seconds: received_frames as f64 / f64::from(sample_rate),
     }

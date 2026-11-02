@@ -83,7 +83,7 @@ test("incomplete sessions show their gaps and offer no padded download", async (
     consent: { allPresentAcknowledged: true, additionalSpeakersDisclosed: false },
     capture: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, clock: "audioWorkletCurrentFrame", baseLatencySeconds: null, userAgentFamily: "chromium" },
     createdBy: { actorType: "browser_session", actorId: "s" }, clientStartedPerformanceMs: null, recordingExpiresAt: "t",
-    coverage: { receivedFrames: 192000, receivedBytes: 384000, chunkCount: 2, highestSequence: 2, missingSequences: [1], gaps: [{ startFrame: 96000, endFrame: 192000 }], finalFrameCount: 288000, receivedSeconds: 4 },
+    coverage: { receivedFrames: 192000, receivedBytes: 384000, chunkCount: 2, highestSequence: 2, missingSequences: [1], gaps: [{ startFrame: 96000, endFrame: 192000 }], storedRanges: [{ startFrame: 0, endFrame: 96000 }, { startFrame: 192000, endFrame: 288000 }], finalFrameCount: 288000, receivedSeconds: 4 },
     chunks: [], events: [{ eventId: "c", kind: "manualSyncCue", audioFrame: 48000, audioSeconds: 1, performanceMs: 1, declaredMovieSeconds: 0, serverReceivedAt: "t", detail: null }],
     limits: { maxChunkBytes: 1, maxSessionBytes: 1, recordingLifetimeHours: 12 },
     storage: { location: "Private server data directory.", retention: "Kept until you delete it.", backup: "Not in backups." },
@@ -93,6 +93,7 @@ test("incomplete sessions show their gaps and offer no padded download", async (
     getReviewSession: vi.fn().mockResolvedValue(session),
     deleteReviewSession: vi.fn().mockResolvedValue(deleted),
     reviewSessionAudioUrl: vi.fn().mockReturnValue("/audio.wav"),
+    reviewSessionSnippetUrl: vi.fn((_p: string, _s: string, a: number, b: number) => `/snippet.wav?startFrame=${a}&endFrame=${b}`),
     listReviewTranscriptions: vi.fn().mockResolvedValue({ items: [] }),
   } as unknown as BrowserProjectClient;
   render(<SessionDetailView client={sessionClient} projectId="p" targetId="rtarget_one" sessionId="rsession_1" navigate={vi.fn()} />);
@@ -100,6 +101,13 @@ test("incomplete sessions show their gaps and offer no padded download", async (
   expect(screen.getByText(/0:02–0:04 \(no audio exists/)).toBeVisible();
   expect(screen.getByText(/reviewer declaration, not measured sync/)).toBeVisible();
   expect(screen.queryByRole("link", { name: "Download WAV" })).toBeNull();
+  // What did arrive is listenable, span by span, and nothing loads until asked.
+  const listen = screen.getByRole("region", { name: "Listen to stored audio" });
+  expect(listen).toHaveTextContent("gaps are skipped, never filled with silence");
+  expect(document.querySelector("audio")).toBeNull();
+  expect(screen.getByRole("button", { name: "Listen to 0:00–0:02" })).toBeVisible();
+  await userEvent.click(screen.getByRole("button", { name: "Listen to 0:04–0:06" }));
+  expect(screen.getByLabelText("Recording 0:04–0:06")).toHaveAttribute("src", "/snippet.wav?startFrame=192000&endFrame=288000");
   await userEvent.click(screen.getByRole("button", { name: "Delete recording…" }));
   await userEvent.click(screen.getByRole("button", { name: "Delete audio permanently" }));
   expect(await screen.findByText(/Audio deleted t3/)).toBeVisible();

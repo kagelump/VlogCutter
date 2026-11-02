@@ -230,6 +230,9 @@ export interface ReviewTargetImportRequest {
   maxVerificationAgeSeconds?: number | null;
 }
 
+/** Longest listening snippet the server returns; mirrors rcdvlog-server-core. */
+export const REVIEW_SNIPPET_MAX_SECONDS = 30;
+
 export interface ReviewTargetCheck {
   name: string;
   status: "pass" | "warn" | "fail";
@@ -428,6 +431,8 @@ export interface ReviewSessionDetail extends ReviewSessionSummary {
     highestSequence: number | null;
     missingSequences: number[];
     gaps: Array<{ startFrame: number; endFrame: number }>;
+    /** Maximal contiguous stored ranges, listenable in any state but deleted. */
+    storedRanges: Array<{ startFrame: number; endFrame: number }>;
     finalFrameCount: number | null;
     receivedSeconds: number;
   };
@@ -678,6 +683,8 @@ export interface BrowserProjectClient extends ProjectClient {
   finalizeReviewSession(projectId: string, sessionId: string, request: { finalFrameCount: number; endReason: RecordingEndReason }): Promise<ReviewSessionDetail>;
   deleteReviewSession(projectId: string, sessionId: string): Promise<ReviewSessionDetail>;
   reviewSessionAudioUrl(projectId: string, sessionId: string): string;
+  /** Bounded (≤ REVIEW_SNIPPET_MAX_SECONDS) inline WAV of stored audio; a gap is a 409, never padded. */
+  reviewSessionSnippetUrl(projectId: string, sessionId: string, startFrame: number, endFrame: number): string;
   preflightReviewTranscription(projectId: string, sessionId: string, request: ReviewTranscriptionRequest): Promise<ReviewTranscriptionPreflight>;
   startReviewTranscription(projectId: string, sessionId: string, request: ReviewTranscriptionRequest): Promise<ReviewTranscriptionRun>;
   listReviewTranscriptions(projectId: string, sessionId: string): Promise<{ items: ReviewTranscriptionRun[] }>;

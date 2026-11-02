@@ -6257,6 +6257,65 @@ mod tests {
             "review_session_audio_unavailable"
         );
 
+        // A bounded snippet of stored audio plays while still recording;
+        // anything past what was stored is a gap, never padding.
+        let get = |uri: String| {
+            Request::builder()
+                .uri(uri)
+                .header(header::COOKIE, &cookie)
+                .body(Body::empty())
+                .unwrap()
+        };
+        let snippet = fixture
+            .app()
+            .oneshot(get(format!(
+                "{base}/{id}/snippet.wav?startFrame=100&endFrame=200"
+            )))
+            .await
+            .unwrap();
+        assert_eq!(snippet.status(), StatusCode::OK);
+        assert_eq!(
+            snippet.headers().get(header::CACHE_CONTROL).unwrap(),
+            "private, no-store"
+        );
+        assert_eq!(
+            snippet.headers().get(header::CONTENT_DISPOSITION).unwrap(),
+            "inline"
+        );
+        let wav = axum::body::to_bytes(snippet.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&wav[0..4], b"RIFF");
+        assert_eq!(&wav[44..], &pcm[200..400]);
+        let gap = fixture
+            .app()
+            .oneshot(get(format!(
+                "{base}/{id}/snippet.wav?startFrame=4700&endFrame=4900"
+            )))
+            .await
+            .unwrap();
+        assert_eq!(gap.status(), StatusCode::CONFLICT);
+        assert_eq!(json(gap).await["code"], "review_session_audio_gap");
+        let unbounded = fixture
+            .app()
+            .oneshot(get(format!(
+                "{base}/{id}/snippet.wav?startFrame=0&endFrame=99999999"
+            )))
+            .await
+            .unwrap();
+        assert_eq!(unbounded.status(), StatusCode::BAD_REQUEST);
+        let anonymous_snippet = fixture
+            .app()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("{base}/{id}/snippet.wav?startFrame=0&endFrame=10"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(anonymous_snippet.status(), StatusCode::UNAUTHORIZED);
+
         let finalized = fixture
             .app()
             .oneshot(send(
