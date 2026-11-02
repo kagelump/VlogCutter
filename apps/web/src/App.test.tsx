@@ -80,6 +80,12 @@ function client(session: SessionState): BrowserProjectClient {
     revokeSession: vi.fn(),
     previewAddToProject: vi.fn(),
     addToProject: vi.fn(),
+    listReviewTargets: vi.fn().mockResolvedValue({ items: [], nextBefore: null }),
+    preflightReviewTarget: vi.fn(),
+    importReviewTarget: vi.fn(),
+    getReviewTarget: vi.fn(),
+    declareReviewTargetYoutube: vi.fn(),
+    getReviewTargetCandidates: vi.fn(),
   };
 }
 

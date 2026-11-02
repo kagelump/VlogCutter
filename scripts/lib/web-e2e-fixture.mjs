@@ -27,3 +27,8 @@ export function fixturePort(addressOrUrl) {
 export function bootstrapCodePath(addressOrUrl, index) {
   return join(tmpdir(), `rcdvlog-web-e2e-bootstrap-${fixturePort(addressOrUrl)}-${index}.secret`);
 }
+
+/** The synthetic TV review-target handoff the seed writes for the run at that address. */
+export function reviewTargetHandoffPath(addressOrUrl) {
+  return join(tmpdir(), `rcdvlog-web-e2e-review-target-${fixturePort(addressOrUrl)}.json`);
+}

@@ -995,6 +995,229 @@
         ],
         "type": "object"
       },
+      "ReviewTargetCandidates": {
+        "properties": {
+          "endSeconds": {
+            "type": "number"
+          },
+          "operationIds": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "reviewTargetId": {
+            "type": "string"
+          },
+          "startSeconds": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "reviewTargetId",
+          "startSeconds",
+          "endSeconds",
+          "operationIds"
+        ],
+        "type": "object"
+      },
+      "ReviewTargetDetail": {
+        "additionalProperties": true,
+        "type": "object"
+      },
+      "ReviewTargetImportRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "availability": {
+            "additionalProperties": false,
+            "properties": {
+              "observedAt": {
+                "format": "date-time",
+                "type": "string"
+              },
+              "state": {
+                "enum": [
+                  "unknown",
+                  "present",
+                  "missing",
+                  "modified"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "state",
+              "observedAt"
+            ],
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "declaredIssuer": {
+            "maxLength": 64,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "handoff": {
+            "description": "The data member of edit-plan.review-target-export; see docs/contracts/review-target-v1.schema.json",
+            "type": "object"
+          },
+          "maxVerificationAgeSeconds": {
+            "minimum": 1,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "handoff"
+        ],
+        "type": "object"
+      },
+      "ReviewTargetImportResult": {
+        "properties": {
+          "outcome": {
+            "enum": [
+              "created",
+              "reused",
+              "refreshed"
+            ],
+            "type": "string"
+          },
+          "reviewTarget": {
+            "$ref": "#/components/schemas/ReviewTargetDetail"
+          }
+        },
+        "required": [
+          "outcome",
+          "reviewTarget"
+        ],
+        "type": "object"
+      },
+      "ReviewTargetPage": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/ReviewTargetSummary"
+            },
+            "type": "array"
+          },
+          "nextBefore": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "type": "object"
+      },
+      "ReviewTargetPreflight": {
+        "properties": {
+          "checks": {
+            "items": {
+              "properties": {
+                "code": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "detail": {
+                  "type": "string"
+                },
+                "name": {
+                  "type": "string"
+                },
+                "status": {
+                  "enum": [
+                    "pass",
+                    "warn",
+                    "fail"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "name",
+                "status",
+                "detail"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "conflictingReviewTargetIds": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "existingReviewTargetId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "importable": {
+            "type": "boolean"
+          },
+          "maxVerificationAgeSeconds": {
+            "type": "integer"
+          },
+          "outcome": {
+            "enum": [
+              "new",
+              "duplicate",
+              "refresh",
+              "conflict",
+              "blocked"
+            ],
+            "type": "string"
+          },
+          "preview": {
+            "additionalProperties": true,
+            "type": [
+              "object",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "outcome",
+          "importable",
+          "checks",
+          "conflictingReviewTargetIds",
+          "maxVerificationAgeSeconds"
+        ],
+        "type": "object"
+      },
+      "ReviewTargetSummary": {
+        "additionalProperties": true,
+        "type": "object"
+      },
+      "ReviewTargetYoutubeRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "youtubeVideoId": {
+            "pattern": "^[A-Za-z0-9_-]{11}$",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "youtubeVideoId"
+        ],
+        "type": "object"
+      },
       "RotationMutationRequest": {
         "properties": {
           "baseRevision": {
@@ -2294,6 +2517,314 @@
             "$ref": "#/components/responses/Error"
           },
           "401": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/v1/projects/{projectId}/review-targets": {
+      "get": {
+        "operationId": "listReviewTargets",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "projectId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "schema": {
+              "maximum": 200,
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "before",
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReviewTargetPage"
+                }
+              }
+            },
+            "description": "ReviewTargetPage"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/v1/projects/{projectId}/review-targets/import": {
+      "post": {
+        "description": "Import or reuse an immutable review target. Never overwrites; a conflicting reuse of a viewed artifact returns 409 review_target_conflict.",
+        "operationId": "importReviewTarget",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "projectId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReviewTargetImportRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReviewTargetImportResult"
+                }
+              }
+            },
+            "description": "ReviewTargetImportResult"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/v1/projects/{projectId}/review-targets/preflight": {
+      "post": {
+        "description": "Non-mutating validation of a version-1 TV review target handoff against the shared Rust validator, freshness/availability policy and stored targets.",
+        "operationId": "preflightReviewTarget",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "projectId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReviewTargetImportRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReviewTargetPreflight"
+                }
+              }
+            },
+            "description": "ReviewTargetPreflight"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/v1/projects/{projectId}/review-targets/{reviewTargetId}": {
+      "get": {
+        "operationId": "getReviewTarget",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "projectId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "reviewTargetId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReviewTargetDetail"
+                }
+              }
+            },
+            "description": "ReviewTargetDetail"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/v1/projects/{projectId}/review-targets/{reviewTargetId}/candidates": {
+      "get": {
+        "description": "Picture-locator candidates for an elapsed movie time point or range. Not a source trim or confirmed target.",
+        "operationId": "getReviewTargetCandidates",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "projectId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "reviewTargetId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "startSeconds",
+            "required": true,
+            "schema": {
+              "minimum": 0,
+              "type": "number"
+            }
+          },
+          {
+            "in": "query",
+            "name": "endSeconds",
+            "required": true,
+            "schema": {
+              "minimum": 0,
+              "type": "number"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReviewTargetCandidates"
+                }
+              }
+            },
+            "description": "ReviewTargetCandidates"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/v1/projects/{projectId}/review-targets/{reviewTargetId}/youtube": {
+      "post": {
+        "description": "Declare or clear the YouTube video ID. Creates or reuses a separate immutable target; the original is retained.",
+        "operationId": "declareReviewTargetYoutube",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "projectId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "reviewTargetId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReviewTargetYoutubeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReviewTargetImportResult"
+                }
+              }
+            },
+            "description": "ReviewTargetImportResult"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
             "$ref": "#/components/responses/Error"
           }
         }

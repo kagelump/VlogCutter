@@ -58,7 +58,12 @@ Implemented now:
 
 - Version-1 path-free TV review target export freshly verifies a full preview,
   preserves measured movie PTS and declared independent audio, and supplies a
-  synthetic cloud fixture. Server import/UI and synchronization remain separate
+  synthetic cloud fixture. The companion server imports it through an
+  authenticated preflight/import (control schema 13, `review_targets` owner in
+  `rcdvlog-server`), deduplicates by project + digest, refuses conflicting reuse
+  of a viewed artifact, keeps a declared-unverified YouTube ID as a separate
+  immutable snapshot, and the Chrome app has a *TV review* selection/import
+  screen. Recording, ASR, sync and feedback reconciliation remain separate
   work; see `docs/tv-review-handoff.md`.
 
 - `tv_soundtrack` supplies bounded local final-mix sync candidates; no hardware
@@ -211,7 +216,7 @@ Implemented now:
 - A non-interactive JSON CLI for catalog, clip annotation, chronology, and media operations.
 - Immutable typed project operations for asset membership, notes, labels, removal, rotation, and fixed clock events, with deterministic materialized views and conflict diagnostics.
 - Read-only catalog/project/clip/proxy diagnostics, including the desktop's persisted last-selected catalog, project, and asset breadcrumb.
-- Optional Ubuntu companion runtime with a local-SSD control catalog (schema 11), local project replicas, logical storage roots/node bindings, a global verified-content library, and scoped availability observations.
+- Optional Ubuntu companion runtime with a local-SSD control catalog (schema 13), local project replicas, logical storage roots/node bindings, a global verified-content library, and scoped availability observations.
 - Durable leased jobs, cancellation/retry/restart recovery, scans/schedules, full hashing, shared proxy/thumbnail generation, node-scoped ETA history, and authenticated byte-range streaming.
 - Baseline format 1 and sync protocol 1.0 with bounded operation pages, per-origin cursors/acknowledgements, deterministic conflict handling, WebSocket hints, and polling recovery.
 - Browser bootstrap/session auth, revocable desktop credentials, Keychain storage, CSRF/Host/Origin/proxy validation, LAN Caddy and Tailscale Serve deployment assets.
@@ -600,7 +605,7 @@ Always pass `--catalog` in agent automation, tests, and temporary workflows. A d
 
 SQLite connections enable foreign keys, WAL journal mode, and a five-second busy timeout. Read operations can continue during an uncommitted writer. Project mutations append typed operations with materialized revisions. Adopted projects synchronize bounded operation pages between independent local catalogs; live SQLite/WAL files are never copied or placed on NAS.
 
-Project catalogs use an explicit `schema_migrations` history and are currently at version 66. The server control catalog is version 11; backup format is version 1. Migration definitions have immutable names/source identities and each migration commits atomically. Migration 18 includes a one-time compatibility reconciliation for catalogs created on the import feature branch before its migration IDs were merged with main. When changing the schema:
+Project catalogs use an explicit `schema_migrations` history and are currently at version 66. The server control catalog is version 13; backup format is version 1. Migration definitions have immutable names/source identities and each migration commits atomically. Migration 18 includes a one-time compatibility reconciliation for catalogs created on the import feature branch before its migration IDs were merged with main. When changing the schema:
 
 - Preserve existing catalogs; never solve migration issues by deleting the database.
 - Add a forward migration and an upgrade test using an older schema fixture.

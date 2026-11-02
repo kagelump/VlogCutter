@@ -218,6 +218,124 @@ export interface ProjectClient {
 }
 
 /** Browser-session operations. Native clients authenticate with device credentials instead. */
+// TV review targets (#221). Mirrors rcdvlog-server-core::review_targets DTOs.
+// The handoff itself is opaque here: digesting and validation are Rust-owned.
+export type ReviewTargetHandoffJson = Record<string, unknown>;
+export type ArtifactAvailabilityState = "unknown" | "present" | "missing" | "modified";
+
+export interface ReviewTargetImportRequest {
+  handoff: ReviewTargetHandoffJson;
+  declaredIssuer?: string | null;
+  availability?: { state: ArtifactAvailabilityState; observedAt: string } | null;
+  maxVerificationAgeSeconds?: number | null;
+}
+
+export interface ReviewTargetCheck {
+  name: string;
+  status: "pass" | "warn" | "fail";
+  code: string | null;
+  detail: string;
+}
+
+export interface ReviewTargetPreflight {
+  outcome: "new" | "duplicate" | "refresh" | "conflict" | "blocked";
+  importable: boolean;
+  checks: ReviewTargetCheck[];
+  preview: {
+    projectId: string;
+    revisionId: string;
+    viewedArtifactId: string;
+    targetDigest: string;
+    movieBlake3: string;
+    durationSeconds: number;
+    cutCount: number;
+    youtubeVideoId: string | null;
+    verifiedAt: string;
+  } | null;
+  existingReviewTargetId: string | null;
+  conflictingReviewTargetIds: string[];
+  maxVerificationAgeSeconds: number;
+}
+
+export interface ReviewTargetActor { actorType: string; actorId: string }
+
+export interface ReviewTargetReadiness {
+  ready: boolean;
+  freshness: "fresh" | "expired" | "future";
+  verificationAgeSeconds: number;
+  maxVerificationAgeSeconds: number;
+  availabilityState: ArtifactAvailabilityState;
+  blockers: string[];
+}
+
+export interface ReviewTargetSummary {
+  reviewTargetId: string;
+  projectId: string;
+  revisionId: string;
+  viewedArtifactId: string;
+  targetDigest: string;
+  durationSeconds: number;
+  cutCount: number;
+  youtube: { videoId: string | null; declaredBy: "export" | "serverRebind" | null; identityStatus: "declaredUnverified" | "absent" };
+  importedAt: string;
+  latestVerifiedAt: string;
+  readiness: ReviewTargetReadiness;
+}
+
+export type DeclaredAudio =
+  | null
+  | { mode: "silent" }
+  | { mode: "source"; version: number; assetId: string; sourceInSeconds: number; sourceOutSeconds: number; timelineStartSeconds: number; syncOffsetSeconds: number; gainDb: number; fadeInSeconds: number; fadeOutSeconds: number };
+
+export interface ReviewTargetCut {
+  operationId: string;
+  position: number;
+  assetId: string;
+  sourceInSeconds: number;
+  sourceOutSeconds: number;
+  movieInPts: number;
+  movieOutPts: number;
+  outputFrameCount: number;
+  declaredAudio: DeclaredAudio;
+  movieInSeconds: number;
+  movieOutSeconds: number;
+}
+
+export interface ReviewTargetDetail extends ReviewTargetSummary {
+  schemaVersion: number;
+  planDigest: string;
+  constraintsKey: string;
+  movie: {
+    blake3: string;
+    byteLength: number;
+    durationSeconds: number;
+    timeBaseNumerator: number;
+    timeBaseDenominator: number;
+    originPts: number;
+    videoFrameCount: number;
+    audioSampleRate: number;
+    audioChannels: number;
+  };
+  mapping: { status: string; picturePrecision: string; sourceRangePrecision: string; audioDeclaration: string; cutCount: number; pictureEndSeconds: number };
+  cuts: ReviewTargetCut[];
+  provenance: { importedAt: string; importer: ReviewTargetActor; declaredIssuer: string | null; issuerVerification: "unverified"; derivedFromReviewTargetId: string | null };
+  observations: Array<{
+    observationId: string;
+    verification: { verifiedAt: string; outputMatches: boolean; inputsMatch: boolean; constraintsMatch: boolean; planRenderable: boolean; fullyDecoded: boolean };
+    availabilityState: ArtifactAvailabilityState;
+    availabilityObservedAt: string;
+    availabilitySource: "exportVerification" | "importerAssertion" | "carriedFromParentTarget";
+    maxVerificationAgeSeconds: number;
+    recordedAt: string;
+    recordedBy: ReviewTargetActor;
+  }>;
+  limitations: string[];
+}
+
+export interface ReviewTargetPage { items: ReviewTargetSummary[]; nextBefore: number | null }
+export interface ReviewTargetImportResult { outcome: "created" | "reused" | "refreshed"; reviewTarget: ReviewTargetDetail }
+export interface ReviewTargetCandidates { reviewTargetId: string; startSeconds: number; endSeconds: number; operationIds: string[] }
+
 export interface BrowserProjectClient extends ProjectClient {
   getSession(): Promise<SessionState>;
   loginWithBootstrapCode(code: string, hostname?: string): Promise<LoginResult>;
@@ -256,6 +374,12 @@ export interface BrowserProjectClient extends ProjectClient {
   listDevices(): Promise<DeviceCredentialInfo[]>;
   revokeDevice(credentialId: string): Promise<void>;
   revokeSession(sessionId: string): Promise<void>;
+  listReviewTargets(projectId: string, limit?: number, before?: number): Promise<ReviewTargetPage>;
+  preflightReviewTarget(projectId: string, request: ReviewTargetImportRequest): Promise<ReviewTargetPreflight>;
+  importReviewTarget(projectId: string, request: ReviewTargetImportRequest): Promise<ReviewTargetImportResult>;
+  getReviewTarget(projectId: string, reviewTargetId: string): Promise<ReviewTargetDetail>;
+  declareReviewTargetYoutube(projectId: string, reviewTargetId: string, youtubeVideoId: string | null): Promise<ReviewTargetImportResult>;
+  getReviewTargetCandidates(projectId: string, reviewTargetId: string, startSeconds: number, endSeconds: number): Promise<ReviewTargetCandidates>;
 }
 
 export function assertProtocolCompatible(version: ServerVersion): void {

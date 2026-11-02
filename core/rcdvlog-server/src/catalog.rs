@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 use crate::ConfigDiagnostics;
 
-pub const CONTROL_CATALOG_SCHEMA_VERSION: u32 = 12;
+pub const CONTROL_CATALOG_SCHEMA_VERSION: u32 = 13;
 pub const CONTROL_DATABASE_FILENAME: &str = "control.sqlite3";
 pub const INSTANCE_LOCK_FILENAME: &str = "server.lock";
 
@@ -93,6 +93,12 @@ pub const CONTROL_CATALOG_MIGRATIONS: &[SqliteMigration] = &[
         name: "media_estimator_history_context",
         source_identity: "server-control/0012-media-estimator-history-context/20261024",
         apply: create_media_estimator_history_context,
+    },
+    SqliteMigration {
+        id: 13,
+        name: "tv_review_targets",
+        source_identity: "server-control/0013-tv-review-targets/20261102",
+        apply: crate::review_targets::migrate,
     },
 ];
 
@@ -253,6 +259,11 @@ impl ControlCatalog {
 
     pub fn representations(&self, derived_root: PathBuf) -> crate::RepresentationService {
         crate::RepresentationService::new(self.storage_library(), self.jobs(), derived_root)
+    }
+
+    /// Imported, path-free TV review targets (#221). Derived evidence only.
+    pub fn review_targets(&self) -> crate::ReviewTargets {
+        crate::ReviewTargets::new(self.database_path.clone())
     }
 
     pub fn project_replicas(&self) -> crate::ProjectReplicaManager {

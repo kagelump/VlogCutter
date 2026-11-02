@@ -19,6 +19,12 @@ import {
   type ProjectPage,
   type ProjectSyncOverview,
   type RepresentationBatchResult,
+  type ReviewTargetCandidates,
+  type ReviewTargetDetail,
+  type ReviewTargetImportRequest,
+  type ReviewTargetImportResult,
+  type ReviewTargetPage,
+  type ReviewTargetPreflight,
   type ReviewMutationResult,
   type ServerReadiness,
   type ServerStatus,
@@ -188,6 +194,12 @@ export class HttpProjectClient implements BrowserProjectClient {
   async requestAdminRepresentationBatch(request: Parameters<BrowserProjectClient["requestAdminRepresentationBatch"]>[0]): Promise<RepresentationBatchResult> { return this.request(API_PATHS.adminRepresentationBatch, jsonPost(request)); }
   async listDevices(): Promise<DeviceCredentialInfo[]> { const result = await this.request<{ devices: DeviceCredentialInfo[] }>(API_PATHS.devices); return result.devices; }
   async revokeDevice(credentialId: string): Promise<void> { await this.request(pathParam(API_PATHS.revokeDevice, "credentialId", credentialId), { method: "DELETE" }); }
+  async listReviewTargets(projectId: string, limit = 50, before?: number): Promise<ReviewTargetPage> { return this.request(`${pathParam(API_PATHS.reviewTargets, "projectId", projectId)}${queryString({ limit, before })}`); }
+  async preflightReviewTarget(projectId: string, request: ReviewTargetImportRequest): Promise<ReviewTargetPreflight> { return this.request(pathParam(API_PATHS.reviewTargetPreflight, "projectId", projectId), jsonPost(request)); }
+  async importReviewTarget(projectId: string, request: ReviewTargetImportRequest): Promise<ReviewTargetImportResult> { return this.request(pathParam(API_PATHS.reviewTargetImport, "projectId", projectId), jsonPost(request)); }
+  async getReviewTarget(projectId: string, reviewTargetId: string): Promise<ReviewTargetDetail> { return this.request(reviewTargetPath(API_PATHS.reviewTarget, projectId, reviewTargetId)); }
+  async declareReviewTargetYoutube(projectId: string, reviewTargetId: string, youtubeVideoId: string | null): Promise<ReviewTargetImportResult> { return this.request(reviewTargetPath(API_PATHS.reviewTargetYoutube, projectId, reviewTargetId), jsonPost({ youtubeVideoId })); }
+  async getReviewTargetCandidates(projectId: string, reviewTargetId: string, startSeconds: number, endSeconds: number): Promise<ReviewTargetCandidates> { return this.request(`${reviewTargetPath(API_PATHS.reviewTargetCandidates, projectId, reviewTargetId)}${queryString({ startSeconds, endSeconds })}`); }
   async revokeSession(sessionId: string): Promise<void> { await this.request(pathParam(API_PATHS.revokeSession, "sessionId", sessionId), { method: "DELETE" }); }
 
   private async request<T>(
@@ -234,6 +246,10 @@ function reviewPath(template: string, projectId: string, assetId: string): strin
   return template
     .replace("{projectId}", encodeURIComponent(projectId))
     .replace("{assetId}", encodeURIComponent(assetId));
+}
+
+function reviewTargetPath(template: string, projectId: string, reviewTargetId: string): string {
+  return pathParam(pathParam(template, "projectId", projectId), "reviewTargetId", reviewTargetId);
 }
 
 function queryString(values: object): string {
