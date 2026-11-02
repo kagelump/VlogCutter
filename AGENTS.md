@@ -70,6 +70,8 @@ Implemented now:
   ASR, sync and feedback reconciliation remain separate work; see
   `docs/tv-review-handoff.md` and `docs/tv-voice-review-recording.md`.
 
+- Historical rendered-movie integrity review has a separate read-only DTO/CLI;
+  it never certifies current plan renderability. See `docs/tv-review-handoff.md`.
 - `tv_soundtrack` supplies bounded local final-mix sync candidates; no hardware
   acceptance is implied. See `docs/tv-soundtrack-matching.md`.
 - `tv_review_sync` owns bounded evidence-only TV recording/movie alignment;

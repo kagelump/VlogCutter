@@ -31,6 +31,11 @@ pub enum EditPlanCommand {
         #[command(subcommand)]
         command: PictureCoverageCommand,
     },
+    /// Review historical movie bytes/mapping without asserting current renderability.
+    HistoricalReviewTargetExport {
+        #[arg(long)]
+        artifact: String,
+    },
     /// Export a path-free versioned TV review target after fresh local verification.
     ReviewTargetExport {
         #[arg(long)]
@@ -466,6 +471,9 @@ struct ApplyReviewFeedbackInput {
 
 pub fn command_name(command: &EditPlanCommand) -> &'static str {
     match command {
+        EditPlanCommand::HistoricalReviewTargetExport { .. } => {
+            "edit-plan.historical-review-target-export"
+        }
         EditPlanCommand::ReviewTargetExport { .. } => "edit-plan.review-target-export",
         EditPlanCommand::Bundle { .. } => "edit-plan.bundle",
         EditPlanCommand::ReviewCoverage { command } => match command {
@@ -552,9 +560,11 @@ pub fn is_read_only(command: &EditPlanCommand) -> bool {
     }
     matches!(
         command,
-        EditPlanCommand::ReviewCoverage {
-            command: ReviewCoverageCommand::Report { .. } | ReviewCoverageCommand::List { .. }
-        } | EditPlanCommand::Coverage { .. }
+        EditPlanCommand::HistoricalReviewTargetExport { .. }
+            | EditPlanCommand::ReviewCoverage {
+                command: ReviewCoverageCommand::Report { .. } | ReviewCoverageCommand::List { .. }
+            }
+            | EditPlanCommand::Coverage { .. }
             | EditPlanCommand::List { .. }
             | EditPlanCommand::PreviewStatus { verify: false, .. }
             | EditPlanCommand::PreviewList { .. }
@@ -594,6 +604,9 @@ fn expected(value: &str) -> Option<&str> {
 
 pub fn execute(catalog: &Catalog, command: &EditPlanCommand) -> Result<Value> {
     match command {
+        EditPlanCommand::HistoricalReviewTargetExport { artifact } => Ok(serde_json::to_value(
+            catalog.review_historical_rendered_artifact(artifact, &|| false)?,
+        )?),
         EditPlanCommand::ReviewTargetExport {
             artifact,
             youtube_video_id,
