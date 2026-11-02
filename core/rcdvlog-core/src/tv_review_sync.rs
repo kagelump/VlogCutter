@@ -594,9 +594,29 @@ impl SyncRequest {
         cancel: &dyn Fn() -> bool,
     ) -> Result<SyncReport> {
         target.validate()?;
-        let m = &target.target.movie;
+        self.map_to_snapshot(queries, &target.target, &target.target_digest, cancel)
+    }
+    /// Explicit historical-review boundary. This provides picture locators for
+    /// the already rendered movie; it cannot establish current renderability.
+    pub fn map_to_historical_cuts(
+        &self,
+        queries: &[SyncQuery],
+        target: &crate::HistoricalRenderedArtifactReview,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<SyncReport> {
+        target.validate()?;
+        self.map_to_snapshot(queries, &target.target, &target.target_digest, cancel)
+    }
+    fn map_to_snapshot(
+        &self,
+        queries: &[SyncQuery],
+        target: &crate::ReviewTargetSnapshot,
+        target_digest: &str,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<SyncReport> {
+        let m = &target.movie;
         ensure!(
-            self.target_digest == target.target_digest
+            self.target_digest == target_digest
                 && self.movie.movie_digest == m.blake3
                 && i64::from(self.movie.time_base_numerator) == m.time_base_numerator
                 && i64::from(self.movie.time_base_denominator) == m.time_base_denominator

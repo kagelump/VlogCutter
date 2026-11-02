@@ -96,7 +96,9 @@ candidates. Requests exceeding the compute budget need a shorter reference
 window; they cannot silently broaden work. Reference decoding has a 180-second
 deadline. No persistent service, extra model, provider spend or schema migration
 is introduced. Indexes may be regenerated, and independent query windows provide
-bounded resumable units. Full-movie orchestration is not implemented here.
+bounded resumable units. [Local session orchestration](tv-review-local-session.md)
+adds exhaustive reference coverage, bounded batches, private receipts and shared
+utterance mapping over these primitives.
 
 ## Acceptance boundary
 

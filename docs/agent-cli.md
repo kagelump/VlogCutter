@@ -1302,3 +1302,8 @@ explicitly unresolved. See [historical review policy](tv-review-handoff.md#histo
 `tv-review sync-preview --input <file>` performs bounded catalog-free recording-clock mapping without writes. See [shared timing contract](tv-review-sync.md).
 
 `tv-review soundtrack-reference` and `tv-review soundtrack-match` are bounded local final-mix diagnostics. See [soundtrack matching](tv-soundtrack-matching.md).
+
+`tv-review soundtrack-session-plan|soundtrack-session-run|soundtrack-session-evidence|soundtrack-session-sync`
+plans complete-reference searches, runs bounded resumable local batches and maps
+native utterance frames through the shared engine. Media/path bindings stay on
+the local media host. See [local session workflow](tv-review-local-session.md).
