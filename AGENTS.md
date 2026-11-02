@@ -61,6 +61,8 @@ Implemented now:
   synthetic cloud fixture. Server import/UI and synchronization remain separate
   work; see `docs/tv-review-handoff.md`.
 
+- `tv_review_sync` owns bounded evidence-only TV recording/movie alignment;
+  CLI `tv-review sync-preview` is read-only. See `docs/tv-review-sync.md`.
 - One supported CLI now includes editing, review and upload against schema 66,
   with observational `doctor --workflow rough-cut|delivery` preflight. Sparse
   stable-ID patches, explicit source-inventory picture-usage reports and unused
