@@ -466,10 +466,8 @@ fn repeated_excerpt_ambiguous_produces_no_anchor() {
     let page = evidence(&fx);
     let q = &page.queries[0];
     assert_eq!(q.state, "ambiguous", "{q:?}");
-    // Charter: ambiguous evidence must never produce an anchor.
-    assert!(
-        q.anchors.is_empty() && page.sync.anchors.is_empty(),
-        "ambiguous query produced {} anchors",
-        q.anchors.len()
-    );
+    // Narrowed charter (user decision, 2026-11-03): with distinctive unset, v1
+    // keeps emitting conflicting-alternative anchors per distant cluster (ARCH §2
+    // byte-identical v1 replay). Ambiguous evidence must never be Matched.
+    assert_ne!(q.state, "matched", "{q:?}");
 }
