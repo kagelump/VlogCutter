@@ -272,6 +272,7 @@ pub use editplan::context_review::*;
 pub use editplan::coverage::*;
 pub use editplan::delivery::*;
 pub use editplan::feedback::*;
+pub use editplan::historical_review::*;
 pub use editplan::inspection_review::*;
 pub use editplan::patch::*;
 pub use editplan::review_coverage::*;

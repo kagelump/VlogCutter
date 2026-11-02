@@ -1,0 +1,79 @@
+{
+  "schemaVersion": 1,
+  "purpose": "historicalRenderedArtifactReview",
+  "targetDigest": "57874921a84c987b85fedff5273180a9202be05b590702fe6234b2cab20d1638",
+  "target": {
+    "projectId": "project_synthetic",
+    "revisionId": "editrev_synthetic",
+    "viewedArtifactId": "preview_synthetic",
+    "planDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "constraintsKey": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "movie": {
+      "blake3": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "byteLength": 123456,
+      "durationSeconds": 6.02,
+      "timeBaseNumerator": 1,
+      "timeBaseDenominator": 90000,
+      "originPts": 90000,
+      "videoFrameCount": 180,
+      "audioSampleRate": 48000,
+      "audioChannels": 2
+    },
+    "cuts": [
+      {
+        "operationId": "editop_split_a",
+        "position": 0,
+        "assetId": "asset_repeated",
+        "sourceInSeconds": 1.0,
+        "sourceOutSeconds": 3.0,
+        "movieInPts": 90000,
+        "movieOutPts": 270000,
+        "outputFrameCount": 60,
+        "declaredAudio": null
+      },
+      {
+        "operationId": "editop_split_b",
+        "position": 1,
+        "assetId": "asset_repeated",
+        "sourceInSeconds": 3.0,
+        "sourceOutSeconds": 5.0,
+        "movieInPts": 270000,
+        "movieOutPts": 450000,
+        "outputFrameCount": 60,
+        "declaredAudio": {
+          "mode": "silent"
+        }
+      },
+      {
+        "operationId": "editop_return",
+        "position": 2,
+        "assetId": "asset_repeated",
+        "sourceInSeconds": 1.0,
+        "sourceOutSeconds": 3.0,
+        "movieInPts": 450000,
+        "movieOutPts": 630000,
+        "outputFrameCount": 60,
+        "declaredAudio": {
+          "mode": "source",
+          "version": 1,
+          "assetId": "asset_sound_only",
+          "sourceInSeconds": 10.0,
+          "sourceOutSeconds": 13.0,
+          "timelineStartSeconds": 1.0,
+          "syncOffsetSeconds": 0.0,
+          "gainDb": -3.0,
+          "fadeInSeconds": 0.05,
+          "fadeOutSeconds": 0.05
+        }
+      }
+    ],
+    "youtubeVideoId": "synthetic01"
+  },
+  "verifiedAt": "2026-01-01T00:00:00Z",
+  "outputMatches": true,
+  "mappingMatchesRevision": true,
+  "storedFullyDecoded": true,
+  "currentSourceVerification": "notEstablishedByThisReview",
+  "currentConstraintsVerification": "notEstablishedByThisReview",
+  "currentPlanRenderability": "notEstablishedByThisReview"
+}
