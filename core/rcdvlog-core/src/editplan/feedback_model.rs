@@ -19,6 +19,8 @@ pub enum ReviewFeedbackError {
     NotAccepted,
     #[error("multiple proposals change the same cut; combine them into one explicit proposal")]
     ConflictingChanges,
+    #[error("review import identity was already used for a different note request")]
+    ImportConflict,
 }
 impl ReviewFeedbackError {
     pub fn code(&self) -> &'static str {
@@ -28,6 +30,7 @@ impl ReviewFeedbackError {
             Self::ChangedTarget => "review_feedback_changed_target",
             Self::NotAccepted => "review_feedback_not_accepted",
             Self::ConflictingChanges => "review_feedback_conflicting_changes",
+            Self::ImportConflict => "review_feedback_import_conflict",
         }
     }
 }
@@ -110,6 +113,22 @@ pub struct RecordReviewNoteRequest {
     pub movie_time_seconds: Option<f64>,
     #[serde(default)]
     pub evidence_refs: Vec<String>,
+}
+/// A stable namespaced external item identity, retained through the canonical
+/// note ID. Identical retries never create a second fact after a lost response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RecordReviewNoteOnceRequest {
+    pub import_id: String,
+    pub record: RecordReviewNoteRequest,
+}
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RecordReviewNoteOnceResult {
+    pub import_id: String,
+    pub note_id: String,
+    pub duplicate: bool,
+    pub feedback: ReviewFeedbackView,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

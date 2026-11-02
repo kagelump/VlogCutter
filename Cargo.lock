@@ -3424,6 +3424,7 @@ dependencies = [
  "anyhow",
  "clap",
  "dirs",
+ "hound",
  "keyring",
  "libc",
  "rcdvlog-core",

@@ -1019,3 +1019,133 @@ fn delegated_agent_decisions_apply_without_becoming_authoritative_human_choices(
             .contains("agent decisions")
     );
 }
+
+fn import_request(plan: &EditPlanRevision) -> RecordReviewNoteOnceRequest {
+    RecordReviewNoteOnceRequest {
+        import_id: "server-fixture/session-a/discussion-b/item-c".into(),
+        record: RecordReviewNoteRequest {
+            project_id: plan.project_id.clone(),
+            revision_id: plan.revision_id.clone(),
+            operation_id: "cut-0".into(),
+            author: ReviewAuthor::Human,
+            category: ReviewCategory::Duration,
+            observation: "Synthetic external reviewer observation.".into(),
+            viewed_artifact_id: None,
+            movie_time_seconds: None,
+            evidence_refs: vec!["utterance-a".into()],
+        },
+    }
+}
+#[test]
+fn import_once_lost_response_and_changed_payload_are_atomic_and_preserve_decisions() {
+    let (_dir, catalog, asset) = fixture();
+    let plan = plan(&catalog, &asset);
+    let request = import_request(&plan);
+    let first = catalog.record_review_note_once(&request).unwrap();
+    assert!(!first.duplicate);
+    let retry = catalog.record_review_note_once(&request).unwrap();
+    assert!(retry.duplicate);
+    assert_eq!(first.note_id, retry.note_id);
+    assert_eq!(retry.feedback.history_total, 1);
+    assert!(retry.feedback.latest_proposal.is_none());
+    assert!(retry.feedback.latest_decision.is_none());
+    for field in [
+        "projectId",
+        "revisionId",
+        "operationId",
+        "author",
+        "category",
+        "observation",
+        "viewedArtifactId",
+        "movieTimeSeconds",
+        "evidenceRefs",
+    ] {
+        let mut value = serde_json::to_value(&request).unwrap();
+        value["record"][field] = match field {
+            "author" => serde_json::json!("reviewer"),
+            "category" => serde_json::json!("order"),
+            "movieTimeSeconds" => serde_json::json!(0.5),
+            "evidenceRefs" => serde_json::json!(["other-evidence"]),
+            _ => serde_json::json!("different"),
+        };
+        let changed: RecordReviewNoteOnceRequest = serde_json::from_value(value).unwrap();
+        let error = catalog.record_review_note_once(&changed).unwrap_err();
+        // Another project is a different namespace, and cannot import against
+        // this immutable revision. Every same-project changed field is a conflict.
+        if field != "projectId" {
+            assert!(
+                matches!(
+                    error.downcast_ref::<ReviewFeedbackError>(),
+                    Some(ReviewFeedbackError::ImportConflict)
+                ),
+                "{field}: {error}"
+            );
+        }
+    }
+    let proposed = propose(
+        &catalog,
+        &first.feedback,
+        ReviewChange::Trim {
+            source_in_seconds: 0.6,
+            source_out_seconds: 1.4,
+        },
+    );
+    let accepted = accept(&catalog, &proposed, None);
+    let retried = catalog.record_review_note_once(&request).unwrap();
+    assert_eq!(retried.feedback.latest_decision, accepted.latest_decision);
+    assert_eq!(retried.feedback.history_total, 3);
+    assert_eq!(catalog.active_edit_plan(&plan.project_id).unwrap(), None);
+    assert_eq!(catalog.edit_plan_revision(&plan.revision_id).unwrap(), plan);
+}
+#[test]
+fn concurrent_identical_imports_create_one_canonical_note_fact() {
+    let (_dir, catalog, asset) = fixture();
+    let plan = plan(&catalog, &asset);
+    let request = import_request(&plan);
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let handles: Vec<_> = (0..2)
+        .map(|_| {
+            let catalog = catalog.clone();
+            let request = request.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                catalog.record_review_note_once(&request).unwrap()
+            })
+        })
+        .collect();
+    let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    assert_eq!(results[0].note_id, results[1].note_id);
+    assert_eq!(results.iter().filter(|r| !r.duplicate).count(), 1);
+    assert_eq!(
+        catalog
+            .review_feedback(&results[0].note_id, &plan.revision_id)
+            .unwrap()
+            .history_total,
+        1
+    );
+}
+#[test]
+fn committed_import_retry_does_not_require_the_viewed_movie_to_remain_online() {
+    let (_dir, catalog, asset) = fixture();
+    let plan = plan(&catalog, &asset);
+    let preview = catalog
+        .render_preview(
+            &PreviewRequest {
+                revision_id: plan.revision_id.clone(),
+                max_height: 144,
+            },
+            &mut |_| {},
+            &|| false,
+        )
+        .unwrap();
+    let mut request = import_request(&plan);
+    request.record.viewed_artifact_id = preview.artifact_id;
+    request.record.movie_time_seconds = Some(0.5);
+    let first = catalog.record_review_note_once(&request).unwrap();
+    std::fs::remove_file(preview.output_path).unwrap();
+    let retry = catalog.record_review_note_once(&request).unwrap();
+    assert!(retry.duplicate);
+    assert_eq!(retry.note_id, first.note_id);
+    assert_eq!(retry.feedback.note, first.feedback.note);
+}
