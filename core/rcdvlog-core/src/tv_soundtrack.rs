@@ -472,9 +472,16 @@ impl SoundtrackIndex {
             let seconds =
                 self.reference.start_seconds + (offset * HOP + center) as f64 / PCM_RATE as f64;
             let tps = self.reference.movie.ticks_per_second();
+            let identity = serde_json::to_vec(&(
+                "vlogcutter.soundtrack-anchor.v1",
+                &capture,
+                &report.query_pcm_digest,
+                &self.index_digest,
+                offset,
+            ))?;
             report.candidates.push(SoundtrackCandidate {
                 anchor: SyncAnchor {
-                    evidence_id: format!("{}_candidate_{}", capture.evidence_id, offset),
+                    evidence_id: format!("soundtrack_{}", blake3::hash(&identity).to_hex()),
                     capture: CapturePosition {
                         clock_id: capture.clock_id.clone(),
                         sample_index: capture_sample,

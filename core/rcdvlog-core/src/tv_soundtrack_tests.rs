@@ -310,3 +310,55 @@ fn final_movie_decoder_checks_bytes_and_retains_reference_window_offset() {
     reference.movie.movie_digest = "f".repeat(64);
     assert!(SoundtrackIndex::from_movie(reference, &movie, &|| false).is_err());
 }
+
+#[test]
+fn repeated_positions_in_separate_reference_windows_keep_unique_evidence_and_one_group() {
+    use crate::tv_review_sync::*;
+    let block = signal(12, 91);
+    let mut first = spec(24);
+    first.duration_seconds = 12.0;
+    let mut second = first.clone();
+    second.start_seconds = 12.0;
+    let a = SoundtrackIndex::from_pcm(first, &block, &|| false).unwrap();
+    let b = SoundtrackIndex::from_pcm(second, &block, &|| false).unwrap();
+    let query = &block[2 * 8000..8 * 8000];
+    let aa = a
+        .match_pcm(query, capture(), &SoundtrackPolicy::default(), &|| false)
+        .unwrap();
+    let bb = b
+        .match_pcm(query, capture(), &SoundtrackPolicy::default(), &|| false)
+        .unwrap();
+    assert_eq!(aa.state, SoundtrackMatchState::Matched);
+    assert_eq!(bb.state, SoundtrackMatchState::Matched);
+    let x = aa.candidates[0].anchor.clone();
+    let y = bb.candidates[0].anchor.clone();
+    assert_ne!(x.evidence_id, y.evidence_id);
+    assert_eq!(x.candidate_group_id, y.candidate_group_id);
+    let sample = x.capture.sample_index;
+    let r = SyncRequest {
+        schema_version: 1,
+        session_id: "session_synthetic".into(),
+        target_digest: "b".repeat(64),
+        movie: spec(24).movie,
+        capture_clocks: vec![CaptureClock {
+            clock_id: "mic".into(),
+            sample_rate: 48000,
+            first_sample: 0,
+            last_sample: 48000 * 30,
+            monotonic_origin_ns: 1000000000,
+            monotonic_tolerance_ns: 2000000,
+        }],
+        anchors: vec![x, y],
+        boundaries: vec![],
+        policy: SyncPolicy::default(),
+    };
+    let q = SyncQuery {
+        clock_id: "mic".into(),
+        start_sample: sample,
+        end_sample: sample,
+    };
+    assert_eq!(
+        r.map(&[q], &|| false).unwrap().slices[0].state,
+        SyncState::Conflicting
+    );
+}

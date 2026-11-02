@@ -54,6 +54,13 @@ movie ticks, similarity as component confidence, movie uncertainty, capture
 uncertainty and candidate group. The report retains query/reference PCM digests,
 index identity, scores, peak margin, grid, reasons and deterministic work counts.
 
+A `matched` result is unique only within that reference window. Full-movie
+callers must search every applicable index and retain all plausible alternatives.
+Reuse the same query evidence ID across indexes: anchor IDs bind the entire
+reference index/query/capture identity, while their shared candidate group makes
+repeated positions across windows conflicting in #223. Never stop at the first
+window that matches.
+
 Scores are not calibrated probabilities. A dominant competing playback from
 another location in the reference can produce strong evidence for the wrong TV
 position; audio alone cannot identify which physical source is the television.
