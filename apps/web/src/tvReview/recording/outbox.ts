@@ -1,7 +1,8 @@
-// Durable local buffer between capture and upload. Every chunk is written here
-// before any upload attempt, so a network drop, tab close or restart leaves it
-// recoverable. Bounded: when the cap or the browser quota is reached, `put`
-// throws `OutboxFullError` and the caller records the lost frames as a gap.
+// Durable local buffer between capture and upload. Every chunk and capture
+// event is written here before any upload attempt, so a network drop, tab close
+// or restart leaves it recoverable. Bounded: when the byte cap, event cap or
+// browser quota is reached, `put` throws `OutboxFullError` and the caller
+// records the loss as a gap instead of evicting evidence.
 
 export interface OutboxChunk {
   sessionId: string;
@@ -20,6 +21,8 @@ export interface OutboxSession {
   /** Recording-relative end of the last chunk produced (stored or lost). */
   capturedFrames: number;
   ended: boolean;
+  /** Evidence storage failed; recovery must not silently certify completion. */
+  eventStorageFailed?: boolean;
   endReason: "stopped" | "deviceLost" | "interrupted" | "cancelled" | null;
   updatedAt: string;
 }
@@ -59,20 +62,42 @@ export class OutboxFullError extends Error {
 }
 
 export const OUTBOX_MAX_BYTES = 256 * 1024 * 1024;
+export const OUTBOX_MAX_EVENTS = 10_000;
+const OUTBOX_MAX_EVENT_BYTES = 4 * 1024;
+
+function validateEvent(event: OutboxEvent) {
+  if (new TextEncoder().encode(JSON.stringify(event)).byteLength > OUTBOX_MAX_EVENT_BYTES) {
+    throw new OutboxFullError();
+  }
+}
 
 export class MemoryOutbox implements ChunkOutbox {
   private readonly chunkMap = new Map<string, OutboxChunk>();
-  private readonly sessionMap = new Map<string, OutboxSession>();
   private readonly eventMap = new Map<string, OutboxEvent>();
+  private readonly sessionMap = new Map<string, OutboxSession>();
   constructor(private readonly maxBytes = OUTBOX_MAX_BYTES) {}
-  async putEvent(event: OutboxEvent) { this.eventMap.set(`${event.sessionId}:${event.eventId}`, { ...event }); }
-  async events(sessionId: string) { return [...this.eventMap.values()].filter((e) => e.sessionId === sessionId).sort((a, b) => a.order - b.order); }
+
+  async putEvent(event: OutboxEvent) {
+    validateEvent(event);
+    const key = `${event.sessionId}:${event.eventId}`;
+    if (!this.eventMap.has(key) && this.eventMap.size >= OUTBOX_MAX_EVENTS) throw new OutboxFullError();
+    this.eventMap.set(key, structuredClone(event));
+  }
+  async events(sessionId: string) {
+    return [...this.eventMap.values()]
+      .filter((event) => event.sessionId === sessionId)
+      .sort((a, b) => a.order - b.order);
+  }
   async deleteEvent(sessionId: string, eventId: string) { this.eventMap.delete(`${sessionId}:${eventId}`); }
   async putChunk(chunk: OutboxChunk) {
     if ((await this.pendingBytes()) + chunk.bytes.byteLength > this.maxBytes) throw new OutboxFullError();
     this.chunkMap.set(`${chunk.sessionId}:${chunk.sequence}`, chunk);
   }
-  async chunks(sessionId: string) { return [...this.chunkMap.values()].filter((c) => c.sessionId === sessionId).sort((a, b) => a.sequence - b.sequence); }
+  async chunks(sessionId: string) {
+    return [...this.chunkMap.values()]
+      .filter((chunk) => chunk.sessionId === sessionId)
+      .sort((a, b) => a.sequence - b.sequence);
+  }
   async deleteChunk(sessionId: string, sequence: number) { this.chunkMap.delete(`${sessionId}:${sequence}`); }
   async putSession(session: OutboxSession) { this.sessionMap.set(session.sessionId, { ...session }); }
   async sessions() { return [...this.sessionMap.values()]; }
@@ -80,7 +105,7 @@ export class MemoryOutbox implements ChunkOutbox {
     this.sessionMap.delete(sessionId);
     for (const [key, event] of this.eventMap) if (event.sessionId === sessionId) this.eventMap.delete(key);
   }
-  async pendingBytes() { let total = 0; for (const c of this.chunkMap.values()) total += c.bytes.byteLength; return total; }
+  async pendingBytes() { let total = 0; for (const chunk of this.chunkMap.values()) total += chunk.bytes.byteLength; return total; }
 }
 
 const DB_NAME = "rcdvlog-voice-review";
@@ -96,10 +121,6 @@ function isQuotaError(error: unknown): boolean {
   return error instanceof DOMException && (error.name === "QuotaExceededError" || error.name === "NS_ERROR_DOM_QUOTA_REACHED");
 }
 
-/**
- * Chunk sizes are tracked per session in the small `sessions` store, updated in
- * the same transaction as the chunk, so the cap check never reads audio back.
- */
 export class IndexedDbOutbox implements ChunkOutbox {
   private db: Promise<IDBDatabase> | null = null;
   constructor(private readonly maxBytes = OUTBOX_MAX_BYTES) {}
@@ -145,7 +166,7 @@ export class IndexedDbOutbox implements ChunkOutbox {
         await tx.done.catch(() => undefined);
         throw new OutboxFullError();
       }
-      const session = all.find((s) => s.sessionId === chunk.sessionId);
+      const session = all.find((candidate) => candidate.sessionId === chunk.sessionId);
       if (!session) throw new Error("outbox session must be registered before its chunks");
       const bytes = chunk.bytes.buffer.slice(chunk.bytes.byteOffset, chunk.bytes.byteOffset + chunk.bytes.byteLength);
       tx.chunks.put({ ...chunk, bytes });
@@ -158,7 +179,15 @@ export class IndexedDbOutbox implements ChunkOutbox {
   }
 
   async putEvent(event: OutboxEvent) {
+    validateEvent(event);
     const tx = await this.transaction("readwrite");
+    const existing = await promisify(tx.events.get([event.sessionId, event.eventId]));
+    const count = await promisify(tx.events.count());
+    if (!existing && count >= OUTBOX_MAX_EVENTS) {
+      tx.events.transaction.abort();
+      await tx.done.catch(() => undefined);
+      throw new OutboxFullError();
+    }
     tx.events.put(event);
     await tx.done;
   }
@@ -166,6 +195,7 @@ export class IndexedDbOutbox implements ChunkOutbox {
   async events(sessionId: string) {
     const tx = await this.transaction("readonly");
     const rows = await promisify(tx.events.index("bySession").getAll(IDBKeyRange.only(sessionId))) as OutboxEvent[];
+    await tx.done;
     return rows.sort((a, b) => a.order - b.order);
   }
 

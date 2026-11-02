@@ -612,3 +612,77 @@ fn event_replay_compares_the_full_payload_and_clock_samples_declare_epoch_and_bo
         .record_event(PROJECT, &id, &boundary, now())
         .unwrap();
 }
+
+#[test]
+fn native_frame_bounds_are_rejected_before_storage() {
+    let f = fixture();
+    let id = f
+        .sessions
+        .create(
+            PROJECT,
+            &create_request(&f.target_id, "frame_bounds"),
+            &actor(),
+            now(),
+        )
+        .unwrap()
+        .summary
+        .session_id;
+    let event = ReviewSessionEventRequest {
+        event_id: "too_far".into(),
+        kind: ReviewSessionEventKind::ManualSyncCue,
+        audio_frame: u64::MAX,
+        performance_ms: Some(1500.0),
+        declared_movie_seconds: Some(0.0),
+        detail: Some(serde_json::json!({"clockEpoch": 0})),
+    };
+    assert!(matches!(
+        f.sessions.record_event(PROJECT, &id, &event, now()),
+        Err(ReviewSessionError::InvalidInput(_))
+    ));
+    assert!(
+        f.sessions
+            .get(PROJECT, &id, now())
+            .unwrap()
+            .events
+            .is_empty()
+    );
+}
+
+#[test]
+fn unacknowledged_capture_tail_remains_incomplete_while_uploaded_bytes_are_usable() {
+    let f = fixture();
+    let id = f
+        .sessions
+        .create(
+            PROJECT,
+            &create_request(&f.target_id, "tail_unknown"),
+            &actor(),
+            now(),
+        )
+        .unwrap()
+        .summary
+        .session_id;
+    upload(&f, &id, 0, 0, 4800).unwrap();
+    f.sessions
+        .record_event(
+            PROJECT,
+            &id,
+            &ReviewSessionEventRequest {
+                event_id: "tail".into(),
+                kind: ReviewSessionEventKind::PageInterrupted,
+                audio_frame: 4800,
+                performance_ms: None,
+                declared_movie_seconds: None,
+                detail: Some(serde_json::json!({"captureTailStatus":"unknown"})),
+            },
+            now(),
+        )
+        .unwrap();
+    let done = finalize(&f, &id, 4800, RecordingEndReason::Interrupted).unwrap();
+    assert_eq!(done.summary.state, ReviewSessionState::Incomplete);
+    assert_eq!(
+        f.sessions.chunk_bytes(PROJECT, &id, 0).unwrap(),
+        pcm(0, 4800)
+    );
+    assert!(f.sessions.audio(PROJECT, &id).is_err());
+}

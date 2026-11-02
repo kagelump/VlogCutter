@@ -67,6 +67,14 @@ test("the outbox is bounded and refuses rather than evicting", async () => {
 function uploadClient(put: BrowserProjectClient["putReviewSessionChunk"]): BrowserProjectClient {
   return {
     putReviewSessionChunk: put,
+    recordReviewSessionEvent: vi.fn(async (_p: string, _s: string, event: { eventId: string; kind: string; audioFrame: number; performanceMs?: number | null; declaredMovieSeconds?: number | null; detail?: Record<string, unknown> | null }) => ({
+      ...event,
+      audioSeconds: event.audioFrame / 48_000,
+      performanceMs: event.performanceMs ?? null,
+      declaredMovieSeconds: event.declaredMovieSeconds ?? null,
+      detail: event.detail ?? null,
+      serverReceivedAt: "t",
+    })),
     finalizeReviewSession: vi.fn().mockResolvedValue({ sessionId: "s", state: "completed" }),
     getReviewSession: vi.fn(),
   } as unknown as BrowserProjectClient;
@@ -87,7 +95,7 @@ test("transient upload failures retry with backoff and keep chunks until receipt
     calls += 1;
     if (calls === 1) throw new ProjectClientError("server_unavailable", "offline", "server_unavailable");
     if (calls === 2) throw new ProjectClientError("server_error", "busy", "review_session_busy", null, 503);
-    return { sessionId: "s", sequence: chunk.sequence, startFrame: 0, frameCount: 2, sha256: chunk.sha256, receivedAt: "t", duplicate: calls === 4 };
+    return { sessionId: "s", sequence: chunk.sequence, startFrame: (chunk as { startFrame?: number }).startFrame ?? 0, frameCount: (chunk as { frameCount?: number }).frameCount ?? 2, sha256: chunk.sha256, receivedAt: "t", duplicate: calls === 4 };
   });
   const sleeps: number[] = [];
   const uploader = new ChunkUploader(uploadClient(put as never), outbox, "p", "s", undefined, async (ms) => { sleeps.push(ms); });
@@ -114,7 +122,7 @@ test("recovery uploads a closed tab's buffered audio and finalizes it as interru
   const meta: OutboxSession = { sessionId: "s", projectId: "p", reviewTargetId: "t", capturedFrames: 6, ended: false, endReason: null, updatedAt: "now" };
   await outbox.putSession(meta);
   await seed(outbox, 3);
-  const put = vi.fn(async (_p: string, _s: string, chunk: { sequence: number; sha256: string }) => ({ sessionId: "s", sequence: chunk.sequence, startFrame: 0, frameCount: 2, sha256: chunk.sha256, receivedAt: "t", duplicate: false }));
+  const put = vi.fn(async (_p: string, _s: string, chunk: { sequence: number; startFrame: number; frameCount: number; sha256: string }) => ({ sessionId: "s", sequence: chunk.sequence, startFrame: chunk.startFrame, frameCount: chunk.frameCount, sha256: chunk.sha256, receivedAt: "t", duplicate: false }));
   const client = uploadClient(put as never);
   const result = await finalizeWhenDrained(client, outbox, meta);
   expect(result?.state).toBe("completed");
@@ -188,6 +196,74 @@ test("the capture worklet delivers its partial batch before acknowledging the fi
   node.port.onmessage({ data: { type: "stop" } });
   expect(sent.map((m) => m.type)).toEqual(["audio", "stopped"]);
   expect(sent[0]).toMatchObject({ frame: 1000, frames: 256 });
-  expect(sent[1]).toMatchObject({ frame: 1256 });
+  expect(sent[1]).toMatchObject({ frame: 1256, firstFrame: 1000, finalFrame: 1256 });
   expect(node.process([[new Float32Array(128)]])).toBe(false);
+});
+
+
+test("a receipt that does not match a queued event stops the drain and keeps the event", async () => {
+  const outbox = new MemoryOutbox();
+  const event = cueEvent("evt_mismatch", 0);
+  await outbox.putEvent(event);
+  const record = vi.fn(async () => ({
+    eventId: event.eventId,
+    kind: event.kind,
+    audioFrame: event.audioFrame + 1,
+    audioSeconds: 0,
+    performanceMs: event.performanceMs,
+    declaredMovieSeconds: event.declaredMovieSeconds,
+    detail: event.detail,
+    serverReceivedAt: "t",
+  }));
+  const client = { ...uploadClient(vi.fn()), recordReviewSessionEvent: record } as unknown as BrowserProjectClient;
+  const uploader = new ChunkUploader(client, outbox, "p", "s");
+  await uploader.kick();
+  expect(uploader.status.blockedCode).toBe("review_session_receipt_mismatch");
+  expect(await outbox.events("s")).toHaveLength(1);
+});
+
+test("a chunk receipt that is not the exact upload stops the drain and keeps the chunk", async () => {
+  const outbox = new MemoryOutbox();
+  await seed(outbox, 1);
+  const put = vi.fn(async (_p: string, _s: string, chunk: { sequence: number; sha256: string }) => ({
+    sessionId: "s", sequence: chunk.sequence, startFrame: 0, frameCount: 2,
+    sha256: "not-the-same", receivedAt: "t", duplicate: false,
+  }));
+  const uploader = new ChunkUploader(uploadClient(put as never), outbox, "p", "s");
+  await uploader.kick();
+  expect(uploader.status.blockedCode).toBe("review_session_receipt_mismatch");
+  expect(await outbox.chunks("s")).toHaveLength(1);
+});
+
+test("cue and calibration events survive lost responses and reload recovery before finalize", async () => {
+  const outbox = new MemoryOutbox();
+  const meta: OutboxSession = { sessionId: "s", projectId: "p", reviewTargetId: "t", capturedFrames: 2, ended: true, endReason: "stopped", updatedAt: "now" };
+  await outbox.putSession(meta);
+  await seed(outbox, 1);
+  const event: OutboxEvent = { sessionId: "s", eventId: "stable-cue", order: 0, kind: "manualSyncCue", audioFrame: 1, performanceMs: 10, declaredMovieSeconds: 0, detail: { clockEpoch: 0 } };
+  await outbox.putEvent(event);
+  const receipt = { eventId: event.eventId, kind: event.kind, audioFrame: event.audioFrame, audioSeconds: 1 / 48000, performanceMs: event.performanceMs, declaredMovieSeconds: event.declaredMovieSeconds, detail: event.detail, serverReceivedAt: "t" };
+  const post = vi.fn()
+    .mockRejectedValueOnce(new ProjectClientError("server_unavailable", "lost committed response", "server_unavailable"))
+    .mockResolvedValue(receipt);
+  const put = vi.fn(async (_p: string, _s: string, chunk: { sequence: number; sha256: string }) => ({ sessionId: "s", sequence: chunk.sequence, startFrame: 0, frameCount: 2, sha256: chunk.sha256, receivedAt: "t", duplicate: false }));
+  const client = { ...uploadClient(put as never), recordReviewSessionEvent: post } as unknown as BrowserProjectClient;
+  const uploader = new ChunkUploader(client, outbox, "p", "s", undefined, async () => undefined);
+  await uploader.kick();
+  expect(post).toHaveBeenCalledTimes(2);
+  expect(post.mock.calls[0][2]).toEqual(post.mock.calls[1][2]);
+  expect(await outbox.events("s")).toEqual([]);
+  expect(post.mock.invocationCallOrder[1]).toBeLessThan(put.mock.invocationCallOrder[0]);
+  expect(await finalizeWhenDrained(client, outbox, meta)).not.toBeNull();
+  expect(client.finalizeReviewSession).toHaveBeenCalledWith("p", "s", { finalFrameCount: 2, endReason: "stopped" });
+});
+
+test("failed event storage cannot be finalized as a complete capture", async () => {
+  const outbox = new MemoryOutbox();
+  const meta: OutboxSession = { sessionId: "s", projectId: "p", reviewTargetId: "t", capturedFrames: 0, ended: true, endReason: "stopped", eventStorageFailed: true, updatedAt: "now" };
+  await outbox.putSession(meta);
+  const client = uploadClient(vi.fn());
+  expect(await finalizeWhenDrained(client, outbox, meta)).toBeNull();
+  expect(client.finalizeReviewSession).not.toHaveBeenCalled();
+  expect((await outbox.sessions()).length).toBe(1);
 });

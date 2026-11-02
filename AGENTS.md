@@ -56,6 +56,10 @@ The implemented slice is intentionally smaller than the launch-critical list in 
 
 Implemented now:
 
+- TV recorder cues/clock events use a durable outbox and acknowledged worklet
+  tail flush; paired native-frame/performance probes preserve calibration
+  evidence and suspension epochs. See `docs/tv-voice-review-recording.md`.
+
 - Version-1 path-free TV review target export freshly verifies a full preview,
   preserves measured movie PTS and declared independent audio, and supplies a
   synthetic cloud fixture. The companion server imports it through an
