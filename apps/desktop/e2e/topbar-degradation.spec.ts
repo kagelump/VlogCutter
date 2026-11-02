@@ -191,6 +191,9 @@ test.describe("the compact progress form", () => {
     await page.setViewportSize({ width: 1920, height: 1080 });
     await startImport(page);
     await showImportStage(page, "copying", "C0097.MP4");
+    // Event delivery completes before React necessarily commits the new stage.
+    // Observe that stage before taking the synchronous geometry snapshot.
+    await expect(page.locator(".operation-label")).toHaveText("Copying and verifying originals");
 
     const full = await page.evaluate(() => ({
       label: document.querySelector(".operation-label")!.textContent,
