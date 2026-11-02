@@ -142,48 +142,6 @@ impl ReviewTargetHandoff {
             self.schema_version == REVIEW_TARGET_SCHEMA_VERSION,
             ReviewTargetError::UnsupportedVersion
         );
-        let t = &self.target;
-        ensure!(
-            [&t.project_id, &t.revision_id, &t.viewed_artifact_id]
-                .into_iter()
-                .all(|v| opaque(v)),
-            "invalid input: opaque target identities required"
-        );
-        ensure!(
-            [
-                &self.target_digest,
-                &t.plan_digest,
-                &t.constraints_key,
-                &t.movie.blake3
-            ]
-            .into_iter()
-            .all(|v| digest(v)),
-            "invalid input: full BLAKE3 digests required"
-        );
-        if let Some(id) = &t.youtube_video_id {
-            ensure!(
-                id.len() == 11 && opaque(id),
-                "invalid input: YouTube video ID must contain 11 URL-safe characters"
-            );
-        }
-        let m = &t.movie;
-        ensure!(
-            m.byte_length > 0
-                && m.byte_length <= MAX_SAFE_INTEGER as u64
-                && m.duration_seconds.is_finite()
-                && m.duration_seconds > 0.0
-                && m.duration_seconds <= 21_600.0
-                && m.time_base_numerator > 0
-                && m.time_base_denominator > 0
-                && safe_integer(m.time_base_numerator)
-                && safe_integer(m.time_base_denominator)
-                && safe_integer(m.origin_pts)
-                && m.video_frame_count > 0
-                && m.video_frame_count <= MAX_SAFE_INTEGER as u64
-                && m.audio_sample_rate == 48_000
-                && m.audio_channels == 2,
-            "invalid input: unsupported or incomplete movie clock/media receipt"
-        );
         let v = &self.verification;
         ensure!(
             v.output_matches
@@ -194,81 +152,7 @@ impl ReviewTargetHandoff {
             ReviewTargetError::ArtifactNotVerified
         );
         DateTime::parse_from_rfc3339(&v.verified_at).context("invalid verification timestamp")?;
-        ensure!(
-            !t.cuts.is_empty() && t.cuts.len() <= REVIEW_TARGET_MAX_CUTS,
-            "invalid input: review target requires 1..20000 measured cuts"
-        );
-        let mut seen = HashSet::new();
-        let mut cursor = m.origin_pts;
-        let mut frames = 0_u64;
-        for (position, cut) in t.cuts.iter().enumerate() {
-            ensure!(
-                opaque(&cut.operation_id)
-                    && opaque(&cut.asset_id)
-                    && seen.insert(&cut.operation_id)
-                    && cut.position as usize == position,
-                "invalid input: duplicate/invalid cut identity or position"
-            );
-            ensure!(
-                cut.source_in_seconds.is_finite()
-                    && cut.source_out_seconds.is_finite()
-                    && cut.source_in_seconds >= 0.0
-                    && cut.source_out_seconds > cut.source_in_seconds
-                    && cut.source_out_seconds <= 21_600.0,
-                "invalid input: declared source range"
-            );
-            ensure!(
-                cut.movie_in_pts == cursor
-                    && cut.movie_out_pts > cursor
-                    && safe_integer(cut.movie_out_pts)
-                    && cut.output_frame_count > 0,
-                "invalid input: missing, overlapping or reversed measured cut mapping"
-            );
-            cursor = cut.movie_out_pts;
-            frames = frames
-                .checked_add(cut.output_frame_count)
-                .context("frame count overflow")?;
-            if let Some(EditPlanAudio::Source(a)) = &cut.declared_audio {
-                ensure!(
-                    a.version == 1
-                        && opaque(&a.asset_id)
-                        && [
-                            a.source_in_seconds,
-                            a.source_out_seconds,
-                            a.timeline_start_seconds,
-                            a.sync_offset_seconds,
-                            a.gain_db,
-                            a.fade_in_seconds,
-                            a.fade_out_seconds
-                        ]
-                        .iter()
-                        .all(|v| v.is_finite())
-                        && a.source_in_seconds >= 0.0
-                        && a.source_out_seconds > a.source_in_seconds
-                        && a.source_out_seconds <= 21_600.0
-                        && a.timeline_start_seconds >= 0.0
-                        && a.timeline_start_seconds + a.source_out_seconds - a.source_in_seconds
-                            <= m.duration_seconds + 0.1
-                        && (-60.0..=0.0).contains(&a.gain_db)
-                        && (0.0..=0.25).contains(&a.fade_in_seconds)
-                        && (0.0..=0.25).contains(&a.fade_out_seconds)
-                        && a.fade_in_seconds + a.fade_out_seconds
-                            <= a.source_out_seconds - a.source_in_seconds,
-                    "invalid input: declared independent audio"
-                );
-            }
-        }
-        let picture_end = (cursor as f64 - m.origin_pts as f64) * m.time_base_numerator as f64
-            / m.time_base_denominator as f64;
-        ensure!(
-            picture_end <= m.duration_seconds + 0.000_001 && frames == m.video_frame_count,
-            "invalid input: movie duration/frame coverage disagrees with mapping"
-        );
-        ensure!(
-            Self::snapshot_digest(t)? == self.target_digest,
-            ReviewTargetError::DigestMismatch
-        );
-        Ok(())
+        validate_snapshot(&self.target, &self.target_digest)
     }
 
     /// Policy is explicit; callers choose the maximum age. Never renew an imported
@@ -324,6 +208,125 @@ impl ReviewTargetHandoff {
     }
 }
 
+pub(super) fn validate_snapshot(t: &ReviewTargetSnapshot, target_digest: &str) -> Result<()> {
+    ensure!(
+        [&t.project_id, &t.revision_id, &t.viewed_artifact_id]
+            .into_iter()
+            .all(|v| opaque(v)),
+        "invalid input: opaque target identities required"
+    );
+    ensure!(
+        [
+            target_digest,
+            t.plan_digest.as_str(),
+            t.constraints_key.as_str(),
+            t.movie.blake3.as_str()
+        ]
+        .into_iter()
+        .all(|v| digest(v)),
+        "invalid input: full BLAKE3 digests required"
+    );
+    if let Some(id) = &t.youtube_video_id {
+        ensure!(
+            id.len() == 11 && opaque(id),
+            "invalid input: YouTube video ID must contain 11 URL-safe characters"
+        );
+    }
+    let m = &t.movie;
+    ensure!(
+        m.byte_length > 0
+            && m.byte_length <= MAX_SAFE_INTEGER as u64
+            && m.duration_seconds.is_finite()
+            && m.duration_seconds > 0.0
+            && m.duration_seconds <= 21_600.0
+            && m.time_base_numerator > 0
+            && m.time_base_denominator > 0
+            && safe_integer(m.time_base_numerator)
+            && safe_integer(m.time_base_denominator)
+            && safe_integer(m.origin_pts)
+            && m.video_frame_count > 0
+            && m.video_frame_count <= MAX_SAFE_INTEGER as u64
+            && m.audio_sample_rate == 48_000
+            && m.audio_channels == 2,
+        "invalid input: unsupported or incomplete movie clock/media receipt"
+    );
+    ensure!(
+        !t.cuts.is_empty() && t.cuts.len() <= REVIEW_TARGET_MAX_CUTS,
+        "invalid input: review target requires 1..20000 measured cuts"
+    );
+    let mut seen = HashSet::new();
+    let mut cursor = m.origin_pts;
+    let mut frames = 0_u64;
+    for (position, cut) in t.cuts.iter().enumerate() {
+        ensure!(
+            opaque(&cut.operation_id)
+                && opaque(&cut.asset_id)
+                && seen.insert(&cut.operation_id)
+                && cut.position as usize == position,
+            "invalid input: duplicate/invalid cut identity or position"
+        );
+        ensure!(
+            cut.source_in_seconds.is_finite()
+                && cut.source_out_seconds.is_finite()
+                && cut.source_in_seconds >= 0.0
+                && cut.source_out_seconds > cut.source_in_seconds
+                && cut.source_out_seconds <= 21_600.0,
+            "invalid input: declared source range"
+        );
+        ensure!(
+            cut.movie_in_pts == cursor
+                && cut.movie_out_pts > cursor
+                && safe_integer(cut.movie_out_pts)
+                && cut.output_frame_count > 0,
+            "invalid input: missing, overlapping or reversed measured cut mapping"
+        );
+        cursor = cut.movie_out_pts;
+        frames = frames
+            .checked_add(cut.output_frame_count)
+            .context("frame count overflow")?;
+        if let Some(EditPlanAudio::Source(a)) = &cut.declared_audio {
+            ensure!(
+                a.version == 1
+                    && opaque(&a.asset_id)
+                    && [
+                        a.source_in_seconds,
+                        a.source_out_seconds,
+                        a.timeline_start_seconds,
+                        a.sync_offset_seconds,
+                        a.gain_db,
+                        a.fade_in_seconds,
+                        a.fade_out_seconds
+                    ]
+                    .iter()
+                    .all(|v| v.is_finite())
+                    && a.source_in_seconds >= 0.0
+                    && a.source_out_seconds > a.source_in_seconds
+                    && a.source_out_seconds <= 21_600.0
+                    && a.timeline_start_seconds >= 0.0
+                    && a.timeline_start_seconds + a.source_out_seconds - a.source_in_seconds
+                        <= m.duration_seconds + 0.1
+                    && (-60.0..=0.0).contains(&a.gain_db)
+                    && (0.0..=0.25).contains(&a.fade_in_seconds)
+                    && (0.0..=0.25).contains(&a.fade_out_seconds)
+                    && a.fade_in_seconds + a.fade_out_seconds
+                        <= a.source_out_seconds - a.source_in_seconds,
+                "invalid input: declared independent audio"
+            );
+        }
+    }
+    let picture_end = (cursor as f64 - m.origin_pts as f64) * m.time_base_numerator as f64
+        / m.time_base_denominator as f64;
+    ensure!(
+        picture_end <= m.duration_seconds + 0.000_001 && frames == m.video_frame_count,
+        "invalid input: movie duration/frame coverage disagrees with mapping"
+    );
+    ensure!(
+        ReviewTargetHandoff::snapshot_digest(t)? == target_digest,
+        ReviewTargetError::DigestMismatch
+    );
+    Ok(())
+}
+
 impl Catalog {
     /// Fresh verification; no movie copy, source upload, timeline write or activation.
     pub fn export_review_target(
@@ -353,59 +356,12 @@ impl Catalog {
             "invalid input: v1 TV review requires a full preview, not an excerpt"
         );
         let plan = self.edit_plan_revision(&artifact.revision_id)?;
-        let identity = artifact.identity.context("missing preview identity")?;
-        let validation = artifact
-            .validation
-            .context("missing measured movie mapping")?;
         let verified = status.verification.context("missing fresh verification")?;
-        ensure!(
-            plan.project_id == artifact.project_id
-                && identity.revision_id == plan.revision_id
-                && validation.cuts.len() == plan.operations.len(),
-            "invalid receipt: project/revision/cut count mismatch"
-        );
-        let mut cuts = Vec::with_capacity(plan.operations.len());
-        for (op, measured) in plan.operations.iter().zip(&validation.cuts) {
-            ensure!(!cancel(), "review target export cancelled");
-            ensure!(
-                op.operation_id == measured.operation_id
-                    && op.asset_id == measured.asset_id
-                    && op.source_in_seconds == measured.source_in_seconds
-                    && op.source_out_seconds == measured.source_out_seconds,
-                "invalid receipt: canonical cut differs from measured mapping"
-            );
-            cuts.push(ReviewTargetCut {
-                operation_id: op.operation_id.clone(),
-                position: op.position,
-                asset_id: op.asset_id.clone(),
-                source_in_seconds: op.source_in_seconds,
-                source_out_seconds: op.source_out_seconds,
-                movie_in_pts: measured.movie_in_pts,
-                movie_out_pts: measured.movie_out_pts,
-                output_frame_count: measured.output_frame_count,
-                declared_audio: op.audio.clone(),
-            });
-        }
-        let target = ReviewTargetSnapshot {
-            project_id: artifact.project_id,
-            revision_id: plan.revision_id,
-            viewed_artifact_id: artifact.artifact_id,
-            plan_digest: identity.plan_digest,
-            constraints_key: identity.constraints_key,
-            movie: ReviewTargetMovie {
-                blake3: validation.output_fingerprint,
-                byte_length: validation.byte_length,
-                duration_seconds: validation.duration_seconds,
-                time_base_numerator: validation.movie_time_base_numerator,
-                time_base_denominator: validation.movie_time_base_denominator,
-                origin_pts: validation.movie_origin_pts,
-                video_frame_count: validation.video_frame_count,
-                audio_sample_rate: validation.audio_sample_rate,
-                audio_channels: validation.audio_channels,
-            },
-            cuts,
-            youtube_video_id,
-        };
+        let fully_decoded = artifact
+            .validation
+            .as_ref()
+            .is_some_and(|v| v.fully_decoded);
+        let target = snapshot_from_artifact(artifact, &plan, youtube_video_id, cancel)?;
         let handoff = ReviewTargetHandoff {
             schema_version: REVIEW_TARGET_SCHEMA_VERSION,
             target_digest: ReviewTargetHandoff::snapshot_digest(&target)?,
@@ -416,7 +372,7 @@ impl Catalog {
                 inputs_match: verified.inputs_match,
                 constraints_match: verified.constraints_match,
                 plan_renderable: verified.plan_renderable,
-                fully_decoded: validation.fully_decoded,
+                fully_decoded,
             },
         };
         handoff.validate()?;
@@ -426,6 +382,68 @@ impl Catalog {
         );
         Ok(handoff)
     }
+}
+
+pub(super) fn snapshot_from_artifact(
+    artifact: super::PreviewArtifact,
+    plan: &super::EditPlanRevision,
+    youtube_video_id: Option<String>,
+    cancel: &dyn Fn() -> bool,
+) -> Result<ReviewTargetSnapshot> {
+    let identity = artifact.identity.context("missing preview identity")?;
+    let validation = artifact
+        .validation
+        .context("missing measured movie mapping")?;
+    ensure!(
+        plan.project_id == artifact.project_id
+            && identity.recipe == super::preview_media::RECIPE
+            && identity.max_height == artifact.request.max_height
+            && identity.revision_id == plan.revision_id
+            && validation.cuts.len() == plan.operations.len(),
+        "invalid receipt: project/revision/cut count mismatch"
+    );
+    let mut cuts = Vec::with_capacity(plan.operations.len());
+    for (op, measured) in plan.operations.iter().zip(&validation.cuts) {
+        ensure!(!cancel(), "review target export cancelled");
+        ensure!(
+            op.operation_id == measured.operation_id
+                && op.asset_id == measured.asset_id
+                && op.source_in_seconds == measured.source_in_seconds
+                && op.source_out_seconds == measured.source_out_seconds,
+            "invalid receipt: canonical cut differs from measured mapping"
+        );
+        cuts.push(ReviewTargetCut {
+            operation_id: op.operation_id.clone(),
+            position: op.position,
+            asset_id: op.asset_id.clone(),
+            source_in_seconds: op.source_in_seconds,
+            source_out_seconds: op.source_out_seconds,
+            movie_in_pts: measured.movie_in_pts,
+            movie_out_pts: measured.movie_out_pts,
+            output_frame_count: measured.output_frame_count,
+            declared_audio: op.audio.clone(),
+        });
+    }
+    Ok(ReviewTargetSnapshot {
+        project_id: artifact.project_id,
+        revision_id: plan.revision_id.clone(),
+        viewed_artifact_id: artifact.artifact_id,
+        plan_digest: identity.plan_digest,
+        constraints_key: identity.constraints_key,
+        movie: ReviewTargetMovie {
+            blake3: validation.output_fingerprint,
+            byte_length: validation.byte_length,
+            duration_seconds: validation.duration_seconds,
+            time_base_numerator: validation.movie_time_base_numerator,
+            time_base_denominator: validation.movie_time_base_denominator,
+            origin_pts: validation.movie_origin_pts,
+            video_frame_count: validation.video_frame_count,
+            audio_sample_rate: validation.audio_sample_rate,
+            audio_channels: validation.audio_channels,
+        },
+        cuts,
+        youtube_video_id,
+    })
 }
 
 #[cfg(test)]

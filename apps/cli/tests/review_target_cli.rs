@@ -118,6 +118,35 @@ fn export_envelope_is_path_free_preserves_revisions_and_refuses_missing_or_chang
         repeated["data"]["targetDigest"],
         envelope["data"]["targetDigest"]
     );
+    let historical = Command::new(env!("CARGO_BIN_EXE_rcdvlog"))
+        .arg("--catalog")
+        .arg(&path)
+        .args([
+            "edit-plan",
+            "historical-review-target-export",
+            "--artifact",
+            &artifact,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        historical.status.success(),
+        "{}",
+        String::from_utf8_lossy(&historical.stderr)
+    );
+    assert!(historical.stderr.is_empty());
+    let historical: Value = serde_json::from_slice(&historical.stdout).unwrap();
+    assert_eq!(
+        historical["data"]["purpose"],
+        "historicalRenderedArtifactReview"
+    );
+    assert_eq!(
+        historical["data"]["currentPlanRenderability"],
+        "notEstablishedByThisReview"
+    );
+    assert!(
+        ReviewTargetHandoff::from_json(&serde_json::to_vec(&historical["data"]).unwrap()).is_err()
+    );
     for missing in [false, true] {
         if missing {
             fs::remove_file(&preview.output_path).unwrap();

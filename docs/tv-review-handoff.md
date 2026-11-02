@@ -189,3 +189,39 @@ initial inspection; validate each later candidate in an isolated worktree.
 
 Priority remains #221 import integration, then the shared #223 anchor mapper,
 then #227 final-mix matching. Do not duplicate the cloud web recorder or ASR.
+
+## Historical rendered-artifact review (separate contract)
+
+`edit-plan historical-review-target-export --artifact <id>` opens the catalog
+read-only and emits `HistoricalRenderedArtifactReview` version 1. It freshly
+hashes the owned completed movie, binds it to its prior fully decoded receipt,
+checks every measured cut against the immutable revision, and runs the same
+snapshot structure/digest validation as the strict exporter. It does not decode
+again, read source media, migrate the catalog or assert current constraints,
+source verification or plan renderability. Each of those is explicitly
+`notEstablishedByThisReview`. This receipt is an observation at `verifiedAt`, not
+an availability promise. Use `from_json` for bounded import validation.
+
+The `purpose: historicalRenderedArtifactReview` discriminator and different Rust
+DTO prevent parsing it as `ReviewTargetHandoff`. A server must implement an
+explicit historical-review policy before accepting it; importing it through the
+strict v1 route fails. Historical sessions may retain movie-time discussion of
+known editorial defects, but this evidence grants no render, editing, activation,
+upload, source-trim or feedback-apply authority. Those existing gates remain.
+Digest consistency cannot authenticate the issuer or establish YouTube identity.
+
+A completed historical cut may predate new rules. In particular, the chronology
+work added story policy and chronology dependencies to plan/constraint digests
+without changing the preview recipe name. `inputsMatch: false` compares the whole
+identity, including tool, plan and constraint digests; it does not by itself mean
+source bytes changed. The existing constraint failure text mentions human source
+constraints, but the key also includes chronology and story policy. Diagnose the
+components before attributing a failure. A historical review never repairs or
+whitelists a known chronology defect.
+
+The historical reader also verifies the complete plan digest, including declared
+audio and decision metadata. It recognizes the current algorithm and the exact
+pre-story-policy algorithm only when no story policy exists. That legacy
+recognition is confined to historical read-only review; it cannot authorize
+render reuse or current strict export. The [historical JSON Schema](contracts/historical-review-v1.schema.json)
+and invented `historical-v1.json` fixture document this separate transport.

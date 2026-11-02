@@ -1292,3 +1292,9 @@ handoff in the normal success envelope, command `edit-plan.review-target-export`
 It copies/uploads no media and writes no edit-plan or feedback operation.
 See [TV review handoff v1](tv-review-handoff.md) for the fixture, clock precision,
 import trust/freshness boundary and canonical feedback reconciliation.
+
+Historical movie review: `edit-plan historical-review-target-export --artifact
+<id>` opens the explicit existing catalog read-only and returns the separate
+`HistoricalRenderedArtifactReview` v1 DTO. It checks fresh movie bytes and stored
+mapping/revision integrity; current source/constraint/renderability checks remain
+explicitly unresolved. See [historical review policy](tv-review-handoff.md#historical-rendered-artifact-review-separate-contract).

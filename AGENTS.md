@@ -61,6 +61,8 @@ Implemented now:
   synthetic cloud fixture. Server import/UI and synchronization remain separate
   work; see `docs/tv-review-handoff.md`.
 
+- Historical rendered-movie integrity review has a separate read-only DTO/CLI;
+  it never certifies current plan renderability. See `docs/tv-review-handoff.md`.
 - One supported CLI now includes editing, review and upload against schema 66,
   with observational `doctor --workflow rough-cut|delivery` preflight. Sparse
   stable-ID patches, explicit source-inventory picture-usage reports and unused
