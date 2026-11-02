@@ -64,7 +64,11 @@ Implemented now:
   of a viewed artifact, keeps a declared-unverified YouTube ID as a separate
   immutable snapshot, and the Chrome app has a *TV review* selection/import
   screen. Recording, ASR, sync and feedback reconciliation remain separate
-  work; see `docs/tv-review-handoff.md`.
+  work; see `docs/tv-review-handoff.md`. `review-markers` (no catalog) writes a
+  separate, create-only, self-verified marked review copy of the BLAKE3-matched
+  master with audible chirp-BFSK movie-time markers (video stream copy) and
+  detects CRC/export-key-checked anchors in recordings as shared `tv_review_sync`
+  `acousticTimecode` anchors; see `docs/tv-review-acoustic-markers.md`.
 
 - Historical rendered-movie integrity review has a separate read-only DTO/CLI;
   it never certifies current plan renderability. See `docs/tv-review-handoff.md`.

@@ -1293,6 +1293,20 @@ It copies/uploads no media and writes no edit-plan or feedback operation.
 See [TV review handoff v1](tv-review-handoff.md) for the fixture, clock precision,
 import trust/freshness boundary and canonical feedback reconciliation.
 
+`review-markers plan|export|detect` (no catalog) handles acoustic movie-time
+markers for separate TV review copies. `plan --handoff <file>` lists marker
+times. `export --handoff <file> --movie <abs> --output <abs.mp4>` checks that
+the master's BLAKE3 and length match the handoff, then writes a create-only
+marked copy (video stream copy, AAC soundtrack with markers) and a path-free
+`<output>.markers.json` lineage manifest. It decodes its own output and
+refuses to publish a copy whose markers or picture stream do not verify.
+`detect --handoff <file> --recording <wav>` returns `detection` (recording-clock/
+movie-time anchors plus rejected candidates) and the same evidence as shared
+`syncAnchors` (`acousticTimecode`) with their `movieClock` and `captureClock`,
+ready for `tv-review sync-preview`. Commands: `review-markers.plan`,
+`review-markers.export`, `review-markers.detect`. See
+[acoustic markers](tv-review-acoustic-markers.md).
+
 Historical movie review: `edit-plan historical-review-target-export --artifact
 <id>` opens the explicit existing catalog read-only and returns the separate
 `HistoricalRenderedArtifactReview` v1 DTO. It checks fresh movie bytes and stored

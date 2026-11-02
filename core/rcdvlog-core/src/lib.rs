@@ -19,6 +19,7 @@ use std::time::Instant;
 use uuid::Uuid;
 use walkdir::WalkDir;
 
+pub mod acoustic_markers;
 mod agent;
 mod analysis;
 mod archive;
