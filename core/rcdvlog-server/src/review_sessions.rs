@@ -805,6 +805,9 @@ impl ReviewSessions {
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         Self::project_registered(&tx, project_id)?;
         let session = load_session_row(&tx, project_id, session_id)?;
+        if event.audio_frame > u64::from(session.sample_rate) * 7 * 3600 {
+            return Err(invalid("event frame exceeds recording bound"));
+        }
         let existing = load_events(&tx, session_id, session.sample_rate)?
             .into_iter()
             .find(|e| e.event_id == event.event_id);
@@ -888,6 +891,19 @@ impl ReviewSessions {
             }
             return Err(ReviewSessionError::NotRecording);
         }
+        if request.final_frame_count > u64::from(session.sample_rate) * 7 * 3600 {
+            return Err(invalid("final frame count exceeds recording bound"));
+        }
+        let tail_unknown = load_events(&tx, session_id, session.sample_rate)?
+            .iter()
+            .any(|e| {
+                e.kind == ReviewSessionEventKind::PageInterrupted
+                    && e.detail
+                        .as_ref()
+                        .and_then(|d| d.get("captureTailStatus"))
+                        .and_then(|v| v.as_str())
+                        == Some("unknown")
+            });
         let chunks = load_chunks(&tx, session_id)?;
         let max_end = chunks
             .iter()
@@ -914,7 +930,7 @@ impl ReviewSessions {
         );
         let state = if corrupt {
             ReviewSessionState::Corrupt
-        } else if coverage.gaps.is_empty() && !chunks.is_empty() {
+        } else if !tail_unknown && coverage.gaps.is_empty() && !chunks.is_empty() {
             ReviewSessionState::Completed
         } else {
             ReviewSessionState::Incomplete
