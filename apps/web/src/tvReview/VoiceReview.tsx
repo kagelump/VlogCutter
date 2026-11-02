@@ -253,7 +253,8 @@ export function RecordView({ client, projectId, targetId, navigate, deps = brows
         {status ? <dl className="tv-facts tv-recorder-facts">
           <dt>Elapsed</dt><dd>{formatClock(status.elapsedSeconds)}</dd>
           <dt>Uploaded</dt><dd>{status.upload.uploadedChunks} chunks{status.upload.pendingChunks ? ` · ${status.upload.pendingChunks} buffered` : ""}{status.upload.retrying ? " · retrying" : ""}</dd>
-          <dt>Cues</dt><dd>{status.cues}</dd>
+          <dt>Cues</dt><dd>{status.cues}{status.upload.pendingEvents ? ` · ${status.upload.pendingEvents} event${status.upload.pendingEvents === 1 ? "" : "s"} awaiting the server` : ""}</dd>
+          {status.unsavedEvents ? <><dt>Events</dt><dd className="inline-error">{status.unsavedEvents} capture event{status.unsavedEvents === 1 ? "" : "s"} could not be saved locally</dd></> : null}
           {status.lostFrames ? <><dt>Lost</dt><dd>{(status.lostFrames / status.sampleRate).toFixed(1)} s could not be buffered (recorded as a gap)</dd></> : null}
           {status.discontinuities ? <><dt>Glitches</dt><dd>{status.discontinuities} capture discontinuities recorded</dd></> : null}
           {status.upload.blockedCode ? <><dt>Upload</dt><dd className="inline-error">{SESSION_CODE_COPY[status.upload.blockedCode] ?? status.upload.blockedCode}</dd></> : null}
@@ -277,7 +278,9 @@ export function SessionDetailView({ client, projectId, targetId, sessionId, navi
   if (!session) return <section className="workspace-page"><StatePanel title="Loading voice review" busy><p>Reading session evidence…</p></StatePanel></section>;
   const rate = session.sampleRate;
   const cues = session.events.filter((event) => event.kind === "manualSyncCue");
-  const health = session.events.filter((event) => event.kind !== "manualSyncCue");
+  const clockSamples = session.events.filter((event) => event.kind === "clockSample");
+  const clockEpochs = new Set(clockSamples.map((event) => Number(event.detail?.clockEpoch ?? 0))).size;
+  const health = session.events.filter((event) => event.kind !== "manualSyncCue" && event.kind !== "clockSample");
   return <section className="workspace-page tv-review-page">
     <div className="page-heading"><div><p className="eyebrow">Voice review / revision {session.revisionId}</p><h1>Voice review session</h1></div>
       <div className="tv-heading-actions">{stateBadge(session)}<button className="secondary" onClick={() => navigate(`/tv-review/${encodeURIComponent(projectId)}/${encodeURIComponent(targetId)}`)}>Back to target</button></div></div>
@@ -289,6 +292,7 @@ export function SessionDetailView({ client, projectId, targetId, sessionId, navi
           <dt>Bound to</dt><dd>revision {session.revisionId} · target digest <code>{session.targetDigest.slice(0, 12)}…</code></dd>
           <dt>Consent</dt><dd>everyone present acknowledged{session.consent.additionalSpeakersDisclosed ? " · second speaker disclosed" : " · single speaker declared"}</dd>
           <dt>Processing</dt><dd>echo cancellation {String(session.capture.echoCancellation)} · noise suppression {String(session.capture.noiseSuppression)} · auto gain {String(session.capture.autoGainControl)}</dd>
+          <dt>Clock</dt><dd>{clockSamples.length ? `${clockSamples.length} sample/performance clock pairs across ${clockEpochs} clock epoch${clockEpochs === 1 ? "" : "s"}` : "no clock pairs recorded"}</dd>
           <dt>Gaps</dt><dd>{session.coverage.gaps.length ? session.coverage.gaps.map((gap) => `${formatClock(gap.startFrame / rate)}–${formatClock(gap.endFrame / rate)}`).join(", ") + " (no audio exists for these spans)" : session.state === "recording" ? "not computed until finalized" : "none"}</dd>
         </dl>
         <h2 className="tv-section-title">Manual cues</h2>

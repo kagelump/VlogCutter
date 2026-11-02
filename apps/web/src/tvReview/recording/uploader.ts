@@ -1,4 +1,5 @@
-// Drains one session's durable outbox to the server in sequence order.
+// Drains one session's durable outbox (queued capture events, then audio
+// chunks in sequence order) to the server.
 // Transient failures back off and retry; the chunk stays on disk until the
 // server returns a receipt. Permanent refusals stop the drain and are surfaced,
 // never retried blindly. Identical retries are safe: the server treats them as
@@ -9,6 +10,8 @@ import type { ChunkOutbox } from "./outbox";
 export interface UploadStatus {
   pendingChunks: number;
   uploadedChunks: number;
+  /** Capture events (cues, clock samples...) queued locally but not yet acknowledged. */
+  pendingEvents: number;
   lastReceiptAt: string | null;
   retrying: boolean;
   /** Stable server code that stopped the drain, if any. */
@@ -16,6 +19,7 @@ export interface UploadStatus {
 }
 
 const PERMANENT = new Set([
+  "idempotency_conflict",
   "review_session_chunk_conflict",
   "review_session_chunk_corrupt",
   "review_session_limit_exceeded",
@@ -35,7 +39,7 @@ export function isPermanentUploadError(error: unknown): boolean {
 export class ChunkUploader {
   private running: Promise<void> | null = null;
   private stopped = false;
-  status: UploadStatus = { pendingChunks: 0, uploadedChunks: 0, lastReceiptAt: null, retrying: false, blockedCode: null };
+  status: UploadStatus = { pendingChunks: 0, uploadedChunks: 0, pendingEvents: 0, lastReceiptAt: null, retrying: false, blockedCode: null };
 
   constructor(
     private readonly client: BrowserProjectClient,
@@ -63,11 +67,27 @@ export class ChunkUploader {
     let delay = 500;
     for (;;) {
       if (this.stopped || this.status.blockedCode) return;
+      const events = await this.outbox.events(this.sessionId);
       const pending = await this.outbox.chunks(this.sessionId);
-      this.update({ pendingChunks: pending.length });
-      if (!pending.length) { this.update({ retrying: false }); return; }
-      const chunk = pending[0];
+      this.update({ pendingChunks: pending.length, pendingEvents: events.length });
+      if (!pending.length && !events.length) { this.update({ retrying: false }); return; }
       try {
+        if (events.length) {
+          const event = events[0];
+          await this.client.recordReviewSessionEvent(this.projectId, this.sessionId, {
+            eventId: event.eventId,
+            kind: event.kind,
+            audioFrame: event.audioFrame,
+            performanceMs: event.performanceMs,
+            declaredMovieSeconds: event.declaredMovieSeconds,
+            detail: event.detail,
+          });
+          await this.outbox.deleteEvent(this.sessionId, event.eventId);
+          delay = 500;
+          this.update({ pendingEvents: events.length - 1, retrying: false });
+          continue;
+        }
+        const chunk = pending[0];
         const receipt = await this.client.putReviewSessionChunk(this.projectId, this.sessionId, {
           sequence: chunk.sequence,
           startFrame: chunk.startFrame,

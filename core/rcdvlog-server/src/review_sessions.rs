@@ -156,7 +156,10 @@ pub enum ReviewSessionEventKind {
     DeviceLost,
     /// The page was hidden, closed or reloaded while capturing.
     PageInterrupted,
-    /// A client/server clock correlation sample.
+    /// A paired microphone sample index / `performance.now()` observation.
+    /// `detail.clockEpoch` scopes it (a suspend/resume starts a new epoch) and
+    /// `detail.uncertaintyMs` declares the pairing bound; a `detail.transition`
+    /// sample only marks an epoch boundary and carries no pairing.
     ClockSample,
 }
 
@@ -403,6 +406,34 @@ fn parse_end_reason(value: &str) -> Option<RecordingEndReason> {
         "cancelled" => Some(RecordingEndReason::Cancelled),
         _ => None,
     }
+}
+
+/// A clock sample must name its epoch, and a pairing sample must carry the
+/// performance reading and a declared, finite, non-negative uncertainty.
+fn validate_clock_sample(event: &ReviewSessionEventRequest) -> Result<(), ReviewSessionError> {
+    let detail = event
+        .detail
+        .as_ref()
+        .and_then(|d| d.as_object())
+        .ok_or_else(|| invalid("clockSample requires a detail object"))?;
+    if !detail
+        .get("clockEpoch")
+        .is_some_and(|v| v.as_u64().is_some())
+    {
+        return Err(invalid(
+            "clockSample requires a non-negative integer clockEpoch",
+        ));
+    }
+    if detail.get("transition").is_some() {
+        return Ok(());
+    }
+    let uncertainty = detail.get("uncertaintyMs").and_then(|v| v.as_f64());
+    if event.performance_ms.is_none() || !uncertainty.is_some_and(|v| v.is_finite() && v >= 0.0) {
+        return Err(invalid(
+            "clockSample pairing requires performanceMs and a non-negative uncertaintyMs",
+        ));
+    }
+    Ok(())
 }
 
 fn event_kind_str(kind: ReviewSessionEventKind) -> &'static str {
@@ -767,6 +798,9 @@ impl ReviewSessions {
             }
             None => None,
         };
+        if event.kind == ReviewSessionEventKind::ClockSample {
+            validate_clock_sample(event)?;
+        }
         let mut connection = open_writable_connection(&self.database_path)?;
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         Self::project_registered(&tx, project_id)?;
@@ -775,7 +809,22 @@ impl ReviewSessions {
             .into_iter()
             .find(|e| e.event_id == event.event_id);
         if let Some(existing) = existing {
-            if existing.kind != event.kind || existing.audio_frame != event.audio_frame {
+            // A replay must carry the identical immutable payload: a reused id
+            // with a different declared movie time, clock reading or detail is
+            // a conflict, never a silent acceptance of the first version.
+            let same_detail = match (&existing.detail, &event.detail) {
+                (None, None) => true,
+                (Some(a), Some(b)) => a == b,
+                _ => false,
+            };
+            if existing.kind != event.kind
+                || existing.audio_frame != event.audio_frame
+                || existing.performance_ms.map(f64::to_bits)
+                    != event.performance_ms.map(f64::to_bits)
+                || existing.declared_movie_seconds.map(f64::to_bits)
+                    != event.declared_movie_seconds.map(f64::to_bits)
+                || !same_detail
+            {
                 return Err(ReviewSessionError::IdempotencyConflict);
             }
             return Ok(existing);

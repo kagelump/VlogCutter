@@ -51,10 +51,38 @@ exact target.
   - each event's `performance.now()`
   - the server's receive time for every chunk and event
 
-  None of these is a client wall-clock claim.
+  None of these is a client wall-clock claim. `clientStartedPerformanceMs`
+  on session create is read before the create round trip and worklet start,
+  so it is not a capture-start time; use clock samples instead.
+- **Clock samples** pair the recording clock with `performance.now()`. A
+  `clockSample` event is queued at the first delivered audio, every 5 s, on
+  resume and at stop. `audioFrame` is the sample index (the shared sync
+  engine's `CapturePosition.sampleIndex`), `performanceMs` the paired reading,
+  and `detail` holds `clockEpoch`, `method` and a declared `uncertaintyMs`:
+  - `getOutputTimestamp` reads both clocks together: ± one render quantum
+    (128 frames, ≈2.7 ms at 48 kHz);
+  - the `currentTime` fallback reads them separately: ± two quanta.
+- **Clock epochs.** A suspended or interrupted AudioContext stops its sample
+  clock while wall time continues. The transition is recorded as a
+  `clockSample` with `detail.transition` and no pairing, and each resume starts
+  a new `clockEpoch`. Pairs from different epochs must never be fitted
+  together. The server requires `clockEpoch` on every clock sample, and a
+  pairing sample must carry `performanceMs` and a finite non-negative
+  `uncertaintyMs`.
 - A manual cue is stored on the recording clock (`AudioContext.currentTime`
-  rebased to frame 0, with `outputLatency` in its detail), together with the
-  declared movie second (0 = first frame).
+  rebased to frame 0, with `outputLatency` and `clockEpoch` in its detail),
+  together with the declared movie second (0 = first frame). Converting that
+  declared elapsed second to the target's raw movie PTS uses the selected
+  target's exact origin and timebase in the shared sync engine; the server's
+  receive time is never a capture time.
+- **Stop.** The worklet flushes its partial batch and then acknowledges the
+  frame after the last one it delivered; port ordering means the audio is
+  already on the main thread. The recorder drains to exactly that frame
+  before closing the context and finalizing. If no acknowledgment arrives
+  within 1 s, the tail is unknown: the final frame count is extended to the
+  context clock's position at stop, a `captureDiscontinuity` with
+  `reason: "stopUnacknowledged"` records the missing frames, and the server
+  reports that span as a gap (the session is `incomplete`), never as audio.
 
 ## Durability
 
@@ -83,8 +111,18 @@ finalizes the session as `interrupted`, using the last chunk end the outbox
 recorded. Up to one unflushed chunk (≤2 s) can be lost on an abrupt tab close.
 Those frames were never on disk, and the session does not claim them.
 
-A session is never finalized while audio for it is still buffered in the
-browser.
+Capture events (cues, discontinuities, clock samples, device loss) use the
+same outbox. Each is stored with a stable `eventId` before any post, posted
+ahead of the audio, retried with the same backoff, and deleted only once the
+server acknowledges it. The recorder counts a cue once it is durably queued and
+shows how many events still await the server. An event that could not even be
+stored locally is counted on screen as unsaved. On the server, a replayed
+`eventId` must carry the identical payload (kind, frame, `performanceMs`,
+declared movie time and detail); any difference is `idempotency_conflict`,
+which stops the drain rather than being accepted silently.
+
+A session is never finalized while audio or an event for it is still buffered
+in the browser.
 
 ## Server owner and API
 
@@ -98,7 +136,7 @@ rest of the server.
 | --- | --- |
 | `POST …/review-sessions` | Create. Idempotent by `clientSessionKey`. Requires consent, `pcm_s16le`, 1–2 channels, a supported rate, and a target whose readiness is `ready`; otherwise its blocker code is returned with 409. At most 4 sessions record at once (503 `review_session_busy`). |
 | `PUT …/{sessionId}/chunks/{sequence}?startFrame&frameCount&sha256&captureEndMs` | Raw body of at most 2 MiB. The server checks the hash, checks that length equals frames × channels × 2, and refuses overlap or a different body for an existing sequence (409). It writes the file with fsync and a temp-file rename, then commits the row. A 4-permit concurrency gate returns 503 with `Retry-After`. Session total is capped at 2 GiB / 7 h. |
-| `POST …/events` | `manualSyncCue`, `captureDiscontinuity`, `localBufferOverflow`, `deviceLost`, `pageInterrupted` or `clockSample`. Idempotent by `eventId`. The `detail` object is at most 2 KiB. |
+| `POST …/events` | `manualSyncCue`, `captureDiscontinuity`, `localBufferOverflow`, `deviceLost`, `pageInterrupted` or `clockSample`. Idempotent by `eventId`; a replay with a different payload is `idempotency_conflict`. The `detail` object is at most 2 KiB. |
 | `POST …/finalize` | Takes `finalFrameCount` and an `endReason`. The server re-hashes every stored chunk and computes received ranges, missing sequences and gaps over `[0, finalFrameCount)`. Identical repeats are idempotent. |
 | `GET …/{sessionId}`, `GET …/review-sessions` | Detail and bounded list. A recording past its 12 h lifetime is marked `abandoned` and can still be finalized. |
 | `GET …/audio.wav` | Only for `completed` sessions. Each chunk is re-verified and the result is streamed. Incomplete audio is never padded (409 `review_session_audio_unavailable`). |
