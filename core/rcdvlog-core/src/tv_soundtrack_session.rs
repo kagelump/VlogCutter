@@ -5,7 +5,7 @@ use crate::{
     tv_review_sync::{SyncAnchor, SyncBoundary, SyncBoundaryKind, SyncQuery, SyncRequest},
     tv_soundtrack::{
         PCM_RATE, SoundtrackCapture, SoundtrackIndex, SoundtrackMatchReport, SoundtrackMovie,
-        SoundtrackPolicy, SoundtrackReferenceSpec,
+        SoundtrackPeak, SoundtrackPolicy, SoundtrackReferenceSpec,
     },
 };
 use anyhow::{Context, Result, ensure};
@@ -40,6 +40,12 @@ pub struct SoundtrackSessionSpec {
     pub query_seconds: u32,
     pub query_step_seconds: u32,
     pub match_policy: SoundtrackPolicy,
+    /// Recording-clock intervals to down-weight (§6). Built by the caller.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub speech_mask: Vec<SyncQuery>,
+    /// None means the v1 recipe (§7).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recipe: Option<String>,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -47,6 +53,9 @@ pub struct SessionMatchQuery {
     pub segment_id: String,
     pub recording: SyncQuery,
     pub capture: SoundtrackCapture,
+    /// None for grid queries, "speech_gap" for gap-placed queries (§6).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -106,6 +115,9 @@ pub struct SessionQueryEvidence {
     pub report_digests: Vec<String>,
     pub supporting_evidence_ids: BTreeMap<String, Vec<String>>,
     pub anchors: Vec<SyncAnchor>,
+    /// Best 4 merged peaks across completed references (§3).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub best_peaks: Vec<SoundtrackPeak>,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -202,6 +214,7 @@ impl SoundtrackSessionPlan {
                 movie: spec.sync.movie.clone(),
                 start_seconds: start,
                 duration_seconds: width,
+                recipe: None,
             });
             if start + width >= duration - 1e-9 {
                 break;
@@ -280,6 +293,7 @@ impl SoundtrackSessionPlan {
                         &segment.wav_blake3,
                     ))?;
                     queries.push(SessionMatchQuery {
+                        origin: None,
                         segment_id: segment.segment_id.clone(),
                         recording: SyncQuery {
                             clock_id: clock.clock_id.clone(),
@@ -387,6 +401,7 @@ impl SoundtrackSessionPlan {
             anchors: report.candidates.iter().map(|c| c.anchor.clone()).collect(),
             boundaries: vec![],
             policy: self.spec.sync.policy.clone(),
+            consensus_segments: vec![],
         };
         check.validate()?;
         let tps = self.spec.sync.movie.ticks_per_second();
@@ -599,6 +614,7 @@ impl SoundtrackSessionPlan {
                 report_digests: vec![],
                 supporting_evidence_ids: BTreeMap::new(),
                 anchors: vec![],
+                best_peaks: vec![],
             };
             let mut candidates = Vec::new();
             for ri in 0..self.references.len() {

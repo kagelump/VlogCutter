@@ -22,6 +22,7 @@ fn fixture() -> SyncRequest {
         anchors: vec![],
         boundaries: vec![],
         policy: SyncPolicy::default(),
+        consensus_segments: vec![],
     }
 }
 fn anchor(
