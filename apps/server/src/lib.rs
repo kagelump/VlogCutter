@@ -3,6 +3,7 @@
 mod job_callback_http;
 mod review_session_http;
 mod review_target_http;
+mod review_transcript_http;
 
 use anyhow::{Context, Result, anyhow};
 use axum::body::Body;
@@ -891,6 +892,7 @@ pub fn router(state: HttpState) -> Router {
         .merge(internal)
         .merge(review_targets)
         .merge(review_session_http::routes(&state))
+        .merge(review_transcript_http::routes(&state))
         .fallback(web_or_not_found)
         .with_state(state.clone())
         .layer(DefaultBodyLimit::max(MAX_HTTP_BODY_BYTES))
@@ -906,6 +908,7 @@ pub fn openapi_document() -> serde_json::Value {
     let mut document = base_openapi_document();
     review_target_http::openapi_extend(&mut document);
     review_session_http::openapi_extend(&mut document);
+    review_transcript_http::openapi_extend(&mut document);
     document
 }
 
@@ -6338,5 +6341,147 @@ mod tests {
                 "missing {action}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn review_transcription_routes_refuse_unauthorized_cloud_dispatch() {
+        let fixture = Fixture::new(false);
+        let source = TempDir::new().unwrap();
+        let envelope = baseline_envelope(&source);
+        let project_id = envelope.payload.project.project_id.clone();
+        fixture
+            .foundation
+            .catalog()
+            .project_replicas()
+            .import_baseline(&envelope)
+            .unwrap();
+        let (session_id, session_token, csrf) = browser_auth(&fixture);
+        let cookie = format!("rcdvlog_session={session_id}:{session_token}");
+        let actor = rcdvlog_server_core::ReviewTargetActor::new(
+            AuditActorType::BrowserSession,
+            &session_id,
+        );
+        let target = fixture
+            .foundation
+            .catalog()
+            .review_targets()
+            .import(
+                &project_id,
+                &rcdvlog_server_core::ReviewTargetImportRequest {
+                    handoff: review_target_handoff(&project_id, None),
+                    declared_issuer: None,
+                    availability: None,
+                    max_verification_age_seconds: None,
+                },
+                &actor,
+                chrono::Utc::now(),
+            )
+            .unwrap()
+            .review_target
+            .summary
+            .review_target_id;
+        let sessions = fixture.foundation.catalog().review_sessions(0);
+        let recording = sessions.create(&project_id, &serde_json::from_value(serde_json::json!({
+            "reviewTargetId": target, "clientSessionKey": "http_asr",
+            "consent": {"allPresentAcknowledged": true, "additionalSpeakersDisclosed": false},
+            "audio": {"sampleRate": 48000, "channels": 1, "encoding": "pcm_s16le"},
+            "capture": {"echoCancellation": false, "noiseSuppression": false, "autoGainControl": false, "clock": "audioWorkletCurrentFrame", "baseLatencySeconds": null, "userAgentFamily": null},
+            "clientStartedPerformanceMs": null
+        })).unwrap(), &actor, chrono::Utc::now()).unwrap().summary.session_id;
+        let pcm = vec![0_u8; 9600];
+        use sha2::Digest;
+        let sha: String = sha2::Sha256::digest(&pcm)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        sessions
+            .put_chunk(
+                &project_id,
+                &recording,
+                &rcdvlog_server_core::ChunkUpload {
+                    sequence: 0,
+                    start_frame: 0,
+                    frame_count: 4800,
+                    sha256: sha,
+                    capture_end_performance_ms: None,
+                },
+                &pcm,
+                chrono::Utc::now(),
+            )
+            .unwrap();
+        sessions
+            .finalize(
+                &project_id,
+                &recording,
+                &rcdvlog_server_core::FinalizeReviewSessionRequest {
+                    final_frame_count: 4800,
+                    end_reason: rcdvlog_server_core::RecordingEndReason::Stopped,
+                },
+                chrono::Utc::now(),
+            )
+            .unwrap();
+
+        let base =
+            format!("/api/v1/projects/{project_id}/review-sessions/{recording}/transcriptions");
+        let post = |uri: String, body: serde_json::Value, csrf: Option<&str>| {
+            let mut builder = Request::builder()
+                .method(Method::POST)
+                .uri(uri)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::COOKIE, &cookie);
+            if let Some(csrf) = csrf {
+                builder = builder.header("x-csrf-token", csrf);
+            }
+            builder
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap()
+        };
+        let unacknowledged = serde_json::json!({"backend": "openrouter", "model": "openai/whisper-1", "authorizedMaxCostUsd": 0.5, "cloudUploadAcknowledged": false});
+        let no_csrf = fixture
+            .app()
+            .oneshot(post(base.clone(), unacknowledged.clone(), None))
+            .await
+            .unwrap();
+        assert_eq!(no_csrf.status(), StatusCode::FORBIDDEN);
+        let preflight = fixture
+            .app()
+            .oneshot(post(
+                format!("{base}/preflight"),
+                unacknowledged.clone(),
+                Some(&csrf),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(preflight.status(), StatusCode::OK);
+        let preflight = json(preflight).await;
+        assert_eq!(preflight["ready"], false);
+        assert!(
+            preflight["blockers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|b| b == "review_transcription_cloud_not_authorized")
+        );
+        assert_eq!(preflight["estimate"]["maxCostUsd"], 0.003);
+        let refused = fixture
+            .app()
+            .oneshot(post(base.clone(), unacknowledged, Some(&csrf)))
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), StatusCode::CONFLICT);
+        let fallback = fixture.app().oneshot(post(base.clone(), serde_json::json!({"backend": "openrouter", "model": "google/gemini-2.5-flash", "authorizedMaxCostUsd": 0.5, "cloudUploadAcknowledged": true}), Some(&csrf))).await.unwrap();
+        assert_eq!(fallback.status(), StatusCode::BAD_REQUEST);
+        let listed = fixture
+            .app()
+            .oneshot(
+                Request::builder()
+                    .uri(&base)
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(json(listed).await["items"].as_array().unwrap().len(), 0);
     }
 }

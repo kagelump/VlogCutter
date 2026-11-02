@@ -4,7 +4,8 @@ Chrome records a reviewer's conversation while they watch a rough cut on a TV,
 then stores it as **private session evidence** on the companion server. The
 recording is bound to one imported, immutable [review target](tv-review-handoff.md)
 (#221). This feature does not transcribe (#224), synchronize (#223), or write
-feedback (#225). Those owners read this evidence later.
+feedback (#225). Those owners read this evidence later; see
+[TV review transcription](tv-review-transcription.md).
 
 The page never plays, controls or observes YouTube. The TV plays on its own.
 The only statement the page makes about the video is the reviewer's optional

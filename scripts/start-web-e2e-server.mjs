@@ -35,6 +35,9 @@ const runtimeEnvironment = {
   RCDVLOG_FFMPEG: "/usr/bin/true",
   RCDVLOG_FFPROBE: "/usr/bin/true",
   RCDVLOG_EXIFTOOL: "/usr/bin/true",
+  // No speech models in the fixture: transcription must report that honestly.
+  RCDVLOG_SPEECH_MODEL_DIR: join(fixture, "no-speech-models"),
+  OPENROUTER_API_KEY: "",
   RUST_LOG: "warn",
 };
 

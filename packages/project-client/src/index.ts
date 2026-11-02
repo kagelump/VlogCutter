@@ -439,6 +439,87 @@ export interface ReviewSessionDetail extends ReviewSessionSummary {
 
 export interface ReviewSessionPage { items: ReviewSessionSummary[]; nextBefore: number | null }
 
+// Review-session transcription (#224). Mirrors rcdvlog-server-core::review_transcripts.
+export type ReviewTranscriptionBackend = "local" | "openrouter";
+export type ReviewTranscriptionState = "queued" | "running" | "completed" | "noSpeech" | "partial" | "failed" | "cancelled";
+
+export interface ReviewTranscriptionRequest {
+  backend: ReviewTranscriptionBackend;
+  model?: string | null;
+  languageHint?: string | null;
+  authorizedMaxCostUsd?: number | null;
+  cloudUploadAcknowledged?: boolean;
+  zeroDataRetention?: boolean;
+}
+
+export interface ReviewTranscriptionPreflight {
+  ready: boolean;
+  blockers: string[];
+  warnings: string[];
+  backend: ReviewTranscriptionBackend;
+  provider: string;
+  model: string;
+  audioFingerprint: string | null;
+  estimate: {
+    receivedAudioSeconds: number;
+    segmentCount: number;
+    maxWindows: number;
+    priceUsdPerSecond: number | null;
+    maxCostUsd: number | null;
+    billingNote: string | null;
+  } | null;
+  existingRunId: string | null;
+}
+
+export interface ReviewUtterance {
+  utteranceId: string;
+  segmentIndex: number;
+  windowIndex: number;
+  startFrame: number;
+  endFrame: number;
+  startSeconds: number;
+  endSeconds: number;
+  text: string;
+  language: string;
+  script: string;
+  displayText: string;
+  displayProjection: string | null;
+  speaker: string;
+  speakerEvidence: string;
+  meanTokenProbability: number | null;
+  flags: string[];
+  suppressed: boolean;
+}
+
+export interface ReviewTranscriptionRun {
+  schema: "review-transcript.v1";
+  runId: string;
+  projectId: string;
+  sessionId: string;
+  reviewTargetId: string;
+  revisionId: string;
+  backend: ReviewTranscriptionBackend;
+  provider: string;
+  model: string;
+  recipe: string;
+  settings: ReviewTranscriptionRequest;
+  audioFingerprint: string;
+  sampleRate: number;
+  state: ReviewTranscriptionState;
+  errorCode: string | null;
+  attemptCount: number;
+  jobId: string | null;
+  createdAt: string;
+  updatedAt: string;
+  createdBy: ReviewTargetActor;
+  segments: Array<{ segmentIndex: number; startFrame: number; endFrame: number; startSeconds: number; endSeconds: number; state: string; speechSeconds: number; windowCount: number; errorCode: string | null }>;
+  utterances: ReviewUtterance[];
+  recordingGaps: Array<{ startFrame: number; endFrame: number }>;
+  spend: { authorizedMaxUsd: number | null; reservedUsd: number; knownCostUsd: number; unknownCostWindows: number; dispatchedWindows: number; cachedWindows: number };
+  diarization: { status: string; reason: string };
+  limitations: string[];
+}
+
 export interface BrowserProjectClient extends ProjectClient {
   getSession(): Promise<SessionState>;
   loginWithBootstrapCode(code: string, hostname?: string): Promise<LoginResult>;
@@ -491,6 +572,11 @@ export interface BrowserProjectClient extends ProjectClient {
   finalizeReviewSession(projectId: string, sessionId: string, request: { finalFrameCount: number; endReason: RecordingEndReason }): Promise<ReviewSessionDetail>;
   deleteReviewSession(projectId: string, sessionId: string): Promise<ReviewSessionDetail>;
   reviewSessionAudioUrl(projectId: string, sessionId: string): string;
+  preflightReviewTranscription(projectId: string, sessionId: string, request: ReviewTranscriptionRequest): Promise<ReviewTranscriptionPreflight>;
+  startReviewTranscription(projectId: string, sessionId: string, request: ReviewTranscriptionRequest): Promise<ReviewTranscriptionRun>;
+  listReviewTranscriptions(projectId: string, sessionId: string): Promise<{ items: ReviewTranscriptionRun[] }>;
+  getReviewTranscription(projectId: string, runId: string): Promise<ReviewTranscriptionRun>;
+  cancelReviewTranscription(projectId: string, runId: string): Promise<ReviewTranscriptionRun>;
 }
 
 export function assertProtocolCompatible(version: ServerVersion): void {

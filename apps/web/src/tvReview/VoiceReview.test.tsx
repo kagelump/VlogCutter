@@ -93,6 +93,7 @@ test("incomplete sessions show their gaps and offer no padded download", async (
     getReviewSession: vi.fn().mockResolvedValue(session),
     deleteReviewSession: vi.fn().mockResolvedValue(deleted),
     reviewSessionAudioUrl: vi.fn().mockReturnValue("/audio.wav"),
+    listReviewTranscriptions: vi.fn().mockResolvedValue({ items: [] }),
   } as unknown as BrowserProjectClient;
   render(<SessionDetailView client={sessionClient} projectId="p" targetId="rtarget_one" sessionId="rsession_1" navigate={vi.fn()} />);
   expect(await screen.findByText("Incomplete",{exact:true})).toBeVisible();

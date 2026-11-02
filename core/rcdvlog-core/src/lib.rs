@@ -104,6 +104,28 @@ pub use analysis::chronology_suggestions::{
 pub use analysis::consolidate::{ConsolidationReport, LabelMapping, LabelProposal};
 pub use analysis::framepack::{FramePackManifest, build_frame_pack, encode_frames};
 pub use analysis::moments;
+/// Narrow facade over the shared speech pipeline for consumers outside this
+/// crate (the companion server's review-session transcription, #224). It
+/// exposes the engine seam, VAD, window packing/re-split, quality gates and the
+/// strict native transport; it does not expose the source-asset transcript store.
+pub mod review_speech {
+    pub use crate::analysis::coverage::{needs_resplit, resplit};
+    pub use crate::analysis::engine::{SttEngine, VAD_MODEL, WHISPER_MODEL, shared_model_dir};
+    pub use crate::analysis::openrouter::resolve_api_key;
+    pub use crate::analysis::openrouter_stt::{
+        NATIVE_STT_MODELS, NativeSttAudioWindow, NativeSttCallResult, NativeSttCost,
+        NativeSttOutcome, NativeSttProviderPolicy, NativeSttReceipt, NativeSttRequest,
+        NativeSttSegment, NativeSttTranscript, NativeSttTransport, NativeSttUsage,
+        OPENROUTER_STT_PROVIDER, OPENROUTER_WHISPER_MODEL, OpenRouterSttClient, SttDataCollection,
+        resolve_native_stt_model, validate_iso639_1,
+    };
+    pub use crate::analysis::quality::{DecodedSegment, RejectReason, reject_reason};
+    pub use crate::analysis::silero_vad::detect_silero_speech;
+    pub use crate::analysis::whisper_engine::WhisperEngine;
+    pub use crate::analysis::windows::{
+        PackedRegion, PackedWindow, SpeechRegion, pack_windows, translate_span,
+    };
+}
 pub use analysis::openrouter::{
     OpenRouterProvider, api_credential_present, frame_data_uri, key_file_path,
     openrouter_request_cost_bound, resolve_api_key,

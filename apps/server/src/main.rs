@@ -432,11 +432,17 @@ async fn run() -> Result<()> {
             worker_catalog.jobs(),
         ));
         let backup_handler = BackupJobHandler::new(backup_manager);
-        let handler = Arc::new(ServerJobHandler::new(
-            scan_handler,
-            representation_handler,
-            backup_handler,
-        ));
+        // Review-session transcription (#224) uses installed shared models
+        // only; it never downloads one.
+        let review_transcription = rcdvlog_server_core::ReviewTranscriptionJobHandler::new(
+            worker_catalog.review_transcripts(),
+            Arc::new(rcdvlog_server_core::ModelDirSpeechRuntime::from_environment()),
+            engine.clone(),
+        );
+        let handler = Arc::new(
+            ServerJobHandler::new(scan_handler, representation_handler, backup_handler)
+                .with_review_transcription(review_transcription),
+        );
 
         let scheduler_config = JobSchedulerConfig {
             local_heavy_lock_path: Some(rcdvlog_server_core::default_local_heavy_lock_path()),

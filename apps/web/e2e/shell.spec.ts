@@ -184,6 +184,15 @@ test("Chrome records a fake-microphone voice review with a manual cue and reopen
   // Sample-clock / performance-clock pairs were queued, posted and kept.
   await expect(page.getByText(/sample\/performance clock pairs across 1 clock epoch$/)).toBeVisible();
 
+  // Transcription is explicit and honest about a server without models.
+  await page.getByRole("button", { name: "Check" }).click();
+  await expect(page.getByText(/speech models are not installed on this server/)).toBeVisible();
+  await expect(page.getByRole("button", { name: "Transcribe" })).toHaveCount(0);
+  await page.getByLabel(/OpenRouter cloud/).check();
+  await page.getByRole("button", { name: "Check" }).click();
+  await expect(page.getByText(/may be sent to the selected provider/)).toBeVisible();
+  await expect(page.getByText(/No OpenRouter credential/)).toBeVisible();
+
   const href = await page.getByRole("link", { name: "Download WAV" }).getAttribute("href");
   // Fetch from the page so the browser's own session cookie is used.
   const download = (url: string) => page.evaluate(async (target) => {

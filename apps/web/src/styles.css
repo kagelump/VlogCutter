@@ -267,3 +267,22 @@ button:disabled { opacity: .5; cursor: default; }
 button.danger { background: #f08a7e; border-color: #f08a7e; }
 .tv-import select { width: 100%; }
 @media (max-width: 900px) { .tv-voice-start, .tv-recovery { flex-direction: column; align-items: stretch; } }
+
+/* Review transcript (#224) */
+.tv-transcript { margin-top: 28px; border-top: 1px solid var(--line); padding-top: 8px; }
+.tv-transcribe fieldset { border: 1px solid var(--line); border-radius: 6px; padding: 10px 14px; display: grid; gap: 8px; margin: 0 0 10px; }
+.tv-transcribe legend { color: var(--muted); font-size: 12px; padding: 0 6px; }
+.tv-transcribe label { display: flex; gap: 8px; align-items: start; }
+.tv-cloud { display: grid; gap: 8px; margin-bottom: 10px; }
+.tv-cloud input[inputmode] { max-width: 140px; }
+.tv-run { margin-top: 18px; display: grid; gap: 8px; }
+.tv-raw-toggle { display: flex; gap: 6px; align-items: center; font-size: 12px; color: var(--muted); }
+.tv-utterances { list-style: none; padding: 0; margin: 0; border-top: 1px solid var(--line); }
+.tv-utterance { display: grid; grid-template-columns: 110px 82px 34px minmax(0, 1fr); gap: 4px 12px; padding: 9px 2px; border-bottom: 1px solid var(--line); font-size: 13px; }
+.tv-utterance.suppressed { opacity: .55; }
+.tv-stamp, .tv-language { color: var(--muted); font: 11px "SFMono-Regular", Consolas, monospace; }
+.tv-speaker { color: var(--amber); font-size: 12px; }
+.tv-text { overflow-wrap: anywhere; }
+.tv-raw { color: var(--muted); margin-left: 6px; }
+.tv-flags { grid-column: 4; color: var(--muted); font-size: 11px; }
+@media (max-width: 700px) { .tv-utterance { grid-template-columns: 1fr; } .tv-flags { grid-column: 1; } }

@@ -22,6 +22,7 @@ rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+ferrous-opencc = { version = "0.4", default-features = false, features = ["s2t-conversion"] }
 thiserror.workspace = true
 uuid.workspace = true
 tokio.workspace = true
