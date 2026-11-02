@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
-import { bootstrapCodePath, fixturePort, reviewRunPath, reviewTargetHandoffPath } from "./lib/web-e2e-fixture.mjs";
+import { bootstrapCodePath, fixturePort, reviewRunPath, reviewTargetHandoffPath, rustLaunch } from "./lib/web-e2e-fixture.mjs";
 
 describe("fixturePort", () => {
   it("reads the port off the listen address the server was given", () => {
@@ -56,5 +56,29 @@ describe("reviewTargetHandoffPath", () => {
 describe("reviewRunPath", () => {
   it("keys the seeded review path to the run's port", () => {
     assert.notEqual(reviewRunPath("127.0.0.1:41235"), reviewRunPath("127.0.0.1:41236"));
+  });
+});
+
+describe("rustLaunch", () => {
+  it("builds from source with cargo by default", () => {
+    assert.deepEqual(rustLaunch({}, "server", []), { command: "cargo", args: ["run", "--quiet", "-p", "rcdvlog-server"] });
+    assert.deepEqual(rustLaunch({}, "server", ["admin", "bootstrap"]), {
+      command: "cargo",
+      args: ["run", "--quiet", "-p", "rcdvlog-server", "--", "admin", "bootstrap"],
+    });
+    assert.deepEqual(rustLaunch({}, "seed", []), {
+      command: "cargo",
+      args: ["run", "--quiet", "-p", "rcdvlog-server", "--example", "web_e2e_seed"],
+    });
+  });
+
+  it("uses the prebuilt binaries CI hands in", () => {
+    const environment = { RCDVLOG_WEB_E2E_SERVER_BIN: "/opt/bin/rcdvlog-server", RCDVLOG_WEB_E2E_SEED_BIN: "/opt/bin/seed" };
+    assert.deepEqual(rustLaunch(environment, "server", ["admin"]), { command: "/opt/bin/rcdvlog-server", args: ["admin"] });
+    assert.deepEqual(rustLaunch(environment, "seed", []), { command: "/opt/bin/seed", args: [] });
+  });
+
+  it("refuses a relative prebuilt path", () => {
+    assert.throws(() => rustLaunch({ RCDVLOG_WEB_E2E_SERVER_BIN: "target/debug/rcdvlog-server" }, "server", []), /absolute/);
   });
 });
