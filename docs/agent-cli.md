@@ -1299,6 +1299,12 @@ Historical movie review: `edit-plan historical-review-target-export --artifact
 mapping/revision integrity; current source/constraint/renderability checks remain
 explicitly unresolved. See [historical review policy](tv-review-handoff.md#historical-rendered-artifact-review-separate-contract).
 
+`edit-plan feedback record-once --input <JSON>` safely imports a stable external
+review item after a lost response; identical retries return the same canonical
+note, while changed content under that identity is a conflict. See
+[feedback import](edit-plan-feedback.md). Proposal, decision and apply remain
+separate explicit operations.
+
 `tv-review sync-preview --input <file>` performs bounded catalog-free recording-clock mapping without writes. See [shared timing contract](tv-review-sync.md).
 
 `tv-review soundtrack-reference` and `tv-review soundtrack-match` are bounded local final-mix diagnostics. See [soundtrack matching](tv-soundtrack-matching.md).

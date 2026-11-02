@@ -5,8 +5,9 @@ use rcdvlog_core::{
     AcceptedReviewReference, ApplyReviewFeedbackRequest, AssembledContextRequest,
     AudioIntegrityRequest, Catalog, ComparisonPreferenceRequest, ConfirmSourceRangeRequest,
     DecideReviewFeedbackRequest, EditPlanOperation, MapReviewTargetRequest, PreviewExcerptRequest,
-    PreviewRequest, ProposeReviewChangeRequest, RecordReviewNoteRequest, SequenceSelectionInput,
-    SequenceSelectionRequest, ShortComparisonRequest, SourceInspectionRequest, SourceTrimRequest,
+    PreviewRequest, ProposeReviewChangeRequest, RecordReviewNoteOnceRequest,
+    RecordReviewNoteRequest, SequenceSelectionInput, SequenceSelectionRequest,
+    ShortComparisonRequest, SourceInspectionRequest, SourceTrimRequest,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -381,6 +382,11 @@ pub enum ReviewFeedbackCommand {
         #[arg(long)]
         input: PathBuf,
     },
+    /// Idempotent external-note import; decisions and timeline edits stay explicit.
+    RecordOnce {
+        #[arg(long)]
+        input: PathBuf,
+    },
     Propose {
         #[arg(long)]
         input: PathBuf,
@@ -521,6 +527,7 @@ pub fn command_name(command: &EditPlanCommand) -> &'static str {
         },
         EditPlanCommand::Feedback { command } => match command {
             ReviewFeedbackCommand::Record { .. } => "edit-plan.feedback.record",
+            ReviewFeedbackCommand::RecordOnce { .. } => "edit-plan.feedback.record-once",
             ReviewFeedbackCommand::Propose { .. } => "edit-plan.feedback.propose",
             ReviewFeedbackCommand::Decide { .. } => "edit-plan.feedback.decide",
             ReviewFeedbackCommand::Map { .. } => "edit-plan.feedback.map",
@@ -885,6 +892,12 @@ pub fn execute(catalog: &Catalog, command: &EditPlanCommand) -> Result<Value> {
             )?),
         },
         EditPlanCommand::Feedback { command } => match command {
+            ReviewFeedbackCommand::RecordOnce { input } => {
+                let request: RecordReviewNoteOnceRequest = read_review_input(input)?;
+                Ok(serde_json::to_value(
+                    catalog.record_review_note_once(&request)?,
+                )?)
+            }
             ReviewFeedbackCommand::Record { input } => {
                 let request: RecordReviewNoteRequest = read_review_input(input)?;
                 Ok(serde_json::to_value(catalog.record_review_note(&request)?)?)

@@ -68,6 +68,8 @@ Implemented now:
 
 - Historical rendered-movie integrity review has a separate read-only DTO/CLI;
   it never certifies current plan renderability. See `docs/tv-review-handoff.md`.
+- External review notes have an idempotent `edit-plan feedback record-once`
+  boundary using normal canonical note facts; retries never accept or apply an edit.
 - `tv_soundtrack` supplies bounded local final-mix sync candidates; no hardware
   acceptance is implied. See `docs/tv-soundtrack-matching.md`.
 - `tv_soundtrack_session` plans complete-reference searches, bounded resumable
