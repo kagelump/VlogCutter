@@ -1298,3 +1298,7 @@ Historical movie review: `edit-plan historical-review-target-export --artifact
 `HistoricalRenderedArtifactReview` v1 DTO. It checks fresh movie bytes and stored
 mapping/revision integrity; current source/constraint/renderability checks remain
 explicitly unresolved. See [historical review policy](tv-review-handoff.md#historical-rendered-artifact-review-separate-contract).
+
+`tv-review sync-preview --input <file>` performs bounded catalog-free recording-clock mapping without writes. See [shared timing contract](tv-review-sync.md).
+
+`tv-review soundtrack-reference` and `tv-review soundtrack-match` are bounded local final-mix diagnostics. See [soundtrack matching](tv-soundtrack-matching.md).
