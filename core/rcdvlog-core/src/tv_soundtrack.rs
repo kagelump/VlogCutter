@@ -8,6 +8,57 @@ use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+/// One fresh whole-movie byte observation shared by bounded window decodes.
+/// Keep this handle inside a scheduling lease. It is not issuer authentication.
+pub struct SoundtrackMovie {
+    path: std::path::PathBuf,
+    movie: SyncMovieClock,
+    metadata: std::fs::Metadata,
+}
+impl SoundtrackMovie {
+    pub fn open(path: &Path, movie: SyncMovieClock, cancel: &dyn Fn() -> bool) -> Result<Self> {
+        let metadata = std::fs::metadata(path)?;
+        ensure!(
+            metadata.is_file(),
+            "invalid input: regular local movie required"
+        );
+        let observed = full_file_blake3(path, cancel)?;
+        ensure!(
+            observed.hex_digest == movie.movie_digest,
+            "invalid input: final movie digest mismatch"
+        );
+        let handle = Self {
+            path: path.into(),
+            movie,
+            metadata,
+        };
+        handle.check_unchanged()?;
+        Ok(handle)
+    }
+    fn check_unchanged(&self) -> Result<()> {
+        let after = std::fs::metadata(&self.path)?;
+        ensure!(
+            self.metadata.len() == after.len() && self.metadata.modified()? == after.modified()?,
+            "input_changed"
+        );
+        Ok(())
+    }
+    pub fn index(
+        &self,
+        reference: SoundtrackReferenceSpec,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<SoundtrackIndex> {
+        ensure!(
+            reference.movie == self.movie,
+            "invalid input: reference movie identity mismatch"
+        );
+        self.check_unchanged()?;
+        let result = SoundtrackIndex::decode_window(reference, &self.path, cancel)?;
+        self.check_unchanged()?;
+        Ok(result)
+    }
+}
+
 pub const SOUNDTRACK_RECIPE: &str = "soundtrack.log-band-delta.fft512-hop128.smooth3-lag6.pcm8k.v1";
 pub const PCM_RATE: u32 = 8000;
 const FFT: usize = 512;
@@ -65,6 +116,23 @@ impl Default for SoundtrackPolicy {
             uncertainty_seconds: 0.08,
             maximum_candidates: 4,
         }
+    }
+}
+impl SoundtrackPolicy {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.minimum_similarity.is_finite()
+                && (0.4..=1.0).contains(&self.minimum_similarity)
+                && self.minimum_peak_margin.is_finite()
+                && (0.01..=0.5).contains(&self.minimum_peak_margin)
+                && self.minimum_subwindow_similarity.is_finite()
+                && (0.3..=1.0).contains(&self.minimum_subwindow_similarity)
+                && self.uncertainty_seconds.is_finite()
+                && (0.032..=2.0).contains(&self.uncertainty_seconds)
+                && (2..=8).contains(&self.maximum_candidates),
+            "invalid input: soundtrack matching policy"
+        );
+        Ok(())
     }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -192,17 +260,14 @@ impl SoundtrackIndex {
         path: &Path,
         cancel: &dyn Fn() -> bool,
     ) -> Result<Self> {
+        SoundtrackMovie::open(path, reference.movie.clone(), cancel)?.index(reference, cancel)
+    }
+    fn decode_window(
+        reference: SoundtrackReferenceSpec,
+        path: &Path,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<Self> {
         reference.validate()?;
-        let before = std::fs::metadata(path)?;
-        ensure!(
-            before.is_file(),
-            "invalid input: reference must be a regular local movie"
-        );
-        let observed = full_file_blake3(path, cancel)?;
-        ensure!(
-            observed.hex_digest == reference.movie.movie_digest,
-            "invalid input: final movie digest mismatch"
-        );
         let mut command = crate::tool_command("ffmpeg");
         command
             .args([
@@ -239,11 +304,6 @@ impl SoundtrackIndex {
         ensure!(
             out.stdout.len() <= MAX_SAMPLES * 4 && out.stdout.len() % 4 == 0,
             "invalid input: decoded soundtrack exceeds bound"
-        );
-        let after = std::fs::metadata(path)?;
-        ensure!(
-            before.len() == after.len() && before.modified()? == after.modified()?,
-            "input_changed"
         );
         let pcm: Vec<f32> = out
             .stdout
@@ -317,18 +377,7 @@ impl SoundtrackIndex {
                 && capture.monotonic_origin_ns <= 9_007_199_254_740_991,
             "invalid input: microphone clock identity"
         );
-        ensure!(
-            policy.minimum_similarity.is_finite()
-                && (0.4..=1.0).contains(&policy.minimum_similarity)
-                && policy.minimum_peak_margin.is_finite()
-                && (0.01..=0.5).contains(&policy.minimum_peak_margin)
-                && policy.minimum_subwindow_similarity.is_finite()
-                && (0.3..=1.0).contains(&policy.minimum_subwindow_similarity)
-                && policy.uncertainty_seconds.is_finite()
-                && (0.032..=2.0).contains(&policy.uncertainty_seconds)
-                && (2..=8).contains(&policy.maximum_candidates),
-            "invalid input: soundtrack matching policy"
-        );
+        policy.validate()?;
         let mut report = SoundtrackMatchReport {
             schema_version: 1,
             recipe: SOUNDTRACK_RECIPE.into(),

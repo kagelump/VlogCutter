@@ -2,11 +2,14 @@
 use anyhow::{Result, ensure};
 use clap::Subcommand;
 use rcdvlog_core::{
-    ReviewTargetHandoff,
+    HistoricalRenderedArtifactReview, ReviewTargetHandoff,
     tv_review_sync::{SYNC_MAX_BYTES, SyncQuery, SyncRequest},
     tv_soundtrack::{
         SoundtrackCapture, SoundtrackIndex, SoundtrackPolicy, SoundtrackReferenceSpec,
         read_pcm8k_wav,
+    },
+    tv_soundtrack_session::{
+        SessionAudioFile, SessionBatch, SoundtrackSessionPlan, SoundtrackSessionSpec,
     },
 };
 use serde::{Deserialize, de::DeserializeOwned};
@@ -37,6 +40,52 @@ pub enum TvReviewCommand {
         query: PathBuf,
         #[arg(long)]
         capture: PathBuf,
+    },
+    /// Plan complete-movie matching from native capture segments; paths stay local.
+    SoundtrackSessionPlan {
+        #[arg(long)]
+        input: PathBuf,
+    },
+    /// Compute a bounded resumable batch; keep private indexes/receipts locally.
+    SoundtrackSessionRun {
+        #[arg(long)]
+        plan: PathBuf,
+        #[arg(long)]
+        movie: PathBuf,
+        #[arg(long)]
+        audio_files: PathBuf,
+        #[arg(long)]
+        cache: PathBuf,
+        #[arg(long, default_value_t = 0)]
+        start_task: usize,
+        #[arg(long, default_value_t = 8)]
+        max_tasks: usize,
+        #[arg(long)]
+        cancel_file: Option<PathBuf>,
+    },
+    /// Emit a page of complete-search anchors and explicit pending/unknown evidence.
+    SoundtrackSessionEvidence {
+        #[arg(long)]
+        plan: PathBuf,
+        #[arg(long)]
+        cache: PathBuf,
+        #[arg(long, default_value_t = 0)]
+        first_query: usize,
+        #[arg(long, default_value_t = 32)]
+        query_count: usize,
+    },
+    /// Map native utterance intervals using fully searched session evidence.
+    SoundtrackSessionSync {
+        #[arg(long)]
+        plan: PathBuf,
+        #[arg(long)]
+        cache: PathBuf,
+        #[arg(long)]
+        queries: PathBuf,
+        #[arg(long, conflicts_with = "historical_target")]
+        target: Option<PathBuf>,
+        #[arg(long)]
+        historical_target: Option<PathBuf>,
     },
 }
 #[derive(Deserialize)]
@@ -70,10 +119,94 @@ pub fn command_name(command: &TvReviewCommand) -> &'static str {
         TvReviewCommand::SyncPreview { .. } => "tv-review.sync-preview",
         TvReviewCommand::SoundtrackReference { .. } => "tv-review.soundtrack-reference",
         TvReviewCommand::SoundtrackMatch { .. } => "tv-review.soundtrack-match",
+        TvReviewCommand::SoundtrackSessionPlan { .. } => "tv-review.soundtrack-session-plan",
+        TvReviewCommand::SoundtrackSessionRun { .. } => "tv-review.soundtrack-session-run",
+        TvReviewCommand::SoundtrackSessionEvidence { .. } => {
+            "tv-review.soundtrack-session-evidence"
+        }
+        TvReviewCommand::SoundtrackSessionSync { .. } => "tv-review.soundtrack-session-sync",
     }
 }
 pub fn execute(command: &TvReviewCommand) -> Result<Value> {
     match command {
+        TvReviewCommand::SoundtrackSessionSync {
+            plan,
+            cache,
+            queries,
+            target,
+            historical_target,
+        } => {
+            let plan = SoundtrackSessionPlan::from_json(&read_bytes(plan, SYNC_MAX_BYTES)?)?;
+            let queries: Vec<SyncQuery> = read_json(queries, 65536)?;
+            let evidence = plan.sync_evidence(cache, &queries, &|| false)?;
+            let (purpose, mapped) = if let Some(path) = target {
+                let target = ReviewTargetHandoff::from_json(&read_bytes(path, 16 * 1024 * 1024)?)?;
+                (
+                    "strictVerifiedReviewTarget",
+                    evidence.sync.map_to_cuts(&queries, &target, &|| false)?,
+                )
+            } else if let Some(path) = historical_target {
+                let target = HistoricalRenderedArtifactReview::from_json(&read_bytes(
+                    path,
+                    16 * 1024 * 1024,
+                )?)?;
+                (
+                    "historicalRenderedArtifactReview",
+                    evidence
+                        .sync
+                        .map_to_historical_cuts(&queries, &target, &|| false)?,
+                )
+            } else {
+                ("noCutMapping", evidence.sync.map(&queries, &|| false)?)
+            };
+            Ok(
+                serde_json::json!({"schemaVersion":1,"mappingPurpose":purpose,"evidence":evidence,"report":mapped}),
+            )
+        }
+        TvReviewCommand::SoundtrackSessionPlan { input } => Ok(serde_json::to_value(
+            SoundtrackSessionPlan::new(read_json::<SoundtrackSessionSpec>(input, SYNC_MAX_BYTES)?)?,
+        )?),
+        TvReviewCommand::SoundtrackSessionRun {
+            plan,
+            movie,
+            audio_files,
+            cache,
+            start_task,
+            max_tasks,
+            cancel_file,
+        } => {
+            let plan = SoundtrackSessionPlan::from_json(&read_bytes(plan, SYNC_MAX_BYTES)?)?;
+            let files: Vec<SessionAudioFile> = read_json(audio_files, 1024 * 1024)?;
+            let cancel = || cancel_file.as_ref().is_some_and(|p| p.exists());
+            let _heavy = rcdvlog_core::acquire_local_heavy_at_cancellable(
+                &rcdvlog_core::default_local_heavy_lock_path(),
+                &cancel,
+            )?;
+            Ok(serde_json::to_value(plan.run_batch(
+                SessionBatch {
+                    movie,
+                    files: &files,
+                    cache,
+                    start_task: *start_task,
+                    max_tasks: *max_tasks,
+                },
+                &cancel,
+            )?)?)
+        }
+        TvReviewCommand::SoundtrackSessionEvidence {
+            plan,
+            cache,
+            first_query,
+            query_count,
+        } => {
+            let plan = SoundtrackSessionPlan::from_json(&read_bytes(plan, SYNC_MAX_BYTES)?)?;
+            Ok(serde_json::to_value(plan.evidence_page(
+                cache,
+                *first_query,
+                *query_count,
+                &|| false,
+            )?)?)
+        }
         TvReviewCommand::SyncPreview { input } => {
             let input: PreviewInput = read_json(input, SYNC_MAX_BYTES)?;
             Ok(serde_json::to_value(if let Some(target) = input.target {

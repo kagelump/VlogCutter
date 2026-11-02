@@ -1,10 +1,9 @@
-// Drains one session's durable outbox to the server in sequence order.
-// Transient failures back off and retry; the chunk stays on disk until the
-// server returns a receipt. Permanent refusals stop the drain and are surfaced,
-// never retried blindly. Identical retries are safe: the server treats them as
-// duplicates and returns the original receipt.
+// Drains one session's durable outbox (queued capture events, then audio
+// chunks in sequence order) to the server. Transient failures back off and
+// retry; the local row stays until the server returns a matching receipt.
+// Permanent refusals stop the drain and are surfaced, never retried blindly.
 import { ProjectClientError, type BrowserProjectClient } from "@rcdvlog/project-client";
-import type { ChunkOutbox } from "./outbox";
+import type { ChunkOutbox, OutboxEvent } from "./outbox";
 
 export interface UploadStatus {
   pendingChunks: number;
@@ -17,11 +16,12 @@ export interface UploadStatus {
 }
 
 const PERMANENT = new Set([
+  "idempotency_conflict",
+  "review_session_receipt_mismatch",
   "review_session_chunk_conflict",
   "review_session_chunk_corrupt",
   "review_session_limit_exceeded",
   "review_session_not_recording",
-  "idempotency_conflict",
   "not_found",
   "project_replica_not_found",
   "invalid_input",
@@ -32,6 +32,26 @@ export function isPermanentUploadError(error: unknown): boolean {
   if (!(error instanceof ProjectClientError)) return false;
   if (error.kind === "session_expired" || error.kind === "csrf_failure" || error.kind === "credential_revoked") return true;
   return PERMANENT.has(error.code);
+}
+
+function eventRequest(event: OutboxEvent) {
+  return {
+    eventId: event.eventId,
+    kind: event.kind,
+    audioFrame: event.audioFrame,
+    performanceMs: event.performanceMs,
+    declaredMovieSeconds: event.declaredMovieSeconds,
+    detail: event.detail,
+  };
+}
+
+function sameEvent(left: OutboxEvent, receipt: Awaited<ReturnType<BrowserProjectClient["recordReviewSessionEvent"]>>): boolean {
+  return receipt.eventId === left.eventId
+    && receipt.kind === left.kind
+    && receipt.audioFrame === left.audioFrame
+    && receipt.performanceMs === (left.performanceMs ?? null)
+    && receipt.declaredMovieSeconds === (left.declaredMovieSeconds ?? null)
+    && JSON.stringify(receipt.detail ?? null) === JSON.stringify(left.detail ?? null);
 }
 
 export class ChunkUploader {
@@ -65,28 +85,24 @@ export class ChunkUploader {
     let delay = 500;
     for (;;) {
       if (this.stopped || this.status.blockedCode) return;
-      const pending = await this.outbox.chunks(this.sessionId);
       const events = await this.outbox.events(this.sessionId);
-      this.update({ pendingChunks: pending.length, pendingEvents:events.length });
-      if (events.length) {
-        const event = events[0].event;
-        try {
-          const receipt = await this.client.recordReviewSessionEvent(this.projectId,this.sessionId,event);
-          if (receipt.eventId!==event.eventId || receipt.kind!==event.kind || receipt.audioFrame!==event.audioFrame || receipt.declaredMovieSeconds!==(event.declaredMovieSeconds??null)) {
-            this.update({blockedCode:"review_session_receipt_mismatch"}); return;
-          }
-          await this.outbox.deleteEvent(this.sessionId,event.eventId);
-          this.update({pendingEvents:events.length-1,retrying:false});
-          delay=500;
-        } catch (error) {
-          if (isPermanentUploadError(error)) { this.update({blockedCode:error instanceof ProjectClientError?error.code:"unexpected_error",retrying:false}); return; }
-          this.update({retrying:true}); await this.sleep(delay); delay=Math.min(delay*2,10_000);
-        }
-        continue;
-      }
-      if (!pending.length) { this.update({ retrying: false }); return; }
-      const chunk = pending[0];
+      const pending = await this.outbox.chunks(this.sessionId);
+      this.update({ pendingChunks: pending.length, pendingEvents: events.length });
+      if (!pending.length && !events.length) { this.update({ retrying: false }); return; }
       try {
+        if (events.length) {
+          const event = events[0];
+          const receipt = await this.client.recordReviewSessionEvent(this.projectId, this.sessionId, eventRequest(event));
+          if (!sameEvent(event, receipt)) {
+            this.update({ blockedCode: "review_session_receipt_mismatch", retrying: false });
+            return;
+          }
+          await this.outbox.deleteEvent(this.sessionId, event.eventId);
+          delay = 500;
+          this.update({ pendingEvents: events.length - 1, retrying: false });
+          continue;
+        }
+        const chunk = pending[0];
         const receipt = await this.client.putReviewSessionChunk(this.projectId, this.sessionId, {
           sequence: chunk.sequence,
           startFrame: chunk.startFrame,
@@ -94,8 +110,11 @@ export class ChunkUploader {
           sha256: chunk.sha256,
           captureEndMs: chunk.captureEndMs,
         }, chunk.bytes);
-        if (receipt.sha256 !== chunk.sha256 || receipt.sequence !== chunk.sequence) {
-          this.update({ blockedCode: "review_session_receipt_mismatch" });
+        if (receipt.sha256 !== chunk.sha256
+          || receipt.sequence !== chunk.sequence
+          || receipt.startFrame !== chunk.startFrame
+          || receipt.frameCount !== chunk.frameCount) {
+          this.update({ blockedCode: "review_session_receipt_mismatch", retrying: false });
           return;
         }
         await this.outbox.deleteChunk(this.sessionId, chunk.sequence);

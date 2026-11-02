@@ -5,8 +5,9 @@ use rcdvlog_core::{
     AcceptedReviewReference, ApplyReviewFeedbackRequest, AssembledContextRequest,
     AudioIntegrityRequest, Catalog, ComparisonPreferenceRequest, ConfirmSourceRangeRequest,
     DecideReviewFeedbackRequest, EditPlanOperation, MapReviewTargetRequest, PreviewExcerptRequest,
-    PreviewRequest, ProposeReviewChangeRequest, RecordReviewNoteRequest, SequenceSelectionInput,
-    SequenceSelectionRequest, ShortComparisonRequest, SourceInspectionRequest, SourceTrimRequest,
+    PreviewRequest, ProposeReviewChangeRequest, RecordReviewNoteOnceRequest,
+    RecordReviewNoteRequest, SequenceSelectionInput, SequenceSelectionRequest,
+    ShortComparisonRequest, SourceInspectionRequest, SourceTrimRequest,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -30,6 +31,11 @@ pub enum EditPlanCommand {
     Coverage {
         #[command(subcommand)]
         command: PictureCoverageCommand,
+    },
+    /// Review historical movie bytes/mapping without asserting current renderability.
+    HistoricalReviewTargetExport {
+        #[arg(long)]
+        artifact: String,
     },
     /// Export a path-free versioned TV review target after fresh local verification.
     ReviewTargetExport {
@@ -376,6 +382,11 @@ pub enum ReviewFeedbackCommand {
         #[arg(long)]
         input: PathBuf,
     },
+    /// Idempotent external-note import; decisions and timeline edits stay explicit.
+    RecordOnce {
+        #[arg(long)]
+        input: PathBuf,
+    },
     Propose {
         #[arg(long)]
         input: PathBuf,
@@ -466,6 +477,9 @@ struct ApplyReviewFeedbackInput {
 
 pub fn command_name(command: &EditPlanCommand) -> &'static str {
     match command {
+        EditPlanCommand::HistoricalReviewTargetExport { .. } => {
+            "edit-plan.historical-review-target-export"
+        }
         EditPlanCommand::ReviewTargetExport { .. } => "edit-plan.review-target-export",
         EditPlanCommand::Bundle { .. } => "edit-plan.bundle",
         EditPlanCommand::ReviewCoverage { command } => match command {
@@ -513,6 +527,7 @@ pub fn command_name(command: &EditPlanCommand) -> &'static str {
         },
         EditPlanCommand::Feedback { command } => match command {
             ReviewFeedbackCommand::Record { .. } => "edit-plan.feedback.record",
+            ReviewFeedbackCommand::RecordOnce { .. } => "edit-plan.feedback.record-once",
             ReviewFeedbackCommand::Propose { .. } => "edit-plan.feedback.propose",
             ReviewFeedbackCommand::Decide { .. } => "edit-plan.feedback.decide",
             ReviewFeedbackCommand::Map { .. } => "edit-plan.feedback.map",
@@ -552,9 +567,11 @@ pub fn is_read_only(command: &EditPlanCommand) -> bool {
     }
     matches!(
         command,
-        EditPlanCommand::ReviewCoverage {
-            command: ReviewCoverageCommand::Report { .. } | ReviewCoverageCommand::List { .. }
-        } | EditPlanCommand::Coverage { .. }
+        EditPlanCommand::HistoricalReviewTargetExport { .. }
+            | EditPlanCommand::ReviewCoverage {
+                command: ReviewCoverageCommand::Report { .. } | ReviewCoverageCommand::List { .. }
+            }
+            | EditPlanCommand::Coverage { .. }
             | EditPlanCommand::List { .. }
             | EditPlanCommand::PreviewStatus { verify: false, .. }
             | EditPlanCommand::PreviewList { .. }
@@ -594,6 +611,9 @@ fn expected(value: &str) -> Option<&str> {
 
 pub fn execute(catalog: &Catalog, command: &EditPlanCommand) -> Result<Value> {
     match command {
+        EditPlanCommand::HistoricalReviewTargetExport { artifact } => Ok(serde_json::to_value(
+            catalog.review_historical_rendered_artifact(artifact, &|| false)?,
+        )?),
         EditPlanCommand::ReviewTargetExport {
             artifact,
             youtube_video_id,
@@ -872,6 +892,12 @@ pub fn execute(catalog: &Catalog, command: &EditPlanCommand) -> Result<Value> {
             )?),
         },
         EditPlanCommand::Feedback { command } => match command {
+            ReviewFeedbackCommand::RecordOnce { input } => {
+                let request: RecordReviewNoteOnceRequest = read_review_input(input)?;
+                Ok(serde_json::to_value(
+                    catalog.record_review_note_once(&request)?,
+                )?)
+            }
             ReviewFeedbackCommand::Record { input } => {
                 let request: RecordReviewNoteRequest = read_review_input(input)?;
                 Ok(serde_json::to_value(catalog.record_review_note(&request)?)?)

@@ -19,6 +19,7 @@ use std::time::Instant;
 use uuid::Uuid;
 use walkdir::WalkDir;
 
+pub mod acoustic_markers;
 mod agent;
 mod analysis;
 mod archive;
@@ -272,6 +273,7 @@ pub use editplan::context_review::*;
 pub use editplan::coverage::*;
 pub use editplan::delivery::*;
 pub use editplan::feedback::*;
+pub use editplan::historical_review::*;
 pub use editplan::inspection_review::*;
 pub use editplan::patch::*;
 pub use editplan::review_coverage::*;
@@ -12351,3 +12353,4 @@ pub use analysis::native_video::*;
 pub mod tv_review_sync;
 
 pub mod tv_soundtrack;
+pub mod tv_soundtrack_session;

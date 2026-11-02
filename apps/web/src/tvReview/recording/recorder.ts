@@ -3,13 +3,21 @@
 // getUserMedia (processing disabled) → AudioWorklet (sample-clock tagged) →
 // PcmChunker → durable outbox → ChunkUploader. The page never plays, controls
 // or observes YouTube; the manual cue is the reviewer's own declaration.
-import type { BrowserProjectClient, CreateReviewSessionRequest, RecordingEndReason, ReviewSessionDetail, ReviewTargetDetail, ReviewSessionEventRequest } from "@rcdvlog/project-client";
+import type { BrowserProjectClient, CreateReviewSessionRequest, RecordingEndReason, ReviewSessionDetail, ReviewTargetDetail } from "@rcdvlog/project-client";
 import { PcmChunker, chunkFramesFor, sha256Hex, type PcmChunk } from "./chunker";
-import { OutboxFullError, type ChunkOutbox, type OutboxSession } from "./outbox";
+import { OutboxFullError, type ChunkOutbox, type OutboxEvent, type OutboxSession } from "./outbox";
 import { ChunkUploader, type UploadStatus } from "./uploader";
 import { captureCalibration } from "./clock";
 
 export const WORKLET_URL = "/pcm-capture-worklet.js";
+/** How often a native-frame / performance-clock bracket is recorded. */
+export const CLOCK_SAMPLE_INTERVAL_MS = 5_000;
+/** How long stop waits for the worklet to acknowledge its final delivered frame. */
+export const STOP_ACK_TIMEOUT_MS = 1_000;
+const RENDER_QUANTUM_FRAMES = 128;
+
+type EventKind = OutboxEvent["kind"];
+interface WorkletStopped { type: "stopped"; frame?: number; firstFrame?: number | null; finalFrame?: number | null }
 
 export interface CaptureStatus {
   sampleRate: number;
@@ -18,7 +26,10 @@ export interface CaptureStatus {
   capturedFrames: number;
   lostFrames: number;
   discontinuities: number;
+  /** Cues persisted locally; `upload.pendingEvents` says how many await the server. */
   cues: number;
+  /** Events that could not even be stored locally (and are therefore lost). */
+  unsavedEvents: number;
   upload: UploadStatus;
 }
 
@@ -59,19 +70,21 @@ export class VoiceRecording {
   private sampleRate = 48_000;
   private startedAt = 0;
   private finished = false;
-  private stopping: Promise<ReviewSessionDetail|null> | null = null;
-  private eventWrites: Promise<void> = Promise.resolve();
-  private stopAck: ((valid: boolean) => void) | null = null;
-  private captureOrigin: number | null = null;
+  private stopping: Promise<ReviewSessionDetail | null> | null = null;
+  private stopAck: ((message: WorkletStopped | null) => void) | null = null;
   private clockEpoch = 0;
-  private epochCalibrated = false;
-  private epochFirstSample = 0;
+  private clockTimer: ReturnType<typeof setInterval> | null = null;
   private probe: { id: string; sentMs: number } | null = null;
   private probeTimer: ReturnType<typeof setInterval> | null = null;
   private writes: Promise<void> = Promise.resolve();
   private meta!: OutboxSession;
+  private eventOrder = 0;
   session!: ReviewSessionDetail;
-  status: CaptureStatus = { sampleRate: 48_000, elapsedSeconds: 0, peak: 0, capturedFrames: 0, lostFrames: 0, discontinuities: 0, cues: 0, upload: { pendingChunks: 0, pendingEvents: 0, uploadedChunks: 0, lastReceiptAt: null, retrying: false, blockedCode: null } };
+  status: CaptureStatus = {
+    sampleRate: 48_000, elapsedSeconds: 0, peak: 0, capturedFrames: 0, lostFrames: 0,
+    discontinuities: 0, cues: 0, unsavedEvents: 0,
+    upload: { pendingChunks: 0, uploadedChunks: 0, pendingEvents: 0, lastReceiptAt: null, retrying: false, blockedCode: null },
+  };
 
   private constructor(
     private readonly client: BrowserProjectClient,
@@ -141,62 +154,121 @@ export class VoiceRecording {
     });
     const mute = this.context.createGain();
     mute.gain.value = 0;
-    this.startedAt = performance.now();
+    source.connect(this.node).connect(mute).connect(this.context.destination);
     this.node.port.onmessage = (event: MessageEvent) => this.onWorklet(event.data);
     track.addEventListener("ended", () => void this.deviceLost());
-    source.connect(this.node).connect(mute).connect(this.context.destination);
-    this.context.onstatechange = () => {
-      if (this.finished) return;
-      if (this.context.state === "suspended") {
-        const origin=this.captureOrigin??this.chunker.originFrame;
-        const sample=origin===null?this.chunker.capturedEndFrame:Math.max(0,Math.round(this.context.currentTime*this.sampleRate)-origin);
-        void this.event("captureDiscontinuity",sample,{cause:"audioContextSuspended",clockEpoch:this.clockEpoch});
-        this.clockEpoch+=1; this.epochFirstSample=sample; this.epochCalibrated=false; this.probe=null;
-      } else if (this.context.state === "running") this.requestCalibration();
-    };
+    this.context.addEventListener("statechange", () => void this.onContextState());
+    this.startedAt = performance.now();
     if (this.context.state === "suspended") await this.context.resume();
+    this.clockTimer = setInterval(() => void this.sampleClock("interval"), CLOCK_SAMPLE_INTERVAL_MS);
+    this.probeTimer = setInterval(() => this.requestCalibration(), CLOCK_SAMPLE_INTERVAL_MS);
     this.requestCalibration();
-    this.probeTimer=setInterval(()=>this.requestCalibration(),30_000);
+  }
+
+  /**
+   * A suspended or interrupted context stops its sample clock while wall time
+   * continues, so sample/performance pairs from either side of the pause must
+   * never be fitted together: each resume starts a new explicit clock epoch.
+   */
+  private async onContextState() {
+    if (this.finished) return;
+    if (this.context.state === "running") {
+      this.clockEpoch += 1;
+      await this.sampleClock("resumed");
+      this.requestCalibration();
+    } else {
+      await this.queueEvent("clockSample", this.contextFrame(), { clockEpoch: this.clockEpoch, transition: this.context.state, method: "statechange", uncertaintyMs: null }, null, null);
+    }
+  }
+
+  /** Recording-relative frame of the context clock right now (0 before the first audio). */
+  private contextFrame(): number {
+    const origin = this.chunker.originFrame;
+    return origin === null ? 0 : Math.round(this.context.currentTime * this.sampleRate) - origin;
+  }
+
+  /**
+   * Record a paired (microphone sample index, performance.now) observation
+   * with its declared uncertainty. getOutputTimestamp pairs both clocks in one
+   * read; the fallback reads them separately and declares a wider bound.
+   */
+  async sampleClock(reason: "first" | "interval" | "resumed" | "stop"): Promise<void> {
+    const origin = this.chunker?.originFrame ?? null;
+    if (origin === null || this.context.state !== "running") return;
+    const quantumMs = (RENDER_QUANTUM_FRAMES / this.sampleRate) * 1000;
+    const stamp = typeof this.context.getOutputTimestamp === "function" ? this.context.getOutputTimestamp() : null;
+    let contextSeconds: number;
+    let performanceMs: number;
+    let method: string;
+    let uncertaintyMs: number;
+    if (stamp && stamp.contextTime && stamp.performanceTime) {
+      contextSeconds = stamp.contextTime;
+      performanceMs = stamp.performanceTime;
+      method = "getOutputTimestamp";
+      uncertaintyMs = quantumMs;
+    } else {
+      contextSeconds = this.context.currentTime;
+      performanceMs = performance.now();
+      method = "currentTime";
+      uncertaintyMs = 2 * quantumMs;
+    }
+    const sampleIndex = Math.round(contextSeconds * this.sampleRate) - origin;
+    if (sampleIndex < 0) return;
+    await this.queueEvent("clockSample", sampleIndex, { clockEpoch: this.clockEpoch, reason, method, uncertaintyMs, sampleRate: this.sampleRate }, null, performanceMs);
+  }
+
+  /**
+   * Ask the audio thread for its native `currentFrame`. The worklet response
+   * brackets that observation with the send/receive performance times; packet
+   * arrival is never treated as sample zero.
+   */
+  private requestCalibration() {
+    if (this.finished || this.context.state !== "running") return;
+    if (this.probe && performance.now() - this.probe.sentMs < 1_000) return;
+    this.probe = { id: randomId("probe"), sentMs: performance.now() };
+    this.node.port.postMessage({ type: "clockProbe", probeId: this.probe.id });
   }
 
   private publish(patch: Partial<CaptureStatus>) {
-    if (this.meta?.eventStorageFailed) patch={...patch,upload:{...(patch.upload??this.status.upload),blockedCode:"review_session_event_storage_failed"}};
     this.status = { ...this.status, ...patch };
     this.onStatus(this.status);
   }
 
-  private requestCalibration() {
-    if (this.finished || this.context.state!=="running") return;
-    if (this.probe && performance.now()-this.probe.sentMs<1000) return;
-    this.probe={id:randomId("probe"),sentMs:performance.now()};
-    this.node.port.postMessage({type:"clockProbe",probeId:this.probe.id});
-  }
-
   private onWorklet(message: { type: string; frame?: number; firstFrame?: number | null; finalFrame?: number | null; probeId?: string; channels?: Float32Array[]; expectedFrame?: number; actualFrame?: number }) {
-    if (message.type==="stopped") {
-      const origin=this.chunker.originFrame??message.firstFrame??null;
-      const end=origin===null?0:(message.finalFrame??origin)-origin;
-      this.stopAck?.(Number.isSafeInteger(end)&&end===this.chunker.capturedEndFrame);
+    if (message.type === "stopped") {
+      this.stopAck?.(message as WorkletStopped);
       return;
     }
     if (this.finished && message.type !== "audio") return;
     const now = performance.now();
-    if (message.type==="clockSample" && this.probe && this.probe.id===message.probeId && message.frame!==undefined && message.firstFrame!=null) {
-      this.captureOrigin=message.firstFrame;
-      const firstSample=this.clockEpoch>0&&!this.epochCalibrated?message.frame-message.firstFrame:this.epochFirstSample;
-      const calibration=captureCalibration({clockId:`mic_epoch_${this.clockEpoch}`,sampleRate:this.sampleRate,firstSample,absoluteFrame:message.frame,originFrame:message.firstFrame,epochMs:this.startedAt,sentMs:this.probe.sentMs,receivedMs:now});
-      this.probe=null;
+    if (message.type === "clockSample" && this.probe && this.probe.id === message.probeId && message.frame !== undefined && message.firstFrame != null) {
+      const origin = this.chunker.originFrame ?? message.firstFrame;
+      const calibration = captureCalibration({
+        clockId: `mic_epoch_${this.clockEpoch}`,
+        sampleRate: this.sampleRate,
+        firstSample: 0,
+        absoluteFrame: message.frame,
+        originFrame: origin,
+        epochMs: this.startedAt,
+        sentMs: this.probe.sentMs,
+        receivedMs: now,
+      });
+      this.probe = null;
       if (calibration) {
-        if (this.clockEpoch>0&&!this.epochCalibrated) void this.event("captureDiscontinuity",calibration.firstSample,{cause:"audioContextResumed",clockId:calibration.clockId});
-        this.epochFirstSample=calibration.firstSample; this.epochCalibrated=true;
-        void this.event("clockSample",calibration.sampleIndex,{...calibration});
+        const uncertaintyMs = calibration.monotonicToleranceNs / 1_000_000;
+        void this.queueEvent("clockSample", calibration.sampleIndex, { ...calibration, clockEpoch: this.clockEpoch, uncertaintyMs }, null, now);
       }
     } else if (message.type === "audio" && message.channels && message.frame !== undefined) {
+      const first = this.chunker.originFrame === null;
       this.chunker.push(message.frame, message.channels, now);
+      if (first) {
+        void this.sampleClock("first");
+        this.requestCalibration();
+      }
     } else if (message.type === "discontinuity" && message.expectedFrame !== undefined && message.actualFrame !== undefined) {
       this.chunker.discontinuity(now);
       const origin = this.chunker.originFrame ?? message.expectedFrame;
-      void this.event("captureDiscontinuity", message.expectedFrame - origin, { missingFrames: message.actualFrame - message.expectedFrame });
+      void this.queueEvent("captureDiscontinuity", message.expectedFrame - origin, { missingFrames: message.actualFrame - message.expectedFrame, clockEpoch: this.clockEpoch });
       this.publish({ discontinuities: this.status.discontinuities + 1 });
     }
     this.publish({ elapsedSeconds: (now - this.startedAt) / 1000, peak: this.chunker.peak, capturedFrames: this.chunker.capturedEndFrame });
@@ -212,40 +284,57 @@ export class VoiceRecording {
     } catch (error) {
       // Audio that cannot be buffered is lost; account for it, never pretend.
       this.publish({ lostFrames: this.status.lostFrames + chunk.frameCount });
-      await this.event("localBufferOverflow", chunk.startFrame, { lostFrames: chunk.frameCount, sequence: chunk.sequence, reason: error instanceof OutboxFullError ? "outboxFull" : "storageError" });
+      await this.queueEvent("localBufferOverflow", chunk.startFrame, { lostFrames: chunk.frameCount, sequence: chunk.sequence, reason: error instanceof OutboxFullError ? "outboxFull" : "storageError" });
     }
   }
 
-  private event(kind: ReviewSessionEventRequest["kind"], audioFrame: number, detail: Record<string, unknown>, declaredMovieSeconds: number | null = null): Promise<boolean> {
-    const event: ReviewSessionEventRequest={eventId:randomId("evt"),kind,audioFrame:Math.max(0,Math.round(audioFrame)),performanceMs:performance.now(),declaredMovieSeconds,detail};
-    const stored=this.eventWrites.then(async()=>{
-      await this.outbox.putEvent({sessionId:this.session.sessionId,event});
-      void this.uploader.kick();
-      return true;
-    }).catch(async()=>{
-      this.meta={...this.meta,eventStorageFailed:true};
-      await this.outbox.putSession(this.meta).catch(()=>undefined);
-      this.publish({upload:{...this.status.upload,blockedCode:"review_session_event_storage_failed"}});
+  /**
+   * Persist an event with a stable id before any post. The uploader posts it
+   * with the audio and retries it until the server acknowledges it; an
+   * identical replay is idempotent on the server. Returns false only when the
+   * event could not be stored locally, which is counted, never hidden.
+   */
+  private async queueEvent(kind: EventKind, audioFrame: number, detail: Record<string, unknown>, declaredMovieSeconds: number | null = null, performanceMs: number | null = performance.now()): Promise<boolean> {
+    const event: OutboxEvent = {
+      sessionId: this.session.sessionId,
+      eventId: randomId("evt"),
+      order: this.eventOrder++,
+      kind,
+      audioFrame: Math.max(0, Math.round(audioFrame)),
+      performanceMs,
+      declaredMovieSeconds,
+      detail,
+    };
+    try {
+      await this.outbox.putEvent(event);
+    } catch {
+      this.meta = { ...this.meta, eventStorageFailed: true };
+      await this.outbox.putSession(this.meta).catch(() => undefined);
+      this.publish({ unsavedEvents: this.status.unsavedEvents + 1, upload: { ...this.status.upload, blockedCode: "review_session_event_storage_failed" } });
       return false;
-    });
-    this.eventWrites=stored.then(()=>undefined);
-    return stored;
+    }
+    void this.uploader.kick();
+    return true;
   }
 
   /** The reviewer's declaration that "now" is a known movie time (default: first frame). */
-  async cue(declaredMovieSeconds = 0): Promise<void> {
-    if (this.finished) return;
-    const origin = this.captureOrigin??this.chunker.originFrame;
-    if (origin===null) return;
+  async cue(declaredMovieSeconds = 0): Promise<boolean> {
+    if (this.finished) return false;
     // currentTime is the rendering clock at the next quantum, closer to the
     // keypress than the last delivered batch.
-    const frame = Math.round(this.context.currentTime * this.sampleRate) - origin;
-    if (await this.event("manualSyncCue", frame, { method: "audioContextCurrentTime", clockId:`mic_epoch_${this.clockEpoch}`, outputLatencySeconds: (this.context as AudioContext & { outputLatency?: number }).outputLatency ?? null }, declaredMovieSeconds)) this.publish({cues:this.status.cues+1});
+    const stored = await this.queueEvent("manualSyncCue", this.contextFrame(), {
+      method: "audioContextCurrentTime",
+      clockEpoch: this.clockEpoch,
+      outputLatencySeconds: (this.context as AudioContext & { outputLatency?: number }).outputLatency ?? null,
+    }, declaredMovieSeconds);
+    // Counted once durably queued; upload.pendingEvents shows server acceptance.
+    if (stored) this.publish({ cues: this.status.cues + 1 });
+    return stored;
   }
 
   private async deviceLost() {
     if (this.finished) return;
-    await this.event("deviceLost", this.chunker.capturedEndFrame, {});
+    await this.queueEvent("deviceLost", this.chunker.capturedEndFrame, { clockEpoch: this.clockEpoch });
     this.onEnded("deviceLost");
     await this.stop("deviceLost");
   }
@@ -254,29 +343,46 @@ export class VoiceRecording {
    * Stop capture, persist the tail, and try to upload and finalize. Returns the
    * finalized session, or null when chunks remain queued for later recovery.
    */
-  stop(reason: RecordingEndReason = "stopped", drainTimeoutMs = 30_000, flushTimeoutMs = 3_000): Promise<ReviewSessionDetail | null> {
-    this.stopping??=this.stopInternal(reason,drainTimeoutMs,flushTimeoutMs);
+  stop(reason: RecordingEndReason = "stopped", drainTimeoutMs = 30_000, flushTimeoutMs = STOP_ACK_TIMEOUT_MS): Promise<ReviewSessionDetail | null> {
+    this.stopping ??= this.stopInternal(reason, drainTimeoutMs, flushTimeoutMs);
     return this.stopping;
   }
-  private async stopInternal(reason: RecordingEndReason, drainTimeoutMs: number, flushTimeoutMs: number): Promise<ReviewSessionDetail|null> {
+
+  private async stopInternal(reason: RecordingEndReason, drainTimeoutMs: number, flushTimeoutMs: number): Promise<ReviewSessionDetail | null> {
     if (!this.finished) {
+      if (this.clockTimer) clearInterval(this.clockTimer);
+      if (this.probeTimer) clearInterval(this.probeTimer);
+      await this.sampleClock("stop");
       this.finished = true;
-      if (this.probeTimer!==null) clearInterval(this.probeTimer);
-      const acknowledged=await new Promise<boolean>((resolve)=>{
-        const timer=setTimeout(()=>{this.stopAck=null;resolve(false);},flushTimeoutMs);
-        this.stopAck=(valid)=>{clearTimeout(timer);this.stopAck=null;resolve(valid);};
-        this.node.port.postMessage({type:"stop"});
+      // The worklet flushes its partial batch and then acknowledges the final
+      // frame; same-port FIFO ordering guarantees the audio arrives first.
+      // Without that acknowledgment the tail is unknown and must not be
+      // certified as a clean stop.
+      const acknowledged = await new Promise<WorkletStopped | null>((resolve) => {
+        const timer = setTimeout(() => { this.stopAck = null; resolve(null); }, flushTimeoutMs);
+        this.stopAck = (message) => { clearTimeout(timer); this.stopAck = null; resolve(message); };
+        this.node.port.postMessage({ type: "stop" });
       });
-      if (!acknowledged) {
-        await this.event("pageInterrupted",this.chunker.capturedEndFrame,{captureTailStatus:"unknown",reason:"workletStopUnacknowledged",originalEndReason:reason});
-        reason="interrupted";
-      }
       this.chunker.flush(performance.now());
       await this.writes;
-      await this.eventWrites;
+      const captured = this.chunker.capturedEndFrame;
+      let finalFrames = captured;
+      if (!acknowledged) {
+        finalFrames = Math.max(captured, this.contextFrame());
+        await this.queueEvent("pageInterrupted", captured, { captureTailStatus: "unknown", reason: "workletStopUnacknowledged", originalEndReason: reason, clockEpoch: this.clockEpoch });
+        this.publish({ discontinuities: this.status.discontinuities + 1 });
+        reason = "interrupted";
+      } else {
+        const ackEnd = acknowledged.firstFrame != null && acknowledged.finalFrame != null
+          ? acknowledged.finalFrame - acknowledged.firstFrame
+          : acknowledged.frame != null && this.chunker.originFrame !== null
+            ? acknowledged.frame - this.chunker.originFrame
+            : null;
+        if (ackEnd !== null && Number.isSafeInteger(ackEnd) && ackEnd >= captured) finalFrames = Math.max(captured, ackEnd);
+      }
       this.stream.getTracks().forEach((track) => track.stop());
       await this.context.close().catch(() => undefined);
-      this.meta = { ...this.meta, capturedFrames: Math.max(this.meta.capturedFrames, this.chunker.capturedEndFrame), ended: true, endReason: reason, updatedAt: new Date().toISOString() };
+      this.meta = { ...this.meta, capturedFrames: Math.max(this.meta.capturedFrames, finalFrames), ended: true, endReason: reason, updatedAt: new Date().toISOString() };
       await this.outbox.putSession(this.meta);
     }
     return finalizeWhenDrained(this.client, this.outbox, this.meta, this.uploader, drainTimeoutMs);
@@ -284,7 +390,7 @@ export class VoiceRecording {
 
   /** Best-effort marker for an abrupt page exit; recovery finalizes as interrupted. */
   pageHidden() {
-    if (!this.finished) void this.event("pageInterrupted", this.chunker.capturedEndFrame, { visibility: document.visibilityState });
+    if (!this.finished) void this.queueEvent("pageInterrupted", this.chunker.capturedEndFrame, { visibility: document.visibilityState, clockEpoch: this.clockEpoch });
   }
 }
 
@@ -299,7 +405,7 @@ export async function finalizeWhenDrained(
   if (!meta.ended) {
     // A restarted page cannot know the worklet's final frame. Do not certify
     // its last stored prefix as an acknowledged complete capture.
-    await outbox.putEvent({sessionId:meta.sessionId,event:{eventId:"recovery_tail",kind:"pageInterrupted",audioFrame:meta.capturedFrames,performanceMs:null,declaredMovieSeconds:null,detail:{captureTailStatus:"unknown",reason:"interruptedBeforeAcknowledgedStop"}}});
+    await outbox.putEvent({ sessionId: meta.sessionId, eventId: "recovery_tail", order: -1, kind: "pageInterrupted", audioFrame: meta.capturedFrames, performanceMs: null, declaredMovieSeconds: null, detail: { captureTailStatus: "unknown", reason: "interruptedBeforeAcknowledgedStop" } });
   }
   const drained = await Promise.race([uploader.kick().then(() => true), new Promise<boolean>((resolve) => setTimeout(() => resolve(false), drainTimeoutMs))]);
   if (!drained || meta.eventStorageFailed || uploader.status.blockedCode || (await outbox.chunks(meta.sessionId)).length || (await outbox.events(meta.sessionId)).length) {

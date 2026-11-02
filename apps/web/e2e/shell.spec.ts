@@ -181,6 +181,8 @@ test("Chrome records a fake-microphone voice review with a manual cue and reopen
   await expect(page.getByText("Completed", { exact: true })).toBeVisible();
   await expect(page.getByText(/reviewer declaration, not measured sync/)).toBeVisible();
   await expect(page.getByText(/echo cancellation false/)).toBeVisible();
+  // Sample-clock / performance-clock pairs were queued, posted and kept.
+  await expect(page.getByText(/sample\/performance clock pairs across 1 clock epoch$/)).toBeVisible();
 
   const href = await page.getByRole("link", { name: "Download WAV" }).getAttribute("href");
   // Fetch from the page so the browser's own session cookie is used.

@@ -22,9 +22,17 @@ class PcmCaptureProcessor extends AudioWorkletProcessor {
       if (event.data?.type === "flush") this.flush();
       if (event.data?.type === "clockProbe") this.probe = event.data.probeId;
       if (event.data?.type === "stop") {
-        this.flush(); this.stopped = true;
-        // Same-port FIFO: every final audio batch precedes this acknowledgment.
-        this.port.postMessage({type:"stopped",firstFrame:this.firstFrame,finalFrame:this.expected});
+        // Deliver the partial batch, then acknowledge the frame after the last
+        // one delivered. Same-port FIFO means the main thread sees every final
+        // audio batch before this acknowledgement.
+        this.flush();
+        this.stopped = true;
+        this.port.postMessage({
+          type: "stopped",
+          frame: this.expected,
+          firstFrame: this.firstFrame,
+          finalFrame: this.expected,
+        });
       }
     };
   }
@@ -52,7 +60,7 @@ class PcmCaptureProcessor extends AudioWorkletProcessor {
     const length = input[0].length;
     if (this.firstFrame === null) this.firstFrame = frame;
     if (this.probe !== null) {
-      this.port.postMessage({type:"clockSample",probeId:this.probe,frame,firstFrame:this.firstFrame});
+      this.port.postMessage({ type: "clockSample", probeId: this.probe, frame, firstFrame: this.firstFrame });
       this.probe = null;
     }
     if (this.expected !== null && frame !== this.expected) {

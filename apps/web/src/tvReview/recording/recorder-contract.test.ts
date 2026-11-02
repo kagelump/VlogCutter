@@ -11,6 +11,7 @@ class Context {
   state="running";
   destination={};
   onstatechange:(()=>void)|null=null;
+  addEventListener() {}
   audioWorklet={addModule:vi.fn().mockResolvedValue(undefined)};
   createMediaStreamSource() { return {connect:(node:unknown)=>node}; }
   createGain() { return {gain:{value:0},connect:(node:unknown)=>node}; }
