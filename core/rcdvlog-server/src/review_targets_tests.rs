@@ -535,3 +535,126 @@ fn listing_is_bounded_newest_first_and_project_scoped() {
     assert!(targets.list(PROJECT, 0, None, now()).is_err());
     assert!(targets.list(PROJECT, 201, None, now()).is_err());
 }
+
+#[test]
+fn a_stricter_accepted_lifetime_keeps_governing_readiness() {
+    let root = TempDir::new().unwrap();
+    let catalog = catalog(&root);
+    let targets = catalog.review_targets();
+    let mut strict = request(valid());
+    strict.max_verification_age_seconds = Some(2 * 3600);
+    let id = targets
+        .import(PROJECT, &strict, &actor(), now())
+        .unwrap()
+        .review_target
+        .summary
+        .review_target_id;
+    // verifiedAt is one hour before now(); four hours later it is three hours old.
+    let later = targets
+        .get(PROJECT, &id, now() + Duration::hours(3))
+        .unwrap();
+    assert_eq!(later.summary.readiness.max_verification_age_seconds, 7200);
+    assert!(!later.summary.readiness.ready);
+    assert_eq!(
+        later.summary.readiness.blockers,
+        vec!["review_target_verification_expired"]
+    );
+    // A later default-lifetime import never loosens the accepted policy.
+    targets
+        .import(PROJECT, &request(valid()), &actor(), now())
+        .unwrap();
+    assert!(
+        !targets
+            .get(PROJECT, &id, now() + Duration::hours(3))
+            .unwrap()
+            .summary
+            .readiness
+            .ready
+    );
+    // A YouTube rebind inherits it.
+    let rebound = targets
+        .rebind_youtube(PROJECT, &id, Some("synthetic07"), &actor(), now())
+        .unwrap()
+        .review_target
+        .summary
+        .review_target_id;
+    assert_eq!(
+        targets
+            .get(PROJECT, &rebound, now())
+            .unwrap()
+            .summary
+            .readiness
+            .max_verification_age_seconds,
+        7200
+    );
+}
+
+#[test]
+fn an_adverse_availability_report_is_retained_and_blocks_new_sessions() {
+    let root = TempDir::new().unwrap();
+    let catalog = catalog(&root);
+    let targets = catalog.review_targets();
+    let id = targets
+        .import(PROJECT, &request(valid()), &actor(), now())
+        .unwrap()
+        .review_target
+        .summary
+        .review_target_id;
+    assert!(
+        targets
+            .get(PROJECT, &id, now())
+            .unwrap()
+            .summary
+            .readiness
+            .ready
+    );
+    let mut missing = request(valid());
+    missing.availability = Some(ArtifactAvailabilityAssertion {
+        state: ArtifactAvailabilityState::Missing,
+        observed_at: "2026-11-02T11:30:00Z".into(),
+    });
+    assert_eq!(
+        rejected_code(
+            targets
+                .import(PROJECT, &missing, &actor(), now())
+                .unwrap_err()
+        ),
+        "review_target_artifact_unavailable"
+    );
+    let detail = targets.get(PROJECT, &id, now()).unwrap();
+    assert!(!detail.summary.readiness.ready);
+    assert_eq!(
+        detail.summary.readiness.availability_state,
+        ArtifactAvailabilityState::Missing
+    );
+    assert_eq!(
+        detail.summary.readiness.blockers,
+        vec!["review_target_artifact_unavailable"]
+    );
+    assert_eq!(detail.observations.len(), 2);
+    // A later present observation restores it.
+    let mut present = request(valid());
+    present.availability = Some(ArtifactAvailabilityAssertion {
+        state: ArtifactAvailabilityState::Present,
+        observed_at: "2026-11-02T11:45:00Z".into(),
+    });
+    targets.import(PROJECT, &present, &actor(), now()).unwrap();
+    assert!(
+        targets
+            .get(PROJECT, &id, now())
+            .unwrap()
+            .summary
+            .readiness
+            .ready
+    );
+    // An adverse report for a target never imported creates nothing.
+    let mut unknown = request(
+        serde_json::to_value(handoff_with(|t| {
+            t.youtube_video_id = Some("synthetic05".into())
+        }))
+        .unwrap(),
+    );
+    unknown.availability = missing.availability.clone();
+    assert!(targets.import(PROJECT, &unknown, &actor(), now()).is_err());
+    assert_eq!(count_targets(&catalog), 1);
+}
