@@ -44,4 +44,4 @@ Agents use `RCDVLOG_SERVER_TOKEN` or an explicit owner-only credential file. Pre
 
 ## Security limits
 
-Open credential exchanges are limited to 64 KiB and 12 attempts per minute per in-process window. The limiter resets on restart and is not an internet-facing abuse system. CSP, restrictive Permissions-Policy, same-origin rules, request limits, path containment, opaque media IDs, and authenticated byte-range streaming are enforced, but the LAN/tailnet boundary and ACLs remain required.
+Open credential exchanges are limited to 64 KiB and 12 attempts per minute per in-process window. The limiter resets on restart and is not an internet-facing abuse system. CSP, restrictive Permissions-Policy (camera and geolocation disabled; microphone allowed for this origin only, for [TV voice review](../tv-voice-review-recording.md)), same-origin rules, request limits, path containment, opaque media IDs, and authenticated byte-range streaming are enforced, but the LAN/tailnet boundary and ACLs remain required.

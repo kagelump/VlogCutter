@@ -140,3 +140,82 @@ test("Chrome imports a verified TV review target through the real server and dec
   await page.getByRole("button", { name: "Check handoff" }).click();
   await expect(page.getByText("Identical target already imported.")).toBeVisible();
 });
+
+async function openSeededTarget(page: import("@playwright/test").Page, code: string) {
+  const baseURL = process.env.RCDVLOG_WEB_E2E_BASE_URL;
+  if (!baseURL) throw new Error("web e2e: no RCDVLOG_WEB_E2E_BASE_URL");
+  const handoff = readFileSync(reviewTargetHandoffPath(baseURL), "utf8");
+  await page.goto("/");
+  await page.getByLabel("Bootstrap code").fill(code);
+  await page.getByRole("button", { name: "Open review desk" }).click();
+  await page.getByRole("link", { name: "TV review" }).click();
+  await page.locator(".project-list button").first().click();
+  await page.getByLabel("Handoff JSON").fill(handoff);
+  await page.getByRole("button", { name: "Check handoff" }).click();
+  await page.getByRole("button", { name: /Import target|Open existing target/ }).click();
+  await expect(page.getByRole("heading", { name: "Revision editrev_synthetic" })).toBeVisible();
+}
+
+async function startRecording(page: import("@playwright/test").Page) {
+  await page.getByRole("button", { name: "Start voice review" }).click();
+  await expect(page.getByRole("heading", { name: "Record a TV review" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "● Record" })).toBeDisabled();
+  await page.getByRole("button", { name: "Allow microphone" }).click();
+  await expect(page.getByLabel("Input device")).toBeVisible();
+  await page.getByLabel(/Everyone present knows/).check();
+  await page.getByRole("button", { name: "● Record" }).click();
+  await expect(page.locator(".tv-recording-indicator")).toBeVisible();
+}
+
+test("Chrome records a fake-microphone voice review with a manual cue and reopens it", async ({ page }) => {
+  await openSeededTarget(page, bootstrapCode(5));
+  await startRecording(page);
+  await page.waitForTimeout(1_500);
+  await page.keyboard.press("m");
+  await page.waitForTimeout(3_000);
+  await expect(page.locator(".tv-recorder-facts")).toContainText(/Uploaded\s*[1-9]/);
+  await page.getByRole("button", { name: "■ Stop" }).click();
+  await expect(page.getByRole("heading", { name: "Voice review session" })).toBeVisible({ timeout: 30_000 });
+  await expect(page.getByText("Completed", { exact: true })).toBeVisible();
+  await expect(page.getByText(/reviewer declaration, not measured sync/)).toBeVisible();
+  await expect(page.getByText(/echo cancellation false/)).toBeVisible();
+
+  const href = await page.getByRole("link", { name: "Download WAV" }).getAttribute("href");
+  // Fetch from the page so the browser's own session cookie is used.
+  const download = (url: string) => page.evaluate(async (target) => {
+    const response = await fetch(target);
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    return { status: response.status, length: bytes.length, magic: String.fromCharCode(...bytes.subarray(0, 4)) };
+  }, url);
+  const wav = await download(href!);
+  expect(wav.status).toBe(200);
+  expect(wav.magic).toBe("RIFF");
+  // 48 kHz mono PCM16: more than four seconds of audio.
+  expect(wav.length - 44).toBeGreaterThan(4 * 48_000 * 2 * 0.9);
+
+  // Reopen from the target's session list.
+  await page.getByRole("button", { name: "Back to target" }).click();
+  await page.locator(".tv-voice-start .project-list button").first().click();
+  await expect(page.getByText("Completed", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Delete recording…" }).click();
+  await page.getByRole("button", { name: "Delete audio permanently" }).click();
+  await expect(page.getByText(/Audio deleted/)).toBeVisible();
+  expect((await download(href!)).status).toBe(409);
+});
+
+test("Chrome recovers a recording interrupted by a page reload and finalizes it honestly", async ({ page }) => {
+  await openSeededTarget(page, bootstrapCode(6));
+  const targetUrl = page.url();
+  await startRecording(page);
+  await page.waitForTimeout(4_500);
+  await page.reload();
+  await page.goto(targetUrl);
+  const recovery = page.getByRole("region", { name: "Unfinished recordings" });
+  await expect(recovery).toBeVisible();
+  await recovery.getByRole("button", { name: "Resume upload and finalize" }).click();
+  await expect(page.getByText("Buffered recordings uploaded and finalized.")).toBeVisible({ timeout: 30_000 });
+  await page.reload();
+  await page.locator(".tv-voice-start .project-list button").first().click();
+  await expect(page.getByRole("heading", { name: "Voice review session" })).toBeVisible();
+  await expect(page.getByText(/^interrupted/)).toBeVisible();
+});

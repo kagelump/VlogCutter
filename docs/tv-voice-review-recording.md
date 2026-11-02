@@ -1,0 +1,176 @@
+# TV voice review recording (#222)
+
+Chrome records a reviewer's conversation while they watch a rough cut on a TV,
+then stores it as **private session evidence** on the companion server. The
+recording is bound to one imported, immutable [review target](tv-review-handoff.md)
+(#221). This feature does not transcribe (#224), synchronize (#223), or write
+feedback (#225). Those owners read this evidence later.
+
+The page never plays, controls or observes YouTube. The TV plays on its own.
+The only statement the page makes about the video is the reviewer's optional
+**manual cue** ("the first frame is showing now"), which is recorded as a
+declaration and not as measured sync.
+
+## User flow
+
+*TV review → project → target → Start voice review*:
+
+1. Open the target's YouTube video on the TV.
+2. Press **Allow microphone**. The browser asks for permission and nothing is
+   captured yet. Then pick the input device.
+3. Confirm that everyone present knows they are being recorded (required). If a
+   second speaker will be recorded, tick the separate opt-in disclosure.
+4. Press **Record**. The heading shows `● Recording <elapsed>`. The level meter
+   and upload counters update while you record.
+5. Optionally press **Mark video start** (or `M`) when the first frame appears.
+6. Press **Stop**. The page flushes and uploads the tail and finalizes the
+   session, then opens the session page.
+
+Recording keeps running while the tab is in the background, as long as Chrome
+keeps the AudioContext alive. The target page lists every session for that
+exact target.
+
+## Capture and clock
+
+- `getUserMedia` requests the device with `echoCancellation`,
+  `noiseSuppression` and `autoGainControl` all off, and `channelCount` ideally 1.
+  The settings the browser actually applied are stored with the session.
+  They are recorded, not trusted.
+- [`pcm-capture-worklet.js`](../apps/web/public/pcm-capture-worklet.js) copies
+  each render quantum verbatim and tags it with the AudioContext `currentFrame`.
+  That frame counter is the **recording clock**. Recording frame 0 is the first
+  captured sample.
+- If `currentFrame` jumps, the worklet reports a discontinuity. The current
+  chunk is closed, the next chunk starts at the true later frame, and a
+  `captureDiscontinuity` event is stored. The server then sees a gap, not
+  stitched audio.
+- Samples are stored as interleaved `pcm_s16le` at the context rate (48 kHz
+  requested). The float → int16 quantization is the only transformation.
+- Timing that is not on the recording clock is correlation data only:
+  - each chunk's `performance.now()` at capture end
+  - each event's `performance.now()`
+  - the server's receive time for every chunk and event
+
+  None of these is a client wall-clock claim.
+- A manual cue is stored on the recording clock (`AudioContext.currentTime`
+  rebased to frame 0, with `outputLatency` in its detail), together with the
+  declared movie second (0 = first frame).
+
+## Durability
+
+Each 2-second chunk is SHA-256 hashed and written to an IndexedDB **outbox**
+before any upload. The outbox has a 256 MiB cap. The uploader drains the outbox
+in sequence order:
+
+- **Transient failures** (network, 503 `review_session_busy`, 507
+  `low_disk_space`, 5xx) back off from 0.5 s up to 10 s.
+- **Permanent refusals** stop the drain and keep the local copy. These are:
+  - conflict
+  - corrupt
+  - limit
+  - not recording
+  - not found
+  - auth
+- **Identical retries** are safe: the server returns the original receipt with
+  `duplicate: true`.
+
+If the outbox or the browser quota is full, that chunk's frames are reported as
+a `localBufferOverflow` event and become a gap. They are never dropped silently.
+
+After a reload, tab close or lost network, the target and record pages show
+**Resume upload and finalize**. Recovery uploads the buffered chunks and then
+finalizes the session as `interrupted`, using the last chunk end the outbox
+recorded. Up to one unflushed chunk (≤2 s) can be lost on an abrupt tab close.
+Those frames were never on disk, and the session does not claim them.
+
+A session is never finalized while audio for it is still buffered in the
+browser.
+
+## Server owner and API
+
+The server owner is [`review_sessions.rs`](../core/rcdvlog-server/src/review_sessions.rs)
+(control catalog migration 14). The adapter is
+[`review_session_http.rs`](../apps/server/src/review_session_http.rs). It uses
+the same session/device auth, CSRF on mutations, and Host/Origin checks as the
+rest of the server.
+
+| Route | Notes |
+| --- | --- |
+| `POST …/review-sessions` | Create. Idempotent by `clientSessionKey`. Requires consent, `pcm_s16le`, 1–2 channels, a supported rate, and a target whose readiness is `ready`; otherwise its blocker code is returned with 409. At most 4 sessions record at once (503 `review_session_busy`). |
+| `PUT …/{sessionId}/chunks/{sequence}?startFrame&frameCount&sha256&captureEndMs` | Raw body of at most 2 MiB. The server checks the hash, checks that length equals frames × channels × 2, and refuses overlap or a different body for an existing sequence (409). It writes the file with fsync and a temp-file rename, then commits the row. A 4-permit concurrency gate returns 503 with `Retry-After`. Session total is capped at 2 GiB / 7 h. |
+| `POST …/events` | `manualSyncCue`, `captureDiscontinuity`, `localBufferOverflow`, `deviceLost`, `pageInterrupted` or `clockSample`. Idempotent by `eventId`. The `detail` object is at most 2 KiB. |
+| `POST …/finalize` | Takes `finalFrameCount` and an `endReason`. The server re-hashes every stored chunk and computes received ranges, missing sequences and gaps over `[0, finalFrameCount)`. Identical repeats are idempotent. |
+| `GET …/{sessionId}`, `GET …/review-sessions` | Detail and bounded list. A recording past its 12 h lifetime is marked `abandoned` and can still be finalized. |
+| `GET …/audio.wav` | Only for `completed` sessions. Each chunk is re-verified and the result is streamed. Incomplete audio is never padded (409 `review_session_audio_unavailable`). |
+| `GET …/chunks/{sequence}` | Exact stored bytes, re-verified, for any non-deleted session. |
+| `DELETE …/{sessionId}` | Removes the audio directory. The metadata, events and chunk ledger remain as a tombstone. |
+
+States are:
+
+- `recording`
+- `completed`: contiguous coverage of the whole declared length
+- `incomplete`: one or more gaps, each listed
+- `corrupt`: a stored file is missing or its hash changed
+- `deleted`
+
+"Pending upload" exists only in the browser, as outbox chunks.
+
+**Privacy and retention.** Audio lives under `<data dir>/review-evidence/<sessionId>/`.
+That is never the derived/media root, and the path is never returned or logged.
+Error logs carry only the stable code. Evidence is kept until deleted.
+**Raw audio is not part of server backups** (the control-catalog metadata is),
+which the session page states next to the **Download WAV** action. The
+microphone is enabled by `Permissions-Policy: microphone=(self)`; camera and
+geolocation stay disabled. Session evidence is separate from source-asset
+transcripts and from canonical edit-plan revisions. The rendered movie is
+never touched.
+
+## Tests
+
+- **Rust core** (`review_sessions_tests.rs`):
+  - complete recording with out-of-order and duplicate chunks, cue and WAV bytes
+  - gaps with a reported local overflow
+  - conflicting, overlapping, corrupt and oversized chunks
+  - a stored chunk modified after upload (marked corrupt)
+  - consent and readiness and the concurrency limit
+  - idempotency conflict
+  - deletion tombstone
+  - abandoned-but-finalizable sessions
+- **HTTP**: auth, CSRF, the Permissions-Policy header, duplicate and corrupt
+  chunks, WAV streaming, 409 after deletion, and audit events.
+- **Vitest**:
+  - chunker rebasing, discontinuity gaps and stereo interleave
+  - SHA-256 vector
+  - outbox bound
+  - uploader backoff and permanent stop
+  - recovery finalization and the refusal to finalize while audio is buffered
+  - consent and permission gating, refusal and retry, cue keyboard shortcut,
+    queued stop
+  - incomplete session view and deletion
+- **Playwright with headless Chromium** against a real disposable server, using
+  Chrome's `--use-fake-device-for-media-stream` microphone:
+  - record, cue, stop, the completed session, a WAV of the expected length,
+    reopen, delete, and a 409 afterwards
+  - reload mid-recording, recover, and an `interrupted` finalization
+
+## Manual real-device acceptance (not run)
+
+Run against the HTTPS deployment in desktop Chrome, with a real microphone and
+a real TV:
+
+1. Refuse the microphone permission, then allow it from site settings and retry.
+2. Record 10+ minutes while the TV plays. Use the manual cue on the first frame,
+   and let the tab go to the background for part of the time.
+3. Unplug a USB microphone mid-recording. Expect the session to end as
+   `deviceLost`, with the audio captured so far kept.
+4. Disable the network for 30 s mid-recording. Expect buffered chunks to upload
+   after reconnection.
+5. Close the tab mid-recording, reopen it, and use **Resume upload and finalize**.
+6. Fill the server disk to `RCDVLOG_MIN_FREE_BYTES`. Expect 507 retries with
+   the audio kept in the browser.
+7. Download the WAV and confirm it plays. Delete the session, and confirm that
+   the audio directory is gone and the tombstone remains.
+
+Record the browser version, device, sample rate the context actually used,
+applied processing flags, and any gaps. None of this was exercised in the
+cloud environment.

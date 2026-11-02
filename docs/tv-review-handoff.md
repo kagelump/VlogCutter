@@ -210,6 +210,9 @@ against a real disposable server seeded with a Rust-digested synthetic handoff.
 Not exercised: real exported handoffs, HTTPS behind Caddy/Tailscale, or any
 YouTube/TV playback.
 
+Recording sessions bound to an imported target are described in
+[TV voice review recording](tv-voice-review-recording.md) (#222).
+
 ## Canonical feedback reconciliation
 
 For a reviewed and corrected note, send the existing `RecordReviewNoteRequest`

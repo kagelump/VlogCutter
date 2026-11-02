@@ -5,9 +5,9 @@ use serde_json::{Value, json};
 use tempfile::TempDir;
 
 const FIXTURE: &str = include_str!("../../rcdvlog-core/tests/fixtures/review-target/v1.json");
-const PROJECT: &str = "project_server_fixture";
+pub(crate) const PROJECT: &str = "project_server_fixture";
 
-fn catalog(root: &TempDir) -> ControlCatalog {
+pub(crate) fn catalog(root: &TempDir) -> ControlCatalog {
     let data = root.path().join("data");
     std::fs::create_dir_all(&data).unwrap();
     let catalog = ControlCatalog::open_or_create(
@@ -49,20 +49,20 @@ fn catalog(root: &TempDir) -> ControlCatalog {
     catalog
 }
 
-fn now() -> DateTime<Utc> {
+pub(crate) fn now() -> DateTime<Utc> {
     DateTime::parse_from_rfc3339("2026-11-02T12:00:00Z")
         .unwrap()
         .with_timezone(&Utc)
 }
 
-fn actor() -> ReviewTargetActor {
+pub(crate) fn actor() -> ReviewTargetActor {
     ReviewTargetActor::new(AuditActorType::BrowserSession, "session_test")
 }
 
 /// The synthetic fixture rebound to the server project, digested by Rust and
 /// verified one hour before `now()`. `edit` mutates the typed snapshot before
 /// the digest is recomputed.
-fn handoff_with(edit: impl FnOnce(&mut ReviewTargetSnapshot)) -> ReviewTargetHandoff {
+pub(crate) fn handoff_with(edit: impl FnOnce(&mut ReviewTargetSnapshot)) -> ReviewTargetHandoff {
     let mut handoff: ReviewTargetHandoff = serde_json::from_str(FIXTURE).unwrap();
     handoff.target.project_id = PROJECT.into();
     edit(&mut handoff.target);
@@ -72,7 +72,7 @@ fn handoff_with(edit: impl FnOnce(&mut ReviewTargetSnapshot)) -> ReviewTargetHan
     handoff
 }
 
-fn request(handoff: Value) -> ReviewTargetImportRequest {
+pub(crate) fn request(handoff: Value) -> ReviewTargetImportRequest {
     ReviewTargetImportRequest {
         handoff,
         declared_issuer: Some("Synthetic laptop".into()),
@@ -81,7 +81,7 @@ fn request(handoff: Value) -> ReviewTargetImportRequest {
     }
 }
 
-fn valid() -> Value {
+pub(crate) fn valid() -> Value {
     serde_json::to_value(handoff_with(|_| {})).unwrap()
 }
 

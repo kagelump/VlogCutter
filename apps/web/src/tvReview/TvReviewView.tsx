@@ -10,6 +10,7 @@ import {
 import { StatePanel, StatusBadge } from "@rcdvlog/review-ui";
 import { InlineError, normalizeError } from "../errors";
 import { parseYoutubeVideoId, unwrapHandoff } from "./youtube";
+import { PendingRecoveries, RecordView, SessionDetailView, SessionList, browserVoiceDeps, type VoiceDeps } from "./VoiceReview";
 
 /// Copy for the stable codes a review-target preflight/import can return.
 /// Keyed by code; the UI never parses server prose to choose a state.
@@ -30,10 +31,12 @@ function describe(error: ProjectClientError): string {
   return (error.code && REVIEW_TARGET_CODE_COPY[error.code]) || error.message;
 }
 
-export function TvReviewView({ client, path, navigate }: { client: BrowserProjectClient; path: string; navigate: (path: string) => void }) {
+export function TvReviewView({ client, path, navigate, voice }: { client: BrowserProjectClient; path: string; navigate: (path: string) => void; voice?: VoiceDeps }) {
   const parts = path.split("/").filter(Boolean).slice(1).map(decodeURIComponent);
-  const [projectId, targetId] = parts;
-  if (projectId && targetId) return <ReviewTargetDetailView client={client} projectId={projectId} reviewTargetId={targetId} navigate={navigate} />;
+  const [projectId, targetId, section, sessionId] = parts;
+  if (projectId && targetId && section === "record") return <RecordView client={client} projectId={projectId} targetId={targetId} navigate={navigate} deps={voice ?? browserVoiceDeps()} />;
+  if (projectId && targetId && section === "sessions" && sessionId) return <SessionDetailView client={client} projectId={projectId} targetId={targetId} sessionId={sessionId} navigate={navigate} />;
+  if (projectId && targetId) return <ReviewTargetDetailView client={client} projectId={projectId} reviewTargetId={targetId} navigate={navigate} voice={voice} />;
   if (projectId) return <ProjectReviewTargets client={client} projectId={projectId} navigate={navigate} />;
   return <ProjectPicker client={client} navigate={navigate} />;
 }
@@ -170,7 +173,7 @@ function preflightTitle(preflight: ReviewTargetPreflight) {
   }
 }
 
-function ReviewTargetDetailView({ client, projectId, reviewTargetId, navigate }: { client: BrowserProjectClient; projectId: string; reviewTargetId: string; navigate: (path: string) => void }) {
+function ReviewTargetDetailView({ client, projectId, reviewTargetId, navigate, voice }: { client: BrowserProjectClient; projectId: string; reviewTargetId: string; navigate: (path: string) => void; voice?: VoiceDeps }) {
   const [detail, setDetail] = useState<ReviewTargetDetail | null>(null);
   const [error, setError] = useState<ProjectClientError | null>(null);
   const [link, setLink] = useState("");
@@ -197,6 +200,11 @@ function ReviewTargetDetailView({ client, projectId, reviewTargetId, navigate }:
   return <section className="workspace-page tv-review-page">
     <div className="page-heading"><div><p className="eyebrow">Voice review / {projectId} / target</p><h1>Revision {detail.revisionId}</h1></div><div className="tv-heading-actions">{readinessBadge(detail)}<button className="secondary" onClick={() => navigate(targetPath(projectId))}>All targets</button></div></div>
     {!detail.readiness.ready ? <p className="inline-error" role="alert">New recording sessions are blocked: {detail.readiness.blockers.map((code) => REVIEW_TARGET_CODE_COPY[code] ?? code).join(" ")} Existing evidence is retained.</p> : null}
+    <PendingRecoveries client={client} projectId={projectId} deps={voice ?? browserVoiceDeps()} />
+    <section className="tv-voice-start" aria-label="Voice review">
+      <div><h2 className="tv-section-title">Voice reviews of this exact cut</h2><SessionList client={client} projectId={projectId} targetId={detail.reviewTargetId} navigate={navigate} /></div>
+      <button disabled={!detail.readiness.ready} onClick={() => navigate(`${targetPath(projectId, detail.reviewTargetId)}/record`)}>Start voice review</button>
+    </section>
     <div className="tv-review-columns">
       <div>
         <dl className="tv-facts">
