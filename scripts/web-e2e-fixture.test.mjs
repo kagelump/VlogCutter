@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
-import { bootstrapCodePath, fixturePort } from "./lib/web-e2e-fixture.mjs";
+import { bootstrapCodePath, fixturePort, reviewTargetHandoffPath } from "./lib/web-e2e-fixture.mjs";
 
 describe("fixturePort", () => {
   it("reads the port off the listen address the server was given", () => {
@@ -43,5 +43,12 @@ describe("bootstrapCodePath", () => {
       bootstrapCodePath("127.0.0.1:41235", 3),
       bootstrapCodePath("http://127.0.0.1:41235", 3),
     );
+  });
+});
+
+describe("reviewTargetHandoffPath", () => {
+  it("keys the synthetic handoff to the run's port", () => {
+    assert.notEqual(reviewTargetHandoffPath("127.0.0.1:41235"), reviewTargetHandoffPath("127.0.0.1:41236"));
+    assert.equal(reviewTargetHandoffPath("http://127.0.0.1:41235"), reviewTargetHandoffPath("127.0.0.1:41235"));
   });
 });

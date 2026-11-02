@@ -17,7 +17,7 @@ pub enum AuditActorType {
 }
 
 impl AuditActorType {
-    fn as_str(&self) -> &'static str {
+    pub(crate) fn as_str(&self) -> &'static str {
         match self {
             Self::BrowserSession => "browser_session",
             Self::DeviceCredential => "device_credential",

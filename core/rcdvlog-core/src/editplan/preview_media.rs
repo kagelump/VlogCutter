@@ -127,6 +127,17 @@ pub(super) fn plan_digest(
     plan: &EditPlanRevision,
     excerpt: Option<&super::PreviewExcerptScope>,
 ) -> Result<String> {
+    let plan_identity = plan_identity(catalog, plan, excerpt)?;
+    Ok(blake3::hash(&serde_json::to_vec(&plan_identity)?)
+        .to_hex()
+        .to_string())
+}
+
+fn plan_identity(
+    catalog: &Catalog,
+    plan: &EditPlanRevision,
+    excerpt: Option<&super::PreviewExcerptScope>,
+) -> Result<Value> {
     let mut plan_identity = json!({"revisionId":plan.revision_id,"projectId":plan.project_id,
         "parentRevisionId":plan.parent_revision_id,"scriptRevisionId":plan.script_revision_id,
         "operations":plan.operations,"storyPolicy":plan.story_policy});
@@ -138,10 +149,35 @@ pub(super) fn plan_digest(
     if excerpt.is_some() {
         plan_identity["excerptRecipe"] = json!(super::preview_excerpt::EXCERPT_RECIPE);
     }
-    let plan_digest = blake3::hash(&serde_json::to_vec(&plan_identity)?)
+    Ok(plan_identity)
+}
+
+/// Historical read-only verification recognizes the one known pre-story-policy
+/// identity. It cannot be used by render/reuse/current verification paths.
+pub(super) fn historical_plan_identity_matches(
+    catalog: &Catalog,
+    plan: &EditPlanRevision,
+    stored: &str,
+) -> Result<bool> {
+    let mut identity = plan_identity(catalog, plan, None)?;
+    if blake3::hash(&serde_json::to_vec(&identity)?)
         .to_hex()
-        .to_string();
-    Ok(plan_digest)
+        .as_str()
+        == stored
+    {
+        return Ok(true);
+    }
+    if plan.story_policy.is_some() {
+        return Ok(false);
+    }
+    identity
+        .as_object_mut()
+        .context("plan identity object")?
+        .remove("storyPolicy");
+    Ok(blake3::hash(&serde_json::to_vec(&identity)?)
+        .to_hex()
+        .as_str()
+        == stored)
 }
 
 pub(super) fn prepare(

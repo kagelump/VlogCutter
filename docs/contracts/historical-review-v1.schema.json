@@ -1,0 +1,299 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Historical rendered-artifact review v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "purpose",
+    "targetDigest",
+    "target",
+    "verifiedAt",
+    "outputMatches",
+    "mappingMatchesRevision",
+    "storedFullyDecoded",
+    "currentSourceVerification",
+    "currentConstraintsVerification",
+    "currentPlanRenderability"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": 1
+    },
+    "purpose": {
+      "const": "historicalRenderedArtifactReview"
+    },
+    "targetDigest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "projectId",
+        "revisionId",
+        "viewedArtifactId",
+        "planDigest",
+        "constraintsKey",
+        "movie",
+        "cuts",
+        "youtubeVideoId"
+      ],
+      "properties": {
+        "projectId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 255,
+          "pattern": "^[A-Za-z0-9_-]+$"
+        },
+        "revisionId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 255,
+          "pattern": "^[A-Za-z0-9_-]+$"
+        },
+        "viewedArtifactId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 255,
+          "pattern": "^[A-Za-z0-9_-]+$"
+        },
+        "planDigest": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "constraintsKey": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "movie": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "blake3",
+            "byteLength",
+            "durationSeconds",
+            "timeBaseNumerator",
+            "timeBaseDenominator",
+            "originPts",
+            "videoFrameCount",
+            "audioSampleRate",
+            "audioChannels"
+          ],
+          "properties": {
+            "blake3": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            "byteLength": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            },
+            "durationSeconds": {
+              "type": "number",
+              "exclusiveMinimum": 0,
+              "maximum": 21600
+            },
+            "timeBaseNumerator": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            },
+            "timeBaseDenominator": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            },
+            "originPts": {
+              "type": "integer",
+              "minimum": -9007199254740991,
+              "maximum": 9007199254740991
+            },
+            "videoFrameCount": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            },
+            "audioSampleRate": {
+              "const": 48000
+            },
+            "audioChannels": {
+              "const": 2
+            }
+          }
+        },
+        "cuts": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 20000,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "operationId",
+              "position",
+              "assetId",
+              "sourceInSeconds",
+              "sourceOutSeconds",
+              "movieInPts",
+              "movieOutPts",
+              "outputFrameCount",
+              "declaredAudio"
+            ],
+            "properties": {
+              "operationId": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 255,
+                "pattern": "^[A-Za-z0-9_-]+$"
+              },
+              "position": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "assetId": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 255,
+                "pattern": "^[A-Za-z0-9_-]+$"
+              },
+              "sourceInSeconds": {
+                "type": "number"
+              },
+              "sourceOutSeconds": {
+                "type": "number"
+              },
+              "movieInPts": {
+                "type": "integer",
+                "minimum": -9007199254740991,
+                "maximum": 9007199254740991
+              },
+              "movieOutPts": {
+                "type": "integer",
+                "minimum": -9007199254740991,
+                "maximum": 9007199254740991
+              },
+              "outputFrameCount": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 9007199254740991
+              },
+              "declaredAudio": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "mode"
+                    ],
+                    "properties": {
+                      "mode": {
+                        "const": "silent"
+                      }
+                    }
+                  },
+                  {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "mode",
+                      "version",
+                      "assetId",
+                      "sourceInSeconds",
+                      "sourceOutSeconds",
+                      "timelineStartSeconds",
+                      "syncOffsetSeconds",
+                      "gainDb",
+                      "fadeInSeconds",
+                      "fadeOutSeconds"
+                    ],
+                    "properties": {
+                      "mode": {
+                        "const": "source"
+                      },
+                      "version": {
+                        "const": 1
+                      },
+                      "assetId": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 255,
+                        "pattern": "^[A-Za-z0-9_-]+$"
+                      },
+                      "sourceInSeconds": {
+                        "type": "number"
+                      },
+                      "sourceOutSeconds": {
+                        "type": "number"
+                      },
+                      "timelineStartSeconds": {
+                        "type": "number"
+                      },
+                      "syncOffsetSeconds": {
+                        "type": "number"
+                      },
+                      "gainDb": {
+                        "type": "number",
+                        "minimum": -60,
+                        "maximum": 0
+                      },
+                      "fadeInSeconds": {
+                        "type": "number",
+                        "minimum": 0,
+                        "maximum": 0.25
+                      },
+                      "fadeOutSeconds": {
+                        "type": "number",
+                        "minimum": 0,
+                        "maximum": 0.25
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        },
+        "youtubeVideoId": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9_-]{11}$"
+            }
+          ]
+        }
+      }
+    },
+    "verifiedAt": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "outputMatches": {
+      "const": true
+    },
+    "mappingMatchesRevision": {
+      "const": true
+    },
+    "storedFullyDecoded": {
+      "const": true
+    },
+    "currentSourceVerification": {
+      "const": "notEstablishedByThisReview"
+    },
+    "currentConstraintsVerification": {
+      "const": "notEstablishedByThisReview"
+    },
+    "currentPlanRenderability": {
+      "const": "notEstablishedByThisReview"
+    }
+  }
+}

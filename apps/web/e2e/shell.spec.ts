@@ -1,7 +1,7 @@
 import { expect, test } from "@playwright/test";
 import { readFileSync } from "node:fs";
 
-import { bootstrapCodePath } from "../../../scripts/lib/web-e2e-fixture.mjs";
+import { bootstrapCodePath, reviewTargetHandoffPath } from "../../../scripts/lib/web-e2e-fixture.mjs";
 
 function bootstrapCode(index: number): string {
   const configured = process.env.RCDVLOG_E2E_BOOTSTRAP_CODES?.split(",")[index - 1]?.trim();
@@ -93,4 +93,50 @@ test("two Chrome tabs converge concurrent notes when one WebSocket is unavailabl
     const values = await Promise.all([firstNote.inputValue(), secondNote.inputValue()]);
     return values[0] === values[1] ? values[0] : "not-converged";
   }, { timeout: 12_000 }).toMatch(/Concurrent note from tab (one|two)/);
+});
+
+test("Chrome imports a verified TV review target through the real server and declares a YouTube link", async ({ page }) => {
+  const baseURL = process.env.RCDVLOG_WEB_E2E_BASE_URL;
+  if (!baseURL) throw new Error("web e2e: no RCDVLOG_WEB_E2E_BASE_URL");
+  const handoff = readFileSync(reviewTargetHandoffPath(baseURL), "utf8");
+  await page.setViewportSize({ width: 980, height: 680 });
+  await page.goto("/");
+  await page.getByLabel("Bootstrap code").fill(bootstrapCode(4));
+  await page.getByRole("button", { name: "Open review desk" }).click();
+  await page.getByRole("link", { name: "TV review" }).click();
+  await expect(page.getByRole("heading", { name: "TV review targets" })).toBeVisible();
+  await page.locator(".project-list button").first().click();
+  await expect(page.getByText("No review targets yet")).toBeVisible();
+
+  // A tampered copy is refused by the shared Rust digest before anything is stored.
+  const tampered = JSON.parse(handoff);
+  tampered.target.cuts[0].sourceInSeconds = 1.25;
+  await page.getByLabel("Handoff JSON").fill(JSON.stringify(tampered));
+  await page.getByRole("button", { name: "Check handoff" }).click();
+  await expect(page.getByText(/modified after export/)).toBeVisible();
+  await expect(page.getByRole("button", { name: "Import target" })).toHaveCount(0);
+
+  await page.getByLabel("Handoff JSON").fill(handoff);
+  await page.getByLabel("Owning host label (optional)").fill("Synthetic Mac");
+  await page.getByRole("button", { name: "Check handoff" }).click();
+  await expect(page.getByText("Ready to import as a new immutable target.")).toBeVisible();
+  await page.getByRole("button", { name: "Import target" }).click();
+  await expect(page.getByRole("heading", { name: "Revision editrev_synthetic" })).toBeVisible();
+  await expect(page.getByText(/Verified measured mapping/)).toBeVisible();
+  await expect(page.getByText("Ready for a session")).toBeVisible();
+  await expect(page.getByText("No YouTube video declared")).toBeVisible();
+  await expect(page.locator(".tv-cuts tbody tr")).toHaveCount(3);
+
+  await page.getByLabel("YouTube link or video ID").fill("https://youtu.be/synthetic02?si=share");
+  await page.getByRole("button", { name: "Declare video" }).click();
+  await expect(page.getByRole("heading", { name: "Video synthetic02" })).toBeVisible();
+  await expect(page.getByText(/Unverified: nothing proves YouTube/)).toBeVisible();
+  await expect(page.getByRole("link", { name: /earlier target without this YouTube link/ })).toBeVisible();
+
+  // Re-importing the identical handoff reuses the original target rather than adding one.
+  await page.getByRole("button", { name: "All targets" }).click();
+  await expect(page.locator(".project-list button")).toHaveCount(2);
+  await page.getByLabel("Handoff JSON").fill(handoff);
+  await page.getByRole("button", { name: "Check handoff" }).click();
+  await expect(page.getByText("Identical target already imported.")).toBeVisible();
 });

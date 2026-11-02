@@ -116,8 +116,8 @@ Keep a separate availability observation (unknown/present/missing/modified) and
 its observation time. New imports/sessions must fail preflight when required
 verification or availability is unresolved; retain historical sessions/evidence.
 
-The following is the **server integration contract**, not a claim that HTTP
-routes already exist. Claude's implementation should use existing authenticated
+The following is the **server integration contract**; the routes that
+implement it are described under [Server import](#server-import-implemented). Claude's implementation should use existing authenticated
 HTTPS/CSRF/Host/Origin guards and the generated OpenAPI client:
 
 1. Accept metadata through a bounded explicit import/preflight, scoped to the
@@ -148,6 +148,72 @@ coverage and source inspection can contain private metadata. Only this allowlist
 snapshot crosses the handoff boundary, privately and on explicit import. No
 movie, PCM, transcript, source clock metadata, filename, absolute path, tool path,
 free-text rationale or private real-project identifiers belong in cloud fixtures.
+
+## Server import (implemented)
+
+The companion server owner is
+[`review_targets.rs`](../core/rcdvlog-server/src/review_targets.rs) (control
+catalog migration 13); the HTTP adapter is
+[`review_target_http.rs`](../apps/server/src/review_target_http.rs). All routes
+sit behind the existing session/device authentication, CSRF on mutations, and
+Host/Origin/forwarded-header validation, with a request body limit sized to the
+validator's 16 MiB cap.
+
+| Route | Purpose |
+| --- | --- |
+| `POST /api/v1/projects/{projectId}/review-targets/preflight` | Non-mutating checks: version, shared Rust validation and digest, verification receipt, project, freshness, availability, identity/conflict. Content failures are `fail` checks with stable codes, not HTTP errors. |
+| `POST /api/v1/projects/{projectId}/review-targets/import` | Same checks inside one immediate transaction. `created`, `reused` (identical digest and receipt) or `refreshed` (identical digest, new receipt appended as an observation). |
+| `GET /api/v1/projects/{projectId}/review-targets` | Bounded newest-first list (`limit` 1–200, `before` cursor). |
+| `GET /api/v1/projects/{projectId}/review-targets/{reviewTargetId}` | Immutable snapshot, per-cut elapsed movie seconds, mapping precision, provenance, every verification observation, session readiness and fixed limitations. |
+| `POST /api/v1/projects/{projectId}/review-targets/{reviewTargetId}/youtube` | Declare or clear an 11-character ID. Creates (or reuses) a separate snapshot digested by Rust, records `derivedFromReviewTargetId`, and leaves the original untouched. |
+| `GET /api/v1/projects/{projectId}/review-targets/{reviewTargetId}/candidates` | `picture_candidates` for an elapsed movie point/range. Picture locators only. |
+
+Request body: `{ "handoff": <data>, "declaredIssuer": "Travel Mac"?, "availability": {"state","observedAt"}?, "maxVerificationAgeSeconds": n? }`.
+
+Policy decisions, recorded here so later owners do not re-derive them:
+
+- **Freshness.** New imports and new sessions require a receipt at most
+  `REVIEW_TARGET_SERVER_MAX_VERIFICATION_AGE_SECONDS` (7 days) old. A caller may
+  request a stricter lifetime, never a longer one. The accepted lifetime is
+  stored with each observation, and readiness uses the **strictest lifetime
+  ever accepted** for the target. A YouTube rebind inherits it. An imported
+  target that later goes stale keeps all evidence; its readiness reports
+  `review_target_verification_expired` as a blocker.
+- **Availability.** Absent an explicit assertion, the server records `present`
+  at `verifiedAt` with source `exportVerification` (the exporter refuses
+  missing/modified bytes). `unknown`, `missing` or `modified` blocks import
+  with `review_target_artifact_unavailable`. If the same target was already
+  imported, that adverse report is still **retained as an observation**. The
+  most recently observed availability governs readiness, so the target stops
+  being ready for new sessions until a later `present` observation.
+- **Identity.** Dedup is `(projectId, targetDigest)`. A *binding digest* — the
+  same Rust digest with the YouTube ID cleared — detects reuse of
+  `(projectId, viewedArtifactId)` with different movie bytes, plan, revision or
+  cut mapping, which is `409 review_target_conflict`; nothing is overwritten.
+  A different YouTube ID with the same binding is a new target, not a conflict.
+- **Provenance.** Importer actor (browser session or device credential),
+  import time and an optional declared issuer label (≤64 characters, no
+  paths) are stored separately. `issuerVerification` is always `unverified`
+  and `youtube.identityStatus` is `declaredUnverified` or `absent`.
+- **Revision.** The server replica has no edit-plan history, so a revision is
+  never checked against or replaced by the "current" revision; a revision
+  mismatch for the same viewed artifact is a conflict.
+
+Additional stable codes: `review_target_invalid` (malformed/unknown field/
+incomplete or overlapping mapping), `review_target_project_mismatch`,
+`review_target_artifact_unavailable`, `review_target_conflict`, plus
+`project_replica_not_found`. The four exporter codes above pass through
+unchanged. The web *TV review* screen accepts the bare handoff or the CLI
+success envelope (it sends only `data`), parses YouTube watch/youtu.be/shorts/
+live/embed links into an ID without fetching them, and branches on codes only.
+
+Tests: core unit tests in `review_targets_tests.rs` (dedup, refresh, every
+rejection code, conflict per field, rebind, staleness, candidate lookup with
+the PTS-origin offset and audio tail, pagination); an HTTP route test for
+auth/CSRF/409/400/audit; Vitest component tests; and a Chrome Playwright test
+against a real disposable server seeded with a Rust-digested synthetic handoff.
+Not exercised: real exported handoffs, HTTPS behind Caddy/Tailscale, or any
+YouTube/TV playback.
 
 ## Canonical feedback reconciliation
 
@@ -189,3 +255,40 @@ initial inspection; validate each later candidate in an isolated worktree.
 
 Priority remains #221 import integration, then the shared #223 anchor mapper,
 then #227 final-mix matching. Do not duplicate the cloud web recorder or ASR.
+
+## Historical rendered-artifact review (separate contract)
+
+`edit-plan historical-review-target-export --artifact <id>` opens the catalog
+read-only and emits `HistoricalRenderedArtifactReview` version 1. Hashing uses
+the shared host scheduling lease without a catalog write. It freshly
+hashes the owned completed movie, binds it to its prior fully decoded receipt,
+checks every measured cut against the immutable revision, and runs the same
+snapshot structure/digest validation as the strict exporter. It does not decode
+again, read source media, migrate the catalog or assert current constraints,
+source verification or plan renderability. Each of those is explicitly
+`notEstablishedByThisReview`. This receipt is an observation at `verifiedAt`, not
+an availability promise. Use `from_json` for bounded import validation.
+
+The `purpose: historicalRenderedArtifactReview` discriminator and different Rust
+DTO prevent parsing it as `ReviewTargetHandoff`. A server must implement an
+explicit historical-review policy before accepting it; importing it through the
+strict v1 route fails. Historical sessions may retain movie-time discussion of
+known editorial defects, but this evidence grants no render, editing, activation,
+upload, source-trim or feedback-apply authority. Those existing gates remain.
+Digest consistency cannot authenticate the issuer or establish YouTube identity.
+
+A completed historical cut may predate new rules. In particular, the chronology
+work added story policy and chronology dependencies to plan/constraint digests
+without changing the preview recipe name. `inputsMatch: false` compares the whole
+identity, including tool, plan and constraint digests; it does not by itself mean
+source bytes changed. The existing constraint failure text mentions human source
+constraints, but the key also includes chronology and story policy. Diagnose the
+components before attributing a failure. A historical review never repairs or
+whitelists a known chronology defect.
+
+The historical reader also verifies the complete plan digest, including declared
+audio and decision metadata. It recognizes the current algorithm and the exact
+pre-story-policy algorithm only when no story policy exists. That legacy
+recognition is confined to historical read-only review; it cannot authorize
+render reuse or current strict export. The [historical JSON Schema](contracts/historical-review-v1.schema.json)
+and invented `historical-v1.json` fixture document this separate transport.
