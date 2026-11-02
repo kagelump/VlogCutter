@@ -218,9 +218,27 @@ fn seed_transcribed_review(control: &ControlCatalog, project_id: &str) -> Result
             )
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
     }
-    sessions
-        .record_event(project_id, &session, &serde_json::from_value(serde_json::json!({"eventId": "seed_cue", "kind": "manualSyncCue", "audioFrame": 48000, "declaredMovieSeconds": 0.0}))?, chrono::Utc::now())
-        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    // A synthetic review-capture-calibration.v1 clock sample (sample 0 at
+    // monotonic 0 ns, ±3 ms) and two cues: movie 0 at 0.5 s and movie 5 at
+    // 5.5 s, so the shared synchronizer can estimate between them.
+    let events = [
+        serde_json::json!({"eventId": "seed_calibration", "kind": "clockSample", "audioFrame": 48000, "performanceMs": 1000.0,
+            "detail": {"schema": "review-capture-calibration.v1", "method": "workletProbeBracket", "clockId": "mic_epoch_0", "clockEpoch": 0,
+                "sampleRate": 48000, "firstSample": 0, "sampleIndex": 48000, "monotonicNs": 1_000_000_000u64, "monotonicOriginNs": 0,
+                "monotonicToleranceNs": 3_000_000, "performanceEpochMs": 0.0, "uncertaintyMs": 3.0}}),
+        serde_json::json!({"eventId": "seed_cue", "kind": "manualSyncCue", "audioFrame": 24000, "performanceMs": 500.0, "declaredMovieSeconds": 0.0, "detail": {"clockEpoch": 0}}),
+        serde_json::json!({"eventId": "seed_cue_five", "kind": "manualSyncCue", "audioFrame": 264000, "performanceMs": 5500.0, "declaredMovieSeconds": 5.0, "detail": {"clockEpoch": 0}}),
+    ];
+    for event in events {
+        sessions
+            .record_event(
+                project_id,
+                &session,
+                &serde_json::from_value(event)?,
+                chrono::Utc::now(),
+            )
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    }
     sessions
         .finalize(
             project_id,

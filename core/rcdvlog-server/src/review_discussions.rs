@@ -3,10 +3,12 @@
 //! This is a *review workspace*, not a feedback owner. It combines:
 //! - machine utterances from a transcription run (#224), never rewritten;
 //! - append-only human corrections of text, speaker, language and movie time;
-//! - a movie-time estimate from the session clock to the verified movie
-//!   (`SessionClockMapping`; today only the manual-cue adapter, to be replaced
-//!   by Codex's shared #223 engine);
-//! - picture candidates from the shared Rust review-target lookup (#221).
+//! - movie time from the shared synchronizer (`rcdvlog_core::tv_review_sync`,
+//!   #223) over each utterance's native frame interval, assembled from stored
+//!   calibration and cue evidence by `review_sync`; every slice, state,
+//!   candidate and evidence id is kept, and conservative cut candidates come
+//!   from the shared `map_to_cuts`;
+//! - explicit human movie-time corrections, kept as attributed declarations.
 //!
 //! Discussions group utterances. Items inside them keep the difference between
 //! an observation, a candidate edit, a speaker's claim, a retraction, a note and
@@ -35,8 +37,6 @@ use uuid::Uuid;
 pub const REVIEW_REPORT_SCHEMA: &str = "review-report.v1";
 /// Human reaction time to a first frame is not measured; this is the stated
 /// uncertainty of a manual cue, widened by unknown clock drift over time.
-const MANUAL_CUE_UNCERTAINTY_SECONDS: f64 = 0.75;
-const DRIFT_PER_MINUTE_SECONDS: f64 = 0.05;
 const HEURISTIC_BREAK_SECONDS: f64 = 6.0;
 const MAX_TEXT: usize = 4096;
 const MAX_DISCUSSION_UTTERANCES: usize = 500;
@@ -108,92 +108,20 @@ pub struct ReviewActor {
 
 // ── Session clock → movie time ──────────────────────────────────────────
 
+pub use crate::review_sync::{SyncDescription, UtteranceSync};
+
+/// A single movie-time locator (the utterance start) for display and export.
+/// Present only for a human declaration, or when the utterance's first slice
+/// is anchored or estimated with exactly one candidate; the full result,
+/// including later unknown or conflicting slices, stays in `sync`.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MovieTimeEstimate {
     pub movie_seconds: f64,
     pub uncertainty_seconds: f64,
-    /// `manualCue` (reviewer declaration), `humanCorrection`; later `sharedSync` (#223).
+    /// `humanCorrection`, or `sharedSync:anchored` / `sharedSync:estimated`.
     pub source: String,
-    pub anchor_event_id: Option<String>,
-}
-
-/// Seam for the shared synchronizer. Implementations map recording seconds to
-/// movie seconds with an honest uncertainty, or return `None` (unanchored).
-pub trait SessionClockMapping {
-    fn estimate(&self, recording_seconds: f64) -> Option<MovieTimeEstimate>;
-    fn description(&self) -> SyncDescription;
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SyncDescription {
-    pub status: &'static str,
-    pub source: &'static str,
-    pub note: &'static str,
-}
-
-/// Interim adapter: the latest manual cue declares "recording t₀ shows movie m₀",
-/// assuming 1:1 clock rate. Replace with the shared #223 mapper; do not extend.
-pub struct ManualCueMapping {
-    cue: Option<(f64, f64, String)>,
-    movie_duration: f64,
-}
-
-impl ManualCueMapping {
-    pub fn from_session(
-        connection: &Connection,
-        session_id: &str,
-        movie_duration: f64,
-    ) -> anyhow::Result<Self> {
-        let cue = connection
-            .query_row(
-                "SELECT e.event_id, e.audio_frame, e.declared_movie_seconds, s.sample_rate
-                 FROM review_session_events e JOIN review_sessions s ON s.session_id = e.session_id
-                 WHERE e.session_id=?1 AND e.kind='manualSyncCue' AND e.declared_movie_seconds IS NOT NULL
-                 ORDER BY e.sequence DESC LIMIT 1",
-                [session_id],
-                |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, f64>(2)?, r.get::<_, u32>(3)?)),
-            )
-            .optional()?
-            .map(|(id, frame, movie, rate)| (frame as f64 / f64::from(rate), movie, id));
-        Ok(Self {
-            cue,
-            movie_duration,
-        })
-    }
-}
-
-impl SessionClockMapping for ManualCueMapping {
-    fn estimate(&self, recording_seconds: f64) -> Option<MovieTimeEstimate> {
-        let (cue_recording, cue_movie, id) = self.cue.as_ref()?;
-        let movie = recording_seconds - cue_recording + cue_movie;
-        if !(0.0..=self.movie_duration).contains(&movie) {
-            return None;
-        }
-        let elapsed_minutes = (recording_seconds - cue_recording).abs() / 60.0;
-        Some(MovieTimeEstimate {
-            movie_seconds: movie,
-            uncertainty_seconds: MANUAL_CUE_UNCERTAINTY_SECONDS
-                + DRIFT_PER_MINUTE_SECONDS * elapsed_minutes,
-            source: "manualCue".into(),
-            anchor_event_id: Some(id.clone()),
-        })
-    }
-    fn description(&self) -> SyncDescription {
-        match self.cue {
-            Some(_) => SyncDescription {
-                status: "provisional",
-                source: "manualCue",
-                note: "Movie time is estimated from your manual cue, assuming the TV played without pauses. It is not measured synchronization; precise cut assignment needs confirmation.",
-            },
-            None => SyncDescription {
-                status: "unanchored",
-                source: "none",
-                note: "No manual cue and no shared synchronization yet: remarks are on the recording clock only and cannot be assigned to cuts by time.",
-            },
-        }
-    }
+    pub evidence_ids: Vec<String>,
 }
 
 // ── Workspace DTOs ──────────────────────────────────────────────────────
@@ -219,7 +147,10 @@ pub struct WorkspaceUtterance {
     pub language: String,
     pub excluded: bool,
     pub movie_time: Option<MovieTimeEstimate>,
-    /// Picture locators overlapping the estimate's uncertainty; never chosen automatically.
+    /// The shared synchronizer's complete result for this utterance's frames.
+    pub sync: UtteranceSync,
+    /// Picture locators from anchored/estimated slices (or a human movie-time
+    /// declaration); never chosen automatically.
     pub candidate_operation_ids: Vec<String>,
     /// `previous` / `next` when the speaker appears to refer to another shot.
     pub reference_hint: Option<String>,
@@ -378,7 +309,7 @@ pub struct ReviewDiscussions {
 struct Context_ {
     run: ReviewTranscriptionRun,
     handoff: ReviewTargetHandoff,
-    mapping: ManualCueMapping,
+    sync: crate::review_sync::SessionSync,
 }
 
 fn reference_hint(text: &str) -> Option<String> {
@@ -446,16 +377,9 @@ impl ReviewDiscussions {
         let handoff = crate::ReviewTargets::new(self.database_path.clone())
             .handoff(project_id, &run.review_target_id)
             .map_err(|_| ReviewDiscussionError::NotFound)?;
-        let mapping = ManualCueMapping::from_session(
-            connection,
-            &run.session_id,
-            handoff.target.movie.duration_seconds,
-        )?;
-        Ok(Context_ {
-            run,
-            handoff,
-            mapping,
-        })
+        let sync =
+            crate::review_sync::SessionSync::from_session(connection, &run.session_id, &handoff)?;
+        Ok(Context_ { run, handoff, sync })
     }
 
     fn corrections(
@@ -500,11 +424,20 @@ impl ReviewDiscussions {
     fn utterances(
         &self,
         connection: &Connection,
-        context: &Context_,
+        context: &mut Context_,
     ) -> Result<Vec<WorkspaceUtterance>, ReviewDiscussionError> {
         let corrections = Self::corrections(connection, &context.run.run_id)?;
+        let intervals: Vec<(u64, u64)> = context
+            .run
+            .utterances
+            .iter()
+            .map(|u| (u.start_frame, u.end_frame.max(u.start_frame)))
+            .collect();
+        let synced = context.sync.map_intervals(&intervals, &context.handoff);
+        let movie = &context.handoff.target.movie;
+        let tps = movie.time_base_denominator as f64 / movie.time_base_numerator as f64;
         let mut out = Vec::new();
-        for machine in &context.run.utterances {
+        for (machine, sync) in context.run.utterances.iter().zip(synced) {
             let history = corrections
                 .get(&machine.utterance_id)
                 .cloned()
@@ -524,32 +457,63 @@ impl ReviewDiscussions {
             } else {
                 machine.display_text.clone()
             };
-            let movie_time = match latest("movieTime") {
-                Some(serde_json::Value::Null) => None,
-                Some(value) => value.as_f64().map(|seconds| MovieTimeEstimate {
-                    movie_seconds: seconds,
-                    uncertainty_seconds: 0.0,
-                    source: "humanCorrection".into(),
-                    anchor_event_id: None,
-                }),
-                None => {
-                    let middle = (machine.start_seconds + machine.end_seconds) / 2.0;
-                    context.mapping.estimate(middle)
-                }
-            };
+            let human = latest("movieTime");
             let duration = context.handoff.target.movie.duration_seconds;
-            let mut candidates = match &movie_time {
-                Some(estimate) => {
-                    let start = (estimate.movie_seconds - estimate.uncertainty_seconds)
-                        .clamp(0.0, duration);
-                    let end = (estimate.movie_seconds + estimate.uncertainty_seconds)
-                        .clamp(0.0, duration);
-                    context
-                        .handoff
-                        .picture_candidates(start, end)
-                        .unwrap_or_default()
+            let (movie_time, mut candidates) = match human {
+                // A human declaration is attributed as such, never as sync.
+                Some(serde_json::Value::Null) => (None, Vec::new()),
+                Some(value) => {
+                    let estimate = value.as_f64().map(|seconds| MovieTimeEstimate {
+                        movie_seconds: seconds,
+                        uncertainty_seconds: 0.0,
+                        source: "humanCorrection".into(),
+                        evidence_ids: vec![],
+                    });
+                    let candidates = estimate
+                        .as_ref()
+                        .map(|e| {
+                            let at = e.movie_seconds.clamp(0.0, duration);
+                            context
+                                .handoff
+                                .picture_candidates(at, at)
+                                .unwrap_or_default()
+                        })
+                        .unwrap_or_default();
+                    (estimate, candidates)
                 }
-                None => Vec::new(),
+                None => {
+                    // Candidates only from anchored/estimated slices: the
+                    // shared mapper never gives unknown or conflicting
+                    // slices any.
+                    let mut candidates: Vec<String> = Vec::new();
+                    for slice in &sync.slices {
+                        for id in &slice.candidate_operation_ids {
+                            if !candidates.contains(id) {
+                                candidates.push(id.clone());
+                            }
+                        }
+                    }
+                    // The locator is the utterance's start; it exists only
+                    // when that slice is anchored/estimated with exactly one
+                    // candidate. Later unknown or conflicting slices stay in
+                    // `sync` and are never smoothed over.
+                    let estimate = sync.slices.first().and_then(|slice| {
+                        let state = serde_json::to_value(slice.state).ok()?;
+                        let state = state.as_str()?;
+                        if !matches!(state, "anchored" | "estimated") || slice.candidates.len() != 1
+                        {
+                            return None;
+                        }
+                        let first = &slice.candidates[0];
+                        Some(MovieTimeEstimate {
+                            movie_seconds: (first.start_pts - movie.origin_pts as f64) / tps,
+                            uncertainty_seconds: first.uncertainty_ticks as f64 / tps,
+                            source: format!("sharedSync:{state}"),
+                            evidence_ids: first.evidence_ids.clone(),
+                        })
+                    });
+                    (estimate, candidates)
+                }
             };
             let hint = reference_hint(&text);
             if let (Some(hint), Some(first)) = (&hint, candidates.first().cloned()) {
@@ -581,6 +545,7 @@ impl ReviewDiscussions {
                     .and_then(|v| v.as_bool())
                     .unwrap_or(machine.suppressed),
                 movie_time,
+                sync,
                 candidate_operation_ids: candidates,
                 reference_hint: hint,
                 corrections: history,
@@ -596,8 +561,8 @@ impl ReviewDiscussions {
         run_id: &str,
     ) -> Result<ReviewWorkspace, ReviewDiscussionError> {
         let connection = open_read_only_connection(&self.database_path)?;
-        let context = self.context(&connection, project_id, run_id)?;
-        let utterances = self.utterances(&connection, &context)?;
+        let mut context = self.context(&connection, project_id, run_id)?;
+        let utterances = self.utterances(&connection, &mut context)?;
         let discussions = load_discussions(&connection, run_id, &utterances)?;
         let movie = &context.handoff.target.movie;
         let seconds = |pts: i64| {
@@ -612,7 +577,7 @@ impl ReviewDiscussions {
             revision_id: context.handoff.target.revision_id.clone(),
             viewed_artifact_id: context.handoff.target.viewed_artifact_id.clone(),
             target_digest: context.handoff.target_digest.clone(),
-            sync: context.mapping.description(),
+            sync: context.sync.description().clone(),
             cuts: context
                 .handoff
                 .target
@@ -1495,4 +1460,4 @@ pub(crate) fn migrate(tx: &rusqlite::Transaction<'_>) -> anyhow::Result<()> {
 
 #[cfg(test)]
 #[path = "review_discussions_tests.rs"]
-mod tests;
+pub(crate) mod tests;

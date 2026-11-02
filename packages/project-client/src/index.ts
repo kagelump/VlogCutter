@@ -524,7 +524,30 @@ export interface ReviewTranscriptionRun {
 export type DiscussionItemKind = "observation" | "candidateEdit" | "speakerClaim" | "retraction" | "note" | "decision";
 export type DecisionAction = "accepted" | "declined" | "deferred";
 
-export interface MovieTimeEstimate { movieSeconds: number; uncertaintySeconds: number; source: string; anchorEventId: string | null }
+/** Utterance-start locator: a human declaration or the shared synchronizer's first slice. */
+export interface MovieTimeEstimate { movieSeconds: number; uncertaintySeconds: number; source: string; evidenceIds: string[] }
+
+/** One slice of the shared synchronizer (`rcdvlog_core::tv_review_sync`) result. */
+export interface SyncSlice {
+  recording: { clockId: string; startSample: number; endSample: number };
+  state: "anchored" | "estimated" | "conflicting" | "unknown";
+  candidates: Array<{ startPts: number; endPts: number; lowerPts: number; upperPts: number; uncertaintyTicks: number; confidence: number; evidenceIds: string[]; measuredDriftPpm: number | null }>;
+  diagnostics: string[];
+  candidateOperationIds: string[];
+}
+
+export interface UtteranceSync { state: "anchored" | "estimated" | "conflicting" | "unknown" | "mixed" | "pending"; slices: SyncSlice[]; uncoveredFrames: number }
+
+export interface ReviewSyncDescription {
+  status: "pending" | "noAnchors" | "mapped" | "failed";
+  source: string;
+  note: string;
+  calibratedClocks: number;
+  anchors: number;
+  boundaries: number;
+  policy: { minimumConfidence: number; maxAnchorGapSeconds: number; maxExtrapolationSeconds: number; maxDriftPpm: number; residualToleranceSeconds: number; unobservedUncertaintyPpm: number };
+  diagnostics: string[];
+}
 
 export interface WorkspaceUtterance {
   machine: ReviewUtterance;
@@ -534,6 +557,7 @@ export interface WorkspaceUtterance {
   language: string;
   excluded: boolean;
   movieTime: MovieTimeEstimate | null;
+  sync: UtteranceSync;
   candidateOperationIds: string[];
   referenceHint: string | null;
   corrections: Array<{ correctionId: string; field: string; value: unknown; reason: string | null; actor: ReviewTargetActor; createdAt: string }>;
@@ -583,7 +607,7 @@ export interface ReviewWorkspace {
   revisionId: string;
   viewedArtifactId: string;
   targetDigest: string;
-  sync: { status: "provisional" | "unanchored" | string; source: string; note: string };
+  sync: ReviewSyncDescription;
   cuts: Array<{ operationId: string; position: number; assetId: string; movieInSeconds: number; movieOutSeconds: number }>;
   utterances: WorkspaceUtterance[];
   discussions: Discussion[];

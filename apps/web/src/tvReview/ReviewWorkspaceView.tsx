@@ -37,10 +37,18 @@ function describe(reason: unknown) {
 }
 
 function movieLabel(u: WorkspaceUtterance) {
-  if (!u.movieTime) return "movie time unknown";
-  const precision = u.movieTime.source === "humanCorrection" ? "set by you" : `±${u.movieTime.uncertaintySeconds.toFixed(1)} s, ${u.movieTime.source}`;
-  return `movie ${formatStamp(u.movieTime.movieSeconds)} (${precision})`;
+  if (!u.movieTime) return u.sync.state === "pending" ? "movie time pending (no calibrated clock)" : `movie time ${u.sync.state}`;
+  const precision = u.movieTime.source === "humanCorrection" ? "set by you" : `±${u.movieTime.uncertaintySeconds.toFixed(2)} s, ${u.movieTime.source.replace("sharedSync:", "")}`;
+  const partial = u.movieTime.source !== "humanCorrection" && u.sync.state === "mixed" ? "; later part unknown or conflicting" : "";
+  return `movie ${formatStamp(u.movieTime.movieSeconds)} (${precision}${partial})`;
 }
+
+const SYNC_LABEL: Record<string, string> = {
+  pending: "Movie time: pending calibration",
+  noAnchors: "Movie time: no anchors",
+  mapped: "Movie time: shared sync",
+  failed: "Movie time: sync failed",
+};
 
 function UtteranceEditor({ utterance, onCorrect }: { utterance: WorkspaceUtterance; onCorrect: (field: "text" | "speaker" | "movieTime" | "excluded", value: unknown) => Promise<void> }) {
   const [editing, setEditing] = useState(false);
@@ -173,7 +181,7 @@ export function ReviewWorkspaceView({ client, projectId, targetId, sessionId, ru
   return <section className="workspace-page tv-review-page">
     <div className="page-heading"><div><p className="eyebrow">Voice review / revision {workspace.revisionId}</p><h1>Editorial review</h1></div>
       <div className="tv-heading-actions">
-        <StatusBadge label={workspace.sync.status === "provisional" ? "Movie time: manual cue" : "Movie time: unanchored"} tone="warning" />
+        <StatusBadge label={SYNC_LABEL[workspace.sync.status] ?? `Movie time: ${workspace.sync.status}`} tone={workspace.sync.status === "mapped" ? "neutral" : "warning"} />
         <a className="button-link secondary-link" href={client.reviewReportUrl(projectId, runId)} target="_blank" rel="noreferrer">Agent report (JSON)</a>
         <button className="secondary" onClick={() => navigate(sessionPath)}>Back to session</button>
       </div></div>

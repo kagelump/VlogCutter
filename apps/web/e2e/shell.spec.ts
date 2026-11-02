@@ -267,7 +267,7 @@ test("Chrome turns a two-reviewer transcript into grouped discussions with a ret
   await expect(page.getByRole("heading", { name: "Review desk ready" })).toBeVisible();
   await page.goto(reviewPath);
   await expect(page.getByRole("heading", { name: "Editorial review" })).toBeVisible();
-  await expect(page.getByText("Movie time: manual cue")).toBeVisible();
+  await expect(page.getByText("Movie time: shared sync")).toBeVisible();
   // Raw Simplified text is preserved; Traditional is the display projection.
   await expect(page.getByText("不要，長度不變，換個轉場。")).toBeVisible();
   await expect(page.getByText(/raw: 不要，长度不变，换个转场。/)).toBeVisible();

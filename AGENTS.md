@@ -80,7 +80,8 @@ Implemented now:
   inferred. The editorial review workspace (control schema 16,
   `review_discussions`) adds append-only human corrections, grouped
   discussions with typed items (human-only decisions, enforced retractions and
-  consistent acceptances), a manual-cue movie-time adapter awaiting #223, and
+  consistent acceptances), movie time only from the shared `tv_review_sync`
+  mapper over calibrated cue evidence (pending without calibration), and
   a `review-report.v1` exporting core `RecordReviewNoteRequest`s with single
   reconciliation receipts; it never writes the project catalog. See
   `docs/tv-review-handoff.md`, `docs/tv-voice-review-recording.md`,

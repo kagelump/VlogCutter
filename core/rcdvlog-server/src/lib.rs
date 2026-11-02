@@ -14,6 +14,7 @@ mod replicas;
 mod representations;
 mod review_discussions;
 mod review_sessions;
+mod review_sync;
 mod review_targets;
 mod review_transcripts;
 mod scan;
@@ -96,9 +97,9 @@ pub use representations::{
     RepresentationService, RepresentationState, ServerJobHandler, THUMBNAIL_RECIPE_KEY,
 };
 pub use review_discussions::{
-    AuthorKind, DecisionAction, Discussion, DiscussionItem, ItemKind, ManualCueMapping,
-    MovieTimeEstimate, NewDiscussionItem, REVIEW_REPORT_SCHEMA, ReviewActor, ReviewDiscussionError,
-    ReviewDiscussions, ReviewWorkspace, SessionClockMapping, WorkspaceUtterance,
+    AuthorKind, DecisionAction, Discussion, DiscussionItem, ItemKind, MovieTimeEstimate,
+    NewDiscussionItem, REVIEW_REPORT_SCHEMA, ReviewActor, ReviewDiscussionError, ReviewDiscussions,
+    ReviewWorkspace, SyncDescription, UtteranceSync, WorkspaceUtterance,
 };
 pub use review_sessions::{
     ChunkReceipt, ChunkUpload, CreateReviewSessionRequest, FinalizeReviewSessionRequest,
@@ -108,6 +109,9 @@ pub use review_sessions::{
     ReviewSessionDetail, ReviewSessionError, ReviewSessionEvent, ReviewSessionEventKind,
     ReviewSessionEventRequest, ReviewSessionPage, ReviewSessionState, ReviewSessionSummary,
     ReviewSessions, wav_header,
+};
+pub use review_sync::{
+    CALIBRATION_SCHEMA, MANUAL_CUE_CONFIDENCE, MANUAL_CUE_MOVIE_UNCERTAINTY_SECONDS, SessionSync,
 };
 pub use review_targets::{
     ArtifactAvailabilityAssertion, ArtifactAvailabilityState, ImportOutcome, PreflightOutcome,

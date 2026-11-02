@@ -17,16 +17,41 @@ proposals, decisions, mappings and `apply` all stay in the project catalog
 
 Every utterance keeps its **recording clock** time.
 
-- **Movie time** comes from the `SessionClockMapping` seam. Today the only
-  implementation is the interim `ManualCueMapping`: the reviewer's last
-  "first frame" cue, assuming the TV played without pauses. Its uncertainty is
-  ±0.75 s plus 0.05 s per minute from the cue. The workspace reports
-  `sync.status: provisional`. **Codex's shared #223 synchronizer replaces this
-  adapter.** It must not be extended into a second sync engine.
-- **No cue and no sync:** `unanchored`. No movie time and no candidates are
-  shown.
-- **Candidate cuts** come from the shared Rust
-  `ReviewTargetHandoff::picture_candidates` over the uncertainty interval.
+- **Movie time** comes only from the shared synchronizer
+  (`rcdvlog_core::tv_review_sync`, #223; see [tv-review-sync.md](tv-review-sync.md)).
+  `review_sync` assembles its `SyncRequest` from stored session evidence and
+  never estimates anything itself:
+  - **Capture clocks** come only from `review-capture-calibration.v1` clock
+    samples (the recorder's bracketed worklet probes), one per `clockId`.
+    Probes of one clock must share a performance epoch, and their origin
+    spread is added to the declared tolerance. A clock runs until the next
+    clock epoch starts or the recording ends.
+  - **Manual cues** are keypresses on the monotonic clock. A cue's capture
+    position is its `performanceMs` mapped through its epoch's calibration;
+    its declared elapsed movie second becomes raw PTS on the target's exact
+    origin and timebase. A cue is a `manualCue` anchor with confidence 0.9 and
+    ±0.25 s movie uncertainty (human reaction). Cues without a calibrated
+    epoch or outside the clock's range are not used and are listed in
+    `sync.diagnostics`.
+  - **Capture discontinuities, buffer overflows, device loss and page
+    interruptions** are `captureInterrupted` boundaries.
+  - The shared default policy applies; in particular there is **no
+    single-anchor extrapolation**, so a remark is estimated only between
+    consistent nearby anchors.
+- Each utterance's complete native `[startFrame, endFrame]` interval is
+  queried, split at clock epochs. Its `sync` keeps every returned slice with
+  its state (`anchored`, `estimated`, `conflicting`, `unknown`), candidates,
+  evidence IDs and diagnostics; `sync.state` is `mixed` when the slices
+  differ. `movieTime` is only a locator for the utterance **start**, present
+  when the first slice is anchored or estimated with one candidate. Later
+  unknown or conflicting parts stay visible and are never smoothed over.
+- `sync.status` is `pending` (no calibrated clock: nothing is synthesized from
+  request start, packet arrival or receive time), `noAnchors`, `mapped` or
+  `failed`.
+- A **human movie-time correction** is an attributed declaration
+  (`source: humanCorrection`), shown alongside, never as measured sync.
+- **Candidate cuts** come from the shared `map_to_cuts` over anchored and
+  estimated slices only (or the picture at a human-declared movie time).
   They are locators only. When the text appears to refer to the previous or
   next shot ("previous shot", 上一個, 下一個 and similar), the neighbouring
   cut is added as a candidate and the utterance shows a `referenceHint`.
@@ -89,7 +114,8 @@ collects its speakers, languages and the union of its candidates.
 
 - **Identity:** project, revision, viewed artifact, target digest, session
   and run.
-- **Sync status:** whether movie time is provisional or unanchored.
+- **Sync status:** the shared synchronizer's status, policy, anchor and
+  boundary counts and diagnostics; each quoted utterance carries its `sync`.
 - **Coverage statement:** `audiovisualReviewAttested: false`. A recording is
   not a continuous-review attestation (#204).
 - **Discussions:** quotes with raw and display text, the machine text, the
@@ -131,8 +157,12 @@ The server never writes the project catalog.
 
 - **Rust core** (`review_discussions_tests.rs`, on a real #222 session and a
   #224 run with a scripted engine):
-  - the manual-cue estimate and its candidates; past-the-movie and no-cue
-    cases are unanchored
+  - shared-synchronizer estimates between two calibrated cues, with the
+    unknown tail kept as its own slice and no extrapolation after the last
+    cue; a cue without calibration leaves everything pending
+  - (`review_sync_tests.rs`) a capture interruption between cues is never
+    interpolated; each clock epoch is its own capture clock; inconsistent
+    calibrations and cues from an uncalibrated epoch are not used
   - append-only corrections, a "previous shot" neighbour candidate, and human-only speaker attribution
   - the **two-reviewer retraction flow**: "keep it longer" → "no, keep the
     duration, change the transition". The retraction is preserved,
@@ -158,6 +188,8 @@ The server never writes the project catalog.
 - A round trip through a real owning catalog's `edit-plan feedback record`.
   It needs a completed preview artifact, which the cloud environment cannot
   render against private media. Only type compatibility is tested.
-- Real conversations, real sync (#223), and bounded raw-audio playback in the
+- Real conversations, real-device calibration and TV timing accuracy, server-side
+  acoustic-marker or passive-soundtrack anchors for stored sessions, and
+  bounded raw-audio playback in the
   workspace. The session page offers the full WAV download only.
 - Utterance-level grouping quality on real speech.

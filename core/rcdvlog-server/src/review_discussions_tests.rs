@@ -17,27 +17,70 @@ fn device() -> ReviewActor {
     }
 }
 
-/// Transcribed fixture (utterances at ~1 s, ~6 s, ~12 s). With `cue`, the
-/// reviewer marked movie 0 at recording 1 s.
+/// A `review-capture-calibration.v1` clock sample: performance epoch 0,
+/// sample 0 at monotonic 0 ns, ±3 ms.
+pub(crate) fn calibration_event(f: &Fixture, event_id: &str, epoch: u64, first_sample: u64) {
+    let origin_ns = 0u64;
+    f.catalog
+        .review_sessions(0)
+        .record_event(
+            PROJECT,
+            &f.session_id,
+            &ReviewSessionEventRequest {
+                event_id: event_id.into(),
+                kind: ReviewSessionEventKind::ClockSample,
+                audio_frame: first_sample + 48_000,
+                performance_ms: Some(1000.0 + first_sample as f64 / 48.0),
+                declared_movie_seconds: None,
+                detail: Some(serde_json::json!({
+                    "schema": "review-capture-calibration.v1",
+                    "method": "workletProbeBracket",
+                    "clockId": format!("mic_epoch_{epoch}"),
+                    "clockEpoch": epoch,
+                    "sampleRate": 48_000,
+                    "firstSample": first_sample,
+                    "sampleIndex": first_sample + 48_000,
+                    "monotonicNs": origin_ns + 1_000_000_000 + first_sample * 1_000_000 / 48,
+                    "monotonicOriginNs": origin_ns,
+                    "monotonicToleranceNs": 3_000_000,
+                    "performanceEpochMs": 0.0,
+                    "uncertaintyMs": 3.0,
+                })),
+            },
+            now(),
+        )
+        .unwrap();
+}
+
+/// A manual cue pressed at `performance_ms` declaring `movie` seconds.
+pub(crate) fn cue_event(f: &Fixture, event_id: &str, epoch: u64, performance_ms: f64, movie: f64) {
+    f.catalog
+        .review_sessions(0)
+        .record_event(
+            PROJECT,
+            &f.session_id,
+            &ReviewSessionEventRequest {
+                event_id: event_id.into(),
+                kind: ReviewSessionEventKind::ManualSyncCue,
+                audio_frame: (performance_ms * 48.0) as u64,
+                performance_ms: Some(performance_ms),
+                declared_movie_seconds: Some(movie),
+                detail: Some(serde_json::json!({"clockEpoch": epoch})),
+            },
+            now(),
+        )
+        .unwrap();
+}
+
+/// Transcribed fixture (utterances at ~1–4 s, ~6–9 s, ~12–15 s). With `cue`,
+/// the capture clock is calibrated and the reviewer marked movie 0 at
+/// recording 0.5 s and movie 5 at recording 5.5 s.
 fn workspace_fixture(cue: bool) -> (Fixture, String, ReviewDiscussions) {
     let f = fixture(false, true);
     if cue {
-        f.catalog
-            .review_sessions(0)
-            .record_event(
-                PROJECT,
-                &f.session_id,
-                &ReviewSessionEventRequest {
-                    event_id: "cue_first_frame".into(),
-                    kind: ReviewSessionEventKind::ManualSyncCue,
-                    audio_frame: 48_000,
-                    performance_ms: None,
-                    declared_movie_seconds: Some(0.0),
-                    detail: None,
-                },
-                now(),
-            )
-            .unwrap();
+        calibration_event(&f, "calibration_0", 0, 0);
+        cue_event(&f, "cue_first_frame", 0, 500.0, 0.0);
+        cue_event(&f, "cue_five", 0, 5500.0, 5.0);
     }
     let run_id = run(&f, &local(), &FakeRuntime::new()).run_id;
     let discussions = f.catalog.review_discussions();
@@ -59,33 +102,80 @@ fn item(kind: ItemKind, text: &str) -> NewDiscussionItem {
 }
 
 #[test]
-fn movie_time_is_estimated_from_the_manual_cue_with_honest_uncertainty_and_candidates() {
+fn movie_time_comes_from_the_shared_synchronizer_over_native_frames() {
     let (_f, run_id, discussions) = workspace_fixture(true);
     let workspace = discussions.workspace(PROJECT, &run_id).unwrap();
-    assert_eq!(workspace.sync.status, "provisional");
+    assert_eq!(workspace.sync.status, "mapped");
+    assert_eq!(workspace.sync.anchors, 2);
+    assert_eq!(workspace.sync.policy.max_extrapolation_seconds, 0.0);
     assert_eq!(workspace.revision_id, "editrev_synthetic");
     assert!(!workspace.coverage.audiovisual_review_attested);
+    // Between the two cues: estimated by the shared mapper, with its evidence.
     let first = &workspace.utterances[0];
+    // The utterance (~1–6 s) runs past the last cue at 5.5 s: its start is
+    // estimated, its tail unknown. Both slices are kept.
+    assert_eq!(first.sync.state, "mixed");
+    let slice = &first.sync.slices[0];
+    assert_eq!(
+        slice.state,
+        rcdvlog_core::tv_review_sync::SyncState::Estimated
+    );
+    assert_eq!(slice.recording.clock_id, "mic_epoch_0");
+    assert_eq!(slice.recording.start_sample, first.machine.start_frame);
+    let tail = first.sync.slices.last().unwrap();
+    assert_eq!(tail.state, rcdvlog_core::tv_review_sync::SyncState::Unknown);
+    assert_eq!(tail.recording.end_sample, first.machine.end_frame);
+    assert!(tail.candidate_operation_ids.is_empty());
     let estimate = first.movie_time.as_ref().unwrap();
-    assert_eq!(estimate.source, "manualCue");
-    assert!(estimate.movie_seconds > 0.0 && estimate.movie_seconds < 3.5);
-    assert!(estimate.uncertainty_seconds >= 0.75);
+    assert_eq!(estimate.source, "sharedSync:estimated");
+    assert!((estimate.movie_seconds - 0.5).abs() < 0.01);
+    assert!(estimate.uncertainty_seconds >= 0.25);
+    assert!(
+        estimate
+            .evidence_ids
+            .contains(&"cue_first_frame".to_string())
+            && estimate.evidence_ids.contains(&"cue_five".to_string())
+    );
     assert!(
         first
             .candidate_operation_ids
             .contains(&"editop_split_a".to_string())
     );
-    // 12 s on the recording is past the 6 s movie: unanchored, no candidates.
-    let late = &workspace.utterances[2];
-    assert!(late.movie_time.is_none());
-    assert!(late.candidate_operation_ids.is_empty());
+    // After the last cue there is no extrapolation: unknown, no candidates.
+    for late in &workspace.utterances[1..] {
+        assert_eq!(late.sync.state, "unknown");
+        assert!(late.movie_time.is_none());
+        assert!(late.candidate_operation_ids.is_empty());
+    }
 }
 
 #[test]
-fn without_any_sync_every_remark_is_unanchored() {
+fn without_calibration_synchronization_is_pending_even_with_a_cue() {
+    let f = fixture(false, true);
+    // A cue alone cannot place the recording clock: nothing is synthesized.
+    cue_event(&f, "cue_uncalibrated", 0, 500.0, 0.0);
+    let run_id = run(&f, &local(), &FakeRuntime::new()).run_id;
+    let workspace = f
+        .catalog
+        .review_discussions()
+        .workspace(PROJECT, &run_id)
+        .unwrap();
+    assert_eq!(workspace.sync.status, "pending");
+    assert!(
+        workspace
+            .utterances
+            .iter()
+            .all(|u| u.sync.state == "pending"
+                && u.movie_time.is_none()
+                && u.candidate_operation_ids.is_empty())
+    );
+}
+
+#[test]
+fn without_any_sync_every_remark_is_pending() {
     let (_f, run_id, discussions) = workspace_fixture(false);
     let workspace = discussions.workspace(PROJECT, &run_id).unwrap();
-    assert_eq!(workspace.sync.status, "unanchored");
+    assert_eq!(workspace.sync.status, "pending");
     assert!(
         workspace
             .utterances
