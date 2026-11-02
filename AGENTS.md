@@ -56,6 +56,11 @@ The implemented slice is intentionally smaller than the launch-critical list in 
 
 Implemented now:
 
+- Version-1 path-free TV review target export freshly verifies a full preview,
+  preserves measured movie PTS and declared independent audio, and supplies a
+  synthetic cloud fixture. Server import/UI and synchronization remain separate
+  work; see `docs/tv-review-handoff.md`.
+
 - One supported CLI now includes editing, review and upload against schema 66,
   with observational `doctor --workflow rough-cut|delivery` preflight. Sparse
   stable-ID patches, explicit source-inventory picture-usage reports and unused
