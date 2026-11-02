@@ -1,17 +1,14 @@
 // Drains one session's durable outbox (queued capture events, then audio
-// chunks in sequence order) to the server.
-// Transient failures back off and retry; the chunk stays on disk until the
-// server returns a receipt. Permanent refusals stop the drain and are surfaced,
-// never retried blindly. Identical retries are safe: the server treats them as
-// duplicates and returns the original receipt.
+// chunks in sequence order) to the server. Transient failures back off and
+// retry; the local row stays until the server returns a matching receipt.
+// Permanent refusals stop the drain and are surfaced, never retried blindly.
 import { ProjectClientError, type BrowserProjectClient } from "@rcdvlog/project-client";
-import type { ChunkOutbox } from "./outbox";
+import type { ChunkOutbox, OutboxEvent } from "./outbox";
 
 export interface UploadStatus {
   pendingChunks: number;
-  uploadedChunks: number;
-  /** Capture events (cues, clock samples...) queued locally but not yet acknowledged. */
   pendingEvents: number;
+  uploadedChunks: number;
   lastReceiptAt: string | null;
   retrying: boolean;
   /** Stable server code that stopped the drain, if any. */
@@ -20,6 +17,7 @@ export interface UploadStatus {
 
 const PERMANENT = new Set([
   "idempotency_conflict",
+  "review_session_receipt_mismatch",
   "review_session_chunk_conflict",
   "review_session_chunk_corrupt",
   "review_session_limit_exceeded",
@@ -36,10 +34,30 @@ export function isPermanentUploadError(error: unknown): boolean {
   return PERMANENT.has(error.code);
 }
 
+function eventRequest(event: OutboxEvent) {
+  return {
+    eventId: event.eventId,
+    kind: event.kind,
+    audioFrame: event.audioFrame,
+    performanceMs: event.performanceMs,
+    declaredMovieSeconds: event.declaredMovieSeconds,
+    detail: event.detail,
+  };
+}
+
+function sameEvent(left: OutboxEvent, receipt: Awaited<ReturnType<BrowserProjectClient["recordReviewSessionEvent"]>>): boolean {
+  return receipt.eventId === left.eventId
+    && receipt.kind === left.kind
+    && receipt.audioFrame === left.audioFrame
+    && receipt.performanceMs === (left.performanceMs ?? null)
+    && receipt.declaredMovieSeconds === (left.declaredMovieSeconds ?? null)
+    && JSON.stringify(receipt.detail ?? null) === JSON.stringify(left.detail ?? null);
+}
+
 export class ChunkUploader {
   private running: Promise<void> | null = null;
   private stopped = false;
-  status: UploadStatus = { pendingChunks: 0, uploadedChunks: 0, pendingEvents: 0, lastReceiptAt: null, retrying: false, blockedCode: null };
+  status: UploadStatus = { pendingChunks: 0, pendingEvents: 0, uploadedChunks: 0, lastReceiptAt: null, retrying: false, blockedCode: null };
 
   constructor(
     private readonly client: BrowserProjectClient,
@@ -74,14 +92,11 @@ export class ChunkUploader {
       try {
         if (events.length) {
           const event = events[0];
-          await this.client.recordReviewSessionEvent(this.projectId, this.sessionId, {
-            eventId: event.eventId,
-            kind: event.kind,
-            audioFrame: event.audioFrame,
-            performanceMs: event.performanceMs,
-            declaredMovieSeconds: event.declaredMovieSeconds,
-            detail: event.detail,
-          });
+          const receipt = await this.client.recordReviewSessionEvent(this.projectId, this.sessionId, eventRequest(event));
+          if (!sameEvent(event, receipt)) {
+            this.update({ blockedCode: "review_session_receipt_mismatch", retrying: false });
+            return;
+          }
           await this.outbox.deleteEvent(this.sessionId, event.eventId);
           delay = 500;
           this.update({ pendingEvents: events.length - 1, retrying: false });
@@ -95,8 +110,11 @@ export class ChunkUploader {
           sha256: chunk.sha256,
           captureEndMs: chunk.captureEndMs,
         }, chunk.bytes);
-        if (receipt.sha256 !== chunk.sha256 || receipt.sequence !== chunk.sequence) {
-          this.update({ blockedCode: "review_session_receipt_mismatch" });
+        if (receipt.sha256 !== chunk.sha256
+          || receipt.sequence !== chunk.sequence
+          || receipt.startFrame !== chunk.startFrame
+          || receipt.frameCount !== chunk.frameCount) {
+          this.update({ blockedCode: "review_session_receipt_mismatch", retrying: false });
           return;
         }
         await this.outbox.deleteChunk(this.sessionId, chunk.sequence);
