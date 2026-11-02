@@ -187,15 +187,27 @@ pub(crate) struct Fixture {
 
 /// 20 s recording: speech 1–4 s, 6–9 s, 12–15 s. `drop_second_chunk` loses 10–20 s.
 pub(crate) fn fixture(drop_second_chunk: bool, finalize: bool) -> Fixture {
+    fixture_for(drop_second_chunk, finalize, false)
+}
+
+/// As [`fixture`], against a historical rendered-artifact target when `historical`.
+pub(crate) fn fixture_for(drop_second_chunk: bool, finalize: bool, historical: bool) -> Fixture {
     let root = TempDir::new().unwrap();
     let catalog = catalog(&root);
-    let target_id = catalog
-        .review_targets()
-        .import(PROJECT, &request(valid()), &actor(), now())
-        .unwrap()
-        .review_target
-        .summary
-        .review_target_id;
+    let targets = catalog.review_targets();
+    let imported = if historical {
+        targets.import_historical(
+            PROJECT,
+            &crate::review_targets::tests::historical_request(
+                crate::review_targets::tests::historical_valid(),
+            ),
+            &actor(),
+            now(),
+        )
+    } else {
+        targets.import(PROJECT, &request(valid()), &actor(), now())
+    };
+    let target_id = imported.unwrap().review_target.summary.review_target_id;
     let sessions = catalog.review_sessions(0);
     let session = sessions
         .create(

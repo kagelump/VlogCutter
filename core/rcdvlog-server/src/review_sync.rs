@@ -15,7 +15,7 @@
 //! - Capture discontinuities, buffer overflows, device loss and page
 //!   interruptions become `captureInterrupted` boundaries.
 //! - The shared default policy applies (no single-anchor extrapolation).
-use rcdvlog_core::ReviewTargetHandoff;
+use crate::ReviewTargetEvidence;
 use rcdvlog_core::tv_review_sync::{
     CaptureClock, CapturePosition, SYNC_VERSION, SyncAnchor, SyncAnchorSource, SyncBoundary,
     SyncBoundaryKind, SyncPolicy, SyncQuery, SyncReport, SyncRequest, SyncSlice,
@@ -128,7 +128,7 @@ impl SessionSync {
     pub fn from_session(
         connection: &Connection,
         session_id: &str,
-        handoff: &ReviewTargetHandoff,
+        handoff: &ReviewTargetEvidence,
     ) -> anyhow::Result<Self> {
         let (sample_rate, final_frames): (u32, Option<i64>) = connection.query_row(
             "SELECT sample_rate, final_frame_count FROM review_sessions WHERE session_id=?1",
@@ -215,7 +215,7 @@ impl SessionSync {
                 .max(c.clock.first_sample);
         }
 
-        let movie = &handoff.target.movie;
+        let movie = &handoff.target().movie;
         let tps = movie.time_base_denominator as f64 / movie.time_base_numerator as f64;
         let movie_clock = rcdvlog_core::tv_review_sync::SyncMovieClock {
             movie_digest: movie.blake3.clone(),
@@ -325,7 +325,7 @@ impl SessionSync {
         let request = (!capture_clocks.is_empty()).then(|| SyncRequest {
             schema_version: SYNC_VERSION,
             session_id: session_id.to_string(),
-            target_digest: handoff.target_digest.clone(),
+            target_digest: handoff.target_digest().to_string(),
             movie: movie_clock,
             capture_clocks: capture_clocks.clone(),
             anchors: anchors.clone(),
@@ -369,7 +369,7 @@ impl SessionSync {
     pub fn map_intervals(
         &mut self,
         intervals: &[(u64, u64)],
-        handoff: &ReviewTargetHandoff,
+        handoff: &ReviewTargetEvidence,
     ) -> Vec<UtteranceSync> {
         let pending = || UtteranceSync {
             state: "pending".into(),
@@ -405,7 +405,7 @@ impl SessionSync {
         let mut slices: Vec<Vec<SyncSlice>> = vec![Vec::new(); intervals.len()];
         for batch in queries.chunks(MAX_QUERIES_PER_CALL) {
             let only: Vec<SyncQuery> = batch.iter().map(|(_, q)| q.clone()).collect();
-            let report: SyncReport = match request.map_to_cuts(&only, handoff, &|| false) {
+            let report: SyncReport = match handoff.map_to_cuts(request, &only, &|| false) {
                 Ok(report) => report,
                 Err(error) => {
                     self.description.status = "failed".into();

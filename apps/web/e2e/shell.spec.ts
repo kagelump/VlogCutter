@@ -1,7 +1,7 @@
 import { expect, test } from "@playwright/test";
 import { readFileSync } from "node:fs";
 
-import { bootstrapCodePath, reviewRunPath, reviewTargetHandoffPath } from "../../../scripts/lib/web-e2e-fixture.mjs";
+import { bootstrapCodePath, historicalReviewPath, reviewRunPath, reviewTargetHandoffPath } from "../../../scripts/lib/web-e2e-fixture.mjs";
 
 function bootstrapCode(index: number): string {
   const configured = process.env.RCDVLOG_E2E_BOOTSTRAP_CODES?.split(",")[index - 1]?.trim();
@@ -312,4 +312,36 @@ test("Chrome turns a two-reviewer transcript into grouped discussions with a ret
   expect(accepted[0].record.author).toBe("human");
   expect(report.feedback.some((f: { record: { observation: string } }) => f.record.observation === "Keep this shot longer.")).toBe(false);
   expect(report.coverage.audiovisualReviewAttested).toBe(false);
+});
+
+test("Chrome imports a historical rendered-artifact review only with an acknowledgement and keeps its weaker guarantees", async ({ page }) => {
+  const baseURL = process.env.RCDVLOG_WEB_E2E_BASE_URL;
+  if (!baseURL) throw new Error("web e2e: no RCDVLOG_WEB_E2E_BASE_URL");
+  const review = readFileSync(historicalReviewPath(baseURL), "utf8");
+  await page.goto("/");
+  await page.getByLabel("Bootstrap code").fill(bootstrapCode(8));
+  await page.getByRole("button", { name: "Open review desk" }).click();
+  await page.getByRole("link", { name: "TV review" }).click();
+  await page.locator(".project-list button").first().click();
+  await expect(page.getByRole("heading", { name: "Review targets" })).toBeVisible();
+
+  // The page detects the purpose discriminator and asks for the acknowledgement.
+  await page.getByLabel("Handoff JSON").fill(review);
+  await expect(page.getByRole("group", { name: "Historical rendered-artifact review" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Check handoff" })).toBeDisabled();
+  await page.getByRole("checkbox", { name: /already rendered movie only/ }).check();
+  await page.getByRole("button", { name: "Check handoff" }).click();
+  await expect(page.getByText("Ready to import as a new immutable historical target.")).toBeVisible();
+  await expect(page.getByText("Historical rendered artifact (integrity only)")).toBeVisible();
+  await expect(page.locator(".tv-checks li[data-status=warn]").filter({ hasText: "currentRenderability" })).toBeVisible();
+  await page.getByRole("button", { name: "Import historical target" }).click();
+
+  await expect(page.getByRole("heading", { name: "Revision editrev_historical" })).toBeVisible();
+  await expect(page.getByText("Historical artifact · integrity only")).toBeVisible();
+  await expect(page.getByRole("note")).toContainText("nothing here can render, edit, activate or upload it");
+  await expect(page.getByText("Current plan renderability was not established by this review", { exact: false })).toBeVisible();
+  // Recording is still allowed: discussing an already rendered movie is the point.
+  await expect(page.getByRole("button", { name: "Start voice review" })).toBeEnabled();
+  await page.getByRole("button", { name: "All targets" }).click();
+  await expect(page.locator(".tv-review-columns .project-list button").filter({ hasText: "editrev_historical" })).toContainText("Historical artifact · integrity only");
 });

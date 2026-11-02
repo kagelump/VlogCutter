@@ -32,10 +32,15 @@ export function parseYoutubeVideoId(input: string): string | null {
 }
 
 /** Accept the CLI success envelope or its `data` member; return the handoff. */
+/** A #232 historical rendered-artifact review, recognized by its purpose discriminator. */
+export function isHistoricalReview(handoff: Record<string, unknown>): boolean {
+  return handoff.purpose === "historicalRenderedArtifactReview";
+}
+
 export function unwrapHandoff(parsed: unknown): Record<string, unknown> | null {
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
   const record = parsed as Record<string, unknown>;
-  if (record.ok === true && record.command === "edit-plan.review-target-export" && record.data && typeof record.data === "object") {
+  if (record.ok === true && (record.command === "edit-plan.review-target-export" || record.command === "edit-plan.historical-review-target-export") && record.data && typeof record.data === "object") {
     return record.data as Record<string, unknown>;
   }
   return record;

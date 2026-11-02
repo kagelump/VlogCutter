@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 use crate::ConfigDiagnostics;
 
-pub const CONTROL_CATALOG_SCHEMA_VERSION: u32 = 16;
+pub const CONTROL_CATALOG_SCHEMA_VERSION: u32 = 17;
 pub const CONTROL_DATABASE_FILENAME: &str = "control.sqlite3";
 pub const INSTANCE_LOCK_FILENAME: &str = "server.lock";
 
@@ -117,6 +117,12 @@ pub const CONTROL_CATALOG_MIGRATIONS: &[SqliteMigration] = &[
         name: "tv_review_discussions",
         source_identity: "server-control/0016-tv-review-discussions/20261102",
         apply: crate::review_discussions::migrate,
+    },
+    SqliteMigration {
+        id: 17,
+        name: "tv_review_target_contract",
+        source_identity: "server-control/0017-tv-review-target-contract/20261102",
+        apply: crate::review_targets::migrate_contract,
     },
 ];
 

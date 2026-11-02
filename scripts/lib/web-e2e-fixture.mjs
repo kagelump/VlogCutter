@@ -33,6 +33,11 @@ export function reviewTargetHandoffPath(addressOrUrl) {
   return join(tmpdir(), `rcdvlog-web-e2e-review-target-${fixturePort(addressOrUrl)}.json`);
 }
 
+/** The synthetic #232 historical rendered-artifact review the seed writes for the run at that address. */
+export function historicalReviewPath(addressOrUrl) {
+  return join(tmpdir(), `rcdvlog-web-e2e-historical-review-${fixturePort(addressOrUrl)}.json`);
+}
+
 /** The web path of the seeded, transcribed voice review for the run at that address. */
 export function reviewRunPath(addressOrUrl) {
   return join(tmpdir(), `rcdvlog-web-e2e-review-run-${fixturePort(addressOrUrl)}.txt`);

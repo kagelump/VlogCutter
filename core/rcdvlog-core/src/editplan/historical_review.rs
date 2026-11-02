@@ -58,6 +58,15 @@ impl HistoricalRenderedArtifactReview {
         chrono::DateTime::parse_from_rfc3339(&self.verified_at)?;
         review_target::validate_snapshot(&self.target, &self.target_digest)
     }
+
+    /// Picture locators in the already rendered movie for a half-open elapsed
+    /// movie-time range. Same lookup as the strict handoff; it establishes
+    /// nothing about current renderability.
+    pub fn picture_candidates(&self, start_seconds: f64, end_seconds: f64) -> Result<Vec<String>> {
+        self.validate()?;
+        self.target
+            .picture_candidates_validated(start_seconds, end_seconds)
+    }
 }
 
 impl Catalog {

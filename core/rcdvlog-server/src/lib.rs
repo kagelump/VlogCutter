@@ -24,7 +24,8 @@ mod storage_path;
 
 pub use rcdvlog_core::review_speech;
 pub use rcdvlog_core::{
-    BindingVerificationStatus, Catalog, CatalogSchemaError, GlobalMediaVerificationState, JobId,
+    BindingVerificationStatus, Catalog, CatalogSchemaError, GlobalMediaVerificationState,
+    HistoricalRenderedArtifactReview, HistoricalReviewPurpose, HistoricalReviewUnresolved, JobId,
     MediaObjectId, NodeAvailabilityState, NodeId, PROJECT_CATALOG_SCHEMA_VERSION,
     ProjectAssetAddedPayload, ProjectAssetItem, ProjectAssetPage, ProjectId, RepresentationId,
     ReviewTargetHandoff, ReviewTargetSnapshot, RootAssociationConfirmation,
@@ -114,13 +115,16 @@ pub use review_sync::{
     CALIBRATION_SCHEMA, MANUAL_CUE_CONFIDENCE, MANUAL_CUE_MOVIE_UNCERTAINTY_SECONDS, SessionSync,
 };
 pub use review_targets::{
-    ArtifactAvailabilityAssertion, ArtifactAvailabilityState, ImportOutcome, PreflightOutcome,
+    ArtifactAvailabilityAssertion, ArtifactAvailabilityState, HISTORICAL_REVIEW_ACKNOWLEDGEMENT,
+    HISTORICAL_REVIEW_TARGET_LIMITATIONS, HistoricalIntegrityReceipt,
+    HistoricalReviewTargetImportRequest, ImportOutcome, PreflightOutcome,
     REVIEW_TARGET_LIMITATIONS, REVIEW_TARGET_LIST_MAX_LIMIT,
     REVIEW_TARGET_SERVER_MAX_VERIFICATION_AGE_SECONDS, ReviewTargetActor, ReviewTargetCandidates,
-    ReviewTargetCheck, ReviewTargetCheckStatus, ReviewTargetCutView, ReviewTargetDetail,
-    ReviewTargetImportRequest, ReviewTargetImportResult, ReviewTargetObservation, ReviewTargetPage,
-    ReviewTargetPreflight, ReviewTargetPreview, ReviewTargetReadiness, ReviewTargetServiceError,
-    ReviewTargetSummary, ReviewTargets, VerificationFreshness,
+    ReviewTargetCheck, ReviewTargetCheckStatus, ReviewTargetContract, ReviewTargetCutView,
+    ReviewTargetDetail, ReviewTargetEvidence, ReviewTargetImportRequest, ReviewTargetImportResult,
+    ReviewTargetObservation, ReviewTargetPage, ReviewTargetPreflight, ReviewTargetPreview,
+    ReviewTargetReadiness, ReviewTargetReceipt, ReviewTargetServiceError, ReviewTargetSummary,
+    ReviewTargets, VerificationFreshness,
 };
 pub use review_transcripts::{
     ModelDirSpeechRuntime, REVIEW_TRANSCRIBE_JOB_TYPE, REVIEW_TRANSCRIPT_SCHEMA,
