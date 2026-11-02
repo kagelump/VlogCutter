@@ -265,6 +265,9 @@ pub struct ReviewTargetObservation {
     pub availability_state: ArtifactAvailabilityState,
     pub availability_observed_at: String,
     pub availability_source: String,
+    /// Verification lifetime accepted with this observation. The strictest
+    /// lifetime ever accepted for a target governs its readiness.
+    pub max_verification_age_seconds: u32,
     pub recorded_at: String,
     pub recorded_by: ReviewTargetActor,
 }
@@ -360,6 +363,7 @@ pub struct ReviewTargets {
 /// Parsed and checked import, before it touches storage.
 struct Evaluated {
     handoff: ReviewTargetHandoff,
+    max_age: u32,
     binding_digest: String,
     availability: ArtifactAvailabilityAssertion,
     availability_source: &'static str,
@@ -434,12 +438,35 @@ fn freshness(verified_at: &str, now: DateTime<Utc>, max_age: u32) -> (Verificati
     (state, age)
 }
 
+/// Readiness from the whole observation history: the freshest receipt, the
+/// most recently observed availability, and the strictest accepted lifetime.
 fn readiness(
-    verified_at: &str,
-    availability: ArtifactAvailabilityState,
+    observations: &[ReviewTargetObservation],
     now: DateTime<Utc>,
 ) -> ReviewTargetReadiness {
-    let max = REVIEW_TARGET_SERVER_MAX_VERIFICATION_AGE_SECONDS;
+    let verified_at = observations
+        .iter()
+        .map(|o| o.verification.verified_at.as_str())
+        .max_by_key(|v| DateTime::parse_from_rfc3339(v).ok())
+        .unwrap_or_default();
+    // Ties go to the later record (observations are in insertion order within a receipt).
+    let availability = observations
+        .iter()
+        .enumerate()
+        .max_by_key(|(i, o)| {
+            (
+                DateTime::parse_from_rfc3339(&o.availability_observed_at).ok(),
+                *i,
+            )
+        })
+        .map(|(_, o)| o.availability_state)
+        .unwrap_or(ArtifactAvailabilityState::Unknown);
+    let max = observations
+        .iter()
+        .map(|o| o.max_verification_age_seconds)
+        .min()
+        .unwrap_or(REVIEW_TARGET_SERVER_MAX_VERIFICATION_AGE_SECONDS)
+        .min(REVIEW_TARGET_SERVER_MAX_VERIFICATION_AGE_SECONDS);
     let (fresh, age) = freshness(verified_at, now, max);
     let mut blockers = Vec::new();
     if fresh != VerificationFreshness::Fresh {
@@ -769,12 +796,14 @@ impl ReviewTargets {
                 .query_row(
                     "SELECT 1 FROM review_target_observations
                      WHERE review_target_id=?1 AND verified_at=?2
-                       AND availability_state=?3 AND availability_observed_at=?4",
+                       AND availability_state=?3 AND availability_observed_at=?4
+                       AND max_verification_age_seconds=?5",
                     params![
                         id,
                         handoff.verification.verified_at,
                         availability.state.as_str(),
-                        availability.observed_at
+                        availability.observed_at,
+                        max_age
                     ],
                     |_| Ok(()),
                 )
@@ -788,12 +817,22 @@ impl ReviewTargets {
         } else {
             PreflightOutcome::New
         };
-        let evaluated = (!failed).then_some(Evaluated {
-            handoff,
-            binding_digest: binding,
-            availability,
-            availability_source,
-        });
+        // An adverse availability report on an already-imported target is
+        // still evidence: it is retained (and blocks new sessions) even
+        // though the import itself is refused.
+        let only_availability_failed = report
+            .checks
+            .iter()
+            .filter(|c| c.status == ReviewTargetCheckStatus::Fail)
+            .all(|c| c.code == Some("review_target_artifact_unavailable"));
+        let evaluated =
+            (!failed || (only_availability_failed && existing.is_some())).then_some(Evaluated {
+                handoff,
+                max_age,
+                binding_digest: binding,
+                availability,
+                availability_source,
+            });
         Ok((report, evaluated))
     }
 
@@ -810,13 +849,26 @@ impl ReviewTargets {
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         Self::project_registered(&tx, project_id)?;
         let (report, evaluated) = Self::evaluate(&tx, project_id, request, now)?;
-        let Some(evaluated) = evaluated else {
-            let code = report.first_failure().unwrap_or("review_target_invalid");
+        if let Some(code) = report.first_failure() {
+            if let (Some(adverse), Some(id)) = (&evaluated, &report.existing_review_target_id) {
+                insert_observation(
+                    &tx,
+                    id,
+                    &adverse.handoff.verification,
+                    &adverse.availability,
+                    adverse.availability_source,
+                    adverse.max_age,
+                    actor,
+                    now,
+                )?;
+                tx.commit()?;
+            }
             return Err(ReviewTargetServiceError::Rejected {
                 code,
                 preflight: Box::new(report),
             });
-        };
+        }
+        let evaluated = evaluated.context("evaluated import")?;
         let declared_issuer = validate_declared_issuer(request.declared_issuer.as_deref())
             .map_err(ReviewTargetServiceError::InvalidInput)?;
         let (review_target_id, outcome) = match report.existing_review_target_id.clone() {
@@ -827,6 +879,7 @@ impl ReviewTargets {
                     &evaluated.handoff.verification,
                     &evaluated.availability,
                     evaluated.availability_source,
+                    evaluated.max_age,
                     actor,
                     now,
                 )?;
@@ -861,6 +914,7 @@ impl ReviewTargets {
                     &evaluated.handoff.verification,
                     &evaluated.availability,
                     evaluated.availability_source,
+                    evaluated.max_age,
                     actor,
                     now,
                 )?;
@@ -899,8 +953,15 @@ impl ReviewTargets {
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         Self::project_registered(&tx, project_id)?;
         let stored = load_stored(&tx, project_id, review_target_id)?;
-        let latest = load_observations(&tx, review_target_id)?
-            .pop()
+        let parent_observations = load_observations(&tx, review_target_id)?;
+        let parent_policy = parent_observations
+            .iter()
+            .map(|o| o.max_verification_age_seconds)
+            .min()
+            .unwrap_or(REVIEW_TARGET_SERVER_MAX_VERIFICATION_AGE_SECONDS);
+        let latest = parent_observations
+            .last()
+            .cloned()
             .context("review target has no verification observation")?;
         let mut target = stored.snapshot.clone();
         target.youtube_video_id = youtube_video_id.map(str::to_string);
@@ -940,6 +1001,7 @@ impl ReviewTargets {
                         observed_at: latest.availability_observed_at.clone(),
                     },
                     "carriedFromParentTarget",
+                    parent_policy,
                     actor,
                     now,
                 )?;
@@ -1105,12 +1167,14 @@ fn insert_target(
 }
 
 /// Returns false when the identical observation is already stored.
+#[allow(clippy::too_many_arguments)]
 fn insert_observation(
     tx: &Transaction<'_>,
     review_target_id: &str,
     verification: &ReviewTargetVerification,
     availability: &ArtifactAvailabilityAssertion,
     availability_source: &str,
+    max_age: u32,
     actor: &ReviewTargetActor,
     now: DateTime<Utc>,
 ) -> Result<bool, ReviewTargetServiceError> {
@@ -1118,9 +1182,9 @@ fn insert_observation(
         "INSERT INTO review_target_observations(
             observation_id, review_target_id, verified_at, verification_json,
             availability_state, availability_observed_at, availability_source,
-            recorded_at, actor_type, actor_id)
-         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
-         ON CONFLICT(review_target_id, verified_at, availability_state, availability_observed_at)
+            recorded_at, actor_type, actor_id, max_verification_age_seconds)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
+         ON CONFLICT(review_target_id, verified_at, availability_state, availability_observed_at, max_verification_age_seconds)
          DO NOTHING",
         params![
             format!("rtobs_{}", Uuid::new_v4().simple()),
@@ -1133,6 +1197,7 @@ fn insert_observation(
             timestamp(now),
             actor.actor_type,
             actor.actor_id,
+            max_age,
         ],
     )?;
     Ok(changed == 1)
@@ -1189,7 +1254,7 @@ fn load_observations(
 ) -> Result<Vec<ReviewTargetObservation>, ReviewTargetServiceError> {
     let mut statement = connection.prepare(
         "SELECT observation_id, verification_json, availability_state, availability_observed_at,
-                availability_source, recorded_at, actor_type, actor_id
+                availability_source, recorded_at, actor_type, actor_id, max_verification_age_seconds
          FROM review_target_observations WHERE review_target_id=?1
          ORDER BY verified_at, sequence",
     )?;
@@ -1204,12 +1269,14 @@ fn load_observations(
                 row.get::<_, String>(5)?,
                 row.get::<_, String>(6)?,
                 row.get::<_, String>(7)?,
+                row.get::<_, u32>(8)?,
             ))
         })?
         .collect::<Result<Vec<_>, _>>()?;
     rows.into_iter()
         .map(|row| {
             Ok(ReviewTargetObservation {
+                max_verification_age_seconds: row.8,
                 observation_id: row.0,
                 verification: serde_json::from_str(&row.1).context("decode stored verification")?,
                 availability_state: ArtifactAvailabilityState::parse(&row.2),
@@ -1284,11 +1351,7 @@ fn load_detail(
         },
         imported_at: stored.imported_at.clone(),
         latest_verified_at: latest.verification.verified_at.clone(),
-        readiness: readiness(
-            &latest.verification.verified_at,
-            latest.availability_state,
-            now,
-        ),
+        readiness: readiness(&observations, now),
     };
     Ok(ReviewTargetDetail {
         summary,
@@ -1353,10 +1416,11 @@ pub(crate) fn migrate(tx: &Transaction<'_>) -> anyhow::Result<()> {
             availability_state TEXT NOT NULL CHECK(availability_state IN ('unknown','present','missing','modified')),
             availability_observed_at TEXT NOT NULL,
             availability_source TEXT NOT NULL CHECK(availability_source IN ('exportVerification','importerAssertion','carriedFromParentTarget')),
+            max_verification_age_seconds INTEGER NOT NULL CHECK(max_verification_age_seconds > 0),
             recorded_at TEXT NOT NULL,
             actor_type TEXT NOT NULL,
             actor_id TEXT NOT NULL,
-            UNIQUE(review_target_id, verified_at, availability_state, availability_observed_at)
+            UNIQUE(review_target_id, verified_at, availability_state, availability_observed_at, max_verification_age_seconds)
         );
         "#,
     )?;

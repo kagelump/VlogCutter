@@ -174,13 +174,18 @@ Policy decisions, recorded here so later owners do not re-derive them:
 
 - **Freshness.** New imports and new sessions require a receipt at most
   `REVIEW_TARGET_SERVER_MAX_VERIFICATION_AGE_SECONDS` (7 days) old. A caller may
-  request a stricter lifetime, never a longer one. An imported target that
-  later goes stale keeps all evidence; its readiness reports
+  request a stricter lifetime, never a longer one. The accepted lifetime is
+  stored with each observation, and readiness uses the **strictest lifetime
+  ever accepted** for the target. A YouTube rebind inherits it. An imported
+  target that later goes stale keeps all evidence; its readiness reports
   `review_target_verification_expired` as a blocker.
 - **Availability.** Absent an explicit assertion, the server records `present`
   at `verifiedAt` with source `exportVerification` (the exporter refuses
   missing/modified bytes). `unknown`, `missing` or `modified` blocks import
-  with `review_target_artifact_unavailable`.
+  with `review_target_artifact_unavailable`. If the same target was already
+  imported, that adverse report is still **retained as an observation**. The
+  most recently observed availability governs readiness, so the target stops
+  being ready for new sessions until a later `present` observation.
 - **Identity.** Dedup is `(projectId, targetDigest)`. A *binding digest* — the
   same Rust digest with the YouTube ID cleared — detects reuse of
   `(projectId, viewedArtifactId)` with different movie bytes, plan, revision or

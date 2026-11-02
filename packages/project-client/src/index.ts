@@ -325,6 +325,7 @@ export interface ReviewTargetDetail extends ReviewTargetSummary {
     availabilityState: ArtifactAvailabilityState;
     availabilityObservedAt: string;
     availabilitySource: "exportVerification" | "importerAssertion" | "carriedFromParentTarget";
+    maxVerificationAgeSeconds: number;
     recordedAt: string;
     recordedBy: ReviewTargetActor;
   }>;
