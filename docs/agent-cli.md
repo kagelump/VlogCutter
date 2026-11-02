@@ -1292,3 +1292,5 @@ handoff in the normal success envelope, command `edit-plan.review-target-export`
 It copies/uploads no media and writes no edit-plan or feedback operation.
 See [TV review handoff v1](tv-review-handoff.md) for the fixture, clock precision,
 import trust/freshness boundary and canonical feedback reconciliation.
+
+`tv-review sync-preview --input <file>` performs bounded catalog-free recording-clock mapping without writes. See [shared timing contract](tv-review-sync.md).

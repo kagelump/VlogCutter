@@ -1,0 +1,71 @@
+{
+  "request": {
+    "schemaVersion": 1,
+    "sessionId": "session_synthetic",
+    "targetDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "movie": {
+      "movieDigest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "timeBaseNumerator": 1,
+      "timeBaseDenominator": 90000,
+      "originPts": 90000,
+      "durationPts": 9000000
+    },
+    "captureClocks": [
+      {
+        "clockId": "mic",
+        "sampleRate": 48000,
+        "firstSample": 0,
+        "lastSample": 5760000,
+        "monotonicOriginNs": 3000000000,
+        "monotonicToleranceNs": 2000000
+      }
+    ],
+    "anchors": [
+      {
+        "evidenceId": "start",
+        "capture": {
+          "clockId": "mic",
+          "sampleIndex": 96000,
+          "monotonicNs": 5000000000
+        },
+        "moviePts": 990000,
+        "source": "manualCue",
+        "confidence": 0.99,
+        "movieUncertaintyTicks": 900,
+        "captureUncertaintySamples": 240,
+        "candidateGroupId": null
+      },
+      {
+        "evidenceId": "later",
+        "capture": {
+          "clockId": "mic",
+          "sampleIndex": 576000,
+          "monotonicNs": 15000000000
+        },
+        "moviePts": 1890900,
+        "source": "manualCue",
+        "confidence": 0.99,
+        "movieUncertaintyTicks": 900,
+        "captureUncertaintySamples": 240,
+        "candidateGroupId": null
+      }
+    ],
+    "boundaries": [],
+    "policy": {
+      "minimumConfidence": 0.8,
+      "maxAnchorGapSeconds": 15,
+      "maxExtrapolationSeconds": 5,
+      "maxDriftPpm": 2000,
+      "residualToleranceSeconds": 0.1,
+      "unobservedUncertaintyPpm": 5000
+    }
+  },
+  "queries": [
+    {
+      "clockId": "mic",
+      "startSample": 144000,
+      "endSample": 192000
+    }
+  ],
+  "target": null
+}
