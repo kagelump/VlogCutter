@@ -45,13 +45,27 @@ function eventRequest(event: OutboxEvent) {
   };
 }
 
-function sameEvent(left: OutboxEvent, receipt: Awaited<ReturnType<BrowserProjectClient["recordReviewSessionEvent"]>>): boolean {
+/**
+ * Key-order-independent JSON for comparing a stored detail with its receipt:
+ * the server re-serializes `detail` with sorted object keys, so insertion
+ * order is not part of an event's identity.
+ */
+export function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    return `{${Object.keys(record).filter((key) => record[key] !== undefined).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(record[key])}`).join(",")}}`;
+  }
+  return JSON.stringify(value ?? null);
+}
+
+export function sameEvent(left: OutboxEvent, receipt: Awaited<ReturnType<BrowserProjectClient["recordReviewSessionEvent"]>>): boolean {
   return receipt.eventId === left.eventId
     && receipt.kind === left.kind
     && receipt.audioFrame === left.audioFrame
     && receipt.performanceMs === (left.performanceMs ?? null)
     && receipt.declaredMovieSeconds === (left.declaredMovieSeconds ?? null)
-    && JSON.stringify(receipt.detail ?? null) === JSON.stringify(left.detail ?? null);
+    && canonicalJson(receipt.detail ?? null) === canonicalJson(left.detail ?? null);
 }
 
 export class ChunkUploader {
