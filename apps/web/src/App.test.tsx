@@ -99,6 +99,15 @@ function client(session: SessionState): BrowserProjectClient {
     listReviewTranscriptions: vi.fn().mockResolvedValue({ items: [] }),
     getReviewTranscription: vi.fn(),
     cancelReviewTranscription: vi.fn(),
+    getReviewWorkspace: vi.fn(),
+    getReviewReport: vi.fn(),
+    reviewReportUrl: vi.fn().mockReturnValue("/report"),
+    proposeReviewDiscussions: vi.fn(),
+    createReviewDiscussion: vi.fn(),
+    correctReviewUtterance: vi.fn(),
+    updateReviewDiscussion: vi.fn(),
+    addReviewDiscussionItem: vi.fn(),
+    reconcileReviewDiscussionItem: vi.fn(),
   };
 }
 

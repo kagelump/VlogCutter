@@ -76,6 +76,14 @@ export const API_PATHS = {
   reviewTranscriptionPreflight: "/api/v1/projects/{projectId}/review-sessions/{sessionId}/transcriptions/preflight",
   reviewTranscription: "/api/v1/projects/{projectId}/review-transcriptions/{runId}",
   reviewTranscriptionCancel: "/api/v1/projects/{projectId}/review-transcriptions/{runId}/cancel",
+  reviewWorkspace: "/api/v1/projects/{projectId}/review-transcriptions/{runId}/review",
+  reviewReport: "/api/v1/projects/{projectId}/review-transcriptions/{runId}/report",
+  reviewDiscussionsPropose: "/api/v1/projects/{projectId}/review-transcriptions/{runId}/discussions/propose",
+  reviewDiscussions: "/api/v1/projects/{projectId}/review-transcriptions/{runId}/discussions",
+  reviewUtteranceCorrections: "/api/v1/projects/{projectId}/review-transcriptions/{runId}/utterances/{utteranceId}/corrections",
+  reviewDiscussion: "/api/v1/projects/{projectId}/review-discussions/{discussionId}",
+  reviewDiscussionItems: "/api/v1/projects/{projectId}/review-discussions/{discussionId}/items",
+  reviewItemReconciliation: "/api/v1/projects/{projectId}/review-discussion-items/{itemId}/reconciliation",
 } as const;
 `;
 const schemaPath = resolve(root, "packages/project-client/openapi.json");

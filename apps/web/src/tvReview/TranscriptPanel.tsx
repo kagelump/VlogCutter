@@ -66,7 +66,7 @@ export function UtteranceRow({ utterance, showRaw }: { utterance: ReviewUtteranc
   </li>;
 }
 
-export function TranscriptPanel({ client, projectId, sessionId, sessionState, pollMs = 2000 }: { client: BrowserProjectClient; projectId: string; sessionId: string; sessionState: string; pollMs?: number }) {
+export function TranscriptPanel({ client, projectId, sessionId, sessionState, pollMs = 2000, onOpenReview }: { client: BrowserProjectClient; projectId: string; sessionId: string; sessionState: string; pollMs?: number; onOpenReview?: (runId: string) => void }) {
   const [backend, setBackend] = useState<"local" | "openrouter">("local");
   const [budget, setBudget] = useState("0.50");
   const [acknowledged, setAcknowledged] = useState(false);
@@ -139,6 +139,7 @@ export function TranscriptPanel({ client, projectId, sessionId, sessionState, po
     {latest ? <div className="tv-run">
       <div className="tv-heading-actions">{stateBadge(latest)}<span className="help">{latest.provider} · {latest.model} · attempt {latest.attemptCount}</span>
         {active ? <button className="secondary" onClick={() => void cancel(active.runId)}>Cancel</button> : null}
+        {onOpenReview && latest.utterances.length ? <button onClick={() => onOpenReview(latest.runId)}>Open editorial review</button> : null}
         <label className="tv-raw-toggle"><input type="checkbox" checked={showRaw} onChange={(event) => setShowRaw(event.target.checked)} /> Show raw text</label></div>
       {latest.errorCode ? <p className="inline-error">{copy(latest.errorCode)}</p> : null}
       {latest.spend.dispatchedWindows || latest.spend.authorizedMaxUsd !== null ? <p className="help">Spend: ${latest.spend.knownCostUsd.toFixed(4)} reported{latest.spend.unknownCostWindows ? `, ${latest.spend.unknownCostWindows} request(s) with unknown cost (held at $${latest.spend.reservedUsd.toFixed(4)})` : ""}{latest.spend.authorizedMaxUsd !== null ? ` of $${latest.spend.authorizedMaxUsd.toFixed(2)} authorized` : ""}.</p> : null}

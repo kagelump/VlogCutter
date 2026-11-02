@@ -32,3 +32,8 @@ export function bootstrapCodePath(addressOrUrl, index) {
 export function reviewTargetHandoffPath(addressOrUrl) {
   return join(tmpdir(), `rcdvlog-web-e2e-review-target-${fixturePort(addressOrUrl)}.json`);
 }
+
+/** The web path of the seeded, transcribed voice review for the run at that address. */
+export function reviewRunPath(addressOrUrl) {
+  return join(tmpdir(), `rcdvlog-web-e2e-review-run-${fixturePort(addressOrUrl)}.txt`);
+}

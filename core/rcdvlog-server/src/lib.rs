@@ -12,7 +12,9 @@ pub mod library_query;
 mod media_facts;
 mod replicas;
 mod representations;
+mod review_discussions;
 mod review_sessions;
+mod review_sync;
 mod review_targets;
 mod review_transcripts;
 mod scan;
@@ -20,6 +22,7 @@ pub mod scan_handler;
 mod search_index;
 mod storage_path;
 
+pub use rcdvlog_core::review_speech;
 pub use rcdvlog_core::{
     BindingVerificationStatus, Catalog, CatalogSchemaError, GlobalMediaVerificationState, JobId,
     MediaObjectId, NodeAvailabilityState, NodeId, PROJECT_CATALOG_SCHEMA_VERSION,
@@ -93,6 +96,11 @@ pub use representations::{
     RepresentationKind, RepresentationNeed, RepresentationRequest, RepresentationRequestResult,
     RepresentationService, RepresentationState, ServerJobHandler, THUMBNAIL_RECIPE_KEY,
 };
+pub use review_discussions::{
+    AuthorKind, DecisionAction, Discussion, DiscussionItem, ItemKind, MovieTimeEstimate,
+    NewDiscussionItem, REVIEW_REPORT_SCHEMA, ReviewActor, ReviewDiscussionError, ReviewDiscussions,
+    ReviewWorkspace, SyncDescription, UtteranceSync, WorkspaceUtterance,
+};
 pub use review_sessions::{
     ChunkReceipt, ChunkUpload, CreateReviewSessionRequest, FinalizeReviewSessionRequest,
     FrameRange, REVIEW_SESSION_LIST_MAX_LIMIT, REVIEW_SESSION_MAX_ACTIVE, REVIEW_SESSION_MAX_BYTES,
@@ -101,6 +109,9 @@ pub use review_sessions::{
     ReviewSessionDetail, ReviewSessionError, ReviewSessionEvent, ReviewSessionEventKind,
     ReviewSessionEventRequest, ReviewSessionPage, ReviewSessionState, ReviewSessionSummary,
     ReviewSessions, wav_header,
+};
+pub use review_sync::{
+    CALIBRATION_SCHEMA, MANUAL_CUE_CONFIDENCE, MANUAL_CUE_MOVIE_UNCERTAINTY_SECONDS, SessionSync,
 };
 pub use review_targets::{
     ArtifactAvailabilityAssertion, ArtifactAvailabilityState, ImportOutcome, PreflightOutcome,

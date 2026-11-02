@@ -381,6 +381,25 @@
         ],
         "type": "object"
       },
+      "CreateReviewDiscussionRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "title": {
+            "type": "string"
+          },
+          "utteranceIds": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "title",
+          "utteranceIds"
+        ],
+        "type": "object"
+      },
       "CreateReviewSessionRequest": {
         "additionalProperties": false,
         "properties": {
@@ -775,6 +794,80 @@
         ],
         "type": "object"
       },
+      "NewReviewDiscussionItem": {
+        "additionalProperties": false,
+        "properties": {
+          "authorKind": {
+            "enum": [
+              "human",
+              "agent"
+            ],
+            "type": "string"
+          },
+          "category": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "change": {
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "decision": {
+            "enum": [
+              "accepted",
+              "declined",
+              "deferred",
+              null
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "kind": {
+            "enum": [
+              "observation",
+              "candidateEdit",
+              "speakerClaim",
+              "retraction",
+              "note",
+              "decision"
+            ],
+            "type": "string"
+          },
+          "quoteUtteranceIds": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "refersToItemId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "speaker": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "text": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "authorKind",
+          "text"
+        ],
+        "type": "object"
+      },
       "NodeAvailabilityState": {
         "enum": [
           "known",
@@ -1091,6 +1184,10 @@
         ],
         "type": "object"
       },
+      "ReviewDiscussionItem": {
+        "additionalProperties": true,
+        "type": "object"
+      },
       "ReviewMutationResult": {
         "properties": {
           "asset": {
@@ -1104,6 +1201,22 @@
           "asset",
           "staleBaseRevision"
         ],
+        "type": "object"
+      },
+      "ReviewReconciliationRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "canonicalNoteId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "canonicalNoteId"
+        ],
+        "type": "object"
+      },
+      "ReviewReport": {
+        "additionalProperties": true,
         "type": "object"
       },
       "ReviewRepresentation": {
@@ -1494,6 +1607,37 @@
         "additionalProperties": true,
         "type": "object"
       },
+      "ReviewUtteranceCorrection": {
+        "additionalProperties": false,
+        "properties": {
+          "field": {
+            "enum": [
+              "text",
+              "speaker",
+              "language",
+              "movieTime",
+              "excluded"
+            ],
+            "type": "string"
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "value": {}
+        },
+        "required": [
+          "field",
+          "value"
+        ],
+        "type": "object"
+      },
+      "ReviewWorkspace": {
+        "additionalProperties": true,
+        "type": "object"
+      },
       "RotationMutationRequest": {
         "properties": {
           "baseRevision": {
@@ -1628,6 +1772,38 @@
           "completedGenerationId",
           "completedGenerationSequence"
         ],
+        "type": "object"
+      },
+      "UpdateReviewDiscussionRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "state": {
+            "enum": [
+              "open",
+              "resolved",
+              "deferred"
+            ],
+            "type": "string"
+          },
+          "targetOperationId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "title": {
+            "type": "string"
+          },
+          "unanchored": {
+            "type": "boolean"
+          },
+          "utteranceIds": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
         "type": "object"
       },
       "Version": {
@@ -2798,6 +2974,179 @@
         }
       }
     },
+    "/api/v1/projects/{projectId}/review-discussion-items/{itemId}/reconciliation": {
+      "post": {
+        "description": "Record the owning catalog's note ID for an exported item; a different ID is a 409.",
+        "operationId": "reconcileReviewDiscussionItem",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "projectId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "itemId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReviewReconciliationRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReviewDiscussionItem"
+                }
+              }
+            },
+            "description": "ReviewDiscussionItem"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/v1/projects/{projectId}/review-discussions/{discussionId}": {
+      "patch": {
+        "operationId": "updateReviewDiscussion",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "projectId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "discussionId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateReviewDiscussionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReviewWorkspace"
+                }
+              }
+            },
+            "description": "ReviewWorkspace"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/v1/projects/{projectId}/review-discussions/{discussionId}/items": {
+      "post": {
+        "description": "Append an observation, candidate edit, speaker claim, retraction, note or (human only) decision.",
+        "operationId": "addReviewDiscussionItem",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "projectId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "discussionId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NewReviewDiscussionItem"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReviewWorkspace"
+                }
+              }
+            },
+            "description": "ReviewWorkspace"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
     "/api/v1/projects/{projectId}/review-sessions": {
       "get": {
         "operationId": "listReviewSessions",
@@ -3809,6 +4158,270 @@
             "description": "ReviewTranscriptionRun"
           },
           "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/v1/projects/{projectId}/review-transcriptions/{runId}/discussions": {
+      "post": {
+        "operationId": "createReviewDiscussion",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "projectId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "runId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateReviewDiscussionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReviewWorkspace"
+                }
+              }
+            },
+            "description": "ReviewWorkspace"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/v1/projects/{projectId}/review-transcriptions/{runId}/discussions/propose": {
+      "post": {
+        "operationId": "proposeReviewDiscussions",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "projectId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "runId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReviewWorkspace"
+                }
+              }
+            },
+            "description": "ReviewWorkspace"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/v1/projects/{projectId}/review-transcriptions/{runId}/report": {
+      "get": {
+        "description": "Deterministic review-report.v1 for a fresh agent, with core-compatible RecordReviewNoteRequest exports.",
+        "operationId": "getReviewReport",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "projectId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "runId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReviewReport"
+                }
+              }
+            },
+            "description": "ReviewReport"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/v1/projects/{projectId}/review-transcriptions/{runId}/review": {
+      "get": {
+        "operationId": "getReviewWorkspace",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "projectId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "runId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReviewWorkspace"
+                }
+              }
+            },
+            "description": "ReviewWorkspace"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/v1/projects/{projectId}/review-transcriptions/{runId}/utterances/{utteranceId}/corrections": {
+      "post": {
+        "operationId": "correctReviewUtterance",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "projectId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "runId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "utteranceId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReviewUtteranceCorrection"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReviewWorkspace"
+                }
+              }
+            },
+            "description": "ReviewWorkspace"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
             "$ref": "#/components/responses/Error"
           }
         }

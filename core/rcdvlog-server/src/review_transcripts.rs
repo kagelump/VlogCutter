@@ -2008,4 +2008,4 @@ pub(crate) fn migrate(tx: &rusqlite::Transaction<'_>) -> anyhow::Result<()> {
 
 #[cfg(test)]
 #[path = "review_transcripts_tests.rs"]
-mod tests;
+pub(crate) mod tests;

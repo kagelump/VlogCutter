@@ -286,3 +286,21 @@ button.danger { background: #f08a7e; border-color: #f08a7e; }
 .tv-raw { color: var(--muted); margin-left: 6px; }
 .tv-flags { grid-column: 4; color: var(--muted); font-size: 11px; }
 @media (max-width: 700px) { .tv-utterance { grid-template-columns: 1fr; } .tv-flags { grid-column: 1; } }
+
+/* Editorial review workspace (#225) */
+.tv-discussion { border: 1px solid var(--line); border-radius: 6px; padding: 14px 16px; margin-bottom: 14px; display: grid; gap: 10px; }
+.tv-discussion header { display: grid; gap: 2px; }
+.tv-discussion h3 { margin: 0; font-size: 15px; }
+.tv-quotes { margin: 0; padding-left: 18px; color: var(--muted); font-size: 13px; display: grid; gap: 3px; }
+.tv-target label { display: grid; gap: 4px; font-size: 12px; color: var(--muted); }
+.tv-items { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; }
+.tv-item { display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: center; font-size: 13px; }
+.tv-item-retracted > span { text-decoration: line-through; color: var(--muted); }
+.tv-item-form { display: flex; flex-wrap: wrap; gap: 6px; }
+.tv-item-form input { flex: 1 1 180px; min-width: 0; }
+.tv-filters { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
+.tv-inline { display: inline-flex; gap: 4px; margin: 0 6px; }
+.link-button { background: none; border: 0; color: var(--cyan); padding: 0 4px; font-weight: 500; font-size: 11px; cursor: pointer; }
+.secondary-link { background: transparent; color: var(--cyan); }
+.tv-speaker-select select { font-size: 12px; padding: 2px; }
+.visually-hidden { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }

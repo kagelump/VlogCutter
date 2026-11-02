@@ -520,6 +520,112 @@ export interface ReviewTranscriptionRun {
   limitations: string[];
 }
 
+// Editorial review workspace (#225). Mirrors rcdvlog-server-core::review_discussions.
+export type DiscussionItemKind = "observation" | "candidateEdit" | "speakerClaim" | "retraction" | "note" | "decision";
+export type DecisionAction = "accepted" | "declined" | "deferred";
+
+/** Utterance-start locator: a human declaration or the shared synchronizer's first slice. */
+export interface MovieTimeEstimate { movieSeconds: number; uncertaintySeconds: number; source: string; evidenceIds: string[] }
+
+/** One slice of the shared synchronizer (`rcdvlog_core::tv_review_sync`) result. */
+export interface SyncSlice {
+  recording: { clockId: string; startSample: number; endSample: number };
+  state: "anchored" | "estimated" | "conflicting" | "unknown";
+  candidates: Array<{ startPts: number; endPts: number; lowerPts: number; upperPts: number; uncertaintyTicks: number; confidence: number; evidenceIds: string[]; measuredDriftPpm: number | null }>;
+  diagnostics: string[];
+  candidateOperationIds: string[];
+}
+
+export interface UtteranceSync { state: "anchored" | "estimated" | "conflicting" | "unknown" | "mixed" | "pending"; slices: SyncSlice[]; uncoveredFrames: number }
+
+export interface ReviewSyncDescription {
+  status: "pending" | "noAnchors" | "mapped" | "failed";
+  source: string;
+  note: string;
+  calibratedClocks: number;
+  anchors: number;
+  boundaries: number;
+  policy: { minimumConfidence: number; maxAnchorGapSeconds: number; maxExtrapolationSeconds: number; maxDriftPpm: number; residualToleranceSeconds: number; unobservedUncertaintyPpm: number };
+  diagnostics: string[];
+}
+
+export interface WorkspaceUtterance {
+  machine: ReviewUtterance;
+  text: string;
+  displayText: string;
+  speaker: string;
+  language: string;
+  excluded: boolean;
+  movieTime: MovieTimeEstimate | null;
+  sync: UtteranceSync;
+  candidateOperationIds: string[];
+  referenceHint: string | null;
+  corrections: Array<{ correctionId: string; field: string; value: unknown; reason: string | null; actor: ReviewTargetActor; createdAt: string }>;
+}
+
+export interface DiscussionItem {
+  itemId: string;
+  kind: DiscussionItemKind;
+  authorKind: "human" | "agent";
+  provisional: boolean;
+  actor: ReviewTargetActor;
+  text: string;
+  speaker: string | null;
+  quoteUtteranceIds: string[];
+  category: string | null;
+  change: Record<string, unknown> | null;
+  decision: DecisionAction | null;
+  refersToItemId: string | null;
+  status: "open" | "accepted" | "declined" | "deferred" | "retracted";
+  createdAt: string;
+  canonicalNoteId: string | null;
+}
+
+export interface Discussion {
+  discussionId: string;
+  title: string;
+  groupingSource: "heuristic" | "human";
+  state: "open" | "resolved" | "deferred";
+  utteranceIds: string[];
+  startRecordingSeconds: number | null;
+  endRecordingSeconds: number | null;
+  languages: string[];
+  speakers: string[];
+  candidateOperationIds: string[];
+  targetOperationId: string | null;
+  targetSource: string | null;
+  unanchored: boolean;
+  items: DiscussionItem[];
+  updatedAt: string;
+}
+
+export interface ReviewWorkspace {
+  runId: string;
+  sessionId: string;
+  projectId: string;
+  reviewTargetId: string;
+  revisionId: string;
+  viewedArtifactId: string;
+  targetDigest: string;
+  sync: ReviewSyncDescription;
+  cuts: Array<{ operationId: string; position: number; assetId: string; movieInSeconds: number; movieOutSeconds: number }>;
+  utterances: WorkspaceUtterance[];
+  discussions: Discussion[];
+  coverage: { audiovisualReviewAttested: boolean; note: string };
+}
+
+export interface NewDiscussionItem {
+  kind: DiscussionItemKind;
+  authorKind: "human" | "agent";
+  text: string;
+  speaker?: string | null;
+  quoteUtteranceIds?: string[];
+  category?: string | null;
+  change?: Record<string, unknown> | null;
+  decision?: DecisionAction | null;
+  refersToItemId?: string | null;
+}
+
 export interface BrowserProjectClient extends ProjectClient {
   getSession(): Promise<SessionState>;
   loginWithBootstrapCode(code: string, hostname?: string): Promise<LoginResult>;
@@ -577,6 +683,15 @@ export interface BrowserProjectClient extends ProjectClient {
   listReviewTranscriptions(projectId: string, sessionId: string): Promise<{ items: ReviewTranscriptionRun[] }>;
   getReviewTranscription(projectId: string, runId: string): Promise<ReviewTranscriptionRun>;
   cancelReviewTranscription(projectId: string, runId: string): Promise<ReviewTranscriptionRun>;
+  getReviewWorkspace(projectId: string, runId: string): Promise<ReviewWorkspace>;
+  getReviewReport(projectId: string, runId: string): Promise<Record<string, unknown>>;
+  reviewReportUrl(projectId: string, runId: string): string;
+  proposeReviewDiscussions(projectId: string, runId: string): Promise<ReviewWorkspace>;
+  createReviewDiscussion(projectId: string, runId: string, title: string, utteranceIds: string[]): Promise<ReviewWorkspace>;
+  correctReviewUtterance(projectId: string, runId: string, utteranceId: string, field: "text" | "speaker" | "language" | "movieTime" | "excluded", value: unknown, reason?: string | null): Promise<ReviewWorkspace>;
+  updateReviewDiscussion(projectId: string, discussionId: string, update: { title?: string; utteranceIds?: string[]; targetOperationId?: string | null; unanchored?: boolean; state?: "open" | "resolved" | "deferred" }): Promise<ReviewWorkspace>;
+  addReviewDiscussionItem(projectId: string, discussionId: string, item: NewDiscussionItem): Promise<ReviewWorkspace>;
+  reconcileReviewDiscussionItem(projectId: string, itemId: string, canonicalNoteId: string): Promise<DiscussionItem>;
 }
 
 export function assertProtocolCompatible(version: ServerVersion): void {

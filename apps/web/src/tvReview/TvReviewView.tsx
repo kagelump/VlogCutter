@@ -10,6 +10,7 @@ import {
 import { StatePanel, StatusBadge } from "@rcdvlog/review-ui";
 import { InlineError, normalizeError } from "../errors";
 import { parseYoutubeVideoId, unwrapHandoff } from "./youtube";
+import { ReviewWorkspaceView } from "./ReviewWorkspaceView";
 import { PendingRecoveries, RecordView, SessionDetailView, SessionList, browserVoiceDeps, type VoiceDeps } from "./VoiceReview";
 
 /// Copy for the stable codes a review-target preflight/import can return.
@@ -33,7 +34,8 @@ function describe(error: ProjectClientError): string {
 
 export function TvReviewView({ client, path, navigate, voice }: { client: BrowserProjectClient; path: string; navigate: (path: string) => void; voice?: VoiceDeps }) {
   const parts = path.split("/").filter(Boolean).slice(1).map(decodeURIComponent);
-  const [projectId, targetId, section, sessionId] = parts;
+  const [projectId, targetId, section, sessionId, subsection, runId] = parts;
+  if (projectId && targetId && section === "sessions" && sessionId && subsection === "review" && runId) return <ReviewWorkspaceView client={client} projectId={projectId} targetId={targetId} sessionId={sessionId} runId={runId} navigate={navigate} />;
   if (projectId && targetId && section === "record") return <RecordView client={client} projectId={projectId} targetId={targetId} navigate={navigate} deps={voice ?? browserVoiceDeps()} />;
   if (projectId && targetId && section === "sessions" && sessionId) return <SessionDetailView client={client} projectId={projectId} targetId={targetId} sessionId={sessionId} navigate={navigate} />;
   if (projectId && targetId) return <ReviewTargetDetailView client={client} projectId={projectId} reviewTargetId={targetId} navigate={navigate} voice={voice} />;
