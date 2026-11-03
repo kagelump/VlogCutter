@@ -30,7 +30,7 @@ pub(crate) fn claim_policy(catalog: &Catalog, policy_id: &str) -> Result<std::fs
         .read(true)
         .write(true)
         .open(path)?;
-    fs2::FileExt::try_lock_exclusive(&file)
+    crate::resources::try_lock_exclusive_with_grace(&file)
         .map_err(|_| anyhow::anyhow!("native policy already has a running owner"))?;
     Ok(file)
 }

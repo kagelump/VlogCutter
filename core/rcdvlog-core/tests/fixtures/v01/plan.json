@@ -1,0 +1,818 @@
+{
+  "planDigest": "555a42a5e2e5cb00583a8977407a511ce0a2d91b48876aab12f3ddec549ee608",
+  "queries": [
+    {
+      "capture": {
+        "clockId": "mic_epoch_0",
+        "evidenceId": "query_85295d11a1a9b40b4b7880ac88ef171559d9f6efdf6c0cacbad59ac09687048a",
+        "firstSample": 0,
+        "monotonicOriginNs": 23033333,
+        "sampleRate": 48000
+      },
+      "recording": {
+        "clockId": "mic_epoch_0",
+        "endSample": 288000,
+        "startSample": 0
+      },
+      "segmentId": "native_recording"
+    },
+    {
+      "capture": {
+        "clockId": "mic_epoch_0",
+        "evidenceId": "query_dce52f90dc1c3788c1daeb39da866bac1934744f12a9a53a703393877324876c",
+        "firstSample": 288000,
+        "monotonicOriginNs": 23033333,
+        "sampleRate": 48000
+      },
+      "recording": {
+        "clockId": "mic_epoch_0",
+        "endSample": 576000,
+        "startSample": 288000
+      },
+      "segmentId": "native_recording"
+    },
+    {
+      "capture": {
+        "clockId": "mic_epoch_0",
+        "evidenceId": "query_cb3ec6d0e9caaa498f1568b8e73cefd31ba99142b3a63d8cb874a087d9c3ffda",
+        "firstSample": 576000,
+        "monotonicOriginNs": 23033333,
+        "sampleRate": 48000
+      },
+      "recording": {
+        "clockId": "mic_epoch_0",
+        "endSample": 864000,
+        "startSample": 576000
+      },
+      "segmentId": "native_recording"
+    },
+    {
+      "capture": {
+        "clockId": "mic_epoch_0",
+        "evidenceId": "query_35488edbc406094b372d7266e800508e11bc859e7f8727e0a0aeab2123b9fa4d",
+        "firstSample": 864000,
+        "monotonicOriginNs": 23033333,
+        "sampleRate": 48000
+      },
+      "recording": {
+        "clockId": "mic_epoch_0",
+        "endSample": 1152000,
+        "startSample": 864000
+      },
+      "segmentId": "native_recording"
+    },
+    {
+      "capture": {
+        "clockId": "mic_epoch_0",
+        "evidenceId": "query_878412ddd880a7f533cd4e7ba5f77d19bd242302e88f0aab30dc638cb5a4cf7f",
+        "firstSample": 1152000,
+        "monotonicOriginNs": 23033333,
+        "sampleRate": 48000
+      },
+      "recording": {
+        "clockId": "mic_epoch_0",
+        "endSample": 1440000,
+        "startSample": 1152000
+      },
+      "segmentId": "native_recording"
+    },
+    {
+      "capture": {
+        "clockId": "mic_epoch_0",
+        "evidenceId": "query_635d254adcb60a3c5d7390d7dcdd30b1527461c1216f91aa16a5f6786cc6ad03",
+        "firstSample": 1440000,
+        "monotonicOriginNs": 23033333,
+        "sampleRate": 48000
+      },
+      "recording": {
+        "clockId": "mic_epoch_0",
+        "endSample": 1728000,
+        "startSample": 1440000
+      },
+      "segmentId": "native_recording"
+    },
+    {
+      "capture": {
+        "clockId": "mic_epoch_0",
+        "evidenceId": "query_eebff89b020775975b84f813210faa3785d697fcc697022be27a622451cb1b52",
+        "firstSample": 1728000,
+        "monotonicOriginNs": 23033333,
+        "sampleRate": 48000
+      },
+      "recording": {
+        "clockId": "mic_epoch_0",
+        "endSample": 2016000,
+        "startSample": 1728000
+      },
+      "segmentId": "native_recording"
+    },
+    {
+      "capture": {
+        "clockId": "mic_epoch_0",
+        "evidenceId": "query_f6309c43bce8da3bdbaa03c059d73f72862e08385dece352714261efe73342cd",
+        "firstSample": 2016000,
+        "monotonicOriginNs": 23033333,
+        "sampleRate": 48000
+      },
+      "recording": {
+        "clockId": "mic_epoch_0",
+        "endSample": 2304000,
+        "startSample": 2016000
+      },
+      "segmentId": "native_recording"
+    },
+    {
+      "capture": {
+        "clockId": "mic_epoch_0",
+        "evidenceId": "query_934b087756b52db08f90cf837ef9bd30b736173f435d96a896da12ae9bb53e21",
+        "firstSample": 2304000,
+        "monotonicOriginNs": 23033333,
+        "sampleRate": 48000
+      },
+      "recording": {
+        "clockId": "mic_epoch_0",
+        "endSample": 2592000,
+        "startSample": 2304000
+      },
+      "segmentId": "native_recording"
+    },
+    {
+      "capture": {
+        "clockId": "mic_epoch_0",
+        "evidenceId": "query_41509bae0c7d4953b6c8749c710a770c4b38ab4e6655f2be14256312ac5a63e5",
+        "firstSample": 2592000,
+        "monotonicOriginNs": 23033333,
+        "sampleRate": 48000
+      },
+      "recording": {
+        "clockId": "mic_epoch_0",
+        "endSample": 2880000,
+        "startSample": 2592000
+      },
+      "segmentId": "native_recording"
+    },
+    {
+      "capture": {
+        "clockId": "mic_epoch_0",
+        "evidenceId": "query_6310ef5f5d27730488ac5d81b1ff3ea69da9b9df67a299b96b32feea6931fac1",
+        "firstSample": 2880000,
+        "monotonicOriginNs": 23033333,
+        "sampleRate": 48000
+      },
+      "recording": {
+        "clockId": "mic_epoch_0",
+        "endSample": 3168000,
+        "startSample": 2880000
+      },
+      "segmentId": "native_recording"
+    },
+    {
+      "capture": {
+        "clockId": "mic_epoch_0",
+        "evidenceId": "query_2497fb1f8f82acac5d918b0b38edac6c366997772da4dd4ebf83acfe30ae78a9",
+        "firstSample": 3168000,
+        "monotonicOriginNs": 23033333,
+        "sampleRate": 48000
+      },
+      "recording": {
+        "clockId": "mic_epoch_0",
+        "endSample": 3456000,
+        "startSample": 3168000
+      },
+      "segmentId": "native_recording"
+    },
+    {
+      "capture": {
+        "clockId": "mic_epoch_0",
+        "evidenceId": "query_e02d5936886332f5737a6c31d83208ac8b9b40374ad1f034d9d0481f59d726cb",
+        "firstSample": 3456000,
+        "monotonicOriginNs": 23033333,
+        "sampleRate": 48000
+      },
+      "recording": {
+        "clockId": "mic_epoch_0",
+        "endSample": 3744000,
+        "startSample": 3456000
+      },
+      "segmentId": "native_recording"
+    },
+    {
+      "capture": {
+        "clockId": "mic_epoch_0",
+        "evidenceId": "query_d3aadba0d53a7c2875c64d0ddc895147d8999d7946e6d37d4da16379d3119476",
+        "firstSample": 3744000,
+        "monotonicOriginNs": 23033333,
+        "sampleRate": 48000
+      },
+      "recording": {
+        "clockId": "mic_epoch_0",
+        "endSample": 4032000,
+        "startSample": 3744000
+      },
+      "segmentId": "native_recording"
+    },
+    {
+      "capture": {
+        "clockId": "mic_epoch_0",
+        "evidenceId": "query_752da670f2e048e16fbda0cdbf219e23e58c7ba18732b1e5698ecafe3c1d118b",
+        "firstSample": 4032000,
+        "monotonicOriginNs": 23033333,
+        "sampleRate": 48000
+      },
+      "recording": {
+        "clockId": "mic_epoch_0",
+        "endSample": 4320000,
+        "startSample": 4032000
+      },
+      "segmentId": "native_recording"
+    },
+    {
+      "capture": {
+        "clockId": "mic_epoch_0",
+        "evidenceId": "query_b1f8ae2d6657b9413561f9837c2da7f0ccd03539238afbc5775ea2a47db36444",
+        "firstSample": 4320000,
+        "monotonicOriginNs": 23033333,
+        "sampleRate": 48000
+      },
+      "recording": {
+        "clockId": "mic_epoch_0",
+        "endSample": 4608000,
+        "startSample": 4320000
+      },
+      "segmentId": "native_recording"
+    },
+    {
+      "capture": {
+        "clockId": "mic_epoch_0",
+        "evidenceId": "query_2dfaf00232f25c974126034ef0fc598bbfe7d803f3055fc7c7ec5df01d906864",
+        "firstSample": 4608000,
+        "monotonicOriginNs": 23033333,
+        "sampleRate": 48000
+      },
+      "recording": {
+        "clockId": "mic_epoch_0",
+        "endSample": 4896000,
+        "startSample": 4608000
+      },
+      "segmentId": "native_recording"
+    },
+    {
+      "capture": {
+        "clockId": "mic_epoch_0",
+        "evidenceId": "query_c9e6157164a0c647567b599605ecbbc47ac432b4ab1a95d407bb1cd7f12d221f",
+        "firstSample": 4896000,
+        "monotonicOriginNs": 23033333,
+        "sampleRate": 48000
+      },
+      "recording": {
+        "clockId": "mic_epoch_0",
+        "endSample": 5184000,
+        "startSample": 4896000
+      },
+      "segmentId": "native_recording"
+    },
+    {
+      "capture": {
+        "clockId": "mic_epoch_0",
+        "evidenceId": "query_ddf665e18eb6f9aa903687f24532a011613cf34408be2176e583d023a29ded37",
+        "firstSample": 5184000,
+        "monotonicOriginNs": 23033333,
+        "sampleRate": 48000
+      },
+      "recording": {
+        "clockId": "mic_epoch_0",
+        "endSample": 5472000,
+        "startSample": 5184000
+      },
+      "segmentId": "native_recording"
+    },
+    {
+      "capture": {
+        "clockId": "mic_epoch_0",
+        "evidenceId": "query_bd5f66b0f869813a966db08f5caf272a85faa83805fdc19213ac45c1d9a3ff7a",
+        "firstSample": 5472000,
+        "monotonicOriginNs": 23033333,
+        "sampleRate": 48000
+      },
+      "recording": {
+        "clockId": "mic_epoch_0",
+        "endSample": 5760000,
+        "startSample": 5472000
+      },
+      "segmentId": "native_recording"
+    },
+    {
+      "capture": {
+        "clockId": "mic_epoch_0",
+        "evidenceId": "query_52bd6391e60862457552d504a7723c1569ba079eb7a362a2990d0b6b16bdfffa",
+        "firstSample": 5760000,
+        "monotonicOriginNs": 23033333,
+        "sampleRate": 48000
+      },
+      "recording": {
+        "clockId": "mic_epoch_0",
+        "endSample": 6048000,
+        "startSample": 5760000
+      },
+      "segmentId": "native_recording"
+    },
+    {
+      "capture": {
+        "clockId": "mic_epoch_0",
+        "evidenceId": "query_d1afd7dba0458062742ddb155428850dc95b089e93d2f315124d1b6265e94827",
+        "firstSample": 6048000,
+        "monotonicOriginNs": 23033333,
+        "sampleRate": 48000
+      },
+      "recording": {
+        "clockId": "mic_epoch_0",
+        "endSample": 6336000,
+        "startSample": 6048000
+      },
+      "segmentId": "native_recording"
+    },
+    {
+      "capture": {
+        "clockId": "mic_epoch_0",
+        "evidenceId": "query_8d0089b95eed4da84e2a0610a37c0e125513cc7e4406abc3849236af41a9799e",
+        "firstSample": 6336000,
+        "monotonicOriginNs": 23033333,
+        "sampleRate": 48000
+      },
+      "recording": {
+        "clockId": "mic_epoch_0",
+        "endSample": 6624000,
+        "startSample": 6336000
+      },
+      "segmentId": "native_recording"
+    },
+    {
+      "capture": {
+        "clockId": "mic_epoch_0",
+        "evidenceId": "query_f82a510b64e9a4c468d1abbbb891eace3d27aea70777e376131c496640c0f1b4",
+        "firstSample": 6624000,
+        "monotonicOriginNs": 23033333,
+        "sampleRate": 48000
+      },
+      "recording": {
+        "clockId": "mic_epoch_0",
+        "endSample": 6912000,
+        "startSample": 6624000
+      },
+      "segmentId": "native_recording"
+    },
+    {
+      "capture": {
+        "clockId": "mic_epoch_0",
+        "evidenceId": "query_df3997f73e0f796d29f4412cf67c6534e3ebc64f55869be1562d40bf7ea74a7f",
+        "firstSample": 6912000,
+        "monotonicOriginNs": 23033333,
+        "sampleRate": 48000
+      },
+      "recording": {
+        "clockId": "mic_epoch_0",
+        "endSample": 7200000,
+        "startSample": 6912000
+      },
+      "segmentId": "native_recording"
+    },
+    {
+      "capture": {
+        "clockId": "mic_epoch_0",
+        "evidenceId": "query_26c6e4e0a36276310cdc639bb47787f232088e1a36001fba1891f00c5969daf1",
+        "firstSample": 7200000,
+        "monotonicOriginNs": 23033333,
+        "sampleRate": 48000
+      },
+      "recording": {
+        "clockId": "mic_epoch_0",
+        "endSample": 7488000,
+        "startSample": 7200000
+      },
+      "segmentId": "native_recording"
+    },
+    {
+      "capture": {
+        "clockId": "mic_epoch_0",
+        "evidenceId": "query_b237cd563d14c299b4cced60e9dba5b4d84996757388deb2db3e073a0bf5e673",
+        "firstSample": 7488000,
+        "monotonicOriginNs": 23033333,
+        "sampleRate": 48000
+      },
+      "recording": {
+        "clockId": "mic_epoch_0",
+        "endSample": 7776000,
+        "startSample": 7488000
+      },
+      "segmentId": "native_recording"
+    },
+    {
+      "capture": {
+        "clockId": "mic_epoch_0",
+        "evidenceId": "query_3505d2281f252513848b509601aa492f3af01273f08f74cbb6b35fd9324b475f",
+        "firstSample": 7776000,
+        "monotonicOriginNs": 23033333,
+        "sampleRate": 48000
+      },
+      "recording": {
+        "clockId": "mic_epoch_0",
+        "endSample": 8064000,
+        "startSample": 7776000
+      },
+      "segmentId": "native_recording"
+    },
+    {
+      "capture": {
+        "clockId": "mic_epoch_0",
+        "evidenceId": "query_f2a59d224832fb85e5cfd292ccb0e8b5a826179f3a0745751853dce3209b68cc",
+        "firstSample": 8064000,
+        "monotonicOriginNs": 23033333,
+        "sampleRate": 48000
+      },
+      "recording": {
+        "clockId": "mic_epoch_0",
+        "endSample": 8352000,
+        "startSample": 8064000
+      },
+      "segmentId": "native_recording"
+    },
+    {
+      "capture": {
+        "clockId": "mic_epoch_0",
+        "evidenceId": "query_106c977df883f309069c96a707c28d047c8268b7bbf314dbcd619c1d6c30c017",
+        "firstSample": 8352000,
+        "monotonicOriginNs": 23033333,
+        "sampleRate": 48000
+      },
+      "recording": {
+        "clockId": "mic_epoch_0",
+        "endSample": 8640000,
+        "startSample": 8352000
+      },
+      "segmentId": "native_recording"
+    },
+    {
+      "capture": {
+        "clockId": "mic_epoch_0",
+        "evidenceId": "query_1dff60461d74bd2af01c00b6dd8e05b38bee3671f26e5821ae31d13b70898182",
+        "firstSample": 8366336,
+        "monotonicOriginNs": 23033333,
+        "sampleRate": 48000
+      },
+      "recording": {
+        "clockId": "mic_epoch_0",
+        "endSample": 8654336,
+        "startSample": 8366336
+      },
+      "segmentId": "native_recording"
+    }
+  ],
+  "recipe": "soundtrack-session.native-wav-ffmpeg8k.v1",
+  "references": [
+    {
+      "durationSeconds": 120.0,
+      "movie": {
+        "durationPts": 648479824,
+        "movieDigest": "0c68f015a143a3279f8f5356f3599b1a3b4816e61fc50be4349496db9b3d533a",
+        "originPts": 0,
+        "timeBaseDenominator": 240000,
+        "timeBaseNumerator": 1
+      },
+      "schemaVersion": 1,
+      "startSeconds": 0.0
+    },
+    {
+      "durationSeconds": 120.0,
+      "movie": {
+        "durationPts": 648479824,
+        "movieDigest": "0c68f015a143a3279f8f5356f3599b1a3b4816e61fc50be4349496db9b3d533a",
+        "originPts": 0,
+        "timeBaseDenominator": 240000,
+        "timeBaseNumerator": 1
+      },
+      "schemaVersion": 1,
+      "startSeconds": 114.0
+    },
+    {
+      "durationSeconds": 120.0,
+      "movie": {
+        "durationPts": 648479824,
+        "movieDigest": "0c68f015a143a3279f8f5356f3599b1a3b4816e61fc50be4349496db9b3d533a",
+        "originPts": 0,
+        "timeBaseDenominator": 240000,
+        "timeBaseNumerator": 1
+      },
+      "schemaVersion": 1,
+      "startSeconds": 228.0
+    },
+    {
+      "durationSeconds": 120.0,
+      "movie": {
+        "durationPts": 648479824,
+        "movieDigest": "0c68f015a143a3279f8f5356f3599b1a3b4816e61fc50be4349496db9b3d533a",
+        "originPts": 0,
+        "timeBaseDenominator": 240000,
+        "timeBaseNumerator": 1
+      },
+      "schemaVersion": 1,
+      "startSeconds": 342.0
+    },
+    {
+      "durationSeconds": 120.0,
+      "movie": {
+        "durationPts": 648479824,
+        "movieDigest": "0c68f015a143a3279f8f5356f3599b1a3b4816e61fc50be4349496db9b3d533a",
+        "originPts": 0,
+        "timeBaseDenominator": 240000,
+        "timeBaseNumerator": 1
+      },
+      "schemaVersion": 1,
+      "startSeconds": 456.0
+    },
+    {
+      "durationSeconds": 120.0,
+      "movie": {
+        "durationPts": 648479824,
+        "movieDigest": "0c68f015a143a3279f8f5356f3599b1a3b4816e61fc50be4349496db9b3d533a",
+        "originPts": 0,
+        "timeBaseDenominator": 240000,
+        "timeBaseNumerator": 1
+      },
+      "schemaVersion": 1,
+      "startSeconds": 570.0
+    },
+    {
+      "durationSeconds": 120.0,
+      "movie": {
+        "durationPts": 648479824,
+        "movieDigest": "0c68f015a143a3279f8f5356f3599b1a3b4816e61fc50be4349496db9b3d533a",
+        "originPts": 0,
+        "timeBaseDenominator": 240000,
+        "timeBaseNumerator": 1
+      },
+      "schemaVersion": 1,
+      "startSeconds": 684.0
+    },
+    {
+      "durationSeconds": 120.0,
+      "movie": {
+        "durationPts": 648479824,
+        "movieDigest": "0c68f015a143a3279f8f5356f3599b1a3b4816e61fc50be4349496db9b3d533a",
+        "originPts": 0,
+        "timeBaseDenominator": 240000,
+        "timeBaseNumerator": 1
+      },
+      "schemaVersion": 1,
+      "startSeconds": 798.0
+    },
+    {
+      "durationSeconds": 120.0,
+      "movie": {
+        "durationPts": 648479824,
+        "movieDigest": "0c68f015a143a3279f8f5356f3599b1a3b4816e61fc50be4349496db9b3d533a",
+        "originPts": 0,
+        "timeBaseDenominator": 240000,
+        "timeBaseNumerator": 1
+      },
+      "schemaVersion": 1,
+      "startSeconds": 912.0
+    },
+    {
+      "durationSeconds": 120.0,
+      "movie": {
+        "durationPts": 648479824,
+        "movieDigest": "0c68f015a143a3279f8f5356f3599b1a3b4816e61fc50be4349496db9b3d533a",
+        "originPts": 0,
+        "timeBaseDenominator": 240000,
+        "timeBaseNumerator": 1
+      },
+      "schemaVersion": 1,
+      "startSeconds": 1026.0
+    },
+    {
+      "durationSeconds": 120.0,
+      "movie": {
+        "durationPts": 648479824,
+        "movieDigest": "0c68f015a143a3279f8f5356f3599b1a3b4816e61fc50be4349496db9b3d533a",
+        "originPts": 0,
+        "timeBaseDenominator": 240000,
+        "timeBaseNumerator": 1
+      },
+      "schemaVersion": 1,
+      "startSeconds": 1140.0
+    },
+    {
+      "durationSeconds": 120.0,
+      "movie": {
+        "durationPts": 648479824,
+        "movieDigest": "0c68f015a143a3279f8f5356f3599b1a3b4816e61fc50be4349496db9b3d533a",
+        "originPts": 0,
+        "timeBaseDenominator": 240000,
+        "timeBaseNumerator": 1
+      },
+      "schemaVersion": 1,
+      "startSeconds": 1254.0
+    },
+    {
+      "durationSeconds": 120.0,
+      "movie": {
+        "durationPts": 648479824,
+        "movieDigest": "0c68f015a143a3279f8f5356f3599b1a3b4816e61fc50be4349496db9b3d533a",
+        "originPts": 0,
+        "timeBaseDenominator": 240000,
+        "timeBaseNumerator": 1
+      },
+      "schemaVersion": 1,
+      "startSeconds": 1368.0
+    },
+    {
+      "durationSeconds": 120.0,
+      "movie": {
+        "durationPts": 648479824,
+        "movieDigest": "0c68f015a143a3279f8f5356f3599b1a3b4816e61fc50be4349496db9b3d533a",
+        "originPts": 0,
+        "timeBaseDenominator": 240000,
+        "timeBaseNumerator": 1
+      },
+      "schemaVersion": 1,
+      "startSeconds": 1482.0
+    },
+    {
+      "durationSeconds": 120.0,
+      "movie": {
+        "durationPts": 648479824,
+        "movieDigest": "0c68f015a143a3279f8f5356f3599b1a3b4816e61fc50be4349496db9b3d533a",
+        "originPts": 0,
+        "timeBaseDenominator": 240000,
+        "timeBaseNumerator": 1
+      },
+      "schemaVersion": 1,
+      "startSeconds": 1596.0
+    },
+    {
+      "durationSeconds": 120.0,
+      "movie": {
+        "durationPts": 648479824,
+        "movieDigest": "0c68f015a143a3279f8f5356f3599b1a3b4816e61fc50be4349496db9b3d533a",
+        "originPts": 0,
+        "timeBaseDenominator": 240000,
+        "timeBaseNumerator": 1
+      },
+      "schemaVersion": 1,
+      "startSeconds": 1710.0
+    },
+    {
+      "durationSeconds": 120.0,
+      "movie": {
+        "durationPts": 648479824,
+        "movieDigest": "0c68f015a143a3279f8f5356f3599b1a3b4816e61fc50be4349496db9b3d533a",
+        "originPts": 0,
+        "timeBaseDenominator": 240000,
+        "timeBaseNumerator": 1
+      },
+      "schemaVersion": 1,
+      "startSeconds": 1824.0
+    },
+    {
+      "durationSeconds": 120.0,
+      "movie": {
+        "durationPts": 648479824,
+        "movieDigest": "0c68f015a143a3279f8f5356f3599b1a3b4816e61fc50be4349496db9b3d533a",
+        "originPts": 0,
+        "timeBaseDenominator": 240000,
+        "timeBaseNumerator": 1
+      },
+      "schemaVersion": 1,
+      "startSeconds": 1938.0
+    },
+    {
+      "durationSeconds": 120.0,
+      "movie": {
+        "durationPts": 648479824,
+        "movieDigest": "0c68f015a143a3279f8f5356f3599b1a3b4816e61fc50be4349496db9b3d533a",
+        "originPts": 0,
+        "timeBaseDenominator": 240000,
+        "timeBaseNumerator": 1
+      },
+      "schemaVersion": 1,
+      "startSeconds": 2052.0
+    },
+    {
+      "durationSeconds": 120.0,
+      "movie": {
+        "durationPts": 648479824,
+        "movieDigest": "0c68f015a143a3279f8f5356f3599b1a3b4816e61fc50be4349496db9b3d533a",
+        "originPts": 0,
+        "timeBaseDenominator": 240000,
+        "timeBaseNumerator": 1
+      },
+      "schemaVersion": 1,
+      "startSeconds": 2166.0
+    },
+    {
+      "durationSeconds": 120.0,
+      "movie": {
+        "durationPts": 648479824,
+        "movieDigest": "0c68f015a143a3279f8f5356f3599b1a3b4816e61fc50be4349496db9b3d533a",
+        "originPts": 0,
+        "timeBaseDenominator": 240000,
+        "timeBaseNumerator": 1
+      },
+      "schemaVersion": 1,
+      "startSeconds": 2280.0
+    },
+    {
+      "durationSeconds": 120.0,
+      "movie": {
+        "durationPts": 648479824,
+        "movieDigest": "0c68f015a143a3279f8f5356f3599b1a3b4816e61fc50be4349496db9b3d533a",
+        "originPts": 0,
+        "timeBaseDenominator": 240000,
+        "timeBaseNumerator": 1
+      },
+      "schemaVersion": 1,
+      "startSeconds": 2394.0
+    },
+    {
+      "durationSeconds": 120.0,
+      "movie": {
+        "durationPts": 648479824,
+        "movieDigest": "0c68f015a143a3279f8f5356f3599b1a3b4816e61fc50be4349496db9b3d533a",
+        "originPts": 0,
+        "timeBaseDenominator": 240000,
+        "timeBaseNumerator": 1
+      },
+      "schemaVersion": 1,
+      "startSeconds": 2508.0
+    },
+    {
+      "durationSeconds": 120.0,
+      "movie": {
+        "durationPts": 648479824,
+        "movieDigest": "0c68f015a143a3279f8f5356f3599b1a3b4816e61fc50be4349496db9b3d533a",
+        "originPts": 0,
+        "timeBaseDenominator": 240000,
+        "timeBaseNumerator": 1
+      },
+      "schemaVersion": 1,
+      "startSeconds": 2581.9992666666667
+    }
+  ],
+  "schemaVersion": 1,
+  "shortSegmentIds": [],
+  "spec": {
+    "matchPolicy": {
+      "maximumCandidates": 4,
+      "minimumPeakMargin": 0.08,
+      "minimumSimilarity": 0.8,
+      "minimumSubwindowSimilarity": 0.3,
+      "uncertaintySeconds": 0.08
+    },
+    "querySeconds": 6,
+    "queryStepSeconds": 6,
+    "referenceSeconds": 120,
+    "schemaVersion": 1,
+    "segments": [
+      {
+        "clockId": "mic_epoch_0",
+        "firstSample": 0,
+        "frameCount": 8654336,
+        "segmentId": "native_recording",
+        "wavBlake3": "997821b3159409252f2743ff22fd2fd28883fae7fcd27bd597b0cd4798e1cdd6"
+      }
+    ],
+    "sync": {
+      "anchors": [],
+      "boundaries": [],
+      "captureClocks": [
+        {
+          "clockId": "mic_epoch_0",
+          "firstSample": 0,
+          "lastSample": 8654336,
+          "monotonicOriginNs": 23033333,
+          "monotonicToleranceNs": 25600000,
+          "sampleRate": 48000
+        }
+      ],
+      "movie": {
+        "durationPts": 648479824,
+        "movieDigest": "0c68f015a143a3279f8f5356f3599b1a3b4816e61fc50be4349496db9b3d533a",
+        "originPts": 0,
+        "timeBaseDenominator": 240000,
+        "timeBaseNumerator": 1
+      },
+      "policy": {
+        "maxAnchorGapSeconds": 15.0,
+        "maxDriftPpm": 2000.0,
+        "maxExtrapolationSeconds": 0.0,
+        "minimumConfidence": 0.8,
+        "residualToleranceSeconds": 0.1,
+        "unobservedUncertaintyPpm": 5000.0
+      },
+      "schemaVersion": 1,
+      "sessionId": "rsession_6fd9d7251a4445c2a1d7589570f42676",
+      "targetDigest": "1471d2f08ce9e4daac7df2eb4ff3a063d24f4be38ec489191dfd87ff574a6894"
+    }
+  },
+  "taskCount": 744
+}

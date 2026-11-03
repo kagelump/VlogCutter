@@ -33,12 +33,16 @@ function runScenario(name, { fail, missingCargo = false, emptyTests = false, wro
       return { status: null, stdout: "", stderr: "", error: { message: "spawnSync cargo ENOENT" } };
     }
     if (command === "rustc") return { status: 0, stdout: `rustc ${wrongRust ? "1.85.0" : "1.97.1"} (fake)\n`, stderr: "" };
-    if (command === "cargo" && args.includes("test")) {
-      assert.ok(args.includes("--test-threads=4"), "full gate uses the bounded CI libtest policy");
+    if (command === "cargo" && args.includes("nextest")) {
+      assert.deepEqual(args.slice(1), ["nextest", "run", "--workspace", "--profile", "ci", "--test-threads", "4"], "full gate mirrors the CI nextest invocation");
       const summary = emptyTests
-        ? "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n"
-        : "test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n";
+        ? "     Summary [   0.001s] 0 tests run: 0 passed, 0 skipped\n"
+        : "     Summary [  12.345s] 3 tests run: 3 passed (1 slow), 0 skipped\n";
       return { status: fail === "test" ? 9 : 0, stdout: summary, stderr: fail === "test" ? "forced test failure\n" : "" };
+    }
+    if (command === "cargo" && args.includes("test")) {
+      assert.deepEqual(args.slice(1), ["test", "--workspace", "--doc"], "doctests run separately because nextest skips them");
+      return { status: 0, stdout: "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n", stderr: "" };
     }
     if (command === "cargo" && args.includes("fmt")) {
       return { status: fail === "format" ? 9 : 0, stdout: "", stderr: fail === "format" ? "forced format failure\n" : "" };
@@ -62,9 +66,10 @@ test("clean pass runs every required pre-PR check", () => {
   assert.match(result.output, /RESULT git diff --cached --check: PASS/);
   assert.match(result.output, /RESULT git diff --check origin\/main\.\.\.HEAD: PASS/);
   assert.match(result.output, /RESULT cargo clippy --workspace --all-targets -- -D warnings: PASS/);
-  assert.match(result.output, /RESULT cargo test --workspace: PASS/);
+  assert.match(result.output, /RESULT cargo nextest run --workspace: PASS/);
+  assert.match(result.output, /RESULT cargo test --workspace --doc: PASS/);
   assert.match(result.output, /RESULT pnpm check:frontend: PASS/);
-  assert.match(result.output, /Gate summary \(pre-pr\): 15 passed, 0 failed\./);
+  assert.match(result.output, /Gate summary \(pre-pr\): 16 passed, 0 failed\./);
 });
 
 test("local scope requires and runs structured focused checks after baseline checks", () => {
@@ -120,7 +125,7 @@ test("format failure appears in summary and fails the gate", () => {
   const result = runScenario("format failure", { fail: "format" });
   assert.equal(result.code, 1);
   assert.match(result.output, /RESULT cargo fmt --all -- --check: FAIL \(exit 9\)/);
-  assert.match(result.output, /Gate summary \(pre-pr\): 14 passed, 1 failed\./);
+  assert.match(result.output, /Gate summary \(pre-pr\): 15 passed, 1 failed\./);
 });
 
 test("clippy failure appears in summary and fails the gate", () => {
@@ -132,8 +137,8 @@ test("clippy failure appears in summary and fails the gate", () => {
 test("test failure keeps its test result output and fails the gate", () => {
   const result = runScenario("test failure retains output", { fail: "test" });
   assert.equal(result.code, 1);
-  assert.match(result.output, /test result: ok\. 3 passed; 0 failed/);
-  assert.match(result.output, /RESULT cargo test --workspace: FAIL \(exit 9\)/);
+  assert.match(result.output, /Summary \[  12\.345s\] 3 tests run: 3 passed/);
+  assert.match(result.output, /RESULT cargo nextest run --workspace: FAIL \(exit 9\)/);
 });
 
 test("frontend failure appears in summary and fails the gate", () => {
