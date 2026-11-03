@@ -3,16 +3,25 @@ use anyhow::{Result, ensure};
 use clap::Subcommand;
 use rcdvlog_core::{
     HistoricalRenderedArtifactReview, ReviewTargetHandoff,
-    tv_review_sync::{SYNC_MAX_BYTES, SyncQuery, SyncRequest},
+    tv_review_sync::{SYNC_MAX_BYTES, SyncMovieClock, SyncQuery, SyncRequest},
     tv_soundtrack::{
         SoundtrackCapture, SoundtrackIndex, SoundtrackPolicy, SoundtrackReferenceSpec,
         read_pcm8k_wav,
     },
+    tv_soundtrack_alignment::{self, Policy as LandmarkAlignmentPolicy},
     tv_soundtrack_consensus::{self, SoundtrackConsensus},
+    tv_soundtrack_landmarks::{
+        self, Index as LandmarkIndex, OffsetEvidence as LandmarkOffsetEvidence,
+        Recipe as LandmarkRecipe, Search as LandmarkSearch, SearchPolicy as LandmarkSearchPolicy,
+    },
     tv_soundtrack_session::{
         SessionAudioFile, SessionBatch, SoundtrackSessionPlan, SoundtrackSessionSpec,
     },
 };
+
+const DEFAULT_LANDMARK_OFFSET_EVIDENCE_PER_TILE: usize = 12;
+const MAX_LANDMARK_OFFSET_EVIDENCE_PER_TILE: usize = 512;
+const MAX_LANDMARK_DIAGNOSTIC_DURATION_SECONDS: f64 = 60.0;
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::Value;
 use std::{
@@ -98,6 +107,53 @@ pub enum TvReviewCommand {
         #[arg(long)]
         cache: PathBuf,
     },
+    /// Build an immutable, full-movie local landmark index for an exact movie identity.
+    SourceAudioLandmarkIndex {
+        #[arg(long)]
+        input: PathBuf,
+        #[arg(long)]
+        movie: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+        #[arg(long)]
+        cancel_file: Option<PathBuf>,
+    },
+    /// Match a complete microphone recording and pass supported segments through the shared mapper.
+    SourceAudioLandmarkMatch {
+        #[arg(long)]
+        index: PathBuf,
+        #[arg(long)]
+        input: PathBuf,
+        #[arg(long)]
+        recording: PathBuf,
+        #[arg(long)]
+        cancel_file: Option<PathBuf>,
+    },
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LandmarkIndexInput {
+    movie: SyncMovieClock,
+    #[serde(default)]
+    fft_size: Option<u16>,
+    #[serde(default)]
+    hashes_per_second: Option<u16>,
+    #[serde(default)]
+    fanout: Option<u8>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LandmarkMatchInput {
+    sync: SyncRequest,
+    capture_clock_id: String,
+    #[serde(default)]
+    policy: Option<LandmarkAlignmentPolicy>,
+    #[serde(default)]
+    search_policy: Option<LandmarkSearchPolicy>,
+    #[serde(default)]
+    diagnostic_offset_evidence_per_tile: Option<u16>,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -139,6 +195,8 @@ pub fn command_name(command: &TvReviewCommand) -> &'static str {
         TvReviewCommand::SoundtrackSessionConsensus { .. } => {
             "tv-review.soundtrack-session-consensus"
         }
+        TvReviewCommand::SourceAudioLandmarkIndex { .. } => "tv-review.source-audio-landmark-index",
+        TvReviewCommand::SourceAudioLandmarkMatch { .. } => "tv-review.source-audio-landmark-match",
     }
 }
 pub fn execute(command: &TvReviewCommand) -> Result<Value> {
@@ -282,5 +340,190 @@ pub fn execute(command: &TvReviewCommand) -> Result<Value> {
                 &|| false,
             )?)?)
         }
+        TvReviewCommand::SourceAudioLandmarkIndex {
+            input,
+            movie,
+            output,
+            cancel_file,
+        } => {
+            let request: LandmarkIndexInput = read_json(input, SYNC_MAX_BYTES)?;
+            let cancel = || cancel_file.as_ref().is_some_and(|p| p.exists());
+            let _heavy = rcdvlog_core::acquire_local_heavy_at_cancellable(
+                &rcdvlog_core::default_local_heavy_lock_path(),
+                &cancel,
+            )?;
+            let mut recipe = LandmarkRecipe::default();
+            if let Some(v) = request.fft_size {
+                recipe.fft_size = v;
+            }
+            recipe.id = if recipe.fft_size == 1024 {
+                tv_soundtrack_landmarks::RECIPE_ID_1024.into()
+            } else {
+                tv_soundtrack_landmarks::RECIPE_ID_512.into()
+            };
+            if let Some(v) = request.hashes_per_second {
+                recipe.hashes_per_second = v;
+            }
+            if let Some(v) = request.fanout {
+                recipe.fanout = v;
+            }
+            let index = LandmarkIndex::from_movie(request.movie, movie, recipe, &cancel)?;
+            let bytes = index.to_json()?;
+            ensure!(!cancel(), "source-audio index write cancelled");
+            write_immutable_artifact(output, &bytes)?;
+            Ok(
+                serde_json::json!({"schemaVersion":1,"indexDigest":index.index_digest,
+                "movieDigest":index.movie.movie_digest,"pcmDigest":index.pcm_digest,
+                "recipe":index.recipe,"sampleCount":index.sample_count,"frameCount":index.frame_count,
+                "postingCount":index.postings.values().map(Vec::len).sum::<usize>(),"bytes":bytes.len()}),
+            )
+        }
+        TvReviewCommand::SourceAudioLandmarkMatch {
+            index,
+            input,
+            recording,
+            cancel_file,
+        } => {
+            let mut request: LandmarkMatchInput = read_json(input, SYNC_MAX_BYTES)?;
+            let cancel = || cancel_file.as_ref().is_some_and(|p| p.exists());
+            let _heavy = rcdvlog_core::acquire_local_heavy_at_cancellable(
+                &rcdvlog_core::default_local_heavy_lock_path(),
+                &cancel,
+            )?;
+            let before = rcdvlog_core::full_file_blake3(recording, &cancel)?;
+            let index = LandmarkIndex::from_json(&read_bytes(index, 64 * 1024 * 1024)?)?;
+            ensure!(
+                request.sync.movie == index.movie,
+                "invalid input: source-audio index movie identity mismatch"
+            );
+            let clock = request
+                .sync
+                .capture_clocks
+                .iter()
+                .find(|c| c.clock_id == request.capture_clock_id)
+                .cloned()
+                .ok_or_else(|| {
+                    anyhow::anyhow!("invalid input: requested capture clock is absent")
+                })?;
+            let pcm = tv_soundtrack_landmarks::decode_wav(recording, &cancel)?;
+            let after = rcdvlog_core::full_file_blake3(recording, &cancel)?;
+            ensure!(
+                before.hex_digest == after.hex_digest && before.byte_count == after.byte_count,
+                "input_changed"
+            );
+            ensure!(
+                pcm.len() as f64 / f64::from(tv_soundtrack_landmarks::RATE)
+                    <= (clock.last_sample - clock.first_sample) as f64
+                        / f64::from(clock.sample_rate)
+                        + 0.1,
+                "invalid input: capture clock is shorter than recording audio"
+            );
+            let search = index.search_pcm_with_policy(
+                &pcm,
+                request.search_policy.take().unwrap_or_default(),
+                &cancel,
+            )?;
+            let offset_evidence_limit = usize::from(
+                request
+                    .diagnostic_offset_evidence_per_tile
+                    .take()
+                    .unwrap_or(DEFAULT_LANDMARK_OFFSET_EVIDENCE_PER_TILE as u16),
+            );
+            ensure!(
+                (1..=MAX_LANDMARK_OFFSET_EVIDENCE_PER_TILE).contains(&offset_evidence_limit),
+                "invalid input: raw offset diagnostic limit must be 1..512 per tile"
+            );
+            if offset_evidence_limit > DEFAULT_LANDMARK_OFFSET_EVIDENCE_PER_TILE {
+                ensure!(
+                    search.query_sample_count as f64 / f64::from(tv_soundtrack_landmarks::RATE)
+                        <= MAX_LANDMARK_DIAGNOSTIC_DURATION_SECONDS,
+                    "invalid input: expanded raw offset diagnostics are limited to one-minute recordings"
+                );
+            }
+            let offset_evidence_count = search.offsets.len();
+            let offset_evidence = bounded_landmark_offset_evidence(&search, offset_evidence_limit);
+            let policy = request.policy.take().unwrap_or_default();
+            let alignment = tv_soundtrack_alignment::infer(&search, &clock, &index.movie, policy)?;
+            let mapping = tv_soundtrack_alignment::attach_and_map(
+                &mut request.sync,
+                &alignment,
+                &clock,
+                &cancel,
+            )?;
+            Ok(
+                serde_json::json!({"schemaVersion":1,"movieDigest":index.movie.movie_digest,
+                "indexDigest":index.index_digest,"recordingDigest":before.hex_digest,
+                "search":{"complete":search.complete,"queryLandmarkCount":search.query_landmark_count,
+                    "matchedLandmarkCount":search.matched_landmark_count,
+                    "candidatePairCount":search.candidate_pair_count,
+                    "rawOffsetEvidenceCount":offset_evidence_count,
+                    "rawOffsetEvidencePerTileLimit":offset_evidence_limit,
+                    "rawOffsetEvidence":offset_evidence},
+                "alignment":alignment,"mapping":mapping}),
+            )
+        }
     }
+}
+
+/// Preserve bounded raw offset modes before per-second alignment gates. These
+/// diagnostics let an evaluator distinguish missing landmarks from evidence
+/// discarded by segment inference without giving truth to the matcher.
+fn bounded_landmark_offset_evidence(
+    search: &LandmarkSearch,
+    limit_per_tile: usize,
+) -> Vec<LandmarkOffsetEvidence> {
+    let mut output = Vec::new();
+    let mut active_tile = None;
+    let mut retained = 0usize;
+    for evidence in &search.offsets {
+        if active_tile != Some(evidence.time_bin) {
+            active_tile = Some(evidence.time_bin);
+            retained = 0;
+        }
+        if retained < limit_per_tile {
+            output.push(evidence.clone());
+            retained += 1;
+        }
+    }
+    output
+}
+
+fn write_immutable_artifact(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    if path.exists() {
+        let old = read_bytes(path, 64 * 1024 * 1024)?;
+        ensure!(
+            old == bytes,
+            "invalid input: immutable source-audio index path already contains different bytes"
+        );
+        return Ok(());
+    }
+    let name = path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("invalid output path"))?
+        .to_string_lossy();
+    let temp = parent.join(format!(".{name}.{}.tmp", uuid::Uuid::new_v4()));
+    let result = (|| -> Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::hard_link(&temp, path)?;
+        std::fs::remove_file(&temp)?;
+        #[cfg(unix)]
+        std::fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if temp.exists() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result
 }

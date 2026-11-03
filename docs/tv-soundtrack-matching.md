@@ -100,6 +100,9 @@ bounded resumable units. [Local session orchestration](tv-review-local-session.m
 adds exhaustive reference coverage, bounded batches, private receipts and shared
 utterance mapping over these primitives.
 
+The experimental full-recording landmark index and piecewise-segment path is a
+separate recipe and CLI contract; see [full-recording source-audio alignment](tv-source-audio-matching.md).
+
 ## Acceptance boundary
 
 Procedural synthetic tests cover gain, room filtering, competing audio, repeated
