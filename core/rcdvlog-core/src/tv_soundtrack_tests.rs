@@ -645,3 +645,286 @@ fn robust_z_is_median_normalised_and_none_without_spread() {
     assert_eq!(robust_z(&[]), None);
     assert_eq!(median(&[4.0, 1.0, 3.0, 2.0]), Some(2.5));
 }
+/// Deterministic loud, speech-like burst used only inside the masked span.
+fn loud_burst(len: usize, seed: u64) -> Vec<f32> {
+    let mut state = seed;
+    (0..len)
+        .map(|i| {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let t = i as f64 / PCM_RATE as f64;
+            let noise = ((state >> 32) as u32 as f64 / u32::MAX as f64 - 0.5) * 2.0;
+            (0.9 * noise * (std::f64::consts::TAU * 700.0 * t).sin()) as f32
+        })
+        .collect()
+}
+fn mask_span(seconds_from: f64, seconds_to: f64) -> Vec<(u64, u64)> {
+    vec![(
+        (seconds_from * PCM_RATE as f64) as u64,
+        (seconds_to * PCM_RATE as f64) as u64,
+    )]
+}
+#[test]
+fn mask_weights_zero_only_frames_whose_own_hop_overlaps_the_mask() {
+    let len = 6 * PCM_RATE as usize;
+    let weights = mask_weights(len, 0, PCM_RATE, &mask_span(2.0, 3.0));
+    assert_eq!(weights.len(), feature_frames(len));
+    assert!(weights.iter().all(|w| *w == 0.0 || *w == 1.0));
+    // Frame n owns samples n*HOP+192..(n+1)*HOP+192 (its centre hop). Against
+    // the mask [16000, 24000) that is frames 123..=185 (exact, no slack). The
+    // frames 0..=122 and 186.. that only share support with the mask keep weight 1.
+    let zeros: Vec<usize> = (0..weights.len()).filter(|&n| weights[n] == 0.0).collect();
+    assert_eq!(zeros.first(), Some(&123));
+    assert_eq!(zeros.last(), Some(&185));
+    assert_eq!(zeros.len(), 185 - 123 + 1);
+    assert!(weights[..123].iter().all(|w| *w == 1.0));
+    assert!(weights[186..].iter().all(|w| *w == 1.0));
+    // A 48 kHz capture with the same span maps to the identical frame weights.
+    let native = mask_weights(len, 0, 48000, &[(2 * 48000, 3 * 48000)]);
+    assert_eq!(native, weights);
+}
+#[test]
+fn masked_span_noise_cannot_change_similarity_and_mask_digest_tracks_weights() {
+    let source = signal(36, 37);
+    let index = SoundtrackIndex::from_pcm(spec(36), &source, &|| false).unwrap();
+    let start = 8.32;
+    let clean = source[(start * 8000.0) as usize..(start * 8000.0) as usize + 6 * 8000].to_vec();
+    let mask = mask_span(2.0, 3.0);
+    let weights = mask_weights(clean.len(), 0, PCM_RATE, &mask);
+    let mut reports = Vec::new();
+    for seed in [5_u64, 991] {
+        let mut query = clean.clone();
+        for (dst, b) in query[16000..24000].iter_mut().zip(loud_burst(8000, seed)) {
+            *dst = b;
+        }
+        reports.push(
+            index
+                .match_pcm_weighted(
+                    &query,
+                    capture(),
+                    &SoundtrackPolicy::default(),
+                    Some(&weights),
+                    &|| false,
+                )
+                .unwrap(),
+        );
+    }
+    let (a, b) = (&reports[0], &reports[1]);
+    assert_ne!(a.query_pcm_digest, b.query_pcm_digest);
+    assert!(a.best_similarity.is_some(), "{a:?}");
+    assert_eq!(a.best_similarity, b.best_similarity);
+    assert_eq!(a.runner_up_similarity, b.runner_up_similarity);
+    assert_eq!(a.best_peaks, b.best_peaks);
+    assert_eq!(a.state, b.state);
+    assert_eq!(a.reason, b.reason);
+    assert_eq!(a.mask_digest, b.mask_digest);
+    assert_eq!(
+        a.mask_digest.as_deref(),
+        Some(weights_digest(&weights).as_str())
+    );
+    // Changing only the mask changes mask_digest.
+    let other = mask_weights(clean.len(), 0, PCM_RATE, &mask_span(4.0, 5.0));
+    let c = index
+        .match_pcm_weighted(
+            &clean,
+            capture(),
+            &SoundtrackPolicy::default(),
+            Some(&other),
+            &|| false,
+        )
+        .unwrap();
+    assert_ne!(c.mask_digest, a.mask_digest);
+    assert_eq!(
+        c.mask_digest.as_deref(),
+        Some(weights_digest(&other).as_str())
+    );
+}
+#[test]
+fn masked_query_with_too_little_unmasked_audio_is_masked_insufficient() {
+    let source = signal(36, 37);
+    let index = SoundtrackIndex::from_pcm(spec(36), &source, &|| false).unwrap();
+    let start = 8.32;
+    let clean = source[(start * 8000.0) as usize..(start * 8000.0) as usize + 6 * 8000].to_vec();
+    // Under 2 s unmasked in total: only 1.5 s survives.
+    let total_masked = mask_weights(clean.len(), 0, PCM_RATE, &mask_span(1.5, 6.0));
+    let r = index
+        .match_pcm_weighted(
+            &clean,
+            capture(),
+            &SoundtrackPolicy::default(),
+            Some(&total_masked),
+            &|| false,
+        )
+        .unwrap();
+    assert_eq!(r.reason, "masked_insufficient");
+    assert_eq!(r.state, SoundtrackMatchState::Unmatched);
+    assert!(r.candidates.is_empty() && r.best_peaks.is_empty());
+    assert_eq!(
+        r.mask_digest.as_deref(),
+        Some(weights_digest(&total_masked).as_str())
+    );
+    // Enough in total, but the final third has no unmasked frames.
+    let frames = feature_frames(clean.len());
+    let mut last_third_masked = vec![1.0f32; frames];
+    for w in &mut last_third_masked[2 * frames / 3..] {
+        *w = 0.0;
+    }
+    let r = index
+        .match_pcm_weighted(
+            &clean,
+            capture(),
+            &SoundtrackPolicy::default(),
+            Some(&last_third_masked),
+            &|| false,
+        )
+        .unwrap();
+    assert_eq!(r.reason, "masked_insufficient");
+    assert_eq!(r.state, SoundtrackMatchState::Unmatched);
+    // 34 unmasked frames in the final third: the last 2 read silenced samples
+    // through their FFT window, leaving 32 effective frames (0.512 s), which
+    // passes the per-third rule.
+    let mut enough_third = vec![1.0f32; frames];
+    for w in &mut enough_third[2 * frames / 3 + 34..] {
+        *w = 0.0;
+    }
+    let r = index
+        .match_pcm_weighted(
+            &clean,
+            capture(),
+            &SoundtrackPolicy::default(),
+            Some(&enough_third),
+            &|| false,
+        )
+        .unwrap();
+    assert_ne!(r.reason, "masked_insufficient", "{r:?}");
+}
+#[test]
+fn all_ones_weights_match_unmasked_scores_and_absent_mask_is_v1_identical() {
+    let source = signal(36, 37);
+    let index = SoundtrackIndex::from_pcm(spec(36), &source, &|| false).unwrap();
+    let start = 8.32;
+    let query = source[(start * 8000.0) as usize..(start * 8000.0) as usize + 6 * 8000].to_vec();
+    let plain = index
+        .match_pcm(&query, capture(), &SoundtrackPolicy::default(), &|| false)
+        .unwrap();
+    let absent = index
+        .match_pcm_weighted(
+            &query,
+            capture(),
+            &SoundtrackPolicy::default(),
+            None,
+            &|| false,
+        )
+        .unwrap();
+    assert_eq!(plain, absent);
+    assert_eq!(plain.mask_digest, None);
+    let json = serde_json::to_string(&plain).unwrap();
+    assert!(!json.contains("maskDigest"), "{json}");
+    let ones = vec![1.0f32; feature_frames(query.len())];
+    let masked = index
+        .match_pcm_weighted(
+            &query,
+            capture(),
+            &SoundtrackPolicy::default(),
+            Some(&ones),
+            &|| false,
+        )
+        .unwrap();
+    assert_eq!(masked.best_similarity, plain.best_similarity);
+    assert_eq!(masked.runner_up_similarity, plain.runner_up_similarity);
+    assert_eq!(masked.best_peaks, plain.best_peaks);
+    assert_eq!(masked.state, plain.state);
+    assert_eq!(masked.reason, plain.reason);
+    assert_eq!(masked.candidates, plain.candidates);
+    assert!(masked.mask_digest.is_some());
+}
+#[test]
+fn malformed_speech_mask_weights_are_rejected() {
+    let source = signal(36, 37);
+    let index = SoundtrackIndex::from_pcm(spec(36), &source, &|| false).unwrap();
+    let start = 8.32;
+    let query = source[(start * 8000.0) as usize..(start * 8000.0) as usize + 6 * 8000].to_vec();
+    let frames = feature_frames(query.len());
+    let short = vec![1.0f32; frames - 1];
+    let out_of_range = vec![1.5f32; frames];
+    let nan = vec![f32::NAN; frames];
+    for bad in [&short, &out_of_range, &nan] {
+        assert!(
+            index
+                .match_pcm_weighted(
+                    &query,
+                    capture(),
+                    &SoundtrackPolicy::default(),
+                    Some(bad),
+                    &|| false,
+                )
+                .is_err()
+        );
+    }
+}
+#[test]
+fn effective_weights_drop_frames_that_read_silenced_samples() {
+    let len = 6 * PCM_RATE as usize;
+    let mask = mask_weights(len, 0, PCM_RATE, &mask_span(2.0, 3.0));
+    let eff = effective_weights(len, &mask);
+    assert_eq!(eff.len(), mask.len());
+    // Masked frames stay zero; nothing gains weight.
+    assert!(eff.iter().zip(&mask).all(|(e, m)| *e <= *m));
+    // Silenced samples are those owned by frames 123..=185, i.e. [15936+192, ...).
+    // Frame n reads [(n-8)*HOP, n*HOP+FFT): the last frame before the mask that
+    // reads no silenced sample, and the first after it, bound the zero run.
+    let silenced_lo = 123 * HOP + OWN_OFFSET;
+    let silenced_hi = 186 * HOP + OWN_OFFSET;
+    for (n, w) in eff.iter().enumerate() {
+        let lo = n.saturating_sub(WARMUP - 1) * HOP;
+        let hi = (n * HOP + FFT).min(len);
+        let reads_silence = lo < silenced_hi && hi > silenced_lo;
+        assert_eq!(*w == 0.0, reads_silence, "frame {n}");
+    }
+    // Frames well after the mask (lag history clear) keep their weight.
+    assert_eq!(eff[200], 1.0);
+    assert_eq!(
+        eff[193], 0.0,
+        "lag-6 history of frame 193 still reads silence"
+    );
+    // No zero in the mask means the mask is returned unchanged.
+    let ones = vec![1.0_f32; mask.len()];
+    assert_eq!(effective_weights(len, &ones), ones);
+}
+#[test]
+fn clean_query_with_mask_boundaries_keeps_its_true_peak_near_one() {
+    // Boundary frames next to silenced spans must not be scored as onsets: a
+    // query that IS the reference, with three masked spans of interfering
+    // noise, must still score close to an unmasked clean query.
+    let source = signal(36, 37);
+    let index = SoundtrackIndex::from_pcm(spec(36), &source, &|| false).unwrap();
+    let start = 8.32;
+    let s0 = (start * 8000.0) as usize;
+    let clean = source[s0..s0 + 6 * 8000].to_vec();
+    let mut mask = Vec::new();
+    for k in 0..3 {
+        mask.extend(mask_span(0.5 + 2.0 * k as f64, 1.1 + 2.0 * k as f64));
+    }
+    let weights = mask_weights(clean.len(), 0, PCM_RATE, &mask);
+    let mut query = clean.clone();
+    for (k, &(a, b)) in mask.iter().enumerate() {
+        for (dst, x) in query[a as usize..b as usize]
+            .iter_mut()
+            .zip(loud_burst((b - a) as usize, 40 + k as u64))
+        {
+            *dst = x;
+        }
+    }
+    let r = index
+        .match_pcm_weighted(
+            &query,
+            capture(),
+            &SoundtrackPolicy::default(),
+            Some(&weights),
+            &|| false,
+        )
+        .unwrap();
+    let best = r.best_similarity.unwrap();
+    assert!(best > 0.95, "masked clean query scored {best}: {r:?}");
+    assert_eq!(r.state, SoundtrackMatchState::Matched, "{r:?}");
+    assert!(center_error(&r, start, 6.0) < 0.05);
+}

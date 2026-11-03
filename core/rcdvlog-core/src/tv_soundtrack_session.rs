@@ -6,7 +6,7 @@ use crate::{
     tv_soundtrack::{
         MAX_BEST_PEAKS, PCM_RATE, PEAK_MERGE_SECONDS, SoundtrackCapture, SoundtrackIndex,
         SoundtrackMatchReport, SoundtrackMatchState, SoundtrackMovie, SoundtrackPeak,
-        SoundtrackPolicy, SoundtrackReferenceSpec,
+        SoundtrackPolicy, SoundtrackReferenceSpec, mask_weights, weights_digest,
     },
 };
 use anyhow::{Context, Result, ensure};
@@ -19,6 +19,7 @@ use std::{
 
 const RECIPE: &str = "soundtrack-session.native-wav-ffmpeg8k.v1";
 const MAX_JSON: usize = 4 * 1024 * 1024;
+const MAX_MASK_INTERVALS: usize = 4096;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -222,6 +223,19 @@ impl SoundtrackSessionPlan {
         );
         // Validate the matching policy through its single shared validator.
         spec.match_policy.validate()?;
+        ensure!(
+            spec.speech_mask.len() <= MAX_MASK_INTERVALS
+                && spec.speech_mask.iter().all(|m| {
+                    m.start_sample < m.end_sample
+                        && m.end_sample <= 9_007_199_254_740_991
+                        && spec
+                            .sync
+                            .capture_clocks
+                            .iter()
+                            .any(|c| c.clock_id == m.clock_id)
+                }),
+            "invalid input: speech mask intervals"
+        );
         let duration = spec.sync.movie.duration_pts as f64 / spec.sync.movie.ticks_per_second();
         ensure!(
             duration >= f64::from(spec.query_seconds),
@@ -389,6 +403,30 @@ impl SoundtrackSessionPlan {
         );
         Ok(())
     }
+    /// ARCHITECTURE §6: per-frame speech-mask weights for one query, None when
+    /// the session has no mask. The plan digest already covers `speech_mask`,
+    /// so a changed mask changes the cache root as well as `mask_digest`.
+    fn query_weights(&self, query: &SessionMatchQuery) -> Option<Vec<f32>> {
+        if self.spec.speech_mask.is_empty() {
+            return None;
+        }
+        let intervals: Vec<(u64, u64)> = self
+            .spec
+            .speech_mask
+            .iter()
+            .filter(|m| m.clock_id == query.recording.clock_id)
+            .map(|m| (m.start_sample, m.end_sample))
+            .collect();
+        let pcm_len = ((query.recording.end_sample - query.recording.start_sample)
+            * u64::from(PCM_RATE)
+            / u64::from(query.capture.sample_rate)) as usize;
+        Some(mask_weights(
+            pcm_len,
+            query.recording.start_sample,
+            query.capture.sample_rate,
+            &intervals,
+        ))
+    }
     fn cache(&self, root: &Path) -> PathBuf {
         root.join(&self.plan_digest)
     }
@@ -416,7 +454,8 @@ impl SoundtrackSessionPlan {
                 && report.policy == self.spec.match_policy
                 && report.query_sample_count
                     == self.spec.query_seconds as usize * PCM_RATE as usize
-                && report.candidates.len() <= self.spec.match_policy.maximum_candidates,
+                && report.candidates.len() <= self.spec.match_policy.maximum_candidates
+                && report.mask_digest == self.query_weights(query).as_deref().map(weights_digest),
             "invalid input: cached match receipt identity mismatch"
         );
         let check = SyncRequest {
@@ -554,10 +593,12 @@ impl SoundtrackSessionPlan {
                 index.reference == self.references[ri],
                 "invalid input: cached reference mismatch"
             );
-            let report = index.match_pcm(
+            let weights = self.query_weights(q);
+            let report = index.match_pcm_weighted(
                 &query_pcm.as_ref().unwrap().1,
                 q.capture.clone(),
                 &self.spec.match_policy,
+                weights.as_deref(),
                 cancel,
             )?;
             let receipt = TaskReceipt {

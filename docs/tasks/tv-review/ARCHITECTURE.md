@@ -137,6 +137,16 @@ transcript utterances padded ±0.25 s. The core never reads transcripts.
   both sums by the weight. If the unmasked weight totals less than 2 s of
   frames, or less than 0.5 s in any third, the query is unmatched with reason
   `"masked_insufficient"`.
+- **Effective weights (revised 2026-11-03, owner-driven V01 cycle).** Masked
+  samples are silenced before features are computed. Frame `n` reads samples
+  `[(n-8)*HOP, n*HOP+FFT)`: its own window plus its smoothed lag-6 delta
+  history. A frame that reads any silenced sample would score the jump from
+  silence as a full-scale onset, so it is weighted zero as well. The
+  sufficiency rule above counts these effective weights. Each masked span
+  therefore costs about 0.19 s of extra frames. A 6 s window with 0.4 s gaps
+  is honestly `masked_insufficient`; gap-placed windows are the intended way
+  to score speech-heavy stretches. `mask_digest` still hashes the supplied
+  mask weights.
 - **Mask identity.** The report gains `mask_digest: Option<String>`, the BLAKE3
   of the weight bytes. The session cache key includes it.
 - **Gap windows.** `SoundtrackSessionPlan::new` keeps the regular grid queries

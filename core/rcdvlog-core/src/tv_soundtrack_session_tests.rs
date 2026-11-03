@@ -611,3 +611,76 @@ fn distinctive_none_keeps_v1_repeat_behaviour_and_peaks() {
     assert_eq!(page.queries[0].state, "ambiguous", "{page:?}");
     assert!(page.sync.anchors.len() >= 2);
 }
+fn with_mask(plan: &SoundtrackSessionPlan, mask: Vec<SyncQuery>) -> Result<SoundtrackSessionPlan> {
+    let mut spec = plan.spec.clone();
+    spec.speech_mask = mask;
+    SoundtrackSessionPlan::new(spec)
+}
+#[test]
+fn speech_mask_is_part_of_session_identity_and_every_receipt_mask_digest() {
+    let (dir, plan, movie, files) = fixture(false);
+    // The whole 6 s recording is masked: every query is masked_insufficient.
+    let full = SyncQuery {
+        clock_id: "mic".into(),
+        start_sample: 16000,
+        end_sample: 64000,
+    };
+    let fully_masked = with_mask(&plan, vec![full]).unwrap();
+    assert_ne!(fully_masked.plan_digest, plan.plan_digest);
+    let full_cache = dir.path().join("full");
+    run_all(&fully_masked, &movie, &files, &full_cache);
+    let page = fully_masked
+        .evidence_page(&full_cache, 0, 1, &|| false)
+        .unwrap();
+    assert!(page.sync.anchors.is_empty(), "{page:?}");
+    for task in 0..fully_masked.task_count {
+        let receipt = fully_masked.receipt(&full_cache, task).unwrap().unwrap();
+        assert_eq!(receipt.report.reason, "masked_insufficient");
+        assert!(receipt.report.mask_digest.is_some());
+    }
+    // A partial mask (first 0.5 s) changes the identity and the mask digest.
+    let partial = SyncQuery {
+        clock_id: "mic".into(),
+        start_sample: 16000,
+        end_sample: 20000,
+    };
+    let partly_masked = with_mask(&plan, vec![partial]).unwrap();
+    assert_ne!(partly_masked.plan_digest, fully_masked.plan_digest);
+    assert_ne!(partly_masked.plan_digest, plan.plan_digest);
+    let partial_cache = dir.path().join("partial");
+    run_all(&partly_masked, &movie, &files, &partial_cache);
+    let partial_receipt = partly_masked.receipt(&partial_cache, 0).unwrap().unwrap();
+    let full_receipt = fully_masked.receipt(&full_cache, 0).unwrap().unwrap();
+    assert_ne!(
+        partial_receipt.report.mask_digest,
+        full_receipt.report.mask_digest
+    );
+    assert_eq!(
+        partial_receipt.report.mask_digest.as_deref(),
+        partly_masked
+            .query_weights(&partly_masked.queries[0])
+            .as_deref()
+            .map(weights_digest)
+            .as_deref()
+    );
+    // Unmasked sessions keep no mask digest, so v1 receipts are unchanged.
+    run_all(&plan, &movie, &files, &dir.path().join("clean"));
+    let clean_receipt = plan.receipt(&dir.path().join("clean"), 0).unwrap().unwrap();
+    assert_eq!(clean_receipt.report.mask_digest, None);
+}
+#[test]
+fn speech_mask_rejects_unknown_clock_and_empty_intervals() {
+    let (_dir, plan, _movie, _files) = fixture(false);
+    let unknown = SyncQuery {
+        clock_id: "nope".into(),
+        start_sample: 16000,
+        end_sample: 20000,
+    };
+    assert!(with_mask(&plan, vec![unknown]).is_err());
+    let empty = SyncQuery {
+        clock_id: "mic".into(),
+        start_sample: 20000,
+        end_sample: 20000,
+    };
+    assert!(with_mask(&plan, vec![empty]).is_err());
+}

@@ -422,6 +422,18 @@ impl SoundtrackIndex {
         policy: &SoundtrackPolicy,
         cancel: &dyn Fn() -> bool,
     ) -> Result<SoundtrackMatchReport> {
+        self.match_pcm_weighted(pcm, capture, policy, None, cancel)
+    }
+    /// ARCHITECTURE §6: `weights` holds one value in [0,1] per query feature
+    /// frame (see `mask_weights`). `None` is the unmasked v1 path.
+    pub fn match_pcm_weighted(
+        &self,
+        pcm: &[f32],
+        capture: SoundtrackCapture,
+        policy: &SoundtrackPolicy,
+        weights: Option<&[f32]>,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<SoundtrackMatchReport> {
         self.validate()?;
         validate_pcm(pcm)?;
         ensure!(
@@ -460,6 +472,35 @@ impl SoundtrackIndex {
             distinctiveness: None,
             mask_digest: None,
         };
+        if let Some(w) = weights {
+            let frames = feature_frames(pcm.len());
+            ensure!(
+                w.len() == frames && w.iter().all(|x| x.is_finite() && (0.0..=1.0).contains(x)),
+                "invalid input: speech mask must give one finite [0,1] weight per query frame"
+            );
+            report.mask_digest = Some(weights_digest(w));
+        }
+        // The supplied mask decides which samples are silenced; the effective
+        // weights additionally drop every frame whose features read a silenced
+        // sample (its own window or the lag-6 delta history), because the jump
+        // from silence would otherwise be scored as a full-scale onset.
+        let mask = weights;
+        let effective = mask.map(|w| effective_weights(pcm.len(), w));
+        let weights = effective.as_deref();
+        if let Some(w) = weights {
+            // §6: at least 2 s of unmasked frames, and at least 0.5 s in each third.
+            let frames_per_second = PCM_RATE as f64 / HOP as f64;
+            let total: f64 = w.iter().map(|x| f64::from(*x)).sum();
+            let third_ok = (0..3).all(|part| {
+                let a = part * w.len() / 3;
+                let b = (part + 1) * w.len() / 3;
+                w[a..b].iter().map(|x| f64::from(*x)).sum::<f64>() >= 0.5 * frames_per_second
+            });
+            if total < 2.0 * frames_per_second || !third_ok {
+                report.reason = "masked_insufficient".into();
+                return Ok(report);
+            }
+        }
         ensure!(!cancel(), "soundtrack match cancelled");
         let rms =
             (pcm.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>() / pcm.len() as f64).sqrt();
@@ -467,12 +508,20 @@ impl SoundtrackIndex {
             report.reason = "quiet_query".into();
             return Ok(report);
         }
-        let query = features(pcm, cancel)?;
+        // §6: masked samples are silenced before features, so frames that only
+        // share support with a masked gap stay weighted without seeing its audio.
+        let silenced = mask
+            .filter(|w| w.contains(&0.0))
+            .map(|w| neutralised(pcm, w));
+        let query = features(silenced.as_deref().unwrap_or(pcm), cancel)?;
         let norm = query
             .iter()
+            .enumerate()
             .skip(WARMUP)
-            .flatten()
-            .map(|x| f64::from(*x).powi(2))
+            .flat_map(|(i, frame)| {
+                let w = weight_at(weights, i);
+                frame.iter().map(move |x| w * f64::from(*x).powi(2))
+            })
             .sum::<f64>();
         if norm / ((query.len() * BANDS) as f64) < 0.0001 {
             report.reason = "insufficient_spectral_variation".into();
@@ -486,6 +535,7 @@ impl SoundtrackIndex {
                 &query,
                 &self.features[offset..offset + query.len()],
                 4,
+                weights,
                 &mut report.comparison_products,
             )?;
             coarse.push((score, offset));
@@ -507,6 +557,7 @@ impl SoundtrackIndex {
                     &query,
                     &self.features[pos..pos + query.len()],
                     1,
+                    weights,
                     &mut report.comparison_products,
                 )?;
                 if score > best.0 {
@@ -532,6 +583,7 @@ impl SoundtrackIndex {
                     &query[a..b],
                     &self.features[offset + a..offset + b],
                     1,
+                    weights.map(|w| &w[a..b]),
                     &mut report.comparison_products,
                 )?;
             }
@@ -569,6 +621,7 @@ impl SoundtrackIndex {
                     &query[a..b],
                     &self.features[offset + a..offset + b],
                     1,
+                    weights.map(|w| &w[a..b]),
                     &mut report.comparison_products,
                 )?;
                 if local < policy.minimum_subwindow_similarity {
@@ -715,22 +768,142 @@ fn median(values: &[f64]) -> Option<f64> {
         (sorted[mid - 1] + sorted[mid]) / 2.0
     })
 }
+/// Per-frame speech-mask weight (ARCHITECTURE §6); absent means weight one.
+fn weight_at(weights: Option<&[f32]>, frame: usize) -> f64 {
+    weights.map_or(1.0, |w| f64::from(w[frame]))
+}
+/// Feature frames produced by `features` for `pcm_len` samples.
+fn feature_frames(pcm_len: usize) -> usize {
+    if pcm_len < FFT {
+        0
+    } else {
+        (pcm_len - FFT) / HOP + 1
+    }
+}
+/// BLAKE3 of the little-endian weight bytes (ARCHITECTURE §6 mask identity).
+pub fn weights_digest(weights: &[f32]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    for w in weights {
+        hasher.update(&w.to_le_bytes());
+    }
+    hasher.finalize().to_hex().to_string()
+}
+/// Samples from the start of a frame's FFT window to the start of its owned
+/// hop: the window centre (FFT/2) minus half a hop.
+const OWN_OFFSET: usize = FFT / 2 - HOP / 2;
+/// Query samples owned by feature frame `n`, the frame's own time. Frame `n`'s
+/// centre is `n*HOP + FFT/2`; it owns the `HOP` samples centred there. The owned
+/// ranges tile `0..pcm_len`, with the first frame also owning the leading
+/// samples and the last frame the trailing ones.
+fn owned_samples(n: usize, frames: usize, pcm_len: usize) -> (usize, usize) {
+    let lo = if n == 0 { 0 } else { n * HOP + OWN_OFFSET };
+    let hi = if n + 1 == frames {
+        pcm_len
+    } else {
+        (n + 1) * HOP + OWN_OFFSET
+    };
+    (lo, hi)
+}
+/// The feature frame that owns query sample `sample` (inverse of `owned_samples`).
+fn owner_frame(sample: usize, frames: usize) -> usize {
+    (sample.saturating_sub(OWN_OFFSET) / HOP).min(frames - 1)
+}
+/// Per-query-frame speech-mask weights (ARCHITECTURE §6). Feature frame `n` is
+/// weighted zero when its own time (`owned_samples`, the hop centred on its
+/// window centre) overlaps a masked interval, and one otherwise. Frames whose
+/// support merely touches the mask keep their weight; `match_pcm_weighted`
+/// zeroes the masked samples themselves so that they cannot leak into them.
+/// `mask` intervals `[start, end)` are on the capture clock; `query_start` is
+/// the capture sample of query PCM sample zero and `native_rate` the capture
+/// sample rate.
+pub fn mask_weights(
+    pcm_len: usize,
+    query_start: u64,
+    native_rate: u32,
+    mask: &[(u64, u64)],
+) -> Vec<f32> {
+    let mut sorted: Vec<(u64, u64)> = mask.iter().copied().filter(|(a, b)| a < b).collect();
+    sorted.sort_unstable();
+    let mut merged: Vec<(u64, u64)> = Vec::new();
+    for (a, b) in sorted {
+        match merged.last_mut() {
+            Some(last) if a <= last.1 => last.1 = last.1.max(b),
+            _ => merged.push((a, b)),
+        }
+    }
+    let scale = f64::from(native_rate) / f64::from(PCM_RATE);
+    let to_capture = |sample: usize| query_start as f64 + sample as f64 * scale;
+    let frames = feature_frames(pcm_len);
+    (0..frames)
+        .map(|n| {
+            let (lo, hi) = owned_samples(n, frames, pcm_len);
+            let (lo, hi) = (to_capture(lo), to_capture(hi));
+            let k = merged.partition_point(|&(_, end)| (end as f64) <= lo);
+            if merged.get(k).is_some_and(|&(start, _)| (start as f64) < hi) {
+                0.0
+            } else {
+                1.0
+            }
+        })
+        .collect()
+}
+/// Scoring weights for a query whose `mask` silences the samples owned by its
+/// zero-weight frames. Frame `n` reads samples `[(n-8)*HOP, n*HOP+FFT)`: its own
+/// FFT window and the windows of its smoothed lag-6 delta history (frames
+/// `n-8..=n`). A frame that reads any silenced sample gets weight zero; other
+/// frames keep their mask weight. Without masked frames this is the mask itself.
+fn effective_weights(pcm_len: usize, mask: &[f32]) -> Vec<f32> {
+    if !mask.contains(&0.0) {
+        return mask.to_vec();
+    }
+    // prefix[s] = silenced samples before sample s.
+    let mut prefix = Vec::with_capacity(pcm_len + 1);
+    prefix.push(0usize);
+    for s in 0..pcm_len {
+        let silenced = mask[owner_frame(s, mask.len())] == 0.0;
+        prefix.push(prefix[s] + usize::from(silenced));
+    }
+    mask.iter()
+        .enumerate()
+        .map(|(n, &w)| {
+            let lo = n.saturating_sub(WARMUP - 1) * HOP;
+            let hi = (n * HOP + FFT).min(pcm_len);
+            if prefix[hi] > prefix[lo] { 0.0 } else { w }
+        })
+        .collect()
+}
+/// Query PCM with the samples owned by zero-weight frames set to silence, so
+/// that masked audio cannot reach any feature frame through its support.
+fn neutralised(pcm: &[f32], weights: &[f32]) -> Vec<f32> {
+    pcm.iter()
+        .enumerate()
+        .map(|(s, &x)| {
+            if weights[owner_frame(s, weights.len())] == 0.0 {
+                0.0
+            } else {
+                x
+            }
+        })
+        .collect()
+}
 fn similarity(
     a: &[[f32; BANDS]],
     b: &[[f32; BANDS]],
     stride: usize,
+    weights: Option<&[f32]>,
     products: &mut u64,
 ) -> Result<f64> {
     let mut dot = 0.0;
     let mut aa = 0.0;
     let mut bb = 0.0;
     for i in (WARMUP..a.len()).step_by(stride) {
+        let w = weight_at(weights, i);
         for j in 0..BANDS {
             let x = f64::from(a[i][j]);
             let y = f64::from(b[i][j]);
-            dot += x * y;
-            aa += x * x;
-            bb += y * y;
+            dot += w * x * y;
+            aa += w * x * x;
+            bb += w * y * y;
             *products += 1;
         }
     }
