@@ -208,7 +208,9 @@ test("Chrome records a fake-microphone voice review with a manual cue and reopen
   const sessionApi=href!.replace(/\/audio\.wav$/,"");
   const evidence=await page.evaluate(async(url)=>{const response=await fetch(url);return response.json();},sessionApi);
   const detail=evidence;
-  const calibrations=detail.events.filter((e:{kind:string})=>e.kind==="clockSample");
+  // The recorder also keeps getOutputTimestamp pairs; the paired native-frame
+  // probe evidence is selected by its schema, not by arrival order.
+  const calibrations=detail.events.filter((e:{kind:string;detail?:{schema?:string}})=>e.kind==="clockSample"&&e.detail?.schema==="review-capture-calibration.v1");
   expect(calibrations.length).toBeGreaterThan(0);
   expect(calibrations[0].detail).toMatchObject({schema:"review-capture-calibration.v1",method:"workletProbeBracket",clockId:"mic_epoch_0",sampleRate:48000,firstSample:0});
   expect(calibrations[0].detail.monotonicToleranceNs).toBeLessThan(1_000_000_000);
