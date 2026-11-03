@@ -28,6 +28,7 @@ mod chronology_commands;
 mod eval_bridge;
 mod keychain;
 mod media_server;
+mod project_work;
 mod server_client;
 mod sync_manager;
 
@@ -109,6 +110,9 @@ pub(crate) struct AppState {
     baseline_attempt: Arc<RwLock<Option<BaselineAttempt>>>,
     sync_manager: sync_manager::SyncManager,
     sync_status: Arc<RwLock<HashMap<String, sync_manager::SyncStatus>>>,
+    /// Detached background writers per project; `delete_project` refuses
+    /// while any is live and tombstones the project so later ones decline.
+    project_work: project_work::ProjectWork,
     /// Set by `cancel_analysis` and observed by the running batch. Cleared when
     /// a run starts so a cancel from a previous run cannot stop the next one.
     analysis_cancel: Arc<AtomicBool>,
@@ -344,11 +348,13 @@ impl AppState {
         let catalog = Arc::new(RwLock::new(catalog));
         let settings = Arc::new(RwLock::new(settings));
         let sync_status = Arc::new(RwLock::new(HashMap::new()));
+        let project_work = project_work::ProjectWork::default();
         let sync_manager = sync_manager::SyncManager::spawn(
             app_handle,
             catalog.clone(),
             settings.clone(),
             sync_status.clone(),
+            project_work.clone(),
         );
         let media_catalog = Arc::new(CatalogMedia {
             catalog: catalog.clone(),
@@ -362,6 +368,7 @@ impl AppState {
             baseline_attempt: Arc::new(RwLock::new(None)),
             sync_manager,
             sync_status,
+            project_work,
             analysis_cancel: Arc::new(AtomicBool::new(false)),
             import_cancel: Arc::new(AtomicBool::new(false)),
             thumbnail_coordinator: Arc::new(ThumbnailCoordinator::default()),
@@ -393,6 +400,7 @@ impl AppState {
             baseline_attempt: Arc::new(RwLock::new(None)),
             sync_manager: sync_manager::SyncManager::spawn_test(),
             sync_status: Arc::new(RwLock::new(HashMap::new())),
+            project_work: project_work::ProjectWork::default(),
             analysis_cancel: Arc::new(AtomicBool::new(false)),
             import_cancel: Arc::new(AtomicBool::new(false)),
             thumbnail_coordinator: Arc::new(ThumbnailCoordinator::default()),
@@ -878,26 +886,50 @@ async fn delete_project(
     catalog_path: String,
     folder_path: String,
     project_id: String,
+    state: State<'_, AppState>,
 ) -> Result<ProjectRemovalAudit, String> {
-    let audit_path = catalog_path.clone();
-    let audit_folder = folder_path.clone();
-    let audit_project = project_id.clone();
-    let audit =
-        tauri::async_runtime::spawn_blocking(move || -> anyhow::Result<ProjectRemovalAudit> {
-            let catalog = Catalog::open_existing(Path::new(&audit_path))?;
-            let audit = catalog.audit_project_removal(&audit_project, Path::new(&audit_folder))?;
-            catalog.delete_project(&audit_project)?;
-            Ok(audit)
-        })
-        .await
-        .map_err(error_message)?
-        .map_err(error_message)?;
+    let work = state.project_work.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        delete_project_blocking(&work, &catalog_path, &folder_path, &project_id)
+    })
+    .await
+    .map_err(error_message)?
+}
+
+/// `delete_project`'s body. Detached background writers (post-import
+/// thumbnails, sync proxy downloads, node-targeted jobs) keep catalog handles
+/// into the folder this removes and never set the frontend `busy` flag, so the
+/// project is first claimed against them: the delete is refused while any is
+/// running, and the tombstone makes any that start later decline instead of
+/// recreating cache directories.
+fn delete_project_blocking(
+    work: &project_work::ProjectWork,
+    catalog_path: &str,
+    folder_path: &str,
+    project_id: &str,
+) -> Result<ProjectRemovalAudit, String> {
+    work.begin_delete(project_id).map_err(error_message)?;
+
+    let removed = (|| -> anyhow::Result<ProjectRemovalAudit> {
+        let catalog = Catalog::open_existing(Path::new(catalog_path))?;
+        let audit = catalog.audit_project_removal(project_id, Path::new(folder_path))?;
+        catalog.delete_project(project_id)?;
+        Ok(audit)
+    })();
+    let audit = match removed {
+        Ok(audit) => audit,
+        Err(error) => {
+            // Nothing was deleted, so the project keeps its background work.
+            work.abort_delete(project_id);
+            return Err(error_message(error));
+        }
+    };
 
     if audit.folder_removable {
         // The catalog handle is dropped by now, so the file is closed before
         // its directory goes. A failure here leaves an empty project folder,
         // which is untidy and harmless — the project itself is already gone.
-        fs::remove_dir_all(Path::new(&folder_path)).map_err(error_message)?;
+        fs::remove_dir_all(Path::new(folder_path)).map_err(error_message)?;
     }
 
     Ok(audit)
@@ -1376,6 +1408,8 @@ async fn run_smart_import(
     schedule_background_thumbnails(
         state.catalog()?,
         state.thumbnail_coordinator.clone(),
+        state.project_work.clone(),
+        project_id.clone(),
         touched_asset_ids,
         app,
     );
@@ -1459,12 +1493,16 @@ fn rollback_import_membership(
 fn schedule_background_thumbnails(
     catalog: Catalog,
     coordinator: Arc<ThumbnailCoordinator>,
+    work: project_work::ProjectWork,
+    project_id: String,
     asset_ids: Vec<String>,
     app: tauri::AppHandle,
 ) {
     schedule_background_thumbnails_with(
         catalog,
         coordinator,
+        &work,
+        &project_id,
         asset_ids,
         move |progress| {
             let _ = app.emit("thumbnail-progress", progress);
@@ -1482,6 +1520,8 @@ fn schedule_background_thumbnails(
 fn schedule_background_thumbnails_with<F, S>(
     catalog: Catalog,
     coordinator: Arc<ThumbnailCoordinator>,
+    work: &project_work::ProjectWork,
+    project_id: &str,
     asset_ids: Vec<String>,
     mut on_progress: F,
     start: S,
@@ -1489,6 +1529,10 @@ fn schedule_background_thumbnails_with<F, S>(
     F: FnMut(rcdvlog_core::AssetBatchProgress) + Send + 'static,
     S: FnOnce(Box<dyn FnOnce() -> anyhow::Result<ThumbnailReport> + Send>),
 {
+    // A project that is being (or has been) deleted gets no new cache writes.
+    let Ok(work_guard) = work.begin(project_id, project_work::WorkKind::ImportThumbnails) else {
+        return;
+    };
     let claims = match coordinator.claim(&catalog, asset_ids) {
         Ok(claims) => claims,
         Err(error) => {
@@ -1501,6 +1545,8 @@ fn schedule_background_thumbnails_with<F, S>(
         return;
     }
     start(Box::new(move || {
+        // Held until the last cache write, so a delete cannot interleave.
+        let _work_guard = work_guard;
         let _claims = claims;
         let _execution = _claims
             .coordinator
@@ -2960,6 +3006,128 @@ mod tests {
         );
     }
 
+    fn project_folder_fixture() -> (tempfile::TempDir, PathBuf, Catalog, String) {
+        let directory = tempdir().unwrap();
+        let folder = directory.path().join("Doomed");
+        fs::create_dir_all(&folder).unwrap();
+        let catalog = Catalog::open(folder.join("catalog.sqlite3")).unwrap();
+        let project = catalog.create_project("Doomed").unwrap();
+        (directory, folder, catalog, project.id)
+    }
+
+    #[test]
+    fn delete_project_is_refused_while_background_work_runs() {
+        let (_directory, folder, catalog, project_id) = project_folder_fixture();
+        let catalog_path = folder.join("catalog.sqlite3");
+        let work = project_work::ProjectWork::default();
+        let guard = work
+            .begin(&project_id, project_work::WorkKind::NodeJobs)
+            .unwrap();
+
+        let error = delete_project_blocking(
+            &work,
+            catalog_path.to_str().unwrap(),
+            folder.to_str().unwrap(),
+            &project_id,
+        )
+        .unwrap_err();
+        assert!(error.contains("still running"), "{error}");
+        assert!(error.contains("server-requested proxy/thumbnail jobs"));
+        assert!(folder.exists(), "a refused delete touches nothing");
+        assert_eq!(catalog.list_projects().unwrap().len(), 1);
+
+        drop(guard);
+        let audit = delete_project_blocking(
+            &work,
+            catalog_path.to_str().unwrap(),
+            folder.to_str().unwrap(),
+            &project_id,
+        )
+        .unwrap();
+        assert!(audit.folder_removable);
+        assert!(!folder.exists());
+    }
+
+    #[test]
+    fn a_failed_delete_lifts_the_tombstone() {
+        let (_directory, folder, _catalog, project_id) = project_folder_fixture();
+        let work = project_work::ProjectWork::default();
+        // The folder holds no catalog at this path, so the audit cannot run.
+        let missing = folder.join("missing.sqlite3");
+        assert!(
+            delete_project_blocking(
+                &work,
+                missing.to_str().unwrap(),
+                folder.to_str().unwrap(),
+                &project_id,
+            )
+            .is_err()
+        );
+        assert!(
+            work.begin(&project_id, project_work::WorkKind::NodeJobs)
+                .is_ok(),
+            "nothing was deleted, so background work may continue"
+        );
+    }
+
+    #[test]
+    fn background_thumbnails_after_the_tombstone_never_start_or_create_cache_dirs() {
+        let (_directory, folder, catalog, project_id) = project_folder_fixture();
+        let catalog_path = folder.join("catalog.sqlite3");
+        let work = project_work::ProjectWork::default();
+        delete_project_blocking(
+            &work,
+            catalog_path.to_str().unwrap(),
+            folder.to_str().unwrap(),
+            &project_id,
+        )
+        .unwrap();
+        assert!(!folder.exists());
+
+        let mut started = false;
+        schedule_background_thumbnails_with(
+            catalog,
+            Arc::new(ThumbnailCoordinator::default()),
+            &work,
+            &project_id,
+            vec!["asset_late".to_string()],
+            |_| {},
+            |_task| started = true,
+        );
+        assert!(!started, "work for a deleted project must not launch");
+        assert!(!folder.exists(), "no cache directory is resurrected");
+    }
+
+    #[test]
+    fn a_running_detached_thumbnail_task_blocks_delete_until_it_ends() {
+        let (_directory, folder, catalog, project_id) = project_folder_fixture();
+        let catalog_path = folder.join("catalog.sqlite3");
+        let work = project_work::ProjectWork::default();
+        let mut parked: Option<Box<dyn FnOnce() -> anyhow::Result<ThumbnailReport> + Send>> = None;
+        schedule_background_thumbnails_with(
+            catalog,
+            Arc::new(ThumbnailCoordinator::default()),
+            &work,
+            &project_id,
+            vec!["asset_a".to_string()],
+            |_| {},
+            |task| parked = Some(task),
+        );
+        let task = parked.expect("the task was scheduled");
+        // Scheduled but not yet run: the work is already registered.
+        assert!(
+            delete_project_blocking(
+                &work,
+                catalog_path.to_str().unwrap(),
+                folder.to_str().unwrap(),
+                &project_id,
+            )
+            .is_err()
+        );
+        drop(task);
+        assert!(work.active(&project_id).is_empty());
+    }
+
     #[test]
     fn detached_q1_failure_does_not_revoke_a_completed_smart_import_and_can_be_repaired() {
         if Command::new("ffmpeg").arg("-version").output().is_err() {
@@ -3015,6 +3183,8 @@ mod tests {
         schedule_background_thumbnails_with(
             catalog.clone(),
             Arc::new(ThumbnailCoordinator::default()),
+            &project_work::ProjectWork::default(),
+            &project.id,
             imported_ids.clone(),
             |_| {},
             |task| automatic_report = Some(task().unwrap()),
