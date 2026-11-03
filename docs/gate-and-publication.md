@@ -26,8 +26,8 @@ and include results or exact-head CI links and failed-step logs in a handoff.
 For one Rust test during iteration, run
 `pnpm test:focused <cargo-package> <exact-test-name>` (for example,
 `pnpm test:focused rcdvlog-core migrations::tests::the_schema_version_constant_tracks_the_migration_list`). It uses the CI Rust
-pin and `--exact`, then requires Cargo to report the named test and at least
-one executed test. The fake-command regression cases are in
+pin and cargo-nextest with an exact `test(=name)` filter, then requires nextest to report
+the named test as passed and at least one executed test. The fake-command regression cases are in
 `scripts/run-focused-test.test.mjs`.
 
 Use `pnpm publish:after-gate push --checks /absolute/path/focused-checks.json` or

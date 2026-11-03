@@ -81,7 +81,11 @@ export function runGate({ args = process.argv.slice(2), spawn = spawnSync, write
   } else {
     checks.push(
       rust("cargo clippy --workspace --all-targets -- -D warnings", ["clippy", "--workspace", "--all-targets", "--", "-D", "warnings"]),
-      { name: "cargo test --workspace", command: "cargo", args: [`+${rustToolchain}`, "test", "--workspace", "--", "--test-threads=4"], requireTests: true },
+      // Same runner and profile as CI's sharded `linux-rust (tests N/4)` jobs, unpartitioned.
+      // Needs cargo-nextest (version pinned as NEXTEST_VERSION in ci.yml).
+      { name: "cargo nextest run --workspace", command: "cargo", args: [`+${rustToolchain}`, "nextest", "run", "--workspace", "--profile", "ci", "--test-threads", "4"], requireTests: true, needsNextest: true },
+      // nextest does not run doctests; CI runs them on shard 1. Zero doctests is legitimate.
+      rust("cargo test --workspace --doc", ["test", "--workspace", "--doc"]),
       { name: "pnpm check:frontend", command: "pnpm", args: ["check:frontend"] },
       { name: "pnpm test:desktop:coverage", command: "pnpm", args: ["test:desktop:coverage"] },
       { name: "pnpm test:desktop:browser", command: "pnpm", args: ["test:desktop:browser"] },
@@ -114,11 +118,16 @@ export function runGate({ args = process.argv.slice(2), spawn = spawnSync, write
     }
     if (check.requireTests && status === 0) {
       const summaries = [...output.matchAll(/test result: (?:ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored;/g)];
-      const observed = summaries.reduce((sum, match) => sum + Number(match[1]) + Number(match[2]), 0);
-      if (summaries.length === 0 || observed === 0) {
+      const nextest = [...output.matchAll(/Summary \[[^\]]*\]\s+(\d+) tests? run:/g)];
+      const observed = summaries.reduce((sum, match) => sum + Number(match[1]) + Number(match[2]), 0)
+        + nextest.reduce((sum, match) => sum + Number(match[1]), 0);
+      if ((summaries.length === 0 && nextest.length === 0) || observed === 0) {
         status = 1;
         detail = "cargo test exited 0 without reporting any executed tests";
       }
+    }
+    if (check.needsNextest && status !== 0 && /no such command: `?nextest|no such subcommand/i.test(output)) {
+      write("cargo-nextest is not installed. Install the version pinned as NEXTEST_VERSION in .github/workflows/ci.yml (cargo install --locked cargo-nextest@<version>).\n");
     }
     if (check.baseGuidance && status !== 0) {
       if (/unknown revision|ambiguous argument|bad revision|not a valid object name/i.test(output)) {
