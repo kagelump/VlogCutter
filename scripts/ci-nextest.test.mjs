@@ -30,7 +30,9 @@ test("doctests, OpenAPI freshness and lint still run, and the job stays aggregat
   assert.match(linuxRust, /cargo test --workspace --doc/);
   assert.match(linuxRust, /run: pnpm check:openapi/);
   assert.match(linuxRust, /cargo clippy --workspace --all-targets -- -D warnings/);
-  assert.match(ci, /ci-required:[\s\S]*needs: \[changes, linux-rust, frontend, browser, macos\]/);
+  // The aggregate must still depend on the sharded job (other required jobs,
+  // such as web-e2e, may sit beside it in the list).
+  assert.match(ci, /ci-required:[\s\S]*needs: \[[^\]]*\blinux-rust\b[^\]]*\]/);
   assert.doesNotMatch(linuxRust, /--no-tests|continue-on-error|--retries/, "nothing is skipped, retried or tolerated");
 });
 
