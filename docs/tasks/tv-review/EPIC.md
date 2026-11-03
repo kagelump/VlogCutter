@@ -35,7 +35,7 @@ byte-identically.
 | 10 | [V01-T001](tasks/V01-T001-v2-contract-types.md) | Freeze v2 contract types with v1 byte compatibility | — | complete |
 | 20 | [V01-T002](tasks/V01-T002-peak-diagnostics.md) | Report best peaks for every searched window | V01-T001 | complete |
 | 30 | [V01-T003](tasks/V01-T003-distinctive-acceptance.md) | Distinctive-peak acceptance in match_pcm | V01-T002 | complete |
-| 40 | [V01-T004](tasks/V01-T004-global-margin.md) | Cross-reference margin in session evidence | V01-T003 | ready |
+| 40 | [V01-T004](tasks/V01-T004-global-margin.md) | Cross-reference margin in session evidence | V01-T003 | complete |
 | 50 | [V01-T005](tasks/V01-T005-speech-mask.md) | Speech mask weights in matching | V01-T001 | ready |
 | 60 | [V01-T006](tasks/V01-T006-gap-windows.md) | Gap-placed query windows in session plans | V01-T005 | ready |
 | 70 | [V01-T007](tasks/V01-T007-offset-consensus.md) | Offset consensus module and CLI | V01-T004 | ready |

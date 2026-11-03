@@ -5,8 +5,8 @@ use crate::{
     tv_review_sync::{SyncAnchor, SyncBoundary, SyncBoundaryKind, SyncQuery, SyncRequest},
     tv_soundtrack::{
         MAX_BEST_PEAKS, PCM_RATE, PEAK_MERGE_SECONDS, SoundtrackCapture, SoundtrackIndex,
-        SoundtrackMatchReport, SoundtrackMovie, SoundtrackPeak, SoundtrackPolicy,
-        SoundtrackReferenceSpec,
+        SoundtrackMatchReport, SoundtrackMatchState, SoundtrackMovie, SoundtrackPeak,
+        SoundtrackPolicy, SoundtrackReferenceSpec,
     },
 };
 use anyhow::{Context, Result, ensure};
@@ -142,7 +142,9 @@ pub struct SessionSyncEvidence {
 }
 /// ARCHITECTURE §3: keep the highest-scoring peak within each 0.256 s movie
 /// neighbourhood, sorted by similarity descending then movie time ascending.
-fn merge_best_peaks(mut pool: Vec<SoundtrackPeak>) -> Vec<SoundtrackPeak> {
+/// The uncapped form lets §5 see every merged rival; its first `cap` entries
+/// equal the capped merge.
+fn merge_peaks(mut pool: Vec<SoundtrackPeak>, cap: usize) -> Vec<SoundtrackPeak> {
     pool.sort_by(|a, b| {
         b.similarity
             .total_cmp(&a.similarity)
@@ -158,7 +160,7 @@ fn merge_best_peaks(mut pool: Vec<SoundtrackPeak>) -> Vec<SoundtrackPeak> {
             continue;
         }
         merged.push(peak);
-        if merged.len() == MAX_BEST_PEAKS {
+        if merged.len() == cap {
             break;
         }
     }
@@ -643,17 +645,47 @@ impl SoundtrackSessionPlan {
             };
             let mut candidates = Vec::new();
             let mut peak_pool = Vec::new();
+            // Best peak of each Matched reference, with the margin it must clear (§5).
+            let mut matched_peaks: Vec<(SoundtrackPeak, f64)> = Vec::new();
             for ri in 0..self.references.len() {
                 ensure!(!cancel(), "session evidence cancelled");
                 if let Some(receipt) = self.receipt(cache, qi * self.references.len() + ri)? {
                     evidence.completed_references += 1;
                     evidence.report_digests.push(receipt.report_digest);
+                    if let (SoundtrackMatchState::Matched, Some(best), Some(distinctive)) = (
+                        &receipt.report.state,
+                        receipt.report.best_peaks.first(),
+                        self.spec.match_policy.distinctive.as_ref(),
+                    ) {
+                        let margin = if receipt.report.reason == "distinctive_peak_low_similarity" {
+                            distinctive.minimum_margin
+                        } else {
+                            self.spec.match_policy.minimum_peak_margin
+                        };
+                        matched_peaks.push((best.clone(), margin));
+                    }
                     peak_pool.extend(receipt.report.best_peaks.iter().cloned());
                     candidates.extend(receipt.report.candidates.into_iter().map(|c| c.anchor));
                 }
             }
-            evidence.best_peaks = merge_best_peaks(peak_pool);
+            let merged_all = merge_peaks(peak_pool, usize::MAX);
+            evidence.best_peaks = merged_all.iter().take(MAX_BEST_PEAKS).cloned().collect();
             if evidence.completed_references == evidence.total_references {
+                // ARCHITECTURE §5: a merged peak at a different movie position that
+                // breaks the applicable margin of any Matched reference makes the
+                // query ambiguous with no anchors. Only with distinctive set.
+                let rival_breaks_margin = matched_peaks.iter().any(|(peak, margin)| {
+                    merged_all.iter().any(|rival| {
+                        (rival.movie_seconds - peak.movie_seconds).abs()
+                            >= PEAK_MERGE_SECONDS - 1e-9
+                            && peak.similarity - rival.similarity < *margin
+                    })
+                });
+                if rival_breaks_margin {
+                    evidence.state = "ambiguous".into();
+                    page.queries.push(evidence);
+                    continue;
+                }
                 candidates.sort_by_key(|a| a.movie_pts);
                 // Only coalesce observations at the same search-grid location.
                 // Never merge nearby but disjoint true alternatives by uncertainty.
