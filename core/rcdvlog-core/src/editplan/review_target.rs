@@ -380,7 +380,13 @@ impl Catalog {
             .validation
             .as_ref()
             .is_some_and(|v| v.fully_decoded);
-        let target = snapshot_from_artifact(artifact, &plan, youtube_video_id, cancel)?;
+        let target = snapshot_from_artifact(
+            artifact,
+            &plan,
+            youtube_video_id,
+            SnapshotPolicy::Strict,
+            cancel,
+        )?;
         let handoff = ReviewTargetHandoff {
             schema_version: REVIEW_TARGET_SCHEMA_VERSION,
             target_digest: ReviewTargetHandoff::snapshot_digest(&target)?,
@@ -403,19 +409,40 @@ impl Catalog {
     }
 }
 
+/// Receipt compatibility is separate from current renderability. TV-range v2
+/// changed pixel normalization/cache identity, retaining the measured clock
+/// and mapping representation. Unknown recipes remain unsupported.
+pub(super) const HISTORICAL_TV_RANGE_V2_RECIPE: &str =
+    "preview.immutable-receipt.h264-30000-1001.stereo48.actual-clock.tv-range.v2";
+pub(super) enum SnapshotPolicy {
+    Strict,
+    Historical,
+}
+
 pub(super) fn snapshot_from_artifact(
     artifact: super::PreviewArtifact,
     plan: &super::EditPlanRevision,
     youtube_video_id: Option<String>,
+    policy: SnapshotPolicy,
     cancel: &dyn Fn() -> bool,
 ) -> Result<ReviewTargetSnapshot> {
     let identity = artifact.identity.context("missing preview identity")?;
     let validation = artifact
         .validation
         .context("missing measured movie mapping")?;
+    let supported_recipe = identity.recipe == super::preview_media::RECIPE
+        || matches!(policy, SnapshotPolicy::Historical)
+            && [
+                "preview.immutable-receipt.h264-30000-1001.stereo48.actual-clock.v1",
+                HISTORICAL_TV_RANGE_V2_RECIPE,
+            ]
+            .contains(&identity.recipe.as_str());
+    ensure!(
+        supported_recipe,
+        "invalid receipt: unsupported preview recipe for the selected review policy"
+    );
     ensure!(
         plan.project_id == artifact.project_id
-            && identity.recipe == super::preview_media::RECIPE
             && identity.max_height == artifact.request.max_height
             && identity.revision_id == plan.revision_id
             && validation.cuts.len() == plan.operations.len(),

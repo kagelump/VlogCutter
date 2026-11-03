@@ -63,6 +63,8 @@ export const API_PATHS = {
   reviewTargets: "/api/v1/projects/{projectId}/review-targets",
   reviewTargetPreflight: "/api/v1/projects/{projectId}/review-targets/preflight",
   reviewTargetImport: "/api/v1/projects/{projectId}/review-targets/import",
+  historicalReviewTargetPreflight: "/api/v1/projects/{projectId}/review-targets/historical/preflight",
+  historicalReviewTargetImport: "/api/v1/projects/{projectId}/review-targets/historical/import",
   reviewTarget: "/api/v1/projects/{projectId}/review-targets/{reviewTargetId}",
   reviewTargetYoutube: "/api/v1/projects/{projectId}/review-targets/{reviewTargetId}/youtube",
   reviewTargetCandidates: "/api/v1/projects/{projectId}/review-targets/{reviewTargetId}/candidates",

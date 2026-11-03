@@ -554,6 +554,66 @@
         ],
         "type": "string"
       },
+      "HistoricalReviewTargetImportRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "acknowledgement": {
+            "enum": [
+              "integrityOnlyCurrentRenderabilityNotEstablished"
+            ],
+            "type": "string"
+          },
+          "availability": {
+            "additionalProperties": false,
+            "properties": {
+              "observedAt": {
+                "format": "date-time",
+                "type": "string"
+              },
+              "state": {
+                "enum": [
+                  "unknown",
+                  "present",
+                  "missing",
+                  "modified"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "state",
+              "observedAt"
+            ],
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "declaredIssuer": {
+            "maxLength": 64,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "maxVerificationAgeSeconds": {
+            "minimum": 1,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "review": {
+            "description": "The data member of edit-plan.historical-review-target-export; see docs/contracts/historical-review-v1.schema.json",
+            "type": "object"
+          }
+        },
+        "required": [
+          "review",
+          "acknowledgement"
+        ],
+        "type": "object"
+      },
       "LabelMutationRequest": {
         "properties": {
           "baseRevision": {
@@ -3882,6 +3942,103 @@
               }
             },
             "description": "ReviewTargetPage"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/v1/projects/{projectId}/review-targets/historical/import": {
+      "post": {
+        "description": "Import or reuse a historical rendered-artifact review under contract historicalRenderedArtifactReviewV1. It can never be read back as a strict review target; a snapshot already stored under the other contract returns 409 review_target_contract_conflict.",
+        "operationId": "importHistoricalReviewTarget",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "projectId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/HistoricalReviewTargetImportRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReviewTargetImportResult"
+                }
+              }
+            },
+            "description": "ReviewTargetImportResult"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/v1/projects/{projectId}/review-targets/historical/preflight": {
+      "post": {
+        "description": "Non-mutating validation of a HistoricalRenderedArtifactReview v1 (#232): integrity of an already rendered movie only. Requires the explicit acknowledgement; current sources, constraints and renderability are reported as not established.",
+        "operationId": "preflightHistoricalReviewTarget",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "projectId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/HistoricalReviewTargetImportRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReviewTargetPreflight"
+                }
+              }
+            },
+            "description": "ReviewTargetPreflight"
           },
           "400": {
             "$ref": "#/components/responses/Error"

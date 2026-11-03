@@ -85,6 +85,42 @@ pub(crate) fn valid() -> Value {
     serde_json::to_value(handoff_with(|_| {})).unwrap()
 }
 
+/// The same synthetic snapshot as a historical rendered-artifact review (#232).
+pub(crate) fn historical_with(
+    edit: impl FnOnce(&mut ReviewTargetSnapshot),
+) -> HistoricalRenderedArtifactReview {
+    let handoff = handoff_with(edit);
+    let review = HistoricalRenderedArtifactReview {
+        schema_version: 1,
+        purpose: HistoricalReviewPurpose::HistoricalRenderedArtifactReview,
+        target_digest: handoff.target_digest,
+        target: handoff.target,
+        verified_at: handoff.verification.verified_at,
+        output_matches: true,
+        mapping_matches_revision: true,
+        stored_fully_decoded: true,
+        current_source_verification: HistoricalReviewUnresolved::NotEstablishedByThisReview,
+        current_constraints_verification: HistoricalReviewUnresolved::NotEstablishedByThisReview,
+        current_plan_renderability: HistoricalReviewUnresolved::NotEstablishedByThisReview,
+    };
+    review.validate().unwrap();
+    review
+}
+
+pub(crate) fn historical_valid() -> Value {
+    serde_json::to_value(historical_with(|_| {})).unwrap()
+}
+
+pub(crate) fn historical_request(review: Value) -> HistoricalReviewTargetImportRequest {
+    HistoricalReviewTargetImportRequest {
+        review,
+        acknowledgement: Some(HISTORICAL_REVIEW_ACKNOWLEDGEMENT.into()),
+        declared_issuer: Some("Synthetic laptop".into()),
+        availability: None,
+        max_verification_age_seconds: None,
+    }
+}
+
 fn rejected_code(error: ReviewTargetServiceError) -> &'static str {
     match error {
         ReviewTargetServiceError::Rejected { code, preflight } => {
@@ -657,4 +693,227 @@ fn an_adverse_availability_report_is_retained_and_blocks_new_sessions() {
     unknown.availability = missing.availability.clone();
     assert!(targets.import(PROJECT, &unknown, &actor(), now()).is_err());
     assert_eq!(count_targets(&catalog), 1);
+}
+
+#[test]
+fn a_historical_review_needs_its_own_route_and_an_explicit_acknowledgement() {
+    let root = TempDir::new().unwrap();
+    let catalog = catalog(&root);
+    let targets = catalog.review_targets();
+    // The strict route names the historical contract instead of a parse error.
+    let preflight = targets
+        .preflight(PROJECT, &request(historical_valid()), now())
+        .unwrap();
+    assert_eq!(preflight.outcome, PreflightOutcome::Blocked);
+    assert_eq!(
+        preflight.first_failure(),
+        Some("review_target_historical_contract")
+    );
+    assert_eq!(
+        rejected_code(
+            targets
+                .import(PROJECT, &request(historical_valid()), &actor(), now())
+                .unwrap_err()
+        ),
+        "review_target_historical_contract"
+    );
+    // No acknowledgement, or a different one: refused before parsing.
+    for acknowledgement in [None, Some("yes".to_string())] {
+        let mut unacknowledged = historical_request(historical_valid());
+        unacknowledged.acknowledgement = acknowledgement;
+        assert_eq!(
+            rejected_code(
+                targets
+                    .import_historical(PROJECT, &unacknowledged, &actor(), now())
+                    .unwrap_err()
+            ),
+            "review_target_historical_acknowledgement_required"
+        );
+    }
+    // A strict handoff sent to the historical route is not silently weakened.
+    assert_eq!(
+        rejected_code(
+            targets
+                .import_historical(PROJECT, &historical_request(valid()), &actor(), now())
+                .unwrap_err()
+        ),
+        "review_target_not_historical"
+    );
+    // A review claiming incomplete integrity fails the shared validator.
+    let mut incomplete = historical_valid();
+    incomplete["storedFullyDecoded"] = json!(false);
+    assert_eq!(
+        rejected_code(
+            targets
+                .import_historical(PROJECT, &historical_request(incomplete), &actor(), now())
+                .unwrap_err()
+        ),
+        "review_target_invalid"
+    );
+    let mut tampered = historical_valid();
+    tampered["targetDigest"] = json!("0".repeat(64));
+    assert_eq!(
+        rejected_code(
+            targets
+                .import_historical(PROJECT, &historical_request(tampered), &actor(), now())
+                .unwrap_err()
+        ),
+        "review_target_digest_mismatch"
+    );
+    assert_eq!(count_targets(&catalog), 0);
+}
+
+#[test]
+fn a_historical_target_keeps_its_weaker_guarantees_everywhere() {
+    let root = TempDir::new().unwrap();
+    let catalog = catalog(&root);
+    let targets = catalog.review_targets();
+    let preflight = targets
+        .preflight_historical(PROJECT, &historical_request(historical_valid()), now())
+        .unwrap();
+    assert_eq!(preflight.outcome, PreflightOutcome::New);
+    assert_eq!(
+        preflight.preview.as_ref().unwrap().contract,
+        ReviewTargetContract::HistoricalRenderedArtifactReviewV1
+    );
+    for name in [
+        "currentSources",
+        "currentConstraints",
+        "currentRenderability",
+    ] {
+        let check = preflight.checks.iter().find(|c| c.name == name).unwrap();
+        assert_eq!(check.status, ReviewTargetCheckStatus::Warn, "{name}");
+    }
+    assert!(
+        !preflight
+            .checks
+            .iter()
+            .any(|c| c.name == "verificationReceipt")
+    );
+
+    let imported = targets
+        .import_historical(
+            PROJECT,
+            &historical_request(historical_valid()),
+            &actor(),
+            now(),
+        )
+        .unwrap();
+    assert_eq!(imported.outcome, ImportOutcome::Created);
+    let detail = imported.review_target;
+    let id = detail.summary.review_target_id.clone();
+    assert_eq!(
+        detail.summary.contract,
+        ReviewTargetContract::HistoricalRenderedArtifactReviewV1
+    );
+    assert!(detail.summary.readiness.ready);
+    assert_eq!(
+        &detail.limitations[..HISTORICAL_REVIEW_TARGET_LIMITATIONS.len()],
+        HISTORICAL_REVIEW_TARGET_LIMITATIONS
+    );
+    assert!(detail.limitations.ends_with(REVIEW_TARGET_LIMITATIONS));
+    let observation = serde_json::to_value(&detail.observations[0]).unwrap();
+    assert_eq!(observation["verification"]["mappingMatchesRevision"], true);
+    assert_eq!(
+        observation["verification"]["currentPlanRenderability"],
+        "notEstablishedByThisReview"
+    );
+    // Never a strict receipt field, and never readable as a strict handoff.
+    assert!(observation["verification"].get("planRenderable").is_none());
+    assert!(matches!(
+        targets.handoff(PROJECT, &id),
+        Err(ReviewTargetServiceError::InvalidInput(_))
+    ));
+    let evidence = targets.evidence(PROJECT, &id).unwrap();
+    assert!(matches!(evidence, ReviewTargetEvidence::Historical(_)));
+    assert_eq!(evidence.target_digest(), detail.summary.target_digest);
+    // Picture locators still use the shared lookup.
+    let candidates = targets.candidates(PROJECT, &id, 0.0, 0.0).unwrap();
+    assert!(!candidates.operation_ids.is_empty());
+    // Identical re-import reuses; nothing is written twice.
+    let again = targets
+        .import_historical(
+            PROJECT,
+            &historical_request(historical_valid()),
+            &actor(),
+            now(),
+        )
+        .unwrap();
+    assert_eq!(again.outcome, ImportOutcome::Reused);
+    assert_eq!(count_targets(&catalog), 1);
+    // A YouTube declaration derives a new snapshot under the same contract.
+    let rebound = targets
+        .rebind_youtube(PROJECT, &id, Some("dQw4w9WgXcQ"), &actor(), now())
+        .unwrap()
+        .review_target;
+    assert_eq!(
+        rebound.summary.contract,
+        ReviewTargetContract::HistoricalRenderedArtifactReviewV1
+    );
+    assert!(matches!(
+        targets
+            .evidence(PROJECT, &rebound.summary.review_target_id)
+            .unwrap(),
+        ReviewTargetEvidence::Historical(_)
+    ));
+}
+
+#[test]
+fn one_snapshot_cannot_be_stored_under_both_contracts() {
+    for strict_first in [true, false] {
+        let root = TempDir::new().unwrap();
+        let catalog = catalog(&root);
+        let targets = catalog.review_targets();
+        let first = if strict_first {
+            targets.import(PROJECT, &request(valid()), &actor(), now())
+        } else {
+            targets.import_historical(
+                PROJECT,
+                &historical_request(historical_valid()),
+                &actor(),
+                now(),
+            )
+        }
+        .unwrap()
+        .review_target
+        .summary
+        .review_target_id;
+        let (preflight, error) = if strict_first {
+            (
+                targets
+                    .preflight_historical(PROJECT, &historical_request(historical_valid()), now())
+                    .unwrap(),
+                targets
+                    .import_historical(
+                        PROJECT,
+                        &historical_request(historical_valid()),
+                        &actor(),
+                        now(),
+                    )
+                    .unwrap_err(),
+            )
+        } else {
+            (
+                targets
+                    .preflight(PROJECT, &request(valid()), now())
+                    .unwrap(),
+                targets
+                    .import(PROJECT, &request(valid()), &actor(), now())
+                    .unwrap_err(),
+            )
+        };
+        assert_eq!(preflight.outcome, PreflightOutcome::Conflict);
+        assert_eq!(preflight.conflicting_review_target_ids, vec![first.clone()]);
+        assert_eq!(rejected_code(error), "review_target_contract_conflict");
+        assert_eq!(count_targets(&catalog), 1);
+        // The stored target and its observations are untouched.
+        assert_eq!(
+            targets
+                .get(PROJECT, &first, now())
+                .unwrap()
+                .observations
+                .len(),
+            1
+        );
+    }
 }

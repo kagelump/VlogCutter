@@ -233,6 +233,22 @@ export interface ReviewTargetImportRequest {
 /** Longest listening snippet the server returns; mirrors rcdvlog-server-core. */
 export const REVIEW_SNIPPET_MAX_SECONDS = 30;
 
+/**
+ * A historical rendered-artifact review (#232) is a different, weaker contract:
+ * it attests the integrity of an already rendered movie only. Importing it
+ * requires this exact acknowledgement.
+ */
+export const HISTORICAL_REVIEW_ACKNOWLEDGEMENT = "integrityOnlyCurrentRenderabilityNotEstablished";
+export type ReviewTargetContract = "reviewTargetV1" | "historicalRenderedArtifactReviewV1";
+
+export interface HistoricalReviewTargetImportRequest {
+  review: ReviewTargetHandoffJson;
+  acknowledgement: typeof HISTORICAL_REVIEW_ACKNOWLEDGEMENT;
+  declaredIssuer?: string | null;
+  availability?: { state: ArtifactAvailabilityState; observedAt: string } | null;
+  maxVerificationAgeSeconds?: number | null;
+}
+
 export interface ReviewTargetCheck {
   name: string;
   status: "pass" | "warn" | "fail";
@@ -245,6 +261,7 @@ export interface ReviewTargetPreflight {
   importable: boolean;
   checks: ReviewTargetCheck[];
   preview: {
+    contract: ReviewTargetContract;
     projectId: string;
     revisionId: string;
     viewedArtifactId: string;
@@ -273,6 +290,7 @@ export interface ReviewTargetReadiness {
 
 export interface ReviewTargetSummary {
   reviewTargetId: string;
+  contract: ReviewTargetContract;
   projectId: string;
   revisionId: string;
   viewedArtifactId: string;
@@ -324,7 +342,8 @@ export interface ReviewTargetDetail extends ReviewTargetSummary {
   provenance: { importedAt: string; importer: ReviewTargetActor; declaredIssuer: string | null; issuerVerification: "unverified"; derivedFromReviewTargetId: string | null };
   observations: Array<{
     observationId: string;
-    verification: { verifiedAt: string; outputMatches: boolean; inputsMatch: boolean; constraintsMatch: boolean; planRenderable: boolean; fullyDecoded: boolean };
+    /** Strict receipt for `reviewTargetV1`; integrity-only receipt for a historical target. */
+    verification: StrictVerificationReceipt | HistoricalIntegrityReceipt;
     availabilityState: ArtifactAvailabilityState;
     availabilityObservedAt: string;
     availabilitySource: "exportVerification" | "importerAssertion" | "carriedFromParentTarget";
@@ -333,6 +352,17 @@ export interface ReviewTargetDetail extends ReviewTargetSummary {
     recordedBy: ReviewTargetActor;
   }>;
   limitations: string[];
+}
+
+export interface StrictVerificationReceipt { verifiedAt: string; outputMatches: boolean; inputsMatch: boolean; constraintsMatch: boolean; planRenderable: boolean; fullyDecoded: boolean }
+export interface HistoricalIntegrityReceipt {
+  verifiedAt: string;
+  outputMatches: boolean;
+  mappingMatchesRevision: boolean;
+  storedFullyDecoded: boolean;
+  currentSourceVerification: "notEstablishedByThisReview";
+  currentConstraintsVerification: "notEstablishedByThisReview";
+  currentPlanRenderability: "notEstablishedByThisReview";
 }
 
 export interface ReviewTargetPage { items: ReviewTargetSummary[]; nextBefore: number | null }
@@ -612,6 +642,7 @@ export interface ReviewWorkspace {
   revisionId: string;
   viewedArtifactId: string;
   targetDigest: string;
+  targetContract: ReviewTargetContract;
   sync: ReviewSyncDescription;
   cuts: Array<{ operationId: string; position: number; assetId: string; movieInSeconds: number; movieOutSeconds: number }>;
   utterances: WorkspaceUtterance[];
@@ -672,6 +703,8 @@ export interface BrowserProjectClient extends ProjectClient {
   listReviewTargets(projectId: string, limit?: number, before?: number): Promise<ReviewTargetPage>;
   preflightReviewTarget(projectId: string, request: ReviewTargetImportRequest): Promise<ReviewTargetPreflight>;
   importReviewTarget(projectId: string, request: ReviewTargetImportRequest): Promise<ReviewTargetImportResult>;
+  preflightHistoricalReviewTarget(projectId: string, request: HistoricalReviewTargetImportRequest): Promise<ReviewTargetPreflight>;
+  importHistoricalReviewTarget(projectId: string, request: HistoricalReviewTargetImportRequest): Promise<ReviewTargetImportResult>;
   getReviewTarget(projectId: string, reviewTargetId: string): Promise<ReviewTargetDetail>;
   declareReviewTargetYoutube(projectId: string, reviewTargetId: string, youtubeVideoId: string | null): Promise<ReviewTargetImportResult>;
   getReviewTargetCandidates(projectId: string, reviewTargetId: string, startSeconds: number, endSeconds: number): Promise<ReviewTargetCandidates>;

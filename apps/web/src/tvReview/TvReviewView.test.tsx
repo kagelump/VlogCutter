@@ -11,6 +11,7 @@ function memoryVoice(): VoiceDeps {
 
 const detail: ReviewTargetDetail = {
   reviewTargetId: "rtarget_one",
+  contract: "reviewTargetV1",
   projectId: "project_fixture",
   revisionId: "editrev_synthetic",
   viewedArtifactId: "preview_synthetic",
@@ -41,6 +42,8 @@ function client(overrides: Partial<BrowserProjectClient> = {}): BrowserProjectCl
     listReviewTargets: vi.fn().mockResolvedValue({ items: [], nextBefore: null }),
     preflightReviewTarget: vi.fn(),
     importReviewTarget: vi.fn(),
+    preflightHistoricalReviewTarget: vi.fn(),
+    importHistoricalReviewTarget: vi.fn(),
     getReviewTarget: vi.fn().mockResolvedValue(detail),
     declareReviewTargetYoutube: vi.fn(),
     getReviewTargetCandidates: vi.fn(),
@@ -54,7 +57,7 @@ const handoff = { schemaVersion: 1, targetDigest: "x", target: {}, verification:
 test("preflight shows checks and only offers import when every check passes", async () => {
   const preflight: ReviewTargetPreflight = {
     outcome: "new", importable: true, existingReviewTargetId: null, conflictingReviewTargetIds: [], maxVerificationAgeSeconds: 604800,
-    preview: { projectId: "project_fixture", revisionId: "editrev_synthetic", viewedArtifactId: "preview_synthetic", targetDigest: "a".repeat(64), movieBlake3: "d".repeat(64), durationSeconds: 6.02, cutCount: 3, youtubeVideoId: "synthetic01", verifiedAt: "2026-11-02T00:00:00Z" },
+    preview: { contract: "reviewTargetV1", projectId: "project_fixture", revisionId: "editrev_synthetic", viewedArtifactId: "preview_synthetic", targetDigest: "a".repeat(64), movieBlake3: "d".repeat(64), durationSeconds: 6.02, cutCount: 3, youtubeVideoId: "synthetic01", verifiedAt: "2026-11-02T00:00:00Z" },
     checks: [{ name: "targetDigest", status: "pass", code: null, detail: "recomputed by Rust" }, { name: "youtube", status: "warn", code: null, detail: "declared, not verified" }],
   };
   const navigate = vi.fn();
@@ -114,6 +117,52 @@ test("an import conflict is shown by code and not retried", async () => {
   await userEvent.click(await screen.findByRole("button", { name: "Import target" }));
   expect(await screen.findByText(/Nothing was overwritten/)).toBeVisible();
   expect(mock.importReviewTarget).toHaveBeenCalledTimes(1);
+});
+
+const historicalReview = { schemaVersion: 1, purpose: "historicalRenderedArtifactReview", targetDigest: "x", target: {}, verifiedAt: "2026-11-02T00:00:00Z" };
+
+test("a historical review is detected, needs an explicit acknowledgement and uses its own route", async () => {
+  const navigate = vi.fn();
+  const historicalDetail: ReviewTargetDetail = { ...detail, reviewTargetId: "rtarget_old", contract: "historicalRenderedArtifactReviewV1" };
+  const mock = client({
+    preflightHistoricalReviewTarget: vi.fn().mockResolvedValue({
+      outcome: "new", importable: true, existingReviewTargetId: null, conflictingReviewTargetIds: [], maxVerificationAgeSeconds: 604800,
+      preview: { contract: "historicalRenderedArtifactReviewV1", projectId: "project_fixture", revisionId: "editrev_old", viewedArtifactId: "preview_old", targetDigest: "a".repeat(64), movieBlake3: "d".repeat(64), durationSeconds: 6, cutCount: 2, youtubeVideoId: null, verifiedAt: "2026-11-02T00:00:00Z" },
+      checks: [{ name: "currentRenderability", status: "warn", code: null, detail: "current plan renderability is not established by this historical review" }],
+    }),
+    importHistoricalReviewTarget: vi.fn().mockResolvedValue({ outcome: "created", reviewTarget: historicalDetail }),
+  });
+  render(<TvReviewView client={mock} path="/tv-review/project_fixture" navigate={navigate} />);
+  await userEvent.click(await screen.findByLabelText("Handoff JSON"));
+  await userEvent.paste(JSON.stringify({ ok: true, command: "edit-plan.historical-review-target-export", data: historicalReview }));
+  expect(screen.getByRole("group", { name: "Historical rendered-artifact review" })).toBeVisible();
+  // Not checkable until the importer acknowledges what it does not establish.
+  expect(screen.getByRole("button", { name: "Check handoff" })).toBeDisabled();
+  await userEvent.click(screen.getByRole("checkbox", { name: /already rendered movie only/ }));
+  await userEvent.click(screen.getByRole("button", { name: "Check handoff" }));
+  expect(await screen.findByText("Ready to import as a new immutable historical target.")).toBeVisible();
+  expect(screen.getByText("Historical rendered artifact (integrity only)")).toBeVisible();
+  expect(mock.preflightReviewTarget).not.toHaveBeenCalled();
+  expect(mock.preflightHistoricalReviewTarget).toHaveBeenCalledWith("project_fixture", { review: historicalReview, acknowledgement: "integrityOnlyCurrentRenderabilityNotEstablished", declaredIssuer: null });
+  await userEvent.click(screen.getByRole("button", { name: "Import historical target" }));
+  await waitFor(() => expect(navigate).toHaveBeenCalledWith("/tv-review/project_fixture/rtarget_old"));
+  expect(mock.importReviewTarget).not.toHaveBeenCalled();
+});
+
+test("a current handoff never shows the historical acknowledgement", async () => {
+  render(<TvReviewView client={client()} path="/tv-review/project_fixture" navigate={vi.fn()} />);
+  await userEvent.click(await screen.findByLabelText("Handoff JSON"));
+  await userEvent.paste(JSON.stringify(handoff));
+  expect(screen.queryByRole("group", { name: "Historical rendered-artifact review" })).toBeNull();
+  expect(screen.getByRole("button", { name: "Check handoff" })).toBeEnabled();
+});
+
+test("a historical target says what it does not establish", async () => {
+  const mock = client({ getReviewTarget: vi.fn().mockResolvedValue({ ...detail, contract: "historicalRenderedArtifactReviewV1", limitations: ["Current plan renderability was not established by this review."] }) });
+  render(<TvReviewView client={mock} path="/tv-review/project_fixture/rtarget_one" navigate={vi.fn()} voice={memoryVoice()} />);
+  expect(await screen.findByText("Historical artifact · integrity only")).toBeVisible();
+  expect(screen.getByRole("note")).toHaveTextContent(/nothing here can render, edit, activate or upload it/);
+  expect(screen.getByText("Current plan renderability was not established by this review.")).toBeVisible();
 });
 
 test("detail shows revision, digest, duration and mapping, and declares a parsed YouTube ID", async () => {

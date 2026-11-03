@@ -5,7 +5,7 @@ import { ReviewWorkspaceView } from "./ReviewWorkspaceView";
 
 const machine = { utteranceId: "s0w0u0", segmentIndex: 0, windowIndex: 0, startFrame: 48000, endFrame: 96000, startSeconds: 1, endSeconds: 2, text: "这个太长", language: "zh", script: "hanSimplified", displayText: "這個太長", displayProjection: "openccS2tw", speaker: "unknown", speakerEvidence: "diarizationUnavailable", meanTokenProbability: 0.8, flags: [], suppressed: false };
 const workspace: ReviewWorkspace = {
-  runId: "r", sessionId: "s", projectId: "p", reviewTargetId: "t", revisionId: "editrev", viewedArtifactId: "preview", targetDigest: "d",
+  runId: "r", sessionId: "s", projectId: "p", reviewTargetId: "t", revisionId: "editrev", viewedArtifactId: "preview", targetDigest: "d", targetContract: "reviewTargetV1",
   sync: { status: "mapped", source: "sharedSync", note: "Movie time comes from the shared synchronizer.", calibratedClocks: 1, anchors: 2, boundaries: 0, diagnostics: [],
     policy: { minimumConfidence: 0.8, maxAnchorGapSeconds: 15, maxExtrapolationSeconds: 0, maxDriftPpm: 2000, residualToleranceSeconds: 0.1, unobservedUncertaintyPpm: 5000 } },
   cuts: [{ operationId: "op_a", position: 0, assetId: "a", movieInSeconds: 0, movieOutSeconds: 2 }, { operationId: "op_b", position: 1, assetId: "a", movieInSeconds: 2, movieOutSeconds: 4 }],
