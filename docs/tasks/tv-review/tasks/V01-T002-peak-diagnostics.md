@@ -7,7 +7,7 @@
   "epic_id": "V01",
   "title": "Report best peaks for every searched window",
   "slug": "peak-diagnostics",
-  "status": "ready",
+  "status": "complete",
   "task_class": "implementation",
   "depends_on": [
     "V01-T001"

@@ -7,7 +7,7 @@
   "epic_id": "V01",
   "title": "Freeze v2 contract types with v1 byte compatibility",
   "slug": "v2-contract-types",
-  "status": "ready",
+  "status": "complete",
   "task_class": "foundation",
   "depends_on": [],
   "principal_invariant": "Every new v2 type, field, recipe constant and SyncState variant named in ARCHITECTURE.md §3–§9 exists, and every existing v1 spec, plan, index, report and sync request round-trips through serde with byte-identical JSON and unchanged digests.",

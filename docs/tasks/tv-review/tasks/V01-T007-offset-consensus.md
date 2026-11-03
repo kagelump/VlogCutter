@@ -7,7 +7,7 @@
   "epic_id": "V01",
   "title": "Offset consensus module and CLI",
   "slug": "offset-consensus",
-  "status": "ready",
+  "status": "complete",
   "task_class": "implementation",
   "depends_on": [
     "V01-T004"

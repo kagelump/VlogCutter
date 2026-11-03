@@ -41,7 +41,7 @@ byte-identically.
 | 70 | [V01-T007](tasks/V01-T007-offset-consensus.md) | Offset consensus module and CLI | V01-T004 | complete |
 | 80 | [V01-T008](tasks/V01-T008-consensus-interpolation.md) | Consensus-gated interpolation in the sync mapper | V01-T007 | complete |
 | 90 | [V01-T009](tasks/V01-T009-recipe-v2.md) | Recipe v2: energy-weighted robust features | V01-T005 | complete |
-| 100 | [V01-T010](tasks/V01-T010-real-room-evidence.md) | Real-room RC6 v2 evidence run | V01-T006, V01-T008, V01-T009 | ready |
+| 100 | [V01-T010](tasks/V01-T010-real-room-evidence.md) | Real-room RC6 v2 evidence run | V01-T006, V01-T008, V01-T009 | blocked |
 | 110 | [V01-T011](tasks/V01-T011-docs-reconcile.md) | Docs and planning reconciliation | V01-T010 | ready |
 
 ## Model guidance
@@ -49,6 +49,11 @@ byte-identically.
 V01-T001 is foundation work. It carries the serde/digest compatibility risk, so
 give it to a stronger model, or review it closely, before handing leaf packets
 to a small model. V01-T010 is a QA packet whose stop condition must be honoured.
+
+## Status note
+
+T010 stopped at its §10 stop condition on 2026-11-03. See
+[HANDOFF_AFTER_T010.md](HANDOFF_AFTER_T010.md) for results and the decisions it needs.
 
 ## Promotion rule
 

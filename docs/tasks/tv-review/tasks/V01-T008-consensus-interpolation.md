@@ -7,7 +7,7 @@
   "epic_id": "V01",
   "title": "Consensus-gated interpolation in the sync mapper",
   "slug": "consensus-interpolation",
-  "status": "ready",
+  "status": "complete",
   "task_class": "implementation",
   "depends_on": [
     "V01-T007"
