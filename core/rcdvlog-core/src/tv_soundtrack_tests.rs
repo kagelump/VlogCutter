@@ -664,19 +664,20 @@ fn mask_span(seconds_from: f64, seconds_to: f64) -> Vec<(u64, u64)> {
     )]
 }
 #[test]
-fn mask_weights_zero_only_frames_whose_features_touch_the_mask() {
+fn mask_weights_zero_only_frames_whose_own_hop_overlaps_the_mask() {
     let len = 6 * PCM_RATE as usize;
     let weights = mask_weights(len, 0, PCM_RATE, &mask_span(2.0, 3.0));
     assert_eq!(weights.len(), feature_frames(len));
     assert!(weights.iter().all(|w| *w == 0.0 || *w == 1.0));
-    // Frame n depends on samples (n-8)*HOP..n*HOP+FFT. Against the mask
-    // [16000, 24000) that is frames 122..=195 (exact, no slack).
+    // Frame n owns samples n*HOP+192..(n+1)*HOP+192 (its centre hop). Against
+    // the mask [16000, 24000) that is frames 123..=185 (exact, no slack). The
+    // frames 0..=122 and 186.. that only share support with the mask keep weight 1.
     let zeros: Vec<usize> = (0..weights.len()).filter(|&n| weights[n] == 0.0).collect();
-    assert_eq!(zeros.first(), Some(&122));
-    assert_eq!(zeros.last(), Some(&195));
-    assert_eq!(zeros.len(), 195 - 122 + 1);
-    assert!(weights[..WARMUP].iter().all(|w| *w == 1.0));
-    assert!(weights[196..].iter().all(|w| *w == 1.0));
+    assert_eq!(zeros.first(), Some(&123));
+    assert_eq!(zeros.last(), Some(&185));
+    assert_eq!(zeros.len(), 185 - 123 + 1);
+    assert!(weights[..123].iter().all(|w| *w == 1.0));
+    assert!(weights[186..].iter().all(|w| *w == 1.0));
     // A 48 kHz capture with the same span maps to the identical frame weights.
     let native = mask_weights(len, 0, 48000, &[(2 * 48000, 3 * 48000)]);
     assert_eq!(native, weights);
