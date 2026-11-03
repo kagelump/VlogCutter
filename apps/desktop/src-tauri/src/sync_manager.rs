@@ -192,6 +192,7 @@ impl SyncManager {
         catalog: Arc<RwLock<Catalog>>,
         settings: Arc<RwLock<crate::DesktopSettings>>,
         status: Arc<RwLock<HashMap<String, SyncStatus>>>,
+        project_work: crate::project_work::ProjectWork,
     ) -> Self {
         let (wake_tx, wake_rx) = tokio::sync::mpsc::unbounded_channel();
         let handle = SyncLoopHandle {
@@ -203,6 +204,7 @@ impl SyncManager {
             active_projects: HashSet::new(),
             wake_tx: wake_tx.clone(),
             guard: rcdvlog_sync::SyncGuardTracker::new(),
+            project_work,
         };
         // `spawn` is called from Tauri's setup hook, which runs on the main
         // thread outside any Tokio runtime context — `tokio::spawn` would panic
@@ -256,6 +258,9 @@ struct SyncLoopHandle {
     wake_tx: tokio::sync::mpsc::UnboundedSender<WakeEvent>,
     /// Holds the sync guard for exactly the catalog being synced.
     guard: rcdvlog_sync::SyncGuardTracker,
+    /// Registers proxy downloads and node jobs so `delete_project` can refuse
+    /// while they hold a project's cache folder.
+    project_work: crate::project_work::ProjectWork,
 }
 
 impl SyncLoopHandle {
@@ -860,6 +865,14 @@ impl SyncLoopHandle {
         catalog: &Catalog,
         project_id: &str,
     ) {
+        // A project being deleted gets no new cache writes; while this guard
+        // is held, `delete_project` refuses instead of racing the download.
+        let Ok(_work) = self
+            .project_work
+            .begin(project_id, crate::project_work::WorkKind::ProxyDownload)
+        else {
+            return;
+        };
         // Collect media_object_ids for assets missing local proxies
         let assets = match catalog.list_assets(project_id) {
             Ok(a) => a,
@@ -927,6 +940,14 @@ impl SyncLoopHandle {
         project_id: &str,
         jobs: &[rcdvlog_sync::NodeTargetedJob],
     ) {
+        // Same protection as proxy downloads: tombstoned projects get no
+        // ffmpeg work, and a live job blocks deletion of the folder.
+        let Ok(_work) = self
+            .project_work
+            .begin(project_id, crate::project_work::WorkKind::NodeJobs)
+        else {
+            return;
+        };
         let Some(client) = self.build_client(endpoint, server_node_id) else {
             return;
         };
