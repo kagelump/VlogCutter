@@ -120,3 +120,62 @@ describe("check-docs.mjs worktree regression", () => {
     }
   });
 });
+
+describe("check-docs.mjs AGENTS.md size guard", () => {
+  it("passes for a small AGENTS.md", () => {
+    const fixture = createFixture();
+    try {
+      writeFileSync(join(fixture, "AGENTS.md"), "# AGENTS.md\n\nShort index.\n");
+      assert.doesNotThrow(() => {
+        execFileSync("node", [SCRIPT], { cwd: fixture, encoding: "utf8" });
+      });
+    } finally {
+      rmSync(fixture, { recursive: true, force: true });
+    }
+  });
+
+  it("passes at exactly the 48 KiB limit", () => {
+    const fixture = createFixture();
+    try {
+      writeFileSync(join(fixture, "AGENTS.md"), "x".repeat(48 * 1024));
+      assert.doesNotThrow(() => {
+        execFileSync("node", [SCRIPT], { cwd: fixture, encoding: "utf8", stdio: "pipe" });
+      });
+    } finally {
+      rmSync(fixture, { recursive: true, force: true });
+    }
+  });
+
+  it("fails above the limit and tells contributors to put detail in docs/", () => {
+    const fixture = createFixture();
+    try {
+      writeFileSync(join(fixture, "AGENTS.md"), "x".repeat(48 * 1024 + 1));
+      let failure;
+      try {
+        execFileSync("node", [SCRIPT], { cwd: fixture, encoding: "utf8", stdio: "pipe" });
+      } catch (error) {
+        failure = error;
+      }
+      assert.ok(failure, "Expected check-docs to fail for an oversized AGENTS.md");
+      assert.notEqual(failure.status, 0);
+      assert.match(failure.stderr, /AGENTS\.md is \d+ bytes, over the \d+-byte limit/);
+      assert.match(failure.stderr, /put feature detail .* in a focused doc under docs\//s);
+      assert.match(failure.stderr, /link/);
+    } finally {
+      rmSync(fixture, { recursive: true, force: true });
+    }
+  });
+
+  it("counts bytes, not characters", () => {
+    const fixture = createFixture();
+    try {
+      // 3-byte characters: 20000 chars is 60000 bytes.
+      writeFileSync(join(fixture, "AGENTS.md"), "\u2500".repeat(20000));
+      assert.throws(() => {
+        execFileSync("node", [SCRIPT], { cwd: fixture, encoding: "utf8", stdio: "pipe" });
+      });
+    } finally {
+      rmSync(fixture, { recursive: true, force: true });
+    }
+  });
+});

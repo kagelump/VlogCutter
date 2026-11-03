@@ -70,6 +70,26 @@ for (const file of markdownFiles) {
   }
 }
 
+// Size guard for the repository-root AGENTS.md (issue #260). Every agent
+// session loads this file first, so it must stay an index: detail belongs in
+// a focused doc under docs/ and AGENTS.md carries one line plus a link. The
+// target is 45 KiB; the hard limit is 48 KiB, leaving ~3 KiB of slack so a
+// feature PR adding an index line or two does not fail, while the file can
+// never again grow back toward the 94 KB it reached before this guard.
+const agentsMdLimitBytes = 48 * 1024;
+const agentsMdPath = join(root, "AGENTS.md");
+if (existsSync(agentsMdPath)) {
+  const size = statSync(agentsMdPath).size;
+  if (size > agentsMdLimitBytes) {
+    failures.push(
+      `AGENTS.md is ${size} bytes, over the ${agentsMdLimitBytes}-byte limit. ` +
+        "AGENTS.md is an index: put feature detail (schema numbers, contracts, " +
+        "measurements) in a focused doc under docs/ (e.g. docs/implementation-status.md) " +
+        "and keep only one index line plus a link here.",
+    );
+  }
+}
+
 const required = [
   "docs/server/README.md",
   "docs/server/deployment.md",
