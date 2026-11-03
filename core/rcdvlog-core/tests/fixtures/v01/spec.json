@@ -1,0 +1,54 @@
+{
+  "schemaVersion": 1,
+  "sync": {
+    "anchors": [],
+    "boundaries": [],
+    "captureClocks": [
+      {
+        "clockId": "mic_epoch_0",
+        "firstSample": 0,
+        "lastSample": 8654336,
+        "monotonicOriginNs": 23033333,
+        "monotonicToleranceNs": 25600000,
+        "sampleRate": 48000
+      }
+    ],
+    "movie": {
+      "durationPts": 648479824,
+      "movieDigest": "0c68f015a143a3279f8f5356f3599b1a3b4816e61fc50be4349496db9b3d533a",
+      "originPts": 0,
+      "timeBaseDenominator": 240000,
+      "timeBaseNumerator": 1
+    },
+    "policy": {
+      "maxAnchorGapSeconds": 15.0,
+      "maxDriftPpm": 2000.0,
+      "maxExtrapolationSeconds": 0.0,
+      "minimumConfidence": 0.8,
+      "residualToleranceSeconds": 0.1,
+      "unobservedUncertaintyPpm": 5000.0
+    },
+    "schemaVersion": 1,
+    "sessionId": "rsession_6fd9d7251a4445c2a1d7589570f42676",
+    "targetDigest": "1471d2f08ce9e4daac7df2eb4ff3a063d24f4be38ec489191dfd87ff574a6894"
+  },
+  "segments": [
+    {
+      "segmentId": "native_recording",
+      "clockId": "mic_epoch_0",
+      "firstSample": 0,
+      "frameCount": 8654336,
+      "wavBlake3": "997821b3159409252f2743ff22fd2fd28883fae7fcd27bd597b0cd4798e1cdd6"
+    }
+  ],
+  "referenceSeconds": 120,
+  "querySeconds": 6,
+  "queryStepSeconds": 6,
+  "matchPolicy": {
+    "minimumSimilarity": 0.8,
+    "minimumPeakMargin": 0.08,
+    "minimumSubwindowSimilarity": 0.3,
+    "uncertaintySeconds": 0.08,
+    "maximumCandidates": 4
+  }
+}

@@ -331,6 +331,7 @@ impl SessionSync {
             anchors: anchors.clone(),
             boundaries: boundaries.clone(),
             policy: policy.clone(),
+            consensus_segments: vec![],
         });
         let mut description = SyncDescription {
             status: status.into(),

@@ -132,6 +132,7 @@ fn actual_render_capture_resume_and_shared_historical_or_strict_mapping() {
             anchors: vec![],
             boundaries: vec![],
             policy: SyncPolicy::default(),
+            consensus_segments: vec![],
         },
         segments: vec![SessionAudioSegment {
             segment_id: "capture".into(),
@@ -144,6 +145,8 @@ fn actual_render_capture_resume_and_shared_historical_or_strict_mapping() {
         query_seconds: 6,
         query_step_seconds: 6,
         match_policy: SoundtrackPolicy::default(),
+        speech_mask: vec![],
+        recipe: None,
     };
     let input = root.join("spec.json");
     std::fs::write(&input, serde_json::to_vec(&spec).unwrap()).unwrap();

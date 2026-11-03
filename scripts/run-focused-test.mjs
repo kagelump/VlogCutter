@@ -16,7 +16,8 @@ export function runFocusedTest({ args = process.argv.slice(2), spawn = spawnSync
     return 2;
   }
   const [packageName, testName] = args;
-  const commandArgs = [`+${pin}`, "test", "-p", packageName, testName, "--", "--exact"];
+  // Same runner as CI (cargo-nextest, see .config/nextest.toml). `test(=name)` is an exact match.
+  const commandArgs = [`+${pin}`, "nextest", "run", "-p", packageName, "-E", `test(=${testName})`];
   write(`=== cargo ${commandArgs.join(" ")} ===\n`);
   const result = spawn("cargo", commandArgs, {
     cwd: root,
@@ -32,10 +33,10 @@ export function runFocusedTest({ args = process.argv.slice(2), spawn = spawnSync
   }
 
   const escapedName = testName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const namedResults = [...output.matchAll(new RegExp(`^test ${escapedName} \\.\\.\\. (ok|FAILED)$`, "gm"))];
-  const summaries = [...output.matchAll(/test result: (?:ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored;/g)];
-  const executed = summaries.reduce((sum, match) => sum + Number(match[1]) + Number(match[2]), 0);
-  if (namedResults.length === 0 || namedResults.every((match) => match[1] !== "ok") || executed < 1) {
+  const namedResults = [...output.matchAll(new RegExp(`^\\s*(?:PASS|SLOW)\\s+\\[[^\\]]*\\]\\s+(?:\\(\\s*\\d+/\\d+\\)\\s+)?\\S+ ${escapedName}$`, "gm"))];
+  const summaries = [...output.matchAll(/Summary \[[^\]]*\]\s+(\d+) tests? run:/g)];
+  const executed = summaries.reduce((sum, match) => sum + Number(match[1]), 0);
+  if (namedResults.length === 0 || executed < 1) {
     write(`RESULT focused Rust test: FAIL (expected test ${testName}; observed ${namedResults.length} matching result(s), ${executed} executed test(s))\n`);
     return 1;
   }

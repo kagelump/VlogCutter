@@ -1,5 +1,6 @@
 use super::*;
 use crate::tv_review_sync::{CaptureClock, SyncMovieClock, SyncPolicy, SyncState};
+use crate::tv_soundtrack::DistinctivePolicy;
 
 fn signal(seconds: usize) -> Vec<f32> {
     let mut state = 37_u64;
@@ -33,6 +34,27 @@ fn wav(path: &Path, pcm: &[f32]) {
 }
 fn fixture(
     repeat: bool,
+) -> (
+    tempfile::TempDir,
+    SoundtrackSessionPlan,
+    PathBuf,
+    Vec<SessionAudioFile>,
+) {
+    fixture_with(repeat, SoundtrackPolicy::default())
+}
+fn distinctive_policy() -> SoundtrackPolicy {
+    SoundtrackPolicy {
+        distinctive: Some(DistinctivePolicy {
+            minimum_similarity: 0.5,
+            minimum_margin: 0.25,
+            minimum_z_score: 6.0,
+        }),
+        ..SoundtrackPolicy::default()
+    }
+}
+fn fixture_with(
+    repeat: bool,
+    match_policy: SoundtrackPolicy,
 ) -> (
     tempfile::TempDir,
     SoundtrackSessionPlan,
@@ -73,6 +95,7 @@ fn fixture(
             anchors: vec![],
             boundaries: vec![],
             policy: SyncPolicy::default(),
+            consensus_segments: vec![],
         },
         segments: vec![SessionAudioSegment {
             segment_id: "native".into(),
@@ -84,7 +107,9 @@ fn fixture(
         reference_seconds: 12,
         query_seconds: 6,
         query_step_seconds: 6,
-        match_policy: SoundtrackPolicy::default(),
+        match_policy,
+        speech_mask: vec![],
+        recipe: None,
     })
     .unwrap();
     (
@@ -364,4 +389,225 @@ fn published_session_schema_bounds_and_shared_sync_contract_agree() {
             .anchors
             .is_empty()
     );
+}
+#[test]
+fn session_best_peaks_merge_overlapping_reference_observations_once() {
+    let (dir, plan, movie, files) = fixture(false);
+    let cache = dir.path().join("cache");
+    plan.run_batch(
+        SessionBatch {
+            movie: &movie,
+            files: &files,
+            cache: &cache,
+            start_task: 0,
+            max_tasks: 128,
+        },
+        &|| false,
+    )
+    .unwrap();
+    // Raw receipts: the same movie position is seen by more than one reference.
+    let mut raw = Vec::new();
+    for ri in 0..plan.references.len() {
+        let receipt = plan.receipt(&cache, ri).unwrap().unwrap();
+        raw.extend(receipt.report.best_peaks.iter().cloned());
+    }
+    let near_true = raw
+        .iter()
+        .filter(|p| (p.movie_seconds - 9.0).abs() < 0.256)
+        .count();
+    assert!(
+        near_true >= 2,
+        "overlap must produce repeated observations: {raw:?}"
+    );
+    let page = plan.evidence_page(&cache, 0, 1, &|| false).unwrap();
+    let evidence = &page.queries[0];
+    assert_eq!(evidence.state, "candidate", "{page:?}");
+    assert!(!evidence.best_peaks.is_empty() && evidence.best_peaks.len() <= MAX_BEST_PEAKS);
+    for (i, a) in evidence.best_peaks.iter().enumerate() {
+        for b in &evidence.best_peaks[i + 1..] {
+            assert!(
+                (a.movie_seconds - b.movie_seconds).abs() >= PEAK_MERGE_SECONDS,
+                "{a:?} {b:?}"
+            );
+        }
+    }
+    for pair in evidence.best_peaks.windows(2) {
+        assert!(pair[0].similarity >= pair[1].similarity);
+    }
+    // The merged best peak is the anchor position, with the §3 centre convention.
+    let anchor = &page.sync.anchors[0];
+    let tps = 90000.0;
+    let anchor_seconds = (anchor.movie_pts - 90000) as f64 / tps;
+    assert!(
+        (evidence.best_peaks[0].movie_seconds - anchor_seconds).abs() <= 0.016,
+        "{:?} vs anchor {anchor_seconds}",
+        evidence.best_peaks[0]
+    );
+    assert_eq!(page, plan.evidence_page(&cache, 0, 1, &|| false).unwrap());
+}
+#[test]
+fn ambiguous_session_query_keeps_its_peaks_as_diagnostics() {
+    let (dir, plan, movie, files) = fixture(true);
+    let cache = dir.path().join("cache");
+    plan.run_batch(
+        SessionBatch {
+            movie: &movie,
+            files: &files,
+            cache: &cache,
+            start_task: 0,
+            max_tasks: 128,
+        },
+        &|| false,
+    )
+    .unwrap();
+    let page = plan.evidence_page(&cache, 0, 1, &|| false).unwrap();
+    let evidence = &page.queries[0];
+    assert_eq!(evidence.state, "ambiguous", "{page:?}");
+    assert!(!evidence.best_peaks.is_empty());
+    assert!(evidence.best_peaks.len() <= MAX_BEST_PEAKS);
+    // The two true repeats (movie 9 s and 33 s) both appear among the merged peaks.
+    let positions: Vec<f64> = evidence
+        .best_peaks
+        .iter()
+        .map(|p| p.movie_seconds)
+        .collect();
+    assert!(
+        positions.iter().any(|s| (s - 9.0).abs() <= 0.016),
+        "{positions:?}"
+    );
+    assert!(
+        positions.iter().any(|s| (s - 33.0).abs() <= 0.016),
+        "{positions:?}"
+    );
+}
+#[test]
+fn merge_keeps_highest_peak_within_merge_distance_and_orders_deterministically() {
+    let peak = |similarity: f64, movie_seconds: f64| SoundtrackPeak {
+        similarity,
+        reference_offset_frames: 0,
+        movie_seconds,
+        subwindow_similarities: [0.0; 3],
+    };
+    let merged = merge_peaks(
+        vec![
+            peak(0.6, 10.00),
+            peak(0.9, 10.10),  // within 0.256 of 10.00 but higher: wins
+            peak(0.7, 10.356), // exactly 0.256 s from the accepted 10.10: kept
+            peak(0.5, 20.0),
+            peak(0.8, 30.0),
+            peak(0.4, 40.0),
+            peak(0.3, 50.0), // fifth distinct peak: dropped by the cap
+        ],
+        MAX_BEST_PEAKS,
+    );
+    let got: Vec<(f64, f64)> = merged
+        .iter()
+        .map(|p| (p.similarity, p.movie_seconds))
+        .collect();
+    assert_eq!(
+        got,
+        vec![(0.9, 10.10), (0.8, 30.0), (0.7, 10.356), (0.5, 20.0)]
+    );
+    // Equal scores break ties by movie time ascending.
+    let tie = merge_peaks(vec![peak(0.5, 9.0), peak(0.5, 3.0)], MAX_BEST_PEAKS);
+    assert_eq!(tie[0].movie_seconds, 3.0);
+    assert!(merge_peaks(vec![], MAX_BEST_PEAKS).is_empty());
+}
+
+fn run_all(plan: &SoundtrackSessionPlan, movie: &Path, files: &[SessionAudioFile], cache: &Path) {
+    plan.run_batch(
+        SessionBatch {
+            movie,
+            files,
+            cache,
+            start_task: 0,
+            max_tasks: 128,
+        },
+        &|| false,
+    )
+    .unwrap();
+}
+#[test]
+fn distinctive_session_with_distant_repeat_emits_no_anchors() {
+    // ARCHITECTURE §5: with distinctive set, a repeat seen by the references
+    // is ambiguous, and no anchor may survive the global margin check.
+    let (dir, plan, movie, files) = fixture_with(true, distinctive_policy());
+    let cache = dir.path().join("cache");
+    run_all(&plan, &movie, &files, &cache);
+    let matched = (0..plan.references.len())
+        .filter(|ri| {
+            plan.receipt(&cache, *ri).unwrap().unwrap().report.state
+                == SoundtrackMatchState::Matched
+        })
+        .count();
+    assert!(matched >= 1, "a reference must report Matched on its own");
+    let page = plan.evidence_page(&cache, 0, 1, &|| false).unwrap();
+    let evidence = &page.queries[0];
+    assert_eq!(evidence.state, "ambiguous", "{page:?}");
+    assert!(evidence.anchors.is_empty());
+    assert!(evidence.supporting_evidence_ids.is_empty());
+    assert!(page.sync.anchors.is_empty());
+    assert!(!evidence.best_peaks.is_empty());
+}
+#[test]
+fn distinctive_session_single_occurrence_across_overlap_stays_matched() {
+    // Both overlapping references see the same position; the rule must not
+    // treat that observation as its own rival.
+    let (dir, plan, movie, files) = fixture_with(false, distinctive_policy());
+    let cache = dir.path().join("cache");
+    run_all(&plan, &movie, &files, &cache);
+    let page = plan.evidence_page(&cache, 0, 1, &|| false).unwrap();
+    assert_eq!(page.queries[0].state, "candidate", "{page:?}");
+    assert_eq!(page.sync.anchors.len(), 1);
+}
+/// Adds a rival peak to every cached receipt, below the top peak by `gap` and at
+/// `seconds`, then rewrites each receipt with a fresh report digest.
+fn inject_rival(plan: &SoundtrackSessionPlan, cache: &Path, gap: f64, seconds: f64) {
+    for ri in 0..plan.references.len() {
+        let path = plan.receipt_path(cache, ri);
+        let mut receipt: TaskReceipt =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let mut rival = receipt.report.best_peaks[0].clone();
+        rival.similarity -= gap;
+        rival.movie_seconds = seconds;
+        receipt.report.best_peaks.push(rival);
+        receipt.report_digest = digest(&receipt.report).unwrap();
+        std::fs::write(&path, serde_json::to_vec(&receipt).unwrap()).unwrap();
+    }
+}
+#[test]
+fn distinctive_session_rival_breaking_margin_removes_anchor() {
+    // A distant rival 0.01 below the matched peak breaks the applicable margin.
+    let (dir, plan, movie, files) = fixture_with(false, distinctive_policy());
+    let cache = dir.path().join("cache");
+    run_all(&plan, &movie, &files, &cache);
+    let baseline = plan.evidence_page(&cache, 0, 1, &|| false).unwrap();
+    assert_eq!(baseline.queries[0].state, "candidate", "{baseline:?}");
+    inject_rival(&plan, &cache, 0.01, 33.0);
+    let page = plan.evidence_page(&cache, 0, 1, &|| false).unwrap();
+    assert_eq!(page.queries[0].state, "ambiguous", "{page:?}");
+    assert!(page.queries[0].anchors.is_empty());
+    assert!(page.sync.anchors.is_empty());
+}
+#[test]
+fn distinctive_session_rival_within_merge_distance_is_not_a_rival() {
+    // The same observation, 0.1 s away and 0.01 lower, does not break margin.
+    let (dir, plan, movie, files) = fixture_with(false, distinctive_policy());
+    let cache = dir.path().join("cache");
+    run_all(&plan, &movie, &files, &cache);
+    let top = plan.receipt(&cache, 0).unwrap().unwrap().report.best_peaks[0].movie_seconds;
+    inject_rival(&plan, &cache, 0.01, top + 0.1);
+    let page = plan.evidence_page(&cache, 0, 1, &|| false).unwrap();
+    assert_eq!(page.queries[0].state, "candidate", "{page:?}");
+    assert_eq!(page.sync.anchors.len(), 1);
+}
+#[test]
+fn distinctive_none_keeps_v1_repeat_behaviour_and_peaks() {
+    // Without distinctive, the §5 check is absent: the v1 two-anchor result stays.
+    let (dir, plan, movie, files) = fixture(true);
+    let cache = dir.path().join("cache");
+    run_all(&plan, &movie, &files, &cache);
+    let page = plan.evidence_page(&cache, 0, 1, &|| false).unwrap();
+    assert_eq!(page.queries[0].state, "ambiguous", "{page:?}");
+    assert!(page.sync.anchors.len() >= 2);
 }
