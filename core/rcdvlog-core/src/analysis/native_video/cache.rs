@@ -89,7 +89,7 @@ impl crate::Catalog {
             .read(true)
             .write(true)
             .open(path)?;
-        fs2::FileExt::try_lock_exclusive(&claim)
+        crate::resources::try_lock_exclusive_with_grace(&claim)
             .context("native window already has a running owner")?;
         let mut connection = self.connection()?;
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -324,7 +324,7 @@ impl crate::Catalog {
             .read(true)
             .write(true)
             .open(path)?;
-        fs2::FileExt::try_lock_exclusive(&claim)
+        crate::resources::try_lock_exclusive_with_grace(&claim)
             .context("native response still has a running owner")?;
         let policy = self.load_run_authorization(&policy_id)?.policy;
         ensure!(

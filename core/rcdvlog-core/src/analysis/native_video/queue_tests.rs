@@ -156,6 +156,7 @@ fn bulk(
 
 #[test]
 fn pilot_gate_cache_bulk_projection_progress_and_status_are_durable_and_free_on_replay() {
+    let _watchdog = crate::analysis::native_video::media::media_tests::Watchdog::start();
     let (_dir, catalog, request, policy_id) = fixture(1.0, 2);
     let transport = FakeTransport::new(&catalog, &request.project_id);
     let never = || false;
@@ -254,6 +255,7 @@ fn pilot_gate_cache_bulk_projection_progress_and_status_are_durable_and_free_on_
 
 #[test]
 fn temporary_reservation_headroom_waits_for_settlement_without_budget_stop() {
+    let _watchdog = crate::analysis::native_video::media::media_tests::Watchdog::start();
     let (_dir, catalog, request, policy_id) = fixture(0.32, 2);
     let mut transport = FakeTransport::new(&catalog, &request.project_id);
     transport.delay = Duration::from_millis(100);
@@ -273,6 +275,7 @@ fn temporary_reservation_headroom_waits_for_settlement_without_budget_stop() {
 
 #[test]
 fn high_usage_stops_new_claims_but_settles_in_flight_windows() {
+    let _watchdog = crate::analysis::native_video::media::media_tests::Watchdog::start();
     let (_dir, catalog, request, policy_id) = fixture(1.0, 2);
     let mut transport = FakeTransport::new(&catalog, &request.project_id);
     let never = || false;
@@ -332,6 +335,7 @@ fn high_usage_stops_new_claims_but_settles_in_flight_windows() {
 
 #[test]
 fn persistent_user_cancel_after_dispatch_retains_unknown_reserve_and_blocks_resend() {
+    let _watchdog = crate::analysis::native_video::media::media_tests::Watchdog::start();
     let (_dir, catalog, request, policy_id) = fixture(1.0, 1);
     let transport = FakeTransport::new(&catalog, &request.project_id);
     let never = || false;
@@ -383,6 +387,7 @@ fn persistent_user_cancel_after_dispatch_retains_unknown_reserve_and_blocks_rese
 
 #[test]
 fn local_recovery_restores_observed_pilot_after_result_write_failure_without_another_send() {
+    let _watchdog = crate::analysis::native_video::media::media_tests::Watchdog::start();
     let (_dir, catalog, request, policy_id) = fixture(1.0, 2);
     let transport = FakeTransport::new(&catalog, &request.project_id);
     catalog.connection().unwrap().execute_batch("CREATE TRIGGER fixture_fail_native_result BEFORE UPDATE OF result_json ON native_video_calls WHEN NEW.result_json IS NOT NULL BEGIN SELECT RAISE(ABORT,'fixture_result_write_failure'); END;").unwrap();
@@ -427,6 +432,7 @@ fn local_recovery_restores_observed_pilot_after_result_write_failure_without_ano
 
 #[test]
 fn failed_progress_observer_stops_workers_and_finishes_as_failure_not_user_cancel() {
+    let _watchdog = crate::analysis::native_video::media::media_tests::Watchdog::start();
     let (_dir, catalog, request, policy_id) = fixture(1.0, 2);
     let mut transport = FakeTransport::new(&catalog, &request.project_id);
     transport.delay = Duration::from_millis(100);

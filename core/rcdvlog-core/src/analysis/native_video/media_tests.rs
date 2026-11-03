@@ -8,6 +8,82 @@ use crate::{
 };
 use std::process::Command;
 
+/// Fails a native-video test that stops making progress, by name, in minutes
+/// instead of letting one stuck worker/network/lock wait consume the whole CI
+/// job timeout (#258). Tests here are cooperative-thread and subprocess based, so
+/// a hung test cannot be unwound from outside; the only safe reaction is to
+/// report which test it was and end the test process with a failure status.
+pub(in crate::analysis::native_video) struct Watchdog {
+    done: Option<std::sync::mpsc::Sender<()>>,
+}
+
+pub(in crate::analysis::native_video) const WATCHDOG_LIMIT: std::time::Duration =
+    std::time::Duration::from_secs(180);
+
+impl Watchdog {
+    pub(in crate::analysis::native_video) fn start() -> Self {
+        Self::start_with(WATCHDOG_LIMIT, |name, limit| {
+            eprintln!(
+                "native-video test `{name}` made no progress for {}s: probable deadlock; \
+                 ending the test process so the hang is attributed to this test",
+                limit.as_secs()
+            );
+            std::process::exit(101);
+        })
+    }
+
+    fn start_with(
+        limit: std::time::Duration,
+        on_expiry: impl FnOnce(&str, std::time::Duration) + Send + 'static,
+    ) -> Self {
+        let name = std::thread::current()
+            .name()
+            .unwrap_or("<unnamed test>")
+            .to_owned();
+        let (done, finished) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            // Dropping the sender (test finished or panicked) disconnects.
+            if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = finished.recv_timeout(limit) {
+                on_expiry(&name, limit);
+            }
+        });
+        Self { done: Some(done) }
+    }
+}
+
+impl Drop for Watchdog {
+    fn drop(&mut self) {
+        drop(self.done.take());
+    }
+}
+
+#[test]
+fn watchdog_names_a_stuck_test_and_stays_quiet_for_a_finished_one() {
+    let (fired, observed) = std::sync::mpsc::channel::<String>();
+    let stuck = Watchdog::start_with(std::time::Duration::from_millis(50), move |name, _| {
+        let _ = fired.send(name.to_owned());
+    });
+    let name = observed
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("an expired watchdog reports the test name");
+    assert!(name.contains("watchdog_names_a_stuck_test"));
+    drop(stuck);
+
+    let (fired, observed) = std::sync::mpsc::channel::<String>();
+    drop(Watchdog::start_with(
+        std::time::Duration::from_millis(50),
+        move |name, _| {
+            let _ = fired.send(name.to_owned());
+        },
+    ));
+    assert!(
+        observed
+            .recv_timeout(std::time::Duration::from_millis(300))
+            .is_err(),
+        "a test that finished must not trip its watchdog"
+    );
+}
+
 pub(in crate::analysis::native_video) fn setup(
     payload: AnalysisPayload,
 ) -> (tempfile::TempDir, Catalog, RunPolicy, String) {
