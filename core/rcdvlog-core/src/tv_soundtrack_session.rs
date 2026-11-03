@@ -4,7 +4,8 @@ use crate::{
     full_file_blake3,
     tv_review_sync::{SyncAnchor, SyncBoundary, SyncBoundaryKind, SyncQuery, SyncRequest},
     tv_soundtrack::{
-        PCM_RATE, SoundtrackCapture, SoundtrackIndex, SoundtrackMatchReport, SoundtrackMovie,
+        MAX_BEST_PEAKS, PCM_RATE, PEAK_MERGE_SECONDS, SoundtrackCapture, SoundtrackIndex,
+        SoundtrackMatchReport, SoundtrackMatchState, SoundtrackMovie, SoundtrackPeak,
         SoundtrackPolicy, SoundtrackReferenceSpec,
     },
 };
@@ -40,6 +41,12 @@ pub struct SoundtrackSessionSpec {
     pub query_seconds: u32,
     pub query_step_seconds: u32,
     pub match_policy: SoundtrackPolicy,
+    /// Recording-clock intervals to down-weight (§6). Built by the caller.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub speech_mask: Vec<SyncQuery>,
+    /// None means the v1 recipe (§7).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recipe: Option<String>,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -47,6 +54,9 @@ pub struct SessionMatchQuery {
     pub segment_id: String,
     pub recording: SyncQuery,
     pub capture: SoundtrackCapture,
+    /// None for grid queries, "speech_gap" for gap-placed queries (§6).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -106,6 +116,9 @@ pub struct SessionQueryEvidence {
     pub report_digests: Vec<String>,
     pub supporting_evidence_ids: BTreeMap<String, Vec<String>>,
     pub anchors: Vec<SyncAnchor>,
+    /// Best 4 merged peaks across completed references (§3).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub best_peaks: Vec<SoundtrackPeak>,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -126,6 +139,32 @@ pub struct SessionSyncEvidence {
     pub relevant_queries: Vec<SessionQueryEvidence>,
     pub search_complete: bool,
     pub sync: SyncRequest,
+}
+/// ARCHITECTURE §3: keep the highest-scoring peak within each 0.256 s movie
+/// neighbourhood, sorted by similarity descending then movie time ascending.
+/// The uncapped form lets §5 see every merged rival; its first `cap` entries
+/// equal the capped merge.
+fn merge_peaks(mut pool: Vec<SoundtrackPeak>, cap: usize) -> Vec<SoundtrackPeak> {
+    pool.sort_by(|a, b| {
+        b.similarity
+            .total_cmp(&a.similarity)
+            .then(a.movie_seconds.total_cmp(&b.movie_seconds))
+    });
+    let mut merged: Vec<SoundtrackPeak> = Vec::new();
+    for peak in pool {
+        // Strictly closer than the merge distance; exactly 16 hops stays distinct.
+        if merged
+            .iter()
+            .any(|m| (m.movie_seconds - peak.movie_seconds).abs() < PEAK_MERGE_SECONDS - 1e-9)
+        {
+            continue;
+        }
+        merged.push(peak);
+        if merged.len() == cap {
+            break;
+        }
+    }
+    merged
 }
 fn digest<T: Serialize>(v: &T) -> Result<String> {
     Ok(blake3::hash(&serde_json::to_vec(v)?).to_hex().to_string())
@@ -202,6 +241,7 @@ impl SoundtrackSessionPlan {
                 movie: spec.sync.movie.clone(),
                 start_seconds: start,
                 duration_seconds: width,
+                recipe: None,
             });
             if start + width >= duration - 1e-9 {
                 break;
@@ -280,6 +320,7 @@ impl SoundtrackSessionPlan {
                         &segment.wav_blake3,
                     ))?;
                     queries.push(SessionMatchQuery {
+                        origin: None,
                         segment_id: segment.segment_id.clone(),
                         recording: SyncQuery {
                             clock_id: clock.clock_id.clone(),
@@ -387,6 +428,7 @@ impl SoundtrackSessionPlan {
             anchors: report.candidates.iter().map(|c| c.anchor.clone()).collect(),
             boundaries: vec![],
             policy: self.spec.sync.policy.clone(),
+            consensus_segments: vec![],
         };
         check.validate()?;
         let tps = self.spec.sync.movie.ticks_per_second();
@@ -599,17 +641,51 @@ impl SoundtrackSessionPlan {
                 report_digests: vec![],
                 supporting_evidence_ids: BTreeMap::new(),
                 anchors: vec![],
+                best_peaks: vec![],
             };
             let mut candidates = Vec::new();
+            let mut peak_pool = Vec::new();
+            // Best peak of each Matched reference, with the margin it must clear (§5).
+            let mut matched_peaks: Vec<(SoundtrackPeak, f64)> = Vec::new();
             for ri in 0..self.references.len() {
                 ensure!(!cancel(), "session evidence cancelled");
                 if let Some(receipt) = self.receipt(cache, qi * self.references.len() + ri)? {
                     evidence.completed_references += 1;
                     evidence.report_digests.push(receipt.report_digest);
+                    if let (SoundtrackMatchState::Matched, Some(best), Some(distinctive)) = (
+                        &receipt.report.state,
+                        receipt.report.best_peaks.first(),
+                        self.spec.match_policy.distinctive.as_ref(),
+                    ) {
+                        let margin = if receipt.report.reason == "distinctive_peak_low_similarity" {
+                            distinctive.minimum_margin
+                        } else {
+                            self.spec.match_policy.minimum_peak_margin
+                        };
+                        matched_peaks.push((best.clone(), margin));
+                    }
+                    peak_pool.extend(receipt.report.best_peaks.iter().cloned());
                     candidates.extend(receipt.report.candidates.into_iter().map(|c| c.anchor));
                 }
             }
+            let merged_all = merge_peaks(peak_pool, usize::MAX);
+            evidence.best_peaks = merged_all.iter().take(MAX_BEST_PEAKS).cloned().collect();
             if evidence.completed_references == evidence.total_references {
+                // ARCHITECTURE §5: a merged peak at a different movie position that
+                // breaks the applicable margin of any Matched reference makes the
+                // query ambiguous with no anchors. Only with distinctive set.
+                let rival_breaks_margin = matched_peaks.iter().any(|(peak, margin)| {
+                    merged_all.iter().any(|rival| {
+                        (rival.movie_seconds - peak.movie_seconds).abs()
+                            >= PEAK_MERGE_SECONDS - 1e-9
+                            && peak.similarity - rival.similarity < *margin
+                    })
+                });
+                if rival_breaks_margin {
+                    evidence.state = "ambiguous".into();
+                    page.queries.push(evidence);
+                    continue;
+                }
                 candidates.sort_by_key(|a| a.movie_pts);
                 // Only coalesce observations at the same search-grid location.
                 // Never merge nearby but disjoint true alternatives by uncertainty.

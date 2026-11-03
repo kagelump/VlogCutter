@@ -37,3 +37,25 @@ export function reviewTargetHandoffPath(addressOrUrl) {
 export function reviewRunPath(addressOrUrl) {
   return join(tmpdir(), `rcdvlog-web-e2e-review-run-${fixturePort(addressOrUrl)}.txt`);
 }
+
+/**
+ * How to launch the server or the seed: `cargo run` from source by default, or
+ * a prebuilt binary when CI hands one in. CI builds both once on a Rust runner
+ * and runs the browser tier in the pinned Playwright image, which has no Rust
+ * toolchain; a prebuilt path must be absolute so it cannot resolve against
+ * whatever directory the fixture happens to start in.
+ */
+export function rustLaunch(environment, kind, args) {
+  const variable = { server: "RCDVLOG_WEB_E2E_SERVER_BIN", seed: "RCDVLOG_WEB_E2E_SEED_BIN" }[kind];
+  if (!variable) throw new Error(`web e2e fixture: unknown launch kind ${kind}`);
+  const prebuilt = environment[variable];
+  if (prebuilt) {
+    if (!prebuilt.startsWith("/")) throw new Error(`web e2e fixture: ${variable} must be an absolute path`);
+    return { command: prebuilt, args };
+  }
+  const target = kind === "seed" ? ["--example", "web_e2e_seed"] : [];
+  return {
+    command: "cargo",
+    args: ["run", "--quiet", "-p", "rcdvlog-server", ...target, ...(args.length ? ["--", ...args] : [])],
+  };
+}

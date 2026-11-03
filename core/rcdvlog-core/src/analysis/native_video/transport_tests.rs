@@ -76,6 +76,7 @@ fn response(index: usize) -> String {
 }
 #[test]
 fn actual_http_client_reuses_live_connection_across_sequential_calls() {
+    let _watchdog = crate::analysis::native_video::media::media_tests::Watchdog::start();
     let (_dir, options, wire) = prepared();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let endpoint = format!("http://{}/fixture", listener.local_addr().unwrap());
@@ -104,6 +105,7 @@ fn actual_http_client_reuses_live_connection_across_sequential_calls() {
 }
 #[test]
 fn in_flight_http_can_be_cancelled_without_claiming_no_upload() {
+    let _watchdog = crate::analysis::native_video::media::media_tests::Watchdog::start();
     let (_dir, options, wire) = prepared();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let endpoint = format!("http://{}/fixture", listener.local_addr().unwrap());
