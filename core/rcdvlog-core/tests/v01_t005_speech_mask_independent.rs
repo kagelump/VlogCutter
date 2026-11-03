@@ -465,7 +465,13 @@ fn burst_mic() -> (Vec<f32>, Vec<(u64, u64)>) {
 }
 
 #[test]
-fn speech_burst_60pct_with_mask_matches_at_true_position() {
+fn speech_burst_6s_fragmented_60pct_mask_is_insufficient_and_never_anchors() {
+    // 0.6 s bursts every 1.0 s leave 0.4 s gaps. Every feature frame reads its
+    // own 64 ms window plus 8 hops (128 ms) of delta history, so ~0.19 s of each
+    // gap reads silenced samples and is weighted zero (ARCHITECTURE section 6):
+    // about 1.2 s of uncontaminated frames remain, below the 2 s floor. The
+    // honest result is masked_insufficient with no anchor. The positive 60%
+    // case with longer gaps is speech_burst_12s_60pct_with_mask_*.
     let (mic, mask) = burst_mic();
     let masked: u64 = mask.iter().map(|(a, b)| b - a).sum();
     assert_eq!(
@@ -479,49 +485,16 @@ fn speech_burst_60pct_with_mask_matches_at_true_position() {
     let pg = page(&s);
     let ev = &pg.queries[0];
     let r = reports(&s);
-    eprintln!(
-        "SCENARIO2 masked state={} anchors={:?} best={:?} reasons={:?} digest0={:?}",
-        ev.state,
-        ev.anchors
-            .iter()
-            .map(|a| anchor_seconds(&s, a.movie_pts))
-            .collect::<Vec<_>>(),
-        r.iter().map(|x| x.best_similarity).collect::<Vec<_>>(),
-        r.iter().map(|x| x.reason.clone()).collect::<Vec<_>>(),
-        r.first().and_then(|x| x.mask_digest.clone())
-    );
-    // The mask must not be insufficient, otherwise this is not the scenario.
     assert!(
-        r.iter().all(|x| x.reason != "masked_insufficient"),
-        "burst mask was insufficient: {:?}",
+        r.iter().all(|x| x.reason == "masked_insufficient"),
+        "{:?}",
         r.iter().map(|x| &x.reason).collect::<Vec<_>>()
     );
-    assert_eq!(ev.state, "candidate", "{ev:?}");
-    assert_eq!(ev.anchors.len(), 1, "{ev:?}");
-    let seconds = anchor_seconds(&s, ev.anchors[0].movie_pts);
-    assert!(
-        (seconds - TRUE_CENTRE).abs() < CENTRE_TOLERANCE,
-        "anchor at {seconds} s, expected {TRUE_CENTRE} s"
-    );
-    // No Matched report may sit on the burst's own content: every Matched
-    // reference must have its best peak at the true excerpt position.
-    for rep in r
-        .iter()
-        .filter(|x| x.state == SoundtrackMatchState::Matched)
-    {
-        let top = rep.best_peaks.first().expect("matched report has peaks");
-        assert!(
-            (top.movie_seconds - TRUE_CENTRE).abs() < CENTRE_TOLERANCE,
-            "Matched on non-true content at {} s",
-            top.movie_seconds
-        );
-    }
+    assert!(r.iter().all(|x| x.state == SoundtrackMatchState::Unmatched));
+    assert!(ev.anchors.is_empty(), "{ev:?}");
     assert!(r.iter().all(|x| x.mask_digest.is_some()));
 }
 
-/// 12 s query variant. Bursts of 1.2 s every 2.0 s: 7.2 s of 12 s (60%) masked,
-/// with 0.8 s unmasked gaps. Each third (4 s) holds two gaps, which is enough
-/// after the frame-support loss (about 0.19 s per gap, see `mask_weights`).
 const LONG_QUERY: usize = 12;
 const LONG_REFERENCE: u32 = 20;
 const LONG_TRUE_CENTRE: f64 = FIRST_AT + LONG_QUERY as f64 / 2.0;

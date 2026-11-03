@@ -779,9 +779,11 @@ fn masked_query_with_too_little_unmasked_audio_is_masked_insufficient() {
         .unwrap();
     assert_eq!(r.reason, "masked_insufficient");
     assert_eq!(r.state, SoundtrackMatchState::Unmatched);
-    // 0.512 s unmasked in the final third passes the per-third rule.
+    // 34 unmasked frames in the final third: the last 2 read silenced samples
+    // through their FFT window, leaving 32 effective frames (0.512 s), which
+    // passes the per-third rule.
     let mut enough_third = vec![1.0f32; frames];
-    for w in &mut enough_third[2 * frames / 3 + 32..] {
+    for w in &mut enough_third[2 * frames / 3 + 34..] {
         *w = 0.0;
     }
     let r = index
@@ -858,4 +860,71 @@ fn malformed_speech_mask_weights_are_rejected() {
                 .is_err()
         );
     }
+}
+#[test]
+fn effective_weights_drop_frames_that_read_silenced_samples() {
+    let len = 6 * PCM_RATE as usize;
+    let mask = mask_weights(len, 0, PCM_RATE, &mask_span(2.0, 3.0));
+    let eff = effective_weights(len, &mask);
+    assert_eq!(eff.len(), mask.len());
+    // Masked frames stay zero; nothing gains weight.
+    assert!(eff.iter().zip(&mask).all(|(e, m)| *e <= *m));
+    // Silenced samples are those owned by frames 123..=185, i.e. [15936+192, ...).
+    // Frame n reads [(n-8)*HOP, n*HOP+FFT): the last frame before the mask that
+    // reads no silenced sample, and the first after it, bound the zero run.
+    let silenced_lo = 123 * HOP + OWN_OFFSET;
+    let silenced_hi = 186 * HOP + OWN_OFFSET;
+    for (n, w) in eff.iter().enumerate() {
+        let lo = n.saturating_sub(WARMUP - 1) * HOP;
+        let hi = (n * HOP + FFT).min(len);
+        let reads_silence = lo < silenced_hi && hi > silenced_lo;
+        assert_eq!(*w == 0.0, reads_silence, "frame {n}");
+    }
+    // Frames well after the mask (lag history clear) keep their weight.
+    assert_eq!(eff[200], 1.0);
+    assert_eq!(
+        eff[193], 0.0,
+        "lag-6 history of frame 193 still reads silence"
+    );
+    // No zero in the mask means the mask is returned unchanged.
+    let ones = vec![1.0_f32; mask.len()];
+    assert_eq!(effective_weights(len, &ones), ones);
+}
+#[test]
+fn clean_query_with_mask_boundaries_keeps_its_true_peak_near_one() {
+    // Boundary frames next to silenced spans must not be scored as onsets: a
+    // query that IS the reference, with three masked spans of interfering
+    // noise, must still score close to an unmasked clean query.
+    let source = signal(36, 37);
+    let index = SoundtrackIndex::from_pcm(spec(36), &source, &|| false).unwrap();
+    let start = 8.32;
+    let s0 = (start * 8000.0) as usize;
+    let clean = source[s0..s0 + 6 * 8000].to_vec();
+    let mut mask = Vec::new();
+    for k in 0..3 {
+        mask.extend(mask_span(0.5 + 2.0 * k as f64, 1.1 + 2.0 * k as f64));
+    }
+    let weights = mask_weights(clean.len(), 0, PCM_RATE, &mask);
+    let mut query = clean.clone();
+    for (k, &(a, b)) in mask.iter().enumerate() {
+        for (dst, x) in query[a as usize..b as usize]
+            .iter_mut()
+            .zip(loud_burst((b - a) as usize, 40 + k as u64))
+        {
+            *dst = x;
+        }
+    }
+    let r = index
+        .match_pcm_weighted(
+            &query,
+            capture(),
+            &SoundtrackPolicy::default(),
+            Some(&weights),
+            &|| false,
+        )
+        .unwrap();
+    let best = r.best_similarity.unwrap();
+    assert!(best > 0.95, "masked clean query scored {best}: {r:?}");
+    assert_eq!(r.state, SoundtrackMatchState::Matched, "{r:?}");
+    assert!(center_error(&r, start, 6.0) < 0.05);
 }

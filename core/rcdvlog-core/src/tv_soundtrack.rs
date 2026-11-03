@@ -479,6 +479,15 @@ impl SoundtrackIndex {
                 "invalid input: speech mask must give one finite [0,1] weight per query frame"
             );
             report.mask_digest = Some(weights_digest(w));
+        }
+        // The supplied mask decides which samples are silenced; the effective
+        // weights additionally drop every frame whose features read a silenced
+        // sample (its own window or the lag-6 delta history), because the jump
+        // from silence would otherwise be scored as a full-scale onset.
+        let mask = weights;
+        let effective = mask.map(|w| effective_weights(pcm.len(), w));
+        let weights = effective.as_deref();
+        if let Some(w) = weights {
             // §6: at least 2 s of unmasked frames, and at least 0.5 s in each third.
             let frames_per_second = PCM_RATE as f64 / HOP as f64;
             let total: f64 = w.iter().map(|x| f64::from(*x)).sum();
@@ -501,7 +510,7 @@ impl SoundtrackIndex {
         }
         // §6: masked samples are silenced before features, so frames that only
         // share support with a masked gap stay weighted without seeing its audio.
-        let silenced = weights
+        let silenced = mask
             .filter(|w| w.contains(&0.0))
             .map(|w| neutralised(pcm, w));
         let query = features(silenced.as_deref().unwrap_or(pcm), cancel)?;
@@ -835,6 +844,31 @@ pub fn mask_weights(
             } else {
                 1.0
             }
+        })
+        .collect()
+}
+/// Scoring weights for a query whose `mask` silences the samples owned by its
+/// zero-weight frames. Frame `n` reads samples `[(n-8)*HOP, n*HOP+FFT)`: its own
+/// FFT window and the windows of its smoothed lag-6 delta history (frames
+/// `n-8..=n`). A frame that reads any silenced sample gets weight zero; other
+/// frames keep their mask weight. Without masked frames this is the mask itself.
+fn effective_weights(pcm_len: usize, mask: &[f32]) -> Vec<f32> {
+    if !mask.contains(&0.0) {
+        return mask.to_vec();
+    }
+    // prefix[s] = silenced samples before sample s.
+    let mut prefix = Vec::with_capacity(pcm_len + 1);
+    prefix.push(0usize);
+    for s in 0..pcm_len {
+        let silenced = mask[owner_frame(s, mask.len())] == 0.0;
+        prefix.push(prefix[s] + usize::from(silenced));
+    }
+    mask.iter()
+        .enumerate()
+        .map(|(n, &w)| {
+            let lo = n.saturating_sub(WARMUP - 1) * HOP;
+            let hi = (n * HOP + FFT).min(pcm_len);
+            if prefix[hi] > prefix[lo] { 0.0 } else { w }
         })
         .collect()
 }
