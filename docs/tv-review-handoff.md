@@ -273,9 +273,47 @@ source verification or plan renderability. Each of those is explicitly
 an availability promise. Use `from_json` for bounded import validation.
 
 The `purpose: historicalRenderedArtifactReview` discriminator and different Rust
-DTO prevent parsing it as `ReviewTargetHandoff`. A server must implement an
-explicit historical-review policy before accepting it; importing it through the
-strict v1 route fails. Historical sessions may retain movie-time discussion of
+DTO prevent parsing it as `ReviewTargetHandoff`. Importing it through the
+strict v1 route fails with `review_target_historical_contract`.
+
+### Server historical-review policy
+
+The companion server accepts this contract only through
+`POST /api/v1/projects/{projectId}/review-targets/historical/preflight` and
+`.../historical/import`, whose body is `{review, acknowledgement}` plus the same
+optional `declaredIssuer`, `availability` and `maxVerificationAgeSeconds` as the
+strict route. `acknowledgement` must equal
+`integrityOnlyCurrentRenderabilityNotEstablished`; there is no default, and a
+missing or different value is `review_target_historical_acknowledgement_required`.
+A strict handoff sent to this route is `review_target_not_historical`, so a
+current target can never be silently weakened.
+
+The shared Rust validator, digest, project, freshness, availability, dedupe and
+viewed-artifact conflict rules are the same as for a strict target. The
+preflight reports `integrityReceipt` instead of `verificationReceipt` and adds
+`currentSources`, `currentConstraints` and `currentRenderability` warnings.
+Both contracts digest the same snapshot, so one snapshot cannot be stored under
+both: the second import is `409 review_target_contract_conflict` and nothing is
+changed. A YouTube re-declaration keeps the parent's contract.
+
+Control migration 17 adds `review_targets.contract`
+(`reviewTargetV1` | `historicalRenderedArtifactReviewV1`; existing rows are
+strict). Each historical observation keeps the integrity receipt
+(`mappingMatchesRevision`, `storedFullyDecoded` and the three
+`notEstablishedByThisReview` fields), never a strict receipt. Every summary and
+detail carries `contract`, and historical details prepend fixed statements to
+`limitations`. `ReviewTargets::handoff` refuses a historical target;
+synchronization, candidates and the editorial workspace use
+`ReviewTargets::evidence`, which maps through `map_to_historical_cuts`. The
+workspace and `review-report.v1` carry `targetContract`, and a historical report
+adds a rule that it grants no render, edit, activation, upload, source-trim or
+feedback-apply authority. Recording sessions use the same readiness policy, so
+discussing an already rendered movie remains possible.
+
+The Chrome import panel detects the purpose discriminator itself, shows what
+the review does not establish, and keeps *Check handoff* disabled until the
+importer ticks the acknowledgement. Historical targets carry a *Historical
+artifact · integrity only* badge in lists, detail and the workspace. Historical sessions may retain movie-time discussion of
 known editorial defects, but this evidence grants no render, editing, activation,
 upload, source-trim or feedback-apply authority. Those existing gates remain.
 Digest consistency cannot authenticate the issuer or establish YouTube identity.
@@ -295,3 +333,10 @@ pre-story-policy algorithm only when no story policy exists. That legacy
 recognition is confined to historical read-only review; it cannot authorize
 render reuse or current strict export. The [historical JSON Schema](contracts/historical-review-v1.schema.json)
 and invented `historical-v1.json` fixture document this separate transport.
+
+Historical receipt compatibility recognizes the current measured-clock preview
+recipe and `preview.immutable-receipt.h264-30000-1001.stereo48.actual-clock.tv-range.v2`.
+The latter changed pixel normalization and cache identity while retaining the
+measured clock/mapping representation. Unknown renderer recipes are refused.
+This compatibility applies only to historical integrity review: fresh strict
+export still requires the current recipe and every existing verification guard.

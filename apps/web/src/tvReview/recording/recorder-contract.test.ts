@@ -1,5 +1,5 @@
 import type { BrowserProjectClient, ReviewTargetDetail } from "@rcdvlog/project-client";
-import { VoiceRecording } from "./recorder";
+import { PROBE_RETRY_MS, VoiceRecording } from "./recorder";
 import { MemoryOutbox } from "./outbox";
 
 type Port={onmessage:((event:MessageEvent)=>void)|null;postMessage:ReturnType<typeof vi.fn>};
@@ -55,6 +55,24 @@ test("stop waits beyond 150 ms for the final worklet batch and a concurrent stop
   await stopped;
   expect(client.finalizeReviewSession).toHaveBeenCalledWith("p","s",{finalFrameCount:640,endReason:"stopped"});
   expect(client.putReviewSessionChunk.mock.calls[0][2]).toMatchObject({frameCount:640,startFrame:0});
+});
+
+test("a probe answered too late for an honest bracket is retried soon, not a clock interval later",async()=>{
+  const {client}=await start();
+  const probes=()=>port.postMessage.mock.calls.map(([m])=>m as {type:string;probeId:string}).filter((m)=>m.type==="clockProbe");
+  expect(probes().length).toBeGreaterThan(0);
+  const now=vi.spyOn(performance,"now");
+  const base=performance.now();
+  now.mockReturnValue(base+900); // beyond the 500 ms bracket bound
+  message({type:"clockSample",probeId:probes()[0].probeId,frame:1000,firstFrame:1000});
+  now.mockReturnValue(base+1_000);
+  const before=probes().length;
+  await vi.advanceTimersByTimeAsync(PROBE_RETRY_MS+1);
+  expect(probes().length).toBe(before+1);
+  message({type:"clockSample",probeId:probes().at(-1)!.probeId,frame:1100,firstFrame:1000});
+  await vi.advanceTimersByTimeAsync(10);
+  now.mockRestore();
+  expect(client.recordReviewSessionEvent).toHaveBeenCalledWith("p","s",expect.objectContaining({kind:"clockSample",detail:expect.objectContaining({method:"workletProbeBracket"})}));
 });
 
 test("unacknowledged stop records unknown tail evidence instead of a clean stop",async()=>{

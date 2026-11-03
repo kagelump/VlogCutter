@@ -1,6 +1,6 @@
 use super::*;
 use crate::review_targets::tests::{PROJECT, actor, now};
-use crate::review_transcripts::tests::{FakeRuntime, Fixture, fixture, local, run};
+use crate::review_transcripts::tests::{FakeRuntime, Fixture, fixture, fixture_for, local, run};
 use crate::{AuditActorType, ReviewSessionEventKind, ReviewSessionEventRequest};
 
 fn human() -> ReviewActor {
@@ -542,5 +542,44 @@ fn reconciliation_receipts_are_single_and_conflicts_are_refused() {
             .as_array()
             .unwrap()
             .is_empty()
+    );
+}
+
+#[test]
+fn a_historical_target_maps_through_the_historical_boundary_and_says_so() {
+    let f = fixture_for(false, true, true);
+    calibration_event(&f, "calibration_0", 0, 0);
+    cue_event(&f, "cue_first_frame", 0, 500.0, 0.0);
+    cue_event(&f, "cue_five", 0, 5500.0, 5.0);
+    let run_id = run(&f, &local(), &FakeRuntime::new()).run_id;
+    let discussions = f.catalog.review_discussions();
+    let workspace = discussions.workspace(PROJECT, &run_id).unwrap();
+    assert_eq!(
+        workspace.target_contract,
+        crate::ReviewTargetContract::HistoricalRenderedArtifactReviewV1
+    );
+    // Same shared mapper and evidence as a strict target.
+    assert_eq!(workspace.sync.status, "mapped");
+    let first = &workspace.utterances[0];
+    assert_eq!(
+        first.movie_time.as_ref().unwrap().source,
+        "sharedSync:estimated"
+    );
+    assert!(
+        first
+            .candidate_operation_ids
+            .contains(&"editop_split_a".to_string())
+    );
+    let report = discussions.report(PROJECT, &run_id).unwrap();
+    assert_eq!(
+        report["targetContract"],
+        "historicalRenderedArtifactReviewV1"
+    );
+    assert!(
+        report["rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r.as_str().unwrap().contains("no render, edit, activation"))
     );
 }

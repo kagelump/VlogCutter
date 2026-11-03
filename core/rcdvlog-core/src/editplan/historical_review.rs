@@ -58,6 +58,15 @@ impl HistoricalRenderedArtifactReview {
         chrono::DateTime::parse_from_rfc3339(&self.verified_at)?;
         review_target::validate_snapshot(&self.target, &self.target_digest)
     }
+
+    /// Picture locators in the already rendered movie for a half-open elapsed
+    /// movie-time range. Same lookup as the strict handoff; it establishes
+    /// nothing about current renderability.
+    pub fn picture_candidates(&self, start_seconds: f64, end_seconds: f64) -> Result<Vec<String>> {
+        self.validate()?;
+        self.target
+            .picture_candidates_validated(start_seconds, end_seconds)
+    }
 }
 
 impl Catalog {
@@ -120,7 +129,13 @@ impl Catalog {
             )?,
             "invalid receipt: canonical plan digest differs from completed render"
         );
-        let target = review_target::snapshot_from_artifact(artifact, &plan, None, cancel)?;
+        let target = review_target::snapshot_from_artifact(
+            artifact,
+            &plan,
+            None,
+            review_target::SnapshotPolicy::Historical,
+            cancel,
+        )?;
         let review = HistoricalRenderedArtifactReview {
             schema_version: 1,
             purpose: HistoricalReviewPurpose::HistoricalRenderedArtifactReview,
@@ -270,6 +285,61 @@ mod tests {
             ro.review_historical_rendered_artifact(&id, &|| true)
                 .is_err()
         );
+        // A known renderer that only changed TV-range pixel normalization
+        // still carries the same measured movie clock/mapping representation.
+        let raw_identity: String = catalog
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT identity_json FROM preview_artifacts WHERE artifact_id=?1",
+                [&id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let mut receipt: serde_json::Value = serde_json::from_str(&raw_identity).unwrap();
+        let store_recipe = |body: String| {
+            catalog
+                .connection()
+                .unwrap()
+                .execute(
+                    "UPDATE preview_artifacts SET identity_json=?2 WHERE artifact_id=?1",
+                    rusqlite::params![id, body],
+                )
+                .unwrap()
+        };
+        for recipe in [
+            "preview.immutable-receipt.h264-30000-1001.stereo48.actual-clock.v1",
+            review_target::HISTORICAL_TV_RANGE_V2_RECIPE,
+        ] {
+            receipt["recipe"] = serde_json::json!(recipe);
+            store_recipe(receipt.to_string());
+            let compatible = ro
+                .review_historical_rendered_artifact(&id, &|| false)
+                .unwrap();
+            assert_eq!(compatible.target, review.target);
+            assert!(catalog.export_review_target(&id, None, &|| false).is_err());
+            if recipe != super::super::preview_media::RECIPE {
+                let artifact = ro.preview_artifact_status(&id, false).unwrap().artifact;
+                assert!(
+                    review_target::snapshot_from_artifact(
+                        artifact,
+                        &plan,
+                        None,
+                        review_target::SnapshotPolicy::Strict,
+                        &|| false
+                    )
+                    .is_err()
+                );
+            }
+        }
+        receipt["recipe"] = serde_json::json!("preview.unknown-clock-semantics.v999");
+        store_recipe(receipt.to_string());
+        let refusal = ro
+            .review_historical_rendered_artifact(&id, &|| false)
+            .unwrap_err();
+        assert!(refusal.to_string().contains("unsupported preview recipe"));
+        store_recipe(raw_identity);
+
         // Damage only the generated test receipt: metadata cannot assert a
         // different immutable operation or an incomplete movie clock.
         let raw: String = catalog

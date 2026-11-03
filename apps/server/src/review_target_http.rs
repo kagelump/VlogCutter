@@ -2,8 +2,9 @@
 //! Validation, digesting, deduplication and conflict policy live in Rust core.
 use super::*;
 use rcdvlog_server_core::{
-    ImportOutcome, REVIEW_TARGET_LIST_MAX_LIMIT, ReviewTargetActor, ReviewTargetImportRequest,
-    ReviewTargetServiceError,
+    HISTORICAL_REVIEW_ACKNOWLEDGEMENT, HistoricalReviewTargetImportRequest, ImportOutcome,
+    REVIEW_TARGET_LIST_MAX_LIMIT, ReviewTargetActor, ReviewTargetImportRequest,
+    ReviewTargetImportResult, ReviewTargetServiceError,
 };
 
 /// The handoff validator caps the snapshot at 16 MiB; leave room for the envelope.
@@ -46,7 +47,9 @@ fn error_response(request_id: &RequestId, error: ReviewTargetServiceError) -> Re
         ReviewTargetServiceError::ProjectNotFound | ReviewTargetServiceError::NotFound => {
             StatusCode::NOT_FOUND
         }
-        ReviewTargetServiceError::Rejected { code, .. } if *code == "review_target_conflict" => {
+        ReviewTargetServiceError::Rejected { code, .. }
+            if *code == "review_target_conflict" || *code == "review_target_contract_conflict" =>
+        {
             StatusCode::CONFLICT
         }
         ReviewTargetServiceError::Rejected { .. } | ReviewTargetServiceError::InvalidInput(_) => {
@@ -130,25 +133,88 @@ pub(super) async fn import(
     };
     let targets = state.foundation.catalog().review_targets();
     let importer = actor(&principal);
-    let result = match blocking(&request_id, move || {
+    let result = blocking(&request_id, move || {
         targets.import(&project_id, &body, &importer, chrono::Utc::now())
+    })
+    .await;
+    audited_import(
+        &state,
+        &principal,
+        &request_id,
+        "review_target.imported",
+        result,
+    )
+}
+
+pub(super) async fn preflight_historical(
+    State(state): State<HttpState>,
+    Extension(request_id): Extension<RequestId>,
+    AxumPath(project_id): AxumPath<String>,
+    body: Result<Json<HistoricalReviewTargetImportRequest>, JsonRejection>,
+) -> Response {
+    let Ok(Json(body)) = body else {
+        return query_error_response(&request_id, "invalid_input", StatusCode::BAD_REQUEST);
+    };
+    let targets = state.foundation.catalog().review_targets();
+    match blocking(&request_id, move || {
+        targets.preflight_historical(&project_id, &body, chrono::Utc::now())
     })
     .await
     {
+        Ok(report) => Json(report).into_response(),
+        Err(response) => response,
+    }
+}
+
+pub(super) async fn import_historical(
+    State(state): State<HttpState>,
+    Extension(request_id): Extension<RequestId>,
+    Extension(principal): Extension<AuthPrincipal>,
+    AxumPath(project_id): AxumPath<String>,
+    body: Result<Json<HistoricalReviewTargetImportRequest>, JsonRejection>,
+) -> Response {
+    let Ok(Json(body)) = body else {
+        return query_error_response(&request_id, "invalid_input", StatusCode::BAD_REQUEST);
+    };
+    let targets = state.foundation.catalog().review_targets();
+    let importer = actor(&principal);
+    let result = blocking(&request_id, move || {
+        targets.import_historical(&project_id, &body, &importer, chrono::Utc::now())
+    })
+    .await;
+    audited_import(
+        &state,
+        &principal,
+        &request_id,
+        "review_target.historical_imported",
+        result,
+    )
+}
+
+/// Audit a created or refreshed import (a reuse changes nothing) and reply.
+fn audited_import(
+    state: &HttpState,
+    principal: &AuthPrincipal,
+    request_id: &RequestId,
+    action: &str,
+    result: Result<ReviewTargetImportResult, Response>,
+) -> Response {
+    let result = match result {
         Ok(result) => result,
         Err(response) => return response,
     };
     if result.outcome != ImportOutcome::Reused
         && let Err(response) = audit_admin(
-            &state,
-            &principal,
-            &request_id,
-            "review_target.imported",
+            state,
+            principal,
+            request_id,
+            action,
             "review_target",
             Some(&result.review_target.summary.review_target_id),
             serde_json::json!({
                 "projectId": result.review_target.summary.project_id,
                 "targetDigest": result.review_target.summary.target_digest,
+                "contract": result.review_target.summary.contract,
                 "outcome": result.outcome,
             }),
         )
@@ -277,6 +343,20 @@ pub(super) fn openapi_extend(document: &mut serde_json::Value) {
             "requestBody": body("ReviewTargetImportRequest"),
             "responses": {"200": ok("ReviewTargetImportResult"), "400": error.clone(), "401": error.clone(), "404": error.clone(), "409": error.clone()}
         }},
+        "/api/v1/projects/{projectId}/review-targets/historical/preflight": {"post": {
+            "operationId": "preflightHistoricalReviewTarget",
+            "description": "Non-mutating validation of a HistoricalRenderedArtifactReview v1 (#232): integrity of an already rendered movie only. Requires the explicit acknowledgement; current sources, constraints and renderability are reported as not established.",
+            "parameters": [project.clone()],
+            "requestBody": body("HistoricalReviewTargetImportRequest"),
+            "responses": {"200": ok("ReviewTargetPreflight"), "400": error.clone(), "401": error.clone(), "404": error.clone()}
+        }},
+        "/api/v1/projects/{projectId}/review-targets/historical/import": {"post": {
+            "operationId": "importHistoricalReviewTarget",
+            "description": "Import or reuse a historical rendered-artifact review under contract historicalRenderedArtifactReviewV1. It can never be read back as a strict review target; a snapshot already stored under the other contract returns 409 review_target_contract_conflict.",
+            "parameters": [project.clone()],
+            "requestBody": body("HistoricalReviewTargetImportRequest"),
+            "responses": {"200": ok("ReviewTargetImportResult"), "400": error.clone(), "401": error.clone(), "404": error.clone(), "409": error.clone()}
+        }},
         "/api/v1/projects/{projectId}/review-targets/{reviewTargetId}": {"get": {
             "operationId": "getReviewTarget",
             "parameters": [project.clone(), target.clone()],
@@ -304,6 +384,18 @@ pub(super) fn openapi_extend(document: &mut serde_json::Value) {
             "type":"object","additionalProperties":false,"required":["handoff"],
             "properties":{
                 "handoff":{"description":"The data member of edit-plan.review-target-export; see docs/contracts/review-target-v1.schema.json","type":"object"},
+                "declaredIssuer":{"type":["string","null"],"maxLength":64},
+                "availability":{"type":["object","null"],"additionalProperties":false,"required":["state","observedAt"],"properties":{
+                    "state":{"type":"string","enum":["unknown","present","missing","modified"]},
+                    "observedAt":{"type":"string","format":"date-time"}}},
+                "maxVerificationAgeSeconds":{"type":["integer","null"],"minimum":1}
+            }
+        },
+        "HistoricalReviewTargetImportRequest": {
+            "type":"object","additionalProperties":false,"required":["review","acknowledgement"],
+            "properties":{
+                "review":{"description":"The data member of edit-plan.historical-review-target-export; see docs/contracts/historical-review-v1.schema.json","type":"object"},
+                "acknowledgement":{"type":"string","enum":[HISTORICAL_REVIEW_ACKNOWLEDGEMENT]},
                 "declaredIssuer":{"type":["string","null"],"maxLength":64},
                 "availability":{"type":["object","null"],"additionalProperties":false,"required":["state","observedAt"],"properties":{
                     "state":{"type":"string","enum":["unknown","present","missing","modified"]},

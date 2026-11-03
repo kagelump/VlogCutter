@@ -97,3 +97,10 @@ source-audio content parity, continuity, or editorial pacing. A stored receipt,
 path existence, or green technical verification is not a human editorial
 approval. These are derived, node-local catalog receipts, not synchronized
 project decisions.
+# RC6 local renderer compatibility
+
+The RC6 tool carries the existing full-range source normalization fix: the
+scaler explicitly converts source pixels to TV range before H.264 encoding.
+Preview and segment recipes are version 2 (`tv-range`) so outputs and rate
+history from the earlier scaler cannot silently satisfy the changed recipe.
+Originals, proxies, declared source ranges and chronology facts are unchanged.

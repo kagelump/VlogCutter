@@ -858,6 +858,14 @@ pub fn router(state: HttpState) -> Router {
             post(review_target_http::import),
         )
         .route(
+            "/api/v1/projects/{project_id}/review-targets/historical/preflight",
+            post(review_target_http::preflight_historical),
+        )
+        .route(
+            "/api/v1/projects/{project_id}/review-targets/historical/import",
+            post(review_target_http::import_historical),
+        )
+        .route(
             "/api/v1/projects/{project_id}/review-targets/{review_target_id}",
             get(review_target_http::get),
         )
@@ -6081,6 +6089,163 @@ mod tests {
             events
                 .iter()
                 .any(|e| e.action == "review_target.youtube_declared")
+        );
+    }
+
+    fn historical_review(project_id: &str) -> Value {
+        let handoff = review_target_handoff(project_id, None);
+        serde_json::json!({
+            "schemaVersion": 1,
+            "purpose": "historicalRenderedArtifactReview",
+            "targetDigest": handoff["targetDigest"],
+            "target": handoff["target"],
+            "verifiedAt": handoff["verification"]["verifiedAt"],
+            "outputMatches": true,
+            "mappingMatchesRevision": true,
+            "storedFullyDecoded": true,
+            "currentSourceVerification": "notEstablishedByThisReview",
+            "currentConstraintsVerification": "notEstablishedByThisReview",
+            "currentPlanRenderability": "notEstablishedByThisReview"
+        })
+    }
+
+    #[tokio::test]
+    async fn historical_review_target_routes_need_acknowledgement_and_keep_their_contract() {
+        let fixture = Fixture::new(false);
+        let source = TempDir::new().unwrap();
+        let envelope = baseline_envelope(&source);
+        let project_id = envelope.payload.project.project_id.clone();
+        fixture
+            .foundation
+            .catalog()
+            .project_replicas()
+            .import_baseline(&envelope)
+            .unwrap();
+        let (session_id, session_token, csrf) = browser_auth(&fixture);
+        let cookie_value = format!("rcdvlog_session={session_id}:{session_token}");
+        let base = format!("/api/v1/projects/{project_id}/review-targets");
+        let post = |uri: String, body: Value, csrf: Option<&str>| {
+            let mut builder = Request::builder()
+                .method(Method::POST)
+                .uri(uri)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::COOKIE, &cookie_value);
+            if let Some(csrf) = csrf {
+                builder = builder.header("x-csrf-token", csrf);
+            }
+            builder
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap()
+        };
+        let review = historical_review(&project_id);
+
+        // Through the strict route: named, not a generic parse failure.
+        let strict = fixture
+            .app()
+            .oneshot(post(
+                format!("{base}/import"),
+                serde_json::json!({"handoff": review.clone()}),
+                Some(&csrf),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(strict.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            json(strict).await["code"],
+            "review_target_historical_contract"
+        );
+        // Without the acknowledgement: refused.
+        let unacknowledged = fixture
+            .app()
+            .oneshot(post(
+                format!("{base}/historical/import"),
+                serde_json::json!({"review": review.clone()}),
+                Some(&csrf),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(unacknowledged.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            json(unacknowledged).await["code"],
+            "review_target_historical_acknowledgement_required"
+        );
+        let request = serde_json::json!({
+            "review": review,
+            "acknowledgement": "integrityOnlyCurrentRenderabilityNotEstablished"
+        });
+        let no_csrf = fixture
+            .app()
+            .oneshot(post(
+                format!("{base}/historical/import"),
+                request.clone(),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(no_csrf.status(), StatusCode::FORBIDDEN);
+        let preflight = fixture
+            .app()
+            .oneshot(post(
+                format!("{base}/historical/preflight"),
+                request.clone(),
+                Some(&csrf),
+            ))
+            .await
+            .unwrap();
+        let preflight = json(preflight).await;
+        assert_eq!(preflight["outcome"], "new");
+        assert_eq!(
+            preflight["preview"]["contract"],
+            "historicalRenderedArtifactReviewV1"
+        );
+        let imported = fixture
+            .app()
+            .oneshot(post(
+                format!("{base}/historical/import"),
+                request.clone(),
+                Some(&csrf),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(imported.status(), StatusCode::OK);
+        let imported = json(imported).await;
+        let target = &imported["reviewTarget"];
+        assert_eq!(target["contract"], "historicalRenderedArtifactReviewV1");
+        assert_eq!(
+            target["observations"][0]["verification"]["currentPlanRenderability"],
+            "notEstablishedByThisReview"
+        );
+        assert!(
+            target["limitations"][0]
+                .as_str()
+                .unwrap()
+                .starts_with("Historical rendered-artifact review")
+        );
+        // The same snapshot through the strict route is a contract conflict.
+        let conflict = fixture
+            .app()
+            .oneshot(post(
+                format!("{base}/import"),
+                serde_json::json!({"handoff": review_target_handoff(&project_id, None)}),
+                Some(&csrf),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(conflict.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            json(conflict).await["code"],
+            "review_target_contract_conflict"
+        );
+        let events = fixture
+            .foundation
+            .catalog()
+            .audit_log()
+            .list(20, None)
+            .unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|e| e.action == "review_target.historical_imported")
         );
     }
 

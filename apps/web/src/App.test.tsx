@@ -83,6 +83,8 @@ function client(session: SessionState): BrowserProjectClient {
     listReviewTargets: vi.fn().mockResolvedValue({ items: [], nextBefore: null }),
     preflightReviewTarget: vi.fn(),
     importReviewTarget: vi.fn(),
+    preflightHistoricalReviewTarget: vi.fn(),
+    importHistoricalReviewTarget: vi.fn(),
     getReviewTarget: vi.fn(),
     declareReviewTargetYoutube: vi.fn(),
     getReviewTargetCandidates: vi.fn(),

@@ -12,6 +12,8 @@ import { captureCalibration } from "./clock";
 export const WORKLET_URL = "/pcm-capture-worklet.js";
 /** How often a native-frame / performance-clock bracket is recorded. */
 export const CLOCK_SAMPLE_INTERVAL_MS = 5_000;
+export const PROBE_RETRY_MS = 250;
+const MAX_PROBE_RETRIES = 8;
 /** How long stop waits for the worklet to acknowledge its final delivered frame. */
 export const STOP_ACK_TIMEOUT_MS = 1_000;
 const RENDER_QUANTUM_FRAMES = 128;
@@ -76,6 +78,8 @@ export class VoiceRecording {
   private clockTimer: ReturnType<typeof setInterval> | null = null;
   private probe: { id: string; sentMs: number } | null = null;
   private probeTimer: ReturnType<typeof setInterval> | null = null;
+  private probeRetryTimer: ReturnType<typeof setTimeout> | null = null;
+  private probeRetries = 0;
   private writes: Promise<void> = Promise.resolve();
   private meta!: OutboxSession;
   private eventOrder = 0;
@@ -229,6 +233,22 @@ export class VoiceRecording {
     this.node.port.postMessage({ type: "clockProbe", probeId: this.probe.id });
   }
 
+  /**
+   * A probe whose round trip exceeded the bracket bound (a cold microphone
+   * graph or a loaded main thread) yields no honest bracket. Rather than wait a
+   * full clock interval with no paired native-frame evidence, ask again soon.
+   * Bounded, so a genuinely unavailable probe still ends in the explicit
+   * getOutputTimestamp fallback samples instead of a busy loop.
+   */
+  private retryCalibration() {
+    if (this.finished || this.probeRetryTimer || this.probeRetries >= MAX_PROBE_RETRIES) return;
+    this.probeRetries += 1;
+    this.probeRetryTimer = setTimeout(() => {
+      this.probeRetryTimer = null;
+      this.requestCalibration();
+    }, PROBE_RETRY_MS);
+  }
+
   private publish(patch: Partial<CaptureStatus>) {
     this.status = { ...this.status, ...patch };
     this.onStatus(this.status);
@@ -254,6 +274,8 @@ export class VoiceRecording {
         receivedMs: now,
       });
       this.probe = null;
+      if (!calibration) this.retryCalibration();
+      else this.probeRetries = 0;
       if (calibration) {
         const uncertaintyMs = calibration.monotonicToleranceNs / 1_000_000;
         void this.queueEvent("clockSample", calibration.sampleIndex, { ...calibration, clockEpoch: this.clockEpoch, uncertaintyMs }, null, now);
@@ -352,6 +374,7 @@ export class VoiceRecording {
     if (!this.finished) {
       if (this.clockTimer) clearInterval(this.clockTimer);
       if (this.probeTimer) clearInterval(this.probeTimer);
+      if (this.probeRetryTimer) clearTimeout(this.probeRetryTimer);
       await this.sampleClock("stop");
       this.finished = true;
       // The worklet flushes its partial batch and then acknowledges the final
