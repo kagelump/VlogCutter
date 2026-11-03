@@ -481,6 +481,11 @@ impl SyncRequest {
                         .push("too_many_anchor_alternatives".into());
                     return slice;
                 }
+                // Offset implied by an anchor: movie seconds (from origin) minus mic seconds.
+                let anchor_offset = |a: &SyncAnchor| {
+                    (a.movie_pts - self.movie.origin_pts) as f64 / tps
+                        - a.capture.sample_index as f64 / c.sample_rate as f64
+                };
                 for a in la {
                     for b in ra {
                         let capture_seconds = (rs - ls) as f64 / c.sample_rate as f64;
@@ -492,6 +497,19 @@ impl SyncRequest {
                             + self.uncertainty(b, c)
                             + tolerance;
                         if progress <= 0.0 || (progress - capture_seconds * tps).abs() > allowed {
+                            slice
+                                .diagnostics
+                                .push("inconsistent_progress_requires_resync".into());
+                            continue;
+                        }
+                        // ARCHITECTURE.md §9: consensus must not override anchors whose
+                        // offset disagrees with the segment beyond residual tolerance.
+                        if let Some(seg) = consensus
+                            && [a, b].iter().any(|x| {
+                                (anchor_offset(x) - seg.offset_seconds).abs()
+                                    > self.policy.residual_tolerance_seconds
+                            })
+                        {
                             slice
                                 .diagnostics
                                 .push("inconsistent_progress_requires_resync".into());
@@ -530,7 +548,7 @@ impl SyncRequest {
                     (true, Some(_)) => SyncState::ConsensusInterpolated,
                     (true, None) => SyncState::Estimated,
                 };
-                if let Some(seg) = consensus {
+                if let (SyncState::ConsensusInterpolated, Some(seg)) = (slice.state, consensus) {
                     slice
                         .diagnostics
                         .push(format!("consensus_segment:{}", seg.segment_id));

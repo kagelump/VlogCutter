@@ -386,6 +386,7 @@ fn consensus_interpolation_allowed_inside_one_segment_with_section_nine_uncertai
     let mut r = fixture();
     r.anchors = far_anchors(&r);
     r.consensus_segments = vec![consensus_segment("seg_one", 0.0, 100.0)];
+    r.consensus_segments[0].offset_seconds = 8.0;
     let e = r.map(&[q(20.0, 21.0)], &|| false).unwrap();
     let s = &e.slices[0];
     assert_eq!(s.state, SyncState::ConsensusInterpolated);
