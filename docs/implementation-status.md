@@ -8,6 +8,11 @@ The implemented slice is intentionally smaller than the launch-critical list in 
 
 Implemented now:
 
+- Preview encoding explicitly normalizes full-range sources to TV range, with
+  versioned TV-range-v2 preview/segment identities. Historical integrity review
+  recognizes measured-clock v1/v2 receipts; strict export requires the current
+  renderer and unchanged verification guards.
+
 - TV recorder cues/clock events use a durable outbox and acknowledged worklet
   tail flush; paired native-frame/performance probes preserve calibration
   evidence and suspension epochs. See `docs/tv-voice-review-recording.md`.

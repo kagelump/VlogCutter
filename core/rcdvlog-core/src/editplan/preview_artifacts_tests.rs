@@ -1,7 +1,7 @@
 use super::*;
 use crate::editplan::inspection::tests::fixture;
 use crate::{AssetPatch, EditPlanOperation, PreviewProgress};
-use std::{io::Write, time::Duration};
+use std::{io::Write, process::Command, time::Duration};
 
 fn plan(catalog: &Catalog, asset: &str) -> EditPlanRevision {
     let project = catalog.get_asset(asset).unwrap().project_id;
@@ -129,6 +129,98 @@ fn completed_previews_keep_unique_bytes_and_actual_decoded_picture_clocks() {
             .unwrap_err()
             .downcast_ref::<PreviewArtifactError>()
             .is_some()
+    );
+}
+
+#[test]
+fn full_range_source_is_converted_to_limited_range_preview() {
+    let (_dir, catalog, asset_id) = fixture();
+    let asset = catalog.get_asset(&asset_id).unwrap();
+    let source = Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=white:s=160x90:r=60:d=4,format=yuvj420p",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuvj420p",
+            "-color_range",
+            "pc",
+            "-t",
+            "4",
+        ])
+        .arg(&asset.path)
+        .output()
+        .unwrap();
+    assert!(
+        source.status.success(),
+        "{}",
+        String::from_utf8_lossy(&source.stderr)
+    );
+    let source_probe = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=pix_fmt,color_range",
+            "-of",
+            "json",
+        ])
+        .arg(&asset.path)
+        .output()
+        .unwrap();
+    assert!(source_probe.status.success());
+    let source_media: serde_json::Value = serde_json::from_slice(&source_probe.stdout).unwrap();
+    assert_eq!(source_media["streams"][0]["pix_fmt"], "yuvj420p");
+    assert_eq!(source_media["streams"][0]["color_range"], "pc");
+
+    let plan = plan(&catalog, &asset_id);
+    let result = catalog
+        .render_preview(&request(&plan), &mut |_| {}, &|| false)
+        .unwrap();
+    let output_probe = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=pix_fmt",
+            "-of",
+            "json",
+        ])
+        .arg(&result.output_path)
+        .output()
+        .unwrap();
+    assert!(output_probe.status.success());
+    let output_media: serde_json::Value = serde_json::from_slice(&output_probe.stdout).unwrap();
+    assert_eq!(output_media["streams"][0]["pix_fmt"], "yuv420p");
+    let decoded = Command::new("ffmpeg")
+        .args(["-v", "error", "-i"])
+        .arg(&result.output_path)
+        .args([
+            "-frames:v",
+            "1",
+            "-pix_fmt",
+            "yuv420p",
+            "-f",
+            "rawvideo",
+            "-",
+        ])
+        .output()
+        .unwrap();
+    assert!(decoded.status.success());
+    let white_luma = *decoded.stdout.first().expect("preview frame is decoded");
+    assert!(
+        (232..=238).contains(&white_luma),
+        "full-range white must become limited-range white near 235, got {white_luma}"
     );
 }
 

@@ -12,7 +12,7 @@ use std::{
     time::Duration,
 };
 
-const SEGMENT_RECIPE: &str = "preview.segment.h264-hardcut.v1";
+const SEGMENT_RECIPE: &str = "preview.segment.h264-hardcut.tv-range.v2";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
