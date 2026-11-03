@@ -928,3 +928,119 @@ fn clean_query_with_mask_boundaries_keeps_its_true_peak_near_one() {
     assert_eq!(r.state, SoundtrackMatchState::Matched, "{r:?}");
     assert!(center_error(&r, start, 6.0) < 0.05);
 }
+fn spec_v2(n: usize) -> SoundtrackReferenceSpec {
+    SoundtrackReferenceSpec {
+        recipe: Some(SOUNDTRACK_RECIPE_V2.into()),
+        ..spec(n)
+    }
+}
+#[test]
+fn v2_index_is_distinct_from_v1_and_self_validates() {
+    let source = signal(36, 37);
+    let v1 = SoundtrackIndex::from_pcm(spec(36), &source, &|| false).unwrap();
+    let v2 = SoundtrackIndex::from_pcm(spec_v2(36), &source, &|| false).unwrap();
+    assert_eq!(v1.recipe, SOUNDTRACK_RECIPE);
+    assert_eq!(v2.recipe, SOUNDTRACK_RECIPE_V2);
+    assert_ne!(v1.index_digest, v2.index_digest);
+    assert_eq!(v1.pcm_digest, v2.pcm_digest);
+    assert!(v1.frame_energy.is_empty());
+    assert_eq!(v2.frame_energy.len(), v2.features.len());
+    assert!(v2.features.iter().flatten().all(|x| x.abs() <= 3.0));
+    // v1 JSON carries no frameEnergy; both round-trip and validate.
+    let j1 = serde_json::to_string(&v1).unwrap();
+    assert!(!j1.contains("frameEnergy"));
+    assert_eq!(SoundtrackIndex::from_json(j1.as_bytes()).unwrap(), v1);
+    let j2 = serde_json::to_string(&v2).unwrap();
+    assert_eq!(SoundtrackIndex::from_json(j2.as_bytes()).unwrap(), v2);
+    // A v2 index relabelled as v1 (or tampered energy) is rejected.
+    let mut relabelled = v2.clone();
+    relabelled.reference.recipe = None;
+    assert!(relabelled.validate().is_err());
+    let mut tampered = v2.clone();
+    tampered.frame_energy[10] += 1.0;
+    assert!(tampered.validate().is_err());
+    // Unknown recipe names are rejected.
+    let mut unknown = spec(36);
+    unknown.recipe = Some(SOUNDTRACK_RECIPE.into());
+    assert!(SoundtrackIndex::from_pcm(unknown, &source, &|| false).is_err());
+    // Reports name the index recipe.
+    let start = 8.32;
+    let s0 = (start * 8000.0) as usize;
+    let q = &source[s0..s0 + 6 * 8000];
+    let r = v2
+        .match_pcm(q, capture(), &SoundtrackPolicy::default(), &|| false)
+        .unwrap();
+    assert_eq!(r.recipe, SOUNDTRACK_RECIPE_V2);
+    assert_eq!(r.state, SoundtrackMatchState::Matched, "{r:?}");
+    assert!(center_error(&r, start, 6.0) < 0.05);
+}
+#[test]
+fn v2_score_ignores_query_audio_where_the_reference_is_silent() {
+    // Reference with a 2 s silent stretch at 10..12 s.
+    let mut source = signal(36, 41);
+    for x in &mut source[10 * 8000..12 * 8000] {
+        *x = 0.0;
+    }
+    let v1 = SoundtrackIndex::from_pcm(spec(36), &source, &|| false).unwrap();
+    let v2 = SoundtrackIndex::from_pcm(spec_v2(36), &source, &|| false).unwrap();
+    let start = 8.0;
+    let s0 = (start * 8000.0) as usize;
+    let clean = source[s0..s0 + 6 * 8000].to_vec();
+    // Room noise only strictly inside the silent stretch (a full FFT window of margin).
+    let mut noisy = clean.clone();
+    let (a, b) = (2 * 8000 + FFT, 4 * 8000 - FFT);
+    for (dst, x) in noisy[a..b].iter_mut().zip(loud_burst(b - a, 9)) {
+        *dst = 0.3 * x;
+    }
+    let score = |index: &SoundtrackIndex, q: &[f32]| {
+        index
+            .match_pcm(q, capture(), &SoundtrackPolicy::default(), &|| false)
+            .unwrap()
+    };
+    let (c2, n2) = (score(&v2, &clean), score(&v2, &noisy));
+    let truth = c2.best_peaks[0].reference_offset_frames;
+    assert_eq!(n2.best_peaks[0].reference_offset_frames, truth);
+    assert_eq!(
+        c2.best_peaks[0].similarity.to_bits(),
+        n2.best_peaks[0].similarity.to_bits(),
+        "v2 score at the true offset must not see audio over reference silence"
+    );
+    let (c1, n1) = (score(&v1, &clean), score(&v1, &noisy));
+    assert_ne!(
+        c1.best_similarity.map(f64::to_bits),
+        n1.best_similarity.map(f64::to_bits),
+        "v1 does see it"
+    );
+}
+#[test]
+fn v2_scores_a_talker_over_quiet_passages_higher_than_v1() {
+    // Reference alternating 1.5 s loud / 1.5 s quiet (-34 dB); a talker speaks
+    // over the quiet passages in the room recording.
+    let mut source = signal(36, 43);
+    for (i, x) in source.iter_mut().enumerate() {
+        if (i / 12000) % 2 == 1 {
+            *x *= 0.02;
+        }
+    }
+    let v1 = SoundtrackIndex::from_pcm(spec(36), &source, &|| false).unwrap();
+    let v2 = SoundtrackIndex::from_pcm(spec_v2(36), &source, &|| false).unwrap();
+    let start = 9.0;
+    let s0 = (start * 8000.0) as usize;
+    let mut query = source[s0..s0 + 6 * 8000].to_vec();
+    let talker = loud_burst(query.len(), 77);
+    for (i, x) in query.iter_mut().enumerate() {
+        if ((s0 + i) / 12000) % 2 == 1 {
+            *x += 0.15 * talker[i];
+        }
+    }
+    let r1 = v1
+        .match_pcm(&query, capture(), &SoundtrackPolicy::default(), &|| false)
+        .unwrap();
+    let r2 = v2
+        .match_pcm(&query, capture(), &SoundtrackPolicy::default(), &|| false)
+        .unwrap();
+    let (b1, b2) = (r1.best_similarity.unwrap(), r2.best_similarity.unwrap());
+    assert!(b2 > b1 + 0.05, "v1 {b1:.3} v2 {b2:.3}");
+    assert_eq!(r2.state, SoundtrackMatchState::Matched, "{r2:?}");
+    assert!(center_error(&r2, start, 6.0) < 0.05);
+}

@@ -185,6 +185,19 @@ transcript utterances padded ±0.25 s. The core never reads transcripts.
   bands, then clip to ±3. (v1 clips to ±8 and has no median step.)
 - **No collisions.** The recipe string is part of every index digest and cache
   key, so v1 and v2 entries can never collide.
+- **Refinements (2026-11-03, owner-driven V01 cycle).**
+  - `frame_energy` is the log of the summed energy of the same 16 bands
+    (≈94 Hz–3.8 kHz). Percentiles are nearest-rank. If p80 − p20 ≤ 1e-6,
+    all weights are 1.
+  - The scoring weight of frame `n` is the **minimum** frame weight over
+    `n-8..=n`, the frames its smoothed lag-6 delta reads. A query frame
+    therefore cannot score audio aligned with near-silent reference audio
+    through its delta history; this is the same lesson as the §6 effective
+    weights.
+  - v1 is always spelled `recipe: None`. `Some(v1 name)` and unknown names
+    are rejected.
+  - The v1 digest input is unchanged. The v2 digest also binds
+    `frame_energy`.
 
 ## §8 Offset consensus
 
