@@ -7,7 +7,7 @@
   "epic_id": "V01",
   "title": "Recipe v2: energy-weighted robust features",
   "slug": "recipe-v2",
-  "status": "ready",
+  "status": "complete",
   "task_class": "implementation",
   "depends_on": [
     "V01-T005"

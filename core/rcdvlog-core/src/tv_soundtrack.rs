@@ -283,7 +283,20 @@ impl SoundtrackReferenceSpec {
                     <= m.duration_pts as f64 / m.ticks_per_second() + 1e-6,
             "invalid input: reference window outside movie or 4..600 second bound"
         );
+        ensure!(
+            self.recipe.is_none() || self.recipe.as_deref() == Some(SOUNDTRACK_RECIPE_V2),
+            "invalid input: unknown soundtrack recipe"
+        );
         Ok(())
+    }
+}
+impl SoundtrackReferenceSpec {
+    /// The recipe this reference is indexed with (§7): None means v1.
+    pub fn recipe_name(&self) -> &str {
+        self.recipe.as_deref().unwrap_or(SOUNDTRACK_RECIPE)
+    }
+    fn is_v2(&self) -> bool {
+        self.recipe.as_deref() == Some(SOUNDTRACK_RECIPE_V2)
     }
 }
 impl SoundtrackIndex {
@@ -300,15 +313,21 @@ impl SoundtrackIndex {
             (pcm.len() as f64 / PCM_RATE as f64 - reference.duration_seconds).abs() <= 0.05,
             "invalid input: reference PCM duration mismatch"
         );
+        let (features, frame_energy) = if reference.is_v2() {
+            let (raw, energy) = features_and_energy(pcm, cancel)?;
+            (robust(raw), energy)
+        } else {
+            (features(pcm, cancel)?, vec![])
+        };
         let mut index = Self {
             schema_version: 1,
-            recipe: SOUNDTRACK_RECIPE.into(),
+            recipe: reference.recipe_name().into(),
             reference,
             pcm_digest: pcm_digest(pcm),
             index_digest: String::new(),
             sample_count: pcm.len(),
-            features: features(pcm, cancel)?,
-            frame_energy: vec![],
+            features,
+            frame_energy,
         };
         index.index_digest = index.digest()?;
         Ok(index)
@@ -373,15 +392,27 @@ impl SoundtrackIndex {
         Self::from_pcm(reference, &pcm, cancel)
     }
     fn digest(&self) -> Result<String> {
-        Ok(blake3::hash(&serde_json::to_vec(&(
-            SOUNDTRACK_RECIPE,
-            &self.reference,
-            &self.pcm_digest,
-            self.sample_count,
-            &self.features,
-        ))?)
-        .to_hex()
-        .to_string())
+        // v1 keeps its exact digest input; v2 names its recipe and also binds
+        // the per-frame energy that weights matching (§7).
+        let bytes = if self.reference.is_v2() {
+            serde_json::to_vec(&(
+                SOUNDTRACK_RECIPE_V2,
+                &self.reference,
+                &self.pcm_digest,
+                self.sample_count,
+                &self.features,
+                &self.frame_energy,
+            ))?
+        } else {
+            serde_json::to_vec(&(
+                SOUNDTRACK_RECIPE,
+                &self.reference,
+                &self.pcm_digest,
+                self.sample_count,
+                &self.features,
+            ))?
+        };
+        Ok(blake3::hash(&bytes).to_hex().to_string())
     }
     pub fn from_json(bytes: &[u8]) -> Result<Self> {
         ensure!(
@@ -396,7 +427,18 @@ impl SoundtrackIndex {
         self.reference.validate()?;
         ensure!(
             self.schema_version == 1
-                && self.recipe == SOUNDTRACK_RECIPE
+                && self.recipe == self.reference.recipe_name()
+                && if self.reference.is_v2() {
+                    self.frame_energy.len() == self.features.len()
+                        && self.frame_energy.iter().all(|x| x.is_finite())
+                        && self
+                            .features
+                            .iter()
+                            .flatten()
+                            .all(|x| x.abs() <= ROBUST_CLIP)
+                } else {
+                    self.frame_energy.is_empty()
+                }
                 && valid_digest(&self.pcm_digest)
                 && valid_digest(&self.index_digest)
                 && self.sample_count >= FFT + 3 * HOP
@@ -452,7 +494,7 @@ impl SoundtrackIndex {
         policy.validate()?;
         let mut report = SoundtrackMatchReport {
             schema_version: 1,
-            recipe: SOUNDTRACK_RECIPE.into(),
+            recipe: self.recipe.clone(),
             reference_movie_digest: self.reference.movie.movie_digest.clone(),
             reference_pcm_digest: self.pcm_digest.clone(),
             reference_index_digest: self.index_digest.clone(),
@@ -514,6 +556,17 @@ impl SoundtrackIndex {
             .filter(|w| w.contains(&0.0))
             .map(|w| neutralised(pcm, w));
         let query = features(silenced.as_deref().unwrap_or(pcm), cancel)?;
+        let query = if self.reference.is_v2() {
+            robust(query)
+        } else {
+            query
+        };
+        // §7: v2 weights each aligned reference frame by its energy.
+        let reference_weights = self
+            .reference
+            .is_v2()
+            .then(|| energy_weights(&self.frame_energy));
+        let ref_w = reference_weights.as_deref();
         let norm = query
             .iter()
             .enumerate()
@@ -536,6 +589,7 @@ impl SoundtrackIndex {
                 &self.features[offset..offset + query.len()],
                 4,
                 weights,
+                ref_w.map(|r| &r[offset..offset + query.len()]),
                 &mut report.comparison_products,
             )?;
             coarse.push((score, offset));
@@ -558,6 +612,7 @@ impl SoundtrackIndex {
                     &self.features[pos..pos + query.len()],
                     1,
                     weights,
+                    ref_w.map(|r| &r[pos..pos + query.len()]),
                     &mut report.comparison_products,
                 )?;
                 if score > best.0 {
@@ -584,6 +639,7 @@ impl SoundtrackIndex {
                     &self.features[offset + a..offset + b],
                     1,
                     weights.map(|w| &w[a..b]),
+                    ref_w.map(|r| &r[offset + a..offset + b]),
                     &mut report.comparison_products,
                 )?;
             }
@@ -622,6 +678,7 @@ impl SoundtrackIndex {
                     &self.features[offset + a..offset + b],
                     1,
                     weights.map(|w| &w[a..b]),
+                    ref_w.map(|r| &r[offset + a..offset + b]),
                     &mut report.comparison_products,
                 )?;
                 if local < policy.minimum_subwindow_similarity {
@@ -891,13 +948,14 @@ fn similarity(
     b: &[[f32; BANDS]],
     stride: usize,
     weights: Option<&[f32]>,
+    reference_weights: Option<&[f32]>,
     products: &mut u64,
 ) -> Result<f64> {
     let mut dot = 0.0;
     let mut aa = 0.0;
     let mut bb = 0.0;
     for i in (WARMUP..a.len()).step_by(stride) {
-        let w = weight_at(weights, i);
+        let w = weight_at(weights, i) * weight_at(reference_weights, i);
         for j in 0..BANDS {
             let x = f64::from(a[i][j]);
             let y = f64::from(b[i][j]);
@@ -918,6 +976,55 @@ fn similarity(
     })
 }
 fn features(pcm: &[f32], cancel: &dyn Fn() -> bool) -> Result<Vec<[f32; BANDS]>> {
+    Ok(features_and_energy(pcm, cancel)?.0)
+}
+/// §7 v2 clip for median-removed features.
+const ROBUST_CLIP: f32 = 3.0;
+/// §7 robust features: subtract each frame's median across its bands, clip ±3.
+fn robust(mut frames: Vec<[f32; BANDS]>) -> Vec<[f32; BANDS]> {
+    for frame in &mut frames {
+        let mut sorted = *frame;
+        sorted.sort_by(f32::total_cmp);
+        let median = (sorted[BANDS / 2 - 1] + sorted[BANDS / 2]) / 2.0;
+        for x in frame.iter_mut() {
+            *x = (*x - median).clamp(-ROBUST_CLIP, ROBUST_CLIP);
+        }
+    }
+    frames
+}
+/// §7 reference-energy weights. A frame's own weight is
+/// clamp((E - p20) / (p80 - p20), 0, 1) over the reference's own energy
+/// percentiles; the scoring weight is the minimum over the frames its smoothed
+/// lag-6 delta reads (`n-8..=n`), so a feature that depends on near-silent
+/// reference audio carries no weight.
+fn energy_weights(energy: &[f32]) -> Vec<f32> {
+    let mut sorted = energy.to_vec();
+    sorted.sort_by(f32::total_cmp);
+    let rank = |q: f64| sorted[((sorted.len() - 1) as f64 * q).round() as usize];
+    let (p20, p80) = (rank(0.2), rank(0.8));
+    let own: Vec<f32> = if p80 - p20 > 1e-6 {
+        energy
+            .iter()
+            .map(|e| ((e - p20) / (p80 - p20)).clamp(0.0, 1.0))
+            .collect()
+    } else {
+        vec![1.0; energy.len()]
+    };
+    (0..own.len())
+        .map(|n| {
+            own[n.saturating_sub(WARMUP - 1)..=n]
+                .iter()
+                .copied()
+                .fold(1.0, f32::min)
+        })
+        .collect()
+}
+/// Per-frame 16-band log-delta features plus the broadband log energy of each
+/// frame's window (the sum over the same bands).
+fn features_and_energy(
+    pcm: &[f32],
+    cancel: &dyn Fn() -> bool,
+) -> Result<(Vec<[f32; BANDS]>, Vec<f32>)> {
     ensure!(
         pcm.len() >= FFT + 3 * HOP,
         "invalid input: PCM too short for features"
@@ -928,6 +1035,7 @@ fn features(pcm: &[f32], cancel: &dyn Fn() -> bool) -> Result<Vec<[f32; BANDS]>>
         6, 8, 10, 13, 16, 20, 25, 31, 39, 49, 61, 76, 95, 119, 149, 187, 240,
     ];
     let mut out = Vec::new();
+    let mut energies = Vec::new();
     let mut history = Vec::<[f32; BANDS]>::new();
     for start in (0..=pcm.len() - FFT).step_by(HOP) {
         ensure!(!cancel(), "soundtrack features cancelled");
@@ -939,12 +1047,15 @@ fn features(pcm: &[f32], cancel: &dyn Fn() -> bool) -> Result<Vec<[f32; BANDS]>>
         }
         fft(&mut real, &mut imag);
         let mut bands = [0.0f32; BANDS];
+        let mut total = 0.0f64;
         for j in 0..BANDS {
             let energy = (edges[j]..edges[j + 1])
                 .map(|k| real[k] * real[k] + imag[k] * imag[k])
                 .sum::<f64>();
+            total += energy;
             bands[j] = (energy + 1e-8).ln() as f32;
         }
+        energies.push((total + 1e-8).ln() as f32);
         history.push(bands);
         let mut delta = [0.0; BANDS];
         if history.len() >= WARMUP {
@@ -957,7 +1068,7 @@ fn features(pcm: &[f32], cancel: &dyn Fn() -> bool) -> Result<Vec<[f32; BANDS]>>
         }
         out.push(delta);
     }
-    Ok(out)
+    Ok((out, energies))
 }
 fn fft(real: &mut [f64; FFT], imag: &mut [f64; FFT]) {
     let mut j = 0;

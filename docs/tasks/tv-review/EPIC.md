@@ -40,7 +40,7 @@ byte-identically.
 | 60 | [V01-T006](tasks/V01-T006-gap-windows.md) | Gap-placed query windows in session plans | V01-T005 | complete |
 | 70 | [V01-T007](tasks/V01-T007-offset-consensus.md) | Offset consensus module and CLI | V01-T004 | complete |
 | 80 | [V01-T008](tasks/V01-T008-consensus-interpolation.md) | Consensus-gated interpolation in the sync mapper | V01-T007 | complete |
-| 90 | [V01-T009](tasks/V01-T009-recipe-v2.md) | Recipe v2: energy-weighted robust features | V01-T005 | ready |
+| 90 | [V01-T009](tasks/V01-T009-recipe-v2.md) | Recipe v2: energy-weighted robust features | V01-T005 | complete |
 | 100 | [V01-T010](tasks/V01-T010-real-room-evidence.md) | Real-room RC6 v2 evidence run | V01-T006, V01-T008, V01-T009 | ready |
 | 110 | [V01-T011](tasks/V01-T011-docs-reconcile.md) | Docs and planning reconciliation | V01-T010 | ready |
 

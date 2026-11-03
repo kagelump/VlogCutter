@@ -263,6 +263,11 @@ impl SoundtrackSessionPlan {
         // Validate the matching policy through its single shared validator.
         spec.match_policy.validate()?;
         ensure!(
+            spec.recipe.is_none()
+                || spec.recipe.as_deref() == Some(crate::tv_soundtrack::SOUNDTRACK_RECIPE_V2),
+            "invalid input: unknown soundtrack recipe"
+        );
+        ensure!(
             spec.speech_mask.len() <= MAX_MASK_INTERVALS
                 && spec.speech_mask.iter().all(|m| {
                     m.start_sample < m.end_sample
@@ -497,7 +502,7 @@ impl SoundtrackSessionPlan {
                 movie: spec.sync.movie.clone(),
                 start_seconds: start,
                 duration_seconds: width,
-                recipe: None,
+                recipe: spec.recipe.clone(),
             });
             if start + width >= duration - 1e-9 {
                 break;
@@ -592,7 +597,7 @@ impl SoundtrackSessionPlan {
                 && receipt.task == task
                 && receipt.report_digest == digest(report)?
                 && report.schema_version == 1
-                && report.recipe == crate::tv_soundtrack::SOUNDTRACK_RECIPE
+                && report.recipe == reference.recipe_name()
                 && report.reference_movie_digest == self.spec.sync.movie.movie_digest
                 && report.capture == query.capture
                 && report.policy == self.spec.match_policy
