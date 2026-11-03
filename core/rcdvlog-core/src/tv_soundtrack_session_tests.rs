@@ -850,3 +850,79 @@ fn gap_query_longer_than_grid_is_searched_and_anchored_at_its_true_position() {
     let receipt = plan.receipt(&cache, qi * plan.references.len()).unwrap();
     assert!(receipt.is_some());
 }
+#[test]
+fn gap_queries_on_a_48k_clock_with_unaligned_mask_edges_decode_and_anchor() {
+    // Regression: gap queries at arbitrary 48 kHz sample positions failed the
+    // decoded-length check ("resampled query duration mismatch").
+    let dir = tempfile::tempdir().unwrap();
+    let movie_pcm = signal(60);
+    let movie = dir.path().join("movie.wav");
+    wav(&movie, &movie_pcm);
+    // 48 kHz mic of movie 10..30 s (sample-and-hold upsampling).
+    let mic_pcm: Vec<f32> = movie_pcm[10 * 8000..30 * 8000]
+        .iter()
+        .flat_map(|&x| std::iter::repeat_n(x, 6))
+        .collect();
+    let mic = dir.path().join("mic48.wav");
+    let mut out = hound::WavWriter::create(
+        &mic,
+        hound::WavSpec {
+            channels: 1,
+            sample_rate: 48000,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        },
+    )
+    .unwrap();
+    for s in &mic_pcm {
+        out.write_sample(*s).unwrap();
+    }
+    out.finalize().unwrap();
+    let mut spec = long_spec(20, 60, 30, 6, &[]);
+    let n = mic_pcm.len() as u64;
+    spec.sync.capture_clocks[0].sample_rate = 48000;
+    spec.sync.capture_clocks[0].last_sample = n;
+    spec.segments[0].frame_count = n as u32;
+    spec.sync.movie.movie_digest = full_file_blake3(&movie, &|| false).unwrap().hex_digest;
+    spec.segments[0].wav_blake3 = full_file_blake3(&mic, &|| false).unwrap().hex_digest;
+    // Mask edges deliberately off the 12-sample (two PCM8k samples) grid.
+    spec.speech_mask = vec![
+        SyncQuery {
+            clock_id: "mic".into(),
+            start_sample: 0,
+            end_sample: 59_261,
+        },
+        SyncQuery {
+            clock_id: "mic".into(),
+            start_sample: 767_405,
+            end_sample: n,
+        },
+    ];
+    let plan = SoundtrackSessionPlan::new(spec).unwrap();
+    let gaps = gap_ranges(&plan);
+    assert_eq!(gaps.len(), 1);
+    let (a, b) = gaps[0];
+    assert_eq!(a % 12, 0);
+    assert_eq!((b - a) % 12, 0);
+    assert!(a >= 59_261 && b <= 767_405);
+    let files = vec![SessionAudioFile {
+        segment_id: "native".into(),
+        path: mic,
+    }];
+    let cache = dir.path().join("cache");
+    run_all(&plan, &movie, &files, &cache);
+    let qi = plan
+        .queries
+        .iter()
+        .position(|q| q.origin.is_some())
+        .unwrap();
+    let page = plan.evidence_page(&cache, qi, 1, &|| false).unwrap();
+    let ev = &page.queries[0];
+    assert_eq!(ev.anchors.len(), 1, "{ev:?}");
+    let centre_mic_s = (a + b) as f64 / 2.0 / 48000.0;
+    let movie_s = ev.anchors[0].movie_pts as f64 / 90000.0 - 1.0;
+    assert!(
+        (movie_s - (10.0 + centre_mic_s)).abs() < 0.05,
+        "anchored at {movie_s}"
+    );
+}

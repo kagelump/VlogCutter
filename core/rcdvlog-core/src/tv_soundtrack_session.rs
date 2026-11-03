@@ -27,6 +27,10 @@ const MIN_GAP_SECONDS: u64 = 4;
 const MAX_GAP_QUERY_SECONDS: u32 = 20;
 const GAP_ORIGIN: &str = "speech_gap";
 
+fn gcd(a: u64, b: u64) -> u64 {
+    if b == 0 { a } else { gcd(b, a % b) }
+}
+
 /// PCM8k samples decoded for one query (its own length; gap queries vary).
 fn query_pcm_len(query: &SessionMatchQuery) -> usize {
     ((query.recording.end_sample - query.recording.start_sample) * u64::from(PCM_RATE)
@@ -400,7 +404,7 @@ impl SoundtrackSessionPlan {
             // query (it adds nothing), then keep the longest gaps first (ties:
             // earliest start) within the query quota, in recording order.
             let mut placed: Vec<(u64, u64, u64, usize)> = Vec::new();
-            for (len, gap_start, segment_index, _) in gaps {
+            for (_, gap_start, segment_index, gap_end) in gaps {
                 let segment = &spec.segments[segment_index];
                 let rate = spec
                     .sync
@@ -409,14 +413,26 @@ impl SoundtrackSessionPlan {
                     .find(|c| c.clock_id == segment.clock_id)
                     .context("invalid input: unknown segment clock")?
                     .sample_rate;
-                let size = len.min((cap * f64::from(rate)) as u64);
-                let first = gap_start + (len - size) / 2;
+                // Align to pairs of PCM8k samples relative to the segment start:
+                // the decoded window then has exactly the expected sample count,
+                // and its even length puts the anchor's centre sample exactly at
+                // the query centre on the native clock.
+                let unit = 2 * u64::from(rate) / gcd(u64::from(rate), u64::from(PCM_RATE));
+                let origin = segment.first_sample;
+                let lo = (gap_start - origin).div_ceil(unit) * unit;
+                let hi = (gap_end - origin) / unit * unit;
+                if hi <= lo || hi - lo < MIN_GAP_SECONDS * u64::from(rate) {
+                    continue;
+                }
+                let len = hi - lo;
+                let size = len.min((cap * f64::from(rate)) as u64) / unit * unit;
+                let first = origin + lo + (len - size) / 2 / unit * unit;
                 if !queries.iter().any(|q| {
                     q.recording.clock_id == segment.clock_id
                         && q.recording.start_sample == first
                         && q.recording.end_sample == first + size
                 }) {
-                    placed.push((len, first, size, segment_index));
+                    placed.push((gap_end - gap_start, first, size, segment_index));
                 }
             }
             placed.sort_by(|x, y| y.0.cmp(&x.0).then(x.1.cmp(&y.1)).then(x.3.cmp(&y.3)));

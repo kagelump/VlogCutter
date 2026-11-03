@@ -164,6 +164,11 @@ transcript utterances padded ±0.25 s. The core never reads transcripts.
     longer than `query_seconds`, the reference windows are exactly v1's, so
     every query position still lies wholly inside some reference.
   - Cached receipts are checked against each query's own PCM length.
+  - Gap query edges snap inward to pairs of PCM8k samples, relative to the
+    segment start (12 native samples at 48 kHz). The decoded window then
+    has exactly the expected length, and its even length puts the anchor
+    centre exactly on the query centre. Found by the T010 seek run: an
+    unaligned 48 kHz gap query failed the decoded-length check.
 
 ## §7 Recipe v2: weighted, robust features
 

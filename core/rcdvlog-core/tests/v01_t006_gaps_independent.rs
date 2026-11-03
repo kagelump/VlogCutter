@@ -62,12 +62,17 @@ fn expected_gap_queries(spec: &SoundtrackSessionSpec) -> Vec<(u64, u64)> {
             _ => runs.push((a, b)),
         }
     }
+    // Section 6: edges snap inward to pairs of 8 kHz samples (12 native samples
+    // at 48 kHz) relative to the segment start (0 here), so the decoded window
+    // has an exact, even length.
+    const UNIT: u64 = 12;
     let cap = 20 * RATE;
     runs.into_iter()
-        .filter(|(a, b)| b - a >= 4 * RATE)
+        .map(|(a, b)| (a.div_ceil(UNIT) * UNIT, b / UNIT * UNIT))
+        .filter(|(a, b)| b > a && b - a >= 4 * RATE)
         .map(|(a, b)| {
-            let size = (b - a).min(cap);
-            let first = a + (b - a - size) / 2;
+            let size = (b - a).min(cap) / UNIT * UNIT;
+            let first = a + (b - a - size) / 2 / UNIT * UNIT;
             (first, first + size)
         })
         .collect()
@@ -147,8 +152,9 @@ fn exactly_four_seconds_qualifies_and_trailing_edge_gap_is_clamped() {
     let plan = check(&[(4.0, 170.0), (174.0, 175.0)]);
     let gaps = gap_queries(&plan);
     assert_eq!(gaps[0], (0, sample(4.0)));
-    // Trailing gap [175 s, end of recording) is ~5.3 s and ends exactly at the recording end.
-    let end = 8_654_336;
+    // Trailing gap [175 s, end of recording) is ~5.3 s; it ends at the last
+    // 12-sample boundary before the recording end (8_654_336).
+    let end = 8_654_336 / 12 * 12;
     assert_eq!(*gaps.last().unwrap(), (sample(175.0), end));
 }
 
