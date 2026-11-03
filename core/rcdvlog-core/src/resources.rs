@@ -187,6 +187,42 @@ fn try_lock_file(file: &File) -> Result<bool> {
     }
 }
 
+/// How long a try-lock on a per-resource claim file tolerates contention before
+/// reporting a genuine second owner.
+const CLAIM_GRACE: Duration = Duration::from_secs(3);
+
+/// `try_lock_exclusive` for per-resource claim files, with a short bounded grace.
+///
+/// `flock` ownership belongs to the open file description, and a child created
+/// by `fork` shares it until the child calls `exec` (which then closes the
+/// close-on-exec descriptor). While this process runs several threads that each
+/// spawn FFmpeg/FFprobe, a claim that was legitimately released by its owner can
+/// therefore still look held for the few milliseconds a sibling thread's
+/// freshly forked child needs to reach `exec`; under load that is long enough to
+/// make an immediate retry of the same claim fail with a false "already has a
+/// running owner". A real second owner keeps the lock for the whole operation,
+/// so waiting a bounded grace distinguishes the two without ever blocking
+/// indefinitely or weakening exclusion.
+pub(crate) fn try_lock_exclusive_with_grace(file: &File) -> io::Result<()> {
+    try_lock_exclusive_within(file, CLAIM_GRACE)
+}
+
+fn try_lock_exclusive_within(file: &File, grace: Duration) -> io::Result<()> {
+    let deadline = std::time::Instant::now() + grace;
+    loop {
+        match file.try_lock_exclusive() {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if error.kind() == io::ErrorKind::WouldBlock
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 /// Try to own the one shared local-heavy slot without waiting. This deliberately
 /// bypasses the wait queue: an opportunistic caller either gets the slot now or
 /// leaves immediately. Serializing ordinary operations goes through
@@ -530,5 +566,30 @@ mod tests {
             "same-host same-user filesystem lease with process-local LIFO waiting; not a distributed cluster lock"
         );
         let _ = catalog;
+    }
+
+    #[test]
+    fn claim_grace_waits_out_a_transient_holder_but_still_excludes_a_real_one() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("claim.lock");
+        let first = open_lock(&path).unwrap();
+        first.try_lock_exclusive().unwrap();
+
+        // A genuine owner keeps the lock past the grace: still refused, and the
+        // refusal arrives after the bounded wait rather than never.
+        let second = open_lock(&path).unwrap();
+        let started = std::time::Instant::now();
+        let error = try_lock_exclusive_within(&second, Duration::from_millis(60)).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert!(started.elapsed() >= Duration::from_millis(60));
+
+        // A holder that lets go inside the grace (an inherited descriptor in a
+        // forked child that has not reached exec yet) no longer fails the claim.
+        let releaser = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(40));
+            drop(first);
+        });
+        try_lock_exclusive_within(&second, Duration::from_secs(5)).unwrap();
+        releaser.join().unwrap();
     }
 }

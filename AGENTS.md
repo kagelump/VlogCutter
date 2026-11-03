@@ -175,7 +175,7 @@ Catalog selection precedence for the CLI:
 
 Always pass `--catalog` in agent automation, tests, and temporary workflows. A desktop project folder can otherwise be confused with the legacy catalog.
 
-SQLite connections enable foreign keys, WAL journal mode, and a five-second busy timeout. Read operations can continue during an uncommitted writer. Project mutations append typed operations with materialized revisions. Adopted projects synchronize bounded operation pages between independent local catalogs; live SQLite/WAL files are never copied or placed on NAS.
+SQLite connections enable foreign keys, WAL journal mode, and a five-second busy timeout. Read operations can continue during an uncommitted writer. Bundled SQLite must stay at 3.51.3 or newer (`rusqlite` 0.39+): 3.51.1 deadlocks when two connections to one WAL database close at the same time, and the catalog opens a connection per operation (guarded by `core/rcdvlog-core/tests/sqlite_concurrent_close.rs`, #258). Project mutations append typed operations with materialized revisions. Adopted projects synchronize bounded operation pages between independent local catalogs; live SQLite/WAL files are never copied or placed on NAS.
 
 Project catalogs use an explicit `schema_migrations` history and are currently at version 66. The server control catalog is version 16; backup format is version 1. Migration definitions have immutable names/source identities and each migration commits atomically. Migration 18 includes a one-time compatibility reconciliation for catalogs created on the import feature branch before its migration IDs were merged with main. When changing the schema:
 
