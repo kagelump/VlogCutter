@@ -7,7 +7,7 @@
   "epic_id": "V01",
   "title": "Cross-reference margin in session evidence",
   "slug": "global-margin",
-  "status": "ready",
+  "status": "complete",
   "task_class": "implementation",
   "depends_on": [
     "V01-T003"

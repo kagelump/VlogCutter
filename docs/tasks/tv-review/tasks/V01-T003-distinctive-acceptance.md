@@ -7,7 +7,7 @@
   "epic_id": "V01",
   "title": "Distinctive-peak acceptance in match_pcm",
   "slug": "distinctive-acceptance",
-  "status": "ready",
+  "status": "complete",
   "task_class": "implementation",
   "depends_on": [
     "V01-T002"

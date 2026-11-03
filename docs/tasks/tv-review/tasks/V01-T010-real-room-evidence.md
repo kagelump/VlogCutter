@@ -7,7 +7,7 @@
   "epic_id": "V01",
   "title": "Real-room RC6 v2 evidence run",
   "slug": "real-room-evidence",
-  "status": "ready",
+  "status": "blocked",
   "task_class": "qa",
   "depends_on": [
     "V01-T006",
