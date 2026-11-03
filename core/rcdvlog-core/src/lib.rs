@@ -12375,5 +12375,7 @@ pub use analysis::native_video::*;
 pub mod tv_review_sync;
 
 pub mod tv_soundtrack;
+pub mod tv_soundtrack_alignment;
 pub mod tv_soundtrack_consensus;
+pub mod tv_soundtrack_landmarks;
 pub mod tv_soundtrack_session;
