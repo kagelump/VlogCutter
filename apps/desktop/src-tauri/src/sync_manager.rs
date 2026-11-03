@@ -205,6 +205,7 @@ impl SyncManager {
             wake_tx: wake_tx.clone(),
             guard: rcdvlog_sync::SyncGuardTracker::new(),
             project_work,
+            node_jobs: crate::single_flight::SingleFlight::default(),
         };
         // `spawn` is called from Tauri's setup hook, which runs on the main
         // thread outside any Tokio runtime context — `tokio::spawn` would panic
@@ -261,6 +262,8 @@ struct SyncLoopHandle {
     /// Registers proxy downloads and node jobs so `delete_project` can refuse
     /// while they hold a project's cache folder.
     project_work: crate::project_work::ProjectWork,
+    /// The one detached node-job batch, never awaited by reconcile.
+    node_jobs: crate::single_flight::SingleFlight,
 }
 
 impl SyncLoopHandle {
@@ -274,7 +277,10 @@ impl SyncLoopHandle {
             let mut targeted_project: Option<String> = None;
 
             match event {
-                Ok(Some(WakeEvent::Shutdown)) => break,
+                Ok(Some(WakeEvent::Shutdown)) => {
+                    self.node_jobs.cancel();
+                    break;
+                }
                 Ok(Some(WakeEvent::ProjectMutated { project_id })) => {
                     targeted_project = Some(project_id);
                 }
@@ -321,6 +327,9 @@ impl SyncLoopHandle {
             let Some(current_path) = self.current_catalog_path() else {
                 continue;
             };
+            // A batch pinned to a catalog the user has swapped away from stops
+            // before its next job.
+            self.node_jobs.cancel_unless_pinned_to(&current_path);
             let guard_state = self.guard.ensure(&current_path);
             let paired_projects = self.list_paired_projects();
             if guard_state.ok() != Some(rcdvlog_sync::GuardState::Held) {
@@ -709,15 +718,17 @@ impl SyncLoopHandle {
                 }
 
                 // ── Process Mac-targeted jobs from the server ──
+                // Dispatched, not awaited: a minutes-long encode must not stall
+                // this reconcile or every other project's. The server re-offers
+                // unfinished jobs on later cycles.
                 if !resp.node_targeted_jobs.is_empty() {
-                    self.handle_node_targeted_jobs(
+                    self.dispatch_node_jobs(
                         endpoint,
                         &server_node_id,
                         &catalog,
                         project_id,
-                        &resp.node_targeted_jobs,
-                    )
-                    .await;
+                        resp.node_targeted_jobs.clone(),
+                    );
                 }
 
                 // If there are more operations to fetch, loop immediately
@@ -929,54 +940,95 @@ impl SyncLoopHandle {
         }
     }
 
-    /// Handle node-targeted jobs received from the server during reconciliation.
-    /// For each job, check original availability, execute locally, and report
-    /// the result back to the server.
-    async fn handle_node_targeted_jobs(
-        &self,
+    /// Hand node-targeted jobs to the single background slot and return
+    /// immediately. At most one batch is in flight; while it runs, further
+    /// offers are dropped because the server re-sends unfinished jobs on its
+    /// next reconcile response.
+    fn dispatch_node_jobs(
+        &mut self,
         endpoint: &str,
         server_node_id: &str,
         catalog: &Catalog,
         project_id: &str,
-        jobs: &[rcdvlog_sync::NodeTargetedJob],
+        jobs: Vec<rcdvlog_sync::NodeTargetedJob>,
     ) {
+        if self.node_jobs.is_running() {
+            return;
+        }
         // Same protection as proxy downloads: tombstoned projects get no
-        // ffmpeg work, and a live job blocks deletion of the folder.
-        let Ok(_work) = self
+        // ffmpeg work, and a live batch blocks deletion of the folder. The
+        // guard is taken now and moves into the task.
+        let Ok(work) = self
             .project_work
             .begin(project_id, crate::project_work::WorkKind::NodeJobs)
         else {
             return;
         };
-        let Some(client) = self.build_client(endpoint, server_node_id) else {
-            return;
+        let run = NodeJobRun {
+            app_handle: self.app_handle.clone(),
+            wake_tx: self.wake_tx.clone(),
+            endpoint: endpoint.to_string(),
+            server_node_id: server_node_id.to_string(),
+            catalog: catalog.clone(),
+            project_id: project_id.to_string(),
+            jobs,
+            _work: work,
+        };
+        let pinned = catalog.database_path().to_path_buf();
+        self.node_jobs
+            .try_spawn(&pinned, move |cancel| run_node_jobs(run, cancel));
+    }
+}
+
+/// Everything a detached node-job batch needs. It owns its catalog handle
+/// (the one pinned for the cycle that received the jobs) and its work guard.
+struct NodeJobRun {
+    app_handle: AppHandle,
+    wake_tx: tokio::sync::mpsc::UnboundedSender<WakeEvent>,
+    endpoint: String,
+    server_node_id: String,
+    catalog: Catalog,
+    project_id: String,
+    jobs: Vec<rcdvlog_sync::NodeTargetedJob>,
+    _work: crate::project_work::WorkGuard,
+}
+
+/// For each job, check original availability, execute locally, and report the
+/// result back to the server. Runs as its own task, never on the reconcile
+/// path; stops before the next job once cancelled.
+async fn run_node_jobs(run: NodeJobRun, cancel: crate::single_flight::CancelFlag) {
+    let Ok(client) = ServerClient::new(run.endpoint.clone(), run.server_node_id.clone()) else {
+        return;
+    };
+
+    let assets = match run.catalog.list_assets(&run.project_id) {
+        Ok(a) => a,
+        Err(_) => return,
+    };
+
+    let mut reported = false;
+    for job in run.jobs.iter() {
+        if cancel.is_cancelled() {
+            break;
+        }
+        // Find the local asset with matching media_object_id
+        let Some(asset) = assets
+            .iter()
+            .find(|a| a.media_object_id.as_deref() == Some(&job.media_object_id))
+        else {
+            continue;
         };
 
-        let assets = match catalog.list_assets(project_id) {
-            Ok(a) => a,
-            Err(_) => return,
-        };
+        // Check original availability
+        let original_path = std::path::Path::new(&asset.path);
+        if !original_path.exists() {
+            // Original is offline — skip, job stays queued on server
+            continue;
+        }
 
-        for job in jobs {
-            // Find the local asset with matching media_object_id
-            let Some(asset) = assets
-                .iter()
-                .find(|a| a.media_object_id.as_deref() == Some(&job.media_object_id))
-            else {
-                continue;
-            };
-
-            // Check original availability
-            let original_path = std::path::Path::new(&asset.path);
-            if !original_path.exists() {
-                // Original is offline — skip, job stays queued on server
-                continue;
-            }
-
-            let result = match job.kind.as_str() {
-                "proxy" => match generate_proxy_for_node_job(catalog.clone(), asset.id.clone())
-                    .await
-                {
+        let result = match job.kind.as_str() {
+            "proxy" => {
+                match generate_proxy_for_node_job(run.catalog.clone(), asset.id.clone()).await {
                     Ok(updated) => {
                         let output_path = updated.proxy_path.as_deref().unwrap_or("");
                         let output = std::path::Path::new(output_path);
@@ -998,47 +1050,56 @@ impl SyncLoopHandle {
                     Err(e) => {
                         CompleteNodeJobResult::failure("proxy_generation_failed", &format!("{e:#}"))
                     }
-                },
-                "thumbnail" => {
-                    match generate_thumbnail_for_node_job(catalog.clone(), asset.id.clone()).await {
-                        Ok(updated) => {
-                            let thumb_path = updated.thumbnail_path.as_deref().unwrap_or("");
-                            let output = std::path::Path::new(thumb_path);
-                            let byte_len = std::fs::metadata(output).ok().map(|m| m.len());
-                            CompleteNodeJobResult::success(
-                                job.representation_id.clone(),
-                                byte_len,
-                                thumb_path,
-                            )
-                        }
-                        Err(error)
-                            if error
-                                .downcast_ref::<rcdvlog_core::RepresentationBusy>()
-                                .is_some() =>
-                        {
-                            // Leave the server job queued; a later reconciliation retries it.
-                            continue;
-                        }
-                        Err(e) => CompleteNodeJobResult::failure(
-                            "thumbnail_generation_failed",
-                            &format!("{e:#}"),
-                        ),
-                    }
-                }
-                _ => continue,
-            };
-
-            // Report result back to server
-            let request = result.to_complete_request();
-            if let Err(e) = client.complete_node_job(&job.job_id, &request).await {
-                eprintln!("failed to report job {} result to server: {e}", job.job_id);
-            } else {
-                // Emit updated asset to refresh UI
-                if let Ok(updated) = catalog.get_asset(&asset.id) {
-                    let _ = self.app_handle.emit("asset-updated", updated);
                 }
             }
+            "thumbnail" => {
+                match generate_thumbnail_for_node_job(run.catalog.clone(), asset.id.clone()).await {
+                    Ok(updated) => {
+                        let thumb_path = updated.thumbnail_path.as_deref().unwrap_or("");
+                        let output = std::path::Path::new(thumb_path);
+                        let byte_len = std::fs::metadata(output).ok().map(|m| m.len());
+                        CompleteNodeJobResult::success(
+                            job.representation_id.clone(),
+                            byte_len,
+                            thumb_path,
+                        )
+                    }
+                    Err(error)
+                        if error
+                            .downcast_ref::<rcdvlog_core::RepresentationBusy>()
+                            .is_some() =>
+                    {
+                        // Leave the server job queued; a later reconciliation retries it.
+                        continue;
+                    }
+                    Err(e) => CompleteNodeJobResult::failure(
+                        "thumbnail_generation_failed",
+                        &format!("{e:#}"),
+                    ),
+                }
+            }
+            _ => continue,
+        };
+
+        // Report result back to server
+        let request = result.to_complete_request();
+        if let Err(e) = client.complete_node_job(&job.job_id, &request).await {
+            eprintln!("failed to report job {} result to server: {e}", job.job_id);
+        } else {
+            reported = true;
+            // Emit updated asset to refresh UI
+            if let Ok(updated) = run.catalog.get_asset(&asset.id) {
+                let _ = run.app_handle.emit("asset-updated", updated);
+            }
         }
+    }
+
+    // Reconcile again so the server's view and any remaining jobs are picked
+    // up. Only after a reported result: skipped jobs must not spin the loop.
+    if reported && !cancel.is_cancelled() {
+        let _ = run.wake_tx.send(WakeEvent::ProjectMutated {
+            project_id: run.project_id.clone(),
+        });
     }
 }
 

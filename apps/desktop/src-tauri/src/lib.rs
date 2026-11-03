@@ -30,6 +30,7 @@ mod keychain;
 mod media_server;
 mod project_work;
 mod server_client;
+mod single_flight;
 mod sync_manager;
 
 // ── Server connection types ────────────────────────────────────────────
