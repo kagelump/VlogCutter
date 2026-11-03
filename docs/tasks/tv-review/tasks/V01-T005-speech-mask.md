@@ -7,7 +7,7 @@
   "epic_id": "V01",
   "title": "Speech mask weights in matching",
   "slug": "speech-mask",
-  "status": "ready",
+  "status": "complete",
   "task_class": "implementation",
   "depends_on": [
     "V01-T001"

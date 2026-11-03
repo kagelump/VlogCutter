@@ -271,7 +271,14 @@ fn setup_q(
     }
     let spec: SoundtrackSessionSpec = serde_json::from_value(value).unwrap();
     let plan = SoundtrackSessionPlan::new(spec).unwrap();
-    assert_eq!(plan.queries.len(), 1, "one query expected");
+    // One grid query. V01-T006 may append speech_gap queries for long unmasked
+    // gaps; this oracle's claims are about the grid query (query 0).
+    assert_eq!(
+        plan.queries.iter().filter(|q| q.origin.is_none()).count(),
+        1,
+        "one grid query expected"
+    );
+    assert!(plan.queries[0].origin.is_none());
     assert!(plan.references.len() >= 2, "expected several references");
     let cache = dir.path().join("cache");
     Setup {
@@ -287,21 +294,25 @@ fn setup_q(
 }
 
 fn run_all(s: &Setup) {
-    let result = s
-        .plan
-        .run_batch(
-            SessionBatch {
-                movie: &s.movie,
-                files: &s.files,
-                cache: &s.cache,
-                start_task: 0,
-                max_tasks: 128,
-            },
-            &|| false,
-        )
-        .unwrap();
-    assert_eq!(result.next_task, s.plan.task_count);
-    assert!(!result.cancelled);
+    let mut next = 0;
+    while next < s.plan.task_count {
+        let result = s
+            .plan
+            .run_batch(
+                SessionBatch {
+                    movie: &s.movie,
+                    files: &s.files,
+                    cache: &s.cache,
+                    start_task: next,
+                    max_tasks: 128,
+                },
+                &|| false,
+            )
+            .unwrap();
+        assert!(!result.cancelled);
+        assert!(result.next_task > next);
+        next = result.next_task;
+    }
 }
 
 fn page(s: &Setup) -> SessionEvidencePage {
@@ -309,8 +320,9 @@ fn page(s: &Setup) -> SessionEvidencePage {
 }
 
 /// Every cached per-reference report, in task order.
+/// Reports of the grid query (query 0); tasks are query-major.
 fn reports(s: &Setup) -> Vec<SoundtrackMatchReport> {
-    (0..s.plan.task_count)
+    (0..s.plan.references.len())
         .map(|ti| {
             let path = s
                 .cache

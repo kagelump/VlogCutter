@@ -20,6 +20,45 @@ use std::{
 const RECIPE: &str = "soundtrack-session.native-wav-ffmpeg8k.v1";
 const MAX_JSON: usize = 4 * 1024 * 1024;
 const MAX_MASK_INTERVALS: usize = 4096;
+const MAX_QUERIES: usize = 4096;
+/// §6 gap-placed queries: gaps of at least this many seconds get one query.
+const MIN_GAP_SECONDS: u64 = 4;
+/// §6 gap-placed queries are at most this long (also below the reference width).
+const MAX_GAP_QUERY_SECONDS: u32 = 20;
+const GAP_ORIGIN: &str = "speech_gap";
+
+fn gcd(a: u64, b: u64) -> u64 {
+    if b == 0 { a } else { gcd(b, a % b) }
+}
+
+/// PCM8k samples decoded for one query (its own length; gap queries vary).
+fn query_pcm_len(query: &SessionMatchQuery) -> usize {
+    ((query.recording.end_sample - query.recording.start_sample) * u64::from(PCM_RATE)
+        / u64::from(query.capture.sample_rate)) as usize
+}
+
+/// Unmasked sub-intervals of `[lo, hi)` on `clock_id` (mask intervals may
+/// overlap or touch; they are merged first).
+fn unmasked(mask: &[SyncQuery], clock_id: &str, lo: u64, hi: u64) -> Vec<(u64, u64)> {
+    let mut spans: Vec<(u64, u64)> = mask
+        .iter()
+        .filter(|m| m.clock_id == clock_id && m.end_sample > lo && m.start_sample < hi)
+        .map(|m| (m.start_sample.max(lo), m.end_sample.min(hi)))
+        .collect();
+    spans.sort_unstable();
+    let mut out = Vec::new();
+    let mut cursor = lo;
+    for (a, b) in spans {
+        if a > cursor {
+            out.push((cursor, a));
+        }
+        cursor = cursor.max(b);
+    }
+    if cursor < hi {
+        out.push((cursor, hi));
+    }
+    out
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -241,36 +280,24 @@ impl SoundtrackSessionPlan {
             duration >= f64::from(spec.query_seconds),
             "invalid input: movie shorter than query window"
         );
-        let width = f64::from(spec.reference_seconds).min(duration);
-        let step = width - f64::from(spec.query_seconds);
-        ensure!(
-            step > 0.0 || width == duration,
-            "invalid input: reference coverage step"
-        );
-        let mut references = Vec::new();
-        let mut start = 0.0;
-        loop {
-            references.push(SoundtrackReferenceSpec {
-                schema_version: 1,
-                movie: spec.sync.movie.clone(),
-                start_seconds: start,
-                duration_seconds: width,
-                recipe: None,
-            });
-            if start + width >= duration - 1e-9 {
-                break;
-            }
-            start = (start + step).min(duration - width);
-            ensure!(
-                references.len() < 512,
-                "invalid input: too many reference windows"
-            );
-        }
+        // §6: gap-placed queries are at most this long (None without a mask).
+        let gap_cap_seconds = if spec.speech_mask.is_empty() {
+            None
+        } else {
+            Some(
+                (MAX_GAP_QUERY_SECONDS.min(spec.reference_seconds - 1) as f64)
+                    .min(duration.floor())
+                    .max(f64::from(spec.query_seconds)),
+            )
+        };
         let mut ids = HashSet::new();
         let mut intervals: BTreeMap<&str, Vec<(u64, u64)>> = BTreeMap::new();
         let mut queries = Vec::new();
         let mut short_segment_ids = Vec::new();
-        for segment in &spec.segments {
+        // §6 gap candidates: (length, start, segment index, end) per unmasked
+        // gap of at least MIN_GAP_SECONDS inside a boundary-free segment range.
+        let mut gaps: Vec<(u64, u64, usize, u64)> = Vec::new();
+        for (segment_index, segment) in spec.segments.iter().enumerate() {
             ensure!(
                 opaque(&segment.segment_id)
                     && ids.insert(&segment.segment_id)
@@ -316,6 +343,16 @@ impl SoundtrackSessionPlan {
             );
             points.sort_unstable();
             points.dedup();
+            if gap_cap_seconds.is_some() {
+                let rate = u64::from(clock.sample_rate);
+                for range in points.windows(2) {
+                    for (a, b) in unmasked(&spec.speech_mask, &clock.clock_id, range[0], range[1]) {
+                        if b - a >= MIN_GAP_SECONDS * rate {
+                            gaps.push((b - a, a, segment_index, b));
+                        }
+                    }
+                }
+            }
             for range in points.windows(2) {
                 if range[1] - range[0] < samples {
                     if !short_segment_ids.contains(&segment.segment_id) {
@@ -350,7 +387,7 @@ impl SoundtrackSessionPlan {
                         },
                     });
                     ensure!(
-                        queries.len() <= 4096,
+                        queries.len() <= MAX_QUERIES,
                         "invalid input: at most 4096 matching windows; increase query step or narrow capture"
                     );
                     if first + samples == range[1] {
@@ -361,6 +398,115 @@ impl SoundtrackSessionPlan {
                     .min(range[1] - samples);
                 }
             }
+        }
+        if let Some(cap) = gap_cap_seconds {
+            // Size and centre each gap's query; drop any identical to a grid
+            // query (it adds nothing), then keep the longest gaps first (ties:
+            // earliest start) within the query quota, in recording order.
+            let mut placed: Vec<(u64, u64, u64, usize)> = Vec::new();
+            for (_, gap_start, segment_index, gap_end) in gaps {
+                let segment = &spec.segments[segment_index];
+                let rate = spec
+                    .sync
+                    .capture_clocks
+                    .iter()
+                    .find(|c| c.clock_id == segment.clock_id)
+                    .context("invalid input: unknown segment clock")?
+                    .sample_rate;
+                // Align to pairs of PCM8k samples relative to the segment start:
+                // the decoded window then has exactly the expected sample count,
+                // and its even length puts the anchor's centre sample exactly at
+                // the query centre on the native clock.
+                let unit = 2 * u64::from(rate) / gcd(u64::from(rate), u64::from(PCM_RATE));
+                let origin = segment.first_sample;
+                let lo = (gap_start - origin).div_ceil(unit) * unit;
+                let hi = (gap_end - origin) / unit * unit;
+                if hi <= lo || hi - lo < MIN_GAP_SECONDS * u64::from(rate) {
+                    continue;
+                }
+                let len = hi - lo;
+                let size = len.min((cap * f64::from(rate)) as u64) / unit * unit;
+                let first = origin + lo + (len - size) / 2 / unit * unit;
+                if !queries.iter().any(|q| {
+                    q.recording.clock_id == segment.clock_id
+                        && q.recording.start_sample == first
+                        && q.recording.end_sample == first + size
+                }) {
+                    placed.push((gap_end - gap_start, first, size, segment_index));
+                }
+            }
+            placed.sort_by(|x, y| y.0.cmp(&x.0).then(x.1.cmp(&y.1)).then(x.3.cmp(&y.3)));
+            placed.truncate(MAX_QUERIES.saturating_sub(queries.len()));
+            placed.sort_by(|x, y| x.3.cmp(&y.3).then(x.1.cmp(&y.1)));
+            for (_, first, size, segment_index) in placed {
+                let segment = &spec.segments[segment_index];
+                let clock = spec
+                    .sync
+                    .capture_clocks
+                    .iter()
+                    .find(|c| c.clock_id == segment.clock_id)
+                    .context("invalid input: unknown segment clock")?;
+                let identity = digest(&(
+                    RECIPE,
+                    &spec.sync.session_id,
+                    &segment.segment_id,
+                    first,
+                    size,
+                    &segment.wav_blake3,
+                    GAP_ORIGIN,
+                ))?;
+                queries.push(SessionMatchQuery {
+                    origin: Some(GAP_ORIGIN.into()),
+                    segment_id: segment.segment_id.clone(),
+                    recording: SyncQuery {
+                        clock_id: clock.clock_id.clone(),
+                        start_sample: first,
+                        end_sample: first + size,
+                    },
+                    capture: SoundtrackCapture {
+                        evidence_id: format!("query_{identity}"),
+                        clock_id: clock.clock_id.clone(),
+                        sample_rate: clock.sample_rate,
+                        first_sample: first,
+                        monotonic_origin_ns: clock.monotonic_origin_ns,
+                    },
+                });
+            }
+        }
+        let width = f64::from(spec.reference_seconds).min(duration);
+        // References overlap by the longest planned query, so every query
+        // position lies wholly inside some reference. Without a gap query
+        // longer than a grid query this is exactly the v1 step.
+        let longest_query = queries
+            .iter()
+            .map(|q| {
+                (q.recording.end_sample - q.recording.start_sample) as f64
+                    / f64::from(q.capture.sample_rate)
+            })
+            .fold(f64::from(spec.query_seconds), f64::max);
+        let step = width - longest_query;
+        ensure!(
+            step > 0.0 || width == duration,
+            "invalid input: reference coverage step"
+        );
+        let mut references = Vec::new();
+        let mut start = 0.0;
+        loop {
+            references.push(SoundtrackReferenceSpec {
+                schema_version: 1,
+                movie: spec.sync.movie.clone(),
+                start_seconds: start,
+                duration_seconds: width,
+                recipe: None,
+            });
+            if start + width >= duration - 1e-9 {
+                break;
+            }
+            start = (start + step).min(duration - width);
+            ensure!(
+                references.len() < 512,
+                "invalid input: too many reference windows"
+            );
         }
         let task_count = references
             .len()
@@ -417,9 +563,7 @@ impl SoundtrackSessionPlan {
             .filter(|m| m.clock_id == query.recording.clock_id)
             .map(|m| (m.start_sample, m.end_sample))
             .collect();
-        let pcm_len = ((query.recording.end_sample - query.recording.start_sample)
-            * u64::from(PCM_RATE)
-            / u64::from(query.capture.sample_rate)) as usize;
+        let pcm_len = query_pcm_len(query);
         Some(mask_weights(
             pcm_len,
             query.recording.start_sample,
@@ -452,8 +596,7 @@ impl SoundtrackSessionPlan {
                 && report.reference_movie_digest == self.spec.sync.movie.movie_digest
                 && report.capture == query.capture
                 && report.policy == self.spec.match_policy
-                && report.query_sample_count
-                    == self.spec.query_seconds as usize * PCM_RATE as usize
+                && report.query_sample_count == query_pcm_len(query)
                 && report.candidates.len() <= self.spec.match_policy.maximum_candidates
                 && report.mask_digest == self.query_weights(query).as_deref().map(weights_digest),
             "invalid input: cached match receipt identity mismatch"

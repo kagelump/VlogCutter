@@ -684,3 +684,245 @@ fn speech_mask_rejects_unknown_clock_and_empty_intervals() {
     };
     assert!(with_mask(&plan, vec![empty]).is_err());
 }
+/// A plan-only spec (no audio is read by `SoundtrackSessionPlan::new`): an
+/// 8 kHz mic clock of `mic_seconds`, a movie of `movie_seconds`.
+fn long_spec(
+    mic_seconds: u64,
+    movie_seconds: u64,
+    reference_seconds: u32,
+    query_step_seconds: u32,
+    mask_seconds: &[(f64, f64)],
+) -> SoundtrackSessionSpec {
+    let (_dir, plan, _movie, _files) = fixture(false);
+    let mut spec = plan.spec.clone();
+    spec.sync.movie.duration_pts = movie_seconds * 90000;
+    spec.sync.capture_clocks[0].first_sample = 0;
+    spec.sync.capture_clocks[0].last_sample = mic_seconds * 8000;
+    spec.segments[0].first_sample = 0;
+    spec.segments[0].frame_count = (mic_seconds * 8000) as u32;
+    spec.reference_seconds = reference_seconds;
+    spec.query_step_seconds = query_step_seconds;
+    spec.speech_mask = mask_seconds
+        .iter()
+        .map(|&(a, b)| SyncQuery {
+            clock_id: "mic".into(),
+            start_sample: (a * 8000.0) as u64,
+            end_sample: (b * 8000.0) as u64,
+        })
+        .collect();
+    spec
+}
+fn gap_ranges(plan: &SoundtrackSessionPlan) -> Vec<(u64, u64)> {
+    plan.queries
+        .iter()
+        .filter(|q| q.origin.as_deref() == Some("speech_gap"))
+        .map(|q| (q.recording.start_sample, q.recording.end_sample))
+        .collect()
+}
+#[test]
+fn gap_queries_cover_each_long_unmasked_gap_once_sized_and_centred() {
+    // Gaps: [0,3) 3 s (too short), [5,9) 4 s, [11,18) 7 s, [20,65) 45 s, then masked to 80 s.
+    let spec = long_spec(
+        80,
+        120,
+        30,
+        6,
+        &[(3.0, 5.0), (9.0, 11.0), (18.0, 20.0), (65.0, 80.0)],
+    );
+    let plan = SoundtrackSessionPlan::new(spec).unwrap();
+    let s = |x: f64| (x * 8000.0) as u64;
+    assert_eq!(
+        gap_ranges(&plan),
+        vec![(s(5.0), s(9.0)), (s(11.0), s(18.0)), (s(32.5), s(52.5))]
+    );
+    // Grid queries are unchanged and keep origin None; gap queries come after them.
+    let grid: Vec<_> = plan
+        .queries
+        .iter()
+        .take_while(|q| q.origin.is_none())
+        .collect();
+    assert_eq!(grid.len() + 3, plan.queries.len());
+    assert!(
+        grid.iter()
+            .all(|q| q.recording.end_sample - q.recording.start_sample == s(6.0))
+    );
+    // Evidence ids are unique even if a gap query repeats a grid range.
+    let ids: HashSet<_> = plan
+        .queries
+        .iter()
+        .map(|q| &q.capture.evidence_id)
+        .collect();
+    assert_eq!(ids.len(), plan.queries.len());
+    // With a mask, references overlap by the 20 s gap cap (30 s wide, 10 s step).
+    assert_eq!(
+        plan.references[1].start_seconds - plan.references[0].start_seconds,
+        10.0
+    );
+    // The plan round-trips through validate().
+    plan.validate().unwrap();
+}
+#[test]
+fn gap_queries_clamp_to_recording_edges_and_merge_overlapping_mask_intervals() {
+    // Overlapping/adjacent intervals merge into [10,30); edge gaps [0,10) and [30,50).
+    let spec = long_spec(50, 120, 30, 6, &[(10.0, 20.0), (15.0, 25.0), (25.0, 30.0)]);
+    let plan = SoundtrackSessionPlan::new(spec).unwrap();
+    let s = |x: f64| (x * 8000.0) as u64;
+    assert_eq!(
+        gap_ranges(&plan),
+        vec![(s(0.0), s(10.0)), (s(30.0), s(50.0))]
+    );
+    // Exactly 4.0 s qualifies; 3.999 s does not.
+    let plan = SoundtrackSessionPlan::new(long_spec(40, 120, 30, 6, &[(4.0, 40.0)])).unwrap();
+    assert_eq!(gap_ranges(&plan), vec![(0, s(4.0))]);
+    let plan = SoundtrackSessionPlan::new(long_spec(40, 120, 30, 6, &[(3.999, 40.0)])).unwrap();
+    assert!(gap_ranges(&plan).is_empty());
+}
+#[test]
+fn gap_queries_respect_the_query_quota_longest_first() {
+    // 4093 s at a 1 s grid step with 6 s queries -> 4088 grid queries, room for 8 gaps.
+    let mut mask = Vec::new();
+    let mut gaps = Vec::new();
+    let mut t = 0.0;
+    for k in 0..12 {
+        let len = 4.0 + k as f64 * 0.5; // 4.0 .. 9.5 s
+        gaps.push((t, t + len));
+        mask.push((t + len, t + len + 1.0));
+        t += len + 1.0;
+    }
+    mask.push((t, 4093.0));
+    let plan = SoundtrackSessionPlan::new(long_spec(4093, 120, 30, 1, &mask)).unwrap();
+    let grid: Vec<_> = plan.queries.iter().filter(|q| q.origin.is_none()).collect();
+    let s = |x: f64| (x * 8000.0) as u64;
+    // Gaps whose range equals a grid query are not duplicated, and do not use
+    // a quota slot.
+    let gaps: Vec<_> = gaps
+        .into_iter()
+        .filter(|&(a, b)| {
+            !grid
+                .iter()
+                .any(|q| q.recording.start_sample == s(a) && q.recording.end_sample == s(b))
+        })
+        .collect();
+    assert!(gaps.len() < 12, "the fixture contains a grid-identical gap");
+    let kept = gap_ranges(&plan);
+    assert_eq!(grid.len() + kept.len(), 4096);
+    // The longest gaps survive, reported in recording order.
+    let expected: Vec<_> = gaps[gaps.len() - kept.len()..]
+        .iter()
+        .map(|&(a, b)| (s(a), s(b)))
+        .collect();
+    assert_eq!(kept, expected);
+}
+#[test]
+fn gap_query_longer_than_grid_is_searched_and_anchored_at_its_true_position() {
+    let dir = tempfile::tempdir().unwrap();
+    let movie_pcm = signal(60);
+    let movie = dir.path().join("movie.wav");
+    wav(&movie, &movie_pcm);
+    // The mic hears movie 10..30 s; masked [0,2) and [16,20) leave a 14 s gap.
+    let mic = dir.path().join("mic.wav");
+    wav(&mic, &movie_pcm[10 * 8000..30 * 8000]);
+    let mut spec = long_spec(20, 60, 30, 6, &[(0.0, 2.0), (16.0, 20.0)]);
+    spec.sync.movie.movie_digest = full_file_blake3(&movie, &|| false).unwrap().hex_digest;
+    spec.segments[0].wav_blake3 = full_file_blake3(&mic, &|| false).unwrap().hex_digest;
+    let plan = SoundtrackSessionPlan::new(spec).unwrap();
+    let s = |x: f64| (x * 8000.0) as u64;
+    assert_eq!(gap_ranges(&plan), vec![(s(2.0), s(16.0))]);
+    let files = vec![SessionAudioFile {
+        segment_id: "native".into(),
+        path: mic,
+    }];
+    let cache = dir.path().join("cache");
+    run_all(&plan, &movie, &files, &cache);
+    let qi = plan
+        .queries
+        .iter()
+        .position(|q| q.origin.is_some())
+        .unwrap();
+    let page = plan.evidence_page(&cache, qi, 1, &|| false).unwrap();
+    let ev = &page.queries[0];
+    assert_eq!(ev.completed_references, ev.total_references);
+    assert_eq!(ev.anchors.len(), 1, "{ev:?}");
+    // Centre of mic [2,16) s is mic 9 s = movie 19 s (origin_pts is 1 s).
+    let tps = 90000.0;
+    let movie_s = ev.anchors[0].movie_pts as f64 / tps - 1.0;
+    assert!((movie_s - 19.0).abs() < 0.05, "anchored at {movie_s}");
+    let receipt = plan.receipt(&cache, qi * plan.references.len()).unwrap();
+    assert!(receipt.is_some());
+}
+#[test]
+fn gap_queries_on_a_48k_clock_with_unaligned_mask_edges_decode_and_anchor() {
+    // Regression: gap queries at arbitrary 48 kHz sample positions failed the
+    // decoded-length check ("resampled query duration mismatch").
+    let dir = tempfile::tempdir().unwrap();
+    let movie_pcm = signal(60);
+    let movie = dir.path().join("movie.wav");
+    wav(&movie, &movie_pcm);
+    // 48 kHz mic of movie 10..30 s (sample-and-hold upsampling).
+    let mic_pcm: Vec<f32> = movie_pcm[10 * 8000..30 * 8000]
+        .iter()
+        .flat_map(|&x| std::iter::repeat_n(x, 6))
+        .collect();
+    let mic = dir.path().join("mic48.wav");
+    let mut out = hound::WavWriter::create(
+        &mic,
+        hound::WavSpec {
+            channels: 1,
+            sample_rate: 48000,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        },
+    )
+    .unwrap();
+    for s in &mic_pcm {
+        out.write_sample(*s).unwrap();
+    }
+    out.finalize().unwrap();
+    let mut spec = long_spec(20, 60, 30, 6, &[]);
+    let n = mic_pcm.len() as u64;
+    spec.sync.capture_clocks[0].sample_rate = 48000;
+    spec.sync.capture_clocks[0].last_sample = n;
+    spec.segments[0].frame_count = n as u32;
+    spec.sync.movie.movie_digest = full_file_blake3(&movie, &|| false).unwrap().hex_digest;
+    spec.segments[0].wav_blake3 = full_file_blake3(&mic, &|| false).unwrap().hex_digest;
+    // Mask edges deliberately off the 12-sample (two PCM8k samples) grid.
+    spec.speech_mask = vec![
+        SyncQuery {
+            clock_id: "mic".into(),
+            start_sample: 0,
+            end_sample: 59_261,
+        },
+        SyncQuery {
+            clock_id: "mic".into(),
+            start_sample: 767_405,
+            end_sample: n,
+        },
+    ];
+    let plan = SoundtrackSessionPlan::new(spec).unwrap();
+    let gaps = gap_ranges(&plan);
+    assert_eq!(gaps.len(), 1);
+    let (a, b) = gaps[0];
+    assert_eq!(a % 12, 0);
+    assert_eq!((b - a) % 12, 0);
+    assert!(a >= 59_261 && b <= 767_405);
+    let files = vec![SessionAudioFile {
+        segment_id: "native".into(),
+        path: mic,
+    }];
+    let cache = dir.path().join("cache");
+    run_all(&plan, &movie, &files, &cache);
+    let qi = plan
+        .queries
+        .iter()
+        .position(|q| q.origin.is_some())
+        .unwrap();
+    let page = plan.evidence_page(&cache, qi, 1, &|| false).unwrap();
+    let ev = &page.queries[0];
+    assert_eq!(ev.anchors.len(), 1, "{ev:?}");
+    let centre_mic_s = (a + b) as f64 / 2.0 / 48000.0;
+    let movie_s = ev.anchors[0].movie_pts as f64 / 90000.0 - 1.0;
+    assert!(
+        (movie_s - (10.0 + centre_mic_s)).abs() < 0.05,
+        "anchored at {movie_s}"
+    );
+}

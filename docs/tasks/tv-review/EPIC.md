@@ -37,7 +37,7 @@ byte-identically.
 | 30 | [V01-T003](tasks/V01-T003-distinctive-acceptance.md) | Distinctive-peak acceptance in match_pcm | V01-T002 | complete |
 | 40 | [V01-T004](tasks/V01-T004-global-margin.md) | Cross-reference margin in session evidence | V01-T003 | complete |
 | 50 | [V01-T005](tasks/V01-T005-speech-mask.md) | Speech mask weights in matching | V01-T001 | complete |
-| 60 | [V01-T006](tasks/V01-T006-gap-windows.md) | Gap-placed query windows in session plans | V01-T005 | ready |
+| 60 | [V01-T006](tasks/V01-T006-gap-windows.md) | Gap-placed query windows in session plans | V01-T005 | complete |
 | 70 | [V01-T007](tasks/V01-T007-offset-consensus.md) | Offset consensus module and CLI | V01-T004 | complete |
 | 80 | [V01-T008](tasks/V01-T008-consensus-interpolation.md) | Consensus-gated interpolation in the sync mapper | V01-T007 | complete |
 | 90 | [V01-T009](tasks/V01-T009-recipe-v2.md) | Recipe v2: energy-weighted robust features | V01-T005 | ready |

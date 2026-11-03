@@ -7,7 +7,7 @@
   "epic_id": "V01",
   "title": "Gap-placed query windows in session plans",
   "slug": "gap-windows",
-  "status": "ready",
+  "status": "complete",
   "task_class": "implementation",
   "depends_on": [
     "V01-T005"
