@@ -319,7 +319,7 @@ requirements remain explicit.
 | CLI parsing/JSON | `cargo nextest run -p rcdvlog-cli` | `pnpm test:integration` |
 | Tauri commands/settings | `cargo test -p rcdvlog-desktop` | real `pnpm dev` smoke test when native behavior changed |
 | Server core/API | `pnpm test:server` | two-node process test plus target-topology check when external behavior changed |
-| Chrome web | `pnpm test:web` | `pnpm test:web:e2e` plus real HTTPS visual/interaction check |
+| Chrome web | `pnpm test:web` | `pnpm test:web:e2e` (mandatory in CI as `web-e2e`) plus real HTTPS visual/interaction check |
 | OpenAPI/deployment/docs | `pnpm check:openapi` | `pnpm check:deployment`, `pnpm check:docs`, and Compose render when available |
 | Repository scripts in `scripts/` | `pnpm test:scripts` | `pnpm check:docs` |
 | Formatting/lints | `cargo fmt --all -- --check` | `cargo clippy --workspace --all-targets -- -D warnings` |

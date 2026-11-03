@@ -3,7 +3,7 @@ import { fileURLToPath } from "node:url";
 
 export function requiredFailures(needs) {
   const failures = [];
-  for (const name of ["changes", "linux-rust", "frontend", "browser"]) {
+  for (const name of ["changes", "linux-rust", "frontend", "browser", "web-e2e-build", "web-e2e"]) {
     if (needs?.[name]?.result !== "success") failures.push(name);
   }
   const macosRequired = needs?.changes?.outputs?.macos !== "false";
