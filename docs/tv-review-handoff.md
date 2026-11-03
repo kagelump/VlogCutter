@@ -295,3 +295,10 @@ pre-story-policy algorithm only when no story policy exists. That legacy
 recognition is confined to historical read-only review; it cannot authorize
 render reuse or current strict export. The [historical JSON Schema](contracts/historical-review-v1.schema.json)
 and invented `historical-v1.json` fixture document this separate transport.
+
+Historical receipt compatibility recognizes the current measured-clock preview
+recipe and `preview.immutable-receipt.h264-30000-1001.stereo48.actual-clock.tv-range.v2`.
+The latter changed pixel normalization and cache identity while retaining the
+measured clock/mapping representation. Unknown renderer recipes are refused.
+This compatibility applies only to historical integrity review: fresh strict
+export still requires the current recipe and every existing verification guard.
