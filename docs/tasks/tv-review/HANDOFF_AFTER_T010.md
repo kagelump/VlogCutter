@@ -1,7 +1,7 @@
 # V01 handoff after T010 (2026-11-03)
 
 **State:** T001–T009 are implemented. **T010 hit its stop condition:** the v2
-positive run matched 0 windows. T011 has not started. Two design decisions
+positive run matched 0 windows. T011 has not started. Five decisions
 below need the owner before work continues. Nothing that shipped changes v1
 behaviour: every V01 feature is off unless explicitly set, and the v1 replay
 of the real RC6 run is bit-identical.
@@ -22,9 +22,10 @@ architecture's revision notes in §6 and §7 record the owner-cycle decisions.
 **Merge order:** #254 → #255 → #256. CI runs only on PRs whose base is
 `main`, so retarget each stacked PR after its parent merges and wait for green.
 
-**Local verification on #256's head** (`515b20b`, pinned toolchain 1.97.1):
+**Local verification on the handoff head** (`ef4ad22`, which includes #256;
+pinned toolchain 1.97.1). Log: `../data/build-v01/verify-ef4ad22.log`.
 
-- `cargo test -p rcdvlog-core --lib tv_`: 72 pass.
+- `cargo test -p rcdvlog-core --lib tv_`: 73 pass.
 - All nine `tests/v01_*_independent.rs` suites pass.
 - `cargo test -p rcdvlog-cli` passes.
 - clippy `-D warnings` and fmt are clean.
@@ -44,6 +45,11 @@ architecture's revision notes in §6 and §7 record the owner-cycle decisions.
     long gap query keep v1's reference windows.
   - Grid-identical gap queries are dropped before the 4096-query quota.
   - Receipts are checked against each query's own length.
+  - **Fix found by T010 (`097d697`, on #255).** Gap query edges now snap to
+    pairs of 8 kHz samples. On the real 48 kHz recording, an unaligned gap
+    query failed the decoded-length check, and an odd 8 kHz length would
+    put the anchor centre 3 native samples off the query centre. A 48 kHz
+    end-to-end regression test now covers this.
   - The T005 oracle harness now scopes to the grid query and runs batches to
     completion. Its claims are unchanged.
 - **T009 refinements (§7).**
@@ -65,14 +71,15 @@ Provider calls: zero.
 | 2. v2 positive (v2 + distinctive 0.5/0.25/6 + transcript mask + consensus) | 0 matched, 2 ambiguous, 31 unmatched; 0 segments; 0/27 utterances mapped | **fail: stop condition** |
 | 3a. Movie window 1000–1240 s only | 0 matches, 0 segments | pass (weak: see below) |
 | 3b. Mic time-reversed | 0 matches, 0 segments | pass (weak) |
-| 3c. RC7 as a different movie | `precheck_rc7` was running at handoff, then `neg_other_movie` | pending |
-| 4. Seek splice (mic 0–90 s + 120–180 s) | queued | pending |
-| Ablation: v1 features + distinctive, no mask | queued | pending (diagnostic only) |
-| Ablation: v2, no mask | queued | pending (diagnostic only) |
+| 3c. RC7 as a different movie | Pre-check: RC6's clean 0–240 s audio matches RC7 in 3 segments (offsets 0, +53, +83 s), so **RC7 shares content and is not a valid control**. On the mic: 0 matches, 1 ambiguous | **invalid control** |
+| 4. Seek splice (mic 0–90 s + 120–180 s) | First run crashed on the T006 alignment bug (preserved as `seek-failed-unaligned-gap-2026-11-03/`); re-run queued with the fixed CLI (`../data/build-v01/rcdvlog-fix`, `ef4ad22`) via `queue-seek.sh` → `seek.log` | pending |
+| Ablation: v1 features + distinctive, no mask | **4 matched, all at −0.96 s** (1:18, 1:42, 1:48, 2:30); 0:06 and 0:12 ambiguous at −0.96 s (nearby runner-ups 0.485 and 0.434, margins 0.13 and 0.19 < 0.25); **0 consensus segments**; 1/27 utterances estimated | diagnostic: confirms Fix 2, exposes D5 |
+| Ablation: v2, no mask | 0 matched, 7 ambiguous | diagnostic: v2 regresses on its own |
 
-The remaining runs continue in the background: `run.log`, then `ablation.log`
-(started by `queue-ablations.sh`). When both end with `exit 0`, re-run
-`python3 summarize.py`.
+Only the seek re-run remains. When `seek.log` ends with `exit 0`, re-run
+`python3 summarize.py`. Note that the seek control uses the v2 recipe and the
+transcript mask, so it inherits both part-2 problems. Expect it to say little
+until D1 and D2 are settled.
 
 **3c pre-check purpose.** §10 requires proving that the other movie shares
 none of RC6's first 4 minutes. `precheck_rc7` uses RC6's own clean movie audio
@@ -97,6 +104,14 @@ so 3c must be read with those windows excluded.
    - **Safety held:** those windows stayed ambiguous or unmatched, and no
      wrong anchor was emitted.
 
+3. **Consensus never forms on real audio (T007, merged).** Each query votes
+   only with its single best peak, and a run breaks whenever that peak falls
+   in a different cluster. Speech-covered windows have a random best peak
+   (≈0.28) at a random offset, so they split every run. In the v1+distinctive
+   ablation, all 31 queries were "unsupported", despite 8 windows whose best
+   peak is exactly −0.96 s and 4 Matched there. §8 step 4 intended only a
+   window *Matched* at another offset to split a segment.
+
 **Caveat on 3a/3b.** Because of cause 1, most control windows were never
 actually scored. These passes say little about false positives; the
 ablations are the meaningful check.
@@ -120,9 +135,18 @@ ablations are the meaningful check.
 - **D3. Ship order.** #254–#256 are opt-in and v1-safe, so merging them does
   not depend on D1 or D2. The alternative is to hold #256 until D2 is
   settled. Recommended: merge #254 and #255, and hold #256 until D2.
+- **D5. Consensus run rule (T007).** Recommended: a run is broken only by a
+  query that is Matched (or has a strong distinctive peak) at a different
+  offset. Weak or unmatched queries neither support nor break it, and
+  ambiguous queries whose best peak is in-cluster count as support. Keep the
+  "≥ 3 supporting, ≥ 2 Matched" floor. On the ablation, this would join
+  1:18–2:30 (4 Matched + 2 in-cluster ambiguous). Do not decide it from this
+  recording alone: add synthetic seek/pause oracles first.
 - **D4. Distinctive acceptance alone.** Should the first deliverable be
   "v1 features + distinctive + consensus", if the ablation confirms the
   2026-11-03 diagnosis (≈6 windows at −0.96 s)? That needs no D1/D2 work.
+  **Update:** the ablation found 4 such windows (not 6), all correct, with no
+  false anchor. It becomes useful once D5 lets them form a segment.
 
 The §10 protocol forbids tuning thresholds to pass, so none was changed.
 Ablations change only which features are enabled, and they must be reported
@@ -148,9 +172,11 @@ as diagnostics, not as an acceptance pass.
 
 ## 6. Next steps
 
-1. Let the queued runs finish, re-run `summarize.py`, and fill rows 3c, 4 and
-   the ablations in §3 (and in an evidence `REPORT.md`).
-2. Owner decides D1–D4.
+1. Let the seek re-run finish, re-run `summarize.py`, fill row 4 above, and
+   write the evidence `REPORT.md`. Pick a genuinely unrelated movie for 3c
+   (verify it with the same clean-audio pre-check).
+2. Owner decides D1–D5. Suggested order: D5 (small, unlocks consensus with
+   the already-correct v1+distinctive anchors), then D1, then D2.
 3. Implement the chosen D1/D2 as a new packet (new recipe string for any
    weighting change), with the RC6 recording as its oracle plus the §10
    negative controls.
