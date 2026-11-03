@@ -491,6 +491,10 @@ impl SoundtrackIndex {
             coarse.push((score, offset));
             report.searched_offsets += 1;
         }
+        if policy.distinctive.is_some() {
+            let scores: Vec<f64> = coarse.iter().map(|c| c.0).collect();
+            report.distinctiveness = robust_z(&scores);
+        }
         coarse.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
         let mut peaks: Vec<(f64, usize)> = vec![];
         for (_, offset) in coarse {
@@ -541,13 +545,22 @@ impl SoundtrackIndex {
         }
         report.best_similarity = peaks.first().map(|p| p.0);
         report.runner_up_similarity = peaks.get(1).map(|p| p.0);
-        if peaks.is_empty() || peaks[0].0 < policy.minimum_similarity {
+        // Low-similarity peaks reach temporal support only when the distinctive
+        // path is enabled (ARCHITECTURE §4). Without it this is the v1 gate.
+        let gate = policy
+            .distinctive
+            .as_ref()
+            .map_or(policy.minimum_similarity, |d| {
+                d.minimum_similarity.min(policy.minimum_similarity)
+            });
+        if peaks.is_empty() || peaks[0].0 < gate {
             return Ok(report);
         }
         // A high score from half a query is insufficient after a buffer/seek.
         // Require independent support in every third of the query.
+        let raw_peaks = peaks;
         let mut supported = Vec::new();
-        for (score, offset) in peaks {
+        for &(score, offset) in &raw_peaks {
             let mut consistent = true;
             for part in 0..3 {
                 let a = part * query.len() / 3;
@@ -568,22 +581,52 @@ impl SoundtrackIndex {
             }
         }
         let peaks = supported;
-        if peaks.is_empty() || peaks[0].0 < policy.minimum_similarity {
+        if peaks.is_empty() {
             report.reason = "insufficient_temporal_support".into();
             return Ok(report);
         }
         let margin = peaks[0].0 - peaks.get(1).map_or(-1.0, |p| p.0);
-        report.state = if margin >= policy.minimum_peak_margin {
-            SoundtrackMatchState::Matched
-        } else {
-            SoundtrackMatchState::Ambiguous
+        // Step 2 (v1): the old path is unchanged.
+        let old_similar = peaks[0].0 >= policy.minimum_similarity;
+        let old_matched = old_similar && margin >= policy.minimum_peak_margin;
+        // §4 distinctive margin: the honest runner-up is the best raw coarse peak
+        // at a different position, whether or not it passed temporal support. A
+        // temporally unsupported copy is a real competitor and must reduce it.
+        let distinctive_margin = {
+            let runner_up = raw_peaks
+                .iter()
+                .find(|p| p.1.abs_diff(peaks[0].1) >= 16)
+                .map_or(0.0, |p| p.0);
+            peaks[0].0 - runner_up
         };
-        report.reason = if report.state == SoundtrackMatchState::Matched {
-            "distinctive_peak"
-        } else {
-            "multiple_similar_positions"
+        // Step 3 (ARCHITECTURE §4): consulted only when the old path did not match.
+        let distinctive_pass = policy.distinctive.as_ref().is_some_and(|d| {
+            peaks[0].0 >= d.minimum_similarity
+                && distinctive_margin >= d.minimum_margin
+                && report
+                    .distinctiveness
+                    .is_some_and(|z| z >= d.minimum_z_score)
+        });
+        if !old_similar && !distinctive_pass {
+            report.reason = "insufficient_temporal_support".into();
+            return Ok(report);
         }
-        .into();
+        let low_similarity = distinctive_pass && !old_matched;
+        let (state, reason) = if old_matched {
+            (SoundtrackMatchState::Matched, "distinctive_peak")
+        } else if low_similarity {
+            (
+                SoundtrackMatchState::Matched,
+                "distinctive_peak_low_similarity",
+            )
+        } else {
+            (
+                SoundtrackMatchState::Ambiguous,
+                "multiple_similar_positions",
+            )
+        };
+        report.state = state;
+        report.reason = reason.into();
         let center = pcm.len() / 2;
         let capture_sample =
             capture.first_sample + (center as u64 * capture.sample_rate as u64 / PCM_RATE as u64);
@@ -623,7 +666,11 @@ impl SoundtrackIndex {
                     },
                     movie_pts: self.reference.movie.origin_pts + (seconds * tps).round() as i64,
                     source: SyncAnchorSource::PassiveSoundtrack,
-                    confidence: score,
+                    confidence: if low_similarity {
+                        (0.5 + distinctive_margin).min(1.0)
+                    } else {
+                        score
+                    },
                     movie_uncertainty_ticks: (policy.uncertainty_seconds * tps).ceil() as u64,
                     capture_uncertainty_samples: (HOP as f64 / PCM_RATE as f64
                         * capture.sample_rate as f64)
@@ -631,12 +678,42 @@ impl SoundtrackIndex {
                     candidate_group_id: Some(format!("{}_matches", capture.evidence_id)),
                 },
                 similarity: score,
-                peak_margin: margin,
+                peak_margin: if low_similarity {
+                    distinctive_margin
+                } else {
+                    margin
+                },
                 reference_offset_frames: offset,
             });
         }
         Ok(report)
     }
+}
+/// Robust z of the best coarse score against all coarse scores (ARCHITECTURE §4):
+/// (best - median) / (1.4826 * MAD). None when the MAD is zero or undefined.
+fn robust_z(scores: &[f64]) -> Option<f64> {
+    let best = scores.iter().copied().reduce(f64::max)?;
+    let center = median(scores)?;
+    let deviations: Vec<f64> = scores.iter().map(|s| (s - center).abs()).collect();
+    let mad = median(&deviations)?;
+    if !mad.is_finite() || mad <= 0.0 {
+        return None;
+    }
+    let z = (best - center) / (1.4826 * mad);
+    z.is_finite().then_some(z)
+}
+fn median(values: &[f64]) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let mid = sorted.len() / 2;
+    Some(if sorted.len() % 2 == 1 {
+        sorted[mid]
+    } else {
+        (sorted[mid - 1] + sorted[mid]) / 2.0
+    })
 }
 fn similarity(
     a: &[[f32; BANDS]],
