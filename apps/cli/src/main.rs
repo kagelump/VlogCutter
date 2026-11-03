@@ -2062,6 +2062,8 @@ fn main() -> ExitCode {
                 error.downcast_ref::<rcdvlog_core::TranscriptionSelectionError>();
             let transcription_readiness_error =
                 error.downcast_ref::<rcdvlog_core::TranscriptionReadinessError>();
+            let chronology_input_error =
+                error.downcast_ref::<chronology_commands::ChronologyInputError>();
             let prerequisite_error = error.downcast_ref::<rcdvlog_core::MediaPrerequisiteError>();
             let representation_busy = error.downcast_ref::<rcdvlog_core::RepresentationBusy>();
             let edit_plan_error = error.downcast_ref::<rcdvlog_core::EditPlanError>();
@@ -2099,6 +2101,8 @@ fn main() -> ExitCode {
                 readiness.code
             } else if representation_busy.is_some() {
                 rcdvlog_core::RepresentationBusy::CODE
+            } else if chronology_input_error.is_some() {
+                chronology_commands::ChronologyInputError::CODE
             } else if prerequisite_error.is_some() {
                 "media_prerequisite_failed"
             } else if let Some(remote) = remote {
