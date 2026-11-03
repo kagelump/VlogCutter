@@ -13,7 +13,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
 import { allocateLoopbackAddress } from "./lib/loopback-port.mjs";
-import { bootstrapCodePath, reviewRunPath, reviewTargetHandoffPath } from "./lib/web-e2e-fixture.mjs";
+import { bootstrapCodePath, reviewRunPath, reviewTargetHandoffPath, rustLaunch } from "./lib/web-e2e-fixture.mjs";
 
 const repository = resolve(import.meta.dirname, "..");
 const listenAddress = process.env.RCDVLOG_LISTEN_ADDR || (await allocateLoopbackAddress());
@@ -45,21 +45,23 @@ const reviewTargetFile = reviewTargetHandoffPath(listenAddress);
 const reviewRunFile = reviewRunPath(listenAddress);
 rmSync(reviewTargetFile, { force: true });
 rmSync(reviewRunFile, { force: true });
+const seedLaunch = rustLaunch(process.env, "seed", []);
 const seed = spawnSync(
-  "cargo",
-  ["run", "--quiet", "-p", "rcdvlog-server", "--example", "web_e2e_seed"],
+  seedLaunch.command,
+  seedLaunch.args,
   { cwd: repository, env: { ...runtimeEnvironment, RCDVLOG_E2E_REVIEW_TARGET_FILE: reviewTargetFile, RCDVLOG_E2E_REVIEW_RUN_FILE: reviewRunFile }, encoding: "utf8" },
 );
 if (seed.status !== 0) {
-  throw new Error(`seed real web project fixture: ${seed.stderr}`);
+  throw new Error(`seed real web project fixture: ${seed.error ?? seed.stderr}`);
 }
 
 const bootstrapFiles = [1, 2, 3, 4, 5, 6, 7, 8].map((index) => bootstrapCodePath(listenAddress, index));
 for (const bootstrapFile of bootstrapFiles) {
   rmSync(bootstrapFile, { force: true });
+  const bootstrapLaunch = rustLaunch(process.env, "server", ["admin", "bootstrap", "create", "--output-file", bootstrapFile]);
   const bootstrap = spawnSync(
-    "cargo",
-    ["run", "--quiet", "-p", "rcdvlog-server", "--", "admin", "bootstrap", "create", "--output-file", bootstrapFile],
+    bootstrapLaunch.command,
+    bootstrapLaunch.args,
     { cwd: repository, env: runtimeEnvironment, encoding: "utf8" },
   );
   if (bootstrap.status !== 0) {
@@ -71,7 +73,8 @@ for (const bootstrapFile of bootstrapFiles) {
 // no other way to learn where the fixture came up.
 console.log(`[rcdvlog-web-e2e] serving http://${listenAddress}`);
 
-const server = spawn("cargo", ["run", "--quiet", "-p", "rcdvlog-server"], {
+const serverLaunch = rustLaunch(process.env, "server", []);
+const server = spawn(serverLaunch.command, serverLaunch.args, {
   cwd: repository,
   env: runtimeEnvironment,
   stdio: "inherit",

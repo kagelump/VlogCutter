@@ -320,7 +320,7 @@ impl Catalog {
             .read(true)
             .write(true)
             .open(lock_path)?;
-        fs2::FileExt::try_lock_exclusive(&lock)
+        crate::resources::try_lock_exclusive_with_grace(&lock)
             .context("native media is already being prepared")?;
         let saved:Option<(String,String)>=self.connection()?.query_row("SELECT identity_json,report_json FROM native_video_media WHERE identity=?1 AND project_id=?2",params![identity,policy.project_id],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
         let mut cached = None;

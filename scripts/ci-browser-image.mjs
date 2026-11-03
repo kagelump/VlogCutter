@@ -4,11 +4,15 @@ import { fileURLToPath } from "node:url";
 
 export function browserImageVersion(lock, workflow) {
   const versions = [...lock.matchAll(/^\s+'?@playwright\/test@([\d.]+)'?:/gm)].map((m) => m[1]);
-  const image = workflow.match(/mcr\.microsoft\.com\/playwright:v([\d.]+)-noble@sha256:[a-f0-9]{64}\b/);
-  if (versions.length === 0 || !image || versions.some((version) => version !== image[1])) {
+  // Every job that runs in the official image (the desktop browser tier and the
+  // real-server web tier) must be pinned to the same digest-verified version.
+  const references = [...workflow.matchAll(/mcr\.microsoft\.com\/playwright\S*/g)].map((m) => m[0]);
+  const images = references.map((reference) => reference.match(/^mcr\.microsoft\.com\/playwright:v([\d.]+)-noble@sha256:[a-f0-9]{64}$/));
+  if (versions.length === 0 || images.length === 0 || images.some((image) => !image)
+    || versions.some((version) => images.some((image) => image[1] !== version))) {
     throw new Error("Official Playwright image must be digest-pinned and match every resolved @playwright/test version");
   }
-  return image[1];
+  return images[0][1];
 }
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const version = browserImageVersion(

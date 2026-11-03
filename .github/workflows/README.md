@@ -11,9 +11,11 @@ filters. The stable merge gate is **`ci-required`**.
 | Job | Checks |
 | --- | --- |
 | `linux-rust (lint)` | Pinned Rust formatting and workspace/all-target Clippy with warnings denied |
-| `linux-rust (tests)` | Full workspace tests (including CLI/media integration), OpenAPI freshness |
+| `linux-rust (tests N/4)` | Four shards of the full workspace tests (including CLI/media integration) via cargo-nextest; shard 1 also runs doctests and OpenAPI freshness |
 | `frontend` | All frontend typechecks, full desktop Vitest with coverage floors (including CUJ), web Vitest, docs, script regressions, deployment invariants |
 | `browser` | Existing desktop Chromium Playwright tier in Microsoft's official image |
+| `web-e2e-build` | Debug `rcdvlog-server` binary and `web_e2e_seed` example, handed to `web-e2e` as an artifact |
+| `web-e2e` | Real-server Chrome Playwright suite (`pnpm test:web:e2e`) in the same official image, using those prebuilt binaries |
 | `macos` | Desktop Rust tests and full native Tauri bundle, when platform-relevant |
 | `changes` | Conservative macOS decision, recorded in its log and step summary |
 | `ci-required` | Always evaluates every required result, including failed/cancelled/missing jobs and justified skips |
@@ -24,9 +26,16 @@ job; later gates may report missing prerequisites rather than silently pass.
 No coverage threshold or test exclusion was changed. Full coverage includes
 `src/test/cuj`; `cargo test --workspace` includes `cli_workflow`. The full
 local gate no longer repeats those suites, while focused commands remain.
-`pnpm test:web:e2e` remains a separate local server/process acceptance tier;
-it was not in the previous full CI and is not part of the isolated desktop
-browser container.
+`pnpm test:web:e2e` is mandatory: it is the only tier that drives the Chrome
+app against the real Axum server and a seeded fixture catalog, and #241 (a
+recorder receipt compared by JSON key order) passed every unit test and failed
+only there. The fixture script (`scripts/start-web-e2e-server.mjs`) builds from
+source with `cargo run` locally; CI sets `RCDVLOG_WEB_E2E_SERVER_BIN` and
+`RCDVLOG_WEB_E2E_SEED_BIN` to absolute prebuilt paths so the browser half can
+run in the Playwright image without a Rust toolchain. It uses Chrome's fake
+microphone, `/usr/bin/true` media tools and no speech models or provider key,
+so it proves server/browser contracts, not real capture, ASR or HTTPS
+deployment. Failure screenshots and traces are uploaded as `web-e2e-results`.
 
 ### Bounded Linux setup and browser provisioning
 
@@ -121,13 +130,33 @@ free, leaving `/opt/hostedtoolcache` intact. Measured runners already had 86 GiB
 free, while unconditional deletion took 49–111 seconds. The reserve comfortably
 covers the measured roughly 14 GB target tree plus cache/setup overhead.
 
-Workspace tests retain Cargo/libtest with **four test workers** (also in the
-full local gate); there is no nextest, sharding, filtering, retry or assertion
-change. A prior libtest-default run spent 269 seconds in the 916-test core
-binary and 210 seconds in the 155-test server core binary. The bounded worker
-increase must pass the same complete suite, including SQLite, file-lock,
-financial and concurrency cases, before merge. Compare executed/ignored counts
-in the benchmark receipt; do not treat lower counts as a speed improvement.
+### Rust tests: nextest, shards and hang detection
+
+Workspace tests run under cargo-nextest (`NEXTEST_VERSION` in `ci.yml`, installed
+with the SHA-pinned `taiki-e/install-action` in a five-minute-bounded step),
+configured in `.config/nextest.toml`. The `linux-rust` job id is unchanged and is
+a matrix of `lint` plus four `tests N/4` shards using
+`--partition count:N/4` with four test threads each, so `ci-required`'s
+`needs.linux-rust.result` is only `success` when every shard succeeded; a failed,
+cancelled, abandoned or missing shard fails closed. All shards share one Rust
+cache key and only shard 1 saves it. `scripts/ci-nextest.test.mjs` checks that the
+shard list, the partition count, the pins, doctests, OpenAPI and the aggregate stay
+consistent. Nothing is skipped, filtered, retried or quarantined.
+
+Before this change the single `cargo test --workspace -- --test-threads=4` step
+ran for 18 min 53 s inside a 21.5 min job (run 41566281241) against a
+30-minute timeout; roughly 2 min 43 s of that was compiling. libtest ran one
+binary at a time, including the 1179-test core binary (470 s) and the 194-test
+server core binary (230 s). nextest schedules tests across binaries in one pool and
+sharding divides the remainder.
+
+`slow-timeout = { period = "60s", terminate-after = 5 }` marks a test SLOW after
+a minute (named in the log) and kills it as TIMEOUT after five, so a hang such as
+issue 258 fails by name in about five minutes instead of an unnamed cancellation
+at 30. nextest does not run doctests, so shard 1 runs `cargo test --workspace --doc`.
+Each shard uploads `target/nextest/ci/junit.xml` (seven days) for per-test timings.
+Local `pnpm gate --scope pre-pr` runs the same unpartitioned nextest invocation and
+`pnpm test:focused` uses nextest's exact filter; install the pinned nextest version locally.
 
 ### Untrusted pull requests
 

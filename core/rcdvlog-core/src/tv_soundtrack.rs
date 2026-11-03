@@ -60,6 +60,9 @@ impl SoundtrackMovie {
 }
 
 pub const SOUNDTRACK_RECIPE: &str = "soundtrack.log-band-delta.fft512-hop128.smooth3-lag6.pcm8k.v1";
+/// Weighted, robust-feature recipe (ARCHITECTURE §7). Opt-in; None means v1.
+pub const SOUNDTRACK_RECIPE_V2: &str =
+    "soundtrack.log-band-delta.fft512-hop128.smooth3-lag6.pcm8k.wtd-robust.v2";
 pub const PCM_RATE: u32 = 8000;
 const FFT: usize = 512;
 const HOP: usize = 128;
@@ -68,6 +71,10 @@ const BANDS: usize = 16;
 const MAX_SAMPLES: usize = 600 * PCM_RATE as usize;
 const MAX_INDEX_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PRODUCTS: u64 = 50_000_000;
+/// Peaks reported per report and per merged session query (ARCHITECTURE §3).
+pub const MAX_BEST_PEAKS: usize = 4;
+/// Peaks closer than 16 hops in movie time are one observation (ARCHITECTURE §3).
+pub const PEAK_MERGE_SECONDS: f64 = 16.0 * HOP as f64 / PCM_RATE as f64;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -76,6 +83,8 @@ pub struct SoundtrackReferenceSpec {
     pub movie: SyncMovieClock,
     pub start_seconds: f64,
     pub duration_seconds: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recipe: Option<String>,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -87,6 +96,9 @@ pub struct SoundtrackIndex {
     pub index_digest: String,
     pub sample_count: usize,
     pub features: Vec<[f32; BANDS]>,
+    /// Broadband log energy per frame (v2 recipe only).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub frame_energy: Vec<f32>,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -106,6 +118,31 @@ pub struct SoundtrackPolicy {
     pub minimum_subwindow_similarity: f64,
     pub uncertainty_seconds: f64,
     pub maximum_candidates: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub distinctive: Option<DistinctivePolicy>,
+}
+/// Opt-in acceptance of a distinctive low-similarity peak (ARCHITECTURE §4).
+/// Recommended values are 0.5 / 0.25 / 6.0; they are never serde defaults.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DistinctivePolicy {
+    pub minimum_similarity: f64,
+    pub minimum_margin: f64,
+    pub minimum_z_score: f64,
+}
+impl DistinctivePolicy {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.minimum_similarity.is_finite()
+                && (0.3..=1.0).contains(&self.minimum_similarity)
+                && self.minimum_margin.is_finite()
+                && (0.1..=0.8).contains(&self.minimum_margin)
+                && self.minimum_z_score.is_finite()
+                && (3.0..=20.0).contains(&self.minimum_z_score),
+            "invalid input: distinctive soundtrack policy"
+        );
+        Ok(())
+    }
 }
 impl Default for SoundtrackPolicy {
     fn default() -> Self {
@@ -115,6 +152,7 @@ impl Default for SoundtrackPolicy {
             minimum_subwindow_similarity: 0.3,
             uncertainty_seconds: 0.08,
             maximum_candidates: 4,
+            distinctive: None,
         }
     }
 }
@@ -132,6 +170,9 @@ impl SoundtrackPolicy {
                 && (2..=8).contains(&self.maximum_candidates),
             "invalid input: soundtrack matching policy"
         );
+        if let Some(d) = &self.distinctive {
+            d.validate()?;
+        }
         Ok(())
     }
 }
@@ -170,6 +211,24 @@ pub struct SoundtrackMatchReport {
     pub grid_seconds: f64,
     pub best_similarity: Option<f64>,
     pub runner_up_similarity: Option<f64>,
+    /// Best peaks of the searched reference, best first, at most 4 (§3).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub best_peaks: Vec<SoundtrackPeak>,
+    /// Robust z-score of the best coarse score (§4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub distinctiveness: Option<f64>,
+    /// BLAKE3 of the per-frame weight bytes when a mask was applied (§6).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mask_digest: Option<String>,
+}
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SoundtrackPeak {
+    pub similarity: f64,
+    pub reference_offset_frames: usize,
+    /// reference.start_seconds + (offset*HOP + query_len_samples/2) / PCM_RATE
+    pub movie_seconds: f64,
+    pub subwindow_similarities: [f64; 3],
 }
 fn valid_digest(s: &str) -> bool {
     s.len() == 64
@@ -249,6 +308,7 @@ impl SoundtrackIndex {
             index_digest: String::new(),
             sample_count: pcm.len(),
             features: features(pcm, cancel)?,
+            frame_energy: vec![],
         };
         index.index_digest = index.digest()?;
         Ok(index)
@@ -396,6 +456,9 @@ impl SoundtrackIndex {
             grid_seconds: HOP as f64 / PCM_RATE as f64,
             best_similarity: None,
             runner_up_similarity: None,
+            best_peaks: vec![],
+            distinctiveness: None,
+            mask_digest: None,
         };
         ensure!(!cancel(), "soundtrack match cancelled");
         let rms =
@@ -428,6 +491,10 @@ impl SoundtrackIndex {
             coarse.push((score, offset));
             report.searched_offsets += 1;
         }
+        if policy.distinctive.is_some() {
+            let scores: Vec<f64> = coarse.iter().map(|c| c.0).collect();
+            report.distinctiveness = robust_z(&scores);
+        }
         coarse.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
         let mut peaks: Vec<(f64, usize)> = vec![];
         for (_, offset) in coarse {
@@ -454,15 +521,46 @@ impl SoundtrackIndex {
             }
         }
         peaks.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+        // §3: diagnostics for every searched report, including unmatched and
+        // ambiguous ones. Filled before any early return below.
+        for &(score, offset) in peaks.iter().take(MAX_BEST_PEAKS) {
+            let mut subwindow_similarities = [0.0; 3];
+            for (part, slot) in subwindow_similarities.iter_mut().enumerate() {
+                let a = part * query.len() / 3;
+                let b = (part + 1) * query.len() / 3;
+                *slot = similarity(
+                    &query[a..b],
+                    &self.features[offset + a..offset + b],
+                    1,
+                    &mut report.comparison_products,
+                )?;
+            }
+            report.best_peaks.push(SoundtrackPeak {
+                similarity: score,
+                reference_offset_frames: offset,
+                movie_seconds: self.reference.start_seconds
+                    + (offset * HOP + pcm.len() / 2) as f64 / PCM_RATE as f64,
+                subwindow_similarities,
+            });
+        }
         report.best_similarity = peaks.first().map(|p| p.0);
         report.runner_up_similarity = peaks.get(1).map(|p| p.0);
-        if peaks.is_empty() || peaks[0].0 < policy.minimum_similarity {
+        // Low-similarity peaks reach temporal support only when the distinctive
+        // path is enabled (ARCHITECTURE §4). Without it this is the v1 gate.
+        let gate = policy
+            .distinctive
+            .as_ref()
+            .map_or(policy.minimum_similarity, |d| {
+                d.minimum_similarity.min(policy.minimum_similarity)
+            });
+        if peaks.is_empty() || peaks[0].0 < gate {
             return Ok(report);
         }
         // A high score from half a query is insufficient after a buffer/seek.
         // Require independent support in every third of the query.
+        let raw_peaks = peaks;
         let mut supported = Vec::new();
-        for (score, offset) in peaks {
+        for &(score, offset) in &raw_peaks {
             let mut consistent = true;
             for part in 0..3 {
                 let a = part * query.len() / 3;
@@ -483,22 +581,52 @@ impl SoundtrackIndex {
             }
         }
         let peaks = supported;
-        if peaks.is_empty() || peaks[0].0 < policy.minimum_similarity {
+        if peaks.is_empty() {
             report.reason = "insufficient_temporal_support".into();
             return Ok(report);
         }
         let margin = peaks[0].0 - peaks.get(1).map_or(-1.0, |p| p.0);
-        report.state = if margin >= policy.minimum_peak_margin {
-            SoundtrackMatchState::Matched
-        } else {
-            SoundtrackMatchState::Ambiguous
+        // Step 2 (v1): the old path is unchanged.
+        let old_similar = peaks[0].0 >= policy.minimum_similarity;
+        let old_matched = old_similar && margin >= policy.minimum_peak_margin;
+        // §4 distinctive margin: the honest runner-up is the best raw coarse peak
+        // at a different position, whether or not it passed temporal support. A
+        // temporally unsupported copy is a real competitor and must reduce it.
+        let distinctive_margin = {
+            let runner_up = raw_peaks
+                .iter()
+                .find(|p| p.1.abs_diff(peaks[0].1) >= 16)
+                .map_or(0.0, |p| p.0);
+            peaks[0].0 - runner_up
         };
-        report.reason = if report.state == SoundtrackMatchState::Matched {
-            "distinctive_peak"
-        } else {
-            "multiple_similar_positions"
+        // Step 3 (ARCHITECTURE §4): consulted only when the old path did not match.
+        let distinctive_pass = policy.distinctive.as_ref().is_some_and(|d| {
+            peaks[0].0 >= d.minimum_similarity
+                && distinctive_margin >= d.minimum_margin
+                && report
+                    .distinctiveness
+                    .is_some_and(|z| z >= d.minimum_z_score)
+        });
+        if !old_similar && !distinctive_pass {
+            report.reason = "insufficient_temporal_support".into();
+            return Ok(report);
         }
-        .into();
+        let low_similarity = distinctive_pass && !old_matched;
+        let (state, reason) = if old_matched {
+            (SoundtrackMatchState::Matched, "distinctive_peak")
+        } else if low_similarity {
+            (
+                SoundtrackMatchState::Matched,
+                "distinctive_peak_low_similarity",
+            )
+        } else {
+            (
+                SoundtrackMatchState::Ambiguous,
+                "multiple_similar_positions",
+            )
+        };
+        report.state = state;
+        report.reason = reason.into();
         let center = pcm.len() / 2;
         let capture_sample =
             capture.first_sample + (center as u64 * capture.sample_rate as u64 / PCM_RATE as u64);
@@ -538,7 +666,11 @@ impl SoundtrackIndex {
                     },
                     movie_pts: self.reference.movie.origin_pts + (seconds * tps).round() as i64,
                     source: SyncAnchorSource::PassiveSoundtrack,
-                    confidence: score,
+                    confidence: if low_similarity {
+                        (0.5 + distinctive_margin).min(1.0)
+                    } else {
+                        score
+                    },
                     movie_uncertainty_ticks: (policy.uncertainty_seconds * tps).ceil() as u64,
                     capture_uncertainty_samples: (HOP as f64 / PCM_RATE as f64
                         * capture.sample_rate as f64)
@@ -546,12 +678,42 @@ impl SoundtrackIndex {
                     candidate_group_id: Some(format!("{}_matches", capture.evidence_id)),
                 },
                 similarity: score,
-                peak_margin: margin,
+                peak_margin: if low_similarity {
+                    distinctive_margin
+                } else {
+                    margin
+                },
                 reference_offset_frames: offset,
             });
         }
         Ok(report)
     }
+}
+/// Robust z of the best coarse score against all coarse scores (ARCHITECTURE §4):
+/// (best - median) / (1.4826 * MAD). None when the MAD is zero or undefined.
+fn robust_z(scores: &[f64]) -> Option<f64> {
+    let best = scores.iter().copied().reduce(f64::max)?;
+    let center = median(scores)?;
+    let deviations: Vec<f64> = scores.iter().map(|s| (s - center).abs()).collect();
+    let mad = median(&deviations)?;
+    if !mad.is_finite() || mad <= 0.0 {
+        return None;
+    }
+    let z = (best - center) / (1.4826 * mad);
+    z.is_finite().then_some(z)
+}
+fn median(values: &[f64]) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let mid = sorted.len() / 2;
+    Some(if sorted.len() % 2 == 1 {
+        sorted[mid]
+    } else {
+        (sorted[mid - 1] + sorted[mid]) / 2.0
+    })
 }
 fn similarity(
     a: &[[f32; BANDS]],

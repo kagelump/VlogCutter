@@ -82,7 +82,7 @@ test("real Git treats renames/new paths conservatively even inside the allowlist
     assert.equal(run("push", { before: modified, after: git(["rev-parse", "HEAD"]) }).macos, true);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
-const green = () => Object.fromEntries(["changes", "linux-rust", "frontend", "browser", "macos"].map((name) => [name, { result: "success" }]));
+const green = () => Object.fromEntries(["changes", "linux-rust", "frontend", "browser", "web-e2e-build", "web-e2e", "macos"].map((name) => [name, { result: "success" }]));
 test("aggregate accepts all green or an explicitly justified macOS skip", () => {
   assert.deepEqual(requiredFailures(green()), []);
   const needs = green();
@@ -100,7 +100,7 @@ test("aggregate rejects failure, cancellation, missing and unjustified skips in 
     const needs = green(); delete needs[job];
     assert.ok(requiredFailures(needs).includes(job));
   }
-  assert.equal(requiredFailures({}).length, 5);
+  assert.equal(requiredFailures({}).length, 7);
   const needs = green(); needs.changes = { result: "failure", outputs: { macos: "false" } }; needs.macos.result = "skipped";
   assert.ok(requiredFailures(needs).includes("changes"));
 });

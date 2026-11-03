@@ -30,6 +30,10 @@ function runCli(name, { fail = "", omit = "", args = ["--scope", "pre-pr"], plan
 case "$2" in
   fmt) if [ "$FAKE_FAIL" = format ]; then echo "forced fmt failure" >&2; exit 11; fi ;;
   clippy) if [ "$FAKE_FAIL" = clippy ]; then echo "forced clippy failure" >&2; exit 12; fi ;;
+  nextest)
+    echo "     Summary [   1.000s] 1 test run: 1 passed, 0 skipped"
+    if [ "$FAKE_FAIL" = test ]; then echo "forced cargo test failure" >&2; exit 13; fi
+    ;;
   test)
     echo "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out"
     if [ "$FAKE_FAIL" = test ]; then echo "forced cargo test failure" >&2; exit 13; fi
@@ -68,7 +72,7 @@ exit 0
 test("CLI succeeds when every fake prerequisite and check succeeds", () => {
   const result = runCli("valid CLI pass");
   assert.equal(result.status, 0, JSON.stringify(result));
-  assert.match(result.stdout, /Gate summary \(pre-pr\): 15 passed, 0 failed\./);
+  assert.match(result.stdout, /Gate summary \(pre-pr\): 16 passed, 0 failed\./);
 });
 
 test("CLI defaults to local scope and requires a focused checks plan", () => {
@@ -115,7 +119,7 @@ test("CLI preserves cargo test output and exits nonzero on failure", () => {
   assert.equal(result.status, 1);
   assert.match(result.stdout, /test result: ok\. 1 passed; 0 failed/);
   assert.match(result.stdout, /forced cargo test failure/);
-  assert.match(result.stdout, /RESULT cargo test --workspace: FAIL \(exit 13\)/);
+  assert.match(result.stdout, /RESULT cargo nextest run --workspace: FAIL \(exit 13\)/);
 });
 
 test("CLI exits nonzero when the fake frontend check fails", () => {
@@ -145,6 +149,7 @@ test("a clean feature commit with trailing whitespace fails the committed-candid
   writeFileSync(join(bin, "rustc"), '#!/bin/sh\necho "rustc 1.97.1 (fake)"\n', { mode: 0o755 });
   writeFileSync(join(bin, "cargo"), `#!/bin/sh
 case "$2" in
+  nextest) echo "     Summary [   1.000s] 1 test run: 1 passed, 0 skipped" ;;
   test) echo "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out" ;;
 esac
 exit 0
@@ -183,7 +188,7 @@ exit 0
     assert.match(result.stdout, /trailing whitespace/);
     assert.match(result.stdout, /fix the trailing-whitespace lines shown above/);
     assert.doesNotMatch(result.stdout, /git fetch origin main/);
-    assert.match(result.stdout, /Gate summary \(pre-pr\): 14 passed, 1 failed\./);
+    assert.match(result.stdout, /Gate summary \(pre-pr\): 15 passed, 1 failed\./);
   } finally {
     rmSync(temp, { recursive: true, force: true });
   }
