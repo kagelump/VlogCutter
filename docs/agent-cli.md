@@ -473,6 +473,43 @@ Preview kinds are `split`, `reassign`, `merge`, `epochSet`, `epochClear`,
 JSON fields. Phases use a `phase` object. A phase-split preview commits both
 resulting phase operations in one transaction. No command edits raw timestamps.
 
+#### Preview-to-apply extraction (exact levels)
+
+Every preview returns a success envelope whose payload has two `data` levels:
+the CLI's own `data` field, and the preview value inside it, which is what
+`apply` takes as `preview`. The preview value is the one at `data.data`:
+
+```json
+{"ok":true,"command":"chronology.preview","data":{"kind":"questionPropose","data":{"question":{},"questionRevision":0,"factsToken":"...","alternativeImpacts":[]}}}
+```
+
+Send the `data.data` value, not `data` and not the whole envelope. A complete
+human-question round trip, using a question object as described above:
+
+```bash
+rcdvlog --catalog /absolute/project/catalog.sqlite3 chronology preview --project <project> --input question-request.json > preview.json
+jq -c '{kind: "questionPropose", preview: .data.data}' preview.json |
+  rcdvlog --catalog /absolute/project/catalog.sqlite3 chronology apply --project <project> --input -
+```
+
+The apply request is `{"kind":"questionPropose","preview":<data.data value>}`.
+Its success envelope is `{"ok":true,"command":"chronology.apply","data":{"kind":"questionPropose","data":{"revision":<n>}}}`.
+Apply uses the same kind as the preview, and `kind` on both must match.
+
+Malformed chronology input fails with the stable `invalid_input` code. This
+covers request or preview JSON that does not parse, a missing or misnamed
+field, a preview at the wrong level, and a `kind` that does not match its
+preview. stdout stays empty, and stderr carries one error envelope with a
+message that names the problem. Nothing is written to the catalog. For
+example, sending the `data` value instead of `data.data` gives:
+
+```json
+{"ok":false,"command":"chronology.apply","error":{"code":"invalid_input","message":"chronology.apply failed: request.preview is not a valid questionPropose preview: missing field `question` (the preview is the data value; send its inner data.data value)"}}
+```
+
+Agents should branch on `error.code`, and treat `invalid_input` as "fix the
+request and send it again", not as a catalog failure.
+
 Each CLI process commits an apply atomically. The direct-mutation preview API
 recognizes retry of the same saved candidate after a lost response and returns
 the applied mutation without appending another operation. Specialized sequence

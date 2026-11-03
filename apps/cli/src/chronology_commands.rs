@@ -253,7 +253,7 @@ pub fn execute_chronology(catalog: &Catalog, command: &ChronologyCommand) -> Res
             let request = read_json(input)?;
             let kind = request["kind"]
                 .as_str()
-                .ok_or_else(|| anyhow::anyhow!("request.kind is required"))?;
+                .ok_or_else(|| input_error("request.kind is required"))?;
             let data = match kind {
                 "split" => {
                     let asset_ids: Vec<String> =
@@ -335,57 +335,50 @@ pub fn execute_chronology(catalog: &Catalog, command: &ChronologyCommand) -> Res
             let request = read_json(input)?;
             let kind = request["kind"]
                 .as_str()
-                .ok_or_else(|| anyhow::anyhow!("request.kind is required"))?;
+                .ok_or_else(|| input_error("request.kind is required"))?;
             let data = match kind {
-                "split" => serde_json::to_value(catalog.apply_capture_sequence_split(
-                    project,
-                    &serde_json::from_value(request["preview"].clone())?,
-                )?)?,
+                "split" => serde_json::to_value(
+                    catalog
+                        .apply_capture_sequence_split(project, &preview_from(&request, kind)?)?,
+                )?,
                 "reassign" => serde_json::to_value(catalog.apply_capture_sequence_reassignment(
                     project,
-                    &serde_json::from_value(request["preview"].clone())?,
+                    &preview_from(&request, kind)?,
                 )?)?,
                 "merge" => {
-                    catalog.apply_capture_sequence_merge(
-                        project,
-                        &serde_json::from_value(request["preview"].clone())?,
-                    )?;
+                    catalog
+                        .apply_capture_sequence_merge(project, &preview_from(&request, kind)?)?;
                     json!({"applied": true})
                 }
-                "epochSet" => serde_json::to_value(catalog.apply_clock_epoch_preview(
-                    project,
-                    &serde_json::from_value(request["preview"].clone())?,
-                )?)?,
+                "epochSet" => serde_json::to_value(
+                    catalog.apply_clock_epoch_preview(project, &preview_from(&request, kind)?)?,
+                )?,
                 "epochClear" => {
-                    catalog.apply_clear_clock_epoch_preview(
-                        project,
-                        &serde_json::from_value(request["preview"].clone())?,
-                    )?;
+                    catalog
+                        .apply_clear_clock_epoch_preview(project, &preview_from(&request, kind)?)?;
                     json!({"applied": true})
                 }
                 "questionPropose" => {
                     let revision = catalog.apply_clock_block_question_preview(
                         project,
-                        &serde_json::from_value(request["preview"].clone())?,
+                        &preview_from(&request, kind)?,
                     )?;
                     json!({"revision": revision})
                 }
-                "questionDecision" => {
-                    serde_json::to_value(catalog.apply_clock_question_decision(
-                        project,
-                        &serde_json::from_value(request["preview"].clone())?,
-                    )?)?
-                }
+                "questionDecision" => serde_json::to_value(
+                    catalog
+                        .apply_clock_question_decision(project, &preview_from(&request, kind)?)?,
+                )?,
                 "sequenceDeclare" | "sameCard" | "sameCardRestore" | "exceptionSet"
                 | "exceptionClear" | "phaseSet" | "phaseRemove" | "phaseSplit"
                 | "constraintSet" | "constraintClear" => {
-                    let preview: ChronologyMutationPreview =
-                        serde_json::from_value(request["preview"].clone())?;
+                    let preview: ChronologyMutationPreview = preview_from(&request, kind)?;
                     let preview_kind = direct_mutation_name(&preview.mutation);
-                    anyhow::ensure!(
-                        kind == preview_kind,
-                        "preview kind does not match request kind"
-                    );
+                    if kind != preview_kind {
+                        return Err(input_error(format!(
+                            "request.kind {kind} does not match preview kind {preview_kind}"
+                        )));
+                    }
                     serde_json::to_value(
                         catalog.apply_chronology_mutation_preview(project, &preview)?,
                     )?
@@ -404,7 +397,50 @@ fn read_json(input: &str) -> Result<Value> {
     } else {
         bytes = std::fs::read(input)?;
     }
-    Ok(serde_json::from_slice(&bytes)?)
+    serde_json::from_slice(&bytes)
+        .map_err(|error| input_error(format!("request is not valid JSON: {error}")))
+}
+
+/// A malformed chronology request or preview payload. The CLI maps it to the
+/// stable `invalid_input` code (AGENTS.md section 11) rather than
+/// `internal_error`, because the caller can fix the input.
+#[derive(Debug)]
+pub struct ChronologyInputError(String);
+
+impl ChronologyInputError {
+    /// The stable error code for this failure.
+    pub const CODE: &'static str = "invalid_input";
+}
+
+impl std::fmt::Display for ChronologyInputError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ChronologyInputError {}
+
+fn input_error(message: impl Into<String>) -> anyhow::Error {
+    ChronologyInputError(message.into()).into()
+}
+
+/// Deserializes `request.preview` for an apply kind. When the value is a whole
+/// CLI envelope or the preview's own `data` level, the message says which level
+/// to send instead.
+fn preview_from<T: serde::de::DeserializeOwned>(request: &Value, kind: &str) -> Result<T> {
+    let preview = &request["preview"];
+    serde_json::from_value(preview.clone()).map_err(|error| {
+        let hint = if preview.get("ok").is_some() && preview.get("command").is_some() {
+            " (the preview is a whole CLI envelope; send its data.data value)"
+        } else if preview.get("kind").is_some() && preview.get("data").is_some() {
+            " (the preview is the data value; send its inner data.data value)"
+        } else {
+            ""
+        };
+        input_error(format!(
+            "request.preview is not a valid {kind} preview: {error}{hint}"
+        ))
+    })
 }
 
 fn required_string<'a>(request: &'a Value, field: &str) -> Result<&'a str> {
