@@ -8,7 +8,7 @@ use rcdvlog_core::{
         SoundtrackCapture, SoundtrackIndex, SoundtrackPolicy, SoundtrackReferenceSpec,
         read_pcm8k_wav,
     },
-    tv_soundtrack_consensus,
+    tv_soundtrack_consensus::{self, SoundtrackConsensus},
     tv_soundtrack_session::{
         SessionAudioFile, SessionBatch, SoundtrackSessionPlan, SoundtrackSessionSpec,
     },
@@ -87,6 +87,9 @@ pub enum TvReviewCommand {
         target: Option<PathBuf>,
         #[arg(long)]
         historical_target: Option<PathBuf>,
+        /// Optional SoundtrackConsensus JSON (from soundtrack-session-consensus) whose segments gate interpolation (§9).
+        #[arg(long)]
+        consensus: Option<PathBuf>,
     },
     /// Derive offset segments and boundaries from complete session evidence.
     SoundtrackSessionConsensus {
@@ -146,10 +149,24 @@ pub fn execute(command: &TvReviewCommand) -> Result<Value> {
             queries,
             target,
             historical_target,
+            consensus,
         } => {
             let plan = SoundtrackSessionPlan::from_json(&read_bytes(plan, SYNC_MAX_BYTES)?)?;
             let queries: Vec<SyncQuery> = read_json(queries, 65536)?;
-            let evidence = plan.sync_evidence(cache, &queries, &|| false)?;
+            let mut evidence = plan.sync_evidence(cache, &queries, &|| false)?;
+            if let Some(path) = consensus {
+                let consensus: SoundtrackConsensus =
+                    read_json(path, SYNC_MAX_BYTES).map_err(|e| {
+                        anyhow::anyhow!(
+                            "invalid input: --consensus must be a bounded SoundtrackConsensus JSON file: {e}"
+                        )
+                    })?;
+                ensure!(
+                    consensus.schema_version == 1 && consensus.plan_digest == plan.plan_digest,
+                    "invalid input: --consensus does not belong to this session plan"
+                );
+                evidence.sync.consensus_segments = consensus.segments;
+            }
             let (purpose, mapped) = if let Some(path) = target {
                 let target = ReviewTargetHandoff::from_json(&read_bytes(path, 16 * 1024 * 1024)?)?;
                 (
