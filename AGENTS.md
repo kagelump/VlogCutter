@@ -1138,9 +1138,9 @@ requirements remain explicit.
 | Desktop user journeys | `pnpm test:desktop:cuj` | `pnpm test:desktop` plus interaction/visual check |
 | Desktop coverage floor | `pnpm test:desktop:coverage` | thresholds in `apps/desktop/vitest.config.ts`; raise them, never lower them to go green |
 | Desktop layout/scroll/focus | `pnpm test:desktop:browser` | headless-Chromium tier; real-engine layout, scrolling, focus, pointer, a11y, and the render-cost budgets in `e2e/scale.spec.ts` — never native evidence |
-| Rust core | `cargo test -p rcdvlog-core` | `cargo test --workspace` |
-| ETA library | `cargo test -p batch-estimator` | `cargo test --workspace` |
-| CLI parsing/JSON | `cargo test -p rcdvlog-cli` | `pnpm test:integration` |
+| Rust core | `cargo nextest run -p rcdvlog-core` | `cargo nextest run --workspace` plus `cargo test --workspace --doc` |
+| ETA library | `cargo nextest run -p batch-estimator` | `cargo nextest run --workspace` plus `cargo test --workspace --doc` |
+| CLI parsing/JSON | `cargo nextest run -p rcdvlog-cli` | `pnpm test:integration` |
 | Tauri commands/settings | `cargo test -p rcdvlog-desktop` | real `pnpm dev` smoke test when native behavior changed |
 | Server core/API | `pnpm test:server` | two-node process test plus target-topology check when external behavior changed |
 | Chrome web | `pnpm test:web` | `pnpm test:web:e2e` plus real HTTPS visual/interaction check |
@@ -1148,6 +1148,14 @@ requirements remain explicit.
 | Repository scripts in `scripts/` | `pnpm test:scripts` | `pnpm check:docs` |
 | Formatting/lints | `cargo fmt --all -- --check` | `cargo clippy --workspace --all-targets -- -D warnings` |
 | Full repository | — | `pnpm check` |
+
+CI runs the Rust workspace tests with cargo-nextest (version pinned as
+`NEXTEST_VERSION` in `.github/workflows/ci.yml`; install the same version
+locally, e.g. `cargo install --locked cargo-nextest@<version>`), sharded as
+`linux-rust (tests N/4)` jobs via `--partition count:N/4`, plus
+`cargo test --workspace --doc` because nextest does not run doctests.
+`.config/nextest.toml` fails a hung test by name after 5 minutes (`slow-timeout`
+60 s period, `terminate-after = 5`). Nothing is skipped or retried.
 
 `pnpm check` runs TypeScript checking followed by all Rust workspace tests. The process-level integration suite creates a real one-second FFmpeg fixture and validates CLI persistence, WAL reads, ingest, metadata, deduplication, labels/notes/removal, clock correction, thumbnails/proxies, and offline-original review. Its media portion skips when FFmpeg or ffprobe is missing.
 
@@ -1175,8 +1183,8 @@ and include results or exact-head CI links and failed-step logs in a handoff.
 For one Rust test during iteration, run
 `pnpm test:focused <cargo-package> <exact-test-name>` (for example,
 `pnpm test:focused rcdvlog-core migrations::tests::the_schema_version_constant_tracks_the_migration_list`). It uses the CI Rust
-pin and `--exact`, then requires Cargo to report the named test and at least
-one executed test. The fake-command regression cases are in
+pin and cargo-nextest with an exact `test(=name)` filter, then requires nextest to report
+the named test as passed and at least one executed test. The fake-command regression cases are in
 `scripts/run-focused-test.test.mjs`.
 
 Use `pnpm publish:after-gate push --checks /absolute/path/focused-checks.json` or

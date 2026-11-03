@@ -18,14 +18,14 @@ function runScenario(name, { output, status = 0 } = {}) {
     write: (chunk) => { captured += chunk; },
   });
   assert.equal(invocation.command, "cargo");
-  assert.deepEqual(invocation.args, ["+1.97.1", "test", "-p", "rcdvlog-core", "chronology::keeps_order", "--", "--exact"]);
+  assert.deepEqual(invocation.args, ["+1.97.1", "nextest", "run", "-p", "rcdvlog-core", "-E", "test(=chronology::keeps_order)"]);
   assert.equal(invocation.options.env.RUSTUP_TOOLCHAIN, "1.97.1");
   return { code, output: captured };
 }
 
 test("named test result and positive executed count pass", () => {
   const result = runScenario("named test and count pass", {
-    output: "test chronology::keeps_order ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 19 filtered out\n",
+    output: "        PASS [   0.004s] rcdvlog-core chronology::keeps_order\n     Summary [   0.005s] 1 test run: 1 passed, 19 skipped\n",
   });
   assert.equal(result.code, 0);
   assert.match(result.output, /observed 1 result\(s\) named chronology::keeps_order; 1 executed test\(s\)/);
@@ -33,7 +33,7 @@ test("named test result and positive executed count pass", () => {
 
 test("zero matching tests fail even when cargo exits successfully", () => {
   const result = runScenario("zero tests fail", {
-    output: "test result: ok. 0 passed; 0 failed; 0 ignored; 20 filtered out\n",
+    output: "     Summary [   0.001s] 0 tests run: 0 passed, 20 skipped\n",
   });
   assert.equal(result.code, 1);
   assert.match(result.output, /observed 0 matching result\(s\), 0 executed test\(s\)/);
@@ -41,7 +41,7 @@ test("zero matching tests fail even when cargo exits successfully", () => {
 
 test("a different passing test name does not satisfy the request", () => {
   const result = runScenario("wrong test name fails", {
-    output: "test chronology::other_test ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 19 filtered out\n",
+    output: "        PASS [   0.004s] rcdvlog-core chronology::other_test\n     Summary [   0.005s] 1 test run: 1 passed, 19 skipped\n",
   });
   assert.equal(result.code, 1);
   assert.match(result.output, /expected test chronology::keeps_order/);
@@ -49,7 +49,7 @@ test("a different passing test name does not satisfy the request", () => {
 
 test("reported zero count fails even if expected name appears", () => {
   const result = runScenario("zero count fails", {
-    output: "test chronology::keeps_order ... ok\ntest result: ok. 0 passed; 0 failed; 0 ignored; 20 filtered out\n",
+    output: "        PASS [   0.004s] rcdvlog-core chronology::keeps_order\n     Summary [   0.001s] 0 tests run: 0 passed, 20 skipped\n",
   });
   assert.equal(result.code, 1);
 });
