@@ -54,355 +54,42 @@ Never violate these invariants without explicit user approval:
 
 The implemented slice is intentionally smaller than the launch-critical list in `PRD.md`.
 
-Implemented now:
+**Convention (keeps this file an index):** a feature PR adds *one index line plus a link* here, not a paragraph. Schema numbers, contracts, measurements, and acceptance detail belong in the feature's focused doc under `docs/`; if none fits, add it to [docs/implementation-status.md](docs/implementation-status.md), which holds the full text of everything below. `pnpm check:docs` fails if this file grows past its size limit.
 
-- TV recorder cues/clock events use a durable outbox and acknowledged worklet
-  tail flush; paired native-frame/performance probes preserve calibration
-  evidence and suspension epochs. See `docs/tv-voice-review-recording.md`.
+Implemented now (detail in [docs/implementation-status.md](docs/implementation-status.md) unless a doc is named):
 
-- Version-1 path-free TV review target export freshly verifies a full preview,
-  preserves measured movie PTS and declared independent audio, and supplies a
-  synthetic cloud fixture. The companion server imports it through an
-  authenticated preflight/import (control schema 13, `review_targets` owner in
-  `rcdvlog-server`), deduplicates by project + digest, refuses conflicting reuse
-  of a viewed artifact, keeps a declared-unverified YouTube ID as a separate
-  immutable snapshot, and the Chrome app has a *TV review* selection/import
-  screen. Chrome voice-review recording (control schema 14, `review_sessions`)
-  captures untouched PCM through an AudioWorklet on the microphone sample
-  clock, buffers it in IndexedDB, uploads hashed sequenced chunks, records
-  manual cues, and has the server compute coverage and gaps at finalization.
-  Review-session ASR (control schema 15, `review_transcripts`, job
-  `review_session.transcribe.v1`) reuses the shared speech pipeline through
-  the `rcdvlog_core::review_speech` facade: local whisper or an explicitly
-  authorized, ledger-capped native OpenRouter model, per-window caching that
-  never rebills, recording-clock utterances with raw text plus an OpenCC s2tw
-  display projection. Speaker diarization is reported as unavailable, never
-  inferred. The editorial review workspace (control schema 16,
-  `review_discussions`) adds append-only human corrections, grouped
-  discussions with typed items (human-only decisions, enforced retractions and
-  consistent acceptances), movie time only from the shared `tv_review_sync`
-  mapper over calibrated cue evidence (pending without calibration), and
-  a `review-report.v1` exporting core `RecordReviewNoteRequest`s with single
-  reconciliation receipts; it never writes the project catalog. See
-  `docs/tv-review-handoff.md`, `docs/tv-voice-review-recording.md`,
-  `docs/tv-review-transcription.md` and `docs/tv-review-discussions.md`.
-  `review-markers` (no catalog) writes a
-  separate, create-only, self-verified marked review copy of the BLAKE3-matched
-  master with audible chirp-BFSK movie-time markers (video stream copy) and
-  detects CRC/export-key-checked anchors in recordings as shared `tv_review_sync`
-  `acousticTimecode` anchors; see `docs/tv-review-acoustic-markers.md`.
+- **Projects and ingest**: one portable SQLite catalog per desktop project, configurable projects root, library discovery, reference-in-place ingest, sampled-fingerprint dedup with repair of offline assets, verified node-local media locations, ffprobe/ExifTool metadata. Smart ingest dialog (preflight classification, archive roots, atomic card copy with optional verification, camera choice, cancel/resume, ledger) and macOS removable-card detection: [docs/tasks/import/ARCHITECTURE.md](docs/tasks/import/ARCHITECTURE.md).
+- **Labeling**: queue, playback, labels, notes, reversible removal, label typeahead, transcript-aware search.
+- **Chronology**: capture sequences, clock epochs, trip phases, deterministic solver, diagnostics, story ribbon, Chronology desk, camera-lane merge; `.LRF` sidecars ([docs/camera-proxy-sidecars.md](docs/camera-proxy-sidecars.md)). See [docs/tasks/desktop/CHRONOLOGY_MODEL.md](docs/tasks/desktop/CHRONOLOGY_MODEL.md) and [docs/edit-plan-chronology.md](docs/edit-plan-chronology.md).
+- **Representations**: Q1 thumbnails and 720p proxies ([docs/proxy-generation.md](docs/proxy-generation.md)); orientation ([docs/orientation-review.md](docs/orientation-review.md)); weighted ETA ([docs/batch-estimation.md](docs/batch-estimation.md)).
+- **Analysis**: local transcription, cloud proxy-only clip analysis, moments, `prepare` CLI, desktop analysis surface, accounting/preflight/native video: [docs/analysis-preflight.md](docs/analysis-preflight.md), [docs/analysis-accounting.md](docs/analysis-accounting.md), [docs/native-video-review.md](docs/native-video-review.md); full recipes in [docs/core-media-reference.md](docs/core-media-reference.md).
+- **Edit planning and review** (schemas 54-66): preview artifacts, inspection, context review, comparisons, selected-audio integrity, chapter selection, feedback, source ranges, coverage, delivery, readiness/doctor, OTIO writing. Start at [docs/rough-cut-readiness.md](docs/rough-cut-readiness.md) and [docs/agent-cli.md](docs/agent-cli.md); each capability has its own `docs/edit-plan-*.md` (e.g. [feedback](docs/edit-plan-feedback.md), [source ranges](docs/edit-plan-source-ranges.md), [preview artifacts](docs/edit-plan-preview-artifacts.md)) and [docs/selected-audio-integrity.md](docs/selected-audio-integrity.md).
+- **TV review** (companion server schemas 13-16): target export/import, Chrome voice-review recording, review-session ASR, discussions, acoustic markers, sync, soundtrack matching. Start at [docs/tv-review-handoff.md](docs/tv-review-handoff.md); siblings are the `docs/tv-review-*.md`, [docs/tv-voice-review-recording.md](docs/tv-voice-review-recording.md), and [docs/tv-soundtrack-matching.md](docs/tv-soundtrack-matching.md).
+- **Desktop shell**: 13" three-row layout (topbar, workbench, story ribbon) with layout invariants enforced by tests, evidence shelf, Focus mode, `projectSession.ts` read owner, `assetMutations.ts` write owner, loopback media origin: [docs/superpowers/specs/2026-08-04-desktop-review-layout-design.md](docs/superpowers/specs/2026-08-04-desktop-review-layout-design.md), [docs/tasks/desktop/MEDIA_DELIVERY.md](docs/tasks/desktop/MEDIA_DELIVERY.md).
+- **CLI and operations**: one JSON CLI (schema 66), typed immutable project operations, read-only diagnostics: [docs/agent-cli.md](docs/agent-cli.md).
+- **Companion server** (control schema 16): control catalog, replicas, storage, jobs, sync 1.0, auth, Chrome review/admin, backups: [docs/server/README.md](docs/server/README.md).
+- **Publishing**: YouTube upload-only OAuth and resumable upload: [docs/youtube-upload.md](docs/youtube-upload.md).
 
-- Historical rendered-movie integrity review has a separate read-only DTO/CLI;
-  it never certifies current plan renderability. See `docs/tv-review-handoff.md`.
-- External review notes have an idempotent `edit-plan feedback record-once`
-  boundary using normal canonical note facts; retries never accept or apply an edit.
-- `tv_soundtrack` supplies bounded local final-mix sync candidates; no hardware
-  acceptance is implied. See `docs/tv-soundtrack-matching.md`.
-- `tv_soundtrack_session` plans complete-reference searches, bounded resumable
-  local batches and native utterance mapping. Its private derived cache is not
-  a project owner; see `docs/tv-review-local-session.md`.
-- `tv_review_sync` owns bounded evidence-only TV recording/movie alignment;
-  CLI `tv-review sync-preview` is read-only. See `docs/tv-review-sync.md`.
-- One supported CLI now includes editing, review and upload against schema 66,
-  with observational `doctor --workflow rough-cut|delivery` preflight. Sparse
-  stable-ID patches, explicit source-inventory picture-usage reports and unused
-  candidate retrieval, agent/human decision provenance, historical-preview
-  verification, audiovisual review coverage and measured local delivery bundles
-  are described in `docs/rough-cut-readiness.md`. Existing source inspection
-  supports bounded local deadlines and explicitly requested proxy fallback.
+Important gaps; do not describe these as complete (detail in [docs/implementation-status.md](docs/implementation-status.md)):
 
-- One portable SQLite catalog per newly created desktop project.
-- Configurable projects root, defaulting to `~/Movies/VideoProjects`.
-- Project library discovery and loading an existing catalog.
-- Reference-in-place recursive ingest of supported media extensions.
-- A desktop smart-ingest dialog that classifies a source before mutation,
-  states the project-scoped delta and resolved destination, checks copy size
-  against free space, creates/rebinds named archive roots, copies removable
-  cards atomically with optional full-file verification, remembers the proxy
-  preference, supports cancellation/resume, and keeps a file ledger available
-  after the dialog closes.
-- Smart ingest shows the resolved camera before import, lets the user choose an
-  existing or new project camera, uses that choice for both asset ingest and
-  sequence preview, and remembers it only when card layout, filename prefix,
-  and representative EXIF make/model form an unambiguous project-local key.
-- Low-frequency macOS removable-card detection with a review/dismiss banner;
-  it lists and counts only until the user asks to review the import.
-- Sampled fingerprint deduplication within a project, with rediscovered content
-  repairing an asset whose original went offline rather than being discarded.
-- Verified camera `.LRF` sidecars can resolve through recorded same-asset
-  alternate originals, with persisted CFR integer-reduction time mappings and
-  bounded content checks. `camera-proxy frame-pack` samples that explicit camera
-  representation offline; generated-proxy readiness remains separate. See
-  `docs/camera-proxy-sidecars.md`.
-- Verified node-local media locations: availability requires that the bytes were
-  checked, so a reformatted card reusing a pathname cannot bind an old asset to
-  new footage.
-- ffprobe technical/timestamp metadata and ExifTool camera make/model lookup.
-- Label queue, playback, free-form labels, notes, reversible removal, and keyboard shortcuts.
-- Fixed camera offset events from a filename boundary onward.
-- Operation-backed capture sequences, clock epochs, clip-time exceptions,
-  clip-anchored trip phases, event-order constraints, a deterministic
-  chronology solver, and durable diagnostics. A ribbon phase boundary follows
-  its anchor clip when later camera-clock corrections change solved order.
-- Read-only chronology/diagnostics CLI commands and basic desktop chronology
-  and edit-plan drawers.
-- Versioned edit-plan persistence and validation, explicit source-audio ranges,
-  J/L placement and short audio fades in local previews (legacy omitted audio
-  remains linked), identity-based audio diffs, and an explicit OTIO rejection
-  until finishing can preserve these edits.
-- Low-resolution preview
-  generation, and deterministic pure-Rust OTIO writing.
-- Local preview renders have schema-54 node-local attempt and verified encoded
-  segment receipts, bounded progress/status reads, explicit cancellation, and
-  opt-in byte/input verification. They are derived evidence, not synchronized
-  decisions; see `docs/edit-plan-preview-artifacts.md`.
-- Schema 57 adds separately labeled published token estimates to shared analysis
-  accounting; estimates consume the same budget without becoming provider-reported
-  charges. Existing transports retain their admission rules. See `docs/analysis-accounting.md`.
-- Schema 58 adds node-local native-video carriers, request evidence and run/window
-  details. The explicit direct Gemini route shares canonical policy approval,
-  bounded capability pilots, reservation/dispatch/receipt accounting and the
-  existing moment artifact owner. Source scopes and video/audio/transcript
-  payloads are explicit; no provider/model/tier fallback or automatic resend is
-  permitted. Local media preparation is not an upload permit. See
-  `docs/native-video-review.md`; fake protocol tests do not establish live
-  provider capability or human listening/pacing acceptance.
-- Schema 59 adds canonical bounded local inspection-review sessions and step
-  receipts over the existing source-inspection and trim-suggestion owners.
-  Sessions freeze source/representation identity and human-range revision,
-  consume durable local step/frame/media limits, and cannot write human facts,
-  plans, or provider accounting. See `docs/edit-plan-inspection.md`.
-- Schema 60 adds revision-bound assembled review evidence for verified whole-cut
-  excerpts, declared audio mappings, and optional separately playable source
-  handles. Explicit human notes flow through the existing feedback owner; this
-  does not invoke a provider, make decisions, or activate plans. See
-  `docs/edit-plan-context-review.md` and `docs/agent-cli.md`.
-- Schema 61 adds bounded local short comparisons over two to four named whole-cut
-  excerpts, with a standalone sequential player and explicit byte verification.
-  Only an explicit human preference records feedback; optional retention and
-  inactive draft application use the existing feedback and revision guards. See
-  `docs/edit-plan-comparisons.md` and `docs/agent-cli.md`.
-- Schema 62 adds bounded selected-audio integrity evidence for original and renderer-selected sound, known silent preview segments, and requested master/selected/rendered energy samples. It is local technical evidence only; it does not infer master silence from derivatives or certify speech/editorial quality. See `docs/selected-audio-integrity.md` and `docs/agent-cli.md`.
-- Schema 56 adds optional immutable chapter selection intent, pacing profiles,
-  evidence identities and reports. Selection reuses local moments, preserves human
-  constraints and creates inactive normal plans; see `docs/edit-plan-selection.md`.
-- Schema 55 adds portable revision-bound edit-review notes, proposals, human
-  decisions and target mappings. Only an explicit accepted proposal can be
-  applied, producing a normal inactive edit-plan draft; feedback does not
-  activate plans or change chronology. See `docs/edit-plan-feedback.md`.
-- Quality-1 thumbnails and 720p H.264/AAC proxies with four concurrent
-  VideoToolbox workers on macOS and a one-worker software fallback elsewhere.
-- Proxy-only cloud clip analysis with deterministic frame packs, transcript
-  fusion, bounded observations, provider fallback, operation-backed AI labels,
-  quality-10 representative thumbnails, and explicit label consolidation.
-- A desktop analysis surface: one cancellable proxies/transcription/analysis
-  chain with a pre-run cost projection and per-run budget ceiling, per-run spend
-  accounting, generated titles as the clip's display name, transcript and
-  observation review panels, transcript-aware queue search, unusable-clip
-  triage, and Keychain-stored OpenRouter credentials.
-- Weighted batch progress and ETA with project-persisted rate history.
-- Review video served from a token-guarded loopback HTTP origin the desktop app
-  binds at startup, replacing the Tauri asset protocol for video so an un-played
-  clip has a frame to paint. Range-streamed from disk, resolved by asset id
-  through the open catalog, and stopped with the app.
-- A main view laid out for a 13" MacBook Air (1440x900). The shell is exactly
-  three rows — topbar, workbench, full-width story ribbon — and two invariants
-  are enforced by tests rather than by review: the right rail holds only
-  human-authored content (notes, labels, title, removal, plus the AI
-  suggestion strip and the unusable chip), and the notes field has fixed
-  geometry that nothing else may move. Machine output lives in a tabbed
-  evidence shelf beneath the player, collapsed by default. Chronology and edit
-  planning are full-window modes on Cmd+1/2/3. Focus is the only fullscreen
-  concept — the transport's ⤢ enters it with the overlays down and leaves it
-  again, and native/DOM fullscreen is gone. A Focus presentation (F) fills
-  the window with the frame and floats the notes card, preserving the caret and
-  the playback position because it restyles the mounted tree rather than
-  replacing it. See `docs/superpowers/specs/2026-08-04-desktop-review-layout-design.md`.
-- One owner for the open project's reads (`apps/desktop/src/session/projectSession.ts`):
-  the queue, chronology overview, analysis index, readiness, and the selected
-  clip's evidence, with explicit `reload`/`reloadAssets`/`reloadChronology`/
-  `reloadReadiness`/`reloadEvidence` invalidation. Every read carries the
-  session that started it, so a response for a project the user has left cannot
-  write state — including its error and loading state. A failed queue read is
-  retryable in the interface (queue heading reload control, and *Try again* in
-  the empty queue) rather than only by relaunching.
-- One owner for the asset write path
-  (`apps/desktop/src/session/assetMutations.ts`): optimistic apply, a stated
-  failure policy per mutation — `rollback` for labels, removal, and rotation;
-  `retain-draft` for human-authored notes — save state, a double-submit guard
-  that refuses an identical in-flight write, and error surfacing. A note whose
-  save was refused stays on screen marked *Unsaved* with a *Retry* that sends
-  the same draft, and survives reloads because retained drafts are written back
-  over what a read returns. Judgments are still one whole-`AssetPatch` write
-  through `update_asset`; the narrow single-field adapters were removed and the
-  decision is recorded in `apps/desktop/src/test/harness/contract.ts`.
-- Relative-order “story ribbon” with camera lanes sized from the project's
-  actual camera count, horizontal scrolling, zoom, and a merged single-lane
-  variant for Focus. The expanded Chronology desk uses the same camera-first
-  hierarchy, with selectable capture-sequence/card runs inside each lane.
-- An explicit camera-lane identity merge previews affected clips and card runs,
-  then moves the source identity into an existing lane without combining its
-  capture sequences or changing clock-epoch IDs. The typed operation is
-  replay/baseline safe, updates Smart ingest mappings, and derives flattened
-  aliases deterministically from all merge facts so later operations carrying
-  an old identity and concurrent chained merges converge.
-- A non-interactive JSON CLI for catalog, clip annotation, chronology, and media operations.
-- Immutable typed project operations for asset membership, notes, labels, removal, rotation, and fixed clock events, with deterministic materialized views and conflict diagnostics.
-- Read-only catalog/project/clip/proxy diagnostics, including the desktop's persisted last-selected catalog, project, and asset breadcrumb.
-- Optional Ubuntu companion runtime with a local-SSD control catalog (schema 16), local project replicas, logical storage roots/node bindings, a global verified-content library, and scoped availability observations.
-- Durable leased jobs, cancellation/retry/restart recovery, scans/schedules, full hashing, shared proxy/thumbnail generation, node-scoped ETA history, and authenticated byte-range streaming.
-- Baseline format 1 and sync protocol 1.0 with bounded operation pages, per-origin cursors/acknowledgements, deterministic conflict handling, WebSocket hints, and polling recovery.
-- Browser bootstrap/session auth, revocable desktop credentials, Keychain storage, CSRF/Host/Origin/proxy validation, LAN Caddy and Tailscale Serve deployment assets.
-- Chrome library/project browse, add-to-project, proxy review, annotations, storage/jobs/sync/credentials administration, and stable polling fallback.
-- Authenticated server CLI families plus local-only bootstrap, restore, sequence-recovery, and redacted diagnostic commands.
-- Verified scheduled/manual backups of server databases with manifest-last publication, integrity/checksum validation, retention, and new-root-only restore.
-
-Important gaps; do not accidentally describe these as complete:
-
-- Import preflight includes a read-only, per-run capture-sequence decision with
-  volume, folder, filename-prefix, counter-reset, and time-discontinuity
-  evidence. The Chronology desk supports explicit split/merge and single-clip
-  or clip-and-following reassignment; preflight never applies those proposals.
-  A counter restart is presented on the desk as a question with two answers —
-  split into a new card, or record "same card" durably — rather than as a
-  problem, because swapping cards through one camera is ordinary practice. The
-  "same card" answer is an operation (`captureSequenceSplitDeclined`) and is
-  reversible from the desk's Card tab.
-- Project deletion and cache cleanup now ship (#16). Deletion runs from the
-  opening project library behind a removability audit — refusing a folder that
-  holds an archive root, a referenced original, another project's rows, or any
-  file the app did not create — and a typed project-name confirmation;
-  `delete_project` removes trip phases before assets because their clip anchors
-  are `ON DELETE RESTRICT`. Cache cleanup is a Settings storage panel that lists
-  the seven cache categories with their weight, replacement cost, and what stops
-  working until rebuilt; there is no single clear-cache button, and cleanup
-  reads nothing about the media so it works with every drive unplugged. There is
-  no general mounted-volume inventory UI. Relink now
-  exists: media locations carry a verification state, ingest repairs an asset
-  whose original it rediscovers, and an offline-volume diagnostic offers
-  `Locate…` (CLI: `relink`). Queue rows carry a compact offline mark that
-  separates *original offline, reviewable from its proxy* from *nothing to
-  play*, and the selected clip's File shelf reaches the same project-wide
-  relink, so repair no longer requires knowing the chronology desk's
-  diagnostics exist. Removable-card detection and archive-root rebinding
-  are implemented; see `docs/tasks/import/EPIC.md` for the remaining physical
-  card/volume acceptance gate.
-- Full-patch writes carry an optimistic `expectedRevision`. `Asset.revision` is
-  the materialized operation revision; `update_asset` refuses a patch built
-  from a stale read, and the desktop recovers by re-reading and re-applying the
-  user's own change on top of what the catalog now holds. The CLI takes
-  `--expected-revision` and reports `stale_revision`. What this does *not* do:
-  tell whose value won when both writers edited the same field — the client
-  cannot distinguish its own optimistic value from the other writer's, so an
-  explicit edit wins that field and the other writer's other fields survive.
-  Cross-node operation sync is unchanged.
-- Search is currently simple filename/camera/label/note/transcript filtering,
-  not SQLite FTS. Result rows say *why* each clip matched — the field and a
-  marked snippet — and Enter in the search box cycles the selected clip's
-  playhead through the places the phrase was spoken, marking them in the
-  transcript. Only the flattened transcript text is indexed per clip, so the
-  per-row snippet has no timestamp; the timings come from the open clip's own
-  transcript.
-- The label field offers the project's existing vocabulary as a keyboard-first
-  typeahead, and a commit that differs from an existing label only by case
-  joins that label rather than opening a second one. Nothing is renamed,
-  merged, or deleted: `apps/desktop/src/review/labelVocabulary.ts` is a
-  read-only view over the labels already written.
-- Sparse suggested key moments and a bounded preparation evidence CLI now exist;
-  they do not certify arbitrary cut ranges or replace human review. Separate chapter/event/script entities remain unimplemented; optional sequence
-  intent is stored with immutable edit-plan revisions. Edit-plan revisions, validation,
-  preview rendering, and OTIO writing exist, but the desktop edit-plan workflow
-  still lacks reordering, trimming, removal, preview playback, export history,
-  and overwrite confirmation. The supported `edit-plan` CLI exposes
-  list/get/create/diff/validate/activate/preview/inspect. Bounded source inspection
-  stores actual decoded PTS, source/excerpt mapping, oriented frames and optional
-  playable sound/waveform as derived SQLite receipts. It never accepts a range
-  or changes human judgments; see `docs/edit-plan-inspection.md`. Explicit human
-  picture/audio allow/exclude constraints are operation-backed, revision-guarded
-  and honored by validation, preview publication and advisory utterance trims;
-  see `docs/edit-plan-source-ranges.md`.
-- No materialized project-local agent workspace. The CLI can report its build
-  and readiness, and can explicitly bind/check the selected executable and
-  catalog in `<project-root>/.vlogcutter/cli-binding.json`. This binding never
-  generates or edits project instructions. Materializing `AGENTS.md`,
-  `PROJECT.md`, `script.md`, `project.json`, and `edit-plan.json` into the
-  video project root remains planned under issue #48 and PRD Milestone 5.
-  Script revisions do not exist either.
-- Trip phases and timezone display are persisted and solved, and the ribbon can
-  add a location/transit phase forward or backward from a hovered clip, edit an
-  existing phase, and atomically cut a new phase from either side of a filled
-  segment. The Chronology desk adds identity-snapped pointer and keyboard
-  boundary adjustment for both phase kinds, plus a full camera-lane/card-run
-  and trip-band view. Story beats remain display-only browser-mock fields and are not
-  persisted.
-- The Chronology desk surfaces conflicts, explanations, diagnostics, clock
-  epochs, phase boundaries, split/merge, single/following reassignment, and
-  bounded solver-owned before/after impact summaries. The compact Review ribbon
-  deep-links into it and Shift+T opens it with the Review zoom and viewport.
-  Dedicated clip-exception and event-order-constraint controls remain domain/API
-  capabilities rather than first-class desk tools.
-- The desk shows the footage. A compare deck plays the focused clip with the
-  clips the solver placed either side of it — either side in *solved* order,
-  across cards — as stills that promote to focus on click or with the arrow
-  keys. Canvas tiles are thumbnails carrying an ordinal, with the time revealed
-  on hover and focus and the full value in `title` and the accessible name; a
-  clip with no thumbnail keeps a text tile. The ordinal strip above the lanes is
-  a time ruler, marking day changes and timezone changes, the latter because a
-  trip crossing zones makes the displayed wall clock run backwards.
-- Web has automated Vitest and Chrome Playwright coverage. Desktop React now has Vitest + jsdom + Testing Library component tests under `apps/desktop/src/components/__tests__/`, but there is still no automated native Tauri UI suite.
-- No macOS signing/notarization or clean-machine packaging acceptance.
-- The transcript shelf follows playback: the segment under the playhead is
-  marked, the list scrolls only when that segment has left the viewport, and a
-  manual scroll suspends following for five seconds or until *Follow playback*.
-  Real scroll geometry is covered by `review/transcriptFollow.ts`'s unit tests
-  rather than by a browser tier — the Vite preview has no media origin, so no
-  playhead there can actually move.
-- Analysis suggestions are shown and editable in the desktop, but there is no
-  per-suggestion accept/reject workflow: an AI title or description is simply an
-  editable field, and a forced re-run overwrites it.
-- Native media playback, filesystem permission prompts, sleep/wake, and NAS-scale behavior remain manual acceptance checks. The loopback media origin's three webview-observable acceptance criteria — an un-played clip's first frame, non-zero `drawImage` alpha before `play()`, and seeking to an unbuffered region — have not been run. Resolve import returns as a later edit-planning acceptance check.
-- Ubuntu/Compose, physical NFS/SMB outage behavior, Caddy/Tailscale HTTPS, native pairing/playback, and target resource/thermal acceptance remain unrun; see `docs/tasks/server/ACCEPTANCE_TASK_19.md`.
-
-Before implementing persisted trip context, resolve the domain question of whether story beats are independent overlapping ranges or must be nested under physical phases. The current recommendation is independent ranges because narrative beats may cross a location or timezone transition.
+- **Import/volumes**: preflight capture-sequence decisions are read-only proposals (the Chronology desk applies split/merge/reassign; "same card" is the reversible `captureSequenceSplitDeclined` operation). Project deletion and cache cleanup ship (#16); there is no mounted-volume inventory UI. Relink exists. Physical card/volume acceptance is unrun: [docs/tasks/import/EPIC.md](docs/tasks/import/EPIC.md).
+- **Revisions**: `update_asset` is a full-patch write guarded by `expectedRevision`; it cannot tell whose value won when two writers edit the same field, and cross-node operation sync is unchanged.
+- **Search** is simple filename/camera/label/note/transcript filtering, not FTS; only flattened transcript text is indexed.
+- **Edit planning**: moments and key moments are sparse suggestions and certify no cut range. No separate chapter/event/script entities and no script revisions. The desktop edit-plan surface still lacks reordering, trimming, removal, preview playback, export history, and overwrite confirmation.
+- **No materialized project-local agent workspace** (issue #48, PRD Milestone 5): the CLI only binds/checks `.vlogcutter/cli-binding.json`; it never generates `AGENTS.md`, `PROJECT.md`, `script.md`, `project.json`, or `edit-plan.json`.
+- **Trip context**: phases and timezones are persisted; story beats are display-only browser-mock fields, not persisted. Before persisting them, decide whether beats are independent ranges (current recommendation) or nested under phases. Clip-exception and event-order controls are domain/API only, not desk tools.
+- **Analysis suggestions** have no per-suggestion accept/reject workflow; a forced re-run overwrites AI titles and descriptions.
+- **Tests/packaging**: no native Tauri UI suite; no macOS signing/notarization or clean-machine packaging acceptance.
+- **Manual acceptance not run**: native media playback and the loopback origin's three webview criteria (un-played first frame, non-zero `drawImage` alpha before `play()`, seek to an unbuffered region), permission prompts, sleep/wake, NAS scale, Resolve import, Ubuntu/Compose, NFS/SMB outage, Caddy/Tailscale HTTPS, native pairing, target resource/thermal ([docs/tasks/server/ACCEPTANCE_TASK_19.md](docs/tasks/server/ACCEPTANCE_TASK_19.md)).
+- No hardware acceptance is implied by `tv_soundtrack` candidates, fake native-video protocol tests, or TV review features.
 
 ## 4. Repository map
 
-```text
-.
-├── AGENTS.md                         # This operational handoff
-├── PRD.md                            # Product scope, architecture, milestones, decisions
-├── README.md                         # Short setup and usage guide
-├── Cargo.toml                        # Rust workspace
-├── package.json                      # Root pnpm command aliases
-├── apps/
-│   ├── cli/
-│   │   ├── src/main.rs               # clap CLI, JSON envelopes, error mapping
-│   │   ├── src/preparation_commands.rs # Thin bounded preparation adapter
-│   │   ├── tests/cli_workflow.rs     # Process-level CLI/media integration tests
-│   │   └── tests/preparation_workflow.rs # Preparation CLI contracts
-│   ├── desktop/
-│   │   ├── src/                      # React UI, API boundary, types, styles
-│   │   └── src-tauri/                # Tauri commands, settings, native entry point
-│   ├── server/                       # Axum runtime, admin CLI, HTTP/process tests
-│   └── web/                          # Authenticated Chrome review/admin app
-├── core/
-│   ├── rcdvlog-core/src/lib.rs       # Canonical catalog, media, annotation, chronology logic
-│   ├── rcdvlog-core/src/operations.rs # Typed operations, HLC, materialization, conflicts
-│   ├── rcdvlog-server/               # Server catalog, storage, jobs, auth, media, backup
-│   ├── rcdvlog-sync/                 # Baseline/reconciliation DTOs and apply logic
-│   └── batch-estimator/src/lib.rs    # Domain-independent weighted ETA library
-├── packages/
-│   ├── project-client/               # OpenAPI snapshot and typed browser client
-│   └── review-ui/                    # Shared review components/types
-├── deploy/server/                    # Dockerfile, Compose, Caddy, Tailscale, example env
-└── docs/
-    ├── agent-cli.md                  # Full CLI and JSON contract
-    ├── batch-estimation.md           # Estimator semantics and persistence
-    ├── integration-testing.md        # Automated versus manual acceptance boundaries
-    └── server/                       # Current server operator/developer contracts
-```
+- `apps/cli` (clap JSON CLI, `src/main.rs`), `apps/desktop` (React in `src/`, Tauri in `src-tauri/`), `apps/server` (Axum runtime and admin CLI), `apps/web` (Chrome review/admin).
+- `core/rcdvlog-core` (canonical catalog, media, annotation, chronology; `src/lib.rs`, `src/operations.rs`), `core/rcdvlog-server`, `core/rcdvlog-sync`, `core/batch-estimator`.
+- `packages/project-client` (OpenAPI snapshot, typed browser client), `packages/review-ui`, `deploy/server/`, `scripts/`, `docs/`, `PRD.md`, `README.md`.
 
-Generated directories such as `target/`, `node_modules/`, `apps/desktop/dist/`, TypeScript build info, and Tauri schema output are not source.
+Annotated tree: [docs/repository-map.md](docs/repository-map.md). Generated directories (`target/`, `node_modules/`, `apps/desktop/dist/`, TypeScript build info, Tauri schema output) are not source.
 
 ## 5. Architecture and data flow
 
@@ -446,170 +133,22 @@ Rules for this boundary:
 
 ## 6. Toolchain and prerequisites
 
-Minimum documented environment:
+Apple Silicon Mac, macOS 13+; Xcode command-line tools; Rust 1.85+; Node.js 22+ and pnpm 10; FFmpeg 7+/ffprobe and ExifTool on `PATH`. Install JS dependencies with `pnpm install` from the root. The app reports missing media tools at startup (`prerequisite_status`).
 
-- Apple Silicon Mac, macOS 13+
-- Xcode command-line tools
-- Rust 1.85+ and Cargo.
-- Node.js 22+ and pnpm 10.
-- FFmpeg 7+ and ffprobe on `PATH`
-- ExifTool on `PATH`
-
-The full local Task 19 gate was verified on 2026-07-28 with Rust/Cargo 1.97.1, Node 24.14, FFmpeg/ffprobe 8.1.2, ExifTool 13.36, and Chrome 150. Docker was unavailable, so the target Ubuntu/Compose topology is not accepted.
-
-Check the environment with:
-
-```bash
-rustc --version
-cargo --version
-node --version
-pnpm --version
-ffmpeg -version | head -1
-ffprobe -version | head -1
-exiftool -ver
-```
-
-If Rust was just installed and `cargo` is not found, start a fresh login shell or load the standard Cargo environment before assuming the toolchain is missing. The app itself calls `prerequisite_status` at startup and reports missing media tools.
-
-Install JavaScript dependencies from the repository root:
-
-```bash
-pnpm install
-```
-
-The full pre-PR gate uses the CI-pinned toolchain: Rust 1.97.1,
-Node.js 24.11.0, and pnpm 10.17.0. When running that gate, install its Rust
-components and package manager with:
-
-```bash
-rustup toolchain install 1.97.1 --component rustfmt --component clippy
-corepack prepare pnpm@10.17.0 --activate
-pnpm install --frozen-lockfile
-```
-
-Use a Node.js version manager or the official Node installer to select
-24.11.0. Do not let a missing pinned tool silently fall back to another Rust
-version; `pnpm gate` verifies and uses the Rust pin before running Rust checks.
-
-Find Cargo with `command -v cargo` and `command -v rustup`; for a standard
-installation, load `~/.cargo/env` or add `~/.cargo/bin` to `PATH`. If a host
-uses a project-local installation, explicitly set `CARGO_HOME` to its Cargo
-directory, `RUSTUP_HOME` to its Rustup directory, and prepend
-`$CARGO_HOME/bin` to `PATH` before installing or invoking the pinned toolchain.
-These directories are host configuration, not paths to assume in a checkout.
-For example, an observed video workspace used `data/tools/cargo` and
-`data/tools/rustup`; other workspaces need not contain either directory.
-Never substitute the installed stable formatter when the CI pin is absent.
-
-Rust dependencies are resolved by Cargo from the checked-in `Cargo.lock`.
-
-For an agent development binding, build the CLI from the intended checkout
-with `rustup toolchain install 1.97.1 --component rustfmt --component clippy`
-and `cargo +1.97.1 build --locked -p rcdvlog-cli`. Respect the checkout's
-`CARGO_TARGET_DIR` and pass the resulting binary's absolute path to
-`workspace refresh`; `workspace check` verifies that exact path, build
-metadata, and digest and never resolves a replacement executable.
+The pre-PR gate and CI pin Rust 1.97.1 (with `rustfmt` and `clippy`), Node.js 24.11.0, and pnpm 10.17.0. Never let a missing pinned tool silently fall back to another Rust version or formatter; `pnpm gate` verifies the pin. If `cargo` is not found, load `~/.cargo/env` or an explicitly configured `CARGO_HOME`/`RUSTUP_HOME` before assuming it is missing. For an agent development binding, build with `cargo +1.97.1 build --locked -p rcdvlog-cli` and pass the resulting absolute binary path to `workspace refresh`; `workspace check` never resolves a replacement executable. Install commands, version-check commands, and the verified-toolchain record: [docs/dev-environment.md](docs/dev-environment.md).
 
 ## 7. Running the app
 
-Run the real Tauri desktop application:
+`pnpm dev` runs the real Tauri app (`RCDVLOG_CATALOG=/abs/catalog.sqlite3 pnpm dev` opens a catalog). `pnpm --dir apps/desktop dev --host 127.0.0.1` runs the Vite-only browser preview at `http://127.0.0.1:1420/` (`?clips=3000` seeds the scale fixture); it uses the CUJ harness as backend and can never validate native dialogs, Tauri-to-Rust calls, the media origin, FFmpeg, persistence, or filesystem permissions. The preview has no media origin, so no clip plays. Never treat a browser-only pass as an end-to-end media test. Builds: `pnpm --dir apps/desktop build`, `pnpm build:cli` (`target/debug/rcdvlog`), `pnpm build` (Tauri bundle), `pnpm build:server`, `pnpm build:web`. Server deployment: `docs/server/deployment.md`; security/pairing: `docs/server/security.md`. Never expose the raw `127.0.0.1:8090` backend or enable Funnel.
 
-```bash
-pnpm dev
-```
+Rules that must not be violated:
 
-Open a specific existing catalog at startup:
+- **Dev eval bridge** (`RCDVLOG_EVAL_BRIDGE=1 pnpm dev`, `pnpm eval -- '<js>'`) is a remote-code-execution surface. It must remain compiled out under `#[cfg(debug_assertions)]`, disabled unless the exact opt-in is present, bound to loopback only, and closed to every WebSocket handshake carrying an `Origin` header. Never turn it into a release diagnostic, runtime setting, or non-loopback listener. A bridge that cannot bind logs and the app starts anyway.
+- **`RCDVLOG_MEDIA_DEBUG=1`** mounts `GET /debug/media` on the media origin (behind its token, `Host` and `Origin` guard); it reports full media paths and must stay compiled out of release. `apps/desktop/src-tauri/tests/release_dev_seams_absent.rs` proves both seams are absent.
+- **Fixed ports are contracts; ephemeral ports are implementation.** A discovered listener binds `127.0.0.1:0`, reads the port back, and publishes it through a channel its consumer already reads (media origin, eval bridge). A config-pinned port gets a preflight naming the holder. Test fixtures allocate ports dynamically (`scripts/lib/loopback-port.mjs`). Never add a retry loop or fallback range.
+- **Desktop 1420 and web 1421 are contracts**: `devUrl`, the Playwright base URL, and the media origin's allowed origins name 1420, and an origin mismatch fails silently. The `predev` preflight (`scripts/preflight-dev-port.mjs`) names the holder and offers a `kill` line only for a Vite inside this checkout; it never kills anything itself.
 
-```bash
-RCDVLOG_CATALOG=/absolute/path/to/catalog.sqlite3 pnpm dev
-```
-
-For defects that only reproduce inside the live native webview, the desktop has
-a dev-only eval bridge. It is a remote-code-execution surface and must remain
-compiled out under `#[cfg(debug_assertions)]`, disabled unless the exact opt-in
-is present, bound to loopback only, and closed to every WebSocket handshake
-carrying an `Origin` header. Never turn it into a release diagnostic, runtime
-setting, or non-loopback listener.
-
-```bash
-RCDVLOG_EVAL_BRIDGE=1 pnpm dev
-pnpm eval -- 'document.readyState'
-pnpm eval -- --file /absolute/path/to/probe.js
-```
-
-The bridge binds an ephemeral port and publishes it two ways: the marker line
-`[RCDVLOG_EVAL_BRIDGE_COMPILED] listening on ws://127.0.0.1:<port>` on the app's
-stdout, for a harness that spawned the app, and a JSON address file for a client
-that did not. `pnpm eval` finds the file on its own; `--port` and `--wait` are
-there for tooling. Set `RCDVLOG_EVAL_BRIDGE_ADDRESS_FILE` to give a concurrent
-run its own address file, and `RCDVLOG_EVAL_BRIDGE_PORT` to pin the listener for
-a tool that can read neither. A bridge that cannot bind logs and the app starts
-anyway: no dev convenience may keep the app from launching.
-
-**Fixed ports are contracts; ephemeral ports are implementation.** A listener
-whose address is discovered at runtime binds `127.0.0.1:0`, reads the assigned
-port back, and publishes it through a channel its consumer already reads — the
-media origin (`media_server.rs`) and the eval bridge both do exactly this. A
-config-pinned port gets a preflight that names the process holding it. Test
-fixtures always allocate dynamically (`scripts/lib/loopback-port.mjs`). Never
-add a retry loop or a fallback range: a listener that comes up somewhere its
-consumers are not looking is a silent failure, which is worse than a named bind
-error.
-
-The desktop's 1420 and the web app's 1421 are contracts — `devUrl`, the
-Playwright base URL, and the media origin's allowed origins all name 1420, and
-an origin mismatch fails *silently*. Their `predev` preflight
-(`scripts/preflight-dev-port.mjs`) turns a raw `EADDRINUSE` into the holder's
-command and pid, and offers a `kill` line only for a Vite whose working
-directory is inside this checkout. It never kills anything itself, and it never
-claims a process it cannot positively identify.
-
-The loopback media origin has a second, narrower dev-only seam under the same
-rules, for the case where a clip will not play and the app is the only thing
-that knows why. `RCDVLOG_MEDIA_DEBUG=1` mounts `GET /debug/media` on the origin
-— behind its existing token, `Host` and `Origin` guard — and publishes the
-origin on `window` so the eval bridge can find its ephemeral port and token.
-
-```bash
-RCDVLOG_EVAL_BRIDGE=1 RCDVLOG_MEDIA_DEBUG=1 pnpm dev
-pnpm eval -- 'window.__RCDVLOG_MEDIA_ORIGIN__.debugUrl'
-curl -s '<that url>&asset=<asset id>' | jq .probe
-```
-
-It reports the last 50 requests and, for a named asset, exactly why resolution
-would fail — `unknown_asset`, `no_representation`, `missing`, `not_a_file` or
-`outside_roots` — which the media route flattens into a bare 404. It reports
-full media paths, so it must stay compiled out of release like the eval bridge;
-`apps/desktop/src-tauri/tests/release_dev_seams_absent.rs` proves both are.
-
-The client prints JSON values and structured JavaScript errors. Every probe is
-logged by the running app. See `docs/tasks/desktop/DEV_EVAL_BRIDGE.md` for the
-contract, tests, and release-binary absence check.
-
-The Vite-only browser preview is useful for fast layout and interaction work:
-
-```bash
-pnpm --dir apps/desktop dev --host 127.0.0.1
-```
-
-It runs at `http://127.0.0.1:1420/`. Append `?clips=3000` to seed a project at
-the scale section 1 sets instead of the fourteen-clip demo; that is what
-`e2e/scale.spec.ts` boots to measure what the queue and the ribbon cost to
-mount. Outside Tauri, `main.tsx` installs the CUJ harness (`apps/desktop/src/preview/`) as the backend, so the preview exercises the real adapters against the same fake backend the CUJ suite drives. `api.ts` and `chronologyApi.ts` have no environment branches left, and a behaviour change in `apps/desktop/src/test/harness/commands/` shows up in both the preview and the CUJ suite. Progress and cancellation are driven on real timers by `src/preview/liveJobs.ts`, which only the preview loads.
-
-It still cannot validate native dialogs, Tauri commands reaching Rust, the loopback media origin, FFmpeg child processes, persistence, or filesystem permissions. The preview has no media origin, so no clip plays. Never treat a browser-only pass as an end-to-end media test.
-
-Build outputs:
-
-```bash
-pnpm --dir apps/desktop build       # TypeScript + Vite frontend
-pnpm build:cli                      # target/debug/rcdvlog
-pnpm build                          # Tauri application bundle
-```
-
-`pnpm build` may require the native macOS/Tauri packaging environment and takes longer than the frontend build.
-
-Build the companion server and web application with `pnpm build:server` and `pnpm build:web`. Production deployment is documented in `docs/server/deployment.md`; security/bootstrap/pairing is in `docs/server/security.md`. Never expose the raw `127.0.0.1:8090` backend, enable Funnel, or treat the desktop/browser mocks as server acceptance.
+Eval-bridge env/address-file and media-debug workflow: [docs/dev-environment.md](docs/dev-environment.md).
 
 ## 8. Project discovery, catalogs, and storage
 
@@ -636,7 +175,7 @@ Catalog selection precedence for the CLI:
 
 Always pass `--catalog` in agent automation, tests, and temporary workflows. A desktop project folder can otherwise be confused with the legacy catalog.
 
-SQLite connections enable foreign keys, WAL journal mode, and a five-second busy timeout. Read operations can continue during an uncommitted writer. Project mutations append typed operations with materialized revisions. Adopted projects synchronize bounded operation pages between independent local catalogs; live SQLite/WAL files are never copied or placed on NAS.
+SQLite connections enable foreign keys, WAL journal mode, and a five-second busy timeout. Read operations can continue during an uncommitted writer. Bundled SQLite must stay at 3.51.3 or newer (`rusqlite` 0.39+): 3.51.1 deadlocks when two connections to one WAL database close at the same time, and the catalog opens a connection per operation (guarded by `core/rcdvlog-core/tests/sqlite_concurrent_close.rs`, #258). Project mutations append typed operations with materialized revisions. Adopted projects synchronize bounded operation pages between independent local catalogs; live SQLite/WAL files are never copied or placed on NAS.
 
 Project catalogs use an explicit `schema_migrations` history and are currently at version 66. The server control catalog is version 16; backup format is version 1. Migration definitions have immutable names/source identities and each migration commits atomically. Migration 18 includes a one-time compatibility reconciliation for catalogs created on the import feature branch before its migration IDs were merged with main. When changing the schema:
 
@@ -648,429 +187,66 @@ Project catalogs use an explicit `schema_migrations` history and are currently a
 
 ## 9. Core data and media behavior
 
-### Assets and patches
+Full recipes and measured tables: [docs/core-media-reference.md](docs/core-media-reference.md); read it before changing these areas. Rules not to violate are inline.
 
-`Asset` is defined canonically in `core/rcdvlog-core/src/lib.rs` and mirrored in `apps/desktop/src/types.ts`. Availability is computed on read:
+### Assets, ingest, chronology
 
-- `originalAvailable`: at least one node-local location exists and its sampled
-  fingerprint has been verified against the asset identity.
-- `proxyAvailable`: stored proxy path currently exists.
-- `available`: original or proxy is available.
-- Thumbnail path/quality are returned only when the stored file exists.
+- `Asset` is defined canonically in `core/rcdvlog-core/src/lib.rs` and mirrored in `apps/desktop/src/types.ts`. Availability is computed on read: `originalAvailable` needs a node-local location whose sampled fingerprint was verified; `proxyAvailable` needs the stored proxy path to exist; thumbnails are returned only when the file exists.
+- `AssetPatch` is a full annotation replacement (notes, labels, removed, rotation all required). React's `patchFor(asset)` sends the full current state; the CLI fetches the asset, merges optional flags, and sends the full patch. Preserve this on both sides.
+- Ingest scans recursively without following symlinks (`mp4 mov m4v mts m2ts avi`, case-insensitive). Identity is a sampled BLAKE3 fingerprint (size plus up to 1 MiB from start, middle, end), unique per `(project_id, fingerprint)`; re-ingest is idempotent. Originals stay at their paths. ExifTool failure degrades to other metadata and must not block ingest.
+- Chronology order is `best_time IS NULL, best_time, filename, id`; raw camera timestamp text is preserved. A clock event applies a fixed offset per camera from a lexical filename boundary and never mutates source metadata. The story ribbon spaces clips by ordinal position, not duration (68 px columns, `[`/`]` zoom, `C` centers); do not revert to a fit-all duration plot.
 
-The Rust/Tauri `AssetPatch` is a full annotation replacement: notes, labels, removed, and rotation are all required. React's `patchFor(asset)` deliberately sends the full current state. The CLI offers patch-like optional flags by fetching the current asset, merging changes, and then sending the full core patch. Do not change one side without preserving this behavior.
+### Proxies and thumbnails
 
-### Ingest and identity
+- **Only the original is accepted as proxy input**; an offline original fails explicitly. Candidates are written to unique staging files and validated (H.264, at most 1280 px wide, `yuv420p`, zero display rotation, duration correspondence, AAC audio present, full decode) before atomic commit; a failed transaction never changes `assets.proxy_path`. Proxy version 2 is obsolete.
+- `auto` is the safe encoder default and `software` never initializes hardware. macOS tries VideoToolbox (up to four workers) and retries the software recipe on failure; Linux `auto` uses VAAPI only after a bounded synthetic FFmpeg probe proves it, never from device-file presence or an encoder listing alone. The software recipe overrides input rotation to 0, scales to at most 1280 px, `libx264 veryfast` CRF 23, AAC 128 kb/s, `+faststart`.
+- FFmpeg progress is ETA display only: only a completed clip updates persisted throughput.
+- Proxy and thumbnail writers share cross-process claims in `cache/.representation-locks`; lock files persist and must never be unlinked. A busy CLI writer exits with `representation_busy`; batches count contention as skipped, not failed.
+- Only thumbnail quality 1 (JPEG at 20% of duration, at most 480 px, `q1.v2.jpg`) is implemented; qualities 2-10 must keep failing clearly. Input preference is original, then proxy.
 
-Ingest recursively scans without following symlinks and accepts these extensions case-insensitively:
+### Transcription (local, offline)
 
-```text
-mp4 mov m4v mts m2ts avi
-```
+- **Audio comes from the proxy, never the original**; a clip with no proxy fails explicitly. Recipe `stt.whisper-large-v3-turbo-q5_0.vad-silero-v5.win30.v1`, batch key `...-w1` (one worker); a transcript is identified by recipe plus the proxy's sampled fingerprint, so a regenerated proxy makes it stale.
+- **Never enable `whisper-rs`'s `metal` feature** (it emits a macOS 15 symbol and will not launch on the documented OS floor); the dependency stays `default-features = false`. CPU-only is deliberate.
+- **Probe audio before extracting PCM** with `probe_source_audio_present`; a valid video without audio completes as `no_audio` with zero VAD/ASR work. Probe or extraction failure is `failed` and retryable; corrupt media is never reclassified as silence.
+- **The VAD gate is a correctness requirement**: with no detected speech the clip is stored as `no_speech` (reason `no_detected_speech`) and never reaches a model. `no_speech` is a success and must never be conflated with `failed`. Detected speech followed by empty provider output is `no_accepted_speech` (`empty_provider_output`). Quality-gate rejections stay `rejected`. Legacy rows migrate as `legacy_no_speech_unverified` and are review-required.
+- Windows are 30 seconds; do not reintroduce 8-25 s chunking. Do not use `no_speech_probability()` as a gate; the local gate is repetition `>= 0.3` or a known token-probability mean below `0.20`. Missing or malformed probability evidence is rejected (`missing_probability_evidence`, `invalid_probability_evidence`), never invented as 0 or 1, and provider confidence or log-probability must not be relabelled as mean token probability.
+- **A batch never downloads a model**; it fails naming the file, size, and location. Installation is explicit (global settings or CLI `models install`). Models live in `<data dir>/com.rcd.vlogcutter/models/` (the older per-project `cache/models/` is still read). CLI `models status` and `transcribe batch` semantics: [docs/agent-cli.md](docs/agent-cli.md).
 
-Identity uses a sampled BLAKE3 fingerprint based on file size plus up to 1 MiB from the beginning, middle, and end. The unique database constraint is `(project_id, fingerprint)`. Re-ingest is idempotent within a project. Originals stay at their existing paths.
+### Clip analysis (opt-in cloud)
 
-ffprobe supplies duration, frame rate, dimensions, codec, tags, and timestamp candidates. ExifTool currently supplements camera make/model; absence or failure should degrade to other metadata rather than prevent every ingest.
+- Reads proxies, never originals; sends a deterministic frame pack (recipe `framepack.2fps.skip400ms.max40.win3-8.sharp-bright-motion.dhash8-d5.v1`) plus an accepted transcript when current. Prompt `vlm.observe.v2` with bounded-schema and domain validation. The OpenRouter key comes from `OPENROUTER_API_KEY` or `~/.openrouter.key` and is never stored in a catalog. Qwen is the default with Gemini fallback.
+- Output is a suggestion layer: human notes are never touched; label consolidation remaps only labels in the AI ownership table and commits typed operations; title/description use `set_clip_summary`, not `AssetPatch`. Analysis is stale when frame recipe, prompt version, representation, or proxy fingerprint changes.
+- Paid analysis is admitted only through a concrete `RunPolicy` ([docs/analysis-preflight.md](docs/analysis-preflight.md)) with a separate authorization record and bounded pilot; frames-only requests never read or send transcripts, project vocabulary needs its own approval, unknown/interrupted usage is fail-closed, and any policy/source/schema/context change invalidates approval. Provider diagnostics persist stable categories only. The legacy runtime ceiling is not cross-process safe; do not claim concurrent safety until runtime wiring calls `analysis::accounting`.
+- Cancellation: batch callbacks return `ControlFlow`; `Break` stops new claims without abandoning paid requests, and every stage commits per clip. `moments` and `prepare` CLI adapters take explicit scope, are suggestions requiring review, and never change inclusion, human annotations, or chronology.
 
-### Chronology
+### Batch estimation, calibration, publishing, edit planning
 
-Assets are ordered deterministically by:
-
-```text
-best_time IS NULL, best_time, filename, id
-```
-
-Raw camera timestamp text is preserved separately. `best_time` is normalized RFC 3339 UTC when parseable. A clock event applies a fixed offset to one camera from a lexical filename boundary onward. Recalculation chooses the latest applicable boundary and never mutates source metadata.
-
-The current compact story ribbon spaces clips by ordinal position, not duration or elapsed wall-clock distance. This is intentional: relative ordering and context are more important than absolute time span. Default column width is 68 px, `[`/`]` zoom, and `C` centers the selected clip. Do not revert it to a fit-all duration plot.
-
-### Proxies
-
-Proxy generation uses one shared explicit encoder policy. `auto` is the safe
-default; `software` never initializes hardware. Linux `auto` first runs a bounded
-synthetic FFmpeg probe and only then may use the VAAPI full-clip
-decode/scale/H.264-encode path. Device-file presence or an encoder listing alone
-never marks hardware usable. Capability JSON distinguishes `device_unavailable`,
-`device_permission_denied`, `ffmpeg_encoder_unavailable`,
-`initialization_failed`, and `usable`; `proxy probe --policy auto|software`
-exposes it. `proxy provenance --asset <id>` exposes durable attempt/fallback
-evidence, and `proxy history` exposes encoder/worker-scoped rates.
-
-On macOS up to four local workers run concurrently. Each first tries
-VideoToolbox hardware decode and H.264 encode with the CPU scaler retained for
-materially better downscale quality. The hardware settings are equivalent to:
-
-- `-hwaccel videotoolbox` with H.264 `h264_videotoolbox` High profile.
-- VideoToolbox constant quality 36 and `power_efficient=1`.
-- Scale down to at most 1280 px wide while preserving aspect ratio.
-- AAC 128 kb/s and `+faststart`.
-
-If VideoToolbox is unavailable, busy, or rejects an input, the Mac retries the
-existing software recipe automatically. On Linux the VAAPI recipe initializes
-one render node for hard decode, `-filter_hw_device`, `scale_vaapi`, and
-`h264_vaapi` at QP 23. A hardware process or validation failure removes only the
-unique staging output and retries software. The Ubuntu companion server reads
-`RCDVLOG_PROXY_ENCODER_POLICY` (default `auto`) and persists actual encoder,
-attempt, fallback, and validation evidence in server job details. The standard
-software recipe remains:
-
-- Override the input display rotation to 0 and disable autorotation, preserving raw encoded orientation without copying the camera display matrix.
-- Scale down to at most 1280 px wide while preserving aspect ratio.
-- H.264 `libx264`, `veryfast`, CRF 23, `yuv420p`.
-- AAC 128 kb/s and `+faststart`.
-
-FFmpeg proxy processes emit output-timestamp progress once per second. Convert
-that duration fraction into partial source-byte work so active clips reduce the
-ETA before they finish. Partial work is display/ETA state only and must not
-update persisted throughput; only a successful completed clip contributes its
-full bytes and worker duration. Reset partial work if VideoToolbox fails before
-starting the software fallback, and retain completion-only behavior when FFmpeg
-does not provide a usable timestamp.
-
-Only the original is accepted as proxy input. If the original is offline, proxy generation fails explicitly. Generated candidates are written to unique staging files and validated for H.264, at most 1280 px wide, `yuv420p`, zero display rotation, source-time duration correspondence, source-audio presence as AAC, and successful video+audio decode before atomic commit. Each transaction writes `proxy_generation_provenance` (recipe, actual encoder, device, policy, timing, ordered failures, fallback flag, validation, timestamp) in canonical SQLite; a failed transaction never changes the registered `assets.proxy_path`. Version-2 proxies are obsolete because they may retain the source display matrix; a later “missing” run regenerates them and skips only valid current-version paths that still exist.
-
-Proxy and thumbnail writers share cross-process claims in the managed `cache/.representation-locks` directory. Claims use the canonical cache root, asset ID, and representation kind; lock files persist after release and must never be unlinked. SQLite remains canonical. A busy single-item CLI writer exits with JSON code `representation_busy`; batch writers count contention as skipped work without recording a failure or throughput sample. Proxy downloads claim before requesting content and stream into unique staging paths, so a stale writer cannot overwrite a later transaction.
-
-### Thumbnails
-
-Only quality 1 is implemented. It is a JPEG at 20% of clip duration, at most 480 px wide, generated to a unique staging file and atomically renamed to `q1.v2.jpg`. Input preference is original, then available proxy. Qualities 2–10 are reserved and must continue to fail clearly until intentionally implemented.
-
-Q1 thumbnails and analysis-selected Q10 representative thumbnails use the same cross-process thumbnail claim as desktop and sync work. See the proxy section above for busy-result and persistent-lockfile behavior; keep the existing output names and recipes unchanged.
-
-### Transcription
-
-Local speech-to-text ships. It runs entirely offline with no API key and never
-touches the network. Design and measurements:
-[spec](docs/superpowers/specs/2026-08-03-stt-vlm-clip-analysis-design.md),
-[round-1 spike](docs/spikes/2026-08-03-stt-analysis-spikes.md).
-
-- **Audio comes from the proxy, never the original.** The original may be
-  offline on the NAS, and transcription must work whenever proxies exist. A clip
-  with no proxy fails explicitly rather than falling back.
-- **Recipe key**: `stt.whisper-large-v3-turbo-q5_0.vad-silero-v5.win30.v1`. A
-  transcript is identified by that key plus the sampled BLAKE3 fingerprint of the
-  proxy it came from, so regenerating a proxy makes its transcript stale.
-- **Batch key**: `stt.whisper-large-v3-turbo-q5_0.vad-silero-v5.win30.v1-w1`,
-  one worker. Peak RSS is 1.15–1.38 GB and concurrent transcription alongside the
-  four-worker VideoToolbox proxy pipeline has never been measured.
-- **CPU-only, deliberately.** Do not enable `whisper-rs`'s `metal` feature: ggml
-  gates `MTLResidencySetDescriptor` on the SDK rather than the deployment target,
-  so a Metal build emits a macOS 15 symbol and will not launch on the documented
-  OS floor. The dependency is declared `default-features = false`.
-- **Probe audio before extracting PCM.** Transcription reads the proxy and
-  calls the reviewed `probe_source_audio_present` FFprobe helper first. A valid
-  video with no audio stream completes as `no_audio` with zero VAD/ASR/model
-  work and is reused like any other terminal transcript. A probe or extraction
-  failure stays `failed` and retryable; corrupt media is never reclassified as
-  silence.
-- **The VAD gate is a correctness requirement, not an optimization.** Given
-  silence, whisper invents fluent speech at high confidence. A clip with no
-  detected speech is stored as `no_speech` with reason `no_detected_speech` and
-  is never handed to any model. `no_speech` is a success and must never be
-  conflated with `failed`, or every silent clip is retried forever. Detected
-  speech followed by empty or unusable provider output is
-  `no_accepted_speech` with reason `empty_provider_output`, not silence.
-  Quality-gate rejections remain `rejected`; exact proxy fingerprints,
-  detected-speech duration, decode-window count, raw provider segment count,
-  mean token probability and repetition ratio stay attached to the outcome.
-  Token probability is optional and stored as SQL NULL when a candidate has no
-  comparable measurement; missing evidence is rejected explicitly rather than
-  invented as confidence 0 or 1. Provider confidence and average log
-  probability are different native metrics and must not be relabelled as a
-  mean token probability.
-- **Legacy compatibility is explicit.** Rows written before audio probing and
-  provider-output distinctions existed keep status `no_speech` but migrate with
-  reason `legacy_no_speech_unverified`. Preparation marks those rows
-  review-required because they cannot prove verified silence. Transcript
-  coverage reports `no_audio` and `no_accepted_speech` separately.
-- **Windows are 30 seconds.** whisper bills a full window per decode regardless
-  of content, so speech regions are packed into as few windows as possible. Do
-  not reintroduce the PRD's 8–25 second chunking: measured, it ran 30% slower on
-  39% less audio.
-- **Do not use `no_speech_probability()`** as a quality gate. Measured median
-  0.000 for good and bad transcripts alike. The local gate that works is
-  repetition at `>= 0.3` or a known token-probability mean below `0.20`.
-  Non-empty candidate output with any missing probability evidence is rejected
-  as `missing_probability_evidence`; malformed provided values are rejected as
-  `invalid_probability_evidence`. Unknown evidence must not dilute a known bad
-  mean into a pass.
-- **A batch never downloads a model.** It fails with an actionable error naming
-  the file, its size, and where it belongs. Installation is a separate, explicit
-  user action: global settings and CLI `models install` share
-  `install_speech_models_with_progress`. Preserve this split; a 574 MB
-  transfer must never begin as a side effect of pressing Analyze.
-- Models live in a shared application-support directory
-  (`<data dir>/com.rcd.vlogcutter/models/`) so one copy serves every project. The
-  older per-project `<project folder>/cache/models/` location is still read when
-  it holds the model, so existing installs are not re-downloaded.
-- CLI `models status` reads identity, integrity, readiness and managed location
-  without catalog writes, downloads or engine initialization. CLI `transcribe
-  batch` validates an exact project-owned selection, reuses current non-failed
-  transcripts, and opens one engine for pending clips. Progress includes per-asset
-  outcomes and a one-worker estimate; cancellation preserves completed work and
-  failures remain retryable. Existing single-clip and whole-project commands stay
-  compatible. See `docs/agent-cli.md`.
-
-**Measured end to end**, release build, M3 MacBook Air (fanless), one worker,
-273-clip Osaka/Expo project, 129.1 minutes of footage:
-
-| Measure | Value |
-| --- | --- |
-| Wall time | **31.5 min** |
-| Clips with speech | 131 |
-| Clips gated as `no_speech` | 135 (49%) |
-| Rejected by the hallucination gate | 7 (5 repetition, 2 low token probability) |
-| Failures | 0 |
-| Windows decoded | 155 |
-| Speech audio | 15.9 min |
-| Cost per window | ~12.2 s |
-| Transcript segments stored | 380 |
-
-Three of these correct round-1's projections and should be trusted over them:
-
-1. **The corpus needs ~155 windows, not the ~20 round 1 projected.** That
-   projection divided total speech by 30 seconds, but a window cannot span two
-   clips, so the floor is one window per speech-bearing clip. 126 of 131 speech
-   clips used exactly one window. Per-window cost was right; the count was off
-   7x, and with it the "~3.5 minutes for the whole project" figure.
-2. **The VAD gate skips 49% of clips, not 64%.** whisper.cpp's built-in VAD at
-   default parameters gates less aggressively than the tuned Silero ONNX harness
-   round 1 used. That costs decode time and is the safer direction, but the
-   thresholds are worth revisiting.
-3. **12% of speech clips get a language tag outside the supported en/ja/zh set**
-   — 12 Korean, 2 Russian, 1 Polish, 1 Spanish. Round 1 called Korean a
-   hallucination marker on this corpus. A World Expo plausibly contains all of
-   them, so this is unverified either way, but STT language tags are currently
-   **not** domain-validated against a closed vocabulary the way the design
-   requires for model output.
-
-### Clip analysis
-
-Cloud vision analysis is opt-in and runs from either the CLI or the desktop. It
-reads proxies, never originals,
-and sends a deterministic pack of JPEG frames plus an accepted speech transcript
-when one is current. The OpenRouter key resolves from `OPENROUTER_API_KEY` or
-`~/.openrouter.key`; it is never stored in a project catalog.
-
-- **Frame recipe**:
-  `framepack.2fps.skip400ms.max40.win3-8.sharp-bright-motion.dhash8-d5.v1`.
-  Candidates begin 400 ms after the start and omit the final 400 ms. Selection
-  is deterministic and combines sharpness, brightness, motion, and dHash
-  diversity into 3–8 frames.
-- **Prompt version**: `vlm.observe.v2`. Every response passes a bounded JSON
-  schema and domain validation. The representative thumbnail must name one of
-  the supplied frame timestamps.
-- **Providers**: Qwen is the default. A process-wide circuit breaker switches
-  the batch to Gemini after repeated transport/provider failures. A
-  domain-invalid default response is retried once with Gemini.
-- **Ownership**: title, description, and AI labels are suggestions. Human notes
-  are never touched; label consolidation remaps only labels recorded in the AI
-  ownership side table and commits the resulting label changes as typed project
-  operations. Title and description are human-editable through the dedicated
-  `set_clip_summary` operation; they are deliberately not part of `AssetPatch`,
-  whose four fields are a full-replacement contract shared with the CLI.
-- **Staleness**: analysis is current only for the same frame recipe, prompt
-  version, representation, and proxy fingerprint. Regenerating the proxy makes
-  the observation stale.
-- **Budget/concurrency**: the cost ceiling and worker count are parameters on
-  `AnalysisRunOptions`, falling back to `RCDVLOG_VLM_MAX_COST_USD` and
-  `RCDVLOG_VLM_WORKERS` (default 4) when unset. The legacy runtime ceiling is
-  checked before each request against returned provider usage and is not yet
-  cross-process safe. The durable admission/dispatch foundation is
-  `analysis::accounting` plus migration 38: initialize its canonical authority
-  before creating new runtime run/pilot rows, then atomically reserve the full
-  provider-owned bound and commit the dispatch marker before transport. Provider
-  wrappers and runtime/CLI wiring are follow-up work; do not claim concurrent
-  runtime safety until they call this owner. Progress weights are the exact
-  number of selected frames.
-- **Cancellation**: batch progress callbacks return `ControlFlow`. Returning
-  `Break` sets the same stop flag the budget ceiling uses, so workers stop
-  claiming new clips without abandoning a request already paid for. Every stage
-  commits per clip and skips current clips, so a cancelled run resumes.
-- **Run accounting**: `analysis_runs` records one row per desktop run with its
-  stage, counts, spend, and stop reason. The pre-run cost projection comes from
-  this project's own observed cost per clip, falling back to
-  `REFERENCE_COST_PER_CLIP_USD` until the first run. Like `analysis_labels`, the
-  table is local and unsynced.
-
-Within-clip moment discovery lives in `analysis/moments` and is exposed through
-the thin `moments plan/discover/list/get` CLI adapter. It requires explicit
-project/asset scope, provider, model, payload and spend ceiling, reuses current
-proxies and accepted timed speech, and stores resumable steps and evidence in
-SQLite. Reuse the shared representation claims and analysis-run accounting;
-unknown usage blocks new paid requests until explicit recovery authorization.
-Sparse coverage and candidate ranges remain suggestions requiring manual
-review; discovery never changes inclusion, human annotations or chronology.
-
-The `prepare preflight/run/evidence` CLI composes existing representation,
-transcript, orientation, and moment evidence for an explicit project/asset
-scope. Preflight and evidence require an existing explicit catalog and open it
-read-only; only `prepare run` mutates, and paid moments work requires its
-explicit provider/model/payload/budget policy. Pagination outcomes describe
-only the current page, scope fingerprints are selectors rather than snapshots,
-and sparse samples never certify arbitrary edit ranges. Full proxy replacement
-invalidates transcript binding. Preparation preserves originals, human
-annotations, orientation choices, and chronology; see `docs/agent-cli.md`.
-
-Paid analysis is admitted only through a concrete `RunPolicy` (see
-`docs/analysis-preflight.md`). The policy binds exact project-owned asset/source
-identities, provider/model allowlist and permitted fallbacks, frames/audio/
-transcript payload, explicitly approved project-vocabulary context, expected
-cost, requested ceiling, prompt/schema/recipe/tool versions and readiness.
-Authorization is a separate SQLite record from the bounded runtime pilot. An
-explicit CLI/desktop batch invocation materializes that policy automatically,
-records approval, runs the pilot, then executes the exact authorized scope; no
-sample or budget approval broadens model/payload/scope. Frames-only requests
-must not read or transmit transcripts; project vocabulary requires its own
-explicitly approved context and stays frozen to that snapshot during a run. Pilot spend counts against
-the same ceiling; unknown or interrupted usage is retained and fail-closed.
-Any policy/source/schema/context change invalidates the approval and pilot,
-including after restart. Provider diagnostics persist only stable categories,
-never response bodies or raw error strings.
-
-**Measured end to end**, 2026-08-04, M3 MacBook Air, four workers, 273-clip
-Osaka/Expo project:
-
-| Measure | Value |
-| --- | --- |
-| Main pending batch | **252 clips in 10 min 29 s** |
-| Final current coverage | **273 / 273** |
-| Failed or rejected | 0 |
-| Transcript fused | 131 clips |
-| Provider fallback | 1 clip (Qwen 429 to Gemini) |
-| Stored analysis cost | **$0.02732851** |
-| Negative controls | 12 / 12 passed; $0.000505 |
-| Consolidated vocabulary | 6 labels; 149 asset mappings |
-
-### Batch estimation
-
-All long batch work should use `core/batch-estimator`, not an ad hoc ETA. Callers provide work weights, explicit worker count, optional persisted `RateHistory`, and successful per-worker elapsed observations. The estimator balances remaining weights across workers and reports the slowest shard. Failures advance item completion but do not contaminate throughput.
-
-Current task keys are versioned. macOS proxy generation has its own history
-because VideoToolbox throughput is not comparable to the server/software path:
-
-```text
-proxy.h264-720p.orientation-v3.macos-videotoolbox-w{1,2,3,4}-v2
-proxy.h264-720p.orientation-v3.macos-software-w{1,2,3,4}-v2
-proxy.h264-720p.orientation-v3.linux-vaapi-qp23-wN-v1
-proxy.h264-720p.orientation-v3.linux-software-wN-v1
-thumbnail.q1.orientation-v2
-stt.whisper-large-v3-turbo-q5_0.vad-silero-v5.win30.v1-w1
-vlm.observe-v2.framepack.2fps.skip400ms.max40.win3-8.sharp-bright-motion.dhash8-d5.v1-w{1,2,3,4}-v1
-```
-
-Change the task key when settings or concurrency change enough that old throughput is no longer comparable. Proxy and thumbnail weights are source bytes. macOS proxy batches use up to four workers, single-proxy calls and thumbnails use one, and the non-macOS/server proxy path remains one worker. A future cloud/VLM task must pass its real shard concurrency.
-
-The server persists histories in its control catalog scoped to its stable node and task key. The default resource model is one shared local-heavy slot (proxy/transcode and full-hash cannot overlap) plus up to two overlapping lightweight workers. Durable progress must supply the exact remaining weights and actual worker count; only successful item observations update throughput.
-
-### Host calibration and the shared local-heavy slot
-
-`rcdvlog calibrate run` is an explicit, bounded, opt-in benchmark. It uses generated synthetic media by default; `--media` is required to authorize one representative file, whose bytes are read but whose path/filename are never persisted. Readiness, preflight, import, and normal analysis must never start a benchmark or download a model. Calibration results live in canonical SQLite and are reused only when host, build, media-tool executable/version, device/model, recipe, representation kind, and candidate configuration identities all match. Running/interrupted rows, failures, not-ready model conditions, changed tools, and explicit overrides remain uncertainty and must not be turned into a calibrated ETA or a completion promise.
-
-One progress/eta range rule applies: a single timing sample widens the reported range rather than pretending a point estimate is precise. Speech calibration compares finite, non-overlapping, in-range detected regions against the baseline before adopting a faster VAD thread setting; it never assumes one thread is universally optimal. Proxy calibration uses the existing output validation/render/audio contract and records the actual selected encoder. Explicit encoder/worker/VAD/decode overrides are validated, carry explicit provenance, and use settings-qualified history keys when they differ from the defaults.
-
-The accepted #53 resource model is one shared local-heavy slot across proxy/transcode, full-hash, speech, and future local VLM/analysis work. The server scheduler claims the union of heavy classes from one durable eligible-work queue (newest explicit heavy work first, intentional LIFO), and lightweight work may overlap under its own cap. Proxy, transcription, preparation, and calibration entrypoints take one advisory same-host/same-user filesystem lease; batch internals must not nested-acquire it. This lock coordinates processes on one host only and is not a distributed cluster scheduler. Existing per-asset representation claims remain separate integrity locks.
-
-### YouTube publishing
-
-Upload-only OAuth, persistent node-local credentials and resumable uploads are
-implemented in `core/rcdvlog-core/src/youtube`, with a thin `youtube` CLI adapter.
-Project schema 49 owns the local, unsynced upload ledger. Credentials stay outside
-project catalogs (macOS Keychain or owner-only local file). Scope is exactly
-`youtube.upload`; do not add read/management scopes for convenience. Desktop
-loopback and Web client HTTPS callbacks share PKCE, state validation and token
-storage. Web callbacks require an exactly registered HTTPS URI, a fixed loopback
-port and a trusted proxy preserving Host; never enable Funnel or open the raw
-listener on a non-loopback address. Auth status
-is observational. Never silently recreate an expired/uncertain session or log
-tokens, codes, verifiers, or resumable session URLs. See
-[YouTube publishing](docs/youtube-upload.md) for setup, recovery, JSON contracts
-and outstanding real-Google/Keychain acceptance. Render scheduling is not
-implemented; a caller explicitly invokes upload after a successful render.
-
-### Edit planning and export
-
-Edit-plan revisions are separate from labels and reversible removal. The basic
-desktop action seeds a plan from visible, non-removed clips, while the core owns
-ordered source ranges, validation, preview generation, and OTIO export. Do not
-move rough-cut inclusion or source-range controls back into the labeling phase;
-finish them in the dedicated edit-plan surface. Removal continues to control
-labeling visibility only.
+- All long batches use `core/batch-estimator` with explicit worker count and versioned task keys; change the key when settings or concurrency change. Failures never contaminate throughput history. Task keys: [docs/batch-estimation.md](docs/batch-estimation.md).
+- `rcdvlog calibrate run` is explicit and opt-in; readiness, preflight, import, and analysis never start a benchmark or download a model. One shared local-heavy slot covers proxy/transcode, full-hash, speech, and future local analysis; entrypoints take one advisory same-host filesystem lease and batch internals must not nested-acquire it.
+- YouTube: scope is exactly `youtube.upload`; never add read/management scopes; never log tokens, codes, verifiers, or session URLs; never silently recreate an expired session. Callers invoke upload explicitly after a successful render ([docs/youtube-upload.md](docs/youtube-upload.md)).
+- Edit-plan revisions are separate from labels and removal; rough-cut inclusion and source ranges live only in the edit-plan surface. Removal controls labeling visibility only.
 
 ## 10. Desktop UI conventions
 
-The UI is intentionally keyboard-first and dense, using one main `App.tsx` today. Keep domain logic out of it even if component extraction is useful.
+Keyboard-first and dense; domain logic stays out of `App.tsx`. Full API/state, ribbon, CSS, and top-bar-ladder detail: [docs/desktop-ui-conventions.md](docs/desktop-ui-conventions.md).
 
-### API and state
-
-- `apps/desktop/src/api.ts` selects real Tauri calls when `__TAURI_INTERNALS__` exists and mock behavior otherwise.
-- Optimistic asset updates call the core and replace the returned canonical `Asset`; failures roll back and surface an error.
-- Progress events are `proxy-progress`, `thumbnail-progress`, `analysis-progress`, and `model-install-progress`. Each of the first three carries an optional completed asset plus a batch estimate. Merge a completed asset immediately so thumbnails, proxies, and generated titles appear as they finish. `analysis-progress` additionally carries the current stage and the run's spend so far.
-- Media playback prefers an available proxy, otherwise an available original. Thumbnails are also used as the video's poster frame.
-- `api.mediaUrl` builds a URL against the loopback media origin, passing the asset id and the representation it chose (`rep=proxy` or `rep=original`) plus the session token. The base URL and token arrive on `mediaOrigin`, returned by `desktopSettings` and the other settings commands and held in memory only. Keep the proxy-versus-original decision here, next to rotation and poster agreement, rather than moving it into the origin.
-- When a mounted element fires `error`, the shell calls `api.recoverMediaOrigin()`, which health-checks the origin and restarts it once per session. A healthy origin is returned unchanged so an ordinary decode failure does not invalidate every URL on screen.
-- Playback controls are custom stage-level UI so they remain horizontal while the media element rotates. Do not re-enable native `<video controls>` unless rotation is moved off the video element; native controls inherit its CSS transform.
-- The React `assets` array is the in-memory metadata cache. Legacy orientation probing uses a two-worker, deduplicated priority queue for current, next, next-next, and previous clips; successful probes persist to SQLite and replace the cached asset.
-- Playback uses a bounded three-slot sliding window (previous/current/next). The next available representation is preloaded automatically (proxy preferred, otherwise one original), the previous slot stays mounted but requests metadata only, and clips outside the window are unmounted. Preserve these bounds unless memory, file-handle, and NAS-read measurements justify a wider cache.
-- Global autoplay settings are `never`, `proxyAvailable` (default), and `always`.
+- `api.ts` selects real Tauri calls when `__TAURI_INTERNALS__` exists, else the harness backend. Optimistic asset updates replace the returned canonical `Asset`; failures roll back and surface an error. Merge completed assets from `proxy-progress`, `thumbnail-progress`, and `analysis-progress` events immediately.
+- Review video is **not** served over the Tauri asset protocol (`WKWebView` yields no first frame through a custom scheme). The app binds its own loopback HTTP origin (`media_server.rs`, [docs/tasks/desktop/MEDIA_DELIVERY.md](docs/tasks/desktop/MEDIA_DELIVERY.md), [docs/desktop/HARD_LESSONS.md](docs/desktop/HARD_LESSONS.md)). Its eight security requirements are acceptance criteria with tests; never weaken one or widen the bind: loopback bind, session token, asset ids rather than paths, storage-root re-validation, `Host`/`Origin` checks, `GET`/`HEAD` only, no token or path in logs, stop with the app. `api.mediaUrl` carries the proxy-versus-original choice (`rep=`); on a media `error`, `api.recoverMediaOrigin()` restarts the origin at most once per session.
+- Playback controls are custom stage-level UI; do not re-enable native `<video controls>` (they inherit the rotation transform). Playback keeps a bounded three-slot window (previous/current/next); do not widen it without measurement. Autoplay is `never`, `proxyAvailable` (default), or `always`.
+- Thumbnails and posters still use the asset protocol (scope: app-data cache, `$HOME/**`, `/Volumes/**`, temp fixtures). If media paths outside it are introduced, update that scope and the loopback origin's storage roots deliberately; never disable security globally.
+- Layout: minimum window 980x680, default 1440x900. Keep visible focus, semantic labels, `aria-keyshortcuts`, and the dark editing-bench look. The top bar degrades rather than clips: anything added to it must be bounded in width, and the bar clips across but not down (`overflow-x: clip`).
 
 ### Keyboard contract
 
-Preserve and update both visible hints and the `?` keyboard map when shortcuts change. Current important behavior:
+Preserve and update both visible hints and the `?` keyboard map when shortcuts change.
 
-- `J`/`K` or arrow keys: next/previous clip.
-- Space: play/pause.
-- `L`: focus the free-form label field; Enter adds the label.
-- `R`: remove the selected clip from the labeling queue, or restore it in the Removed view.
-- `N`: focus notes. Consume the original `n` key event before focusing so it is not inserted.
-- Notes: Enter saves; Command+Enter inserts a newline; Shift+Enter saves and advances; Escape discards the current editing session and removes focus. After advancing, notes must not remain focused.
-- `/`: focus queue search.
-- `P`: selected proxy; Shift+`P`: missing proxies; `T`: missing thumbnails; `A`: analyze project.
-- `M`: add media.
-- `[`/`]`: story-ribbon zoom; `C`: center selected clip.
-- `O`: rotate the selected clip 90° clockwise; Shift+`O`: flip it 180°.
-- Command+`N`: new project; Command+`O`: open catalog; Command+`,`: global settings; `?`: keyboard map.
+- `J`/`K` or arrows: next/previous clip. Space: play/pause. `L`: label field (Enter adds). `R`: remove/restore. `N`: focus notes (consume the `n` keydown first). `/`: queue search.
+- Notes: Enter saves; Command+Enter newline; Shift+Enter saves and advances; Escape discards the editing session and blurs. After advancing, notes must not remain focused.
+- `P` selected proxy; Shift+`P` missing proxies; `T` missing thumbnails; `A` analyze project; `M` add media; `[`/`]` ribbon zoom; `C` center clip; `O` rotate 90 degrees clockwise; Shift+`O` flip 180; `F` Focus; Cmd+`1`/`2`/`3` modes; Shift+`T` Chronology desk.
+- Command+`N` new project; Command+`O` open catalog; Command+`,` global settings; `?` keyboard map.
 
-Global shortcuts must return early for text inputs, textareas, and selects, except modal-level Escape handling. Any shortcut that moves focus must call `preventDefault()` before focusing the destination.
-
-### Story-ribbon context
-
-The ribbon already accepts optional TypeScript fields `phase`, `location`, `timezone`, and `storyBeat` and groups contiguous equal contexts. These fields are populated only in the browser demo. When persisted context is added, prefer a core-derived per-asset display projection from explicit time/range records rather than making the optional UI fields an independent source of truth.
-
-### CSS and layout
-
-The app has a minimum 980×680 window and a three-column workbench. Review queue and inspector scroll independently; the player and story ribbon occupy the center. Preserve visible focus styles, semantic labels, `aria-keyshortcuts`, and reduced-clutter dark editing-bench aesthetic. Test at the configured 1440×900 default and the 980×680 minimum.
-
-The top bar is one row that degrades rather than clips (#75). Its ladder is in
-`styles.css` under "The degradation ladder": stage 1 drops the wordmark word,
-the full progress form, and the lifecycle labels (into `•••`); stage 2 drops
-the mode switcher's words to glyphs and the `?` button into the same menu. The
-`N/N` count, Stop/Cancel, Add media, and the project switcher never give way
-and are asserted whole and clickable in `e2e/topbar-degradation.spec.ts`. Each
-stage is a container query on the bar with a wider twin for
-`[data-operation="active"]`, because a running operation claims ~400px of the
-same row. Two rules keep it working: anything added to the bar must be bounded
-in width — the operation slot's compact form relocates its variable text to a
-tooltip for exactly that reason — and the bar clips across but not down
-(`overflow-x: clip`), because its own dropdown menus open below it.
-
-Review video is **not** served over the Tauri asset protocol. `WKWebView` never
-produces a video frame for media delivered through a custom scheme, so an
-un-played clip has no first frame; the app binds its own loopback HTTP origin at
-startup and `api.mediaUrl` points at that instead. See
-`apps/desktop/src-tauri/src/media_server.rs`, `docs/tasks/desktop/MEDIA_DELIVERY.md`,
-and the evidence in `docs/desktop/HARD_LESSONS.md`. Its eight security
-requirements — loopback bind, session token, asset ids rather than paths,
-storage-root re-validation, `Host`/`Origin` checks, `GET`/`HEAD` only, no token
-or path in logs, stop with the app — are acceptance criteria with tests, not
-prose. Do not weaken one to make a surface easier to build, and never widen the
-bind address.
-
-Thumbnails and posters still use the asset protocol, which permits app-data
-cache paths, `$HOME/**`, `/Volumes/**`, and temporary RCD VlogCutter cache
-fixtures. If media paths outside these scopes are introduced, update both that
-scope and the loopback origin's storage roots deliberately, validate on macOS,
-and do not disable security globally as a shortcut.
+Global shortcuts return early for text inputs, textareas, and selects (except modal Escape). A shortcut that moves focus must call `preventDefault()` first.
 
 ## 11. CLI contract for agents
 
@@ -1138,62 +314,27 @@ requirements remain explicit.
 | Desktop user journeys | `pnpm test:desktop:cuj` | `pnpm test:desktop` plus interaction/visual check |
 | Desktop coverage floor | `pnpm test:desktop:coverage` | thresholds in `apps/desktop/vitest.config.ts`; raise them, never lower them to go green |
 | Desktop layout/scroll/focus | `pnpm test:desktop:browser` | headless-Chromium tier; real-engine layout, scrolling, focus, pointer, a11y, and the render-cost budgets in `e2e/scale.spec.ts` — never native evidence |
-| Rust core | `cargo test -p rcdvlog-core` | `cargo test --workspace` |
-| ETA library | `cargo test -p batch-estimator` | `cargo test --workspace` |
-| CLI parsing/JSON | `cargo test -p rcdvlog-cli` | `pnpm test:integration` |
+| Rust core | `cargo nextest run -p rcdvlog-core` | `cargo nextest run --workspace` plus `cargo test --workspace --doc` |
+| ETA library | `cargo nextest run -p batch-estimator` | `cargo nextest run --workspace` plus `cargo test --workspace --doc` |
+| CLI parsing/JSON | `cargo nextest run -p rcdvlog-cli` | `pnpm test:integration` |
 | Tauri commands/settings | `cargo test -p rcdvlog-desktop` | real `pnpm dev` smoke test when native behavior changed |
 | Server core/API | `pnpm test:server` | two-node process test plus target-topology check when external behavior changed |
-| Chrome web | `pnpm test:web` | `pnpm test:web:e2e` plus real HTTPS visual/interaction check |
+| Chrome web | `pnpm test:web` | `pnpm test:web:e2e` (mandatory in CI as `web-e2e`) plus real HTTPS visual/interaction check |
 | OpenAPI/deployment/docs | `pnpm check:openapi` | `pnpm check:deployment`, `pnpm check:docs`, and Compose render when available |
 | Repository scripts in `scripts/` | `pnpm test:scripts` | `pnpm check:docs` |
 | Formatting/lints | `cargo fmt --all -- --check` | `cargo clippy --workspace --all-targets -- -D warnings` |
 | Full repository | — | `pnpm check` |
 
+CI runs the Rust workspace tests with cargo-nextest (version pinned as `NEXTEST_VERSION` in `.github/workflows/ci.yml`; install the same version locally, e.g. `cargo install --locked cargo-nextest@<version>`), sharded as `linux-rust (tests N/4)` jobs via `--partition count:N/4`, plus `cargo test --workspace --doc` because nextest does not run doctests. `.config/nextest.toml` fails a hung test by name after 5 minutes (`slow-timeout` 60 s period, `terminate-after = 5`). Nothing is skipped or retried.
+
 `pnpm check` runs TypeScript checking followed by all Rust workspace tests. The process-level integration suite creates a real one-second FFmpeg fixture and validates CLI persistence, WAL reads, ingest, metadata, deduplication, labels/notes/removal, clock correction, thumbnails/proxies, and offline-original review. Its media portion skips when FFmpeg or ffprobe is missing.
 
-Use `pnpm gate --scope fast` for a quick iteration check. The default local
-gate requires a JSON focused-check plan and runs the candidate diff checks,
-pinned formatter/toolchain, workspace Clippy, frontend typecheck, and the
-named checks in that plan. For example, save
-`{"checks":[{"name":"migration test","command":"pnpm","args":["test:focused","rcdvlog-core","migrations::tests::the_schema_version_constant_tracks_the_migration_list"]}]}`
-to `/absolute/path/focused-checks.json`, then run
-`pnpm gate --checks /absolute/path/focused-checks.json`. Commands are spawned directly
-with argument arrays; shell strings are not accepted. Local verification should
-cover the changed behavior and its dependencies, including targeted integration
-checks for migrations, integrity, concurrency, cancellation, or paid accounting
-when those boundaries change. Use the full pre-PR scope only when a specific
-risk or repeated CI failure justifies its broader cost:
-`pnpm gate --scope pre-pr`. It follows all Linux CI checks in
-`.github/workflows/ci.yml`, prints each command's output and status, and fails
-if any prerequisite or command fails. `pnpm gate --scope fast` remains
-iteration-only. Before merge, completed Linux and platform-relevant macOS CI
-must pass on the exact candidate head; coverage and safety checks remain mandatory. The gate's
-isolated regression suite is `node --test scripts/pre-pr-gate.test.mjs`, and
-`pnpm test:scripts` includes it. Re-run relevant checks after each code change
-and include results or exact-head CI links and failed-step logs in a handoff.
+Gate commands (full usage, JSON focused-check plan format, publication wrapper, and post-publication CI handling: [docs/gate-and-publication.md](docs/gate-and-publication.md)):
 
-For one Rust test during iteration, run
-`pnpm test:focused <cargo-package> <exact-test-name>` (for example,
-`pnpm test:focused rcdvlog-core migrations::tests::the_schema_version_constant_tracks_the_migration_list`). It uses the CI Rust
-pin and `--exact`, then requires Cargo to report the named test and at least
-one executed test. The fake-command regression cases are in
-`scripts/run-focused-test.test.mjs`.
-
-Use `pnpm publish:after-gate push --checks /absolute/path/focused-checks.json` or
-`pnpm publish:after-gate pr --checks /absolute/path/focused-checks.json` to publish after
-the focused local gate. Choose the broader policy explicitly with
-`--scope pre-pr`; the fast scope is refused at the publication boundary. The
-wrapper runs the actual gate from a clean tree, snapshots HEAD and tracked/untracked
-working-tree content, and rechecks that identity before each external action.
-It refuses publication if the gate fails or that identity changes. The `pr`
-action pushes the current branch upstream and then creates the PR, stopping if
-the push fails.
-
-After publication, inspect CI on meaningful status transitions and wait for
-jobs to finish before retrieving failure logs. Repair failures locally, rerun
-the gate on the repaired code, and push the new commit. Confirm CI passes on
-that exact commit before declaring an issue complete; neither an in-progress
-run nor a green run for an older commit is confirmation.
+- `pnpm gate --scope fast` is iteration-only. `pnpm gate --checks /abs/focused-checks.json` is the default local gate (pinned toolchain, diff checks, Clippy, typecheck, plus the named checks you list); `--scope pre-pr` follows all Linux CI checks and is for specific risk or repeated CI failure.
+- `pnpm test:focused <cargo-package> <exact-test-name>` runs one Rust test on the CI pin.
+- Publish with `pnpm publish:after-gate push|pr --checks ...` (fast scope is refused).
+- Before declaring an issue complete, CI must pass on the exact candidate head; neither an in-progress run nor a green run for an older commit is confirmation. Wait for jobs to finish before fetching failure logs, repair locally, re-gate, and push a new commit.
 
 The CI encoding of this gate table lives in `.github/workflows/ci.yml`: concurrent
 Linux Rust lint/tests, frontend and browser jobs, conditional macOS, and the
@@ -1231,66 +372,16 @@ For frontend interaction changes, use the Vite browser preview for focus, keyboa
 
 ## 13. Real-project acceptance fixture
 
-Scale acceptance runs against a large real corpus that is **not** named in this
-repository. Point the tooling at it through local configuration:
-
-```bash
-export RCDVLOG_ACCEPTANCE_MEDIA_ROOT="/absolute/path/to/your/large/corpus"
-```
-
-Everything below assumes that variable. Never hard-code the path in Git, in an
-issue, or in a commit message: it names somebody's private footage, and the
-technical value of an acceptance run is in the counts and the behaviour, not in
-where the files live.
-
-It is source media, not a disposable test directory. Before accessing it:
-
-- Confirm the volume is mounted and macOS permission has been granted.
-- Enumerate read-only first; permission prompts may require the user to click Allow and retry.
-- Never write generated files into the source tree.
-- Use a project catalog under the configured laptop-local projects root.
-- Start with a single source/small subset for smoke testing before any all-media batch.
-- Report exact scan/import/failure counts and preserve partial successful work.
-
-Scale acceptance should cover thousands of assets, offline behavior, progress responsiveness, estimated time remaining, horizontal story-ribbon navigation, and restart/interruption behavior. It is periodic manual acceptance, not part of every test run.
+Scale acceptance runs against a large real corpus that is **not** named in this repository; point tooling at it with `RCDVLOG_ACCEPTANCE_MEDIA_ROOT`. Never hard-code its path in Git, an issue, or a commit message (it names somebody's private footage). It is source media, not a disposable test directory: confirm the volume is mounted and permission granted, enumerate read-only first, never write generated files into the source tree, use a catalog under the laptop-local projects root, start with a small subset, and report exact scan/import/failure counts while preserving partial work. It is periodic manual acceptance. Checklist and coverage: [docs/acceptance-fixture.md](docs/acceptance-fixture.md).
 
 ## 14. Change recipes
 
-### Add a new domain operation
+Step lists are in [docs/change-recipes.md](docs/change-recipes.md). In short:
 
-1. Add or change canonical types and validation in `rcdvlog-core`.
-2. Add core unit tests, including invalid input and missing/offline state.
-3. Add a thin Tauri command and register it.
-4. Mirror DTOs in `types.ts` and expose the call only through `api.ts`.
-5. Add UI behavior, accessible labels, keyboard access, error state, and progress if relevant.
-6. Add a CLI command when agents need the operation; preserve JSON envelopes and stable error codes.
-7. Add process-level integration coverage for cross-boundary behavior.
-8. Update the relevant document under `docs/` and this file if architecture or workflow changed.
-
-### Add a long-running batch task
-
-1. Choose a meaningful work unit and versioned task key.
-2. Declare the actual worker count; never assume all jobs are single-worker.
-3. Use `BatchEstimator` and persisted per-project rate history.
-4. Emit initial progress, each completed asset/result, failures, worker count, and ETA.
-5. Commit successes incrementally so interruption does not discard completed work.
-6. Do not let failed observations poison speed history.
-7. Update assets in the UI as each item completes.
-8. Test heterogeneous task sizes, worker sharding, no-history estimation, and failures.
-
-### Add or change project settings
-
-1. Update Rust `DesktopSettings` with a Serde default so older settings files remain valid.
-2. Update the TypeScript mirror and the harness settings fixture (`apps/desktop/src/test/harness/state.ts`), which the browser preview reads too.
-3. Persist atomically where practical and test a missing/older/corrupt settings file.
-4. Expose the control in global settings, not per-project UI, unless the setting truly belongs in the catalog.
-
-### Change media generation settings
-
-1. Treat outputs as a new representation version.
-2. Change cache/task keys so stale files and throughput history are not silently reused.
-3. Update docs, tool checks, tests, and offline fallback behavior.
-4. Test representative Sony/DJI/iPhone/Insta360 H.264/H.265 media, not only synthetic MPEG-4 fixtures.
+- **New domain operation**: core types and validation with tests, thin Tauri command (registered), `types.ts`/`api.ts` mirror, UI with accessible keyboard/error states, CLI command with stable JSON, process-level integration test, docs.
+- **Long-running batch**: versioned task key, explicit worker count, `BatchEstimator` with persisted history, per-item progress and incremental commits, failures excluded from throughput, UI merges each result.
+- **Project settings**: Rust `DesktopSettings` with a Serde default, TypeScript mirror and harness fixture, atomic persistence with missing/older/corrupt-file tests, control in global settings.
+- **Media generation settings**: treat outputs as a new representation version; change cache and task keys; update docs and tool checks; test real Sony/DJI/iPhone/Insta360 H.264/H.265 media.
 
 ## 15. Safety and working-tree discipline
 

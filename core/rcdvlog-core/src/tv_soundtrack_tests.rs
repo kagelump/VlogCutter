@@ -28,6 +28,7 @@ fn spec(n: usize) -> SoundtrackReferenceSpec {
         },
         start_seconds: 0.0,
         duration_seconds: n as f64,
+        recipe: None,
     }
 }
 fn capture() -> SoundtrackCapture {
@@ -171,6 +172,7 @@ fn passive_anchors_integrate_with_shared_mapper_and_manual_conflicts_stay_visibl
         anchors: vec![anchor.clone()],
         boundaries: vec![],
         policy: SyncPolicy::default(),
+        consensus_segments: vec![],
     };
     let q = SyncQuery {
         clock_id: "mic".into(),
@@ -351,6 +353,7 @@ fn repeated_positions_in_separate_reference_windows_keep_unique_evidence_and_one
         anchors: vec![x, y],
         boundaries: vec![],
         policy: SyncPolicy::default(),
+        consensus_segments: vec![],
     };
     let q = SyncQuery {
         clock_id: "mic".into(),
@@ -361,4 +364,284 @@ fn repeated_positions_in_separate_reference_windows_keep_unique_evidence_and_one
         r.map(&[q], &|| false).unwrap().slices[0].state,
         SyncState::Conflicting
     );
+}
+#[test]
+fn unmatched_buried_excerpt_reports_its_true_position_as_best_peak() {
+    let source = signal(36, 37);
+    let index = SoundtrackIndex::from_pcm(spec(36), &source, &|| false).unwrap();
+    let start = 8.32;
+    let at = (start * 8000.0) as usize;
+    let clean = source[at..at + 6 * 8000].to_vec();
+    let noise = signal(6, 987);
+    let query: Vec<f32> = clean.iter().zip(&noise).map(|(q, n)| q + n).collect();
+    let r = index
+        .match_pcm(&query, capture(), &SoundtrackPolicy::default(), &|| false)
+        .unwrap();
+    assert_eq!(r.state, SoundtrackMatchState::Unmatched, "{r:?}");
+    assert!(r.candidates.is_empty());
+    assert!(!r.best_peaks.is_empty() && r.best_peaks.len() <= MAX_BEST_PEAKS);
+    let top = &r.best_peaks[0];
+    // Query centre is start + 3 s; the search grid is one hop (16 ms).
+    assert!(
+        (top.movie_seconds - (start + 3.0)).abs() <= 0.016,
+        "{top:?}"
+    );
+    assert_eq!(top.reference_offset_frames, 520);
+    assert_eq!(Some(top.similarity), r.best_similarity);
+    assert!(
+        top.subwindow_similarities
+            .iter()
+            .all(|s| (-1.0..=1.0).contains(s))
+    );
+    for pair in r.best_peaks.windows(2) {
+        assert!(pair[0].similarity >= pair[1].similarity);
+        assert_ne!(
+            pair[0].reference_offset_frames,
+            pair[1].reference_offset_frames
+        );
+    }
+    // Reports are deterministic, including the new diagnostics.
+    assert_eq!(
+        r,
+        index
+            .match_pcm(&query, capture(), &SoundtrackPolicy::default(), &|| false)
+            .unwrap()
+    );
+}
+#[test]
+fn matched_query_best_peak_is_the_top_candidate() {
+    let source = signal(36, 37);
+    let index = SoundtrackIndex::from_pcm(spec(36), &source, &|| false).unwrap();
+    let start = 8.32;
+    let at = (start * 8000.0) as usize;
+    let query = source[at..at + 6 * 8000].to_vec();
+    let r = index
+        .match_pcm(&query, capture(), &SoundtrackPolicy::default(), &|| false)
+        .unwrap();
+    assert_eq!(r.state, SoundtrackMatchState::Matched, "{r:?}");
+    let candidate = &r.candidates[0];
+    let top = &r.best_peaks[0];
+    assert_eq!(
+        top.reference_offset_frames,
+        candidate.reference_offset_frames
+    );
+    assert_eq!(top.similarity, candidate.similarity);
+    // §3 movie_seconds is the query centre, identical to the candidate anchor.
+    let tps = spec(36).movie.ticks_per_second();
+    let anchor_seconds = (candidate.anchor.movie_pts - spec(36).movie.origin_pts) as f64 / tps;
+    assert!((top.movie_seconds - anchor_seconds).abs() <= 1.0 / tps);
+    assert!((top.movie_seconds - (start + 3.0)).abs() <= 0.016);
+}
+#[test]
+fn quiet_and_flat_queries_leave_best_peaks_empty() {
+    let source = signal(36, 37);
+    let index = SoundtrackIndex::from_pcm(spec(36), &source, &|| false).unwrap();
+    let quiet = vec![0.0; 6 * 8000];
+    let r = index
+        .match_pcm(&quiet, capture(), &SoundtrackPolicy::default(), &|| false)
+        .unwrap();
+    assert_eq!(r.reason, "quiet_query");
+    assert!(r.best_peaks.is_empty());
+    let flat = vec![0.05f32; 6 * 8000];
+    let r = index
+        .match_pcm(&flat, capture(), &SoundtrackPolicy::default(), &|| false)
+        .unwrap();
+    assert_eq!(r.reason, "insufficient_spectral_variation", "{r:?}");
+    assert!(r.best_peaks.is_empty());
+    let json = serde_json::to_value(&r).unwrap();
+    assert!(
+        json.get("bestPeaks").is_none(),
+        "empty peaks must be omitted"
+    );
+}
+fn distinctive_policy(sim: f64, margin: f64, z: f64) -> SoundtrackPolicy {
+    SoundtrackPolicy {
+        distinctive: Some(DistinctivePolicy {
+            minimum_similarity: sim,
+            minimum_margin: margin,
+            minimum_z_score: z,
+        }),
+        ..SoundtrackPolicy::default()
+    }
+}
+/// Excerpt of `source` at 8.32 s, mixed with `noise_gain * other` (cosine about 0.6 at 0.5).
+fn buried_query(source: &[f32], noise_gain: f32) -> Vec<f32> {
+    let at = (8.32 * 8000.0) as usize;
+    let noise = signal(6, 987);
+    source[at..at + 6 * 8000]
+        .iter()
+        .zip(&noise)
+        .map(|(c, n)| c + noise_gain * n)
+        .collect()
+}
+#[test]
+fn distinctive_low_similarity_unique_peak_matches_with_its_own_reason_and_confidence() {
+    let source = signal(36, 37);
+    let index = SoundtrackIndex::from_pcm(spec(36), &source, &|| false).unwrap();
+    let query = buried_query(&source, 0.5);
+    let r = index
+        .match_pcm(
+            &query,
+            capture(),
+            &distinctive_policy(0.5, 0.25, 6.0),
+            &|| false,
+        )
+        .unwrap();
+    assert_eq!(r.state, SoundtrackMatchState::Matched, "{r:?}");
+    assert_eq!(r.reason, "distinctive_peak_low_similarity", "{r:?}");
+    let best = r.best_similarity.unwrap();
+    assert!(
+        (0.5..0.8).contains(&best),
+        "not a low-similarity peak: {best}"
+    );
+    let z = r
+        .distinctiveness
+        .expect("distinctiveness is reported when set");
+    assert!(z >= 6.0, "{z}");
+    assert!(center_error(&r, 8.32, 6.0) <= 0.1, "{r:?}");
+    let candidate = &r.candidates[0];
+    assert_eq!(
+        candidate.anchor.confidence,
+        (0.5 + candidate.peak_margin).min(1.0)
+    );
+    assert_eq!(candidate.anchor.source, SyncAnchorSource::PassiveSoundtrack);
+    // Deterministic, including the new fields.
+    assert_eq!(
+        r,
+        index
+            .match_pcm(
+                &query,
+                capture(),
+                &distinctive_policy(0.5, 0.25, 6.0),
+                &|| { false }
+            )
+            .unwrap()
+    );
+}
+#[test]
+fn distinctive_none_keeps_the_same_query_unmatched_with_v1_bytes() {
+    let source = signal(36, 37);
+    let index = SoundtrackIndex::from_pcm(spec(36), &source, &|| false).unwrap();
+    let query = buried_query(&source, 0.5);
+    let r = index
+        .match_pcm(&query, capture(), &SoundtrackPolicy::default(), &|| false)
+        .unwrap();
+    assert_eq!(r.state, SoundtrackMatchState::Unmatched, "{r:?}");
+    assert_eq!(r.reason, "weak_or_non_distinctive");
+    assert!(r.candidates.is_empty());
+    assert_eq!(r.distinctiveness, None);
+    let json = serde_json::to_value(&r).unwrap();
+    assert!(json.get("distinctiveness").is_none(), "{json}");
+    assert!(json["policy"].get("distinctive").is_none(), "{json}");
+    // Turning the policy on changes only what it is allowed to change.
+    let on = index
+        .match_pcm(
+            &query,
+            capture(),
+            &distinctive_policy(0.5, 0.25, 6.0),
+            &|| false,
+        )
+        .unwrap();
+    assert_eq!(on.best_peaks, r.best_peaks);
+    assert_eq!(on.best_similarity, r.best_similarity);
+}
+#[test]
+fn distinctive_thresholds_are_each_required() {
+    let source = signal(36, 37);
+    let index = SoundtrackIndex::from_pcm(spec(36), &source, &|| false).unwrap();
+    let query = buried_query(&source, 0.5);
+    for policy in [
+        distinctive_policy(0.7, 0.25, 6.0),
+        distinctive_policy(0.5, 0.25, 20.0),
+    ] {
+        let r = index
+            .match_pcm(&query, capture(), &policy, &|| false)
+            .unwrap();
+        assert_ne!(r.state, SoundtrackMatchState::Matched, "{r:?}");
+        assert!(r.candidates.is_empty(), "{r:?}");
+        assert_ne!(r.reason, "distinctive_peak_low_similarity");
+    }
+    // Repeated content at the same gain must not be accepted. At this gain the
+    // two identical copies fail temporal support, so neither becomes a candidate.
+    let block = signal(12, 91);
+    let mut repeated = block.clone();
+    repeated.extend(&block);
+    let rep_index = SoundtrackIndex::from_pcm(spec(24), &repeated, &|| false).unwrap();
+    let rep_query: Vec<f32> = repeated[2 * 8000..8 * 8000]
+        .iter()
+        .zip(&signal(6, 987))
+        .map(|(c, n)| c + 0.5 * n)
+        .collect();
+    let rep = rep_index
+        .match_pcm(
+            &rep_query,
+            capture(),
+            &distinctive_policy(0.5, 0.25, 3.0),
+            &|| false,
+        )
+        .unwrap();
+    assert_ne!(rep.state, SoundtrackMatchState::Matched, "{rep:?}");
+    assert!(rep.candidates.is_empty(), "{rep:?}");
+}
+#[test]
+fn distinctive_path_never_skips_temporal_support() {
+    // The raw best peak clears all three distinctive thresholds (similarity
+    // 0.52, margin 0.26, z 4.18 with z threshold 3.0), but the last third of
+    // the query is unsupported, so the report must stay unmatched.
+    let source = signal(36, 37);
+    let index = SoundtrackIndex::from_pcm(spec(36), &source, &|| false).unwrap();
+    let at = (8.32 * 8000.0) as usize;
+    let clean = source[at..at + 6 * 8000].to_vec();
+    let noise = signal(6, 555);
+    let query: Vec<f32> = (0..6 * 8000)
+        .map(|i| {
+            if i < 3 * 8000 {
+                clean[i]
+            } else {
+                clean[i] + 3.0 * noise[i]
+            }
+        })
+        .collect();
+    let r = index
+        .match_pcm(
+            &query,
+            capture(),
+            &distinctive_policy(0.5, 0.25, 3.0),
+            &|| false,
+        )
+        .unwrap();
+    assert_eq!(r.state, SoundtrackMatchState::Unmatched, "{r:?}");
+    assert_eq!(r.reason, "insufficient_temporal_support", "{r:?}");
+    assert!(r.candidates.is_empty());
+    assert!(r.distinctiveness.unwrap() >= 3.0);
+}
+#[test]
+fn distinctive_path_rejects_unrelated_and_flat_evidence() {
+    let source = signal(36, 37);
+    let index = SoundtrackIndex::from_pcm(spec(36), &source, &|| false).unwrap();
+    let policy = distinctive_policy(0.5, 0.25, 6.0);
+    let unrelated = signal(6, 878123);
+    let r = index
+        .match_pcm(&unrelated, capture(), &policy, &|| false)
+        .unwrap();
+    assert_ne!(r.state, SoundtrackMatchState::Matched, "{r:?}");
+    assert!(r.candidates.is_empty(), "{r:?}");
+    assert!(r.distinctiveness.is_some());
+    let flat = vec![0.05f32; 6 * 8000];
+    let r = index
+        .match_pcm(&flat, capture(), &policy, &|| false)
+        .unwrap();
+    assert_eq!(r.reason, "insufficient_spectral_variation", "{r:?}");
+    assert_eq!(r.distinctiveness, None);
+    assert!(r.candidates.is_empty());
+}
+#[test]
+fn robust_z_is_median_normalised_and_none_without_spread() {
+    let z = robust_z(&[1.0, 2.0, 3.0, 4.0, 100.0]).unwrap();
+    assert!((z - (100.0 - 3.0) / (1.4826 * 1.0)).abs() < 1e-12, "{z}");
+    // Majority-equal scores have MAD 0, so z is None and fails the z test.
+    assert_eq!(robust_z(&[0.1, 0.1, 0.1, 0.1, 0.9]), None);
+    assert_eq!(robust_z(&[0.4; 9]), None);
+    assert_eq!(robust_z(&[]), None);
+    assert_eq!(median(&[4.0, 1.0, 3.0, 2.0]), Some(2.5));
 }
