@@ -9,10 +9,13 @@ test("the actual workflow image matches every resolved lockfile version", () => 
 });
 test("image verification rejects version skew, multiple resolutions and mutable images", () => {
   assert.equal(browserImageVersion(lock, image), "1.61.1");
+  assert.equal(browserImageVersion(lock, `${image}\n${image}`), "1.61.1");
   for (const [badLock, badImage] of [
     ["", image], [lock, ""], [lock.replace("1.61.1", "1.62.0"), image],
     [lock + "  '@playwright/test@1.62.0':\n", image],
     [lock, "image: mcr.microsoft.com/playwright:v1.61.1-noble"],
     [lock, image.replace("sha256:", "sha256:z")],
+    [lock, `${image}\n${image.replace("v1.61.1", "v1.62.0")}`],
+    [lock, `${image}\nimage: mcr.microsoft.com/playwright:v1.61.1-noble`],
   ]) assert.throws(() => browserImageVersion(badLock, badImage), /digest-pinned and match/);
 });

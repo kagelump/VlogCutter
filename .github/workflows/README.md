@@ -14,6 +14,8 @@ filters. The stable merge gate is **`ci-required`**.
 | `linux-rust (tests N/4)` | Four shards of the full workspace tests (including CLI/media integration) via cargo-nextest; shard 1 also runs doctests and OpenAPI freshness |
 | `frontend` | All frontend typechecks, full desktop Vitest with coverage floors (including CUJ), web Vitest, docs, script regressions, deployment invariants |
 | `browser` | Existing desktop Chromium Playwright tier in Microsoft's official image |
+| `web-e2e-build` | Debug `rcdvlog-server` binary and `web_e2e_seed` example, handed to `web-e2e` as an artifact |
+| `web-e2e` | Real-server Chrome Playwright suite (`pnpm test:web:e2e`) in the same official image, using those prebuilt binaries |
 | `macos` | Desktop Rust tests and full native Tauri bundle, when platform-relevant |
 | `changes` | Conservative macOS decision, recorded in its log and step summary |
 | `ci-required` | Always evaluates every required result, including failed/cancelled/missing jobs and justified skips |
@@ -24,9 +26,16 @@ job; later gates may report missing prerequisites rather than silently pass.
 No coverage threshold or test exclusion was changed. Full coverage includes
 `src/test/cuj`; `cargo test --workspace` includes `cli_workflow`. The full
 local gate no longer repeats those suites, while focused commands remain.
-`pnpm test:web:e2e` remains a separate local server/process acceptance tier;
-it was not in the previous full CI and is not part of the isolated desktop
-browser container.
+`pnpm test:web:e2e` is mandatory: it is the only tier that drives the Chrome
+app against the real Axum server and a seeded fixture catalog, and #241 (a
+recorder receipt compared by JSON key order) passed every unit test and failed
+only there. The fixture script (`scripts/start-web-e2e-server.mjs`) builds from
+source with `cargo run` locally; CI sets `RCDVLOG_WEB_E2E_SERVER_BIN` and
+`RCDVLOG_WEB_E2E_SEED_BIN` to absolute prebuilt paths so the browser half can
+run in the Playwright image without a Rust toolchain. It uses Chrome's fake
+microphone, `/usr/bin/true` media tools and no speech models or provider key,
+so it proves server/browser contracts, not real capture, ASR or HTTPS
+deployment. Failure screenshots and traces are uploaded as `web-e2e-results`.
 
 ### Bounded Linux setup and browser provisioning
 
