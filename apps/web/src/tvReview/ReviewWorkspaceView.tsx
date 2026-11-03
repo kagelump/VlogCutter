@@ -185,6 +185,7 @@ export function ReviewWorkspaceView({ client, projectId, targetId, sessionId, ru
         <a className="button-link secondary-link" href={client.reviewReportUrl(projectId, runId)} target="_blank" rel="noreferrer">Agent report (JSON)</a>
         <button className="secondary" onClick={() => navigate(sessionPath)}>Back to session</button>
       </div></div>
+    {workspace.targetContract === "historicalRenderedArtifactReviewV1" ? <p className="tv-historical-note" role="note"><strong>Historical rendered artifact.</strong> These notes describe an already rendered movie. Its current sources, constraints and renderability were not established; the report says so and grants no render, edit or activation authority.</p> : null}
     <p className="help">{workspace.sync.note} {workspace.coverage.note}</p>
     {error ? <p className="inline-error" role="alert">{error}</p> : null}
     <div className="tv-review-columns">

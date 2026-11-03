@@ -1,5 +1,6 @@
 import { useEffect, useState, type ChangeEvent, type FormEvent } from "react";
 import {
+  HISTORICAL_REVIEW_ACKNOWLEDGEMENT,
   ProjectClientError,
   type BrowserProjectClient,
   type ProjectSummary,
@@ -9,7 +10,7 @@ import {
 } from "@rcdvlog/project-client";
 import { StatePanel, StatusBadge } from "@rcdvlog/review-ui";
 import { InlineError, normalizeError } from "../errors";
-import { parseYoutubeVideoId, unwrapHandoff } from "./youtube";
+import { isHistoricalReview, parseYoutubeVideoId, unwrapHandoff } from "./youtube";
 import { ReviewWorkspaceView } from "./ReviewWorkspaceView";
 import { PendingRecoveries, RecordView, SessionDetailView, SessionList, browserVoiceDeps, type VoiceDeps } from "./VoiceReview";
 
@@ -24,6 +25,10 @@ export const REVIEW_TARGET_CODE_COPY: Record<string, string> = {
   review_target_artifact_unavailable: "The preview movie is not known to be present and unmodified on its owning host.",
   review_target_project_mismatch: "This handoff belongs to a different project. Open the matching project and import it there.",
   review_target_conflict: "This viewed artifact was already imported with different bytes, plan, revision or cuts. Nothing was overwritten.",
+  review_target_contract_conflict: "This exact snapshot is already stored under the other contract (current versus historical). Nothing was changed; open the existing target instead.",
+  review_target_historical_contract: "This is a historical rendered-artifact review. It is imported separately, with an acknowledgement of what it does not establish.",
+  review_target_historical_acknowledgement_required: "Confirm that you understand what a historical review does not establish before importing it.",
+  review_target_not_historical: "This is a current review target, not a historical review. Import it as a current target.",
   project_replica_not_found: "This project is not registered on the server.",
   invalid_input: "The request was not valid.",
 };
@@ -60,6 +65,14 @@ function ProjectPicker({ client, navigate }: { client: BrowserProjectClient; nav
   </section>;
 }
 
+function isHistorical(summary: { contract?: string }) {
+  return summary.contract === "historicalRenderedArtifactReviewV1";
+}
+
+function contractBadge(summary: ReviewTargetSummary) {
+  return isHistorical(summary) ? <StatusBadge label="Historical artifact · integrity only" tone="warning" /> : null;
+}
+
 function readinessBadge(summary: ReviewTargetSummary) {
   if (summary.readiness.ready) return <StatusBadge label="Ready for a session" tone="positive" />;
   if (summary.readiness.freshness !== "fresh") return <StatusBadge label="Verification expired" tone="warning" />;
@@ -83,7 +96,7 @@ function ProjectReviewTargets({ client, projectId, navigate }: { client: Browser
         <h2 className="tv-section-title">Imported targets</h2>
         <div className="project-list">{(targets ?? []).map((target) => <button key={target.reviewTargetId} onClick={() => navigate(targetPath(projectId, target.reviewTargetId))}>
           <span><strong>Revision {target.revisionId}</strong><small>{formatSeconds(target.durationSeconds)} · {target.cutCount} cuts · digest {short(target.targetDigest)} · {youtubeLabel(target)}</small></span>
-          {readinessBadge(target)}
+          {contractBadge(target)}{readinessBadge(target)}
         </button>)}</div>
         {targets && !targets.length ? <StatePanel title="No review targets yet"><p>Export one on the Mac with <code>rcdvlog edit-plan review-target-export --artifact &lt;preview_id&gt;</code>, then import it here.</p></StatePanel> : null}
       </div>
@@ -99,14 +112,21 @@ function ImportPanel({ client, projectId, imported }: { client: BrowserProjectCl
   const [parseError, setParseError] = useState<string | null>(null);
   const [error, setError] = useState<ProjectClientError | null>(null);
   const [busy, setBusy] = useState(false);
+  const [acknowledged, setAcknowledged] = useState(false);
+  // Detected from the pasted JSON's purpose discriminator, never chosen by
+  // the user: a strict handoff cannot be weakened into a historical import.
+  const historical = (() => {
+    try { const handoff = unwrapHandoff(JSON.parse(text)); return handoff ? isHistoricalReview(handoff) : false; } catch { return false; }
+  })();
 
   function request() {
     let parsed: unknown;
     try { parsed = JSON.parse(text); } catch { setParseError("This is not valid JSON. Paste the export output or choose its .json file."); return null; }
     const handoff = unwrapHandoff(parsed);
     if (!handoff) { setParseError("Expected a review target handoff object."); return null; }
+    if (isHistoricalReview(handoff) && !acknowledged) { setParseError("Confirm what a historical review does not establish before checking it."); return null; }
     setParseError(null);
-    return { handoff, declaredIssuer: issuer.trim() || null };
+    return { handoff, historical: isHistoricalReview(handoff), declaredIssuer: issuer.trim() || null };
   }
 
   async function check(event?: FormEvent) {
@@ -114,7 +134,11 @@ function ImportPanel({ client, projectId, imported }: { client: BrowserProjectCl
     const body = request();
     if (!body) return;
     setBusy(true); setError(null); setPreflight(null);
-    try { setPreflight(await client.preflightReviewTarget(projectId, body)); }
+    try {
+      setPreflight(body.historical
+        ? await client.preflightHistoricalReviewTarget(projectId, { review: body.handoff, acknowledgement: HISTORICAL_REVIEW_ACKNOWLEDGEMENT, declaredIssuer: body.declaredIssuer })
+        : await client.preflightReviewTarget(projectId, { handoff: body.handoff, declaredIssuer: body.declaredIssuer }));
+    }
     catch (reason) { setError(normalizeError(reason)); }
     finally { setBusy(false); }
   }
@@ -123,7 +147,12 @@ function ImportPanel({ client, projectId, imported }: { client: BrowserProjectCl
     const body = request();
     if (!body) return;
     setBusy(true); setError(null);
-    try { const result = await client.importReviewTarget(projectId, body); imported(result.reviewTarget.reviewTargetId); }
+    try {
+      const result = body.historical
+        ? await client.importHistoricalReviewTarget(projectId, { review: body.handoff, acknowledgement: HISTORICAL_REVIEW_ACKNOWLEDGEMENT, declaredIssuer: body.declaredIssuer })
+        : await client.importReviewTarget(projectId, { handoff: body.handoff, declaredIssuer: body.declaredIssuer });
+      imported(result.reviewTarget.reviewTargetId);
+    }
     catch (reason) { setError(normalizeError(reason)); setBusy(false); }
   }
 
@@ -145,14 +174,20 @@ function ImportPanel({ client, projectId, imported }: { client: BrowserProjectCl
     <label className="file-choice">Or choose the exported .json file<input type="file" accept="application/json,.json" onChange={(event) => void chooseFile(event)} /></label>
     <label htmlFor="tv-issuer">Owning host label (optional)</label>
     <input id="tv-issuer" value={issuer} maxLength={64} onChange={(event) => { setIssuer(event.target.value); setPreflight(null); }} placeholder="e.g. Travel MacBook" />
+    {historical ? <fieldset className="tv-historical" aria-label="Historical rendered-artifact review">
+      <legend>Historical rendered-artifact review</legend>
+      <p className="help">This movie was rendered earlier. Its owning host re-hashed it and matched it to its earlier full-decode receipt and immutable cut mapping. It did <strong>not</strong> verify today’s sources, constraints or that the plan can still be rendered.</p>
+      <label className="tv-acknowledge"><input type="checkbox" checked={acknowledged} onChange={(event) => { setAcknowledged(event.target.checked); setPreflight(null); }} /> I understand this review covers the already rendered movie only, and grants no render, edit, activation, upload or source-trim authority.</label>
+    </fieldset> : null}
     {parseError ? <p className="inline-error" role="alert">{parseError}</p> : null}
     {error ? <p className="inline-error" role="alert">{describe(error)}{error.requestId ? ` Request ID: ${error.requestId}` : ""}</p> : null}
-    <div className="tv-actions"><button disabled={busy || !text.trim()} className="secondary">{busy && !preflight ? "Checking…" : "Check handoff"}</button>
-      {preflight?.importable ? <button type="button" disabled={busy} onClick={() => void importTarget()}>{preflight.outcome === "duplicate" ? "Open existing target" : preflight.outcome === "refresh" ? "Record refreshed verification" : "Import target"}</button> : null}
+    <div className="tv-actions"><button disabled={busy || !text.trim() || (historical && !acknowledged)} className="secondary">{busy && !preflight ? "Checking…" : "Check handoff"}</button>
+      {preflight?.importable ? <button type="button" disabled={busy} onClick={() => void importTarget()}>{preflight.outcome === "duplicate" ? "Open existing target" : preflight.outcome === "refresh" ? "Record refreshed verification" : historical ? "Import historical target" : "Import target"}</button> : null}
     </div>
     {preflight ? <section className="tv-preflight" aria-label="Preflight result">
       <p><strong>{preflightTitle(preflight)}</strong></p>
       {preflight.preview ? <dl className="tv-facts">
+        <dt>Contract</dt><dd>{preflight.preview.contract === "historicalRenderedArtifactReviewV1" ? "Historical rendered artifact (integrity only)" : "Current review target (fully verified)"}</dd>
         <dt>Revision</dt><dd>{preflight.preview.revisionId}</dd>
         <dt>Duration</dt><dd>{formatSeconds(preflight.preview.durationSeconds)} · {preflight.preview.cutCount} cuts</dd>
         <dt>Target digest</dt><dd><code>{short(preflight.preview.targetDigest)}</code></dd>
@@ -167,7 +202,7 @@ function ImportPanel({ client, projectId, imported }: { client: BrowserProjectCl
 
 function preflightTitle(preflight: ReviewTargetPreflight) {
   switch (preflight.outcome) {
-    case "new": return "Ready to import as a new immutable target.";
+    case "new": return preflight.preview?.contract === "historicalRenderedArtifactReviewV1" ? "Ready to import as a new immutable historical target." : "Ready to import as a new immutable target.";
     case "duplicate": return "Identical target already imported.";
     case "refresh": return "Same target; this import records a newer verification receipt.";
     case "conflict": return "Conflict: this viewed artifact was imported with different contents.";
@@ -200,7 +235,8 @@ function ReviewTargetDetailView({ client, projectId, reviewTargetId, navigate, v
   if (!detail) return <section className="workspace-page"><StatePanel title="Loading review target" busy><p>Reading the immutable snapshot…</p></StatePanel></section>;
   const latest = detail.observations[detail.observations.length - 1];
   return <section className="workspace-page tv-review-page">
-    <div className="page-heading"><div><p className="eyebrow">Voice review / {projectId} / target</p><h1>Revision {detail.revisionId}</h1></div><div className="tv-heading-actions">{readinessBadge(detail)}<button className="secondary" onClick={() => navigate(targetPath(projectId))}>All targets</button></div></div>
+    <div className="page-heading"><div><p className="eyebrow">Voice review / {projectId} / target</p><h1>Revision {detail.revisionId}</h1></div><div className="tv-heading-actions">{contractBadge(detail)}{readinessBadge(detail)}<button className="secondary" onClick={() => navigate(targetPath(projectId))}>All targets</button></div></div>
+    {isHistorical(detail) ? <p className="tv-historical-note" role="note"><strong>Historical rendered artifact.</strong> Discuss what this already rendered movie shows. Current sources, constraints and renderability were not established, so nothing here can render, edit, activate or upload it.</p> : null}
     {!detail.readiness.ready ? <p className="inline-error" role="alert">New recording sessions are blocked: {detail.readiness.blockers.map((code) => REVIEW_TARGET_CODE_COPY[code] ?? code).join(" ")} Existing evidence is retained.</p> : null}
     <PendingRecoveries client={client} projectId={projectId} deps={voice ?? browserVoiceDeps()} />
     <section className="tv-voice-start" aria-label="Voice review">
@@ -216,6 +252,7 @@ function ReviewTargetDetailView({ client, projectId, reviewTargetId, navigate, v
           <dt>Viewed artifact</dt><dd>{detail.viewedArtifactId}</dd>
           <dt>Cut mapping</dt><dd>{detail.mapping.status === "measuredComplete" ? "Verified measured mapping" : detail.mapping.status} · {detail.cutCount} cuts · picture from decoded output PTS; source ranges declared</dd>
           <dt>Movie clock</dt><dd>origin PTS {detail.movie.originPts}, time base {detail.movie.timeBaseNumerator}/{detail.movie.timeBaseDenominator}</dd>
+          <dt>Contract</dt><dd>{isHistorical(detail) ? "Historical rendered-artifact review: movie bytes, earlier full decode and cut mapping only" : "Current review target: output, inputs, constraints, renderability and full decode"}</dd>
           <dt>Verification</dt><dd>{detail.latestVerifiedAt} · {detail.readiness.freshness} · artifact {detail.readiness.availabilityState}{latest ? ` (${latest.availabilitySource})` : ""}</dd>
           <dt>Imported</dt><dd>{detail.provenance.importedAt} by {detail.provenance.importer.actorType.replace("_", " ")}{detail.provenance.declaredIssuer ? ` · issuer declared as “${detail.provenance.declaredIssuer}” (unverified)` : " · issuer unverified"}</dd>
           {detail.provenance.derivedFromReviewTargetId ? <><dt>Derived from</dt><dd><a href={targetPath(projectId, detail.provenance.derivedFromReviewTargetId)} onClick={(event) => { event.preventDefault(); navigate(targetPath(projectId, detail.provenance.derivedFromReviewTargetId!)); }}>earlier target without this YouTube link</a></dd></> : null}
