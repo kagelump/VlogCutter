@@ -558,8 +558,9 @@ impl SoundtrackIndex {
         }
         // A high score from half a query is insufficient after a buffer/seek.
         // Require independent support in every third of the query.
+        let raw_peaks = peaks;
         let mut supported = Vec::new();
-        for (score, offset) in peaks {
+        for &(score, offset) in &raw_peaks {
             let mut consistent = true;
             for part in 0..3 {
                 let a = part * query.len() / 3;
@@ -588,10 +589,20 @@ impl SoundtrackIndex {
         // Step 2 (v1): the old path is unchanged.
         let old_similar = peaks[0].0 >= policy.minimum_similarity;
         let old_matched = old_similar && margin >= policy.minimum_peak_margin;
+        // §4 distinctive margin: the honest runner-up is the best raw coarse peak
+        // at a different position, whether or not it passed temporal support. A
+        // temporally unsupported copy is a real competitor and must reduce it.
+        let distinctive_margin = {
+            let runner_up = raw_peaks
+                .iter()
+                .find(|p| p.1.abs_diff(peaks[0].1) >= 16)
+                .map_or(0.0, |p| p.0);
+            peaks[0].0 - runner_up
+        };
         // Step 3 (ARCHITECTURE §4): consulted only when the old path did not match.
         let distinctive_pass = policy.distinctive.as_ref().is_some_and(|d| {
             peaks[0].0 >= d.minimum_similarity
-                && margin >= d.minimum_margin
+                && distinctive_margin >= d.minimum_margin
                 && report
                     .distinctiveness
                     .is_some_and(|z| z >= d.minimum_z_score)
@@ -656,7 +667,7 @@ impl SoundtrackIndex {
                     movie_pts: self.reference.movie.origin_pts + (seconds * tps).round() as i64,
                     source: SyncAnchorSource::PassiveSoundtrack,
                     confidence: if low_similarity {
-                        (0.5 + margin).min(1.0)
+                        (0.5 + distinctive_margin).min(1.0)
                     } else {
                         score
                     },
@@ -667,7 +678,11 @@ impl SoundtrackIndex {
                     candidate_group_id: Some(format!("{}_matches", capture.evidence_id)),
                 },
                 similarity: score,
-                peak_margin: margin,
+                peak_margin: if low_similarity {
+                    distinctive_margin
+                } else {
+                    margin
+                },
                 reference_offset_frames: offset,
             });
         }
