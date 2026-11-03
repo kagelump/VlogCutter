@@ -155,6 +155,15 @@ transcript utterances padded ±0.25 s. The core never reads transcripts.
   `origin: Option<String>`: None for grid queries, `"speech_gap"` for gap
   queries. If the quota would be exceeded, keep the longest gaps, breaking ties
   by earliest start.
+- **Gap windows, refinements (2026-11-03, owner-driven V01 cycle).**
+  - A gap query whose range equals a grid query is dropped before the quota
+    is applied, so it never takes a slot.
+  - Gap queries are capped at `min(20 s, reference_seconds - 1, movie
+    seconds)`.
+  - References overlap by the longest planned query. Without a gap query
+    longer than `query_seconds`, the reference windows are exactly v1's, so
+    every query position still lies wholly inside some reference.
+  - Cached receipts are checked against each query's own PCM length.
 
 ## §7 Recipe v2: weighted, robust features
 
