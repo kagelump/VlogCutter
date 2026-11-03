@@ -349,3 +349,154 @@ fn broad_uncertainty_cannot_amplify_movie_operation_responses() {
         .unwrap_err();
     assert!(err.to_string().contains("operation budget"));
 }
+
+fn consensus_segment(
+    id: &str,
+    start_seconds: f64,
+    end_seconds: f64,
+) -> crate::tv_soundtrack_consensus::ConsensusSegment {
+    crate::tv_soundtrack_consensus::ConsensusSegment {
+        segment_id: id.into(),
+        clock_id: "mic".into(),
+        offset_seconds: -0.96,
+        mic_start_sample: (start_seconds * 48000.0) as u64,
+        mic_end_sample: (end_seconds * 48000.0) as u64,
+        supporting_queries: vec![0, 1, 2],
+        residual_rms_seconds: 0.02,
+        drift_ppm: 0.0,
+    }
+}
+
+/// Anchors 60 s apart in mic time (2 s and 62 s) and movie time (10 s and 70 s).
+fn far_anchors(r: &SyncRequest) -> Vec<SyncAnchor> {
+    vec![
+        anchor(r, "near_left", 2.0, 10.0, SyncAnchorSource::ManualCue),
+        anchor(
+            r,
+            "near_right",
+            62.0,
+            70.0,
+            SyncAnchorSource::AcousticTimecode,
+        ),
+    ]
+}
+
+#[test]
+fn consensus_interpolation_allowed_inside_one_segment_with_section_nine_uncertainty() {
+    let mut r = fixture();
+    r.anchors = far_anchors(&r);
+    r.consensus_segments = vec![consensus_segment("seg_one", 0.0, 100.0)];
+    let e = r.map(&[q(20.0, 21.0)], &|| false).unwrap();
+    let s = &e.slices[0];
+    assert_eq!(s.state, SyncState::ConsensusInterpolated);
+    assert_eq!(s.diagnostics, ["consensus_segment:seg_one"]);
+    assert_eq!(s.candidates.len(), 1);
+    let c = &s.candidates[0];
+    assert!((c.start_pts - (90000.0 + 28.0 * 90000.0)).abs() < 0.01);
+    assert!((c.measured_drift_ppm.unwrap()).abs() < 1e-6);
+    // Anchor uncertainty 1350 ticks each (900 + 240 samples at 48 kHz),
+    // residual 0.02 s = 1800 ticks, unobserved 5000 ppm over 60 s = 27000 ticks.
+    assert_eq!(c.uncertainty_ticks, 1350 + 1800 + 27000);
+    assert_eq!(c.uncertainty_ticks, 30150);
+    assert!(c.lower_pts as f64 <= c.start_pts && c.upper_pts as f64 >= c.end_pts);
+}
+
+#[test]
+fn same_far_anchors_without_a_segment_stay_unknown() {
+    let mut r = fixture();
+    r.anchors = far_anchors(&r);
+    let e = r.map(&[q(20.0, 21.0)], &|| false).unwrap();
+    assert_eq!(e.slices[0].state, SyncState::Unknown);
+    assert!(e.slices[0].candidates.is_empty());
+    assert!(
+        e.slices[0]
+            .diagnostics
+            .contains(&"gap_or_discontinuity".into())
+    );
+}
+
+#[test]
+fn consensus_interpolation_refused_across_a_boundary_inside_the_gap() {
+    let mut r = fixture();
+    r.anchors = far_anchors(&r);
+    r.consensus_segments = vec![consensus_segment("seg_one", 0.0, 100.0)];
+    r.boundaries.push(SyncBoundary {
+        evidence_id: "pause_in_gap".into(),
+        clock_id: "mic".into(),
+        sample_index: 30 * 48000,
+        kind: SyncBoundaryKind::Pause,
+    });
+    let e = r.map(&[q(20.0, 21.0)], &|| false).unwrap();
+    assert_eq!(e.slices[0].state, SyncState::Unknown);
+    assert!(e.slices[0].candidates.is_empty());
+}
+
+#[test]
+fn consensus_interpolation_refused_outside_the_supporting_span() {
+    // Right anchor (62 s) lies past the segment's last supporting query.
+    let mut r = fixture();
+    r.anchors = far_anchors(&r);
+    r.consensus_segments = vec![consensus_segment("seg_short", 0.0, 50.0)];
+    assert_eq!(
+        r.map(&[q(20.0, 21.0)], &|| false).unwrap().slices[0].state,
+        SyncState::Unknown
+    );
+    // Left anchor (2 s) lies before the segment's first supporting query.
+    r.consensus_segments = vec![consensus_segment("seg_late", 5.0, 100.0)];
+    assert_eq!(
+        r.map(&[q(20.0, 21.0)], &|| false).unwrap().slices[0].state,
+        SyncState::Unknown
+    );
+    // A segment on another capture clock never applies.
+    let mut clock_other = r.capture_clocks[0].clone();
+    clock_other.clock_id = "mic_other".into();
+    r.capture_clocks.push(clock_other);
+    let mut other = consensus_segment("seg_other", 0.0, 100.0);
+    other.clock_id = "mic_other".into();
+    r.consensus_segments = vec![other];
+    assert_eq!(
+        r.map(&[q(20.0, 21.0)], &|| false).unwrap().slices[0].state,
+        SyncState::Unknown
+    );
+}
+
+#[test]
+fn consensus_does_not_override_anchors_that_contradict_the_gap_progress() {
+    // Movie advances 90 s over 60 s of mic time: far beyond drift and residual tolerance.
+    let mut r = fixture();
+    r.anchors = far_anchors(&r);
+    r.anchors[1].movie_pts = 90000 + 100 * 90000;
+    r.consensus_segments = vec![consensus_segment("seg_one", 0.0, 100.0)];
+    let e = r.map(&[q(20.0, 21.0)], &|| false).unwrap();
+    let s = &e.slices[0];
+    assert_eq!(s.state, SyncState::Conflicting);
+    assert!(
+        s.diagnostics
+            .contains(&"inconsistent_progress_requires_resync".into())
+    );
+    assert!(s.candidates.is_empty());
+}
+
+#[test]
+fn empty_consensus_segments_leave_v1_mapping_and_bytes_unchanged() {
+    let mut r = fixture();
+    r.anchors = far_anchors(&r);
+    assert!(r.consensus_segments.is_empty());
+    let json = serde_json::to_string(&r).unwrap();
+    assert!(!json.contains("consensusSegments"));
+    let e = r.map(&[q(20.0, 21.0), q(2.0, 2.0)], &|| false).unwrap();
+    assert_eq!(e.slices[0].state, SyncState::Unknown);
+    assert_eq!(e.slices[1].state, SyncState::Anchored);
+    let again = r.map(&[q(20.0, 21.0), q(2.0, 2.0)], &|| false).unwrap();
+    assert_eq!(e, again);
+}
+
+#[test]
+fn consensus_segment_input_is_validated_before_mapping() {
+    let mut r = fixture();
+    r.consensus_segments = vec![consensus_segment("seg_bad", 50.0, 10.0)];
+    assert!(r.validate().is_err());
+    r.consensus_segments = vec![consensus_segment("seg_ok", 10.0, 50.0)];
+    r.consensus_segments[0].clock_id = "unknown_clock".into();
+    assert!(r.validate().is_err());
+}

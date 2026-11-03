@@ -296,6 +296,23 @@ impl SyncRequest {
                 "invalid input: discontinuity evidence"
             );
         }
+        ensure!(
+            self.consensus_segments.len() <= 4096,
+            "invalid input: consensus segment bounds"
+        );
+        for s in &self.consensus_segments {
+            let c = self.clock(&s.clock_id)?;
+            ensure!(
+                opaque(&s.segment_id)
+                    && s.mic_start_sample <= s.mic_end_sample
+                    && s.mic_start_sample >= c.first_sample
+                    && s.mic_end_sample <= c.last_sample
+                    && s.offset_seconds.is_finite()
+                    && s.residual_rms_seconds.is_finite()
+                    && s.residual_rms_seconds >= 0.0,
+                "invalid input: consensus segment"
+            );
+        }
         Ok(())
     }
     fn clock(&self, id: &str) -> Result<&CaptureClock> {
@@ -313,6 +330,23 @@ impl SyncRequest {
         self.boundaries
             .iter()
             .any(|e| e.clock_id == clock && a < e.sample_index && e.sample_index <= b)
+    }
+    /// The first supplied segment whose supporting span holds both anchors and
+    /// the whole query (ARCHITECTURE.md §9). Segments are never inferred here.
+    fn consensus_span(
+        &self,
+        c: &CaptureClock,
+        left: u64,
+        right: u64,
+        q: &SyncQuery,
+    ) -> Option<&ConsensusSegment> {
+        self.consensus_segments.iter().find(|s| {
+            s.clock_id == c.clock_id
+                && s.mic_start_sample <= left
+                && right <= s.mic_end_sample
+                && s.mic_start_sample <= q.start_sample
+                && q.end_sample <= s.mic_end_sample
+        })
     }
 
     /// Deterministic bounded pure computation. Cancellation is checked per query
@@ -426,9 +460,19 @@ impl SyncRequest {
                 }
                 slice.state = SyncState::Anchored;
             } else if rs > ls
-                && (rs - ls) as f64 / c.sample_rate as f64 <= self.policy.max_anchor_gap_seconds
                 && !self.crosses(&c.clock_id, ls, rs)
+                && ((rs - ls) as f64 / c.sample_rate as f64 <= self.policy.max_anchor_gap_seconds
+                    || self.consensus_span(c, ls, rs, &q).is_some())
             {
+                // Interpolation beyond max_anchor_gap_seconds is reached only through
+                // a supplied consensus segment that contains both anchors and the query.
+                let consensus = if (rs - ls) as f64 / c.sample_rate as f64
+                    > self.policy.max_anchor_gap_seconds
+                {
+                    self.consensus_span(c, ls, rs, &q)
+                } else {
+                    None
+                };
                 // All alternatives are retained. Too many combinations remain
                 // unknown rather than allowing quadratic work from hostile input.
                 if la.len() * ra.len() > 64 {
@@ -456,9 +500,21 @@ impl SyncRequest {
                         let map = |s: u64| {
                             a.movie_pts as f64 + (s - ls) as f64 / (rs - ls) as f64 * progress
                         };
-                        let uncertainty = self.uncertainty(a, c).max(self.uncertainty(b, c))
-                            + tolerance
-                            + capture_seconds * tps * self.policy.unobserved_uncertainty_ppm / 1e6;
+                        let unobserved =
+                            capture_seconds * tps * self.policy.unobserved_uncertainty_ppm / 1e6;
+                        let uncertainty = match consensus {
+                            // ARCHITECTURE.md §9: anchor uncertainty + residual_rms + unobserved.
+                            Some(seg) => {
+                                self.uncertainty(a, c).max(self.uncertainty(b, c))
+                                    + seg.residual_rms_seconds * tps
+                                    + unobserved
+                            }
+                            None => {
+                                self.uncertainty(a, c).max(self.uncertainty(b, c))
+                                    + tolerance
+                                    + unobserved
+                            }
+                        };
                         slice.candidates.push(self.estimate(
                             map(q.start_sample),
                             map(q.end_sample),
@@ -469,11 +525,16 @@ impl SyncRequest {
                         ));
                     }
                 }
-                slice.state = if slice.diagnostics.is_empty() {
-                    SyncState::Estimated
-                } else {
-                    SyncState::Conflicting
+                slice.state = match (slice.diagnostics.is_empty(), consensus) {
+                    (false, _) => SyncState::Conflicting,
+                    (true, Some(_)) => SyncState::ConsensusInterpolated,
+                    (true, None) => SyncState::Estimated,
                 };
+                if let Some(seg) = consensus {
+                    slice
+                        .diagnostics
+                        .push(format!("consensus_segment:{}", seg.segment_id));
+                }
             } else {
                 slice.diagnostics.push("gap_or_discontinuity".into());
             }
